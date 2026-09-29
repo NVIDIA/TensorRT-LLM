@@ -33,10 +33,9 @@ A capacity-only worker opens its handle and stops there, with no layout, no
 buffer registration and no save thread, so a node can lend host memory to the
 pool without an HCA that can pin GPU pages.
 
-A layer group moves as two pages. Its shard-specific bytes are keyed per rank as
-usual, while roles the manager declares replicated are keyed once for the whole
-TP group, since every rank holds the same bytes. Only one rank writes that copy;
-all of them read it, because each still needs the bytes in its own GPU memory.
+A layer group moves as two pages. The shard-specific one is keyed per rank; the
+replicated one is keyed once for the whole TP group. One rank writes that shared
+copy and every rank reads it, since each needs the bytes in its own GPU memory.
 """
 
 import os
@@ -198,9 +197,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._addressing: Optional[PageAddressing] = None
         #: Namespaces for this attention shard, shared by compatible ADP owners.
         self._namespaces: Dict[int, KeyNamespace] = {}
-        # Namespaces for roles whose bytes are identical on every shard, keyed
-        # without a rank so the whole TP group shares one copy. Present only
-        # for layer groups that hold such a role.
+        # Rank-independent namespaces, present only for the layer groups that
+        # hold a replicated role.
         self._replicated_namespaces: Dict[int, KeyNamespace] = {}
         # A TP hit requires every attention shard. ADP has one complete shard,
         # so neither content identity nor lookup depends on unrelated owners.
@@ -400,8 +398,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         Only the directions this role drives get a pool, since each one costs
         a pinned allocation of its own.
         """
-        # Both classes pass through the same slots, so a slot has to hold the
-        # larger of the two; a replicated page is usually the smaller one.
+        # Both page classes pass through the same slots, so a slot has to hold
+        # the larger of the two.
         max_bytes_per_page = max(
             max(
                 addressing.bytes_per_page(layer_group_id),
@@ -464,9 +462,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     def _owns_replicated_saves(self) -> bool:
         """Whether this rank writes the replicated pages of its group.
 
-        Replicated pages carry one key for the whole TP group, so every rank
-        holding identical bytes would otherwise race to write the same value.
-        Naming a single owner keeps that to one write.
+        Naming a single owner keeps ranks holding identical bytes from racing
+        to write the same key.
 
         Under ADP every owner reports attention rank 0, which is deliberate:
         owners there serve different requests and so mostly produce different
@@ -497,8 +494,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         for block_hash in block_hashes:
             for namespaces in self._peer_namespaces.values():
                 keys.extend(namespace.key(block_hash) for namespace in namespaces)
-            # One key for the whole group rather than one per shard, so a block
-            # whose replicated page was dropped reads as a miss on every rank.
+            # One key for the whole group, so a block whose replicated page was
+            # dropped reads as a miss on every rank.
             keys.extend(
                 namespace.key(block_hash) for namespace in self._replicated_namespaces.values()
             )
@@ -540,10 +537,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._reraise_save_error()
 
         keys, addresses, sizes, total_pages = self._resolve(metadata.loads)
-        # Every rank reads the replicated pages even though one rank wrote
-        # them: the bytes are shared only in the store, and each rank still
-        # needs its own GPU copy. Appending rather than loading separately
-        # keeps both classes inside the same transfer batches.
+        # Appending rather than loading separately keeps both page classes
+        # inside the same transfer batches.
         rep_keys, rep_addresses, rep_sizes, rep_pages = self._resolve(
             metadata.loads, replicated=True
         )
@@ -775,9 +770,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         Args:
             transfers: Pages to move, as the scheduler reported them.
             replicated: Resolve the replicated page of each layer group rather
-                than the shard-specific one. Layer groups holding no replicated
-                role contribute nothing, so the result is empty for a model
-                that declares none.
+                than the shard-specific one. Groups holding no replicated role
+                contribute nothing.
 
         Returns:
             Parallel lists of keys, per-key buffer addresses and per-key buffer

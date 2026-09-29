@@ -24,10 +24,9 @@ that decides what the stored bytes mean: the model, the shard that produced
 them, the layer group inside that shard, the tokens each page holds and how many
 bytes a page is. A change to any of those reads as a miss rather than as garbage.
 
-The shard component is where replicated roles pay off. A page whose bytes depend
-on the shard is named per rank, but one whose bytes are identical on every rank
-is named `REPLICATED_SHARD_KEY` instead, so a TP group stores it once rather
-than once per rank.
+The shard component has two forms. A page whose bytes depend on the shard is
+named per rank, while one whose bytes are identical on every rank is named
+`REPLICATED_SHARD_KEY` instead, giving a TP group a single shared key.
 """
 
 import hashlib
@@ -147,8 +146,7 @@ class BlockHashChain:
 
 
 #: Shard component for pages whose bytes do not depend on the attention shard.
-#: A literal rather than a rank, so a replicated page has one key for the whole
-#: TP group. It cannot collide with a sharded component, which is always
+#: A literal cannot collide with a sharded component, which is always
 #: `w<int>r<int>`.
 REPLICATED_SHARD_KEY = "replicated"
 
@@ -169,9 +167,8 @@ class KeyNamespace:
 
     namespace: str
     model_key: str
-    #: Which shard's bytes these are: `sharded_shard_key(...)` for a page whose
-    #: content depends on the shard that produced it, `REPLICATED_SHARD_KEY`
-    #: for one whose content is identical on every shard.
+    #: Which shard's bytes these are, from `sharded_shard_key` for a page whose
+    #: content depends on its producer, `REPLICATED_SHARD_KEY` otherwise.
     shard_key: str
     layer_group_id: int
     tokens_per_block: int

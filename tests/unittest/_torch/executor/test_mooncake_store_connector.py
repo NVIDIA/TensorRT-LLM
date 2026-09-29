@@ -127,7 +127,7 @@ def make_layout(*, num_groups=1, regions_per_group=1, num_slots=8, replicated_pe
     """A layout whose regions are laid out back to back in a fake address space.
 
     `replicated_per_group` adds that many index-K style regions per group,
-    standing in for a role the manager declared identical on every shard.
+    standing in for a role the manager declared replicated.
     """
     groups = []
     base = 0x1000
@@ -596,7 +596,7 @@ def test_page_addressing_resolves_the_two_classes_separately():
     assert rep_addresses == [region.base + region.stride * 2 for region in group.replicated_regions]
     assert rep_sizes == [region.size for region in group.replicated_regions]
 
-    # The two payloads are disjoint, so their sizes do not overlap-count.
+    # The two payloads are disjoint, so their sizes do not double-count.
     assert addressing.has_replicated(0)
     assert addressing.bytes_per_page(0) == sum(region.size for region in group.regions)
     assert addressing.replicated_bytes_per_page(0) == sum(
@@ -869,7 +869,7 @@ def test_worker_load_addresses_the_requested_page(store_config, fake_store):
 def test_worker_names_the_replicated_page_without_a_rank(
     store_config: Path, fake_store: FakeStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The point of the split: one key for index-K across the whole TP group."""
+    """Index-K carries one key across the whole TP group."""
     layout = make_layout(replicated_per_group=1)
     block_hash = b"\x03" * 16
     monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 8)
@@ -888,7 +888,7 @@ def test_worker_names_the_replicated_page_without_a_rank(
 def test_worker_has_no_replicated_namespace_without_the_role(store_config, fake_store):
     with make_worker(fake_store, layout=make_layout(num_groups=2)) as worker:
         assert worker._replicated_namespaces == {}
-        # And nothing resolves, so neither path gains a key.
+        # And nothing resolves, so the replicated path contributes no keys.
         transfers = [RequestTransfers(1, [PageTransfer(b"\x00" * 16, 0, 0)])]
         assert worker._resolve(transfers, replicated=True)[0] == []
 

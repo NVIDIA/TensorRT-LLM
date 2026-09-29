@@ -24,11 +24,9 @@ and parallel layout because `build_kv_cache_layout_v2` derives it from the
 allocator's own aggregation. `bytes_per_page` goes into the key namespace so a
 geometry change cannot be read as a valid page.
 
-A layer group yields two pages rather than one. Most roles hold bytes belonging
-to a single attention shard; roles the manager declares replicated hold bytes
-identical on every shard. They are addressed separately so the connector can
-key the replicated page once for the whole TP group. Groups with no replicated
-role report an empty second page, which the worker skips.
+A layer group yields two pages rather than one, since its shard-specific and
+replicated regions are keyed separately. Groups with no replicated role report
+an empty second page, which the worker skips.
 """
 
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -96,10 +94,9 @@ def merge_intervals(intervals: Iterable[Tuple[int, int]]) -> List[Tuple[int, int
     """Collapse `(start, end)` byte ranges into a minimal disjoint cover.
 
     A range may not be registered twice, but several regions routinely live
-    inside one pool allocation: sliding-window layer groups share it, and
-    separating replicated roles from shard-specific ones (MiniMax-M3's index-K
-    beside K/V) splits one pool into interleaved regions of both classes.
-    Merging first spares the caller that distinction.
+    inside one pool allocation: sliding-window layer groups share it, and a
+    pool holding both region classes (MiniMax-M3's index-K beside K/V) splits
+    into interleaved regions. Merging first spares the caller that distinction.
     """
     ordered = sorted((int(start), int(end)) for start, end in intervals if end > start)
     merged: List[Tuple[int, int]] = []
@@ -147,8 +144,7 @@ class PageAddressing:
             self._replicated_bytes_per_page[group.layer_group_id] = group.replicated_bytes_per_page
             # Regions of a group come from the same pool group and so share a
             # slot count. Disagreement would make the page index ambiguous.
-            # Replicated regions are indexed by that same space, so they are
-            # held to it too.
+            # Replicated regions share that space, so they are held to it too.
             slot_counts = {
                 region.num_slots for region in (*group.regions, *group.replicated_regions)
             }
@@ -237,10 +233,9 @@ class PageAddressing:
     ) -> Tuple[List[int], List[int]]:
         """Addresses and sizes of one replicated page, in concatenation order.
 
-        These bytes are identical on every attention shard, so the same page is
-        described here on every rank even though each rank names its own copy.
-        A region crossing a GPU pool mapping boundary is split the same way as
-        in `buffers`.
+        The bytes match on every rank but the addresses do not, since each rank
+        names the copy in its own memory. A region crossing a GPU pool mapping
+        boundary is split the same way as in `buffers`.
 
         Args:
             layer_group_id: Layer group the page index is scoped to.
@@ -287,8 +282,8 @@ class PageAddressing:
         from the first slot to the end of the last. Registering the whole span
         is what makes every slot's address valid for RDMA, and merging keeps a
         shared pool from being registered once per region. Both region classes
-        are covered: replicated bytes are transferred like any other, so
-        leaving them unregistered would fail every transfer that touches them.
+        are covered, since replicated bytes are transferred like any other and
+        an unregistered range cannot be transferred at all.
 
         Merged spans are then cut at GPU pool mapping boundaries, measured from
         the reservation each pool was mapped into, since a registration covering

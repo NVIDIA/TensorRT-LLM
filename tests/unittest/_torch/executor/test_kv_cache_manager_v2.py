@@ -566,8 +566,7 @@ def test_replicated_roles_follow_the_disagg_declaration():
     manager = object.__new__(KVCacheManagerV2)
     assert manager.get_replicated_roles() == frozenset({Role.INDEX_KEY})
 
-    # A subclass declaring a new replicated side cache is picked up without
-    # touching the connectors that consume this.
+    # A subclass declaring a new replicated side cache is picked up on its own.
     extra = Role.KEY_BLOCK_SCALE
     manager.get_disagg_role_mapper_kinds = lambda: {
         Role.ALL: MapperKind.INDEXED,

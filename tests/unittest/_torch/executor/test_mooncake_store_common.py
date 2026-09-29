@@ -213,7 +213,7 @@ def test_key_namespace_separates_every_dimension():
 
 
 def test_shard_key_distinguishes_rank_and_world_size():
-    # rank 3 of 8 holds different heads than rank 3 of 4, so both components
+    # Rank 3 of 8 holds different heads than rank 3 of 4, so both components
     # have to appear.
     assert sharded_shard_key(3, 8) != sharded_shard_key(3, 4)
     assert sharded_shard_key(0, 2) != sharded_shard_key(1, 2)
