@@ -130,6 +130,9 @@ class SampleStateTensorsSpec(SampleStateTensors):
 
     new_tokens_lens: torch.Tensor
     next_draft_tokens: torch.Tensor
+    # Actual token windows, aligned with SampleStateSpec.requests, when the
+    # worker selects verification lengths on device.
+    verify_lens: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
@@ -145,6 +148,10 @@ class SampleStateSpec(SampleState):
     # instead would see the NEXT step's buffer, which update_requests itself
     # installs.
     draft_lens: Optional[list[int]] = None
+    # Per-request verify windows for this sampler step, keyed by request id.
+    # The overlap scheduler can stamp the next step on the live request before
+    # this state is consumed, so rewind accounting must use this snapshot.
+    verify_lens_snapshot: Optional[dict[int, int]] = None
 
 
 class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
@@ -320,6 +327,57 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 
+    @staticmethod
+    def _verified_len(
+        request: LlmRequest,
+        runtime_draft_len: int,
+        verify_lens_snapshot: Optional[dict[int, int]],
+        token_window: Optional[int] = None,
+    ) -> int:
+        """Return the number of draft positions verified for one request."""
+        if token_window is not None and token_window > 0:
+            return int(token_window) - 1
+        verify_len = (
+            verify_lens_snapshot.get(request.py_request_id)
+            if verify_lens_snapshot is not None
+            else None
+        )
+        return runtime_draft_len if verify_len is None else int(verify_len)
+
+    @staticmethod
+    def _snapshot_verify_lens(
+        requests: list[LlmRequest],
+    ) -> Optional[dict[int, int]]:
+        """Capture overlap-sensitive ragged windows for one sampler step."""
+        snapshot = {
+            request.py_request_id: int(verify_len)
+            for request in requests
+            if (verify_len := getattr(request, "py_verify_len", None)) is not None
+        }
+        return snapshot or None
+
+    @classmethod
+    def _snapshot_policy_windows_for_step(
+        cls,
+        requests: list[LlmRequest],
+        *,
+        native_uniform: bool,
+        host_snapshot_required: bool,
+        device_verify_lens_available: bool,
+    ) -> Optional[dict[int, int]]:
+        """Select one authoritative verification-window source for this step."""
+        if type(native_uniform) is not bool or type(host_snapshot_required) is not bool:
+            raise ValueError("verification-window markers must be boolean")
+        if native_uniform and (host_snapshot_required or device_verify_lens_available):
+            raise ValueError("native-uniform verification cannot also publish ragged windows")
+        if host_snapshot_required and device_verify_lens_available:
+            raise ValueError("device windows and host-window snapshots are mutually exclusive")
+        if native_uniform:
+            return {}
+        if device_verify_lens_available:
+            return None
+        return cls._snapshot_verify_lens(requests)
+
     def update_requests(
         self,
         state: SampleStateSpec,
@@ -338,6 +396,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens.tolist()
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
+        token_windows = (
+            state.host.verify_lens.tolist() if state.host.verify_lens is not None else None
+        )
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
@@ -365,16 +426,25 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             # replaces py_draft_tokens with the next step's buffer, so its
             # length must not be used as the denominator (0 for the request's
             # prefill step, where nothing was verified).
-            req.py_num_draft_tokens_verified = (
-                state.draft_lens[req_idx] if state.draft_lens is not None else 0
+            verified_len = (
+                runtime_draft_len
+                if token_windows is None and state.verify_lens_snapshot is None
+                else self._verified_len(
+                    req,
+                    runtime_draft_len,
+                    state.verify_lens_snapshot,
+                    token_windows[req_idx] if token_windows is not None else None,
+                )
             )
-            req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
+            drafted_len = state.draft_lens[req_idx] if state.draft_lens is not None else 0
+            req.py_num_draft_tokens_verified = min(drafted_len, verified_len)
+            req.py_rewind_len = verified_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
     def sample_async(
         self,
         scheduled_requests: ScheduledRequests,
-        outputs: dict[str, torch.Tensor],
+        outputs: dict[str, torch.Tensor | bool],
         num_context_logits_prefix_sum: list[int],
     ) -> SampleStateSpec:
         """
@@ -388,6 +458,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 - new_tokens_lens: [batch] number of accepted tokens
                 - next_draft_tokens: [batch, max_draft_len] draft tokens for next iter
                 - next_new_tokens: [batch, max_draft_len + 1] input for next iter
+                - verify_lens: optional [batch] device-selected token windows
+                - native_uniform_verify: optional boolean declaring uniform windows
+                - host_policy_windows_snapshot: optional boolean declaring host windows
             num_context_logits_prefix_sum: Prefix sum of context logits (unused)
 
         Returns:
@@ -423,6 +496,25 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         ]
         o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
         runtime_draft_len = o_next_draft_tokens.shape[1]
+
+        o_verify_lens = outputs.get("verify_lens")
+        if o_verify_lens is not None:
+            if (
+                not isinstance(o_verify_lens, torch.Tensor)
+                or o_verify_lens.dim() != 1
+                or o_verify_lens.dtype not in (torch.int32, torch.int64)
+                or o_verify_lens.shape[0] < num_skip + num_sampling_requests
+            ):
+                raise ValueError(
+                    "verify_lens must contain one integer token window per sampled request"
+                )
+            o_verify_lens = o_verify_lens[num_skip : num_skip + num_sampling_requests]
+        verify_lens_snapshot = self._snapshot_policy_windows_for_step(
+            sampling_requests,
+            native_uniform=outputs.get("native_uniform_verify", False),
+            host_snapshot_required=outputs.get("host_policy_windows_snapshot", False),
+            device_verify_lens_available=o_verify_lens is not None,
+        )
 
         # Pad or truncate to match fixed-size store buffers for index_copy_.
         # The worker output width tracks runtime_draft_len, which dynamic draft
@@ -466,6 +558,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             new_tokens=self._copy_to_host(self.store.new_tokens),
             new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
             next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
+            verify_lens=(self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None),
         )
         sampler_event = self._record_sampler_event()
 
@@ -480,4 +573,5 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             sampler_event=sampler_event,
             runtime_draft_len=runtime_draft_len,
             draft_lens=draft_lens,
+            verify_lens_snapshot=verify_lens_snapshot,
         )
