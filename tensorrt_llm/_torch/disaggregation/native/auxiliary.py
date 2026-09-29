@@ -114,8 +114,8 @@ def build_aux_transfer_layout(
 
 AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
 
-_DRAFT_HISTORY_VERSION = 3
-_DRAFT_HISTORY_FIELDS = 11
+_DRAFT_HISTORY_VERSION = 2
+_DRAFT_HISTORY_FIELDS = 10
 _DRAFT_DTYPE_CODES = {"torch.float16": 1, "torch.bfloat16": 2}
 _DRAFT_BACKEND_CODES = {"VANILLA": 1, "TRTLLM": 2, "DSv4": 3}
 
@@ -136,7 +136,6 @@ def _encode_draft_history(history: dict[str, Any]) -> list[int]:
         _DRAFT_BACKEND_CODES[layout["attention_backend"]],
         layout["kv_factor"],
         layout["window_size"] or 0,
-        int(history.get("is_disabled", False)),
     ]
 
 
@@ -154,7 +153,6 @@ def _decode_draft_history(values: list[int]) -> dict[str, Any]:
         backend_code,
         kv_factor,
         window_size,
-        is_disabled,
     ) = values
     dtypes = {code: name for name, code in _DRAFT_DTYPE_CODES.items()}
     backends = {code: name for name, code in _DRAFT_BACKEND_CODES.items()}
@@ -171,7 +169,6 @@ def _decode_draft_history(values: list[int]) -> dict[str, Any]:
         "valid_length": valid_length,
         "position": position,
         "layout": layout,
-        "is_disabled": bool(is_disabled),
     }
 
 

@@ -536,16 +536,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return req.prompt_len
 
     def _validate_draft_history_range(self, req: LlmRequest, history: dict) -> None:
-        # Full-attention drafters retain the whole prompt; rolling drafters
-        # retain its complete live suffix. Neither includes speculative scratch.
-        # Disabled drafters transfer only the prompt position.
+        # Full-attention drafters can skip an oversized context store; rolling
+        # drafters retain their complete live suffix. Neither includes scratch.
         window_size = history["layout"]["window_size"]
+        max_positions = self._kv_cache_manager.draft_layout.max_position_embeddings
         prompt_len = self._global_prompt_len(req)
-        expected_length = 0 if history.get("is_disabled", False) else prompt_len
+        expected_length = prompt_len
         if window_size is not None:
             if type(window_size) is not int or window_size <= 0:
                 raise ValueError("Invalid draft history window size")
             expected_length = min(expected_length, window_size)
+        elif max_positions is not None and prompt_len > max_positions:
+            expected_length = min(history["valid_length"], max_positions)
         if history["valid_length"] != expected_length or history["position"] != prompt_len:
             raise ValueError(
                 "DSpark transfer requires valid draft history and sequence position "

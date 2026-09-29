@@ -3401,21 +3401,13 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_draft_history(self, request_id: int) -> Optional[StandaloneDraftHistory]:
         return self.draft_history.get(request_id)
 
-    def set_draft_history(
-        self, request_id: int, valid_length: int, position: int, is_disabled: bool = False
-    ) -> None:
+    def set_draft_history(self, request_id: int, valid_length: int, position: int) -> None:
         cache = self.kv_cache_map.get(request_id)
         if cache is None or not cache.is_active:
             raise ValueError(
                 f"Standalone draft request {request_id} has no active cache allocation"
             )
-        history = StandaloneDraftHistory(valid_length, position, is_disabled)
-        previous = self.get_draft_history(request_id)
-        # Fallback remains terminal when older overlapping updates arrive.
-        if previous is not None and previous.is_disabled:
-            history = StandaloneDraftHistory(0, max(position, previous.position), True)
-        elif is_disabled:
-            history = StandaloneDraftHistory(0, position, True)
+        history = StandaloneDraftHistory(valid_length, position)
         if history.position > cache.capacity:
             raise ValueError("Standalone draft history exceeds allocated capacity")
         if (
@@ -3436,7 +3428,6 @@ class KVCacheManagerV2(BaseResourceManager):
         return {
             "valid_length": history.valid_length,
             "position": history.position,
-            "is_disabled": history.is_disabled,
             "layout": self.draft_layout.transfer_identity(),
         }
 
@@ -3448,11 +3439,10 @@ class KVCacheManagerV2(BaseResourceManager):
             raise ValueError("Standalone draft transfer layout does not match the receiving worker")
         valid_length = metadata.get("valid_length")
         position = metadata.get("position")
-        is_disabled = metadata.get("is_disabled", False)
-        history = StandaloneDraftHistory(valid_length, position, is_disabled)
+        history = StandaloneDraftHistory(valid_length, position)
         # Validate receiver-local allocation before publishing history.
         self.get_draft_block_table([request_id], [history])
-        self.set_draft_history(request_id, valid_length, position, is_disabled)
+        self.set_draft_history(request_id, valid_length, position)
 
     def get_index_k_buffer(
         self,
@@ -3878,12 +3868,26 @@ class KVCacheManagerV2(BaseResourceManager):
         self._restore_page_index_bufs(req_id, kv_cache)
         return True
 
+    def _draft_context_exceeds_limit(self, req: LlmRequest) -> bool:
+        """Whether draft prefill skips this prompt, preventing unified block reuse."""
+        layout = self.draft_layout
+        if (
+            layout is None
+            or layout.window_size is not None
+            or layout.max_position_embeddings is None
+        ):
+            return False
+        prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+        return prompt_len > min(self.max_seq_len, layout.max_position_embeddings)
+
     def _context_reuse_tokens(
         self, req: LlmRequest, reuse_limit: int | None = None
     ) -> Sequence[TokenIdExt]:
         """Radix-tree evidence for one context prefix. Raw prompt, so block hashes
         stay comparable with KV cache events, the cache-aware router and disagg peers.
         """
+        if self._draft_context_exceeds_limit(req):
+            return []
         all_tokens = self._reuse_token_source(req)
         # The target must recompute the last prompt token, but a one-model draft
         # also reads D prompt tokens ahead. Include those tokens as match evidence;
@@ -3958,7 +3962,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
-            if not self.enable_block_reuse:
+            if not self.enable_block_reuse or self._draft_context_exceeds_limit(req):
                 kv_cache.stop_committing()
             else:
                 self._record_branch_snapshot_point(req, kv_cache, num_lookup_tokens)
@@ -5570,20 +5574,13 @@ class KVCacheManagerV2(BaseResourceManager):
             self.enable_block_reuse
             and self._can_publish_block_reuse
             and not request.is_dummy_request
+            and not self._draft_context_exceeds_limit(request)
         )
         if not should_block_reuse:
             return
 
         kv_cache = self.kv_cache_map.get(request.py_request_id)
         if kv_cache is None:
-            return
-
-        draft_history = (
-            self.get_draft_history(request.py_request_id) if self.draft_layout is not None else None
-        )
-        if draft_history is not None and draft_history.is_disabled:
-            # Unwritten draft rows cannot become reusable snapshots.
-            kv_cache.stop_committing()
             return
 
         commit_end = request.context_current_position
@@ -6088,6 +6085,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.enable_block_reuse
                 and self._can_publish_block_reuse
                 and not req.is_dummy_request
+                and not self._draft_context_exceeds_limit(req)
             )
             is_all_reusable = self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
             should_resize = not should_block_reuse or not is_all_reusable

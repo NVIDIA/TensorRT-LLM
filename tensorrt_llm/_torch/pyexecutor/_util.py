@@ -1916,6 +1916,7 @@ class KvCacheCreator:
         attention_backend = self._speculative_config.attention_backend
         if attention_backend == "AUTO":
             attention_backend = draft.dflash_attention_backend
+        draft_model_config = getattr(draft, "config", None)
         return StandaloneDraftLayout(
             num_layers=config.num_hidden_layers,
             num_kv_heads=(num_kv_heads + attention_tp_size - 1) //
@@ -1926,6 +1927,9 @@ class KvCacheCreator:
             extra_tokens=self._speculative_config.max_draft_len + 1,
             attention_backend=attention_backend,
             total_num_kv_heads=num_kv_heads,
+            max_position_embeddings=(getattr(draft_model_config,
+                                             "max_position_embeddings", None)
+                                     if draft_model_config else None),
         )
 
     def _should_create_separate_draft_kv_cache(self) -> bool:
