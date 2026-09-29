@@ -133,6 +133,7 @@ l0_h100:
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_python_nixl_cache_transceiver_uses_cpp_bounce
   # Helix CP
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_helix_cp
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_kv_cache_manager_v2_accepts_attention_dp_with_helix_cp
   # V1 host offload: the send path must address primary slots, not block IDs.
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_sends_primary_slots_under_host_offload
   # Real scheduler/resource lifecycle: pending pins, capacity recovery and host-prefix replay.
