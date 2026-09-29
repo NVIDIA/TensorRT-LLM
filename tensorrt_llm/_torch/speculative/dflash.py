@@ -1435,10 +1435,8 @@ class DFlashWorker(SpecWorkerBase):
         rows: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        if v is None:
-            # Single-latent (MLA) cache: one vector per token per layer, so
-            # there is no K/V interleave for append_paged_kv_cache to do and the
-            # write is a plain scatter into the page the block table names.
+        if v is None or self._dflash_attention_backend == "VANILLA":
+            # VANILLA and single-latent (MLA) caches use direct page writes.
             table = (
                 self._ctx_block_tables
                 if self._ctx_block_tables is not None
@@ -1448,7 +1446,10 @@ class DFlashWorker(SpecWorkerBase):
             pages = table[rows.long(), positions.long() // page_size].long()
             offsets = positions.long() % page_size
             for layer_idx in range(k.size(1)):
-                self._ctx_kv_buf[layer_idx][pages, 0, 0, offsets] = k[:, layer_idx, 0]
+                pool = self._ctx_kv_buf[layer_idx]
+                pool[pages, 0, :, offsets] = k[:, layer_idx].to(pool.dtype)
+                if v is not None:
+                    pool[pages, 1, :, offsets] = v[:, layer_idx].to(pool.dtype)
             return
         append_paged_kv_cache = self._get_ctx_paged_append()
 

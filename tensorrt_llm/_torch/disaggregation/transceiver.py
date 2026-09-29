@@ -441,6 +441,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     isinstance(self._kv_cache_manager, KVCacheManagerV2)
                     and self._kv_cache_manager.draft_layout is not None
                     and lg.sliding_window_size is not None
+                    and (
+                        is_gen_only
+                        or not self.pipeline_transfer_enabled
+                        or req.context_remaining_length == 0
+                    )
                 ):
                     stale_end = max(0, (prompt_len + 1 - lg.sliding_window_size) // tpb)
                     if not getattr(lg, "cp_as_tp", False):
@@ -517,19 +522,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         )
 
-    def _validate_draft_transfer(self, req: LlmRequest) -> None:
-        manager = getattr(self, "_kv_cache_manager", None)
-        if getattr(manager, "draft_layout", None) is None:
-            return
-        params = req.py_disaggregated_params
-        if params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST:
-            raise ValueError(
-                "DSpark draft-state transfer requires context_first scheduling; "
-                "generation_first is not yet supported for draft history."
-            )
-        if self.pipeline_transfer_enabled:
-            raise ValueError("DSpark draft-state transfer does not support pipelined transfer.")
-
     def _global_prompt_len(self, req: LlmRequest) -> int:
         if getattr(self._kv_cache_manager, "_has_cp_helix", False):
             return req.total_input_len_cp
@@ -559,7 +551,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         manager = getattr(self, "_kv_cache_manager", None)
         if getattr(manager, "draft_layout", None) is None:
             return
-        self._validate_draft_transfer(req)
         history = self._kv_cache_manager.export_draft_history(req.py_request_id)
         self._validate_draft_history_range(req, history)
         req.py_draft_transfer_history = history
@@ -970,9 +961,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         assert self._page_table is not None
         for lg, block_ids in zip(self._page_table.layer_groups, all_block_ids):
             window_size = getattr(lg, "sliding_window_size", None)
-            if window_size is not None and window_size < req.prompt_len:
-                # SWA pages can leave the active window between chunks. Defer
-                # the group and send its complete final active window at once.
+            if getattr(lg, "cp_as_tp", False) or (
+                window_size is not None and window_size < req.prompt_len
+            ):
+                # Draft history can be rewritten and SWA pages can leave the
+                # active window between chunks. Send these groups at the end.
                 chunk_block_ids.append(block_ids if is_last_chunk else np.full_like(block_ids, -1))
             else:
                 # Positional: keep the chunk's ordinals, blank everything else.
@@ -1000,7 +993,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         if not self._validate_bridge_req(req):
             return
-        self._pack_draft_history(req)
         self._ever_had_send_session = True
         # Keep the latest slice's transfer-start timestamp.
         req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
@@ -1030,6 +1022,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else:
                 extent = self._create_cache_extent(req)
             chunk = extent.local
+            if chunk.is_last:
+                self._pack_draft_history(req)
             # The handle that comes back is the contract's answer about this piece. What retires
             # the request is the sweep over the session tables, as it was before.
             PeerPublish(session, req).publish(extent)
@@ -1049,7 +1043,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def request_and_receive_sync(self, req: LlmRequest) -> None:
         if not self._validate_bridge_req(req, synchronous=True):
             return
-        self._validate_draft_transfer(req)
         rid = get_unique_rid(req)
         self._ever_had_recv_session = True
         if rid in self._recv_sessions:
@@ -1126,7 +1119,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """
         if not self._validate_bridge_req(req):
             return
-        self._validate_draft_transfer(req)
         self._ever_had_recv_session = True
         req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
         rid = get_unique_rid(req)
