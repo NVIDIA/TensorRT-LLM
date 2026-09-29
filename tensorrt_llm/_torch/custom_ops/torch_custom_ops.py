@@ -33,9 +33,10 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils import fp8_quantize
 
-from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
-                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
-                         TuningConfig, autotune)
+from ..autotuner import (_TORCH_PROFILER_TIMER_KEY, AutoTuner, ConstraintSpec,
+                         DistributedTuningStrategy, DynamicTensorSpec,
+                         OptimizationProfile, TunableRunner, TuningConfig,
+                         autotune)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
@@ -1492,13 +1493,17 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             raise ValueError(f"Invalid tactic: {tactic}")
 
     def use_torch_profiler(self, tactic) -> bool:
-        # Keep one timing backend for every candidate in a mixed-backend sweep.
-        return "cutedsl" in self.allowed_backends
+        """Use CUPTI for a mixed-backend sweep only when explicitly requested."""
+        return ("cutedsl" in self.allowed_backends and os.getenv(
+            "TLLM_PROFILING_TIMER", "").lower() == _TORCH_PROFILER_TIMER_KEY)
 
     def profiling_timer_cache_key(self) -> Optional[str]:
-        return "torch_profiler" if "cutedsl" in self.allowed_backends else None
+        """Tag mixed-backend results ranked with the opt-in CUPTI timer."""
+        return _TORCH_PROFILER_TIMER_KEY if self.use_torch_profiler(
+            None) else None
 
     def tactic_search_cache_key(self):
+        """Distinguish candidate sets affected by the active NVMMH policy."""
         if "cutedsl" not in self.allowed_backends or not IS_CUTLASS_DSL_AVAILABLE:
             return None
         return _cutedsl_nvmmh_tactic_search_cache_key()

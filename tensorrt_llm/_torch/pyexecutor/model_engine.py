@@ -1153,8 +1153,12 @@ class PyTorchModelEngine(ModelEngine):
 
         # Release model weights.
         release_gc()
-        AutoTuner.get()._release_nvmmh_policy(self)
+        self._release_autotuner_nvmmh_policy()
         self._cleanup_done = True
+
+    def _release_autotuner_nvmmh_policy(self) -> None:
+        """Release the policy pin after the executor stops using this engine."""
+        AutoTuner.get()._release_nvmmh_policy(self)
 
     def __del__(self) -> None:
         """Best-effort cleanup during garbage collection.

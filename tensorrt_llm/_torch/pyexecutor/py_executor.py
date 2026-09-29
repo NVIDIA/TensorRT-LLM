@@ -1856,9 +1856,12 @@ class PyExecutor:
         # to compute kv_cache_max_memory. cleanup() would set
         # model_engine.model = None, breaking that read with
         # `'NoneType' object has no attribute 'model_config'`.
-        # The engine's __del__ still calls cleanup() at terminal teardown
-        # (when the executor's reference is dropped), which is sufficient for
-        # the GMS daemon registry eviction the cleanup hook was added for.
+        # Release the NVMMH policy pin explicitly; cleanup() still runs when
+        # the engine is collected and releases its remaining resources.
+        for engine in (self.model_engine, self.draft_model_engine):
+            if engine is not None and hasattr(
+                    engine, '_release_autotuner_nvmmh_policy'):
+                engine._release_autotuner_nvmmh_policy()
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine
