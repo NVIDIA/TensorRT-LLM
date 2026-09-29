@@ -19,20 +19,21 @@
 
 Two formats from one record: `.ids` files the pipeline filters with `awk`, and
 a JSON record holding the counts and the per-test outcome. `plugin.py` holds
-the hooks.
+the hooks and renders the summary through pytest's terminal reporter.
 """
 
 import json
 import subprocess
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import pytest
-
-from .collection import Selection
-from .core.allocation import Assignment, GpuDemand, Ladder
-from .core.machines import MachineProfile
+from .allocation import Assignment, GpuDemand
+from .artifacts import ArtifactNames
+from .ladder import Ladder
+from .machines import MachineProfile
+from .selection import Selection
 
 
 class NodeIds:
@@ -155,7 +156,7 @@ class SelectionReport:
     def live(self) -> Tuple[Outcome, ...]:
         """The tests this invocation kept, by the rule `Selection.is_live` uses.
 
-        Equals `feasible` unless `--gpus` named a rung.
+        Equals `feasible` unless `--rung` named an allocation.
         """
         if self.target_rung is None:
             return self.feasible
@@ -181,6 +182,11 @@ class SelectionReport:
 
         Feasible only: an infeasible test is not waiting for an allocation.
         Never folded into the largest rung.
+
+        Reachable by design. A ladder shorter than the machine -- `1,4` on an
+        8-GPU node -- is a caller running only the small work there, not a
+        mistake, so it is not refused. What it strands lands in no `.ids` file,
+        which is why the record lists these by node id and the run warns.
         """
         return tuple(outcome for outcome in self.feasible if outcome.unassignable)
 
@@ -192,6 +198,26 @@ class SelectionReport:
         collect run cannot see what it did not collect.
         """
         return self.ladder.smallest if self.ladder is not None else GpuDemand.ASSUMED_GPUS
+
+    @property
+    def deselected_by_reason(self) -> Dict[str, List[str]]:
+        """The dropped tests, grouped by the blocker that dropped each one.
+
+        Answers the first question anyone asks of the record -- why did my test
+        not run -- without the reader writing a grouper. Every reason here is
+        one the curated table decided, by construction: a skip the table
+        declines to encode produces no blocker and drops nothing.
+
+        A test with several blockers appears under each of them, because
+        "which rule dropped this" has as many answers as it has blockers.
+        Built from the same outcomes as `tests[]`, in collection order, so it
+        cannot disagree with them and the file stays byte-stable across runs.
+        """
+        grouped: Dict[str, List[str]] = {}
+        for outcome in self.outcomes:
+            for blocker in outcome.blockers:
+                grouped.setdefault(blocker, []).append(outcome.nodeid)
+        return grouped
 
     @property
     def counts(self) -> Dict[str, int]:
@@ -207,7 +233,7 @@ class SelectionReport:
 
     def to_mapping(self) -> Dict[str, object]:
         """The record, as written to `<machine>.json`."""
-        return {
+        record: Dict[str, object] = {
             "machine": self.machine,
             "gpu_count": self.profile.gpu_count,
             "max_gpu_per_node": self.profile.max_gpu_per_node,
@@ -217,9 +243,46 @@ class SelectionReport:
             "nodeid_form": NodeIds.FORM,
             "counts": self.counts,
             "rungs": {str(rung): len(outcomes) for rung, outcomes in self.rungs.items()},
+            # Named, not just counted: these appear in no `.ids` file, so the
+            # record is the only place a caller can find out which they are.
+            "unassignable": {
+                "largest_rung": self.ladder.largest if self.ladder is not None else None,
+                "nodeids": NodeIds.of(self.unassignable),
+            },
             "unclassified": {"route_to_rung": self.unclassified_rung, "nodeids": []},
-            "tests": [outcome.to_mapping() for outcome in self.outcomes],
         }
+        # Omitted entirely when nothing was dropped, as the terminal summary
+        # omits a population with no members.
+        deselected = self.deselected_by_reason
+        if deselected:
+            record["deselected_by_reason"] = deselected
+        record["tests"] = [outcome.to_mapping() for outcome in self.outcomes]
+        return record
+
+
+class UnassignableWarning(UserWarning):
+    """Feasible tests that no rung of the ladder can hold.
+
+    Not an error. A ladder shorter than the machine is a legitimate way to run
+    only part of the suite on it, so the run continues -- but the tests it
+    strands are written to no `.ids` file, and would otherwise be dropped in
+    silence. This is what makes the silence audible in a job log.
+    """
+
+    @classmethod
+    def issue_for(cls, report: "SelectionReport") -> None:
+        """Warn when this run stranded anything; say nothing when it did not."""
+        stranded = report.unassignable
+        if not stranded:
+            return
+        warnings.warn(
+            cls(
+                f"{len(stranded)} feasible test(s) need more than {report.ladder.largest} "
+                f"GPUs and fit no rung of --ladder={report.ladder}, so they are in no "
+                f".ids file; they are listed under 'unassignable' in {report.machine}.json"
+            ),
+            stacklevel=2,
+        )
 
 
 class Artifacts:
@@ -230,8 +293,6 @@ class Artifacts:
         awk 'NR==FNR{keep[$0];next} ($1 in keep)' B200-4gpu.ids list.txt
     """
 
-    RECORD_SUFFIX = ".json"
-    IDS_SUFFIX = ".ids"
     INDENT = 2
 
     @classmethod
@@ -247,7 +308,7 @@ class Artifacts:
     @classmethod
     def write_record(cls, report: SelectionReport, out_dir: Path) -> Path:
         """Write `<machine>.json`."""
-        path = out_dir / f"{report.machine}{cls.RECORD_SUFFIX}"
+        path = out_dir / ArtifactNames.record(report.machine)
         path.write_text(json.dumps(report.to_mapping(), indent=cls.INDENT) + "\n")
         return path
 
@@ -257,19 +318,19 @@ class Artifacts:
         path.write_text("".join(f"{nodeid}\n" for nodeid in nodeids))
         return path
 
-    @classmethod
-    def id_lists(cls, report: SelectionReport) -> Dict[str, List[str]]:
+    @staticmethod
+    def id_lists(report: SelectionReport) -> Dict[str, List[str]]:
         """Filename -> node ids, for every list this run emits.
 
         Without a ladder, one `<machine>.ids` of everything feasible; with one,
-        `<machine>-<rung>gpu.ids` per rung, written even when empty.
+        `<machine>-<rung>gpu.ids` per rung, written even when empty. The names
+        come from `ArtifactNames`, the same source the configure-time guard
+        checked the output directory against.
         """
         if report.ladder is None:
-            return {
-                f"{report.machine}{cls.IDS_SUFFIX}": NodeIds.of(report.feasible),
-            }
+            return {ArtifactNames.ids(report.machine): NodeIds.of(report.feasible)}
         return {
-            f"{report.machine}-{rung}gpu{cls.IDS_SUFFIX}": NodeIds.of(outcomes)
+            ArtifactNames.rung_ids(report.machine, rung): NodeIds.of(outcomes)
             for rung, outcomes in report.rungs.items()
         }
 
@@ -277,9 +338,6 @@ class Artifacts:
 @dataclass(frozen=True)
 class SelectionOutput:
     """The record one run produced, and the files it went to."""
-
-    # Resolved once collection is over and kept on `config.stash`.
-    STASH_KEY = pytest.StashKey()
 
     report: SelectionReport
     written: Tuple[Path, ...]
@@ -340,7 +398,7 @@ class TerminalSummary:
 
     @staticmethod
     def rung_note(report: SelectionReport) -> str:
-        """Names the rung when `--gpus` narrowed the live set to one."""
+        """Names the rung when `--rung` narrowed the live set to one."""
         return "" if report.target_rung is None else f"  (rung {report.target_rung} only)"
 
     @staticmethod
@@ -358,4 +416,10 @@ class TerminalSummary:
         count = report.counts["unassignable"]
         if not count:
             return []
-        return [cls.line("unassignable", f"{count}  -- demand exceeds every rung")]
+        return [
+            cls.line(
+                "unassignable",
+                f"{count}  -- above every rung, in no .ids file; "
+                f"see 'unassignable' in {report.machine}.json",
+            )
+        ]
