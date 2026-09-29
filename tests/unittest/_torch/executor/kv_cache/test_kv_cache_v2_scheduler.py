@@ -174,6 +174,7 @@ def make_kv_cache_manager(
     is_vswa=False,
 ):
     mgr = Mock()
+    mgr.kv_connector_manager = None
     mgr.tokens_per_block = tokens_per_block
     # A real policy, not an auto-created Mock attribute: the prefix-aware skip
     # is gated on ALL_REUSABLE (see _skip_pays_off_under_reuse_policy).
@@ -3456,3 +3457,110 @@ class TestPrefixAwareSkip:
         # on behalf of a request that this iteration paused.
         assert 1 not in ids(out.paused_requests)
         assert ids(out.context_requests) in ([1], [])
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_connector_credit_admits_another_request(chunked: bool) -> None:
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import BudgetTracker
+
+    def run_with_offer(offered_tokens: int) -> tuple[object, list[int], Mock]:
+        mgr = make_kv_cache_manager(tokens_per_block=32, enable_block_reuse=True)
+        mgr.is_draft = False
+        connector = Mock(prefix_reservations_enabled=True)
+        connector.should_add_sequence.return_value = True
+        connector.reserve_prefix.side_effect = lambda req, local_end: (
+            SimpleNamespace(start=local_end, end=local_end + offered_tokens)
+            if offered_tokens
+            else None
+        )
+        connector.trim_prefix_reservation.side_effect = lambda req, start, end: SimpleNamespace(
+            start=start, end=end
+        )
+        mgr.kv_connector_manager = connector
+        for name in (
+            "_connector_reservations_enabled",
+            "_connector_may_serve",
+            "_prepare_connector_prefix_reservation",
+        ):
+            setattr(mgr, name, getattr(KVCacheManagerV2, name).__get__(mgr))
+        mgr.prepare_context.side_effect = KVCacheManagerV2.prepare_context.__get__(mgr)
+        requests = [
+            LlmRequest(
+                request_id=request_id,
+                max_new_tokens=1,
+                input_tokens=list(range(request_id * 100, request_id * 100 + 96)),
+                sampling_config=SamplingConfig(1),
+                is_streaming=False,
+            )
+            for request_id in (1, 2)
+        ]
+        for req in requests:
+            mgr.kv_cache_map[req.request_id].num_committed_tokens = 0
+        scheduler = make_scheduler(
+            mgr,
+            max_num_tokens=64 if chunked else 128,
+            ctx_chunk_config=(None, 32) if chunked else None,
+        )
+        original_commit = BudgetTracker.commit
+        with patch.object(
+            BudgetTracker, "commit", autospec=True, side_effect=original_commit
+        ) as commit:
+            output = scheduler.schedule_request(requests, set())
+        charges = [entry.args[2] for entry in commit.call_args_list]
+        connector.accept_prefix_load.assert_not_called()
+        return output, charges, mgr
+
+    baseline, baseline_charges, _ = run_with_offer(0)
+    credited, credited_charges, manager = run_with_offer(64)
+
+    assert ids(baseline.context_requests) == [1]
+    assert baseline_charges == [64 if chunked else 96]
+    assert ids(credited.context_requests) == [1, 2]
+    assert credited_charges == [32, 32]
+    assert [call.args[1] for call in manager.resize_context.call_args_list] == [32, 32]
+
+
+def test_pending_connector_load_is_not_a_recompute_or_eviction_victim() -> None:
+    manager = make_kv_cache_manager(can_evict=True)
+    connector = Mock()
+    connector.has_pending_load.return_value = True
+    manager.kv_connector_manager = connector
+    request = make_gen_request(1)
+    scheduler = make_scheduler(manager)
+    assert not scheduler._is_evictable(request, set())
+    assert not scheduler._is_recompute_pause_candidate(request, set())
+
+
+def test_pending_connector_load_does_not_self_evict_or_report_deadlock() -> None:
+    manager = make_kv_cache_manager(
+        can_evict=True, try_allocate_generation_fn=lambda request: False
+    )
+    connector = Mock()
+    connector.has_pending_load.return_value = True
+    manager.kv_connector_manager = connector
+    request = make_gen_request(1)
+    scheduler = make_scheduler(manager)
+    output = scheduler.schedule_request([request], set())
+    assert output.generation_requests == []
+    assert output.paused_requests == []
+    assert output.recompute_paused_requests == []
+    manager.suspend_request.assert_not_called()
+    manager.free_resources.assert_not_called()
+
+
+def test_parked_connector_load_keeps_kv_pressure_retryable() -> None:
+    manager = make_kv_cache_manager(try_allocate_generation_fn=lambda request: False)
+    connector = Mock()
+    connector.has_pending_load.side_effect = lambda request: request.request_id == 1
+    manager.kv_connector_manager = connector
+    loading = make_filtered_request(1, state_value=DISAGG_GEN_TRANS_IN_PROGRESS)
+    generation = make_gen_request(2)
+    manager.kv_cache_map[2].is_active = False
+    scheduler = make_scheduler(manager)
+    output = scheduler.schedule_request([loading, generation], set())
+    assert output.generation_requests == []
+    assert output.recompute_paused_requests == []

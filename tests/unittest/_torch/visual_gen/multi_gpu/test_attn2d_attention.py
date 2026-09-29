@@ -721,10 +721,11 @@ class TestFlashAttn4Forward:
 
     def test_fa4_forward_returns_correct_shape(self):
         """FlashAttn4Attention.forward runs end-to-end and returns the correct shape."""
-        if not _flash_attn4_available:
-            pytest.skip("FlashAttn4 JIT kernels not available")
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
+        assert _flash_attn4_available, (
+            "FlashAttn4 JIT kernels not available; expected on the Blackwell CI runner"
+        )
 
         batch, seq, num_heads, head_dim = 1, 16, 8, 128
         device = torch.device("cuda:0")
