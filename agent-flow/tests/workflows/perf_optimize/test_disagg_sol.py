@@ -291,6 +291,46 @@ def test_each_campaign_is_an_ordinary_single_track_spec(tmp_path):
     assert "disagg_sol" not in spec
 
 
+def test_both_halves_inherit_where_to_execute_and_neither_inherits_what(tmp_path):
+    """`slurm-environment` reaches both halves; `benchmark` reaches neither.
+
+    Off-cluster execution IS `cluster_ssh` + `remote_run_root`. Dropping that
+    block did not fail -- both halves ran as though the flow were on the
+    cluster, with the spec's remote settings absent from the only two files
+    that could act on them.
+
+    `benchmark` is the other half of the same rule and must stay out: the
+    operating point comes from the design and travels in the derived sweep, so
+    an inherited workload would be a second, unmeasured description of the run
+    sitting beside the selected row.
+    """
+    remote = {
+        "cluster_ssh": "aga-300",
+        "remote_run_root": "/scratch/run-root",
+        "docker_image": "/scratch/img.sqsh",
+        "slurm_partition": "batch",
+    }
+    base = dict(BASE, **{"slurm-environment": remote, "benchmark": {"concurrency": 64}})
+
+    specs = {
+        track: disagg_sol.campaign_spec(
+            base,
+            track=track,
+            sweep=tmp_path / f"{track}.yaml",
+            repo=tmp_path / track,
+            point=POINT if track == disagg_sol.GEN_TRACK else CTX_POINT,
+            design=tmp_path / "d",
+        )
+        for track in disagg_sol.TRACKS
+    }
+
+    for track, spec in specs.items():
+        assert spec["slurm-environment"] == remote, f"{track} half lost its remote settings"
+        assert "benchmark" not in spec, f"{track} half inherited a workload it did not measure"
+    # The checkout is the one thing that must differ, and it is set per track.
+    assert specs["ctx"]["trtllm_repo_path"] != specs["gen"]["trtllm_repo_path"]
+
+
 def test_the_campaign_can_say_where_its_operating_point_came_from(tmp_path):
     """A path instead of a shrug -- the whole reason this layer exists."""
     spec = disagg_sol.campaign_spec(

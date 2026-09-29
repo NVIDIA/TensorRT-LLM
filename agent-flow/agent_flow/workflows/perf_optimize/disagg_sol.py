@@ -69,6 +69,27 @@ CTX_TRACK = "ctx"
 GEN_TRACK = "gen"
 TRACKS: tuple[str, ...] = (CTX_TRACK, GEN_TRACK)
 
+#: What each half inherits from the run's spec.
+#:
+#: The rule is: **how and where to execute passes through; what to measure does
+#: not.** A half's operating point comes from the design and travels in its
+#: derived sweep, so `benchmark` is deliberately absent — inheriting one would
+#: put a second, unmeasured description of the workload beside the selected row,
+#: which is the failure `sol_track` exists to remove.
+#:
+#: `slurm-environment` is the half of that rule easiest to forget, and it was:
+#: it carries `cluster_ssh` and `remote_run_root`, which ARE off-cluster
+#: execution. Dropping it did not fail — both halves simply ran as though the
+#: flow were on the cluster, with the spec's remote settings absent from the
+#: only two files that could act on them. A setting that vanishes silently is
+#: worse than one that is refused.
+INHERITED: tuple[str, ...] = (
+    "checkpoint_path",
+    "optimize",
+    "profile",
+    "slurm-environment",
+)
+
 #: Why the selection frontier is not the deployment frontier.
 #:
 #: Stated in the selection result, and required to survive into any report
@@ -707,14 +728,12 @@ def campaign_spec(
 
     No ``ctx_json``: this module does not build an end-to-end view (see
     :data:`NO_JOIN`), so the gen half is scored anchor-free and says so.
+
+    What a half inherits is :data:`INHERITED` — see the rule stated there.
     """
     if track not in TRACKS:
         raise DisaggSolError(f"unknown track {track!r}, expected one of {list(TRACKS)}")
-    spec: dict[str, Any] = {
-        key: value
-        for key, value in base.items()
-        if key in ("checkpoint_path", "optimize", "profile")
-    }
+    spec: dict[str, Any] = {key: value for key, value in base.items() if key in INHERITED}
     spec["trtllm_repo_path"] = str(repo)
     spec["sol_track"] = {
         "track": track,
