@@ -128,7 +128,7 @@ def test_missing_bindings_are_reported_as_the_separate_component_they_are(monkey
     monkeypatch.setitem(sys.modules, "mooncake", None)
     monkeypatch.setitem(sys.modules, "mooncake.store", None)
 
-    with pytest.raises(ImportError, match="mooncake-transfer-engine"):
+    with pytest.raises(ImportError, match=r"tensorrt-llm\[mooncake\]"):
         with donate_segment("10.0.0.1:50051", GIB):
             pytest.fail("donation should not have yielded")
 
