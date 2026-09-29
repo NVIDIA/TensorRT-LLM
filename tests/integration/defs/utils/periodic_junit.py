@@ -357,7 +357,6 @@ class PeriodicJUnitXML:
 
             # Atomic rename to final location
             os.replace(temp_file, output_file)
-            self._clear_saved_unfinished_tests()
 
             self._log_info(
                 f"{'Final report' if is_final else 'Periodic report'} generated with {numtests} tests: {output_file}"
@@ -372,6 +371,8 @@ class PeriodicJUnitXML:
                 except OSError:
                     pass
             raise
+
+        self._clear_saved_unfinished_tests()
 
     def _clear_saved_unfinished_tests(self) -> None:
         """Clear completed records only after their XML has been published."""
@@ -391,7 +392,7 @@ class PeriodicJUnitXML:
                     if line.strip() not in self._completed_unfinished_tests)
             os.replace(temp_path, unfinished_test_path)
             self._completed_unfinished_tests.clear()
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
             self._log_warning(
                 f"Error clearing saved tests from {unfinished_test_path}: {e}")
             # Keep completed nodeids so the next successful save retries cleanup.
