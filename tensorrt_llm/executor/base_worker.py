@@ -48,7 +48,7 @@ from ..llmapi.startup_checks import no_visible_gpu_error
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
-from ..sampling_params import SamplingParams
+from ..sampling_params import EmbeddingBias, SamplingParams
 from .executor import GenerationExecutor
 from .ipc import IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
@@ -539,7 +539,7 @@ class BaseWorker(GenerationExecutor):
                 bad_words=request.sampling_params._get_bad_words(),
                 stop_words=[] if request.sampling_params.ignore_eos else
                 request.sampling_params._get_stop_words(),
-                embedding_bias=request.sampling_params.embedding_bias,
+                embedding_bias=None,  # not used when backend=="pytorch"
                 lora_config=lora_config,
                 multimodal_input=multimodal_input,
                 mrope_config=None,
@@ -569,6 +569,7 @@ class BaseWorker(GenerationExecutor):
                     logprobs_mode=request.sampling_params.logprobs_mode,
                     logprobs_simple_format=request.sampling_params.
                     logprobs_simple_format,
+                    embedding_bias=request.sampling_params._embedding_bias_sparse,
                     return_routed_experts=request.sampling_params.
                     return_routed_experts,
                     disaggregated_params=request.disaggregated_params,
