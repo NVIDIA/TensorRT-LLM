@@ -1044,6 +1044,15 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 f"MSA out_cache_loc buffer ({self.msa_out_cache_loc.shape[0]}) is "
                 f"smaller than the step's new-token count ({total_new_tokens})."
             )
+        # The cache writers trim to num_tokens, so that count and the mapping
+        # have to describe the same rows. The mapping emits one slot per new
+        # token, so they agree unless a caller staged lengths this metadata's
+        # seq_lens does not match.
+        if total_new_tokens != int(self.num_tokens):
+            raise ValueError(
+                f"MSA slot mapping covers {total_new_tokens} new tokens, but the "
+                f"step's token count is {int(self.num_tokens)}."
+            )
         if kv_indices is not None and int(kv_indices.shape[0]) > self.msa_kv_indices.shape[0]:
             raise ValueError(
                 f"MSA kv_indices buffer ({self.msa_kv_indices.shape[0]}) is "
@@ -1058,8 +1067,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             )
 
         self.msa_out_cache_loc[:total_new_tokens].copy_(out_cache_loc, non_blocking=True)
-        # Captured producers also execute padded rows. Invalidate only the
-        # unwritten tail so they cannot reuse the previous step's live slots.
+        # Captured producers also execute padded rows: the fused index producer
+        # sits inside the captured region, so trimming it to a host-side count
+        # would make its shape dynamic, and a negative slot is what makes those
+        # rows cache-write no-ops instead. Invalidate the unwritten tail so they
+        # cannot reuse the previous step's live slots, which address real pages.
         if total_new_tokens < self.msa_out_cache_loc.shape[0]:
             self.msa_out_cache_loc[total_new_tokens:].fill_(-1)
         if kv_indices is not None:
@@ -1168,6 +1180,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             cache,
             self.msa_out_cache_loc[:num_tokens],
             idx_k.reshape(num_tokens, 1, sparse_index_dim),
+            # idx_k arrives over the padded token extent; the live prefix is
+            # where msa_out_cache_loc stops holding real slots.
+            int(self.num_tokens),
             layout="HND",
         )
 
@@ -1349,16 +1364,21 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             return
         num_kv_heads = int(k_view.shape[1])
         head_dim = int(k_view.shape[3])
+        # The dispatch clips k/v/idx_k to the step's live tokens before this
+        # runs, so every supplied row owns a real slot: num_tokens is the live
+        # count write_kv_slots requires.
         write_kv_slots(
             k_view,
             out_cache_loc,
             k.reshape(num_tokens, num_kv_heads, head_dim),
+            num_tokens,
             layout="HND",
         )
         write_kv_slots(
             v_view,
             out_cache_loc,
             v.reshape(num_tokens, num_kv_heads, head_dim),
+            num_tokens,
             layout="HND",
         )
         if idx_k is not None:
@@ -1366,6 +1386,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                 idx_cache,
                 out_cache_loc,
                 idx_k.reshape(num_tokens, 1, int(idx_cache.shape[-1])),
+                num_tokens,
                 layout="HND",
             )
 
