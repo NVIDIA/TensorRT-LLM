@@ -8,4 +8,4 @@ DeepSeekV4SparseAttentionConfig
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: validate,model_parametrized_name,schema_json,model_fields_set,copy,from_orm,model_json_schema,model_rebuild,construct,model_config,schema,model_extra,model_dump_json,model_construct,parse_raw,update_forward_refs,model_copy,parse_obj,model_computed_fields,model_dump,json,parse_file,model_validate_strings,Config,model_post_init,model_validate,dict,model_fields,model_validate_json
+    :exclude-members: model_copy,model_validate_strings,parse_raw,model_computed_fields,model_rebuild,dict,model_config,parse_file,schema,model_json_schema,validate,update_forward_refs,model_dump_json,from_orm,model_validate_json,Config,model_parametrized_name,model_construct,construct,model_dump,model_validate,model_post_init,schema_json,parse_obj,json,copy,model_extra,model_fields_set,model_fields

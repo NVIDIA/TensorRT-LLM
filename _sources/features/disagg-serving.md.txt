@@ -268,7 +268,7 @@ The three resulting topologies:
 | any | set | **No** coordinator starts here; a fleet of `num_workers` delegating servers points at the external `disagg_coordinator_url`. |
 
 ```{note}
-The fleet is most useful with a *stateful* router (`kv_cache_aware`, `conversation`) where placement must be globally consistent — that decision is delegated to the coordinator. With a *stateless* router (`round_robin`, `load_balancing`) each worker simply places locally and no coordinator round-trip occurs.
+The fleet delegates `load_balancing`, `kv_cache_aware`, and `conversation` routing to the coordinator, so their placement and in-flight load state are globally consistent across workers. `round_robin` remains local to each worker and does not make a coordinator round-trip.
 ```
 
 #### Example: implicit coordinator + 4-worker fleet

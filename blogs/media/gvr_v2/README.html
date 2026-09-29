@@ -1,0 +1,1114 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>GVR V2: Benchmark Methodology and Figure Reproduction &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=4351f35f" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+
+
+
+    <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../../_static/config_selector.js?v=db50c9f4"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/media/gvr_v2/README';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc29';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../search.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc29" />
+  
+    
+    <script src="../../../_static/searchtools.js"></script>
+    <script src="../../../_static/language_data.js"></script>
+    <script src="../../../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button type="button" class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button type="button" class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../models/supported-models.html">Supported Models</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/subagent-routing.html">Sub-agent Routing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/kv-cache-compression.html">KV Cache Compression</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/telemetry.html">Telemetry</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">GVR V2: Benchmark Methodology and Figure Reproduction</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+<section class="tex2jax_ignore mathjax_ignore" id="gvr-v2-benchmark-methodology-and-figure-reproduction">
+<h1>GVR V2: Benchmark Methodology and Figure Reproduction<a class="headerlink" href="#gvr-v2-benchmark-methodology-and-figure-reproduction" title="Link to this heading">#</a></h1>
+<p>This companion to <a class="reference internal" href="../../tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html"><span class="std std-doc">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</span></a> contains the observations and definitions needed to reproduce the article’s performance figures, plus the scope of its supplied temporal-overlap illustration and statistics. The article focuses on the algorithm and its performance; this document records the measurement boundaries.</p>
+<section id="regenerate-the-figures">
+<h2>Regenerate the Figures<a class="headerlink" href="#regenerate-the-figures" title="Link to this heading">#</a></h2>
+<p>With NumPy and Matplotlib installed, run from the repository root:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>docs/source/blogs/media/gvr_v2/plot_results.py
+</pre></div>
+</div>
+<p>The script regenerates <code class="docutils literal notranslate"><span class="pre">summary.json</span></code> and ten SVGs: <code class="docutils literal notranslate"><span class="pre">speedup.svg</span></code>, <code class="docutils literal notranslate"><span class="pre">evolution.svg</span></code>, <code class="docutils literal notranslate"><span class="pre">candidate_work.svg</span></code>, <code class="docutils literal notranslate"><span class="pre">algorithm.svg</span></code>, <code class="docutils literal notranslate"><span class="pre">gpu_sampling.svg</span></code>, <code class="docutils literal notranslate"><span class="pre">radix_cuda_map.svg</span></code>, <code class="docutils literal notranslate"><span class="pre">gvr_v1_map.svg</span></code>, <code class="docutils literal notranslate"><span class="pre">latency.svg</span></code>, <code class="docutils literal notranslate"><span class="pre">roofline.svg</span></code>, and <code class="docutils literal notranslate"><span class="pre">integration.svg</span></code>. It requires no GPU. The algorithm diagrams are schematic; every performance panel uses the bundled timing observations.</p>
+<p>The remaining figure, <a class="reference download internal" download="" href="../../../_downloads/c69315fd218be764bc7b80a024193b98/temporal_overlap.svg"><span class="xref download myst">temporal_overlap.svg</span></a>, is an author-supplied illustration converted directly from its standalone PDF. Its labels, axes, and plotted contents are preserved. It is not generated by <code class="docutils literal notranslate"><span class="pre">plot_results.py</span></code> or derived from the kernel-timing CSVs.</p>
+</section>
+<section id="gpu-sampling-implementation">
+<h2>GPU Sampling Implementation<a class="headerlink" href="#gpu-sampling-implementation" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">gpu_sampling.svg</span></code> illustrates the public device implementation at <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_self_sampling.py">the measured PR #19076 revision</a>. It is schematic and adds no measured performance claim.</p>
+<p>Both streaming families use packed/vectorized current-row windows. Let <code class="docutils literal notranslate"><span class="pre">d</span> <span class="pre">=</span> <span class="pre">SS2</span></code> be the integer stride in window units and <code class="docutils literal notranslate"><span class="pre">SMP</span></code> the number of windows. The score offsets below are relative to the aligned sampling base, with <code class="docutils literal notranslate"><span class="pre">0</span> <span class="pre">&lt;=</span> <span class="pre">j</span> <span class="pre">&lt;</span> <span class="pre">SMP</span></code>:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Family</p></th>
+<th class="head text-left"><p>Window start</p></th>
+<th class="head text-left"><p>Loads and logical ownership</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">main</span></code></p></td>
+<td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">8*j*d</span></code></p></td>
+<td class="text-left"><p>Work item <code class="docutils literal notranslate"><span class="pre">j</span></code> loads two adjacent <code class="docutils literal notranslate"><span class="pre">float4</span></code> vectors, covering eight FP32 scores</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">clus</span></code></p></td>
+<td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">16*j*d</span></code></p></td>
+<td class="text-left"><p>Work item <code class="docutils literal notranslate"><span class="pre">j</span></code> loads the lower eight scores and <code class="docutils literal notranslate"><span class="pre">j</span> <span class="pre">+</span> <span class="pre">SMP</span></code> loads the upper eight, using two <code class="docutils literal notranslate"><span class="pre">float4</span></code> vectors each</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The clustered work items need not be adjacent lanes or distinct physical threads when the logical sample exceeds the CTA size. In both families, physical threads stride through additional work items in CTA-sized increments. Vector loads use <code class="docutils literal notranslate"><span class="pre">ld.global.nc.v4.f32</span></code>; the stride and count guards keep them inside the permitted interval. Prefill substitutes a valid score for leading alignment lanes before histogramming. The initial two vectors remain available for the sample histogram; extra work items are reloaded after sample extrema establish the bin scale. Eight retained sample scores are not the kernel’s total register count.</p>
+<p>The <a class="reference external" href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory">CUDA Best Practices Guide</a> documents 32-byte access granularity and the cost of sparse or misaligned accesses. A 32-byte-aligned eight-score window occupies one sector and a similarly aligned sixteen-score window occupies two. The supported API guarantees vector alignment, not universal 32/64-byte row alignment; a window offset by 16 bytes touches two or three sectors respectively. Cache reuse, warp issue patterns, and replay can further affect traffic. A 64-byte window is a software grouping, not a claim about cache-line size or a single memory instruction.</p>
+<p>The locality/coverage and register-lifetime explanation is an engineering interpretation of this implementation, not a measured 8-versus-16 ablation or evidence that either width is universally optimal. At fixed total sample count, the larger window has fewer distinct locations. Correlated values within a window do not supply independent random observations.</p>
+<p>The runtime geometry starts with a route-dependent budget proportional to <code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">/</span> <span class="pre">aim</span></code>, clamps the requested score count between 256 scores and half the row, then derives the integer window stride and count. Targets use the actual <code class="docutils literal notranslate"><span class="pre">S</span> <span class="pre">=</span> <span class="pre">SMP*8</span></code> or <code class="docutils literal notranslate"><span class="pre">S</span> <span class="pre">=</span> <span class="pre">SMP*16</span></code> population after rounding. For desired candidate population <code class="docutils literal notranslate"><span class="pre">A</span> <span class="pre">=</span> <span class="pre">aim</span></code>, the descending target ranks are approximately <code class="docutils literal notranslate"><span class="pre">A*S/N</span></code>, <code class="docutils literal notranslate"><span class="pre">K*S/N</span></code>, and <code class="docutils literal notranslate"><span class="pre">2*A*S/N</span></code>; the third target is implemented as twice the first integer target. The 256-score budget floor and 256 histogram bins are separate tuning parameters.</p>
+<p>Sample extrema reduce within each warp, pass through shared memory, and combine across warps after a CTA barrier to establish the 256 sample bins. Workers increment shared-memory counters, then synchronize before warp 0 calls <code class="docutils literal notranslate"><span class="pre">scan_cross0</span></code>. Each lane scans eight counters using two vector shared-memory loads and warp shuffles. This single scan extracts up to three rank crossings and clears the counters; a caller-side barrier publishes its results.</p>
+<p>Sample-bin lower edges define the primary threshold <code class="docutils literal notranslate"><span class="pre">T</span></code> near rank <code class="docutils literal notranslate"><span class="pre">A*S/N</span></code>, the upper anchor <code class="docutils literal notranslate"><span class="pre">T_K</span></code> near rank <code class="docutils literal notranslate"><span class="pre">K*S/N</span></code>, and the lower anchor <code class="docutils literal notranslate"><span class="pre">T_3</span></code> near rank <code class="docutils literal notranslate"><span class="pre">2*A*S/N</span></code>. For sample-bin width <code class="docutils literal notranslate"><span class="pre">w</span></code>, sampled <code class="docutils literal notranslate"><span class="pre">main</span></code> sets <code class="docutils literal notranslate"><span class="pre">HIC</span> <span class="pre">=</span> <span class="pre">max(T</span> <span class="pre">+</span> <span class="pre">4*max(T_K</span> <span class="pre">-</span> <span class="pre">T,</span> <span class="pre">0),</span> <span class="pre">T</span> <span class="pre">+</span> <span class="pre">8*w)</span></code>: fourfold extrapolation of the nonnegative upper gap with at least eight bin widths of headroom. In <code class="docutils literal notranslate"><span class="pre">clus</span></code>, when a valid lower anchor satisfies <code class="docutils literal notranslate"><span class="pre">T_3</span> <span class="pre">&lt;</span> <span class="pre">T</span></code>, the upper gap is first capped at <code class="docutils literal notranslate"><span class="pre">2*(T</span> <span class="pre">-</span> <span class="pre">T_3)</span></code> before applying that same extrapolation and headroom. <code class="docutils literal notranslate"><span class="pre">HIC</span></code> tightens the classification bound; scores above it saturate into the top bin and remain candidates.</p>
+<p>Where enabled and valid, <code class="docutils literal notranslate"><span class="pre">T_3</span></code> supplies the lower admission floor <code class="docutils literal notranslate"><span class="pre">TSH</span></code>. Non-split streaming can retry with this floor after an aggressive primary threshold; the gated split-row route can stage down to the floor during its scan so the merged histogram already includes that wider admitted set. Sample misses, incomplete staging, and degenerate brackets still require exact verification or recovery. Non-sampled short-row and register routes retain their separate initialization policies.</p>
+<p>In variable-length <code class="docutils literal notranslate"><span class="pre">main</span></code>, warp 0 derives sampling geometry and publishes it through shared memory while the other warps issue register-free L2 prefetch hints for their CTA’s upcoming row slice. Later register preloads and L2 hints are placed after the sample-reduction publication barrier, limiting overlap between live sample-reduction state and prefetched values. Cluster ranks repeat an identical full-row sample and prime their row slices after the corresponding barrier. Their sample histograms are CTA-local; subsequent verification histograms may be merged across the cluster. The prefetch placement is an implementation detail, not an independently measured contribution to speedup.</p>
+</section>
+<section id="candidate-work-illustration">
+<h2>Candidate-Work Illustration<a class="headerlink" href="#candidate-work-illustration" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">candidate_work.svg</span></code> is a schematic, independent of the timing observations. For a finite-score row with K-th-largest boundary <span class="math notranslate nohighlight">\(\tau\)</span> and <span class="math notranslate nohighlight">\(q\le\tau\)</span>, the admitted population obeys <span class="math notranslate nohighlight">\(C_p=C(q)=K+E+D(q,\tau)\)</span>. Here <span class="math notranslate nohighlight">\(E=C(\tau)-K\)</span> counts excess boundary ties and <span class="math notranslate nohighlight">\(D\)</span> counts entries with <span class="math notranslate nohighlight">\(q\le x_i\lt\tau\)</span>. The simplified curve labels the three population segments directly, and the matching bar explains their roles without numerical ratios. Their proportions are illustrative, not benchmark measurements.</p>
+<p>Both panels are computed from the same finite synthetic row in <code class="docutils literal notranslate"><span class="pre">plot_results.py</span></code>. The tail-count axis is linear, and the stacked bar is proportional to population size. At the exact boundary, the filled marker includes ties and the open marker excludes them; their difference is the entire tied population, of which only the excess contributes to E.</p>
+<p>The admission band requires <span class="math notranslate nohighlight">\(K\le C(q)\le B_r\)</span>. A large tie plateau can leave no threshold in this band; the exact recovery path still applies. In V2, the admitted count describes candidate handling, while only the crossing bin requires the remaining exact selection. The illustration does not imply that every execution family materializes the same buffer or that candidate count alone predicts latency. The tail-count curve explains threshold admission; it does not prescribe a scalar search or a particular number of verification thresholds.</p>
+</section>
+<section id="temporal-overlap-illustration">
+<h2>Temporal-Overlap Illustration<a class="headerlink" href="#temporal-overlap-illustration" title="Link to this heading">#</a></h2>
+<p>Figure 2 shows SWE-bench-64K decode traces for DeepSeek-V3.2 and DeepSeek-V4 Pro. The temporal-hint index mapping shifts each prior index by +1 for V3.2 and leaves each compressed-bin index unchanged for V4 Pro. Overlap is the fraction of current Top-K indices covered by that mapped prior. Blue points are current selections matched by the mapped hint; orange points are current selections it misses. For V3.2, +1 predicts a one-position shift as decoding advances; this evaluates a prediction rule, not retention at identical token indices. The top panels show selected 1,024-position crops for layer 60. The bottom panels use the full index domain over 298 transitions per trace, without smoothing, for V3.2 layers 0/20/60 and Pro layers 2/22/60. Parenthesized legend values are mean overlaps.</p>
+<p>The figure illustrates temporal-hint variability, not kernel speedup. Its source Top-K streams are separate from the timing observations bundled below. <code class="docutils literal notranslate"><span class="pre">provenance.json</span></code> records the supplied SVG’s checksum without private source paths or submission metadata.</p>
+<section id="temporal-overlap-statistics">
+<h3>Temporal-Overlap Statistics<a class="headerlink" href="#temporal-overlap-statistics" title="Link to this heading">#</a></h3>
+<p>The table following Figure 2 uses author-supplied near-64K overlap summaries. Layer IDs are matched between SWE-bench and random-token inputs within each indexer. First average the adjacent-step hit ratio after temporal-hint index mapping over time for each layer; then compute statistics across those layer means, with equal weight per layer despite unequal decode durations. P10 and P90 are linearly interpolated empirical quantiles. V3.2 maps prior indices by +1; V4 retains the same compressed-bin indices.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Indexer</p></th>
+<th class="head text-left"><p>Input</p></th>
+<th class="head text-right"><p>Layers</p></th>
+<th class="head text-right"><p>Mean</p></th>
+<th class="head text-right"><p>Median</p></th>
+<th class="head text-right"><p>P10</p></th>
+<th class="head text-right"><p>P90</p></th>
+<th class="head text-right"><p>Min–max</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>V4 Pro</p></td>
+<td class="text-left"><p>SWE-bench</p></td>
+<td class="text-right"><p>30</p></td>
+<td class="text-right"><p>71.5%</p></td>
+<td class="text-right"><p>70.5%</p></td>
+<td class="text-right"><p>60.3%</p></td>
+<td class="text-right"><p>82.6%</p></td>
+<td class="text-right"><p>57.1–85.0%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>V4 Pro</p></td>
+<td class="text-left"><p>Random tokens</p></td>
+<td class="text-right"><p>30</p></td>
+<td class="text-right"><p>57.9%</p></td>
+<td class="text-right"><p>58.1%</p></td>
+<td class="text-right"><p>33.6%</p></td>
+<td class="text-right"><p>80.4%</p></td>
+<td class="text-right"><p>28.4–86.7%</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>V4 Flash</p></td>
+<td class="text-left"><p>SWE-bench</p></td>
+<td class="text-right"><p>21</p></td>
+<td class="text-right"><p>62.8%</p></td>
+<td class="text-right"><p>61.5%</p></td>
+<td class="text-right"><p>53.4%</p></td>
+<td class="text-right"><p>73.3%</p></td>
+<td class="text-right"><p>53.2–83.7%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>V4 Flash</p></td>
+<td class="text-left"><p>Random tokens</p></td>
+<td class="text-right"><p>21</p></td>
+<td class="text-right"><p>52.8%</p></td>
+<td class="text-right"><p>49.2%</p></td>
+<td class="text-right"><p>30.7%</p></td>
+<td class="text-right"><p>74.7%</p></td>
+<td class="text-right"><p>25.9–81.3%</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>V3.2</p></td>
+<td class="text-left"><p>SWE-bench</p></td>
+<td class="text-right"><p>61</p></td>
+<td class="text-right"><p>47.4%</p></td>
+<td class="text-right"><p>47.8%</p></td>
+<td class="text-right"><p>37.9%</p></td>
+<td class="text-right"><p>59.7%</p></td>
+<td class="text-right"><p>5.7–70.7%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>V3.2</p></td>
+<td class="text-left"><p>Random tokens</p></td>
+<td class="text-right"><p>61</p></td>
+<td class="text-right"><p>46.0%</p></td>
+<td class="text-right"><p>46.5%</p></td>
+<td class="text-right"><p>33.1%</p></td>
+<td class="text-right"><p>62.2%</p></td>
+<td class="text-right"><p>6.0–67.9%</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>These percentages preserve the supplied summaries’ precision. They are independent of the timing CSVs and are not regenerated by <code class="docutils literal notranslate"><span class="pre">plot_results.py</span></code>. They summarize per-layer means, not individual-step extremes or the selected traces in Figure 2. Different K values and index-mapping rules make this evidence of hint variability, not a controlled ranking of models or a universal causal effect of prompt type. Low overlap concerns prediction quality and execution cost; exact verification and recovery preserve selection correctness.</p>
+</section>
+</section>
+<section id="published-data">
+<h2>Published Data<a class="headerlink" href="#published-data" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>File</p></th>
+<th class="head text-left"><p>Contents</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><a class="reference download internal" download="" href="../../../_downloads/504e2b8979906610cb300e338831636b/flash_timings.csv.gz"><span class="xref download myst">flash_timings.csv.gz</span></a></p></td>
+<td class="text-left"><p>2,079 DeepSeek-V4 Flash cases</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><a class="reference download internal" download="" href="../../../_downloads/fec6f6586202444bd2bff68fd3ea3793/pro_timings.csv.gz"><span class="xref download myst">pro_timings.csv.gz</span></a></p></td>
+<td class="text-left"><p>2,970 DeepSeek-V4 Pro cases</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><a class="reference download internal" download="" href="../../../_downloads/aad668bb998982bc63bcbe17fc8bcdd9/v32_timings.csv.gz"><span class="xref download myst">v32_timings.csv.gz</span></a></p></td>
+<td class="text-left"><p>4,697 DeepSeek-V3.2 cases</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><a class="reference download internal" download="" href="../../../_downloads/4b67df47c30a7207d7cabd42f295cbf4/temporal_comparison.csv.gz"><span class="xref download myst">temporal_comparison.csv.gz</span></a></p></td>
+<td class="text-left"><p>One GVR V1 observation for each of the same 9,746 cases</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><a class="reference download internal" download="" href="../../../_downloads/f3ba47b197d395a68d7935dabc5a02f3/provenance.json"><span class="xref download myst">provenance.json</span></a></p></td>
+<td class="text-left"><p>Published-file checksums, implementation labels, pairing, and roofline constants</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><a class="reference download internal" download="" href="../../../_downloads/14408907e2cf304da3059ef609f4a411/summary.json"><span class="xref download myst">summary.json</span></a></p></td>
+<td class="text-left"><p>Recomputed statistics</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><a class="reference download internal" download="" href="../../../_downloads/00c245612153c4e18672e62e4e36c842/plot_results.py"><span class="xref download myst">plot_results.py</span></a></p></td>
+<td class="text-left"><p>Figure generation</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The CSVs begin with a copyright comment. <code class="docutils literal notranslate"><span class="pre">cell</span></code>, <code class="docutils literal notranslate"><span class="pre">model</span></code>, <code class="docutils literal notranslate"><span class="pre">isl_bucket</span></code>, and <code class="docutils literal notranslate"><span class="pre">layer</span></code> identify a workload. <code class="docutils literal notranslate"><span class="pre">batch</span></code>, <code class="docutils literal notranslate"><span class="pre">n</span></code>, and <code class="docutils literal notranslate"><span class="pre">k</span></code> specify its dimensions. Columns ending in <code class="docutils literal notranslate"><span class="pre">_us</span></code> contain case-level mean kernel durations in microseconds. Join the temporal supplement by <code class="docutils literal notranslate"><span class="pre">(cell,</span> <span class="pre">batch)</span></code>. Blank entries indicate missing or unsupported measurements, never zero latency. The loader maps blanks to <code class="docutils literal notranslate"><span class="pre">None</span></code> in both timing sources; statistics exclude missing observations, and complete-case comparisons exclude rows with any missing comparison timing. The full figure-regeneration command requires the bundled complete grid for all three implementations and rejects missing timings before writing outputs, preserving the article’s common-coverage claims.</p>
+<p>The files contain kernel timings and workload dimensions. They do not contain input scores, prompt contents, or individual timing repetitions. They reproduce the published statistics and charts; repeating the GPU experiment requires suitable score inputs and a benchmark harness.</p>
+</section>
+<section id="measurement-and-comparison-scope">
+<h2>Measurement and Comparison Scope<a class="headerlink" href="#measurement-and-comparison-scope" title="Link to this heading">#</a></h2>
+<p>Measurements use NVIDIA B200, FP32 indexer scores, and batch sizes from 1 to 1,024. The GVR V2 reference covers 886 row geometries and 9,746 workload/batch cases, all passing tie-aware exactness checks. Each published GVR time is the arithmetic mean of 10 cold-L2 repetitions, rounded to 0.001 µs; five warm-L2 repetitions are excluded from these figures. A 512 MiB cache eviction runs outside the timed region. Compilation, input preparation, allocation during setup, and Python launch overhead are excluded; required device kernels remain timed.</p>
+<p>Each workload/batch case repeats one captured layer/step score row into distinct batch rows. This controls the input distribution and valid width while measuring batch scaling; it is not a heterogeneous batch of independent serving requests. GVR uses <code class="docutils literal notranslate"><span class="pre">next_n=1</span></code> and sets <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> to that case’s valid row length times its compression ratio. A serving graph may use a larger stable envelope and choose a different execution plan. The bundled grid does not independently benchmark ragged mixed-length batches, MTP, or prefill.</p>
+<p>The primary reference is the hint-free GVR V2 <code class="docutils literal notranslate"><span class="pre">run_varlen</span></code> implementation from <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/19076">PR #19076</a>, measured at its <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/commit/be1b9885e8df9bf070e8cb68459e24a7119afaa9">final public revision</a>. Its FP32 comparisons with GVR V1 and TensorRT LLM radix CUDA match observations from separate runs by workload identity and batch size, with shape metadata checked where available. All three implementations cover the same 9,746 cases. Baseline times are retained as measured; no aggregate correction factor is applied. These comparisons describe the bundled kernel implementations and workloads, rather than the performance of entire serving frameworks.</p>
+<p>The device kernel and host dispatcher at the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/commit/73c70633b2547eedf0c91f85e760aec534f6af84">main revision audited on September 17, 2026</a> are byte-identical to those measured for the reference. This establishes source continuity for those files, not a new whole-framework performance measurement.</p>
+<p>Figures 1, 3, and 7–10 and their numerical summaries all use this PR #19076 reference. B300 measurements are outside the B200 comparison. Historical serving experiments retain their original implementation scope, as described below.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Implementation</p></th>
+<th class="head text-left"><p>Relevant comparison contract</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>GVR V2</p></td>
+<td class="text-left"><p>FP32 scores, valid row lengths, unordered INT32 indices</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>GVR V1</p></td>
+<td class="text-left"><p>Temporal-prior pivot/rescue admission; complete implementation paired by workload and batch</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>TensorRT LLM radix CUDA</p></td>
+<td class="text-left"><p>Production dispatcher, including short-row insertion and long-row split-work paths</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The GVR V1 implementation reference appears below. Complete build revisions for the historical radix observations are unavailable in the timing export.</p>
+</section>
+<section id="gvr-v1-and-algorithm-evolution">
+<h2>GVR V1 and Algorithm Evolution<a class="headerlink" href="#gvr-v1-and-algorithm-evolution" title="Link to this heading">#</a></h2>
+<p>The GVR V1 baseline is the tiered temporal implementation from public <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/16877">PR #16877</a>, recorded in the <code class="docutils literal notranslate"><span class="pre">temporal_tiered_us</span></code> column. It already uses multi-threshold admission: sampled ladder counts choose a pivot and rescue rung, then a fused count/collect pass verifies both exactly. Its short-row and register routes have different execution strategies; Figure 3 sketches the streaming comparison, while its bars measure complete implementations.</p>
+<p>V2 changes calibration to packed/vectorized current-row windows and couples it to dense verification-bin counts and crossing-bin refinement; multi-thresholding itself is not a V2-only contribution. The GVR V1 comparison spans full implementations, including scheduling and integration; it is not an isolated self-sampling ablation. The public source at the article’s implementation reference is <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_tp.py">the GVR V1 kernel</a>.</p>
+<p>The prior contract depends on the selected engine. At the measured revision, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/modules/top_k.py#L69-L75"><code class="docutils literal notranslate"><span class="pre">TopK.needs_gvr_prior</span></code></a> is true only for the temporal GVR path. V2 decode calls the self-sampling <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_self_sampling_host.py#L1435-L1445"><code class="docutils literal notranslate"><span class="pre">run_varlen</span></code></a>, whose public signature has no <code class="docutils literal notranslate"><span class="pre">pre_idx</span></code>. The V1 <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_dispatch.py#L334-L357"><code class="docutils literal notranslate"><span class="pre">tiered_topk</span></code></a> dispatcher retains its required prior input. The self-sampling launcher fills an internal kernel argument slot named <code class="docutils literal notranslate"><span class="pre">pre_idx</span></code> with the output-index tensor; its <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_self_sampling_host.py#L1598-L1612">hint-free kernels do not read that slot</a>. This internal ABI slot is not a previous-step input to the V2 public entry point.</p>
+<p>Figure 3 computes each implementation’s speedup directly from its paired radix times. The geometric means are 3.471858× for GVR V1 and 5.051864× for V2. The direct GVR V1/V2 time ratio is 1.455089×. <code class="docutils literal notranslate"><span class="pre">summary.json</span></code> records these under <code class="docutils literal notranslate"><span class="pre">evolution_vs_radix</span></code> and <code class="docutils literal notranslate"><span class="pre">temporal_vs_v2</span></code>.</p>
+<p>The direct V2 comparison also exposes the lower end of the measured speedup distribution:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Baseline</p></th>
+<th class="head text-right"><p>V2 speedup, geometric mean</p></th>
+<th class="head text-right"><p>V2 speedup, P5</p></th>
+<th class="head text-right"><p>V2 wins / cases</p></th>
+<th class="head text-right"><p>V2 win rate</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>GVR V1</p></td>
+<td class="text-right"><p>1.455089×</p></td>
+<td class="text-right"><p>1.095922×</p></td>
+<td class="text-right"><p>9,704 / 9,746</p></td>
+<td class="text-right"><p>99.569054%</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The P5 value is the fifth percentile across per-case <code class="docutils literal notranslate"><span class="pre">temporal_tiered_us</span> <span class="pre">/</span> <span class="pre">gvr_v2_us</span></code> mean-time ratios, not a runtime tail latency or a percentile of individual timing repetitions. It describes the bundled case distribution and does not establish a worst-case latency guarantee.</p>
+</section>
+<section id="aggregation-and-coverage">
+<h2>Aggregation and Coverage<a class="headerlink" href="#aggregation-and-coverage" title="Link to this heading">#</a></h2>
+<p>Speedup is the geometric mean of per-case <code class="docutils literal notranslate"><span class="pre">baseline_us</span> <span class="pre">/</span> <span class="pre">gvr_v2_us</span></code> ratios. Every case has equal weight. A win is a ratio strictly above one; minima and percentiles also use individual ratios of case-level mean durations. <code class="docutils literal notranslate"><span class="pre">_stats</span></code> in <code class="docutils literal notranslate"><span class="pre">plot_results.py</span></code> calls <code class="docutils literal notranslate"><span class="pre">numpy.percentile</span></code> without a method override, using its default linear interpolation between adjacent sorted ratios at fractional index <code class="docutils literal notranslate"><span class="pre">(cases</span> <span class="pre">-</span> <span class="pre">1)*p/100</span></code> for percentile <code class="docutils literal notranslate"><span class="pre">p</span></code>. No slower case is discarded.</p>
+<p>Figure 1 uses the same cases for all three implementations within each model: 2,079 Flash, 2,970 Pro, and 4,697 V3.2 cases, totaling 9,746. V2 is fixed at 1.00; shorter bars mean less time. These values are recorded under <code class="docutils literal notranslate"><span class="pre">comparison_common_cases</span></code>. The article’s overall and per-model tables use this same full paired coverage.</p>
+<p>The latency and roofline curves use arithmetic-mean durations over all captured layers at each row-length/batch point: 21 layers for Flash, 30 for Pro, and 61 for V3.2. All layers at each plotted point have the same valid width. The radix CUDA comparison heatmap (Figure 7) instead geometrically averages per-layer <code class="docutils literal notranslate"><span class="pre">radix_cuda_us</span> <span class="pre">/</span> <span class="pre">gvr_v2_us</span></code> ratios at each shape, using the same layers. It contains 275 cells: 99 each for Flash and Pro, and 77 for V3.2, covering all 11 batch sizes. The panels share a 1–21× color scale with parity at 1.0, and cell labels round to one decimal place. The cell values range from 1.522571× to 20.182551×, with no clipping by the color scale. A shape average can hide variation among individual cases.</p>
+<p>The GVR V1 comparison heatmap (Figure 8) uses the same 275 shapes and layer weights, with per-layer <code class="docutils literal notranslate"><span class="pre">temporal_tiered_us</span> <span class="pre">/</span> <span class="pre">gvr_v2_us</span></code> ratios. Its shared 1–3× scale is separate from the radix heatmap’s scale; cell labels round to two decimal places. Shape averages range from 1.053828× to 2.865232× without clipping. Per-model minima/maxima are 1.058428×/2.865232× for Flash, 1.053828×/2.828985× for Pro, and 1.100878×/1.862122× for V3.2.</p>
+<p>All shape averages exceed one, but 15 shapes contain at least one slower constituent layer: one for Flash, six for Pro, and eight for V3.2. An orange corner identifies these cells using the unrounded per-layer ratios and a strict below-one comparison. There are 41 individual regressing cases overall; the markers indicate their presence, not their count or magnitude, and do not claim statistical significance. At Pro N=131,075 and B=512, the 30-layer geometric mean is 1.053828× while the minimum layer ratio is 0.688535×. These are the same observations used in the article’s overall comparison.</p>
+<p>Correctness compares selected value multisets with <code class="docutils literal notranslate"><span class="pre">torch.topk</span></code>, allowing tied indices to differ. The capture-grid checks do not establish NaN ordering parity or a universal tie order. The linked implementation PRs additionally cover padding, variable lengths, exceptional values, and graph replay.</p>
+</section>
+<section id="additional-numerical-views">
+<h2>Additional Numerical Views<a class="headerlink" href="#additional-numerical-views" title="Link to this heading">#</a></h2>
+<p>The article uses Figure 1 for the model-level comparison. The following table uses the same full paired coverage and reports geometric-mean speedups of V2 over each baseline.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Baseline</p></th>
+<th class="head text-right"><p>V4 Flash, <span class="math notranslate nohighlight">\(K=512\)</span></p></th>
+<th class="head text-right"><p>V4 Pro, <span class="math notranslate nohighlight">\(K=1024\)</span></p></th>
+<th class="head text-right"><p>V3.2, <span class="math notranslate nohighlight">\(K=2048\)</span></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>GVR V1</p></td>
+<td class="text-right"><p>1.53×</p></td>
+<td class="text-right"><p>1.54×</p></td>
+<td class="text-right"><p>1.37×</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>TensorRT LLM radix CUDA</p></td>
+<td class="text-right"><p>4.88×</p></td>
+<td class="text-right"><p>4.87×</p></td>
+<td class="text-right"><p>5.25×</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><em>Each model column uses the same workloads for both baselines.</em></p>
+<p>For a concrete large-batch slice, the following times are at <span class="math notranslate nohighlight">\(B=1024\)</span> and <span class="math notranslate nohighlight">\(N\approx131{,}072\)</span>, averaged over the same layers as Figure 9:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Model</p></th>
+<th class="head text-right"><p>GVR V2</p></th>
+<th class="head text-right"><p>GVR V1</p></th>
+<th class="head text-right"><p>Radix CUDA</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>V4 Flash</p></td>
+<td class="text-right"><p><strong>113.1 µs</strong></p></td>
+<td class="text-right"><p>138.4 µs</p></td>
+<td class="text-right"><p>461.3 µs</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>V4 Pro</p></td>
+<td class="text-right"><p><strong>132.8 µs</strong></p></td>
+<td class="text-right"><p>146.1 µs</p></td>
+<td class="text-right"><p>477.7 µs</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>V3.2</p></td>
+<td class="text-right"><p><strong>123.9 µs</strong></p></td>
+<td class="text-right"><p>166.0 µs</p></td>
+<td class="text-right"><p>496.7 µs</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="roofline-definitions">
+<h2>Roofline Definitions<a class="headerlink" href="#roofline-definitions" title="Link to this heading">#</a></h2>
+<p>The logical work is <code class="docutils literal notranslate"><span class="pre">W</span> <span class="pre">=</span> <span class="pre">B*N</span></code> abstract comparisons and the minimum traffic is <code class="docutils literal notranslate"><span class="pre">Q_min</span> <span class="pre">=</span> <span class="pre">4*B*(N+K)</span></code> bytes, accounting for FP32 score reads and INT32 index writes. Operational intensity is <code class="docutils literal notranslate"><span class="pre">I</span> <span class="pre">=</span> <span class="pre">W/Q_min</span></code>; measured useful throughput is <code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">=</span> <span class="pre">B*N/(time_us*1e6)</span></code> Tcompare/s. Every kernel uses this same normalization. Temporal-prior accesses, padding, staging, repeated scans, and synchronization remain in measured time but do not enlarge the ideal work or minimum-traffic terms. The plotted throughput is not a hardware instruction rate or measured DRAM bandwidth.</p>
+<p>The full model is <code class="docutils literal notranslate"><span class="pre">min(R,</span> <span class="pre">BW*I)</span></code>. The theoretical parameters are <code class="docutils literal notranslate"><span class="pre">R=37.224960</span> <span class="pre">Tcompare/s</span></code> and <code class="docutils literal notranslate"><span class="pre">BW=8</span> <span class="pre">TB/s</span></code>; calibrated parameters are <code class="docutils literal notranslate"><span class="pre">R=37.047490</span> <span class="pre">Tcompare/s</span></code> and <code class="docutils literal notranslate"><span class="pre">BW=6.912116</span> <span class="pre">TB/s</span></code>. Their knees are 4.65312 and approximately 5.35979 compare/byte, above Top-K’s ideal <code class="docutils literal notranslate"><span class="pre">[0.125,</span> <span class="pre">0.25)</span></code> intensity range. The semantic comparison convention counts two binary comparisons per FMNMX3 result; it is not FP32 FLOPS.</p>
+<p>Figure 10B uses linear axes at B=1024. In this article, a Pareto curve denotes each operator’s measured intensity–throughput trace across row lengths at that fixed batch. The points connect in intensity order; the curve is not a computed nondominated frontier or a search over configurations. Figure 9 also shows B=1, and the heatmaps in Figures 7–8 cover all 11 batches.</p>
+<p>Reachable rate is <code class="docutils literal notranslate"><span class="pre">100</span> <span class="pre">*</span> <span class="pre">P</span> <span class="pre">/</span> <span class="pre">min(R,</span> <span class="pre">BW*I)</span></code> percent, using the calibrated roof. Compute each point from the arithmetic-mean duration across the same 21/30/61 layers used in Figure 10B for Flash/Pro/V3.2. The average reachable rate is the unweighted arithmetic mean of these point-level percentages, and the peak is their maximum. Flash and Pro each contribute nine intensity points; V3.2 contributes seven. The average is not weighted by row length or serving frequency. <code class="docutils literal notranslate"><span class="pre">summary.json</span></code> records the point counts and average/peak percentages under <code class="docutils literal notranslate"><span class="pre">roofline_reachable_rate</span></code>.</p>
+<p>Every plotted point lies on the bandwidth branch of the roof. With elapsed time <code class="docutils literal notranslate"><span class="pre">t</span></code> and consistent units, the fractional reachable rate simplifies to <code class="docutils literal notranslate"><span class="pre">(W/t)/(BW*W/Q_min)</span> <span class="pre">=</span> <span class="pre">Q_min/(BW*t)</span></code>; multiply by 100 for percent. This is the ideal minimum-traffic time <code class="docutils literal notranslate"><span class="pre">Q_min/BW</span></code> divided by measured time. The cancellation of <code class="docutils literal notranslate"><span class="pre">W</span></code> explains why the comparison convention does not change the reachable rate on this branch. Additional traffic and kernel work remain in <code class="docutils literal notranslate"><span class="pre">t</span></code>, so the rate does not measure actual DRAM bytes transferred or bandwidth utilization.</p>
+<p>The read-dominated roof is optimistic; mixed read/write behavior and additional kernel work can lower achievable throughput. Reachable rate describes useful selection work relative to this model, not measured DRAM bandwidth utilization.</p>
+<p>The input-read term applies to nontrivial selection with more valid scores than output slots. Short-row identity/padding paths can skip score reads; they are outside the measured grid and should not be evaluated against this traffic bound.</p>
+</section>
+<section id="serving-results">
+<h2>Serving Results<a class="headerlink" href="#serving-results" title="Link to this heading">#</a></h2>
+<p>Decode TPOT results come from public <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18410">PR #18410</a>; prefill results come from public <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18702">PR #18702</a>. These are separate historical serving experiments, not transformations of the operator speedups or measurements of the current complete framework. The 1.84–2.61× prefill-kernel range compares aggregate rank-0 Top-K kernel durations within measured Flash/Pro prefill windows; it is not the latency of a single Top-K invocation. The 2.9–4.5% throughput increase isolates adding V2 prefill to a deployment already using V2 decode on the tested long-input, batched configurations. It is not the throughput gain of replacing radix in both phases.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#regenerate-the-figures">Regenerate the Figures</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-sampling-implementation">GPU Sampling Implementation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#candidate-work-illustration">Candidate-Work Illustration</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#temporal-overlap-illustration">Temporal-Overlap Illustration</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#temporal-overlap-statistics">Temporal-Overlap Statistics</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#published-data">Published Data</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#measurement-and-comparison-scope">Measurement and Comparison Scope</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gvr-v1-and-algorithm-evolution">GVR V1 and Algorithm Evolution</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#aggregation-and-coverage">Aggregation and Coverage</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#additional-numerical-views">Additional Numerical Views</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#roofline-definitions">Roofline Definitions</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-results">Serving Results</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on September 26, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8">c76f4a8</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
