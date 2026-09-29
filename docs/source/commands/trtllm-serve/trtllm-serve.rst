@@ -415,7 +415,7 @@ Use YAML mappings for nested fields:
        backend: CUTLASS
 
 Use repeatable ``--set PATH=YAML_VALUE`` options to override individual fields.
-Paths use canonical snake-case ``LlmArgs`` field names and dots for nesting:
+Paths use exact, case-sensitive ``LlmArgs`` field names and dots for nesting:
 
 .. code-block:: bash
 

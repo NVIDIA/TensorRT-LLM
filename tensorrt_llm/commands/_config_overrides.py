@@ -26,7 +26,7 @@ from typing import Any, NamedTuple
 import yaml
 from pydantic import BaseModel
 
-_PATH_COMPONENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+_PATH_COMPONENT_RE = re.compile(r"^[a-z_][A-Za-z0-9_]*$")
 _MAX_VALUE_DEPTH = 64
 _MAX_VALUE_NODES = 10_000
 
@@ -76,8 +76,7 @@ def _validate_path(path_text: str) -> tuple[str, ...]:
     path = tuple(path_text.split("."))
     if any(not _PATH_COMPONENT_RE.fullmatch(component) for component in path):
         raise ConfigOverrideError(
-            "Override paths must use dot-separated canonical snake_case "
-            "field names without empty components."
+            "Override paths must use dot-separated canonical field names without empty components."
         )
     return path
 

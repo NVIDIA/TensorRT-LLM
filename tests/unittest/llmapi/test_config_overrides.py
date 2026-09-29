@@ -51,14 +51,16 @@ def _parse(*assignments: str) -> tuple[ConfigOverride, ...]:
         ("dtype=null", None),
         ("scheduler_config={capacity: 4}", {"capacity": 4}),
         ("kv_cache_config.batch_sizes=[1, 2, 4]", [1, 2, 4]),
+        ("speculative_config.dynamic_tree_max_topK=4", 4),
         ("model_kwargs.enabled=true", True),
         ("dtype='value=with=equals'", "value=with=equals"),
     ],
 )
 def test_parse_config_overrides_supports_yaml_values(assignment: str, expected: object) -> None:
-    actual = _parse(assignment)[0].value
-    assert actual == expected
-    assert type(actual) is type(expected)
+    override = _parse(assignment)[0]
+    assert override.path == tuple(assignment.split("=", 1)[0].split("."))
+    assert override.value == expected
+    assert type(override.value) is type(expected)
 
 
 @pytest.mark.parametrize(
@@ -69,6 +71,7 @@ def test_parse_config_overrides_supports_yaml_values(assignment: str, expected: 
         "max_batch_size=",
         "scheduler_config..capacity=1",
         "SchedulerConfig.capacity=1",
+        "scheduler_config.Capacity=1",
         "scheduler-config.capacity=1",
     ],
 )
