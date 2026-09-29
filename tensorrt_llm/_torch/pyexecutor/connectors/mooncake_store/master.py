@@ -459,8 +459,9 @@ def _launch_master(pool: PoolSpec, run_dir: str) -> LaunchedMaster:
     if resolved is None:
         raise FileNotFoundError(
             f"{binary!r} is not on PATH, so launch_master cannot start a "
-            "Mooncake master. It ships with the Mooncake runtime, which "
-            "docker/common/install_mooncake.sh installs. Point "
+            "Mooncake master. It comes from the Mooncake Python client, an "
+            "optional dependency: install it with "
+            "`pip install tensorrt-llm[mooncake]`. Otherwise point "
             f"{MASTER_BINARY_ENV} at the binary, or drop launch_master and "
             "set master_server_address to a master you run yourself."
         )

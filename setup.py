@@ -157,8 +157,7 @@ mx_deps = ["modelexpress>=0.5.1,<0.6.0"]
 # affecting the default dependency graph.
 grpc_smg_deps, _ = parse_requirements(Path("requirements-grpc-smg.txt"))
 # The mooncake-store KV cache connector is opt-in: its Python client is heavy
-# and CUDA-ABI specific, so the default installation must not carry it. The pin
-# lives in requirements-mooncake.txt, the same file the container build reads.
+# and CUDA-ABI specific, so no container and no default installation carries it.
 mooncake_deps, _ = parse_requirements(Path("requirements-mooncake.txt"))
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
