@@ -52,12 +52,13 @@ class ModelCaller:
         self._aux_streams = aux_streams
         self._prefill_compile_only = prefill_compile_only
 
-    def __call__(self, **kwargs: Any) -> Any:
+    def __call__(self, *, moe_graph_padding: torch.Tensor | None = None, **kwargs: Any) -> Any:
         attrs = get_model_extra_attrs()
         assert attrs is not None, "Model extra attrs is not set"
         # Attention and compiled custom ops dereference these borrowed resources.
         attrs["attention_metadata"] = weakref.ref(kwargs["attn_metadata"])
         attrs.update(self._model.model_config.extra_attrs)
+        attrs["moe_graph_padding"] = moe_graph_padding
         attrs["spec_metadata"] = kwargs.get("spec_metadata", None)
 
         if self._compile_backend is not None:

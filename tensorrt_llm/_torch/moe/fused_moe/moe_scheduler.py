@@ -49,7 +49,8 @@ import torch
 
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
-from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor, get_moe_graph_padding
+from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
@@ -67,6 +68,35 @@ __all__ = [
 
 if TYPE_CHECKING:
     from .configurable_moe import ConfigurableMoE
+
+
+def _mask_prefill_padding_routes(
+    slots: torch.Tensor, padding: torch.Tensor, row_offset: Optional[int]
+) -> torch.Tensor:
+    if row_offset is None:
+        # Empty DP chunks still participate in collectives, but send no tokens.
+        return torch.full_like(slots, -1)
+    end = row_offset + slots.shape[0]
+    if row_offset < 0 or end > padding.shape[0]:
+        raise ValueError("MoE chunk exceeds the BCG padding mask")
+    return slots.masked_fill(padding[row_offset:end, None], -1)
+
+
+def _get_supported_graph_padding(moe: "ConfigurableMoE") -> Optional[torch.Tensor]:
+    padding = get_moe_graph_padding()
+    if padding is None:
+        return None
+    if (
+        moe.backend.capabilities.supports_graph_padding_trim
+        and moe.comm is not None
+        and moe.comm.supports_graph_padding_trim
+    ):
+        return padding
+    logger.warning_once(
+        f"BCG padding trim is unsupported for {type(moe.backend).__name__}/"
+        f"{type(moe.comm).__name__}; padding tokens will still be computed."
+    )
+    return None
 
 
 class MoEScheduler(ABC):
@@ -463,6 +493,13 @@ class ExternalCommMoEScheduler(MoEScheduler):
             token_selected_experts = None
             token_final_scales = None
 
+        # Exclude padding from EPLB without changing Router Replay's logical routes.
+        graph_padding = _get_supported_graph_padding(moe)
+        if graph_padding is not None and token_selected_experts is not None:
+            token_selected_experts = _mask_prefill_padding_routes(
+                token_selected_experts, graph_padding, row_offset
+            )
+
         # ========== Step 3: EPLB - Update statistics and route ==========
         if moe.layer_load_balancer and token_selected_experts is not None:
             moe._load_balancer_done_wait_gpu_stage(is_first_call)
@@ -489,6 +526,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
         token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
             moe.num_slots, token_selected_slots
         )
+
+        # EPLB remapping and calibration replay can replace masked routes.
+        if (
+            graph_padding is not None
+            and token_selected_slots is not None
+            and token_selected_slots is not token_selected_experts
+        ):
+            token_selected_slots = _mask_prefill_padding_routes(
+                token_selected_slots, graph_padding, row_offset
+            )
 
         # ========== Step 4: Communication prepare phase (NVLINK two-sided only) ==========
         local_statistic_tensor_for_dispatch = None

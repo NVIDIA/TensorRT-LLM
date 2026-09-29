@@ -69,7 +69,8 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
 from ..speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_static_draft_len, update_draft_len
-from ..utils import (get_per_request_prefill_cuda_graph_flag, helix_local_len,
+from ..utils import (MOE_TRIM_GRAPH_PADDING,
+                     get_per_request_prefill_cuda_graph_flag, helix_local_len,
                      set_per_request_prefill_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
@@ -632,6 +633,13 @@ class PyTorchModelEngine(ModelEngine):
 
         self.torch_compile_config = self.llm_args.torch_compile_config
         self.prefill_cuda_graph_backend = self.llm_args.prefill_cuda_graph_backend
+        # Allocate once: captured MoE kernels retain this address across batches.
+        self._moe_row_is_padding_cuda = (
+            torch.empty(
+                (self.max_num_tokens, ), dtype=torch.bool, device='cuda')
+            if MOE_TRIM_GRAPH_PADDING and self.prefill_cuda_graph_backend
+            == PrefillCudaGraphBackend.BREAKABLE else None)
+        self._moe_graph_padding = None
         torch_compile_enabled = bool(self.torch_compile_config is not None)
         torch_compile_fullgraph = self.torch_compile_config.enable_fullgraph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_fullgraph'].default
@@ -3577,6 +3585,15 @@ class PyTorchModelEngine(ModelEngine):
         if self.llm_args.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:
             return
 
+        # Mixed batches require decode support even when capture uses only prefill.
+        model_config = getattr(self.model, "model_config", None)
+        if model_config is not None:
+            for layer_ref in model_config.extra_attrs.get("kda_layers",
+                                                          {}).values():
+                layer = layer_ref()
+                if layer is not None:
+                    layer.validate_breakable_cuda_graph()
+
         if isinstance(self.model, DecoderModelForCausalLM):
             return
         decoder_model = getattr(self.model, "llm", None)
@@ -5871,6 +5888,19 @@ class PyTorchModelEngine(ModelEngine):
         return inputs, self.gather_ids_cuda[:len(
             gather_ids)] if self.enable_spec_decode else None
 
+    def _publish_moe_graph_padding(self, num_tokens: int,
+                                   padded_num_tokens: int) -> None:
+        self._moe_graph_padding = None
+        mask = self._moe_row_is_padding_cuda
+        if (mask is None or not get_per_request_prefill_cuda_graph_flag()
+                or self.prefill_cuda_graph_backend
+                != PrefillCudaGraphBackend.BREAKABLE):
+            return
+        # Exact bucket hits also publish the mask so capture records the trim.
+        mask[:num_tokens].fill_(False)
+        mask[num_tokens:padded_num_tokens].fill_(True)
+        self._moe_graph_padding = mask[:padded_num_tokens]
+
     @nvtx_range("_prepare_inputs")
     def _prepare_inputs(
         self,
@@ -5886,6 +5916,7 @@ class PyTorchModelEngine(ModelEngine):
         use_lora_graph: bool = False,
     ) -> Tuple[Dict[str, Any], Optional[torch.Tensor]]:
         set_per_request_prefill_cuda_graph_flag(False)
+        self._moe_graph_padding = None
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if cp_type in (CpType.HELIX, CpType.ULYSSES):
@@ -5918,16 +5949,19 @@ class PyTorchModelEngine(ModelEngine):
                         sa_manager._initialized_requests.add(
                             request.py_request_id)
 
-        return self._prepare_tp_inputs(scheduled_requests,
-                                       kv_cache_manager,
-                                       attn_metadata,
-                                       spec_metadata,
-                                       new_tensors_device,
-                                       cache_indirection_buffer,
-                                       resource_manager,
-                                       maybe_graph,
-                                       promoted_context_request_ids,
-                                       use_lora_graph=use_lora_graph)
+        result = self._prepare_tp_inputs(scheduled_requests,
+                                         kv_cache_manager,
+                                         attn_metadata,
+                                         spec_metadata,
+                                         new_tensors_device,
+                                         cache_indirection_buffer,
+                                         resource_manager,
+                                         maybe_graph,
+                                         promoted_context_request_ids,
+                                         use_lora_graph=use_lora_graph)
+        self._publish_moe_graph_padding(attn_metadata.num_tokens,
+                                        result[0]['input_ids'].shape[0])
+        return result
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
@@ -6260,7 +6294,8 @@ class PyTorchModelEngine(ModelEngine):
                          and isinstance(metadata, TrtllmAttentionMetadata) else
                          contextlib.nullcontext())
         with reclaim_scope:
-            return self._model_caller(**kwargs)
+            return self._model_caller(moe_graph_padding=self._moe_graph_padding,
+                                      **kwargs)
 
     @nvtx_range("_forward_step")
     def _forward_step(self,

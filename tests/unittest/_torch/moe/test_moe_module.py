@@ -496,6 +496,7 @@ def _test_moe_worker(
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
     bias_dtype: Optional[torch.dtype] = None,
+    graph_padding_replay: bool = False,
 ):
     """
     Test MoE module worker function.
@@ -516,6 +517,9 @@ def _test_moe_worker(
         bias_dtype: Data type for routing bias (default: same as dtype).
                     Use torch.float32 to test fp32 bias plumbing.
     """
+    old_force_cft = os.environ.get("TRTLLM_MOE_A2A_FORCE_CFT")
+    if graph_padding_replay:
+        os.environ["TRTLLM_MOE_A2A_FORCE_CFT"] = "0"
     try:
         _test_moe_worker_impl(
             moe_backend=moe_backend,
@@ -534,10 +538,17 @@ def _test_moe_worker(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             bias_dtype=bias_dtype,
+            graph_padding_replay=graph_padding_replay,
         )
     except Exception:
         traceback.print_exc()
         raise
+    finally:
+        if graph_padding_replay:
+            if old_force_cft is None:
+                os.environ.pop("TRTLLM_MOE_A2A_FORCE_CFT", None)
+            else:
+                os.environ["TRTLLM_MOE_A2A_FORCE_CFT"] = old_force_cft
 
 
 def _test_moe_worker_impl(
@@ -557,6 +568,7 @@ def _test_moe_worker_impl(
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
     bias_dtype: Optional[torch.dtype] = None,
+    graph_padding_replay: bool = False,
 ):
     """Actual implementation of _test_moe_worker."""
     # Default routing logits dtype to model dtype if not specified
@@ -762,6 +774,11 @@ def _test_moe_worker_impl(
             # Get reference output
             with torch.inference_mode():
                 ref_output = ref_fused_moe.forward(x, router_logits)
+
+            if graph_padding_replay:
+                _check_graph_padding_replay(
+                    fused_moe, backend_type, quant_algo, x, router_logits, all_rank_num_tokens
+                )
 
             # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
             use_flashinfer = getattr(fused_moe, "use_flashinfer", False)
@@ -2224,3 +2241,93 @@ def test_configurable_moe_multi_gpu_eplb(
         model_config=model_config,
         routing_method_cls=routing_method_cls,
     )
+
+
+def _check_graph_padding_replay(
+    moe, backend_type, quant_algo, x, router_logits, all_rank_num_tokens
+):
+    from _torch.moe.moe_test_utils import get_backend_class
+
+    from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
+    from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
+        BreakableCUDAGraph,
+        BreakableCUDAGraphCapture,
+        enable_breakable_cuda_graph,
+    )
+    from tensorrt_llm._torch.utils import model_extra_attrs
+
+    assert isinstance(moe.backend, get_backend_class(backend_type, quant_algo))
+    assert isinstance(moe.comm, NVLinkOneSided)
+    assert moe.backend.capabilities.supports_graph_padding_trim
+    mask = torch.zeros(x.shape[0], device=x.device, dtype=torch.bool)
+    attrs = {"moe_graph_padding": mask}
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = BreakableCUDAGraph()
+    with torch.inference_mode(), torch.cuda.stream(stream):
+        reference = moe(x, router_logits, all_rank_num_tokens=all_rank_num_tokens).clone()
+        with model_extra_attrs(attrs):
+            moe(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
+            with enable_breakable_cuda_graph(), BreakableCUDAGraphCapture(graph, stream=stream):
+                output = moe(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
+            assert graph.num_segments > 0
+            try:
+                # Rank-skewed counts and globally empty dispatch must still run
+                # the real expert kernels and participate in all collectives.
+                for count in (x.shape[0], MPI.COMM_WORLD.rank * 3, 0, x.shape[0]):
+                    mask[:count].fill_(False)
+                    mask[count:].fill_(True)
+                    graph.replay()
+                    live_ok = torch.allclose(
+                        output[:count], reference[:count], rtol=0.05, atol=0.01
+                    )
+                    padding_ok = torch.count_nonzero(output[count:]).item() == 0
+                    results = MPI.COMM_WORLD.allgather((live_ok, padding_ok))
+                    assert all(a and b for a, b in results), (backend_type, count, results)
+            finally:
+                stream.synchronize()
+                graph.reset()
+    torch.cuda.current_stream().wait_stream(stream)
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize(
+    "backend,quant_algo",
+    [
+        (MoeBackendType.TRTLLM, QuantAlgo.NVFP4),
+        (MoeBackendType.CUTLASS, QuantAlgo.NVFP4),
+        (MoeBackendType.CUTEDSL, QuantAlgo.NVFP4),
+        (MoeBackendType.DEEPGEMM, QuantAlgo.FP8_BLOCK_SCALES),
+    ],
+)
+def test_configurable_moe_graph_padding_replay(moe_multi_gpu_executor, backend, quant_algo):
+    if torch.cuda.device_count() < 4:
+        pytest.skip("requires four NVLink GPUs")
+    if get_sm_version() not in (100, 103, 107) or not _is_mnnvl_supported():
+        pytest.skip("requires Blackwell/Rubin NVLink communication")
+    mapping = _create_mapping_for_parallel_mode(4, "DEP")
+    args = (
+        backend.value,
+        torch.bfloat16,
+        quant_algo,
+        mapping,
+        False,
+        -1,
+        -1,
+        MoeModelConfig(8, 2, 512, 512),
+        32,
+        False,
+        RenormalizeMoeRoutingMethod,
+        None,
+        1,
+        0,
+        float("inf"),
+        None,
+        True,
+    )
+    futures = [
+        moe_multi_gpu_executor.submit(_moe_worker_entry, "NVLINK_ONE_SIDED", *args)
+        for _ in range(4)
+    ]
+    for future in futures:
+        future.result()

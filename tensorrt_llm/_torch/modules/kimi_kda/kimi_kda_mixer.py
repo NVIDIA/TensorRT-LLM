@@ -304,6 +304,24 @@ class KimiKDALinearAttention(nn.Module):
             kda_layers[self.layer_idx_str] = weakref.ref(self)
             self.register_to_config = True
 
+    def validate_breakable_cuda_graph(self) -> None:
+        """Validate KDA requirements before BCG capture."""
+        if not self._use_indexed_ssm_pool:
+            raise ValueError(
+                "Kimi K3 breakable CUDA graph requires TLLM_KDA_ENABLE_INDEXED_STATE_POOL=1"
+            )
+        if self._dispatch.decode_kernel_path != "optimized" or not self.use_full_rank_gate:
+            raise ValueError(
+                "Kimi K3 breakable CUDA graph requires optimized KDA decode "
+                "with head_dim=128 and use_full_rank_gate=True on a supported GPU"
+            )
+        if (
+            self._qkvg_proj_weight is None and self.qkvg_proj is None
+        ) or self._bfa_proj_weight is None:
+            raise ValueError(
+                "Kimi K3 breakable CUDA graph requires finalized QKVG/BFA decode weights"
+            )
+
     def finalize_decode_weights(self) -> None:
         """Build fused projection weights and decode constants after weight load.
 

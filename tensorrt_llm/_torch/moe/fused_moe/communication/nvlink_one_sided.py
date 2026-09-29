@@ -209,6 +209,8 @@ class NVLinkOneSided(Communication):
     scale well for very large-scale parallelization.
     """
 
+    supports_graph_padding_trim = True
+
     # Constants from C++ (must match moeAlltoAllKernels.h)
     MAX_RANKS = 256
     MAX_TOP_K = 8

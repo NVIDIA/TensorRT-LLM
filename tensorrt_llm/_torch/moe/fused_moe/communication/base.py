@@ -64,6 +64,8 @@ class Communication(ABC):
     The communication method declares which mode(s) it supports via supports_post_quant_dispatch()
     """
 
+    supports_graph_padding_trim = False
+
     def __init__(
         self,
         mapping: Mapping,

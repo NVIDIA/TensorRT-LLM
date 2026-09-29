@@ -150,6 +150,16 @@ def get_model_extra_attrs():
     return getattr(_model_extra_attrs, 'attrs', None)
 
 
+MOE_TRIM_GRAPH_PADDING = os.environ.get("TLLM_MOE_TRIM_GRAPH_PADDING",
+                                        "1") == "1"
+
+
+def get_moe_graph_padding() -> Optional[torch.Tensor]:
+    """Return the live device padding mask shared by BCG MoE layers."""
+    attrs = get_model_extra_attrs()
+    return attrs.get("moe_graph_padding") if attrs is not None else None
+
+
 def is_nvfp4_marlin_supported_sm(sm_version: int | None = None) -> bool:
     """Return True on Ada Lovelace (SM89, e.g. L40S) and Hopper (SM90-99)."""
     if sm_version is None:
