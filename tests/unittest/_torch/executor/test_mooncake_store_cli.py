@@ -155,16 +155,22 @@ def command(request, master, donor) -> CommandUnderTest:
     return {"mooncake_master": master, "mooncake_donor": donor}[request.param]
 
 
-def signal_on_idle(monkeypatch, number: int) -> None:
+def signal_on_idle(monkeypatch, number: int, on_idle=None) -> None:
     """Deliver `number` to this process the first time a command idles.
 
     The handler runs at the next bytecode boundary in the main thread, so the
     loop here only has to give the interpreter one. It bounds the wait rather
     than blocking, so a handler that never fires fails the test rather than
     hanging it.
+
+    `on_idle` runs before the signal, which is the only point at which a
+    command's resources are all held. Anything a command releases on its way
+    out has to be observed from there rather than after `run` returns.
     """
 
     def sleep(_seconds):
+        if on_idle is not None:
+            on_idle()
         os.kill(os.getpid(), number)
         for _ in range(100):
             time.sleep(0.01)
@@ -422,10 +428,23 @@ def test_the_donor_defaults_the_protocol_to_rdma_when_the_config_value_is_null(
     assert donation.resolved["protocol"] == "rdma"
 
 
-def test_the_donor_announces_the_mounted_segment_in_its_ready_file(monkeypatch, donation, tmp_path):
-    """A launcher waits on this file before letting prefill fill the pool."""
+def test_the_donors_ready_file_lasts_exactly_as_long_as_the_segment(
+    monkeypatch, donation, tmp_path
+):
+    """A launcher waits on this file before letting prefill fill the pool.
+
+    So the file has to appear once the segment is mounted and go when it is
+    withdrawn. Outliving the segment would clear that gate for capacity this
+    donor no longer contributes, and prefill would start writing into a pool
+    short of the memory the launcher waited for.
+    """
     ready_file = tmp_path / "ready"
-    signal_on_idle(monkeypatch, signal.SIGTERM)
+    announced = []
+    signal_on_idle(
+        monkeypatch,
+        signal.SIGTERM,
+        on_idle=lambda: announced.append(ready_file.read_text()),
+    )
 
     with pytest.raises(_telemetry.SignalExit):
         donor_running(
@@ -438,7 +457,8 @@ def test_the_donor_announces_the_mounted_segment_in_its_ready_file(monkeypatch, 
             str(ready_file),
         ).run()
 
-    assert ready_file.read_text() == f"{donation.host} {2 * 1024**3}\n"
+    assert announced == [f"{donation.host} {2 * 1024**3}\n"]
+    assert not ready_file.exists()
 
 
 # ---- describing the pool from the master's own run directory ----

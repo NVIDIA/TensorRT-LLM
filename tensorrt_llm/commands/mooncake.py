@@ -92,6 +92,39 @@ def _signal_handoff():
         raise
 
 
+@contextlib.contextmanager
+def _announce_ready(ready_file: Optional[str], host: str, segment_size: int):
+    """Hold a readiness file for exactly as long as the segment is mounted.
+
+    Launchers gate prefill on this file existing, so it has to go when the
+    capacity does. Left behind, it would clear that gate for a pool the donor
+    no longer contributes to, and prefill would start writing into a pool
+    short of the memory the launcher waited for.
+    """
+    if ready_file is None:
+        yield
+        return
+
+    with open(ready_file, "w") as handle:
+        handle.write(f"{host} {segment_size}\n")
+    logger.info(
+        f"mooncake-store: announced this segment in {ready_file}, so a "
+        "launcher waiting on the pool's capacity can proceed"
+    )
+    try:
+        yield
+    finally:
+        # A launcher that consumes the file by removing it has already had the
+        # signal, so its absence here is a success and not worth failing the
+        # shutdown over.
+        with contextlib.suppress(OSError):
+            os.unlink(ready_file)
+        logger.info(
+            f"mooncake-store: withdrew the announcement in {ready_file}; a "
+            "launcher waiting on this pool's capacity will wait again"
+        )
+
+
 @click.command("mooncake_master")
 @click.option(
     "--rpc_port",
@@ -363,16 +396,10 @@ def mooncake_donor(
             ),
             local_buffer_size=buffer_size,
         ) as host,
+        # After `as host`, so the announcement names the segment that mounted
+        # and is withdrawn before the segment is.
+        _announce_ready(ready_file, host, donating),
     ):
-        if ready_file:
-            with open(ready_file, "w") as handle:
-                handle.write(f"{host} {donating}\n")
-            logger.info(
-                f"mooncake-store: announced this segment in "
-                f"{ready_file}, so a launcher waiting on the pool's "
-                "capacity can proceed"
-            )
-
         # Idle by design: a put or get here would make this node a traffic
         # client, which is what donation exists to avoid.
         started = time.monotonic()
