@@ -28,6 +28,7 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
+from ..pyexecutor.config_utils import get_layer_attention_window
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
@@ -498,37 +499,6 @@ def confident_prefix_length(confidence_logits: torch.Tensor, *, block_size: int,
     return int(torch.nonzero(below[0], as_tuple=False)[0].item())
 
 
-def _resolve_eagle3_sliding_window(config: PretrainedConfig,
-                                   local_layer_idx: int) -> Optional[int]:
-    """Resolve the sliding-window size for a single Eagle3 draft layer.
-
-    For variable-sliding-window (VSWA) models the draft config exposes a
-    ``layer_types`` list (e.g. the alternating ``"sliding_attention"`` /
-    ``"full_attention"`` pattern used by GPT-OSS / Ministral). Only
-    sliding-attention layers use ``config.sliding_window``; full-attention
-    layers get ``None`` so they keep global attention. When ``layer_types`` is
-    absent we fall back to applying ``config.sliding_window`` uniformly, which
-    preserves behaviour for single-layer drafts that only set
-    ``sliding_window``. This mirrors ``MistralAttention`` in
-    ``modeling_mistral.py``.
-
-    ``local_layer_idx`` is the draft-local layer index (0-based within the
-    draft model). It is distinct from the global ``layer_idx`` used for KV
-    cache, which is offset past the target model's layers
-    (see ``get_draft_model``).
-    """
-    sliding_window = getattr(config, "sliding_window", None)
-    if sliding_window is None:
-        return None
-
-    layer_types = getattr(config, "layer_types", None)
-    if layer_types is not None and 0 <= local_layer_idx < len(layer_types):
-        if layer_types[local_layer_idx] != "sliding_attention":
-            return None
-
-    return sliding_window
-
-
 class Eagle3Attention(Attention):
 
     def __init__(
@@ -679,14 +649,13 @@ class Eagle3DecoderLayer(DecoderLayer):
             self.self_attn = Eagle3Attention(model_config, layer_idx,
                                              self._next_layer_regular)
 
-        # Resolve the per-layer sliding window. VSWA drafts expose
-        # ``layer_types`` so that only sliding-attention layers use
-        # ``config.sliding_window``; full-attention layers fall back to global
-        # attention (``None``). Drafts that only set ``sliding_window`` (no
-        # ``layer_types``) keep applying it uniformly. The window is forwarded
-        # to attention as ``attention_window_size`` only when its forward
-        # accepts it -- MLA does not, and no MLA model currently uses SWA.
-        sliding_window = _resolve_eagle3_sliding_window(config, local_layer_idx)
+        # Resolve the per-layer sliding window with the same helper that sizes
+        # the draft KV cache (``_derive_draft_max_attention_window``), indexed
+        # by the draft-local layer index rather than the target-offset global
+        # ``layer_idx``. The window is forwarded to attention as
+        # ``attention_window_size`` only when its forward accepts it -- MLA
+        # does not, and no MLA model currently uses SWA.
+        sliding_window = get_layer_attention_window(config, local_layer_idx)
         self.self_attn.sliding_window = sliding_window
         self._attn_kwargs = {}
         if sliding_window is not None:

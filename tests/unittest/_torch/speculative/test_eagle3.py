@@ -43,6 +43,8 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.pyexecutor._util import (
     _derive_draft_max_attention_window,
     _expand_attention_window_pattern_to_global_layers)
+from tensorrt_llm._torch.pyexecutor.config_utils import \
+    get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
     _extend_full_attention_windows_for_spec_decode
 from tensorrt_llm._torch.speculative.eagle3 import (Eagle3OneModelSpecMetadata,
@@ -636,7 +638,7 @@ def test_eagle3_sliding_window_wiring(use_mla, sliding_window):
     ``tensorrt_llm/_torch/models/modeling_speculative.py``:
 
     1. ``Eagle3DecoderLayer.__init__`` resolves the per-layer window via
-       ``_resolve_eagle3_sliding_window`` and stores it on ``self.self_attn``.
+       ``get_layer_attention_window`` and stores it on ``self.self_attn``.
     2. It then copies the window into ``self._attn_kwargs`` as
        ``attention_window_size`` when the attention ``forward`` accepts it, so
        it is forwarded via ``**kwargs`` to ``self.self_attn(...)`` on every
@@ -756,6 +758,68 @@ def test_eagle3_sliding_window_layer_types(layer_type, expected_window):
                                local_layer_idx=local_layer_idx)
 
     assert layer.self_attn.sliding_window == expected_window
+    expected_kwargs = ({
+        "attention_window_size": expected_window
+    } if expected_window is not None else {})
+    assert layer._attn_kwargs == expected_kwargs
+
+
+@pytest.mark.parametrize("extra_config,local_layer_idx,expected_window", [
+    ({
+        "use_sliding_window": False
+    }, 0, None),
+    ({
+        "use_sliding_window": True
+    }, 0, 64),
+    ({
+        "max_window_layers": 1
+    }, 0, None),
+    ({
+        "max_window_layers": 1
+    }, 1, 64),
+])
+def test_eagle3_sliding_window_matches_draft_kv_cache(extra_config,
+                                                      local_layer_idx,
+                                                      expected_window):
+    """The draft layer window must agree with the draft KV-cache window.
+
+    ``_derive_draft_max_attention_window`` sizes the draft KV cache with
+    ``get_layer_attention_window``, so ``Eagle3DecoderLayer`` must resolve the
+    same window: an explicit ``use_sliding_window=False`` (common in Qwen2-style
+    configs that still carry a ``sliding_window`` value) disables SWA, and
+    ``max_window_layers`` keeps the leading layers on full attention.
+    """
+    config = transformers.LlamaConfig(
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        intermediate_size=256,
+        max_position_embeddings=2048,
+        rms_norm_eps=1e-5,
+        attention_bias=False,
+        sliding_window=64,
+    )
+    config.layer_types = None
+    for key, value in extra_config.items():
+        setattr(config, key, value)
+    config.torch_dtype = torch.bfloat16
+
+    mc = model_config_lib.ModelConfig(
+        pretrained_config=config,
+        mapping=mapping_lib.Mapping(world_size=1, tp_size=1, rank=0),
+        skip_create_weights_in_init=True,
+    )
+
+    layer = Eagle3DecoderLayer(mc,
+                               layer_idx=0,
+                               is_first_layer=True,
+                               use_mla=False,
+                               local_layer_idx=local_layer_idx)
+
+    assert layer.self_attn.sliding_window == expected_window
+    assert (layer.self_attn.sliding_window == get_layer_attention_window(
+        config, local_layer_idx))
     expected_kwargs = ({
         "attention_window_size": expected_window
     } if expected_window is not None else {})
