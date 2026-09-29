@@ -315,7 +315,6 @@ unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py:
 unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[False] SKIP (https://nvbugs/6535767)
 unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[True] SKIP (https://nvbugs/6535767)
 unittest/_torch/speculative/test_eagle3.py SKIP (https://nvbugs/5461761)
-unittest/_torch/thop/parallel/test_cute_dsl_moe.py -k "rubin" SKIP (https://nvbugs/6801229)
 unittest/_torch/thop/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend[mnk2-cublaslt] SKIP (https://nvbugs/6581067)
 unittest/_torch/thop/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend[mnk2-cutlass] SKIP (https://nvbugs/6581067)
 unittest/_torch/thop/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend[mnk3-cublaslt] SKIP (https://nvbugs/6581067)
