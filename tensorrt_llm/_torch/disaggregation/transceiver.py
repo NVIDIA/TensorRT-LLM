@@ -443,6 +443,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     and lg.sliding_window_size is not None
                 ):
                     stale_end = max(0, (prompt_len + 1 - lg.sliding_window_size) // tpb)
+                    if not getattr(lg, "cp_as_tp", False):
+                        stale_end = len(range(cp_rank, stale_end, cp_size))
                     prompt_pages = ordinals[stale_end:local_prompt_blocks]
                     if prompt_pages.size != local_prompt_blocks - stale_end or np.any(
                         prompt_pages < 0

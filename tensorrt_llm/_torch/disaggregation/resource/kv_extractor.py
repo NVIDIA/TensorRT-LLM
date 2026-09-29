@@ -754,7 +754,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             cache_kind = CacheKind.STATE if is_recurrent else CacheKind.PAGED
 
             is_draft = manager._is_standalone_draft_layer(all_internal_layer_ids[0])
-            if is_draft and manager.draft_layout.attention_backend != "DSv4":
+            if is_draft:
                 draft_pool_group, pool_views = _build_draft_pool_views(manager, variant, pg_desc)
                 draft_pool_group_idx = len(pool_groups)
                 pool_groups.append(draft_pool_group)
@@ -808,9 +808,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             # may exceed the length of num_kv_heads_per_layer. Use index 0 as
             # all layers within a pool group share the same kv_heads count.
             first_local_layer = all_internal_layer_ids[0]
-            if manager._is_standalone_draft_layer(first_local_layer):
-                num_kv_heads = manager.draft_layout.num_kv_heads
-            elif first_local_layer < len(manager.num_kv_heads_per_layer):
+            if first_local_layer < len(manager.num_kv_heads_per_layer):
                 num_kv_heads = manager.num_kv_heads_per_layer[first_local_layer]
             else:
                 num_kv_heads = manager.num_kv_heads_per_layer[0]

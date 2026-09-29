@@ -1883,9 +1883,6 @@ class KvCacheCreator:
         if (self._is_standalone_dspark()
                 and is_mla(self._draft_config.pretrained_config)):
             return "Unified DSpark KV cache does not yet support MLA drafters."
-        if (self._mapping.has_cp_helix() and not self._is_standalone_dspark()):
-            return ("Unified Helix KV cache requires a standalone "
-                    "DSpark drafter.")
         return None
 
     def _get_draft_mapping(self) -> Mapping:

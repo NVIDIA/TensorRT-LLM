@@ -560,7 +560,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._managed_residency.clear()
         if manager is not None:
             self._draft_block_tables = torch.zeros(
-                (self._batch_to_slot.shape[0], manager.max_blocks_per_seq),
+                (self._batch_to_slot.shape[0], manager.draft_max_blocks_per_seq),
                 dtype=torch.int32,
                 device=self._kv_windows.device,
             )
