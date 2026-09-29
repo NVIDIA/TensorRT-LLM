@@ -1501,7 +1501,7 @@ def _worker_rank_mask_one_rank_masked(
         token_selected_experts = live_expert_ids[live_expert_indices]
         payload = _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank)
 
-        combined, topk_target_ranks, topk_send_indices = _run_nvlink_rank_mask_dispatch_combine(
+        combined, topk_target_ranks, topk_target_indices = _run_nvlink_rank_mask_dispatch_combine(
             comm,
             token_selected_experts,
             payload,
