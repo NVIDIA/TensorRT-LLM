@@ -282,6 +282,6 @@ Rules:
 - `input_ids`, `position_ids`, `seq_lens`, `multi_item_part_lens`, `attn_metadata` and
   `return_context_logits` are managed by the runtime and cannot be declared.
 - Extra model inputs are available through the Python `llm.encode()` API only.
-  `trtllm-serve embeddings` does not support them yet, so do not declare
-  `extra_model_inputs` in its `--config`. They are also not supported for
+  `trtllm-serve embeddings` does not support them yet and rejects a `--config` that
+  declares `extra_model_inputs` at startup. They are also not supported for
   encoder-decoder models or encoders that take fixed-shape feature tensors.
