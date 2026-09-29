@@ -72,7 +72,7 @@ from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.drafter import Drafter
-from ..speculative.spec_sampler_base import SampleStateTensorsSpec
+from ..speculative.spec_sampler_base import SampleStateTensorsSpec, SpecSampler
 from ..speculative.speculation_gate import SpeculationGate
 from ..speculative.utils import update_draft_len
 from .adp_iter_stats import ADPIterStatsBuffer
@@ -118,6 +118,7 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter, count_retiring_requests
+from .step_prologue_trim import step_prologue_trim_enabled
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -797,6 +798,10 @@ class PyExecutor:
         self.pp_multi_stream_sample = os.environ.get(
             "TRTLLM_PP_MULTI_STREAM_SAMPLE", "1") == "1"
         self.sample_stream = torch.cuda.Stream()
+        # Step-prologue trim (TRTLLM_STEP_PROLOGUE_TRIM): whether the overlap
+        # loop samples on the execution stream; see _spec_sampler_stream_scope.
+        self._sample_on_execution_stream = self._spec_sampler_on_execution_stream(
+            self.sampler, self.drafter, self.guided_decoder)
         self.finish_sample_event = torch.cuda.Event()
         # Set of request IDs that are currently in flight across all micro batches
         # or waiting for synchronized PP resource teardown. The scheduler avoids
@@ -5415,7 +5420,8 @@ class PyExecutor:
 
                 if can_queue:
                     guided_decoder_failed_requests = None
-                    with self.perf_manager.record_perf_events(
+                    with self._spec_sampler_stream_scope(
+                    ), self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
                         with self._step_scope(scheduled_batch, phase="sample"):
                             if self.guided_decoder is not None:
@@ -5506,6 +5512,33 @@ class PyExecutor:
                     self.disagg.pace_idle()
 
                 self.iter_counter += 1
+
+    @staticmethod
+    def _spec_sampler_on_execution_stream(sampler, drafter,
+                                          guided_decoder) -> bool:
+        """Step-prologue trim: sample on the execution stream only for exactly
+        SpecSampler without a drafter or a guided decoder (decided once, in
+        __init__)."""
+        return (step_prologue_trim_enabled() and drafter is None
+                and guided_decoder is None and type(sampler) is SpecSampler)
+
+    def _spec_sampler_stream_scope(self):
+        """Step-prologue trim (TRTLLM_STEP_PROLOGUE_TRIM): in the overlap loop,
+        issue the one-model speculative sampler's work (seq-slot H2D, store
+        index_copy_ + D2H copies, sampler event) on the execution stream right
+        behind the forward instead of on the default stream. The next step's
+        prologue runs on the execution stream after waiting on the default
+        stream, so with sampling on the default stream every step boundary
+        pays two cross-stream event hops (forward -> sampler, sampler ->
+        prologue) on top of the sampler's own ops. The sampler only uses the
+        current stream (its copies, event and optional async-worker handoff
+        are all relative to it), and its device outputs are consumed only by
+        the next forward on the execution stream and by the host after the
+        sampler event (update_requests is host-only), so the order of every
+        op is unchanged."""
+        if self._sample_on_execution_stream:
+            return torch.cuda.stream(self.execution_stream)
+        return nullcontext()
 
     @nvtx_range("_accept_draft_tokens")
     def _accept_draft_tokens(
