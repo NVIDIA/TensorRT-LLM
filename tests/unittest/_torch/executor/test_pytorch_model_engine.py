@@ -296,7 +296,6 @@ def _make_forward_only_engine(
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     engine.enable_spec_decode = False
     engine.is_spec_decode = False
-    engine.is_draft_model = False
     engine.guided_decoder = None
     engine.max_beam_width = 1
     engine._is_encode_only = False
@@ -739,7 +738,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_graph_key_forwards_promoted_context_ids(self) -> None:
         runner = Mock()
-        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.config = SimpleNamespace()
         runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = True
         request = _make_request_stub(7)
@@ -766,7 +765,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_graph_key_aggregates_encoder_tokens(self) -> None:
         runner = Mock()
-        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.config = SimpleNamespace()
         runner._resolve_sample_type.return_value = SampleType.FULL
         runner.max_beam_width = 1
         runner._get_seq_len_mode.return_value = False
@@ -791,7 +790,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_graph_key_rejects_nonuniform_context_query_lengths(self) -> None:
         runner = Mock()
-        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.config = SimpleNamespace()
         runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = False
         first_context = _make_request_stub(1)
@@ -838,7 +837,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_graph_key_includes_peft_cache_dtype(self) -> None:
         runner = Mock()
-        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.config = SimpleNamespace()
         runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = False
         request = _make_request_stub(7)
@@ -896,7 +895,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_graph_key_includes_lora_variant(self) -> None:
         runner = Mock()
-        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.config = SimpleNamespace()
         runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = False
         request = _make_request_stub(7)
@@ -1278,7 +1277,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         cases = (
             "graphs_disabled",
             "speculative_nonzero_runtime_draft",
-            "speculative_draft_model",
             "beam",
             "encoder_decoder",
             "ple_recurrent_state",
@@ -1294,9 +1292,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 elif case == "speculative_nonzero_runtime_draft":
                     engine.enable_spec_decode = True
                     engine.runtime_draft_len = 1
-                elif case == "speculative_draft_model":
-                    engine.enable_spec_decode = True
-                    engine.is_draft_model = True
                 elif case == "beam":
                     engine.max_beam_width = 2
                 elif case == "encoder_decoder":

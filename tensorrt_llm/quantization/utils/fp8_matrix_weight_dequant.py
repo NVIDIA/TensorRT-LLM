@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # Pure PyTorch helpers to expand block FP8 weight scales and dequantize ``[N, K]``
-# matrices. Used by AutoDeploy load hooks and FineGrained FP8 linear fallbacks.
+# matrices. Used by FineGrained FP8 linear fallbacks.
 # Intentionally avoids Triton so model import paths stay lightweight.
 
 import math

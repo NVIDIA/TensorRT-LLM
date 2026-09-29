@@ -95,7 +95,6 @@ def _config() -> NoKVCacheRunnerConfig:
         prefill_cuda_graph_num_tokens=[],
         mm_encoder_cache_enabled=False,
         spec_config=None,
-        is_draft_model=False,
         num_seq_slots=None,
         original_max_draft_len=0,
         original_max_total_draft_tokens=0,
@@ -220,7 +219,6 @@ def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
     engine.without_logits = False
     engine.attn_backend = _AttentionBackend
     engine.attn_runtime_features = AttentionRuntimeFeatures()
-    engine.is_draft_model = False
     engine.dist = object()
     engine.moe_load_balancer = None
     runner_config = object()
@@ -698,29 +696,6 @@ def test_engine_forward_preserves_raw_decoder_outputs_and_length(raw_output, is_
 
     assert engine.forward(ScheduledRequests(), resources) is raw_output
     assert engine.runtime_draft_len == 4
-
-
-@pytest.mark.parametrize("previous_slots", [None, {}, {7: 3, 2: 9}])
-def test_engine_forwards_previous_request_slots_to_decoder(previous_slots):
-    engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
-    engine._fallback_to_engine = True
-    engine._forward_decoder = Mock(return_value={"logits": None})
-    previous_requests = (
-        {req_id: SimpleNamespace(py_seq_slot=slot) for req_id, slot in previous_slots.items()}
-        if previous_slots is not None
-        else None
-    )
-    batch = ScheduledRequests()
-
-    engine.forward(batch, resources, req_id_to_old_request=previous_requests)
-
-    inputs, actual_resources = engine._forward_decoder.call_args.args
-    assert inputs.batch is batch
-    assert actual_resources is resources
-    assert inputs.previous_request_slots == previous_slots
-    if previous_requests:
-        previous_requests[7].py_seq_slot = 5
-        assert inputs.previous_request_slots[7] == 3
 
 
 def test_model_caller_uses_current_forward_and_restores_outer_attribute_context():

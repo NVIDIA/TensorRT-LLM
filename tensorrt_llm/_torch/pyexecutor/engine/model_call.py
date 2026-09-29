@@ -5,13 +5,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import weakref
 from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.utils import get_model_extra_attrs
+from tensorrt_llm._torch.utils import (
+    get_model_extra_attrs,
+    get_per_request_prefill_cuda_graph_flag,
+    torch_compiling,
+)
 from tensorrt_llm._utils import is_trace_enabled, trace_func
 
 if TYPE_CHECKING:
@@ -25,6 +30,8 @@ class ModelCaller:
         model: The loaded model after compilation setup.
         compile_backend: Optional backend owning compilation events.
         aux_streams: The backend's mutable stream container, retained by reference.
+        prefill_compile_only: Whether torch.compile covers only eligible prefill
+            batches, so each call must scope ``is_torch_compiling()`` to that decision.
 
     Encoder stacks and multimodal encoders with different invocation contracts
     call their models directly.
@@ -36,12 +43,14 @@ class ModelCaller:
         *,
         compile_backend: Backend | None = None,
         aux_streams: Backend.Streams | None = None,
+        prefill_compile_only: bool = False,
     ) -> None:
         if compile_backend is not None and aux_streams is None:
             raise ValueError("A compile backend requires its auxiliary stream container.")
         self._model = model
         self._compile_backend = compile_backend
         self._aux_streams = aux_streams
+        self._prefill_compile_only = prefill_compile_only
 
     def __call__(self, **kwargs: Any) -> Any:
         attrs = get_model_extra_attrs()
@@ -58,6 +67,14 @@ class ModelCaller:
             attrs["events"] = weakref.ref(self._compile_backend.events)
             attrs["global_stream"] = torch.cuda.current_stream()
 
-        if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
-            return trace_func(self._model.forward)(**kwargs)
-        return self._model.forward(**kwargs)
+        # Scope the entire top-level forward, including Eagle3's epilogue, so
+        # eager decode and over-ceiling prefill do not select compile-only ops.
+        compile_scope = (
+            torch_compiling(get_per_request_prefill_cuda_graph_flag())
+            if self._prefill_compile_only
+            else contextlib.nullcontext()
+        )
+        with compile_scope:
+            if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+                return trace_func(self._model.forward)(**kwargs)
+            return self._model.forward(**kwargs)

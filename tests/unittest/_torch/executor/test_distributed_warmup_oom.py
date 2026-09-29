@@ -13,6 +13,7 @@ import torch
 from tensorrt_llm._torch.pyexecutor import model_engine as model_engine_module
 from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 
 
 class _StandInMambaCacheManager:
@@ -295,6 +296,7 @@ def test_tp_agreement_lets_a_symmetric_world_run() -> None:
 
 def _general_warmup_engine(*, world_size: int, dwdp_size: int) -> PyTorchModelEngine:
     engine = _engine(world_size=world_size, dwdp_size=dwdp_size)
+    engine._warmup_timer = _WarmupTimer(rank=engine.dist.rank)
     batch = object()
     engine._create_warmup_request = mock.Mock(return_value=batch)
     engine._release_batch_context = lambda *_a, **_kw: _released_batch(batch)
@@ -340,7 +342,6 @@ def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[PyTorchMo
     engine.batch_size = 4
     engine.max_seq_len = 8
     engine.original_max_draft_len = 0
-    engine.is_draft_model = False
     engine.llm_args = SimpleNamespace(enable_autotuner=False)
     engine.no_cuda_graph = contextlib.nullcontext
     batch = object()

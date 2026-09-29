@@ -59,8 +59,6 @@ class ScheduledInputs:
     batch: ScheduledRequests
     new_tensors_device: SampleStateTensors | None = None
     cache_indirection_buffer: torch.Tensor | None = None
-    num_accepted_tokens_device: torch.Tensor | None = None
-    previous_request_slots: dict[int, int] | None = None
     gather_context_logits: bool = False
     enable_spec_decode: bool = False
     runtime_draft_len: int = 0

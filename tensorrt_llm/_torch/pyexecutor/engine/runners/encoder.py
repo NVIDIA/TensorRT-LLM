@@ -87,7 +87,6 @@ class EncoderConfigMixin:
         attention_runtime_features: AttentionRuntimeFeatures,
         enable_autotuner: bool,
         is_encoder_decoder: bool,
-        draft_model: bool,
     ) -> Self:
         """Resolve encoder settings and construct the concrete runner config."""
         batch_sizes = list(graph_config.batch_sizes or []) if graph_config is not None else []
@@ -114,12 +113,7 @@ class EncoderConfigMixin:
         feature_shape = None
         feature_dtype = None
         fixed_seq_len = None
-        if (
-            graph_config is not None
-            and not draft_model
-            and is_encoder_decoder
-            and model_graph_spec is not None
-        ):
+        if graph_config is not None and is_encoder_decoder and model_graph_spec is not None:
             if mapping.tp_size > 1:
                 logger.warning(
                     "Feature-mode encoder CUDA graphs require TP=1; the encoder phase stays eager."
@@ -233,7 +227,6 @@ class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
         attention_backend: type[AttentionBackend],
         attention_runtime_features: AttentionRuntimeFeatures,
         enable_autotuner: bool,
-        draft_model: bool,
     ) -> Self:
         return super().create(
             model=model,
@@ -248,7 +241,6 @@ class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
             attention_runtime_features=attention_runtime_features,
             enable_autotuner=enable_autotuner,
             is_encoder_decoder=False,
-            draft_model=draft_model,
         )
 
 

@@ -82,7 +82,6 @@ def test_forward_step_carries_context_logits_request_to_runner(return_context_lo
     resources = object()
     cache_indirection = object()
     new_tensors = object()
-    accepted_tokens = object()
     executor = types.SimpleNamespace(
         model_engine=engine,
         resource_manager=resources,
@@ -103,7 +102,7 @@ def test_forward_step_carries_context_logits_request_to_runner(return_context_lo
         patch("torch.cuda.stream", return_value=nullcontext()),
         patch("tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter"),
     ):
-        outputs = PyExecutor._forward_step(executor, batch, new_tensors, accepted_tokens)
+        outputs = PyExecutor._forward_step(executor, batch, new_tensors)
 
     executor._handle_errors.assert_not_called()
     runner.forward.assert_called_once()
@@ -112,7 +111,6 @@ def test_forward_step_carries_context_logits_request_to_runner(return_context_lo
     assert inputs.gather_context_logits is return_context_logits
     assert inputs.new_tensors_device is new_tensors
     assert inputs.cache_indirection_buffer is cache_indirection
-    assert inputs.num_accepted_tokens_device is accepted_tokens
     assert runner.forward.call_args.kwargs["resource_manager"] is resources
     torch.testing.assert_close(outputs["logits"], logits if return_context_logits else logits[-1:])
 

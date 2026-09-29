@@ -51,7 +51,6 @@ class NoKVCacheRunnerConfig(RunnerConfig):
     prefill_cuda_graph_num_tokens: list[int]
     mm_encoder_cache_enabled: bool
     spec_config: DecodingBaseConfig | None
-    is_draft_model: bool
     num_seq_slots: int | None
     original_max_draft_len: int
     original_max_total_draft_tokens: int
@@ -136,7 +135,6 @@ class NoKVCacheRunner(ScheduledModelRunner):
             runner_config.max_batch_size,
             max_num_tokens=runner_config.max_num_tokens,
             spec_resource_manager=spec_resource_manager,
-            is_draft_model=runner_config.is_draft_model,
             max_seq_len=runner_config.max_seq_len,
             num_seq_slots=runner_config.num_seq_slots,
         )
@@ -150,7 +148,6 @@ class NoKVCacheRunner(ScheduledModelRunner):
             runtime_tokens_per_gen_step=spec_config.get_runtime_tokens_per_gen_step(
                 runtime_draft_len
             ),
-            is_draft_model=runner_config.is_draft_model,
             attention_backend=runner_config.attention_backend,
             original_max_draft_len=runner_config.original_max_draft_len,
             original_max_total_draft_tokens=(runner_config.original_max_total_draft_tokens),
@@ -393,12 +390,10 @@ class NoKVCacheRunner(ScheduledModelRunner):
         return PreparedInputs(inputs)
 
     def _validate_resources(self, resource_manager: ResourceManager) -> None:
-        kv_cache_manager_key = (
-            ResourceManagerType.DRAFT_KV_CACHE_MANAGER
-            if self._config.is_draft_model
-            else ResourceManagerType.KV_CACHE_MANAGER
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
         )
-        assert resource_manager.get_resource_manager(kv_cache_manager_key) is None, (
+        assert kv_cache_manager is None, (
             "a no-KV-cache runner was initialized, but a KV cache manager was allocated"
         )
 

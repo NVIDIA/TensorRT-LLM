@@ -216,7 +216,13 @@ def uniform_subpages_per_slot(kv_cache_manager) -> int:
     layer_offsets = getattr(kv_cache_manager, "layer_offsets", None)
     if get_pool is None or not layer_offsets:
         return 0
-    factors = {int(get_pool(layer_idx, "HND")[1]) for layer_idx in layer_offsets}
+    is_nvfp4 = getattr(kv_cache_manager, "is_nvfp4_layer", lambda _: False)
+    is_subpaged = getattr(kv_cache_manager, "is_fp8_subpaged_layer", lambda _: False)
+    factors = {
+        int(get_pool(layer_idx, "HND")[1])
+        for layer_idx in layer_offsets
+        if not is_nvfp4(layer_idx) and not is_subpaged(layer_idx)
+    }
     return factors.pop() if len(factors) == 1 else 0
 
 
