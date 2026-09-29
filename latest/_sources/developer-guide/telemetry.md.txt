@@ -32,7 +32,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-306 captured fields.
+308 captured fields.
 
 | Captured key | Capture policy | Kind | Categorical domain |
 |--------------|----------------|------|--------------------|
@@ -285,12 +285,13 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.use_cute_dsl_topk` | `bool` | `value` |  |
 | `sparse_attention_config.use_gvr_emission` | `bool` | `value` |  |
 | `sparse_attention_config.use_self_sampling_topk` | `bool` | `value` |  |
+| `sparse_attention_config.uses_spcompress` | `bool` | `value` |  |
 | `sparse_attention_config.window_size` | `int\|none` | `value` |  |
 | `speculative_config.acceptance_rate_threshold` | `float\|none` | `value` |  |
 | `speculative_config.acceptance_rate_window_size` | `int\|none` | `value` |  |
 | `speculative_config.advanced_sampling_mode` | `enum[AdvancedSamplingMode]` | `categorical` | `full`, `no_topk`, `no_topp`, `no_topk_no_topp` |
 | `speculative_config.allow_advanced_sampling` | `bool` | `value` |  |
-| `speculative_config.attention_backend` | `literal` | `categorical` | `VANILLA`, `TRTLLM`, `FA4` |
+| `speculative_config.attention_backend` | `literal` | `categorical` | `VANILLA`, `TRTLLM`, `FA4`, `AUTO`, `CUTEDSL` |
 | `speculative_config.begin_thinking_phase_token` | `int` | `value` |  |
 | `speculative_config.block_size` | `int\|none` | `value` |  |
 | `speculative_config.decoding_type` | `literal` | `categorical` | `AUTO`, `DFlash`, `DSpark`, `Draft_Target`, `Eagle3`, `Eagle`, `MTP`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
@@ -319,6 +320,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.relaxed_topk` | `int` | `value` |  |
 | `speculative_config.sa_config.enable_global_pool` | `bool` | `value` |  |
 | `speculative_config.sa_config.threshold` | `int` | `value` |  |
+| `speculative_config.skip_ctx_buffer_budget_check` | `bool` | `value` |  |
 | `speculative_config.target_layer_ids` | `list[int]\|none` | `value` |  |
 | `speculative_config.use_dynamic_tree` | `bool\|none` | `value` |  |
 | `speculative_config.use_mtp_vanilla` | `bool` | `value` |  |

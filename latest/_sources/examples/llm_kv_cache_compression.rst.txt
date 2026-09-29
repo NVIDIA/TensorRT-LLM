@@ -1,6 +1,6 @@
 KV Cache Compression
 ====================
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/fca831eac3da515461e148b05e0663c29ab6aaa5/examples/llm-api/llm_kv_cache_compression.py.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/c76f4a856447820aa1f994b053da7580d69b657d/examples/llm-api/llm_kv_cache_compression.py.
 
 .. literalinclude:: ../../../examples/llm-api/llm_kv_cache_compression.py
     :lines: 1-14,18-151

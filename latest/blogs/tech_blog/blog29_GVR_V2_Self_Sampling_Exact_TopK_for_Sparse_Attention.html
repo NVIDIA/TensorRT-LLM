@@ -1,0 +1,1510 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=4351f35f" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+
+
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=db50c9f4"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc29';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html" />
+    <link rel="prev" title="Telemetry" href="../../developer-guide/telemetry.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc29" />
+  
+    
+    <script src="../../_static/searchtools.js"></script>
+    <script src="../../_static/language_data.js"></script>
+    <script src="../../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button type="button" class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button type="button" class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+<section class="tex2jax_ignore mathjax_ignore" id="gvr-v2-self-sampling-and-multi-thresholding-for-faster-exact-top-k">
+<h1>GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K<a class="headerlink" href="#gvr-v2-self-sampling-and-multi-thresholding-for-faster-exact-top-k" title="Link to this heading">#</a></h1>
+<p><em>A Unified Selection Core for Prefill and Decode in TensorRT LLM</em></p>
+<p>By NVIDIA TensorRT LLM Team</p>
+<p>Selecting 1,024 INT32 indices from 131,072 FP32 scores writes just <strong>4 KiB of output</strong>, yet one complete read of the scores moves <strong>512 KiB</strong>. Every additional full-row pass pays that input cost again. For a sparse-attention indexer, finding the Top-K boundary can therefore cost far more than emitting the winners.</p>
+<p>GVR V2 makes each full-row pass more useful without depending on the previous decode step to predict the current one. <strong>Self-sampling estimates where the current row’s Top-K boundary lies; multi-thresholding derives many exact population counts from one classification pass.</strong> Together, they concentrate exact refinement on the small group of scores still competing for the final slots. Removing the Top-K prior also lets prefill and decode share a streaming selection core, with phase differences handled by row adapters.</p>
+<p>On B200, this design delivers <strong>5.05× geometric-mean speedup over TensorRT LLM radix CUDA</strong>, with <strong>1.46× over GVR V1</strong>. Both comparisons use the same 9,746 workloads spanning DeepSeek-V3.2, DeepSeek-V4 Flash, and DeepSeek-V4 Pro indexers.</p>
+<p><img alt="Three horizontal bar-chart panels compare GVR V2, GVR V1, and TensorRT LLM radix CUDA on the same cases per model. GVR V2 is 1.00; shorter bars mean less kernel time." src="../../_images/speedup.svg" /></p>
+<p><em>Figure 1. Kernel time relative to GVR V2, geometrically averaged over the same workloads within each model; shorter is faster. GVR V1 uses a temporal hint. All three implementations cover the full 9,746-case grid.</em></p>
+<p><strong>The operator contract.</strong> Given FP32 indexer scores and valid-row metadata, Top-K returns unordered INT32 positions for sparse attention’s KV selection. With finite scores and at least <span class="math notranslate nohighlight">\(K\)</span> entries, it selects an exact value multiset through <span class="math notranslate nohighlight">\(K\)</span> distinct indices; ties can choose different positions. <a class="reference internal" href="#enable-gvr-v2">Enablement</a> lists hardware, shape, and configuration requirements.</p>
+<p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">The original GVR blog</a> described a temporal shortcut: the previous decode step’s selected indices predict the next step’s winners. Experience with V1 exposed two limits: hint quality varies sharply, and maintaining the hint couples selection to the serving framework. V2 makes the current row the source of the guess, targeting <strong>a stronger performance floor and better average latency</strong>, while enabling <strong>one selection core for prefill and decode</strong>. The <strong>Guess–Verify–Refine</strong> exactness contract remains.</p>
+<p><strong>Table of Contents</strong></p>
+<ul class="simple">
+<li><p><strong><a class="reference internal" href="#motivation-and-design-foundations">Motivation and Design Foundations</a></strong></p>
+<ul>
+<li><p><a class="reference internal" href="#from-gvr-v1-to-v2-why-move-beyond-temporal-hints">From GVR V1 to V2: Why Move Beyond Temporal Hints?</a></p></li>
+<li><p><a class="reference internal" href="#from-floydrivest-select-to-gpu-top-k">From Floyd–Rivest SELECT to GPU Top-K</a></p></li>
+</ul>
+</li>
+<li><p><strong><a class="reference internal" href="#self-sampling-and-multi-thresholding">Self-Sampling and Multi-Thresholding</a></strong></p>
+<ul>
+<li><p><a class="reference internal" href="#why-threshold-quality-matters-passes-and-candidate-work">Why Threshold Quality Matters: Passes and Candidate Work</a></p></li>
+<li><p><a class="reference internal" href="#self-sampling-calibrate-the-search-to-this-row">Self-Sampling: Calibrate the Search to This Row</a></p></li>
+<li><p><a class="reference internal" href="#multi-thresholding-make-each-full-row-pass-count">Multi-Thresholding: Make Each Full-Row Pass Count</a></p></li>
+<li><p><a class="reference internal" href="#mapping-selection-to-blackwell">Mapping Selection to Blackwell</a></p></li>
+</ul>
+</li>
+<li><p><strong><a class="reference internal" href="#performance-and-roofline-analysis">Performance and Roofline Analysis</a></strong></p>
+<ul>
+<li><p><a class="reference internal" href="#performance-against-gvr-v1-and-radix-cuda">Performance Against GVR V1 and Radix CUDA</a></p></li>
+<li><p><a class="reference internal" href="#the-roofline-model-fewer-passes-more-useful-work">The Roofline Model: Fewer Passes, More Useful Work</a></p></li>
+</ul>
+</li>
+<li><p><strong><a class="reference internal" href="#tensorrt-llm-integration-and-takeaways">TensorRT LLM Integration and Takeaways</a></strong></p>
+<ul>
+<li><p><a class="reference internal" href="#decode-and-prefill-in-tensorrt-llm">Decode and Prefill in TensorRT LLM</a></p></li>
+<li><p><a class="reference internal" href="#conclusion">Conclusion</a></p></li>
+<li><p><a class="reference internal" href="#further-reading">Further Reading</a></p></li>
+</ul>
+</li>
+</ul>
+<section id="motivation-and-design-foundations">
+<h2>Motivation and Design Foundations<a class="headerlink" href="#motivation-and-design-foundations" title="Link to this heading">#</a></h2>
+<section id="from-gvr-v1-to-v2-why-move-beyond-temporal-hints">
+<h3>From GVR V1 to V2: Why Move Beyond Temporal Hints?<a class="headerlink" href="#from-gvr-v1-to-v2-why-move-beyond-temporal-hints" title="Link to this heading">#</a></h3>
+<p>GVR V1 gathers current scores at the previous step’s Top-K indices to predict admission thresholds. <strong>The GVR V1 baseline already uses multi-thresholding.</strong> Its <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/16877">streaming implementation</a> uses sampled ladder counts to choose a pivot and a rescue rung, then verifies both exactly in a fused count/collect pass. This is the temporal-hint implementation compared with V2 below.</p>
+<p>Its admission objective is expressed through the monotone count function</p>
+<div class="math notranslate nohighlight">
+\[
+C(T)=\sum_{i=0}^{N-1}\mathbf{1}[x_i\ge T].
+\]</div>
+<p>An admission threshold should leave enough survivors to contain Top-K, but few enough to fit candidate capacity. A high-quality temporal hint can make admission very cheap. The difficulty is making that benefit reliable across inference workloads, even with several thresholds checked together.</p>
+<section id="a-biased-sample-with-variable-value">
+<h4>A Biased Sample with Variable Value<a class="headerlink" href="#a-biased-sample-with-variable-value" title="Link to this heading">#</a></h4>
+<p>Temporal hints are a <strong>biased sample</strong> of current scores at positions predicted from the previous step’s winners. The hit rate is the fraction of the current Top-K covered by the mapped temporal hint. High, stable overlap makes that bias useful. Figure 2 shows why it is an unreliable assumption across layers and decode steps.</p>
+<p><img alt="Temporal Top-K overlap for DeepSeek-V3.2 and DeepSeek-V4 Pro. Upper panels distinguish current selections matched by the mapped temporal hint from those it misses; lower panels show raw overlap across three layers, including abrupt drops despite a high average." src="../../_images/temporal_overlap.svg" /></p>
+<p><em>Figure 2. Temporal overlap on SWE-bench-64K workloads. Blue marks current selections matched after applying the temporal-hint index mapping; orange marks selections not predicted by that hint. V3.2 shifts prior indices by +1, while V4 Pro keeps the same compressed-bin indices. Upper panels show position crops; lower curves measure full-domain overlap across layers and steps, with means in parentheses. Even a high-mean layer can suffer an abrupt collapse.</em></p>
+<p>The V3.2 +1 shift is a temporal prediction rule. Its overlap measures how well the shifted positions predict the current Top-K, rather than retention at identical token indices.</p>
+<p>Near-64K measurements also expose dependence on the input and layer:</p>
+<div align="center">
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Indexer</p></th>
+<th class="head text-center"><p>Input</p></th>
+<th class="head text-center"><p>Layers</p></th>
+<th class="head text-center"><p>Mean</p></th>
+<th class="head text-center"><p>P10–P90</p></th>
+<th class="head text-center"><p>Min–max</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>V4 Pro</p></td>
+<td class="text-center"><p>SWE-bench</p></td>
+<td class="text-center"><p>30</p></td>
+<td class="text-center"><p>71.5%</p></td>
+<td class="text-center"><p>60.3–82.6%</p></td>
+<td class="text-center"><p>57.1–85.0%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>V4 Pro</p></td>
+<td class="text-center"><p>Random tokens</p></td>
+<td class="text-center"><p>30</p></td>
+<td class="text-center"><p>57.9%</p></td>
+<td class="text-center"><p>33.6–80.4%</p></td>
+<td class="text-center"><p>28.4–86.7%</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>V4 Flash</p></td>
+<td class="text-center"><p>SWE-bench</p></td>
+<td class="text-center"><p>21</p></td>
+<td class="text-center"><p>62.8%</p></td>
+<td class="text-center"><p>53.4–73.3%</p></td>
+<td class="text-center"><p>53.2–83.7%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>V4 Flash</p></td>
+<td class="text-center"><p>Random tokens</p></td>
+<td class="text-center"><p>21</p></td>
+<td class="text-center"><p>52.8%</p></td>
+<td class="text-center"><p>30.7–74.7%</p></td>
+<td class="text-center"><p>25.9–81.3%</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>V3.2</p></td>
+<td class="text-center"><p>SWE-bench</p></td>
+<td class="text-center"><p>61</p></td>
+<td class="text-center"><p>47.4%</p></td>
+<td class="text-center"><p>37.9–59.7%</p></td>
+<td class="text-center"><p>5.7–70.7%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>V3.2</p></td>
+<td class="text-center"><p>Random tokens</p></td>
+<td class="text-center"><p>61</p></td>
+<td class="text-center"><p>46.0%</p></td>
+<td class="text-center"><p>33.1–62.2%</p></td>
+<td class="text-center"><p>6.0–67.9%</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<p><em>Distribution of per-layer mean hit rates, with layer IDs matched between inputs within each model. Each layer is averaged over its decode steps and then weighted equally; P10–P90 and min–max describe those layer means, not individual transitions. V3.2 uses +1 alignment.</em></p>
+<p>V4 Pro’s mean changes from <strong>71.5% to 57.9%</strong> between these inputs, and its random-token P10–P90 spans <strong>33.6–80.4%</strong>. V3.2 has similar overall means across inputs, yet its weakest SWE-bench layer averages only <strong>5.7%</strong>. <strong>An average overlap cannot serve as a dependable per-row performance assumption.</strong> The table exposes variation across inputs and layers; Figure 2 adds the abrupt changes within a layer over time.</p>
+<p>A row’s true hit rate is known only after the current selection is established. Verification can expose a poor threshold, but the hint gather and initial work have already been paid for. Conservative admission, repeated counts, capacity checks, and exact recovery keep weak hints safe; their overhead and extra reads reduce average speedup and make latency less predictable.</p>
+<p>V2 calibrates from the <strong>current row</strong>, removing dependence on temporal overlap and the read through old indices. It combines this calibration with histogram-based multi-threshold verification and crossing-bin refinement. <strong>The defining change from GVR V1 is the source of the guess and the removal of temporal state; multi-thresholding is part of the design continuity.</strong> These choices target a stronger practical performance floor and better average latency, without a fixed worst-case latency guarantee.</p>
+</section>
+<section id="a-hint-that-crosses-framework-boundaries">
+<h4>A Hint That Crosses Framework Boundaries<a class="headerlink" href="#a-hint-that-crosses-framework-boundaries" title="Link to this heading">#</a></h4>
+<p>V1’s prior also has a lifecycle outside the kernel. GVR V1 has no prefill engine: TensorRT LLM uses radix for prefill and can seed the decode prior from each request’s last prefill selection. That phase-dependent history complicates a common selection architecture. V2’s current-row calibration removes the Top-K prior dependency, allowing phase differences to stay in dispatch and row-interface adapters. The <a class="reference internal" href="#decode-and-prefill-in-tensorrt-llm">integration section</a> traces the consequences for CUDA Graph preparation and disaggregated serving.</p>
+<div align="center">
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Algorithm question</p></th>
+<th class="head text-center"><p>GVR V1 (temporal hint)</p></th>
+<th class="head text-center"><p>Streaming GVR V2</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>Where does the guess come from?</p></td>
+<td class="text-center"><p>Current scores gathered through previous-step indices</p></td>
+<td class="text-center"><p>Packed sample windows spread across the current row</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>What makes the guess useful?</p></td>
+<td class="text-center"><p>High, stable overlap with previous winners</p></td>
+<td class="text-center"><p>Coverage of the current row’s score distribution</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>What guides admission?</p></td>
+<td class="text-center"><p>A hint-derived pivot and rescue rung</p></td>
+<td class="text-center"><p>Sample-derived primary threshold, lower safety floor, and upper anchor</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>What does verification learn?</p></td>
+<td class="text-center"><p>Exact counts at multiple admission thresholds</p></td>
+<td class="text-center"><p>Exact bin populations and counts at many boundaries</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>Where does exact refinement start?</p></td>
+<td class="text-center"><p>The admitted candidate set, with path-specific local refinement</p></td>
+<td class="text-center"><p>The crossing bin containing rank <span class="math notranslate nohighlight">\(K\)</span></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>What state crosses decode steps?</p></td>
+<td class="text-center"><p>Per-layer prior indices</p></td>
+<td class="text-center"><p>No Top-K prior in the self-sampling path</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>How do prefill and decode relate?</p></td>
+<td class="text-center"><p>Radix prefill; its last selection can seed temporal decode</p></td>
+<td class="text-center"><p>Shared streaming selection with phase-specific row adapters</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>How does a bad guess affect the result?</p></td>
+<td class="text-center"><p>More admission/refinement work or recovery; membership remains exact</p></td>
+<td class="text-center"><p>Lower admission or exact recovery; membership remains exact</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<p><img alt="GVR V1 and streaming V2 both use multi-thresholding. V1 calibrates through previous winners; V2 samples the current row without a temporal prior. Measured bars compare GVR V1 and V2." src="../../_images/evolution.svg" /></p>
+<p><em>Figure 3. Multi-thresholding is shared by GVR V1 and V2. The flows emphasize their calibration and refinement choices on streaming paths; the bars compare complete GVR V1 and V2 implementations over radix CUDA. V2 removes the temporal-overlap dependency and prior-state lifecycle.</em></p>
+<p>GVR V1 achieves <strong>3.47×</strong> speedup over radix CUDA; V2 reaches <strong>5.05×</strong>. V2 is <strong>1.46× faster than GVR V1</strong>. These gains compare complete implementations, including their calibration, verification, refinement, and execution paths.</p>
+<p>The fifth percentile remains above parity, while the minimum exposes workloads where V1 retains an advantage:</p>
+<div align="center">
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Baseline</p></th>
+<th class="head text-center"><p>Geomean speedup</p></th>
+<th class="head text-center"><p>P5 speedup</p></th>
+<th class="head text-center"><p>Minimum speedup</p></th>
+<th class="head text-center"><p>V2 faster</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>GVR V1</p></td>
+<td class="text-center"><p><strong>1.46×</strong></p></td>
+<td class="text-center"><p><strong>1.10×</strong></p></td>
+<td class="text-center"><p>0.689×</p></td>
+<td class="text-center"><p>99.57%</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<p>P5 is the fifth percentile across workload-level speedups, each computed as V1 time divided by V2 time. The <strong>0.689× minimum means V2 takes about 45% longer than V1</strong> in the worst measured case. The 99.57% win rate supports broad improvement, while this minimum makes the remaining regressions explicit.</p>
+<p><strong>V1’s calibration with temporal hints can still produce a better admission threshold.</strong> An informative prior, validated against current-row samples, can let V1 admit a tighter candidate set than self-sampling. Diagnostics of the pronounced large-batch regressions show V1 accepting enough candidates on its first pass, while V2 initially admits fewer than <span class="math notranslate nohighlight">\(K\)</span> scores and rescans at a lower threshold. This identifies extra admission work; differences in dispatch and refinement also contribute to total kernel cost.</p>
+<p>These local wins fit the motivation for moving beyond temporal hints. Their usefulness varies across inputs, layers, and decode steps, and their true overlap is unavailable before selection. V2 removes that unstable dependency to improve robustness and average latency with a shared current-row selection core. Self-sampling can still misestimate a tail, so its admission margin and recovery cost remain optimization targets. <strong>A stronger practical performance floor is a design objective, not a guarantee that V2 beats V1 on every input.</strong> This workload distribution also does not establish runtime P95/P99 latency or a fixed worst-case bound.</p>
+</section>
+</section>
+<section id="from-floydrivest-select-to-gpu-top-k">
+<h3>From Floyd–Rivest SELECT to GPU Top-K<a class="headerlink" href="#from-floydrivest-select-to-gpu-top-k" title="Link to this heading">#</a></h3>
+<p>GVR V2’s self-sampling was inspired by Floyd and Rivest’s 1975 paper, <a class="reference external" href="https://people.csail.mit.edu/rivest/pubs/FR75a.pdf"><em>Expected Time Bounds for Selection</em></a>. Its theoretical SELECT algorithm draws a random sample, chooses two sample order statistics to bracket the desired rank, partitions the full input, and continues exactly in the partition containing that rank. If the bracket misses, selection continues in the appropriate outer partition. Sampling reduces expected work without making the answer approximate.</p>
+<p>The classical expected comparison bound for ascending rank <span class="math notranslate nohighlight">\(i\)</span> among <span class="math notranslate nohighlight">\(n\)</span> elements is</p>
+<div class="math notranslate nohighlight">
+\[
+n+\min(i,n-i)+o(n).
+\]</div>
+<p>This belongs to a comparison model with random-sampling assumptions; the original treatment assumes distinct keys. <a class="reference external" href="https://arxiv.org/abs/cs/0312055">Kiwiel’s later analysis</a> establishes rigorous bounds for SELECT variants, including repeated keys. These results motivate <strong>using sample ranks to narrow an exact selection problem</strong>.</p>
+<p>GVR V2 carries that principle into a different cost model:</p>
+<div align="center">
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Design choice</p></th>
+<th class="head text-center"><p>Floyd–Rivest theoretical SELECT</p></th>
+<th class="head text-center"><p>GVR V2 streaming</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>Primary objective</p></td>
+<td class="text-center"><p>Expected element comparisons</p></td>
+<td class="text-center"><p>Kernel latency: input passes, memory traffic, and parallel work</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>Calibration</p></td>
+<td class="text-center"><p>Random sample and sample order statistics</p></td>
+<td class="text-center"><p>Regularly spaced, packed sample windows and histogram quantiles</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>Remaining selection</p></td>
+<td class="text-center"><p>Exact partitioning and recursive selection</p></td>
+<td class="text-center"><p>Exact bin counts, crossing-bin refinement, and recovery</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>Result</p></td>
+<td class="text-center"><p>An element at the requested rank</p></td>
+<td class="text-center"><p>An exact set of <span class="math notranslate nohighlight">\(K\)</span> indices, without requiring sorted output</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<p>On a GPU, doing more work on chip can be worthwhile if it avoids another full-row read. V2 couples sampling to candidate capacity, vectorized loads, and multi-threshold counts. <strong>The inherited idea is sample-guided exact selection; the optimization target is GPU execution cost.</strong> Its deterministic sampling policy does not inherit SELECT’s randomized comparison bound. Exactness follows from full-row accounting and exact refinement or recovery.</p>
+</section>
+</section>
+<section id="self-sampling-and-multi-thresholding">
+<h2>Self-Sampling and Multi-Thresholding<a class="headerlink" href="#self-sampling-and-multi-thresholding" title="Link to this heading">#</a></h2>
+<p>For nontrivial selection, the sampled streaming paths follow three steps. Register-resident families bypass sparse sampling and use a different initial bracket, while retaining exact classification and refinement; the dispatcher chooses among these execution families for each workload.</p>
+<ol class="arabic simple">
+<li><p><strong>Guess:</strong> sample packed windows of the current row to place admission and verification bins near its tail.</p></li>
+<li><p><strong>Verify:</strong> account for every valid score and establish a complete admitted population containing at least K candidates. Too few survivors require wider admission; incomplete staging requires exact recovery.</p></li>
+<li><p><strong>Refine:</strong> emit winners above the crossing bin and select the remaining slots exactly from that bin.</p></li>
+</ol>
+<p><img alt="Self-sampling, exact multi-threshold counts, and crossing-bin refinement, with three verification outcomes: refine, lower admission, or exact recovery." src="../../_images/algorithm.svg" /></p>
+<p><em>Figure 4. The sample histogram estimates a bracket; the verification histogram counts the complete admitted population. The lower panel shows how verification controls refinement and recovery. Bin heights and the 980/73/44 example are illustrative; exact recovery depends on the kernel family.</em></p>
+<p>For example, with <span class="math notranslate nohighlight">\(K=1024\)</span>, suppose 980 scores lie above the crossing bin and 73 lie inside it. Emit the 980 directly and select the best <strong>44 of those 73</strong>. A useful sample keeps this boundary problem small; complete counts and exact refinement make the answer correct.</p>
+<section id="why-threshold-quality-matters-passes-and-candidate-work">
+<h3>Why Threshold Quality Matters: Passes and Candidate Work<a class="headerlink" href="#why-threshold-quality-matters-passes-and-candidate-work" title="Link to this heading">#</a></h3>
+<p>A useful threshold balances <strong>full-row passes and candidate work</strong>. A loose threshold may save a scan yet admit so many candidates that processing them consumes the saving. Another pass is worthwhile only when the work it removes exceeds its cost.</p>
+<p>For a finite-score row, let <span class="math notranslate nohighlight">\(\tau\)</span> be the exact K-th-largest score and <span class="math notranslate nohighlight">\(q\le\tau\)</span> an admission threshold. The candidate population decomposes as</p>
+<div class="math notranslate nohighlight">
+\[
+C_p=C(q)=K+E+D(q,\tau),\qquad
+\frac{C_p}{K}=1+\frac{E+D(q,\tau)}{K}.
+\]</div>
+<p>Here <span class="math notranslate nohighlight">\(E\)</span> counts excess entries tied at the boundary, and <span class="math notranslate nohighlight">\(D\)</span> counts scores in the shell <span class="math notranslate nohighlight">\(q\le x_i\lt\tau\)</span>. Dense scores near the boundary can turn a small threshold error into large <strong>candidate amplification</strong>. Temporal overlap alone therefore cannot predict refinement work.</p>
+<p><img alt="Threshold admission and candidate amplification for one schematic score row. A simplified tail-count curve labels the K required winners, E excess boundary ties, and D additional shell candidates that make up the admitted population Cp. The right panel explains the same three components without numerical ratios." src="../../_images/candidate_work.svg" /></p>
+<p><em>Figure 5.</em> A: exact tail counts identify thresholds satisfying <span class="math notranslate nohighlight">\(K\le C(q)\le B_r\)</span>, where <span class="math notranslate nohighlight">\(B_r\)</span> is candidate capacity. The labeled segments split the admitted population into required winners, excess boundary ties, and the boundary shell. B: candidate amplification arises from the latter two components; their proportions are schematic. Exact handling of ties preserves the Top-K value multiset.</p>
+<p>Self-sampling aims to place admission near the current tail; multi-thresholding separates certain winners, the crossing bin, and lower bins. V2 balances full-row reads against candidate handling over <span class="math notranslate nohighlight">\(C(q)\)</span> entries and exact refinement over <span class="math notranslate nohighlight">\(m\)</span> crossing-bin candidates.</p>
+</section>
+<section id="self-sampling-calibrate-the-search-to-this-row">
+<h3>Self-Sampling: Calibrate the Search to This Row<a class="headerlink" href="#self-sampling-calibrate-the-search-to-this-row" title="Link to this heading">#</a></h3>
+<p>V2 calibrates inside the selection kernel, using the current row’s layout to generate sample addresses. It needs neither previous winners nor a separate sampling kernel. The sample estimates a useful starting region; full-row verification determines whether that region contains enough candidates.</p>
+<section id="load-short-windows-spread-them-across-the-row">
+<h4>Load Short Windows, Spread Them Across the Row<a class="headerlink" href="#load-short-windows-spread-them-across-the-row" title="Link to this heading">#</a></h4>
+<p>A <strong>sample window</strong> is a contiguous group of scores. A CUDA thread block processes many such windows. The streaming families use these layouts:</p>
+<div align="center">
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Family</p></th>
+<th class="head text-center"><p>Scores per window</p></th>
+<th class="head text-center"><p>Loads and logical ownership</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">main</span></code></p></td>
+<td class="text-center"><p>8 FP32 scores = 32 bytes</p></td>
+<td class="text-center"><p>One work item loads two adjacent <code class="docutils literal notranslate"><span class="pre">float4</span></code> vectors</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">clus</span></code></p></td>
+<td class="text-center"><p>16 FP32 scores = 64 bytes</p></td>
+<td class="text-center"><p>Two work items each load two vectors, covering the lower and upper halves</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<p>Regular spacing spreads the windows across the valid row. The sampling budget sets their count and spacing, while bounds and alignment handling keep loads valid for each phase. A thread block processes more windows in iterations when the sample exceeds its parallel capacity.</p>
+<p><strong>Why eight?</strong> Eight FP32 scores fill a 32-byte memory sector when the window is sector-aligned. A scattered scalar sample can use only four bytes from each fetched sector. Two adjacent, 16-byte-aligned <code class="docutils literal notranslate"><span class="pre">float4</span></code> loads consume the whole window, giving more sample values per touched sector. This is local packing within each window; widely spaced windows still produce strided accesses across the warp. The <a class="reference external" href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory">CUDA memory-access model</a> explains the sector granularity. Actual sector traffic also depends on the row’s alignment and cache state.</p>
+<p><strong>Why sixteen in <code class="docutils literal notranslate"><span class="pre">clus</span></code>?</strong> It groups two neighboring 32-byte pieces into one sampled location, divided between two work items. Each retains the same eight-score payload as <code class="docutils literal notranslate"><span class="pre">main</span></code>, avoiding a sixteen-score live payload in one worker. The engineering tradeoff is locality versus coverage: at a fixed sample budget, sixteen-score windows visit half as many locations as eight-score windows. Both aligned layouts can fully use their sectors; the clustered grouping favors wider local coverage at each visited location without doubling the per-worker sample payload. These are implementation tradeoffs, not a statistical guarantee or a universal optimum; a 64-byte window comprises four vector loads.</p>
+<p><img alt="GPU sampling layout: regularly spaced windows, two float4 loads for a main work item, and four float4 loads split across two clustered work items, followed by register reduction, a shared histogram, and a warp-zero scan." src="../../_images/gpu_sampling.svg" /></p>
+<p><em>Figure 6. Each outlined memory box holds four FP32 scores. The 8/16-score grouping describes data layout, while CTA threads execute the work items. Register values feed a shared sample histogram; its rank crossings produce calibration anchors. The lower floor is computed where enabled.</em></p>
+</section>
+<section id="reduce-histogram-and-extract-the-anchors-on-chip">
+<h4>Reduce, Histogram, and Extract the Anchors On Chip<a class="headerlink" href="#reduce-histogram-and-extract-the-anchors-on-chip" title="Link to this heading">#</a></h4>
+<p>Each sampling worker keeps its first two vectors in registers. Local minima and maxima reduce within each warp; warp results are published through shared memory and combined after a CTA barrier. These extrema define <strong>256 sample bins</strong>. Workers then increment shared-memory counters for their sample values. Additional windows beyond the initially retained pair are reloaded for histogramming, limiting live register state.</p>
+<p>After another barrier, warp 0 scans the histogram using vector counter loads and warp shuffles. One scan finds all required rank crossings and clears the counters for the next phase, avoiding a sample sort or a separate search for every anchor.</p>
+<p>Let <span class="math notranslate nohighlight">\(S\)</span> be the actual sample size and <span class="math notranslate nohighlight">\(A\ge K\)</span> the desired full-row candidate population. The launch policy starts with a sample budget proportional to <span class="math notranslate nohighlight">\(N/A\)</span>, clamps its target between 256 scores and half the row, and rounds to legal windows. It computes target ranks from the resulting <span class="math notranslate nohighlight">\(S\)</span>, rather than the unrounded budget:</p>
+<div class="math notranslate nohighlight">
+\[
+r_A\approx\frac{AS}{N},\qquad r_K\approx\frac{KS}{N},\qquad r_{2A}\approx\frac{2AS}{N}.
+\]</div>
+<p>The intuition is to keep enough observations in the relevant tail: as its target fraction <span class="math notranslate nohighlight">\(A/N\)</span> shrinks, increasing <span class="math notranslate nohighlight">\(S\)</span> maintains roughly <span class="math notranslate nohighlight">\(AS/N\)</span> tail observations, before clamping and window rounding. Descending histogram crossings supply:</p>
+<ul class="simple">
+<li><p><strong>Primary threshold <span class="math notranslate nohighlight">\(T\)</span>:</strong> the lower edge of the sample bin at rank <span class="math notranslate nohighlight">\(r_A\)</span>, aiming for roughly <span class="math notranslate nohighlight">\(A\)</span> full-row survivors.</p></li>
+<li><p><strong>Upper anchor <span class="math notranslate nohighlight">\(T_K\)</span>:</strong> the bin edge near rank <span class="math notranslate nohighlight">\(r_K\)</span>, used to choose the verification histogram’s upper bound with headroom for sampling error. Values beyond that bound remain candidates.</p></li>
+<li><p><strong>Lower floor <span class="math notranslate nohighlight">\(T_{\mathrm{floor}}\)</span>:</strong> the bin edge near rank <span class="math notranslate nohighlight">\(r_{2A}\)</span>, where enabled, admitting a larger population after an aggressive estimate.</p></li>
+</ul>
+<p>The sample histogram estimates these anchors without assuming a known score distribution. Regularly spaced windows can still miss an unusual tail or correlate with structured scores. Degenerate samples use conservative recovery paths; exact full-row accounting remains the authority.</p>
+</section>
+<section id="overlap-calibration-with-the-upcoming-row-read">
+<h4>Overlap Calibration with the Upcoming Row Read<a class="headerlink" href="#overlap-calibration-with-the-upcoming-row-read" title="Link to this heading">#</a></h4>
+<p>In the variable-length <code class="docutils literal notranslate"><span class="pre">main</span></code> route, warp 0 prepares sampling geometry while other warps can prefetch their upcoming row slice. The schedule limits overlapping register lifetimes. Clustered streaming repeats the same sample in each CTA so that all ranks derive a common bracket before merging verification histograms. These choices trade a little repeated calibration work for simpler communication. Exact address formulas, prefetch placement, and anchor constants are retained in the <a class="reference internal" href="../media/gvr_v2/README.html#gpu-sampling-implementation"><span class="std std-ref">implementation companion</span></a>.</p>
+</section>
+</section>
+<section id="multi-thresholding-make-each-full-row-pass-count">
+<h3>Multi-Thresholding: Make Each Full-Row Pass Count<a class="headerlink" href="#multi-thresholding-make-each-full-row-pass-count" title="Link to this heading">#</a></h3>
+<p>A scalar verification pass answers one question: how many scores exceed <span class="math notranslate nohighlight">\(T\)</span>? GVR V1 already amortizes row reads across several admission thresholds. V2’s streaming path uses a verification histogram to obtain a dense family of counts from the same classification work and locate the boundary for exact refinement.</p>
+<p>Conceptually, divide the bracket <span class="math notranslate nohighlight">\([T,H]\)</span> into <span class="math notranslate nohighlight">\(M\)</span> ordered bins, with boundaries <span class="math notranslate nohighlight">\(t_0,\ldots,t_M\)</span>, and let <span class="math notranslate nohighlight">\(h_j\)</span> be the exact population of bin <span class="math notranslate nohighlight">\(j\)</span>. A descending cumulative scan yields</p>
+<div class="math notranslate nohighlight">
+\[
+C(t_j)=\sum_{\ell=j}^{M-1}h_\ell,\qquad 0\le j\lt M.
+\]</div>
+<p>The streaming verification histogram has 256 bins. Each survivor is assigned to a bin once; a small on-chip cumulative scan then exposes counts at all its boundaries. <strong>One classification contributes to an entire family of threshold counts.</strong> The expensive score reads are shared, and the remaining scan touches only the bin counters. Verification can locate where the population crosses <span class="math notranslate nohighlight">\(K\)</span> without issuing another full-row query for each trial threshold.</p>
+<p>Values above <span class="math notranslate nohighlight">\(H\)</span> saturate into the top bin and remain candidates. Full-row accounting establishes whether enough survivors exist. The implementation may build the histogram during streaming, merge shard histograms through distributed shared memory, or reconstruct it from a complete bounded staging slab. Those execution choices preserve the same logical result: exact populations must cover the admitted set before its crossing is trusted.</p>
+<section id="turn-a-threshold-search-into-a-boundary-problem">
+<h4>Turn a Threshold Search into a Boundary Problem<a class="headerlink" href="#turn-a-threshold-search-into-a-boundary-problem" title="Link to this heading">#</a></h4>
+<p>Scanning bins from high scores to low identifies the crossing bin <span class="math notranslate nohighlight">\(j^{\ast}\)</span> with</p>
+<div class="math notranslate nohighlight">
+\[
+a=\sum_{\ell\gt j^{\ast}}h_\ell\lt K,\qquad a+h_{j^{\ast}}\ge K.
+\]</div>
+<p>Every score in a higher bin is a certain winner. Every score in a lower bin is unnecessary. Only <span class="math notranslate nohighlight">\(K-a\)</span> winners must be chosen from the crossing bin’s <span class="math notranslate nohighlight">\(m=h_{j^{\ast}}\)</span> candidates:</p>
+<div class="math notranslate nohighlight">
+\[
+\mathrm{TopK}(x)=\lbrace \text{all positions in higher bins}\rbrace
+\quad\cup\quad \mathrm{Top}_{K-a}(\text{crossing bin}).
+\]</div>
+<p>If the entire crossing bin is needed, it can be emitted directly. Small crossings use direct ranking; larger ones use exact order-preserving FP32 key refinement. The same decomposition underlies the 980-plus-44 example in Figure 4.</p>
+<p>The histogram discretizes the search region, not the selected scores. Exact comparisons within the crossing bin resolve its coarse boundaries, including ties. Thus fewer passes do not require approximate Top-K membership.</p>
+</section>
+<section id="how-verification-preserves-exactness">
+<h4>How Verification Preserves Exactness<a class="headerlink" href="#how-verification-preserves-exactness" title="Link to this heading">#</a></h4>
+<p><strong>The sample focuses the bins; exact bin counts make the sample safe.</strong> A useful bracket keeps the crossing small, while multi-threshold verification avoids a separate full-row query for every trial boundary. Figure 4 distinguishes the resulting paths: refine a complete admitted set, lower admission when too few scores survive, or recover exactly when staging or bracket checks fail.</p>
+<p>Two mechanisms have different jobs. The <strong>admission ladder</strong>—the primary threshold, lower floor, and conservative sentinel—widens the candidate region. The <strong>verification bin boundaries</strong> locate rank <span class="math notranslate nohighlight">\(K\)</span> within that region. Non-split streaming can rescan at a lower threshold; split-row streaming can stage down to the lower floor within its scan. Overflow requires complete-set or whole-row exact recovery.</p>
+<p>Guess quality controls work, while complete counts and exact refinement control membership. There is no fixed one-pass guarantee. For example, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18625">PR #18625</a> repairs infinite-width brackets in register families with exact whole-row key selection, preserving <code class="docutils literal notranslate"><span class="pre">+inf</span></code> winners.</p>
+<p>The output contract is an exact selected <strong>value multiset</strong> with valid unique indices. Tied indices may differ from <code class="docutils literal notranslate"><span class="pre">torch.topk</span></code>; output order is unrestricted. Short rows return valid local indices followed by <code class="docutils literal notranslate"><span class="pre">-1</span></code> padding. NaN ordering remains implementation-specific.</p>
+</section>
+</section>
+<section id="mapping-selection-to-blackwell">
+<h3>Mapping Selection to Blackwell<a class="headerlink" href="#mapping-selection-to-blackwell" title="Link to this heading">#</a></h3>
+<p>A single scheduling policy cannot serve both one short row and thousands of long rows efficiently. GVR V2 uses four kernel families, implemented in CuTe DSL:</p>
+<div align="center">
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Family</p></th>
+<th class="head text-center"><p>Where the scores or candidates live</p></th>
+<th class="head text-center"><p>Why it helps</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">reg</span></code></p></td>
+<td class="text-center"><p>A row resides in one thread block’s registers</p></td>
+<td class="text-center"><p>Avoids repeated global loads when the row fits</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">reg_clus</span></code></p></td>
+<td class="text-center"><p>Register slices across cooperating blocks</p></td>
+<td class="text-center"><p>Exposes more parallelism for medium rows at small batch sizes</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">clus</span></code></p></td>
+<td class="text-center"><p>Streaming shards; histograms and candidates shared within a hardware cluster</p></td>
+<td class="text-center"><p>Merges through distributed shared memory</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">main</span></code></p></td>
+<td class="text-center"><p>Streaming scan with bounded candidate staging</p></td>
+<td class="text-center"><p>Covers the remaining shapes, including long rows and large batches</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<p>A thread block is also called a cooperative thread array, or CTA. Blackwell thread-block clusters let cooperating CTAs exchange data through distributed shared memory. This reduces the need to materialize intermediate results in global memory for eligible shapes.</p>
+<p>Register families bypass sparse sampling but retain exact histogram crossing and refinement. In the normal case, the first <span class="math notranslate nohighlight">\(K\)</span> current-row values establish the initial bracket; near the short-row regime, a whole-row bracket is used. Full-row classification and exact crossing refinement still determine the output. The <code class="docutils literal notranslate"><span class="pre">main</span></code> family can assign multiple CTAs to a row when a small batch would otherwise leave much of the GPU idle.</p>
+<p>This explains the two sources of performance improvement: a better starting threshold reduces selection work, and a suitable kernel family reduces the cost of executing that work. Neither eliminates the obligation to examine all valid scores.</p>
+<p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/19076">PR #19076</a> extends this execution policy through host dispatch while keeping the device kernels unchanged. It adds register plans for roughly 4K–8K-score rows, sizes register waves using the device’s SM count, and includes targeted B300 routing. It also sets the direct-ranking gate to <strong>96 candidates across register plans</strong>, limiting quadratic work for difficult crossings. The streaming <code class="docutils literal notranslate"><span class="pre">main</span></code> and <code class="docutils literal notranslate"><span class="pre">clus</span></code> families retain their separate <strong>288-candidate</strong> gate. Dispatch therefore balances refinement cost with each family’s execution strategy.</p>
+</section>
+</section>
+<section id="performance-and-roofline-analysis">
+<h2>Performance and Roofline Analysis<a class="headerlink" href="#performance-and-roofline-analysis" title="Link to this heading">#</a></h2>
+<section id="performance-against-gvr-v1-and-radix-cuda">
+<h3>Performance Against GVR V1 and Radix CUDA<a class="headerlink" href="#performance-against-gvr-v1-and-radix-cuda" title="Link to this heading">#</a></h3>
+<section id="benchmark-setup">
+<h4>Benchmark Setup<a class="headerlink" href="#benchmark-setup" title="Link to this heading">#</a></h4>
+<p>The benchmarks use FP32 indexer scores from the three models below on NVIDIA B200. Batch size <span class="math notranslate nohighlight">\(B\)</span> counts score rows: each case repeats one captured row across 1 to 1,024 batch rows to measure kernel scaling. It does not represent heterogeneous serving concurrency. GVR V2 uses the merged <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/19076">PR #19076</a> implementation. Results report cold-L2 GPU kernel time, excluding compilation, input preparation, and Python overhead. Speedups are geometric means over matched workloads from separate benchmark runs. The grid uses single-token decode and case-matched launch envelopes; ragged batches, MTP, and prefill require separate evaluation. Historical serving results appear in the <a class="reference internal" href="#serving-gains-from-the-shared-engine">integration section</a>.</p>
+<div align="center">
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Model</p></th>
+<th class="head text-center"><p><span class="math notranslate nohighlight">\(K\)</span></p></th>
+<th class="head text-center"><p>Indexer compression</p></th>
+<th class="head text-center"><p>Valid row lengths <span class="math notranslate nohighlight">\(N\)</span></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>DeepSeek-V4 Flash</p></td>
+<td class="text-center"><p>512</p></td>
+<td class="text-center"><p>4</p></td>
+<td class="text-center"><p>1,027–262,127</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>DeepSeek-V4 Pro</p></td>
+<td class="text-center"><p>1,024</p></td>
+<td class="text-center"><p>4</p></td>
+<td class="text-center"><p>1,027–262,127</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>DeepSeek-V3.2</p></td>
+<td class="text-center"><p>2,048</p></td>
+<td class="text-center"><p>1</p></td>
+<td class="text-center"><p>4,111–163,775</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<p><strong><span class="math notranslate nohighlight">\(N\)</span> is the indexer row width, not the original prompt length.</strong> A roughly 512K-token V4 context yields a roughly 128K-wide indexer row because of 4× compression.</p>
+</section>
+<section id="overall-results">
+<h4>Overall Results<a class="headerlink" href="#overall-results" title="Link to this heading">#</a></h4>
+<div align="center">
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Baseline</p></th>
+<th class="head text-center"><p>Geomean speedup</p></th>
+<th class="head text-center"><p>Minimum speedup</p></th>
+<th class="head text-center"><p>GVR V2 faster</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>GVR V1</p></td>
+<td class="text-center"><p><strong>1.46×</strong></p></td>
+<td class="text-center"><p>0.689×</p></td>
+<td class="text-center"><p>99.57%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>TensorRT LLM radix CUDA dispatch</p></td>
+<td class="text-center"><p><strong>5.05×</strong></p></td>
+<td class="text-center"><p>1.34×</p></td>
+<td class="text-center"><p>100.00%</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<p>Both comparisons use the same 9,746 cases. The minimum column retains individual regressions, including the GVR V1 cases where V2 is slower; the <a class="reference internal" href="#from-gvr-v1-to-v2-why-move-beyond-temporal-hints">V1-to-V2 discussion</a> explains how informative temporal hints can retain an admission advantage. Figure 1 shows the model-level comparison over this same workload grid.</p>
+</section>
+<section id="the-gains-extend-beyond-an-average">
+<h4>The Gains Extend Beyond an Average<a class="headerlink" href="#the-gains-extend-beyond-an-average" title="Link to this heading">#</a></h4>
+<p>The gains over TensorRT LLM radix CUDA vary with the model and shape. Figure 7 shows V2’s speedup across every captured row length and all 11 batch sizes, with one panel per model.</p>
+<p><img alt="Three heatmap panels of GVR V2 speedup over TensorRT LLM radix CUDA across captured row lengths and all eleven batch sizes, averaged geometrically across all layers in each model." src="../../_images/radix_cuda_map.svg" /></p>
+<p><em>Figure 7. TensorRT LLM radix CUDA time divided by GVR V2 time, geometrically averaged across layers at each shape. The panels share a 1–21× color scale; 1.0 means equal performance. Row lengths are rounded in the axis labels, and cell labels round to one decimal place.</em></p>
+<p>The strongest shape-average gains occur around 4K scores at <span class="math notranslate nohighlight">\(B=1024\)</span>: <strong>19.85× for V4 Flash and 20.18× for V4 Pro</strong> at <span class="math notranslate nohighlight">\(N=4{,}099\)</span>, and <strong>10.96× for V3.2</strong> at <span class="math notranslate nohighlight">\(N=4{,}111\)</span>. The Pro result is the largest shape-average speedup in the grid.</p>
+<p>The advantage extends across all 275 plotted shapes. The smallest shape-average speedups are <strong>1.55× for Flash, 1.52× for Pro, and 3.50× for V3.2</strong>. These averages summarize layers at each shape; the overall table retains the lower minimum across individual workload cases.</p>
+<p>GVR V1 is the closer comparison. Figure 8 uses the same grid and aggregation, with a separate <strong>1–3× color scale</strong> to resolve the smaller differences.</p>
+<p><img alt="Three heatmap panels of GVR V2 speedup over GVR V1 across captured row lengths and all eleven batch sizes. Cell values are geometric means across layers; orange corners mark shapes containing at least one layer where V2 is slower." src="../../_images/gvr_v1_map.svg" /></p>
+<p><em>Figure 8. GVR V1 time divided by GVR V2 time, geometrically averaged across layers at each shape. All three panels share a 1–3× color scale, with parity at 1.0× and cell labels rounded to two decimal places. An orange corner marks at least one constituent layer with speedup below 1×, even when the cell average is above parity.</em></p>
+<p>The strongest shape-average gains are <strong>2.87× for Flash, 2.83× for Pro, and 1.86× for V3.2</strong>. Flash and Pro peak at <span class="math notranslate nohighlight">\(B=1024\)</span> on short rows; V3.2 peaks near 128K scores at <span class="math notranslate nohighlight">\(B=8\)</span>.</p>
+<p>All 275 shape averages exceed parity, but layer averaging can hide local regressions. For Pro at <span class="math notranslate nohighlight">\(N=131{,}075\)</span> and <span class="math notranslate nohighlight">\(B=512\)</span>, the shape average is <strong>1.05×</strong> even though one layer reaches <strong>0.689×</strong>. The orange markers preserve this distinction; the earlier <a class="reference internal" href="#from-gvr-v1-to-v2-why-move-beyond-temporal-hints">V1-to-V2 analysis</a> explains why informative temporal hints can still give V1 a local admission advantage.</p>
+</section>
+<section id="what-explains-the-differences">
+<h4>What Explains the Differences<a class="headerlink" href="#what-explains-the-differences" title="Link to this heading">#</a></h4>
+<p><strong>TensorRT LLM radix CUDA.</strong> The baseline uses the production dispatcher, including short-row insertion and long-row split-work paths. V2’s <strong>5.05×</strong> advantage is consistent with reducing full-row selection passes and matching execution to the workload.</p>
+<p><strong>GVR V1 (temporal hint).</strong> V1 already combines multiple admission thresholds through pivot/rescue verification. V2 replaces the temporal prior with current-row calibration and couples exact bin counts to crossing-bin refinement. Its <strong>1.46×</strong> gain compares complete implementations, including their execution policies; it does not isolate the contribution of self-sampling alone.</p>
+</section>
+<section id="latency-across-row-length-and-batch-size">
+<h4>Latency Across Row Length and Batch Size<a class="headerlink" href="#latency-across-row-length-and-batch-size" title="Link to this heading">#</a></h4>
+<p><img alt="Cold kernel latency for GVR V2, GVR V1, and TensorRT LLM radix CUDA versus valid row length, with separate panels for three models and batch sizes 1 and 1024." src="../../_images/latency.svg" /></p>
+<p><em>Figure 9. Mean cold kernel time across all captured layers: 21 for Flash, 30 for Pro, and 61 for V3.2. Each row is a model; the columns contrast batch sizes 1 and 1,024. The solid line shows GVR V2; dashed lines show baselines measured in separate runs. Both axes are logarithmic; 1K means 1,024.</em></p>
+<p>At <span class="math notranslate nohighlight">\(B=1\)</span>, keeping a short row in registers and exposing parallelism within a longer row matter more than saturating HBM. At <span class="math notranslate nohighlight">\(B=1024\)</span>, streaming throughput becomes more visible. The different shapes of these curves are why a single average cannot identify every useful operating region.</p>
+</section>
+</section>
+<section id="the-roofline-model-fewer-passes-more-useful-work">
+<h3>The Roofline Model: Fewer Passes, More Useful Work<a class="headerlink" href="#the-roofline-model-fewer-passes-more-useful-work" title="Link to this heading">#</a></h3>
+<p>The bar chart shows how much time GVR V2 saves. The roofline compares that time with an ideal one-read, index-write traffic model. It connects the algorithm’s goal—fewer full-row passes—to a bandwidth reference.</p>
+<section id="locate-top-k-on-the-hardware-roof">
+<h4>Locate Top-K on the Hardware Roof<a class="headerlink" href="#locate-top-k-on-the-hardware-roof" title="Link to this heading">#</a></h4>
+<p>For FP32 input and INT32 index-only output, define the ideal work and minimum traffic as</p>
+<div class="math notranslate nohighlight">
+\[
+W=BN,\qquad Q_{\min}=4B(N+K)\ \text{bytes},\qquad
+I=\frac{W}{Q_{\min}}=\frac{N}{4(N+K)}.
+\]</div>
+<p>Each work unit is an <strong>abstract comparison per input score</strong>, shared across implementations; it is neither an instruction count nor SELECT’s comparison bound. For nontrivial selection, <span class="math notranslate nohighlight">\(1\le K\lt N\)</span>, intensity lies in <strong><span class="math notranslate nohighlight">\(0.125\lt I\lt 0.25\)</span> compare/byte</strong>.</p>
+<p>The theoretical and calibrated B200 roofs, in Tcompare/s, are</p>
+<div class="math notranslate nohighlight">
+\[
+P_{\mathrm{theory}}(I)=\min(37.225,8I),\qquad
+P_{\mathrm{calibrated}}(I)=\min(37.047,6.912I).
+\]</div>
+<p>The calibrated limits are <strong>6.912 TB/s</strong> sustained read bandwidth and <strong>37.047 Tcompare/s</strong> semantic comparison throughput. Their <strong>5.36 compare/byte</strong> intersection exceeds the maximum ideal Top-K intensity by over 21×, placing the workload band on Figure 10A’s bandwidth slope.</p>
+<p><img alt="A two-level roofline: the full B200 hardware model highlights Top-K's narrow bandwidth-limited band; three linear-scale Pareto curve panels compare GVR V2, GVR V1, and TensorRT LLM radix CUDA at batch 1024, with GVR V2 highlighted in green." src="../../_images/roofline.svg" /></p>
+<p><em>Figure 10.</em> A: theoretical and calibrated roofs. B: Pareto curves at <span class="math notranslate nohighlight">\(B=1024\)</span>, plotting useful throughput <span class="math notranslate nohighlight">\(P=BN/t\)</span> against ideal intensity <span class="math notranslate nohighlight">\(I=N/[4(N+K)]\)</span>. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share <span class="math notranslate nohighlight">\(Q_{\min}\)</span>; extra work remains in measured time. This measures useful work relative to ideal traffic, not actual DRAM utilization.</p>
+</section>
+<section id="compare-pareto-curves-and-reachable-rates">
+<h4>Compare Pareto Curves and Reachable Rates<a class="headerlink" href="#compare-pareto-curves-and-reachable-rates" title="Link to this heading">#</a></h4>
+<p>Each operator’s <strong>Pareto curve</strong> in Figure 10B is its measured intensity–throughput trace across row lengths at <span class="math notranslate nohighlight">\(B=1024\)</span>. At fixed <span class="math notranslate nohighlight">\(N\)</span> and <span class="math notranslate nohighlight">\(K\)</span>, every implementation has the same horizontal position; a faster kernel moves <strong>upward</strong>, toward the calibrated roof. Figure 9 retains the contrasting single-row view, and Figures 7–8 cover all 11 batch sizes.</p>
+<p>The <strong>reachable rate</strong> is useful throughput divided by the calibrated roof, expressed as a percentage. Throughout the plotted bandwidth branch, its underlying ratio simplifies to</p>
+<div class="math notranslate nohighlight">
+\[
+\rho=\frac{P(I)}{P_{\mathrm{calibrated}}(I)}
+=\frac{Q_{\min}}{\mathrm{BW}\,t}.
+\]</div>
+<p>It measures efficiency relative to the ideal traffic bound. The table compares <strong>average / peak reachable rate</strong> along each Pareto curve: the average weights the plotted intensity points equally, and the peak is their maximum. Both use the same layer-averaged timings as Figure 10B.</p>
+<div align="center">
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Operator</p></th>
+<th class="head text-center"><p>V4 Flash</p></th>
+<th class="head text-center"><p>V4 Pro</p></th>
+<th class="head text-center"><p>V3.2</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p><strong>GVR V2</strong></p></td>
+<td class="text-center"><p><strong>41.6% / 77.8%</strong></p></td>
+<td class="text-center"><p><strong>39.0% / 68.4%</strong></p></td>
+<td class="text-center"><p><strong>41.5% / 66.5%</strong></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>GVR V1</p></td>
+<td class="text-center"><p>26.1% / 63.3%</p></td>
+<td class="text-center"><p>25.4% / 58.9%</p></td>
+<td class="text-center"><p>27.8% / 51.1%</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>TensorRT LLM radix CUDA</p></td>
+<td class="text-center"><p>7.7% / 16.9%</p></td>
+<td class="text-center"><p>7.8% / 16.4%</p></td>
+<td class="text-center"><p>8.3% / 17.8%</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<p><em>Each cell shows average / peak.</em></p>
+<p>GVR V2 leads both measures on all three models: its average reachable rate is <strong>39.0–41.6%</strong>, with peaks of <strong>66.5–77.8%</strong>. GVR V1 is the stronger baseline by both measures, averaging <strong>25.4–27.8%</strong>, with peaks of <strong>51.1–63.3%</strong>. On V3.2, it reaches <strong>27.8% / 51.1%</strong>, compared with V2’s <strong>41.5% / 66.5%</strong>. Reporting both measures captures the best operating point and the performance sustained across the curve.</p>
+</section>
+<section id="interpret-the-remaining-gap">
+<h4>Interpret the Remaining Gap<a class="headerlink" href="#interpret-the-remaining-gap" title="Link to this heading">#</a></h4>
+<p>The full ideal bound is <span class="math notranslate nohighlight">\(T_{\mathrm{roof}}=\max(Q_{\min}/\mathrm{BW},W/R_{\mathrm{compare}})\)</span>. Within the Top-K band, the bandwidth term sets this bound. A kernel’s actual bottleneck can also involve histogram updates, synchronization, register pressure, candidate staging, or exact refinement. Attributing the measured gap to these mechanisms requires counters or ablations beyond the latency comparisons. Short-row identity/padding paths can skip score reads and lie outside this model.</p>
+<p>The pass/candidate tradeoff in Figure 5 explains two sources of this gap: another full-row scan adds traffic, while a loose admission threshold adds candidate work even when the scan count stays fixed. V2 uses exact bin populations to restrict the remaining selection to the crossing bin. These costs increase measured time; under the shared minimum-traffic model, they move useful throughput downward at the same intensity. The read-dominated roof is optimistic, especially when <span class="math notranslate nohighlight">\(K/N\)</span> is large; the plotted throughput describes useful selection work rather than measured DRAM traffic.</p>
+</section>
+</section>
+</section>
+<section id="tensorrt-llm-integration-and-takeaways">
+<h2>TensorRT LLM Integration and Takeaways<a class="headerlink" href="#tensorrt-llm-integration-and-takeaways" title="Link to this heading">#</a></h2>
+<section id="decode-and-prefill-in-tensorrt-llm">
+<h3>Decode and Prefill in TensorRT LLM<a class="headerlink" href="#decode-and-prefill-in-tensorrt-llm" title="Link to this heading">#</a></h3>
+<p>The integration follows three boundaries: remove the Top-K prior lifecycle, adapt each phase’s row metadata, and prepare launch specializations before graph capture.</p>
+<section id="remove-the-top-k-prior-lifecycle">
+<h4>Remove the Top-K Prior Lifecycle<a class="headerlink" href="#remove-the-top-k-prior-lifecycle" title="Link to this heading">#</a></h4>
+<p>A temporal prior carries state from an earlier selection. Its buffers, initialization, request alignment, and write-back must stay valid through CUDA Graph warmup and replay. Disaggregated prefill/decode also needs a policy for providing that prior at the phase handoff.</p>
+<p>With <code class="docutils literal notranslate"><span class="pre">use_self_sampling_topk:</span> <span class="pre">true</span></code>, the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/modules/top_k.py#L350-L392"><code class="docutils literal notranslate"><span class="pre">TopK</span></code> wrapper</a> selects V2’s self-sampling decode <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_self_sampling_host.py#L1435-L1445"><code class="docutils literal notranslate"><span class="pre">run_varlen</span></code></a> entry point. Its public signature takes score, sequence-length, and output-index tensors plus row/launch metadata; it has <strong>no <code class="docutils literal notranslate"><span class="pre">pre_idx</span></code> parameter</strong>. The wrapper’s <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/modules/top_k.py#L69-L75"><code class="docutils literal notranslate"><span class="pre">needs_gvr_prior</span></code></a> property is false for this path.</p>
+<p>The separate V1 temporal dispatcher, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/be1b9885e8df9bf070e8cb68459e24a7119afaa9/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_dispatch.py#L334-L357"><code class="docutils literal notranslate"><span class="pre">tiered_topk</span></code></a>, still requires valid <code class="docutils literal notranslate"><span class="pre">pre_idx</span></code> for its supported heuristic routes. Setting <code class="docutils literal notranslate"><span class="pre">use_self_sampling_topk:</span> <span class="pre">false</span></code> selects that temporal engine; callers must retain its prior input.</p>
+<p>V2 derives its bracket from the current scores in both phases, removing the previous-step Top-K buffer, prefill-to-decode prior seeding, and prior write-back from the self-sampling path. Request metadata and launch preparation remain, but they no longer maintain a selection history. <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18446">PR #18446</a> confines prior ownership to the temporal engine.</p>
+</section>
+<section id="one-selection-core-two-row-interfaces">
+<h4>One Selection Core, Two Row Interfaces<a class="headerlink" href="#one-selection-core-two-row-interfaces" title="Link to this heading">#</a></h4>
+<p>TensorRT LLM separates phase-specific row metadata from shared selection logic. The <code class="docutils literal notranslate"><span class="pre">TopK</span></code> module applies the same self-sampling configuration to supported decode and prefill paths, then passes each phase’s valid score interval to the selected engine.</p>
+<p><img alt="Integration diagram: a shared TopK dispatcher feeds decode and prefill row adapters, which reuse GvrMainKernel's streaming selection pipeline; decode also retains register and cluster routes." src="../../_images/integration.svg" /></p>
+<p><em>Figure 11. Current-row calibration lets both phases enter the same selection core without a temporal-prior lifecycle. The decode arrow shows its streaming route; register and cluster routes remain available under the same output contract. Prefill specializes the streaming implementation at compile time.</em></p>
+<p>The adapters preserve each phase’s indexing semantics. Decode derives valid prefixes from device KV lengths, multi-token prediction offsets, and compression. Prefill receives <code class="docutils literal notranslate"><span class="pre">[start,</span> <span class="pre">end)</span></code> in compressed columns and returns indices relative to <code class="docutils literal notranslate"><span class="pre">start</span></code>. Both write INT32 indices into caller-owned output, with identity indices and <code class="docutils literal notranslate"><span class="pre">-1</span></code> padding for short rows.</p>
+<p>Prefill’s compile-time mode changes addressing, masking, and index origin in the same <strong><code class="docutils literal notranslate"><span class="pre">GvrMainKernel</span></code> streaming implementation</strong> used by decode. Self-sampling, multi-threshold counting, collection, and exact refinement stay shared. One block per prefill row and specialized decode scheduling let the common algorithm serve different parallelism requirements. <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18702">PR #18702</a> implements this reuse.</p>
+<p>This separation keeps phase-specific decisions in the wrapper, dispatch, and compile-time row adapters. Improvements to threshold calibration, counting, and exact recovery can serve both phases through the shared streaming body, reducing duplicated selection logic and the number of state transitions the framework must maintain.</p>
+</section>
+<section id="stable-launches-dynamic-row-lengths">
+<h4>Stable Launches, Dynamic Row Lengths<a class="headerlink" href="#stable-launches-dynamic-row-lengths" title="Link to this heading">#</a></h4>
+<p>Host routing chooses a stable launch envelope; device metadata supplies each row’s actual length. The physical memory bound remains separate from the bound used to select an execution plan. Before capture, warmup must prepare exact-row decode launchers and a bounded set of prefill tiers and width buckets, using the same envelope-dependent plan rule as execution and readiness checks.</p>
+<p>Prefill and decode have distinct specialization keys; decode launcher and warmup caches also distinguish SM count and architecture. This lets dispatch tune execution, including sampled prefill plans for qualifying small envelopes, while preserving the graph’s prepared launch contract. These rules are implemented through <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18683">PR #18683</a>, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18702">PR #18702</a>, and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/19076">PR #19076</a>.</p>
+<p>When scores fail the <code class="docutils literal notranslate"><span class="pre">TopK</span></code> module’s dtype, stride, or alignment gate, it selects native insertion/radix. Prefill also selects radix for an all-short tile or a missing capture-time specialization. Decode requires its exact launcher key to be warmed before capture; a missing key raises an error. Invalid low-level tensor or storage contracts likewise raise, so fallback is a dispatch policy, not a catch-all for engine errors.</p>
+</section>
+<section id="serving-gains-from-the-shared-engine">
+<h4>Serving Gains from the Shared Engine<a class="headerlink" href="#serving-gains-from-the-shared-engine" title="Link to this heading">#</a></h4>
+<p>In <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18702">PR #18702’s B200 profiles</a>, the aggregate Top-K kernel time within measured Flash/Pro prefill windows improves by <strong>1.84–2.61×</strong> over radix CUDA. Adding V2 prefill to a deployment already using V2 decode improves serving throughput by <strong>2.9–4.5%</strong> on the tested long-input, batched workloads. These are historical integration results and measure the incremental benefit of the prefill change.</p>
+<p>For decode, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18410">PR #18410</a> reports <strong>6–19% lower time per output token</strong> on 8×B200 with TP8/EP8 and batch/concurrency 1. The serving benefit depends on Top-K’s share of total execution time; the kernel comparisons above do not measure competing serving stacks.</p>
+</section>
+<section id="enable-gvr-v2">
+<h4>Enable GVR V2<a class="headerlink" href="#enable-gvr-v2" title="Link to this heading">#</a></h4>
+<p>Use a TensorRT LLM revision containing <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/19076">PR #19076</a>. The production V2 dispatch requires CUTLASS DSL, datacenter Blackwell SM100/SM103, <span class="math notranslate nohighlight">\(K\in\lbrace 512,1024,2048\rbrace\)</span>, and indexer compression ratios 1 or 4. Save the following as <code class="docutils literal notranslate"><span class="pre">gvr_v2.yaml</span></code>:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">deepseek_v4</span>
+<span class="w">  </span><span class="nt">enable_heuristic_topk</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">use_self_sampling_topk</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</pre></div>
+</div>
+<p>Use <code class="docutils literal notranslate"><span class="pre">algorithm:</span> <span class="pre">dsa</span></code> for DeepSeek-V3.2. The checkpoint supplies the model’s Top-K width. With a prepared benchmark dataset in <code class="docutils literal notranslate"><span class="pre">dataset.jsonl</span></code>, run:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>deepseek-ai/DeepSeek-V4-Flash<span class="w"> </span>throughput<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dataset<span class="w"> </span>dataset.jsonl<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>gvr_v2.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tp<span class="w"> </span><span class="m">8</span><span class="w"> </span>--ep<span class="w"> </span><span class="m">8</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">enable_heuristic_topk</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">false</span></code>. Once it is enabled, <code class="docutils literal notranslate"><span class="pre">use_self_sampling_topk</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">true</span></code>; the second field is explicit here for clarity. Supported prefill layers follow the same V2 selection. Setting <code class="docutils literal notranslate"><span class="pre">use_self_sampling_topk:</span> <span class="pre">false</span></code> selects the temporal-hint decode dispatcher, which chooses among temporal kernel routes; prefill remains radix.</p>
+<p>The fast path expects FP32 scores with unit inner stride, a row stride divisible by four floats, and a 16-byte-aligned base. A single-row decode input also needs its physical width divisible by four; its valid prefix may be shorter. The retired <code class="docutils literal notranslate"><span class="pre">TRTLLM_GVR_SELF_SAMPLING</span></code> environment variable is no longer the enablement mechanism, and <code class="docutils literal notranslate"><span class="pre">use_cute_dsl_topk</span></code> is not required to select V2.</p>
+</section>
+</section>
+<section id="conclusion">
+<h3>Conclusion<a class="headerlink" href="#conclusion" title="Link to this heading">#</a></h3>
+<p>GVR V2 follows from a practical limit of temporal prediction: a biased hint can be excellent when overlap is high, yet expensive to rely on when quality fluctuates. <strong>Self-sampling calibrates from the current row; multi-threshold counts locate the crossing; exact refinement resolves the remaining membership.</strong> Together, they target both difficult-input performance and average latency while preserving exactness.</p>
+<p>The performance map shows the gains across shapes, and the Pareto curves relate them to the bandwidth roof. Removing the temporal prior also removes its framework lifecycle: a shared streaming implementation serves prefill and decode through phase-specific row interfaces. The result is one algorithmic core whose calibration depends on the input it is selecting now.</p>
+</section>
+<section id="further-reading">
+<h3>Further Reading<a class="headerlink" href="#further-reading" title="Link to this heading">#</a></h3>
+<p><a class="reference internal" href="../media/gvr_v2/README.html"><span class="std std-doc">Benchmark methodology and figure reproduction</span></a> are available separately.</p>
+<p>Selection background:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://people.csail.mit.edu/rivest/pubs/FR75a.pdf">Floyd and Rivest, <em>Expected Time Bounds for Selection</em> (1975)</a>, <em>Communications of the ACM</em> 18(3), 165–172: the sampling-based selection idea behind V2’s calibration.</p></li>
+<li><p><a class="reference external" href="https://arxiv.org/abs/cs/0312055">Kiwiel, <em>Randomized Selection with Quintary Partitions</em></a>: rigorous analysis of SELECT variants and repeated-key handling.</p></li>
+</ul>
+<p>Implementation milestones:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/17821">PR #17821: original self-sampling decode integration</a>.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18410">PR #18410: current-row brackets and hint-free production API</a>.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18625">PR #18625: exact handling of positive infinity in register families</a>.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18646">PR #18646: device-side prior seeding for the temporal path</a>.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18683">PR #18683: physical envelopes and exact-row warmup</a>.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18446">PR #18446: configuration-based dispatch and prior-state removal for V2</a>.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18702">PR #18702: self-sampling prefill</a>.</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/19076">PR #19076: register-plan tuning, a unified crossing-bin gate, sampled prefill plans, and SM-aware B200/B300 dispatch</a>.</p></li>
+</ul>
+<p>For the surrounding model pipeline, see <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a> and <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell</a>.</p>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../../developer-guide/telemetry.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Telemetry</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#motivation-and-design-foundations">Motivation and Design Foundations</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#from-gvr-v1-to-v2-why-move-beyond-temporal-hints">From GVR V1 to V2: Why Move Beyond Temporal Hints?</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#a-biased-sample-with-variable-value">A Biased Sample with Variable Value</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#a-hint-that-crosses-framework-boundaries">A Hint That Crosses Framework Boundaries</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#from-floydrivest-select-to-gpu-top-k">From Floyd–Rivest SELECT to GPU Top-K</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#self-sampling-and-multi-thresholding">Self-Sampling and Multi-Thresholding</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#why-threshold-quality-matters-passes-and-candidate-work">Why Threshold Quality Matters: Passes and Candidate Work</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#self-sampling-calibrate-the-search-to-this-row">Self-Sampling: Calibrate the Search to This Row</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#load-short-windows-spread-them-across-the-row">Load Short Windows, Spread Them Across the Row</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#reduce-histogram-and-extract-the-anchors-on-chip">Reduce, Histogram, and Extract the Anchors On Chip</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#overlap-calibration-with-the-upcoming-row-read">Overlap Calibration with the Upcoming Row Read</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-thresholding-make-each-full-row-pass-count">Multi-Thresholding: Make Each Full-Row Pass Count</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#turn-a-threshold-search-into-a-boundary-problem">Turn a Threshold Search into a Boundary Problem</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#how-verification-preserves-exactness">How Verification Preserves Exactness</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mapping-selection-to-blackwell">Mapping Selection to Blackwell</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-and-roofline-analysis">Performance and Roofline Analysis</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-against-gvr-v1-and-radix-cuda">Performance Against GVR V1 and Radix CUDA</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmark-setup">Benchmark Setup</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#overall-results">Overall Results</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#the-gains-extend-beyond-an-average">The Gains Extend Beyond an Average</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#what-explains-the-differences">What Explains the Differences</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#latency-across-row-length-and-batch-size">Latency Across Row Length and Batch Size</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-roofline-model-fewer-passes-more-useful-work">The Roofline Model: Fewer Passes, More Useful Work</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#locate-top-k-on-the-hardware-roof">Locate Top-K on the Hardware Roof</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#compare-pareto-curves-and-reachable-rates">Compare Pareto Curves and Reachable Rates</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#interpret-the-remaining-gap">Interpret the Remaining Gap</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-integration-and-takeaways">TensorRT LLM Integration and Takeaways</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#decode-and-prefill-in-tensorrt-llm">Decode and Prefill in TensorRT LLM</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#remove-the-top-k-prior-lifecycle">Remove the Top-K Prior Lifecycle</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#one-selection-core-two-row-interfaces">One Selection Core, Two Row Interfaces</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#stable-launches-dynamic-row-lengths">Stable Launches, Dynamic Row Lengths</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-gains-from-the-shared-engine">Serving Gains from the Shared Engine</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-gvr-v2">Enable GVR V2</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">Conclusion</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#further-reading">Further Reading</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on September 26, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c76f4a8">c76f4a8</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

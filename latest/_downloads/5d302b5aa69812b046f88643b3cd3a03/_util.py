@@ -188,6 +188,26 @@ def get_kv_cache_manager_cls(
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
     sparse_attn_algorithm = getattr(sparse_attn_config, "algorithm", None)
+    quant_config = getattr(model_config, "quant_config", None)
+    if (sparse_attn_config is None and is_mla(config)
+            and quant_config is not None
+            and quant_config.quant_mode.has_fp4_kv_cache()):
+        if kv_cache_config.use_kv_cache_manager_v2 is False:
+            raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
+        if model_config.attn_backend != "TRTLLM":
+            raise ValueError("FP4 MLA requires the TRTLLM attention backend.")
+        if is_disagg:
+            raise NotImplementedError(
+                "FP4 MLA disaggregated serving requires the follow-up "
+                "Python NIXL integration.")
+        if is_hybrid_linear(config):
+            raise NotImplementedError(
+                "FP4 MLA requires Fp4MlaKVCacheManagerV2, which does not "
+                "support hybrid linear-attention models.")
+        from ..attention.backends.fp4_mla.cache_manager import \
+            Fp4MlaKVCacheManagerV2
+
+        return Fp4MlaKVCacheManagerV2
     use_v2 = kv_cache_config.use_kv_cache_manager_v2 is True
     if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
@@ -230,6 +250,20 @@ def get_kv_cache_manager_cls(
         # the shared hybrid transceiver validation below: the Python NIXL
         # transceiver selects the Mixed manager, whose KDA recurrent/conv
         # states transfer through the bounce buffer.
+        # Helix x speculation bookkeeping (per-token verify groups on the
+        # superblock ledger, py_helix_decode_group_index advancement) exists
+        # only in KVCacheManagerV2. The V1-family hybrid managers account
+        # helix decode one token per iteration and have no helix-x-spec
+        # path, so a default (V1) resolution would run silently wrong.
+        if (model_config.mapping is not None
+                and model_config.mapping.has_cp_helix()
+                and model_config.spec_config is not None and not use_v2):
+            raise ValueError(
+                "Helix with speculative decoding requires "
+                "kv_cache_config.use_kv_cache_manager_v2=True; the V1-family "
+                "hybrid managers do not implement per-token verify-group "
+                "bookkeeping.")
+
         if is_kimi_linear(config) and not use_v2 and not is_disagg:
             if kv_cache_config.enable_block_reuse:
                 logger.info(
@@ -252,7 +286,7 @@ def get_kv_cache_manager_cls(
                 # results. Model loading resolves ``auto`` to PYTHON via
                 # KimiLinearForCausalLM.get_preferred_transceiver_runtime
                 # (NIXL-gated); this rejects explicit non-Python routes and
-                # paths that skip model defaults (e.g. AutoDeploy).
+                # paths that skip model defaults.
                 raise ValueError(
                     "Kimi K3 disaggregated serving requires the Python "
                     "transceiver: set cache_transceiver_config "
@@ -872,6 +906,14 @@ class KvCacheCreator:
                         f"Gemma4 hybrid attention requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
+                quant_config = getattr(model_config, "quant_config", None)
+                if (sparse_attn_config is None and is_mla(config)
+                        and quant_config is not None
+                        and quant_config.quant_mode.has_fp4_kv_cache()):
+                    raise NotImplementedError(
+                        "FP4 MLA requires Fp4MlaKVCacheManagerV2, which is "
+                        f"not yet supported with {incompat_str}. Disable these "
+                        "features to run FP4 MLA.")
                 if is_hybrid_linear(config):
                     raise NotImplementedError(
                         "Hybrid Mamba cache managers do not support "
@@ -897,6 +939,7 @@ class KvCacheCreator:
                                 kv_cache_config: Optional[KvCacheConfig] = None,
                                 *,
                                 is_draft: bool = False,
+                                mapping=None,
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
@@ -913,7 +956,7 @@ class KvCacheCreator:
         return CacheCost.from_raw(
             manager_cls.get_cache_size_per_token(
                 model_config,
-                self._mapping,
+                mapping if mapping is not None else self._mapping,
                 tokens_per_block=self._tokens_per_block,
                 max_seq_len=self._max_seq_len,
                 max_batch_size=self._max_batch_size,
@@ -966,14 +1009,33 @@ class KvCacheCreator:
         *,
         use_separate_draft_kv_cache: bool,
     ) -> Optional[CacheCost]:
-        """Return the draft manager's standalone cache cost, if it has one."""
+        """Return the draft manager's standalone cache cost, if it has one.
+
+        Under helix CP the drafter is dense rather than helix-sharded, so it is
+        costed with the same repurposed mapping runtime construction uses, then
+        the slope is multiplied by cp_size to express it per rank-LOCAL target
+        token (the target stores only every cp_size-th page per rank).
+        Intercepts are per-request rank-local bytes and stay unscaled.
+        """
+        draft_mapping = self._mapping
+        helix_cp_scale = 1
+        if self._mapping.has_cp_helix():
+            draft_mapping = self._mapping.repurpose_helix_cp_to_tp()
+            helix_cp_scale = self._mapping.cp_size
+
+        def scaled(cost: CacheCost) -> CacheCost:
+            return CacheCost(slope=cost.slope * helix_cp_scale,
+                             intercept=cost.intercept)
+
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
             draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
                 self._draft_model_engine, kv_cache_config)
-            return self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                                draft_model_config,
-                                                kv_cache_config)
+            return scaled(
+                self._per_manager_cache_cost(draft_kv_cache_manager_cls,
+                                             draft_model_config,
+                                             kv_cache_config,
+                                             mapping=draft_mapping))
         if use_separate_draft_kv_cache:
             # One-model draft with separate KV cache layout.
             # Pass num_layers explicitly since the HF config may report a
@@ -981,7 +1043,10 @@ class KvCacheCreator:
             # (e.g. EAGLE3: config says 1, runtime uses 4).
             # For PP, draft layers are only on the last rank (see
             # get_pp_layers), so only that rank should include draft cost.
-            effective_draft_config = self._get_effective_draft_config()
+            # _get_draft_kv_model_config(), not _get_effective_draft_config():
+            # the cost charged here must be the cost of the pool that
+            # _create_one_model_draft_kv_cache_manager actually allocates.
+            effective_draft_config = self._get_draft_kv_model_config()
             draft_kv_cache_config = self._get_one_model_draft_kv_cache_config(
                 kv_cache_config, self._max_seq_len)
             # Resolve draft manager class from draft config — may differ
@@ -996,18 +1061,22 @@ class KvCacheCreator:
                 draft_kv_cache_config)
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
-                return self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                                    effective_draft_config,
-                                                    draft_kv_cache_config,
-                                                    is_draft=True)
+                return scaled(
+                    self._per_manager_cache_cost(draft_kv_cache_manager_cls,
+                                                 effective_draft_config,
+                                                 draft_kv_cache_config,
+                                                 mapping=draft_mapping,
+                                                 is_draft=True))
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
-                return self._per_manager_cache_cost(
-                    draft_kv_cache_manager_cls,
-                    effective_draft_config,
-                    draft_kv_cache_config,
-                    num_layers=self._get_num_draft_layers(),
-                    is_draft=True)
+                return scaled(
+                    self._per_manager_cache_cost(
+                        draft_kv_cache_manager_cls,
+                        effective_draft_config,
+                        draft_kv_cache_config,
+                        mapping=draft_mapping,
+                        num_layers=self._get_num_draft_layers(),
+                        is_draft=True))
         return None
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
@@ -1774,10 +1843,18 @@ class KvCacheCreator:
         """
         if not self._is_kv_cache_manager_v2:
             return False
-        if not getattr(self._kv_cache_manager_cls,
-                       "_supports_reuse_match_backoff", False):
+        lookahead = draft_prompt_lookahead(self._speculative_config)
+        if lookahead is None:
             return False
-        return draft_prompt_lookahead(self._speculative_config) is not None
+        if lookahead > 0 and not getattr(self._kv_cache_manager_cls,
+                                         "_supports_reuse_match_backoff",
+                                         False):
+            # The opt-out is about backing the match off by `lookahead` tokens,
+            # which a specialized commit/history protocol (recurrent snapshots,
+            # DSA) cannot express. A zero span asks for no backoff at all, so
+            # every backoff-sized path stays a no-op and the pairing is safe.
+            return False
+        return True
 
     def _get_effective_draft_config(self) -> ModelConfig:
         """
@@ -1795,6 +1872,53 @@ class KvCacheCreator:
         # model's config describes the correct KV cache layout for the draft
         # layers as well.
         return self._model_engine.model.model_config
+
+    def _get_draft_kv_model_config(self) -> ModelConfig:
+        """The draft ModelConfig describing the KV pool as it is ALLOCATED.
+
+        The args-level ``kv_cache_config.dtype`` sync stamps the TARGET's fp8 KV
+        algo onto every loaded model, including a standalone drafter. The drafter
+        stores and reads its pool in its weights dtype (DFlash validates a bf16 pool
+        and otherwise falls back to the max_seq_len-dense private arena, which OOMs at
+        long context), so the pool dtype must follow the drafter.
+
+        Every consumer of draft KV bytes must go through here. If the budget split
+        and the allocation read different dtypes, the split charges fp8 bytes for a
+        bf16 pool and the draft manager gets HALF the target's tokens. The capacity
+        scheduler admits on the target pool alone, so past ~50% target utilization it
+        raises "Draft KV cache context resize failed", fatal to every rank.
+        """
+        effective_draft_config = self._get_effective_draft_config()
+        # Narrower than is_external_drafter(), matching
+        # _should_create_separate_draft_kv_cache. PARD and DRAFT_TARGET_ONE_MODEL
+        # reach here too and can carry a genuine fp8 KV algo of their own, which
+        # dtype="auto" keeps; dropping it would allocate bf16 under attention
+        # modules that still read and write fp8.
+        spec_dec_mode = self._speculative_config.spec_dec_mode
+        if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
+            return effective_draft_config
+        quant_config = getattr(effective_draft_config, "quant_config", None)
+        if quant_config is None or not quant_config.quant_mode.has_fp8_kv_cache(
+        ):
+            return effective_draft_config
+        logger.info(
+            "External drafter KV pool keeps the drafter dtype; dropping "
+            "the fp8 KV quant algo inherited from the target.")
+        neutral_quant = copy.copy(quant_config)
+        neutral_quant.kv_cache_quant_algo = None
+        # QuantConfig.quant_mode and .layer_quant_mode are both cached_property
+        # and the copy carries the already-computed caches, so BOTH must be
+        # dropped for the mutation to take: _create_kv_cache_manager reads
+        # quant_mode off this copy, and layer_quant_mode is the pair's other
+        # half, stale in the same way.
+        neutral_quant.__dict__.pop("quant_mode", None)
+        neutral_quant.__dict__.pop("layer_quant_mode", None)
+        # No _frozen dance: ModelConfig.__setattr__ exempts quant_config by
+        # name, and restoring _frozen to True would freeze a copy whose source
+        # may not have been frozen.
+        effective_draft_config = copy.copy(effective_draft_config)
+        effective_draft_config.quant_config = neutral_quant
+        return effective_draft_config
 
     def _get_num_draft_layers(self) -> int:
         """Return the actual number of draft KV cache layers.
@@ -1852,8 +1976,11 @@ class KvCacheCreator:
         spec_dec_layer_mask = self._get_one_model_draft_layer_mask()
 
         # Get the effective draft config (explicit draft_config if available,
-        # otherwise fall back to target model config for MTP).
-        effective_draft_config = self._get_effective_draft_config()
+        # otherwise fall back to target model config for MTP), with the
+        # target's inherited fp8 KV algo dropped for a standalone drafter. The
+        # budget split in _get_kv_size_per_token resolves it through the SAME
+        # helper, so the bytes/token it charges match the pool allocated here.
+        effective_draft_config = self._get_draft_kv_model_config()
 
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
@@ -1898,12 +2025,20 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
+        # Under helix the standalone drafter is built against the repurposed
+        # mapping (CP ranks become TP ranks) and every rank keeps its full
+        # drafter KV, so its paged manager needs the CP-free mapping: the
+        # round-robin ledger applies to the TARGET KV alone, and
+        # KVCacheManagerV2 rejects is_draft x helix outright.
+        draft_mapping = self._mapping
+        if draft_mapping.has_cp_helix():
+            draft_mapping = draft_mapping.repurpose_helix_cp_to_tp()
         return _create_kv_cache_manager(
             model_engine=None,
             max_cuda_graph_batch_size=self._model_engine.
             _max_cuda_graph_batch_size,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
-            mapping=self._mapping,
+            mapping=draft_mapping,
             kv_cache_config=draft_kv_config,
             tokens_per_block=self._tokens_per_block,
             max_seq_len=max_seq_len,
@@ -3254,7 +3389,7 @@ def validate_kv_cache_compression_compatibility(
         if config.quant == "nvfp4" and not is_sm_100f():
             raise RuntimeError(
                 "NVFP4 cold-page quantization requires an SM100-family device "
-                "(SM100 or SM103).")
+                "(SM100, SM103 or SM107).")
     elif config.algorithm == "triattention" and not is_sm_100f():
         raise RuntimeError(
             "TriAttention requires an SM100-family device (SM100 or SM103).")

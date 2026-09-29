@@ -18,9 +18,9 @@ Replace `x.y.z` with the desired version tag. The [available tags on NGC](https:
 include both regular and `.dev` nightly releases.
 
 ```bash
-docker pull nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc28
+docker pull nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc29
 
-docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc28
+docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc29
 ```
 
 {{container_tag_admonition}}
@@ -58,7 +58,7 @@ driver version. For additional information, refer to the [CUDA Forward Compatibi
 
 ```bash
 # By default, the PyTorch CUDA 13.0 package is installed. Install the PyTorch CUDA 13.2 package instead to better align with the CUDA version used to build the TensorRT LLM wheels.
-pip3 install torch==2.13.0 torchvision --index-url https://download.pytorch.org/whl/cu132
+pip3 install torch==2.14.0 torchvision --index-url https://download.pytorch.org/whl/cu132
 
 sudo apt-get -y install libopenmpi-dev
 
