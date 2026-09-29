@@ -37,8 +37,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine, _PrefillCompiledModel
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
-from tensorrt_llm._torch.speculative.utils import update_draft_len
+from tensorrt_llm._torch.speculative.utils import resolve_draft_len, update_draft_len
 from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (
@@ -289,7 +290,6 @@ def test_prefill_compile_scopes_whole_model_forward(
     engine = SimpleNamespace(
         _model_caller=ModelCaller(model, prefill_compile_only=prefill_only),
         _eager_workspace_reclaimer=None,
-        is_warmup=False,
     )
     monkeypatch.setattr(model_call_module, "get_model_extra_attrs", lambda: {})
     monkeypatch.setattr(
@@ -299,9 +299,12 @@ def test_prefill_compile_scopes_whole_model_forward(
     with torch_compiling(True):
         if raises:
             with pytest.raises(RuntimeError, match="epilogue failure"):
-                PyTorchModelEngine.model_forward(engine, attn_metadata=Mock())
+                PyTorchModelEngine.model_forward(engine, is_dummy=False, attn_metadata=Mock())
         else:
-            assert PyTorchModelEngine.model_forward(engine, attn_metadata=Mock()) == "done"
+            assert (
+                PyTorchModelEngine.model_forward(engine, is_dummy=False, attn_metadata=Mock())
+                == "done"
+            )
         assert is_torch_compiling()
     expected = eligible if prefill_only else True
     assert observed == [expected] * (1 if raises else 2)
@@ -348,7 +351,6 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
         _warmup_timer=_WarmupTimer(rank=0),
-        is_warmup=True,
         cuda_graph_runner=SimpleNamespace(enabled=True),
         model=SimpleNamespace(
             modules=lambda: [
@@ -375,7 +377,10 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
         _should_run_warmup_batch=Mock(return_value=True),
         _release_megamoe_profiling_scratch=Mock(),
-        forward=Mock(),
+        enable_spec_decode=False,
+        spec_config=None,
+        max_draft_len=0,
+        _forward_warmup=Mock(),
     )
     engine._model_caller = ModelCaller(engine.model, prefill_compile_only=prefill_only)
     cache = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
@@ -392,7 +397,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
     monkeypatch.setattr(model_call_module, "get_model_extra_attrs", lambda: {})
     monkeypatch.setattr(model_call_module, "is_trace_enabled", lambda name: False)
 
-    def forward(batch: Mock, **kwargs: object) -> torch.Tensor:
+    def forward(batch: Mock, *args: object, **kwargs: object) -> torch.Tensor:
         # Stand in for input preparation, but use the real model-call compile scope
         # and linear dispatch for each prefill/generation warmup batch.
         monkeypatch.setattr(
@@ -400,9 +405,9 @@ def test_compiled_mxfp8_warmup_backend_selection(
             "get_per_request_prefill_cuda_graph_flag",
             lambda: batch.num_gen_requests == 0,
         )
-        return PyTorchModelEngine.model_forward(engine, attn_metadata=batch)
+        return PyTorchModelEngine.model_forward(engine, is_dummy=True, attn_metadata=batch)
 
-    engine.forward.side_effect = forward
+    engine._forward_warmup.side_effect = forward
     with torch_compiling(compile_enabled):
         PyTorchModelEngine._run_autotuner_warmup(engine, resources)
         assert is_torch_compiling() is compile_enabled
@@ -415,19 +420,23 @@ def test_compiled_mxfp8_warmup_backend_selection(
     assert method._native_autotuned
     assert method._flashinfer_autotuned == flashinfer_expected
     assert flashinfer_tune.call_count == int(flashinfer_expected)
-    assert engine.forward.call_count == (4 if flashinfer_expected else 2)
+    assert engine._forward_warmup.call_count == (4 if flashinfer_expected else 2)
+    assert engine._forward_warmup.call_args.kwargs == {
+        "enable_spec_decode": False,
+        "runtime_draft_len": 0,
+    }
     expected_flashinfer_calls = (
         (4 if expected_backend == "flashinfer" else (1 if prefill_only else 2))
         if flashinfer_expected
         else 0
     )
     assert flashinfer_gemm.call_count == expected_flashinfer_calls
-    assert native_gemm.call_count == engine.forward.call_count - expected_flashinfer_calls
+    assert native_gemm.call_count == (engine._forward_warmup.call_count - expected_flashinfer_calls)
     assert os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND") == backend
 
 
 @pytest.mark.parametrize("config_cls", [DraftTargetDecodingConfig, PARDDecodingConfig])
-def test_warmup_overrides_dynamic_draft_length(config_cls):
+def test_warmup_draft_length_resolution_leaves_engine_length(config_cls):
     config = config_cls(max_draft_len=3, speculative_model="dummy", draft_len_schedule={1: 3, 4: 2})
     engine = SimpleNamespace(
         spec_config=config,
@@ -444,20 +453,34 @@ def test_warmup_overrides_dynamic_draft_length(config_cls):
     ]
     batch = SimpleNamespace(batch_size=2, generation_requests=requests)
 
-    # Normal iteration selects K=2. Each explicit warmup shape must then
-    # update both the engine and buffers, even when the batch size is unchanged.
+    def resolve(**kwargs):
+        return resolve_draft_len(config, batch, max_draft_len=3, static_draft_len=3, **kwargs)
+
+    # Normal iteration selects K=2 and stores it on the engine.
     update_draft_len(engine, batch)
     assert engine.runtime_draft_len == 2
     assert all(request.py_draft_tokens[:2] == [7, 8] for request in requests)
+    # Each explicit warmup shape resynchronizes the buffers and returns its
+    # length, even when the batch size is unchanged, without touching the engine.
     for draft_len in (0, 3, 1):
-        update_draft_len(engine, batch, draft_len=draft_len)
-        assert engine.runtime_draft_len == draft_len
+        assert resolve(draft_len=draft_len) == draft_len
+        assert engine.runtime_draft_len == 2
         assert all(
             len(request.py_draft_tokens) == config.get_runtime_tokens_per_gen_step(draft_len) - 1
             for request in requests
         )
-    update_draft_len(engine, batch)
-    assert engine.runtime_draft_len == 2
+    assert resolve() == 2
+    assert resolve(speculation_permanently_disabled=True) == 0
+    assert all(request.py_draft_tokens == [] for request in requests)
+
+
+def test_static_draft_length_resolution_preserves_proposals():
+    request = SimpleNamespace(py_draft_tokens=[7], py_needs_onehot_draft_probs=False)
+    batch = SimpleNamespace(batch_size=1, generation_requests=[request])
+
+    assert resolve_draft_len(None, batch, max_draft_len=3, static_draft_len=5) == 5
+    assert request.py_draft_tokens == [7]
+    assert not request.py_needs_onehot_draft_probs
 
 
 # Minimal fixtures mirroring sibling test_pytorch_model_engine.py — duplicated
@@ -546,7 +569,7 @@ def _build_engine_and_resource_manager():
 @pytest.mark.parametrize(
     "draft_len", [None, 0, 3, 1], ids=["general", "cuda_graph_0", "cuda_graph_3", "cuda_graph_1"]
 )
-def test_warmup_builders_resynchronize_stale_draft_length(
+def test_warmup_builders_resynchronize_stale_draft_buffers(
     config_cls: type[DecodingBaseConfig], draft_len: int | None
 ) -> None:
     config = config_cls(max_draft_len=3, speculative_model="dummy", draft_len_schedule={1: 3, 4: 2})
@@ -557,7 +580,8 @@ def test_warmup_builders_resynchronize_stale_draft_length(
     engine.max_draft_loop_tokens = engine.max_total_draft_tokens
     engine.get_runtime_tokens_per_gen_step = config.get_runtime_tokens_per_gen_step
     # Profiling a batch of two leaves K=2; every requested warmup shape below
-    # differs from that value and must synchronize the real engine and requests.
+    # differs from that value and must synchronize the requests, while the
+    # engine keeps the serving value.
     engine.runtime_draft_len = 2
     batch_size = 2
 
@@ -577,12 +601,57 @@ def test_warmup_builders_resynchronize_stale_draft_length(
     with engine._release_batch_context(warmup_request, resource_manager) as batch:
         assert batch is not None
         assert len(batch.generation_requests) == batch_size
-        assert engine.runtime_draft_len == expected_draft_len
+        assert engine.runtime_draft_len == 2
         expected_buffer_width = config.get_runtime_tokens_per_gen_step(expected_draft_len) - 1
         assert all(
             len(request.py_draft_tokens) == expected_buffer_width
             for request in batch.generation_requests
         )
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
+    engine, resource_manager = _build_engine_and_resource_manager()
+    assert not engine.is_spec_decode
+    # Serving values that differ from every captured shape below.
+    engine.enable_spec_decode = True
+    engine.runtime_draft_len = 5
+    batches = {}
+
+    def create_request(resources, batch_size, draft_len, *args, **kwargs):
+        return batches.setdefault(draft_len, ScheduledRequests())
+
+    forward_warmup = Mock(side_effect=RuntimeError("capture failure") if fails else None)
+    with (
+        patch.object(engine, "_get_graphs_to_capture", return_value=[(1, 0), (1, 2)]),
+        patch.object(engine, "_create_cuda_graph_warmup_request", side_effect=create_request),
+        patch.object(
+            engine,
+            "_release_batch_context",
+            side_effect=lambda request, resources: contextlib.nullcontext(request),
+        ),
+        patch.object(engine, "_forward_warmup", forward_warmup),
+    ):
+        if fails:
+            with pytest.raises(RuntimeError, match="capture failure"):
+                engine._capture_generation_cuda_graphs(resource_manager)
+        else:
+            engine._capture_generation_cuda_graphs(resource_manager)
+
+    expected_calls = [
+        call(batches[2], resource_manager, enable_spec_decode=True, runtime_draft_len=2)
+    ]
+    if not fails:
+        expected_calls.append(
+            call(batches[0], resource_manager, enable_spec_decode=False, runtime_draft_len=0)
+        )
+    assert forward_warmup.call_args_list == expected_calls
+    assert engine.runtime_draft_len == 5
+    # Successful capture ends in the engine default; a failed one keeps the
+    # serving value it started with.
+    expected_enable_spec_decode = True if fails else engine.is_spec_decode
+    assert engine.enable_spec_decode is expected_enable_spec_decode
+    assert engine._force_lora_graph_for_capture is None
 
 
 class _Tracker:
@@ -911,7 +980,10 @@ class TestWarmupCleanup(unittest.TestCase):
                 ),
                 _should_run_warmup_batch=Mock(return_value=True),
                 _release_megamoe_profiling_scratch=Mock(),
-                forward=Mock(side_effect=lambda *args, **kwargs: calls.append("forward")),
+                enable_spec_decode=False,
+                spec_config=None,
+                max_draft_len=0,
+                _forward_warmup=Mock(side_effect=lambda *args, **kwargs: calls.append("forward")),
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
@@ -1026,7 +1098,10 @@ class TestWarmupCleanup(unittest.TestCase):
                 ),
                 _should_run_warmup_batch=Mock(return_value=False),
                 _release_megamoe_profiling_scratch=Mock(),
-                forward=Mock(),
+                enable_spec_decode=False,
+                spec_config=None,
+                max_draft_len=0,
+                _forward_warmup=Mock(),
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
@@ -1063,7 +1138,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertEqual(method.backend, "trtllm")
         self.assertFalse(method._flashinfer_autotuned)
         sync_tactics.assert_not_called()
-        engine.forward.assert_not_called()
+        engine._forward_warmup.assert_not_called()
 
     @pytest.mark.cpu_only
     def test_flashinfer_mxfp8_rank_mismatch_falls_back_before_warmup(self):
@@ -1119,7 +1194,10 @@ class TestWarmupCleanup(unittest.TestCase):
                 _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
                 _should_run_warmup_batch=Mock(return_value=True),
                 _release_megamoe_profiling_scratch=Mock(),
-                forward=Mock(),
+                enable_spec_decode=False,
+                spec_config=None,
+                max_draft_len=0,
+                _forward_warmup=Mock(),
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
@@ -1149,7 +1227,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertFalse(method._flashinfer_autotuned)
         sync_tactics.assert_called_once_with(tuner)
         flashinfer_module.autotune.assert_not_called()
-        self.assertEqual(engine.forward.call_count, 1)
+        self.assertEqual(engine._forward_warmup.call_count, 1)
 
     @pytest.mark.cpu_only
     def test_native_mxfp8_respects_disabled_global_autotuner(self):
