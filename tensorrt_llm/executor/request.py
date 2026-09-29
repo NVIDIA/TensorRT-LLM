@@ -125,8 +125,10 @@ class GenerationRequest:
                 if isinstance(prompt_token_ids, torch.Tensor):
                     prompt_token_ids = prompt_token_ids.cpu().numpy()
                 self._prompt_token_ids = None
-                self._prompt_token_ids_i32 = np.ascontiguousarray(
-                    prompt_token_ids, dtype=np.int32)
+                # Always a copy: the caller may reuse or mutate its array.
+                self._prompt_token_ids_i32 = np.array(prompt_token_ids,
+                                                      dtype=np.int32,
+                                                      order="C")
             else:
                 self.prompt_token_ids = prompt_token_ids.tolist()
         else:

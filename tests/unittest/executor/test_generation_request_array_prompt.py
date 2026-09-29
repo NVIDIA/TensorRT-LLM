@@ -38,6 +38,14 @@ def test_flat_array_prompt_round_trips_through_pickle_without_a_list():
     assert clone.prompt_token_ids == ids.tolist()
 
 
+def test_array_prompt_is_snapshotted_at_construction():
+    ids = _ids()
+    req = GenerationRequest(prompt_token_ids=ids, sampling_params=SamplingParams(max_tokens=1))
+    ids[:] = 0
+    np.testing.assert_array_equal(req.__dict__["_prompt_token_ids_i32"], _ids())
+    assert req.prompt_token_ids == _ids().tolist()
+
+
 def test_list_and_2d_array_prompts_are_unchanged():
     req = GenerationRequest(
         prompt_token_ids=[3, 4, 5], sampling_params=SamplingParams(max_tokens=1)
