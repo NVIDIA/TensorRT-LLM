@@ -2295,6 +2295,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     documents=request.documents,
                     chat_template=request.chat_template or self.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
+                    injected_chat_template_kwargs=request.
+                    injected_chat_template_kwargs,
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
@@ -2815,6 +2817,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     documents=request.documents,
                     chat_template=request.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
+                    injected_chat_template_kwargs=request.
+                    injected_chat_template_kwargs,
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
