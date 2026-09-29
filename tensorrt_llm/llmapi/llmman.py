@@ -43,6 +43,10 @@ DEFAULT_PORT = 17434
 
 PROBE_TIMEOUT_SECONDS = 5
 
+# Per-read socket timeout for /api/pull. Not a cap on total pull time; it only
+# needs to exceed the longest silence between streamed progress lines.
+PULL_IDLE_TIMEOUT_SECONDS = 300
+
 
 def _connectable_host(host: str) -> str:
     """Rewrite a wildcard bind host to its loopback equivalent."""
@@ -133,7 +137,7 @@ def pull(base: str, reference: str, progress: Optional[ProgressCallback] = None)
 
     succeeded = False
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=PULL_IDLE_TIMEOUT_SECONDS) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"llmman pull of {reference!r} failed: HTTP {resp.status}")
             for raw_line in resp:
@@ -160,6 +164,11 @@ def pull(base: str, reference: str, progress: Optional[ProgressCallback] = None)
         raise RuntimeError(f"llmman pull of {reference!r} failed: HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"llmman pull of {reference!r} failed: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"llmman pull of {reference!r} timed out: no data from {base} "
+            f"for {PULL_IDLE_TIMEOUT_SECONDS}s"
+        ) from exc
 
     if not succeeded:
         raise RuntimeError(f"llmman pull of {reference!r} ended without reporting success")

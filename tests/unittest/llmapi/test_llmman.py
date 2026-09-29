@@ -28,6 +28,8 @@ class _FakeDaemon:
         self.version = {"version": "0.1.0", "pid": 1}
         self.pull_body = _ndjson({"status": "success"})
         self.pull_status = 200
+        self.stall_pull = False
+        self.release = threading.Event()
         self.last_request = None
         daemon = self
 
@@ -49,6 +51,13 @@ class _FakeDaemon:
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0))
                 daemon.last_request = json.loads(self.rfile.read(length))
+                if daemon.stall_pull:
+                    # Accept the request, send headers, then go silent.
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.flush()
+                    daemon.release.wait(10)
+                    return
                 self._send(daemon.pull_status, daemon.pull_body, "application/x-ndjson")
 
         self._server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
@@ -56,6 +65,7 @@ class _FakeDaemon:
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
 
     def close(self):
+        self.release.set()
         self._server.shutdown()
         self._server.server_close()
 
@@ -93,6 +103,26 @@ def test_pull_succeeds_and_forwards_progress(daemon):
 
     assert daemon.last_request == {"model": "ghcr.io/org/model:tag"}
     assert seen == [("pulling manifest", 0, 0), ("pulling blobs", 50, 100)]
+
+
+def test_pull_passes_an_idle_timeout_to_urlopen(daemon, monkeypatch):
+    seen = {}
+    real_urlopen = llmman.urllib.request.urlopen
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real_urlopen(*args, **kwargs)
+
+    monkeypatch.setattr(llmman.urllib.request, "urlopen", spy)
+    llmman.pull(daemon.url, "ref")
+    assert seen["timeout"] == llmman.PULL_IDLE_TIMEOUT_SECONDS
+
+
+def test_pull_fails_when_the_daemon_goes_silent(daemon, monkeypatch):
+    monkeypatch.setattr(llmman, "PULL_IDLE_TIMEOUT_SECONDS", 0.2)
+    daemon.stall_pull = True
+    with pytest.raises(RuntimeError, match="timed out"):
+        llmman.pull(daemon.url, "ref")
 
 
 def test_reports_an_in_band_error_at_http_200(daemon):
