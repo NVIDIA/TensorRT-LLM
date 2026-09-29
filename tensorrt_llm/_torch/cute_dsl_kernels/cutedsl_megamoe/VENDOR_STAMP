@@ -1,5 +1,9 @@
 upstream: https://gitlab-master.nvidia.com/jintaop/cutedsl_megamoe/-/tree/megamoe-dynamic-loadbalance-PR
 commit: 522fbb019942ad6bbe0f418dba02541f837ea46c
+project: CuTe DSL MegaMoE
+original_authors: Bangyu Shen <bangyus@nvidia.com>; Aragorn Guan <aragorng@nvidia.com>; Hao Sheng <hsheng@nvidia.com>; Yuhan Li <alel@nvidia.com>; Yucheng Yan <yuchengy@nvidia.com>; XingFei Xi <xxi@nvidia.com>; Shawn Wang <shawnwan@nvidia.com>
+dynamic_load_balance_author: Jintao Peng <jintaop@nvidia.com>
+license: per-file SPDX declarations (BSD-3-Clause where declared)
 source_tree_dirty: false
 kind: inference closure
 downstream_modified: true
