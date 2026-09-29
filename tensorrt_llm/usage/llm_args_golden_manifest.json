@@ -1756,6 +1756,7 @@
       "allowed_values": [
         "unknown",
         "llm_class",
+        "visual_gen_class",
         "cli_serve",
         "cli_bench",
         "cli_eval",

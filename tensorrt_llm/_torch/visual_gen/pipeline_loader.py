@@ -225,6 +225,7 @@ class PipelineLoader:
         Returns:
             Loaded pipeline (WanPipeline, FluxPipeline, etc.) - type auto-detected
         """
+        telemetry_start = time.perf_counter()
         checkpoint_dir = checkpoint_dir or self.args.model
         if not checkpoint_dir:
             raise ValueError("checkpoint_dir must be provided or set in VisualGenArgs")
@@ -348,11 +349,29 @@ class PipelineLoader:
         if getattr(pipeline, "transformer", None) is not None:
             pipeline._setup_cache_acceleration()
 
+        warmup_start = time.perf_counter()
         if not skip_warmup:
             pipeline.warmup()
             logger.info(f"Warmup completed in {time.time() - t0:.2f}s")
         else:
             logger.info("Warmup skipped (skip_warmup=True)")
+
+        try:
+            pipeline._telemetry_load_duration_sec = min(
+                warmup_start - telemetry_start, 4_294_967_295
+            )
+            pipeline._telemetry_warmup_duration_sec = (
+                min(time.perf_counter() - warmup_start, 4_294_967_295) if not skip_warmup else 0.0
+            )
+            pipeline._telemetry_checkpoint_format = (
+                "single_safetensors"
+                if "monolithic_safetensors_config" in config.extra_attrs
+                else "diffusers"
+                if os.path.isdir(checkpoint_dir)
+                else "other"
+            )
+        except Exception:
+            pass  # Optional metadata must not interfere with pipeline loading.
 
         if config.enable_layerwise_nvtx_marker:
             from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker

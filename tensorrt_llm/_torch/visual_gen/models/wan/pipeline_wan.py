@@ -122,6 +122,8 @@ _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES = (
     ],
     doc="Wan 2.1 & 2.2 text-to-video family.",
     supports_nvfp4_vae=True,
+    modality="video",
+    telemetry_safe=True,
 )
 class WanPipeline(BasePipeline):
     def __init__(self, pipeline_config):

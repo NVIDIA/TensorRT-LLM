@@ -20,7 +20,7 @@ Follows: VisualGenArgs → PipelineLoader → DiffusionPipelineConfig → AutoPi
 All pipelines (Wan, Flux, Flux2, LTX2, QwenImage) register via @register_pipeline decorator.
 
 The registry value is a private ``_PipelineEntry`` dataclass that carries
-the pipeline class plus four pieces of per-family metadata:
+the pipeline class plus per-family metadata:
 
   * ``hf_ids``  — canonical HuggingFace model IDs that dispatch to this
                   pipeline. Powers ``VisualGen.supported_models()`` and
@@ -33,6 +33,8 @@ the pipeline class plus four pieces of per-family metadata:
                             that contain multiple checkpoint formats/variants.
   * ``doc``     — short human-readable description for discovery tooling.
   * ``supports_nvfp4_vae`` — whether this family can execute an NVFP4 VAE.
+  * ``modality`` — bounded pipeline capability used by telemetry and discovery.
+  * ``telemetry_safe`` — explicit opt-in for transmitting public registry metadata.
 
 The dataclass and the registry itself are deliberately private — users go
 through ``VisualGenArgs(model=...)``, ``VisualGen.supported_models()``,
@@ -46,7 +48,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Type
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -81,6 +83,16 @@ class PipelineComponent(str, Enum):
     VISION_LANGUAGE_ENCODER = "vision_language_encoder"
 
 
+VisualGenModality = Literal[
+    "image",
+    "video",
+    "video_audio",
+    "layered_image",
+    "mixed",
+    "unknown",
+]
+
+
 @dataclass
 class _PipelineEntry:
     """Private per-pipeline-family metadata stored in PIPELINE_REGISTRY."""
@@ -91,6 +103,8 @@ class _PipelineEntry:
     download_patterns: List[str] = field(default_factory=list)
     doc: str = ""
     supports_nvfp4_vae: bool = False
+    modality: VisualGenModality = "unknown"
+    telemetry_safe: bool = False
 
 
 # Keyed by Diffusers ``_class_name`` (from either manifest format). ~3-5 entries
@@ -107,6 +121,8 @@ def register_pipeline(
     download_patterns: Optional[List[str]] = None,
     doc: str = "",
     supports_nvfp4_vae: bool = False,
+    modality: VisualGenModality = "unknown",
+    telemetry_safe: bool = False,
 ) -> Callable[[Type["BasePipeline"]], Type["BasePipeline"]]:
     """Register a pipeline class with optional per-family metadata.
 
@@ -121,6 +137,8 @@ def register_pipeline(
             defaults={"text_encoder_path": ""},
             download_patterns=["model_index.json", "transformer/*"],
             doc="Lightricks LTX-Video family.",
+            modality="video_audio",
+            telemetry_safe=True,
         )
         class LTX2Pipeline(BasePipeline):
             ...
@@ -141,6 +159,8 @@ def register_pipeline(
             download_patterns=list(download_patterns or []),
             doc=doc,
             supports_nvfp4_vae=supports_nvfp4_vae,
+            modality=modality,
+            telemetry_safe=telemetry_safe,
         )
         logger.debug(f"Registered pipeline: {name} -> {cls.__name__}")
         return cls
@@ -179,8 +199,15 @@ class AutoPipeline:
 
         logger.info(f"AutoPipeline: Creating {pipeline_class.__name__} from {checkpoint_dir}")
 
-        # Instantiate pipeline with DiffusionPipelineConfig
-        return pipeline_class(config)
+        # Preserve the allowlisted registry key separately from the resolved
+        # runtime class (a pipeline may select a specialized variant).
+        pipeline = pipeline_class(config)
+        if entry.telemetry_safe:
+            try:
+                pipeline._telemetry_pipeline_class_name = class_name
+            except Exception as exc:
+                logger.debug(f"Could not attach pipeline telemetry metadata: {exc}")
+        return pipeline
 
     @staticmethod
     def _validate_vae_quantization(

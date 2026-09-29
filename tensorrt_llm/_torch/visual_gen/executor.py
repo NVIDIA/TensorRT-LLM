@@ -20,10 +20,13 @@ import zmq
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi.utils import configure_cpu_affinity
 from tensorrt_llm.logger import logger
+from tensorrt_llm.usage.visual_gen import record as _record_visual_gen
+from tensorrt_llm.usage.visual_gen import request_shape
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 if TYPE_CHECKING:
@@ -50,6 +53,132 @@ _start_coordinator_watchdog = start_coordinator_watchdog
 # Default cap on the size of the iteration-stats snapshot buffer used by the
 # /metrics endpoint.  Mirrors the LLM ``iter_stats_max_iterations`` default.
 _DEFAULT_ITER_STATS_MAX = 1000
+_TELEMETRY_TRANSFORMER_COMPONENTS = frozenset(("transformer", "transformer_2"))
+
+
+def _visual_gen_launch_metadata(
+    external_launch: Optional[Tuple[int, int, int, str, int]],
+) -> Tuple[str, int]:
+    """Return a bounded launch mode and best-known deployment node count."""
+    if external_launch is None:
+        return "local_spawn", 1
+
+    if "SLURM_PROCID" in os.environ:
+        launch_mode = "slurm"
+        node_count_value = os.environ.get("SLURM_NNODES")
+    else:
+        launch_mode = "torchrun"
+        node_count_value = os.environ.get("GROUP_WORLD_SIZE")
+
+    try:
+        node_count = int(node_count_value) if node_count_value is not None else 0
+    except ValueError:
+        node_count = 0
+    if node_count <= 0:
+        try:
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
+            world_size = external_launch[2]
+            node_count = (world_size + local_world_size - 1) // local_world_size
+        except (TypeError, ValueError, ZeroDivisionError):
+            node_count = 0
+    return launch_mode, max(node_count, 0)
+
+
+def _quant_algo_name(quant_config: Any) -> str:
+    """Return a bounded enum label from a resolved component config."""
+    quant_algo = getattr(quant_config, "quant_algo", None)
+    if quant_algo is None:
+        return ""
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    return quant_algo.name if isinstance(quant_algo, QuantAlgo) else "other"
+
+
+def _visual_gen_telemetry_metadata(pipeline: Any, args: VisualGenArgs) -> Dict[str, Any]:
+    """Build bounded READY metadata from the successfully loaded pipeline."""
+    defaults: Dict[str, Any] = {
+        "model_id": "other",
+        "pipeline_class_name": "other",
+        "resolved_pipeline_class": "other",
+        "modality": "unknown",
+        "quantization_algo": "",
+        "dynamic_weight_quant": False,
+        "quantized_components": [],
+    }
+    try:
+        pipeline_class_name = getattr(pipeline, "_telemetry_pipeline_class_name", "other")
+        entry = PIPELINE_REGISTRY.get(pipeline_class_name)
+        if entry is None or not entry.telemetry_safe:
+            pipeline_class_name = "other"
+            entry = None
+
+        resolved_entry = next(
+            (
+                candidate
+                for candidate in PIPELINE_REGISTRY.values()
+                if candidate.telemetry_safe and type(pipeline) is candidate.pipeline_cls
+            ),
+            None,
+        )
+        resolved_pipeline_class = type(pipeline).__name__ if resolved_entry is not None else "other"
+
+        model_id = "other"
+        if any(
+            candidate.telemetry_safe and args.model in candidate.hf_ids
+            for candidate in PIPELINE_REGISTRY.values()
+        ):
+            model_id = args.model
+
+        pipeline_config = pipeline.pipeline_config
+        quantized_components = []
+        quantization_algos = []
+        for component in pipeline.transformer_components:
+            if component not in _TELEMETRY_TRANSFORMER_COMPONENTS:
+                continue
+            component_quant = pipeline_config.get_quant_config(component)
+            quantization_algo = _quant_algo_name(component_quant)
+            if quantization_algo:
+                quantized_components.append(component)
+                if quantization_algo not in quantization_algos:
+                    quantization_algos.append(quantization_algo)
+
+        if len(quantization_algos) == 1:
+            quantization_algo = quantization_algos[0]
+        elif quantization_algos:
+            quantization_algo = "mixed"
+        else:
+            quantization_algo = ""
+
+        defaults.update(
+            model_id=model_id,
+            pipeline_class_name=pipeline_class_name,
+            resolved_pipeline_class=resolved_pipeline_class,
+            modality=entry.modality if entry is not None else "unknown",
+            quantization_algo=quantization_algo,
+            dynamic_weight_quant=bool(pipeline_config.dynamic_weight_quant),
+            quantized_components=quantized_components,
+            components_present={
+                label: any(
+                    getattr(pipeline, attribute, None) is not None for attribute in attributes
+                )
+                for label, attributes in (
+                    ("vae", ("vae", "video_decoder")),
+                    ("textEncoder", ("text_encoder",)),
+                    ("textEncoder2", ("text_encoder_2",)),
+                    ("textEncoder3", ("text_encoder_3",)),
+                    ("audioVae", ("audio_vae", "audio_decoder")),
+                    ("vocoder", ("vocoder",)),
+                )
+            },
+            transformer_count=min(len(pipeline.transformer_components), 4_294_967_295),
+            checkpoint_format=getattr(pipeline, "_telemetry_checkpoint_format", "other"),
+            pipeline_load_duration_sec=getattr(pipeline, "_telemetry_load_duration_sec", 0.0),
+            warmup_duration_sec=getattr(pipeline, "_telemetry_warmup_duration_sec", 0.0),
+        )
+    except Exception:
+        # Telemetry metadata is optional and must never disrupt worker startup.
+        pass
+    return defaults
 
 
 def _reap_worker_process(process: mp.Process) -> bool:
@@ -155,6 +284,7 @@ class _IterationStatsTracker:
 
     def __init__(self, maxlen: int = _DEFAULT_ITER_STATS_MAX):
         self._iter = 0
+        self._telemetry_queued = 0
         self._buffer: deque = deque(maxlen=maxlen)
         self._lock = threading.Lock()
         # Set of request ids that have been pushed onto the worker queue but
@@ -184,6 +314,7 @@ class _IterationStatsTracker:
     def _snapshot_locked(self, num_queued_requests: int) -> Dict:
         """Build a snapshot dict (caller must hold ``self._lock``)."""
         self._iter += 1
+        _record_visual_gen("queue", num_queued_requests, len(self._active_request_ids))
         return {
             "iter": self._iter,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -194,6 +325,12 @@ class _IterationStatsTracker:
             "currentRequestStepIdx": self._current_request_step_idx,
         }
 
+    def record_telemetry_enqueue(self) -> None:
+        """Observe accepted work before the dispatcher can remove it from the queue."""
+        with self._lock:
+            self._telemetry_queued += 1
+            _record_visual_gen("queue", self._telemetry_queued, len(self._active_request_ids))
+
     def record_enqueue(self, num_queued_requests: int) -> None:
         """Append a snapshot reflecting an enqueue event."""
         with self._lock:
@@ -203,6 +340,7 @@ class _IterationStatsTracker:
         """Append a snapshot reflecting a request being dispatched to workers."""
         with self._lock:
             if request_id not in self._active_request_ids:
+                self._telemetry_queued = max(0, self._telemetry_queued - 1)
                 self._active_request_ids.add(request_id)
                 self._active_order.append(request_id)
             # The most-recently-dispatched request becomes the "current" one
@@ -212,7 +350,12 @@ class _IterationStatsTracker:
             self._current_request_step_idx = None
             self._buffer.append(self._snapshot_locked(num_queued_requests))
 
-    def record_request_completed(self, request_id: int, num_queued_requests: int) -> None:
+    def record_request_completed(
+        self,
+        request_id: int,
+        num_queued_requests: int,
+        response: Optional["DiffusionResponse"] = None,
+    ) -> None:
         """Append a snapshot reflecting a request completion.
 
         Idempotent: a duplicate completion event for the same ``request_id``
@@ -222,6 +365,19 @@ class _IterationStatsTracker:
         """
         with self._lock:
             if request_id in self._active_request_ids:
+                if response is not None:
+                    _record_visual_gen(
+                        "complete",
+                        response.telemetry_shape,
+                        {
+                            "generation": response.generation,
+                            **{
+                                phase: getattr(response.output, phase, 0.0)
+                                for phase in ("pre_denoise", "denoise", "post_denoise")
+                            },
+                        },
+                        (response.error_type or "unclassified") if response.error_msg else None,
+                    )
                 self._active_request_ids.discard(request_id)
                 # Lazy removal from the ordering deque -- we filter stale
                 # entries when picking a fallback "current" id below.
@@ -361,6 +517,7 @@ class DiffusionRequest:
     prompt: List[str]
     params: Optional["VisualGenParams"] = None
     prepared_inputs: Dict[str, Any] = field(default_factory=dict, repr=False)
+    telemetry_extra_keys: Tuple[str, ...] = field(default=(), repr=False)
     # Set only between the two ends of the coordinator -> rank0 hop; see
     # ``refs_to_shm``.
     ref_handles: Optional[List[Dict[str, Any]]] = field(default=None, repr=False)
@@ -442,6 +599,7 @@ class DiffusionResponse:
     error_msg: Optional[str] = None
     error_type: Optional[str] = None
     generation: float = 0.0
+    telemetry_shape: Dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 class DiffusionExecutor:
@@ -543,6 +701,9 @@ class DiffusionExecutor:
                         "extra_param_specs": self.pipeline.extra_param_specs,
                         "supports_image_edit": self.pipeline.supports_image_edit,
                         "ref_slot_specs": self.pipeline.ref_slot_specs,
+                        "telemetry_metadata": _visual_gen_telemetry_metadata(
+                            self.pipeline, self.visual_gen_args
+                        ),
                     },
                 )
             )
@@ -657,6 +818,7 @@ class DiffusionExecutor:
 
     def process_request(self, req: DiffusionRequest):
         """Process a single request."""
+        telemetry_shape = {}
         log_cuda_memory = _cuda_memory_logging_enabled()
         if log_cuda_memory:
             self._reset_cuda_peak_memory_stats()
@@ -667,6 +829,17 @@ class DiffusionExecutor:
             # can resolve shape-dependent request fields such as output size.
             generation_start = time.perf_counter()
             self.pipeline.prepare_request(req)
+            try:
+                from tensorrt_llm.usage import is_usage_stats_enabled
+
+                if self.rank == 0 and is_usage_stats_enabled(
+                    self.visual_gen_args.telemetry_config.disabled
+                ):
+                    telemetry_shape = request_shape(
+                        req.params, len(req.prompt), req.telemetry_extra_keys
+                    )
+            except Exception:
+                pass  # Optional telemetry must not affect generation.
             cache_key = self.pipeline.request_warmup_cache_key(req)
             cache_key_is_resolved = all(value is not None for value in cache_key)
             if (
@@ -694,6 +867,7 @@ class DiffusionExecutor:
                         request_id=req.request_id,
                         output=output,
                         generation=generation,
+                        telemetry_shape=telemetry_shape,
                     )
                 )
         except Exception as e:
@@ -707,6 +881,7 @@ class DiffusionExecutor:
                         request_id=req.request_id,
                         error_msg=str(e),
                         error_type=self.pipeline.classify_request_failure(e),
+                        telemetry_shape=telemetry_shape,
                     )
                 )
 
@@ -883,6 +1058,7 @@ class DiffusionRemoteClient:
 
         # --- Detect external launcher (torchrun / srun) ---
         ext = _detect_external_launch()
+        self.launch_mode, self.node_count = _visual_gen_launch_metadata(ext)
 
         if ext is None:
             # Single-node: coordinator spawns all workers locally
@@ -962,6 +1138,7 @@ class DiffusionRemoteClient:
         self.extra_param_specs: Dict = {}
         self.supports_image_edit: bool = False
         self.ref_slot_specs: Dict = {}
+        self.telemetry_metadata: Dict[str, Any] = {}
 
         # --- Launch workers ---
         # multiprocessing installs its own timeout-less child joins at import
@@ -1054,6 +1231,8 @@ class DiffusionRemoteClient:
 
         req_ids = []
         for req in requests:
+            _record_visual_gen("request", self.telemetry_metadata.get("modality", "unknown"))
+            self._iter_stats.record_telemetry_enqueue()
             self.pending_requests.put(req)
             req_ids.append(req.request_id)
         # Record one snapshot per enqueue so a /metrics consumer sees the
@@ -1265,7 +1444,7 @@ class DiffusionRemoteClient:
         # uses request_id == -1 and is not tracked as a real request.
         if response.request_id != -1:
             self._iter_stats.record_request_completed(
-                response.request_id, self.pending_requests.qsize()
+                response.request_id, self.pending_requests.qsize(), response
             )
         self.response_event.set()
 
@@ -1298,6 +1477,8 @@ class DiffusionRemoteClient:
           checks the abandoned set and drops it on arrival.
         """
         async with self.lock:
+            if request_id not in self._abandoned_request_ids:
+                _record_visual_gen("error", "timeout")
             self.completed_responses.pop(request_id, None)
             self._abandoned_request_ids.add(request_id)
 
@@ -1548,6 +1729,9 @@ class DiffusionRemoteClient:
                         self.extra_param_specs = payload.get("extra_param_specs", {})
                         self.supports_image_edit = bool(payload.get("supports_image_edit", False))
                         self.ref_slot_specs = payload.get("ref_slot_specs", {})
+                        telemetry_metadata = payload.get("telemetry_metadata")
+                        if isinstance(telemetry_metadata, dict):
+                            self.telemetry_metadata = telemetry_metadata
                     if self._worker_failure is not None:
                         raise RuntimeError(self._worker_failure)
                     elapsed = time.time() - start_time

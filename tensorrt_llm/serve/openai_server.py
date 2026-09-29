@@ -942,6 +942,12 @@ class OpenAIServer(_VideoRoutesMixin):
             assert self._is_visual_gen, \
                 "generator must be a VisualGen for VISUAL_GEN server"
             self.register_visual_gen_routes()
+            try:
+                from tensorrt_llm.usage.visual_gen import \
+                    VisualGenTelemetryMiddleware
+                self.app.add_middleware(VisualGenTelemetryMiddleware)
+            except Exception:
+                pass  # Telemetry cannot prevent server startup.
         elif self.server_role is ServerRole.MM_ENCODER:
             assert isinstance(
                 self.generator, MultimodalEncoder
@@ -1307,6 +1313,11 @@ class OpenAIServer(_VideoRoutesMixin):
         each error in ``exc.errors()`` so clients can fix the request
         without parsing the full Pydantic payload.
         """
+        try:
+            from tensorrt_llm.usage.visual_gen import record
+            record("error", "client")
+        except Exception:
+            pass
         parts: List[str] = []
         for err in exc.errors():
             loc = ".".join(

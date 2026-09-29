@@ -79,7 +79,11 @@ _DEFAULT_GENERATION_PARAMS = {
 }
 
 
-@register_pipeline("QwenImagePipeline")
+@register_pipeline(
+    "QwenImagePipeline",
+    modality="image",
+    telemetry_safe=True,
+)
 class QwenImagePipeline(BasePipeline):
     """Qwen-Image text-to-image pipeline.
 

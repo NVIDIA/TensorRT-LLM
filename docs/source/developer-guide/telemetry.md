@@ -337,3 +337,17 @@ unset or when the safety sanitizer rejects the runtime value.
 | `use_cute_dsl_blockscaling_bmm` | `bool` | `value` |  |
 | `use_cute_dsl_blockscaling_mm` | `bool` | `value` |  |
 | `use_fine_grained_sync` | `bool` | `value` |  |
+
+## VisualGen telemetry
+
+VisualGen uses the same process-scoped reporter and opt-outs as LLM telemetry.
+Its initial report contains explicitly allowlisted pipeline/model identity,
+deployment, parallelism, attention, cache, compilation, and component metadata.
+Heartbeats and the final exit snapshot carry cumulative endpoint/modality counts,
+bucketed request shapes, approximate latency percentiles, queue peaks, and
+reliability counters. No individual request record, prompt, media, output, private
+model path, arbitrary extra parameter, or exception message is sent.
+
+See the [VisualGen field inventory](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/usage/schemas/README.md#visualgen-events)
+for wire fields, buckets, and collection limits. Use `TelemetryConfig(disabled=True)`
+with `VisualGenArgs`, or the existing environment/file and CLI opt-outs.
