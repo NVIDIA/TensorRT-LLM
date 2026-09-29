@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 import torch
+import yaml
 from defs.common import venv_check_call
 from defs.examples.visual_gen.visual_gen_test_utils import (
     FeatureConfigState,
@@ -228,6 +229,7 @@ def _generate_qwen_image_layered_lpips_image(model_path, input_path, output_path
                 resolution=QWEN_IMAGE_LAYERED_LPIPS_RESOLUTION,
                 cfg_normalize=True,
                 use_en_prompt=True,
+                save_layers_to_grid=True,
                 seed=QWEN_IMAGE_LAYERED_LPIPS_SEED,
             )
         generated_image = result.image[0].detach().cpu()
@@ -446,7 +448,41 @@ def test_qwen_image_layered_example(_visual_gen_deps, tmp_path, llm_root, llm_ve
             output_path,
         ],
     )
-    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+    output_stem, output_ext = os.path.splitext(output_path)
+    for layer_idx in range(4):
+        layer_output_path = f"{output_stem}_layer_{layer_idx}{output_ext}"
+        assert os.path.isfile(layer_output_path), (
+            f"Example did not produce layer output at {layer_output_path}"
+        )
+
+    fp8_config_path = os.path.join(
+        llm_root, "examples", "visual_gen", "configs", "qwen-image-layered-fp8-1gpu.yaml"
+    )
+    assert os.path.isfile(fp8_config_path), f"Config not found: {fp8_config_path}"
+    with open(config_path) as config_file:
+        cache_dit_config = yaml.safe_load(config_file)
+    cache_dit_config["cache_config"] = {"cache_backend": "cache_dit"}
+    cache_dit_config_path = tmp_path / "qwen-image-layered-cache-dit-1gpu.yaml"
+    with open(cache_dit_config_path, "w") as config_file:
+        yaml.safe_dump(cache_dit_config, config_file, sort_keys=False)
+
+    for feature_config_path in (fp8_config_path, cache_dit_config_path):
+        venv_check_call(
+            llm_venv,
+            [
+                script_path,
+                "--model",
+                model_path,
+                "--visual_gen_args",
+                feature_config_path,
+                "--image",
+                str(input_path),
+                "--prompt",
+                QWEN_IMAGE_LAYERED_LPIPS_PROMPT,
+                "--output_path",
+                output_path,
+            ],
+        )
 
 
 def test_qwen_image_edit_example(_visual_gen_deps: Any, llm_root: str, llm_venv: Any) -> None:
