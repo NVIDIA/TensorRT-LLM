@@ -2097,7 +2097,16 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                     def logger = new Logger(pipeline)
                     try {
-                        def cached = findCachedPLCSourceScanResult(env.gitlabCommit)
+                        // find_plc_build.py only needs python3 + network access to Jenkins, but
+                        // the top-level pipeline agent (createKubernetesPodConfig("", "agent")) is
+                        // a bare alpine container with neither, so run the lookup in a "package"
+                        // pod instead (same image used by preparation()'s mergeWaiveList.py call).
+                        def cached
+                        def packageImage = "urm.nvidia.com/docker/buildpack-deps:trixie-scm"
+                        trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(packageImage, "package"), "trt-llm", {
+                            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+                            cached = findCachedPLCSourceScanResult(env.gitlabCommit)
+                        })
                         def handleResult
                         if (cached) {
                             echo "Commit ${env.gitlabCommit} unchanged since a prior PLC source-code scan; reusing its result: ${cached.result}"
