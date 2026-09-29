@@ -8,7 +8,8 @@ SPDX-License-Identifier: Apache-2.0
 This draft demonstrates selecting FA4's CTA count and exp2 emulation together
 using TRT-LLM's existing warmup `AutoTuner`. It is opt-in. TRT-LLM's build now
 fetches and patches FA4 b19, then builds a companion FA4 wheel; users do not patch their
-installation. This draft still needs GPU and end-to-end performance validation.
+installation. Functional validation has passed on an SM103 development GPU;
+target-device coverage and repeatable end-to-end performance remain release gates.
 
 ## Why tune both?
 
@@ -95,7 +96,7 @@ These timings describe attention only. They do not measure Wan pipeline latency.
 ## Use with VisualGen warmup
 
 Set `TLLM_VISUAL_GEN_FA4_AUTOTUNE=1` before constructing the pipeline, select
-`attention.backend: FA4`, and keep the existing `torch_compile.enable_autotune`
+`attention_config.backend: FA4`, and keep the existing `torch_compile_config.enable_autotune`
 enabled. Populate warmup with the actual generation shapes. The existing
 `TLLM_AUTOTUNER_CACHE_PATH` saves and reloads the selected tactics.
 
@@ -103,7 +104,8 @@ The cache uses exact Q/K/V shapes plus dtype, strides, GPU name/capability,
 softmax scale, CUDA/PyTorch/CUTLASS versions and FA4 dispatch flags. Changing
 these yields a different cache entry. Profiling happens only in the existing
 autotune context; a cache miss outside that context runs the original heuristic.
-An outer CUDA graph capture never starts a new search.
+An outer CUDA graph capture reuses the cached winner without starting a new search,
+including when VisualGen captures its production graphs inside the warmup context.
 
 With #19292 applied, its default `FA_DISABLE_2CTA=1` is honored, so the demo searches
 exp2 policy within 1CTA. Set `FA_DISABLE_2CTA=0` before importing FA4 to evaluate
@@ -111,15 +113,42 @@ both CTA choices. A production follow-up should distinguish an explicit user
 disable from a conservative untuned default, rather than overriding that policy
 implicitly.
 
+## Validation snapshot
+
+The draft passed 66 unique pytest cases: 24 package/staging/precompiled-install
+checks and 42 FA4 checks in an SM103 GPU environment. The FA4 suite includes 12
+tuner/cache policy checks, FP16/BF16 output and float32 LSE against an FP32
+reference, self/cross-attention, unequal sequence lengths, contiguous and strided
+layouts (including packed QKV with CFG batch size 2), and CUDA graph replay.
+
+Real profiling and cache reload in a fresh process passed, with no profiling on
+reload. The standalone sweep passed at sequence lengths 4096, 14040 and 65520.
+A Wan2.2 A14B BF16 480x832x33, 4-step CUDA-graph smoke passed through the full
+pipeline, public Python API and HTTP serving. Default/tuned decoded videos and
+outputs across these entry points were bitwise identical (LPIPS 0). These smoke
+and standalone results do not establish an end-to-end speedup.
+
+A compiled 480x832x165, 20-step comparison also passed decoded-video parity
+(bitwise identical, LPIPS 0). Three warmed default/tuned generations showed no
+material latency difference on the tested SM103 device. This does not establish
+a production benefit for runtime tuning.
+
+Testing found and fixed two issues: capture inside warmup discarded the selected
+tactic, and the benchmark imported FA4 before the backend compatibility shims.
+The GPU checks used PR Python sources with source-compatible precompiled native
+artifacts; a clean native build was not tested.
+
 ## Validation still required before productization
 
 - Run all candidate numerical/LSE and graph tests on B200 and B300 with the exact
   FA4/CUTLASS/CUDA package combination; measure startup/JIT cost too.
-- Compare 1CTA/default, 1CTA/tuned, 2CTA/default and 2CTA/tuned under identical
-  warmed Wan configurations. Include unchanged FA4 and TRTLLM controls.
+- On SM100, compare 2CTA/frequency 16 with the existing noncausal h128 default
+  (frequency 10) and 1CTA across representative workloads, preserving FA4's
+  eligibility guards. Measure warmed pipeline latency as well as attention time.
 - Check generated-media quality and warmed full-pipeline latency; standalone
   attention gains cannot establish an end-to-end improvement.
-- Validate cache reload in a new process and distributed execution, including
+- Validate distributed execution, including
   Ulysses/Attention2D/Ring callers and their actual local shapes.
-- Upstream the per-call dependency API, then reconsider the candidate set and
-  default opt-in policy based on measurements.
+- Compare runtime tuning with a validated static FA4 policy. Retain runtime
+  search only if workload-dependent winner changes provide a meaningful
+  end-to-end benefit beyond the simpler policy.
