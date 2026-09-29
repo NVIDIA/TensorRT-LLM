@@ -15,6 +15,7 @@
 from abc import ABC
 from typing import Dict, List, Optional
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1114,6 +1115,12 @@ class FP8BlockScalesRefGatedMLPFusedMoE(RefMLPFusedMoE):
     expected_quant_algo = QuantAlgo.FP8_BLOCK_SCALES
 
     def __init__(self, *args, use_cute_dsl_blockscaling_mm=True, **kwargs):
+        # RefMLPFusedMoE.forward runs the dense FP8 block-scale Linear, which has no SM121 path yet.
+        if get_sm_version() == 121 and type(self).forward is RefMLPFusedMoE.forward:
+            pytest.skip(
+                "The FP8_BLOCK_SCALES reference runs the dense FP8 block-scale Linear, "
+                "which needs #17166 on SM121."
+            )
         # Note: use deepgemm mm will cause accuracy error, so we use cute_dsl_blockscaling_mm here
         super().__init__(*args, use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm, **kwargs)
 

@@ -91,6 +91,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
     MoEDep,
+    MoEEnvFlag,
     collect_moe_environment,
     override_moe_environment,
 )
@@ -109,6 +110,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
 )
 from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
+    DeepSeekFP8BlockScalesFusedMoEMethod,
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
@@ -119,6 +121,8 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     W4A16NVFP4CutlassFusedMoEMethod,
 )
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
+    FlashinferTrtllmGenFp8BlockScalesImpl,
+    TrtllmTrtllmGenFp8BlockScalesImpl,
     TrtllmTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
 )
@@ -3094,6 +3098,238 @@ def test_trtllm_fp8_block_scales_fuse_shared_expert_layout():
                 backend.w2_weight_scaling_factor.data[slot],
                 down.weight_scale.data[:, scale_rows],
             )
+
+
+# load_quant_scales always stages the block scales on CUDA.
+_requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+
+
+def _create_fp8_block_scale_moe(
+    intermediate_size: int, is_gated: bool, tp_size: int = 1
+) -> Tuple[DeepSeekFP8BlockScalesFusedMoEMethod, torch.nn.Module]:
+    """A bare module with what DeepSeekFP8BlockScalesFusedMoEMethod reads, after create_weights."""
+    module = torch.nn.Module()
+    module.expert_size_per_partition = 2
+    module.hidden_size = 256
+    module.intermediate_size = intermediate_size
+    # As CutlassFusedMoE.__init__ sets it: whole 128-row blocks on a single MoE TP rank.
+    module.intermediate_size_per_partition = (
+        (intermediate_size + 127) // 128 * 128 if tp_size == 1 else intermediate_size // tp_size
+    )
+    module.is_gated_activation = is_gated
+    module.intermediate_size_expand_ratio = 2 if is_gated else 1
+    module.tp_size = tp_size
+    module.tp_rank = 0
+    module.bias = False
+    module.weight_loading_mode = MoEWeightLoadingMode.VANILLA
+    module.initial_local_expert_ids = [0, 1]
+    module._add_raw_shared_weights_for_unmap = lambda weights: None
+    method = DeepSeekFP8BlockScalesFusedMoEMethod()
+    method.create_weights(module)
+    return method, module
+
+
+def _create_fp8_block_scale_expert_weights(
+    intermediate_size: int, hidden_size: int, is_gated: bool
+) -> dict:
+    """Checkpoint tensors for experts 0 and 1; non-gated w3 is empty, as the Nemotron-H mapper emits it."""
+    shapes = {
+        "w1": (intermediate_size, hidden_size),
+        "w3": (intermediate_size if is_gated else 0, hidden_size),
+        "w2": (hidden_size, intermediate_size),
+    }
+    weights = {}
+    for expert_id in range(2):
+        for name, (rows, cols) in shapes.items():
+            weights[f"{expert_id}.{name}.weight"] = torch.randn(rows, cols).to(torch.float8_e4m3fn)
+            weights[f"{expert_id}.{name}.weight_scale_inv"] = torch.rand(
+                (rows + 127) // 128, (cols + 127) // 128
+            )
+    return weights
+
+
+@_requires_cuda
+def test_fp8_block_scales_method_loads_padded_non_gated_experts():
+    """Nemotron-H Lightning's non-gated 1856-row experts on a single MoE TP rank.
+
+    With the intermediate size padded to 1920, create_weights allocates one
+    projection, the loaders put the checkpoint rows first and zero the tail,
+    and the checkpoint's ceil(1856 / 128) = 15 scale blocks fill the grid.
+    """
+    with torch.device("cuda"):
+        method, module = _create_fp8_block_scale_moe(1856, is_gated=False)
+
+        assert module.w3_w1_weight.shape == (2, 1920, 256)
+        assert module.w2_weight.shape == (2, 256, 1920)
+        assert module.w3_w1_weight_scaling_factor.shape == (2, 15, 2)
+        assert module.w2_weight_scaling_factor.shape == (2, 2, 15)
+
+        # torch.empty may already hold zeros, so start from 1.0 (0x38) to see the tail get zeroed.
+        module.w3_w1_weight.data.view(torch.uint8).fill_(0x38)
+        module.w2_weight.data.view(torch.uint8).fill_(0x38)
+        weights = _create_fp8_block_scale_expert_weights(1856, 256, is_gated=False)
+        method.load_weights(module, weights, MoEWeightLoadingMode.VANILLA)
+
+        for expert_id in range(2):
+            w3_w1 = module.w3_w1_weight.data[expert_id].view(torch.uint8)
+            w2 = module.w2_weight.data[expert_id].view(torch.uint8)
+            assert torch.equal(w3_w1[:1856], weights[f"{expert_id}.w1.weight"].view(torch.uint8))
+            assert not w3_w1[1856:].any()
+            assert torch.equal(w2[:, :1856], weights[f"{expert_id}.w2.weight"].view(torch.uint8))
+            assert not w2[:, 1856:].any()
+            assert torch.equal(
+                module.w3_w1_weight_scaling_factor.data[expert_id],
+                weights[f"{expert_id}.w1.weight_scale_inv"],
+            )
+            assert torch.equal(
+                module.w2_weight_scaling_factor.data[expert_id],
+                weights[f"{expert_id}.w2.weight_scale_inv"],
+            )
+
+
+@_requires_cuda
+def test_fp8_block_scales_method_keeps_aligned_gated_layout():
+    """An aligned gated layer is allocated and loaded as before: two 512-row halves, no padding."""
+    with torch.device("cuda"):
+        method, module = _create_fp8_block_scale_moe(512, is_gated=True)
+
+        assert module.w3_w1_weight.shape == (2, 1024, 256)
+        assert module.w2_weight.shape == (2, 256, 512)
+        assert module.w3_w1_weight_scaling_factor.shape == (2, 8, 2)
+        assert module.w2_weight_scaling_factor.shape == (2, 2, 4)
+
+        weights = _create_fp8_block_scale_expert_weights(512, 256, is_gated=True)
+        method.load_weights(module, weights, MoEWeightLoadingMode.VANILLA)
+
+        for expert_id in range(2):
+            expected_w3_w1 = torch.cat(
+                [
+                    weights[f"{expert_id}.w3.weight"].view(torch.uint8),
+                    weights[f"{expert_id}.w1.weight"].view(torch.uint8),
+                ]
+            )
+            expected_w3_w1_scale = torch.cat(
+                [
+                    weights[f"{expert_id}.w3.weight_scale_inv"],
+                    weights[f"{expert_id}.w1.weight_scale_inv"],
+                ]
+            )
+            assert torch.equal(
+                module.w3_w1_weight.data[expert_id].view(torch.uint8), expected_w3_w1
+            )
+            assert torch.equal(
+                module.w3_w1_weight_scaling_factor.data[expert_id], expected_w3_w1_scale
+            )
+
+
+@_requires_cuda
+def test_fp8_block_scales_method_rejects_unaligned_moe_tp_shard():
+    """Under MoE TP 2 a rank's 928 of 1856 rows would split a 128-row block from its scale."""
+    with torch.device("cuda"):
+        method, module = _create_fp8_block_scale_moe(1856, is_gated=False, tp_size=2)
+
+        weights = _create_fp8_block_scale_expert_weights(1856, 256, is_gated=False)
+        with pytest.raises(AssertionError, match="divisible by FP8_QUANT_BLOCK_SIZE"):
+            method.load_weights(module, weights, MoEWeightLoadingMode.VANILLA)
+
+
+@_requires_cuda
+def test_fp8_block_scales_method_rejects_short_scale_grid():
+    """A grid of floor(1856 / 128) = 14 blocks has no scale for rows 1792-1855."""
+    with torch.device("cuda"):
+        method, module = _create_fp8_block_scale_moe(1856, is_gated=False)
+
+        weights = _create_fp8_block_scale_expert_weights(1856, 256, is_gated=False)
+        weights["0.w1.weight_scale_inv"] = weights["0.w1.weight_scale_inv"][:14]
+        with pytest.raises(ValueError, match="does not match the expected"):
+            method.load_weights(module, weights, MoEWeightLoadingMode.VANILLA)
+
+
+@pytest.mark.parametrize(
+    "quant_algo,moe_tp_size,expected",
+    [
+        pytest.param(QuantAlgo.FP8_BLOCK_SCALES, 1, 1920, id="fp8_block_scales_tp1"),
+        pytest.param(QuantAlgo.FP8_BLOCK_SCALES, 2, 928, id="fp8_block_scales_tp2"),
+        pytest.param(None, 1, 1856, id="unquantized_tp1"),
+    ],
+)
+def test_cutlass_pads_fp8_block_scales_intermediate_on_single_moe_tp_rank(
+    monkeypatch: pytest.MonkeyPatch, quant_algo, moe_tp_size: int, expected: int
+) -> None:
+    """Only an FP8 block-scale layer on one MoE TP rank rounds 1856 up to whole 128-row blocks."""
+    monkeypatch.setattr(torch.cuda, "Stream", MagicMock(return_value=object()))
+    monkeypatch.setattr(torch.cuda, "Event", MagicMock(return_value=object()))
+    model_config = ModelConfig(
+        quant_config=QuantConfig(quant_algo=quant_algo),
+        mapping=Mapping(
+            world_size=moe_tp_size,
+            rank=0,
+            tp_size=moe_tp_size,
+            moe_tp_size=moe_tp_size,
+            moe_ep_size=1,
+        ),
+        skip_create_weights_in_init=True,
+    )
+
+    backend = CutlassFusedMoE(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=8,
+        hidden_size=256,
+        intermediate_size=1856,
+        dtype=torch.bfloat16,
+        model_config=model_config,
+    )
+
+    assert backend.intermediate_size_per_partition == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "backend_cls",
+    [TrtllmTrtllmGenFp8BlockScalesImpl, FlashinferTrtllmGenFp8BlockScalesImpl],
+    ids=["trtllm", "flashinfer"],
+)
+@pytest.mark.parametrize(
+    "activation,eligible",
+    [("Swiglu", True), ("Relu2", False), ("Silu", False)],
+    ids=["gated", "relu2", "silu"],
+)
+def test_trtllm_gen_fp8_block_scales_rejects_non_gated_activation(
+    backend_cls, activation, eligible
+):
+    """The FP8 block-scale runners always run the gated FC1 kernel, so a
+    non-gated layer (Nemotron-H's Relu2) must stand aside for another backend.
+    """
+    problem = MoEProblem(
+        quant=QuantAlgo.FP8_BLOCK_SCALES.value,
+        dtype_act=torch.bfloat16,
+        hidden_size=2688,
+        intermediate_size=1856,
+        num_experts=128,
+        top_k=6,
+        activation=activation,
+    )
+    # The FlashInfer leaf is opt-in and needs its wheel; admit both so the activation decides.
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=128,
+        env=MoEEnvironment(
+            sm=100,
+            available_deps=(MoEDep.FLASHINFER,),
+            env_flags=((MoEEnvFlag.TRTLLM_GEN_USE_FLASHINFER.value, "1"),),
+        ),
+    )
+
+    verdict = backend_cls.can_implement(problem, deployment)
+
+    if eligible:
+        assert verdict.eligible, verdict.detail
+    else:
+        assert not verdict.eligible
+        assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
 
 
 @contextmanager

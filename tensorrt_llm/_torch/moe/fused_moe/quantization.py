@@ -1208,7 +1208,8 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
 
         w3_w1_weight_shape = (module.expert_size_per_partition +
                               n_shared_experts,
-                              module.intermediate_size_per_partition * 2,
+                              module.intermediate_size_per_partition *
+                              module.intermediate_size_expand_ratio,
                               module.hidden_size)
         w2_weight_shape = (
             module.expert_size_per_partition + n_shared_experts,
@@ -1222,7 +1223,8 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
         w3_w1_weight_scaling_factor = nn.Parameter(torch.empty(
             (module.expert_size_per_partition + n_shared_experts,
              cell_div(module.intermediate_size_per_partition,
-                      self.FP8_QUANT_BLOCK_SIZE) * 2,
+                      self.FP8_QUANT_BLOCK_SIZE) *
+             module.intermediate_size_expand_ratio,
              cell_div(w3_w1_weight_shape[2], self.FP8_QUANT_BLOCK_SIZE)),
             dtype=torch.float32),
                                                    requires_grad=False)
@@ -1249,6 +1251,52 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                      allow_partial_loading: bool = False):
         super().load_weights(module, weights, weight_loading_mode,
                              allow_partial_loading)
+
+    def load_expert_w3_w1_weight(self,
+                                 module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor,
+                                 allow_partial_loading: bool = False):
+        logical_size = module.intermediate_size // module.tp_size
+        if logical_size == module.intermediate_size_per_partition:
+            super().load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+                                             dst_w3_w1_weight,
+                                             allow_partial_loading)
+            return
+        if not allow_partial_loading:
+            assert w1_weight is not None and w3_weight is not None
+        if module.is_gated_activation:
+            src_weights = (w3_weight, w1_weight)
+        else:
+            src_weights = (w1_weight, )
+        dst_weights = dst_w3_w1_weight.chunk(
+            module.intermediate_size_expand_ratio, dim=0)
+        for src_weight, dst_weight in zip(src_weights, dst_weights):
+            if src_weight is not None:
+                src_weight = load_weight_shard(src_weight,
+                                               device=dst_weight.device)
+                src_weight = src_weight.view(dst_weight.dtype)
+                dst_weight[:logical_size].copy_(src_weight, non_blocking=True)
+            # The GEMMs read the padded tail, so zero it rather than leave torch.empty data.
+            dst_weight[logical_size:].zero_()
+
+    def load_expert_w2_weight(self,
+                              module: torch.nn.Module,
+                              w2_weight: torch.Tensor,
+                              dst_w2_weight: torch.Tensor,
+                              allow_partial_loading: bool = False):
+        logical_size = module.intermediate_size // module.tp_size
+        # A w2 bias is per hidden unit, so only the weight has padded columns.
+        if (logical_size == module.intermediate_size_per_partition
+                or dst_w2_weight.dim() == 1):
+            super().load_expert_w2_weight(module, w2_weight, dst_w2_weight,
+                                          allow_partial_loading)
+            return
+        super().load_expert_w2_weight(module, w2_weight,
+                                      dst_w2_weight[:, :logical_size],
+                                      allow_partial_loading)
+        dst_w2_weight[:, logical_size:].zero_()
 
     def fuse_shared_expert(self, module: torch.nn.Module,
                            shared_experts: GatedMLP, n_shared_experts: int):
@@ -1311,6 +1359,15 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
             proj_weight_scales=module.w2_weight_scaling_factor,
         )
 
+    def _copy_block_scale(self, dst_scale: torch.Tensor,
+                          scale: torch.Tensor) -> None:
+        # An unaligned size needs ceil(n / 128) blocks; fewer leave its tail rows without a scale.
+        if scale.shape != dst_scale.shape:
+            raise ValueError(
+                f"FP8 block-scale grid {tuple(scale.shape)} does not match the expected {tuple(dst_scale.shape)}."
+            )
+        dst_scale.copy_(scale)
+
     def load_expert_all_weight_scale_fp8_block_scale(
             self, module: torch.nn.Module, weights: Dict,
             load_expert_ids: List[int], dst_w3_w1_weight_scale: torch.Tensor,
@@ -1336,8 +1393,17 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                     f"{expert_id}.w1.weight_scale_inv"] if f"{expert_id}.w1.weight_scale_inv" in weights else None
                 w2_scale = weights[
                     f"{expert_id}.w2.weight_scale_inv"] if f"{expert_id}.w2.weight_scale_inv" in weights else None
-                dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale[
-                    local_slot_id].chunk(2, dim=0)
+                if module.is_gated_activation:
+                    dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale[
+                        local_slot_id].chunk(2, dim=0)
+                else:
+                    # Non-gated experts have no w3; the Nemotron-H mapper passes an empty w3 scale.
+                    if w3_scale is not None and w3_scale.shape[0] != 0:
+                        raise ValueError(
+                            f"Non-gated FP8 block-scale expert {expert_id} has a non-empty w3 scale."
+                        )
+                    w3_scale = None
+                    dst_w1_weight_scale = dst_w3_w1_weight_scale[local_slot_id]
                 assert module.intermediate_size_per_partition % self.FP8_QUANT_BLOCK_SIZE == 0, "For DeepSeekFP8BlockScalesFusedMoEMethod, intermediate_size_per_partition should be divisible by FP8_QUANT_BLOCK_SIZE."
                 if w1_scale is not None:
                     w1_scale_shard = load_weight_shard(
@@ -1346,7 +1412,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                         module.tp_rank,
                         TensorParallelMode.COLUMN,
                         device=device)
-                    dst_w1_weight_scale.copy_(w1_scale_shard)
+                    self._copy_block_scale(dst_w1_weight_scale, w1_scale_shard)
                 if w3_scale is not None:
                     w3_scale_shard = load_weight_shard(
                         w3_scale,
@@ -1354,7 +1420,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                         module.tp_rank,
                         TensorParallelMode.COLUMN,
                         device=device)
-                    dst_w3_weight_scale.copy_(w3_scale_shard)
+                    self._copy_block_scale(dst_w3_weight_scale, w3_scale_shard)
             else:
                 raise NotImplementedError(
                     f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
@@ -1365,7 +1431,8 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                                                    module.tp_rank,
                                                    TensorParallelMode.ROW,
                                                    device=device)
-                dst_w2_weight_scale[local_slot_id].copy_(w2_scale_shard)
+                self._copy_block_scale(dst_w2_weight_scale[local_slot_id],
+                                       w2_scale_shard)
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         self.load_expert_all_weight_scale_fp8_block_scale(
