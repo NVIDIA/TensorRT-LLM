@@ -162,6 +162,8 @@ def test_tp_forward_distributed_and_graph(tokens):
     mod.pooler = lambda x: x
     mod.pre_expert_norm = lambda x: x
     mod.unpooler = lambda x: x
+    mod._pool_gather_workspace = None
+    mod._unpool_gather_workspace = None
 
     class Experts:
         comm = None

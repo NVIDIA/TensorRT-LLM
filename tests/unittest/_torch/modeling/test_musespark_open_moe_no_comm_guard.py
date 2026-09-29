@@ -74,6 +74,7 @@ def _moe(*, comm, expert_output):
     mod.nvtx = _Nvtx()
     mod.router_logits = lambda h: torch.zeros(h.shape[0], 4)
     mod.pooler = lambda h: h
+    mod._pool_gather_workspace = None
     mod.pre_expert_norm = lambda h: h
     mod.finalize = lambda *a, **k: pytest.fail(
         "self.finalize must not run when the scheduler already finalized"

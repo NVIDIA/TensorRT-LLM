@@ -32,6 +32,10 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
 - ``MUSESPARK_OPEN_FROZEN_GATE_CACHE`` (default on): cached gate coefficients.
 - ``MUSESPARK_OPEN_FUSED_FINALIZE_AR`` (default on): fused expert finalize +
   TP4 all-reduce.
+- ``MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL`` (default off): extend finalize fusion
+  to TP8/EP8 across two NVLink-connected four-GPU GB300 nodes.
+- ``MUSESPARK_OPEN_SHARDED_PROJECTIONS`` (default off, experimental): column-shard
+  TP8 pool/unpool projections for batches of at most eight tokens.
 - ``MUSESPARK_OPEN_FUSED_PRE_EXPERT_QUANT`` (default on): fused pre-expert
   RMSNorm + NVFP4 quantization.
 - ``MUSESPARK_OPEN_FUSED_PREATTN`` (default OFF, opt-in): fused pre-attention.
@@ -57,7 +61,7 @@ Default-on switches read as disabled for the values ``0``/``false``/``no``/
 import contextlib
 import copy
 import os
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 import triton
@@ -68,6 +72,7 @@ from tensorrt_llm._torch.configs.musespark_open import SLIDING_ATTENTION, MuseSp
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import (
@@ -89,6 +94,10 @@ from ..moe.fused_moe.moe_op_backend import TRTLLMOpBackend
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel
+
+if TYPE_CHECKING:
+    from .musespark_open_finalize_ar import FinalizeIpcWorkspace
+    from .musespark_open_projection_gather import ProjectionGatherWorkspace
 
 # Perception subtrees in the checkpoint. Text requests never build these, and
 # their tensors must not be materialized (they are hundreds of GiB).
@@ -1820,6 +1829,38 @@ class MuseSparkOpenMoE(nn.Module):
             layer_idx,
             ("router", "pool", "experts", "finalize", "all_reduce", "unpool"),
         )
+        self._pool_gather_workspace: "ProjectionGatherWorkspace | None" = None
+        self._unpool_gather_workspace: "ProjectionGatherWorkspace | None" = None
+
+    def _replicated_projection(
+        self,
+        module: Linear,
+        hidden_states: torch.Tensor,
+        workspace: "ProjectionGatherWorkspace | None",
+    ) -> torch.Tensor:
+        """Shard small BF16 ``[tokens, hidden]`` projections, then gather columns.
+
+        The workspace is shared across layers in CUDA execution order. Larger
+        batches and compiled execution retain the original replicated Linear.
+        """
+        if (
+            workspace is None
+            or torch.compiler.is_compiling()
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.ndim != 2
+            or not 0 < hidden_states.shape[0] <= 8
+            or not hidden_states.is_contiguous()
+        ):
+            return module(hidden_states)
+        from ..modules.low_m_gemm import apply_low_m_gemm
+
+        columns = module.weight.shape[0] // self.mapping.tp_size
+        begin = self.mapping.tp_rank * columns
+        weight = module.weight[begin : begin + columns]
+        projected = apply_low_m_gemm(module, hidden_states, weight, None, force_active=True)
+        if projected is None:
+            projected = torch.nn.functional.linear(hidden_states, weight)
+        return workspace.gather(projected)
 
     def router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """FP32 router logits, scaled by the metap multiplier before routing."""
@@ -1975,7 +2016,9 @@ class MuseSparkOpenMoE(nn.Module):
             torch.cuda.stream(self._prepare_stream) if overlap else contextlib.nullcontext()
         )
         with stream_context, self.nvtx("pool"):
-            pooled = self.prepare_expert_input(self.pooler(hidden_states))
+            pooled = self.prepare_expert_input(
+                self._replicated_projection(self.pooler, hidden_states, self._pool_gather_workspace)
+            )
         if overlap:
             main_stream.wait_stream(self._prepare_stream)
             if not torch.cuda.is_current_stream_capturing():
@@ -2190,7 +2233,9 @@ class MuseSparkOpenMoE(nn.Module):
             with self.nvtx("all_reduce"):
                 combined = self.all_reduce(combined)
         with self.nvtx("unpool"):
-            return self.unpooler(combined)
+            return self._replicated_projection(
+                self.unpooler, combined, self._unpool_gather_workspace
+            )
 
 
 class MuseSparkOpenDecoderLayer(DecoderLayer):
@@ -2354,12 +2399,14 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
         return hidden_states
 
 
-def _build_finalize_ar_workspace(mapping):
-    """Construct the finalize+all-reduce IPC workspace, or None to stay unfused.
+def _build_finalize_ar_workspace(
+    mapping: Mapping, *, use_mnnvl: bool = False
+) -> "FinalizeIpcWorkspace | None":
+    """Construct the finalize+all-reduce workspace, or None to stay unfused.
 
-    The constructor probes the TP group's IPC topology and raises when a peer
-    is not IPC-accessible (or the group's configuration disagrees). That is a
-    property of the deployment, not a bug in this process, so it must degrade
+    The constructor probes the TP group's local or fabric topology and raises
+    when peers are inaccessible or the group's configuration disagrees. That is
+    a property of the deployment, so it must degrade
     to the unfused finalize + AllReduce path instead of failing model init.
     """
     if not _fused_finalize_ar_enabled():
@@ -2370,6 +2417,8 @@ def _build_finalize_ar_workspace(mapping):
     if not HAS_CUTEDSL:
         return None
     try:
+        if use_mnnvl:
+            return FinalizeIpcWorkspace(mapping, use_mnnvl=True)
         return FinalizeIpcWorkspace(mapping)
     except (ValueError, RuntimeError) as exc:
         logger.warning(
@@ -2427,11 +2476,22 @@ class MuseSparkOpenModel(DecoderModel):
             ):
                 raise ValueError("Prefill sequence parallelism requires single-node BF16 TP4/EP4")
             logger.info("MuseSparkOpen prefill sequence parallelism enabled for >=4096 tokens")
-        if (
+        local_finalize_tp4 = (
             mapping.tp_size == 4
-            and mapping.moe_ep_size == 4
-            and not mapping.enable_attention_dp
             and len({rank // mapping.gpus_per_node for rank in mapping.tp_group}) == 1
+        )
+        fabric_finalize_tp8 = (
+            os.getenv("MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL", "0") == "1"
+            and mapping.tp_size == 8
+            and mapping.gpus_per_node == 4
+            and mapping.cp_size == 1
+            and mapping.pp_size == 1
+            and len({rank // mapping.gpus_per_node for rank in mapping.tp_group}) == 2
+        )
+        if (
+            (local_finalize_tp4 or fabric_finalize_tp8)
+            and mapping.moe_ep_size == mapping.tp_size
+            and not mapping.enable_attention_dp
             and torch.cuda.is_available()
             and config.torch_dtype == torch.bfloat16
             and torch.cuda.get_device_capability() == (10, 3)
@@ -2440,10 +2500,43 @@ class MuseSparkOpenModel(DecoderModel):
                 for layer in self.layers
             )
         ):
-            self._finalize_ar_workspace = _build_finalize_ar_workspace(mapping)
+            self._finalize_ar_workspace = _build_finalize_ar_workspace(
+                mapping, use_mnnvl=fabric_finalize_tp8
+            )
             if self._finalize_ar_workspace is not None:
+                if fabric_finalize_tp8:
+                    logger.info("MuseSparkOpen TP8 fabric finalize enabled")
                 for layer in self.layers:
                     layer.feed_forward._finalize_ar_workspace = self._finalize_ar_workspace
+        if os.getenv("MUSESPARK_OPEN_SHARDED_PROJECTIONS", "0") == "1":
+            if not (
+                mapping.tp_size == mapping.moe_ep_size == 8
+                and mapping.gpus_per_node == 4
+                and mapping.cp_size == mapping.pp_size == 1
+                and not mapping.enable_attention_dp
+                and config.torch_dtype == torch.bfloat16
+                and torch.cuda.get_device_capability() == (10, 3)
+                and all(
+                    layer.feed_forward.expert_hidden_size == 4096
+                    and getattr(layer.feed_forward.experts, "comm", None) is None
+                    for layer in self.layers
+                )
+            ):
+                raise ValueError(
+                    "Sharded projections require GB300 BF16 TP8/EP8, four GPUs per node, "
+                    "CP1/PP1, expert width 4096, and no attention DP or external MoE communication"
+                )
+            from .musespark_open_projection_gather import ProjectionGatherWorkspace
+
+            # Pool runs on the preparation stream and unpool on the main stream.
+            # Keep their epochs independent; successive layers already join the
+            # preparation stream before consuming its result.
+            pool_workspace = ProjectionGatherWorkspace(mapping)
+            unpool_workspace = ProjectionGatherWorkspace(mapping)
+            for layer in self.layers:
+                layer.feed_forward._pool_gather_workspace = pool_workspace
+                layer.feed_forward._unpool_gather_workspace = unpool_workspace
+            logger.info("MuseSparkOpen experimental TP8 sharded projections enabled for M<=8")
         # Final norm keeps the raw stored weight (gain center 0).
         self.norm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype

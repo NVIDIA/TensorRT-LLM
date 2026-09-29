@@ -3,7 +3,7 @@
 """Keep finalize fusion confined to the supported model execution paths."""
 
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -49,8 +49,10 @@ def test_finalize_dispatch_preserves_fallback(
         finalize=Mock(return_value=finalized),
         all_reduce=Mock(return_value=reduced),
         unpooler=Mock(side_effect=lambda value: value),
+        _unpool_gather_workspace=None,
         mapping=SimpleNamespace(enable_attention_dp=False, has_tp=lambda: True, moe_tp_size=1),
     )
+    module._replicated_projection = MethodType(MuseSparkOpenMoE._replicated_projection, module)
     with patch("torch.compiler.is_compiling", return_value=compiling):
         result = MuseSparkOpenMoE.forward(module, hidden, None)
     if expect_fused:

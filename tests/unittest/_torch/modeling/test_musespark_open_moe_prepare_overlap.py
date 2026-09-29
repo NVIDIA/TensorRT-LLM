@@ -31,6 +31,7 @@ def test_prepare_overlap_matches_serial_and_graph_replay(tokens):
         mod = MuseSparkOpenMoE.__new__(MuseSparkOpenMoE)
         torch.nn.Module.__init__(mod)
         mod._prepare_stream = torch.cuda.Stream()
+        mod._pool_gather_workspace = None
         mod.nvtx = lambda name: contextlib.nullcontext()
         router_weight = torch.randn(256, 256, device="cuda")
         bias = torch.randn(256, device="cuda")

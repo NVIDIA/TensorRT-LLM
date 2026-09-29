@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Four-rank GB300 finalize/IPC parity, including mutated CUDA graph inputs.
+"""GB300 finalize parity, including mutated CUDA graph inputs.
 
-Run this file with four MPI ranks and one local GPU per rank.
+Run with four local MPI ranks, or eight ranks across two NVLink-connected
+four-GPU nodes to exercise the experimental fabric workspace.
 """
 
 import pytest
@@ -34,14 +35,15 @@ from tensorrt_llm.mapping import Mapping
 @pytest.mark.parametrize("case", ["normal", "upper", "empty_rank", "zero_rows"])
 @torch.inference_mode()
 def test_finalize_allreduce_graph_parity(tokens: int, case: str) -> None:
-    if MPI.COMM_WORLD.Get_size() != 4 or not torch.cuda.is_available() or not HAS_CUTEDSL:
-        pytest.skip("Requires four local MPI ranks, CUDA and CuTe DSL")
+    world_size = MPI.COMM_WORLD.Get_size()
+    if world_size not in (4, 8) or not torch.cuda.is_available() or not HAS_CUTEDSL:
+        pytest.skip("Requires four or eight MPI ranks, CUDA and CuTe DSL")
     rank = tensorrt_llm.mpi_rank()
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(rank % 4)
     if torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("GB300 required")
-    mapping = Mapping(world_size=4, tp_size=4, rank=rank, gpus_per_node=4)
-    workspace = FinalizeIpcWorkspace(mapping)
+    mapping = Mapping(world_size=world_size, tp_size=world_size, rank=rank, gpus_per_node=4)
+    workspace = FinalizeIpcWorkspace(mapping, use_mnnvl=world_size == 8)
     nccl = AllReduce(mapping, strategy=AllReduceStrategy.NCCL).cuda()
     torch.manual_seed(1270 + tokens)
     weights = torch.rand(tokens, 8, device="cuda")
@@ -51,13 +53,13 @@ def test_finalize_allreduce_graph_parity(tokens: int, case: str) -> None:
     source = torch.randn(max(64, tokens * 8), 4096, device="cuda", dtype=torch.bfloat16)
     gemm = source.clone()
     indices = torch.arange(tokens * 8, device="cuda", dtype=torch.int32).reshape(tokens, 8)
-    indices = torch.where(indices % 4 == rank, indices, -1).contiguous()
+    indices = torch.where(indices % world_size == rank, indices, -1).contiguous()
     if case == "upper":
         indices[0, rank] = 10000
-    if case == "empty_rank" and rank == 3:
+    if case == "empty_rank" and rank == world_size - 1:
         indices.fill_(-1)
         gemm.fill_(float("nan"))
-    if case == "zero_rows" and rank == 3:
+    if case == "zero_rows" and rank == world_size - 1:
         indices.zero_()
         gemm = torch.empty(0, 4096, device="cuda", dtype=torch.bfloat16)
 
@@ -84,7 +86,7 @@ def test_finalize_allreduce_graph_parity(tokens: int, case: str) -> None:
         for _ in range(5):
             actual = workspace.finalize(gemm, indices, weights, norm, 1e-8, tokens)
     for repeat in range(3):
-        if not (case in ("empty_rank", "zero_rows") and rank == 3):
+        if not (case in ("empty_rank", "zero_rows") and rank == world_size - 1):
             gemm.copy_(source * (-1 if repeat % 2 else 1) + 0.1 * repeat)
         expected = reference()
         torch.cuda.synchronize()
@@ -92,7 +94,9 @@ def test_finalize_allreduce_graph_parity(tokens: int, case: str) -> None:
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(actual.float(), expected.float(), rtol=0.04, atol=0.02)
-        assert (actual.float() - expected.float()).norm() / expected.float().norm() < 0.01
+        # TP8 can mask every expert in the one-token upper-bound case. Require
+        # exact zero error there instead of dividing two zero norms.
+        assert (actual.float() - expected.float()).norm() <= 0.01 * expected.float().norm()
         for peer in MPI.COMM_WORLD.allgather(actual.cpu().float().numpy()):
             torch.testing.assert_close(actual.cpu().float(), torch.from_numpy(peer), rtol=0, atol=0)
     del graph
@@ -113,14 +117,15 @@ def test_finalize_reuses_compilation_across_mixed_shapes(
     shapes: tuple[tuple[int, int], ...],
 ) -> None:
     """New mixed-batch sizes and per-rank expert row counts must not compile."""
-    if MPI.COMM_WORLD.Get_size() != 4 or not torch.cuda.is_available() or not HAS_CUTEDSL:
-        pytest.skip("Requires four local MPI ranks, CUDA and CuTe DSL")
+    world_size = MPI.COMM_WORLD.Get_size()
+    if world_size not in (4, 8) or not torch.cuda.is_available() or not HAS_CUTEDSL:
+        pytest.skip("Requires four or eight MPI ranks, CUDA and CuTe DSL")
     rank = tensorrt_llm.mpi_rank()
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(rank % 4)
     if torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("GB300 required")
-    mapping = Mapping(world_size=4, tp_size=4, rank=rank, gpus_per_node=4)
-    workspace = FinalizeIpcWorkspace(mapping)
+    mapping = Mapping(world_size=world_size, tp_size=world_size, rank=rank, gpus_per_node=4)
+    workspace = FinalizeIpcWorkspace(mapping, use_mnnvl=world_size == 8)
     nccl = AllReduce(mapping, strategy=AllReduceStrategy.NCCL).cuda()
     compiled_keys = None
     # Each group retains its launch cluster size while token and expert-row
@@ -139,7 +144,7 @@ def test_finalize_reuses_compilation_across_mixed_shapes(
         torch.manual_seed(1729 + rank)
         gemm = torch.randn(rank_rows, 4096, device="cuda", dtype=torch.bfloat16)
         indices = torch.arange(tokens * 8, device="cuda", dtype=torch.int32).reshape(tokens, 8)
-        indices = torch.where(indices % 4 == rank, indices, -1).contiguous()
+        indices = torch.where(indices % world_size == rank, indices, -1).contiguous()
         expected = nccl(
             post_expert_norm_combine(
                 gemm,

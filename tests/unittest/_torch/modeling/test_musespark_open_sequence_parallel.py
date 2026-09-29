@@ -80,6 +80,8 @@ def test_prefill_moe_token_shards(tokens: int, owner: int) -> None:
     module.router_logits = lambda hidden: hidden[:, :4].float()
     module.pooler = nn.Identity()
     module.unpooler = nn.Identity()
+    module._pool_gather_workspace = None
+    module._unpool_gather_workspace = None
     prepared_rows = []
 
     def prepare(pooled: torch.Tensor) -> torch.Tensor:
