@@ -158,12 +158,31 @@ def test_real_autotuner_selects_and_reuses_winner(runtime, monkeypatch) -> None:
     assert kernel.call_args.kwargs["ex2_emu_freq"] == 8
 
 
-def test_never_profiles_during_outer_capture(runtime, monkeypatch) -> None:
-    tuner = Mock(is_tuning_mode=True)
-    monkeypatch.setattr(AutoTuner, "get", lambda: tuner)
+@pytest.mark.parametrize("cached", [False, True])
+def test_outer_capture_reuses_cached_tactic_without_profiling(runtime, monkeypatch, cached) -> None:
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *args: "B200")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (10, 0))
+    monkeypatch.setenv("TLLM_PROFILING_TIMER", "cuda_event")
+    monkeypatch.setattr(AutoTuner, "_instance", None)
+    tuner = AutoTuner.get()
+    tuner.is_tuning_mode = True
+    inputs = _inputs()
+    runner = fa4.Fa4Runner(inputs, 0.125)
+    if cached:
+        key = tuner.profiling_cache.get_cache_key(
+            "visual_gen::fa4_dense", runner, tuple(t.shape for t in inputs), TuningConfig(), False
+        )
+        tuner.profiling_cache[key] = (0, 2, 1.0)
+    choose = Mock(side_effect=AssertionError("Capture must not profile or prime tactics"))
+    monkeypatch.setattr(tuner, "choose_one", choose)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    fa4.tuned_forward(*_inputs(), 0.125)
-    tuner.choose_one.assert_not_called()
+    fa4.tuned_forward(*inputs, 0.125)
+    choose.assert_not_called()
+    kernel, _ = runtime
+    if cached:
+        assert kernel.call_args.kwargs["ex2_emu_freq"] == 4
+    else:
+        assert "ex2_emu_freq" not in kernel.call_args.kwargs
 
 
 def test_cpu_and_causal_inputs_are_ineligible() -> None:

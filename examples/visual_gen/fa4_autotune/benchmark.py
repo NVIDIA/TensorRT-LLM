@@ -10,7 +10,6 @@ from importlib.metadata import version
 from pathlib import Path
 
 import torch
-from flash_attn.cute._trtllm_build_info import BUILD_ID
 
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, TuningConfig, autotune
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import FlashAttn4Attention
@@ -41,6 +40,9 @@ def _measure(runner: Fa4Runner, inputs: list[torch.Tensor], tactic: int, repeats
 
 @torch.inference_mode()
 def main() -> None:
+    # Importing flash_attn.cute first would bypass the backend's compatibility shims.
+    from flash_attn.cute._trtllm_build_info import BUILD_ID
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seq-lens", type=int, nargs="+", default=[4096])
     parser.add_argument("--heads", type=int, default=40)

@@ -134,7 +134,12 @@ def tuned_forward(
     tuner = AutoTuner.get()
     # Profiling uses CUDA graphs itself. Never start a search inside an outer capture.
     if tuner.is_tuning_mode and torch.cuda.is_current_stream_capturing():
-        return runner(inputs)
+        # Warmup also captures the production graph while tuning mode is active.
+        # Reuse its winner; choose_one can prime kernels or profile on a miss.
+        _, _, tactic, _ = tuner.profiling_cache.search_cache(
+            "visual_gen::fa4_dense", [runner], tuple(t.shape for t in inputs), _TUNING_CONFIG
+        )
+        return runner(inputs, tactic=tactic)
     selected_runner, tactic = tuner.choose_one(
         "visual_gen::fa4_dense", [runner], _TUNING_CONFIG, inputs
     )

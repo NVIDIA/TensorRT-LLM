@@ -38,9 +38,10 @@ def require_patched_fa4():
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("layout", ["contiguous", "head_slice", "packed_qkv"])
+@pytest.mark.parametrize("seq_lens", [(512, 512), (320, 129), (64, 4096)])
 @torch.inference_mode()
-def test_autotuned_tactics_output_lse_and_graph_replay(dtype, strided):
+def test_autotuned_tactics_output_lse_and_graph_replay(dtype, layout, seq_lens):
     """Every demo tactic must preserve both attention output and float32 LSE."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("FA4 tuning demo targets SM100/SM103")
@@ -48,11 +49,20 @@ def test_autotuned_tactics_output_lse_and_graph_replay(dtype, strided):
     from tensorrt_llm._torch.visual_gen.attention_backend.fa4_autotuner import Fa4Runner
 
     torch.manual_seed(42)
-    inputs = [
-        torch.randn(1, 512, 4 if strided else 2, 128, device="cuda", dtype=dtype) for _ in range(3)
-    ]
-    if strided:
-        inputs = [t[:, :, ::2] for t in inputs]
+    seq_q, seq_kv = seq_lens
+    if layout == "packed_qkv":
+        # Wan batches CFG and exposes Q/K/V views into a packed projection.
+        inputs = [
+            torch.randn(2, seq, 3, 2, 128, device="cuda", dtype=dtype)[:, :, idx]
+            for idx, seq in enumerate((seq_q, seq_kv, seq_kv))
+        ]
+    else:
+        inputs = [
+            torch.randn(1, seq, 4 if layout == "head_slice" else 2, 128, device="cuda", dtype=dtype)
+            for seq in (seq_q, seq_kv, seq_kv)
+        ]
+        if layout == "head_slice":
+            inputs = [t[:, :, ::2] for t in inputs]
     q, k, v = (t.float().transpose(1, 2) for t in inputs)
     scale = 128**-0.5
     scores = q @ k.transpose(-2, -1) * scale
@@ -70,6 +80,49 @@ def test_autotuned_tactics_output_lse_and_graph_replay(dtype, strided):
         torch.cuda.synchronize()
         torch.testing.assert_close(graph_output, output, atol=0, rtol=0)
         torch.testing.assert_close(graph_lse, lse, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_backend_capture_keeps_warmup_tactic(monkeypatch):
+    """Production graph capture inside autotune must retain the cached winner."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("FA4 tuning targets SM100/SM103")
+    from tensorrt_llm._torch.autotuner import AutoTuner, TuningConfig, autotune
+    from tensorrt_llm._torch.visual_gen.attention_backend.fa4_autotuner import Fa4Runner
+
+    monkeypatch.setenv("TLLM_VISUAL_GEN_FA4_AUTOTUNE", "1")
+    monkeypatch.setattr(AutoTuner, "_instance", None)
+    inputs = [torch.randn(1, 512, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    backend = FlashAttn4Attention(num_heads=2, head_dim=128)
+    runner = Fa4Runner(inputs, backend.scale)
+    # Hardware exp2 with 1CTA is a valid, non-default tactic on both targets.
+    tactic = 1
+    runner(inputs, tactic=tactic)
+    torch.cuda.synchronize()
+    tuner = AutoTuner.get()
+    key = tuner.profiling_cache.get_cache_key(
+        "visual_gen::fa4_dense", runner, tuple(t.shape for t in inputs), TuningConfig(), False
+    )
+    tuner.profiling_cache[key] = (0, tactic, 1.0)
+    dispatched = []
+    original = Fa4Runner.forward
+
+    def record_dispatch(self, tensors, *, tactic=-1, **kwargs):
+        dispatched.append(tactic)
+        return original(self, tensors, tactic=tactic, **kwargs)
+
+    monkeypatch.setattr(Fa4Runner, "forward", record_dispatch)
+    graph = torch.cuda.CUDAGraph()
+    with autotune():
+        with torch.cuda.graph(graph):
+            output, lse = backend.forward_with_lse(*inputs)
+    assert dispatched == [tactic]
+    for tensor in inputs:
+        tensor.copy_(torch.randn_like(tensor))
+    graph.replay()
+    expected, expected_lse = runner(inputs, tactic=tactic)
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    torch.testing.assert_close(lse, expected_lse, atol=0, rtol=0)
 
 
 def _run_self_attn(B, S_real, S_pad, H, d_h, dtype=torch.bfloat16):
