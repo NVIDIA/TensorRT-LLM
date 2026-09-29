@@ -538,7 +538,7 @@ def test_minimax_h3_diffusers_lpips_and_audio_reference(
             model=checkpoint_path,
             pipeline_config={"workflow": "ref2va"} if references else {},
             quant_config={"quant_algo": quant_algo, "dynamic": True} if quant_algo else None,
-            torch_compile_config=TorchCompileConfig(enable=not bool(references)),
+            torch_compile_config=TorchCompileConfig(enable=True),
         )
     ).load(skip_warmup=True)
     try:

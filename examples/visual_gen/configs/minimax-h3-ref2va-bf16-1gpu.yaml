@@ -4,9 +4,8 @@
 # Ref2VA uses transformer_ref/ from the converted MiniMax-H3 checkpoint.
 pipeline_config:
   workflow: ref2va
-# Use eager execution for the Ref2VA example.
 torch_compile_config:
-  enable: false
+  enable: true
 cuda_graph_config:
   enable: false
 attention_config:
