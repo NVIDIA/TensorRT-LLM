@@ -21,7 +21,10 @@ import torch
 
 import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import (
+    MnnvlMoe,
+    NVLinkTwoSided,
+)
 from tensorrt_llm.mapping import Mapping
 
 
@@ -432,10 +435,10 @@ def test_mnnvl_moe_restore_publishes_all_workspaces_after_frontend_ready(monkeyp
     initialize_workspace = Mock()
     synchronize = Mock()
     comm = _FakeComm()
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_workspace", first)
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_prepare_workspace", second)
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_workspace_tensor", workspace_tensor)
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_mapping", mapping)
+    monkeypatch.setattr(MnnvlMoe, "moe_workspace", first)
+    monkeypatch.setattr(MnnvlMoe, "moe_prepare_workspace", second)
+    monkeypatch.setattr(MnnvlMoe, "moe_workspace_tensor", workspace_tensor)
+    monkeypatch.setattr(MnnvlMoe, "moe_mapping", mapping)
     monkeypatch.setattr(
         mnnvl.torch.ops.trtllm,
         "moe_initialize_workspace",
@@ -443,7 +446,7 @@ def test_mnnvl_moe_restore_publishes_all_workspaces_after_frontend_ready(monkeyp
     )
     monkeypatch.setattr(mnnvl.torch.cuda, "synchronize", synchronize)
 
-    mnnvl.MnnvlMoe.checkpoint_restore(comm)
+    MnnvlMoe.checkpoint_restore(comm)
 
     first.checkpoint_restore.assert_called_once_with(comm)
     second.checkpoint_restore.assert_called_once_with(comm)
@@ -463,9 +466,9 @@ def test_mnnvl_moe_restore_prepare_only_skips_main_workspace_initialization(monk
     initialize_workspace = Mock()
     synchronize = Mock()
     comm = _FakeComm()
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_workspace", main_workspace)
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_prepare_workspace", prepare_workspace)
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_workspace_tensor", workspace_tensor)
+    monkeypatch.setattr(MnnvlMoe, "moe_workspace", main_workspace)
+    monkeypatch.setattr(MnnvlMoe, "moe_prepare_workspace", prepare_workspace)
+    monkeypatch.setattr(MnnvlMoe, "moe_workspace_tensor", workspace_tensor)
     monkeypatch.setattr(
         mnnvl.torch.ops.trtllm,
         "moe_initialize_workspace",
@@ -473,7 +476,7 @@ def test_mnnvl_moe_restore_prepare_only_skips_main_workspace_initialization(monk
     )
     monkeypatch.setattr(mnnvl.torch.cuda, "synchronize", synchronize)
 
-    mnnvl.MnnvlMoe.checkpoint_restore(comm)
+    MnnvlMoe.checkpoint_restore(comm)
 
     initialize_workspace.assert_not_called()
     synchronize.assert_called_once_with()
@@ -487,11 +490,11 @@ def test_mnnvl_moe_restore_failure_marks_earlier_workspace_broken(monkeypatch):
     first.checkpoint_restore.return_value = True
     second = Mock()
     second.checkpoint_restore.side_effect = RuntimeError("second restore failed")
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_workspace", first)
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_prepare_workspace", second)
+    monkeypatch.setattr(MnnvlMoe, "moe_workspace", first)
+    monkeypatch.setattr(MnnvlMoe, "moe_prepare_workspace", second)
 
     with pytest.raises(RuntimeError, match="second restore failed"):
-        mnnvl.MnnvlMoe.checkpoint_restore(_FakeComm())
+        MnnvlMoe.checkpoint_restore(_FakeComm())
 
     first._checkpoint_restore_failed.assert_called_once_with()
     first._checkpoint_restore_complete.assert_not_called()
@@ -747,9 +750,9 @@ def test_two_sided_combine_requires_new_prepare_before_next_dispatch(monkeypatch
     communication.top_k = 1
     communication.use_low_precision_combine = False
     communication.alltoall_result_do_sum = True
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "require_mapped", Mock())
+    monkeypatch.setattr(MnnvlMoe, "require_mapped", Mock())
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "mnnvl_moe_alltoallv_combine",
         Mock(return_value=torch.ones(1, 1)),
     )
