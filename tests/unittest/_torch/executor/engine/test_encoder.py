@@ -26,7 +26,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
     EncoderDecoderRunnerConfig,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedInputs
-from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig
+from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, EncodeExtraInputSpec
 
 pytestmark = pytest.mark.cpu_only
 
@@ -473,6 +473,49 @@ def test_encoder_warmup_oom_is_fatal_when_distributed() -> None:
 
     assert raised.value is error
     runner._execute_prepared.assert_called_once_with(runner._prepare_encoder_batch.return_value)
+
+
+def _capture_input_runner(extra_input_specs: list[EncodeExtraInputSpec]) -> EncoderRunner:
+    runner = object.__new__(EncoderRunner)
+    runner._encoder_cuda_graph_runner = SimpleNamespace(extra_input_specs=extra_input_specs)
+    runner._prepare_encoder_batch = Mock(
+        return_value=EncoderPreparedInputs({}, sequence_lengths=[3, 5])
+    )
+    return runner
+
+
+def test_capture_inputs_build_zero_stand_ins_for_declared_extra_inputs() -> None:
+    runner = _capture_input_runner(
+        [
+            EncodeExtraInputSpec(name="feat", shape=("batch_size", 40), dtype="int32"),
+            EncodeExtraInputSpec(name="embeds", shape=("num_tokens", 768), dtype="float16"),
+        ]
+    )
+
+    # 8 tokens across 2 requests, so swapping the two symbolic sizes would fail.
+    runner._prepare_capture_inputs([3, 5])
+
+    input_ids, sequence_lengths = runner._prepare_encoder_batch.call_args.args
+    model_inputs = runner._prepare_encoder_batch.call_args.kwargs["model_inputs"]
+    assert input_ids == [0] * 8
+    assert sequence_lengths == [3, 5]
+    assert set(model_inputs) == {"feat", "embeds"}
+    for name, shape, dtype in (
+        ("feat", (2, 40), torch.int32),
+        ("embeds", (8, 768), torch.float16),
+    ):
+        stand_in = model_inputs[name]
+        assert stand_in.shape == shape
+        assert stand_in.dtype == dtype
+        assert not stand_in.any()
+
+
+def test_capture_inputs_without_declared_extra_inputs_pass_no_model_inputs() -> None:
+    runner = _capture_input_runner([])
+
+    runner._prepare_capture_inputs([3, 5])
+
+    assert runner._prepare_encoder_batch.call_args.kwargs["model_inputs"] is None
 
 
 def test_encoder_release_clears_owned_graph_backend() -> None:
