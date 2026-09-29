@@ -23,19 +23,25 @@ and crosses the executor IPC boundary as a plain string, so the server
 recognizes it by text in ``OpenAIServer.create_error_response`` — the single
 chokepoint through which the chat, completions, and responses endpoints all
 render request errors. These tests cover the message builder, the detector,
-and that chokepoint; they are CPU-only.
+that chokepoint, and the disaggregated router's forwarding of the worker's
+error envelope; they are CPU-only.
 """
 
 import json
 from http import HTTPStatus
+from types import SimpleNamespace
+from unittest.mock import Mock
 
+import aiohttp
 import pytest
+from fastapi import HTTPException
 
 from tensorrt_llm.executor.utils import (
     CONTEXT_LENGTH_EXCEEDED_CODE,
     context_length_exceeded_message,
     is_context_length_exceeded_message,
 )
+from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 # The CPU stage collects with `-m cpu_only`; unittest/conftest.py also skips
@@ -103,3 +109,63 @@ def test_error_response_non_400_status_unchanged():
     body = _body(response)
     assert body["code"] == 404
     assert body["type"] == "InvalidRequestError"
+
+
+def _upstream_error(worker_body: str, status: int = 400) -> aiohttp.ClientResponseError:
+    """A ClientResponseError the way openai_client builds one.
+
+    post_json/_send_request raise with ``message=f"{reason}: {body[:2048]}"``,
+    where ``body`` is the worker's HTTP response text.
+    """
+    return aiohttp.ClientResponseError(
+        request_info=Mock(),
+        history=(),
+        status=status,
+        message=f"Bad Request: {worker_body}",
+    )
+
+
+def _disagg_server() -> OpenAIDisaggServer:
+    server = object.__new__(OpenAIDisaggServer)
+    server._perf_metrics_collector = SimpleNamespace(
+        http_exceptions=SimpleNamespace(inc=Mock()),
+        internal_errors=SimpleNamespace(inc=Mock()),
+    )
+    return server
+
+
+def test_disagg_route_preserves_machine_readable_code():
+    """The disagg router must not drop the worker's context-length code.
+
+    The router forwards a worker error as HTTPException(detail=<message>),
+    which keeps HTTP 400 and the text but loses ``code``; a client that
+    checks ``code == "context_length_exceeded"`` could then never detect the
+    rejection through the disaggregated route. _handle_exception must re-emit
+    the worker's envelope instead for this error.
+    """
+    msg = context_length_exceeded_message(2048, 4096)
+    # create_error_response's body is the exact JSON a context worker sends.
+    worker_body = OpenAIServer.create_error_response(msg).body.decode()
+
+    response = _disagg_server()._handle_exception(_upstream_error(worker_body))
+
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    body = _body(response)
+    assert body["code"] == CONTEXT_LENGTH_EXCEEDED_CODE
+    assert body["type"] == "BadRequestError"
+    assert body["message"] == msg
+
+
+def test_disagg_route_other_upstream_errors_unchanged():
+    """Non-context-length worker errors keep the {"detail": message} contract."""
+    worker_body = json.dumps(
+        {
+            "message": "`max_tokens` (0) must be greater than 0",
+            "type": "BadRequestError",
+            "code": 400,
+        }
+    )
+    with pytest.raises(HTTPException) as excinfo:
+        _disagg_server()._handle_exception(_upstream_error(worker_body))
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.detail == "`max_tokens` (0) must be greater than 0"
