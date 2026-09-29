@@ -1866,27 +1866,17 @@ class KvCacheCreator:
                 or self._unified_draft_cache_unsupported_reason() is None)
 
     def _validate_standalone_draft_cache(self) -> None:
-        """Reject unsupported DSpark configurations before profiling."""
-        if not (self._is_standalone_dspark() or self._is_embedded_dspark()):
+        """Validate manager-owned DSpark history for disaggregated serving."""
+        if (not (self._is_standalone_dspark() or self._is_embedded_dspark())
+                or not self._is_disagg):
             return
         if not self._is_kv_cache_manager_v2:
-            if self._kv_cache_config.use_kv_cache_manager_v2 is True:
-                raise ValueError(
-                    "DSpark requested KVCacheManagerV2 but its "
-                    "configuration resolved to V1. Remove unsupported V2 "
-                    "features, including beam search, instead of falling "
-                    "back to private draft state.")
-            if self._is_disagg:
-                raise ValueError("DSpark disaggregation requires "
-                                 "kv_cache_config.use_kv_cache_manager_v2=True "
-                                 "on both workers.")
-            return
-        if self._mapping.pp_size != 1:
-            raise ValueError("DSpark KVCacheManagerV2 requires PP=1.")
-        if self._is_disagg:
-            reason = self._unified_draft_cache_unsupported_reason()
-            if reason is not None:
-                raise ValueError(reason)
+            raise ValueError("DSpark disaggregation requires "
+                             "kv_cache_config.use_kv_cache_manager_v2=True "
+                             "on both workers.")
+        reason = self._unified_draft_cache_unsupported_reason()
+        if reason is not None:
+            raise ValueError(reason)
 
     def _unified_draft_cache_unsupported_reason(self) -> Optional[str]:
         """Shared admission requirements for unified aggregate and disagg KV."""
