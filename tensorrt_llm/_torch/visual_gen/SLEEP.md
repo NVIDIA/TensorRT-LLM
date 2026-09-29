@@ -22,11 +22,15 @@ addresses. Reserve host RAM for the captured allocation pool in addition to
 ordinary process memory. The allocator retains host backing after wake, so this
 RAM budget is required for the lifetime of the pipeline after its first sleep.
 
-Loading captures persistent allocations; inference and warmup allocations are
-outside that pool. Sleep also empties PyTorch's unused caching-allocator blocks,
-but does not release the CUDA context or guarantee that all device memory is
-free. Live outputs and allocations from other users of the same process remain
-outside this pipeline's unique allocation tag.
+The captured pool can include cached space from temporary loading and
+quantization buffers, so backups and transfers may be larger than the model
+weights alone. Repeated sleep/wake cycles reuse the same pool and host backup;
+wake does not reload or requantize the model. Each instance needs its own backup.
+
+Inference and warmup allocations are outside the captured pool. Sleep clears
+unused PyTorch cache outside that pool, but leaves the CUDA context, live
+outputs, and other users' allocations in place. GPU memory usage will not drop
+to zero.
 
 Calls are idempotent in their completed state. Sleep closes admission, waits for
 the active `forward` call (including calls through `infer`), and synchronizes CUDA
