@@ -20,12 +20,18 @@ when head already contains target. It asks CodeRabbit to distinguish cross-branc
 interactions from PR-local compatibility defects and to verify how both sides'
 edits combine. An alleged caller/definition mismatch must remain after three-way
 merge analysis before it can support FAIL. Unresolved relevant
-textual conflicts must not be replaced with an assumed resolution.
+textual conflicts must not be replaced with an assumed resolution. Independent
+operations added by both branches must also work together, including outside
+conflict hunks.
 
 FAIL needs a supported trigger, a reachable failure path and evidence that paired
 edits, feature gates or recovery logic do not prevent the problem. Unrelated
 pre-existing defects, missing tests alone and wording-only improvements do not
-support FAIL. Missing material evidence supports INCONCLUSIVE. Each reply must
+support FAIL. Intentional rejection of unmet prerequisites needs evidence of a
+broken supported contract before it supports FAIL. Resource-exhaustion findings
+need a concrete supported configuration, numeric demand and capacity, and a
+comparison of baseline and combined allocation including recovery behavior.
+Missing material evidence supports INCONCLUSIVE. Each reply must
 include the advisory notice and put its fixed-revision citations inside the
 `SEMANTIC_REVIEW` section. These are instructions to the AI, not guarantees of
 its compliance or semantic accuracy.
@@ -131,7 +137,7 @@ after partial selection failures or quota exhaustion if at least one PR was
 visited. Upload failure is reported and prevents dispatching that batch's PR
 jobs. Cursor maintenance does not change the version deduplication rules.
 
-Artifacts use a 90-day retention request, subject to repository limits. If no
+Artifacts use a 14-day retention request, subject to repository limits. If no
 trusted cursor artifact is retained, log initialization and start with the
 newest PR. This includes first use and deletion of all retained cursor artifacts;
 artifact storage cannot distinguish those cases. Do not delete these artifacts
@@ -165,6 +171,15 @@ the request but lacking a valid result format does not complete it; it remains
 eligible for the bounded timeout retry. A correctly bound PASS/FAIL without the
 required fixed-revision source citations completes as INCONCLUSIVE. This does
 not establish the semantic correctness of those citations or the AI's findings.
+
+Publication logs and job summaries explain why a result was not accepted and
+link the observed comment. A known CodeRabbit service-error message, a missing
+or malformed result record, mismatched identities or revisions, and missing
+source citations have distinct diagnostics. A comment without the request's
+identity is an unverified observation, not proof that it answers that request.
+These diagnostics do not complete requests, change verdicts or request retries.
+They remain visible when no status update is needed; ordinary unrelated bot
+comments do not create an analysis result.
 
 Publication uses only the latest request and its matching replies. A new request
 updates the same PR context on its requested head commit; an old request's late
@@ -243,9 +258,10 @@ node --test .github/scripts/semantic_review*.test.js
 ```
 
 `semantic_review_cases.js` freezes three real incidents in divergent,
-already-integrated and repaired states, plus three paired-edit controls, for
-analysis replay. Integrated inputs use the actual defective merge commits to
-exercise `merge_base == target`;
+already-integrated and repaired states, three paired-edit controls, and five
+fixed inputs covering release prerequisites, resource allocation, integrated
+test patches, symbol bindings and test attributes. Integrated inputs use the
+actual defective merge commits to exercise `merge_base == target`;
 they are not newly synthesized rebases. Repair controls compare each historical
 fix with its immediate parent to exclude unrelated intervening changes. Build
 each request with the same `command()` used by the workflow:
@@ -262,7 +278,13 @@ preserves the paired edits. #19397 also has textual conflicts, so rejecting that
 specific false finding does not require an overall PASS. Fixtures carry no
 expected answer into `command()`.
 
-Replay all twelve inputs with the final prompt, retaining request IDs, input SHAs,
+The additional inputs use PRs #19429, #19213, #19397, #18813 and #19418. Assess
+release-policy and resource findings against their supported trigger, rather
+than requiring an overall PASS. For the known incompatible inputs, require at
+least one independently supported incompatibility; also record whether the
+specific duplicate-operation, binding or test-attribute defect was found.
+
+Replay all seventeen inputs with the final prompt, retaining request IDs, input SHAs,
 raw replies, concrete findings and timings, including missed/inconclusive results.
 Use an independent context without giving the incident explanation or a repair.
 If the hosting discussion reveals the answer, label the run as a replay rather

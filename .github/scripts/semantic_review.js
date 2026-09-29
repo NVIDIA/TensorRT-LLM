@@ -71,17 +71,19 @@ function awaiting(request) {
       `merge base ${request.mergeBase}.\n\n${notice}`};
 }
 
-function parseResult(comment, request, repo) {
-  if (!isReviewer(comment.user)) return;
+function inspectResult(comment, request, repo) {
+  if (!isReviewer(comment.user)) return {};
   const parts = (comment.body || '').split(/^(?:#{1,6}[ \t]+)?SEMANTIC_REVIEW[ \t]*\r?$/m);
-  if (parts.length !== 2) return;
+  if (parts.length !== 2) return {reason: parts.length === 1 ?
+    'Missing standalone SEMANTIC_REVIEW heading.' : 'Multiple SEMANTIC_REVIEW headings.'};
   const lines = parts[1].match(/^SEMANTIC_RESULT[^\r\n]*$/gmi) || [];
-  if (lines.length !== 1) return;
+  if (lines.length !== 1) return {reason: lines.length === 0 ?
+    'Missing SEMANTIC_RESULT record.' : 'Multiple SEMANTIC_RESULT records.'};
   const record = lines[0].match(/^SEMANTIC_RESULT request_id=([^\s]+) head=([^\s]+) target=([^\s]+) merge_base=([^\s]+) verdict=(PASS|FAIL|INCONCLUSIVE)[ \t]*$/i);
-  if (!record) return;
+  if (!record) return {reason: 'Malformed SEMANTIC_RESULT record.'};
   const [, id, head, target, mergeBase, rawVerdict] = record;
   if (id !== request.id || head !== request.head || target !== request.target ||
-      mergeBase !== request.mergeBase) return;
+      mergeBase !== request.mergeBase) return {reason: 'Request ID or fixed commit SHA mismatch.'};
   let verdict = rawVerdict.toUpperCase();
   const citations = [...parts[1].matchAll(/https:\/\/github\.com\/([^/\s]+\/[^/\s]+)\/blob\/([a-f0-9]{40})\/[^\s<>)]+#L[1-9]\d*/g)]
     .filter(match => match[1].toLowerCase() === `${repo.owner}/${repo.repo}`.toLowerCase())
@@ -89,7 +91,12 @@ function parseResult(comment, request, repo) {
   const missingEvidence = verdict !== 'INCONCLUSIVE' &&
     ![head, target].every(revision => citations.includes(revision));
   if (missingEvidence) verdict = 'INCONCLUSIVE';
-  return {verdict, missingEvidence, comment};
+  return {result: {verdict, missingEvidence, comment}, reason: missingEvidence ?
+    'Missing fixed-revision source citations; accepted as INCONCLUSIVE.' : undefined};
+}
+
+function parseResult(comment, request, repo) {
+  return inspectResult(comment, request, repo).result;
 }
 
 function refersToRequest(comment, request) {
@@ -98,6 +105,18 @@ function refersToRequest(comment, request) {
   return bindings.length ? bindings.some(([, id, head, target, mergeBase]) =>
     id === request.id && head === request.head && target === request.target &&
       mergeBase === request.mergeBase) : body.includes(request.id);
+}
+
+function replyDiagnostic(comment, inspected, request) {
+  if (!isReviewer(comment.user) || !inspected.reason) return;
+  const body = comment.body || '';
+  const serviceError = !inspected.result &&
+    /^Oops, something went wrong! Please try again later\./m.test(body);
+  if (!serviceError && !/SEMANTIC_(REVIEW|RESULT)/.test(body) &&
+      !refersToRequest(comment, request)) return;
+  return {commentId: comment.id,
+    reason: serviceError ? 'CodeRabbit reported a service error.' : inspected.reason,
+    unbound: !refersToRequest(comment, request)};
 }
 
 async function reviewState({github, repo, number, comments, head}) {
@@ -144,14 +163,22 @@ async function reviewState({github, repo, number, comments, head}) {
     .sort((a, b) => b.id - a.id);
   let result;
   let invalidSource;
+  const diagnostics = [];
   for (const comment of replies) {
-    const parsed = parseResult(comment, request, repo);
-    if (parsed) { result = parsed; break; }
+    const inspected = inspectResult(comment, request, repo);
+    const diagnostic = replyDiagnostic(comment, inspected, request);
+    if (diagnostic && comment.id === sourceId) diagnostic.unbound = false;
+    if (diagnostic) diagnostics.push(diagnostic);
+    if (inspected.result) { result = inspected.result; break; }
     if (comment.id === sourceId || refersToRequest(comment, request)) {
       invalidSource = comment;
+      if (!diagnostic) diagnostics.push({commentId: comment.id, reason: inspected.reason});
       break;
     }
   }
+  if (!result && !invalidSource) diagnostics.push(sourceId ? {
+    commentId: sourceId, reason: 'Previously observed reply is deleted or unavailable; no accepted result.',
+  } : {commentId: request.commentId, reason: 'No accepted reply received for the latest request.'});
   const source = result?.comment.id || invalidSource?.id || sourceId;
   const url = source ? `${link}#issuecomment-${source}` : undefined;
   const output = result ? {
@@ -172,7 +199,7 @@ async function reviewState({github, repo, number, comments, head}) {
   };
   const changed = !isPublisher(status?.creator) ||
     Object.entries(desired).some(([key, value]) => status?.[key] !== value);
-  return {request, result, status, cleanup, output,
+  return {request, result, status, cleanup, output, diagnostics,
     update: changed ? {...repo, sha: request.head, context: statusContext(number), ...desired} : undefined};
 }
 
@@ -184,8 +211,26 @@ async function publish({github, context, core, number, comments, head}) {
   const state = await reviewState({github, repo: context.repo, number, comments, head});
   if (state?.update) {
     await github.rest.repos.createCommitStatus(state.update);
+  }
+  const event = context.payload?.comment;
+  const eventDiagnostic = event && state?.request ?
+    replyDiagnostic(event, inspectResult(event, state.request, context.repo), state.request) : undefined;
+  if (state?.output && (!event || state.update || eventDiagnostic ||
+      state.diagnostics.some(item => item.commentId === event.id))) {
+    const diagnostics = [...state.diagnostics];
+    if (eventDiagnostic && !diagnostics.some(item => item.commentId === event.id)) {
+      diagnostics.unshift(eventDiagnostic);
+    }
+    const observations = diagnostics.slice(0, 10).map(({commentId, reason, unbound}) => {
+      const link = `https://github.com/${context.repo.owner}/${context.repo.repo}/pull/${number}#issuecomment-${commentId}`;
+      const message = (unbound ? 'Observed comment; request association is unverified. ' : '') + reason;
+      core.info(`Semantic review PR #${number}: ${message} ${link}`);
+      return `- ${message} [Comment](${link})`;
+    }).join('\n');
     const {title, summary} = state.output;
-    await core.summary.addRaw(`${title}\n\n${summary}\n`).write();
+    await core.summary.addRaw(`${title}\n\n${summary}\n` +
+      (observations ? `\nReply diagnostics:\n\n${observations}\n` : '') +
+      (diagnostics.length > 10 ? `\n${diagnostics.length - 10} additional observations omitted.\n` : '')).write();
   }
   for (const check of state?.cleanup || []) {
     await github.rest.checks.update({...context.repo, check_run_id: check.id,

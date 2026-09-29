@@ -82,7 +82,7 @@ jobs:
           name: ${{ steps.select.outputs.cursor_artifact }}
           path: ${{ runner.temp }}/semantic-review-cursor/cursor.json
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 14
           overwrite: true
 
   request:

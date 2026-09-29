@@ -30,7 +30,7 @@ const legacy = (r = request(), extra = {}) => ({id: 100, name: NAME, head_sha: r
   external_id: identity(1, r), app: {slug: 'github-actions'}, status: 'in_progress',
   conclusion: null, output: awaiting(r), ...extra});
 function harness(r = request()) {
-  const state = {comments: [record(10, r)], writes: [], updates: [], summaries: [], reads: 0,
+  const state = {comments: [record(10, r)], writes: [], updates: [], summaries: [], logs: [], reads: 0,
     refs: [], updateFailures: new Set(), statusFailures: 0, statusErrorCode: 503, statuses: [], checks: []};
   const github = {
     paginate: async (method, args) => {
@@ -72,7 +72,8 @@ function harness(r = request()) {
       },
     }},
   };
-  const core = {summary: {addRaw(text) {state.summaries.push(text); return this;}, async write() {}},
+  const core = {info: message => state.logs.push(message),
+    summary: {addRaw(text) {state.summaries.push(text); return this;}, async write() {}},
     setFailed() {throw new Error('AI verdict must not fail the orchestration job');}};
   const deliver = async event => publish({github, core, context: {
     repo, eventName: 'issue_comment', payload: {issue: {number: 1, pull_request: {}}, comment: event},
@@ -152,6 +153,127 @@ test('waiting is pending with request link and no invented result', async () => 
   assert.equal(Object.hasOwn(state.status, 'conclusion'), false);
   assert.equal((await repair()).update, undefined);
   assert.equal(state.writes.length, 1);
+  assert.match(state.logs[0], /No accepted reply received.*#issuecomment-10$/);
+  assert.match(state.summaries[1], /No accepted reply received/);
+});
+
+test('reply diagnostics explain rejected protocol records without changing acceptance', async () => {
+  const r = request();
+  for (const [change, reason] of [
+    [body => body.replace('SEMANTIC_REVIEW', 'Findings'), 'Missing standalone SEMANTIC_REVIEW heading'],
+    [body => body + '\nSEMANTIC_REVIEW\n', 'Multiple SEMANTIC_REVIEW headings'],
+    [body => body.replace(/^SEMANTIC_RESULT[^\n]+\n/m, ''), 'Missing SEMANTIC_RESULT record'],
+    [body => body + body.match(/^SEMANTIC_RESULT[^\n]+/m)[0], 'Multiple SEMANTIC_RESULT records'],
+    [body => body.replace('verdict=PASS', 'verdict=UNKNOWN'), 'Malformed SEMANTIC_RESULT record'],
+  ]) {
+    const {state, deliver, inspect, repair} = harness(r);
+    await repair();
+    const message = reply(20, r);
+    message.body = change(message.body);
+    state.comments.push(message);
+    await deliver(message);
+    const current = await inspect();
+    assert.equal(current.result, undefined);
+    assert.equal(current.update, undefined);
+    assert.equal(state.status.state, 'pending');
+    assert.ok(state.logs.some(line => line.includes(reason) && line.endsWith('#issuecomment-20')));
+    assert.ok(state.summaries.at(-1).includes(reason));
+  }
+});
+
+test('an unbound missing result or service error is observable without binding it to a request', async () => {
+  const r = request();
+  for (const [body, reason] of [
+    ['SEMANTIC_REVIEW\nFAIL: evidence found, but no result record.', 'Missing SEMANTIC_RESULT record'],
+    ['<!-- This is an auto-generated reply by CodeRabbit -->\n' +
+      'Oops, something went wrong! Please try again later. 🐰 💔', 'CodeRabbit reported a service error'],
+  ]) {
+    const {state, deliver, repair} = harness(r);
+    await repair();
+    const original = structuredClone(state.status);
+    const message = {...comment(20, body), html_url: 'https://untrusted.invalid/leak'};
+    state.comments.push(message);
+    await deliver(message);
+    assert.equal(state.writes.length, 1);
+    assert.deepEqual(state.status, original);
+    assert.match(state.summaries.at(-1), /request association is unverified/);
+    assert.ok(state.logs.at(-2).includes(reason));
+    assert.doesNotMatch(state.summaries.at(-1), /untrusted\.invalid|evidence found|🐰/);
+    assert.match(state.summaries.at(-1), /pull\/1#issuecomment-20/);
+    state.summaries.length = 0;
+    await repair();
+    assert.ok(state.summaries[0].includes(reason));
+    assert.equal(state.writes.length, 1);
+    state.comments.push(reply(30, r, 'FAIL'));
+    await repair();
+    const accepted = structuredClone(state.status);
+    const late = comment(40, body);
+    state.comments.push(late);
+    await deliver(late);
+    assert.deepEqual(state.status, accepted);
+    assert.equal(state.writes.length, 2);
+  }
+});
+
+test('ordinary comments and spoofed bot identities produce no rejection diagnostics', async () => {
+  const r = request();
+  const {state, deliver, repair} = harness(r);
+  state.comments.push(reply(20, r));
+  await repair();
+  state.logs.length = 0;
+  state.summaries.length = 0;
+  for (const message of [comment(30, 'Please add tests for the changed behavior.'),
+    comment(40, 'SEMANTIC_REVIEW\nFAIL', {...bot, id: 1})]) {
+    state.comments.push(message);
+    await deliver(message);
+  }
+  assert.deepEqual(state.logs, []);
+  assert.deepEqual(state.summaries, []);
+  assert.equal(state.writes.length, 1);
+  assert.equal(state.status.state, 'success');
+});
+
+test('late mismatched replies are logged without replacing a completed current result', async () => {
+  const r = request();
+  for (const extra of [{id: id(2)}, {head: 'd'.repeat(40)}, {target: 'd'.repeat(40)},
+    {mergeBase: 'd'.repeat(40)}]) {
+    const {state, deliver, repair} = harness(r);
+    state.comments.push(reply(20, r));
+    await repair();
+    const message = reply(30, {...r, ...extra}, 'FAIL');
+    state.comments.push(message);
+    await deliver(message);
+    assert.equal(state.writes.length, 1);
+    assert.equal(state.status.state, 'success');
+    assert.match(state.summaries.at(-1), /request association is unverified.*Request ID or fixed commit SHA mismatch/);
+    assert.match(state.logs.at(-1), /#issuecomment-30$/);
+  }
+});
+
+test('event diagnostics remain separate from a newer accepted result and API comment freshness', async () => {
+  const r = request();
+  const {state, deliver, repair} = harness(r);
+  state.comments.push(reply(30, r));
+  await repair();
+  const message = comment(20, 'SEMANTIC_REVIEW\nNo result record.');
+  await deliver(message);
+  assert.equal(state.writes.length, 1);
+  assert.match(state.status.target_url, /semantic_review_source=30#issuecomment-30$/);
+  assert.match(state.logs.at(-1), /Missing SEMANTIC_RESULT record.*#issuecomment-20$/);
+});
+
+test('diagnostic output is bounded and does not make an unchanged status need repair', async () => {
+  const r = request();
+  const {state, inspect, repair} = harness(r);
+  await repair();
+  state.logs.length = 0;
+  for (let n = 20; n < 32; n++) state.comments.push(comment(n, 'SEMANTIC_REVIEW\nNo result record.'));
+  assert.equal((await inspect()).update, undefined);
+  await repair();
+  assert.equal(state.writes.length, 1);
+  assert.equal(state.logs.length, 10);
+  assert.match(state.summaries.at(-1), /3 additional observations omitted/);
+  assert.match(state.logs[0], /#issuecomment-31$/);
 });
 
 test('all valid verdicts finish internally, with distinct descriptions and reply links', async () => {
@@ -172,6 +294,9 @@ test('all valid verdicts finish internally, with distinct descriptions and reply
     assert.equal(current.result.verdict, expected === 'pending' ? 'INCONCLUSIVE' : verdict);
     assert.match(state.status.target_url, /semantic_review_source=20#issuecomment-20$/);
     assert.match(state.summaries[0], new RegExp(r.target));
+    if (verdict !== 'INCONCLUSIVE' && !evidence) {
+      assert.match(state.logs[0], /Missing fixed-revision source citations; accepted as INCONCLUSIVE/);
+    }
     assert.equal((await repair()).update, undefined);
   }
 });
@@ -225,6 +350,9 @@ test('edited or deleted published replies revoke a verdict without falling back 
     assert.equal(state.status.description, 'Waiting for CodeRabbit response');
     assert.match(state.status.target_url, /semantic_review_source=30#issuecomment-10$/);
     assert.equal((await repair()).update, undefined);
+    assert.ok(state.summaries.at(-1).includes(change === 'delete' ?
+      'Previously observed reply is deleted or unavailable' : change === 'invalid' ?
+        'Missing standalone SEMANTIC_REVIEW heading' : 'Request ID or fixed commit SHA mismatch'));
     state.comments.push(reply(40, r));
     assert.equal((await repair()).result.verdict, 'PASS');
     assert.equal(state.status.state, 'success');
@@ -309,7 +437,7 @@ test('a missing status never prevents result parsing and publication failure is 
   await repair(comments);
   assert.equal((await repair(comments)).update, undefined);
   assert.equal(state.writes.length, 1);
-  assert.equal(state.summaries.length, 1);
+  assert.equal(state.summaries.length, 2);
 });
 
 test('status API errors, including the per-SHA context cap, are reported without alternate contexts', async () => {
@@ -425,7 +553,7 @@ test('legacy cleanup reads only recorded and explicit heads, deduplicating ident
 });
 
 test('fixed historical inputs round-trip request identity and all three result verdicts', () => {
-  assert.equal(cases.length, 12);
+  assert.equal(cases.length, 17);
   for (const [index, fixture] of cases.entries()) {
     const r = request(index + 1, fixture);
     const body = command(r);
