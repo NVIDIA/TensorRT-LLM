@@ -883,8 +883,16 @@ class CUDAGraphRunner:
     @staticmethod
     def _assert_graph_tensor_ptrs_stable(obj: Any,
                                          expected_ptrs: Dict[str, int]) -> None:
-        """Raise if any tensor captured by _snapshot_graph_tensor_ptrs has moved."""
+        """Raise if any tensor captured by _snapshot_graph_tensor_ptrs has moved.
+
+        Attributes listed in obj.draft_replay_swapped_attrs are skipped: they
+        are deliberately rebound to draft KV cache buffers for the duration of
+        a draft replay and restored afterwards.
+        """
+        swapped_attrs = getattr(obj, "draft_replay_swapped_attrs", frozenset())
         for name, expected_ptr in expected_ptrs.items():
+            if name in swapped_attrs:
+                continue
             value = getattr(obj, name, None)
             if not isinstance(value, torch.Tensor):
                 raise RuntimeError(

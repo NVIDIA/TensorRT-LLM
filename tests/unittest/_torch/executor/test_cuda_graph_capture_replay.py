@@ -434,6 +434,50 @@ class TestStrictBufferCheck:
         with pytest.raises(RuntimeError, match="some_buf"):
             runner.replay(key, inputs)
 
+    def test_replay_skips_draft_replay_swapped_attrs(self, monkeypatch):
+        """draft_replay_swapped_attrs skips only the pointer check; it doesn't
+        redirect the captured graph to the rebound tensor. Once cleared, the
+        same rebind is flagged again.
+        """
+        runner, key, attn_metadata, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
+
+        def forward_fn(fn_inputs):
+            return fn_inputs["input_ids"].clone() + fn_inputs["attn_metadata"].some_buf
+
+        runner.capture(key, forward_fn, inputs)
+
+        attn_metadata.some_buf = torch.full((1,), 99, device="cuda", dtype=torch.int32)
+
+        attn_metadata.draft_replay_swapped_attrs = frozenset({"some_buf"})
+        output = runner.replay(key, inputs)
+
+        # Graph kernels still read the buffer captured at address-bake time
+        # (10), not the rebound tensor (99).
+        assert output.item() == 10
+
+        attn_metadata.draft_replay_swapped_attrs = frozenset()
+        with pytest.raises(RuntimeError, match="some_buf"):
+            runner.replay(key, inputs)
+
+    def test_draft_replay_swapped_attrs_does_not_mask_other_rebinds(self, monkeypatch):
+        """Exempting one attribute must not blind the check to an unrelated,
+        unexpected rebind on a different attribute.
+        """
+        runner, key, attn_metadata, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
+        attn_metadata.other_buf = torch.full((1,), 1, device="cuda", dtype=torch.int32)
+
+        def forward_fn(fn_inputs):
+            return fn_inputs["input_ids"].clone() + fn_inputs["attn_metadata"].some_buf
+
+        runner.capture(key, forward_fn, inputs)
+
+        attn_metadata.some_buf = torch.full((1,), 99, device="cuda", dtype=torch.int32)
+        attn_metadata.other_buf = torch.full((1,), 2, device="cuda", dtype=torch.int32)
+
+        attn_metadata.draft_replay_swapped_attrs = frozenset({"some_buf"})
+        with pytest.raises(RuntimeError, match="other_buf"):
+            runner.replay(key, inputs)
+
 
 class TestStrictBufferCheckEnvVar:
     """TLLM_CUDA_GRAPH_STRICT_BUFFERS must actually control
