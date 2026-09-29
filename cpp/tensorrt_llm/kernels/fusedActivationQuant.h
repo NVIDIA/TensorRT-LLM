@@ -24,6 +24,20 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
+// Post-softplus xIELU coefficients (https://arxiv.org/abs/2411.13010):
+//   xielu(x) = alphaP * x^2 + beta * x                              for x > 0
+//            = alphaN * (expm1(min(x, eps)) - x) + beta * x         otherwise
+struct XieluParams
+{
+    float alphaP;
+    float alphaN;
+    float beta;
+    float eps;
+};
+
+template <typename T>
+void invokeXielu(T const* input, T* output, int64_t numel, XieluParams params, cudaStream_t stream);
+
 template <typename T>
 void invokeFusedRelu2Quantize(T const* input, float const* sfScale, std::uint8_t* outputFp4, std::uint8_t* outputSf,
     int m, int n, int sfVecSize, cudaStream_t stream);

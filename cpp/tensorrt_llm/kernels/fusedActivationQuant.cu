@@ -19,6 +19,7 @@
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include "tensorrt_llm/kernels/quantization.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -36,6 +37,91 @@ __device__ __forceinline__ float relu2_f32(float x)
     float r = fmaxf(0.0f, x);
     return r * r;
 }
+
+// Explicitly rounded operations (no FMA contraction) evaluate the same fp32
+// expression, in the same order, as the PyTorch reference. min(x, eps) is
+// written as a select so that NaN propagates as it does in torch.clamp_max.
+__device__ __forceinline__ float xielu_f32(float x, XieluParams const& p)
+{
+    float const betaX = __fmul_rn(p.beta, x);
+    if (x > 0.0f)
+    {
+        return __fadd_rn(__fmul_rn(__fmul_rn(p.alphaP, x), x), betaX);
+    }
+    float const clamped = x > p.eps ? p.eps : x;
+    return __fadd_rn(__fmul_rn(__fsub_rn(expm1f(clamped), x), p.alphaN), betaX);
+}
+
+template <typename T>
+__device__ __forceinline__ T float_to_native(float x)
+{
+    if constexpr (std::is_same_v<T, half>)
+    {
+        return __float2half_rn(x);
+    }
+    else
+    {
+        return __float2bfloat16_rn(x);
+    }
+}
+
+template <typename T>
+__global__ void xieluKernel(
+    T const* __restrict__ input, T* __restrict__ output, int64_t numel, XieluParams params, bool vectorized)
+{
+    constexpr int kVecSize = sizeof(uint4) / sizeof(T);
+    int64_t const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    int64_t const tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+    int64_t numVecs = 0;
+    if (vectorized)
+    {
+        numVecs = numel / kVecSize;
+        for (int64_t v = tid; v < numVecs; v += stride)
+        {
+            uint4 const in = reinterpret_cast<uint4 const*>(input)[v];
+            T const* inVals = reinterpret_cast<T const*>(&in);
+            uint4 out;
+            T* outVals = reinterpret_cast<T*>(&out);
+#pragma unroll
+            for (int i = 0; i < kVecSize; i++)
+            {
+                outVals[i] = float_to_native<T>(xielu_f32(static_cast<float>(inVals[i]), params));
+            }
+            reinterpret_cast<uint4*>(output)[v] = out;
+        }
+    }
+
+    for (int64_t i = numVecs * kVecSize + tid; i < numel; i += stride)
+    {
+        output[i] = float_to_native<T>(xielu_f32(static_cast<float>(input[i]), params));
+    }
+}
+
+template <typename T>
+void invokeXielu(T const* input, T* output, int64_t numel, XieluParams params, cudaStream_t stream)
+{
+    if (numel == 0)
+    {
+        return;
+    }
+    constexpr int kVecSize = sizeof(uint4) / sizeof(T);
+    constexpr int kThreadsPerBlock = 256;
+    bool const vectorized = reinterpret_cast<uintptr_t>(input) % sizeof(uint4) == 0
+        && reinterpret_cast<uintptr_t>(output) % sizeof(uint4) == 0;
+    int64_t const work = vectorized ? (numel + kVecSize - 1) / kVecSize : numel;
+    static int const maxBlocks = tensorrt_llm::common::getMultiProcessorCount() * 32;
+    int const numBlocks
+        = static_cast<int>(std::min<int64_t>((work + kThreadsPerBlock - 1) / kThreadsPerBlock, maxBlocks));
+    xieluKernel<T><<<numBlocks, kThreadsPerBlock, 0, stream>>>(input, output, numel, params, vectorized);
+    sync_check_cuda_error(stream);
+}
+
+template void invokeXielu<half>(half const*, half*, int64_t, XieluParams, cudaStream_t);
+
+#ifdef ENABLE_BF16
+template void invokeXielu<__nv_bfloat16>(__nv_bfloat16 const*, __nv_bfloat16*, int64_t, XieluParams, cudaStream_t);
+#endif
 
 // Fused relu2 + NVFP4 quantization kernel.
 //

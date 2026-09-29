@@ -14,7 +14,9 @@
 # limitations under the License.
 """xIELU activation (https://arxiv.org/abs/2411.13010)."""
 
+import functools
 import math
+import os
 
 import torch
 import torch.nn.functional as F
@@ -29,6 +31,12 @@ def xielu_reference(
     pos = a_p * xf * xf + beta * xf
     neg = (torch.expm1(torch.clamp_max(xf, eps)) - xf) * a_n + beta * xf
     return torch.where(xf > 0, pos, neg).to(x.dtype)
+
+
+@functools.lru_cache(maxsize=1)
+def _xielu_op_available() -> bool:
+    # Set TRTLLM_XIELU_CUDA=0 to use the PyTorch expression instead of the kernel.
+    return os.environ.get("TRTLLM_XIELU_CUDA", "1") == "1" and hasattr(torch.ops.trtllm, "xielu")
 
 
 class XIELU(nn.Module):
@@ -91,6 +99,8 @@ class XIELU(nn.Module):
         self.cache_derived_state()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda and x.dtype in (torch.float16, torch.bfloat16) and _xielu_op_available():
+            return torch.ops.trtllm.xielu(x, self.a_p, self.a_n, self.beta_value, self.eps_value)
         return xielu_reference(x, self.a_p, self.a_n, self.beta_value, self.eps_value)
 
     def extra_repr(self) -> str:

@@ -31,6 +31,36 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
+at::Tensor xielu(at::Tensor const& input, double a_p, double a_n, double beta, double eps)
+{
+    CHECK_TH_CUDA(input);
+    at::Tensor const in = input.contiguous();
+    at::Tensor output = at::empty_like(in);
+    kernels::XieluParams const params{
+        static_cast<float>(a_p), static_cast<float>(a_n), static_cast<float>(beta), static_cast<float>(eps)};
+    auto stream = at::cuda::getCurrentCUDAStream(in.get_device());
+
+    if (in.scalar_type() == at::ScalarType::Half)
+    {
+        kernels::invokeXielu<half>(reinterpret_cast<half const*>(in.data_ptr()),
+            reinterpret_cast<half*>(output.data_ptr()), in.numel(), params, stream);
+    }
+    else if (in.scalar_type() == at::ScalarType::BFloat16)
+    {
+#ifdef ENABLE_BF16
+        kernels::invokeXielu<__nv_bfloat16>(reinterpret_cast<__nv_bfloat16 const*>(in.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()), in.numel(), params, stream);
+#else
+        C10_THROW_ERROR(NotImplementedError, "BFloat16 not enabled.");
+#endif
+    }
+    else
+    {
+        C10_THROW_ERROR(NotImplementedError, "xielu only supports fp16/bf16.");
+    }
+    return output;
+}
+
 std::tuple<at::Tensor, at::Tensor> fused_relu2_quantize(
     at::Tensor const& input, at::Tensor const& sf_scale, int64_t sf_vec_size)
 {
@@ -85,10 +115,12 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def("xielu(Tensor input, float a_p, float a_n, float beta, float eps) -> Tensor");
     m.def("fused_relu2_quantize(Tensor input, Tensor sf_scale, int sf_vec_size=16) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
+    m.impl("xielu", &tensorrt_llm::torch_ext::xielu);
     m.impl("fused_relu2_quantize", &tensorrt_llm::torch_ext::fused_relu2_quantize);
 }
