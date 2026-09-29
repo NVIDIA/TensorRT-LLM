@@ -961,6 +961,7 @@ def test_transfer_worker_passes_overall_timeout_to_tx_session(monkeypatch) -> No
         timeout_s=0.25,
         prompt_len=128,
         overall_timeout_s=60.0,
+        retirement_watchdog=None,
     )
 
 

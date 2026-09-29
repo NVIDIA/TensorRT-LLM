@@ -15,13 +15,14 @@
 
 from __future__ import annotations
 
+import math
 import os
 import queue
 import struct
 import threading
 import time
 import weakref
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Optional, Union
@@ -69,6 +70,11 @@ from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.retirement import (
+    QuiescenceFatalEvent,
+    RetirementDeadline,
+    RetirementWatchdog,
+)
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
@@ -219,10 +225,33 @@ class _LogicalOutcomes:
     backend handle is retained here: memory ownership remains a separate concern.
     """
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
+    def __init__(self, retirement: Optional[RetirementDeadline] = None) -> None:
+        self._lock = threading.Lock() if retirement is None else retirement.lock
+        self._retirement = retirement
         self._terminal: Optional[_LogicalOutcome] = None
         self._results: list[Optional[_LogicalOutcome]] = []
+        if retirement is not None:
+            retirement.bind_timeout_outcome(self._timeout_locked)
+
+    def _timeout_locked(self) -> None:
+        """Commit timeout metadata without entering session, backend or CUDA code."""
+        self._end_locked(_LogicalOutcome(SessionStatus.ERROR, reason="KV transfer timed out"))
+
+    def _end_locked(self, outcome: _LogicalOutcome) -> None:
+        """End pending results once, preserving every previously committed outcome."""
+        if self._terminal is None:
+            self._terminal = outcome
+            for index, result in enumerate(self._results):
+                if result is None:
+                    self._results[index] = outcome
+
+    @property
+    def terminal(self) -> Optional[_LogicalOutcome]:
+        """Return the stable terminal decision, including an elapsed request timeout."""
+        with self._lock:
+            if self._retirement is not None:
+                self._retirement.check()
+            return self._terminal
 
     def add_task(self) -> int:
         with self._lock:
@@ -232,10 +261,14 @@ class _LogicalOutcomes:
 
     def get(self, index: int) -> Optional[_LogicalOutcome]:
         with self._lock:
+            if self._retirement is not None:
+                self._retirement.check()
             return self._results[index]
 
     def complete(self, index: int) -> None:
         with self._lock:
+            if self._retirement is not None:
+                self._retirement.check()
             if self._results[index] is None:
                 self._results[index] = _LogicalOutcome(SessionStatus.TRANSFERRED)
 
@@ -247,23 +280,26 @@ class _LogicalOutcomes:
 
     def _end(self, outcome: _LogicalOutcome) -> None:
         with self._lock:
+            if self._retirement is not None:
+                self._retirement.check()
             if self._terminal is not None:
                 return
-            self._terminal = outcome
-            for index, result in enumerate(self._results):
-                if result is None:
-                    self._results[index] = self._terminal
+            self._end_locked(outcome)
+            if self._retirement is not None:
+                self._retirement.request_drain(outcome.reason or outcome.status.value)
 
 
 class _LogicalTask:
     def __init__(self) -> None:
         self._logical_outcomes = _LogicalOutcomes()
         self._logical_index = self._logical_outcomes.add_task()
+        self._retirement: Optional[RetirementDeadline] = None
 
     def bind_logical_outcomes(self, outcomes: _LogicalOutcomes) -> None:
         """Join the session before this task is exposed to a worker or caller."""
         self._logical_outcomes = outcomes
         self._logical_index = outcomes.add_task()
+        self._retirement = outcomes._retirement
 
     @property
     def logical_outcome(self) -> Optional[_LogicalOutcome]:
@@ -273,8 +309,9 @@ class _LogicalTask:
 class _ReceiveOperationOwner:
     """Track destination access independently from a task's logical result."""
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
+    def __init__(self, retirement: Optional[RetirementDeadline] = None) -> None:
+        self._retirement = retirement
+        self._lock = threading.Lock() if retirement is None else retirement.lock
         self._publication_pending = False
         self._cancelled_unpublished = False
         self._expected_writers: Optional[int] = None
@@ -285,6 +322,17 @@ class _ReceiveOperationOwner:
         self._publication_failed = False
         self._local_completion_pending = False
         self._invalid_evidence = False
+
+    def _settle_if_drained_locked(self) -> None:
+        """Remove this claim only after the complete cohort and local work settle."""
+        if self._retirement is not None and self._resources_drained_locked():
+            self._retirement.settle(self)
+
+    def _invalidate_evidence_locked(self) -> None:
+        """Quarantine conflicting proof, including proof disputed after settlement."""
+        self._invalid_evidence = True
+        if self._retirement is not None:
+            self._retirement.retain_unproven(self, "invalid receive ownership evidence")
 
     def begin_publication(self) -> None:
         with self._lock:
@@ -316,21 +364,24 @@ class _ReceiveOperationOwner:
         """Record that every authorized REQUEST_DATA message was sent."""
         with self._lock:
             self._publication_pending = False
+            self._settle_if_drained_locked()
 
     def abort_publication(self, published_writers: set[int]) -> None:
         """Close a failed fan-out around the writers whose sends succeeded."""
         with self._lock:
             published = frozenset(published_writers)
             if self._writer_cohort is not None and not published.issubset(self._writer_cohort):
-                self._invalid_evidence = True
+                self._invalidate_evidence_locked()
                 raise RuntimeError("publication recorded a writer outside the sealed cohort")
             if not (self._writer_results.keys() | self._in_doubt_writers) <= published:
-                self._invalid_evidence = True
+                self._invalidate_evidence_locked()
                 raise RuntimeError("terminal evidence came from an unpublished writer")
             self._expected_writers = len(published)
             self._writer_cohort = frozenset(published)
             self._publication_failed = True
+            self._cancelled_unpublished = not published
             self._publication_pending = False
+            self._settle_if_drained_locked()
 
     def cancel_unpublished(self) -> bool:
         """Close a publication that did not authorize a remote writer."""
@@ -343,22 +394,25 @@ class _ReceiveOperationOwner:
             self._expected_writers = 0
             self._writer_cohort = frozenset()
             self._publication_pending = False
+            self._settle_if_drained_locked()
             return True
 
     def record_writer_in_doubt(self, peer_rank: int) -> bool:
         """Retain ownership after a writer reports no safe terminal evidence."""
         with self._lock:
             if self._expected_writers is None:
-                self._invalid_evidence = True
+                self._invalidate_evidence_locked()
                 raise RuntimeError(
                     f"writer {peer_rank} reported ambiguous evidence before publication"
                 )
             if self._writer_cohort is not None and peer_rank not in self._writer_cohort:
-                self._invalid_evidence = True
+                self._invalidate_evidence_locked()
                 raise RuntimeError(f"writer {peer_rank} is outside the sealed cohort")
             if peer_rank in self._in_doubt_writers or peer_rank in self._settled_writers:
                 return False
             self._in_doubt_writers.add(peer_rank)
+            if self._retirement is not None:
+                self._retirement.retain_unproven(self, "receive ownership is in doubt")
             return True
 
     def record_writer_settlement(self, peer_rank: int) -> bool:
@@ -371,19 +425,20 @@ class _ReceiveOperationOwner:
             if self._expected_writers is None or (
                 self._writer_cohort is not None and peer_rank not in self._writer_cohort
             ):
-                self._invalid_evidence = True
+                self._invalidate_evidence_locked()
                 raise RuntimeError(f"writer {peer_rank} settled outside the published cohort")
             if peer_rank in self._settled_writers:
                 return False
             if peer_rank not in self._in_doubt_writers:
-                self._invalid_evidence = True
+                self._invalidate_evidence_locked()
                 raise RuntimeError(f"writer {peer_rank} settled without prior ambiguous evidence")
             if self._writer_results.get(peer_rank) is True:
-                self._invalid_evidence = True
+                self._invalidate_evidence_locked()
                 raise RuntimeError(f"writer {peer_rank} settled after contradictory success")
             self._writer_results[peer_rank] = False
             self._in_doubt_writers.remove(peer_rank)
             self._settled_writers.add(peer_rank)
+            self._settle_if_drained_locked()
             return True
 
     def record_writer_result(
@@ -396,22 +451,22 @@ class _ReceiveOperationOwner:
         """Record one writer and return ``(accepted, all_succeeded)``."""
         with self._lock:
             if self._expected_writers is None:
-                self._invalid_evidence = True
+                self._invalidate_evidence_locked()
                 raise RuntimeError(
                     f"writer {peer_rank} reported terminal evidence before publication"
                 )
             if self._writer_cohort is not None and peer_rank not in self._writer_cohort:
-                self._invalid_evidence = True
+                self._invalidate_evidence_locked()
                 raise RuntimeError(f"writer {peer_rank} is outside the sealed cohort")
             if peer_rank in self._in_doubt_writers:
                 if succeeded:
-                    self._invalid_evidence = True
+                    self._invalidate_evidence_locked()
                     raise RuntimeError(f"writer {peer_rank} reported success while in doubt")
                 return False, False
             previous = self._writer_results.get(peer_rank)
             if previous is not None:
                 if previous != succeeded:
-                    self._invalid_evidence = True
+                    self._invalidate_evidence_locked()
                     raise RuntimeError(
                         f"writer {peer_rank} reported contradictory terminal evidence"
                     )
@@ -425,11 +480,13 @@ class _ReceiveOperationOwner:
             )
             if all_succeeded and wait_for_local_completion:
                 self._local_completion_pending = True
+            self._settle_if_drained_locked()
             return True, all_succeeded
 
     def finish_local_completion(self) -> None:
         with self._lock:
             self._local_completion_pending = False
+            self._settle_if_drained_locked()
 
     @property
     def all_writers_reported(self) -> bool:
@@ -444,16 +501,20 @@ class _ReceiveOperationOwner:
     @property
     def resources_drained(self) -> bool:
         with self._lock:
-            writers_drained = self._expected_writers is not None and (
-                len(self._writer_results) == self._expected_writers
+            return self._resources_drained_locked() and (
+                self._retirement is None or self._retirement.can_retire()
             )
-            return (
-                writers_drained
-                and not self._publication_pending
-                and not self._local_completion_pending
-                and not self._in_doubt_writers
-                and not self._invalid_evidence
-            )
+
+    def _resources_drained_locked(self) -> bool:
+        """Check physical evidence without consulting the session's other owners."""
+        return (
+            self._expected_writers is not None
+            and len(self._writer_results) == self._expected_writers
+            and not self._publication_pending
+            and not self._local_completion_pending
+            and not self._in_doubt_writers
+            and not self._invalid_evidence
+        )
 
 
 class AgentResult(Enum):
@@ -572,6 +633,16 @@ class SendTaskBase(_LogicalTask):
         self._physical_lock = threading.Lock()
         self._physical_operations: dict[int, _PhysicalOperation] = {}
 
+    def bind_logical_outcomes(self, outcomes: _LogicalOutcomes) -> None:
+        """Bind session outcome and deadline before exposing the task to workers.
+
+        Args:
+            outcomes: The session's stable logical-result arbiter.
+        """
+        super().bind_logical_outcomes(outcomes)
+        if self._retirement is not None:
+            self._physical_lock = self._retirement.lock
+
     def fail(self, exc: Exception) -> None:
         self._logical_outcomes.fail(exc)
         self._exception = exc
@@ -624,6 +695,9 @@ class SendTaskBase(_LogicalTask):
             operation = self._require_physical_operation_locked(
                 peer_rank, (_PhysicalOperationState.ADMITTED,)
             )
+            if self._retirement is not None and not self._retirement.expose(operation):
+                operation.state = _PhysicalOperationState.NOT_SUBMITTED
+                raise _TransferNotSubmittedError("source retirement admission is closed")
             operation.request = request
             operation.state = _PhysicalOperationState.SUBMITTING
 
@@ -646,6 +720,8 @@ class SendTaskBase(_LogicalTask):
                 ),
             )
             operation.state = _PhysicalOperationState.IN_DOUBT
+            if self._retirement is not None:
+                self._retirement.request_drain("backend quiescence unproven")
 
     def retire_unsubmitted_physical_operation(self, peer_rank: int) -> None:
         with self._physical_lock:
@@ -658,7 +734,7 @@ class SendTaskBase(_LogicalTask):
             )
             operation.state = _PhysicalOperationState.NOT_SUBMITTED
 
-    def retire_backend_done_physical_operation(self, peer_rank: int) -> None:
+    def retire_backend_done_physical_operation(self, peer_rank: int) -> bool:
         with self._physical_lock:
             operation = self._require_physical_operation_locked(
                 peer_rank,
@@ -667,9 +743,15 @@ class SendTaskBase(_LogicalTask):
                     _PhysicalOperationState.BACKEND_DONE,
                 ),
             )
+            if operation.state is _PhysicalOperationState.BACKEND_DONE:
+                return True
+            if self._retirement is not None and not self._retirement.settle(operation):
+                operation.state = _PhysicalOperationState.IN_DOUBT
+                return False
             operation.request = None
             operation.status = None
             operation.state = _PhysicalOperationState.BACKEND_DONE
+            return True
 
     def poll_in_doubt_physical_operation(self, peer_rank: int) -> bool:
         """Retire once, only after a fresh DONE query on the retained status.
@@ -699,6 +781,8 @@ class SendTaskBase(_LogicalTask):
                 or operation.status is not status
             ):
                 return False
+            if self._retirement is not None and not self._retirement.settle(operation):
+                return False
             operation.request = None
             operation.status = None
             operation.state = _PhysicalOperationState.BACKEND_DONE
@@ -711,7 +795,7 @@ class SendTaskBase(_LogicalTask):
     @property
     def resources_drained(self) -> bool:
         with self._physical_lock:
-            return all(
+            return (self._retirement is None or self._retirement.can_retire()) and all(
                 operation.state in _DRAINED_PHYSICAL_OPERATION_STATES
                 for operation in self._physical_operations.values()
             )
@@ -774,12 +858,14 @@ class Sender(SenderBase):
         agent: BaseTransferAgent,
         bounce=None,
         enforce_physical_ownership: bool = False,
+        retirement_watchdog: Optional[RetirementWatchdog] = None,
     ) -> None:
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         self._bounce = bounce
         self._enforce_physical_ownership = enforce_physical_ownership
+        self._retirement_watchdog = retirement_watchdog
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
@@ -799,7 +885,9 @@ class Sender(SenderBase):
         self._loaded_remote_agents: set[str] = set()
         self._loaded_remote_agents_lock = threading.Lock()
         self._ownership_poisoned: Optional[Exception] = None
-        self._ownership_poison_lock = threading.Lock()
+        self._ownership_poison_lock = (
+            threading.Lock() if retirement_watchdog is None else retirement_watchdog.lock
+        )
         self._num_threads = KV_TRANSFER_NUM_THREADS
         self._send_task_queues: List[queue.Queue] = [
             queue.Queue() for _ in range(self._num_threads)
@@ -1009,16 +1097,16 @@ class Sender(SenderBase):
                     "NIXL sender rejected transfer before backend submission"
                 ) from error
             task.begin_backend_submission(peer_rank, request)
-            try:
-                # Serialize only the backend admission call with the sticky
-                # quarantine transition. Waiting for completion remains fully
-                # concurrent across worker threads.
-                status = self._agent.submit_transfer_requests(request)
-                task.record_backend_submission(peer_rank, status)
-            except Exception as error:
+        try:
+            # SUBMITTING already retains the request. Neither backend admission
+            # nor completion may hold the lock needed by deadline containment.
+            status = self._agent.submit_transfer_requests(request)
+            task.record_backend_submission(peer_rank, status)
+        except Exception as error:
+            with self._ownership_poison_lock:
                 self._ownership_poisoned = error
                 task.mark_physical_operation_in_doubt(peer_rank)
-                return False, str(error)
+            return False, str(error)
         try:
             if not status.wait():
                 # A non-success query is a logical transfer failure, but the
@@ -1036,7 +1124,8 @@ class Sender(SenderBase):
                 self._ownership_poisoned = error
                 task.mark_physical_operation_in_doubt(peer_rank)
             return False, str(error)
-        task.retire_backend_done_physical_operation(peer_rank)
+        if not task.retire_backend_done_physical_operation(peer_rank):
+            return False, "quiescence deadline expired before backend completion"
         return True, None
 
     def _process_task_queue(self, thread_idx: int):
@@ -2010,6 +2099,10 @@ class Sender(SenderBase):
                 logger.warning(f"send_cancel_to_receivers: failed for rid={unique_rid}: {e}")
 
     def shutdown(self):
+        watchdog = getattr(self, "_retirement_watchdog", None)
+        if watchdog is not None:
+            watchdog.request_shutdown()
+            watchdog.require_retired()
         with self._sessions_lock:
             if self._shutdown:
                 return
@@ -2072,6 +2165,8 @@ class TxSession(TxSessionBase):
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
         overall_timeout_s: Optional[float] = None,
+        *,
+        retirement_watchdog: Optional[RetirementWatchdog] = None,
     ):
         super().__init__(sender, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
@@ -2081,15 +2176,29 @@ class TxSession(TxSessionBase):
         self._enforce_physical_ownership = getattr(sender, "_enforce_physical_ownership", False)
         self._sender: Sender  # narrow base class type for Pylance
         self.request_id = request_id
+        self._retirement = None
+        if retirement_watchdog is not None:
+            if overall_timeout_s is None:
+                raise ValueError("deadline retirement requires the overall transfer timeout")
+            self._retirement = retirement_watchdog.create_owner(
+                request_id, "send", overall_timeout_s
+            )
         self._aux_buffer = aux_buffer
-        self.aux_slot = aux_buffer.alloc_slot().id if aux_buffer is not None else None
+        self.aux_slot = None
+        try:
+            if aux_buffer is not None:
+                self.aux_slot = aux_buffer.alloc_slot().id
+        except Exception:
+            if self._retirement is not None:
+                self._retirement.close()
+            raise
         self.receiver_ready: bool = False
         self.kv_tasks = []
         self.aux_task = None
         self._reported_aux_peer_ranks: set[int] = set()
         self._has_last_slice = False
         self.lock = threading.Lock()
-        self._logical_outcomes = _LogicalOutcomes()
+        self._logical_outcomes = _LogicalOutcomes(self._retirement)
 
         self._exception: Optional[Exception] = None
         self._closed = False
@@ -2098,7 +2207,20 @@ class TxSession(TxSessionBase):
         self.transfer_end_time = None
         # Must be last: makes session visible to listener thread,
         # so all attributes above must be initialized first.
-        self._sender.setup_session(self)
+        try:
+            self._sender.setup_session(self)
+        except Exception:
+            with self._sender._sessions_lock:
+                entry = self._sender._sessions.get(self.disagg_request_id)
+                if entry is self or (isinstance(entry, weakref.ReferenceType) and entry() is self):
+                    self._sender._sessions.pop(self.disagg_request_id, None)
+            if self._retirement is not None:
+                self._retirement.close()
+            if self._aux_buffer is not None and self.aux_slot is not None:
+                self._aux_buffer.free_slot(self.aux_slot)
+                self.aux_slot = None
+            self._closed = True
+            raise
 
     @property
     def disagg_request_id(self) -> int:
@@ -2114,6 +2236,10 @@ class TxSession(TxSessionBase):
 
     @property
     def status(self) -> SessionStatus:
+        if getattr(self, "_retirement", None) is not None:
+            terminal = self._logical_outcomes.terminal
+            if terminal is not None:
+                return terminal.status
         if self._terminal_status is not None:
             return self._terminal_status
         # A chunk may fail before the final task is created.
@@ -2252,6 +2378,9 @@ class TxSession(TxSessionBase):
     def resources_drained(self) -> bool:
         if not getattr(self, "_enforce_physical_ownership", False):
             return not any(task.status == TaskStatus.TRANSFERRING for task in self.kv_tasks)
+        retirement = getattr(self, "_retirement", None)
+        if retirement is not None and not retirement.can_retire():
+            return False
         tasks = self.kv_tasks + ([self.aux_task] if self.aux_task is not None else [])
         return all(task.resources_drained for task in tasks)
 
@@ -2277,6 +2406,9 @@ class TxSession(TxSessionBase):
 
     def cancel_local(self, by_peer: bool = False) -> bool:
         aux_failures: list[RecvReqInfo] = []
+        retirement = getattr(self, "_retirement", None)
+        if retirement is not None:
+            retirement.request_drain("peer cancellation" if by_peer else "cancellation")
         with self.lock:
             # A later cancellation must still notify peers after logical failure.
             # The logical arbiter preserves whichever outcome already committed.
@@ -2336,7 +2468,7 @@ class TxSession(TxSessionBase):
                     return self._failed_wait_result()
                 if self.aux_task.status != TaskStatus.TRANSFERRED:
                     return None
-            return WaitResult.COMPLETED
+            return self._failed_wait_result() if self.has_failed() else WaitResult.COMPLETED
 
         # send() normally anchors this once, at the first dispatched KV task.
         # Keep direct/internal TxSession construction bounded as well, and never
@@ -2363,7 +2495,7 @@ class TxSession(TxSessionBase):
                 if self.has_failed():
                     return self._failed_wait_result()
                 if task.status == TaskStatus.TRANSFERRED:
-                    return WaitResult.COMPLETED
+                    return self._failed_wait_result() if self.has_failed() else WaitResult.COMPLETED
 
                 remaining_s = None
                 if self._deadline_monotonic_s is not None:
@@ -2375,7 +2507,11 @@ class TxSession(TxSessionBase):
                         if self.has_failed():
                             return self._failed_wait_result()
                         if task.status == TaskStatus.TRANSFERRED:
-                            return WaitResult.COMPLETED
+                            return (
+                                self._failed_wait_result()
+                                if self.has_failed()
+                                else WaitResult.COMPLETED
+                            )
                         return WaitResult.TIMEOUT
                 timeout_s = wait_slice_s if remaining_s is None else min(wait_slice_s, remaining_s)
                 task.wait(timeout=timeout_s)
@@ -2440,6 +2576,9 @@ class TxSession(TxSessionBase):
             if self._closed:
                 return True
             if getattr(self, "_enforce_physical_ownership", False) and not self.resources_drained():
+                return False
+            retirement = getattr(self, "_retirement", None)
+            if retirement is not None and not retirement.close():
                 return False
             self._closed = True
         if self._aux_buffer is not None and self.aux_slot is not None:
@@ -2558,7 +2697,7 @@ class KVRecvTask(_LogicalTask):
 
     def begin_publication(self) -> None:
         if self._physical_owner is None:
-            self._physical_owner = _ReceiveOperationOwner()
+            self._physical_owner = _ReceiveOperationOwner(self._retirement)
             self._ownership_state_lock = threading.Lock()
         self._physical_owner.begin_publication()
 
@@ -2625,6 +2764,7 @@ class Receiver(ReceiverBase):
         agent: BaseTransferAgent,
         bounce=None,
         enforce_physical_ownership: bool = False,
+        retirement_watchdog: Optional[RetirementWatchdog] = None,
     ):
         self._registrar = peer_registrar
         self._agent = agent
@@ -2632,6 +2772,7 @@ class Receiver(ReceiverBase):
         # Internal component gate only. Production wiring is added after the
         # complete Phase 1 ownership path is available and qualified.
         self._enforce_physical_ownership = enforce_physical_ownership
+        self._retirement_watchdog = retirement_watchdog
         self._dealers = {}
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
@@ -2659,6 +2800,10 @@ class Receiver(ReceiverBase):
         return self._messenger.endpoint
 
     def shutdown(self):
+        watchdog = getattr(self, "_retirement_watchdog", None)
+        if watchdog is not None:
+            watchdog.request_shutdown()
+            watchdog.require_retired()
         with self._sessions_lock:
             if self._shutdown:
                 return
@@ -2687,6 +2832,10 @@ class Receiver(ReceiverBase):
     def _acquire_ownership_admission(self) -> Callable[[], None]:
         lock = self._get_ownership_admission_lock()
         lock.acquire()
+        watchdog = getattr(self, "_retirement_watchdog", None)
+        if watchdog is not None and watchdog.fatal is not None:
+            lock.release()
+            raise RuntimeError("receiver retirement admission is closed")
         error = getattr(self, "_ownership_poisoned", None)
         if error is not None:
             lock.release()
@@ -2970,19 +3119,15 @@ class Receiver(ReceiverBase):
         writer_cohort = (
             set(peer_ranks) if sender_dp_rank is not None or peer_infos.dp_size == 1 else None
         )
-        release_admission = self._acquire_ownership_admission()
-        try:
-            if not session.try_begin_transfer(
-                task.slice_id,
-                sender_endpoints,
-                writer_cohort,
-                publish=publish_requests,
-                published_writers=published_writers,
-            ):
-                self._bounce.release_idle_reservation(key)
-                task.cancel_unpublished()
-        finally:
-            release_admission()
+        if not session.try_begin_transfer(
+            task.slice_id,
+            sender_endpoints,
+            writer_cohort,
+            publish=publish_requests,
+            published_writers=published_writers,
+        ):
+            self._bounce.release_idle_reservation(key)
+            task.cancel_unpublished()
         return
 
     @staticmethod
@@ -3188,6 +3333,8 @@ class RxSession(RxSessionBase):
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
+        *,
+        retirement_watchdog: Optional[RetirementWatchdog] = None,
     ):
         super().__init__(receiver, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
@@ -3195,8 +3342,20 @@ class RxSession(RxSessionBase):
         self._enforce_physical_ownership = getattr(receiver, "_enforce_physical_ownership", False)
         self._receiver: Receiver  # narrow base class type for Pylance
         self.request_id = request_id
+        self._retirement = None
+        if retirement_watchdog is not None:
+            if timeout_s is None:
+                raise ValueError("deadline retirement requires the transfer timeout")
+            self._retirement = retirement_watchdog.create_owner(request_id, "receive", timeout_s)
         self._aux_buffer = aux_buffer
-        self.aux_slot = aux_buffer.alloc_slot().id if aux_buffer is not None else None
+        self.aux_slot = None
+        try:
+            if aux_buffer is not None:
+                self.aux_slot = aux_buffer.alloc_slot().id
+        except Exception:
+            if self._retirement is not None:
+                self._retirement.close()
+            raise
         self._exception: Optional[Exception] = None
         self._closed = False
         self._terminal_status: Optional[SessionStatus] = None
@@ -3209,7 +3368,7 @@ class RxSession(RxSessionBase):
         self._publication_may_have_escaped = False
         self._aux_physical_owner: Optional[_ReceiveOperationOwner] = None
         if self._enforce_physical_ownership and self._need_aux:
-            self._aux_physical_owner = _ReceiveOperationOwner()
+            self._aux_physical_owner = _ReceiveOperationOwner(self._retirement)
             self._aux_physical_owner.begin_publication()
         self._sender_endpoints: set[str] = set()
         # Serialize REQUEST_DATA publication with cancellation notification
@@ -3218,12 +3377,14 @@ class RxSession(RxSessionBase):
         # publication wins the state transition.
         self._publication_lock = threading.Lock()
         self.lock = threading.Lock()
-        self._logical_outcomes = _LogicalOutcomes()
+        self._logical_outcomes = _LogicalOutcomes(self._retirement)
         try:
             self._receiver.setup_session(self)
         except Exception:
             if self._aux_physical_owner is not None:
                 self._aux_physical_owner.cancel_unpublished()
+            if self._retirement is not None:
+                self._retirement.close()
             with self._receiver._sessions_lock:
                 session_entry = self._receiver._sessions.get(self.disagg_request_id)
                 if (
@@ -3234,6 +3395,7 @@ class RxSession(RxSessionBase):
             if self._aux_buffer is not None and self.aux_slot is not None:
                 self._aux_buffer.free_slot(self.aux_slot)
                 self.aux_slot = None
+            self._closed = True
             raise
 
     @property
@@ -3272,6 +3434,10 @@ class RxSession(RxSessionBase):
 
     @property
     def status(self) -> SessionStatus:
+        if getattr(self, "_retirement", None) is not None:
+            terminal = self._logical_outcomes.terminal
+            if terminal is not None:
+                return terminal.status
         if self._terminal_status is not None:
             return self._terminal_status
         if self._exception is not None or any(t.status == TaskStatus.ERROR for t in self._kv_tasks):
@@ -3300,15 +3466,35 @@ class RxSession(RxSessionBase):
         if publish is not None and published_writers is None:
             raise ValueError("publication must track successfully queued writers")
         with self._publication_lock:
-            with self.lock:
+            # Only metadata and publication reservation use the admission gate.
+            # Network I/O must not hold the arbiter needed by the watchdog.
+            retirement = getattr(self, "_retirement", None)
+            with (
+                self._ownership_evidence_guard(),
+                self.lock,
+                retirement.lock if retirement is not None else nullcontext(),
+            ):
                 if self._closed or self._terminal_status is not None:
                     return False
+                error = getattr(self._receiver, "_ownership_poisoned", None)
+                if error is not None:
+                    raise RuntimeError("receiver ownership admission is quarantined") from error
                 task = self._kv_tasks[slice_id]
-                task.seal_writer_cohort(writer_cohort)
+                owners = [task._get_physical_owner()]
                 if self._aux_physical_owner is not None:
-                    self._aux_physical_owner.seal_writer_cohort(
-                        task.expected_transfers, writer_cohort
-                    )
+                    owners.append(self._aux_physical_owner)
+                unpublished = [owner for owner in owners if owner._expected_writers is None]
+                try:
+                    for owner in owners:
+                        owner.seal_writer_cohort(task.expected_transfers, writer_cohort)
+                    if retirement is not None and not retirement.expose(*owners):
+                        raise RuntimeError("destination retirement admission is closed")
+                except Exception:
+                    # No send has run for this reservation. Roll back only new
+                    # owners; AUX may already belong to an earlier published slice.
+                    for owner in unpublished:
+                        owner.abort_publication(set())
+                    raise
                 task.status = TaskStatus.TRANSFERRING
                 self._sender_endpoints.update(sender_endpoints)
             if publish is not None:
@@ -3431,6 +3617,8 @@ class RxSession(RxSessionBase):
         transfer_size: int = 0,
     ):
         with self._ownership_evidence_guard(), self.lock:
+            if self._retirement is not None and self._closed:
+                return
             assert receiver_slice_id < len(self._kv_tasks), (
                 f"Receiver got receiver_slice_id={receiver_slice_id} but only has "
                 f"{len(self._kv_tasks)} receive task(s) for request {self.request_id}. "
@@ -3594,6 +3782,8 @@ class RxSession(RxSessionBase):
         # Aux is session-level (not per-slice); expected_transfers is identical
         # across all kv_tasks, so any task provides the right count.
         with self._ownership_evidence_guard(), self.lock:
+            if self._retirement is not None and self._closed:
+                return
             if not self._kv_tasks:
                 logger.warning(
                     f"Aux result received before any KV tasks for request {self.request_id}"
@@ -3711,12 +3901,18 @@ class RxSession(RxSessionBase):
     def resources_drained(self) -> bool:
         if not self._enforce_physical_ownership:
             return not any(task.status == TaskStatus.TRANSFERRING for task in self._kv_tasks)
+        retirement = getattr(self, "_retirement", None)
+        if retirement is not None and not retirement.can_retire():
+            return False
         kv_drained = all(task.resources_drained for task in self._kv_tasks)
         aux_drained = self._aux_physical_owner is None or self._aux_physical_owner.resources_drained
         return kv_drained and aux_drained
 
     def cancel_local(self, by_peer: bool = False) -> bool:
         """Commit cancellation under the same lock used for publication."""
+        retirement = getattr(self, "_retirement", None)
+        if retirement is not None:
+            retirement.request_drain("peer cancellation" if by_peer else "cancellation")
         with self.lock:
             # A later cancellation must still notify peers after logical failure.
             # The logical arbiter preserves whichever outcome already committed.
@@ -3813,20 +4009,36 @@ class RxSession(RxSessionBase):
             while True:
                 status = self.status
                 if status == SessionStatus.TRANSFERRED:
-                    return WaitResult.COMPLETED
+                    return self._failed_wait_result() if self.has_failed() else WaitResult.COMPLETED
                 elif status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
                     return self._failed_wait_result()
                 if not blocking:
                     return None  # KV done, aux still in flight; re-poll next cycle
                 time.sleep(0.001)
-        return WaitResult.COMPLETED
+        return self._failed_wait_result() if self.has_failed() else WaitResult.COMPLETED
 
     def close(self) -> bool:
         if self._enforce_physical_ownership:
             with self.lock:
                 if self._closed:
                     return True
+                retirement = getattr(self, "_retirement", None)
+                if retirement is not None and retirement.controller.admission_closed:
+                    # Publication also holds this session lock. Only unsealed
+                    # owners can be cancelled here; a reserved send remains live
+                    # even before its network callback has actually started.
+                    cancelled = [task for task in self._kv_tasks if task.cancel_unpublished()]
+                    aux_cancelled = (
+                        self._aux_physical_owner is not None
+                        and self._aux_physical_owner.cancel_unpublished()
+                    )
+                    if cancelled or aux_cancelled:
+                        self._logical_outcomes.cancel(by_peer=False)
+                        for task in cancelled:
+                            task.fail(RuntimeError("receiver shutdown before publication"))
                 if not self.resources_drained():
+                    return False
+                if retirement is not None and not retirement.close():
                     return False
                 self._closed = True
         else:
@@ -3971,6 +4183,8 @@ class TransferWorkerConfig:
     bounce: Optional["Config"] = None
     tx_overall_timeout_s: Optional[float] = None
     enforce_physical_ownership: bool = False
+    # Internal activation gate: only the qualified containment policy supplies it.
+    quiescence_fatal_callback: Optional[Callable[[QuiescenceFatalEvent], None]] = None
     # Transfer-agent staging (bounce v2) buffer size in MiB; 0 disables the
     # fast path. Derived upstream from CacheTransceiverConfig: it equals
     # kv_cache_bounce_size_mb when agent_bounce_buffer_enable is set (in which
@@ -3985,6 +4199,16 @@ class TransferWorkerConfig:
 class TransferWorker:
     def __init__(self, config: TransferWorkerConfig):
         self._config = config
+        self._retirement_watchdog = None
+        if config.quiescence_fatal_callback is not None:
+            if not config.enforce_physical_ownership:
+                raise ValueError("deadline retirement requires physical ownership")
+            for timeout in (config.tx_overall_timeout_s, config.rx_timeout_s):
+                if timeout is None or not math.isfinite(timeout) or timeout <= 0:
+                    raise ValueError(
+                        "deadline retirement requires finite positive transfer timeouts"
+                    )
+            self._retirement_watchdog = RetirementWatchdog(self._on_quiescence_fatal)
         kvm = config.kv_cache_manager
         self._aux_buffer = _make_aux_buffer(
             kvm, config.max_concurrent_sessions, config.max_draft_len
@@ -3997,6 +4221,24 @@ class TransferWorker:
         )
         self._setup_peer_infrastructure(kvm)
         self._setup_transfer_engine()
+        if self._retirement_watchdog is not None:
+            self._retirement_watchdog.start()
+
+    def _on_quiescence_fatal(self, event: QuiescenceFatalEvent) -> None:
+        """Forward fatal evidence while rooting all worker-owned resources.
+
+        Args:
+            event: Immutable deadline decision; never authorizes resource release.
+        """
+        callback = self._config.quiescence_fatal_callback
+        assert callback is not None
+        callback(event)
+
+    def request_shutdown(self) -> None:
+        """Close admission and start drain before any potentially blocking teardown."""
+        watchdog = getattr(self, "_retirement_watchdog", None)
+        if watchdog is not None:
+            watchdog.request_shutdown()
 
     def populate_instance_and_rank_info(self, endpoints: list[str], layer_num_per_pp: list[int]):
         assert self._rank_info is not None
@@ -4014,6 +4256,7 @@ class TransferWorker:
             timeout_s=self._config.tx_timeout_s,
             prompt_len=request.prompt_len,
             overall_timeout_s=self._config.tx_overall_timeout_s,
+            retirement_watchdog=getattr(self, "_retirement_watchdog", None),
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
@@ -4026,6 +4269,7 @@ class TransferWorker:
             aux_buffer=self._aux_buffer,
             timeout_s=self._config.rx_timeout_s,
             prompt_len=request.prompt_len,
+            retirement_watchdog=getattr(self, "_retirement_watchdog", None),
         )
 
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:
@@ -4085,12 +4329,14 @@ class TransferWorker:
                 self._agent,
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
+                retirement_watchdog=self._retirement_watchdog,
             )
             self._receiver = Receiver(
                 self._peer_registrar,
                 self._agent,
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
+                retirement_watchdog=self._retirement_watchdog,
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
@@ -4145,6 +4391,11 @@ class TransferWorker:
     def shutdown(self):
         if getattr(self, "_shutdown", False):
             return
+        self.request_shutdown()
+        watchdog = getattr(self, "_retirement_watchdog", None)
+        if watchdog is not None:
+            watchdog.require_retired()
+            watchdog.stop()
         # Use getattr guards: __init__ may have failed partway, leaving some
         # attributes unset.  Without them, __del__ -> shutdown() raises
         # AttributeError and ZMQ resources from already-created sub-objects
