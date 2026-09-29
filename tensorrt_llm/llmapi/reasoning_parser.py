@@ -418,13 +418,16 @@ class Qwen3ReasoningParser(DeepSeekV4ReasoningParser):
         self._strip_start = (isinstance(self._parser, DeepSeekR1Parser)
                              and self._parser.reasoning_at_start)
 
+    def _strip_leading_start(self, text: str) -> str:
+        # Leading whitespace can precede a redundant `<think>`; strip the
+        # tag after it without losing the whitespace itself.
+        prefix_len = len(text) - len(text.lstrip())
+        return text[:prefix_len] + text[prefix_len:].removeprefix(
+            self.reasoning_start)
+
     def parse(self, text: str) -> ReasoningParserResult:
         if self._strip_start:
-            # Leading whitespace can precede a redundant `<think>`; strip the
-            # tag after it without losing the whitespace itself.
-            prefix_len = len(text) - len(text.lstrip())
-            text = text[:prefix_len] + text[prefix_len:].removeprefix(
-                self.reasoning_start)
+            text = self._strip_leading_start(text)
         return self._parser.parse(text)
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
@@ -433,11 +436,12 @@ class Qwen3ReasoningParser(DeepSeekV4ReasoningParser):
                                   or result.reasoning_content.strip()):
             # `DeepSeekR1Parser` withholds a partial tag, so the first
             # delta with real content holds the whole leading `<think>`, if
-            # any. A whitespace-only delta must not disarm the strip early,
-            # or a redundant `<think>` arriving later leaks unstripped.
+            # any, possibly after whitespace from the same multi-token delta.
+            # A whitespace-only delta must not disarm the strip early, or a
+            # redundant `<think>` arriving later leaks unstripped.
             self._strip_start = False
-            result.reasoning_content = result.reasoning_content.removeprefix(
-                self.reasoning_start)
+            result.reasoning_content = self._strip_leading_start(
+                result.reasoning_content)
         return result
 
 

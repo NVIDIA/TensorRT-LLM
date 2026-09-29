@@ -626,6 +626,26 @@ def test_qwen3_mode_resolved_from_prompt(prompt_tail: str,
                         streaming) == (content, reasoning_content)
 
 
+@pytest.mark.parametrize(
+    ("deltas", "content", "reasoning_content"),
+    [
+        # A larger stream interval or speculative decoding can pack leading
+        # whitespace and a redundant `<think>` into one delta.
+        ([f" {R1_START}a{R1_END}b"], "b", " a"),
+        ([f"\n{R1_START}\nhidden{R1_END}x"], "x", "\n\nhidden"),
+        ([" ", f"\n{R1_START}a{R1_END}b"], "b", " \na"),
+    ])
+def test_qwen3_redundant_think_after_whitespace_in_one_delta(
+        deltas: list[str], content: str, reasoning_content: str) -> None:
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "qwen3", dict(thinking=True))
+    results = [reasoning_parser.parse_delta(delta) for delta in deltas]
+    results.append(reasoning_parser.finish())
+    assert ("".join(r.content for r in results),
+            "".join(r.reasoning_content
+                    for r in results)) == (content, reasoning_content)
+
+
 TOOL_CALL = "<tool_call>"
 TOOL_CALL_END = "</tool_call>"
 
