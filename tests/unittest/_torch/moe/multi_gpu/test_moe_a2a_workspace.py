@@ -99,6 +99,11 @@ def _run_worker(capture, in_workspace, use_cft, low_precision):
                 "TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB",
             ):
                 patch.delenv(name, raising=False)
+            # The constructor selects CFT automatically; force only the fence
+            # case. Leaving FORCE_CFT unset for the CFT case keeps the token
+            # thresholds live, which the capacity assertions below rely on.
+            if not use_cft:
+                patch.setenv("TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT", "0")
             try:
                 rank = tllm.mpi_rank()
                 assert tllm.mpi_world_size() == _EP_SIZE
@@ -136,7 +141,6 @@ def _run_worker(capture, in_workspace, use_cft, low_precision):
                             payload_in_workspace=in_workspace,
                             hidden_size=hidden,
                             dtype=torch.bfloat16,
-                            can_use_cft_counted_writes=use_cft,
                             use_low_precision_combine=low_precision,
                         )
                     )
