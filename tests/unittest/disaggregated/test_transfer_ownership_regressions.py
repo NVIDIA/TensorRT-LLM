@@ -1235,13 +1235,14 @@ def test_shutdown_refuses_to_drop_active_receive_owner() -> None:
     transceiver._send_reqs = {}
     transceiver._recv_sessions = {rid: session}
     transceiver._recv_reqs = {rid: object()}
-    transceiver._transfer_worker = SimpleNamespace(shutdown=Mock())
+    transceiver._transfer_worker = SimpleNamespace(request_shutdown=Mock(), shutdown=Mock())
 
     with pytest.raises(RuntimeError, match="physical resources remain active"):
         transceiver.shutdown()
 
     assert not transceiver._shutdown_complete
     assert transceiver._recv_sessions[rid] is session
+    transceiver._transfer_worker.request_shutdown.assert_called_once_with()
     session.close.assert_not_called()
     transceiver._transfer_worker.shutdown.assert_not_called()
 
@@ -1269,7 +1270,7 @@ def test_shutdown_fails_stop_when_receive_close_refuses_after_preflight() -> Non
     transceiver._send_reqs = {rid + 1: object()}
     transceiver._recv_sessions = {rid: recv_session}
     transceiver._recv_reqs = {rid: object()}
-    transceiver._transfer_worker = SimpleNamespace(shutdown=Mock())
+    transceiver._transfer_worker = SimpleNamespace(request_shutdown=Mock(), shutdown=Mock())
 
     with pytest.raises(RuntimeError, match="session close refused"):
         transceiver.shutdown()
@@ -1311,7 +1312,9 @@ def test_concurrent_shutdown_is_serialized() -> None:
     transceiver._send_reqs = {}
     transceiver._recv_sessions = {}
     transceiver._recv_reqs = {}
-    transceiver._transfer_worker = SimpleNamespace(shutdown=worker_shutdown)
+    transceiver._transfer_worker = SimpleNamespace(
+        request_shutdown=Mock(), shutdown=worker_shutdown
+    )
 
     first = _start_checked_thread(transceiver.shutdown, thread_results)
     assert entered.wait(timeout=10)
