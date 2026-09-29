@@ -2774,19 +2774,19 @@ test = ["Faker (>=1.0.8)", "allpairspy (>=2)", "click (>=6.2)", "pytest (>=6.0.1
 
 [[package]]
 name = "peft"
-version = "0.21.0"
+version = "0.21.1"
 description = "Parameter-Efficient Fine-Tuning (PEFT)"
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "peft-0.21.0-py3-none-any.whl", hash = "sha256:b64eb75fd9dece7401c70e675b8d9de024993b70483691b41c62876f0c7809b7"},
-    {file = "peft-0.21.0.tar.gz", hash = "sha256:17f2b5a264439f4cd983c02e95954f2e948e3bcb85f75895ee307f94a55fd28f"},
+    {file = "peft-0.21.1-py3-none-any.whl", hash = "sha256:6b99d659a33acc17295c0838f1e58267337b8c30ac9aef0c8f2d48364d3f24e2"},
+    {file = "peft-0.21.1.tar.gz", hash = "sha256:95f239f84da1919a6d0c64c4049650a6a79804e3a87c78f35c597da771e31f68"},
 ]
 
 [package.dependencies]
 accelerate = ">=0.21.0"
-huggingface_hub = ">=0.25.0"
+huggingface-hub = ">=0.25.0"
 numpy = ">=1.17"
 packaging = ">=20.0"
 psutil = "*"
@@ -2797,10 +2797,10 @@ tqdm = "*"
 transformers = "*"
 
 [package.extras]
-dev = ["black", "black", "griffe", "hf-doc-builder", "hf-doc-builder", "requests", "ruff (==0.16.4)"]
+dev = ["black", "griffe", "hf-doc-builder", "requests", "ruff (==0.16.4)"]
 docs-specific = ["black", "hf-doc-builder", "requests"]
 quality = ["black", "griffe", "hf-doc-builder", "ruff (==0.16.4)"]
-test = ["black", "black", "datasets", "diffusers", "griffe", "hf-doc-builder", "hf-doc-builder", "parameterized", "protobuf", "pytest", "pytest-cov", "pytest-xdist", "requests", "ruff (==0.16.4)", "scikit-learn", "scipy", "sentencepiece", "torchvision"]
+test = ["black", "datasets", "diffusers", "griffe", "hf-doc-builder", "parameterized", "protobuf", "pytest", "pytest-cov", "pytest-xdist", "requests", "ruff (==0.16.4)", "scikit-learn", "scipy", "sentencepiece", "torchvision"]
 
 [[package]]
 name = "portalocker"
