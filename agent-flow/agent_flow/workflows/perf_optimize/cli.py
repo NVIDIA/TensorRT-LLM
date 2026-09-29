@@ -4,6 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from agent_flow.agent_runtime import resolve_agent_config
 from agent_flow.workflows.perf_analyze.sol_methodology import resolve_sol_methodology
 from agent_flow.workflows.perf_analyze.task_schema import casebook_enabled
 
@@ -111,10 +112,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
+    resume = not args.clean and (args.workspace / STATE_FILENAME).is_file()
+    task_path = args.workspace / "task.yaml" if resume else args.task
     try:
         task_data = load_and_validate_task_yaml(
-            args.task,
-            max_rounds_override=args.max_rounds,
+            task_path,
+            max_rounds_override=None if resume else args.max_rounds,
         )
     except TaskSchemaError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -128,7 +131,8 @@ def main(argv: list[str] | None = None) -> None:
     # Resolve the projector's methodology skill once, before the run, so
     # it is told to load a skill this session actually has. Skipped (free)
     # when the stage is off.
-    methodology = resolve_sol_methodology(sol_enabled(task_data))
+    projector_backend = resolve_agent_config(task_data, "projector").backend
+    methodology = resolve_sol_methodology(sol_enabled(task_data), backend_kind=projector_backend)
     note = methodology.console_note()
     if note:
         print(note, file=sys.stderr)

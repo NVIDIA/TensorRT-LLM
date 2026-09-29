@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 from agent_flow import CLAUDE_CODE_DEFAULT_MODEL
+from agent_flow.workflows.perf_analyze import cli as cli_module
 from agent_flow.workflows.perf_analyze import progress as progress_module
 from agent_flow.workflows.perf_analyze import state as state_module
 from agent_flow.workflows.perf_analyze import workflow as workflow_module
@@ -531,6 +532,47 @@ def test_casebook_disable_reaches_every_backend(tmp_path):
             assert getattr(workflow, role).config.backend.disabled_skills
     finally:
         workflow.close()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_casebook", "input_casebook"),
+    [(True, False), (False, True)],
+)
+def test_cli_resume_builds_prompts_from_checkpointed_task(
+    tmp_path, monkeypatch, checkpoint_casebook, input_casebook
+):
+    task = _write_task(tmp_path)
+    input_data = yaml.safe_load(task.read_text(encoding="utf-8"))
+    input_data["casebook"] = {"enabled": input_casebook}
+    input_data["agents"] = {"roles": {"projector": {"backend": "claude-code"}}}
+    task.write_text(yaml.safe_dump(input_data), encoding="utf-8")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    checkpoint_data = dict(input_data)
+    checkpoint_data["casebook"] = {"enabled": checkpoint_casebook}
+    checkpoint_data["agents"] = {"roles": {"projector": {"backend": "codex"}}}
+    (workspace / "task.yaml").write_text(yaml.safe_dump(checkpoint_data), encoding="utf-8")
+    (workspace / state_module.STATE_FILENAME).write_text("{}", encoding="utf-8")
+
+    captured = {}
+
+    def resolve_methodology(enabled, backend_kind="claude-code"):
+        captured["backend_kind"] = backend_kind
+        return SolMethodology()
+
+    def build_prompts(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after prompt construction")
+
+    monkeypatch.setattr(cli_module, "resolve_sol_methodology", resolve_methodology)
+    monkeypatch.setattr(cli_module, "build_perf_analyze_prompts", build_prompts)
+
+    with pytest.raises(RuntimeError, match="stop after prompt construction"):
+        cli_module.main(["--task", str(task), "--workspace", str(workspace)])
+
+    assert captured["include_casebook"] is checkpoint_casebook
+    assert captured["backend_kind"] == "codex"
 
 
 def test_no_role_wires_an_external_mcp_server(tmp_path):

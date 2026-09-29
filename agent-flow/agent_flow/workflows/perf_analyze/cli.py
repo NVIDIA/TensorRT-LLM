@@ -4,6 +4,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from agent_flow.agent_runtime import resolve_agent_config
+
 from .prompts import build_perf_analyze_prompts
 from .sol_methodology import resolve_sol_methodology
 from .state import STATE_FILENAME
@@ -62,15 +64,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
+    task_path = args.task
+    if not args.clean and (args.workspace / STATE_FILENAME).is_file():
+        task_path = args.workspace / "task.yaml"
     try:
-        task_data = load_and_validate_task_yaml(args.task)
+        task_data = load_and_validate_task_yaml(task_path)
     except TaskSchemaError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(2)
     # Resolve the projector's methodology skill once, before the run, so
     # it is told to load a skill this session actually has. Skipped (free)
     # when the stage is off.
-    methodology = resolve_sol_methodology(sol_enabled(task_data))
+    projector_backend = resolve_agent_config(task_data, "projector").backend
+    methodology = resolve_sol_methodology(sol_enabled(task_data), backend_kind=projector_backend)
     note = methodology.console_note()
     if note:
         print(note, file=sys.stderr)
