@@ -39,7 +39,7 @@ class PipelineSleepManager:
         restore_mode: Literal["CPU", "PINNED"],
         device: torch.device,
         *,
-        release_cpu_backup: bool = False,
+        release_host_backup: bool = False,
     ) -> None:
         if restore_mode not in ("CPU", "PINNED"):
             raise ValueError("Pipeline sleep requires CPU or PINNED memory backing")
@@ -54,7 +54,7 @@ class PipelineSleepManager:
         self._condition = Condition()
         self._transition_lock = Lock()
         self._generation_thread: int | None = None
-        self._release_backup_on_wake = release_cpu_backup
+        self._release_backup_on_wake = release_host_backup
 
     @contextmanager
     def loading(self) -> Iterator[None]:

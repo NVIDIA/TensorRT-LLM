@@ -54,12 +54,12 @@ def allocation_backend(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("mode", ["CPU", "PINNED"])
-@pytest.mark.parametrize("release_cpu_backup", [False, True])
+@pytest.mark.parametrize("release_host_backup", [False, True])
 def test_sleep_cycle_and_idempotence(
-    allocation_backend: SimpleNamespace, mode: str, release_cpu_backup: bool
+    allocation_backend: SimpleNamespace, mode: str, release_host_backup: bool
 ) -> None:
     manager = PipelineSleepManager(
-        mode, torch.device("cuda:0"), release_cpu_backup=release_cpu_backup
+        mode, torch.device("cuda:0"), release_host_backup=release_host_backup
     )
     with manager.loading():
         pass
@@ -82,7 +82,7 @@ def test_sleep_cycle_and_idempotence(
         assert not manager.is_sleeping
         assert allocation_backend.restore.call_count == cycle + 1
         allocation_backend.restore.assert_called_with(tag)
-        if release_cpu_backup:
+        if release_host_backup:
             assert allocation_backend.discard.call_count == cycle + 1
             allocation_backend.discard.assert_called_with(tag)
         else:
@@ -100,7 +100,7 @@ def test_wake_waits_for_cleanup_before_allowing_generation(
         return 2
 
     allocation_backend.discard.side_effect = discard
-    manager = PipelineSleepManager("PINNED", torch.device("cuda:0"), release_cpu_backup=True)
+    manager = PipelineSleepManager("PINNED", torch.device("cuda:0"), release_host_backup=True)
     with manager.loading():
         pass
     other = PipelineSleepManager("PINNED", torch.device("cuda:0"))
@@ -127,7 +127,7 @@ def test_wake_waits_for_cleanup_before_allowing_generation(
 def test_backup_cleanup_starts_after_restore_synchronization(
     allocation_backend: SimpleNamespace,
 ) -> None:
-    manager = PipelineSleepManager("CPU", torch.device("cuda:0"), release_cpu_backup=True)
+    manager = PipelineSleepManager("CPU", torch.device("cuda:0"), release_host_backup=True)
     with manager.loading():
         pass
     manager.sleep()
@@ -144,7 +144,7 @@ def test_backup_cleanup_failure_disables_further_generation(
     allocation_backend: SimpleNamespace,
     error_type: type[BaseException],
 ) -> None:
-    manager = PipelineSleepManager("CPU", torch.device("cuda:0"), release_cpu_backup=True)
+    manager = PipelineSleepManager("CPU", torch.device("cuda:0"), release_host_backup=True)
     with manager.loading():
         pass
     manager.sleep()
@@ -163,7 +163,7 @@ def test_backup_cleanup_failure_disables_further_generation(
 def test_failed_wake_does_not_discard_backup(
     allocation_backend: SimpleNamespace, failure_stage: str
 ) -> None:
-    manager = PipelineSleepManager("CPU", torch.device("cuda:0"), release_cpu_backup=True)
+    manager = PipelineSleepManager("CPU", torch.device("cuda:0"), release_host_backup=True)
     with manager.loading():
         pass
     manager.sleep()
@@ -360,7 +360,7 @@ def test_transitions_are_serialized(
     blocked_stage: str,
 ) -> None:
     manager = PipelineSleepManager(
-        "CPU", torch.device("cuda:0"), release_cpu_backup=blocked_stage == "discard"
+        "CPU", torch.device("cuda:0"), release_host_backup=blocked_stage == "discard"
     )
     with manager.loading():
         pass
@@ -435,14 +435,14 @@ def test_loader_rejects_backup_release_without_sleep(allocation_backend: SimpleN
     loader = PipelineLoader.__new__(PipelineLoader)
     loader._load = MagicMock()
     with pytest.raises(ValueError, match="requires sleep_restore_mode"):
-        loader.load("checkpoint", sleep_release_cpu_backup=True)
+        loader.load("checkpoint", sleep_release_host_backup=True)
     loader._load.assert_not_called()
     allocation_backend.scope.assert_not_called()
 
 
-@pytest.mark.parametrize("release_cpu_backup", [None, False, True])
+@pytest.mark.parametrize("release_host_backup", [None, False, True])
 def test_loader_warmup_is_outside_persistent_pool(
-    allocation_backend: SimpleNamespace, release_cpu_backup: bool | None
+    allocation_backend: SimpleNamespace, release_host_backup: bool | None
 ) -> None:
     loader = PipelineLoader.__new__(PipelineLoader)
     loader.args = SimpleNamespace(
@@ -467,14 +467,16 @@ def test_loader_warmup_is_outside_persistent_pool(
 
     allocation_backend.scope.side_effect = lambda *_args: AllocationScope()
     pipeline.warmup.side_effect = lambda: events.append("warmup")
-    options = {} if release_cpu_backup is None else {"sleep_release_cpu_backup": release_cpu_backup}
+    options = (
+        {} if release_host_backup is None else {"sleep_release_host_backup": release_host_backup}
+    )
     assert loader.load("checkpoint", sleep_restore_mode="PINNED", **options) is pipeline
     loader._load.assert_called_once_with("checkpoint", True, None, sleep_enabled=True)
     assert events == ["enter", "exit", "warmup"]
     assert (
         allocation_backend.scope.call_args.args[1] == sleep_module.virtual_memory.RestoreMode.PINNED
     )
-    assert pipeline._sleep_manager._release_backup_on_wake == bool(release_cpu_backup)
+    assert pipeline._sleep_manager._release_backup_on_wake == bool(release_host_backup)
     pipeline._sleep_manager.ensure_awake()
 
 

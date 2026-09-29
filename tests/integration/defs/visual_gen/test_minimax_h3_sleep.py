@@ -22,8 +22,8 @@ from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("release_cpu_backup", [False, True])
-def test_minimax_h3_sleep_preserves_video_and_audio(release_cpu_backup: bool) -> None:
+@pytest.mark.parametrize("release_host_backup", [False, True])
+def test_minimax_h3_sleep_preserves_video_and_audio(release_host_backup: bool) -> None:
     if torch.cuda.get_device_properties(0).total_memory < 140 * 1024**3:
         pytest.skip("H3 FP8 sleep test requires a GPU with at least 140 GiB")
     checkpoint = os.environ.get("MINIMAX_H3_CHECKPOINT") or get_checkpoint("MiniMax-H3")
@@ -38,7 +38,7 @@ def test_minimax_h3_sleep_preserves_video_and_audio(release_cpu_backup: bool) ->
     pipeline = PipelineLoader(config).load(
         skip_warmup=True,
         sleep_restore_mode="PINNED",
-        sleep_release_cpu_backup=release_cpu_backup,
+        sleep_release_host_backup=release_host_backup,
     )
     process = psutil.Process()
     request = dict(
@@ -114,7 +114,7 @@ def test_minimax_h3_sleep_preserves_video_and_audio(release_cpu_backup: bool) ->
             pipeline.wake_up()
             wake_s = time.perf_counter() - wake_start
             freed_host_gib = (asleep_rss - process.memory_info().rss) / 1024**3
-            if release_cpu_backup:
+            if release_host_backup:
                 assert freed_host_gib > 50
             else:
                 assert abs(freed_host_gib) < 1

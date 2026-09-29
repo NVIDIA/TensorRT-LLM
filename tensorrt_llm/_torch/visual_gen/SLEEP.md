@@ -27,7 +27,7 @@ To release that host backup on every wake instead, opt in when loading:
 
 ```python
 pipeline = PipelineLoader(args).load(
-    sleep_restore_mode="PINNED", sleep_release_cpu_backup=True
+    sleep_restore_mode="PINNED", sleep_release_host_backup=True
 )
 ```
 
