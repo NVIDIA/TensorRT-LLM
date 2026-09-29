@@ -28,7 +28,11 @@ from weakref import WeakSet
 
 import torch
 
-from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlCheckpointCommunicator, MnnvlMemory
+from tensorrt_llm._torch.distributed.mnnvl_memory import (
+    MnnvlCheckpointCommunicator,
+    MnnvlMemory,
+    _checkpoint_allgather,
+)
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _collect_active_ranks
 from tensorrt_llm.mapping import Mapping
 
@@ -52,6 +56,68 @@ class MnnvlMoe:
     moe_workspace_tensor: torch.Tensor = None
     moe_prepare_workspace_tensor: torch.Tensor = None
     moe_mapping: Mapping = None
+
+    @staticmethod
+    def checkpoint_prepare() -> None:
+        """Detach TRT-native two-sided MoE workspaces for checkpointing."""
+        for workspace in (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace):
+            if workspace is not None:
+                workspace.checkpoint_prepare()
+
+    @staticmethod
+    def checkpoint_restore(comm: MnnvlCheckpointCommunicator) -> None:
+        """Restore TRT-native two-sided MoE workspaces at their original virtual addresses."""
+        workspaces = (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
+        restored_workspaces = []
+        try:
+            for workspace in workspaces:
+                if workspace is not None and workspace.checkpoint_restore(comm):
+                    restored_workspaces.append(workspace)
+            if not restored_workspaces:
+                return
+            restored_main_workspace = any(
+                workspace is MnnvlMoe.moe_workspace for workspace in restored_workspaces
+            )
+            local_error = None
+            try:
+                if restored_main_workspace and MnnvlMoe.moe_workspace_tensor is not None:
+                    assert MnnvlMoe.moe_mapping is not None
+                    torch.ops.trtllm.moe_initialize_workspace(
+                        MnnvlMoe.moe_workspace_tensor,
+                        MnnvlMoe.moe_mapping.moe_ep_rank,
+                        MnnvlMoe.moe_mapping.moe_ep_size,
+                    )
+                torch.cuda.synchronize()
+            except Exception as error:
+                local_error = f"{type(error).__name__}: {error}"
+            readiness_errors = _checkpoint_allgather(
+                comm,
+                local_error,
+                operation="two-sided frontend readiness",
+            )
+            failed_ranks = [
+                f"rank {rank}: {error}"
+                for rank, error in enumerate(readiness_errors)
+                if error is not None
+            ]
+            if failed_ranks:
+                raise RuntimeError(
+                    "Native two-sided MoE restore failed on one or more ranks:\n"
+                    + "\n".join(failed_ranks)
+                )
+        except Exception:
+            for workspace in restored_workspaces:
+                workspace._checkpoint_restore_failed()
+            raise
+        for workspace in restored_workspaces:
+            workspace._checkpoint_restore_complete()
+
+    @staticmethod
+    def require_mapped() -> None:
+        """Reject kernel access while either native MoE workspace is detached."""
+        for workspace in (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace):
+            if workspace is not None and not workspace.mapped:
+                raise RuntimeError("Native MoE All-to-All workspace handles are unmapped")
 
     @staticmethod
     def get_moe_workspaces(mapping: Mapping):
