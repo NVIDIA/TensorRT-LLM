@@ -158,6 +158,8 @@ class Attention(nn.Module):
                 or self.quant_config.layer_quant_mode.has_fp8_qdq()
             )
             and not self.force_dynamic_quantization
+            # Weights quantized at load carry no calibrated scales to share.
+            and not config.dynamic_weight_quant
         )
 
         attention_metadata_state = getattr(config, "attention_metadata_state", None)

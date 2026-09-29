@@ -86,7 +86,6 @@ def test_unquantized_attention_does_not_share():
     """Without FP8 weights there is no static scale to quantize against."""
     attn = _make(quant_algo=None)
     assert attn._maybe_share_qkv_quantize is False
-    _calibrate(attn)
     x = torch.randn(TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16)
     assert attn._can_share_qkv_quantize(x, None) is False
 
