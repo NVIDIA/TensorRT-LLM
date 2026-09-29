@@ -54,20 +54,25 @@ fi
 
 echo "config_file: ${config_file}"
 
-# The mooncake-store pool is described in the worker config and provisioned by
-# trtllm-serve during bringup. Anchoring its run directory here keeps the
-# master's log, the rendered client config and the published address in the
-# job's log directory rather than in a temporary directory that shutdown
-# removes, and it is how the ranks srun started, which never inherited the
-# leader's environment, find that client config. An inherited
-# MOONCAKE_CONFIG_PATH still wins, so an externally managed pool stays reachable.
-export TRTLLM_MOONCAKE_RUN_DIR="${log_dir}"
+# The mooncake-store pool this server joins is named in its worker config, and
+# trtllm-serve renders the Mooncake client config during bringup. Anchoring the
+# run directory here keeps that client config and this server's segment records
+# in the job's log directory rather than in a temporary directory that shutdown
+# removes. It is also how the ranks srun started, which never inherited the
+# leader's environment, find the client config.
+#
+# One directory per server, not one per job. Every server that joins the pool
+# renders a client config, and the context and generation sides differ in
+# `role`, so sharing a directory would leave whichever started second in charge
+# of both. The pool report reads the segment records from the tree under the
+# job's log directory, so they still total up. An inherited
+# MOONCAKE_CONFIG_PATH wins, so an externally managed pool stays reachable.
+export TRTLLM_MOONCAKE_RUN_DIR="${log_dir}/mooncake_${role}_${instance_id}"
 
-# The generation servers wait for a master the context server starts. Both are
-# launched together and the master comes up before its model loads, but the wait
-# spans container start on another node, so it is given far more than the 60s
-# default. Too short fails the job; too long costs nothing when the master is
-# already there.
+# Every server waits for the manifest the job's mooncake_master step publishes.
+# That step is launched before these, but the wait spans container start on
+# another node, so it is given far more than the 60s default. Too short fails
+# the job; too long costs nothing when the manifest is already there.
 export TRTLLM_MOONCAKE_MASTER_TIMEOUT="${TRTLLM_MOONCAKE_MASTER_TIMEOUT:-900}"
 
 # MiniMax-M3's MSA sparse attention JIT-compiles its FMHA kernels on first use,

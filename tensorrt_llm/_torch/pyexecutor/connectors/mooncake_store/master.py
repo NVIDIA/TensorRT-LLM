@@ -12,22 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Bring the Mooncake store's pool up as part of a server's own startup.
+"""Bring a server onto a Mooncake pool that something else already owns.
 
 The connector needs two things that are not the engine's to produce: a reachable
 `mooncake_master`, and a JSON client config named by `MOONCAKE_CONFIG_PATH` that
 points every worker at it.
 
-`provision_pool` does that work inside the serving process. It resolves the
-master, either launching one here or checking that the configured one answers,
-renders the client config, and exports `MOONCAKE_CONFIG_PATH`, which reaches the
-ranks because the LLM constructor spawns them from this process. Everything it
-started is torn down when the context exits.
+The master is infrastructure, not engine state. One runs per deployment, with a
+lifetime of its own, and publishes a **manifest** describing the pool it owns:
+its address and the transport every participant has to agree on. `running_master`
+is that process, reachable as `trtllm-serve mooncake_master`.
 
-A master launched here lives and dies with the server, so it suits one engine
-talking to its own pool. Several engines sharing a pool, or a pool meant to
-survive a restart, need a master with its own lifetime named by
-`master_server_address`.
+`provision_pool` is the other half, inside each serving process. It reads the
+manifest, adds what is this server's alone, being the traffic it drives, the
+memory each of its ranks lends and the RDMA devices this node happens to have,
+and renders the client config, exporting `MOONCAKE_CONFIG_PATH`, which reaches
+the ranks because the LLM constructor spawns them from this process.
+
+Splitting it this way keeps the pool's own settings from drifting: they are
+stated once, by the process that owns the pool, rather than restated in every
+worker config.
 """
 
 import contextlib
@@ -38,41 +42,54 @@ import socket
 import subprocess  # nosec B404
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from tensorrt_llm.logger import logger
 
 from ..registry import uses_connector
-from .config import CLIENT_CONFIG_NAME, CONFIG_PATH_ENV, RUN_DIR_ENV
+from .config import (
+    CLIENT_CONFIG_NAME,
+    CONFIG_PATH_ENV,
+    DEFAULT_LOCAL_BUFFER_SIZE,
+    DEFAULT_METADATA_SERVER,
+    DEFAULT_NAMESPACE,
+    RUN_DIR_ENV,
+    StoreRole,
+    parse_size,
+)
 
 __all__ = [
+    "POOL_MANIFEST_NAME",
+    "PoolManifest",
     "local_address",
     "maybe_provision_pool",
     "master_timeout",
     "provision_pool",
     "resolve_device_name",
-    "resolve_master_address",
+    "resolve_pool",
     "running_master",
     "wait_for_master",
 ]
 
-#: Override the binary that `launch_master` runs.
+#: Override the binary `running_master` runs.
 MASTER_BINARY_ENV = "TRTLLM_MOONCAKE_MASTER_BINARY"
 #: How long to wait for a master to accept connections, in seconds.
 MASTER_TIMEOUT_ENV = "TRTLLM_MOONCAKE_MASTER_TIMEOUT"
 DEFAULT_MASTER_BINARY = "mooncake_master"
 DEFAULT_MASTER_TIMEOUT = 60.0
 MASTER_LOG_NAME = "mooncake_master.log"
-#: Name a launched master's address is always published under in the run
-#: directory, so even a run that named no address file records its pool.
-MASTER_ADDRESS_NAME = "master.addr"
-#: Prefix that makes `master_server_address` name a file holding the address
-#: rather than the address itself.
-ADDRESS_FILE_SCHEME = "file://"
+#: Name the pool manifest always takes in the run directory, so even a run that
+#: asked for it nowhere else still records the pool it used.
+POOL_MANIFEST_NAME = "pool.json"
+#: Prefix that makes `pool` name a manifest file rather than a master address.
+POOL_FILE_SCHEME = "file://"
 #: Lines of the master's log to quote when startup fails, since its last words
 #: (a port in use, a bad flag) are usually the whole diagnosis.
 LOG_TAIL_LINES = 20
+DEFAULT_MASTER_PORT = 50051
+DEFAULT_MASTER_METRICS_PORT = 9004
+DEFAULT_MASTER_EVICTION_RATIO = 0.05
 
 
 def _log_tail(path: str, lines: int = LOG_TAIL_LINES) -> str:
@@ -124,51 +141,159 @@ def _split_address(address: str) -> Optional[Tuple[str, int]]:
     return host.strip("[]"), int(port)
 
 
-def resolve_master_address(address: str, timeout: float) -> str:
-    """Read a `file://` address through, and pass anything else along.
+@dataclass(frozen=True)
+class PoolManifest:
+    """What every participant in one pool has to agree on.
 
-    A master with its own lifetime runs on whichever host its scheduler gave
-    it, which is not known when the worker configs are written. Naming the file
-    it publishes to keeps the address out of both the config and the launch
-    script: `trtllm-serve mooncake_master --address-file` writes it, every
-    worker's `master_server_address` names the same path, and the wait here
-    doubles as the wait for the master to exist at all.
+    Published by the master that owns the pool and read by each server joining
+    it. These are exactly the settings that are properties of the pool rather
+    than of any engine in it, which is why they live here: restating them in
+    every worker config is how they come to disagree.
     """
-    if not address.startswith(ADDRESS_FILE_SCHEME):
-        return address
 
-    path = address[len(ADDRESS_FILE_SCHEME) :]
+    master_server_address: str
+    metadata_server: str = DEFAULT_METADATA_SERVER
+    protocol: str = "rdma"
+    namespace: str = DEFAULT_NAMESPACE
+    #: Reported for a reader's benefit rather than used; the master owns them.
+    metrics_port: Optional[int] = None
+    eviction_ratio: Optional[float] = None
+    #: Anything a newer master published that this reader does not know about,
+    #: kept so a round trip through here does not quietly drop it.
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    #: Fields spelled out above. Everything else in the file lands in `extra`.
+    _KNOWN = (
+        "master_server_address",
+        "metadata_server",
+        "protocol",
+        "namespace",
+        "metrics_port",
+        "eviction_ratio",
+    )
+
+    def to_json(self) -> Dict[str, Any]:
+        record: Dict[str, Any] = dict(self.extra)
+        record.update(
+            {
+                "master_server_address": self.master_server_address,
+                "metadata_server": self.metadata_server,
+                "protocol": self.protocol,
+                "namespace": self.namespace,
+            }
+        )
+        if self.metrics_port is not None:
+            record["metrics_port"] = self.metrics_port
+        if self.eviction_ratio is not None:
+            record["eviction_ratio"] = self.eviction_ratio
+        return record
+
+    @staticmethod
+    def from_json(raw: Dict[str, Any], source: str = "<manifest>") -> "PoolManifest":
+        address = str(raw.get("master_server_address", "")).strip()
+        if not address:
+            raise ValueError(
+                f"The Mooncake pool manifest at {source} names no "
+                "master_server_address, so there is no pool to join. It is "
+                "written by 'trtllm-serve mooncake_master --pool_file'."
+            )
+        return PoolManifest(
+            master_server_address=address,
+            metadata_server=str(raw.get("metadata_server") or DEFAULT_METADATA_SERVER),
+            protocol=str(raw.get("protocol", "rdma")),
+            namespace=str(raw.get("namespace", DEFAULT_NAMESPACE)),
+            metrics_port=raw.get("metrics_port"),
+            eviction_ratio=raw.get("eviction_ratio"),
+            extra={k: v for k, v in raw.items() if k not in PoolManifest._KNOWN},
+        )
+
+    def describe(self) -> str:
+        return (
+            f"master={self.master_server_address} protocol={self.protocol} "
+            f"metadata={self.metadata_server} namespace={self.namespace}"
+        )
+
+
+def _wait_for_manifest(path: str, timeout: float) -> Dict[str, Any]:
+    """Block until `path` holds a readable manifest, then return it.
+
+    The master runs on whichever host its scheduler gave it, which nothing
+    knows when the worker configs are written, so the file is the rendezvous:
+    the master writes it once it answers, every worker's `pool` names the same
+    path, and waiting here doubles as waiting for the master to exist at all.
+
+    A half-written file cannot be observed, since the writer renames into
+    place, but an empty or unparseable one is treated as not there yet rather
+    than as an error: that is what a reader racing a slow filesystem sees.
+    """
     started = time.monotonic()
     deadline = started + timeout
     announced = started
-    logger.info(f"mooncake-store: reading the master's address from {path}")
+    logger.info(f"mooncake-store: reading the pool manifest from {path}")
     while True:
+        raw: Optional[Any] = None
         try:
-            published = open(path).read().strip()
-        except FileNotFoundError:
-            published = ""
-        if published:
-            logger.info(f"mooncake-store: {path} names the master at {published}")
-            return published
+            with open(path) as handle:
+                text = handle.read().strip()
+            if text:
+                raw = json.loads(text)
+        except (FileNotFoundError, json.JSONDecodeError):
+            raw = None
+        if isinstance(raw, dict) and raw:
+            logger.info(
+                f"mooncake-store: {path} describes the pool: {json.dumps(raw, sort_keys=True)}"
+            )
+            return raw
         now = time.monotonic()
         if now - announced >= 5.0:
             announced = now
-            # Waiting on a master in another job is normal here, so say so
+            # Waiting on a master in another job step is normal here, so say so
             # rather than letting the wait look like a hang.
             logger.info(
-                f"mooncake-store: no master address in {path} yet "
+                f"mooncake-store: no pool manifest at {path} yet "
                 f"({now - started:.0f}s of {timeout:g}s); waiting for the "
                 "master to start and publish it"
             )
         if now >= deadline:
             raise TimeoutError(
-                f"No Mooncake master address appeared in {path} within "
-                f"{timeout:g}s. Start one with 'trtllm-serve mooncake_master "
-                f"--address-file {path}', or name a reachable host:port in "
-                f"master_server_address. Raise {MASTER_TIMEOUT_ENV} if the "
-                "master is only slow to start."
+                f"No Mooncake pool manifest appeared at {path} within "
+                f"{timeout:g}s. Start the pool's master with 'trtllm-serve "
+                f"mooncake_master --pool_file {path}', or name a reachable "
+                f"host:port in pool. Raise {MASTER_TIMEOUT_ENV} if the master "
+                "is only slow to start."
             )
         time.sleep(0.5)
+
+
+def resolve_pool(pool: str, timeout: Optional[float] = None) -> PoolManifest:
+    """The pool `pool` names, waiting for its manifest if it names a file.
+
+    Args:
+        pool: Either `file://<path>` naming a manifest, or the bare `host:port`
+            of a master. The second form is for joining a master run without
+            our CLI; it carries no pool-wide settings, so those take defaults
+            and it is then on the deployment to keep them consistent.
+        timeout: Seconds to wait for a manifest. Defaults to `master_timeout`.
+
+    Returns:
+        The pool's manifest.
+    """
+    if not pool:
+        raise ValueError(
+            "mooncake_store.pool is required: name the manifest a master "
+            "published, as file://<path>, or a master's host:port."
+        )
+    if not pool.startswith(POOL_FILE_SCHEME):
+        logger.info(
+            f"mooncake-store: pool={pool!r} is a bare master address, so "
+            "pool-wide settings take their defaults. Point pool at a "
+            "file://<path> manifest to have the master state them instead."
+        )
+        return PoolManifest(master_server_address=pool)
+
+    path = pool[len(POOL_FILE_SCHEME) :]
+    timeout = master_timeout() if timeout is None else timeout
+    return PoolManifest.from_json(_wait_for_manifest(path, timeout), path)
 
 
 def _wait_until_accepting(
@@ -318,32 +443,33 @@ def wait_for_master(master_address: str, timeout: Optional[float] = None) -> Opt
     return elapsed
 
 
-def _client_config(
-    pool: Any, master_address: str, device_name: Optional[str] = None
-) -> Dict[str, Any]:
-    """Render the Mooncake client config for a pool.
+def _client_config(pool: Any, manifest: PoolManifest, device_name: str) -> Dict[str, Any]:
+    """Render the Mooncake client config for this server.
 
-    The schema is vLLM's, so one pool can serve both engines. `role` is written
-    as `both` because the file describes the pool; the directions of traffic a
-    given process drives come from its own `TRTLLM_MOONCAKE_STORE_ROLE`.
+    The schema is vLLM's, so one pool can serve both engines. Pool-wide
+    settings come from the manifest; what this server contributes and what it
+    does with the pool come from its own config.
+
+    Sizes are written as integers rather than as the suffixed strings a user
+    may have typed. `"80GB"` means a power of 1000 to this parser and a power
+    of 1024 to vLLM's, so resolving it here is what lets both engines read the
+    same file and see the same segment.
     """
     config: Dict[str, Any] = {
-        "metadata_server": pool.metadata_server,
-        "master_server_address": master_address,
-        "protocol": pool.protocol,
-        "device_name": pool.device_name if device_name is None else device_name,
-        "global_segment_size": pool.global_segment_size,
-        "local_buffer_size": pool.local_buffer_size,
-        "role": "both",
+        # ---- the pool's, from the manifest ----
+        "master_server_address": manifest.master_server_address,
+        "metadata_server": manifest.metadata_server,
+        "protocol": manifest.protocol,
+        "namespace": manifest.namespace if pool.namespace is None else pool.namespace,
+        # ---- this node's ----
+        "device_name": device_name,
+        # ---- this server's ----
+        "global_segment_size": parse_size(pool.segment_size, strict_units=True),
+        "local_buffer_size": DEFAULT_LOCAL_BUFFER_SIZE,
+        "role": StoreRole(pool.role).value,
         "transfer_batch_size": pool.transfer_batch_size,
         "stage_through_host": pool.stage_through_host,
     }
-    if pool.cache_prefix is not None:
-        config["cache_prefix"] = pool.cache_prefix
-    # Left out when unset so the connector's own default applies instead of a
-    # second copy of it here.
-    if pool.staging_buffer_bytes is not None:
-        config["staging_buffer_bytes"] = pool.staging_buffer_bytes
     return config
 
 
@@ -366,17 +492,23 @@ class LaunchedMaster:
             self.process.wait()
 
 
-def _launch_master(pool: Any, run_dir: str) -> LaunchedMaster:
+def _launch_master(
+    run_dir: str,
+    *,
+    rpc_port: int = DEFAULT_MASTER_PORT,
+    metrics_port: int = DEFAULT_MASTER_METRICS_PORT,
+    eviction_ratio: float = DEFAULT_MASTER_EVICTION_RATIO,
+) -> LaunchedMaster:
     """Start a master on this host and wait for it to answer."""
     binary = os.getenv(MASTER_BINARY_ENV) or DEFAULT_MASTER_BINARY
     resolved = shutil.which(binary)
     if resolved is None:
         raise FileNotFoundError(
-            f"{binary!r} is not on PATH, so launch_master cannot start a "
-            "Mooncake master. It ships with the Mooncake runtime, which "
+            f"{binary!r} is not on PATH, so no Mooncake master can be started "
+            "here. It ships with the Mooncake runtime, which "
             "docker/common/install_mooncake.sh installs. Point "
-            f"{MASTER_BINARY_ENV} at the binary, or drop launch_master and "
-            "set master_server_address to a master you run yourself."
+            f"{MASTER_BINARY_ENV} at the binary, or run the master elsewhere "
+            "and point the servers' pool at the manifest it publishes."
         )
 
     host = local_address()
@@ -386,14 +518,14 @@ def _launch_master(pool: Any, run_dir: str) -> LaunchedMaster:
     # GLOG_logtostderr the log opened below stays empty. GLOG_v=1 adds the
     # per-RPC lines showing segments registering and keys moving, which is the
     # only view of the pool's own side of the conversation short of scraping
-    # the metrics port.
+    # the metrics port, and is what the run's capacity report joins against.
     env = dict(os.environ, GLOG_logtostderr="1")
     env.setdefault("GLOG_v", "1")
     command = [
         resolved,
-        f"--rpc_port={pool.master_port}",
-        f"--metrics_port={pool.master_metrics_port}",
-        f"--eviction_ratio={pool.master_eviction_ratio}",
+        f"--rpc_port={rpc_port}",
+        f"--metrics_port={metrics_port}",
+        f"--eviction_ratio={eviction_ratio}",
     ]
 
     logger.info(f"mooncake-store: starting {' '.join(command)} on {host}")
@@ -401,16 +533,14 @@ def _launch_master(pool: Any, run_dir: str) -> LaunchedMaster:
         process = subprocess.Popen(  # nosec B603
             command, env=env, stdout=log_file, stderr=subprocess.STDOUT
         )
-    master = LaunchedMaster(
-        process=process, address=f"{host}:{pool.master_port}", log_path=log_path
-    )
+    master = LaunchedMaster(process=process, address=f"{host}:{rpc_port}", log_path=log_path)
     logger.info(
         f"mooncake-store: master pid={process.pid} logging to {log_path} "
         f"(GLOG_v={env['GLOG_v']}); waiting for it to accept connections"
     )
     try:
         elapsed = _wait_until_accepting(
-            host, pool.master_port, master_timeout(), process=process, log_path=log_path
+            host, rpc_port, master_timeout(), process=process, log_path=log_path
         )
     except BaseException:
         master.stop()
@@ -418,45 +548,46 @@ def _launch_master(pool: Any, run_dir: str) -> LaunchedMaster:
 
     logger.info(
         f"mooncake-store: master ready at {master.address} after {elapsed:.1f}s "
-        f"(metrics http://{host}:{pool.master_metrics_port}, log {log_path})"
+        f"(metrics http://{host}:{metrics_port}, log {log_path})"
     )
     return master
 
 
 @contextlib.contextmanager
-def _published_address(address: str, paths: Sequence[str]) -> Iterator[None]:
-    """Write `address` to every path for the life of the context.
+def _published_manifest(manifest: PoolManifest, paths: Sequence[str]) -> Iterator[None]:
+    """Write `manifest` to every path for the life of the context.
 
-    Publishing is how anything else finds this master: a donor or a second
-    server names the path as `file://<path>` in `master_server_address`.
-    Retracting on the way out matters as much as writing, since an address that
-    outlives its master sends the next run's workers to a dead port.
+    Publishing is how anything else finds this pool: each server names the path
+    as `file://<path>` in `pool`. Retracting on the way out matters as much as
+    writing, since a manifest that outlives its master sends the next run's
+    workers to a dead port.
     """
+    record = json.dumps(manifest.to_json(), indent=2, sort_keys=True)
     for path in paths:
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        # Renamed into place so a reader never sees a partial address.
+        # Renamed into place so a reader never sees a partial manifest.
         staging = f"{path}.partial"
         with open(staging, "w") as handle:
-            handle.write(f"{address}\n")
+            handle.write(f"{record}\n")
         os.replace(staging, path)
-        logger.info(f"mooncake-store: published master {address} to {path}")
+        logger.info(f"mooncake-store: published the pool manifest to {path}: {manifest.describe()}")
     try:
         yield
     finally:
         for path in paths:
             with contextlib.suppress(OSError):
                 os.remove(path)
-                logger.info(f"mooncake-store: withdrew the master address at {path}")
+                logger.info(f"mooncake-store: withdrew the pool manifest at {path}")
 
 
-def _address_files(run_dir: str, extra: Optional[str] = None) -> List[str]:
-    """Where a master this process starts should publish its address.
+def _manifest_paths(run_dir: str, extra: Optional[str] = None) -> List[str]:
+    """Where a master this process starts should publish its manifest.
 
     Always the run directory, plus wherever the deployment asked for.
     """
-    paths = [os.path.join(run_dir, MASTER_ADDRESS_NAME)]
+    paths = [os.path.join(run_dir, POOL_MANIFEST_NAME)]
     if extra and os.path.abspath(extra) not in {os.path.abspath(p) for p in paths}:
         paths.append(extra)
     return paths
@@ -464,38 +595,81 @@ def _address_files(run_dir: str, extra: Optional[str] = None) -> List[str]:
 
 @contextlib.contextmanager
 def running_master(
-    pool: Any, run_dir: str, address_file: Optional[str] = None
+    run_dir: str,
+    *,
+    pool_file: Optional[str] = None,
+    rpc_port: int = DEFAULT_MASTER_PORT,
+    metrics_port: int = DEFAULT_MASTER_METRICS_PORT,
+    eviction_ratio: float = DEFAULT_MASTER_EVICTION_RATIO,
+    metadata_server: str = DEFAULT_METADATA_SERVER,
+    protocol: str = "rdma",
+    namespace: str = DEFAULT_NAMESPACE,
 ) -> Iterator[LaunchedMaster]:
-    """Run a master whose lifetime is this process's rather than an engine's.
+    """Run a master, and publish the manifest describing the pool it owns.
 
-    `provision_pool` covers the server that owns its pool. Several engines on
-    one pool, or a pool that has to survive a restart, need the master
-    somewhere that is not any of them.
+    The master is infrastructure: it outlives no single engine's startup and
+    belongs to none of them, which is what lets several servers share one pool
+    and what keeps the pool-wide settings stated in one place.
 
-    `address_file` receives `host:port` once the master answers, so workers can
-    name the file instead of an address nobody knows until the scheduler has
+    `pool_file` receives the manifest once the master answers, so servers can
+    name a path instead of an address nobody knows until the scheduler has
     placed this process. One is written to `run_dir` either way.
     """
     os.makedirs(run_dir, exist_ok=True)
-    master = _launch_master(pool, run_dir)
+    master = _launch_master(
+        run_dir, rpc_port=rpc_port, metrics_port=metrics_port, eviction_ratio=eviction_ratio
+    )
+    manifest = PoolManifest(
+        master_server_address=master.address,
+        metadata_server=metadata_server,
+        protocol=protocol,
+        namespace=namespace,
+        metrics_port=metrics_port,
+        eviction_ratio=eviction_ratio,
+    )
     try:
-        with _published_address(master.address, _address_files(run_dir, address_file)):
+        with _published_manifest(manifest, _manifest_paths(run_dir, pool_file)):
             yield master
     finally:
         master.stop()
         logger.info(f"mooncake-store: master at {master.address} stopped")
 
 
+def _log_contribution(segment_size: int, role: str, run_dir: str) -> None:
+    """State the capacity arithmetic while the numbers are still in hand.
+
+    Capacity is what explains a hit rate, and it is a sum over processes that
+    no process can see. Each one can at least report its own term and the node
+    total it implies, so a pool that came up an order of magnitude smaller than
+    intended is visible at bring-up rather than inferred from a topology
+    afterwards. The whole sum lands in the run's report; see `ledger.py`.
+    """
+    from tensorrt_llm._utils import local_mpi_size
+
+    gib = segment_size / (1 << 30)
+    try:
+        ranks_here = max(1, local_mpi_size())
+    except Exception:  # noqa: BLE001 - reporting only; never fail bring-up here
+        ranks_here = 1
+    logger.info(
+        f"mooncake-store: each of this server's ranks contributes {gib:.1f} GiB "
+        f"({segment_size} bytes) as role={role}; with {ranks_here} rank(s) on "
+        f"this node that is {ranks_here * gib:.1f} GiB of its host memory. "
+        f"Pool capacity is the sum over every participating rank, reported in "
+        f"{os.path.join(run_dir, 'segments')}."
+    )
+
+
 @contextlib.contextmanager
 def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optional[str]]:
-    """Make `pool` reachable and name it in this process's environment.
+    """Join the pool `pool` names and point this process's ranks at it.
 
     Yields the path of the client config written, or `None` when an inherited
     `MOONCAKE_CONFIG_PATH` was left in charge.
 
     Args:
         pool: A `MooncakeStoreConfig`.
-        run_dir: Where to write the client config and the master's log.
+        run_dir: Where to write the client config and the segment records.
             Defaults to `TRTLLM_MOONCAKE_RUN_DIR`, else a temporary directory
             that is removed on exit.
     """
@@ -513,68 +687,43 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
     run_dir = run_dir or os.getenv(RUN_DIR_ENV) or tempfile.mkdtemp(prefix="trtllm-mooncake-")
     os.makedirs(run_dir, exist_ok=True)
     if keep_run_dir:
-        logger.info(f"mooncake-store: provisioning the pool, run directory {run_dir}")
+        logger.info(f"mooncake-store: joining the pool, run directory {run_dir}")
     else:
         logger.info(
-            f"mooncake-store: provisioning the pool in {run_dir}, which is "
-            f"removed at shutdown along with the master's log; set "
-            f"{RUN_DIR_ENV} to keep them"
+            f"mooncake-store: joining the pool with run directory {run_dir}, "
+            f"which is removed at shutdown along with this run's segment "
+            f"records; set {RUN_DIR_ENV} to keep them"
         )
 
-    master: Optional[LaunchedMaster] = None
     exported = False
-    with contextlib.ExitStack() as stack:
-        try:
-            if pool.launch_master:
-                master = _launch_master(pool, run_dir)
-                master_address = master.address
-                # Published even when only this server uses it, since that is
-                # how its donors reach it.
-                stack.enter_context(
-                    _published_address(
-                        master_address, _address_files(run_dir, pool.master_address_file)
-                    )
-                )
-            else:
-                master_address = resolve_master_address(
-                    pool.master_server_address, master_timeout()
-                )
-                wait_for_master(master_address)
-                logger.info(f"mooncake-store: using the master at {master_address}")
+    try:
+        manifest = resolve_pool(pool.pool)
+        # Checked before any rank opens a handle so an absent master is
+        # reported as such, rather than as the status code store.setup returns
+        # for every kind of failure, in every rank, after the model has loaded.
+        wait_for_master(manifest.master_server_address)
+        logger.info(f"mooncake-store: joining the pool at {manifest.describe()}")
 
-            config_path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
-            config = _client_config(
-                pool, master_address, resolve_device_name(pool.protocol, pool.device_name)
-            )
-            with open(config_path, "w") as handle:
-                json.dump(config, handle, indent=2)
-            # Inherited by the ranks the LLM constructor spawns. Ranks an
-            # external launcher started were already running, so they read the
-            # config out of the run directory instead; see
-            # provisioned_config_path.
-            os.environ[CONFIG_PATH_ENV] = config_path
-            exported = True
-            logger.info(
-                f"mooncake-store: {CONFIG_PATH_ENV}={config_path} "
-                f"({json.dumps(config, sort_keys=True)})"
-            )
-            # Capacity is what explains a low hit rate, so state the
-            # arithmetic instead of leaving it to be derived later.
-            logger.info(
-                "mooncake-store: this server's ranks will each contribute "
-                f"global_segment_size={pool.global_segment_size} to the pool; "
-                "total capacity is that times the number of ranks that open a "
-                "handle, plus whatever any mooncake_donation adds"
-            )
-            yield config_path
-        finally:
-            if exported:
-                os.environ.pop(CONFIG_PATH_ENV, None)
-            if master is not None:
-                master.stop()
-                logger.info(f"mooncake-store: master at {master.address} stopped")
-            if not keep_run_dir:
-                shutil.rmtree(run_dir, ignore_errors=True)
+        config_path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
+        config = _client_config(pool, manifest, resolve_device_name(manifest.protocol, ""))
+        with open(config_path, "w") as handle:
+            json.dump(config, handle, indent=2)
+        # Inherited by the ranks the LLM constructor spawns. Ranks an external
+        # launcher started were already running, so they read the config out of
+        # the run directory instead; see provisioned_config_path.
+        os.environ[CONFIG_PATH_ENV] = config_path
+        exported = True
+        logger.info(
+            f"mooncake-store: {CONFIG_PATH_ENV}={config_path} "
+            f"({json.dumps(config, sort_keys=True)})"
+        )
+        _log_contribution(config["global_segment_size"], config["role"], run_dir)
+        yield config_path
+    finally:
+        if exported:
+            os.environ.pop(CONFIG_PATH_ENV, None)
+        if not keep_run_dir:
+            shutil.rmtree(run_dir, ignore_errors=True)
 
 
 @contextlib.contextmanager

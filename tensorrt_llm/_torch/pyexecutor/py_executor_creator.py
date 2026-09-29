@@ -384,19 +384,6 @@ def create_py_executor(
         kv_cache_config.enable_block_reuse = False
         kv_cache_config.enable_partial_reuse = False
 
-    # Must happen before the KV cache manager is built, since the manager reads
-    # enable_partial_reuse to construct its block pools.
-    if (kv_cache_config.enable_partial_reuse
-            and uses_connector(kv_connector_config, "mooncake-store")):
-        logger.warning(
-            "Disabling partial reuse: it is not usable with the mooncake-store "
-            "connector. The store is addressed by whole blocks, so a partial "
-            "device match leaves the matched length off a block boundary and "
-            "the connector declines the lookup rather than resume a block from "
-            "the middle. Partial reuse therefore trades part of one block for "
-            "every stored block of the remaining prefix.")
-        kv_cache_config.enable_partial_reuse = False
-
     decoding_config = llm_args.decoding_config
 
     # The tokenizer is stripped from MPI kwargs in proxy.py to avoid pickle
@@ -848,11 +835,6 @@ def create_py_executor(
         logger.info(
             f"Initializing kv connector with config: {kv_connector_config}")
 
-        if scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
-            raise NotImplementedError(
-                "KV connector is only supported with guaranteed no evict scheduler policy."
-            )
-
         # VSWA allocates one pool per window size, which the V1 connector
         # registration cannot describe: it hands the worker a single primary
         # pool tensor. KVCacheManagerV2 has no such limitation -- its layout
@@ -917,6 +899,35 @@ def create_py_executor(
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")
             raise e
+
+        # Both restrictions below exist because a connector registers page
+        # addresses and moves KV against them, which a capacity-only connector
+        # does not. Asked here so the worker itself can answer, and still
+        # before the KV cache manager is built, which partial reuse requires
+        # since the manager reads it to construct its block pools.
+        if not kv_connector_manager.capacity_only:
+            if (scheduler_config.capacity_scheduler_policy
+                    != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT):
+                raise NotImplementedError(
+                    "KV connector is only supported with guaranteed no evict scheduler policy."
+                )
+
+            if (kv_cache_config.enable_partial_reuse
+                    and uses_connector(kv_connector_config, "mooncake-store")):
+                logger.warning(
+                    "Disabling partial reuse: it is not usable with the mooncake-store "
+                    "connector. The store is addressed by whole blocks, so a partial "
+                    "device match leaves the matched length off a block boundary and "
+                    "the connector declines the lookup rather than resume a block from "
+                    "the middle. Partial reuse therefore trades part of one block for "
+                    "every stored block of the remaining prefix.")
+                kv_cache_config.enable_partial_reuse = False
+        else:
+            logger.info(
+                "KV connector is capacity-only: it registers no KV cache pages "
+                "and transfers nothing, so this engine keeps its capacity "
+                "scheduler policy, its cache tiers and its block reuse "
+                "settings unchanged.")
     else:
         kv_connector_manager = None
 

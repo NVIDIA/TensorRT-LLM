@@ -1005,7 +1005,10 @@ class PyExecutor:
 
     def _maybe_init_kv_connector_manager(self) -> None:
         if self.kv_connector_manager is not None:
-            if self.kv_cache_transceiver is not None:
+            # A connector that moves no KV cannot contend with the transceiver
+            # for it, which is the normal arrangement on a generation server.
+            capacity_only = self.kv_connector_manager.capacity_only
+            if self.kv_cache_transceiver is not None and not capacity_only:
                 logger.warning(
                     "Both KV Cache Connector and KV Cache Transceiver are enabled. Are you sure you want to do this?"
                 )
@@ -1036,8 +1039,9 @@ class PyExecutor:
                                                 KVCacheManagerV2)
 
             kv_cache_config = getattr(self.llm_args, 'kv_cache_config', None)
-            if not is_kv_cache_manager_v2 and (kv_cache_config is not None and
-                                               kv_cache_config.host_cache_size):
+            if not is_kv_cache_manager_v2 and not capacity_only and (
+                    kv_cache_config is not None
+                    and kv_cache_config.host_cache_size):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with KV cache host "
                     "offloading (KvCacheConfig.host_cache_size). The connector "
@@ -1074,7 +1078,8 @@ class PyExecutor:
                 # until the connector participates in migration. Read the
                 # resolved tier list rather than KvCacheConfig.host_cache_size:
                 # the default of None is falsy but still yields a host tier.
-                self._reject_non_gpu_cache_tiers(self.kv_cache_manager)
+                if not capacity_only:
+                    self._reject_non_gpu_cache_tiers(self.kv_cache_manager)
                 layout = build_kv_cache_layout_v2(self.kv_cache_manager)
                 self.kv_connector_manager.worker.register_kv_cache_layout(
                     layout)
@@ -1084,12 +1089,15 @@ class PyExecutor:
 
             # For each of our layers, we need to register the pre/post hooks.
             # These are used for methods like `wait_for_layer_load` and `save_kv_layer`.
-            for _name, module in self.model_engine.model.named_modules():
-                if isinstance(module, DecoderLayer):
-                    module.register_forward_pre_hook(
-                        self.kv_connector_manager.layer_pre_hook)
-                    module.register_forward_hook(
-                        self.kv_connector_manager.layer_post_hook)
+            # A capacity-only connector has no per-layer work, so it is spared
+            # a hook on every layer of every forward pass.
+            if not capacity_only:
+                for _name, module in self.model_engine.model.named_modules():
+                    if isinstance(module, DecoderLayer):
+                        module.register_forward_pre_hook(
+                            self.kv_connector_manager.layer_pre_hook)
+                        module.register_forward_hook(
+                            self.kv_connector_manager.layer_post_hook)
 
             self.kv_connector_manager.wait_for_initialization()
 

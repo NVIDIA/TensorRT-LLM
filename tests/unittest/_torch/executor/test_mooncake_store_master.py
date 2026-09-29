@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for provisioning a Mooncake store pool during server bringup.
+"""Unit tests for the Mooncake pool manifest and joining a pool.
 
 Runs without a Mooncake installation and without a GPU. A master this process
 launches is a fake standing in for `Popen` that opens the RPC port, which is
@@ -34,11 +34,13 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import master as m
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     CONFIG_PATH_ENV,
     MooncakeStoreConnectorConfig,
+    StoreRole,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
+    PoolManifest,
     maybe_provision_pool,
     provision_pool,
-    resolve_master_address,
+    resolve_pool,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, MooncakeStoreConfig
 
@@ -90,7 +92,7 @@ class FakeMasterProcess:
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    """No ambient pool: these tests are about what provisioning does itself."""
+    """No ambient pool: these tests are about what joining does itself."""
     for name in (
         CONFIG_PATH_ENV,
         master_module.MASTER_BINARY_ENV,
@@ -107,7 +109,7 @@ def clean_env(monkeypatch):
 def fake_master(monkeypatch):
     """Replace the master binary and its process with in-process fakes.
 
-    Returns a callable that arms the fake. Once provisioning has run, the
+    Returns a callable that arms the fake. Once the master has run, the
     launched instance is available as `.process` for inspection.
     """
 
@@ -147,7 +149,7 @@ def fake_master(monkeypatch):
 
 
 @pytest.fixture
-def running_master():
+def live_master():
     """A socket standing in for a master someone else is running."""
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
@@ -158,26 +160,27 @@ def running_master():
         listener.close()
 
 
+def manifest_file(tmp_path, address, **overrides):
+    """A published manifest naming `address`, as the master would write it."""
+    record = {
+        "master_server_address": address,
+        "metadata_server": "P2PHANDSHAKE",
+        "protocol": "rdma",
+        "namespace": "trtllm",
+    }
+    record.update(overrides)
+    path = tmp_path / "pool.json"
+    path.write_text(json.dumps(record))
+    return path
+
+
 # ---- configuration ----
 
 
-@pytest.mark.parametrize(
-    "kwargs, message",
-    [
-        (dict(launch_master=True, master_server_address="host:50051"), "not both"),
-        (dict(), "needs a master"),
-        # master_address_file only writes an address; reading one is
-        # master_server_address, so publishing without launching is incoherent.
-        (
-            dict(master_server_address="host:50051", master_address_file="/shared/master.addr"),
-            "needs launch_master",
-        ),
-    ],
-    ids=["two_masters", "no_master", "publishing_without_launching"],
-)
-def test_pool_needs_exactly_one_master(kwargs, message):
-    with pytest.raises(ValueError, match=message):
-        MooncakeStoreConfig(**kwargs)
+def test_a_pool_must_be_named():
+    """Without it there is no master to reach and nothing to join."""
+    with pytest.raises(ValueError):
+        MooncakeStoreConfig()
 
 
 def test_pool_is_rejected_unless_the_connector_is_mooncake_store():
@@ -185,15 +188,59 @@ def test_pool_is_rejected_unless_the_connector_is_mooncake_store():
     with pytest.raises(ValueError, match="mooncake_store describes a Mooncake pool"):
         KvCacheConnectorConfig(
             connector="lmcache",
-            mooncake_store=MooncakeStoreConfig(launch_master=True),
+            mooncake_store=MooncakeStoreConfig(pool="host:50051"),
         )
     # Naming the module rather than the preset selects the same connector.
     KvCacheConnectorConfig(
         connector_module="tensorrt_llm._torch.pyexecutor.connectors.mooncake_store",
         connector_scheduler_class="MooncakeStoreConnectorScheduler",
         connector_worker_class="MooncakeStoreConnectorWorker",
-        mooncake_store=MooncakeStoreConfig(launch_master=True),
+        mooncake_store=MooncakeStoreConfig(pool="host:50051"),
     )
+
+
+@pytest.mark.parametrize("role", ["both", "producer", "consumer", "capacity"])
+def test_every_role_is_configurable(role):
+    assert MooncakeStoreConfig(pool="host:50051", role=role).role == role
+
+
+def test_an_unknown_role_is_refused():
+    with pytest.raises(ValueError):
+        MooncakeStoreConfig(pool="host:50051", role="donor")
+
+
+# ---- the manifest ----
+
+
+def test_a_manifest_round_trips():
+    original = PoolManifest(
+        master_server_address="10.0.0.1:50051",
+        metadata_server="http://127.0.0.1:8080/metadata",
+        protocol="tcp",
+        namespace="experiment-4",
+        metrics_port=9100,
+        eviction_ratio=0.2,
+    )
+    assert PoolManifest.from_json(original.to_json()) == original
+
+
+def test_a_manifest_keeps_keys_it_does_not_understand():
+    """A newer master's manifest must survive an older reader unharmed."""
+    raw = {"master_server_address": "h:1", "future_setting": "keep me"}
+    parsed = PoolManifest.from_json(raw)
+    assert parsed.extra == {"future_setting": "keep me"}
+    assert parsed.to_json()["future_setting"] == "keep me"
+
+
+def test_a_manifest_without_a_master_is_refused():
+    """Its whole purpose is naming the master, so this is not a usable pool."""
+    with pytest.raises(ValueError, match="names no master_server_address"):
+        PoolManifest.from_json({"protocol": "rdma"}, "/shared/pool.json")
+
+
+def test_a_manifest_names_the_command_that_writes_it():
+    with pytest.raises(ValueError, match="mooncake_master --pool_file"):
+        PoolManifest.from_json({}, "/shared/pool.json")
 
 
 # ---- the rendered client config ----
@@ -202,17 +249,20 @@ def test_pool_is_rejected_unless_the_connector_is_mooncake_store():
 def test_client_config_is_what_the_connector_reads_back(tmp_path):
     """The generated JSON has to survive the connector's own parser."""
     pool = MooncakeStoreConfig(
-        master_server_address="10.0.0.1:50051",
-        protocol="rdma",
-        device_name="mlx5_0",
-        global_segment_size="64GiB",
-        local_buffer_size="4GiB",
-        cache_prefix="trtllm-m3",
+        pool="file:///shared/pool.json",
+        role="capacity",
+        segment_size="64GiB",
+        namespace="trtllm-m3",
         stage_through_host=True,
         transfer_batch_size=32,
     )
+    manifest = PoolManifest(
+        master_server_address="10.0.0.1:50051",
+        metadata_server="P2PHANDSHAKE",
+        protocol="rdma",
+    )
     path = tmp_path / "mooncake.json"
-    path.write_text(json.dumps(master_module._client_config(pool, "10.0.0.1:50051")))
+    path.write_text(json.dumps(master_module._client_config(pool, manifest, "mlx5_0")))
 
     parsed = MooncakeStoreConnectorConfig.from_file(str(path))
     assert parsed.master_server_address == "10.0.0.1:50051"
@@ -220,18 +270,51 @@ def test_client_config_is_what_the_connector_reads_back(tmp_path):
     assert parsed.protocol == "rdma"
     assert parsed.device_name == "mlx5_0"
     assert parsed.global_segment_size == 64 * 1024**3
-    assert parsed.local_buffer_size == 4 * 1024**3
-    assert parsed.cache_prefix == "trtllm-m3"
+    assert parsed.namespace == "trtllm-m3"
+    assert parsed.role is StoreRole.CAPACITY
     assert parsed.stage_through_host is True
     assert parsed.transfer_batch_size == 32
 
 
-def test_client_config_omits_the_fields_the_pool_left_unset():
-    """An absent key leaves the connector its own default; a null would not."""
-    pool = MooncakeStoreConfig(master_server_address="host:50051")
-    written = master_module._client_config(pool, "host:50051")
-    assert "cache_prefix" not in written
-    assert "staging_buffer_bytes" not in written
+def test_the_pool_supplies_what_the_server_does_not(tmp_path):
+    """Pool-wide settings come from the manifest, not from each worker config."""
+    pool = MooncakeStoreConfig(pool="file:///shared/pool.json")
+    manifest = PoolManifest(
+        master_server_address="10.9.9.9:50051",
+        metadata_server="http://meta:8080/metadata",
+        protocol="tcp",
+        namespace="from-the-pool",
+    )
+    written = master_module._client_config(pool, manifest, "")
+
+    assert written["master_server_address"] == "10.9.9.9:50051"
+    assert written["metadata_server"] == "http://meta:8080/metadata"
+    assert written["protocol"] == "tcp"
+    assert written["namespace"] == "from-the-pool"
+
+
+def test_a_server_may_override_the_pools_namespace():
+    """Isolating one deployment's keys is the server's business, not the pool's."""
+    pool = MooncakeStoreConfig(pool="h:1", namespace="mine")
+    manifest = PoolManifest(master_server_address="h:1", namespace="shared")
+    assert master_module._client_config(pool, manifest, "")["namespace"] == "mine"
+
+
+def test_sizes_reach_the_client_config_as_resolved_integers():
+    """vLLM reads this file too, and reads 'GB' as a power of 1024, not 1000."""
+    pool = MooncakeStoreConfig(pool="h:1", segment_size="160GiB")
+    manifest = PoolManifest(master_server_address="h:1")
+    written = master_module._client_config(pool, manifest, "")
+    assert written["global_segment_size"] == 160 * 1024**3
+    assert isinstance(written["global_segment_size"], int)
+
+
+def test_an_ambiguous_segment_size_is_refused():
+    """It would name two different sizes to the two engines sharing the pool."""
+    pool = MooncakeStoreConfig(pool="h:1", segment_size="160GB")
+    manifest = PoolManifest(master_server_address="h:1")
+    with pytest.raises(ValueError, match="160GiB"):
+        master_module._client_config(pool, manifest, "")
 
 
 @pytest.mark.parametrize(
@@ -247,62 +330,59 @@ def test_master_addresses_are_split_or_declined(address, expected):
     assert master_module._split_address(address) == expected
 
 
-# ---- provisioning against a master someone else runs ----
+# ---- joining a pool ----
 
 
-def test_provisioning_points_the_workers_at_a_running_master(running_master):
-    pool = MooncakeStoreConfig(master_server_address=running_master)
+def test_joining_points_the_workers_at_the_pools_master(live_master, tmp_path):
+    pool = MooncakeStoreConfig(pool=f"file://{manifest_file(tmp_path, live_master)}")
 
     with provision_pool(pool) as config_path:
         # The workers are spawned inside this window and are told about the
         # pool through the environment, so both have to hold while it is open.
         assert os.environ[CONFIG_PATH_ENV] == config_path
         written = json.loads(open(config_path).read())
-        assert written["master_server_address"] == running_master
+        assert written["master_server_address"] == live_master
 
     assert CONFIG_PATH_ENV not in os.environ
     assert not os.path.exists(config_path)
 
 
-def test_a_staging_buffer_can_be_sized_where_staging_is_turned_on(running_master):
-    """Undersizing it silently shrinks the transfer batch, so it must be settable."""
-    pool = MooncakeStoreConfig(
-        master_server_address=running_master,
-        stage_through_host=True,
-        staging_buffer_bytes="4GiB",
-    )
+def test_a_bare_master_address_needs_no_manifest(live_master):
+    """Joining a master run without this CLI still has to work."""
+    pool = MooncakeStoreConfig(pool=live_master)
 
     with provision_pool(pool) as config_path:
         written = json.loads(open(config_path).read())
-        assert written["stage_through_host"] is True
-        assert written["staging_buffer_bytes"] == "4GiB"
+        assert written["master_server_address"] == live_master
+        assert written["metadata_server"] == "P2PHANDSHAKE"
 
 
-def test_provisioning_fails_before_the_model_loads_if_the_master_is_absent(monkeypatch):
+def test_joining_fails_before_the_model_loads_if_the_master_is_absent(monkeypatch, tmp_path):
     monkeypatch.setenv(master_module.MASTER_TIMEOUT_ENV, "1")
-    pool = MooncakeStoreConfig(master_server_address=f"127.0.0.1:{free_port()}")
+    absent = f"127.0.0.1:{free_port()}"
+    pool = MooncakeStoreConfig(pool=f"file://{manifest_file(tmp_path, absent)}")
 
     with pytest.raises(TimeoutError, match="did not accept connections"):
         with provision_pool(pool):
-            pytest.fail("provisioning should not have yielded")
+            pytest.fail("joining should not have yielded")
     assert CONFIG_PATH_ENV not in os.environ
 
 
-def test_an_unparseable_master_address_is_left_to_the_workers():
+def test_an_unparseable_master_address_is_left_to_the_workers(tmp_path):
     """Not every address is host:port, so an unprobeable one passes through."""
-    pool = MooncakeStoreConfig(master_server_address="unix:///var/run/mooncake")
+    address = "unix:///var/run/mooncake"
+    pool = MooncakeStoreConfig(pool=f"file://{manifest_file(tmp_path, address)}")
 
     with provision_pool(pool) as config_path:
-        written = json.loads(open(config_path).read())
-        assert written["master_server_address"] == "unix:///var/run/mooncake"
+        assert json.loads(open(config_path).read())["master_server_address"] == address
 
 
 def test_an_inherited_config_path_wins(monkeypatch, tmp_path):
-    """An externally managed pool names itself this way, so provisioning defers."""
+    """An externally managed pool names itself this way, so joining defers."""
     harness_config = tmp_path / "harness.json"
     harness_config.write_text("{}")
     monkeypatch.setenv(CONFIG_PATH_ENV, str(harness_config))
-    pool = MooncakeStoreConfig(launch_master=True)
+    pool = MooncakeStoreConfig(pool="file:///nowhere/pool.json")
 
     with provision_pool(pool) as config_path:
         assert config_path is None
@@ -311,95 +391,15 @@ def test_an_inherited_config_path_wins(monkeypatch, tmp_path):
     assert os.environ[CONFIG_PATH_ENV] == str(harness_config)
 
 
-# ---- provisioning with a master of our own ----
-
-
-def test_a_launched_master_is_named_in_the_config_and_stopped_on_exit(fake_master):
-    port = free_port()
-    fake_master.arm(listen_on=port)
-    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
-
-    with provision_pool(pool) as config_path:
-        written = json.loads(open(config_path).read())
-        host, _, named_port = written["master_server_address"].rpartition(":")
-        assert int(named_port) == port
-        # The address in the config is all a worker on another host gets, so
-        # it has to be dialable.
-        with socket.create_connection((host, port), timeout=5):
-            pass
-
-    assert fake_master.process.terminated
-    assert not fake_master.process.killed
-
-
-def test_a_launched_master_gets_the_flags_and_logging_it_needs(fake_master):
-    port = free_port()
-    fake_master.arm(listen_on=port)
-    pool = MooncakeStoreConfig(
-        launch_master=True,
-        master_port=port,
-        master_metrics_port=free_port(),
-        master_eviction_ratio=0.1,
-    )
-
-    with provision_pool(pool):
-        command = fake_master.process.command
-        assert command[0].endswith("mooncake_master")
-        assert f"--rpc_port={port}" in command
-        assert f"--metrics_port={pool.master_metrics_port}" in command
-        assert "--eviction_ratio=0.1" in command
-        # Without these the master logs to a file under /tmp and the log the
-        # run directory holds stays empty.
-        assert fake_master.process.env["GLOG_logtostderr"] == "1"
-        assert fake_master.process.env["GLOG_v"] == "1"
-
-
-def test_a_master_that_dies_during_startup_says_so(fake_master):
-    fake_master.arm(exit_code=3)
-    pool = MooncakeStoreConfig(launch_master=True, master_port=free_port())
-
-    with pytest.raises(RuntimeError, match="exited with code 3"):
-        with provision_pool(pool):
-            pytest.fail("provisioning should not have yielded")
-    assert CONFIG_PATH_ENV not in os.environ
-
-
-def test_a_master_that_never_listens_times_out(monkeypatch, fake_master):
-    monkeypatch.setenv(master_module.MASTER_TIMEOUT_ENV, "1")
-    fake_master.arm()
-    pool = MooncakeStoreConfig(launch_master=True, master_port=free_port())
-
-    with pytest.raises(TimeoutError, match="did not accept connections"):
-        with provision_pool(pool):
-            pytest.fail("provisioning should not have yielded")
-    assert fake_master.process.terminated
-
-
-def test_a_missing_master_binary_names_the_alternatives(monkeypatch):
-    monkeypatch.setattr(
-        master_module,
-        "shutil",
-        SimpleNamespace(which=lambda _name: None, rmtree=shutil.rmtree),
-    )
-    pool = MooncakeStoreConfig(launch_master=True)
-
-    with pytest.raises(FileNotFoundError, match="master_server_address"):
-        with provision_pool(pool):
-            pytest.fail("provisioning should not have yielded")
-
-
-def test_a_run_dir_keeps_the_master_log_and_the_config(fake_master, tmp_path):
-    port = free_port()
-    fake_master.arm(listen_on=port)
-    run_dir = tmp_path / "pool"
-    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
+def test_a_run_dir_keeps_the_client_config(live_master, tmp_path):
+    run_dir = tmp_path / "run"
+    pool = MooncakeStoreConfig(pool=live_master)
 
     with provision_pool(pool, run_dir=str(run_dir)) as config_path:
         assert config_path == str(run_dir / master_module.CLIENT_CONFIG_NAME)
 
     # An explicit run directory outlives the run that filled it, since the
-    # master's log is where pool occupancy and eviction are read from.
-    assert (run_dir / master_module.MASTER_LOG_NAME).exists()
+    # segment records in it are what the run's capacity is reported from.
     assert (run_dir / master_module.CLIENT_CONFIG_NAME).exists()
 
 
@@ -415,117 +415,218 @@ def test_a_run_dir_keeps_the_master_log_and_the_config(fake_master, tmp_path):
     ],
     ids=["another_connector", "no_connector", "pool_left_undescribed"],
 )
-def test_provisioning_is_a_no_op_unless_a_pool_is_described(config):
+def test_joining_is_a_no_op_unless_a_pool_is_described(config):
     """Without `mooncake_store`, MOONCAKE_CONFIG_PATH is still the only input."""
     with maybe_provision_pool(config):
         assert CONFIG_PATH_ENV not in os.environ
 
 
-def test_a_described_pool_is_provisioned(running_master):
+def test_a_described_pool_is_joined(live_master):
     config = KvCacheConnectorConfig(
         connector="mooncake-store",
-        mooncake_store=MooncakeStoreConfig(master_server_address=running_master),
+        mooncake_store=MooncakeStoreConfig(pool=live_master),
     )
     with maybe_provision_pool(config):
         written = json.loads(open(os.environ[CONFIG_PATH_ENV]).read())
-        assert written["master_server_address"] == running_master
+        assert written["master_server_address"] == live_master
     assert CONFIG_PATH_ENV not in os.environ
 
 
-# ---- reaching a master whose host nobody knew in advance ----
+# ---- reaching a pool whose host nobody knew in advance ----
 
 
 @pytest.mark.parametrize("address", ["10.0.0.1:50051", "unix:///var/run/mooncake"])
 def test_an_address_that_is_not_a_file_passes_through(address):
-    assert resolve_master_address(address, timeout=1.0) == address
+    assert resolve_pool(address, timeout=1.0).master_server_address == address
 
 
-def test_a_published_address_is_read_from_the_file_that_names_it(tmp_path):
-    published = tmp_path / "master.addr"
-    published.write_text("10.0.0.7:50051\n")
-
-    assert resolve_master_address(f"file://{published}", timeout=1.0) == "10.0.0.7:50051"
-
-
-def test_an_address_not_published_yet_is_waited_for(tmp_path):
-    """Master and workers are started together; neither one orders the other."""
-    published = tmp_path / "master.addr"
-    threading.Timer(0.5, published.write_text, ["10.0.0.9:50051\n"]).start()
-
-    assert resolve_master_address(f"file://{published}", timeout=10.0) == "10.0.0.9:50051"
+def test_a_published_manifest_is_read_from_the_file_that_names_it(tmp_path):
+    path = manifest_file(tmp_path, "10.0.0.7:50051", protocol="tcp")
+    resolved = resolve_pool(f"file://{path}", timeout=1.0)
+    assert resolved.master_server_address == "10.0.0.7:50051"
+    assert resolved.protocol == "tcp"
 
 
-def test_an_empty_address_file_is_not_taken_for_an_address(tmp_path):
-    """An existing file is not the same as a published address."""
-    published = tmp_path / "master.addr"
-    published.write_text("")
+def test_a_manifest_not_published_yet_is_waited_for(tmp_path):
+    """Master and servers are started together; neither one orders the other."""
+    path = tmp_path / "pool.json"
+    threading.Timer(
+        0.5, path.write_text, [json.dumps({"master_server_address": "10.0.0.9:50051"})]
+    ).start()
 
-    with pytest.raises(TimeoutError, match="No Mooncake master address"):
-        resolve_master_address(f"file://{published}", timeout=1.0)
-
-
-def test_an_unpublished_address_names_the_command_that_publishes_it(tmp_path):
-    with pytest.raises(TimeoutError, match="--address-file"):
-        resolve_master_address(f"file://{tmp_path / 'absent'}", timeout=1.0)
+    assert resolve_pool(f"file://{path}", timeout=10.0).master_server_address == "10.0.0.9:50051"
 
 
-# ---- a master with a lifetime of its own ----
+def test_an_empty_manifest_file_is_not_taken_for_a_pool(tmp_path):
+    """An existing file is not the same as a published manifest."""
+    path = tmp_path / "pool.json"
+    path.write_text("")
+
+    with pytest.raises(TimeoutError, match="No Mooncake pool manifest"):
+        resolve_pool(f"file://{path}", timeout=1.0)
 
 
-def test_a_standalone_master_publishes_an_address_that_can_be_dialed(fake_master, tmp_path):
+def test_an_unparseable_manifest_is_treated_as_not_there_yet(tmp_path):
+    """What a reader racing a slow filesystem sees, not a reason to fail."""
+    path = tmp_path / "pool.json"
+    path.write_text("{not json")
+
+    with pytest.raises(TimeoutError, match="No Mooncake pool manifest"):
+        resolve_pool(f"file://{path}", timeout=1.0)
+
+
+def test_an_unpublished_manifest_names_the_command_that_publishes_it(tmp_path):
+    with pytest.raises(TimeoutError, match="--pool_file"):
+        resolve_pool(f"file://{tmp_path / 'absent'}", timeout=1.0)
+
+
+def test_a_pool_must_be_named_to_be_resolved():
+    with pytest.raises(ValueError, match="pool is required"):
+        resolve_pool("", timeout=1.0)
+
+
+# ---- the master, which owns the pool ----
+
+
+def test_a_master_publishes_a_manifest_that_can_be_dialed(fake_master, tmp_path):
     port = free_port()
     fake_master.arm(listen_on=port)
-    address_file = tmp_path / "master.addr"
-    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
+    pool_file = tmp_path / "shared" / "pool.json"
 
     with master_module.running_master(
-        pool, str(tmp_path / "run"), address_file=str(address_file)
+        str(tmp_path / "run"), pool_file=str(pool_file), rpc_port=port
     ) as master:
-        assert resolve_master_address(f"file://{address_file}", timeout=5.0) == master.address
+        resolved = resolve_pool(f"file://{pool_file}", timeout=5.0)
+        assert resolved.master_server_address == master.address
         host, _, named_port = master.address.rpartition(":")
         assert int(named_port) == port
         with socket.create_connection((host, port), timeout=5):
             pass
 
 
-def test_a_stopped_master_leaves_no_address_behind(fake_master, tmp_path):
-    """A stale address would send the next run's workers to a dead port."""
+def test_the_master_states_the_settings_every_participant_shares(fake_master, tmp_path):
+    """Stated once here rather than restated in each worker config."""
     port = free_port()
     fake_master.arm(listen_on=port)
-    address_file = tmp_path / "master.addr"
-    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
+    pool_file = tmp_path / "pool.json"
 
-    with master_module.running_master(pool, str(tmp_path / "run"), address_file=str(address_file)):
-        assert address_file.exists()
+    with master_module.running_master(
+        str(tmp_path / "run"),
+        pool_file=str(pool_file),
+        rpc_port=port,
+        metrics_port=9100,
+        eviction_ratio=0.25,
+        metadata_server="http://meta:8080/metadata",
+        protocol="tcp",
+        namespace="round5",
+    ):
+        published = json.loads(pool_file.read_text())
 
-    assert not address_file.exists()
+    assert published["protocol"] == "tcp"
+    assert published["metadata_server"] == "http://meta:8080/metadata"
+    assert published["namespace"] == "round5"
+    assert published["eviction_ratio"] == 0.25
+    assert published["metrics_port"] == 9100
+
+
+def test_a_stopped_master_leaves_no_manifest_behind(fake_master, tmp_path):
+    """A stale manifest would send the next run's workers to a dead port."""
+    port = free_port()
+    fake_master.arm(listen_on=port)
+    pool_file = tmp_path / "pool.json"
+
+    with master_module.running_master(
+        str(tmp_path / "run"), pool_file=str(pool_file), rpc_port=port
+    ):
+        assert pool_file.exists()
+
+    assert not pool_file.exists()
     assert fake_master.process.terminated
 
 
-def test_a_standalone_master_keeps_its_log(fake_master, tmp_path):
-    """A standalone master outlives the servers that used it, so its log is kept."""
+def test_a_master_always_publishes_into_its_run_directory(fake_master, tmp_path):
+    """So a finished run's own logs say which pool it used."""
     port = free_port()
     fake_master.arm(listen_on=port)
     run_dir = tmp_path / "run"
-    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
 
-    with master_module.running_master(pool, str(run_dir)):
+    with master_module.running_master(str(run_dir), rpc_port=port):
+        assert (run_dir / master_module.POOL_MANIFEST_NAME).exists()
+
+    assert not (run_dir / master_module.POOL_MANIFEST_NAME).exists()
+
+
+def test_a_master_keeps_its_log(fake_master, tmp_path):
+    """It outlives the servers that used it, so its log is kept."""
+    port = free_port()
+    fake_master.arm(listen_on=port)
+    run_dir = tmp_path / "run"
+
+    with master_module.running_master(str(run_dir), rpc_port=port):
         pass
 
     assert (run_dir / master_module.MASTER_LOG_NAME).exists()
 
 
-def test_provisioning_joins_a_master_it_was_never_given_the_address_of(fake_master, tmp_path):
-    """The address file is how workers reach a master no config names a host for."""
+def test_a_master_gets_the_flags_and_logging_it_needs(fake_master, tmp_path):
     port = free_port()
+    metrics_port = free_port()
     fake_master.arm(listen_on=port)
-    address_file = tmp_path / "master.addr"
-    standalone = MooncakeStoreConfig(launch_master=True, master_port=port)
-    worker = MooncakeStoreConfig(master_server_address=f"file://{address_file}")
 
     with master_module.running_master(
-        standalone, str(tmp_path / "run"), address_file=str(address_file)
+        str(tmp_path / "run"), rpc_port=port, metrics_port=metrics_port, eviction_ratio=0.1
+    ):
+        command = fake_master.process.command
+        assert command[0].endswith("mooncake_master")
+        assert f"--rpc_port={port}" in command
+        assert f"--metrics_port={metrics_port}" in command
+        assert "--eviction_ratio=0.1" in command
+        # Without these the master logs to a file under /tmp and the log the
+        # run directory holds stays empty.
+        assert fake_master.process.env["GLOG_logtostderr"] == "1"
+        assert fake_master.process.env["GLOG_v"] == "1"
+
+
+def test_a_master_that_dies_during_startup_says_so(fake_master, tmp_path):
+    fake_master.arm(exit_code=3)
+
+    with pytest.raises(RuntimeError, match="exited with code 3"):
+        with master_module.running_master(str(tmp_path / "run"), rpc_port=free_port()):
+            pytest.fail("the master should not have come up")
+
+
+def test_a_master_that_never_listens_times_out(monkeypatch, fake_master, tmp_path):
+    monkeypatch.setenv(master_module.MASTER_TIMEOUT_ENV, "1")
+    fake_master.arm()
+
+    with pytest.raises(TimeoutError, match="did not accept connections"):
+        with master_module.running_master(str(tmp_path / "run"), rpc_port=free_port()):
+            pytest.fail("the master should not have come up")
+    assert fake_master.process.terminated
+
+
+def test_a_missing_master_binary_names_the_alternatives(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        master_module,
+        "shutil",
+        SimpleNamespace(which=lambda _name: None, rmtree=shutil.rmtree),
+    )
+
+    with pytest.raises(FileNotFoundError, match="install_mooncake.sh"):
+        with master_module.running_master(str(tmp_path / "run")):
+            pytest.fail("the master should not have come up")
+
+
+def test_a_server_joins_a_master_it_was_never_given_the_address_of(fake_master, tmp_path):
+    """The manifest is how servers reach a master no config names a host for."""
+    port = free_port()
+    fake_master.arm(listen_on=port)
+    pool_file = tmp_path / "pool.json"
+
+    with master_module.running_master(
+        str(tmp_path / "run"), pool_file=str(pool_file), rpc_port=port
     ) as master:
+        worker = MooncakeStoreConfig(pool=f"file://{pool_file}")
         with provision_pool(worker) as config_path:
             # Mooncake cannot dial a file:// URL, so what reaches the workers
             # has to be the address it resolved to.
@@ -533,47 +634,14 @@ def test_provisioning_joins_a_master_it_was_never_given_the_address_of(fake_mast
             assert written["master_server_address"] == master.address
 
 
-# ---- a master a server launched, made findable ----
+def test_a_half_written_manifest_is_never_read(tmp_path):
+    """A reader sees the whole manifest or nothing, never a prefix of one."""
+    target = tmp_path / "pool.json"
+    manifest = PoolManifest(master_server_address="10.0.0.7:50051")
 
-
-def test_a_launched_master_publishes_where_its_run_left_its_logs(fake_master, tmp_path):
-    """A finished run's logs still say which pool it used."""
-    port = free_port()
-    fake_master.arm(listen_on=port)
-    run_dir = tmp_path / "run"
-    pool = MooncakeStoreConfig(launch_master=True, master_port=port)
-
-    with provision_pool(pool, run_dir=str(run_dir)):
-        address = (run_dir / master_module.MASTER_ADDRESS_NAME).read_text().strip()
-        assert address.endswith(f":{port}")
-
-    assert not (run_dir / master_module.MASTER_ADDRESS_NAME).exists()
-
-
-def test_a_launched_master_can_be_published_where_the_donors_look(fake_master, tmp_path):
-    """This is what lets a server that launched its own master have donors."""
-    port = free_port()
-    fake_master.arm(listen_on=port)
-    shared = tmp_path / "shared" / "master.addr"
-    pool = MooncakeStoreConfig(
-        launch_master=True, master_port=port, master_address_file=str(shared)
-    )
-
-    with provision_pool(pool, run_dir=str(tmp_path / "run")):
-        assert resolve_master_address(f"file://{shared}", timeout=5.0).endswith(f":{port}")
-
-    # Retracted, so the next run's donors wait for a live master rather than
-    # joining a pool that no longer exists.
-    assert not shared.exists()
-
-
-def test_a_half_written_address_is_never_read(tmp_path):
-    """A reader sees the whole address or nothing, never a prefix of one."""
-    target = tmp_path / "master.addr"
-
-    with master_module._published_address("10.0.0.7:50051", [str(target)]):
-        assert not (tmp_path / "master.addr.partial").exists()
-        assert target.read_text().strip() == "10.0.0.7:50051"
+    with master_module._published_manifest(manifest, [str(target)]):
+        assert not (tmp_path / "pool.json.partial").exists()
+        assert json.loads(target.read_text())["master_server_address"] == "10.0.0.7:50051"
 
 
 # ---- saying why bringup is stuck ----
@@ -595,13 +663,11 @@ def test_an_address_of_a_shape_we_cannot_probe_is_not_fatal():
 
 def test_a_master_that_died_starting_is_reported_with_its_last_words(fake_master, tmp_path):
     """The reason is in the master's log, which is only read if the error quotes it."""
-    run_dir = tmp_path / "run"
     fake_master.arm(exit_code=1, log_text="E0903 bind(50051) failed: Address already in use\n")
-    pool = MooncakeStoreConfig(launch_master=True, master_port=free_port())
 
     with pytest.raises(RuntimeError, match="Address already in use"):
-        with provision_pool(pool, run_dir=str(run_dir)):
-            pytest.fail("provisioning should not have yielded")
+        with master_module.running_master(str(tmp_path / "run"), rpc_port=free_port()):
+            pytest.fail("the master should not have come up")
 
 
 # ---- choosing the fabric without naming it in a config ----
@@ -642,13 +708,12 @@ def test_a_node_without_infiniband_is_left_to_mooncake_s_own_discovery(tmp_path)
     assert master_module.resolve_device_name("rdma", "", sysfs_root=str(tmp_path / "absent")) == ""
 
 
-def test_the_detected_device_is_what_the_workers_are_told(fake_master, tmp_path, monkeypatch):
+def test_the_detected_device_is_what_the_workers_are_told(live_master, tmp_path, monkeypatch):
+    """Which HCAs a node has is the node's property, not the deployment's."""
     sysfs = tmp_path / "sysfs"
     fake_hca(sysfs, "mlx5_0")
     monkeypatch.setattr(master_module, "IB_SYSFS_ROOT", str(sysfs))
-    port = free_port()
-    fake_master.arm(listen_on=port)
-    pool = MooncakeStoreConfig(launch_master=True, master_port=port, protocol="rdma")
+    pool = MooncakeStoreConfig(pool=live_master)
 
     with provision_pool(pool, run_dir=str(tmp_path / "run")) as config_path:
         assert json.loads(open(config_path).read())["device_name"] == "mlx5_0"

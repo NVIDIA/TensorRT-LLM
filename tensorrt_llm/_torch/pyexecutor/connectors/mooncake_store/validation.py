@@ -24,14 +24,25 @@ Checks run at construction, before any request is admitted, so a bad deployment
 fails at startup instead of after the first cache hit.
 """
 
-from typing import TYPE_CHECKING
+import os
+from typing import TYPE_CHECKING, Optional
 
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     from ..kv_cache_layout import KvCacheLayout
+    from .config import MooncakeStoreConnectorConfig
 
-__all__ = ["validate_layout", "validate_llm_args"]
+__all__ = ["validate_layout", "validate_llm_args", "validate_node_budget"]
+
+_GIB = 1 << 30
+
+#: Host memory to leave unclaimed after the segments. Weights stream through
+#: page cache, the allocator holds arenas, and the runtime's own host buffers
+#: are not accounted here, so a check that permitted every last byte would pass
+#: configurations that then die under load.
+NODE_BUDGET_RESERVE_BYTES = 32 * _GIB
 
 
 def validate_llm_args(llm_args: TorchLlmArgs) -> None:
@@ -63,6 +74,95 @@ def validate_llm_args(llm_args: TorchLlmArgs) -> None:
             "replayed prefix would carry index-K from the store alongside stale "
             "index-V. This is the same restriction disaggregated serving applies."
         )
+
+
+def _available_host_memory() -> Optional[int]:
+    """Host memory the kernel says is available, or `None` if unknowable."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+    except (ValueError, OSError):
+        return None
+
+
+def validate_node_budget(
+    config: "MooncakeStoreConnectorConfig",
+    *,
+    ranks_on_node: Optional[int] = None,
+    available_bytes: Optional[int] = None,
+) -> None:
+    """Reject a segment size this node cannot afford once every rank asks.
+
+    Contribution is per rank, so capacity scales with the hardware in the
+    deployment, but host DRAM is a per-node limit and the ranks sharing a node
+    each claim the segment independently. Under attention DP that multiplier is
+    the whole decode server: eight ranks at 160 GiB want 1280 GiB of a node
+    that has around 956 GiB.
+
+    Checked here because the failure mode otherwise is not an allocation error
+    but the OOM killer, arriving minutes later while weights are still loading,
+    naming no cause.
+
+    Args:
+        config: The resolved connector configuration.
+        ranks_on_node: Ranks of this server sharing this physical node.
+            Defaults to the local MPI communicator's size.
+        available_bytes: Host memory to measure against. Defaults to the
+            kernel's own figure.
+    """
+    from tensorrt_llm._utils import local_mpi_size
+
+    if config.global_segment_size <= 0:
+        return
+
+    if ranks_on_node is None:
+        try:
+            ranks_on_node = max(1, local_mpi_size())
+        except Exception:  # noqa: BLE001 - a missing communicator must not block startup
+            ranks_on_node = 1
+    if available_bytes is None:
+        available_bytes = _available_host_memory()
+    if available_bytes is None:
+        logger.warning(
+            "mooncake-store: cannot read this node's available memory, so the "
+            f"{ranks_on_node} rank(s) here claiming "
+            f"{config.global_segment_size / _GIB:.1f} GiB each are not checked "
+            "against it."
+        )
+        return
+
+    claimed = ranks_on_node * config.global_segment_size
+    # Staging is pinned for the process's lifetime and comes out of the same
+    # DRAM, so it belongs in the sum rather than in the slack.
+    if config.stage_through_host:
+        from .staging import MAX_STAGING_BUFFER_BYTES
+
+        # One pool per direction, and a capacity-only rank opens neither.
+        directions = int(config.role.loads) + int(config.role.saves)
+        claimed += ranks_on_node * directions * MAX_STAGING_BUFFER_BYTES
+
+    budget = available_bytes - NODE_BUDGET_RESERVE_BYTES
+    if claimed <= budget:
+        logger.info(
+            f"mooncake-store: {ranks_on_node} rank(s) on this node will claim "
+            f"{claimed / _GIB:.1f} GiB of host memory for the pool, within the "
+            f"{budget / _GIB:.1f} GiB available after a "
+            f"{NODE_BUDGET_RESERVE_BYTES / _GIB:.0f} GiB reserve."
+        )
+        return
+
+    affordable = budget // ranks_on_node
+    raise ValueError(
+        f"mooncake-store: this node cannot afford the configured segment. "
+        f"{ranks_on_node} rank(s) here would each claim "
+        f"{config.global_segment_size / _GIB:.1f} GiB, "
+        f"{claimed / _GIB:.1f} GiB in total, but only "
+        f"{available_bytes / _GIB:.1f} GiB is available and "
+        f"{NODE_BUDGET_RESERVE_BYTES / _GIB:.0f} GiB of that is reserved for "
+        f"weights and the runtime's own host buffers. Lower segment_size to at "
+        f"most {affordable / _GIB:.1f} GiB, or run fewer ranks per node. "
+        f"Contribution is per rank, so a server's demand on its node grows "
+        f"with its parallelism."
+    )
 
 
 def validate_layout(layout: "KvCacheLayout") -> None:
