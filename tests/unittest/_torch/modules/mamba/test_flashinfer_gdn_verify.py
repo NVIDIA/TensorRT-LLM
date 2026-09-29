@@ -21,9 +21,9 @@ import torch
 def _fi_mtp_available() -> bool:
     if not torch.cuda.is_available():
         return False
-    from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
+    from tensorrt_llm._utils import is_flashinfer_gdn_decode_supported_arch
 
-    if not is_flashinfer_gdn_supported_arch():
+    if not is_flashinfer_gdn_decode_supported_arch():
         return False
     try:
         from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp  # noqa: F401

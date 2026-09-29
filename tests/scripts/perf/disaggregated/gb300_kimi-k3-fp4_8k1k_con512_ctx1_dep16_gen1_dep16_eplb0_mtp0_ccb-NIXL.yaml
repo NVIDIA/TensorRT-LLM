@@ -37,14 +37,14 @@ environment:
   trtllm_repo: ''
   build_wheel: false
   work_dir: <full_path_to_work_dir>
-  # TLLM_K3_MLA_GEN_BACKEND / TLLM_KV_CACHE_MANAGER_V2_BACKEND /
-  # TRTLLM_ENABLE_PDL / NCCL_GRAPH_MIXING_SUPPORT act on the model runtime, so
+  # TLLM_KV_CACHE_MANAGER_V2_BACKEND / TRTLLM_ENABLE_PDL /
+  # NCCL_GRAPH_MIXING_SUPPORT act on the model runtime, so
   # they belong on the ctx and gen workers only; the disagg proxy server does
   # not read them. TRTLLM_SERVER_DISABLE_GC / TRTLLM_WORKER_DISABLE_GC are set
   # on both sides.
   worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1
-    TRTLLM_ENABLE_PDL=1 NCCL_GRAPH_MIXING_SUPPORT=0 TLLM_K3_MLA_GEN_BACKEND=trtllm-gen
-    TLLM_KV_CACHE_MANAGER_V2_BACKEND=cpp ENROOT_ALLOW_DEV=yes
+    TRTLLM_ENABLE_PDL=1 NCCL_GRAPH_MIXING_SUPPORT=0 TLLM_KV_CACHE_MANAGER_V2_BACKEND=cpp
+    ENROOT_ALLOW_DEV=yes
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: false

@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 import soundfile
 
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
@@ -275,15 +276,15 @@ def test_whisper_pytorch_beam_search(
 def _assert_cuda_graph_state(llm: LLM, captured: bool, encoder_captured: bool = False) -> None:
     """Introspect the in-process engine (single-process mode only).
 
-    The enc-dec encoder step shares `encoder_cuda_graph_runner` with the
-    `llm.encode()` path; feature mode is a mode of that one runner, selected by
-    `encoder_cuda_graph_config`, not a second runner.
+    The independent encoder phase owns its graphs inside EncoderDecoderRunner;
+    the engine retains the decoder graphs.
     """
     model_engine = llm._executor.engine.model_engine
     assert model_engine.cuda_graph_runner.enabled == captured
     assert bool(model_engine.cuda_graph_runner.graphs) == captured
 
-    encoder_runner = model_engine.encoder_cuda_graph_runner
+    assert isinstance(model_engine._runner, EncoderDecoderRunner)
+    encoder_runner = model_engine._runner._encoder_cuda_graph_runner
     if not encoder_captured:
         assert not encoder_runner.enabled
         assert not encoder_runner.graphs
@@ -293,8 +294,8 @@ def _assert_cuda_graph_state(llm: LLM, captured: bool, encoder_captured: bool = 
     assert encoder_runner.feature_mode
     assert encoder_runner.is_encoder_decoder
     # Capture alone is not enough: `pad_batch` and the shape checks in
-    # `_maybe_forward_encoder_graph` can route every request to the eager
-    # encoder while `graphs` stays populated, and that silent fallback would
+    # `EncoderMixin._prepare_encoder_feature_graph_inputs` can route every request
+    # to the eager encoder while `graphs` stays populated. That silent fallback would
     # pass every output assertion above. Only the replay counter rules it out,
     # and only against the warmup baseline: the capture pass replays each key
     # once immediately after capturing it, so anything at or below

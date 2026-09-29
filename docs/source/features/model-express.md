@@ -109,7 +109,8 @@ Support for another model family requires a focused qualification change:
 5. Run a real ModelExpress donor/receiver test with the model configurations
    being claimed, including the supported quantization and TP/PP/EP layouts.
    Compare deterministic output token IDs with the standard Hugging Face load
-   path before documenting the family as supported.
+   path, and require the per-rank weight manifests to match (see the
+   qualification test below), before documenting the family as supported.
 
 ### Qualification Test
 
@@ -120,7 +121,36 @@ uses a metadata-only view of the donor's canonical snapshot and contains no
 weight shards. A positive result therefore requires direct transfer; disk
 fallback cannot accidentally satisfy the test.
 
-Run the TP=1 smoke test against an isolated ModelExpress 0.4.1 service with
+Each role generates eight fixed prompts for exactly 32 greedy tokens
+(`end_id=-1`, so no sequence stops early), and the test requires exact
+token-ID equality of the donor and the receiver against the HF baseline.
+
+**Weight manifests.** Every rank also writes a SHA-256 manifest of all
+registered parameters and buffers
+(`tensorrt_llm/_torch/weight_sharing/weight_manifest.py`) when
+`MX_WEIGHT_MANIFEST_DIR` is set; the harness sets it for all three roles and
+production loads never write one. Two manifest families are compared byte for
+byte:
+
+- `manifest.final.<role>.rank<N>.json` is written at the end of
+  `ModelLoader.load`, after every post-load hook and MoE load-balancer
+  finalization. Baseline, donor, and receiver must be pairwise identical:
+  same tensor names, dtypes, shapes, strides, storage offsets, digests,
+  skipped-tensor sets, and storage-alias partitions.
+- `manifest.transfer.<role>.rank<N>.json` is written inside the MX checkpoint
+  loader at the donor's publish point and at the receiver's P2P success point
+  (MX roles only). Donor and receiver parameters must be identical at this
+  boundary; derived buffers are enforced at the final tier because the
+  receiver's `cache_derived_state()` runs after the transfer.
+
+A row may list `final_manifest_exempt_patterns` on its `MxE2ECase` to exempt
+named tensors from the final-tier digest comparison. That is never a numeric
+tolerance and never applies to the transfer tier, and every pattern needs a
+code comment explaining why; the current BF16 dense rows exempt nothing.
+Manifests carry a `manifest_format_version`, and manifests of different
+versions never compare.
+
+Run the TP=1 smoke test against an isolated ModelExpress 0.5.1 service with
 NIXL enabled:
 
 ```bash
@@ -128,8 +158,15 @@ TRTLLM_MX_E2E_REQUIRED=1 \
 MODEL_EXPRESS_URL=http://127.0.0.1:8001 \
 LLM_MODELS_ROOT=/path/to/llm-models \
 pytest -v tests/integration/defs/model_express/test_model_express.py \
-  -k llama-bf16-tp1
+  -k llama-bf16-tp1 --output-dir /path/to/artifacts
 ```
+
+With `--output-dir` (always set in CI), the worker payloads, worker logs,
+transfer logs, weight manifests, and `timing.json` are copied to
+`model_express/<case-id>/` under that directory, so they are part of the stage
+results archive even when the test fails. The test also prints one
+`MX E2E timing` line per role and rank with the load, generation, and manifest
+durations.
 
 Run the TP=2 rank-mapping qualification on four GPUs by selecting
 `llama-bf16-tp2`. `TRTLLM_MX_LLAMA_MODEL` can override the default TinyLlama
@@ -144,7 +181,7 @@ row. `TRTLLM_MX_E2E_TIMEOUT_S` controls the 1200-second timeout used for the
 baseline worker, receiver worker, and donor-readiness wait; increase it for
 slow model storage or startup.
 
-The dedicated H100 CI stages own isolated Redis and ModelExpress 0.4.1
+The dedicated H100 CI stages own isolated Redis and ModelExpress 0.5.1
 sidecars. The two-GPU TP=1 stage is classified as multi-GPU: it runs
 automatically in post-merge pipelines or when a multi-GPU file changes, while
 direct pre-merge dispatch requires the `ci: full pre-merge approved` label.
@@ -190,11 +227,14 @@ When adding an ABI ID:
 
 ## Installation
 
-The official TensorRT LLM release container includes the MX Python client. No
-additional Python package installation is required in that container. MX
-remains opt-in at runtime: TensorRT LLM uses the client only when the MX
-checkpoint-loading path and a server URL are configured. Installing the client
-does not expand the model support scope described above.
+TensorRT LLM release containers that include this feature already install a
+compatible MX Python client; no additional client installation is needed for
+P2P transfer. For earlier TensorRT LLM releases, use a release or container
+built with this feature; upgrading the MX package alone does not add the
+missing TensorRT LLM integration. MX remains opt-in at runtime: TensorRT LLM
+uses the client only when the MX checkpoint-loading path and a server URL are
+configured. Installing the client does not expand the model support scope
+described above.
 
 For pip installations outside the official release container, install the MX
 Python client through the optional `mx` extra:
@@ -203,15 +243,14 @@ Python client through the optional `mx` extra:
 pip install "tensorrt-llm[mx]"
 ```
 
-The extra accepts ModelExpress client versions `>=0.4.1,<0.6.0`. Version
-`0.4.1` is the minimum client API qualified by this integration, while the
-upper bound prevents resolving unqualified `0.6.0` or newer client APIs.
-Deploy a compatible MX server version.
+The extra accepts ModelExpress client versions `>=0.5.1,<0.6.0`. Version
+`0.5.1` is the minimum client release that provides the TensorRT LLM adapter,
+while the upper bound prevents resolving unqualified `0.6.0` or newer client
+APIs. Deploy a compatible MX server version.
 The extra can be added to an existing TensorRT LLM installation. If the MX
 loading path is configured but the client cannot be imported, TensorRT LLM
-fails with an actionable installation message instead of silently loading from
-the Hugging Face checkpoint. Source discovery and transfer failures continue to
-use the Hugging Face fallback described above.
+logs a warning and uses the Hugging Face fallback described above. Source
+discovery and transfer failures use the same fallback.
 
 ## Deploy the MX Service
 
@@ -236,7 +275,7 @@ docker run -d --name modelexpress-server \
   -e MODEL_EXPRESS_LOG_LEVEL=info \
   -e MX_METADATA_BACKEND=redis \
   -e REDIS_URL=redis://modelexpress-redis:6379 \
-  nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.4.1
+  nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.1
 ```
 
 ## Configure TensorRT LLM
@@ -272,7 +311,7 @@ path.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `mx_config.server_url` | `null` | URL of the separately managed MX server. |
-| `mx_config.server_query_timeout_s` | `null` | Timeout for MX source discovery. When unset, TensorRT LLM uses a short fallback cap when no source exists and otherwise lets MX wait for long donor loads. |
+| `mx_config.server_query_timeout_s` | `null` | Deprecated and ignored. MX checks once for a compatible source, then falls back to native checkpoint loading. |
 
 ## Notes and Limitations
 

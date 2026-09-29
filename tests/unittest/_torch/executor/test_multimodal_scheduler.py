@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -610,8 +611,7 @@ def test_terminate_request_releases_partial_multimodal_encoder_state():
     executor = object.__new__(PyExecutor)
     executor.resource_manager = SimpleNamespace(free_resources=freed.append)
     executor._prefetched_request_ids = {request.py_request_id}
-    executor._disagg_timed_out_ctx_cancelled_ids = {request.py_request_id}
-    executor._disagg_timed_out_gen_cancelled_ids = {request.py_request_id}
+    executor._disagg_coordinator = Mock()
     executor.gather_all_responses = False
     executor.dist = SimpleNamespace(rank=1)
 
@@ -621,8 +621,7 @@ def test_terminate_request_releases_partial_multimodal_encoder_state():
     assert request.py_mm_encoder_state is None
     assert request.py_multimodal_data == {}
     assert executor._prefetched_request_ids == set()
-    assert executor._disagg_timed_out_ctx_cancelled_ids == set()
-    assert executor._disagg_timed_out_gen_cancelled_ids == set()
+    executor._disagg_coordinator.forget_request.assert_called_once_with(request.py_request_id)
 
 
 # ---------------------------------------------------------------------------

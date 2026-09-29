@@ -17,6 +17,11 @@ Use it when modifying the current implementation or adding a new model's
 attention behavior. It covers standard `Attention`, Multi-head Latent
 Attention (MLA), dense backends, and sparse backends.
 
+For user-visible sparse attention capabilities and configuration, see the
+[Sparse Attention feature guide](../../../docs/source/features/sparse-attention.md).
+For the framework hooks and steps for adding a sparse algorithm, see the
+[Sparse Attention Development Guide](../../../docs/source/developer-guide/sparse-attention-development-guide.md).
+
 ## Glossary
 
 | Acronym | Meaning |
@@ -137,29 +142,34 @@ statically checkable without runtime signature inspection.
 
 Ordinary sparse variants use `attention_output_hidden_size` and the shared
 output allocation. DeepSeek-V4's fused epilogue instead uses the optional
-output-preparation hook to create one token-major O-LoRA output tensor. Its
-context- and generation-phase helpers allocate the private FP8 attention and
-scale buffers, then write the O-LoRA result into the corresponding token range.
-The shared MLA custom-op contract exposes exactly one mutable output tensor;
-`_create_outputs()` keeps that tensor in a single-entry list through forward
-and output projection. Phase-specific scratch buffers remain inside the
-DeepSeek-V4 algorithm module and do not widen the generic hook facade.
+output-preparation hook to create one token-major O-LoRA-sized output tensor.
+Its context- and generation-phase helpers allocate the private FP8 attention
+and scale buffers, run both O-LoRA projections, and write the final hidden
+states into the leading columns of that tensor. The shared MLA custom-op
+contract exposes exactly one mutable output tensor; `_create_outputs()` keeps
+that tensor in a single-entry list through forward and output projection.
+Phase-specific scratch buffers remain inside the DeepSeek-V4 algorithm module
+and do not widen the generic hook facade.
 
 Sparse prediction inputs stay out of shared MLA APIs. Algorithm modules wrap
 their module-to-backend inputs in a `SparseBackendForwardArgs` subclass and
 pass it through the registered `AttentionForwardArgs.sparse_backend_args`
 field. For example, DSA owns `DSABackendForwardArgs`, whose indexer
 intermediates are consumed by `DSATrtllmAttention.sparse_attn_predict`.
-Shared sparse carriers, including `SparseBackendForwardArgs.topk_indices` and
-the backend-to-AttentionOp `SparseRuntimeParams`, live in
-`attention/backends/sparse/params.py`.
+Shared sparse carriers, including `SparseBackendForwardArgs.topk_indices`,
+`SparseBackendForwardArgs.block_sparse_inputs`, and the
+backend-to-FMHA/`AttentionOp` `SparseRuntimeParams`, live in
+`attention/backends/sparse/params.py`. The latter is carried by
+`AttentionForwardArgs.sparse_runtime_params` and nests optional general
+block-sparse inputs in `SparseRuntimeParams.block_sparse_inputs`.
 
 For MLA-related tasks, first check whether the work fits the current
 projection structure, can stay on an existing backend and metadata family, and
-can preserve the current latent-cache / paged-KV contract. If it can, the
-task usually stays within the existing MLA stack. If it depends on sparse
-helper-level control flow, read `mla.py`, `attention/backends/sparse/hooks.py`,
-and the relevant algorithm's `module.py` directly.
+can preserve the current model-specific shared-KV / paged-KV contract. If it
+can, the task usually stays within the existing MLA stack. If it depends on
+sparse helper-level control flow, read `mla.py`,
+`attention/backends/sparse/hooks.py`, and the relevant algorithm's `module.py`
+directly.
 
 ## 2. Backend Layer Reference
 
@@ -183,14 +193,56 @@ Base backend families:
 
 Sparse attention is not selected by a separate top-level module. User-facing
 `SparseAttentionConfig` objects live in LLM / VisualGen args and `ModelConfig`.
-Attention modules use those configs to select sparse backend classes, then
-lower the configs into `SparseParams` for backend construction. KV-cache
-managers stay model-scope and consume the user-facing config directly.
-Sparse metadata consumes `SparseMetadataParams`, derived independently from the
-same user-facing config.
+`config.attn_backend` still selects the base backend family; the sparse
+algorithm refines that choice through `attention/backends/sparse/registry.py`.
+Attention modules lower the user config into backend-owned `SparseParams`.
+KV-cache managers stay model-scope and consume the user-facing config directly,
+while sparse metadata consumes a separately lowered `SparseMetadataParams`.
+
+Framework-level algorithms either use the hook-based `TrtllmAttention` /
+`AttentionOp` path or own prediction and computation in a dedicated backend.
+The hook-based path carries module inputs through `SparseBackendForwardArgs`
+and backend outputs through `SparseRuntimeParams`. `VanillaAttention` does not
+use that contract; RocketKV's Vanilla implementation uses per-request Python
+hooks. Kernel-level sparsity such as Skip Softmax has no external predictor.
+See the
+[Sparse Attention Development Guide](../../../docs/source/developer-guide/sparse-attention-development-guide.md)
+for algorithm-specific hooks, index layouts, and cache managers.
 
 Sparse registrations are defined in `attention/backends/sparse/registry.py`. Check
-that file for the current supported combinations, as they may change over time.
+that file for the current config/backend combinations. Consult the
+[feature guide](../../../docs/source/features/sparse-attention.md#supported-sparse-attentions)
+for the supported attention shapes; do not infer support from algorithm
+registration alone.
+
+Block-sparse FMHA is a kernel-library contract rather than a sparse algorithm.
+Algorithms lower their live routing state to an algorithm-neutral
+`BlockSparseForwardInputs`, nested at
+`SparseRuntimeParams.block_sparse_inputs`: block geometry plus either canonical
+BSR routes or an exact packed bitmask. Optional K/V summaries enable proxy
+routes, and optional token-validity bits mask ragged KV tails. Plans contain
+only static format, proxy, geometry, and capacity choices; every run receives
+the live routes, summaries, validity bits, page tables, and sequence lengths.
+
+`PrimsTSBlockSparseFmha` owns its wrapper-plan cache by default. Integrations
+whose attention layers execute serially may explicitly bind a model-scoped
+cache to reuse graph-stable route workspaces across compatible layers. The
+cache must not be shared by concurrent forwards; each independent model
+component must own separate state.
+
+`TrtllmAttention.block_sparse_attn_predict(q, k, v, metadata, forward_args)`
+is the backend hook that produces this payload; `prepare_sparse_runtime_params`
+calls it even when the backend has no `SparseParams`. The default hands through
+`SparseBackendForwardArgs.block_sparse_inputs`, which lets an attention module
+predict routes before the core forward and pass the complete payload in
+`AttentionForwardArgs.sparse_backend_args`. Algorithms that predict inside the
+backend override the hook and return `None` for dense phases.
+
+The core library owns this general planning, validation, and execution
+contract. Algorithm integrations own the surrounding lifecycle: prediction
+policy, effective Q/K/V preparation before the core forward, plus any
+algorithm-specific post-processing afterward. They route their payload through
+these hooks instead of adding algorithm-specific FMHA libraries.
 
 ### 2.3 Backend contract
 
@@ -206,6 +258,7 @@ The core contract is:
   - `support_fused_rope()`
   - `support_fused_qkv()`
   - `support_mla()`
+  - `support_fp4_kv_cache()`
 - `runtime_workspace_bytes_per_token(model_config, mapping)` — the memory-accounting
   contract (default `0`); see below
 - `runtime_workspace_is_chunked_prefill_bounded(model_config)` — whether
@@ -229,11 +282,12 @@ estimator reserves it from the KV budget and the scheduler caps the driving sum.
 Keep the declared cost identical to the runtime allocation's when possible, or
 use a documented conservative upper bound. The current instances are the fp8
 context-MLA K/V dequant workspace and
-the NVFP4 DSA context gather workspace. Both are sized by summed attended KV
-length (`total_kv_len`), which cached prefixes can decouple from
-`max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`). NVFP4
-DSA reads the complete attended prefix even with chunked prefill, so it also
-returns `False` from `runtime_workspace_is_chunked_prefill_bounded`.
+the NVFP4 DSA and DeepSeek-V4 context gather workspaces. They are sized by
+summed attended KV length (`total_kv_len`), which cached prefixes can decouple
+from `max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`).
+NVFP4 sparse MLA reads the complete attended prefix even with chunked prefill,
+so it also returns `False` from
+`runtime_workspace_is_chunked_prefill_bounded`.
 
 ### 2.4 Capability reference
 
@@ -272,6 +326,10 @@ workspace, page-table KV metadata, and prefill/decode wrapper state.
 sparse-specific runtime state (indexer buffers, routing state, side-cache
 state).
 
+`SparseRuntimeParams` is the backend-to-`AttentionOp` carrier only on the
+`TrtllmAttention` path. Its fields are algorithm-specific, not a generic
+sparse-attention ABI; `VanillaAttention` uses its own per-request contract.
+
 ### 3.2 KV-cache and decode-time semantics
 
 The main question is not just "does the backend read K and V?" but:
@@ -296,7 +354,8 @@ use cache. `KVCacheManager.get_buffers()` exposes a per-layer view of the
 primary pool:
 
 - For standard dense attention, `kv_factor = 2` (separate K and V planes).
-- For MLA-style cache, `kv_factor = 1` (one latent-cache tensor per token).
+- For MLA-style cache, `kv_factor = 1` (one model-specific shared-KV tensor per
+  token in the primary pool).
 
 The main differences across backends:
 
@@ -319,43 +378,42 @@ starting with an empty selection cache. `TrtllmAttention` prepares the complete
 per-forward state, passes itself to the manager for selection, and then executes
 the selected library.
 
-`TLLM_FMHA_LIBS` controls the ordered selection. PrimTS is opt-in because it may
-add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the defaults or
-`TLLM_FMHA_LIBS=fallback` to force the fallback path. Delta entries update the
+`TLLM_FMHA_LIBS` controls the ordered selection. Dense PrimTS is opt-in because
+it may add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the
+defaults or `TLLM_FMHA_LIBS=fallback` to force the fallback path. Generic
+block-sparse PrimTS remains enabled by default because a dense fallback cannot
+preserve its routing semantics. Delta entries update the
 default membership and follow canonical registry order, while an exact list
 preserves the user-specified order. Each FMHA library exposes `is_available()`
 for module/static environment checks and `is_supported()` for per-forward
-request checks. For mixed non-MLA batches, the manager checks each active phase
+request checks. `AttentionForwardArgs.sparse_runtime_params` is the sole
+per-call lowered sparse runtime carrier and defaults to an empty
+`SparseRuntimeParams()`. The core forward overwrites that field with the carrier
+that `prepare_sparse_runtime_params` builds from the caller's carrier plus the
+hook results. The carrier holds both flat `AttentionOp` parameters and optional
+`BlockSparseForwardInputs` in its nested `block_sparse_inputs` field.
+`Fmha.is_supported()` rejects a request that carries routes for every library
+that does not declare `supports_block_sparse_inputs`, so no dense kernel can
+silently drop the routing semantics.
+For mixed non-MLA batches, the manager checks each active phase
 independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.
 
-The `TrtllmAttention` constructor's optional `flashinfer_mla_backend` argument
-explicitly selects the MLA generation kernel inside
-`FlashInferTrtllmGenFmha` for that attention instance. It accepts
-`trtllm-gen` or `cute-dsl`; the latter uses the monolithic CuTeDSL decode
-implementation. When the argument is `None`, the ordered FMHA-library
-dispatch is preserved and FlashInfer uses `trtllm-gen` if reached. When it is
-set, the standalone `CuteDslMlaFmha` defers to the explicit FlashInfer
-selection. Selecting `cute-dsl` for an MLA layer using FP8 KV cache raises an
-exception because the current CuTeDSL kernel does not accept the
-device-resident BMM scale tensors produced for FP8 KV.
+`Fmha` owns both entry points. Libraries declare shared capabilities through
+class attributes, such as `supports_skip_correction`, `supports_block_sparse_inputs`,
+and `supports_fp4_mla`, and override only
+`_is_available()` and `_is_supported()` for implementation-specific checks.
+`is_available()` rejects unsupported static capabilities before calling
+`_is_available()`. `is_supported()` provides the same boundary for shared
+request capability checks and delegates all inputs, including `phase`, to
+`_is_supported()`. Both hooks default to `True` when no additional restriction
+is needed. Parent-hook delegation must use `super()._is_available()` or
+`super()._is_supported()` to avoid re-entering the public wrapper.
 
-`TrtllmAttention.mla_backend_policy` is an optional per-batch override hook:
-model code may install a callable
-`(static_backend, metadata, num_gen_tokens) -> backend` on an attention
-instance to adjust the selection to the batch composition.
-
-Kimi K3 defaults its absorbed-generation MLA backend to `cute-dsl` for BF16 KV
-cache (override with `TLLM_K3_MLA_GEN_BACKEND=trtllm-gen`; other values are
-rejected at model build). FP8 KV cache forces `trtllm-gen`. K3 also installs a
-per-batch policy that falls back to `trtllm-gen` for mixed
-context/generation batches and multi-token generation (speculative
-verification), keeping `cute-dsl` for plain one-token-per-request decode.
-Any H=96 batch (K3's attention-DP shape) remains on `cute-dsl` regardless of
-batch composition: TRTLLM-Gen may select a 64-head Q tile, which does not
-divide 96 after K3's head padding removal, and its decode gate rejects
-`64 < num_heads_q < 128` — so falling back there would fail engine
-initialization (this covers attention-DP speculative verification).
+Availability requirements must be finalized before manager construction and
+remain invariant for its lifetime. Request-varying capability requirements
+must be represented in `FmhaManager._make_cache_key`, because a cache hit
+reuses the selected library without rechecking support.
 
 The FMHA package is split by role:
 
@@ -364,19 +422,33 @@ The FMHA package is split by role:
   selection caching.
 - `fmha/phased.py` defines `PhasedFmha`, shared phase splitting, and the
   context/generation and MHA/MLA entry points.
+  Each phase's `FmhaParams` carries packed QKV in `qkv_input` or separate Q
+  in `query_input`, with the other field set to `None`. Separate K/V remain
+  in `key_input`/`value_input`, and `output` holds the phase's output view.
+  MLA uses `query_input` with `is_fused_qkv=False`.
 - `fmha/combined.py` composes different context and generation implementations
   for non-MLA mixed batches.
+- `fmha/fp4_mla.py` implements FP4 MLA using FP8 context attention with FP4
+  cache updates and FP4 no-dequant decode. It uses KV Cache Manager V2;
+  batch state, cache storage, and kernels live in `fp4_mla/`.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through
   `CombinedFmha`.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
+- `fmha/prims_ts_block_sparse.py` adapts generic block-sparse requests to the
+  vendored PrimTS contiguous and paged wrappers. Paged generation passes a
+  live, zero-copy 2D K-page-table view with its TRT-LLM padded row stride; it
+  does not stage page tables through CSR metadata.
 - `fmha/prims_ts.py` adapts TRT-LLM inputs and paged-cache metadata to the
   vendored PrimTS kernels. Before changing the managed source under
   `backends/prims_ts`, read the
   [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Land
   upstream-worthy changes in FlashInfer and update the vendor lock; keep only
   TRT-LLM-specific adaptations in the persistent patch.
+- `fmha/msa_prefill.py` integrates the packaged SM100/SM103 block-sparse GQA
+  implementation for the context phase, and `fmha/msa_decode.py` runs the
+  MiniMax-M3 decode kernels for the generation phase.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
@@ -390,13 +462,15 @@ shape.
 
 #### 3.2.3 MLA cached-context semantics
 
-MLA cached state is not regular dense K and V. The paged cache stores
-latent-cache state rather than separate K and V planes. Backend ops handle
-appending, RoPE application, and loading cached state for attention use.
+MLA cached state is not regular dense K and V. Dense MLA and DSA store a
+low-rank latent representation rather than separate K and V planes.
+DeepSeek-V4 instead combines model-specific sliding-window and compressed
+full-head representations across multiple pools. Backend ops handle appending,
+RoPE application, and loading the appropriate cached state for attention use.
 
 MLA fit cannot be judged from attention math alone. The module and backend must
-agree on latent-cache layout, paged-KV read/write paths, and cached/chunked
-context behavior. Read `mla.py` and the relevant
+agree on the shared-KV representation, paged-KV read/write paths, auxiliary
+pools, and cached/chunked-context behavior. Read `mla.py` and the relevant
 backend code for the current implementation details.
 
 fp8 context-MLA also stages a K/V dequant workspace sized by summed attended KV
@@ -404,13 +478,80 @@ length; it is declared through the workspace memory-accounting contract (§2.3).
 
 #### 3.2.4 Sparse side-cache semantics
 
-Sparse backends may add side caches beyond the main KV cache. Some sparse
-algorithms keep the standard cache manager; others replace it with a
-sparse-aware cache manager that adds side caches for indexing or routing.
+Sparse backends may add side caches for indexing, routing, or compressed
+history. Check their allocation, request lifecycle, block reuse, chunked
+prefill, disaggregated transfer, CUDA Graph, and speculative-decoding contracts.
+See `attention/backends/sparse/` and the
+[Sparse Attention Development Guide](../../../docs/source/developer-guide/sparse-attention-development-guide.md)
+for details.
 
-When evaluating new sparse attention, check both the main KV-cache contract
-and the side-cache contract. See `attention/backends/sparse/` for the current
-sparse cache managers and their side-cache structures.
+#### 3.2.5 Paged-context FMHA requires a fused kernel
+
+`TrtllmAttentionMetadata` enables `use_paged_context_fmha` whenever chunked
+prefill, KV block reuse or speculative draft tokens are configured. Those
+features all require the context phase to attend to KV that is already in the
+cache, and only the fused context FMHA kernel can do that.
+
+`AttentionOp::initialize()` ends with
+`mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported()`, so a
+configuration with no compiled kernel silently clears the flag and the context
+phase runs the unfused path instead. That path builds K and V from the current
+chunk alone: the cached prefix is dropped from attention and then overwritten
+by the chunk's write-back, which turns a missing kernel into a plausible wrong
+answer rather than an error.
+
+`get_attention_op` in `thop/attentionOp.cpp` therefore refuses a non-MLA,
+non-cross paged-context configuration whose initialization produced no context
+FMHA kernel. The check runs after `initialize()`, because only the initialized
+op reflects the exact Q/KV/output precision, mask type and page size, and
+outside `initialize()` itself, which is `noexcept`.
+
+The refusal has three distinct causes, each with its own message, and the
+distinction matters when triaging:
+
+- Relative position embedding (T5-style self attention). `initialize()` clears
+  `mEnableContextFMHA` for it before the kernel table is consulted, so no
+  build carries a fused kernel for it. This is an unsupported feature
+  combination: disable chunked prefill, KV block reuse and speculative
+  decoding for the model. The message says so and does not point at the
+  build's architecture list, because no architecture list can supply the
+  kernel.
+- The kernel set genuinely has no kernel for that combination (precision,
+  head size, page size, mask).
+- The build's `--cuda_architectures` does not name the SM of the device it is
+  running on. `cuda_configuration.cmake` stamps `-DEXCLUDE_SM_<arch>` for every
+  architecture the list omits, and that macro compiles the matching block of
+  the trtllm-gen cubin table out, so such a build carries no kernels for that
+  SM at all. Check the architecture list first.
+
+The last two share one message ("requires a fused context FMHA kernel, and this
+build has none").
+
+Cross attention is exempt from the op-construction check. Its unfused path
+builds K and V from the encoder output (`params.cross_kv`) rather than from a
+cached prefix, so it is correct whenever the encoder output is supplied, which
+is the case on the first decoder context step and on every generation step.
+The exception is the later chunks of a chunked decoder prefill: the executor
+marks the encoder output consumed after the first chunk, the cross layer then
+passes no K/V, and the op must read the cross KV cache instead. Only the fused
+kernel can do that, so the context-stage enqueue in `thop/attentionOp.cpp`
+checks per call that a cross-attention op called without `cross_kv` has
+`mEnableContextFMHA`.
+
+`thop.fused_context_fmha_kernel_exists(head_size, kv_cache_dtype,
+tokens_per_block, output_dtype)` reports whether this build contains a fused
+context FMHA kernel for an ordinary dense causal paged-context configuration
+with equal Q/KV head counts. Q is probed at the KV precision, except for an
+NVFP4 KV cache, which `AttentionOp` reads with an FP8 Q kernel
+(`hasFp4KvCache()` requires `mFP8ContextFMHA`); only the trtllm-gen kernel
+set carries E2M1-KV context kernels, and the probe reports absent for NVFP4
+KV wherever `FmhaDispatcher` would select FMHA-v2 instead (outside the SM100
+family, or head size 72) rather than trip that runner's Q/KV precision
+assertion. It is a diagnostic aid: the output dtype is an explicit
+argument because the runtime chooses it independently of the KV cache dtype,
+and the probe fixes the mask, layout and head ratio, so its answer does not by
+itself describe the configuration a given model will run. The op-level refusal
+above is the authoritative check.
 
 ## 4. Evaluating New Attention
 
@@ -493,6 +634,8 @@ Working rules:
 | `tensorrt_llm/_torch/attention/backends/fmha/` | Internal TRTLLM FMHA libraries |
 | `tensorrt_llm/_torch/attention/backends/vanilla.py` | Torch fallback backend and metadata |
 | `tensorrt_llm/_torch/attention/backends/flashinfer.py` | FlashInfer backend and metadata |
+| `tensorrt_llm/_torch/attention/backends/sparse/params.py` | Lowered sparse parameters and module/backend runtime carriers |
+| `tensorrt_llm/_torch/attention/backends/sparse/registry.py` | Sparse backend, metadata, and cache-manager registration |
 | `tensorrt_llm/_torch/attention/backends/sparse/hooks.py` | Sparse module hooks and backend prediction orchestration |
 | `tensorrt_llm/_torch/attention/backends/sparse/<algorithm>/module.py` | Algorithm-specific module-hook implementations |
 | `tensorrt_llm/_torch/attention/backends/sparse/` | Sparse prediction backends, metadata, cache managers, and kernels |
@@ -505,12 +648,15 @@ Working rules:
   separately.
 - Any dispatch change touching `forward_context()` needs chunked-context tests.
 
+Keep reusable sparse computation in the root `test_sparse_mla_forward.py`,
+`test_sparse_mqa_gqa.py`, and `test_sparse_mha.py` modules. Shared framework
+tests live in `test_sparse_attention.py`; selector and cache tests belong in
+algorithm subdirectories such as `dsa/`, `msa/`, and `rocketkv/`.
+
 Key test files:
 
 - `tests/unittest/_torch/attention/test_attention.py`
 - `tests/unittest/_torch/attention/test_attention_mla.py`
-- `tests/unittest/_torch/attention/test_fmha_manager.py`
-- `tests/unittest/_torch/attention/test_combined_fmha.py`
 - `tests/unittest/_torch/attention/test_vanilla_attention.py`
 - `tests/unittest/_torch/attention/test_flashinfer_attention.py`
 - `tests/unittest/_torch/attention/kernels/`

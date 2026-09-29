@@ -23,10 +23,7 @@
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // The number of threads per warp.
-enum
-{
-    THREADS_PER_WARP = 32
-};
+static constexpr int THREADS_PER_WARP = 32;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -908,17 +905,11 @@ static __global__ void softmax_kernel(Softmax_params<Dst_type, Src_type> params)
 {
 
     // By default, use LDG.64 for the loads and STG.64 for the stores.
-    enum
-    {
-        ELEMENTS_PER_LDG = X,
-        ELEMENTS_PER_STG = X
-    };
+    static constexpr int ELEMENTS_PER_LDG = X;
+    static constexpr int ELEMENTS_PER_STG = X;
 
     // The number of Vec_type per thread.
-    enum
-    {
-        VECs_PER_THREAD = SEQLEN / THREADS_PER_WARP / ELEMENTS_PER_LDG
-    };
+    static constexpr int VECs_PER_THREAD = SEQLEN / THREADS_PER_WARP / ELEMENTS_PER_LDG;
 
     // DEBUG.
     static_assert(VECs_PER_THREAD * THREADS_PER_WARP * ELEMENTS_PER_LDG == SEQLEN, "");
@@ -1078,10 +1069,7 @@ void run_softmax(void* dst, void const* src, void const* mask, void const* atten
     params.warps_n = warps_n;
 
     // Compute the grid size.
-    enum
-    {
-        WARPS_PER_CTA = 4
-    };
+    static constexpr int WARPS_PER_CTA = 4;
 
     dim3 grid(s_outer, (h + WARPS_PER_CTA - 1) / WARPS_PER_CTA, b);
     dim3 threads_per_cta(THREADS_PER_WARP, WARPS_PER_CTA);

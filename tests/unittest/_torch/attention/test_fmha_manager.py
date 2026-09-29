@@ -31,6 +31,10 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     PredefinedAttentionMask,
 )
+from tensorrt_llm._torch.attention.backends.sparse.params import (
+    BlockSparseForwardInputs,
+    SparseRuntimeParams,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -50,12 +54,14 @@ def _make_metadata(
     num_generations: int,
     num_ctx_tokens: int = 0,
     use_spec_decoding: bool = False,
+    num_sparse_topk: int = 0,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         num_contexts=num_contexts,
         num_generations=num_generations,
         num_ctx_tokens=num_ctx_tokens,
         use_spec_decoding=use_spec_decoding,
+        num_sparse_topk=num_sparse_topk,
     )
 
 
@@ -538,6 +544,79 @@ def test_fmha_cache_tracks_attention_mask_data() -> None:
         assert len(manager._cache) == 2
 
 
+def test_block_sparse_requests_only_reach_libraries_that_declare_support() -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    dense_fmha = FakeFmha(attn, "dense", events)
+    block_sparse_fmha = FakeFmha(attn, "block-sparse", events)
+    block_sparse_fmha.supports_block_sparse_inputs = True
+    manager.fmha_libs = [dense_fmha, block_sparse_fmha]
+    metadata = _make_metadata(num_contexts=1, num_generations=0, num_ctx_tokens=1)
+    forward_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.context_only,
+        sparse_runtime_params=SparseRuntimeParams(
+            block_sparse_inputs=BlockSparseForwardInputs(
+                q_block_size=64,
+                kv_block_size=64,
+                exact_block_bits=torch.zeros((1, 1, 1, 1), dtype=torch.int32),
+            )
+        ),
+    )
+
+    selected = manager.select(attn, torch.empty((1, 4)), None, None, metadata, forward_args)
+
+    assert selected is block_sparse_fmha
+    assert [event[1] for event in events if event[0] == "support"] == ["block-sparse"]
+
+
+@pytest.mark.parametrize("block_sparse_first", [False, True])
+def test_fmha_cache_separates_block_sparse_mode(block_sparse_first: bool) -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    block_sparse_fmha = FakeFmha(
+        attn,
+        "block-sparse",
+        events,
+        support_predicate=lambda forward_args: (
+            forward_args.sparse_runtime_params.block_sparse_inputs is not None
+        ),
+    )
+    block_sparse_fmha.supports_block_sparse_inputs = True
+    dense_fmha = FakeFmha(
+        attn,
+        "dense",
+        events,
+        support_predicate=lambda forward_args: (
+            forward_args.sparse_runtime_params.block_sparse_inputs is None
+        ),
+    )
+    manager.fmha_libs = [block_sparse_fmha, dense_fmha]
+    metadata = _make_metadata(num_contexts=1, num_generations=0, num_ctx_tokens=1)
+    q = torch.empty((1, 4))
+    by_mode = {
+        False: AttentionForwardArgs(attention_input_type=AttentionInputType.context_only),
+        True: AttentionForwardArgs(
+            attention_input_type=AttentionInputType.context_only,
+            sparse_runtime_params=SparseRuntimeParams(
+                block_sparse_inputs=BlockSparseForwardInputs(
+                    q_block_size=64,
+                    kv_block_size=64,
+                    exact_block_bits=torch.zeros((1, 1), dtype=torch.uint32),
+                ),
+            ),
+        ),
+    }
+    order = (True, False) if block_sparse_first else (False, True)
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        selected = {
+            mode: manager.select(attn, q, None, None, metadata, by_mode[mode]) for mode in order
+        }
+
+    assert selected == {False: dense_fmha, True: block_sparse_fmha}
+    assert len(manager._cache) == 2
+
+
 @pytest.mark.parametrize("speculative_first", [False, True])
 def test_fmha_cache_separates_speculative_decoding(speculative_first: bool) -> None:
     events: list[tuple] = []
@@ -868,6 +947,7 @@ def test_update_quant_config_replaces_manager_with_fresh_cache() -> None:
 
     attn = TrtllmAttention.__new__(TrtllmAttention)
     attn.is_mla_enable = False
+    attn.skip_correction_threshold = 0.0
     metadata = _make_metadata(num_contexts=0, num_generations=1)
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
     q = torch.empty((1, 4))

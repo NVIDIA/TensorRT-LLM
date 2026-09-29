@@ -43,7 +43,7 @@ the item is failed and the loop moves on.)
 - Start from the item's `how_to_apply` and the matched casebook case (see
   *Apply from the optimization casebook* below).
 - `approach: config` — edit `tuning/extra_llm_api_options.yaml` (the live
-  copy; see *The live tuning config* below). Change only the keys the
+  copy; see *The active tuning config* below). Change only the keys the
   item calls for; keep the rest of the YAML intact. Check field names
   against `trtllm-serve --help` / the LLM API reference in
   `trtllm_repo_path` — a typo'd key can be silently ignored or crash the

@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from defs import conftest
 from defs.common import venv_check_call
 from defs.examples.visual_gen.visual_gen_test_utils import (
     FeatureConfigState,
@@ -39,11 +40,11 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _lpips_model_path,
     _lpips_pinned_fp32_matmul_precision,
     _preserve_lpips_candidate_on_failure,
+    _require_exists,
     _run_lpips_eval,
     _run_reusable_image_lpips_eval,
     _run_single_device_feature_generator,
     _save_lpips_video_mp4,
-    _skip_if_missing,
     _validate_single_feature_config,
 )
 
@@ -175,7 +176,7 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
         )
 
         model_path = _lpips_model_path(COSMOS3_NANO_MODEL_SUBPATH)
-        _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
+        _require_exists(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
         _disable_inductor_compile_worker_quiesce()
         args = VisualGenArgs(
             model=model_path,
@@ -234,7 +235,7 @@ COSMOS3_LPIPS_V2V_REFERENCE_MP4 = os.path.join(
 
 
 def _cosmos3_v2v_lpips_reference_bytes():
-    _skip_if_missing(COSMOS3_LPIPS_V2V_REFERENCE_MP4, "Cosmos3 V2V LPIPS reference fixture")
+    _require_exists(COSMOS3_LPIPS_V2V_REFERENCE_MP4, "Cosmos3 V2V LPIPS reference fixture")
     with open(COSMOS3_LPIPS_V2V_REFERENCE_MP4, "rb") as f:
         return f.read()
 
@@ -271,7 +272,7 @@ def _generate_cosmos3_feature_image(case, output_path):
     pipeline = None
     try:
         model_path = _lpips_model_path(COSMOS3_NANO_MODEL_SUBPATH)
-        _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
+        _require_exists(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
         _disable_inductor_compile_worker_quiesce()
         # Pin fp32-matmul arithmetic only for the profiles whose goldens are
         # re-baselined under it. NVFP4's golden is waived (nvbugs/6572800) and
@@ -427,17 +428,33 @@ def test_cosmos3_nano_t2i_lpips_against_golden(_visual_gen_deps, tmp_path):
     _assert_lpips_below_threshold(score, COSMOS3_LPIPS_T2I_THRESHOLD)
 
 
-def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run examples/visual_gen/models/cosmos3/cosmos3.py with FP8 config end-to-end.
+@pytest.fixture
+def _cosmos3_example_deps(request, model_subpath):
+    """Filter the Super release platform before checking media dependencies."""
+    if model_subpath == "Cosmos3-Super" and conftest.get_sm_version() != 100:
+        pytest.skip("Cosmos3-Super release tests target B200/GB200 (SM100)")
+    request.getfixturevalue("_visual_gen_deps")
 
-    Validates that the Cosmos3-Nano example script and ``configs/cosmos3-nano-1gpu.yaml``
-    work together as documented. Uses the local Cosmos3-Nano checkpoint and
-    the shared FP8 dynamic-quant config.
+
+@pytest.mark.parametrize(
+    "model_subpath",
+    [
+        pytest.param("Cosmos3-Nano", id="nano-1gpu"),
+        pytest.param("Cosmos3-Super", id="super-1gpu"),
+    ],
+)
+def test_cosmos3_example(_cosmos3_example_deps, model_subpath, llm_root, llm_venv):
+    """Run the Nano or Super example with the shared single-GPU config.
+
+    Uses VANILLA attention and the checkpoint's quantization settings through
+    ``configs/cosmos3-nano-1gpu.yaml``, which supports both models.
     """
-    model_path = _lpips_model_path("Cosmos3-Nano")
-    _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
+    model_path = _lpips_model_path(model_subpath)
+    _require_exists(model_path, f"{model_subpath} checkpoint", is_dir=True)
 
-    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_example")
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_example", model_subpath
+    )
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, "cosmos3_output.mp4")
 
@@ -477,7 +494,7 @@ def test_cosmos3_t2i_4step_example(_visual_gen_deps, llm_root, llm_venv):
     checkpoint's fixed distilled schedule; the run must produce an image.
     """
     model_path = _lpips_model_path("Cosmos3-Super-Text2Image-4Step")
-    _skip_if_missing(model_path, "Cosmos3-Super-Text2Image-4Step checkpoint", is_dir=True)
+    _require_exists(model_path, "Cosmos3-Super-Text2Image-4Step checkpoint", is_dir=True)
 
     out_dir = os.path.join(
         llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_t2i_4step_example"
@@ -545,7 +562,7 @@ def test_cosmos3_i2v_4step_example(_visual_gen_deps, llm_root, llm_venv):
     must produce a video.
     """
     model_path = _lpips_model_path("Cosmos3-Super-Image2Video-4Step")
-    _skip_if_missing(model_path, "Cosmos3-Super-Image2Video-4Step checkpoint", is_dir=True)
+    _require_exists(model_path, "Cosmos3-Super-Image2Video-4Step checkpoint", is_dir=True)
 
     out_dir = os.path.join(
         llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_i2v_4step_example"
@@ -601,7 +618,7 @@ def _run_cosmos3_i2v_4step_lpips_pipeline(image_path):
         )
 
         model_path = _lpips_model_path(COSMOS3_I2V_4STEP_MODEL_SUBPATH)
-        _skip_if_missing(model_path, "Cosmos3-Super-Image2Video-4Step checkpoint", is_dir=True)
+        _require_exists(model_path, "Cosmos3-Super-Image2Video-4Step checkpoint", is_dir=True)
         _disable_inductor_compile_worker_quiesce()
         args = VisualGenArgs(
             model=model_path,
@@ -624,7 +641,10 @@ def _run_cosmos3_i2v_4step_lpips_pipeline(image_path):
                     # so pin it rather than inheriting the video-mode default.
                     negative_prompt="",
                     seed=COSMOS3_LPIPS_SEED,
-                    image=image_path,
+                    # forward() takes an encoded reference, not a path: the serve
+                    # path resolves MediaRef to bytes on the coordinator, so
+                    # direct callers read the file themselves.
+                    image=image_path.read_bytes(),
                     height=COSMOS3_LPIPS_HEIGHT,
                     width=COSMOS3_LPIPS_WIDTH,
                     num_frames=COSMOS3_I2V_4STEP_LPIPS_NUM_FRAMES,
@@ -664,7 +684,7 @@ def test_cosmos3_i2v_4step_lpips_against_golden(_visual_gen_deps, request, tmp_p
     regression against a past TRT-LLM run. Full provenance:
     ``golden/visual_gen_lpips/cosmos3_i2v_4step_lpips_golden_video.json``.
     """
-    image_path = str(tmp_path / "cosmos3_i2v_4step_conditioning.png")
+    image_path = tmp_path / "cosmos3_i2v_4step_conditioning.png"
     _write_cosmos3_i2v_conditioning_image(image_path)
     generated_path = tmp_path / "cosmos3_i2v_4step_generated.mp4"
     golden_path = _golden_media_path(
@@ -718,7 +738,7 @@ def test_cosmos3_edge_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     video.
     """
     model_path = _lpips_model_path("Cosmos3-Edge")
-    _skip_if_missing(model_path, "Cosmos3-Edge checkpoint", is_dir=True)
+    _require_exists(model_path, "Cosmos3-Edge checkpoint", is_dir=True)
 
     out_dir = os.path.join(
         llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_edge_i2v_example"
@@ -772,7 +792,7 @@ def test_cosmos3_edge_policy_droid_example(_visual_gen_deps, llm_root, llm_venv)
     from safetensors.torch import load_file
 
     model_path = _lpips_model_path("Cosmos3-Edge-Policy-DROID")
-    _skip_if_missing(model_path, "Cosmos3-Edge-Policy-DROID checkpoint", is_dir=True)
+    _require_exists(model_path, "Cosmos3-Edge-Policy-DROID checkpoint", is_dir=True)
 
     out_dir = os.path.join(
         llm_venv.get_working_directory(),
@@ -875,7 +895,7 @@ def _run_cosmos3_edge_lpips_pipeline(**forward_kwargs):
         )
 
         model_path = _lpips_model_path("Cosmos3-Edge")
-        _skip_if_missing(model_path, "Cosmos3-Edge checkpoint", is_dir=True)
+        _require_exists(model_path, "Cosmos3-Edge checkpoint", is_dir=True)
         _disable_inductor_compile_worker_quiesce()
         args = VisualGenArgs(
             model=model_path,
@@ -952,10 +972,13 @@ def test_cosmos3_edge_i2v_lpips_against_golden(_visual_gen_deps, request, tmp_pa
         tmp_path, "cosmos3_edge_i2v_lpips_golden_video.mp4", "Cosmos3-Edge I2V LPIPS golden video"
     )
     image_path = tmp_path / "cosmos3_edge_i2v_conditioning.png"
-    _write_cosmos3_edge_conditioning_image(str(image_path))
+    _write_cosmos3_edge_conditioning_image(image_path)
     result = _run_cosmos3_edge_lpips_pipeline(
         prompt=COSMOS3_EDGE_I2V_LPIPS_PROMPT,
-        image=str(image_path),
+        # forward() takes an encoded reference, not a path: the serve path
+        # resolves MediaRef to bytes on the coordinator, so direct callers
+        # read the file themselves.
+        image=image_path.read_bytes(),
         height=480,
         width=832,
         num_frames=COSMOS3_EDGE_LPIPS_NUM_FRAMES,

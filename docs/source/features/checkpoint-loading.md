@@ -121,11 +121,20 @@ The optimized path currently requires identical policy configuration across
 all ranks, the automatically constructed built-in HF loader
 (`checkpoint_loader` must be unset), `load_format: auto`, SafeTensors, and an
 active MPI model-load communicator for distributed jobs. Static incompatibility
-such as MX, AutoDeploy, a custom or explicitly provided loader, a non-automatic
+such as MX, a custom or explicitly provided loader, a non-automatic
 load format, or known partial-model loading selects native I/O before any
 rank-striped communicator or reader setup. An explicit incompatible
 `rank_striped_read_ahead` request emits a warning instead of failing startup;
 `auto` records the native selection at info level.
+
+Sessionless compatibility is a separate structural fallback:
+
+- Direct `load_weights()` calls use native I/O because they cannot keep
+  `open_weight_session()` alive through model materialization. Current callers
+  include separate draft/MTP checkpoint loading and the GMS restore path; the
+  primary built-in HF path remains eligible for rank-striped read-ahead. This
+  structural fallback is reported at info level even for an explicit
+  `rank_striped_read_ahead` request.
 
 Checkpoint-dependent eligibility remains a coordinated preflight. Lazy Kimi
 loading, raw-weight caching, layer overrides, insufficient host-memory
@@ -148,8 +157,56 @@ TRT-LLM instances. Policy logs distinguish requested, selected, activated, and
 effective policy, so `auto` selection and native fallback remain observable;
 activation logs also report the local reader assignment.
 
-This policy remains separate from future ModelStreamer, MX, GMS, or snapshot
-integration. Those systems may change the source or bypass raw loading without
+### CI startup experiment
+
+Pre-merge perf-sanity runs that upload telemetry explicitly assign eligible
+built-in PyTorch/HF launches to the default `auto` policy, so merge decisions do
+not depend on an unrelated CI identifier. Post-merge telemetry runs use the
+numeric root Jenkins build number modulo 2 to assign `native` to even builds and
+`auto` to odd builds before generated server configs are written. This gives a
+50/50 assignment across consecutive root builds without adding CI stages or
+model launches; successful observations may not be evenly split. Every rank
+and node in one distributed startup receives the same concrete policy. The
+experiment version is `checkpoint-io-v4-postmerge-50-auto-50-native`, distinct
+from the previous 75/25 assignment.
+Non-telemetry runs, invalid or missing post-merge build identities,
+incompatible configurations, and purpose-built configs with an explicit
+`checkpoint_io_policy` are not assigned and retain their normal configuration,
+whose checkpoint I/O default remains `auto`.
+
+Set `TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY=auto` or `native` to reproduce an
+experiment arm without bucket assignment. Uploaded rows record the experiment
+version, bucket, assigned arm, assignment source, PR number or root build
+number, actual checkpoint loader/source metadata,
+requested/selected/activated/effective policy, and a bounded fallback category
+and reason. The primary comparison is intent-to-treat across post-merge rows
+whose assignment source is `postmerge_build_number`: an `auto` assignment that
+executes native I/O remains an auto fallback, not a native control. Pre-merge
+rows use `premerge_default` and are excluded from that comparison.
+Multiple client rows can share one server startup; use
+`s_startup_observation_id` to group them and filter
+`b_startup_observation_primary_row:true` to count each startup once.
+
+To compare rank-striped loading against native loading, separately report
+confirmed effective `rank_striped_read_ahead` observations and native controls
+with matching runtime-image identity, GPU, model/checkpoint, and parallelism
+configuration. Keep auto fallbacks and unknown effective policies separate;
+do not infer activation from the assigned arm. Retain root build IDs when
+grouping repeated observations. This effective-policy comparison is
+observational, not a controlled head-to-head benchmark.
+
+Keep results from the old 75/25 split separate from the new 50/50 split using
+the experiment version, not bucket numbers alone. To check the split, use the
+assigned policy; to compare loading performance, use the loader that actually
+ran.
+
+Even builds use native loading, while odd builds use auto. Before comparing
+performance, check that both groups use comparable runtime images, hardware,
+CI configurations, and cache conditions—otherwise, those differences could be
+mistaken for a loader improvement.
+
+This policy remains separate from ModelStreamer, MX, GMS, or snapshot
+integrations. Those systems may change the source or bypass raw loading without
 requiring a new combined checkpoint format.
 
 ## Using Checkpoint Loaders

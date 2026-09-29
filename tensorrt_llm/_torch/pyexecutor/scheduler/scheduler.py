@@ -1110,7 +1110,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 )
 
         # Sort requests for consistency with C++
-        # C++ reference: utils::sortRequests in inflightBatchingUtils.cpp
+        # C++ reference: sortRequests in microBatchScheduler.cpp
         encoder_requests.sort(key=_get_lora_task_id)
         self._sort_requests(context_requests, generation_requests, not all_context_requests_fit)
 
@@ -1131,7 +1131,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
     ) -> None:
         """
         Sort requests for consistency with C++.
-        C++ reference: utils::sortRequests in inflightBatchingUtils.cpp
+        C++ reference: sortRequests in microBatchScheduler.cpp
 
         1. If chunks are present, move context requests that reached the last
            context chunk to the end of the vector.

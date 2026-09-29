@@ -86,7 +86,7 @@ class ActType_TrtllmGen(IntEnum):
 
 
 # IMPORTANT: when adding a new activation type, please update this function.
-# And make sure it aligned with cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h::isGatedActivation function.
+# And make sure it aligned with cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_gemm_kernels.h::isGatedActivation function.
 def is_gated_activation(activation_type: ActivationType) -> bool:
     return activation_type in [
         ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu,
@@ -100,6 +100,12 @@ def set_torch_compiling(enable: bool):
 
 
 def is_torch_compiling() -> bool:
+    """Return the runtime compile-dispatch policy, not Dynamo tracing state.
+
+    Prefill-only models scope this process-global flag to each full forward:
+    eligible prefill/mixed batches use True, original eager fallbacks False.
+    Other compiled models retain the engine-wide value.
+    """
     global is_torch_compiling_flag
     return is_torch_compiling_flag
 
@@ -213,6 +219,10 @@ class Fp4QuantizedTensor:
     # needing the un-quantized form (e.g. DSv3.2's DSA indexer at
     # sparse/dsa.py:pre_indexer_proj) can use it without dequantizing FP4.
     unquantized_hidden_states: Optional[torch.Tensor] = None
+    # Reciprocal activation scale (max_raw / 448.0) carried from deferred
+    # dynamic NVFP4 producers for consumer GEMM alpha derivation:
+    # alpha = reciprocal_scale * weight_scale_2.
+    reciprocal_scale: Optional[torch.Tensor] = None
 
     @property
     def shape(self):
@@ -786,3 +796,49 @@ def torch_multi_arange(
     seq = seq.repeat_interleave(seq_repeats, output_size=output_length_arg)
     seq = seq.cumsum(0, dtype=ends.dtype)
     return seq
+
+
+# ---------------------------------------------------------------------------
+# Helix CP round-robin ledger
+# ---------------------------------------------------------------------------
+# THE rule, stated once. Under helix context parallelism the KV ledger is a
+# round-robin over CP ranks at page granularity: ledger page b lives on rank
+# b % cp_size, so one "ledger block" spans tokens_per_block * cp_size global
+# token positions and contributes exactly tokens_per_block of them to each
+# rank. For a global prefix of length ``global_len`` this rank therefore owns
+#
+#     full, rem = divmod(global_len, tokens_per_block * cp_size)
+#     full * tokens_per_block + clamp(rem - cp_rank * tokens_per_block,
+#                                     0, tokens_per_block)
+#
+# tokens: every complete ledger block gives it a whole page, and the trailing
+# partial block gives it however much of its own page the remainder reaches.
+# Summed over all ranks this is exactly ``global_len``.
+#
+# Both forms below are that expression and nothing else. Keep them that way:
+# a drift between the scalar host-side packing and the tensor form used to
+# derive the device write slots puts KV on the wrong rank, and only shows up
+# on groups that straddle a page boundary.
+
+
+def helix_local_len(global_len: int, tokens_per_block: int, cp_size: int,
+                    cp_rank: int) -> int:
+    """Scalar form: tokens of the first ``global_len`` owned by ``cp_rank``."""
+    ledger = tokens_per_block * cp_size
+    full, rem = divmod(global_len, ledger)
+    return full * tokens_per_block + min(
+        max(rem - cp_rank * tokens_per_block, 0), tokens_per_block)
+
+
+def helix_local_len_tensor(global_lens: torch.Tensor, tokens_per_block: int,
+                           cp_size: int, cp_rank: int) -> torch.Tensor:
+    """Tensor form of :func:`helix_local_len`, applied elementwise.
+
+    Kept allocation-minimal: this runs on the CUDA-graph capture path, and the
+    ``clamp_`` is in place on the temporary the subtraction just produced.
+    """
+    ledger = tokens_per_block * cp_size
+    full = torch.div(global_lens, ledger, rounding_mode='floor')
+    rem = global_lens - full * ledger
+    return full * tokens_per_block + (rem - cp_rank * tokens_per_block).clamp_(
+        0, tokens_per_block)

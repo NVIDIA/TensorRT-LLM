@@ -57,8 +57,6 @@ class GeneralExecSettings(BaseModel):
                                          description="Path to dataset file")
     duration: Optional[int] = Field(default=None,
                                     description="Maximum run time in seconds")
-    engine_dir: Optional[Path] = Field(
-        default=None, description="Path to a serialized TRT-LLM engine")
     eos_id: int = Field(
         default=-1, description="End-of-sequence token ID, -1 to disable EOS")
     iteration_log: Optional[Path] = Field(
@@ -107,7 +105,7 @@ def ignore_trt_only_args(kwargs: dict, backend: str):
 
     Args:
         kwargs: Dictionary of keyword arguments to be passed to the LLM constructor.
-        backend: The backend type (e.g., "pytorch", "_autodeploy").
+        backend: The backend type.
     """
     trt_only_args = [
         "batching_type",
@@ -131,7 +129,7 @@ def get_llm(runtime_config: RuntimeConfig, kwargs: dict):
     """
     llm_cls = PyTorchLLM
 
-    if runtime_config.backend != None:
+    if runtime_config.backend is not None:
         ignore_trt_only_args(kwargs, runtime_config.backend)
 
     if runtime_config.iteration_log is not None:
@@ -139,12 +137,6 @@ def get_llm(runtime_config: RuntimeConfig, kwargs: dict):
 
     if runtime_config.backend == 'pytorch':
         llm_cls = PyTorchLLM
-
-    elif runtime_config.backend == "_autodeploy":
-        from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-
-        kwargs["world_size"] = kwargs.pop("tensor_parallel_size", None)
-        llm_cls = AutoDeployLLM
 
     llm = llm_cls(**kwargs)
     return llm

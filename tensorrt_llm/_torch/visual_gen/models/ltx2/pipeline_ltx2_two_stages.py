@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import safetensors.torch
 import torch
 import torch.distributed as dist
+from diffusers.utils.torch_utils import randn_tensor
 
 from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig
@@ -22,7 +23,7 @@ from tensorrt_llm._torch.visual_gen.quantization.ops import (
     quantize_fp8_rowwise,
     quantize_nvfp4,
 )
-from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator, postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils.fp8_utils import (
@@ -1106,6 +1107,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             self._current_lora_cuda_graph_state,
             lambda: self.transformer.active_topology,
         )
+        # Same registration the single-stage pipeline does: without it the
+        # dense-prefix and sparse phases of skip-softmax / Sol-Attn share one
+        # captured graph and the wrong kernel is replayed.
+        self.transformer.register_cuda_graph_extra_key_fns(runner)
         compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         logger.info(
             "CUDA graph runner: wrapping LTX-2 two-stage transformer.forward "
@@ -1620,7 +1625,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             (video_latents, audio_latents) in 5-D un-patchified form.
         """
         logger.info("Stage 2: refinement denoising...")
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed, self.device)
 
         # --- Text conditioning: reuse Stage 1 encoder output ---
         # Gemma3 + Connector outputs depend only on prompt text, not on
@@ -1683,7 +1688,12 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             )
             clean_latent = self.video_patchifier.patchify(full_clean)
 
-            noise_5d = torch.randn_like(video_latents)
+            noise_5d = randn_tensor(
+                video_latents.shape,
+                generator=generator,
+                device=video_latents.device,
+                dtype=video_latents.dtype,
+            )
             mask_5d = torch.ones(
                 1,
                 1,
@@ -1719,12 +1729,16 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         #   z_t = noise * sigma + clean * (1 - sigma)
         # This matches the reference GaussianNoiser, NOT additive noise.
         sigma_0 = sigmas[0]
-        v_noise = torch.randn_like(v_latents, generator=generator)
+        v_noise = randn_tensor(
+            v_latents.shape, generator=generator, device=v_latents.device, dtype=v_latents.dtype
+        )
         v_working = v_noise * sigma_0 + v_latents * (1.0 - sigma_0)
 
         a_working = a_latents
         if a_working is not None:
-            a_noise = torch.randn_like(a_working, generator=generator)
+            a_noise = randn_tensor(
+                a_working.shape, generator=generator, device=a_working.device, dtype=a_working.dtype
+            )
             a_working = a_noise * sigma_0 + a_working * (1.0 - sigma_0)
 
         # --- Pre-compute static preproc (context, PE, KV) for Stage 2 ---
@@ -1783,6 +1797,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     audio=audio_mod,
                     text_cache=_s2_static,
                     step_index=i,
+                    timestep=timestep,
                 )
 
                 # Video: velocity → x0 → post-process → Euler step

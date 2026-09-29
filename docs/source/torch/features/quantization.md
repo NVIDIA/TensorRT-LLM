@@ -40,6 +40,14 @@ position embeddings on K; FP8 or FP4 scales cannot be reused unchanged.
 `TRTLLM_LOAD_KV_SCALES` must remain enabled (`1`, the default) for INT8;
 disabling calibrated scale loading raises an error.
 
+The attention backend validates both runtime scales on every call: they must be
+finite, positive FP32 scalars on the attention input device, and their product
+must equal one within a tolerance of `1e-5`. Eager execution raises `ValueError`
+for invalid values and synchronizes to read the scales. CUDA Graph execution
+records a device assertion that checks the live scale buffers on each replay.
+An invalid scale during replay invalidates the CUDA context; restart the worker
+before continuing inference.
+
 ```python
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig

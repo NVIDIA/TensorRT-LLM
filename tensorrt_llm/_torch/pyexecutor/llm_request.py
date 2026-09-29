@@ -907,6 +907,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             logprobs_simple_format: bool = False,
+            return_routed_experts: bool = False,
             **kwargs):
         self.py_sampling_strategy: "Strategy | None" = None
 
@@ -1018,6 +1019,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_num_logprobs = num_logprobs
         self.py_return_log_probs = return_log_probs
         self.py_logprobs_simple_format = logprobs_simple_format
+        # Router Replay: attach routed_experts to this request's output.
+        self.py_return_routed_experts = return_routed_experts
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
@@ -1050,6 +1053,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_num_connector_matched_tokens = 0
 
+        # Destination pages are reported once per allocation. Destroying the
+        # allocation clears this flag so replay can report its new pages.
+        self.py_connector_allocation_reported = False
+
+        # End of the connector prefix retained by this allocation, or 0. This
+        # depth survives async parking; local reuse cannot reconstruct it.
+        self.py_connector_served_position = 0
+
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
             max_new_tokens=self.py_max_new_tokens,
@@ -1071,6 +1082,18 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         decoding-iteration index with the array's own length so that decoding
         past the end of the array holds its last width.
 
+        Indexed with ``py_decoding_iter``, the counter the Python sampling loop
+        advances, rather than the C++ ``decoding_iter``. Under the overlap
+        scheduler ``_handle_responses`` copies the former into the latter only
+        once the step has been sampled, so reading ``decoding_iter`` here trails
+        by one step exactly where the width is consumed: a widening schedule
+        repeats a width instead of advancing, and the run ends narrower than
+        beam_width_array asks for. The two counters are equal wherever the C++
+        side reads the width -- the micro-batch scheduler runs before the
+        sampler advances ``py_decoding_iter`` -- so the clamping formula still
+        agrees with llmRequest.cpp; test_vbws_cpp_formula_matches_past_array_end
+        pins that with the counters held in sync.
+
         The C++ implementation used to clamp with the global
         kMaxBeamWidthArrayLength constant instead, reading past the end of
         the user array and returning arbitrary widths; that is fixed in
@@ -1079,8 +1102,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         would otherwise bind to whatever libtensorrt_llm.so happens to
         provide -- including a prebuilt one from before that fix, against
         which the mismatch starves the request in the micro-batch scheduler
-        and decoding hangs. test_vbws_cpp_formula_matches_past_array_end
-        pins the agreement.
+        and decoding hangs.
 
         An empty array falls through to the base implementation rather than
         indexing it, matching the emptiness guard the C++ side checks before
@@ -1088,7 +1110,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         """
         beam_width_array = self.sampling_config.beam_width_array
         if beam_width_array:
-            iteration = self.decoding_iter + (1 if for_next_iteration else 0)
+            iteration = self.py_decoding_iter + (1 if for_next_iteration else 0)
             index = max(min(iteration, len(beam_width_array)) - 1, 0)
             return int(beam_width_array[index])
         return super().get_beam_width_by_iter(for_next_iteration)
@@ -1168,7 +1190,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                          orig_prompt_len=self.prompt_len,
                                          clear_draft_tokens=True)
 
+    @property
     def is_generation_only_request(self):
+        # Must stay a property: the C++ base exposes this as a read-only
+        # property (nanobind/batch_manager/bindings.cpp), and a plain method
+        # here shadows it with something always-truthy for any caller that
+        # reads it as an attribute.
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
 
     def create_response(self,
@@ -1258,7 +1285,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if not time_breakdown_metrics:
                 time_breakdown_metrics = None
 
-        return LlmResponse(
+        response = LlmResponse(
             request_id=self.py_request_id
             if not self.is_child else self.parent_request_id,
             result=LlmResult(result,
@@ -1266,6 +1293,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                              is_final,
                              time_breakdown_metrics=time_breakdown_metrics),
             client_id=self.py_client_id) if len(result) > 0 else None
+        if response is not None:
+            response.result.cached_tokens = self.cached_tokens
+        return response
 
     @property
     def is_dummy(self):
@@ -1543,7 +1573,6 @@ def executor_request_to_llm_request(
         sampling_config=sampling_config,
         is_streaming=executor_request.streaming,
         end_id=executor_request.end_id,
-        pad_id=executor_request.pad_id,
         embedding_bias=executor_request.embedding_bias,
         stop_words_list=stop_words_list,
         position_ids=position_ids,
@@ -1568,7 +1597,6 @@ def executor_request_to_llm_request(
         py_lora_path=getattr(executor_request, "py_lora_path", None),
         mrope_rotary_cos_sin=mrope_rotary_cos_sin,
         mrope_position_deltas=mrope_position_deltas,
-        lookahead_config=None,
         return_log_probs=executor_request.output_config.return_log_probs,
         num_logprobs=getattr(executor_request, "py_num_logprobs", 0),
         return_context_logits=executor_request.output_config.
@@ -1583,11 +1611,8 @@ def executor_request_to_llm_request(
         ] if executor_request.output_config.additional_model_outputs is not None
         else None,
         draft_tokens=getattr(executor_request, "draft_tokens", None),
-        draft_logits=None,
         exclude_input_from_output=executor_request.output_config.
         exclude_input_from_output,
-        logits_post_processor=None,
-        apply_logits_post_processor_batched=False,
         guided_decoding_params=executor_request.guided_decoding_params,
         py_logits_post_processors=getattr(executor_request,
                                           "py_logits_post_processors", None),
@@ -1612,6 +1637,8 @@ def executor_request_to_llm_request(
                               LogprobMode.RAW),
         logprobs_simple_format=getattr(executor_request,
                                        "py_logprobs_simple_format", False),
+        return_routed_experts=getattr(executor_request,
+                                      "py_return_routed_experts", False),
     )
 
     # Bad-words list for the TorchSampler path, kept in its native
@@ -1641,6 +1668,17 @@ def executor_request_to_llm_request(
             llm_request.create_child_request(child_id)
 
     return llm_request
+
+
+def rewind_context_after_cache_drop(request: LlmRequest,
+                                    tokens_per_block: int) -> None:
+    """Reset context progress after callers release the request's KV caches."""
+    request.set_prepopulated_prompt_len(0, tokens_per_block)
+    # Clearing prepopulation does not rewind the native context cursor.
+    request.context_current_position = 0
+    request.context_chunk_size = request.prompt_len
+    request.estimated_reusable_tokens = 0
+    request.py_ctx_pre_resize_cap = None
 
 
 def get_draft_token_length(request: LlmRequest) -> int:

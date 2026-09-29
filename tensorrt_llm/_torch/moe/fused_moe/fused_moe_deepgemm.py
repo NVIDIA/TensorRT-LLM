@@ -35,7 +35,8 @@ from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
                             MoEStaticCapability)
-from .interface import _reject
+from .impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
+from .interface import MoESchedulerKind, _reject
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
@@ -751,8 +752,11 @@ def set_strides(workspace: torch.Tensor, g: int, m: int, k: int):
     return workspace
 
 
-class DeepGemmFusedMoE(MoEImplBase):
-    """DeepGEMM flow of fused mixture of experts (MoE) Layer.
+@register_moe_impl
+class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
+    """``deepgemm.cuda.grouped_gemm.fp8_block_scales``.
+
+    DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103/SM107.
 
     Args:
         num_experts (int): Number of experts in the MoE layer.
@@ -765,13 +769,26 @@ class DeepGemmFusedMoE(MoEImplBase):
         model_config (ModelConfig): Configuration object for the model.
     """
 
-    capabilities = MoEStaticCapability(
-        supports_eplb=True, supports_apply_router_weight_on_input=True)
-
-    input_requirement = MoEInputRequirement(
-        routing_scales_dtype=torch.float32,
-        requires_run_moe_workspace=True,
+    descriptor = MoEImplDescriptor(
+        identity=MoEImplId("deepgemm", "cuda", "grouped_gemm",
+                           "fp8_block_scales"),
+        scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
+        capabilities=MoEStaticCapability(
+            supports_eplb=True, supports_apply_router_weight_on_input=True),
+        input_requirement=MoEInputRequirement(
+            routing_scales_dtype=torch.float32,
+            requires_run_moe_workspace=True,
+        ),
+        doc=
+        "DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103/SM107.",
     )
+
+    # Taken off the descriptor, not restated: the scheduler reads these three
+    # attributes and the registry publishes the descriptor, so a second literal
+    # would let the two drift apart.
+    scheduler_kind = descriptor.scheduler_kind
+    capabilities = descriptor.capabilities
+    input_requirement = descriptor.input_requirement
 
     # The DeepGEMM Triton activation kernel implements SwiGLU only, and takes
     # the clamp by value -- a per-expert tensor would never be read.
@@ -788,14 +805,15 @@ class DeepGemmFusedMoE(MoEImplBase):
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        """DeepGEMM grouped GEMM: FP8 block scales on SM100/SM103."""
+        """DeepGEMM grouped GEMM: FP8 block scales on SM100/SM103/SM107."""
         sm_version = d.env.sm
         quant_algo = p.quant_algo
 
-        if sm_version not in {100, 103}:
+        if sm_version not in {100, 103, 107}:
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
-                f"DeepGemmFusedMoE requires SM100 or SM103, got SM{sm_version}")
+                f"DeepGemmFusedMoE requires SM100, SM103, or SM107, "
+                f"got SM{sm_version}")
 
         # moe_permute_op only supports float32, bfloat16, float16
         if p.dtype_act not in {torch.float32, torch.bfloat16, torch.float16}:
@@ -904,12 +922,12 @@ class DeepGemmFusedMoE(MoEImplBase):
 
         # create workspace
         fp8_dim = max(hidden_size, intermediate_size)
-        workspace_0 = DeepGemmFusedMoE.buffers.get_buffer(
+        workspace_0 = type(self).buffers.get_buffer(
             (num_experts * m_max * fp8_dim, ),
             dtype=torch.float8_e4m3fn,
             buffer_name='workspace_0',
             reserve_buffer=capture_graph)
-        workspace_1 = DeepGemmFusedMoE.buffers.get_buffer(
+        workspace_1 = type(self).buffers.get_buffer(
             (num_experts * m_max * max(intermediate_size * 2, hidden_size), ),
             dtype=torch.bfloat16,
             buffer_name='workspace_1',
@@ -920,7 +938,7 @@ class DeepGemmFusedMoE(MoEImplBase):
         scale_k = fp8_utils.ceil_div(fp8_dim, group_size)
         scale_k_padded = fp8_utils.align(scale_k, 4)
 
-        workspace_sf = DeepGemmFusedMoE.buffers.get_buffer(
+        workspace_sf = type(self).buffers.get_buffer(
             (num_experts * (scale_k_padded // 4) * m_padded, ),
             dtype=torch.int32,
             buffer_name='workspace_sf',
@@ -1169,3 +1187,7 @@ class DeepGemmFusedMoE(MoEImplBase):
         )
 
         return final_hidden_states
+
+
+# An alias, not a base class, so there is no second class to keep in step.
+DeepGemmFusedMoE = DeepgemmCudaFp8BlockScalesImpl

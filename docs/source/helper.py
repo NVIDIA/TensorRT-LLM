@@ -373,7 +373,30 @@ def get_pydantic_methods() -> list[str]:
     methods = set(
         [method for method in dir(Dummy) if not method.startswith('_')])
     methods.discard("__init__")
+    # `Config` comes from our own StrictBaseModel rather than from Pydantic, so
+    # it is absent from `dir(Dummy)`, yet every model inherits it and Sphinx
+    # reports one duplicate object description per reference page.
+    methods.add("Config")
     return list(methods)
+
+
+def is_pydantic_model(cls_name: str) -> bool:
+    """Whether a public llmapi symbol is a Pydantic model.
+
+    Used to decide whether the inherited Pydantic machinery should be kept out
+    of the generated reference page: it documents no TensorRT-LLM behaviour,
+    and some of its upstream docstrings are not valid reStructuredText.
+    """
+    try:
+        from pydantic import BaseModel
+
+        import tensorrt_llm.llmapi as llmapi
+        cls = getattr(llmapi, cls_name, None)
+        return isinstance(cls, type) and issubclass(cls, BaseModel)
+    except ImportError:
+        # A doc-only build without the wheel still renders, just without the
+        # Pydantic exclusions; any other failure is a real bug and must surface.
+        return False
 
 
 def generate_llmapi():
@@ -441,7 +464,8 @@ def generate_llmapi():
         ]
 
         options.append("    :inherited-members:")
-        if cls_name in ["TorchLlmArgs", "TrtLlmArgs"]:
+        if cls_name in ["TorchLlmArgs", "TrtLlmArgs"
+                        ] or is_pydantic_model(cls_name):
             # exclude tons of methods from Pydantic
             options.append(
                 f"    :exclude-members: {','.join(get_pydantic_methods())}")

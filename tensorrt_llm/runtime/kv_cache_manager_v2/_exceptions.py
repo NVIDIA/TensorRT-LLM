@@ -41,6 +41,14 @@ class LogicError(Exception):
         super().__init__(message)
 
 
+class CorruptedError(Exception):
+    """A broken invariant was detected; this process refuses further KV cache work.
+
+    Only the C++ backend has the poison latch that raises this, so the pure-Python backend
+    never does. It is defined here so that callers can catch it under either backend.
+    """
+
+
 class CuError(Exception):
     error_code: drv.CUresult
 

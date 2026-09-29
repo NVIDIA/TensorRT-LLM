@@ -40,6 +40,7 @@ def make_cuda_graph_lora_manager(
     lora_model_config: LoraModelConfig,
     max_batch_size: int,
     max_tokens_per_seq: int,
+    max_num_tokens: int,
 ) -> CudaGraphLoraManager:
     """Build the CUDA-graph LoRA manager. Only call this when graphs are enabled."""
     max_lora_size = lora_config.max_loras or 8  # Default fallback
@@ -52,6 +53,7 @@ def make_cuda_graph_lora_manager(
         overlap_lora_and_base=lora_config.overlap_lora_and_base,
         device="cuda",
         max_tokens_per_seq=max_tokens_per_seq,
+        max_num_tokens=max_num_tokens,
     )
 
     logger.info(

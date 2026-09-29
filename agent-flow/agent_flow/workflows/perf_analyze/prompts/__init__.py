@@ -1,7 +1,14 @@
 import dataclasses
 from dataclasses import dataclass
+from typing import Any, Mapping
 
-from ._common import EXECUTION_SLURM_BOOTSTRAP, SOL_ANALYZER_CONTEXT, SOL_REPORTER_GUIDANCE
+from ..task_schema import cluster_ssh, remote_run_root
+from ._common import (
+    EXECUTION_SLURM_BOOTSTRAP,
+    REMOTE_SLURM_EXECUTION,
+    SOL_ANALYZER_CONTEXT,
+    SOL_REPORTER_GUIDANCE,
+)
 from .analyzer import SYSTEM_PROMPT as ANALYZER_SYSTEM_PROMPT
 from .benchmarker import SYSTEM_PROMPT as BENCHMARKER_SYSTEM_PROMPT
 from .projector import SYSTEM_PROMPT as PROJECTOR_SYSTEM_PROMPT
@@ -59,10 +66,34 @@ DEFAULT_PROMPTS = PromptBundle(
 )
 
 
+def build_remote_execution_context(
+    task: Mapping[str, Any] | None,
+    campaign_name: str,
+) -> str:
+    """Return the task-specific remote execution prompt, or an empty string."""
+    if task is None or not cluster_ssh(task):
+        return ""
+
+    slurm = task["slurm-environment"]
+    options = [f"partition={slurm['slurm_partition']}"]
+    options.extend(f"{key}={slurm[key]}" for key in ("account", "qos") if slurm.get(key))
+    return (
+        f"{REMOTE_SLURM_EXECUTION}\n\n"
+        "## Remote execution context\n\n"
+        f"SSH target: {cluster_ssh(task)}\n"
+        f"Remote run root: {remote_run_root(task, campaign_name)}\n"
+        f"Container image: {slurm['docker_image']}\n"
+        f"Model checkpoint: {task['checkpoint_path']}\n"
+        f"Slurm options: {', '.join(options)}\n"
+    )
+
+
 def build_perf_analyze_prompts(
     include_slurm_environment: bool = False,
     include_sol: bool = False,
     sol_methodology: str = "full",
+    remote_execution: Mapping[str, Any] | None = None,
+    campaign_name: str = "perf-analyze",
 ) -> PromptBundle:
     """Return the workflow's prompt bundle, optionally augmented.
 
@@ -83,6 +114,10 @@ def build_perf_analyze_prompts(
     ``perf-analysis`` but not ``internal-perf-sol-analysis`` (resolved
     before the run by ``sol_methodology.resolve_sol_methodology``); it
     appends the projector's fallback block and changes nothing else.
+
+    ``remote_execution`` is the resolved task spec. When it names an SSH
+    target, the remote boundary and task-specific connection values are
+    appended to the three roles that may inspect or produce runtime data.
     """
     bundle = DEFAULT_PROMPTS
     if sol_methodology != "full":
@@ -97,6 +132,13 @@ def build_perf_analyze_prompts(
             analyzer=SOL_ANALYZER_CONTEXT,
             reporter=SOL_REPORTER_GUIDANCE,
         )
+    context = build_remote_execution_context(remote_execution, campaign_name)
+    if context:
+        bundle = bundle.with_extensions(
+            benchmarker=context,
+            projector=context,
+            analyzer=context,
+        )
     return bundle
 
 
@@ -107,6 +149,7 @@ __all__ = [
     "PROJECTOR_SYSTEM_PROMPT",
     "PromptBundle",
     "REPORTER_SYSTEM_PROMPT",
+    "build_remote_execution_context",
     "build_perf_analyze_prompts",
     "build_projector_prompt",
 ]

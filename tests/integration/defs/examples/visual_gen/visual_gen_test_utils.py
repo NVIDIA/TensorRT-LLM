@@ -355,14 +355,14 @@ def _lpips_model_path(*parts):
     return os.path.join(_llm_models_root(), *parts)
 
 
-def _skip_if_missing(path, label, is_dir=False):
+def _require_exists(path, label, is_dir=False):
     exists = os.path.isdir(path) if is_dir else os.path.exists(path)
     if not exists:
-        pytest.skip(f"{label} not found: {path}")
+        raise FileNotFoundError(f"{label} not found: {path}")
 
 
 def _extract_visual_gen_lpips_golden_media(tmp_path):
-    _skip_if_missing(VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP, "VisualGen LPIPS golden media zip")
+    _require_exists(VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP, "VisualGen LPIPS golden media zip")
     extract_dir = tmp_path / "visual_gen_lpips_golden_media"
     if extract_dir.exists():
         return extract_dir
@@ -377,7 +377,7 @@ def _extract_visual_gen_lpips_golden_media(tmp_path):
 
 def _golden_media_path(tmp_path, media_name, label):
     path = _extract_visual_gen_lpips_golden_media(tmp_path) / media_name
-    _skip_if_missing(path, label)
+    _require_exists(path, label)
     return path
 
 
@@ -603,6 +603,7 @@ def _run_lpips_eval(tmp_path, sample_id, media_type, prompt, reference_path, gen
             stderr=subprocess.STDOUT,
             text=True,
             check=False,
+            timeout=600,
         )
     if result.returncode != 0:
         pytest.fail(f"LPIPS eval script failed for {sample_id}:\n{result.stdout}")
@@ -633,8 +634,9 @@ def _run_reusable_video_lpips_eval(sample_id, reference_path, generated_path, sc
     return score
 
 
-def _assert_lpips_below_threshold(score, threshold):
-    assert score < threshold, f"LPIPS too high: {score:.6f} (expected < {threshold:.6f})"
+def _assert_lpips_below_threshold(score, threshold, label=""):
+    context = f" [{label}]" if label else ""
+    assert score < threshold, f"LPIPS too high{context}: {score:.6f} (expected < {threshold:.6f})"
 
 
 def _preserve_lpips_candidate_on_failure(request, score, threshold, candidate_path, artifact_name):
@@ -743,7 +745,7 @@ def _run_wan_lpips_pipeline(
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig, VisualGenArgs
 
-    _skip_if_missing(model_path, "Wan checkpoint", is_dir=True)
+    _require_exists(model_path, "Wan checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
     args_kwargs = dict(
         model=model_path,

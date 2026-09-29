@@ -14,6 +14,7 @@ import pytest
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.mapping import Mapping
 
@@ -80,7 +81,9 @@ def _make_runner(dist, max_batch=64, dummy_ok=True):
         dist=dist,
         batch_size=max_batch,
         use_mrope=False,
+        enable_in_graph_sampling=False,
     )
+    runner._sample_type_resolver = None
     runner._round_up_batch_size_with_draft_len = lambda bs, draft_len: 4 if bs <= 4 else 8
     dummy = SimpleNamespace(py_request_id=-1) if dummy_ok else None
     runner._get_or_create_padding_dummy = lambda rm, draft_len: dummy
@@ -120,11 +123,15 @@ def _run_two_ranks(dist, batches, runner_kwargs=({}, {})):
     return results[0], results[1]
 
 
+_FULL = SampleType.FULL.value
+
+
 def _assert_payload_types(dist):
-    """The gathered vector is [can_run_cuda_graph, batch_size]: a bool and an int, on both ranks."""
+    """The gathered vector is [can_run_cuda_graph, batch_size, sample_type]:
+    a bool and two ints, on both ranks."""
     for calls in dist.calls.values():
-        for flag, size in calls:
-            assert type(flag) is bool and type(size) is int
+        for flag, size, tier in calls:
+            assert type(flag) is bool and type(size) is int and type(tier) is int
 
 
 def test_pad_batch_pads_to_the_largest_eligible_rank():
@@ -135,9 +142,12 @@ def test_pad_batch_pads_to_the_largest_eligible_rank():
 
     assert (padding0, padding1) == (1, 0)
     assert (batch0.batch_size, batch1.batch_size) == (4, 4)
-    assert dist.calls[0] == [[True, 3], [True, 4]]
-    assert dist.calls[1] == [[True, 4], [True, 4]]
-    assert dist.rows == [[[True, 3], [True, 4]], [[True, 4], [True, 4]]]
+    assert dist.calls[0] == [[True, 3, _FULL], [True, 4, _FULL]]
+    assert dist.calls[1] == [[True, 4, _FULL], [True, 4, _FULL]]
+    assert dist.rows == [
+        [[True, 3, _FULL], [True, 4, _FULL]],
+        [[True, 4, _FULL], [True, 4, _FULL]],
+    ]
     _assert_payload_types(dist)
 
 
@@ -151,8 +161,8 @@ def test_ineligible_peer_does_not_skip_any_collective():
 
     assert (padding0, padding1) == (1, 0)
     assert result0 == result1 == (None, None, None)
-    assert dist.calls[0] == [[True, 3], [True, 4]]
-    assert dist.calls[1] == [[False, 2], [False, 2]]
+    assert dist.calls[0] == [[True, 3, _FULL], [True, 4, _FULL]]
+    assert dist.calls[1] == [[False, 2, _FULL], [False, 2, _FULL]]
     _assert_payload_types(dist)
 
 
@@ -166,8 +176,8 @@ def test_local_padding_dummy_failure_does_not_skip_any_collective():
 
     assert (padding0, padding1) == (0, 0)
     assert result0 == result1 == (None, None, None)
-    assert dist.calls[0] == [[True, 3], [True, 3]]
-    assert dist.calls[1] == [[True, 4], [True, 4]]
+    assert dist.calls[0] == [[True, 3, _FULL], [True, 3, _FULL]]
+    assert dist.calls[1] == [[True, 4, _FULL], [True, 4, _FULL]]
     _assert_payload_types(dist)
 
 

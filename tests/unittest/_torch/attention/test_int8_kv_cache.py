@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise INT8 cache writes and reads through the native attention backend."""
 
+import subprocess
+import sys
 from dataclasses import replace
 
 import pytest
@@ -17,7 +19,11 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     PredefinedAttentionMask,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import (
+    TrtllmAttention,
+    TrtllmAttentionMetadata,
+    _validate_int8_kv_scale_values,
+)
 from tensorrt_llm._torch.attention.backends.utils import create_attention
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -301,7 +307,21 @@ def test_int8_kv_mixed_prefill_and_decode() -> None:
         manager.shutdown()
 
 
-@pytest.mark.parametrize("scale_kind", ["missing", "cpu", "float16", "vector"])
+@pytest.mark.parametrize(
+    "scale_kind",
+    [
+        "missing",
+        "cpu",
+        "float16",
+        "vector",
+        "zero",
+        "negative",
+        "nan",
+        "inf",
+        "negative_inf",
+        "non_reciprocal",
+    ],
+)
 @pytest.mark.parametrize("scale_field", ["kv_scale_orig_quant", "kv_scale_quant_orig"])
 @pytest.mark.parametrize("after_warmup", [False, True])
 @torch.inference_mode()
@@ -342,8 +362,23 @@ def test_int8_kv_rejects_invalid_scale_tensor(
                 device="cpu" if scale_kind == "cpu" else "cuda",
             )
         )
+        invalid_values = {
+            "zero": 0.0,
+            "negative": -1.0,
+            "nan": float("nan"),
+            "inf": float("inf"),
+            "negative_inf": -float("inf"),
+            "non_reciprocal": 2.0,
+        }
+        if scale_kind in invalid_values:
+            invalid_scale.fill_(invalid_values[scale_kind])
         setattr(forward_args, scale_field, invalid_scale)
-        with pytest.raises(ValueError, match="scalar float32 KV scales"):
+        error = (
+            "finite, positive, reciprocal KV scales"
+            if scale_kind in invalid_values
+            else "scalar float32 KV scales"
+        )
+        with pytest.raises(ValueError, match=error):
             attention.forward(qkv, None, None, metadata, forward_args=forward_args)
     finally:
         manager.shutdown()
@@ -400,3 +435,60 @@ def test_int8_kv_rejects_unsupported_forward_inputs(
             _forward(attention, metadata, q, k, v, scale)
     finally:
         manager.shutdown()
+
+
+@pytest.mark.parametrize("scale_value", [0.1, 1e-20, 1e20])
+@torch.inference_mode()
+def test_int8_kv_scale_values_cuda_graph(scale_value: float) -> None:
+    """Finite non-power-of-two scales pass eager, capture, and repeated replay."""
+    scale = torch.tensor([scale_value], dtype=torch.float32, device="cuda")
+    inverse = scale.reciprocal()
+    _validate_int8_kv_scale_values(inverse, scale)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _validate_int8_kv_scale_values(inverse, scale)
+    for value in (scale_value, 0.2):
+        scale.fill_(value)
+        inverse.copy_(scale.reciprocal())
+        graph.replay()
+        torch.cuda.synchronize()
+    scale.fill_(0.0)
+    with pytest.raises(ValueError, match="finite, positive, reciprocal KV scales"):
+        _validate_int8_kv_scale_values(inverse, scale)
+
+
+@pytest.mark.parametrize("scale_field", [0, 1], ids=["orig_quant", "quant_orig"])
+@pytest.mark.parametrize("invalid_value", ["0", "-1", "nan", "inf", "-inf", "2"])
+def test_int8_kv_scale_graph_rejects_invalid_replay(scale_field: int, invalid_value: str) -> None:
+    """Graph replay checks mutated scales; isolate fatal CUDA assertions in a child."""
+    script = """
+import sys
+import torch
+from tensorrt_llm._torch.attention.backends.trtllm import _validate_int8_kv_scale_values
+
+scales = [torch.tensor([32.0], device="cuda"), torch.tensor([1 / 32], device="cuda")]
+_validate_int8_kv_scale_values(*scales)
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    _validate_int8_kv_scale_values(*scales)
+graph.replay()
+torch.cuda.synchronize()
+scales[int(sys.argv[1])].fill_(float(sys.argv[2]))
+try:
+    graph.replay()
+    torch.cuda.synchronize()
+except RuntimeError as error:
+    if "device-side assert" not in str(error):
+        raise
+    print("Rejected invalid live KV scale during graph replay")
+else:
+    raise AssertionError("Invalid live KV scale was accepted by graph replay")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(scale_field), invalid_value],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Rejected invalid live KV scale during graph replay" in result.stdout

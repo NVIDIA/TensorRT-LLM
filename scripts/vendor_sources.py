@@ -524,11 +524,21 @@ def _sync_directory(path: Path) -> None:
 
 
 def _matches(path: str, patterns: Sequence[str]) -> bool:
-    pure_path = PurePosixPath(path)
+    """Match a full relative POSIX path, with ** spanning zero or more components."""
+    path_parts = PurePosixPath(path).parts
     for pattern in patterns:
-        if pure_path.match(pattern) or fnmatch.fnmatchcase(path, pattern):
-            return True
-        if pattern.startswith("**/") and fnmatch.fnmatchcase(path, pattern[3:]):
+        # Each entry records whether that path prefix matches the pattern so far.
+        matched = [True] + [False] * len(path_parts)
+        for part in PurePosixPath(pattern).parts:
+            if part == "**":
+                for index in range(1, len(matched)):
+                    matched[index] = matched[index] or matched[index - 1]
+            else:
+                matched = [False] + [
+                    matched[index] and fnmatch.fnmatchcase(path_part, part)
+                    for index, path_part in enumerate(path_parts)
+                ]
+        if matched[-1]:
             return True
     return False
 

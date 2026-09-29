@@ -14,12 +14,17 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import safetensors.torch
 import torch
 import torch.distributed as dist
+from diffusers.utils.torch_utils import randn_tensor
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.utils import make_weak_ref
 from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext, register_extractor
 from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
-from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import (
+    CUDAGraphRunner,
+    CUDAGraphRunnerConfig,
+    resolved_extra_keys_scope,
+)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import (
     BasePipeline,
@@ -28,7 +33,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
     RoleSpec,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
-from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator, postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
 from .ltx2_core.audio_vae import AudioDecoderConfigurator, VocoderConfigurator, decode_audio
@@ -492,14 +497,19 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
         static_kwargs = {k: self._clone_value(v) for k, v in kwargs.items()}
 
         graph = torch.cuda.CUDAGraph()
-        for _ in range(self.WARMUP_STEPS):
-            fn(*static_args, **static_kwargs)
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+        # Same contract as CUDAGraphRunner.capture: warmup and capture read the
+        # host-resolved extra keys (skip-softmax / Sol-Attn dense-prefix phase)
+        # from this scope instead of syncing the CUDA timestep, which capture
+        # would reject.
+        with resolved_extra_keys_scope(getattr(self, "_last_resolved_extra_keys", {})):
+            for _ in range(self.WARMUP_STEPS):
+                fn(*static_args, **static_kwargs)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
 
-        with torch.cuda.graph(graph, pool=self._get_pool()):
-            output = fn(*static_args, **static_kwargs)
+            with torch.cuda.graph(graph, pool=self._get_pool()):
+                output = fn(*static_args, **static_kwargs)
 
         self.graphs[key] = graph
         self.static_inputs[key] = (static_args, static_kwargs)
@@ -1497,7 +1507,7 @@ class LTX2Pipeline(BasePipeline):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed, self.device)
 
         # Build guider params
         video_guider_params = MultiModalGuiderParams(
@@ -1623,7 +1633,7 @@ class LTX2Pipeline(BasePipeline):
         self.transformer.configure_audio_ulysses(audio_shape.frames)
 
         # ---- 4. Generate initial noise / image conditioning ---------------
-        latents = torch.randn(
+        latents = randn_tensor(
             video_shape.to_torch_shape(),
             generator=generator,
             device=self.device,
@@ -1653,7 +1663,9 @@ class LTX2Pipeline(BasePipeline):
             )
             mask_5d[:, :, :1, :, :] = 1.0 - cond_strength
 
-            noise = torch.randn_like(latents)
+            noise = randn_tensor(
+                latents.shape, generator=generator, device=latents.device, dtype=latents.dtype
+            )
             latents = noise * mask_5d + latents * (1.0 - mask_5d)
 
             # Token-space mask for per-token timesteps (after patchification)
@@ -1676,7 +1688,7 @@ class LTX2Pipeline(BasePipeline):
 
         latents = self.video_patchifier.patchify(latents)
 
-        audio_latents = torch.randn(
+        audio_latents = randn_tensor(
             audio_shape.to_torch_shape(),
             generator=generator,
             device=self.device,
@@ -1702,15 +1714,15 @@ class LTX2Pipeline(BasePipeline):
         )
 
         # ---- 6. Prepare scheduler / timesteps ---------------------------
-        latents_5d = torch.randn(
+        latents_5d = randn_tensor(
             video_shape.to_torch_shape(),
+            generator=generator,
             device=self.device,
         )
         self.scheduler.set_timesteps(num_inference_steps, latent=latents_5d)
         audio_scheduler = copy.deepcopy(self.scheduler)
         audio_scheduler.set_timesteps(num_inference_steps, latent=latents_5d)
         timesteps = self.scheduler.timesteps
-        num_steps = len(timesteps)
 
         # ---- 7. Build perturbation config for STG -----------------------
         stg_perturbation: PerturbationConfig | None = None
@@ -1838,7 +1850,11 @@ class LTX2Pipeline(BasePipeline):
                 audio=audio_mod,
                 perturbations=perturbations,
                 text_cache=text_cache,
-                timestep=timestep_val.new_tensor(float(step_index) / num_steps),
+                # The scheduler sigma is already normalized to [0, 1] with the
+                # contract's sense (larger = noisier). The previous
+                # step_index / num_steps was ascending, which inverted the
+                # sparse-attention dense prefix on this model.
+                timestep=timestep_val,
                 step_index=step_index,
             )
 

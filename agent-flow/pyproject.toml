@@ -8,8 +8,8 @@ dependencies = [
     "anyio>=4.0",
     "pyyaml>=6.0",
     "rich>=13.0",
-    "claude-agent-sdk==0.2.143",
-    "openai-codex==0.147.0",
+    "claude-agent-sdk==0.2.152",
+    "openai-codex==0.154.0",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +30,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["agent_flow*"]
+
+# Prompt assets read at runtime (the analyzer copies the TRT-LLM kernel
+# taxonomy into its workspace), so they must survive a non-editable install.
+[tool.setuptools.package-data]
+"agent_flow.workflows.perf_analyze" = ["assets/*.json"]
 
 ####################################################################################################
 ###############################  LINTING, FORMATTING AND TESTING CONFIGURATION  ####################

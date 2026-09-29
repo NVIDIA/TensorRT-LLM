@@ -1227,7 +1227,7 @@ class Qwen3VisionModelBase(nn.Module):
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         """Standalone mm-encoder-only executor entry.
 
-        `_forward_step_mm_encoder_only` invokes this and then splits the
+        `runners.mm_encoder.MultimodalEncoderRunner._forward_step` invokes this and then splits the
         returned tensor request-by-request using request-ordered
         `split_lengths`, so the rows must be in request-then-prompt order.
         Delegating to `encode_multimodal_by_groups` runs the same
@@ -1388,7 +1388,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
             )
 
         # Surface the in-vocab image / video placeholder IDs to the model
-        # engine's ``_prepare_multimodal_indices`` so it selects the
+        # ``runners.prepare_multimodal_indices`` so it selects the
         # ``torch.isin`` predicate.
         _mm_ids = [
             tid

@@ -312,7 +312,7 @@ class DSATrtllmAttention(TrtllmAttention):
 
         Grouped output is bit-identical to the per-layer path by construction;
         that equivalence is covered by unit tests (see
-        ``tests/unittest/_torch/attention/sparse/test_cpp_custom_ops.py``).
+        ``tests/unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py``).
         """
         struct = metadata._ensure_group_remap_struct()
         leader_of = struct.get("leader_of")

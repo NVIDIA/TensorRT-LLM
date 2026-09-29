@@ -57,6 +57,7 @@ def _make_executor(
     cp_size: int = 1,
     enable_attention_dp: bool = False,
     kv_cache_transceiver=None,
+    kv_connector_manager=None,
     is_warmup: bool = False,
     is_shutdown: bool = False,
     max_beam_width: int = 1,
@@ -90,6 +91,7 @@ def _make_executor(
     exe.dist = MagicMock(pp_size=pp_size, tp_size=tp_size, cp_size=cp_size)
     exe.enable_attention_dp = enable_attention_dp
     exe.kv_cache_transceiver = kv_cache_transceiver
+    exe.kv_connector_manager = kv_connector_manager
     exe.is_warmup = is_warmup
     exe.is_shutdown = is_shutdown
     exe.drafter = drafter
@@ -201,6 +203,13 @@ class TestCanPauseForRebalance:
 
     def test_transceiver_present_returns_false(self):
         exe = _make_executor(kv_cache_transceiver=MagicMock())
+        assert PyExecutor._can_pause_for_rebalance(exe) is False
+
+    def test_connector_present_returns_false(self):
+        """A rebalance reassigns ``slot_id``, and a connector holds addresses
+        derived from it across iterations (``update_state_after_alloc``), so
+        every connector run is exposed -- synchronous ones included."""
+        exe = _make_executor(kv_connector_manager=MagicMock())
         assert PyExecutor._can_pause_for_rebalance(exe) is False
 
     def test_warmup_returns_false(self):
@@ -908,6 +917,9 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     exe.iter_counter = 0
     exe._mm_encoder_item_scheduling_enabled = False
     exe._pending_recompute_pause_ids = set()
+    # The loop wraps forward+sample in ``_step_scope()``, which reads this to
+    # decide whether to open a profiler range. False keeps it at nullcontext.
+    exe._profile_enabled = False
 
     # Rebalance state uses the executor's global KV manager gate.
     exe._is_kv_manager_v2 = True
@@ -920,7 +932,6 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     exe._rebalance_kv_pools_now = MagicMock()
 
     # Per-iteration no-ops.
-    exe._handle_disagg_cache_errors_synced = MagicMock()
     exe._handle_control_request = MagicMock()
     exe._pad_attention_dp_dummy_request = MagicMock()
     exe._revert_gen_alloc = MagicMock()

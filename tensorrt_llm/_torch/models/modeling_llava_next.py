@@ -664,7 +664,7 @@ class LlavaNextModel(PreTrainedModel):
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         # Surface the in-vocab image placeholder to the model engine's
-        # ``_prepare_multimodal_indices``.
+        # ``runners.prepare_multimodal_indices``.
         self._mm_token_ids = torch.tensor(
             [model_config.pretrained_config.image_token_index],
             dtype=torch.int32)

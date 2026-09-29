@@ -1580,7 +1580,7 @@ class Qwen2_5_VLVisionAttention(Attention):
         cos, sin = position_embeddings
 
         # FlashInfer fused RoPE assumes head_size is a multiple of 64 (see
-        # auto_deploy custom op rope docs / flashinfer tests). Qwen2.5-VL vision
+        # custom op RoPE docs / FlashInfer tests). Qwen2.5-VL vision
         # uses head_dim=80 (e.g. 1280 hidden / 16 heads), so use PyTorch RoPE.
         if IS_FLASHINFER_AVAILABLE and self.head_dim % 64 == 0 and position_ids is not None:
             try:
@@ -2210,7 +2210,7 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
             self.mm_encoder = None
 
         # Surface the in-vocab image / vision / video placeholder IDs to the
-        # model engine's ``_prepare_multimodal_indices`` so it selects the
+        # ``runners.prepare_multimodal_indices`` so it selects the
         # ``torch.isin`` predicate. Filter out None — some Qwen2-VL variants
         # only define a subset of these.
         _mm_ids = [
