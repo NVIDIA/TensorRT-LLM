@@ -131,7 +131,7 @@ def make_layout(
     """A layout whose regions are laid out back to back in a fake address space.
 
     `replicated_per_group` adds that many index-K style regions per group,
-    standing in for a role the manager declared identical on every shard.
+    standing in for a role the manager declared replicated.
     """
     groups = []
     base = 0x1000
@@ -312,7 +312,7 @@ def test_key_namespace_separates_every_dimension():
 
 
 def test_shard_key_distinguishes_rank_and_world_size():
-    # rank 3 of 8 holds different heads than rank 3 of 4, so both components
+    # Rank 3 of 8 holds different heads than rank 3 of 4, so both components
     # have to appear.
     assert sharded_shard_key(3, 8) != sharded_shard_key(3, 4)
     assert sharded_shard_key(0, 2) != sharded_shard_key(1, 2)
@@ -425,12 +425,10 @@ def test_page_addressing_resolves_the_two_classes_separately():
     assert sizes == [region.size for region in group.regions]
 
     rep_addresses, rep_sizes = addressing.replicated_buffers(0, 2)
-    assert rep_addresses == [
-        region.base + region.stride * 2 for region in group.replicated_regions
-    ]
+    assert rep_addresses == [region.base + region.stride * 2 for region in group.replicated_regions]
     assert rep_sizes == [region.size for region in group.replicated_regions]
 
-    # The two payloads are disjoint, so their sizes do not overlap-count.
+    # The two payloads are disjoint, so their sizes do not double-count.
     assert addressing.has_replicated(0)
     assert addressing.bytes_per_page(0) == sum(region.size for region in group.regions)
     assert addressing.replicated_bytes_per_page(0) == sum(
@@ -450,9 +448,7 @@ def test_page_addressing_registers_replicated_regions_too():
     # would fail every transfer that touches it.
     layout = make_layout(regions_per_group=1, replicated_per_group=1, num_slots=4)
     replicated = layout.groups[0].replicated_regions[0]
-    span_end = (
-        replicated.base + replicated.stride * (replicated.num_slots - 1) + replicated.size
-    )
+    span_end = replicated.base + replicated.stride * (replicated.num_slots - 1) + replicated.size
     covered = PageAddressing(layout).registration_ranges()
     assert any(start <= replicated.base and span_end <= end for start, end in covered)
 
@@ -716,7 +712,7 @@ def test_worker_save_skips_pages_already_in_the_store(store_config, fake_store):
 def test_worker_names_the_replicated_page_without_a_rank(
     store_config: Path, fake_store: FakeStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The point of the split: one key for index-K across the whole TP group."""
+    """Index-K carries one key across the whole TP group."""
     layout = make_layout(replicated_per_group=1)
     block_hash = b"\x03" * 16
     monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 8)
@@ -735,7 +731,7 @@ def test_worker_names_the_replicated_page_without_a_rank(
 def test_worker_has_no_replicated_namespace_without_the_role(store_config, fake_store):
     with make_worker(fake_store, layout=make_layout(num_groups=2)) as worker:
         assert worker._replicated_namespaces == {}
-        # And nothing resolves, so neither path gains a key.
+        # And nothing resolves, so the replicated path contributes no keys.
         transfers = [RequestTransfers(1, [PageTransfer(b"\x00" * 16, 0, 0)])]
         assert worker._resolve(transfers, replicated=True)[0] == []
 

@@ -116,8 +116,8 @@ class TestKvCacheRegionArithmetic(unittest.TestCase):
             regions=(self._region(size=256), self._region(base=8192, size=128)),
             replicated_regions=(self._region(base=16384, size=64),),
         )
-        # The replicated bytes are a page of their own, not part of the
-        # shard-specific one: a connector keys and transfers them separately.
+        # The replicated bytes are a page of their own, since a connector keys
+        # and transfers them separately.
         self.assertEqual(group.bytes_per_page, 384)
         self.assertEqual(group.replicated_bytes_per_page, 64)
 
@@ -290,8 +290,7 @@ class TestBuildKvCacheLayoutV2(unittest.TestCase):
                 ["key", "value"] * 4,
             )
             # The base manager declares INDEX_KEY replicated but registers no
-            # such buffer, so splitting by class must leave this layout exactly
-            # as it was before the split existed.
+            # such buffer, so every region stays shard-specific.
             self.assertEqual(group.replicated_regions, ())
             self.assertEqual(group.replicated_bytes_per_page, 0)
         finally:
@@ -301,9 +300,7 @@ class TestBuildKvCacheLayoutV2(unittest.TestCase):
     def test_a_replicated_role_is_described_as_its_own_regions(self):
         # A manager registering an index-K buffer whose per-block size equals
         # K/V's gets it coalesced into the same pool, interleaved per layer as
-        # K, V, INDEX_KEY. The split must still separate the classes, which is
-        # what lets a connector store the replicated bytes once per TP group
-        # rather than once per rank.
+        # K, V, INDEX_KEY. The two classes must still come out separated.
         num_layers = 4
         kwargs = _make_kwargs(num_layers=num_layers)
         bytes_per_block = (

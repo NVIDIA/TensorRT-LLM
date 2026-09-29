@@ -33,12 +33,11 @@ has no VALUE buffer), sliding-window attention and hybrid models (one layer grou
 per window size) without any of them being special cases.
 
 A group's ranges are split into two sets. Most roles hold bytes particular to one
-attention shard, but a side cache may hold bytes identical on every shard --
-MiniMax-M3's index-K is computed from a replicated projection. The manager
-declares which roles those are, and they are described as ``replicated_regions``
-so a connector can store them once for the whole TP group rather than once per
-rank. V2 may interleave the two classes in one pool, so the split is done by
-aggregating each class separately rather than by slicing a merged range.
+attention shard, but a side cache may hold bytes identical on every shard, such
+as MiniMax-M3's index-K. The manager declares which roles those are, and they
+are described as replicated_regions so a connector can store them once for a TP
+group instead of once per rank. V2 may interleave the two classes within a pool,
+so each class is aggregated separately rather than sliced out of a merged range.
 """
 
 from dataclasses import dataclass
@@ -130,9 +129,8 @@ class KvCacheLayerGroupLayout:
     window_size: Optional[int]
     #: Regions holding bytes specific to this attention shard.
     regions: Tuple[KvCacheRegion, ...]
-    #: Regions holding bytes identical on every attention shard, as declared
-    #: by the manager's ``get_replicated_roles()``. Empty for models that
-    #: register no such role, which is every model without a side cache.
+    #: Regions holding bytes identical on every attention shard, as named by
+    #: the manager's get_replicated_roles(). Empty unless a role is declared.
     replicated_regions: Tuple[KvCacheRegion, ...] = ()
 
     @property
@@ -200,12 +198,11 @@ def _regions_for(
     num_slots: int,
     global_by_local: Dict[int, int],
 ) -> Tuple[KvCacheRegion, ...]:
-    """Aggregate ``buffer_ids`` into the regions they occupy in one slot.
+    """Aggregate buffer_ids into the regions they occupy in one slot.
 
-    ``get_aggregated_pages`` coalesces only buffers adjacent *within the set it
-    is given*, so passing a subset yields regions covering exactly that subset.
-    That is what lets shard-specific and replicated roles be described
-    separately even when V2 packed them into one interleaved pool.
+    get_aggregated_pages coalesces only buffers adjacent *within the set it is
+    given*, so passing a subset yields regions covering exactly that subset.
+    That is what keeps the two region classes separable.
     """
     regions: List[KvCacheRegion] = []
     for desc in impl.get_aggregated_pages(buffer_ids):
@@ -239,10 +236,8 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
     order, kv factor, or the number of pools.
 
     Roles the manager declares replicated are described as a separate region
-    set. Their bytes are identical on every attention shard, so a connector can
-    address them once rather than once per rank. A manager that declares none
-    yields the same regions it would have without the split, since the buffer
-    set handed to the aggregator is then unchanged.
+    set. A manager that declares none leaves replicated_regions empty and every
+    buffer in regions.
     """
     impl = manager.impl
     init_config = impl.init_config
@@ -259,9 +254,9 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
     for buffer_id in impl.all_buffer_ids:
         buffers_by_layer.setdefault(int(buffer_id.layer_id), []).append(buffer_id)
 
-    # Role names rather than DataRole values: a region records the manager's
-    # native role string, and comparing strings keeps this free of the
-    # disaggregation types the manager uses to express the same declaration.
+    # Compare role names rather than DataRole values: a region records the
+    # manager's native role string, which keeps this free of the
+    # disaggregation types used to express the declaration.
     replicated_roles = {str(role) for role in manager.get_replicated_roles()}
 
     groups: List[KvCacheLayerGroupLayout] = []
@@ -282,9 +277,7 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
                 layer_group_id=layer_group_id,
                 layer_ids=tuple(global_by_local[lid] for lid in local_layer_ids),
                 window_size=_window_size(init_config, local_layer_ids[0]),
-                regions=_regions_for(
-                    impl, sharded_ids, layer_group_id, num_slots, global_by_local
-                ),
+                regions=_regions_for(impl, sharded_ids, layer_group_id, num_slots, global_by_local),
                 replicated_regions=_regions_for(
                     impl, replicated_ids, layer_group_id, num_slots, global_by_local
                 ),
