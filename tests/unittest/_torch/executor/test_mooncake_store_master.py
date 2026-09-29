@@ -640,29 +640,50 @@ def test_a_named_device_is_what_the_workers_are_told(fake_master, tmp_path):
 # ---- what a server does with the pool settings around its own lifetime ----
 
 
-@contextlib.contextmanager
-def _recording(log, name):
-    log.append(name)
-    yield
+class ProvisioningLog:
+    """Entries and exits of the two contexts a serving process holds open.
+
+    Recording only entries would accept a `_provision_kv_cache_pool` that
+    closed the pool before yielding, which is the one thing it must not do:
+    the pool has to outlive the server it was provisioned for.
+    """
+
+    def __init__(self):
+        self.events: list = []
+
+    @contextlib.contextmanager
+    def holding(self, name, argument):
+        self.events.append(("enter", name, argument))
+        try:
+            yield
+        finally:
+            self.events.append(("exit", name, argument))
+
+    @property
+    def open_contexts(self) -> list:
+        entered = [name for event, name, _ in self.events if event == "enter"]
+        for event, name, _ in self.events:
+            if event == "exit":
+                entered.remove(name)
+        return entered
+
+    def order(self, event: str) -> list:
+        return [name for kind, name, _ in self.events if kind == event]
 
 
 @pytest.fixture
-def provisioning(monkeypatch):
-    """Record which of the two pool contexts a server enters, in order."""
+def provisioning(monkeypatch) -> SimpleNamespace:
+    """Drive `_provision_kv_cache_pool` against recorded pool contexts."""
     from tensorrt_llm.commands import serve
 
-    entered: list = []
+    log = ProvisioningLog()
     monkeypatch.setattr(
-        mooncake_store,
-        "maybe_provision_pool",
-        lambda config: _recording(entered, ("pool", config)),
+        mooncake_store, "maybe_provision_pool", lambda config: log.holding("pool", config)
     )
     monkeypatch.setattr(
-        mooncake_store,
-        "maybe_donate_segment",
-        lambda donation: _recording(entered, ("donation", donation)),
+        mooncake_store, "maybe_donate_segment", lambda donation: log.holding("donation", donation)
     )
-    return SimpleNamespace(serve=serve, entered=entered)
+    return SimpleNamespace(serve=serve, log=log)
 
 
 def test_an_attached_frontend_provisions_nothing(provisioning):
@@ -675,7 +696,26 @@ def test_an_attached_frontend_provisions_nothing(provisioning):
     with provisioning.serve._provision_kv_cache_pool(llm_args, owns_engine=False):
         pass
 
-    assert provisioning.entered == []
+    assert provisioning.log.events == []
+
+
+def test_the_pool_and_the_segment_stay_open_for_the_server(provisioning):
+    """Both have to outlive bringup, and the segment closes before the pool."""
+    llm_args = {
+        "kv_connector_config": {
+            "connector": "mooncake-store",
+            "mooncake_store": {"launch_master": True},
+        },
+        "mooncake_donation": {"master_server_address": "10.0.0.1:50051"},
+    }
+
+    with provisioning.serve._provision_kv_cache_pool(llm_args):
+        # Where the server runs. A pool closed by now is capacity the engine
+        # would find gone the moment it opened a store handle.
+        assert provisioning.log.open_contexts == ["pool", "donation"]
+
+    assert provisioning.log.order("enter") == ["pool", "donation"]
+    assert provisioning.log.order("exit") == ["donation", "pool"]
 
 
 def test_pool_settings_from_yaml_are_typed_before_the_llm_sees_them(provisioning):
@@ -693,16 +733,38 @@ def test_pool_settings_from_yaml_are_typed_before_the_llm_sees_them(provisioning
 
     assert isinstance(llm_args["kv_connector_config"], KvCacheConnectorConfig)
     assert isinstance(llm_args["mooncake_donation"], MooncakeDonationConfig)
-    assert [name for name, _ in provisioning.entered] == ["pool", "donation"]
 
 
-def test_the_user_facing_pool_settings_name_the_fields_provisioning_takes():
-    """`maybe_provision_pool` matches the two by field name, so they must agree."""
+def test_the_user_facing_pool_settings_reach_provisioning(monkeypatch):
+    """`maybe_provision_pool` matches the two models by field name.
+
+    A field renamed on either side would otherwise raise `TypeError` inside
+    `PoolSpec.from_json`, at serve time, with the model already loading.
+    """
+    provisioned = []
+
+    @contextlib.contextmanager
+    def record(spec, **kwargs):
+        provisioned.append(spec)
+        yield "mooncake.json"
+
+    monkeypatch.setattr(master_module, "provision_pool", record)
+
     config = KvCacheConnectorConfig(
         connector="mooncake-store",
-        mooncake_store=MooncakeStoreConfig(launch_master=True),
+        mooncake_store=MooncakeStoreConfig(
+            launch_master=True,
+            master_port=50099,
+            protocol="tcp",
+            global_segment_size="4GiB",
+            transfer_batch_size=8,
+        ),
     )
-    spec = PoolSpec.from_json({}, **config.mooncake_store.model_dump())
+    with master_module.maybe_provision_pool(config):
+        pass
 
-    assert spec.launch_master is True
-    assert spec.master_port == MooncakeStoreConfig(launch_master=True).master_port
+    assert len(provisioned) == 1
+    spec = provisioned[0]
+    assert (spec.launch_master, spec.master_port) == (True, 50099)
+    assert (spec.protocol, spec.global_segment_size) == ("tcp", "4GiB")
+    assert spec.transfer_batch_size == 8
