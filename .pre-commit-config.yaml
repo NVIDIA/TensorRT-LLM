@@ -1628,10 +1628,10 @@ repos:
         language: script
         pass_filenames: false
     -   id: qa-selection-rules
-        name: Check QA selection rules still match the integration skip decorators
+        name: Check QA selection rules and markers still match the integration suite
         entry: python scripts/check_qa_selection_rules.py
         language: python
-        files: ^(tests/integration/defs/.*\.py|tests/qa_selection/core/rules\.(py|json)|scripts/check_qa_selection_rules\.py)$
+        files: ^(tests/integration/defs/(.*\.py|pytest\.ini)|tests/qa_selection/core/(rules|markers)\.(py|json)|tests/qa_selection/core/allocation\.py|scripts/check_qa_selection_rules\.py)$
         pass_filenames: false
     -   id: DCO check
         name: Checks the commit message for a developer certificate of origin signature
