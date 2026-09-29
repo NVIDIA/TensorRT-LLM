@@ -68,7 +68,6 @@ def captured_exit_payloads(monkeypatch, enable_telemetry):
     usage_lib._REPORTER_ACTIVE = False
     usage_lib._REPORTER_LOCK = threading.Lock()
     usage_lib._REPORTER_STOP = threading.Event()
-    usage_lib._PENDING_TERMINAL = None
     usage_lib._PROCESS_PID = os.getpid()
 
     payloads = []
@@ -81,7 +80,6 @@ def captured_exit_payloads(monkeypatch, enable_telemetry):
     usage_lib._SESSION_DISABLED = False
     usage_lib._REPORTER_STARTED = False
     usage_lib._REPORTER_ACTIVE = False
-    usage_lib._PENDING_TERMINAL = None
 
 
 @pytest.fixture

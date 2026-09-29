@@ -190,6 +190,12 @@ def reset_usage_state():
         deadline = time.monotonic() + 2
         while usage_lib._REPORTER_ACTIVE and time.monotonic() < deadline:
             time.sleep(0.01)
+        session = usage_lib._SESSION
+        if session is not None:
+            session.disable()
+            if session.terminal_thread is not None:
+                session.terminal_thread.join(timeout=2)
+                assert not session.terminal_thread.is_alive()
         usage_lib._SESSION = None
         usage_lib._SESSION_DISABLED = False
         usage_lib._SESSION_LOCK = threading.Lock()
@@ -197,7 +203,6 @@ def reset_usage_state():
         usage_lib._REPORTER_ACTIVE = False
         usage_lib._REPORTER_LOCK = threading.Lock()
         usage_lib._REPORTER_STOP = threading.Event()
-        usage_lib._PENDING_TERMINAL = None
         usage_lib._PROCESS_PID = os.getpid()
 
     reset()

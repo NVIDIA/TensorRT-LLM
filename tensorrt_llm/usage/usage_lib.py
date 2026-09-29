@@ -777,7 +777,6 @@ _REPORTER_STARTED = False
 _REPORTER_ACTIVE = False
 _REPORTER_LOCK = threading.Lock()
 _REPORTER_STOP = threading.Event()  # signal heartbeat loop to exit
-_PENDING_TERMINAL: Optional["_PendingTerminal"] = None
 _PROCESS_PID = os.getpid()
 _PROCESS_EXIT_HOOK_REGISTERED = False
 
@@ -819,6 +818,10 @@ class _TelemetrySession:
         self.disabled = False
         self.initial_reported = False
         self.terminal_reported = False
+        self.terminal_ready = threading.Event()
+        self.terminal_completion = threading.Event()
+        self.terminal_payload: Optional[dict] = None
+        self.terminal_thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
         self.refresh_metadata()
 
@@ -994,15 +997,8 @@ class _TelemetrySession:
         """Prevent a stale reference from emitting after process opt-out."""
         with self.lock:
             self.disabled = True
-
-
-@dataclass(frozen=True)
-class _PendingTerminal:
-    """Terminal payload waiting for the active reporter to finish."""
-
-    session: _TelemetrySession
-    payload: dict
-    completion: threading.Event
+        self.terminal_ready.set()
+        self.terminal_completion.set()
 
 
 _SESSION: Optional[_TelemetrySession] = None
@@ -1013,7 +1009,6 @@ _SESSION_DISABLED = False
 def _ensure_process_state() -> None:
     """Reset inherited process-local state after ``fork()``."""
     global _NOTIFICATION_SHOWN
-    global _PENDING_TERMINAL
     global _PROCESS_PID
     global _REPORTER_ACTIVE
     global _REPORTER_LOCK
@@ -1033,7 +1028,6 @@ def _ensure_process_state() -> None:
     _REPORTER_ACTIVE = False
     _REPORTER_LOCK = threading.Lock()
     _REPORTER_STOP = threading.Event()
-    _PENDING_TERMINAL = None
     _NOTIFICATION_SHOWN = threading.Event()
 
 
@@ -1049,21 +1043,15 @@ def _get_session() -> Optional[_TelemetrySession]:
 
 def _deactivate_usage_session() -> None:
     """Stop process telemetry after any authoritative opt-out decision."""
-    global _PENDING_TERMINAL
     global _SESSION
     global _SESSION_DISABLED
     with _SESSION_LOCK:
         session = _SESSION
         _SESSION = None
         _SESSION_DISABLED = True
-    pending = None
     with _REPORTER_LOCK:
         if session is not None:
             session.disable()
-        pending = _PENDING_TERMINAL
-        _PENDING_TERMINAL = None
-    if pending is not None:
-        pending.completion.set()
     _REPORTER_STOP.set()
 
 
@@ -1334,38 +1322,51 @@ def get_observed_signal() -> int:
 def _send_if_session_active(
     session: _TelemetrySession,
     payload: dict,
-    completion: Optional[threading.Event] = None,
 ) -> bool:
     """Start delivery only if process opt-out has not already won."""
-    try:
-        if not session.try_start_delivery():
-            return False
-        _send_to_gxt(payload)
-        return True
-    finally:
-        if completion is not None:
-            completion.set()
+    if not session.try_start_delivery():
+        return False
+    _send_to_gxt(payload)
+    return True
 
 
 def _finish_background_reporter() -> None:
-    """Deactivate the reporter and flush a terminal payload queued to it."""
-    global _PENDING_TERMINAL
+    """Mark the initial/heartbeat reporter as finished."""
     global _REPORTER_ACTIVE
-    pending = None
+    with _REPORTER_LOCK:
+        _REPORTER_ACTIVE = False
+
+
+def _terminal_sender(session: _TelemetrySession) -> None:
+    """Wait for one exit payload independently of initial/heartbeat delivery."""
     try:
+        session.terminal_ready.wait()
         with _REPORTER_LOCK:
-            _REPORTER_ACTIVE = False
-            pending = _PENDING_TERMINAL
-            _PENDING_TERMINAL = None
-        if pending is not None:
-            _send_if_session_active(
-                pending.session,
-                pending.payload,
-                pending.completion,
-            )
+            payload = session.terminal_payload
+            session.terminal_payload = None
+        if payload is not None:
+            _send_if_session_active(session, payload)
     except Exception:
-        if pending is not None:
-            pending.completion.set()
+        pass  # Telemetry must not surface transport errors during shutdown.
+    finally:
+        session.terminal_completion.set()
+
+
+def _start_terminal_sender(session: _TelemetrySession) -> None:
+    """Start once while holding _REPORTER_LOCK; retry later if startup fails."""
+    if session.terminal_thread is not None or not session.try_start_delivery():
+        return
+    try:
+        thread = threading.Thread(
+            target=_terminal_sender,
+            args=(session,),
+            daemon=True,
+            name="trtllm-usage-terminal",
+        )
+        thread.start()
+        session.terminal_thread = thread
+    except Exception:
+        pass  # Exit-sender setup must not prevent normal usage reporting.
 
 
 def report_exit(
@@ -1445,34 +1446,17 @@ def report_exit(
             trtllm_version=session.trtllm_version,
         )
 
-        completion = threading.Event()
-        queued_to_reporter = False
-        global _PENDING_TERMINAL
         with _REPORTER_LOCK:
             if not session.try_start_delivery():
-                completion.set()
                 return True
-            if _REPORTER_ACTIVE:
-                _PENDING_TERMINAL = _PendingTerminal(
-                    session=session,
-                    payload=payload,
-                    completion=completion,
-                )
-                queued_to_reporter = True
+            _start_terminal_sender(session)
+            _REPORTER_STOP.set()
+            if session.terminal_thread is None:
+                return True
+            session.terminal_payload = payload
+            session.terminal_ready.set()
 
-        _REPORTER_STOP.set()
-        if queued_to_reporter:
-            completion.wait(timeout=_TERMINAL_FLUSH_TIMEOUT)
-            return True
-
-        thread = threading.Thread(
-            target=_send_if_session_active,
-            args=(session, payload, completion),
-            daemon=True,
-            name="trtllm-usage-terminal",
-        )
-        thread.start()
-        completion.wait(timeout=_TERMINAL_FLUSH_TIMEOUT)
+        session.terminal_completion.wait(timeout=_TERMINAL_FLUSH_TIMEOUT)
         return True
     except Exception:
         return claimed
@@ -1485,9 +1469,9 @@ def report_usage(
 ) -> None:
     """Start background usage telemetry reporting.
 
-    Call this once after model initialization. It spawns a daemon thread
-    that sends an initial report and periodic heartbeats. Subsequent calls
-    are no-ops (only one reporter thread per process).
+    Call this once after model initialization. It starts an initial/heartbeat
+    daemon and a one-shot exit sender so shutdown cannot queue behind a blocked
+    heartbeat. Subsequent calls are no-ops (one pair per reporting process).
 
     This function is fail-silent -- it will never raise an exception or
     block the calling thread.
@@ -1497,7 +1481,6 @@ def report_usage(
         pretrained_config: The pretrained model config (for architecture name).
         telemetry_config: TelemetryConfig object (opt-out + usage context).
     """
-    global _PENDING_TERMINAL
     global _REPORTER_ACTIVE
     global _REPORTER_STARTED
     try:
@@ -1514,6 +1497,10 @@ def report_usage(
                 return
             _REPORTER_STARTED = True
             _REPORTER_ACTIVE = True
+            session = _get_session()
+            if session is not None:
+                # Python 3.12+ cannot create threads from an atexit callback.
+                _start_terminal_sender(session)
 
         _show_usage_notification()
 
@@ -1526,11 +1513,6 @@ def report_usage(
         thread.start()
 
     except Exception:
-        pending = None
         with _REPORTER_LOCK:
             _REPORTER_STARTED = False
             _REPORTER_ACTIVE = False
-            pending = _PENDING_TERMINAL
-            _PENDING_TERMINAL = None
-        if pending is not None:
-            pending.completion.set()
