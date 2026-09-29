@@ -4,6 +4,7 @@ from typing import Any, Mapping
 
 from ..task_schema import cluster_ssh, remote_run_root
 from ._common import (
+    CASEBOOK_DISABLED,
     EXECUTION_SLURM_BOOTSTRAP,
     REMOTE_SLURM_EXECUTION,
     SOL_ANALYZER_CONTEXT,
@@ -94,6 +95,7 @@ def build_perf_analyze_prompts(
     sol_methodology: str = "full",
     remote_execution: Mapping[str, Any] | None = None,
     campaign_name: str = "perf-analyze",
+    include_casebook: bool = True,
 ) -> PromptBundle:
     """Return the workflow's prompt bundle, optionally augmented.
 
@@ -120,6 +122,11 @@ def build_perf_analyze_prompts(
     appended to the three roles that may inspect or produce runtime data.
     """
     bundle = DEFAULT_PROMPTS
+    if not include_casebook:
+        bundle = bundle.with_extensions(
+            benchmarker=CASEBOOK_DISABLED,
+            analyzer=CASEBOOK_DISABLED,
+        )
     if sol_methodology != "full":
         bundle = dataclasses.replace(bundle, projector=build_projector_prompt(sol_methodology))
     if include_slurm_environment:
