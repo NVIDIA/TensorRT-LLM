@@ -1,7 +1,7 @@
-upstream: external MegaMoE source
+upstream: https://gitlab-master.nvidia.com/jintaop/cutedsl_megamoe/-/tree/megamoe-dynamic-loadbalance-PR
 commit: 522fbb019942ad6bbe0f418dba02541f837ea46c
 source_tree_dirty: false
 kind: inference closure
 downstream_modified: true
 manifest: VENDOR_MANIFEST.json
-Regenerate with scripts/vendor_dynamic_load_balance.py; recorded downstream patches are replayed.
+Downstream changes are recorded in VENDOR_MANIFEST.json and adjacent patch files.
