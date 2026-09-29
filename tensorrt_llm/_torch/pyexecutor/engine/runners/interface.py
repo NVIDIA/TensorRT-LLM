@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
@@ -36,6 +36,22 @@ class PreparedInputs:
 
 
 @dataclass(frozen=True)
+class PackedEncoderBatch:
+    """An encode-only batch whose tokens the caller already packed.
+
+    The token lists are referenced, not copied, so callers must not mutate them
+    while a forward pass is in flight. ``model_inputs`` carries model-specific
+    inputs for the batch, not scheduling or lifecycle controls; supported keys
+    depend on the runner.
+    """
+
+    input_ids: list[int]
+    sequence_lengths: list[int]
+    multi_item_part_lens: list[list[int]] | None = None
+    model_inputs: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class RunnerConfig:
     """Immutable settings shared by encoder, decoder, and no-KV-cache runners."""
 
@@ -60,11 +76,16 @@ class RunnerDeps:
     draft_tokens_cuda: torch.Tensor | None
     cache_indirection: torch.Tensor | None
     lora: LoraParamBuilder
+    moe_load_balancer: MoeLoadBalancer | None
     model_forward: Callable[..., Any]
 
 
 class ModelRunner(Protocol):
-    """Run a model family through its four lifecycle phases."""
+    """Run a model family whose batch arrives as scheduled requests."""
+
+    def warmup(self, resource_manager: ResourceManager) -> None: ...
+
+    def capture_graphs(self, resource_manager: ResourceManager) -> None: ...
 
     def prepare_inputs(
         self,
@@ -73,11 +94,12 @@ class ModelRunner(Protocol):
         resource_manager: ResourceManager,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
-    ) -> PreparedInputs: ...
+    ) -> PreparedInputs:
+        """Prepare the scheduled batch for execution.
 
-    def warmup(self, resource_manager: ResourceManager) -> None: ...
-
-    def capture_graphs(self, resource_manager: ResourceManager) -> None: ...
+        Graph compatibility is decided here, before execution.
+        """
+        ...
 
     def forward(
         self,
@@ -86,6 +108,48 @@ class ModelRunner(Protocol):
         resource_manager: ResourceManager,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
-        moe_load_balancer: MoeLoadBalancer | None,
         gather_context_logits: bool,
-    ) -> dict[str, Any]: ...
+    ) -> dict[str, Any]:
+        """Pass the scheduled batch to ``prepare_inputs`` and execute its result."""
+        ...
+
+    def cleanup(self) -> None:
+        """Release everything the runner owns; the engine drops it afterwards."""
+        ...
+
+
+class PackedModelRunner(Protocol):
+    """Run a model family whose batch arrives already packed.
+
+    A runner implements this contract or ``ModelRunner``, never both; the engine
+    resolves which one it holds at initialization. The packed batch carries its
+    own request boundaries and model-specific inputs, so none of the scheduling
+    collaborators apply.
+    """
+
+    def warmup(self) -> None: ...
+
+    def capture_graphs(self) -> None: ...
+
+    def prepare_inputs(self, batch: PackedEncoderBatch) -> PreparedInputs:
+        """Prepare the packed batch for execution.
+
+        Implementations must validate the batch and its model-specific inputs, and
+        reject unsupported keys or overrides of runner-managed fields. Graph
+        compatibility is decided here, before execution; inputs must not be
+        silently ignored.
+        """
+        ...
+
+    def forward(
+        self,
+        batch: PackedEncoderBatch,
+        *,
+        gather_context_logits: bool = False,
+    ) -> dict[str, Any]:
+        """Pass the packed batch to ``prepare_inputs`` and execute its result."""
+        ...
+
+    def cleanup(self) -> None:
+        """Release everything the runner owns; the engine drops it afterwards."""
+        ...

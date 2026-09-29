@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Set
 
@@ -14,6 +15,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
+from ..attention.backends.sparse.params import MTPIndexShareMetadata
 from ..model_config import ModelConfig
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
@@ -27,6 +29,13 @@ from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
+
+
+def _reset_mtp_index_share(attn_metadata: MTPIndexShareMetadata) -> None:
+    """Clear the draft-loop state a sparse indexer reads."""
+    attn_metadata.set_skip_topk(False)
+    attn_metadata.set_in_mtp_draft_loop(False)
+    attn_metadata.set_mtp_num_accepted(None)
 
 
 class Eagle3ResourceManager(BaseResourceManager):
@@ -43,7 +52,8 @@ class Eagle3ResourceManager(BaseResourceManager):
                  max_num_requests: int,
                  max_seq_len: int,
                  max_num_tokens: int,
-                 sa_manager=None):
+                 sa_manager=None,
+                 num_seq_slots: Optional[int] = None):
         self.dtype = dtype
         self.max_draft_len = config.max_draft_len
         self.hidden_size = hidden_size
@@ -51,9 +61,10 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.max_seq_len = max_seq_len
         # Optional SA manager for EAGLE3+SA mode
         self.sa_manager = sa_manager
+        self.num_seq_slots = max(num_seq_slots or 0, max_num_requests)
         # There could be dummy request for padding batch when using CUDA graph.
         # Reserve one more slot for the dummy request.
-        slot_size = self.max_seq_len + 1
+        slot_size = max(self.num_seq_slots, self.max_seq_len) + 1
         self.slot_manager = SlotManager(slot_size)
         # This class is reused by MTP_EAGLE
         from ...llmapi.llm_args import EagleDecodingConfig
@@ -94,16 +105,13 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.is_first_draft = True
         self.spec_tree_manager = None
 
-        if isinstance(config,
-                      EagleDecodingConfig) and (config.eagle_choices is not None
-                                                or config.use_dynamic_tree):
+        if isinstance(config, EagleDecodingConfig) and config.use_dynamic_tree:
             self.spec_tree_manager = SpecTreeManager(
                 max_num_requests=self.max_num_requests,
-                use_dynamic_tree=config.use_dynamic_tree,
                 max_draft_len=self.max_draft_len,
                 max_total_draft_tokens=self.max_total_draft_tokens,
-                eagle_choices=config.eagle_choices,
                 dynamic_tree_max_topK=config.dynamic_tree_max_topK,
+                num_seq_slots=self.num_seq_slots,
             )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -165,7 +173,10 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
     hidden_states: Optional[torch.Tensor] = None
     batch_indices_cuda: Optional[torch.Tensor] = None
 
-    def __init__(self, config: "EagleDecodingConfig", max_num_requests: int):
+    def __init__(self,
+                 config: "EagleDecodingConfig",
+                 max_num_requests: int,
+                 num_seq_slots: Optional[int] = None):
         self.max_num_requests = max_num_requests
         self.batch_indices_cuda = torch.empty(
             [max_num_requests],
@@ -174,11 +185,10 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
         )
         self.spec_tree_manager = SpecTreeManager(
             max_num_requests=max_num_requests,
-            use_dynamic_tree=config.use_dynamic_tree,
             max_draft_len=config.max_draft_len,
             max_total_draft_tokens=config.tokens_per_gen_step - 1,
-            eagle_choices=config.eagle_choices,
             dynamic_tree_max_topK=config.dynamic_tree_max_topK,
+            num_seq_slots=num_seq_slots,
         )
 
     def free_resources(self, request: LlmRequest):
@@ -224,7 +234,6 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     spec_resource_manager: Optional[Eagle3ResourceManager] = None
     # Dynamic tree flags
     use_dynamic_tree: bool = False
-    eagle_choices: Optional[List[List[int]]] = None
     # Slot IDs for each request; populated in prepare() when spec_resource_manager
     # is present (required for relaxed acceptance, mirrors MTPSpecMetadata.slot_ids).
     slot_ids: Optional[torch.Tensor] = None
@@ -312,15 +321,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         )
 
         # Set tree flags based on config
-        if self.use_dynamic_tree:
-            self.is_spec_dec_tree = True
-            self.is_spec_dec_dynamic_tree = True
-        elif self.eagle_choices is not None:
-            self.is_spec_dec_tree = True
-            self.is_spec_dec_dynamic_tree = False
-        else:
-            self.is_spec_dec_tree = False
-            self.is_spec_dec_dynamic_tree = False
+        self.is_spec_dec_tree = self.use_dynamic_tree
+        self.is_spec_dec_dynamic_tree = self.use_dynamic_tree
 
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
@@ -765,8 +767,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                    num_accepted_tokens,
                                    original_all_rank_num_tokens):
         """Linear draft loop, unified for Eagle3 and MTP Eagle."""
-        from ..attention.backends.sparse.dsa import (DSAtrtllmAttentionMetadata,
-                                                     is_dsa_cache_manager)
+        from ..attention.backends.sparse.dsa import is_dsa_cache_manager
 
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
@@ -775,18 +776,29 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         position_ids = inputs["position_ids"]
 
-        uses_dsa_mtp_metadata = self.is_mtp_eagle and isinstance(
-            attn_metadata, DSAtrtllmAttentionMetadata)
-        if uses_dsa_mtp_metadata:
-            attn_metadata.set_in_mtp_draft_loop(True)
-            # Accepted counts let the indexer stash each gen's last-accepted row.
-            attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
-
-        with self.draft_kv_cache_context(
-                attn_metadata, draft_kv_cache_manager) as draft_attn_metadata:
+        # Sparse backends that can reuse one indexer selection across the draft
+        # loop expose this setter; each indexer still decides whether its own
+        # config turns the reuse on.
+        uses_mtp_index_share = self.is_mtp_eagle and isinstance(
+            attn_metadata, MTPIndexShareMetadata)
+        with contextlib.ExitStack() as draft_scope:
+            if uses_mtp_index_share:
+                attn_metadata.set_in_mtp_draft_loop(True)
+                # Accepted counts let the indexer stash each gen's last-accepted row.
+                attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
+                # The metadata outlives this call, so clear the state even when a
+                # draft step raises: a stale draft-loop flag would make the next
+                # target forward reuse these selections. The loop writes
+                # set_skip_topk on the metadata yielded below, which is this same
+                # object: draft_kv_cache_context swaps buffers in place for every
+                # TrtllmAttentionMetadata, and sparse metadata all derive from it.
+                draft_scope.callback(_reset_mtp_index_share, attn_metadata)
+            draft_attn_metadata = draft_scope.enter_context(
+                self.draft_kv_cache_context(attn_metadata,
+                                            draft_kv_cache_manager))
             attn_metadata = draft_attn_metadata
             inputs["attn_metadata"] = draft_attn_metadata
-            if uses_dsa_mtp_metadata and is_dsa_cache_manager(
+            if self.is_mtp_eagle and is_dsa_cache_manager(
                     draft_kv_cache_manager):
                 # Overlap scheduling corrects kv_lens_cuda from the runtime
                 # accepted-token counts inside the captured graph. The target
@@ -795,7 +807,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # writes the separate DSA indexer cache at the same positions.
                 attn_metadata.on_update_kv_lens()
             for i in range(runtime_draft_len):
-                if uses_dsa_mtp_metadata:
+                if uses_mtp_index_share:
                     attn_metadata.set_skip_topk(i > 0)
                 # Run draft model (mode-specific via helper). The helper
                 # passes ``all_rank_num_tokens`` as a kwarg so the draft model
@@ -1003,11 +1015,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     "spec_metadata": spec_metadata,
                 }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
-
-        if uses_dsa_mtp_metadata:
-            attn_metadata.set_skip_topk(False)
-            attn_metadata.set_in_mtp_draft_loop(False)
-            attn_metadata.set_mtp_num_accepted(None)
 
         # Override with SA draft tokens after all draft layers have run,
         # so that draft layers never see SA tokens in their inputs.

@@ -89,17 +89,27 @@ class MLAStaticTileSchedulerParams:
         return values
 
     def __new_from_mlir_values__(self, values):
-        problem_shape_b = cutlass.new_from_mlir_values(self.problem_shape_b,
-                                                       (values[0], ))
-        problem_shape_s = cutlass.new_from_mlir_values(self.problem_shape_s,
-                                                       (values[1], ))
-        split_kv = cutlass.new_from_mlir_values(self.split_kv, (values[2], ))
-        problem_shape_b_fdd = cutlass.new_from_mlir_values(
-            self.problem_shape_b_fdd, (values[3], ))
-        problem_shape_s_fdd = cutlass.new_from_mlir_values(
-            self.problem_shape_s_fdd, (values[4], ))
-        split_kv_fdd = cutlass.new_from_mlir_values(self.split_kv_fdd,
-                                                    (values[5], ))
+        # Slice per field by that field's own extraction width, in
+        # __extract_mlir_values__ order. FastDivmodDivisor occupies 2 SSA values
+        # on nvidia-cutlass-dsl-internal, so fixed indices mis-slice (cutlass #3243).
+        fields = (
+            self.problem_shape_b,
+            self.problem_shape_s,
+            self.split_kv,
+            self.problem_shape_b_fdd,
+            self.problem_shape_s_fdd,
+            self.split_kv_fdd,
+        )
+        rebuilt = []
+        offset = 0
+        for field in fields:
+            width = len(cutlass.extract_mlir_values(field))
+            rebuilt.append(
+                cutlass.new_from_mlir_values(
+                    field, tuple(values[offset:offset + width])))
+            offset += width
+        (problem_shape_b, problem_shape_s, split_kv, problem_shape_b_fdd,
+         problem_shape_s_fdd, split_kv_fdd) = rebuilt
         return MLAStaticTileSchedulerParams(
             self.is_persistent,
             problem_shape_b,
@@ -281,16 +291,21 @@ class MLAStaticTileScheduler:
         return values
 
     def __new_from_mlir_values__(self, values):
-        assert len(values) == 13
-        new_params = cutlass.new_from_mlir_values(self.params, values[0:6])
-        new_current_work_linear_idx = cutlass.new_from_mlir_values(
-            self.current_work_linear_idx, [values[6]])
-        new_blk_coord = cutlass.new_from_mlir_values(self.blk_coord,
-                                                     values[7:10])
-        new_grid_shape = cutlass.new_from_mlir_values(self.grid_shape,
-                                                      values[10:])
-        return MLAStaticTileScheduler(new_params, new_current_work_linear_idx,
-                                      new_blk_coord, new_grid_shape)
+        # Width-driven slicing, as in MLAStaticTileSchedulerParams: params holds
+        # three FastDivmodDivisors, which are not 1 SSA value each on every
+        # cutlass-dsl build, so the old fixed 6/1/3/rest split mis-slices.
+        rebuilt = []
+        offset = 0
+        for field in (self.params, self.current_work_linear_idx, self.blk_coord,
+                      self.grid_shape):
+            width = len(cutlass.extract_mlir_values(field))
+            rebuilt.append(
+                cutlass.new_from_mlir_values(
+                    field, list(values[offset:offset + width])))
+            offset += width
+        assert offset == len(values), (
+            f"MLAStaticTileScheduler consumed {offset} of {len(values)} values")
+        return MLAStaticTileScheduler(*rebuilt)
 
 
 def create_mla_static_tile_scheduler(

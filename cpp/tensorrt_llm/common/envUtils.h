@@ -72,10 +72,10 @@ bool getEnvUseFineGrainedSync();
 void setFineGrainedSyncDisabledOverride(bool disabled);
 
 template <typename KernelFn, typename... Args>
-inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block, size_t dynamicShmSize,
-    cudaStream_t stream, Args&&... args)
+inline void launchWithPdl(char const* name, bool enablePdl, KernelFn kernelFn, dim3 grid, dim3 block,
+    size_t dynamicShmSize, cudaStream_t stream, Args&&... args)
 {
-    TLLM_LOG_DEBUG("Enable PDL in %s", name);
+    TLLM_LOG_DEBUG("PDL in %s: %s", name, enablePdl ? "enabled" : "disabled");
     cudaLaunchConfig_t kernelConfig;
     kernelConfig.gridDim = grid;
     kernelConfig.blockDim = block;
@@ -84,11 +84,18 @@ inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 g
 
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    attrs[0].val.programmaticStreamSerializationAllowed = enablePdl;
     kernelConfig.attrs = attrs;
     kernelConfig.numAttrs = 1;
 
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&kernelConfig, kernelFn, std::forward<Args>(args)...));
+}
+
+template <typename KernelFn, typename... Args>
+inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block, size_t dynamicShmSize,
+    cudaStream_t stream, Args&&... args)
+{
+    launchWithPdl(name, getEnvEnablePDL(), kernelFn, grid, block, dynamicShmSize, stream, std::forward<Args>(args)...);
 }
 
 bool getEnvUseUCXKvCache();

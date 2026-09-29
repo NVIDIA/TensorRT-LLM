@@ -16,11 +16,6 @@ Run all:
 Run one:
     pytest tests/unittest/_torch/visual_gen/test_wan_transformer.py -v -s -k t2v
     pytest tests/unittest/_torch/visual_gen/test_wan_transformer.py -v -s -k i2v
-
-Override checkpoint paths:
-    DIFFUSION_MODEL_PATH_WAN21_1_3B=/path/to/Wan2.1-T2V-1.3B-Diffusers \\
-    DIFFUSION_MODEL_PATH_WAN21_I2V_480P=/path/to/Wan2.1-I2V-14B-480P-Diffusers \\
-        pytest tests/unittest/_torch/visual_gen/test_wan_transformer.py -v -s
 """
 
 import os
@@ -28,13 +23,13 @@ import os
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import gc
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as HFWanTransformer3DModel
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import (
@@ -59,34 +54,6 @@ def _cleanup_gpu():
     yield
     gc.collect()
     torch.cuda.empty_cache()
-
-
-# ============================================================================
-# Path helpers
-# ============================================================================
-
-
-def _llm_models_root() -> str:
-    """Return LLM_MODELS_ROOT path if set in env, assert when it's set but not a valid path."""
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return str(root)
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
-
-
-WAN21_1_3B_PATH = _checkpoint("DIFFUSION_MODEL_PATH_WAN21_1_3B", "Wan2.1-T2V-1.3B-Diffusers")
-WAN21_I2V_480P_PATH = _checkpoint(
-    "DIFFUSION_MODEL_PATH_WAN21_I2V_480P", "Wan2.1-I2V-14B-480P-Diffusers"
-)
 
 
 COS_SIM_THRESHOLD = 0.99
@@ -365,9 +332,7 @@ class TestWanT2VTransformerCorrectness:
 
     @pytest.fixture(scope="class")
     def t2v_models(self):
-        if not os.path.exists(WAN21_1_3B_PATH):
-            pytest.skip(f"Checkpoint not found: {WAN21_1_3B_PATH}")
-        hf_model, our_model = _load_models(WAN21_1_3B_PATH)
+        hf_model, our_model = _load_models(get_checkpoint("Wan2.1-T2V-1.3B-Diffusers"))
         yield hf_model, our_model
         del hf_model, our_model
         torch.cuda.empty_cache()
@@ -434,12 +399,7 @@ class TestWanI2VTransformerCorrectness:
 
     @pytest.fixture(scope="class")
     def i2v_models(self):
-        if not WAN21_I2V_480P_PATH or not os.path.exists(WAN21_I2V_480P_PATH):
-            pytest.skip(
-                "Checkpoint not found. "
-                "Set DIFFUSION_MODEL_PATH_WAN21_I2V_480P=/path/to/Wan2.1-I2V-14B-480P-Diffusers"
-            )
-        hf_model, our_model = _load_models(WAN21_I2V_480P_PATH)
+        hf_model, our_model = _load_models(get_checkpoint("Wan2.1-I2V-14B-480P-Diffusers"))
         yield hf_model, our_model
         del hf_model, our_model
         torch.cuda.empty_cache()

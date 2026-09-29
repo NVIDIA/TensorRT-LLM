@@ -616,6 +616,12 @@ models:
         default: none
         status: stable
         required: false
+      parallel_tool_calls:
+        kind: openai
+        type: Optional[bool]
+        default: null
+        status: stable
+        required: false
       user:
         kind: openai
         type: Optional[str]
@@ -777,6 +783,12 @@ models:
         type: Optional[Dict[str, Any]]
         default: null
         status: stable
+        required: false
+      injected_chat_template_kwargs:
+        kind: extension
+        type: Optional[List[str]]
+        default: null
+        status: prototype
         required: false
       media_io_kwargs:
         kind: extension

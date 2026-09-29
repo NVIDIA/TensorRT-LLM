@@ -198,6 +198,7 @@ set(TRTLLM_LINK_LIBS
     cute_dsl_src
     runtime_src
     compressorKernels_src
+    fusedSamplingKernels_src
     mhcKernels_src
     userbuffers_src
     ${DECODER_SHARED_TARGET_0}
@@ -247,7 +248,7 @@ add_library(${SHARED_TARGET} SHARED)
 
 set_target_properties(
   ${SHARED_TARGET}
-  PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
+  PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
@@ -298,6 +299,10 @@ add_subdirectory(nanobind)
 
 if(BUILD_DEEP_EP)
   add_subdirectory(deep_ep)
+endif()
+
+if(BUILD_PYT AND BUILD_NCCL_EXTENSIONS)
+  add_subdirectory(nccl_extensions)
 endif()
 
 if(BUILD_DEEP_GEMM)

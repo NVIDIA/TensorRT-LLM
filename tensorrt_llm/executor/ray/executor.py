@@ -43,7 +43,6 @@ from ..postproc_worker import PostprocWorkerConfig
 from ..request import GenerationRequest
 from ..result import GenerationResult
 from ..rpc_proxy_mixin import RpcExecutorMixin
-from ..utils import has_event_loop
 from .gpu_worker import RayGPUWorker, RayWorkerWrapper
 
 __all__ = [
@@ -117,8 +116,10 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                 ]  # Placeholder, will be initialized in setup_async
                 self._mainloop_started = False  # DO NOT start mainloop until after setup_engine_remote_async is called
             else:
-                if not has_event_loop():
-                    self.init_workers_sync()
+                # Deferring is requested through defer_workers_init above, not
+                # inferred from the calling context: a synchronous LLM() built
+                # inside a coroutine still has to create its workers here.
+                self.init_workers_sync()
                 self.setup_engine_remote()
                 self.setup_mainloop(tasks=[self._fetch_responses_loop_async],
                                     thread_name="ray_executor_main_loop")

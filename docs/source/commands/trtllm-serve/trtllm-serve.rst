@@ -267,9 +267,7 @@ Metrics Endpoint
 
 .. note::
 
-   The metrics endpoint for the default PyTorch backend are in beta and are not as comprehensive as those for the TensorRT backend.
-
-   Some fields, such as CPU memory usage, are not yet available for the PyTorch backend.
+   The metrics endpoint is in beta. Some fields, such as CPU memory usage, are not yet available.
 
    Enabling ``enable_iter_perf_stats`` in the PyTorch backend can slightly impact performance, depending on the serving configuration.
 

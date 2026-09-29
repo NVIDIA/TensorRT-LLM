@@ -697,6 +697,7 @@ def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):
         pretrained_config=config,
         mapping=Mapping(world_size=4, rank=2, tp_size=4),
         quant_config=quant_config,
+        use_cute_dsl_blockscaling_mm=True,
     )
 
     mtp_layer = DeepseekV4MTP(
@@ -715,6 +716,8 @@ def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):
     assert mtp_layer.h_proj.out_features == config.hidden_size
     assert mtp_layer.e_proj.reduce_output is True
     assert mtp_layer.h_proj.reduce_output is True
+    assert mtp_layer.e_proj.use_cute_dsl_blockscaling_mm is True
+    assert mtp_layer.h_proj.use_cute_dsl_blockscaling_mm is True
     assert mtp_layer.e_proj.weight.dtype is torch.float8_e4m3fn
     assert mtp_layer.h_proj.weight.dtype is torch.float8_e4m3fn
     assert hasattr(mtp_layer.e_proj, "weight_scale")

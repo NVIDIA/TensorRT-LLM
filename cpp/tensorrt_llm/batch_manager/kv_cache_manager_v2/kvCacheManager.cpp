@@ -102,6 +102,11 @@ std::vector<int> PageIndexConverter::operator()(int baseIndex) const
 // KvCacheManager
 // ---------------------------------------------------------------------------
 
+uint32_t KvCacheManager::numLiveManagers() noexcept
+{
+    return PoisonHold::count();
+}
+
 KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink,
     std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec)
     : mConfig(config)
@@ -129,14 +134,7 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
 
 KvCacheManager::~KvCacheManager()
 {
-    try
-    {
-        shutdown();
-    }
-    catch (std::exception const& e)
-    {
-        TLLM_LOG_ERROR("%s", e.what());
-    }
+    KVCM2_POISON_ON_EXCEPT([this]() { shutdown(); });
 }
 
 void KvCacheManager::_checkNoLivingKvCaches(char const* api) const
@@ -147,7 +145,18 @@ void KvCacheManager::_checkNoLivingKvCaches(char const* api) const
 
 void KvCacheManager::shutdown()
 {
+    // Disposal, not work: a caller that detects corruption still has to be able to tear the
+    // manager down, so this succeeds while poisoned instead of rejecting. The cleanup below is
+    // skipped for the same reason every poisoned destructor skips its own -- the structures it
+    // would walk are known to be inconsistent -- so the manager's memory is leaked deliberately.
+    //
+    // The latch is read under the lock because it is normally set by a thread holding it: a read
+    // taken before blocking would only say the cache was intact before this call started waiting.
     auto const apiLock = lockExclusive();
+    if (Poison::poisoned())
+    {
+        return;
+    }
     _checkNoLivingKvCaches("shutdown()");
     clearReusableBlocks();
     TLLM_CHECK_DEBUG(mStorage);
@@ -167,6 +176,7 @@ void KvCacheManager::shutdown()
 
 void KvCacheManager::clearReusableBlocks()
 {
+    KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
     _checkNoLivingKvCaches("clear_reusable_blocks()");
     TLLM_CHECK_DEBUG(mRadixTree);
@@ -177,6 +187,7 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
     std::optional<bool> textOnly, bool enableRequestStats)
 {
+    KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
     if (!priorityCb)
     {
@@ -204,14 +215,39 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
 BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
     ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
 {
+    KVCM2_REJECT_IF_POISONED();
     return mRadixTree->match(reuseScope, inputTokens, knownNoDigest, enablePartialMatch(), mConfig.reuseMatchBackoff);
 }
 
 int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
 {
+    KVCM2_REJECT_IF_POISONED();
     // Shared: the traversal is read-only and the matched Block* never escape this call.
     auto const apiLock = lockShared();
     return matchReuse(reuseScope, inputTokens, knownNoDigest).numTokens;
+}
+
+std::optional<BlockKey> KvCacheManager::probeFirstNewBlockKey(
+    ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
+{
+    // The matched Block* remain protected until the key has been copied out.
+    // Call matchReuse directly: probeReuse would nest shared-lock acquisitions.
+    auto const apiLock = lockShared();
+    auto const match = matchReuse(reuseScope, inputTokens, knownNoDigest);
+    int const blockSize = tokensPerBlock();
+    int const blockIndex = match.numTokens / blockSize;
+    size_t const begin = static_cast<size_t>(blockIndex) * static_cast<size_t>(blockSize);
+    if (begin + static_cast<size_t>(blockSize) > static_cast<size_t>(inputTokens.size()))
+    {
+        return std::nullopt;
+    }
+
+    // Derive the boundary from the final, pruned match, not the raw token path.
+    // A partial match can end in a block with a different suffix, so only the
+    // preceding fully matched block supplies the query's exact prefix key.
+    BlockKey const previousKey
+        = blockIndex == 0 ? RootBlock::makeKey(reuseScope) : match.blocks[BlockOrdinal{blockIndex - 1}]->key;
+    return Block::makeKey(previousKey, inputTokens.begin() + begin, static_cast<size_t>(blockSize), knownNoDigest);
 }
 
 // ---- Memory pool queries --------------------------------------------------
@@ -408,6 +444,7 @@ TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() con
 
 bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
 {
+    KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
     // Same precondition as adjust(): _adjustLevel may defragment, invalidating any page index an
     // ACTIVE cache holds.
@@ -424,6 +461,7 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
     }
     catch (std::exception const& e)
     {
+        TLLM_LOG_WARNING("Failed to resize cache level %d to %zu: %s", level.value(), quota, e.what());
         return false;
     }
 }
@@ -506,6 +544,49 @@ SsmSnapshotIterationStatsByLifeCycle KvCacheManager::getAndResetSsmSnapshotItera
     return stats;
 }
 
+TypedVec<PoolGroupIndex, StorageStatistics> KvCacheManager::getStorageStatistics(CacheLevel cacheLevel) const
+{
+    auto const apiLock = lockShared();
+    TypedVec<PoolGroupIndex, StorageStatistics> result;
+    PoolGroupIndex const numPoolGroups = mStorage->numPoolGroups(cacheLevel);
+    result.reserve(numPoolGroups);
+    for (PoolGroupIndex poolGroup{0}; poolGroup < numPoolGroups; ++poolGroup)
+    {
+        result.push_back(mStorage->getStatistics(cacheLevel, poolGroup));
+    }
+    return result;
+}
+
+TypedVec<LifeCycleId, PoolGroupIndex> KvCacheManager::getLifeCyclePoolGroupIndices(CacheLevel cacheLevel) const
+{
+    TypedVec<LifeCycleId, PoolGroupIndex> result;
+    result.reserve(mLifeCycles.size());
+    for (LifeCycleId lifeCycle{0}; lifeCycle < mLifeCycles.size(); ++lifeCycle)
+    {
+        result.push_back(mStorage->getPoolGroupIndex(cacheLevel, lifeCycle));
+    }
+    return result;
+}
+
+void KvCacheManager::commitReusedBlocksByLevel(ReusedBlocksByLevelByLifeCycle const& byLifeCycle)
+{
+    for (auto const& [lifeCycle, byLevel] : byLifeCycle)
+    {
+        if (!byLevel.empty())
+        {
+            mIterReusedBlocksByLevel[lifeCycle].add(byLevel);
+        }
+    }
+}
+
+ReusedBlocksByLevelByLifeCycle KvCacheManager::getAndResetIterationReusedBlocksByLevel()
+{
+    auto const apiLock = lockExclusive();
+    ReusedBlocksByLevelByLifeCycle byLifeCycle;
+    byLifeCycle.swap(mIterReusedBlocksByLevel);
+    return byLifeCycle;
+}
+
 void KvCacheManager::recordRequestSuspended()
 {
     auto const apiLock = lockExclusive();
@@ -524,6 +605,42 @@ void KvCacheManager::recordRequestResumed()
         return;
     }
     ++mIterResumedRequests;
+}
+
+void KvCacheManager::recordDiskPrefetchBlocks(int64_t numBlocks)
+{
+    TLLM_CHECK_DEBUG(numBlocks >= 0);
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    mIterDiskPrefetchBlocks += numBlocks;
+}
+
+int64_t KvCacheManager::getAndResetIterationDiskPrefetchBlocks()
+{
+    auto const apiLock = lockExclusive();
+    auto const numBlocks = mIterDiskPrefetchBlocks;
+    mIterDiskPrefetchBlocks = 0;
+    return numBlocks;
+}
+
+void KvCacheManager::commitCachedTokensByLevel(CountsByLevel const& counts)
+{
+    TLLM_CHECK_DEBUG(std::all_of(counts.begin(), counts.end(), [](int64_t count) { return count >= 0; }));
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    addCountsByLevel(mIterCachedTokensByLevel, counts);
+}
+
+CountsByLevel KvCacheManager::getAndResetIterationCachedTokensByLevel()
+{
+    auto const apiLock = lockExclusive();
+    CountsByLevel counts;
+    std::swap(counts, mIterCachedTokensByLevel);
+    return counts;
 }
 
 std::pair<int64_t, int64_t> KvCacheManager::getAndResetIterationSuspendResumeStats()
@@ -595,6 +712,15 @@ PeakBlockStatsByPoolGroup KvCacheManager::getAndResetIterationPeakBlockStats(Cac
     _updateIterationPeakNumBlocks();
     PeakBlockStatsByPoolGroup peak = mIterationPeakNumBlocksByCacheLevel.at(cacheLevel);
     _resetIterationPeakNumBlocks(cacheLevel);
+    return peak;
+}
+
+PeakBlockStatsByCacheLevel KvCacheManager::getAndResetIterationPeakBlockStatsByLevel()
+{
+    auto const apiLock = lockExclusive();
+    _updateIterationPeakNumBlocks();
+    PeakBlockStatsByCacheLevel peak = mIterationPeakNumBlocksByCacheLevel;
+    _resetIterationPeakNumBlocks();
     return peak;
 }
 
@@ -913,6 +1039,7 @@ bool KvCacheManager::needAdjustment() const
 
 void KvCacheManager::adjust()
 {
+    KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
     for (KvCache* kvc : mLivingKvCaches)
         TLLM_CHECK_WITH_INFO(kvc->status() == KvCache::Status::SUSPENDED,
