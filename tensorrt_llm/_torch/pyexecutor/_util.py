@@ -1886,12 +1886,6 @@ class KvCacheCreator:
         if (self._mapping.has_cp_helix() and not self._is_standalone_dspark()):
             return ("Unified Helix KV cache requires a standalone "
                     "DSpark drafter.")
-        transceiver_config = self._cache_transceiver_config
-        if self._is_disagg and (transceiver_config is None
-                                or transceiver_config.transceiver_runtime
-                                != "PYTHON"):
-            return ("DSpark draft-state transfer requires the PYTHON "
-                    "transceiver on both workers.")
         return None
 
     def _get_draft_mapping(self) -> Mapping:

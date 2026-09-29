@@ -1283,7 +1283,7 @@ class DFlashWorker(SpecWorkerBase):
                     tokens_per_block=page_size,
                     has_context_attention=has_context_attention,
                 )
-            elif self._dflash_attention_backend == "FA4":
+            elif not unified and self._dflash_attention_backend == "FA4":
                 validate_dflash_fa4_runtime(dtype=dtype, head_dim=hd)
             # Settle the block table before committing to the pool: it is the
             # last thing that can rule the pool out, and falling back after
