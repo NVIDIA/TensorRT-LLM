@@ -115,6 +115,30 @@ void CUDAVirtualMemoryChunk::_release(bool destructing)
     }
 }
 
+void CUDAVirtualMemoryChunk::detachHostBackups(std::vector<IBuffer::UniquePtr>& backups)
+{
+    TLLM_CHECK_WITH_INFO(status() == MATERIALIZED, "Host backups require materialized allocations");
+    // Reserve before detaching so a vector allocation cannot free a backup under the manager lock.
+    backups.reserve(backups.size() + mConfigurators.size());
+    for (auto& configurator : mConfigurators)
+    {
+        auto backup = configurator->detachHostBackup();
+        if (backup != nullptr)
+        {
+            backups.push_back(std::move(backup));
+        }
+    }
+}
+
+IBuffer::UniquePtr OffloadConfigurator::detachHostBackup()
+{
+    if (mBackedStorage != nullptr)
+    {
+        TLLM_CU_CHECK(cuStreamSynchronize(mStream));
+    }
+    return std::move(mBackedStorage);
+}
+
 void OffloadConfigurator::setup(CUmemGenericAllocationHandle)
 {
     if (mBackedStorage != nullptr)
@@ -327,26 +351,15 @@ size_t CudaVirtualMemoryManager::releaseHostBackupsWithTag(std::string const& ta
     {
         std::unique_lock lock(mMutex);
         auto const [begin, end] = mEntries.equal_range(tag);
-        size_t count = 0;
         for (auto it = begin; it != end; ++it)
         {
             auto const& memory = it->second->second.mMemory;
             TLLM_CHECK_WITH_INFO(memory.status() == CUDAVirtualMemoryChunk::MATERIALIZED,
                 "Host backups can only be released after restoring all allocations for the tag");
-            count += memory.mConfigurators.size();
         }
-        // Reserve before transferring ownership so allocation failure leaves backups intact.
-        backups.reserve(count);
         for (auto it = begin; it != end; ++it)
         {
-            for (auto& configurator : it->second->second.mMemory.mConfigurators)
-            {
-                auto* offload = dynamic_cast<OffloadConfigurator*>(configurator.get());
-                if (offload != nullptr && offload->mBackedStorage != nullptr)
-                {
-                    backups.push_back(std::move(offload->mBackedStorage));
-                }
-            }
+            it->second->second.mMemory.detachHostBackups(backups);
         }
     }
     // Pinned-memory deallocation can be slow; do not hold the shared manager lock.

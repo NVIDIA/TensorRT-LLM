@@ -87,6 +87,12 @@ public:
         // is being destructed.
         virtual void setup(CUmemGenericAllocationHandle handle) = 0;
         virtual void teardown(CUmemGenericAllocationHandle handle, bool destructing) = 0;
+
+        //! Finish pending restoration and transfer ownership of any host backup.
+        virtual IBuffer::UniquePtr detachHostBackup()
+        {
+            return nullptr;
+        }
     };
 
     using ConfiguratorPtr = std::unique_ptr<Configurator>;
@@ -130,6 +136,9 @@ public:
      * Stop at the first thrown exception and propagates it.
      */
     void materialize();
+
+    //! Append detached host backups after their restoration copies complete. Requires MATERIALIZED status.
+    void detachHostBackups(std::vector<IBuffer::UniquePtr>& backups);
 
     /**
      * Release this CUDAVirtualMemoryChunk.
@@ -200,8 +209,6 @@ private:
     CUmemGenericAllocationHandle mHandle{};
     std::unique_ptr<Creator> mCreator;
     std::vector<std::unique_ptr<Configurator>> mConfigurators;
-
-    friend class CudaVirtualMemoryManager;
 };
 
 /**
@@ -342,6 +349,7 @@ struct OffloadConfigurator : CUDAVirtualMemoryChunk::Configurator
 
     void setup(CUmemGenericAllocationHandle handle) override;
     void teardown(CUmemGenericAllocationHandle handle, bool destructing) override;
+    IBuffer::UniquePtr detachHostBackup() override;
 
     CUdeviceptr mAddress;
     size_t mSize;
@@ -423,9 +431,11 @@ public:
 
     /**
      * Discard host backups of materialized allocations with the given tag.
-     * The caller must finish restoration copies and serialize this operation with
-     * release/materialize. Sleeping allocations are rejected without discarding any backups.
-     * Host buffers are detached under the manager lock, then freed outside it.
+     * Waits for restoration copies before detaching buffers. The caller must serialize
+     * this operation with release/materialize. Sleeping allocations are rejected without
+     * discarding any backups. Host buffers are detached under the manager lock, then freed
+     * outside it. Unlike per-allocation on-demand restoration, this keeps asynchronous
+     * restore copies and avoids holding the shared lock during host deallocation.
      * @return Number of host buffers freed.
      */
     size_t releaseHostBackupsWithTag(std::string const& tag);

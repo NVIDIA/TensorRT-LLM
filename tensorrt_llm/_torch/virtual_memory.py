@@ -143,7 +143,7 @@ def materialize_with_tag(*tags: str) -> int:
 
 
 def release_host_backups_with_tag(tag: str) -> int:
-    """Discard a tag's host backups after restoration copies have finished.
+    """Wait for restoration copies, then discard a tag's host backups.
 
     Serialize this operation with release/materialize for the same tag.
     Sleeping allocations are rejected. GPU allocations remain unchanged.

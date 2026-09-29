@@ -26,7 +26,9 @@
 #include "tensorrt_llm/runtime/virtualMemory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <future>
 #include <random>
 #include <tuple>
 #include <unistd.h>
@@ -246,6 +248,75 @@ TEST_P(VirtualMemoryOffloadConfigurator, Test)
 
 INSTANTIATE_TEST_SUITE_P(
     Backends, VirtualMemoryOffloadConfigurator, ::testing::Values(MemoryType::kCPU, MemoryType::kPINNED));
+
+TEST_P(VirtualMemoryOffloadConfigurator, DetachWaitsForRestoreStream)
+{
+    using namespace std::chrono_literals;
+    std::size_t constexpr kSize = 4 * 1024 * 1024;
+    std::uint8_t constexpr kValue = 42;
+    auto buffer = BufferManager::gpuSync(kSize);
+    CudaStream stream;
+    OffloadConfigurator configurator(reinterpret_cast<CUdeviceptr>(buffer->data()), kSize, GetParam(), stream.get());
+    EXPECT_EQ(configurator.detachHostBackup(), nullptr);
+    TLLM_CUDA_CHECK(cudaMemset(buffer->data(), kValue, kSize));
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    configurator.teardown({}, false);
+    auto const* backupAddress = configurator.mBackedStorage->data();
+    TLLM_CUDA_CHECK(cudaMemset(buffer->data(), 0, kSize));
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    configurator.setup({});
+
+    CUcontext context;
+    TLLM_CU_CHECK(cuCtxGetCurrent(&context));
+    std::promise<void> detachStarted;
+    std::future<IBuffer::UniquePtr> detached;
+    {
+        struct StreamGate
+        {
+            cudaStream_t stream;
+            std::promise<void> entered;
+            std::promise<void> release;
+            std::shared_future<void> released = release.get_future().share();
+            std::atomic<bool> timedOut{false};
+
+            ~StreamGate()
+            {
+                release.set_value();
+                EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+                EXPECT_FALSE(timedOut.load());
+            }
+        } gate{stream.get()};
+
+        TLLM_CUDA_CHECK(cudaLaunchHostFunc(
+            stream.get(),
+            [](void* data)
+            {
+                auto& gate = *static_cast<StreamGate*>(data);
+                gate.entered.set_value();
+                gate.timedOut = gate.released.wait_for(10s) != std::future_status::ready;
+            },
+            &gate));
+        ASSERT_EQ(gate.entered.get_future().wait_for(5s), std::future_status::ready);
+        detached = std::async(std::launch::async,
+            [&]
+            {
+                TLLM_CU_CHECK(cuCtxSetCurrent(context));
+                detachStarted.set_value();
+                return configurator.detachHostBackup();
+            });
+        ASSERT_EQ(detachStarted.get_future().wait_for(5s), std::future_status::ready);
+        // Keep the returned buffer alive so cudaFreeHost cannot mask a missing stream wait.
+        EXPECT_EQ(detached.wait_for(100ms), std::future_status::timeout);
+    }
+    auto backup = detached.get();
+    ASSERT_NE(backup, nullptr);
+    EXPECT_EQ(backup->data(), backupAddress);
+    EXPECT_EQ(configurator.mBackedStorage, nullptr);
+    EXPECT_EQ(configurator.detachHostBackup(), nullptr);
+    std::vector<std::uint8_t> restored(kSize);
+    TLLM_CUDA_CHECK(cudaMemcpy(restored.data(), buffer->data(), kSize, cudaMemcpyDeviceToHost));
+    EXPECT_TRUE(std::all_of(restored.begin(), restored.end(), [](auto value) { return value == kValue; }));
+}
 
 // Test CUDAVirtualMemoryChunk calls creator and configurators in correct order
 TEST_F(VirtualMemoryTest, TestOrder)
@@ -1595,6 +1666,7 @@ TEST_P(VirtualMemoryAllocatorOffloadTest, BackupLifetimeAndIsolation)
     TLLM_CUDA_CHECK(cudaMemset(other->data(), kOtherValue, kSize));
     TLLM_CUDA_CHECK(cudaDeviceSynchronize());
     ASSERT_EQ(hostBytes(), baseline);
+    EXPECT_EQ(manager.releaseHostBackupsWithTag(tag), 0);
     ASSERT_EQ(manager.releaseWithTag(otherTag), 1);
     ASSERT_EQ(hostBytes(), baseline + kSize);
 
@@ -1608,12 +1680,15 @@ TEST_P(VirtualMemoryAllocatorOffloadTest, BackupLifetimeAndIsolation)
         EXPECT_THROW(manager.releaseHostBackupsWithTag(tag), std::runtime_error);
         ASSERT_EQ(hostBytes(), baseline + 2 * kSize);
         ASSERT_EQ(manager.materializeWithTag(tag), 1);
-        stream->synchronize();
         ASSERT_EQ(hostBytes(), baseline + 2 * kSize);
         if (releaseBackup)
         {
             EXPECT_EQ(manager.releaseHostBackupsWithTag(tag), 1);
             EXPECT_EQ(manager.releaseHostBackupsWithTag(tag), 0);
+        }
+        else
+        {
+            stream->synchronize();
         }
         EXPECT_EQ(hostBytes(), baseline + (releaseBackup ? kSize : 2 * kSize));
         ASSERT_EQ(buffer->data(), pointer);
