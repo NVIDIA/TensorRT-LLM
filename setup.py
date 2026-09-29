@@ -58,13 +58,13 @@ def sanity_check():
             'If you are attempting to use the pip development mode (editable installation), '
             'please execute `scripts/build_wheel.py` first, and then run `pip install -e .`.'
         )
-    for package in ("fmha_sm100", "trtllm_flash_attn"):
-        if not (Path(__file__).resolve().parent / "3rdparty" / package /
-                "__init__.py").is_file():
-            raise ImportError(
-                f"The `{package}` package is missing. Run `scripts/build_wheel.py` "
-                "first, or use TRTLLM_USE_PRECOMPILED with a wheel built from this revision."
-            )
+    if not (Path(__file__).resolve().parent / "3rdparty" /
+            "fmha_sm100").is_dir():
+        raise ImportError(
+            'The `fmha_sm100` package is missing. Please execute '
+            '`scripts/build_wheel.py` first (CMake FetchContent stages it under '
+            '3rdparty/fmha_sm100), or use TRTLLM_USE_PRECOMPILED to extract it '
+            'from a published wheel.')
 
 
 def get_version():
@@ -144,6 +144,14 @@ class BinaryDistribution(Distribution):
 on_windows = platform.system() == "Windows"
 required_deps, extra_URLs = parse_requirements(
     Path("requirements-windows.txt" if on_windows else "requirements.txt"))
+if not on_windows:
+    # Source-build bootstrap requirements accept stock FA4; installed TRT-LLM
+    # requires the separately built wheel with the per-call tuning API.
+    required_deps = [
+        dep for dep in required_deps if not dep.startswith("flash-attn-4==")
+    ]
+    fa4_deps, _ = parse_requirements(Path("requirements-fa4.txt"))
+    required_deps.extend(fa4_deps)
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
@@ -416,43 +424,38 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                         os.unlink(dst_file)
                     shutil.copy2(src_file, dst_file)
 
-        for package in ("fmha_sm100", "trtllm_flash_attn"):
-            source_package = os.path.join(precompiled_location, "3rdparty",
-                                          package)
-            if not os.path.isdir(source_package):
-                raise SetupError(
-                    f"Precompiled directory {precompiled_location} predates {package} "
-                    f"packaging and does not contain 3rdparty/{package}. Use a "
-                    f"precompiled source built with {package} packaging support."
-                )
-            dst_package = os.path.join("3rdparty", package)
-            if link_artifacts:
-                if os.path.islink(dst_package) and os.path.realpath(
-                        dst_package) == os.path.realpath(source_package):
-                    # Already points at this source; leave the shared link alone.
-                    print(f"Keeping existing {package} symlink: {dst_package}")
-                else:
-                    # A stale link (pointing at a different source) or a real
-                    # directory: replace it so the package tracks the same source
-                    # as the other linked artifacts.
-                    if os.path.islink(dst_package):
-                        os.unlink(dst_package)
-                    elif os.path.isdir(dst_package):
-                        shutil.rmtree(dst_package)
-                    # copytree() creates the parent below; os.symlink() does not.
-                    os.makedirs(os.path.dirname(dst_package), exist_ok=True)
-                    print(
-                        f"Linking {package} from local directory: {source_package}"
-                    )
-                    os.symlink(source_package, dst_package)
+        source_fmha = os.path.join(precompiled_location, "3rdparty",
+                                   "fmha_sm100")
+        if not os.path.isdir(source_fmha):
+            raise SetupError(
+                f"Precompiled directory {precompiled_location} predates MSA "
+                "packaging and does not contain 3rdparty/fmha_sm100. Use a "
+                "precompiled source built with MSA packaging support.")
+        dst_fmha = os.path.join("3rdparty", "fmha_sm100")
+        if link_artifacts:
+            if os.path.islink(dst_fmha) and os.path.realpath(
+                    dst_fmha) == os.path.realpath(source_fmha):
+                # Already points at this source; leave the shared link alone.
+                print(f"Keeping existing fmha_sm100 symlink: {dst_fmha}")
             else:
-                print(
-                    f"Copying {package} from local directory: {source_package}")
-                if os.path.islink(dst_package):
-                    os.unlink(dst_package)
-                elif os.path.isdir(dst_package):
-                    shutil.rmtree(dst_package)
-                shutil.copytree(source_package, dst_package)
+                # A stale link (pointing at a different source) or a real
+                # directory: replace it so fmha_sm100 tracks the same source
+                # as the other linked artifacts.
+                if os.path.islink(dst_fmha):
+                    os.unlink(dst_fmha)
+                elif os.path.isdir(dst_fmha):
+                    shutil.rmtree(dst_fmha)
+                # copytree() creates the parent below; os.symlink() does not.
+                os.makedirs(os.path.dirname(dst_fmha), exist_ok=True)
+                print(f"Linking fmha_sm100 from local directory: {source_fmha}")
+                os.symlink(source_fmha, dst_fmha)
+        else:
+            print(f"Copying fmha_sm100 from local directory: {source_fmha}")
+            if os.path.islink(dst_fmha):
+                os.unlink(dst_fmha)
+            elif os.path.isdir(dst_fmha):
+                shutil.rmtree(dst_fmha)
+            shutil.copytree(source_fmha, dst_fmha)
 
         source_nccl_extensions = os.path.join(precompiled_location, "3rdparty",
                                               "nccl_extensions")
@@ -520,16 +523,18 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
         wheel_path = precompiled_path
 
     with zipfile.ZipFile(wheel_path) as wheel:
-        for package in ("fmha_sm100", "trtllm_flash_attn"):
-            if f"{package}/__init__.py" not in wheel.namelist():
-                raise SetupError(
-                    f"Precompiled wheel {wheel_path} does not contain {package}. "
-                    "Use a precompiled wheel built from this revision.")
-            destination = os.path.join("3rdparty", package)
-            if os.path.islink(destination):
-                os.unlink(destination)
-            elif os.path.isdir(destination):
-                shutil.rmtree(destination)
+        dst_fmha = os.path.join("3rdparty", "fmha_sm100")
+        wheel_has_fmha = any(
+            file.filename.startswith("fmha_sm100/") for file in wheel.filelist)
+        if not wheel_has_fmha:
+            raise SetupError(
+                f"Precompiled wheel {wheel_path} predates MSA packaging and "
+                "does not contain fmha_sm100. Use a precompiled wheel built "
+                "with MSA packaging support.")
+        if os.path.islink(dst_fmha):
+            os.unlink(dst_fmha)
+        elif os.path.isdir(dst_fmha):
+            shutil.rmtree(dst_fmha)
         dst_nccl_extensions = os.path.join("3rdparty", "nccl_extensions")
         if os.path.islink(dst_nccl_extensions):
             os.unlink(dst_nccl_extensions)
@@ -545,9 +550,9 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
             if should_skip_precompiled_package_data(file.filename):
                 continue
 
-            # Top-level patched JIT packages; stage under 3rdparty for
+            # Top-level MSA package in the wheel; stage under 3rdparty for
             # setuptools package_dir, matching scripts/build_wheel.py.
-            if file.filename.startswith(("fmha_sm100/", "trtllm_flash_attn/")):
+            if file.filename.startswith("fmha_sm100/"):
                 print(
                     f"Extracting and including {file.filename} from precompiled wheel."
                 )
@@ -646,13 +651,10 @@ else:
 # internal absolute imports (e.g., "from triton_kernels.foo import bar") work.
 packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 
-# Patched JIT packages are staged under 3rdparty/ by build_wheel.py from the
+# fmha_sm100 is staged under 3rdparty/ by scripts/build_wheel.py from the
 # CMake FetchContent tree (same packaging role as tensorrt_llm/deep_ep).
-package_dirs = {
-    "fmha_sm100": "3rdparty/fmha_sm100",
-    "trtllm_flash_attn": "3rdparty/trtllm_flash_attn",
-}
-packages += ["fmha_sm100", "trtllm_flash_attn"]
+package_dirs = {"fmha_sm100": "3rdparty/fmha_sm100"}
+packages += ["fmha_sm100"]
 
 # NCCL-EP is staged from the source-built nccl-extensions wheel under
 # 3rdparty/. Its ``nccl`` package is a namespace shared with nccl4py, so
@@ -728,7 +730,6 @@ setup(
         'tensorrt_llm':
         package_data,
         'triton_kernels': ['LICENSE', 'VERSION', 'README.md'],
-        'trtllm_flash_attn': ['LICENSE', 'AUTHORS'],
         'fmha_sm100': [
             '*.py',
             'csrc/**/*',

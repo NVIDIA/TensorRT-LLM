@@ -1,4 +1,7 @@
 -r requirements.txt
+# Build the source-patched FA4 wheel with its upstream setuptools backend.
+setuptools>=75,<80
+setuptools-scm>=8
 # Pin the exact diffusers version VisualGen LPIPS tests run against; install it
 # before pytest collection so already-imported Diffusers modules match the
 # package files. 0.40.0 provides the MiniMax-H3 reference implementation.

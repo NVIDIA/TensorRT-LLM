@@ -26,7 +26,7 @@ and its currency-check note) under ``..cute_dsl_kernels.blackwell.sol_attn``
 / ``sol_attn_backend.py``. Only the sm100 (B200/GB200)
 Blackwell) kernels are carried; the upstream sm89/sm90 kernels and the Triton
 reference path are not, and the FlashAttention CuTe helpers they needed come
-from the source-built ``trtllm_flash_attn`` package bundled in the TRT-LLM wheel.
+from the ``flash-attn-4`` dependency rather than a vendored copy.
 
 This file is only the TRT-LLM AttentionBackend adapter around that kernel's
 public BTHD entry point, plus the dense_layers layer-skip guard.

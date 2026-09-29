@@ -16,20 +16,23 @@ from tensorrt_llm._torch.visual_gen.attention_backend import fa4_autotuner as fa
 @pytest.fixture
 def runtime(monkeypatch):
     """Mock the optional FA4 dependency, never a timing or numerical result."""
-    interface = ModuleType("trtllm_flash_attn.interface")
+    interface = ModuleType("flash_attn.cute.interface")
     interface._flash_attn_fwd = Mock(return_value=(torch.empty(0), torch.empty(0), "diagnostics"))
-    utils = ModuleType("trtllm_flash_attn.utils")
+    utils = ModuleType("flash_attn.cute.utils")
     utils._get_disable_2cta_default = Mock(return_value=False)
     utils._get_use_clc_scheduler_default = Mock(return_value=False)
-    cute = ModuleType("trtllm_flash_attn")
+    cute = ModuleType("flash_attn.cute")
     cute.utils = utils
-    build_info = ModuleType("trtllm_flash_attn._build_info")
+    build_info = ModuleType("flash_attn.cute._trtllm_build_info")
     build_info.BUILD_ID = ("4.0.0b19", "test-revision", "test-source", "test-patch")
+    package = ModuleType("flash_attn")
+    package.cute = cute
     for name, module in (
-        ("trtllm_flash_attn._build_info", build_info),
-        ("trtllm_flash_attn", cute),
-        ("trtllm_flash_attn.interface", interface),
-        ("trtllm_flash_attn.utils", utils),
+        ("flash_attn", package),
+        ("flash_attn.cute._trtllm_build_info", build_info),
+        ("flash_attn.cute", cute),
+        ("flash_attn.cute.interface", interface),
+        ("flash_attn.cute.utils", utils),
     ):
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(fa4, "_require_tuning_api", lambda: None)
@@ -169,10 +172,10 @@ def test_cpu_and_causal_inputs_are_ineligible() -> None:
     assert not fa4.can_tune(*inputs, causal=True)
 
 
-def test_cache_identity_separates_bundled_fa4_builds(runtime, monkeypatch) -> None:
+def test_cache_identity_separates_patched_fa4_builds(runtime, monkeypatch) -> None:
     inputs = _inputs()
     runner = fa4.Fa4Runner(inputs, 0.125)
     original = runner.unique_id()
-    build_info = sys.modules["trtllm_flash_attn._build_info"]
+    build_info = sys.modules["flash_attn.cute._trtllm_build_info"]
     monkeypatch.setattr(build_info, "BUILD_ID", (*build_info.BUILD_ID, "new-patch"))
     assert runner.unique_id() != original

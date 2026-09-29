@@ -875,6 +875,34 @@ def install_editable_package(venv_python: Path) -> None:
     build_run(f"\"{venv_python}\" -m pip install -e .[devel]")
 
 
+def build_fa4_wheel(project_dir: Path, build_dir: Path,
+                    venv_python: Path) -> Path:
+    """Build and install the pinned FA4 dependency for this build environment."""
+    wheel_dir = build_dir / "fa4-wheel"
+    run([
+        str(venv_python),
+        str(project_dir / "3rdparty" / "prepare_fa4.py"),
+        "--source",
+        str(build_dir / "_deps" / "flash_attn_4-src"),
+        "--destination",
+        str(build_dir / "fa4-package"),
+        "--wheel-dir",
+        str(wheel_dir),
+    ],
+        check=True)
+    wheels = list(wheel_dir.glob("flash_attn_4-*.whl"))
+    if len(wheels) != 1:
+        raise RuntimeError(f"Expected one patched FA4 wheel at {wheel_dir}")
+    wheel = wheels[0]
+    run([
+        str(venv_python), "-m", "pip", "install", "--no-deps",
+        "--force-reinstall",
+        str(wheel)
+    ],
+        check=True)
+    return wheel
+
+
 def has_sm90_or_newer(cuda_architectures: str) -> bool:
     """Return whether a CUDA architecture list includes an SM90+ target."""
     if cuda_architectures == "all":
@@ -1589,16 +1617,7 @@ def main(*,
             build_dir / "tensorrt_llm" / "flash_mla" / "python" / "flash_mla",
             pkg_dir / "flash_mla")
 
-    # FA4 is pure Python with runtime CuTe JIT; ship its patched sources.
-    run([
-        str(venv_python),
-        str(project_dir / "3rdparty" / "prepare_fa4.py"),
-        "--source",
-        str(build_dir / "_deps" / "flash_attn_4-src"),
-        "--destination",
-        str(wheel_project_dir / "3rdparty" / "trtllm_flash_attn"),
-    ],
-        check=True)
+    fa4_wheel = build_fa4_wheel(project_dir, build_dir, venv_python)
 
     # Stage the FetchContent-patched MSA package for setup.py packaging.
     msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
@@ -1671,6 +1690,10 @@ def main(*,
                 staging_build = Path(staging_dir) / "build"
                 if staging_build.exists():
                     clear_folder(staging_build)
+
+        for stale_wheel in dist_dir.glob("flash_attn_4-*.whl"):
+            stale_wheel.unlink()
+        copy(fa4_wheel, dist_dir)
 
         extra_wheel_build_args = os.getenv("EXTRA_WHEEL_BUILD_ARGS", "")
         plat_name_arg = ""

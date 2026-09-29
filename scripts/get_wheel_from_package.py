@@ -79,6 +79,7 @@ def get_wheel_from_package(arch, artifact_path, timeout):
     build_dir.mkdir(parents=True, exist_ok=True)
 
     wheel_files = glob.glob(str(tmp_dir / "tensorrt_llm*.whl"))
+    wheel_files += glob.glob(str(tmp_dir / "flash_attn_4-*.whl"))
     for wheel_file in wheel_files:
         shutil.move(wheel_file, str(build_dir))
         print(f"Moved wheel file: {wheel_file} -> {build_dir}")

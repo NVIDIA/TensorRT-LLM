@@ -4024,7 +4024,7 @@ def runLLMDocBuild(pipeline, config)
         sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl TensorRT-LLM/flash_attn_4-*.whl")
 
     // Step 3: build doc
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y doxygen python3-pip graphviz")
@@ -5125,7 +5125,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 // test_llm_update_weights_nemotron_h is waived under nvbugs/6729495.
             }
             if (!skipInstallWheel) {
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl TensorRT-LLM/flash_attn_4-*.whl")
             }
             if (stageName.contains("-ModelExpress-")) {
                 // The wheel goes in with --no-deps above, so its `mx` extra never
@@ -5608,7 +5608,7 @@ def checkPipInstall(pipeline, wheel_path)
     def wheelArtifactLinks = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
     trtllm_utils.llmExecStepWithRetry(pipeline, script: """
         cd ${LLM_ROOT}/tests/unittest && \
-        python3 check_pip_install.py --wheel_path ${wheelArtifactLinks}
+        PIP_FIND_LINKS=${wheelArtifactLinks.substring(0, wheelArtifactLinks.lastIndexOf('/') + 1)} python3 check_pip_install.py --wheel_path ${wheelArtifactLinks}
         """)
 }
 
@@ -5745,7 +5745,7 @@ def runLLMBuild(
         sh "bash -c 'pip3 show tensorrt || true'"
     }
 
-    def wheelName = sh(returnStdout: true, script: 'cd tensorrt_llm/build && ls -1 *.whl').trim()
+    def wheelName = sh(returnStdout: true, script: 'cd tensorrt_llm/build && ls -1 tensorrt_llm-*.whl').trim()
     def rootWheelUploadPath = "${cpu_arch}/${wheel_path}"
     // DLFW publishes the built public-version wheel under its subdirectory. Other
     // builds continue to publish the built wheel at the original path.
@@ -5755,6 +5755,15 @@ def runLLMBuild(
     trtllm_utils.uploadArtifacts(
         "tensorrt_llm/build/${wheelName}",
         "${UPLOAD_PATH}/${builtWheelUploadPath}")
+
+    trtllm_utils.uploadArtifacts(
+        "tensorrt_llm/build/flash_attn_4-*.whl",
+        "${UPLOAD_PATH}/${builtWheelUploadPath}")
+    if (is_dlfw) {
+        trtllm_utils.uploadArtifacts(
+            "tensorrt_llm/build/flash_attn_4-*.whl",
+            "${UPLOAD_PATH}/${rootWheelUploadPath}")
+    }
 
     def uploadedWheelPath = "${builtWheelUploadPath}${wheelName}"
     def wheelPath = uploadedWheelPath
@@ -5810,7 +5819,7 @@ def runLLMBuild(
     }
 
     // Test preview installation
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install pytest build/tensorrt_llm-*.whl")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install --find-links=build pytest build/tensorrt_llm-*.whl")
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
     }
@@ -5865,7 +5874,7 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get remove -y python3-pygments")
 
     // Test preview installation
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'pip3 install pytest tensorrt_llm-*.whl'")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'pip3 install --find-links=${whlUrl.substring(0, whlUrl.lastIndexOf('/') + 1)} pytest tensorrt_llm-*.whl'")
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
     }

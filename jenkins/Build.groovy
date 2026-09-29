@@ -499,7 +499,7 @@ def runLLMBuild(
 
     sh "cp ${LLM_ROOT}/tensorrt_llm/version.py TensorRT-LLM/src/tensorrt_llm/version.py"
     // Step 3: packaging wheels into tarfile
-    sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
+    sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl ${LLM_ROOT}/build/flash_attn_4-*.whl TensorRT-LLM/"
 
     // Step 4: packaging attribution files into tarfile when they exist
     sh "mkdir -p TensorRT-LLM/attribution"

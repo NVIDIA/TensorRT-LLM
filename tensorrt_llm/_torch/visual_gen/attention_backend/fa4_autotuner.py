@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Experimental FA4 dense forward tuning using per-call dependency controls.
 
-Uses the source-built FA4 package shipped in the TRT-LLM wheel. Import this
+Uses the patched FA4 wheel built alongside TRT-LLM. Import this
 module after flash_attn4 has installed the CUTLASS compatibility shims.
 """
 
@@ -20,12 +20,12 @@ _TUNING_CONFIG = TuningConfig()
 
 @lru_cache(maxsize=1)
 def _require_tuning_api() -> None:
-    from trtllm_flash_attn.interface import _flash_attn_fwd
+    from flash_attn.cute.interface import _flash_attn_fwd
 
     if getattr(_flash_attn_fwd, "visual_gen_tuning_api", None) != 1:
         raise RuntimeError(
-            "The bundled FA4 package is missing its per-call tuning API. "
-            "Rebuild TRT-LLM with scripts/build_wheel.py or install a matching TRT-LLM wheel."
+            "The patched FA4 package is missing its per-call tuning API. "
+            "Install the patched flash-attn-4 wheel built alongside TRT-LLM."
         )
 
 
@@ -58,7 +58,7 @@ class Fa4Runner(TunableRunner):
     """Time CTA count and exp2 emulation jointly without modifying FA4 globals."""
 
     def __init__(self, inputs: list[torch.Tensor], scale: float) -> None:
-        from trtllm_flash_attn import utils
+        from flash_attn.cute import utils
 
         _require_tuning_api()
         self.scale = scale
@@ -68,7 +68,7 @@ class Fa4Runner(TunableRunner):
         self.tensor_metadata = tuple((str(t.dtype), tuple(t.stride())) for t in inputs)
 
     def unique_id(self) -> tuple:
-        from trtllm_flash_attn._build_info import BUILD_ID
+        from flash_attn.cute._trtllm_build_info import BUILD_ID
 
         # Shapes are keyed by AutoTuner; strides/dtypes and runtime controls are not.
         return (
@@ -107,7 +107,7 @@ class Fa4Runner(TunableRunner):
         do_preparation: bool = False,
         **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        from trtllm_flash_attn.interface import _flash_attn_fwd
+        from flash_attn.cute.interface import _flash_attn_fwd
 
         tuning_kwargs = {}
         if tactic != -1:

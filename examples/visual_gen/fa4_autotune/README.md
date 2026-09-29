@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 This draft demonstrates selecting FA4's CTA count and exp2 emulation together
 using TRT-LLM's existing warmup `AutoTuner`. It is opt-in. TRT-LLM's build now
-fetches, patches and bundles FA4 b19 in the wheel; users do not patch their
+fetches and patches FA4 b19, then builds a companion FA4 wheel; users do not patch their
 installation. This draft still needs GPU and end-to-end performance validation.
 
 ## Why tune both?
@@ -51,10 +51,12 @@ The explicit capability marker prevents the opt-in path from silently pretending
 to tune an unpatched dependency.
 
 The patch lives at `3rdparty/patches/flash_attn_4_b19.patch`. CMake applies it
-while fetching the pinned source; `scripts/build_wheel.py` stages the validated
-result as `trtllm_flash_attn`, and `setup.py` bundles it into the TRT-LLM wheel.
+while fetching the pinned source; `scripts/build_wheel.py` builds the validated
+result as `flash-attn-4==4.0.0b19+trtllm.1`, retaining `flash_attn.cute`.
+The TRT-LLM wheel pins that exact dependency.
 Python examples and `trtllm-serve` therefore use the same patched implementation.
-There is no runtime patch step or separate FA4 wheel to install.
+Install the generated wheels with `pip install --find-links=build build/tensorrt_llm-*.whl`.
+The release container installs the companion FA4 wheel automatically.
 
 See [FA4 build integration](../../../3rdparty/flash-attn-4.md) for source and
 editable installs, version-bump checks and dependency provenance. A newer FA4

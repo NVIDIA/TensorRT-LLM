@@ -13,7 +13,8 @@
 # that provides NO importable `tensorrt` module -- it uninstalls the container's
 # good TensorRT and breaks `import tensorrt` (and thus `import tensorrt_llm`).
 # So we install the wheel with --no-deps (libs + python only, tensorrt
-# untouched). The remaining runtime deps are expected to already be present in
+# untouched), along with the companion patched FA4 wheel. The remaining
+# runtime deps are expected to already be present in
 # the pinned container image (kept in sync with requirements.txt), so we don't
 # reinstall them here.
 #
@@ -55,7 +56,7 @@ fi
 # 1. Wheel WITHOUT deps -> never touches tensorrt. --force-reinstall so the BOLT
 #    libs overlay any preinstalled trtllm (release image).
 echo "[INFO] Installing BOLT wheel (--no-deps): $(basename "$WHEEL")"
-pip install --no-deps --force-reinstall "$WHEEL"
+pip install --no-deps --force-reinstall "$WHEEL" "$EXTRACT"/TensorRT-LLM/flash_attn_4-*.whl
 
 # 2. Verify from a neutral cwd so the extracted source tree doesn't shadow the
 #    installed package (a source `tensorrt_llm/` has no compiled bindings).

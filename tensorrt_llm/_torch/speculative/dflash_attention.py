@@ -69,11 +69,11 @@ def get_dflash_fa4_fwd() -> Callable[..., tuple]:
     """Load the FlashAttention-4 (CuTe DSL) forward."""
     try:
         install_cutlass_dsl_compatibility()
-        from trtllm_flash_attn.interface import _flash_attn_fwd
+        from flash_attn.cute.interface import _flash_attn_fwd
     except (ImportError, OSError, AttributeError) as error:
         raise RuntimeError(
-            "DFlash FA4 attention requires the bundled trtllm_flash_attn package. "
-            "Rebuild TRT-LLM or install a matching TRT-LLM wheel."
+            "DFlash FA4 attention requires a flash-attn build with the CuTe DSL "
+            "interface (flash_attn.cute)."
         ) from error
     return _flash_attn_fwd
 
@@ -98,7 +98,7 @@ def validate_dflash_fa4_runtime(
             f"DFlash FA4 attention backend is supported on SM90 only, got SM{sm}. "
             "Use attention_backend='VANILLA'."
         )
-    # Mirrors trtllm_flash_attn.interface._validate_head_dims for SM90.
+    # Mirrors flash_attn.cute.interface._validate_head_dims for SM90.
     if not (8 <= head_dim <= 256) or head_dim % 8 != 0:
         raise RuntimeError(f"DFlash FA4 attention does not support head_dim={head_dim} on SM90.")
 

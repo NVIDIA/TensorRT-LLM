@@ -38,7 +38,7 @@ from .interface import AttentionBackend, AttentionTensorLayout
 _flash_attn_combine_import_error = None
 try:
     _install_cutlass_dsl_compatibility()
-    from trtllm_flash_attn.interface import flash_attn_combine as _flash_attn_combine
+    from flash_attn.cute.interface import flash_attn_combine as _flash_attn_combine
 except (ImportError, OSError) as e:
     _flash_attn_combine = None
     _flash_attn_combine_import_error = e

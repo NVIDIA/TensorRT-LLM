@@ -99,7 +99,8 @@ partial_json_parser
 mcp>=1.23.0,<2.0.0 # 2.0.0 removed mcp.server.fastmcp; scaffolding still uses the 1.x APIs
 apache-tvm-ffi==0.1.13.post2 # required by the CUTLASS DSL TVM-FFI provider
 torch-c-dlpack-ext==0.1.3 # used for reduce nvidia-cutlass-dsl host overhead, optional package for improved torch tensor calling perf
-# FA4 is source-built and bundled by 3rdparty/prepare_fa4.py.
+# Bootstrap pin; setup.py uses the patched runtime pin from requirements-fa4.txt.
+flash-attn-4==4.0.0b19
 mistral-common>=1.10.0
 torchao>=0.14.1,<0.16.0
 cuda-core

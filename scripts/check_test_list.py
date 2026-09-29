@@ -906,7 +906,8 @@ def install_python_dependencies(llm_src):
                    shell=True,
                    check=True)
     subprocess.run(
-        f"pip3 install --force-reinstall --no-deps {llm_src}/../tensorrt_llm-*.whl",
+        f"pip3 install --force-reinstall --no-deps {llm_src}/../tensorrt_llm-*.whl "
+        f"{llm_src}/../flash_attn_4-*.whl",
         shell=True,
         check=True)
     subprocess.run(

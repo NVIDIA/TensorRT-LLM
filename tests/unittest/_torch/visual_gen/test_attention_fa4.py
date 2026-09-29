@@ -32,8 +32,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="FA4 requi
 
 
 @pytest.fixture(autouse=True)
-def require_bundled_fa4():
-    assert _flash_attn_fwd is not None, "The bundled FA4 backend failed to import"
+def require_patched_fa4():
+    assert _flash_attn_fwd is not None, "The patched FA4 backend failed to import"
     assert getattr(_flash_attn_fwd, "visual_gen_tuning_api", None) == 1
 
 

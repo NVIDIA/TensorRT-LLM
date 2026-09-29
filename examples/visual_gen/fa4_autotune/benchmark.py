@@ -10,7 +10,7 @@ from importlib.metadata import version
 from pathlib import Path
 
 import torch
-from trtllm_flash_attn._build_info import BUILD_ID
+from flash_attn.cute._trtllm_build_info import BUILD_ID
 
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, TuningConfig, autotune
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import FlashAttn4Attention

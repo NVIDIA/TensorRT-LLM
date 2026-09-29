@@ -65,7 +65,7 @@ slurm_install_setup() {
 
             if [ -n "$WHEEL_FILE" ]; then
                 echo "Found wheel: $WHEEL_FILE"
-                retry_command pip install --retries 10 "$WHEEL_FILE"
+                retry_command pip install --retries 10 --find-links="$(dirname "$WHEEL_FILE")" "$WHEEL_FILE"
                 retry_command pip install --retries 10 -r "$llmSrcNode/requirements-dev.txt"
             else
                 echo "ERROR: No wheel file found in $llmSrcNode/build, falling back to source install"

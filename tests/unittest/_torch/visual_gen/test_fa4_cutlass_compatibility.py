@@ -47,11 +47,11 @@ def test_cutlass_dsl_existing_names_are_preserved(monkeypatch):
 
 def test_cutlass_dsl_47_aliases_allow_fa4_interface_import() -> None:
     _install_cutlass_dsl_compatibility()
-    interface = import_module("trtllm_flash_attn.interface")
+    interface = import_module("flash_attn.cute.interface")
 
     assert callable(interface._flash_attn_fwd)
     assert interface._flash_attn_fwd.visual_gen_tuning_api == 1
-    assert interface._flash_attn_fwd.__module__ == "trtllm_flash_attn.interface"
+    assert interface._flash_attn_fwd.__module__ == "flash_attn.cute.interface"
     assert callable(interface.flash_attn_combine)
     assert callable(flash_attn4._flash_attn_fwd)
     assert callable(parallel._flash_attn_combine)
@@ -59,7 +59,7 @@ def test_cutlass_dsl_47_aliases_allow_fa4_interface_import() -> None:
 
 def test_fa4_work_tile_info_survives_cutlass_task_scheduling_import() -> None:
     task_scheduling = pytest.importorskip("cutlass.experimental.task_scheduling")
-    tile_scheduler = import_module("trtllm_flash_attn.tile_scheduler")
+    tile_scheduler = import_module("flash_attn.cute.tile_scheduler")
     import cutlass
     from cutlass.cutlass_dsl import Boolean
     from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo as CutlassWorkTileInfo
@@ -80,7 +80,7 @@ def test_fa4_work_tile_info_survives_cutlass_task_scheduling_import() -> None:
 
 def test_fa4_work_tile_info_survives_task_scheduling_imported_first() -> None:
     pytest.importorskip("cutlass.experimental.task_scheduling")
-    import_module("trtllm_flash_attn.tile_scheduler")
+    import_module("flash_attn.cute.tile_scheduler")
     script = textwrap.dedent(
         """
         import cutlass
@@ -88,7 +88,7 @@ def test_fa4_work_tile_info_survives_task_scheduling_imported_first() -> None:
         from cutlass.cutlass_dsl import Boolean
 
         import tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4  # noqa: F401
-        from trtllm_flash_attn.tile_scheduler import WorkTileInfo
+        from flash_attn.cute.tile_scheduler import WorkTileInfo
 
         tile_idx = (cutlass.Int32(1), cutlass.Int32(2), cutlass.Int32(3), cutlass.Int32(0))
         tile = WorkTileInfo(tile_idx, Boolean(True))
@@ -116,7 +116,7 @@ def test_fa4_kernel_traces_after_task_scheduling_imported_first() -> None:
     covers the captured path used by VisualGen.
     """
     pytest.importorskip("cutlass.experimental.task_scheduling")
-    import_module("trtllm_flash_attn.tile_scheduler")
+    import_module("flash_attn.cute.tile_scheduler")
     script = textwrap.dedent(
         """
         import cutlass.experimental.task_scheduling  # noqa: F401
