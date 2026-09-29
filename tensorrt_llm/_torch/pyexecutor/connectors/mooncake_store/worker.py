@@ -34,6 +34,7 @@ buffer registration and no save thread, so a node can lend host memory to the
 pool without an HCA that can pin GPU pages.
 """
 
+import os
 import threading
 import traceback
 from collections import defaultdict
@@ -50,6 +51,7 @@ from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, pool_config
+from .gpudirect import REGISTRATION_DEBUG_ENV, format_diagnosis
 from .keys import KeyNamespace
 from .ledger import record_segment
 from .metadata import MooncakeStoreMetadata, RequestTransfers
@@ -65,6 +67,8 @@ from .staging import sync_stream as _sync_stream
 from .validation import validate_layout, validate_llm_args, validate_node_budget
 
 __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
+
+_GIB = 1 << 30
 
 #: Set by the worker's constructor so the scheduler adapter, built in the same
 #: process on every ADP owner (rank 0 for TP), can reach the store handle
@@ -302,17 +306,29 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if self._config.stage_through_host:
             self._open_staging(addressing)
         else:
-            for start, end in addressing.registration_ranges():
+            ranges = addressing.registration_ranges()
+            boundary = addressing.mapping_bytes
+            logger.info(
+                f"mooncake-store rank {self._rank} registering {len(ranges)} range(s) "
+                f"covering {sum(end - start for start, end in ranges) / _GIB:.1f} GiB, "
+                f"pool mapping boundary {boundary if boundary else 'unknown'}"
+            )
+            # One line per range, so only on request.
+            if os.getenv(REGISTRATION_DEBUG_ENV):
+                logger.info(format_diagnosis(ranges, self._rank, boundary))
+            for start, end in ranges:
                 status = self._store.register_buffer(start, end - start)
                 if status != 0:
+                    # Collected only on failure, so the common path pays nothing.
                     raise RuntimeError(
                         f"MooncakeDistributedStore.register_buffer failed with status "
                         f"{status} for [{start:#x}, {end:#x}). Without registration "
                         "the store cannot read or write these pages. Registering "
-                        "device memory needs GPUDirect RDMA (nvidia_peermem or "
-                        "dma-buf); where that is unavailable, set "
-                        "stage_through_host to pass pages through pinned host "
-                        "memory instead."
+                        "device memory needs GPUDirect RDMA, either nvidia_peermem "
+                        "(Mooncake's default, selected unless WITH_NVIDIA_PEERMEM=0) "
+                        "or dma-buf. Set stage_through_host to pass pages through "
+                        "pinned host memory instead.\n"
+                        f"{format_diagnosis(ranges, self._rank, boundary)}"
                     )
 
         self._addressing = addressing
