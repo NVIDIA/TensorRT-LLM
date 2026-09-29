@@ -446,6 +446,8 @@ class TestStrictBufferCheck:
 
         runner.capture(key, forward_fn, inputs)
 
+        # Keep the captured tensor alive so the graph doesn't read freed memory.
+        captured_buf = attn_metadata.some_buf
         attn_metadata.some_buf = torch.full((1,), 99, device="cuda", dtype=torch.int32)
 
         attn_metadata.draft_replay_swapped_attrs = frozenset({"some_buf"})
@@ -456,6 +458,26 @@ class TestStrictBufferCheck:
         assert output.item() == 10
 
         attn_metadata.draft_replay_swapped_attrs = frozenset()
+        with pytest.raises(RuntimeError, match="some_buf"):
+            runner.replay(key, inputs)
+        del captured_buf
+
+    def test_replay_rejects_tensor_rebound_by_postprocess_fn(self, monkeypatch):
+        """The snapshot records the addresses the graph baked in, so a
+        rebind inside capture's postprocess_fn is still flagged on replay.
+        """
+        runner, key, attn_metadata, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
+
+        def forward_fn(fn_inputs):
+            return fn_inputs["input_ids"].clone() + fn_inputs["attn_metadata"].some_buf
+
+        def postprocess_fn(fn_inputs):
+            fn_inputs["attn_metadata"].some_buf = torch.full(
+                (1,), 99, device="cuda", dtype=torch.int32
+            )
+
+        runner.capture(key, forward_fn, inputs, postprocess_fn=postprocess_fn)
+
         with pytest.raises(RuntimeError, match="some_buf"):
             runner.replay(key, inputs)
 

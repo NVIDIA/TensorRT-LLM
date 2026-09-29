@@ -746,12 +746,13 @@ class CUDAGraphRunner:
             output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = forward_fn(capture_inputs)
+            # Snapshot before postprocessing so the check compares against
+            # the addresses the graph actually baked in.
+            self._record_strict_buffer_snapshot(key)
             if postprocess_fn is not None:
                 postprocess_fn(capture_inputs)
             _restore_spec_decode_capture_state(attn_metadata,
                                                saved_kv_lens_cuda)
-
-        self._record_strict_buffer_snapshot(key)
 
         self.graphs[key] = graph
         graph_output = make_weak_ref(output)
