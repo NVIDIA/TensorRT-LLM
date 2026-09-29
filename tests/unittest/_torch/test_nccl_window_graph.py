@@ -387,8 +387,9 @@ def test_failed_autotuner_tactic_preserves_profile_inputs(monkeypatch, tensor_sc
     ]
 
 
-def test_tensor_scope_collects_cuda_tensors_from_dataclass():
-    @dataclass
+@pytest.mark.parametrize("slots", [False, True])
+def test_tensor_scope_collects_cuda_tensors_from_dataclass(slots):
+    @dataclass(slots=slots)
     class StructuredOutput:
         hidden_states: torch.Tensor
         residual: torch.Tensor | None = None
@@ -406,8 +407,9 @@ def test_tensor_scope_collects_cuda_tensors_from_dataclass():
     assert tensors == [hidden_states, residual]
 
 
-def test_tensor_scope_skips_uninitialized_dataclass_fields():
-    @dataclass
+@pytest.mark.parametrize("slots", [False, True])
+def test_tensor_scope_skips_uninitialized_dataclass_fields(slots):
+    @dataclass(slots=slots)
     class PartiallyInitialized:
         hidden_states: torch.Tensor
         deferred: torch.Tensor = field(init=False)
@@ -417,6 +419,26 @@ def test_tensor_scope_skips_uninitialized_dataclass_fields():
 
     tensors = []
     nccl_window_tensor_scope._cuda_tensors(PartiallyInitialized(hidden_states), tensors)
+
+    assert tensors == [hidden_states]
+
+
+def test_tensor_scope_skips_computed_dataclass_properties():
+    @dataclass
+    class Metadata:
+        hidden_states: torch.Tensor
+        max_seq_len: int = field(init=False)
+
+    class ComputedMetadata(Metadata):
+        @property
+        def max_seq_len(self) -> int:
+            raise AssertionError("Tensor discovery must not evaluate metadata properties")
+
+    with FakeTensorMode():
+        hidden_states = torch.empty(1, device="cuda")
+
+    tensors = []
+    nccl_window_tensor_scope._cuda_tensors(ComputedMetadata(hidden_states), tensors)
 
     assert tensors == [hidden_states]
 

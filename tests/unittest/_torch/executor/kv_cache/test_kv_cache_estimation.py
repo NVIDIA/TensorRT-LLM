@@ -1260,7 +1260,8 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     assert kv_cache_config.max_gpu_total_bytes == expected_budget
     assert creator._fp8_ctx_mla_kv_len_cap == expected_cap
     py_executor.start_worker.assert_called_once()
-    py_executor.shutdown.assert_called_once()
+    py_executor.shutdown_for_kv_cache_estimation.assert_called_once()
+    py_executor.shutdown.assert_not_called()
     assert kv_cache_config.max_tokens == user_max_tokens
     assert kv_cache_config.pool_ratio == pool_ratio
     assert kv_cache_config.avg_seq_len == avg_seq_len

@@ -78,6 +78,7 @@ def test_shutdown_graph_lifecycle(shutdown_method, releases_model_owned_graphs):
     executor.dist = types.SimpleNamespace(pp_size=1)
     executor._shutdown_sleep_wakeup_listeners = Mock()
     executor.encoder_launch_executor = None
+    executor.kv_connector_manager = None
     executor.model_engine = engine
     executor.draft_model_engine = None
     executor.resource_manager = types.SimpleNamespace(resource_managers={})

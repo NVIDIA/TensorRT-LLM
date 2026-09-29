@@ -68,6 +68,9 @@ def _cuda_tensors(
         _cuda_tensors(value.scaling_factor, tensors, visited)
     elif is_dataclass(value) and not isinstance(value, type):
         for field in fields(value):
+            # Computed metadata properties can require initialization or read CUDA values.
+            if isinstance(getattr(type(value), field.name, None), property):
+                continue
             # ``init=False`` fields need not exist until the dataclass initializes them.
             _cuda_tensors(getattr(value, field.name, None), tensors, visited)
     elif isinstance(value, dict):
