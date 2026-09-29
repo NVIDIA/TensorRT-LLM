@@ -4,19 +4,27 @@
 """Shared helpers used by multiple model-runner families."""
 
 import bisect
+import functools
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_multimodal_utils import filter_mm_token_from_input_ids
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+from ..multimodal import is_multimodal, mm_encoder_cache_enabled
+from .interface import ScheduledInputs
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.sampler.sampler import SampleStateTensors
 
 
 def get_all_rank_num_tokens(
@@ -207,3 +215,72 @@ def ship_multimodal_indices(
         text_token_indices_cpu = torch.cat([text_token_indices_cpu, extra_text])
     text_token_indices_cpu = maybe_pin_memory(text_token_indices_cpu)
     inputs["text_token_indices"] = text_token_indices_cpu.to("cuda", non_blocking=True)
+
+
+def make_scheduled_inputs(
+    batch: ScheduledRequests,
+    new_tensors_device: "SampleStateTensors | None",
+    cache_indirection_buffer: torch.Tensor | None,
+    *,
+    enable_spec_decode: bool,
+    runtime_draft_len: int,
+) -> ScheduledInputs:
+    """Build a scheduled record that gathers context logits when any request returns them."""
+    return ScheduledInputs(
+        batch=batch,
+        new_tensors_device=new_tensors_device,
+        cache_indirection_buffer=cache_indirection_buffer,
+        gather_context_logits=any(
+            request.py_return_context_logits for request in batch.context_requests
+        ),
+        enable_spec_decode=enable_spec_decode,
+        runtime_draft_len=runtime_draft_len,
+    )
+
+
+class ModelTraitsMixin:
+    """Model-derived predicates shared by the engine and its decoder execution.
+
+    Requires ``model``, ``input_processor`` and ``max_beam_width``.
+    """
+
+    @property
+    def use_mrope(self):
+        use_mrope = False
+        try:
+            use_mrope = self.model.model_config.pretrained_config.rope_scaling["type"] == "mrope"
+        except Exception:
+            pass
+        logger.debug(f"Detected use_mrope: {use_mrope}")
+        return use_mrope
+
+    @functools.cached_property
+    def _mm_encoder_cache_enabled(self) -> bool:
+        """Whether the multimodal encoder cache is active for this model."""
+        return mm_encoder_cache_enabled(self.model)
+
+    @property
+    def use_beam_search(self):
+        return self.max_beam_width > 1
+
+    @property
+    def is_multimodal(self) -> bool:
+        """True iff this engine drives a multimodal model."""
+        return is_multimodal(self.model, self.input_processor)
+
+    def _is_encoder_decoder_model(self) -> bool:
+        return bool(getattr(getattr(self.model, "model_config", None), "is_encoder_decoder", False))
+
+    @functools.cached_property
+    def _model_uses_ple_recurrent_state(self) -> bool:
+        """Detect PLE on text-only and multimodal model wrappers.
+
+        The answer is fixed once the model is loaded, and the CUDA-graph gate
+        below consults it on every forward that has context requests.
+        """
+        top_level_model = get_top_level_model(self.model)
+        if getattr(top_level_model, "has_ple", False):
+            return True
+        llm = getattr(top_level_model, "llm", None)
+        text_model = getattr(llm, "model", llm)
+        return bool(getattr(text_model, "has_ple", False))

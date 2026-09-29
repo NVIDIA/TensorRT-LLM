@@ -1544,6 +1544,64 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                             (tuple(pinned.shape), pinned.device.type),
                             ((8, ), "cpu"))
 
+    def test_init_decoder_state_sets_decoder_only_defaults(self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.spec_config = None
+        engine.attn_backend = Mock()
+        engine._cuda_graph_batch_sizes = [1, 2]
+
+        with patch.dict("os.environ",
+                        {"TLLM_LOG_CACHED_KV_TOKENS_PER_REQ": "1"}):
+            engine._init_decoder_state()
+
+        self.assertEqual(engine._encoder_decoder_host_buffer_pool, [])
+        for name in ("_encoder_decoder_input_fast_path_static_eligible",
+                     "_encoder_decoder_position_id_offset",
+                     "_encoder_decoder_staged_request_ids",
+                     "_cross_attn_stable_cached_tokens",
+                     "_cross_attn_stable_request_ids",
+                     "_eager_workspace_reclaimer", "_steady_gen_cache",
+                     "_force_lora_graph_for_capture", "_prepare_inputs_event",
+                     "_cuda_graph_mem_pool", "_dynamic_draft_len_mapping"):
+            self.assertIsNone(getattr(engine, name), name)
+        self.assertTrue(engine._log_cached_kv_tokens_per_req)
+        self.assertFalse(engine._trtllm_gen_jit_warmup)
+        self.assertIsNone(engine._lora.cuda_graph_manager)
+
+    def test_runner_engine_shared_entries_skip_decoder_state(self) -> None:
+        runner = Mock()
+        engine = object.__new__(PyTorchModelEngine)
+        engine._fallback_to_engine = False
+        engine._runner = runner
+        engine._torch_compile_backend = None
+        engine.cuda_graph_runner = None
+        engine.breakable_cuda_graph_runner = None
+
+        engine.wait_for_input_copy()
+        engine._release_cuda_graphs()
+        engine._init_cuda_graph_lora_manager(Mock())
+
+        runner.wait_for_input_copy.assert_called_once_with()
+        runner.release_graphs.assert_called_once_with()
+        self.assertFalse(hasattr(engine, "_prepare_inputs_event"))
+        self.assertFalse(hasattr(engine, "_lora"))
+
+    def test_decoder_engine_shared_entries_use_decoder_state(self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine._fallback_to_engine = True
+        engine._runner = None
+        engine._torch_compile_backend = None
+        engine._prepare_inputs_event = Mock()
+        engine.cuda_graph_runner = Mock()
+        engine.breakable_cuda_graph_runner = Mock()
+
+        engine.wait_for_input_copy()
+        engine._release_cuda_graphs()
+
+        engine._prepare_inputs_event.synchronize.assert_called_once_with()
+        engine.cuda_graph_runner.clear.assert_called_once_with()
+        engine.breakable_cuda_graph_runner.clear.assert_called_once_with()
+
     def test_prepare_tp_inputs_fast_path_returns_call_draft_length(
             self) -> None:
         engine = object.__new__(PyTorchModelEngine)

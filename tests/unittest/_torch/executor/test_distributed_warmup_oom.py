@@ -70,7 +70,7 @@ def _engine(
         tp_size=tp_size,
     )
     engine._reset_moe_alltoall_state = mock.Mock()
-    engine.enable_spec_decode = False
+    engine.is_spec_decode = False
     engine.spec_config = None
     engine.max_draft_len = 0
     return engine

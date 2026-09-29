@@ -699,7 +699,6 @@ def test_engine_forward_keeps_call_state_when_decoder_fails():
 
 def test_forward_warmup_runs_local_call_state_in_forward_context():
     engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
-    engine._fallback_to_engine = True
     engine._is_warmup = True
     engine.enable_spec_decode = False
     engine.runtime_draft_len = 5

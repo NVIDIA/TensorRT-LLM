@@ -377,7 +377,9 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
         _should_run_warmup_batch=Mock(return_value=True),
         _release_megamoe_profiling_scratch=Mock(),
-        enable_spec_decode=False,
+        # The serving flag differs from the configuration; warmup follows the configuration.
+        is_spec_decode=False,
+        enable_spec_decode=True,
         spec_config=None,
         max_draft_len=0,
         _forward_warmup=Mock(),
@@ -646,11 +648,7 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
             call(batches[0], resource_manager, enable_spec_decode=False, runtime_draft_len=0)
         )
     assert forward_warmup.call_args_list == expected_calls
-    assert engine.runtime_draft_len == 5
-    # Successful capture ends in the engine default; a failed one keeps the
-    # serving value it started with.
-    expected_enable_spec_decode = True if fails else engine.is_spec_decode
-    assert engine.enable_spec_decode is expected_enable_spec_decode
+    assert (engine.enable_spec_decode, engine.runtime_draft_len) == (True, 5)
     assert engine._force_lora_graph_for_capture is None
 
 
@@ -980,7 +978,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 ),
                 _should_run_warmup_batch=Mock(return_value=True),
                 _release_megamoe_profiling_scratch=Mock(),
-                enable_spec_decode=False,
+                is_spec_decode=False,
                 spec_config=None,
                 max_draft_len=0,
                 _forward_warmup=Mock(side_effect=lambda *args, **kwargs: calls.append("forward")),
@@ -1098,7 +1096,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 ),
                 _should_run_warmup_batch=Mock(return_value=False),
                 _release_megamoe_profiling_scratch=Mock(),
-                enable_spec_decode=False,
+                is_spec_decode=False,
                 spec_config=None,
                 max_draft_len=0,
                 _forward_warmup=Mock(),
@@ -1194,7 +1192,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
                 _should_run_warmup_batch=Mock(return_value=True),
                 _release_megamoe_profiling_scratch=Mock(),
-                enable_spec_decode=False,
+                is_spec_decode=False,
                 spec_config=None,
                 max_draft_len=0,
                 _forward_warmup=Mock(),
