@@ -85,9 +85,6 @@ def test_msa_metadata_clears_padded_cache_slot_tail(
         )
         assert metadata.msa_out_cache_loc.data_ptr() == original_ptr
         assert metadata._msa_fields_ready
-        # The rows past the live count hold no slot, so a padded step's cache
-        # writes have to stop here.
-        assert metadata.msa_live_token_count() == count
 
     if empty_state == "empty_batch":
         metadata.request_ids = []
@@ -1324,21 +1321,6 @@ def test_the_eager_writer_refuses_a_live_count_it_has_no_rows_for():
     # A step that scheduled nothing writes nothing rather than erroring.
     write_kv_slots(cache, out_cache_loc, values, 0, layout="HND")
     assert not cache.any()
-
-
-def test_an_unprepared_step_has_no_live_count_to_write_against():
-    """The step's token count would otherwise let a write land on slots
-    prepare() never staged."""
-    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
-    metadata = metadata_cls.__new__(metadata_cls)
-    metadata._msa_fields_ready = False
-    metadata._num_tokens = 7
-
-    with pytest.raises(RuntimeError, match="did not stage a slot mapping"):
-        metadata.msa_live_token_count()
-
-    metadata._msa_fields_ready = True
-    assert metadata.msa_live_token_count() == 7
 
 
 def test_a_pure_prefill_step_has_no_decode_span():

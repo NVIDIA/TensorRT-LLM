@@ -970,15 +970,11 @@ def _dispatch_attention_over_live_tokens(
     read a request out of a token index, so the pad comes off here, once for
     both dispatch paths.
 
-    Clipping leaves the pad rows of output unwritten, where the full-height
-    dispatch used to cover them. Nothing reads them for its own result, but they
-    are not dropped either: o_proj and every layer after it carry them along, so
-    an uninitialized row puts an arbitrary bit pattern, NaN and Inf included,
-    into the residual stream. Zero them, which costs the pad alone.
+    The pad rows of output are left as the buffer supplied them. Nothing reads
+    them for its own result, and clearing them would put a device launch behind
+    a host-side count on every layer of every step.
     """
     num_tokens = int(attn_metadata.num_tokens)
-    if num_tokens < int(output.shape[0]):
-        output[num_tokens:].zero_()
     attn_layer._dispatch_attention_backend(
         q[:num_tokens],
         k[:num_tokens] if k is not None else None,

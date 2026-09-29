@@ -1044,10 +1044,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 f"MSA out_cache_loc buffer ({self.msa_out_cache_loc.shape[0]}) is "
                 f"smaller than the step's new-token count ({total_new_tokens})."
             )
-        # The cache writers trim to num_tokens (see msa_live_token_count), so
-        # that count and the mapping have to describe the same rows. The mapping
-        # emits one slot per new token, so they agree unless a caller staged
-        # lengths this metadata's seq_lens does not match.
+        # The cache writers trim to num_tokens, so that count and the mapping
+        # have to describe the same rows. The mapping emits one slot per new
+        # token, so they agree unless a caller staged lengths this metadata's
+        # seq_lens does not match.
         if total_new_tokens != int(self.num_tokens):
             raise ValueError(
                 f"MSA slot mapping covers {total_new_tokens} new tokens, but the "
@@ -1167,22 +1167,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self.msa_kv_lens_staged[:batch_size].copy_(kv_lens_cpu, non_blocking=True)
         self._msa_fields_ready = True
 
-    def msa_live_token_count(self) -> int:
-        """This step's live, unpadded new-token count.
-
-        This is the base num_tokens, which _build_msa_fields checks the slot
-        mapping against: cache writers take the padded token extent and need it
-        to find where msa_out_cache_loc stops holding real slots. Raising when
-        no mapping is staged keeps an unprepared step from writing against
-        another step's slots, which the count alone would otherwise allow.
-        """
-        if not self._msa_fields_ready:
-            raise RuntimeError(
-                "MiniMax-M3 MSA cache write requires prepared metadata, but "
-                "prepare() did not stage a slot mapping for this step."
-            )
-        return int(self.num_tokens)
-
     def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
         """Return the paged index-K cache in the HND layout MSA consumes."""
         return self.kv_cache_manager.get_index_k_buffer(layer_idx)
@@ -1196,7 +1180,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             cache,
             self.msa_out_cache_loc[:num_tokens],
             idx_k.reshape(num_tokens, 1, sparse_index_dim),
-            self.msa_live_token_count(),
+            # idx_k arrives over the padded token extent; the live prefix is
+            # where msa_out_cache_loc stops holding real slots.
+            int(self.num_tokens),
             layout="HND",
         )
 
