@@ -1277,8 +1277,6 @@ ready = threading.Event()
 blocked = threading.Event()
 usage_lib._is_reporting_rank = lambda: True
 usage_lib._get_heartbeat_interval = lambda: 0.001
-if state == "finished":
-    usage_lib._REPORTER_STOP.set()
 usage_lib._collect_gpu_info = lambda: {}
 
 def send(payload):
@@ -1292,6 +1290,7 @@ def send(payload):
 usage_lib._send_to_gxt = send
 usage_lib.report_usage()
 if state == "finished":
+    usage_lib._REPORTER_STOP.set()
     for thread in threading.enumerate():
         if thread.name == "trtllm-usage-stats":
             thread.join(5)
