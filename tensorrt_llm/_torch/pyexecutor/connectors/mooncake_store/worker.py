@@ -29,6 +29,10 @@ once the forward pass that wrote them has retired, and blocking the executor
 loop on an RDMA write is exactly the cost the store is supposed to avoid. The
 scheduler reports such a request as saving asynchronously, which keeps its pages
 pinned until `get_finished` says the writes landed.
+
+A layer group moves as two pages. The shard-specific one is keyed per rank; the
+replicated one is keyed once for the whole TP group. One rank writes that shared
+copy and every rank reads it, since each needs the bytes in its own GPU memory.
 """
 
 import threading
@@ -47,7 +51,7 @@ from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig
-from .keys import KeyNamespace
+from .keys import REPLICATED_SHARD_KEY, KeyNamespace, sharded_shard_key
 from .metadata import MooncakeStoreMetadata, RequestTransfers
 from .staging import (
     HostStagingPool,
@@ -171,6 +175,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._addressing: Optional[PageAddressing] = None
         # Namespaces for this attention shard, shared by compatible ADP owners.
         self._namespaces: Dict[int, KeyNamespace] = {}
+        # Rank-independent namespaces, present only for the layer groups that
+        # hold a replicated role.
+        self._replicated_namespaces: Dict[int, KeyNamespace] = {}
         # A TP hit requires every attention shard. ADP has one complete shard,
         # so neither content identity nor lookup depends on unrelated owners.
         self._peer_namespaces: Dict[int, Tuple[KeyNamespace, ...]] = {}
@@ -256,12 +263,24 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         for layer_group_id in addressing.layer_group_ids:
             bytes_per_page = addressing.bytes_per_page(layer_group_id)
             self._namespaces[layer_group_id] = self._namespace(
-                self._attention_rank, layer_group_id, bytes_per_page
+                sharded_shard_key(self._attention_rank, self._attention_world_size),
+                layer_group_id,
+                bytes_per_page,
             )
             self._peer_namespaces[layer_group_id] = tuple(
-                self._namespace(rank, layer_group_id, bytes_per_page)
+                self._namespace(
+                    sharded_shard_key(rank, self._attention_world_size),
+                    layer_group_id,
+                    bytes_per_page,
+                )
                 for rank in range(self._attention_world_size)
             )
+            if addressing.has_replicated(layer_group_id):
+                self._replicated_namespaces[layer_group_id] = self._namespace(
+                    REPLICATED_SHARD_KEY,
+                    layer_group_id,
+                    addressing.replicated_bytes_per_page(layer_group_id),
+                )
 
         if self._config.role.saves:
             self._save_thread = threading.Thread(
@@ -282,8 +301,13 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         pinned allocation of its own. The GPU pools are left unregistered,
         which is the point of the mode.
         """
+        # Both page classes pass through the same slots, so a slot has to hold
+        # the larger of the two.
         max_bytes_per_page = max(
-            addressing.bytes_per_page(layer_group_id)
+            max(
+                addressing.bytes_per_page(layer_group_id),
+                addressing.replicated_bytes_per_page(layer_group_id),
+            )
             for layer_group_id in addressing.layer_group_ids
         )
         slot_bytes, num_slots = plan_slot_geometry(
@@ -315,12 +339,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 f"staging_buffer_bytes to restore the configured batch size."
             )
 
-    def _namespace(self, rank: int, layer_group_id: int, bytes_per_page: int) -> KeyNamespace:
+    def _namespace(self, shard_key: str, layer_group_id: int, bytes_per_page: int) -> KeyNamespace:
         return KeyNamespace(
             cache_prefix=self._config.cache_prefix,
             model_key=self._model_key,
-            rank=rank,
-            world_size=self._attention_world_size,
+            shard_key=shard_key,
             layer_group_id=layer_group_id,
             tokens_per_block=self._addressing.tokens_per_block,
             bytes_per_page=bytes_per_page,
@@ -338,12 +361,27 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         """Whether a KV cache layout has been registered yet."""
         return self._addressing is not None
 
+    @property
+    def _owns_replicated_saves(self) -> bool:
+        """Whether this rank writes the replicated pages of its group.
+
+        Naming a single owner keeps ranks holding identical bytes from racing
+        to write the same key.
+
+        Under ADP every owner reports attention rank 0, which is deliberate:
+        owners there serve different requests and so mostly produce different
+        keys, and the existence filter in `_put` collapses the overlap. Gating
+        them on rank would drop the pages of every owner but one.
+        """
+        return self._attention_rank == 0
+
     def count_prefix_hit(self, block_hashes: Sequence[bytes]) -> int:
         """How many leading blocks of `block_hashes` are fully present.
 
         A block counts only when every layer group and attention shard has its
-        page. ADP owners share the one unsharded representation; TP requires
-        all shards because a prefix is replayed as a whole. The scan stops at the first
+        page, plus the one replicated page a layer group may carry. ADP owners
+        share the one unsharded representation; TP requires all shards because
+        a prefix is replayed as a whole. The scan stops at the first
         incomplete block: the runtime consumes a prefix, so a later hit is not
         usable on its own.
 
@@ -360,6 +398,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         for block_hash in block_hashes:
             for namespaces in self._peer_namespaces.values():
                 keys.extend(namespace.key(block_hash) for namespace in namespaces)
+            # One key for the whole group, so a block whose replicated page was
+            # dropped reads as a miss on every rank.
+            keys.extend(
+                namespace.key(block_hash) for namespace in self._replicated_namespaces.values()
+            )
         keys_per_block = len(keys) // len(block_hashes)
 
         try:
@@ -398,6 +441,15 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._reraise_save_error()
 
         keys, addresses, sizes, total_pages = self._resolve(metadata.loads)
+        # Appending rather than loading separately keeps both page classes
+        # inside the same transfer batches.
+        rep_keys, rep_addresses, rep_sizes, rep_pages = self._resolve(
+            metadata.loads, replicated=True
+        )
+        keys += rep_keys
+        addresses += rep_addresses
+        sizes += rep_sizes
+        total_pages += rep_pages
         if not keys:
             return
 
@@ -546,6 +598,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
     def _put(self, transfers: Sequence[RequestTransfers]) -> None:
         keys, addresses, sizes, _ = self._resolve(transfers)
+        if self._owns_replicated_saves:
+            rep_keys, rep_addresses, rep_sizes, _ = self._resolve(transfers, replicated=True)
+            keys += rep_keys
+            addresses += rep_addresses
+            sizes += rep_sizes
         if not keys:
             return
 
@@ -596,9 +653,20 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     # ---- shared ----
 
     def _resolve(
-        self, transfers: Sequence[RequestTransfers]
+        self, transfers: Sequence[RequestTransfers], replicated: bool = False
     ) -> Tuple[List[str], List[List[int]], List[List[int]], int]:
-        """Expand per-request page transfers into parallel store call arguments."""
+        """Expand per-request page transfers into parallel store call arguments.
+
+        Args:
+            transfers: Pages to move, as the scheduler reported them.
+            replicated: Resolve the replicated page of each layer group rather
+                than the shard-specific one. Groups holding no replicated role
+                contribute nothing.
+
+        Returns:
+            Parallel lists of keys, per-key buffer addresses and per-key buffer
+            sizes, plus the page count.
+        """
         if self._addressing is None:
             raise RuntimeError("KV cache layout has not been registered")
         keys: List[str] = []
@@ -607,15 +675,23 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         pages = 0
         for entry in transfers:
             for page in entry.pages:
-                namespace = self._namespaces.get(page.layer_group_id)
-                if namespace is None:
-                    raise KeyError(
-                        f"layer group {page.layer_group_id} is not in the registered "
-                        "layout; the scheduler and worker disagree about the model"
+                if replicated:
+                    namespace = self._replicated_namespaces.get(page.layer_group_id)
+                    if namespace is None:
+                        continue
+                    page_addresses, page_sizes = self._addressing.replicated_buffers(
+                        page.layer_group_id, page.page_index
                     )
-                page_addresses, page_sizes = self._addressing.buffers(
-                    page.layer_group_id, page.page_index
-                )
+                else:
+                    namespace = self._namespaces.get(page.layer_group_id)
+                    if namespace is None:
+                        raise KeyError(
+                            f"layer group {page.layer_group_id} is not in the registered "
+                            "layout; the scheduler and worker disagree about the model"
+                        )
+                    page_addresses, page_sizes = self._addressing.buffers(
+                        page.layer_group_id, page.page_index
+                    )
                 keys.append(namespace.key(page.block_hash))
                 addresses.append(page_addresses)
                 sizes.append(page_sizes)

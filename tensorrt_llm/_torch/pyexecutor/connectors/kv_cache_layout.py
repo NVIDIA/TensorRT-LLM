@@ -31,6 +31,13 @@ where ``i`` comes from ``_KVCache.get_aggregated_page_indices(layer_group_id)``.
 Because ranges are described rather than implied, this covers MLA (a pool simply
 has no VALUE buffer), sliding-window attention and hybrid models (one layer group
 per window size) without any of them being special cases.
+
+A group's ranges are split into two sets. Most roles hold bytes particular to one
+attention shard, but a side cache may hold bytes identical on every shard, such
+as MiniMax-M3's index-K. The manager declares which roles those are, and they
+are described as replicated_regions so a connector can store them once for a TP
+group instead of once per rank. V2 may interleave the two classes within a pool,
+so each class is aggregated separately rather than sliced out of a merged range.
 """
 
 from dataclasses import dataclass
@@ -120,12 +127,21 @@ class KvCacheLayerGroupLayout:
     layer_ids: Tuple[int, ...]
     #: Attention window for this group, or None for full attention.
     window_size: Optional[int]
+    #: Regions holding bytes specific to this attention shard.
     regions: Tuple[KvCacheRegion, ...]
+    #: Regions holding bytes identical on every attention shard, as named by
+    #: the manager's get_replicated_roles(). Empty unless a role is declared.
+    replicated_regions: Tuple[KvCacheRegion, ...] = ()
 
     @property
     def bytes_per_page(self) -> int:
-        """Total bytes this group occupies for a single page slot."""
+        """Bytes this group's shard-specific regions occupy for one page slot."""
         return sum(region.size for region in self.regions)
+
+    @property
+    def replicated_bytes_per_page(self) -> int:
+        """Bytes this group's replicated regions occupy for one page slot."""
+        return sum(region.size for region in self.replicated_regions)
 
 
 @dataclass(frozen=True)
@@ -175,6 +191,42 @@ def _window_size(init_config, local_layer_id: int) -> Optional[int]:
     return None if window is None else int(window)
 
 
+def _regions_for(
+    impl,
+    buffer_ids: List,
+    layer_group_id: int,
+    num_slots: int,
+    global_by_local: Dict[int, int],
+) -> Tuple[KvCacheRegion, ...]:
+    """Aggregate buffer_ids into the regions they occupy in one slot.
+
+    get_aggregated_pages coalesces only buffers adjacent *within the set it is
+    given*, so passing a subset yields regions covering exactly that subset.
+    That is what keeps the two region classes separable.
+    """
+    regions: List[KvCacheRegion] = []
+    for desc in impl.get_aggregated_pages(buffer_ids):
+        if int(desc.layer_group_id) != layer_group_id:
+            continue
+        regions.append(
+            KvCacheRegion(
+                base=int(desc.base),
+                size=int(desc.size),
+                stride=int(desc.stride),
+                num_slots=num_slots,
+                buffers=tuple(
+                    KvCacheBufferRef(
+                        layer_id=global_by_local[int(b.id.layer_id)],
+                        role=str(b.id.role),
+                        expansion=int(b.expansion),
+                    )
+                    for b in desc.buffers
+                ),
+            )
+        )
+    return tuple(regions)
+
+
 def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
     """Describe a ``KVCacheManagerV2``'s GPU pools for a KV connector.
 
@@ -182,6 +234,10 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
     ``all_buffer_ids``, ``get_aggregated_pages`` and ``pool_group_descs``. No
     private storage state is touched, and no assumption is made about dimension
     order, kv factor, or the number of pools.
+
+    Roles the manager declares replicated are described as a separate region
+    set. A manager that declares none leaves replicated_regions empty and every
+    buffer in regions.
     """
     impl = manager.impl
     init_config = impl.init_config
@@ -198,6 +254,11 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
     for buffer_id in impl.all_buffer_ids:
         buffers_by_layer.setdefault(int(buffer_id.layer_id), []).append(buffer_id)
 
+    # Compare role names rather than DataRole values: a region records the
+    # manager's native role string, which keeps this free of the
+    # disaggregation types used to express the declaration.
+    replicated_roles = {str(role) for role in manager.get_replicated_roles()}
+
     groups: List[KvCacheLayerGroupLayout] = []
     for layer_group_id, local_layer_ids in enumerate(impl.layer_grouping):
         local_layer_ids = [int(lid) for lid in local_layer_ids]
@@ -208,34 +269,18 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
         global_by_local = dict(zip(local_layer_ids, _global_layer_ids(manager, local_layer_ids)))
 
         buffer_ids = [b for lid in local_layer_ids for b in buffers_by_layer.get(lid, ())]
-
-        regions: List[KvCacheRegion] = []
-        for desc in impl.get_aggregated_pages(buffer_ids):
-            if int(desc.layer_group_id) != layer_group_id:
-                continue
-            regions.append(
-                KvCacheRegion(
-                    base=int(desc.base),
-                    size=int(desc.size),
-                    stride=int(desc.stride),
-                    num_slots=num_slots,
-                    buffers=tuple(
-                        KvCacheBufferRef(
-                            layer_id=global_by_local[int(b.id.layer_id)],
-                            role=str(b.id.role),
-                            expansion=int(b.expansion),
-                        )
-                        for b in desc.buffers
-                    ),
-                )
-            )
+        sharded_ids = [b for b in buffer_ids if str(b.role) not in replicated_roles]
+        replicated_ids = [b for b in buffer_ids if str(b.role) in replicated_roles]
 
         groups.append(
             KvCacheLayerGroupLayout(
                 layer_group_id=layer_group_id,
                 layer_ids=tuple(global_by_local[lid] for lid in local_layer_ids),
                 window_size=_window_size(init_config, local_layer_ids[0]),
-                regions=tuple(regions),
+                regions=_regions_for(impl, sharded_ids, layer_group_id, num_slots, global_by_local),
+                replicated_regions=_regions_for(
+                    impl, replicated_ids, layer_group_id, num_slots, global_by_local
+                ),
             )
         )
 

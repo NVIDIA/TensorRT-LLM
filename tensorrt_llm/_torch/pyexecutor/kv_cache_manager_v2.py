@@ -1915,6 +1915,24 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
 
+    def get_replicated_roles(self) -> frozenset[DataRole]:
+        """Roles whose bytes are identical on every attention shard.
+
+        Derived from :meth:`get_disagg_role_mapper_kinds` so a manager declares
+        replication once and every consumer agrees. Role.ALL is the fallback
+        for roles without an entry rather than a role of its own, so it is
+        never reported here.
+
+        A KV connector uses this to give replicated bytes a single
+        rank-independent store key. A role with no registered buffers
+        contributes nothing, so declaring one is harmless.
+        """
+        return frozenset(
+            role
+            for role, kind in self.get_disagg_role_mapper_kinds().items()
+            if role != Role.ALL and kind is MapperKind.REPLICATED
+        )
+
     @property
     def blocks_in_primary_pool(self) -> int:
         """
