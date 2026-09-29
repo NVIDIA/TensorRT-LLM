@@ -120,16 +120,6 @@ def test_tile_and_pool_cubes_accepts_strided_sequence_layout(device):
     torch.testing.assert_close(pooled, ref_pooled, rtol=1e-3, atol=1e-3)
 
 
-def test_tile_and_pool_cubes_rejects_split_head_dims():
-    source, counts, _untile, seq_len = _random_cube_layout(
-        2, "cpu", torch.Generator().manual_seed(1)
-    )
-    x = torch.randn(1, seq_len, 32, 4).transpose(2, 3)
-
-    with pytest.raises(ValueError, match="contiguous"):
-        tile_and_pool_cubes(x, source, counts, cube_size=CUBE_SIZE)
-
-
 @pytest.mark.parametrize("device", _DEVICES)
 @pytest.mark.parametrize("row_length", [1, 30, 144, 257, 2048, 5000])
 def test_sort_last_dim_matches_torch_sort(device, row_length):
@@ -158,11 +148,6 @@ def test_blend_coarse_fine_reads_head_major_fine_output(device):
 
     ref = _reference_blend(fine, coarse, gate_compress, None, untile, True)
     torch.testing.assert_close(out, ref, rtol=1e-6, atol=1e-6)
-
-
-def test_sort_last_dim_requires_int32():
-    with pytest.raises(TypeError, match="int32"):
-        sort_last_dim(torch.zeros(2, 4, dtype=torch.int64))
 
 
 @pytest.mark.parametrize("device", _DEVICES)

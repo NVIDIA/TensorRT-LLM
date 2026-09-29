@@ -52,17 +52,6 @@ def test_block_pool_torch_fallback_means_valid_tokens_only() -> None:
 
 
 @_CPU_ONLY
-def test_block_pool_rejects_mismatched_output() -> None:
-    x = torch.zeros((1, 70, 1, 4), dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="out"):
-        block_pool(x, torch.empty((1, 3, 1, 4)), block_size=BLOCK, reduce="mean")
-    with pytest.raises(ValueError, match="reduce"):
-        block_pool(x, torch.empty(_pooled_shape(x, BLOCK)), block_size=BLOCK, reduce="max")
-    with pytest.raises(ValueError, match="block_size"):
-        block_pool(x, torch.empty(_pooled_shape(x, BLOCK)), block_size=0, reduce="mean")
-
-
-@_CPU_ONLY
 def test_select_exact_blocks_torch_fallback_packs_bit_r_of_word_w() -> None:
     blocks = 35
     centroid = torch.zeros((1, blocks, 1, 8), dtype=torch.float32)

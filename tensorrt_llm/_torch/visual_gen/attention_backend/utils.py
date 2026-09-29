@@ -32,12 +32,16 @@ from .interface import AttentionBackend
 
 def get_visual_gen_attention_backend(
     backend_name: str,
+    sparse_algorithm: Optional[str] = None,
 ) -> Type[AttentionBackend]:
     """
-    Get diffusion attention backend class by name.
+    Get diffusion attention backend class by name and sparse algorithm.
 
     Args:
         backend_name: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4")
+        sparse_algorithm: ``algorithm`` of the sparse attention config, if any. VSA
+            ("vsa") and SOL ("sol_attn") have their own TRTLLM and CUTEDSL classes;
+            other algorithms, such as skip-softmax, run in the dense class.
 
     Returns:
         Diffusion attention backend class
@@ -50,15 +54,31 @@ def get_visual_gen_attention_backend(
                         and architecture-specific NVFP4 attention recipes.
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
                  Requires flash-attn package with cute interface
-        - "CUTEDSL": CuTe DSL kernels. create_attention selects dense/SkipSoftmax FMHA, VSA or SOL
-                      from AttentionConfig.sparse_attention_config.
+        - "CUTEDSL": CuTe DSL kernels: dense/SkipSoftmax FMHA, VSA or SOL depending on
+                     ``sparse_algorithm``.
         - "CUDNN": cuDNN fused SDPA. Unquantized by default; quant_attention_config
                    selects per-tensor FP8 or block-scaled MXFP8 (Blackwell).
     """
 
     backend_name = backend_name.upper()
 
-    if backend_name == "VANILLA":
+    if sparse_algorithm == "vsa" and backend_name == "TRTLLM":
+        from .sparse.vsa.backend import VSATrtllmAttention
+
+        return VSATrtllmAttention
+    elif sparse_algorithm == "vsa" and backend_name == "CUTEDSL":
+        from .sparse.vsa.backend import VSACuTeDSLAttention
+
+        return VSACuTeDSLAttention
+    elif sparse_algorithm == "sol_attn" and backend_name == "TRTLLM":
+        from .sparse.sol.backend import SOLTrtllmAttention
+
+        return SOLTrtllmAttention
+    elif sparse_algorithm == "sol_attn" and backend_name == "CUTEDSL":
+        from .sparse.sol.backend import SOLCuTeDSLAttention
+
+        return SOLCuTeDSLAttention
+    elif backend_name == "VANILLA":
         from .vanilla import VanillaAttention
 
         return VanillaAttention
@@ -139,24 +159,7 @@ def create_attention(
     is_sol = sparse_algorithm == "sol_attn"
 
     backend_name = backend.upper()
-    if is_vsa and backend_name == "CUTEDSL":
-        from .sparse.vsa.backend import VSACuTeDSLAttention
-
-        attn_cls = VSACuTeDSLAttention
-    elif is_vsa and backend_name == "TRTLLM":
-        from .sparse.vsa.backend import VSATrtllmAttention
-
-        attn_cls = VSATrtllmAttention
-    elif is_sol and backend_name == "CUTEDSL":
-        from .sparse.sol.backend import SOLCuTeDSLAttention
-
-        attn_cls = SOLCuTeDSLAttention
-    elif is_sol and backend_name == "TRTLLM":
-        from .sparse.sol.backend import SOLTrtllmAttention
-
-        attn_cls = SOLTrtllmAttention
-    else:
-        attn_cls = get_visual_gen_attention_backend(backend)
+    attn_cls = get_visual_gen_attention_backend(backend_name, sparse_algorithm)
 
     if is_vsa:
         sparse_params = kwargs.pop("sparse_params", None)

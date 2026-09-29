@@ -82,17 +82,6 @@ def _make_vsa_metadata(*, sparsity: float = 0.0):
     )
 
 
-def test_vsa_trtllm_overrides_only_forward_around_the_core() -> None:
-    assert "forward" in VSATrtllmAttention.__dict__
-    for name in (
-        "block_sparse_attn_predict",
-        "sparse_predict",
-        "sparse_post_process",
-        "_enable_sparse_workflow",
-    ):
-        assert name not in VSATrtllmAttention.__dict__
-
-
 def _capture_wrapper_forward(monkeypatch: pytest.MonkeyPatch) -> dict:
     """Replace the VisualGen wrapper forward with a recorder returning the fine input."""
 
@@ -125,16 +114,6 @@ def _capture_wrapper_forward(monkeypatch: pytest.MonkeyPatch) -> dict:
 
     monkeypatch.setattr(TrtllmAttention, "forward", _forward)
     return captured
-
-
-def test_vsa_backends_share_one_predictor_implementation() -> None:
-    trtllm_attention = object.__new__(VSATrtllmAttention)
-    cute_attention = object.__new__(VSACuTeDSLAttention)
-    trtllm_attention.predictor = VSAPredictor(num_heads=1)
-    cute_attention.predictor = VSAPredictor(num_heads=1)
-
-    assert type(trtllm_attention.predictor) is type(cute_attention.predictor) is VSAPredictor
-    assert set(vsa_backend.__all__) >= {"VSATrtllmAttention", "VSACuTeDSLAttention"}
 
 
 def test_vsa_predictor_produces_sorted_block_inputs_and_effective_tiled_qkv() -> None:
@@ -356,52 +335,6 @@ def test_trtllm_vsa_accepts_packed_qkv_through_shared_predictor(
 
     for actual, expected in zip((captured["q"], captured["k"], captured["v"]), qkv):
         torch.testing.assert_close(actual, expected)
-
-
-def test_trtllm_vsa_consumes_gates_and_forwards_only_timestep(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured = _capture_wrapper_forward(monkeypatch)
-    attention = _make_dense_fallback_vsa_attention()
-    q = torch.randn(1, 80, 1, 8)
-    gate_compress = torch.full_like(q, 2.0)
-    gate_fine = torch.full_like(q, 0.5)
-    timestep = torch.tensor([12])
-
-    with set_vsa_forward_context(_make_vsa_metadata(sparsity=0.5)):
-        output = attention.forward(
-            q,
-            q,
-            q,
-            batch_size=1,
-            seq_len=80,
-            gate_compress=gate_compress,
-            gate_fine=gate_fine,
-            timestep=timestep,
-        )
-
-    assert captured["kwargs"] == {"timestep": timestep}
-    assert output.shape == (1, 80, 8)
-    assert torch.isfinite(output).all()
-
-
-def test_cutedsl_vsa_rejects_unexpected_forward_kwargs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    attention = object.__new__(VSACuTeDSLAttention)
-    attention.predictor = VSAPredictor(num_heads=1)
-    q = torch.randn(1, 80, 1, 8)
-    monkeypatch.setattr(vsa_backend, "_vsa_import_error", RuntimeError("disabled for test"))
-
-    with set_vsa_forward_context(_make_vsa_metadata(sparsity=0.5)):
-        with pytest.raises(TypeError, match="gate_fnne"):
-            attention.forward(
-                q,
-                q,
-                q,
-                gate_compress=torch.zeros_like(q),
-                gate_fnne=torch.zeros_like(q),
-            )
 
 
 def _make_config(

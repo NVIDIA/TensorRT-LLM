@@ -33,9 +33,10 @@ from ...attention.backends.interface import (
     PredefinedAttentionMask,
 )
 from ...attention.backends.sparse.params import SparseBackendForwardArgs, SparseParams
-from ...attention.backends.sparse.timestep_phase import graph_phase_for_timestep, timestep_to_float
+from ...attention.backends.sparse.timestep_phase import graph_phase_for_timestep
 from ...attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ...attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
+from ..cuda_graph_runner import resolved_extra_key
 from .interface import AttentionBackend, AttentionTensorLayout
 
 
@@ -132,26 +133,6 @@ class TrtllmAttentionMetadata:
         self._prepared = cached["prepared"]
         self._cached_seq_lens = cached["seq_lens"]
 
-    def prepare_timestep(self, timestep: object) -> Optional[float]:
-        """Reduce ``timestep`` to a host scalar and keep it for CUDA Graph capture.
-
-        Timestep-scheduled sparse algorithms read the timestep on the host,
-        which CUDA Graph capture cannot do for a device tensor. Eager calls,
-        including the warmup that precedes capture, reduce the tensor and store
-        the value in the component state; capture returns the stored value.
-        """
-
-        state = self._metadata_state
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            if "timestep" not in state:
-                raise RuntimeError(
-                    "sparse attention timestep must be prepared before CUDA Graph capture"
-                )
-            return state["timestep"]
-        value = timestep_to_float(timestep)
-        state["timestep"] = value
-        return value
-
     def prepare(
         self,
         batch_size: int,
@@ -242,8 +223,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             quant_config=quant_config,
             sparse_params=sparse_params,
             dtype=dtype,
-            # Every layer of one model component shares its FMHA plan caches.
-            fmha_state=attention_metadata_state.setdefault("fmha_caches", {}),
         )
 
         # TRTLLM expects flat [B*S, H*D] format
@@ -261,39 +240,41 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
         return getattr(self.sparse_params, "disabled_until_timestep", None)
 
-    def resolve_timestep(self, timestep: object) -> object:
-        """Return the host timestep the sparse schedule consumes.
-
-        Layers with a timestep cutoff hand the tensor to the metadata adapter,
-        which reduces it during eager calls and reuses the prepared value under
-        CUDA Graph capture. Without a cutoff the timestep passes through
-        untouched.
-        """
-
-        if self.timestep_cutoff is None:
-            return timestep
-        return self.metadata.prepare_timestep(timestep)
-
     @property
     def dense_layers(self) -> frozenset[int]:
         """Layer indices that always run dense attention."""
 
         return getattr(self.sparse_params, "dense_layers", frozenset())
 
-    def should_use_sparse(self, timestep: object) -> bool:
-        """Return whether this layer runs its sparse path for the prepared ``timestep``.
+    @torch.compiler.disable
+    def _sparse_attn_phase(self, timestep: object) -> Optional[int]:
+        """Return the dense (0) or sparse (1) phase of this call, or ``None``.
 
-        Dense layers never do. Otherwise the layer is sparse unless the timestep
-        schedule places the call in the dense prefix; without a cutoff or a
-        timestep the call is sparse.
+        The phase belongs to the transformer call, not to the layer: every layer
+        of one call sees the same timestep and the same cutoff. The CUDA graph
+        runner resolves it once per call on the host and publishes it during
+        warmup and capture, so capture never reads the timestep tensor. Eager
+        calls outside the runner derive it from the timestep. Layers without a
+        timestep cutoff have no phase.
+        """
+
+        if self.timestep_cutoff is None:
+            return None
+        phase = resolved_extra_key("sparse_attn_phase")
+        if phase is None:
+            phase = graph_phase_for_timestep(timestep, disabled_until_timestep=self.timestep_cutoff)
+        return phase
+
+    def should_use_sparse(self, sparse_attn_phase: Optional[int]) -> bool:
+        """Return whether this layer runs its sparse path in ``sparse_attn_phase``.
+
+        Dense layers never do. Otherwise only the dense prefix (phase 0) is
+        dense; a call without a phase (no cutoff or no timestep) is sparse.
         """
 
         if self.layer_idx in self.dense_layers:
             return False
-        graph_phase = graph_phase_for_timestep(
-            timestep, disabled_until_timestep=self.timestep_cutoff
-        )
-        return graph_phase is None or graph_phase == 1
+        return sparse_attn_phase != 0
 
     # Needed to work with torch compile cause of attention metadata
     # make attn metadata as input for it to work
@@ -385,7 +366,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         Returns:
             Output tensor [B, S, H*D]
         """
-        timestep = self.resolve_timestep(timestep)
+        sparse_attn_phase = self._sparse_attn_phase(timestep)
         block_sparse_inputs = (
             sparse_backend_args.block_sparse_inputs if sparse_backend_args is not None else None
         )
@@ -396,7 +377,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         use_separate_qkv = (
             block_sparse_inputs is not None
             or self.quant_attention_config is not None
-            or (not self.support_fused_qkv() and self.should_use_sparse(timestep))
+            or (not self.support_fused_qkv() and self.should_use_sparse(sparse_attn_phase))
         )
         if use_separate_qkv and (k is None or v is None):
             raise ValueError("This TRTLLM attention call requires separate q, k, and v tensors.")
@@ -433,6 +414,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             forward_args=AttentionForwardArgs(
                 attention_mask=attention_mask,
                 timestep=timestep,
+                sparse_attn_phase=sparse_attn_phase,
                 sparse_backend_args=sparse_backend_args,
                 **sage_kwargs,
             ),

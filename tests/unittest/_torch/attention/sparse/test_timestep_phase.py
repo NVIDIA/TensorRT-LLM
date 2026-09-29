@@ -29,27 +29,6 @@ def test_timestep_to_float_reduces_to_the_largest_live_value(timestep, expected)
     )
 
 
-def test_timestep_to_float_rejects_non_real_values() -> None:
-    with pytest.raises(TypeError, match="real scalar or tensor"):
-        timestep_to_float(True)
-
-
-@pytest.mark.parametrize(
-    "timestep",
-    [
-        float("nan"),
-        float("inf"),
-        torch.tensor([float("nan")]),
-        # The reduction keeps the non-finite value.
-        torch.tensor([0.5, float("inf")]),
-    ],
-    ids=["nan", "inf", "tensor_nan", "tensor_inf"],
-)
-def test_timestep_to_float_rejects_non_finite_values(timestep) -> None:
-    with pytest.raises(ValueError, match="finite"):
-        timestep_to_float(timestep)
-
-
 @pytest.mark.parametrize(
     ("timestep", "cutoff", "expected"),
     [

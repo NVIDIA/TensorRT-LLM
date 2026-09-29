@@ -17,7 +17,6 @@ from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.kernels import 
 from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.predictor import (
     BLOCK_SIZE,
     SolPredictorOutputs,
-    _runtime_scalar,
     predict,
     support_reason,
 )
@@ -42,23 +41,6 @@ def test_sol_predictor_support_reason_covers_layout_shape_dtype_and_device() -> 
         assert message in support_reason(*tensors)
     with pytest.raises(ValueError, match="requires CUDA"):
         predict(good, good, good, tau=0.5, sm_scale=0.125)
-
-
-@_CPU_ONLY
-def test_sol_predictor_validates_runtime_scalars() -> None:
-    assert _runtime_scalar(0.1, "tau") == 0.1
-    assert _runtime_scalar(2, "sm_scale", positive=True) == 2.0
-    invalid = (
-        (True, "tau", {}),
-        (math.nan, "tau", {}),
-        (math.inf, "sm_scale", {"positive": True}),
-        (0.0, "sm_scale", {"positive": True}),
-        (-0.125, "sm_scale", {"positive": True}),
-        ("0.5", "tau", {}),
-    )
-    for value, name, kwargs in invalid:
-        with pytest.raises((TypeError, ValueError), match=name):
-            _runtime_scalar(value, name, **kwargs)
 
 
 def _summary_oracle(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

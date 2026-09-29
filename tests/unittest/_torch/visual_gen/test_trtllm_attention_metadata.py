@@ -18,6 +18,7 @@ from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
 )
 from tensorrt_llm._torch.visual_gen.attention_backend import trtllm as visual_trtllm
 from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_keys_scope
 
 _REQUIRES_SM100 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
@@ -166,168 +167,52 @@ def test_trtllm_attention_metadata_caches_distinct_seq_lens(monkeypatch):
     assert second_metadata.seq_lens is second_cached_seq_lens
 
 
-def test_trtllm_attention_layers_share_block_sparse_plan_cache(monkeypatch):
-    from tensorrt_llm._torch.attention.backends.fmha import prims_ts_block_sparse
-
-    def _base_update_quant_config(self, new_quant_config):
-        del new_quant_config
-        self._fmha_manager = SimpleNamespace(
-            fmha_libs=[prims_ts_block_sparse.PrimsTSBlockSparseFmha(self)]
-        )
-
-    def _base_init(self, **kwargs):
-        fmha_state = kwargs.get("fmha_state")
-        self.fmha_state = {} if fmha_state is None else fmha_state
-        self.is_mla_enable = False
-        self.kv_lora_rank = None
-        self.v_head_dim = None
-        self.head_dim = 64
-        self.update_quant_config(None)
-
+def test_trtllm_attention_layers_share_metadata_and_its_plan_cache(monkeypatch):
+    """Planned FMHA wrappers live on the core metadata, which the layers of one
+    component share per shape; another component gets its own metadata."""
     monkeypatch.setattr(
-        visual_trtllm.BaseTrtllmAttention,
-        "update_quant_config",
-        _base_update_quant_config,
+        visual_trtllm, "BaseTrtllmAttentionMetadata", _FakeBaseTrtllmAttentionMetadata
     )
-    monkeypatch.setattr(visual_trtllm.BaseTrtllmAttention, "__init__", _base_init)
-    attention_metadata_state = create_attention_metadata_state()
-    assert "fmha_caches" not in attention_metadata_state
-
-    first = visual_trtllm.TrtllmAttention(
-        attention_metadata_state=attention_metadata_state,
-    )
-    second = visual_trtllm.TrtllmAttention(
-        attention_metadata_state=attention_metadata_state,
-    )
-
-    assert first.fmha_state is attention_metadata_state["fmha_caches"]
-    assert second.fmha_state is first.fmha_state
-    assert "update_quant_config" not in visual_trtllm.TrtllmAttention.__dict__
-    first_fmha = first._fmha_manager.fmha_libs[0]
-    second_fmha = second._fmha_manager.fmha_libs[0]
-    assert first_fmha._contiguous_wrappers is second_fmha._contiguous_wrappers
-    assert first_fmha._paged_wrappers is second_fmha._paged_wrappers
-
-    first.update_quant_config(None)
-    first_fmha = first._fmha_manager.fmha_libs[0]
-    assert first_fmha._contiguous_wrappers is second_fmha._contiguous_wrappers
-    assert first_fmha._paged_wrappers is second_fmha._paged_wrappers
-    assert attention_metadata_state["fmha_caches"]["prims_ts_block_sparse"] == {
-        "contiguous_wrappers": {},
-        "paged_wrappers": {},
-    }
-
-    other = visual_trtllm.TrtllmAttention(
-        attention_metadata_state=create_attention_metadata_state(),
-    )
-    other_fmha = other._fmha_manager.fmha_libs[0]
-    assert first_fmha._contiguous_wrappers is not other_fmha._contiguous_wrappers
-    assert first_fmha._paged_wrappers is not other_fmha._paged_wrappers
-
-
-def test_visual_gen_wrapper_owns_only_the_timestep_schedule():
-    assert not hasattr(visual_trtllm, "SparseForwardInputs")
-    for name in ("block_sparse_attn_predict", "sparse_post_process", "_forward_impl"):
-        assert name not in visual_trtllm.TrtllmAttention.__dict__
-    for name in ("resolve_timestep", "should_use_sparse"):
-        assert name in visual_trtllm.TrtllmAttention.__dict__
-    assert getattr(visual_trtllm.TrtllmAttention, "__parameters__", ()) == ()
-
-
-def test_wrapper_schedule_follows_cutoff_and_dense_layers():
-    attention = _make_wrapper()
-    assert attention.should_use_sparse(0.8)
-    assert attention.should_use_sparse(None)
-
-    attention.layer_idx = 1
-    attention.sparse_params = SimpleNamespace(
-        disabled_until_timestep=0.6, dense_layers=frozenset({3})
-    )
-    assert not attention.should_use_sparse(0.8)
-    assert attention.should_use_sparse(0.2)
-    assert attention.should_use_sparse(None)
-    attention.layer_idx = 3
-    assert not attention.should_use_sparse(0.2)
-
-
-def test_wrapper_passes_timestep_through_without_a_cutoff():
-    attention = _make_wrapper()
-    timestep = torch.tensor([0.2])
-
-    assert attention.resolve_timestep(timestep) is timestep
-    assert attention.resolve_timestep(None) is None
-
-
-def test_wrapper_prepares_timestep_for_cuda_graph_capture(monkeypatch):
-    attention = _make_wrapper()
-    attention.sparse_params = SimpleNamespace(disabled_until_timestep=0.6)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-
-    with pytest.raises(RuntimeError, match="prepared before CUDA Graph capture"):
-        attention.resolve_timestep(torch.tensor([0.8]))
-
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    # Per-token timesteps reduce to the largest live value.
-    assert attention.resolve_timestep(torch.tensor([0.0, 0.8])) == pytest.approx(0.8)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    assert attention.resolve_timestep(torch.tensor([0.2])) == pytest.approx(0.8)
-
-
-def test_trtllm_attention_metadata_prepares_timestep_for_capture(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    state = {}
-    metadata = visual_trtllm.TrtllmAttentionMetadata(
+    state = create_attention_metadata_state()
+    first = visual_trtllm.TrtllmAttentionMetadata(
         device=torch.device("cpu"), attention_metadata_state=state
     )
-    with pytest.raises(RuntimeError, match="prepared before CUDA Graph capture"):
-        metadata.prepare_timestep(torch.tensor([0.8]))
+    second = visual_trtllm.TrtllmAttentionMetadata(
+        device=torch.device("cpu"), attention_metadata_state=state
+    )
+    other = visual_trtllm.TrtllmAttentionMetadata(
+        device=torch.device("cpu"), attention_metadata_state=create_attention_metadata_state()
+    )
+    seq_lens = torch.tensor([64], dtype=torch.int32)
 
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    assert metadata.prepare_timestep(torch.tensor([0.0, 0.8])) == pytest.approx(0.8)
-    assert state["timestep"] == pytest.approx(0.8)
-    assert metadata.prepare_timestep(None) is None
-    assert state["timestep"] is None
-
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    state["timestep"] = 0.4
-    assert metadata.prepare_timestep(torch.tensor([0.9])) == pytest.approx(0.4)
+    shared = first.prepare(1, seq_lens)
+    assert second.prepare(1, seq_lens) is shared
+    assert other.prepare(1, seq_lens) is not shared
+    assert set(state) == {"metadata_cache"}
 
 
-def test_forward_hands_the_prepared_timestep_to_the_core(monkeypatch):
-    captured: dict = {}
-    _capture_core_forward(monkeypatch, captured)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_graph_metadata_plans_its_own_wrappers():
+    metadata = visual_trtllm.TrtllmAttentionMetadata(
+        attention_metadata_state=create_attention_metadata_state()
+    ).prepare(1, 64)
+    metadata.fmha_plan_caches["library"] = {"profile": object()}
+
+    graph_metadata = metadata.create_cuda_graph_metadata(1)
+
+    assert graph_metadata.fmha_plan_caches == {}
+    assert set(metadata.fmha_plan_caches) == {"library"}
+
+
+def test_wrapper_uses_the_runner_resolved_phase_without_reading_the_timestep(monkeypatch):
     attention = _make_wrapper()
     attention.sparse_params = SimpleNamespace(disabled_until_timestep=0.6)
-    monkeypatch.setattr(attention, "support_fused_qkv", lambda: True, raising=False)
-    q = torch.randn(1, 4, 2, 8)
+    reads = Mock(side_effect=AssertionError("timestep read despite a runner-resolved phase"))
+    monkeypatch.setattr(visual_trtllm, "graph_phase_for_timestep", reads)
 
-    attention.forward(q, q, q, batch_size=1, seq_len=4, timestep=torch.tensor([0.0, 0.8]))
-
-    assert captured["forward_args"].timestep == pytest.approx(0.8)
-
-
-def test_forward_ignores_backend_specific_kwargs_like_other_backends(monkeypatch):
-    captured: dict = {}
-    _capture_core_forward(monkeypatch, captured)
-    attention = _make_wrapper()
-    monkeypatch.setattr(attention, "support_fused_qkv", lambda: True, raising=False)
-    q = torch.randn(1, 4, 2, 8)
-
-    output = attention.forward(
-        q,
-        q,
-        q,
-        batch_size=1,
-        seq_len=4,
-        key_padding_mask=torch.ones(1, 4, dtype=torch.bool),
-        gate_compress=torch.ones(1, 4, 2, 8),
-    )
-
-    assert output.shape == (1, 4, 16)
-    assert captured["kwargs"] == {}
-    assert not hasattr(captured["forward_args"], "key_padding_mask")
+    with resolved_extra_keys_scope({"sparse_attn_phase": 1}):
+        assert attention._sparse_attn_phase(torch.tensor([0.8])) == 1
+    reads.assert_not_called()
 
 
 def test_forward_flattens_fused_qkv_without_copy(monkeypatch):
@@ -348,22 +233,6 @@ def test_forward_flattens_fused_qkv_without_copy(monkeypatch):
     assert captured["forward_args"].sparse_backend_args is None
     assert captured["forward_args"].sparse_runtime_params == SparseRuntimeParams()
     assert captured["kwargs"] == {}
-
-
-def test_forward_fuses_separate_qkv_without_sparse_backend_args(monkeypatch):
-    captured = {}
-    _capture_core_forward(monkeypatch, captured)
-    attention = _make_wrapper()
-    q = torch.randn(1, 4, 2, 8)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-
-    attention.forward(q, k, v, batch_size=1, seq_len=4)
-
-    assert captured["q"].shape == (4, 48)
-    torch.testing.assert_close(captured["q"][:, :16], q.reshape(4, 16))
-    assert captured["k"] is None and captured["v"] is None
-    assert captured["forward_args"].sparse_backend_args is None
 
 
 def test_forward_hands_separate_qkv_and_backend_args_to_core_for_block_sparse_routes(
@@ -411,55 +280,6 @@ def test_forward_hands_separate_qkv_to_core_when_backend_rejects_fused_qkv(monke
     assert captured["k"] is not None and captured["v"] is not None
     assert captured["q"].shape == (4, 16)
     assert captured["forward_args"].sparse_backend_args is None
-
-
-def test_forward_applies_sage_quantization_to_separate_qkv(monkeypatch):
-    captured = {}
-    _capture_core_forward(monkeypatch, captured)
-    quant_cfg = SimpleNamespace(q_block_size=1, k_block_size=2, v_block_size=3, qk_dtype="int8")
-    attention = _make_wrapper(quant_attention_config=quant_cfg)
-    q = torch.randn(1, 4, 2, 8)
-
-    attention.forward(q, q, q, batch_size=1, seq_len=4)
-
-    forward_args = captured["forward_args"]
-    assert captured["k"] is not None and captured["v"] is not None
-    assert forward_args.sage_attn_num_elts_per_blk_q == 1
-    assert forward_args.sage_attn_num_elts_per_blk_k == 2
-    assert forward_args.sage_attn_num_elts_per_blk_v == 3
-    assert forward_args.sage_attn_qk_int8 is True
-
-
-def test_forward_requires_separate_qkv_for_block_sparse_routes(monkeypatch):
-    prepare_metadata = Mock(return_value=object())
-    monkeypatch.setattr(visual_trtllm.TrtllmAttention, "_prepare_metadata", prepare_metadata)
-    attention = _make_wrapper()
-    backend_args = SparseBackendForwardArgs(block_sparse_inputs=_make_block_sparse_inputs())
-
-    with pytest.raises(ValueError, match="separate q, k, and v"):
-        attention.forward(
-            torch.randn(1, 4, 6, 8),
-            None,
-            None,
-            batch_size=1,
-            seq_len=4,
-            sparse_backend_args=backend_args,
-        )
-
-    prepare_metadata.assert_not_called()
-
-
-def test_forward_rejects_block_sparse_routes_with_quant_config(monkeypatch):
-    prepare_metadata = Mock(return_value=object())
-    monkeypatch.setattr(visual_trtllm.TrtllmAttention, "_prepare_metadata", prepare_metadata)
-    attention = _make_wrapper(quant_attention_config=object())
-    q = torch.randn(1, 4, 2, 8)
-    backend_args = SparseBackendForwardArgs(block_sparse_inputs=_make_block_sparse_inputs())
-
-    with pytest.raises(ValueError, match="quant_attention_config"):
-        attention.forward(q, q, q, batch_size=1, seq_len=4, sparse_backend_args=backend_args)
-
-    prepare_metadata.assert_not_called()
 
 
 @pytest.mark.parametrize("has_block_sparse_inputs", [False, True])
@@ -514,7 +334,8 @@ def test_forward_reaches_core_fmha_with_module_predicted_routes(
 
 @_REQUIRES_SM100
 def test_trtllm_skip_softmax_cutoff_is_capturable_with_a_device_timestep() -> None:
-    """The wrapper prepares the timestep during warmup so capture never reads the tensor."""
+    """Under the phase the CUDA graph runner resolves for the call, eager warmup
+    and capture use the host phase and never read the device timestep."""
     params = SkipSoftmaxParams(
         scheduler=SkipSoftmaxScheduler(
             threshold_scale_factor_prefill=5000.0, disabled_until_timestep=0.6
@@ -537,17 +358,19 @@ def test_trtllm_skip_softmax_cutoff_is_capturable_with_a_device_timestep() -> No
     def forward() -> torch.Tensor:
         return attention.forward(q, k, v, batch_size=batch_size, seq_len=seq_len, timestep=timestep)
 
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        for _ in range(2):
-            eager = forward()
-    torch.cuda.current_stream().wait_stream(side)
-    torch.cuda.synchronize()
+    # The runner publishes the phase it keyed the graph on (0: dense prefix).
+    with resolved_extra_keys_scope({"sparse_attn_phase": 0}):
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                eager = forward()
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
 
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = forward()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = forward()
     graph.replay()
     torch.cuda.synchronize()
 

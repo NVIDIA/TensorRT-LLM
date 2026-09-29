@@ -18,7 +18,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
@@ -127,6 +127,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
     beam_width: int = 1
+
+    # Plan caches of the FMHA libraries, keyed by library. A planned wrapper owns
+    # workspaces that CUDA graphs capture, so it lives exactly as long as this
+    # metadata; every layer that runs with this metadata reuses it.
+    fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
+                                              init=False,
+                                              repr=False)
 
     @property
     def effective_beam_width(self) -> int:
@@ -346,6 +353,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             or self.runtime_features.cache_reuse
             or self.runtime_features.has_speculative_draft_tokens
         ) if self.runtime_features is not None else False
+        # CUDA-graph metadata is a shallow copy that re-runs this method; give it
+        # its own plan caches so each captured batch size plans its own wrappers.
+        self.fmha_plan_caches = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
     def update_position_offsets_for_cpp(self, query_len: int) -> None:
@@ -1592,7 +1602,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sparse_params: Optional[SparseParams] = None,
         kv_cache_dtype: str = "auto",
         skip_correction_threshold: float = 0.0,
-        fmha_state: Optional[dict] = None,
         **kwargs,
     ) -> None:
         """
@@ -1617,10 +1626,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 used by DeepSeek-V4 and DSA on SM120/SM121.
             skip_correction_threshold (float): Runtime MLA threshold. Zero disables
                 skip-correction.
-            fmha_state (dict): Optional state shared with the FMHA libraries of this
-                backend, for example plan caches. Libraries read the entries they own
-                from it, so handing one dict to several layers shares those entries
-                across them; the default is a private dict per instance.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
@@ -1692,7 +1697,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.kv_scale_orig_quant = 1.0 / self.kv_cache_scaling_factor
 
         self.local_layer_idx: Optional[int] = None
-        self.fmha_state: dict = {} if fmha_state is None else fmha_state
         self._fmha_manager: FmhaManager
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)

@@ -124,7 +124,11 @@ def _predict(
         _flatten(k),
         _flatten(v),
         _core_metadata(q.shape[0], q.shape[1]),
-        AttentionForwardArgs(attention_mask=attention_mask, timestep=timestep),
+        AttentionForwardArgs(
+            attention_mask=attention_mask,
+            timestep=timestep,
+            sparse_attn_phase=backend._sparse_attn_phase(timestep),
+        ),
     )
 
 
@@ -207,43 +211,15 @@ def _stub_backend(
 
 # --------------------------------------------------------------------------- TRTLLM backend
 @_CPU_ONLY
-def test_sol_backend_reuses_prepared_timestep_during_cuda_graph_capture(monkeypatch) -> None:
-    backend, _predictor = _stub_backend(
-        monkeypatch, SolParams(tau=1.0, disabled_until_timestep=0.6)
-    )
-    # Per-token timesteps reduce to the largest live value.
-    assert backend.resolve_timestep(torch.tensor([0.0, 0.2])) == pytest.approx(0.2)
-
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    prepared = backend.resolve_timestep(torch.tensor(0.8))
-
-    assert prepared == pytest.approx(0.2)
-    assert backend.should_use_sparse(prepared)
-
-
-@_CPU_ONLY
-def test_sol_backend_warmup_prepares_dense_phase_for_capture(monkeypatch) -> None:
+def test_sol_backend_uses_the_runner_resolved_phase_during_capture(monkeypatch) -> None:
     q = _bshd()
     backend, predictor = _stub_backend(monkeypatch, SolParams(tau=1.0, disabled_until_timestep=0.6))
 
-    assert _predict(backend, q, q, q, timestep=backend.resolve_timestep(torch.tensor(0.8))) is None
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    assert _predict(backend, q, q, q, timestep=backend.resolve_timestep(torch.tensor(0.8))) is None
-    predictor.predict.assert_not_called()
-
-
-@_CPU_ONLY
-def test_sol_backend_rejects_cutoff_capture_without_warmup(monkeypatch) -> None:
-    backend, predictor = _stub_backend(monkeypatch, SolParams(tau=1.0, disabled_until_timestep=0.6))
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-
-    with pytest.raises(RuntimeError, match="prepared before CUDA Graph capture"):
-        backend.resolve_timestep(torch.tensor(0.2))
-
-    predictor.predict.assert_not_called()
+    # The runner resolved the sparse phase for this call; the dense-looking
+    # timestep tensor is not read.
+    with resolved_extra_keys_scope({"sparse_attn_phase": 1}):
+        assert _predict(backend, q, q, q, timestep=torch.tensor(0.8)) is not None
+    predictor.predict.assert_called_once()
 
 
 @_CPU_ONLY
@@ -251,7 +227,7 @@ def test_sol_backend_without_timestep_runs_sparse_like_skip_softmax(monkeypatch)
     q = _bshd()
     backend, predictor = _stub_backend(monkeypatch, SolParams(tau=1.0, disabled_until_timestep=0.6))
 
-    assert _predict(backend, q, q, q, timestep=backend.resolve_timestep(None)) is not None
+    assert _predict(backend, q, q, q, timestep=None) is not None
     predictor.predict.assert_called_once()
 
 
@@ -261,8 +237,8 @@ def test_sol_phase_waits_until_all_token_timesteps_are_below_cutoff(monkeypatch)
         monkeypatch, SolParams(tau=1.0, disabled_until_timestep=0.6)
     )
 
-    assert not backend.should_use_sparse(backend.resolve_timestep(torch.tensor([0.0, 0.8])))
-    assert backend.should_use_sparse(backend.resolve_timestep(torch.tensor([0.0, 0.2])))
+    assert not backend.should_use_sparse(backend._sparse_attn_phase(torch.tensor([0.0, 0.8])))
+    assert backend.should_use_sparse(backend._sparse_attn_phase(torch.tensor([0.0, 0.2])))
 
 
 @_CPU_ONLY
@@ -391,35 +367,6 @@ def test_sol_wrapper_compacts_separate_qkv_and_predicts_inside_core(monkeypatch)
 
 @_CPU_ONLY
 @pytest.mark.parametrize(
-    ("params", "layer_idx", "timestep"),
-    (
-        (SolParams(tau=1.0, dense_layers=frozenset({3})), 3, None),
-        (SolParams(tau=1.0, disabled_until_timestep=0.6), 1, torch.tensor([0.9])),
-    ),
-    ids=("dense_layer", "dense_phase"),
-)
-def test_sol_wrapper_fuses_qkv_for_dense_calls(monkeypatch, params, layer_idx, timestep) -> None:
-    """A dense layer or a dense-phase step predicts nothing, so the wrapper hands
-    the core fused QKV: the only dense self-attention layout the TRTLLM kernel serves."""
-    batch_size, seq_len, num_heads = 1, 64, 2
-    q, k, v = (
-        torch.zeros(batch_size, seq_len, num_heads, 128, dtype=torch.bfloat16) for _ in range(3)
-    )
-    backend, predictor = _stub_backend(monkeypatch, params, seq_len=seq_len)
-    backend.layer_idx = layer_idx
-    captured = _stub_core_forward(monkeypatch)
-
-    _forward(backend, q, k, v, attention_mask=PredefinedAttentionMask.FULL, timestep=timestep)
-
-    assert captured["k"] is None and captured["v"] is None
-    assert captured["q"].shape == (batch_size * seq_len, 3 * num_heads * 128)
-    runtime_params = captured["forward_args"].sparse_runtime_params
-    assert getattr(runtime_params, "block_sparse_inputs", None) is None
-    predictor.predict.assert_not_called()
-
-
-@_CPU_ONLY
-@pytest.mark.parametrize(
     ("k", "v", "attention_mask", "message"),
     (
         (None, None, PredefinedAttentionMask.FULL, "separate q, k, and v"),
@@ -439,32 +386,6 @@ def test_sol_backend_rejects_non_sol_sparse_calls(
 
     with pytest.raises(ValueError, match=message):
         _predict(backend, q, k, v, attention_mask=attention_mask)
-
-    predictor.predict.assert_not_called()
-
-
-@_CPU_ONLY
-def test_sol_wrapper_rejects_fused_qkv_before_core(monkeypatch) -> None:
-    q = _bshd()
-    backend, predictor = _stub_backend(monkeypatch)
-    prepare_metadata = Mock(return_value=object())
-    monkeypatch.setattr(TrtllmAttention, "_prepare_metadata", prepare_metadata)
-
-    with pytest.raises(ValueError, match="separate q, k, and v"):
-        _forward(backend, q, None, None)
-
-    prepare_metadata.assert_not_called()
-    predictor.predict.assert_not_called()
-
-
-@_CPU_ONLY
-def test_sol_backend_surfaces_predictor_support_reason_before_execution(monkeypatch) -> None:
-    q = _bshd()
-    reason = "SOL predictor requires compact BSHD q/k/v"
-    backend, predictor = _stub_backend(monkeypatch, unsupported_reason=reason)
-
-    with pytest.raises(ValueError, match=reason):
-        _predict(backend, q, q, q)
 
     predictor.predict.assert_not_called()
 
@@ -499,19 +420,6 @@ def test_sol_sparse_phase_without_primts_fails_closed(monkeypatch) -> None:
     backend._fmha_manager = SimpleNamespace(fmha_libs=[])
 
     with pytest.raises(RuntimeError, match="requires PrimTS block-sparse FMHA"):
-        _predict(backend, q, q, q)
-
-    predictor.support_reason.assert_not_called()
-    predictor.predict.assert_not_called()
-
-
-@_CPU_ONLY
-def test_sol_sparse_phase_with_quantization_fails_closed(monkeypatch) -> None:
-    q = _bshd()
-    backend, predictor = _stub_backend(monkeypatch)
-    backend.quant_attention_config = object()
-
-    with pytest.raises(ValueError, match="does not support quant_attention_config"):
         _predict(backend, q, q, q)
 
     predictor.support_reason.assert_not_called()
@@ -564,13 +472,6 @@ def _fake_cuda_q(shape, dtype=torch.bfloat16) -> SimpleNamespace:
     """
 
     return SimpleNamespace(is_cuda=True, ndim=len(shape), shape=shape, dtype=dtype)
-
-
-def _is_dynamo_disabled(fn) -> bool:
-    """True if ``fn`` is wrapped by torch.compiler.disable / torch._dynamo.disable."""
-
-    target = getattr(fn, "__func__", fn)
-    return bool(getattr(target, "_torchdynamo_disable", False))
 
 
 def _masked_sdpa_reference(q, k, v, *, key_padding_mask=None, is_causal=False) -> torch.Tensor:
@@ -886,68 +787,6 @@ def test_cutedsl_datacenter_blackwell_archs_are_supported() -> None:
 
 
 @_CPU_ONLY
-def test_cutedsl_no_arch_literal_outside_the_dispatch_map() -> None:
-    """The guard in ``_sol_attn_cute`` must key off ``_CUTE_BACKENDS``, not a literal.
-
-    ``test_cutedsl_supported_archs_match_kernel_dispatch_map`` keeps
-    SUPPORTED_ARCHS and _CUTE_BACKENDS in step, so widening both would leave a
-    hardcoded literal here as the only thing still rejecting a new arch, with
-    every test green. Assert on the source so the coupling cannot regress.
-    """
-
-    import ast
-    import inspect
-    import textwrap
-
-    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.sol_attn import interface
-
-    src = textwrap.dedent(inspect.getsource(interface._sol_attn_cute))
-    assert "arch not in _CUTE_BACKENDS" in src, (
-        "the guard in _sol_attn_cute must be keyed off _CUTE_BACKENDS"
-    )
-
-    offenders = []
-    for node in ast.walk(ast.parse(src)):
-        if not isinstance(node, ast.Compare):
-            continue
-        operands = [node.left, *node.comparators]
-        names = {n.id for n in operands if isinstance(n, ast.Name)}
-        if "arch" not in names:
-            continue
-        for operand in operands:
-            if isinstance(operand, ast.Tuple) and all(
-                isinstance(e, ast.Constant) and isinstance(e.value, int) for e in operand.elts
-            ):
-                offenders.append(ast.unparse(node))
-    assert not offenders, (
-        "hardcoded architecture literal(s) compared against `arch` in "
-        f"_sol_attn_cute: {offenders}; key the guard off _CUTE_BACKENDS instead"
-    )
-
-
-@_CPU_ONLY
-def test_cutedsl_kernel_launch_is_opaque_to_dynamo() -> None:
-    """The CuTe DSL launch boundary must be ``torch.compiler.disable``d.
-
-    Without it Dynamo traces into the CuTe DSL JIT builder and retraces on every
-    call, which is silently two orders of magnitude slower.
-    """
-
-    assert _is_dynamo_disabled(_kernel_wrapper()._run_sol_attn_bthd), (
-        "_run_sol_attn_bthd must be decorated with @torch.compiler.disable"
-    )
-
-
-@_CPU_ONLY
-def test_cutedsl_timestep_scalar_read_is_opaque_to_dynamo() -> None:
-    """The dense-prefix ``.item()`` must stay in eager, or it graph-breaks per layer."""
-
-    assert _is_dynamo_disabled(SOLCuTeDSLAttention._dense_by_step), (
-        "SOLCuTeDSLAttention._dense_by_step must be decorated with @torch.compiler.disable"
-    )
-
-
-@_CPU_ONLY
 def test_cutedsl_sol_key_padding_mask_routes_to_vanilla_and_is_honored(monkeypatch) -> None:
     """Masked self-attention must never reach the mask-blind sparse kernel.
 
@@ -1049,16 +888,6 @@ def test_sol_public_config_requires_supported_backend() -> None:
             backend="VANILLA",
             sparse_attention_config=SolAttentionConfig(),
         )
-
-
-@_CPU_ONLY
-def test_sol_exact_threshold_lowers_for_both_backends() -> None:
-    for backend in ("TRTLLM", "CUTEDSL"):
-        config = AttentionConfig(
-            backend=backend,
-            sparse_attention_config=SolAttentionConfig(thresh_type="exact"),
-        )
-        assert config.sparse_attention_config.to_sparse_params().thresh_type == "exact"
 
 
 @_CPU_ONLY

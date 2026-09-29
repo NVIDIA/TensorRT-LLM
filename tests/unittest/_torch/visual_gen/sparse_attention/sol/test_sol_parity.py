@@ -41,6 +41,7 @@ from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.predictor impor
 )
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_keys_scope
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import sol_attn_backend
 from tensorrt_llm.visual_gen import SolAttentionConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig
@@ -301,8 +302,9 @@ def test_trtllm_sol_all_exact_routes_match_dense_under_cuda_graph() -> None:
     torch.cuda.synchronize()
     torch.testing.assert_close(eager, _dense_reference(q, k, v), rtol=2e-2, atol=2e-2)
 
+    # Capture sees the sparse phase the CUDA graph runner resolved for the call.
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with resolved_extra_keys_scope({"sparse_attn_phase": 1}), torch.cuda.graph(graph):
         captured = _forward_trtllm(backend, q, k, v, timestep=timestep)
 
     next_q, next_k, next_v = _packed_strided_inputs(generator, shape)

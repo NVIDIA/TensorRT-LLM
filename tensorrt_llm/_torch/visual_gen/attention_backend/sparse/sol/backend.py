@@ -355,11 +355,11 @@ class SOLTrtllmAttention(TrtllmAttention):
         """Return SOL routes for sparse calls and ``None`` for dense calls.
 
         ``q``, ``k``, and ``v`` arrive in the flattened ``[B*S, H*D]`` core
-        layout; the batch layout comes from ``metadata`` and the timestep,
-        already prepared by the wrapper forward, from ``forward_args``.
+        layout; the batch layout comes from ``metadata`` and the dense or
+        sparse phase, resolved by the wrapper forward, from ``forward_args``.
         """
 
-        if not self.should_use_sparse(forward_args.timestep):
+        if not self.should_use_sparse(forward_args.sparse_attn_phase):
             return None
 
         if self.quant_attention_config is not None:
