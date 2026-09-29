@@ -323,7 +323,16 @@ All active model engines in one process must use the same effective policy,
 including the disabled default. Creating an engine with a conflicting policy
 or changing that policy through `configure_nvmmh()` raises `ValueError` without
 replacing the current configuration. Identical policies can be reused. After
-the last engine is cleaned up or garbage-collected, a new policy can be installed.
+the last executor shuts down (or its engine is cleaned up or collected), a new
+policy can be installed.
+
+CuTe DSL runners use the existing globaltimer or CUDA-event timing by default.
+Set `TLLM_PROFILING_TIMER=torch_profiler` to opt in to Kineto/CUPTI timing for
+these runners. Explicit `globaltimer` and `cuda_event` values keep their
+existing meanings. CUPTI results and CUDA-event fallbacks have separate cache
+keys; enabling CUPTI or NVMMH can require re-tuning entries in an existing
+`TLLM_AUTOTUNER_CACHE_PATH` file. The layer-wise benchmark YAML examples leave
+NVMMH disabled; set `autotuner_nvmmh: true` to benchmark pruning.
 
 Compatible validated runner-specific tactics that NVMMH cannot represent are
 retained automatically and empirically profiled. The BF16 and SM107

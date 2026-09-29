@@ -5600,7 +5600,7 @@ class AutoTunerNvMMHConfig(StrictBaseModel):
         default=5,
         strict=True,
         description=
-        "Maximum number of NVMMH-ranked tile/cluster signatures to retain.")
+        "Maximum number of NVMMH-ranked selected-field signatures to retain.")
 
     @field_validator('fields')
     @classmethod

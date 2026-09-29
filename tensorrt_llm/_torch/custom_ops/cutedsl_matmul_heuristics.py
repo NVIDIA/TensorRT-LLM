@@ -119,10 +119,11 @@ class HeuristicConfig(NamedTuple):
 def nvmmh_cta_order_to_cute_raster(cta_order: int) -> str:
     """Translate CUTLASS3 nvMMH CTA order to CuTe's raster name.
 
-    nvMMH's CUTLASS swizzler and DKG integration use order 0 for an
-    M-fast raster and order 1 for an N-fast raster.  Keep this conversion at
-    the adapter boundary because the public nvMMH header's row/column wording
-    does not match the CUTLASS3 implementation used to score the configs.
+    CUTLASS's nvMMH adapter maps order 0 to ``along_m`` and order 1 to
+    ``along_n`` (python/cutlass_library/heuristics_provider.py in CUTLASS,
+    see https://github.com/NVIDIA/cutlass/blob/main/python/cutlass_library/heuristics_provider.py#L222).
+    Keep this conversion at the adapter boundary because the public nvMMH
+    header's row/column wording differs from this CUTLASS3 mapping.
     """
     if cta_order == 0:
         return "m"
@@ -558,12 +559,9 @@ def _bf16_config_signature(config: HeuristicConfig, fields: set) -> tuple:
     if fields & {"tile", "cluster"}:
         cta_m, cta_n = (int(v) for v in config.cta)
         cluster_m, cluster_n = (int(v) for v in config.cluster)
-        # libheuristics encodes its two-CTA MMA with cluster_m == 2 while the
-        # CuTe DSL runner encodes it by doubling mma_tiler_mn[0].
-        n_align = 32 if cta_n > 256 else 16
-        use_2cta = cluster_m == 2 and cta_n % n_align == 0
-        mma_tiler_mn = ((2 * cta_m if use_2cta else cta_m), cta_n)
-        signature.extend((use_2cta, mma_tiler_mn, (cluster_m, cluster_n)))
+        # The model reports a per-CTA tile. Both MMA instruction modes remain
+        # local choices for this tile and cluster.
+        signature.extend(((cta_m, cta_n), (cluster_m, cluster_n)))
     if "split_k" in fields:
         signature.append(max(1, int(config.split_k)))
     if "swizzle" in fields:
@@ -581,7 +579,11 @@ def _bf16_tactic_signature(tactic: tuple, fields: set) -> Optional[tuple]:
     fields = _bf16_actionable_fields(fields, split_k)
     signature = []
     if fields & {"tile", "cluster"}:
-        signature.extend((bool(tactic[1]), tuple(tactic[2]), tuple(tactic[3])))
+        cta_group = 2 if tactic[1] else 1
+        mma_tiler_m, mma_tiler_n = tactic[2]
+        if mma_tiler_m % cta_group:
+            return None
+        signature.extend(((mma_tiler_m // cta_group, mma_tiler_n), tuple(tactic[3])))
     if "split_k" in fields:
         signature.append(split_k)
     if "swizzle" in fields:
