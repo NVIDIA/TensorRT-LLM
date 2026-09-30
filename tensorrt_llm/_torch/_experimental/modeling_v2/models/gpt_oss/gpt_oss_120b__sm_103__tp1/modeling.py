@@ -43,6 +43,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
+from tensorrt_llm._torch._experimental.modeling_v2._target import Phase, Target, phase_of
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
     fused_qk_norm_rope,
 )
@@ -80,14 +81,20 @@ from . import weights as _weights
 _SM = (10, 3)
 
 
-def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
+def _build_step_args(
+    md: TrtllmAttentionMetadata, *, num_contexts: int, num_ctx_tokens: int
+) -> dict:
     """Project the prepared metadata onto thop_attention's explicit batch
     state, once per forward; every runtime-owned value passes through as
     the engine prepared it. CUDA-graph classes: tensors are engine-owned
     persistent buffers refreshed in place (reference class); Python ints
-    are per-capture constants (host-derived class — a decode-only graph
-    always sees num_contexts == 0). attention_window_size is absent here
-    on purpose: it varies per layer and is passed at the call site."""
+    are per-capture constants (host-derived class). attention_window_size is
+    absent here on purpose: it varies per layer and is passed at the call site.
+
+    `num_contexts` and `num_ctx_tokens` are passed rather than read off `md`
+    because they are the two values a decode target knows by its routing --
+    it states them as 0 instead of reading back what the predicate already
+    guaranteed."""
     return dict(
         sequence_length=md.kv_lens_cuda_runtime,
         host_past_key_value_lengths=md.kv_lens_runtime,
@@ -103,8 +110,8 @@ def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
         max_num_requests=md.max_num_requests,
         max_context_length=md.max_context_length,
         max_seq_len=md.max_seq_len,
-        num_contexts=md.num_contexts,
-        num_ctx_tokens=md.num_ctx_tokens,
+        num_contexts=num_contexts,
+        num_ctx_tokens=num_ctx_tokens,
         trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
         use_paged_context_fmha=md.use_paged_context_fmha,
         beam_width=md.effective_beam_width,
@@ -393,6 +400,7 @@ class ModelingV2Core(DecoderModel):
 
         self._layers: list | None = None
         self._call_tensors: dict | None = None
+        self._targets: dict[Phase, Target] | None = None
         # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it: read once here
         # rather than per forward, and False for the whole life of a served
         # engine. "pending" rather than "enabled" because the check runs once
@@ -443,6 +451,14 @@ class ModelingV2Core(DecoderModel):
             )
         self._layers = layers
 
+        # After the weights are real, never in __init__: the shell builds its
+        # containers while every parameter is still a meta tensor, and the
+        # engine materializes the registry by replacing those tensor objects.
+        self._targets = {
+            Phase.PREFILL: PrefillTarget(self),
+            Phase.DECODE: DecodeTarget(self),
+        }
+
     def _check_step_contract(self, md, position_ids) -> None:
         """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE
         asks for it: the metadata fields this target consumes must exist (they
@@ -464,7 +480,7 @@ class ModelingV2Core(DecoderModel):
         # a hand-kept list of the same names drifts silently the first time
         # _build_step_args gains a field and nobody updates the copy.
         try:
-            _build_step_args(md)
+            _build_step_args(md, num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
         except AttributeError as exc:
             raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
         assert position_ids.dtype == torch.int32
@@ -478,13 +494,45 @@ class ModelingV2Core(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Route the step, and nothing else.
+
+        The contract check runs here rather than inside a target for two
+        reasons: it is phase-independent, and it is what regrows `_rope` when
+        the engine admits a longer `max_seq_len` than the table was built for.
+        A target reading `_rope` before it had run would read the short table.
+        """
+        assert self._targets is not None, "load_weights must run before forward"
+        assert isinstance(attn_metadata, TrtllmAttentionMetadata)
+        if self._contract_pending:
+            self._check_step_contract(attn_metadata, kwargs.get("position_ids"))
+        return self._targets[phase_of(attn_metadata)].forward(attn_metadata, *args, **kwargs)
+
+
+class _GptOssTarget(Target):
+    """The shared step body.
+
+    gpt_oss is not MLA, so `TrtllmAttention` accepts `mixed` and the
+    context/generation split stays inside the C++ dispatcher: this forward has
+    no phase branch to divide. The two concrete targets below therefore differ
+    only in `step_args`. A model whose phases run different computations --
+    deepseek's MLA, where generation works in latent space and context
+    materializes K and V -- overrides `forward` itself instead.
+    """
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
         input_ids: torch.IntTensor | None = None,
         position_ids: torch.IntTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        assert self._layers is not None and self._call_tensors is not None, (
+        core = self.core
+        assert core._layers is not None and core._call_tensors is not None, (
             "load_weights must run before forward"
         )
         assert position_ids is not None
@@ -495,32 +543,30 @@ class ModelingV2Core(DecoderModel):
         assert kwargs.get("spec_metadata") is None, (
             "speculative decoding is not implemented by this target"
         )
-        if self._contract_pending:
-            self._check_step_contract(attn_metadata, position_ids)
 
-        step = _build_step_args(attn_metadata)
+        step = self.step_args(attn_metadata)
         # Full-attention layers take the no-window value; sliding layers take
         # the checkpoint's window. Both are host-derived per-capture constants
         # (max_seq_len is an engine-construction constant).
         full_window = attn_metadata.max_seq_len
-        const = self._call_tensors
+        const = core._call_tensors
         no_qk_norm = const["no_qk_norm"]
         pos = torch.reshape(position_ids, [-1])
 
         if inputs_embeds is None:
             assert input_ids is not None
-            h = nn.functional.embedding(input_ids, self.w["embed"])
+            h = nn.functional.embedding(input_ids, core.w["embed"])
         else:
             h = inputs_embeds
         num_tokens = h.shape[0]
         dt = h.dtype
         attn_out = torch.empty(
-            [num_tokens, self.heads_q * self.head_dim], dtype=dt, device=h.device
+            [num_tokens, core.heads_q * core.head_dim], dtype=dt, device=h.device
         )
 
-        x = flashinfer_rmsnorm(h, self.w["l0_norm1"], self.eps)
+        x = flashinfer_rmsnorm(h, core.w["l0_norm1"], core.eps)
         residual = h
-        for i in range(self.num_layers):
+        for i in range(core.num_layers):
             (
                 w_qkv,
                 b_qkv,
@@ -537,41 +583,41 @@ class ModelingV2Core(DecoderModel):
                 fc2_s,
                 fc2_b,
                 w_next,
-            ) = self._layers[i]
+            ) = core._layers[i]
             qkv = cublas_mm(x, w_qkv, b_qkv)
             fused_qk_norm_rope(
                 qkv,
-                num_heads_q=self.heads_q,
-                num_heads_k=self.heads_kv,
-                num_heads_v=self.heads_kv,
-                head_dim=self.head_dim,
-                rotary_dim=self.rotary_dim,
-                eps=self.eps,
+                num_heads_q=core.heads_q,
+                num_heads_k=core.heads_kv,
+                num_heads_v=core.heads_kv,
+                head_dim=core.head_dim,
+                rotary_dim=core.rotary_dim,
+                eps=core.eps,
                 q_weight=no_qk_norm,
                 k_weight=no_qk_norm,
-                base=self.theta,
+                base=core.theta,
                 is_neox=True,
                 position_ids=pos,
-                factor=self.yarn_factor,
-                low=self.yarn_low,
-                high=self.yarn_high,
-                attention_factor=self.yarn_attn_factor,
+                factor=core.yarn_factor,
+                low=core.yarn_low,
+                high=core.yarn_high,
+                attention_factor=core.yarn_attn_factor,
                 is_qk_norm=False,
             )
             thop_attention(
                 q=qkv,
                 output=attn_out,
                 local_layer_idx=i,
-                num_heads=self.heads_q,
-                num_kv_heads=self.heads_kv,
-                head_size=self.head_dim,
+                num_heads=core.heads_q,
+                num_kv_heads=core.heads_kv,
+                head_size=core.head_dim,
                 attention_sinks=sinks,
-                attention_window_size=self.window if self.sliding[i] else full_window,
+                attention_window_size=core.window if core.sliding[i] else full_window,
                 **step,
                 **_CALL_CONSTANTS,
             )
             o = cublas_mm(attn_out, w_o, b_o)
-            flashinfer_fused_add_rmsnorm(o, residual, w_n2, self.eps)
+            flashinfer_fused_add_rmsnorm(o, residual, w_n2, core.eps)
             # The router bias rides the GEMM epilogue: the MoE op silently
             # ignores routing_bias on this routing method.
             router_logits = cublas_mm(o, w_rt, b_rt)
@@ -593,22 +639,47 @@ class ModelingV2Core(DecoderModel):
                 fc2_w,
                 fc2_s,
                 fc2_b,
-                self.num_experts,
-                self.topk,
+                core.num_experts,
+                core.topk,
                 None,
                 None,
-                self.inter_pad,
-                self.hidden,
-                self.inter,
+                core.inter_pad,
+                core.hidden,
+                core.inter,
                 0,
-                self.num_experts,
+                core.num_experts,
                 None,
                 _ROUTING_METHOD_RENORMALIZE,
                 _ACT_TYPE_SWIGLU,
             )
-            flashinfer_fused_add_rmsnorm(moe, residual, w_next, self.eps)
+            flashinfer_fused_add_rmsnorm(moe, residual, w_next, core.eps)
             x = moe
         return x
+
+
+class PrefillTarget(_GptOssTarget):
+    """The general case: context rows, and possibly generation rows beside them.
+
+    In-flight batching puts both in one step, and that mixed batch routes here
+    rather than to decode -- so this target reads both counts off the metadata
+    and may not assume either is zero.
+    """
+
+    def step_args(self, md: TrtllmAttentionMetadata) -> dict:
+        return _build_step_args(md, num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
+
+
+class DecodeTarget(_GptOssTarget):
+    """The specialization: routed to only when there are no context rows.
+
+    It states the two counts rather than reading them. Not an optimization --
+    they are per-capture host constants either way -- but it is what makes the
+    invariant checkable: a decode target that reads the phase back has stopped
+    being one, and the source gate in test_modeling_v2_claims.py can see that.
+    """
+
+    def step_args(self, md: TrtllmAttentionMetadata) -> dict:
+        return _build_step_args(md, num_contexts=0, num_ctx_tokens=0)
 
 
 @register_auto_model("ModelingV2GptOss120bSm103Tp1")
