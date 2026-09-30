@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 from collections.abc import Sequence
 from typing import Optional
 
@@ -64,8 +65,6 @@ def get_cache_salt_id(cache_salt: str) -> int:
     here. Router-computed v1 hashes for salted requests therefore only match
     workers running KV cache manager V2.
     """
-    import hashlib
-
     digest = hashlib.sha256(cache_salt.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "little", signed=False)
 

@@ -49,6 +49,8 @@ get_cache_salt_id = kv_cache_hash.get_cache_salt_id
 hash_v1_block_key = kv_cache_hash.hash_v1_block_key
 truncate_sha256_hash_to_int64 = kv_cache_hash.truncate_sha256_hash_to_int64
 
+_UINT64_MASK = (1 << 64) - 1
+
 OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
 BlockHash = Union[int, str]
 
@@ -165,11 +167,15 @@ def block_key_hasher(
 ) -> int:
     parent = 0 if parent_hash is None else parent_hash
     # Fast path: the native C++ BlockKeyHasher is bit-exact with
-    # hash_v1_block_key and avoids the per-token Python loop. Its hash() binding
-    # takes no cache_salt_id or lora_task_id, so fall back to Python whenever
-    # either is set (rare opt-in; never in the plain agent/chat completion path).
-    if cache_salt_id is None and lora_task_id is None:
-        return _NativeBlockKeyHasher.hash(_NativeBlockKey(token_ids), parent)
+    # hash_v1_block_key and avoids the per-token Python loop. The native
+    # BlockKey carries the LoRA task id (a uint64, masked here the same way
+    # hash_v1_block_key masks it), but its binding exposes no cache salt, so
+    # only salted requests take the Python path.
+    if cache_salt_id is None:
+        native_lora_id = None if lora_task_id is None else lora_task_id & _UINT64_MASK
+        return _NativeBlockKeyHasher.hash(
+            _NativeBlockKey(token_ids, lora_task_id=native_lora_id), parent
+        )
     return hash_v1_block_key(
         token_ids, parent_hash=parent, lora_task_id=lora_task_id, cache_salt_id=cache_salt_id
     )
