@@ -32,6 +32,8 @@ import sys
 import urllib.error
 import urllib.request
 
+REUSABLE_RESULTS = ("SUCCESS", "UNSTABLE")
+
 
 def fetch_json(url):
     request = urllib.request.Request(url)
@@ -65,7 +67,7 @@ def find_plc_build(
     )
     data = fetch_json(url)
     for build_info in data.get("allBuilds", []):
-        if build_info.get("building") or build_info.get("result") is None:
+        if build_info.get("building") or build_info.get("result") not in REUSABLE_RESULTS:
             continue
         params = build_parameters(build_info)
         if (
