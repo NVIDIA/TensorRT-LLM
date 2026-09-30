@@ -39,11 +39,11 @@ function pull(number = 1, changes = {}) {
 function fixture(prs = [pull()], options = {}) {
   const state = {
     prs, legacyChecks: [], statuses: [], comments: new Map(), posts: [], updates: [], warnings: [],
-    failures: [], remaining: options.remaining ?? 5000, target: TARGET,
+    failures: [], summaries: [], remaining: options.remaining ?? 5000, target: TARGET,
     mergeBase: BASE, service: SERVICE, readCounts: new Map(), refReads: 0,
     hooks: [], commandHooks: [], postAttempts: 0,
     commandRemaining: options.commandRemaining ?? 5000, postErrors: new Map(), comparisons: 0,
-    now: NOW, nextCommentId: 1000, commentReads: new Map(), statusFailures: 0, readOrder: [],
+    now: NOW, nextCommentId: 1000, commentReads: new Map(), statusFailures: 0, summaryFailures: 0, readOrder: [],
   };
   const hook = key => ({
     ...Object.fromEntries(['before', 'after', 'error', 'wrap'].map(kind =>
@@ -158,7 +158,13 @@ function fixture(prs = [pull()], options = {}) {
   const core = {
     warning: (message) => state.warnings.push(message), info: () => {},
     setFailed: (message) => state.failures.push(message),
-    summary: { addRaw: () => ({ write: async () => {} }) },
+    summary: { addRaw: (message) => ({ write: async () => {
+      if (state.summaryFailures > 0) {
+        state.summaryFailures -= 1;
+        throw new Error('Summary write unavailable');
+      }
+      state.summaries.push(message);
+    } }) },
   };
   const args = { github, commandGithub, context, core };
   return { ...args, state,
@@ -204,12 +210,17 @@ test('transient GET failures recover within three attempts and send one AI reque
 
 test('persistent GET failure stops after three attempts without sending AI or status writes', async () => {
   const failure = httpError(504);
+  failure.request = {method: 'GET', url: 'https://example.test/?secret=do-not-log',
+    headers: {authorization: 'do-not-log'}, body: 'do-not-log'};
+  failure.message = 'do-not-log';
   const f = fixture([pull()], {readPR: () => {throw failure;}});
   assert.equal((await f.worker()).status, 'failed');
   assert.equal(f.state.readCounts.get(1), 3);
   assert.equal(f.state.postAttempts, 0);
   assert.equal(f.state.statuses.length, 0);
-  assert.match(f.state.failures[0], /HTTP 504/);
+  assert.equal(f.state.failures[0], 'PR #1: semantic review preparing/reading PR failed ' +
+    '(HTTP 504 GET; new command delivery not attempted).');
+  assert.equal(f.state.summaries.at(-1), f.state.failures[0]);
   assert.equal(f.state.hooks.length, 0);
   await assert.rejects(f.github.rest.pulls.get({pull_number: 1}), error => error === failure);
   assert.equal(f.state.readCounts.get(1), 4);
@@ -291,12 +302,61 @@ test('persistent delivery readback failure leaves the accepted request for recon
   assert.equal((await f.worker()).status, 'failed');
   assert.equal(f.state.postAttempts, 1);
   assert.equal(f.state.statuses.length, 0);
-  assert.match(f.state.warnings[0], /delivery remains unknown/);
+  const request = requests(f.state.comments.get(1))[0];
+  assert.equal(f.state.warnings[0], 'PR #1: request delivery remains unknown ' +
+    `(HTTP 504; request ID ${request.id}).`);
+  assert.equal(f.state.failures[0], 'PR #1: semantic review command delivery failed ' +
+    `(HTTP 502; new command delivery unknown; request ID ${request.id}).`);
+  assert.equal(f.state.summaries.at(-1), f.state.failures[0]);
   const scan = await f.scan();
   assert.deepEqual(scan.jobs, [{number: 1, allowRequest: false}]);
   assert.equal((await f.worker(scan.jobs[0])).status, 'reconciled');
   assert.equal(f.state.postAttempts, 1);
   assert.equal(f.state.statuses.length, 1);
+});
+
+test('accepted delivery remains confirmed when publication fails, including after POST readback', async () => {
+  for (const publication of ['GET', 'POST']) {
+    for (const lostResponse of [false, true]) {
+      const f = fixture();
+      if (lostResponse) f.state.postErrors.set(1, 'after');
+      if (publication === 'POST') f.state.statusFailures = 2;
+      else f.state.onListComments = (_number, count) => {
+        if (count >= (lostResponse ? 4 : 3)) throw httpError(502);
+      };
+      assert.equal((await f.worker()).status, 'failed');
+      const request = requests(f.state.comments.get(1))[0];
+      assert.equal(f.state.failures[0], 'PR #1: semantic review result publication failed ' +
+        `(HTTP 502; new command delivery confirmed; request ID ${request.id}).`);
+      assert.equal(f.state.summaries.at(-1), f.state.failures[0]);
+      assert.equal(f.state.postAttempts, 1);
+      assert.equal(f.state.statuses.length, 0);
+      assert.equal(f.state.warnings.length, 0);
+      assert.equal(f.state.statusFailures, publication === 'POST' ? 1 : 0);
+      assert.equal(f.state.commentReads.get(1), (lostResponse ? 1 : 0) +
+        (publication === 'GET' ? 5 : 3));
+      f.state.statusFailures = 0;
+      delete f.state.onListComments;
+      f.reply(request);
+      await withReadRetries(f.github, () => f.publish());
+      assert.equal(f.state.statuses.at(-1).state, 'success');
+      assert.equal(f.state.postAttempts, 1);
+      assert.deepEqual((await f.scan()).jobs, []);
+    }
+  }
+});
+
+test('a summary failure after writing the status preserves confirmed command delivery', async () => {
+  const f = fixture();
+  f.state.summaryFailures = 1;
+  assert.equal((await f.worker()).status, 'failed');
+  const request = requests(f.state.comments.get(1))[0];
+  assert.equal(f.state.failures[0], 'PR #1: semantic review result publication failed ' +
+    `(HTTP unknown; new command delivery confirmed; request ID ${request.id}).`);
+  assert.equal(f.state.summaries.at(-1), f.state.failures[0]);
+  assert.equal(f.state.statuses.length, 1);
+  assert.equal(f.state.statuses[0].state, 'pending');
+  assert.equal(f.state.postAttempts, 1);
 });
 
 test('result publication recovers GET errors below the reserve without retrying failed writes', async () => {
@@ -326,6 +386,10 @@ test('writes with transient errors remain single attempts for both clients', asy
     const f = fixture();
     f.state.postErrors.set(1, mode);
     assert.equal((await f.worker()).status, mode === 'after' ? 'requested' : 'failed');
+    if (mode === 'before') {
+      assert.match(f.state.failures[0], /command delivery failed \(HTTP 502; new command delivery unknown; request ID [a-f0-9-]+\)\./);
+      assert.equal(f.state.posts.length, 0);
+    }
     assert.equal(f.state.postAttempts, 1);
     assert.equal(timers.setTimeout.mock.calls.length, 0);
   }
@@ -628,6 +692,8 @@ test('worker operational errors fail its job, release quota hooks and never pass
   f.state.service = { ...SERVICE, id: 999 };
   assert.equal((await f.worker()).status, 'failed');
   assert.equal(f.state.failures.length, 1);
+  assert.equal(f.state.failures[0], 'PR #1: semantic review preparing/reading PR failed ' +
+    '(HTTP unknown; new command delivery not attempted).');
   assert.equal(f.state.posts.length, 0);
   assert.equal(f.state.statuses.length, 0);
   assert.equal(f.state.hooks.length + f.state.commandHooks.length, 0);
@@ -744,6 +810,23 @@ test('a failed status write is retried from the reply rather than asking AI agai
   assert.equal((await f.worker({ commandGithub: undefined })).status, 'unchanged');
   assert.equal(f.state.statuses.at(-1).state, 'failure');
   assert.equal(f.state.posts.length, 1);
+});
+
+test('repair publication failure reports no new command attempt', async () => {
+  for (const allowRequest of [true, false]) {
+    const f = fixture();
+    const first = await f.one();
+    f.reply(first.request);
+    f.state.statusFailures = 1;
+    assert.equal((await f.worker({allowRequest})).status, 'failed');
+    assert.equal(f.state.failures[0], 'PR #1: semantic review result publication failed ' +
+      '(HTTP 502; new command delivery not attempted).');
+    assert.equal(f.state.postAttempts, 1);
+    assert.equal(f.state.statuses.at(-1).state, 'pending');
+    assert.equal((await f.worker({allowRequest})).status, allowRequest ? 'unchanged' : 'reconciled');
+    assert.equal(f.state.statuses.at(-1).state, 'success');
+    assert.equal(f.state.postAttempts, 1);
+  }
 });
 
 test('an accepted comment whose initial status write fails is repaired without another AI request', async () => {

@@ -128,15 +128,20 @@ async function pending({ github, context, number, manual, now = Date.now(), onVi
 }
 
 async function requestOne({ github, commandGithub, context, core, number, manual = false,
-  allowRequest = true, now = Date.now() }) {
+  allowRequest = true, now = Date.now(), progress = {} }) {
+  const publishStatus = async (args) => {
+    progress.stage = 'result publication';
+    await publish(args);
+    progress.stage = 'preparing/reading PR';
+  };
   if (!allowRequest) {
     const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: number });
-    await publish({ github, context, core, number, head: pr.head.sha });
+    await publishStatus({ github, context, core, number, head: pr.head.sha });
     return { status: 'reconciled' };
   }
   const snapshot = await pending({ github, context, number, manual, now });
   if (snapshot.review?.update || snapshot.review?.cleanup.length) {
-    await publish({ github, context, core, number, comments: snapshot.comments, head: snapshot.head });
+    await publishStatus({ github, context, core, number, comments: snapshot.comments, head: snapshot.head });
   }
   if (snapshot.status !== 'ready') return { status: snapshot.status };
   if (!commandGithub) throw new Error('Missing semantic command token.');
@@ -158,7 +163,7 @@ async function requestOne({ github, commandGithub, context, core, number, manual
 
     const current = await pending({ github, context, number, manual, now });
     if (current.review?.update || current.review?.cleanup.length) {
-      await publish({ github, context, core, number, comments: current.comments, head: current.head });
+      await publishStatus({ github, context, core, number, comments: current.comments, head: current.head });
     }
     if (current.status !== 'ready') return { status: current.status };
     if (current.head !== head || current.target !== target || current.branch !== branch ||
@@ -166,14 +171,19 @@ async function requestOne({ github, commandGithub, context, core, number, manual
 
     const request = { id: randomUUID(), head, target, mergeBase, branch,
       ...(current.automaticRetryOf ? { automaticRetryOf: current.automaticRetryOf } : {}) };
+    progress.requestId = request.id;
+    const body = `${command(request)}\n\n<!-- semantic-review-request:${JSON.stringify(request)} -->`;
+    progress.stage = 'command delivery';
+    progress.delivery = 'unknown';
     try {
       await commandGithub.rest.issues.createComment({
         ...repo,
         issue_number: number,
-        body: `${command(request)}\n\n<!-- semantic-review-request:${JSON.stringify(request)} -->`,
+        body,
         request: { retries: 0 },
       });
     } catch (error) {
+      if (error.semanticReviewQuota) progress.delivery = 'not attempted';
       let accepted;
       try {
         const comments = await github.paginate(github.rest.issues.listComments, {
@@ -181,11 +191,13 @@ async function requestOne({ github, commandGithub, context, core, number, manual
         });
         accepted = requests(comments).some((r) => r.id === request.id);
       } catch (readError) {
-        core.warning(`PR #${number}: request delivery remains unknown (HTTP ${readError.status || 'unknown'}).`);
+        core.warning(`PR #${number}: request delivery remains ${progress.delivery} ` +
+          `(HTTP ${readError.status || 'unknown'}; request ID ${request.id}).`);
       }
       if (!accepted) throw error;
     }
-    await publish({ github, context, core, number, head: current.review?.request?.head || head });
+    progress.delivery = 'confirmed';
+    await publishStatus({ github, context, core, number, head: current.review?.request?.head || head });
     return { status: 'requested', request };
   });
 }
@@ -246,19 +258,26 @@ async function run({ github, commandGithub, context, core, number, allowRequest 
     throw new Error('A positive pull request number is required.');
   }
   let result;
+  let failure;
+  const progress = {stage: 'preparing/reading PR', delivery: 'not attempted'};
   try {
     const operation = () => requestOne({ github, commandGithub, context, core, number,
-      allowRequest, now, manual: context.eventName === 'workflow_dispatch' });
+      allowRequest, now, progress, manual: context.eventName === 'workflow_dispatch' });
     result = allowRequest ? await withReserve(github, operation) : await withReadRetries(github, operation);
   } catch (error) {
     if (isRateLimitError(error)) {
       result = { status: 'limited' };
     } else {
-      core.setFailed(`PR #${number}: semantic review request failed (HTTP ${error.status || 'unknown'}).`);
+      const method = ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'HEAD'].includes(error.request?.method) ?
+        ` ${error.request.method}` : '';
+      failure = `PR #${number}: semantic review ${progress.stage} failed ` +
+        `(HTTP ${error.status || 'unknown'}${method}; new command delivery ${progress.delivery}` +
+        (progress.requestId ? `; request ID ${progress.requestId}` : '') + ').';
+      core.setFailed(failure);
       result = { status: 'failed' };
     }
   }
-  const summary = `PR #${number}: semantic review ${result.status}.`;
+  const summary = failure || `PR #${number}: semantic review ${result.status}.`;
   core.info(summary);
   if (core.summary) await core.summary.addRaw(summary).write();
   return result;

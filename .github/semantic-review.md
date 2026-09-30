@@ -20,18 +20,21 @@ when head already contains target. It asks CodeRabbit to distinguish cross-branc
 interactions from PR-local compatibility defects and to verify how both sides'
 edits combine. An alleged caller/definition mismatch must remain after three-way
 merge analysis before it can support FAIL. Unresolved relevant
-textual conflicts must not be replaced with an assumed resolution. Independent
-operations added by both branches must also work together, including outside
-conflict hunks.
+textual conflicts must not be replaced with an assumed resolution. Assess
+unaffected code regions independently even within a conflicted file; a possible
+future repair does not invalidate an established defect. Independent operations
+added by both branches must also work together, including outside conflict hunks.
 
 FAIL needs a supported trigger, a reachable failure path and evidence that paired
 edits, feature gates or recovery logic do not prevent the problem. Unrelated
 pre-existing defects, missing tests alone and wording-only improvements do not
 support FAIL. Intentional rejection of unmet prerequisites needs evidence of a
 broken supported contract before it supports FAIL. Resource-exhaustion findings
-need a concrete supported configuration, numeric demand and capacity, and a
-comparison of baseline and combined allocation including recovery behavior.
-Missing material evidence supports INCONCLUSIVE. Each reply must
+compare baseline and combined demand, capacity and recovery, quantifying them
+where available. Source evidence of a reachable failure can support FAIL without
+runtime reproduction. A specific risk whose capacity or recovery remains
+materially unresolved belongs under INCONCLUSIVE, with the missing evidence
+stated; lack of that evidence does not establish PASS. Each reply must
 include the advisory notice and put its fixed-revision citations inside the
 `SEMANTIC_REVIEW` section. These are instructions to the AI, not guarantees of
 its compliance or semantic accuracy.
@@ -105,6 +108,17 @@ directly request analysis. The scheduled scan observes those changes.
   Check writes are not automatically repeated. Exhausted reads retain the
   normal failure and cursor rules; HTTP retries do not create additional AI
   requests or consume additional selection slots.
+
+Worker failure annotations and summaries identify the stage: preparing/reading
+the PR, command delivery, or result publication. Result publication covers
+reading review state, writing the status and job summary, and legacy Check
+cleanup. The diagnostics include the HTTP status,
+request method when available, and allocated request ID. The separate
+`new command delivery` field records `not attempted`, `unknown`, or `confirmed`
+for this attempt. A publication failure can follow confirmed delivery; an
+ambiguous POST whose read-back cannot confirm delivery remains `unknown`.
+Repairing an earlier request does not count as sending a new command. Logs omit
+raw request URLs, headers, bodies and error messages.
 
 A scan first recovers any valid result already received for the latest request,
 then considers a new analysis. A reply received before the worker's final
@@ -295,11 +309,17 @@ than requiring an overall PASS. For the known incompatible inputs, require at
 least one independently supported incompatibility; also record whether the
 specific duplicate-operation, binding or test-attribute defect was found.
 
-Replay all seventeen inputs with the final prompt, retaining request IDs, input SHAs,
-raw replies, concrete findings and timings, including missed/inconclusive results.
+Use the seventeen fixed inputs for real prompt evaluation. For focused changes,
+declare the affected cases, a known incompatible input and its repaired control,
+and repeat counts before sending requests. Compare old and new prompts on the
+same fixed revisions and report which cases were actually run. Retain request
+IDs, prompt hashes, input SHAs, raw replies, concrete findings and timings,
+including missed/inconclusive results; do not replace an unfavorable reply with
+an unreported rerun.
 Use an independent context without giving the incident explanation or a repair.
-If the hosting discussion reveals the answer, label the run as a replay rather
-than a blind evaluation. Fixed repeats characterize variability; production
+If the hosting discussion or shared CodeRabbit Learnings reveal relevant context,
+label the run as a replay rather than a blind evaluation and do not attribute
+changes solely to the prompt. Fixed repeats characterize variability; production
 uses one initial request and at most one automatic timeout retry per version.
 Assess known defect detection and repair false positives separately; a narrow
 repair control does not establish general accuracy.

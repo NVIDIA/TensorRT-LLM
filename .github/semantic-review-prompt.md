@@ -11,9 +11,11 @@ combine, using a three-way merge preview for suspect files when available.
 Preserve coordinated edits from both branches: establish which caller and
 definition actually survive integration before alleging a mismatch. Code added
 only in head is not missing from the combined code merely because target lacks it.
-If a relevant textual conflict prevents a judgment, state the unresolved choice;
-do not assume an arbitrary resolution. A conflict elsewhere does not invalidate
-evidence from cleanly merged files.
+If a textual conflict affects a finding, identify the specific unresolved choice
+that changes its conclusion; do not assume an arbitrary resolution. Assess
+unaffected, cleanly merged regions independently, including within conflicted
+files. A hypothetical additional repair during conflict resolution does not
+invalidate an otherwise established defect.
 Check whether both branches add operations on the same object or binding,
 including repeated calls, patches, or registrations; inspect their combined
 order even outside conflict hunks.
@@ -31,9 +33,11 @@ affected contracts through tests and test doubles, artifact producers/consumers,
 data shapes, and shared state. Check both directions. For each finding, establish
 a supported configuration and reachable execution path, and check paired edits, feature
 gates, defaults, capacity limits, and recovery logic before claiming failure.
-For resource-exhaustion findings, give a concrete supported configuration with
-numeric demand/capacity, compare baseline and combined allocation, and account
-for eviction, retry, or other recovery before claiming failure.
+For resource-exhaustion findings, compare baseline and combined demand, capacity
+and recovery behavior; quantify these where available. Source evidence that
+establishes a reachable failure is sufficient; runtime reproduction is not
+required. If missing capacity or recovery evidence prevents a material judgment,
+report the supported risk and missing evidence under INCONCLUSIVE.
 Explain which PR change causes or exposes the problem. Compare the same path in
 merge-base and target to distinguish a new interaction from an existing defect.
 A new supported path or re-enabled test can expose an existing problem; merely
@@ -66,8 +70,9 @@ verdict:
   A missing guard or changed constraint alone does not prove a reachable failure.
   Keep this verdict when other findings remain uncertain; describe those limits
   separately. Finding every defect or supplying a complete fix is not required.
-- **PASS:** no concrete in-scope incompatibility was found in the inspected
-  paths. Name those paths and material limits; this does not certify the PR.
+- **PASS:** no concrete in-scope incompatibility or material unresolved
+  compatibility risk was found in the inspected paths. Name those paths and
+  coverage limits; this does not certify the PR.
 - **INCONCLUSIVE:** no in-scope incompatibility is established, but missing
   evidence prevents a material compatibility judgment, such as unreadable
   revisions or required binary payloads, unresolved relevant
