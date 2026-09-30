@@ -2,7 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -98,18 +98,22 @@ def test_augment_tokens_for_block_reuse_uses_exact_multimodal_runs():
     assert sliced == [tokens[7], mm_tokens[2], mm_tokens[3]]
 
 
-def test_augment_tokens_for_block_reuse_uses_two_item_exact_multimodal_runs():
+def test_augment_tokens_for_block_reuse_uses_two_item_exact_multimodal_runs(monkeypatch):
+    """Keep each item's UUID and token offsets across separated and sliced runs."""
     vocab_size = 1000
     digest_a = b"".join(v.to_bytes(4, "big", signed=True) for v in _HASH_INTS)
     digest_b = b"".join(v.to_bytes(4, "big", signed=True) for v in _OTHER_HASH_INTS)
     mm_tokens_a = gen_multimodal_cache_key_tokens(vocab_size, digest_a, 3)
     mm_tokens_b = gen_multimodal_cache_key_tokens(vocab_size, digest_b, 3)
+    generator = Mock(wraps=gen_multimodal_cache_key_tokens)
+    monkeypatch.setattr(resource_manager, "gen_multimodal_cache_key_tokens", generator)
 
     tokens = list(range(16))
     manager = _make_manager(vocab_size)
     req = _make_request(
         tokens,
         multimodal_hashes=[_HASH_INTS, _OTHER_HASH_INTS],
+        multimodal_uuids=["item-a", "item-b"],
         multimodal_positions=[1, 9],
         multimodal_lengths=[3, 3],
         multimodal_item_run_cu_offsets=[0, 2, 4],
@@ -124,9 +128,33 @@ def test_augment_tokens_for_block_reuse_uses_two_item_exact_multimodal_runs():
     assert augmented[12:14] == mm_tokens_b[1:3]
     assert augmented[3:6] == tokens[3:6]
     assert augmented[10:12] == tokens[10:12]
+    assert augmented[1].uuid == "item-a"
+    assert augmented[9].uuid == "item-b"
+    assert generator.call_args_list == [
+        call(vocab_size, digest_a, 2, token_offset=0, uuid="item-a"),
+        call(vocab_size, digest_a, 1, token_offset=2, uuid="item-a"),
+        call(vocab_size, digest_b, 1, token_offset=0, uuid="item-b"),
+        call(vocab_size, digest_b, 2, token_offset=1, uuid="item-b"),
+    ]
 
+    generator.reset_mock()
     sliced = KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req, start=8, end=13)
     assert sliced == [tokens[8], mm_tokens_b[0], tokens[10], tokens[11], mm_tokens_b[1]]
+    assert sliced[1].uuid == "item-b"
+    assert generator.call_args_list == [
+        call(vocab_size, digest_b, 1, token_offset=0, uuid="item-b"),
+        call(vocab_size, digest_b, 1, token_offset=1, uuid="item-b"),
+    ]
+
+    generator.reset_mock()
+    continuation = KVCacheManagerV2._augment_tokens_for_block_reuse(
+        manager, tokens, req, start=2, end=7
+    )
+    assert continuation == [mm_tokens_a[1], *tokens[3:6], mm_tokens_a[2]]
+    assert generator.call_args_list == [
+        call(vocab_size, digest_a, 1, token_offset=1, uuid="item-a"),
+        call(vocab_size, digest_a, 1, token_offset=2, uuid="item-a"),
+    ]
 
 
 def test_augment_tokens_for_block_reuse_skips_out_of_slice_runs(monkeypatch):
@@ -265,10 +293,12 @@ def test_augment_tokens_for_block_reuse_canonicalizes_adjacent_runs():
 
 @pytest.mark.parametrize("hybrid", [False, True])
 def test_multimodal_events_keep_chunked_commit_incremental(hybrid):
+    """Preserve UUID context while committing each prefill chunk only once."""
     tokens = list(range(12))
     req = _make_request(
         tokens,
         multimodal_hashes=[_HASH_INTS],
+        multimodal_uuids=["chunked-item"],
         multimodal_positions=[1],
         multimodal_lengths=[8],
         multimodal_item_run_cu_offsets=None,
@@ -320,6 +350,7 @@ def test_multimodal_events_keep_chunked_commit_incremental(hybrid):
 
     digest = resource_manager._hash_to_digest(_HASH_INTS)
     assert calls == [[0, digest, 1001, 1002], [1003, 1004, 1005, 1006], [1007, 9, 10, 11]]
+    assert calls[0][1].uuid == "chunked-item"
     assert [call.kwargs for call in manager._augment_tokens_for_block_reuse.call_args_list] == [
         {"start": 0, "end": 4},
         {"start": 4, "end": 8},
