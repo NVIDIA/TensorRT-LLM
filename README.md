@@ -335,10 +335,8 @@ deployment, and not linked to users. The data we collect includes:
 
 Telemetry is automatically disabled in CI and test environments.
 
-Observable LLM startup failures can include marked partial environment and
-sanitized configuration context. Requested or pre-initialization settings are
-distinguished from effective serving configuration; unavailable values remain
-unknown. This does not start heartbeats or imply successful model initialization.
+If LLM startup fails, an initial report can still include the available environment
+and sanitized configuration information, marked as partial context.
 
 ### Opting Out of Telemetry Data Collection
 
