@@ -13,10 +13,8 @@ import torch
 import yaml
 from pydantic import ValidationError
 
-from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
-    SkipSoftmaxParams,
-    SkipSoftmaxScheduler,
-)
+from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxParams
+from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import fmha as cute_dsl_fmha
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha import (
     CuTeDSLAttention,
@@ -393,6 +391,9 @@ class TestVisualGenSkipSoftmaxTimestepCutoff:
             (0.6, 0),
             (0.59, 1),
             (None, None),
+            # Per-token timesteps stay dense until every live token is below the cutoff.
+            (torch.tensor([0.0, 0.8]), 0),
+            (torch.tensor([0.0, 0.2]), 1),
         ],
     )
     def test_graph_phase_tracks_disabled_until_timestep_boundary(
@@ -402,13 +403,7 @@ class TestVisualGenSkipSoftmaxTimestepCutoff:
     ):
         # CUDA graph keys need a stable sparse-attention phase so captured
         # graphs are not reused across disabled and enabled skip-softmax states.
-        assert (
-            SkipSoftmaxScheduler.get_graph_phase_for_timestep(
-                timestep,
-                disabled_until_timestep=0.6,
-            )
-            == expected
-        )
+        assert graph_phase_for_timestep(timestep, disabled_until_timestep=0.6) == expected
 
 
 class TestVisualGenSkipSoftmaxCuTeDSL:
@@ -491,7 +486,7 @@ class TestVisualGenSkipSoftmaxCuTeDSL:
         runner = _Runner()
         model.register_cuda_graph_extra_key_fns(runner)
 
-        phase_fn = runner.extra_key_fns["skip_softmax_phase"]
+        phase_fn = runner.extra_key_fns["sparse_attn_phase"]
         assert phase_fn(timestep=0.6) == 0
         assert phase_fn(timestep=0.59) == 1
 
