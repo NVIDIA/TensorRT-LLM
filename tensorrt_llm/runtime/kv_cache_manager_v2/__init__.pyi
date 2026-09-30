@@ -77,14 +77,22 @@ LifeCycleId = NewType("LifeCycleId", int)
 LayerGroupId: TypeAlias = LifeCycleId
 
 class AttnLifeCycle:
-    """The attention life cycle, keyed by its window, sink-token shape, and sparsity."""
+    """The attention life cycle, keyed by window, sink tokens, sparsity, and reuse policy."""
 
+    def __init__(
+        self,
+        window_size: int | None,
+        num_sink_blocks: int,
+        is_sparse: bool = False,
+        reuse_policy: AttentionReusePolicy = ...,
+    ) -> None: ...
     @staticmethod
     def make(
         window_size: int | None,
         num_sink_tokens: int | None,
         tokens_per_block: int,
         is_sparse: bool = False,
+        reuse_policy: AttentionReusePolicy = ...,
     ) -> "AttnLifeCycle": ...
     @property
     def window_size(self) -> int | None: ...
@@ -92,6 +100,8 @@ class AttnLifeCycle:
     def num_sink_blocks(self) -> int: ...
     @property
     def is_sparse(self) -> bool: ...
+    @property
+    def reuse_policy(self) -> AttentionReusePolicy: ...
     def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
 
 CacheLevel = NewType("CacheLevel", int)
@@ -222,12 +232,18 @@ class BufferConfig:
     tokens_per_block_override: int | None = None
     is_sparse: bool = False
 
+class AttentionReusePolicy(enum.IntEnum):
+    REQUIRED = 0
+    PRIVATE = 1
+    OPTIONAL = 2
+
 @dataclass(slots=True)
 class AttentionLayerConfig:
     layer_id: LayerId
     buffers: list[BufferConfig]
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
+    reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
     @property
     def window_size(self) -> int | None: ...
 
@@ -391,6 +407,27 @@ KvCacheStatus: TypeAlias = _Status
 
 IndexSeq = array.array[int] | memoryview[int]
 
+class ReuseGroupStatus:
+    """Group availability at the initial prefix claim, not subsequent request progress."""
+
+    # Lifecycle group from get_layer_group_id(layer_id), not a physical pool index.
+    @property
+    def group_id(self) -> LayerGroupId: ...
+    # REQUIRED constrains the match; OPTIONAL is selected at resume; PRIVATE is never reused.
+    @property
+    def policy(self) -> AttentionReusePolicy: ...
+    # Exclusive token endpoint claimed by REQUIRED groups, shared by all groups.
+    @property
+    def endpoint(self) -> int: ...
+    # All needed state is available, not necessarily on GPU or selected for reuse.
+    # False for an empty prefix, PRIVATE groups, or missing/discarded OPTIONAL candidates.
+    @property
+    def complete(self) -> bool: ...
+    # Retained [begin, end) ranges, including block-rounded SWA windows and sinks.
+    # SSM uses (endpoint, endpoint) for its exact state; empty when complete is false.
+    @property
+    def coverage(self) -> Sequence[tuple[int, int]]: ...
+
 class _KVCache:
     Status: ClassVar[Type[_Status]]
     id: Any
@@ -453,13 +490,19 @@ class _KVCache:
     def cached_tokens_by_level(self) -> list[int]: ...
     def _get_last_cached_token_level(self) -> int | None: ...
     @property
+    def reuse_status(self) -> Sequence[ReuseGroupStatus]: ...
+    @property
     def committed_tokens(self) -> list[TokenIdExt]: ...
     @property
     def reuse_scope(self) -> ReuseScope: ...
     def plan_committed_block_drop(self) -> PlannedDropHandle | None: ...
     def stop_committing(self) -> None: ...
     def suspend(self) -> None: ...
-    def resume(self, cuda_stream: CudaStream | None = None) -> bool: ...
+    def resume(
+        self,
+        cuda_stream: CudaStream | None = None,
+        optional_reuse_groups: Sequence[LayerGroupId] | None = None,
+    ) -> bool: ...
     def prefetch(self, target: CacheLevel) -> bool: ...
     def get_scratch_desc(self, layer_group_id: LayerGroupId) -> ScratchDesc | None: ...
     @property

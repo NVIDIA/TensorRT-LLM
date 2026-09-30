@@ -12,10 +12,11 @@ set(DEEP_GEMM_SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/deepgemm-src)
 get_filename_component(DEEP_GEMM_SOURCE_DIR ${DEEP_GEMM_SOURCE_DIR} ABSOLUTE)
 
 # Check if submodules are initialized
-if(NOT EXISTS ${DEEP_GEMM_SOURCE_DIR}/third-party/cutlass/include)
+if(NOT EXISTS ${DEEP_GEMM_SOURCE_DIR}/third-party/cutlass/include
+   OR NOT EXISTS ${DEEP_GEMM_SOURCE_DIR}/third-party/deep_jit/include)
   message(
     FATAL_ERROR
-      "DeepGEMM submodules not initialized. Something went wrong with FetchContent.\n"
+      "DeepGEMM submodules (cutlass, deep_jit) not initialized. Something went wrong with FetchContent.\n"
   )
 endif()
 
@@ -83,7 +84,8 @@ foreach(SOURCE_FILE ${DEEP_GEMM_ALL_FILES})
     PROPERTY CMAKE_CONFIGURE_DEPENDS ${SOURCE_FILE})
 endforeach()
 
-# Copy third-party includes (cutlass and fmt) to the include directory
+# Copy third-party includes (cutlass) to the include directory. DeepJIT is
+# header-only and host-side only, so it is not needed at kernel JIT time.
 set(DEEP_GEMM_INCLUDE_DEST ${DEEP_GEMM_PYTHON_DEST}/include)
 file(MAKE_DIRECTORY ${DEEP_GEMM_INCLUDE_DEST})
 file(COPY ${DEEP_GEMM_SOURCE_DIR}/third-party/cutlass/include/cute
@@ -119,9 +121,25 @@ target_compile_definitions(deep_gemm_cpp_tllm
 # Include directories matching deep_gemm setup.py
 target_include_directories(
   deep_gemm_cpp_tllm
-  PRIVATE ${CUDA_INCLUDE_DIRS} ${DEEP_GEMM_SOURCE_DIR}/deep_gemm/include
-          ${DEEP_GEMM_SOURCE_DIR}/third-party/cutlass/include
-          ${DEEP_GEMM_SOURCE_DIR}/third-party/fmt/include)
+  PRIVATE ${CUDA_INCLUDE_DIRS}
+          ${CUDA_TOOLKIT_ROOT_DIR}/include/cccl
+          ${DEEP_GEMM_SOURCE_DIR}/deep_gemm/include
+          ${DEEP_GEMM_SOURCE_DIR}/third-party/deep_jit/include
+          ${DEEP_GEMM_SOURCE_DIR}/third-party/cutlass/include)
+
+# DeepJIT resolves libdwfl through dlopen at runtime but includes the elfutils
+# header for its types. Hosts without the elfutils development headers use the
+# minimal declaration shim under deep_jit_shim/ instead.
+include(CheckIncludeFileCXX)
+check_include_file_cxx("elfutils/libdwfl.h" DEEP_GEMM_HAVE_LIBDWFL_HEADER)
+if(NOT DEEP_GEMM_HAVE_LIBDWFL_HEADER)
+  message(
+    STATUS
+      "elfutils/libdwfl.h not found; DeepJIT builds against the libdwfl declaration shim"
+  )
+  target_include_directories(deep_gemm_cpp_tllm
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/deep_jit_shim)
+endif()
 
 # Link libraries (matching deep_gemm setup.py: cuda, cudart + torch)
 target_link_libraries(

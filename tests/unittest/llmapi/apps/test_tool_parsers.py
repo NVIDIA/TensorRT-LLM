@@ -33,6 +33,7 @@ from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
 from tensorrt_llm.serve.tool_parser.deepseekv4_parser import DeepSeekV4Parser
 from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
 from tensorrt_llm.serve.tool_parser.deepseekv32_parser import DeepSeekV32Parser
+from tensorrt_llm.serve.tool_parser.deepseekv41_parser import DeepSeekV41Parser
 from tensorrt_llm.serve.tool_parser.gemma4_parser import Gemma4ToolParser
 from tensorrt_llm.serve.tool_parser.glm4_parser import Glm4ToolParser
 from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
@@ -1861,6 +1862,77 @@ class TestDeepSeekV4Parser(BaseToolParserTestClass):
              '<｜DSML｜parameter name="arg" string="true">value</｜DSML｜parameter> '
              "</｜DSML｜invoke> </｜DSML｜tool_calls>"),
         )
+
+
+class TestDeepSeekV41Parser(BaseToolParserTestClass):
+    """Test DeepSeek-V4.1's spaced DSML tool-call format."""
+
+    def make_parser(self):
+        return DeepSeekV41Parser()
+
+    def make_tool_parser_test_cases(self):
+        return ToolParserTestCases(
+            has_tool_call_true=
+            ('Some text <｜DSML｜ calls> <｜DSML｜ invoke name="get_weather"> '
+             '<｜DSML｜ parameter name="location" string="true">NYC</｜DSML｜ parameter> '
+             "</｜DSML｜ invoke> </｜DSML｜ calls>"),
+            detect_and_parse_single_tool=(
+                ('Normal text<｜DSML｜ calls> <｜DSML｜ invoke name="get_weather"> '
+                 '<｜DSML｜ parameter name="location" string="true">NYC</｜DSML｜ parameter> '
+                 "</｜DSML｜ invoke> </｜DSML｜ calls>"),
+                "Normal text",
+                "get_weather",
+                {
+                    "location": "NYC"
+                },
+            ),
+            detect_and_parse_multiple_tools=(
+                ('<｜DSML｜ calls> <｜DSML｜ invoke name="get_weather"> '
+                 '<｜DSML｜ parameter name="location" string="true">NYC</｜DSML｜ parameter> '
+                 '</｜DSML｜ invoke> <｜DSML｜ invoke name="search_web"> '
+                 '{ "query": "AI" } </｜DSML｜ invoke> </｜DSML｜ calls>'),
+                ("get_weather", "search_web"),
+            ),
+            detect_and_parse_malformed_tool=
+            ('<｜DSML｜ calls> <｜DSML｜invoke name="get_weather"> '
+             '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
+             "</｜DSML｜invoke> </｜DSML｜ calls>"),
+            detect_and_parse_with_parameters_key=(
+                ('<｜DSML｜ calls> <｜DSML｜ invoke name="search_web"> '
+                 '{ "query": "test" } </｜DSML｜ invoke> </｜DSML｜ calls>'),
+                "search_web",
+                {
+                    "query": "test"
+                },
+            ),
+            parse_streaming_increment_partial_bot_token="<｜DSML｜ cal",
+            undefined_tool=
+            ('<｜DSML｜ calls> <｜DSML｜ invoke name="undefined_func"> '
+             '<｜DSML｜ parameter name="arg" string="true">value</｜DSML｜ parameter> '
+             "</｜DSML｜ invoke> </｜DSML｜ calls>"),
+        )
+
+    def test_parse_streaming_increment_complete_tool_call(self, sample_tools):
+        parser = self.make_parser()
+        chunks = [
+            "Normal text<｜DSML｜ cal",
+            'ls><｜DSML｜ invoke name="get_weather">',
+            '<｜DSML｜ parameter name="location" string="true">NYC',
+            "</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>",
+        ]
+
+        results = [
+            parser.parse_streaming_increment(chunk, sample_tools)
+            for chunk in chunks
+        ]
+
+        assert "".join(result.normal_text
+                       for result in results) == "Normal text"
+        calls = [call for result in results for call in result.calls]
+        assert [call.name for call in calls if call.name] == ["get_weather"]
+        assert json.loads("".join(call.parameters for call in calls)) == {
+            "location": "NYC"
+        }
 
 
 # ============================================================================

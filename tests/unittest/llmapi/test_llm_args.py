@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import math
 import re
 import tempfile
@@ -562,6 +563,62 @@ def test_dspark_target_layer_ids_resolved_from_checkpoint(tmp_path):
 
     # Order is preserved (projection columns are order-dependent).
     assert args.speculative_config.target_layer_ids == [3, 1, 2]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "spelling", ["prefixed", "plain", "dspark_config", "dflash_config"])
+def test_dspark_nested_language_config(tmp_path: Path, spelling: str) -> None:
+    values = {
+        "target_layer_ids": [0, 20, 39],
+        "mask_token_id": 0,
+        "block_size": 5,
+        "markov_rank": 256,
+    }
+    if spelling == "prefixed":
+        config = {f"dspark_{key}": value for key, value in values.items()}
+        config["dspark_noise_token_id"] = config.pop("dspark_mask_token_id")
+    elif spelling == "plain":
+        config = values
+    else:
+        config = {spelling: values}
+    (tmp_path / "config.json").write_text(json.dumps({"text_config": config}),
+                                          encoding="utf-8")
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=DSparkDecodingConfig(max_draft_len=5,
+                                                speculative_model=tmp_path),
+    )
+    spec = args.speculative_config
+    assert spec.target_layer_ids == [0, 20, 39]
+    assert spec.mask_token_id == 0
+    assert spec.block_size == 5
+    assert spec.markov_rank == 256
+
+
+@pytest.mark.cpu_only
+def test_dspark_language_scope_precedes_legacy_fallback(tmp_path: Path) -> None:
+    config = {
+        "dspark_target_layer_ids": [1, 2, 3],
+        "dspark_markov_rank": 256,
+        "text_config": {
+            "dspark_target_layer_ids": [0, 20, 39],
+            "dspark_noise_token_id": 0,
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=DSparkDecodingConfig(max_draft_len=5,
+                                                speculative_model=tmp_path),
+    )
+    assert args.speculative_config.target_layer_ids == [0, 20, 39]
+    assert args.speculative_config.mask_token_id == 0
+    assert args.speculative_config.markov_rank == 256
 
 
 @pytest.mark.cpu_only

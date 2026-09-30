@@ -1779,6 +1779,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 (latent_dim + nvfp4_gather_aux_bytes_per_compressed_token) /
                 min_compress_ratio)
 
+        if sparse_algorithm == "csa2":
+            # CSA2 never runs dense context MLA: every C++ attention call carries its
+            # selected indices (AttentionOp::useSparseMLA), so no expanded K/V is staged.
+            # Its own staging scales with the scheduled tokens and is profiled.
+            return 0
+
         fp8_context_mla = (quant_config is not None
                            and quant_config.quant_mode.has_fp8_kv_cache()
                            and get_sm_version() in (90, 100, 103, 107, 120))

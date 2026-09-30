@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners import common
 from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     apply_position_id_offset,
@@ -55,7 +56,12 @@ def test_get_all_rank_num_tokens_uses_tp_collective() -> None:
     mapping = SimpleNamespace(has_cp_helix=lambda: False)
 
     result = get_all_rank_num_tokens(
-        SimpleNamespace(num_tokens=5),
+        SimpleNamespace(
+            get_adp_token_counts=lambda: [5],
+            set_adp_token_counts=lambda counts: AttentionMetadata.set_adp_token_counts(
+                None, counts
+            ),
+        ),
         enable_attention_dp=True,
         mapping=mapping,
         dist=dist,
@@ -72,7 +78,12 @@ def test_get_all_rank_num_tokens_reports_post_reduce_scatter_helix_count() -> No
     mapping = SimpleNamespace(cp_size=2, has_cp_helix=lambda: True)
 
     result = get_all_rank_num_tokens(
-        SimpleNamespace(num_tokens=5),
+        SimpleNamespace(
+            get_adp_token_counts=lambda: [5],
+            set_adp_token_counts=lambda counts: AttentionMetadata.set_adp_token_counts(
+                None, counts
+            ),
+        ),
         enable_attention_dp=True,
         mapping=mapping,
         dist=dist,

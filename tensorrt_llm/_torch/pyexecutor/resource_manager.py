@@ -973,10 +973,11 @@ class KVCacheManager(BaseResourceManager):
         """
         draft_len = get_draft_token_length(req)
         if is_context:
+            from .ced_replay import encoder_replay_tokens
             materialized = min(req.context_chunk_size,
                                req.context_remaining_length)
-            return materialized + (draft_len
-                                   if req.is_last_context_chunk else 0)
+            return materialized + encoder_replay_tokens(req) + (
+                draft_len if req.is_last_context_chunk else 0)
         # Generation: one position per beam for the new token, plus draft tokens
         # (speculative verification) per beam.
         return req.py_beam_width * (1 + draft_len)
@@ -3076,6 +3077,7 @@ class ResourceManager:
                     resource_manager.update_resources(scheduled_batch)
 
     def free_resources(self, request: LlmRequest):
+        request.py_ced_replay = None
         for resource_type, resource_manager in reversed(
                 self.resource_managers.items()):
             if hasattr(resource_manager, "free_resources"):

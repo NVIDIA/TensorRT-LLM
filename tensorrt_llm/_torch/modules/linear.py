@@ -3477,6 +3477,10 @@ class MXFP8LinearMethod(LinearMethodBase):
                                               dtype=torch.float8_e4m3fn),
                                   requires_grad=False)
         if self.use_cutlass:
+            # Reuse an initialized, immutable alpha across PDL GEMM launches.
+            module.register_buffer("_mxfp8_alpha",
+                                   torch.ones(1, dtype=torch.float32),
+                                   persistent=False)
             # Swizzled 1D UE8M0 block-scale buffer matching CUTLASS layout.
             module.weight_scale = Parameter(torch.empty(
                 [self._swizzled_scale_size(out_features, in_features)],
@@ -3548,11 +3552,6 @@ class MXFP8LinearMethod(LinearMethodBase):
                         module.dtype,
                     )
                 else:
-                    # globalScale is the alpha multiplier; pure MXFP8xMXFP8
-                    # uses 1.0.
-                    global_scale = torch.ones([1],
-                                              dtype=torch.float32,
-                                              device=input.device)
                     gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
                             if self.needs_native_autotune else
                             torch.ops.trtllm.mxfp8_mxfp8_gemm)
@@ -3561,7 +3560,7 @@ class MXFP8LinearMethod(LinearMethodBase):
                         act_sf,
                         module.weight,
                         module.weight_scale,
-                        global_scale,
+                        module._mxfp8_alpha,
                         module.dtype,
                     )
             if bias is not None:

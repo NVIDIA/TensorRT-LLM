@@ -137,6 +137,19 @@ inline void validateNoDuplicateBufferRoles(std::vector<BufferConfig> const& buff
 
 } // namespace detail
 
+//! Controls whether an attention lifecycle participates in prefix matching and page reuse.
+enum class AttentionReusePolicy
+{
+    //! Commit reusable pages and require live-window coverage when matching a prefix.
+    REQUIRED = 0,
+    //! Keep request-local working pages; never publish or reuse them through the radix tree.
+    PRIVATE = 1,
+    //! Commit reusable pages without constraining the REQUIRED prefix match. The caller selects
+    //! available groups at resume; missing or unselected groups use fresh pages for recomputation.
+    //! These pages may be evicted independently without removing the REQUIRED prefix.
+    OPTIONAL = 2,
+};
+
 struct AttentionLayerConfig
 {
     static constexpr LayerType type = LayerType::ATTENTION;
@@ -149,6 +162,9 @@ struct AttentionLayerConfig
 
     // nullopt or 0 = no sink tokens.
     std::optional<int> numSinkTokens;
+
+    // Private working pages never constrain prefix matching or enter the tree.
+    AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
 
     [[nodiscard]] std::optional<int> windowSize() const noexcept
     {

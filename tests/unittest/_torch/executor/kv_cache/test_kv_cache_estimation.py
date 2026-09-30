@@ -1155,6 +1155,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     expected_cap: int | None,
 ) -> None:
     """Verify measured chunk capacity and preserve Hopper's existing reserve policy."""
+
     pool_ratio = [0.2, 0.3, 0.5]
     avg_seq_len = 128
     max_seq_len = 4096
@@ -1253,6 +1254,56 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     assert kv_cache_config.max_tokens == user_max_tokens
     assert kv_cache_config.pool_ratio == pool_ratio
     assert kv_cache_config.avg_seq_len == avg_seq_len
+
+
+@pytest.mark.parametrize("estimating", [False, True])
+@pytest.mark.parametrize("layer_limit", [None, 20])
+def test_csa2_creation_preserves_resolved_context_cache_boundary(estimating, layer_limit):
+    from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
+
+    captured = {}
+
+    class RecordingManager:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+    pretrained = SimpleNamespace(
+        hidden_size=5120,
+        head_dim=512,
+        num_attention_heads=64,
+        num_key_value_heads=1,
+        num_hidden_layers=40,
+        vocab_size=32000,
+    )
+    derived = {} if layer_limit is None else {"csa2_context_swa_layer_limit": layer_limit}
+    model_config = SimpleNamespace(
+        pretrained_config=pretrained, quant_config=None, extra_attrs=derived
+    )
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=RecordingManager,
+        mapping=Mapping(),
+        kv_cache_config=KvCacheConfig(),
+        tokens_per_block=128,
+        max_seq_len=10240,
+        max_batch_size=32,
+        spec_config=None,
+        sparse_attention_config=SimpleNamespace(algorithm="csa2"),
+        max_num_tokens=8192,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        is_draft=False,
+        is_disagg=True,
+        estimating_kv_cache=estimating,
+    )
+    assert captured["context_swa_layer_limit"] == layer_limit
+    # Layer 20 still owns the boundary GLOBAL cache; reducing num_layers would
+    # remove it and renumber the peer's later model-layer identities.
+    assert captured["num_layers"] == 40
+    assert captured["is_estimating_kv_cache"] is estimating
+    assert captured["pretrained_config"] is pretrained
 
 
 @pytest.mark.parametrize(

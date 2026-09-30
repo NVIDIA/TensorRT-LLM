@@ -39,7 +39,8 @@ from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
-from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
+from tensorrt_llm.llmapi.llm_args import (CSA2SparseAttentionConfig,
+                                          DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
                                           KvCacheConfig, MoeLoadBalancerConfig,
                                           MultimodalConfig)
@@ -69,6 +70,14 @@ TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 _LINUX_EBADHANDLE = 521
 
 _DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
+# V4.1 shares V4's routed-MoE formats and backend choice, but needs its own
+# dense FP8 policy for both original and ModelOpt-converted checkpoints.
+_DEEPSEEK_V41_ARCHITECTURES = {
+    "DeepseekV41ForCausalLM",
+    "DeepseekV41ForConditionalGeneration",
+}
+# Shared by V4 and V4.1: both name the first routed expert identically, and both
+# encode the routed-MoE format in its dtype (I8 -> MXFP4, U8 -> NVFP4).
 _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 
 _KIMI_K3_ARCHITECTURES = {
@@ -326,6 +335,10 @@ class ModelConfig(Generic[TConfig]):
         super().__setattr__(key, value)
 
     def __post_init__(self):
+        if (self.sparse_attention_config is None
+                and getattr(self.pretrained_config, "model_type",
+                            None) in ("deepseek_v41", "deepseek_v41_text")):
+            self.sparse_attention_config = CSA2SparseAttentionConfig()
         if self.pretrained_config and self.sparse_attention_config:
             # Sparse geometry can come from the checkpoint. Resolve it once so
             # cache allocation, CUDA-graph routing, and model layers all read
@@ -497,7 +510,8 @@ class ModelConfig(Generic[TConfig]):
         if architecture in _KIMI_K3_ARCHITECTURES:
             return "TRTLLM"
 
-        if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+        if (architecture in _DEEPSEEK_V4_ARCHITECTURES
+                or architecture in _DEEPSEEK_V41_ARCHITECTURES):
             sm_version = get_sm_version()
             if 100 <= sm_version < 120:
                 return "TRTLLM"
@@ -830,6 +844,32 @@ class ModelConfig(Generic[TConfig]):
             checkpoint_dir) not in ("mxfp4", "nvfp4")
 
     @staticmethod
+    def _build_deepseek_v41_quant_config(hf_quant_config: dict) -> QuantConfig:
+        """Build the global quant policy for a DeepSeek-V4.1 checkpoint.
+
+        Grouped output and shared-expert GEMMs use ``FP8_BLOCK_SCALES``.
+        CSA2 Linear projections retain native block-32 FP8 weights; routed
+        experts retain their separately detected quantization policy.
+        """
+        block_size = tuple(hf_quant_config.get("weight_block_size") or ())
+        if not block_size:
+            return QuantConfig()
+
+        # ModelOpt metadata describes the experts, not the dense FP8 weights.
+        # Do not let its producer field redispatch this view to ModelOpt.
+        as_128 = {
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert":
+            hf_quant_config.get("modules_to_not_convert"),
+        }
+        if block_size != (128, 128):
+            logger.info("DeepSeek-V4.1: grouped output and shared-expert FP8 "
+                        "weights are requantized from "
+                        f"{list(block_size)} to [128, 128] at load.")
+        return ModelConfig.load_hf_quant_config(as_128, 'TRTLLM')[0]
+
+    @staticmethod
     def _has_deepseek_v4_layer_only_modelopt_quant_config(
             quant_config_file: str) -> bool:
         with open(quant_config_file) as f:
@@ -1101,6 +1141,14 @@ class ModelConfig(Generic[TConfig]):
                     trust_remote_code=trust_remote_code,
                     **kwargs,
                 )
+                # transformers 5 leaves `_name_or_path` empty when the config
+                # JSON does not carry one, so a config loaded from a local
+                # directory no longer remembers where it came from. Record it:
+                # a model whose weights need a sibling file from the checkpoint
+                # (DeepSeek-V4.1's Engram needs the checkpoint's own tokenizer to
+                # derive its hash multipliers) has no other way to find it.
+                if not getattr(pretrained_config, '_name_or_path', None):
+                    pretrained_config._name_or_path = str(checkpoint_dir)
                 if pretrained_config.architectures[0] in [
                         "DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"
                 ]:
@@ -1161,6 +1209,16 @@ class ModelConfig(Generic[TConfig]):
                             indexer_k_dtype=indexer_k_dtype,
                             index_share_for_mtp_iteration=
                             index_share_for_mtp_iteration)
+                elif pretrained_config.architectures[
+                        0] in _DEEPSEEK_V41_ARCHITECTURES:
+                    sparse_config = kwargs.get('sparse_attention_config')
+                    if sparse_config is not None and not isinstance(
+                            sparse_config, CSA2SparseAttentionConfig):
+                        raise ValueError(
+                            "DeepSeek-V4.1 requires CSA2 sparse attention")
+                    kwargs[
+                        'sparse_attention_config'] = sparse_config or CSA2SparseAttentionConfig(
+                        )
                 elif pretrained_config.architectures[
                         0] == "DeepseekV4ForCausalLM":
                     if cls._is_deepseek_v4_base_checkpoint(checkpoint_dir):
@@ -1333,6 +1391,13 @@ class ModelConfig(Generic[TConfig]):
         requested_moe_backend = kwargs.get('moe_backend', 'AUTO')
         architecture = pretrained_config.architectures[
             0] if pretrained_config.architectures else ""
+        hf_quant_config = getattr(pretrained_config, "quantization_config",
+                                  None)
+        has_deepseek_v41_dense_fp8 = (
+            architecture in _DEEPSEEK_V41_ARCHITECTURES
+            and hf_quant_config is not None
+            and hf_quant_config.get("quant_method") == "fp8"
+            and bool(hf_quant_config.get("weight_block_size")))
         # Use an architecture-only backend hint for quant config parsing. Some
         # quant formats choose the quant_algo from the backend name, so the final
         # quant-aware AUTO resolution happens after quant_config is loaded.
@@ -1358,9 +1423,8 @@ class ModelConfig(Generic[TConfig]):
                         quant_config_file))
             quant_config, layer_quant_config = cls._build_modelopt_quant_config(
                 normalized, checkpoint_dir, moe_backend_hint)
-            hf_quant_config = getattr(pretrained_config, "quantization_config",
-                                      None)
-            if quant_config.quant_algo is None and hf_quant_config is not None:
+            if (quant_config.quant_algo is None and hf_quant_config is not None
+                    and not has_deepseek_v41_dense_fp8):
                 hf_quant_config, hf_layer_quant_config = cls.load_hf_quant_config(
                     hf_quant_config,
                     moe_backend_hint,
@@ -1379,6 +1443,19 @@ class ModelConfig(Generic[TConfig]):
                                 **hf_layer_quant_config,
                                 **layer_quant_config,
                             }
+        # DeepSeek-V4.1: 32x32 block-scaled dense FP8, which the generic
+        # FP8_BLOCK_SCALES path cannot represent. Must precede the generic
+        # branch below, which would assert on the block size.
+        elif (architecture in _DEEPSEEK_V41_ARCHITECTURES
+              and hf_quant_config is not None):
+            if is_modelopt_quant_config(hf_quant_config):
+                quant_config, layer_quant_config = cls.load_hf_quant_config(
+                    hf_quant_config,
+                    moe_backend_hint,
+                    checkpoint_dir=checkpoint_dir)
+            else:
+                quant_config = cls._build_deepseek_v41_quant_config(
+                    hf_quant_config)
         # quantized ckpt in other formats
         elif getattr(pretrained_config, "quantization_config",
                      None) is not None:
@@ -1391,13 +1468,25 @@ class ModelConfig(Generic[TConfig]):
             quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
                 quant_config_file, moe_backend_hint)
 
+        if (has_deepseek_v41_dense_fp8 and quant_config.quant_algo
+                in (None, QuantAlgo.MIXED_PRECISION)):
+            # Preserve the parsed expert and KV policies; only dense weights
+            # use the V4.1 remapper's FP8 block-128 layout.
+            dense_quant_config = cls._build_deepseek_v41_quant_config(
+                hf_quant_config)
+            dense_quant_config.kv_cache_quant_algo = quant_config.kv_cache_quant_algo
+            quant_config = dense_quant_config
+
         kwargs['moe_backend'] = cls.resolve_moe_backend(
             requested_moe_backend,
             architecture,
             quant_config=quant_config,
         )
 
-        if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+        # V4.1 names the routed experts exactly as V4 does and encodes MXFP4 the
+        # same way (I8 storage), so the detector and setter apply verbatim.
+        if (architecture in _DEEPSEEK_V4_ARCHITECTURES
+                or architecture in _DEEPSEEK_V41_ARCHITECTURES):
             layer_quant_config = cls._set_deepseek_v4_routed_moe_quant_config(
                 pretrained_config,
                 checkpoint_dir,

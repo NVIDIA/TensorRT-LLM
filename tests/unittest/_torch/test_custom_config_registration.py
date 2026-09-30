@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for the transformers AutoConfig / AutoTokenizer dispatch
-for TRT-LLM-only model_types (cosmos3, deepseek_v32, kimi_k2).
+for TRT-LLM-only model_types (cosmos3, deepseek_v32, kimi_k2, deepseek_v41).
 
 Before this registration, transformers >= 5.5 falls back to a bare
 PreTrainedConfig that lacks `max_position_embeddings`, and
@@ -18,7 +18,13 @@ import pytest
 from transformers import AutoConfig
 
 import tensorrt_llm  # noqa: F401  triggers AutoConfig registration
-from tensorrt_llm._torch.configs import Cosmos3Config, DeepseekV3Config
+from tensorrt_llm._torch.configs import (
+    Cosmos3Config,
+    DeepseekV3Config,
+    DeepseekV41Config,
+    DeepseekV41TextConfig,
+    DeepseekV41VisionConfig,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -56,6 +62,21 @@ def _deepseek_min_config(model_type: str) -> dict:
     }
 
 
+# DeepSeek-V4.1 nests its text tower, so `max_position_embeddings` lives one level down
+# and the shared assertion below reads it off the composite. That is deliberate: it makes
+# this test also cover the composite's attribute forwarding, which is the mechanism
+# `modeling_deepseekv4.py`'s `config.<field>` read sites depend on.
+_DEEPSEEK_V41_MIN_CONFIG = {
+    "architectures": ["DeepseekV41ForCausalLM"],
+    "model_type": "deepseek_v41",
+    "text_config": {
+        "model_type": "deepseek_v41_text",
+        "max_position_embeddings": 16384,
+    },
+    "vision_config": {"model_type": "deepseek_v41_vision"},
+}
+
+
 def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None:
     assert isinstance(cfg, config_cls)
     assert cfg.model_type == model_type
@@ -67,6 +88,14 @@ def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None
         assert cfg.text_config.max_position_embeddings == 8192
         assert cfg.vision_config.hidden_size == 256
         assert cfg.vision_config.out_hidden_size == 1024
+    elif model_type == "deepseek_v41":
+        assert not isinstance(cfg.text_config, dict)
+        assert not isinstance(cfg.vision_config, dict)
+        assert cfg.text_config.model_type == "deepseek_v41_text"
+        assert cfg.text_config.max_position_embeddings == 16384
+        # Read off the *composite*: the field only exists on the text tower, so this
+        # passes only if attribute forwarding is wired.
+        assert cfg.max_position_embeddings == 16384
     else:
         assert cfg.max_position_embeddings == 16384
 
@@ -78,6 +107,9 @@ def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None
         ("cosmos3_omni", Cosmos3Config),  # backward-compat alias
         ("deepseek_v32", DeepseekV3Config),
         ("kimi_k2", DeepseekV3Config),
+        # The composite is covered by from_pretrained below; check subtypes directly.
+        ("deepseek_v41_text", DeepseekV41TextConfig),
+        ("deepseek_v41_vision", DeepseekV41VisionConfig),
     ],
 )
 def test_custom_model_type_registered_with_autoconfig(model_type, config_cls):
@@ -93,6 +125,7 @@ def test_custom_model_type_registered_with_autoconfig(model_type, config_cls):
         ("cosmos3", Cosmos3Config, _COSMOS3_MIN_CONFIG),
         ("deepseek_v32", DeepseekV3Config, _deepseek_min_config("deepseek_v32")),
         ("kimi_k2", DeepseekV3Config, _deepseek_min_config("kimi_k2")),
+        ("deepseek_v41", DeepseekV41Config, _DEEPSEEK_V41_MIN_CONFIG),
     ],
 )
 def test_autoconfig_from_pretrained_resolves_to_local_config(

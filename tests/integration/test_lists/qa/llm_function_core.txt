@@ -1,3 +1,4 @@
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[mxfp4-tp4]
 accuracy/test_disaggregated_serving.py::TestDeepSeekR1::test_kv_cache_v2_nixl_python[cache_mgr_v1]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=False]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=True]
@@ -707,6 +708,8 @@ disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_two_mtp[DeepSeek-V3-Lite-fp8]
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v41_gsm8k_ctxdp4_gendp4[DeepSeek-V4.1-Flash-NVFP4]
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v41_gsm8k_ctxtp4_gentp4[DeepSeek-V4.1-Flash-NVFP4]
 disaggregated/test_disaggregated.py::test_disaggregated_diff_max_tokens[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_genbs1[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt_oss/gpt-oss-120b]

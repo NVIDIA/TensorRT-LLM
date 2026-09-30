@@ -1527,6 +1527,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         "`fp4` to reduce the per-token indexer K footprint on Blackwell+ "
         "(SM>=100). Set to `fp8` for the legacy FP8 indexer K cache path.",
     )
+
     skip_indexer_for_short_seqs: bool = Field(
         default=False,
         description=
@@ -1650,6 +1651,42 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             window_size=self.window_size,
             enable_kv_cache_offload=self.enable_kv_cache_offload,
         )
+
+
+class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
+    """Use checkpoint-owned CSA2 geometry with the PyTorch sparse backend."""
+    algorithm: Literal["csa2"] = "csa2"
+    use_fp8_staging: Optional[bool] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Stage CSA2 KV as E4M3 for native trtllm-gen on SM100-family. The "
+        "per-tensor staging scale is a power of two derived every forward from "
+        "the persistent pools' own group scales, so staged rows keep the E4M3 "
+        "range they decode to. Left unset, staging turns on wherever that path "
+        "is available: attn_backend=TRTLLM on an SM100-family GPU, an FP8 "
+        "kv_cache_config.dtype, and no packed sparse attention. Set True to "
+        "require it, which rejects a configuration that cannot serve it instead "
+        "of falling back, or False to pin BF16 staging.")
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    def to_sparse_params(self, **kwargs):
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
+            CSA2Layout, CSA2Params)
+
+        return CSA2Params(
+            layout=CSA2Layout.from_hf_config(kwargs.get("pretrained_config")),
+            use_fp8_staging=self.use_fp8_staging,
+        )
+
+    def to_sparse_metadata_params(self, **kwargs):
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
+            CSA2Layout, CSA2MetadataParams)
+
+        return CSA2MetadataParams(
+            layout=CSA2Layout.from_hf_config(kwargs.get("pretrained_config")))
 
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
@@ -3401,7 +3438,8 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         if os.path.isfile(config_path):
             try:
                 with open(config_path, encoding="utf-8") as f:
-                    return json.load(f).get("model_type") == "deepseek_v4"
+                    return json.load(f).get("model_type") in (
+                        "deepseek_v4", "deepseek_v41", "deepseek_v41_text")
             except (OSError, ValueError):
                 return False
         return False
@@ -4053,6 +4091,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         DeepSeekV4SparseAttentionConfig,
+        CSA2SparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
         MiniMaxM3SparseAttentionConfig,
     ],
@@ -6147,6 +6186,14 @@ class TorchLlmArgs(BaseLlmArgs):
         "Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes. If 0, disables token-based batching delays.",
         status="prototype")
 
+    bounded_replay_on_generation: bool = Field(
+        default=False,
+        description=
+        ("Run the DeepSeek-V4.1 bounded decoder replay tail on the generation "
+         "worker in disaggregated serving. Configure both worker roles alike."),
+        status="prototype",
+        telemetry=False)
+
     torch_compile_config: Optional[TorchCompileConfig] = Field(
         default=None, description="Torch compile config.", status="prototype")
 
@@ -6883,7 +6930,7 @@ class TorchLlmArgs(BaseLlmArgs):
                 _ = spec_cfg.draft_is_embedded_in_target
                 # Resolve target_layer_ids / mask_token_id / block_size /
                 # markov_rank from the draft (or main) model config if not set.
-                # Three checkpoint spellings are in the wild for the same knobs
+                # Several checkpoint spellings are in the wild for the same knobs
                 # and all are accepted here, because a key the reader misses is
                 # not an error -- it silently falls back to a default and the
                 # drafter degrades (a markov_rank read as 0 skips the Markov
@@ -6892,22 +6939,28 @@ class TorchLlmArgs(BaseLlmArgs):
                 #   - nested ``dflash_config``  (SpecForge / RadixArk drafters)
                 #   - nested ``dspark_config``  (forward compatibility)
                 #   - plain top-level keys  (TorchSpec drafters)
+                # V4.1 wraps the language model settings in ``text_config``;
+                # prefer that scope, retaining the top-level legacy fallback.
                 draft_config_path = os.path.join(spec_cfg.speculative_model,
                                                  "config.json")
                 if os.path.exists(draft_config_path):
                     with open(draft_config_path) as f:
                         draft_cfg = json.load(f)
-                    dspark_cfg = draft_cfg.get("dspark_config") or {}
-                    dflash_cfg = draft_cfg.get("dflash_config") or {}
+                    text_cfg = draft_cfg.get("text_config") or {}
 
-                    def _dspark_get(key, top_level_key):
-                        for source, name in ((dspark_cfg, key), (dflash_cfg,
-                                                                 key),
-                                             (draft_cfg,
-                                              top_level_key), (draft_cfg, key)):
-                            value = source.get(name)
-                            if value is not None:
-                                return value
+                    def _dspark_get(
+                            key: str, top_level_key: str
+                    ) -> Optional[Union[List[int], int]]:
+                        for scope in (text_cfg, draft_cfg):
+                            for source, name in ((scope.get("dspark_config")
+                                                  or {}, key),
+                                                 (scope.get("dflash_config")
+                                                  or {}, key),
+                                                 (scope, top_level_key), (scope,
+                                                                          key)):
+                                value = source.get(name)
+                                if value is not None:
+                                    return value
                         return None
 
                     # The checkpoint's ``dspark_target_layer_ids`` is

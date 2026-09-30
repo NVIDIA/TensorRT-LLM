@@ -19,8 +19,9 @@ import os
 import pytest
 
 from tensorrt_llm.llmapi.reasoning_parser import (
-    MODEL_TYPE_TO_REASONING_PARSER, NemotronV3ReasoningParser,
-    ReasoningParserFactory, resolve_auto_reasoning_parser)
+    MODEL_TYPE_TO_REASONING_PARSER, DeepSeekV41ReasoningParser,
+    NemotronV3ReasoningParser, ReasoningParserFactory,
+    resolve_auto_reasoning_parser)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -161,6 +162,18 @@ def test_deepseek_v4_reasoning_parser_streams_when_thinking():
     assert [result.content for result in results] == ["", "visible", " tail"]
     assert [result.reasoning_content
             for result in results] == ["hid", "den", ""]
+
+
+def test_deepseek_v41_reasoning_parser_adapter():
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "deepseek_v41", {"thinking": True})
+
+    assert isinstance(reasoning_parser, DeepSeekV41ReasoningParser)
+
+    result = reasoning_parser.parse(f"hidden{R1_END}visible")
+
+    assert result.content == "visible"
+    assert result.reasoning_content == "hidden"
 
 
 TOOL_START = "<|tool_calls_section_begin|>"
@@ -531,15 +544,16 @@ def test_resolved_mode_overrides_whatever_the_caller_sent(
 
 
 @pytest.mark.parametrize("parser", [
-    "deepseek-r1", "deepseek_v4", "qwen3", "qwen3_5", "minimax_m2",
-    "minimax_m3", "nemotron-v3", "nano-v3", "gemma4", "kimi_k2", "kimi_k25"
+    "deepseek-r1", "deepseek_v4", "deepseek_v41", "qwen3", "qwen3_5",
+    "minimax_m2", "minimax_m3", "nemotron-v3", "nano-v3", "gemma4", "kimi_k2",
+    "kimi_k25"
 ])
 def test_resolve_prefilled_thinking_requires_opt_in(parser: str) -> None:
     """Parsers that have not opted in must never be resolved from the prompt.
 
-    `deepseek_v4` shares the base class and `nemotron-v3` / `nano-v3` also read
-    `enable_thinking`, so without the flag they would silently pick up a mode
-    the server inferred.
+    The DeepSeek V4 family shares the base class and `nemotron-v3` / `nano-v3`
+    also read `enable_thinking`, so without the flag they would silently pick
+    up a mode the server inferred.
     """
     # Otherwise a typo or a dropped registration passes vacuously, since an
     # unknown name also resolves to None.
@@ -905,6 +919,18 @@ def test_auto_detect_deepseek_non_r1(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result is None
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v41", "deepseek_v41_text"])
+def test_auto_detect_deepseek_v41(tmp_path, model_type):
+    """DeepSeek V4.1 variants use the explicit V4.1 reasoning adapter."""
+    model_dir = str(tmp_path / model_type)
+    os.makedirs(model_dir)
+    _write_config(model_dir, model_type)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+
+    assert result == "deepseek_v41"
 
 
 def test_auto_detect_unknown_model(tmp_path):

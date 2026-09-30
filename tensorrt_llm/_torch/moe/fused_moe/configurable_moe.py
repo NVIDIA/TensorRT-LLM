@@ -81,6 +81,7 @@ class ConfigurableMoE(MoE):
     # Do not treat this ``True`` as "the wrapper supports it": nothing else
     # checks, because the backend is built with ``init_load_balancer=False``.
     _supports_non_divisible_ep: bool = True
+    supports_routing_aux: bool = True
     """
     Configurable MoE layer using composition pattern with automatic configuration
 
@@ -645,6 +646,11 @@ class ConfigurableMoE(MoE):
         DP-padding handling and chunking live in the scheduler.
         """
         input_ids = kwargs.get("input_ids")
+        routing_aux = kwargs.get("routing_aux")
+        if routing_aux is not None and (
+            routing_aux.ndim == 0 or routing_aux.shape[0] != router_logits.shape[0]
+        ):
+            raise ValueError("routing_aux must have one row per router-logit row")
 
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -667,6 +673,7 @@ class ConfigurableMoE(MoE):
             use_dp_padding=use_dp_padding,
             input_ids=input_ids,
             lora_params=lora_params,
+            routing_aux=routing_aux,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).

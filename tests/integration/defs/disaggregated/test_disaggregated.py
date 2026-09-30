@@ -36,6 +36,7 @@ from defs.common import (parse_gsm8k_output, resolve_llm_model_path,
                          wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
+from defs.deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT
 from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
@@ -131,7 +132,10 @@ def scan_logs_for_fatal_errors(processes):
     return findings
 
 
-def print_first_fatal_log_context(processes, context_lines=20):
+def print_first_fatal_log_context(processes,
+                                  context_lines=20,
+                                  *,
+                                  patterns=_FATAL_LOG_PATTERNS):
     """Print the lines around the FIRST fatal-pattern match in each log.
 
     The last-N-lines tail printed on failure usually shows only post-crash
@@ -151,8 +155,7 @@ def print_first_fatal_log_context(processes, context_lines=20):
             with open(log_path, "r", errors="replace") as f:
                 for lineno, line in enumerate(f, 1):
                     if matched is None:
-                        pat = next(
-                            (p for p in _FATAL_LOG_PATTERNS if p in line), None)
+                        pat = next((p for p in patterns if p in line), None)
                         if pat is None:
                             before.append(line)
                             continue
@@ -2920,6 +2923,247 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
                            env=llm_venv._new_env,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory())
+
+
+def _deepseek_v41_completion(server_url: str, model: str, prompt: str,
+                             streaming: bool) -> tuple[str, dict[str, int]]:
+    import requests
+    from defs.deepseek_v41_serving import MAX_OUTPUT_TOKENS
+
+    body = dict(model=model,
+                prompt=prompt,
+                temperature=0,
+                top_p=1,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                stream=streaming)
+    if streaming:
+        body["stream_options"] = {"include_usage": True}
+    with requests.post(f"{server_url}/v1/completions",
+                       json=body,
+                       stream=streaming,
+                       timeout=600) as response:
+        response.raise_for_status()
+        if not streaming:
+            payload = response.json()
+            assert payload["choices"][0]["finish_reason"] == "stop", payload
+            return payload["choices"][0]["text"], payload["usage"]
+        text, usage, finished, done = "", {}, False, False
+        # Consume metrics events after [DONE] so the response closes cleanly.
+        for line in response.iter_lines():
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                done = True
+                continue
+            payload = json.loads(data)
+            assert "error" not in payload, payload
+            if payload.get("usage"):
+                usage = payload["usage"]
+            for choice in payload.get("choices", []):
+                text += choice.get("text", "")
+                if choice.get("finish_reason") is not None:
+                    assert choice["finish_reason"] == "stop", choice
+                    finished = True
+        assert done and finished, "Streaming response did not finish cleanly"
+        return text, usage
+
+
+def _deepseek_v41_handoff(metrics_dir: str, transfer_dir: str,
+                          seen_ids: set[str], *, attention_dp: bool) -> str:
+    import csv
+    from pathlib import Path
+
+    # Requests are sequential, with one context, generation and proxy record each.
+    records = wait_for_perf_metrics_jsonl(metrics_dir,
+                                          3 * (len(seen_ids) + 1),
+                                          timeout=60)
+    proxies = [
+        r for r in records if "ctx_server" in r
+        and str(r.get("disagg_request_id", "")) not in seen_ids
+    ]
+    assert len(proxies) == 1, proxies
+    proxy = proxies[0]
+    request_id = str(proxy["disagg_request_id"])
+    assert request_id and proxy["status"] == "complete", proxy
+    workers = [
+        r for r in records if "request_id" in r
+        and str(r.get("disagg_request_id", "")) == request_id
+    ]
+    assert len(workers) == 2, workers
+    # Local request IDs can collide across the two worker executors.
+    generation = []
+    for path in Path(metrics_dir).glob("perf_metrics-generation-*.jsonl"):
+        for line in path.read_text().splitlines():
+            if line.strip():
+                record = json.loads(line)
+                if str(record.get("disagg_request_id", "")) == request_id:
+                    generation.append(record)
+    assert len(generation) == 1, generation
+    assert all(r["status"] == "complete" for r in workers), workers
+    # Header-derived proxy metrics do not carry worker-local or context IDs.
+    ctx_request_id = generation[0]["ctx_request_id"]
+    assert all(r["ctx_request_id"] == ctx_request_id for r in workers), workers
+    timing = generation[0]["perf_metrics"]["timing_metrics"]
+    assert timing["kv_cache_size"] > 0, timing
+    assert 0 < timing["kv_cache_transfer_start"] <= timing[
+        "kv_cache_transfer_end"], timing
+    deadline = time.monotonic() + 10
+    while True:
+        ranks = []
+        for path in Path(transfer_dir).glob("*_gen_transfer_summary.csv"):
+            rank = int(
+                path.name.removesuffix("_gen_transfer_summary.csv").rsplit(
+                    "_", 1)[-1])
+            with path.open() as stream:
+                for row in csv.DictReader(stream):
+                    if row["RequestID"] == request_id:
+                        # TP records a consensus total; DP records the receiving rank's bytes.
+                        assert int(row["kv_cache_size"]) > 0, row
+                        ranks.append(rank)
+        if attention_dp and len(ranks) == 1 and ranks[0] in range(4):
+            return request_id
+        if not attention_dp and sorted(ranks) == [0, 1, 2, 3]:
+            return request_id
+        assert time.monotonic() < deadline, (request_id, ranks)
+        time.sleep(0.1)
+
+
+@pytest.mark.timeout(GSM8K_TEST_TIMEOUT)
+@skip_pre_blackwell
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_path", ['DeepSeek-V4.1-Flash-NVFP4'])
+def test_disaggregated_deepseek_v41_gsm8k_ctxtp4_gentp4(llm_venv, model_path,
+                                                        tmp_path) -> None:
+    """Check GSM8K accuracy, DSpark AL, and NIXL handoff on TP4/EP4 workers."""
+    _run_deepseek_v41_gsm8k(llm_venv, model_path, tmp_path, attention_dp=False)
+
+
+@pytest.mark.timeout(GSM8K_TEST_TIMEOUT)
+@skip_pre_blackwell
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_path", ['DeepSeek-V4.1-Flash-NVFP4'])
+def test_disaggregated_deepseek_v41_gsm8k_ctxdp4_gendp4(llm_venv, model_path,
+                                                        tmp_path) -> None:
+    """Check GSM8K accuracy, DSpark AL, and NIXL handoff on attention DP4/EP4 workers."""
+    _run_deepseek_v41_gsm8k(llm_venv, model_path, tmp_path, attention_dp=True)
+
+
+def _run_deepseek_v41_gsm8k(llm_venv, model_path, tmp_path, *,
+                            attention_dp: bool) -> None:
+    from defs.deepseek_v41_serving import baseline_env, model_kwargs
+
+    from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
+
+    model_dir = resolve_llm_model_path(model_path)
+    tokenizer = DeepseekV41Tokenizer.from_pretrained(model_dir,
+                                                     trust_remote_code=True,
+                                                     local_files_only=True)
+    config = {
+        "model": model_dir,
+        "hostname": "localhost",
+        "backend": "pytorch",
+        "return_perf_metrics": True
+    }
+    for role in ("context_servers", "generation_servers"):
+        config[role] = model_kwargs(attention_dp=attention_dp) | {
+            "num_instances": 1,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 8192
+            },
+        }
+        # Both workers share one node. The KV cache manager V2 auto host tier
+        # only counts its own TP ranks, so each worker would pin half of the
+        # free host memory and the two together would pin all of it; that
+        # page-population stalls for over an hour. A fixed small host tier
+        # keeps the V2 suspend/resume path available without oversubscribing.
+        config[role]["kv_cache_config"]["host_cache_size"] = 2 * (1 << 30)
+    config["context_servers"].update(cuda_graph_config=None,
+                                     disable_overlap_scheduler=True,
+                                     speculative_config=None)
+    config["generation_servers"]["speculative_config"] = {
+        "decoding_type": "DSpark",
+        "max_draft_len": 5,
+    }
+    config_path = tmp_path / "disagg.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    metrics_dir, transfer_dir = str(tmp_path / "metrics"), str(tmp_path /
+                                                               "transfers")
+    env = baseline_env(llm_venv._new_env) | {
+        "UCX_TLS": get_ucx_tls(),
+        "TRTLLM_NIXL_KVCACHE_BACKEND": "UCX",
+        "TRTLLM_NIXL_NUM_THREADS": "1",
+        "TRTLLM_KVCACHE_TIME_OUTPUT_PATH": transfer_dir,
+        "TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO": "1",
+    }
+    _, ctx_workers, gen_workers, server, port, _ = setup_disagg_cluster(
+        str(config_path),
+        model_name=model_dir,
+        env=env,
+        cwd=str(tmp_path),
+        server_start_timeout=5400,
+        save_log=True,
+        perf_metrics_output_dir=metrics_dir)
+    try:
+        _check_deepseek_v41_gsm8k(f"http://localhost:{port}",
+                                  model_dir,
+                                  tokenizer,
+                                  tmp_path,
+                                  metrics_dir=metrics_dir,
+                                  transfer_dir=transfer_dir,
+                                  attention_dp=attention_dp)
+        assert not build_worker_diag(ctx_workers + gen_workers, server)
+        for worker in ctx_workers + gen_workers:
+            with open(worker.log_path) as log:
+                assert "Using KvCacheTransceiverV2" in log.read(
+                ), worker.log_path
+    except Exception:
+        print_first_fatal_log_context(
+            [*ctx_workers, *gen_workers, server],
+            patterns=_FATAL_LOG_PATTERNS +
+            ("Assertion `", "Assertion failed:", "CUDA error:"))
+        raise
+    finally:
+        terminate(*ctx_workers, *gen_workers, server)
+
+
+def _check_deepseek_v41_gsm8k(server_url: str, model_dir: str, tokenizer,
+                              tmp_path, *, metrics_dir: str, transfer_dir: str,
+                              attention_dp: bool) -> set[str]:
+    """Apply the same accuracy and handoff gates to local or multinode workers."""
+    from defs.deepseek_v41_gsm8k import evaluate_gsm8k_server
+    from defs.deepseek_v41_serving import MAX_NUM_TOKENS, build_smoke_cases
+
+    seen_ids = set()
+    with (tmp_path / "requests.jsonl").open("w") as evidence:
+        for case in build_smoke_cases(tokenizer):
+            outputs = []
+            for streaming in (False, True):
+                text, usage = _deepseek_v41_completion(server_url, model_dir,
+                                                       case.prompt, streaming)
+                request_id = _deepseek_v41_handoff(metrics_dir,
+                                                   transfer_dir,
+                                                   seen_ids,
+                                                   attention_dp=attention_dp)
+                seen_ids.add(request_id)
+                evidence.write(
+                    json.dumps(
+                        dict(name=case.name,
+                             stream=streaming,
+                             text=text,
+                             usage=usage,
+                             disagg_request_id=request_id)) + "\n")
+                evidence.flush()
+                assert text.strip() == case.expected, (case.name, text)
+                assert usage["completion_tokens"] > 1, (case.name, usage)
+                if case.name == "long_recall":
+                    assert usage["prompt_tokens"] > 4096 > MAX_NUM_TOKENS, usage
+                outputs.append(text)
+            assert outputs[0] == outputs[1], (case.name, outputs)
+    evaluate_gsm8k_server(server_url, model_dir, tokenizer, tmp_path / "gsm8k")
+    return seen_ids
 
 
 @pytest.mark.timeout(12600)

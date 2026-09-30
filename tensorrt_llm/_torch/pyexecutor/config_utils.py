@@ -1116,6 +1116,30 @@ def load_pretrained_config(model_name_or_path: str,
             text_dict["quantization_config"] = quantization_config
         model_config = Qwen4ExpTextConfig.from_dict(text_dict)
         model_config.architectures = ["Qwen4ExpForCausalLM"]
+    elif model_type in ("deepseek_v41", "deepseek_v41_text"):
+        # Preserve the composite config and propagate its dtype to the text tower.
+        # Vision checkpoints use the internal ConditionalGeneration dispatch alias.
+        from tensorrt_llm._torch.configs import (DeepseekV41Config,
+                                                 DeepseekV41TextConfig)
+        nested_text = config_dict.get("text_config")
+        if isinstance(nested_text, dict) and nested_text:
+            resolved_dtype = _resolve_composite_torch_dtype(
+                config_dict, nested_text)
+            model_config = DeepseekV41Config.from_dict(config_dict, **kwargs)
+            model_config.text_config.architectures = ["DeepseekV41ForCausalLM"]
+            model_config.text_config.torch_dtype = resolved_dtype
+            model_config.torch_dtype = resolved_dtype
+        else:
+            # ``dict(config_dict)`` already carries the top-level
+            # ``quantization_config``, and ``DeepseekV41TextConfig`` propagates it
+            # in ``__init__`` (see the note above), so the flat branch needs no
+            # hoisting step of its own.
+            model_config = DeepseekV41TextConfig.from_dict(
+                dict(config_dict), **kwargs)
+        model_config.architectures = ["DeepseekV41ForCausalLM"]
+        vision_config = getattr(model_config, "vision_config", None)
+        if getattr(vision_config, "num_hidden_layers", 0) > 0:
+            model_config.architectures = ["DeepseekV41ForConditionalGeneration"]
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

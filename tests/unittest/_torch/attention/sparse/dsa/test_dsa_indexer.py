@@ -1396,8 +1396,8 @@ def test_dsa_cache_manager_v2_remaps_indexer_after_empty_layers() -> None:
         cache_manager.shutdown()
 
 
-def create_indexer(sparse_attn_config, layer_idx=0):
-    """Helper to create an Indexer for testing."""
+def create_indexer(sparse_attn_config, layer_idx=0, pretrained_config=None, compress_ratio=1):
+    """Create a test indexer using checkpoint-derived parameters and an explicit pooling ratio."""
     # Create RopeParams
     rope_params = RopeParams(
         dim=64,  # qk_rope_head_dim
@@ -1420,7 +1420,7 @@ def create_indexer(sparse_attn_config, layer_idx=0):
             self.q_lora_rank = 512  # Example q_lora_rank
             self.qk_rope_head_dim = 64
 
-    sparse_params = sparse_attn_config.to_sparse_params()
+    sparse_params = sparse_attn_config.to_sparse_params(pretrained_config=pretrained_config)
     mla_params = MLAParams(sparse_params.index_head_dim)
 
     # Mock RotaryEmbedding since we're only testing cache management, not rope functionality
@@ -1439,6 +1439,7 @@ def create_indexer(sparse_attn_config, layer_idx=0):
             skip_create_weights_in_init=True,  # Skip weight creation for test
             sparse_params=sparse_params,
             dtype=torch.bfloat16,
+            compress_ratio=compress_ratio,
             layer_idx=layer_idx,
         )
 

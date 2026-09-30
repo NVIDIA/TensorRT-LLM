@@ -53,6 +53,34 @@ CudaAllocation allocateCuda(size_t numBytes)
     return CudaAllocation{ptr};
 }
 
+struct PageIndexArray
+{
+    CudaAllocation deviceStorage;
+    PageIndexPair const* data = nullptr;
+};
+
+PageIndexArray preparePageIndices(PageIndexLocation location, PageIndexPair const* indices, size_t count)
+{
+    if (location == PageIndexLocation::kHost)
+    {
+        return {CudaAllocation{}, indices};
+    }
+    EXPECT_EQ(location, PageIndexLocation::kDevice);
+    size_t const bytes = count * sizeof(PageIndexPair);
+    PageIndexArray result{allocateCuda(bytes)};
+    EXPECT_NE(result.deviceStorage, nullptr);
+    if (result.deviceStorage)
+    {
+        auto const status = cudaMemcpy(result.deviceStorage.get(), indices, bytes, cudaMemcpyHostToDevice);
+        EXPECT_EQ(status, cudaSuccess);
+        if (status == cudaSuccess)
+        {
+            result.data = static_cast<PageIndexPair const*>(result.deviceStorage.get());
+        }
+    }
+    return result;
+}
+
 CoalescedBuffer makeCoalescedBuffer(size_t size, LayerId layerId, std::string role)
 {
     return CoalescedBuffer{size, {BufferId{layerId, std::move(role)}}};
@@ -169,8 +197,9 @@ TEST(KvCacheManagerV2DefaultColdPageCodecTest, ConcatenatesAndRestoresLargeNonCo
     EXPECT_EQ(codec->getBatchingLayerGroupId(LifeCycleId{0}), LifeCycleId{0});
     EXPECT_EQ(codec->getBatchingLayerGroupId(LifeCycleId{1}), LifeCycleId{0});
     EXPECT_EQ(codec->getBatchingLayerGroupId(LifeCycleId{2}), LifeCycleId{-1});
-    EXPECT_EQ(codec->queryPageIndexLocation(LifeCycleId{0}), PageIndexLocation::kHost);
-    EXPECT_EQ(codec->queryPageIndexLocation(LifeCycleId{1}), PageIndexLocation::kHost);
+    auto const indexLocation = codec->queryPageIndexLocation(LifeCycleId{0});
+    ASSERT_TRUE(indexLocation == PageIndexLocation::kHost || indexLocation == PageIndexLocation::kDevice);
+    EXPECT_EQ(codec->queryPageIndexLocation(LifeCycleId{1}), indexLocation);
     EXPECT_EQ(codec->queryPageIndexLocation(LifeCycleId{2}), PageIndexLocation::kBadLocation);
     EXPECT_FALSE(configureOne(*codec, desc));
 
@@ -184,12 +213,16 @@ TEST(KvCacheManagerV2DefaultColdPageCodecTest, ConcatenatesAndRestoresLargeNonCo
         decodePageIndices[index] = PageIndexPair{hotIndex, coldIndex};
     }
 
+    auto encodeIndices = preparePageIndices(indexLocation, encodePageIndices.data(), encodePageIndices.size());
+    auto decodeIndices = preparePageIndices(indexLocation, decodePageIndices.data(), decodePageIndices.size());
+    ASSERT_NE(encodeIndices.data, nullptr);
+    ASSERT_NE(decodeIndices.data, nullptr);
     cudaStream_t stream = nullptr;
     ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
-    ASSERT_TRUE(codec->encode(LifeCycleId{0}, cold.get(), encodePageIndices.data(), kBatchSize, stream));
+    ASSERT_TRUE(codec->encode(LifeCycleId{0}, cold.get(), encodeIndices.data, kBatchSize, stream));
     ASSERT_EQ(cudaMemsetAsync(pool0.get(), 0, kPool0Bytes * kNumSlots, stream), cudaSuccess);
     ASSERT_EQ(cudaMemsetAsync(pool1.get(), 0, kPool1Bytes * kNumSlots, stream), cudaSuccess);
-    ASSERT_TRUE(codec->decode(LifeCycleId{0}, cold.get(), decodePageIndices.data(), kBatchSize, stream));
+    ASSERT_TRUE(codec->decode(LifeCycleId{0}, cold.get(), decodeIndices.data, kBatchSize, stream));
     std::vector<uint8_t> pool0Output(kPool0Bytes * kNumSlots);
     std::vector<uint8_t> pool1Output(kPool1Bytes * kNumSlots);
     ASSERT_EQ(cudaMemcpyAsync(pool0Output.data(), pool0.get(), pool0Output.size(), cudaMemcpyDeviceToHost, stream),
@@ -232,12 +265,15 @@ TEST(KvCacheManagerV2DefaultColdPageCodecTest, RoundTripsBatchedCopies)
     ASSERT_TRUE(configureOne(*codec, makePoolGroupDesc(pool0.get(), kPool0Bytes, pool1.get(), kPool1Bytes, kNumSlots)));
 
     std::array<PageIndexPair, kNumSlots> const indices{{PageIndexPair{0, 1}, PageIndexPair{1, 0}}};
+    auto pageIndices
+        = preparePageIndices(codec->queryPageIndexLocation(LifeCycleId{0}), indices.data(), indices.size());
+    ASSERT_NE(pageIndices.data, nullptr);
     cudaStream_t stream = nullptr;
     ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
-    ASSERT_TRUE(codec->encode(LifeCycleId{0}, cold.get(), indices.data(), kNumSlots, stream));
+    ASSERT_TRUE(codec->encode(LifeCycleId{0}, cold.get(), pageIndices.data, kNumSlots, stream));
     ASSERT_EQ(cudaMemsetAsync(pool0.get(), 0, pool0Input.size(), stream), cudaSuccess);
     ASSERT_EQ(cudaMemsetAsync(pool1.get(), 0, pool1Input.size(), stream), cudaSuccess);
-    ASSERT_TRUE(codec->decode(LifeCycleId{0}, cold.get(), indices.data(), kNumSlots, stream));
+    ASSERT_TRUE(codec->decode(LifeCycleId{0}, cold.get(), pageIndices.data, kNumSlots, stream));
 
     std::vector<uint8_t> pool0Output(pool0Input.size());
     std::vector<uint8_t> pool1Output(pool1Input.size());

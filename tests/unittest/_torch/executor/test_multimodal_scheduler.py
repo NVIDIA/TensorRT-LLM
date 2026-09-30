@@ -609,6 +609,8 @@ def test_terminate_request_releases_partial_multimodal_encoder_state():
     freed = []
 
     executor = object.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.resource_manager = SimpleNamespace(free_resources=freed.append)
     executor._prefetched_request_ids = {request.py_request_id}
     executor._disagg_coordinator = Mock()
