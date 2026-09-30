@@ -50,7 +50,6 @@ __all__ = [
     "local_address",
     "master_timeout",
     "provision_pool",
-    "resolve_device_name",
     "resolve_master_address",
     "running_master",
     "wait_for_master",
@@ -104,7 +103,9 @@ class PoolSpec:
     metadata_server: str = DEFAULT_METADATA_SERVER
     #: `rdma` or `tcp`. TCP is for bring-up only.
     protocol: str = "rdma"
-    #: RDMA device to transfer over, from `ibv_devinfo`. Empty auto-detects.
+    #: RDMA device to transfer over, from `ibv_devinfo`. One config serves a
+    #: whole pool, so naming a device here names it for every node; left empty
+    #: each client discovers its own, which is what differing HCAs need.
     device_name: str = ""
     #: Host memory each worker process contributes. Pool capacity is this times
     #: the number of processes that open a store handle.
@@ -285,78 +286,6 @@ def _wait_until_accepting(
         time.sleep(0.5)
 
 
-#: Where the InfiniBand devices of a host are described.
-IB_SYSFS_ROOT = "/sys/class/infiniband"
-
-
-def _highest_rate_ib_devices(sysfs_root: Optional[str] = None) -> List[str]:
-    """The active InfiniBand devices on the compute fabric, fastest first.
-
-    A node's HCAs are not interchangeable. On GB300 six are exposed, of which
-    four run at 800Gb/s (two per NUMA node, one per GPU) while the rest share a
-    PCI device with an Ethernet port and serve storage or management. Taking
-    every device at the highest rate picks the compute fabric on any node type,
-    where a hardcoded name would be wrong on the next one.
-    """
-    sysfs_root = sysfs_root or IB_SYSFS_ROOT
-    rated: Dict[str, int] = {}
-    try:
-        devices = sorted(os.listdir(sysfs_root))
-    except OSError:
-        return []
-    for device in devices:
-        port = os.path.join(sysfs_root, device, "ports", "1")
-
-        def attribute(name: str) -> str:
-            try:
-                with open(os.path.join(port, name)) as handle:
-                    return handle.read().strip()
-            except OSError:
-                return ""
-
-        if attribute("link_layer") != "InfiniBand":
-            continue
-        if "ACTIVE" not in attribute("state"):
-            continue
-        # "800 Gb/sec (4X XDR)"
-        rate = attribute("rate").split()
-        if not rate or not rate[0].isdigit():
-            continue
-        rated[device] = int(rate[0])
-
-    if not rated:
-        return []
-    fastest = max(rated.values())
-    return [device for device, rate in sorted(rated.items()) if rate == fastest]
-
-
-def resolve_device_name(protocol: str, configured: str, sysfs_root: Optional[str] = None) -> str:
-    """The RDMA devices to transfer over, detected if the config left it open.
-
-    Which HCAs a node has is a property of the node, not of the deployment, so
-    requiring it in a config would tie that config to one machine type.
-    Detecting it keeps `protocol: rdma` portable; setting `device_name`
-    overrides the detection.
-    """
-    if configured or protocol != "rdma":
-        return configured
-    detected = _highest_rate_ib_devices(sysfs_root)
-    if not detected:
-        logger.warning(
-            "mooncake-store: protocol is rdma but no active InfiniBand device "
-            f"was found under {sysfs_root or IB_SYSFS_ROOT}, so device_name is "
-            "left empty for Mooncake's own discovery. Set device_name to "
-            "choose explicitly."
-        )
-        return ""
-    joined = ",".join(detected)
-    logger.info(
-        f"mooncake-store: transferring over the fastest active InfiniBand "
-        f"devices on this host: {joined}"
-    )
-    return joined
-
-
 def wait_for_master(master_address: str, timeout: Optional[float] = None) -> Optional[float]:
     """Block until the master at `master_address` accepts connections.
 
@@ -381,9 +310,7 @@ def wait_for_master(master_address: str, timeout: Optional[float] = None) -> Opt
     return elapsed
 
 
-def _client_config(
-    pool: PoolSpec, master_address: str, device_name: Optional[str] = None
-) -> Dict[str, Any]:
+def _client_config(pool: PoolSpec, master_address: str) -> Dict[str, Any]:
     """Render the Mooncake client config for a pool.
 
     The schema is vLLM's, so one pool can serve both engines. `role` is written
@@ -394,7 +321,7 @@ def _client_config(
         "metadata_server": pool.metadata_server,
         "master_server_address": master_address,
         "protocol": pool.protocol,
-        "device_name": pool.device_name if device_name is None else device_name,
+        "device_name": pool.device_name,
         "global_segment_size": pool.global_segment_size,
         "local_buffer_size": pool.local_buffer_size,
         "role": "both",
@@ -424,9 +351,7 @@ def write_client_config(pool: PoolSpec, master_address: str, run_dir: str) -> st
     """
     os.makedirs(run_dir, exist_ok=True)
     config_path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
-    config = _client_config(
-        pool, master_address, resolve_device_name(pool.protocol, pool.device_name)
-    )
+    config = _client_config(pool, master_address)
     with open(config_path, "w") as handle:
         json.dump(config, handle, indent=2)
     logger.info(f"mooncake-store: wrote {config_path} ({json.dumps(config, sort_keys=True)})")

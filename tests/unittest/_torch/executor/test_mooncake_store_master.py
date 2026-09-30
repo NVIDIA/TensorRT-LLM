@@ -601,51 +601,30 @@ def test_a_master_that_died_starting_is_reported_with_its_last_words(fake_master
             pytest.fail("provisioning should not have yielded")
 
 
-# ---- choosing the fabric without naming it in a config ----
+# ---- which fabric a client transfers over ----
 
 
-def fake_hca(root, device, link_layer="InfiniBand", state="4: ACTIVE", rate="800 Gb/sec"):
-    port = root / device / "ports" / "1"
-    port.mkdir(parents=True)
-    (port / "link_layer").write_text(f"{link_layer}\n")
-    (port / "state").write_text(f"{state}\n")
-    (port / "rate").write_text(f"{rate}\n")
+def test_the_pool_config_leaves_the_fabric_to_each_client(fake_master, tmp_path):
+    """One config describes a whole pool, so it must not name one node's HCAs.
 
-
-def test_the_compute_fabric_is_picked_over_the_management_adapter(tmp_path):
-    """A node's HCAs are not interchangeable: only some are the fast fabric."""
-    fake_hca(tmp_path, "mlx5_0")
-    fake_hca(tmp_path, "mlx5_1")
-    fake_hca(tmp_path, "mlx5_2", rate="400 Gb/sec")
-    fake_hca(tmp_path, "mlx5_3", state="1: DOWN")
-    fake_hca(tmp_path, "mlx5_4", link_layer="Ethernet")
-
-    assert (
-        master_module.resolve_device_name("rdma", "", sysfs_root=str(tmp_path)) == "mlx5_0,mlx5_1"
-    )
-
-
-def test_a_named_device_is_not_second_guessed(tmp_path):
-    fake_hca(tmp_path, "mlx5_0")
-    assert master_module.resolve_device_name("rdma", "mlx5_7", sysfs_root=str(tmp_path)) == "mlx5_7"
-
-
-def test_tcp_needs_no_device_and_looks_for_none(tmp_path):
-    assert master_module.resolve_device_name("tcp", "", sysfs_root=str(tmp_path)) == ""
-
-
-def test_a_node_without_infiniband_is_left_to_mooncake_s_own_discovery(tmp_path):
-    """Falling back beats failing, since Mooncake may still find a usable device."""
-    assert master_module.resolve_device_name("rdma", "", sysfs_root=str(tmp_path / "absent")) == ""
-
-
-def test_the_detected_device_is_what_the_workers_are_told(fake_master, tmp_path, monkeypatch):
-    sysfs = tmp_path / "sysfs"
-    fake_hca(sysfs, "mlx5_0")
-    monkeypatch.setattr(master_module, "IB_SYSFS_ROOT", str(sysfs))
+    Mooncake discovers devices locally on each client when `device_name` is
+    empty. Resolving a device while writing the config would instead freeze
+    whatever the provisioning host happens to have into a file every node
+    reads, which is wrong as soon as their HCAs differ.
+    """
     port = free_port()
     fake_master.arm(listen_on=port)
     pool = PoolSpec(launch_master=True, master_port=port, protocol="rdma")
 
     with provision_pool(pool, run_dir=str(tmp_path / "run")) as config_path:
-        assert json.loads(open(config_path).read())["device_name"] == "mlx5_0"
+        assert json.loads(open(config_path).read())["device_name"] == ""
+
+
+def test_a_named_device_is_what_the_workers_are_told(fake_master, tmp_path):
+    """Naming one is still how a deployment overrides that discovery."""
+    port = free_port()
+    fake_master.arm(listen_on=port)
+    pool = PoolSpec(launch_master=True, master_port=port, protocol="rdma", device_name="mlx5_7")
+
+    with provision_pool(pool, run_dir=str(tmp_path / "run")) as config_path:
+        assert json.loads(open(config_path).read())["device_name"] == "mlx5_7"
