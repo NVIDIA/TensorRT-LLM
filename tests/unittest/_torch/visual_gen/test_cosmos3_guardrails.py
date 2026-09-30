@@ -46,6 +46,17 @@ class _RecordingSnapshotDownload:
         return outcome
 
 
+class _GatedRepo(GatedRepoError):
+    """A GatedRepoError that skips HfHubHTTPError.__init__.
+
+    Depending on the huggingface_hub version that constructor demands a live
+    ``requests.Response``; the code under test only needs the exception type.
+    """
+
+    def __init__(self):
+        Exception.__init__(self, "gated")
+
+
 def _pinned(call):
     return (call["repo_id"], call["revision"], call["allow_patterns"])
 
@@ -94,9 +105,9 @@ class TestDownloadGuardrailCheckpoint:
             )
 
     def test_gated_repo_is_reported_as_value_error(self, monkeypatch):
-        _install(
-            monkeypatch, _RecordingSnapshotDownload([FileNotFoundError(), GatedRepoError("gated")])
-        )
+        _install(monkeypatch, _RecordingSnapshotDownload([FileNotFoundError(), _GatedRepo()]))
 
-        with pytest.raises(ValueError, match="accepted the terms of use"):
+        with pytest.raises(ValueError, match="accepted the terms of use") as excinfo:
             download_guardrail_checkpoint()
+
+        assert isinstance(excinfo.value.__cause__, GatedRepoError)
