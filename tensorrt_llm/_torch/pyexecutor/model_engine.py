@@ -83,7 +83,8 @@ from .engine.lora import (LoraParamBuilder, make_cuda_graph_lora_manager,
                           make_lora_model_config)
 from .engine.metadata import build_attention_metadata, update_spec_metadata
 from .engine.model_call import ModelCaller
-from .engine.multimodal import (MultimodalItemScheduler,
+from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
+                                mm_encoder_cache_enabled,
                                 setup_mm_encoder_attn_metadata)
 from .engine.runners import (apply_position_id_offset, get_all_rank_num_tokens,
                              get_padding_params, get_position_id_offset,
@@ -91,7 +92,7 @@ from .engine.runners import (apply_position_id_offset, get_all_rank_num_tokens,
                              resolve_runner_type,
                              set_spec_metadata_all_rank_num_tokens,
                              ship_multimodal_indices)
-from .engine.runners.common import ModelTraitsMixin, make_scheduled_inputs
+from .engine.runners.common import make_scheduled_inputs
 from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
 from .engine.runners.encoder_decoder import (EncoderDecoderRunner,
                                              EncoderDecoderRunnerConfig)
@@ -360,7 +361,7 @@ def _set_moe_a2a_warmup(in_warmup: bool) -> None:
             f"budget was not switched: {type(e).__name__}: {e}")
 
 
-class PyTorchModelEngine(ModelTraitsMixin, ModelEngine):
+class PyTorchModelEngine(ModelEngine):
 
     def __init__(
         self,
@@ -1133,6 +1134,22 @@ class PyTorchModelEngine(ModelTraitsMixin, ModelEngine):
         return False
 
     @property
+    def use_mrope(self):
+        use_mrope = False
+        try:
+            use_mrope = self.model.model_config.pretrained_config.rope_scaling[
+                'type'] == 'mrope'
+        except Exception:
+            pass
+        logger.debug(f"Detected use_mrope: {use_mrope}")
+        return use_mrope
+
+    @functools.cached_property
+    def _mm_encoder_cache_enabled(self) -> bool:
+        """Whether the multimodal encoder cache is active for this model."""
+        return mm_encoder_cache_enabled(self.model)
+
+    @property
     def is_warmup(self):
         return getattr(self, "_is_warmup", False)
 
@@ -1160,6 +1177,10 @@ class PyTorchModelEngine(ModelTraitsMixin, ModelEngine):
         if moe_load_balancer is not None:
             moe_load_balancer.set_iter_info(enable_statistic=value[0],
                                             enable_update_weights=value[1])
+
+    @property
+    def use_beam_search(self):
+        return self.max_beam_width > 1
 
     def _get_draft_kv_cache_manager(
         self, resource_manager: ResourceManager
@@ -3567,6 +3588,11 @@ class PyTorchModelEngine(ModelTraitsMixin, ModelEngine):
 
         return self.attn_metadata
 
+    @property
+    def is_multimodal(self) -> bool:
+        """True iff this engine drives a multimodal model."""
+        return is_multimodal(self.model, self.input_processor)
+
     def _validate_breakable_cuda_graph_compatibility(self) -> None:
         if self.llm_args.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:
             return
@@ -4051,6 +4077,25 @@ class PyTorchModelEngine(ModelTraitsMixin, ModelEngine):
         if not self.use_mrope or not _has_mm_payload_keys(multimodal_data):
             return True
         return CUDAGraphRunner._get_mrope_position_delta(request) is not None
+
+    def _is_encoder_decoder_model(self) -> bool:
+        return bool(
+            getattr(getattr(self.model, "model_config", None),
+                    "is_encoder_decoder", False))
+
+    @functools.cached_property
+    def _model_uses_ple_recurrent_state(self) -> bool:
+        """Detect PLE on text-only and multimodal model wrappers.
+
+        The answer is fixed once the model is loaded, and the CUDA-graph gate
+        below consults it on every forward that has context requests.
+        """
+        top_level_model = get_top_level_model(self.model)
+        if getattr(top_level_model, "has_ple", False):
+            return True
+        llm = getattr(top_level_model, "llm", None)
+        text_model = getattr(llm, "model", llm)
+        return bool(getattr(text_model, "has_ple", False))
 
     def _prepare_enc_dec_cross_attn_inputs(
         self,

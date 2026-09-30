@@ -4,7 +4,6 @@
 """Shared helpers used by multiple model-runner families."""
 
 import bisect
-import functools
 import math
 from typing import TYPE_CHECKING, Any
 
@@ -20,7 +19,6 @@ from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..multimodal import is_multimodal, mm_encoder_cache_enabled
 from .interface import ScheduledInputs
 
 if TYPE_CHECKING:
@@ -236,51 +234,3 @@ def make_scheduled_inputs(
         enable_spec_decode=enable_spec_decode,
         runtime_draft_len=runtime_draft_len,
     )
-
-
-class ModelTraitsMixin:
-    """Model-derived predicates shared by the engine and its decoder execution.
-
-    Requires ``model``, ``input_processor`` and ``max_beam_width``.
-    """
-
-    @property
-    def use_mrope(self):
-        use_mrope = False
-        try:
-            use_mrope = self.model.model_config.pretrained_config.rope_scaling["type"] == "mrope"
-        except Exception:
-            pass
-        logger.debug(f"Detected use_mrope: {use_mrope}")
-        return use_mrope
-
-    @functools.cached_property
-    def _mm_encoder_cache_enabled(self) -> bool:
-        """Whether the multimodal encoder cache is active for this model."""
-        return mm_encoder_cache_enabled(self.model)
-
-    @property
-    def use_beam_search(self):
-        return self.max_beam_width > 1
-
-    @property
-    def is_multimodal(self) -> bool:
-        """True iff this engine drives a multimodal model."""
-        return is_multimodal(self.model, self.input_processor)
-
-    def _is_encoder_decoder_model(self) -> bool:
-        return bool(getattr(getattr(self.model, "model_config", None), "is_encoder_decoder", False))
-
-    @functools.cached_property
-    def _model_uses_ple_recurrent_state(self) -> bool:
-        """Detect PLE on text-only and multimodal model wrappers.
-
-        The answer is fixed once the model is loaded, and the CUDA-graph gate
-        below consults it on every forward that has context requests.
-        """
-        top_level_model = get_top_level_model(self.model)
-        if getattr(top_level_model, "has_ple", False):
-            return True
-        llm = getattr(top_level_model, "llm", None)
-        text_model = getattr(llm, "model", llm)
-        return bool(getattr(text_model, "has_ple", False))
