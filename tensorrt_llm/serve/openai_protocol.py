@@ -1711,7 +1711,10 @@ class ResponsesResponse(OpenAIBaseModel):
     service_tier: Literal["auto", "default", "flex", "scale", "priority"]
     status: ResponseStatus
     text: Optional[ResponseTextConfig] = None
-    top_logprobs: int
+    # Optional, like openai.types.responses.Response.top_logprobs: from_request
+    # fills it from SamplingParams.logprobs, which is None when the caller did
+    # not ask for log probabilities.
+    top_logprobs: Optional[int] = None
     truncation: Literal["auto", "disabled"]
     usage: Optional[ResponseUsage] = None
     user: Optional[str] = None

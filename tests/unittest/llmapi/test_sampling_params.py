@@ -31,6 +31,7 @@ from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     KVCacheTruncateRequest,
     ResponsesRequest,
+    ResponsesResponse,
     ensure_request_chat_template_allowed,
 )
 from tensorrt_llm.serve.resource_governor import ResourceGovernor
@@ -163,6 +164,21 @@ def test_responses_request_asks_for_no_logprobs_unless_told_to():
     assert logprobs_for(top_logprobs=None) is None
     assert logprobs_for(top_logprobs=0) == 0
     assert logprobs_for(top_logprobs=3) == 3
+
+
+def test_responses_response_echoes_an_absent_top_logprobs():
+    """The response carries back what the sampling params hold, None included."""
+
+    def echoed(**kwargs):
+        request = ResponsesRequest(model="test", input="hi", **kwargs)
+        sampling_params = request.to_sampling_params()
+        response = ResponsesResponse.from_request(request, sampling_params,
+                                                  "test", 0, [], "completed")
+        return response.top_logprobs
+
+    assert echoed() is None
+    assert echoed(top_logprobs=0) == 0
+    assert echoed(top_logprobs=3) == 3
 
 
 @pytest.mark.parametrize(
