@@ -170,6 +170,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = object.__new__(PyTorchModelEngine)
         self.engine._eager_workspace_reclaimer = None
+        self.engine._moe_graph_padding = None
         self.engine.is_spec_decode = False
         self.engine.mapping = SimpleNamespace(cp_size=1)
         self.engine.sparse_attention_config = None
