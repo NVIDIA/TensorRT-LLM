@@ -530,8 +530,8 @@ def test_failed_receive_consensus_waits_for_every_rank_to_drain() -> None:
         side_effect=[
             [[], []],
             [
-                [[], [rid], [], [rid]],
-                [[], [], [], []],
+                [[], [rid], [], [rid], []],
+                [[], [], [], [], []],
             ],
         ]
     )
@@ -547,8 +547,8 @@ def test_failed_receive_consensus_waits_for_every_rank_to_drain() -> None:
         side_effect=[
             [[rid], [rid]],
             [
-                [[], [rid], [], [rid]],
-                [[], [rid], [], [rid]],
+                [[], [rid], [], [rid], []],
+                [[], [rid], [], [rid], []],
             ],
         ]
     )
@@ -1133,6 +1133,7 @@ def test_completed_session_is_not_reported_retired_when_close_refuses() -> None:
         is_completed=Mock(return_value=True),
         has_failed=Mock(return_value=False),
         wait_complete=Mock(return_value=WaitResult.COMPLETED),
+        kv_write_verified=Mock(return_value=True),
         close=Mock(return_value=False),
     )
     transceiver = object.__new__(KvCacheTransceiverV2)
@@ -1341,6 +1342,9 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender._ownership_poisoned, sender._ownership_poison_lock = None, threading.Lock()
     sender._loaded_remote_agents_lock, sender._loaded_remote_agents = threading.Lock(), set()
     sender._instance_rank = 0
+    sender._num_threads = 1
+    sender._pending_settlements = [{}]
+    sender._send_task_queues = [queue.Queue()]
     return sender
 
 
@@ -1401,6 +1405,7 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
 def test_sender_failed_result_routes_messages_directly_in_order(monkeypatch) -> None:
     rid = 98
     sender = object.__new__(transfer_mod.Sender)
+    sender._enforce_physical_ownership = False
     sender._instance_rank = 5
     sender._registrar = SimpleNamespace(
         get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="receiver"))
@@ -2484,7 +2489,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
 
     recv_tasks = []
 
-    def receive_after_rooting(_chunk: Chunk) -> None:
+    def receive_after_rooting(_chunk: Chunk, expected_write_bytes=None) -> None:
         assert receiver._recv_reqs[rid] is recv_req
         recv_tasks.append(SimpleNamespace(status=None, _exception=None))
 

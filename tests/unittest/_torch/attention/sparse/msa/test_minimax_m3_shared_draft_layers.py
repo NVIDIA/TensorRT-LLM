@@ -49,7 +49,6 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
-from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 DRAFT_LOCAL_LAYER = 60
 SCALE = 179  # sub-pages per M3 mega-slot: 3 dense x 2 + 57 sparse x 3 + draft x 2
@@ -59,7 +58,7 @@ DRAFT_K_ADDR = 0x7000_0000
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
 def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables() -> None:
     """Exercise real pool allocation and both target/draft page-table consumers."""
-    init_cuda_once()
+    torch.cuda.init()
     manager = MiniMaxM3KVCacheManagerV2(
         KvCacheConfig(
             max_gpu_total_bytes=16 << 20,
