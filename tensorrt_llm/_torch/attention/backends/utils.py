@@ -374,6 +374,7 @@ def check_page_table(
     page_size: int,
     pool_size: Optional[int] = None,
     max_rows_reported: int = 8,
+    parked_pages: Optional[Sequence[int]] = None,
 ) -> List[str]:
     """Return a list of structural problems with a page table, empty if it is sound.
 
@@ -392,6 +393,15 @@ def check_page_table(
       number of rows in the batch;
     * a ``last_page_len`` outside ``[1, page_size]``, derived from ``kv_lens``
       and the committed page count;
+    * a row whose reservation width (``num_blocks``) departs from its
+      committed page count (``logical_num_blocks``) -- the one case where the
+      decode indptr and ``last_page_len`` are built from different arrays and
+      the kernel would reconstruct a length one page too long.
+
+    ``parked_pages`` names page ids that legitimately repeat inside a row
+    (e.g. SWA page sanitization parks evicted out-of-window pages on page 0
+    or on a reserved guard page); they are excluded from the duplicate check.
+
     Every input is already on the host when a plan is built, so this costs no
     GPU work and no device synchronization.
     """
@@ -422,6 +432,8 @@ def check_page_table(
         for row in range(num_blocks_arr.size):
             span = flat[int(starts[row]):int(starts[row + 1])]
             real = span[span != PLACEHOLDER_PAGE_INDEX]
+            if parked_pages:
+                real = real[~np.isin(real, np.asarray(list(parked_pages)))]
             if real.size and np.unique(real).size != real.size:
                 problems.append(
                     f"pool {pool_id} row {row}: repeated page id in a span of {span.size}"
@@ -441,5 +453,11 @@ def check_page_table(
                 f"last_page_len outside [1, {page_size}] on rows "
                 f"{bad_len.tolist()[:max_rows_reported]}: "
                 f"{last_page_len[bad_len].tolist()[:max_rows_reported]}")
+        widened = np.flatnonzero(num_blocks_arr != logical_arr)
+        if widened.size:
+            problems.append(
+                f"reservation width departs from the committed page count on "
+                f"rows {widened.tolist()[:max_rows_reported]}; the decode "
+                f"indptr and last_page_len then describe different lengths")
 
     return problems
