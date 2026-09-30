@@ -14,10 +14,97 @@
 # limitations under the License.
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("producer", ["norm_rope", "main_kv", "horizontal"])
+def test_fp8_producer_meta_keeps_dynamic_num_tokens(producer: str) -> None:
+    """All FP8 fake kernels must retain the symbolic token dimension."""
+    with FakeTensorMode(shape_env=ShapeEnv()) as mode:
+        num_tokens = mode.shape_env.create_unbacked_symint()
+        qkv = torch.empty((num_tokens, 1280), dtype=torch.bfloat16)
+        positions = torch.empty((num_tokens,), dtype=torch.int32)
+        slots = torch.empty((num_tokens,), dtype=torch.int32)
+        weight = torch.empty(128, dtype=torch.bfloat16)
+        kv_cache = torch.empty((2, 2, 1, 128, 128), dtype=torch.float8_e4m3fn)
+        if producer == "norm_rope":
+            output = torch.ops.trtllm.fused_qk_norm_rope_to_fp8(
+                qkv,
+                8,
+                1,
+                1,
+                128,
+                64,
+                1e-5,
+                weight,
+                weight,
+                10000.0,
+                True,
+                positions,
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+                True,
+                True,
+                False,
+                0,
+                0,
+            )
+            outputs, tails = [output], [(1280,)]
+        elif producer == "main_kv":
+            output = torch.ops.trtllm.minimax_m3_fp8_qk_norm_rope_kv_insert(
+                qkv,
+                kv_cache,
+                slots,
+                8,
+                1,
+                1,
+                128,
+                64,
+                1e-5,
+                weight,
+                weight,
+                10000.0,
+                True,
+                positions,
+            )
+            outputs, tails = [output], [(8, 128)]
+        else:
+            packed = torch.empty((num_tokens, 1536), dtype=torch.bfloat16)
+            index_cache = torch.empty((2, 1, 128, 128), dtype=torch.float8_e4m3fn)
+            rope = torch.empty((16, 2, 32), dtype=torch.float32)
+            outputs = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
+                packed,
+                kv_cache,
+                index_cache,
+                slots,
+                8,
+                1,
+                1,
+                128,
+                64,
+                1e-5,
+                weight,
+                weight,
+                weight,
+                weight,
+                rope,
+                positions,
+            )
+            tails = [(8, 128), (1, 128)]
+
+    for output, tail in zip(outputs, tails):
+        assert isinstance(output.shape[0], torch.SymInt)
+        assert output.shape[0].node.expr == num_tokens.node.expr
+        assert output.shape[1:] == tail
+        assert output.dtype == torch.float8_e4m3fn
 
 
 @torch.inference_mode()

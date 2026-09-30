@@ -284,9 +284,9 @@ exposed through `LLM.get_kv_cache_events()` / `LLM.get_kv_cache_events_async()`,
 Configured with ```kv_cache_config.kv_events_config```. Streaming is intended to reduce event
 publishing overhead under attention data parallelism: each emitting rank publishes its own
 events over a ZeroMQ `PUB` socket, removing the rank-0 gather and the consumer pull through the
-LLM API. Each emitting rank still drains its local event source, converts the events to wire
-structs and enqueues one batch at the iteration boundary. A background thread performs msgpack
-encoding and socket I/O.
+LLM API. Each emitting rank still drains its local native event source, converts the events to
+wire structs and enqueues one batch at the iteration boundary. A background thread performs
+msgpack encoding and socket I/O.
 
 ```python
 from tensorrt_llm.llmapi import KvCacheConfig, KVEventsConfig
@@ -301,17 +301,16 @@ kv_cache_config = KvCacheConfig(
 )
 ```
 
-**Constraints.** The streaming path supports both KV cache manager V2 backends. With the
-default `cpp` backend, a native event sink captures compact semantic event data and Python
-converts it to the wire structs at the once-per-iteration flush boundary; no Python callback
-runs from the native cache hot path. Pipeline parallelism and context parallelism are
-rejected. Events are not published for draft models or during KV-cache-size estimation.
-When streaming is enabled the buffered pull API returns an empty list rather than raising.
+**Constraints.** A native event sink captures compact semantic event data and Python converts
+it to the wire structs at the once-per-iteration flush boundary; no Python callback runs from
+the native cache hot path. Pipeline parallelism and context parallelism are rejected. Events
+are not published for draft models or during KV-cache-size estimation. When streaming is
+enabled the buffered pull API returns an empty list rather than raising.
 
 The streaming contract starts from the external router's requirement—whether a full, reusable
 attention block is resident—rather than mirroring every internal cache-manager transition. It
 therefore selects one attention lifecycle (the maximum-window lifecycle), publishes only full
-blocks, and emits only `BlockStored` and `BlockRemoved`. Backend-specific event data is converted
+blocks, and emits only `BlockStored` and `BlockRemoved`. Native semantic event data is converted
 to the common wire structs at the publisher boundary. This centralizes event conversion while
 keeping lifecycle IDs, cache tiers, priorities, and other cache-manager details inside TensorRT
 LLM. Use the buffered path when a consumer needs those richer internal lifecycle events.
