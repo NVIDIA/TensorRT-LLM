@@ -27,6 +27,7 @@
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -213,6 +214,18 @@ public:
     void setCapacity(int capacity);
     void setHistoryLength(int historyLength);
 
+    //! Internal explicit demotion of complete, locked sparse history. Takes the manager's exclusive lock.
+    //! Duplicate pages and pages already in host history are ignored. Does not advance history length.
+    //! Caller must ensure every owner has finished the execution phase that requires these pages on GPU.
+    void offloadSparsePages(std::vector<SharedPtr<Page>> const& pages);
+
+    //! Changes when offload relocates an owned page, even if its numeric slot index stays the same.
+    //! Internal invalidation hook for page metadata; read under the manager's API lock.
+    uint64_t pageStorageVersion() const noexcept
+    {
+        return mPageStorageVersion;
+    }
+
     // ---- Committing tokens -------------------------------------------------
 
     // Commit tokens: finalises the oldest uncommitted block and makes it
@@ -231,7 +244,7 @@ public:
     // Get base page indices (slot_id) for beamIdx × layerGroupId.
     // Returns a non-owning Span into the page-index buffer (owned by this KvCache, or by the
     // caller when set via setBasePageIndexBuf). The span is valid until the next resize(),
-    // setBasePageIndexBuf() or close(); its contents are also rewritten by suspend()/resume().
+    // setBasePageIndexBuf() or close(); its contents are also rewritten by suspend()/resume() and offload.
     Span<int const> getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx = kDefaultBeamIndex) const;
 
     // Get aggregated (slot-level) page indices for one layer group + beam.
@@ -457,8 +470,14 @@ public:
 
 private:
     friend class KvCacheIntrospection;
+    friend class UniqPageLock;
     friend std::vector<SharedPageLock> batchedLockPages(
         KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
+
+    void onPageStorageChanged() noexcept
+    {
+        ++mPageStorageVersion;
+    }
 
     // Activate: lock active pages at their required levels. mCudaStream must already be set.
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
@@ -632,6 +651,7 @@ private:
     using LifeCyclePageIndexBuffers = TypedVec<LifeCycleId, PageIndexBuf>;
     using BeamPageIndexBuffers = TypedVec<BeamIndex, LifeCyclePageIndexBuffers>;
     BeamPageIndexBuffers mBasePageIndices;
+    uint64_t mPageStorageVersion = 0;
 
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
 

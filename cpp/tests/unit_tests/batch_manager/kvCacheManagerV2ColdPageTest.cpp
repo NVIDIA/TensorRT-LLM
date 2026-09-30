@@ -18,6 +18,7 @@
 #include "kvCacheManagerV2TestUtils.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/blockRadixTree.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/config.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/eventManager.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.h"
@@ -299,6 +300,91 @@ private:
     Operation mOperation;
     std::atomic<bool> mLaunched{false};
     std::atomic<bool> mRelease{false};
+};
+
+class ObservingColdPageCodec final : public IKvCacheColdPageCodec
+{
+public:
+    bool configure(PoolGroupDesc const* descriptors, PoolGroupIndex count) noexcept override
+    {
+        return mCodec->configure(descriptors, count);
+    }
+
+    size_t queryColdPageBytes(LayerGroupId layerGroup) const noexcept override
+    {
+        return mCodec->queryColdPageBytes(layerGroup);
+    }
+
+    LayerGroupId getBatchingLayerGroupId(LayerGroupId layerGroup) const noexcept override
+    {
+        return mCodec->getBatchingLayerGroupId(layerGroup);
+    }
+
+    PageIndexLocation queryPageIndexLocation(LayerGroupId layerGroup) const noexcept override
+    {
+        return mCodec->queryPageIndexLocation(layerGroup);
+    }
+
+    bool encode(LayerGroupId layerGroup, void* destination, PageIndexPair const* indices, size_t count,
+        cudaStream_t stream) noexcept override
+    {
+        ++encodeCalls;
+        encodedPages += count;
+        encodeStream = stream;
+        bool const submitted = mCodec->encode(layerGroup, destination, indices, count, stream);
+        return submitted && encodeCalls != rejectEncodeCall;
+    }
+
+    bool decode(LayerGroupId layerGroup, void const* source, PageIndexPair const* indices, size_t count,
+        cudaStream_t stream) noexcept override
+    {
+        return mCodec->decode(layerGroup, source, indices, count, stream);
+    }
+
+    size_t encodeCalls = 0;
+    size_t encodedPages = 0;
+    size_t rejectEncodeCall = 0;
+    cudaStream_t encodeStream{};
+
+private:
+    std::unique_ptr<IKvCacheColdPageCodec> mCodec = createDefaultKvCacheColdPageCodec();
+};
+
+class StreamGate
+{
+public:
+    ~StreamGate()
+    {
+        release();
+        if (mStream)
+        {
+            cudaStreamSynchronize(mStream);
+        }
+    }
+
+    cudaError_t enqueue(cudaStream_t stream)
+    {
+        mStream = stream;
+        return cudaLaunchHostFunc(stream, wait, this);
+    }
+
+    void release() noexcept
+    {
+        mRelease.store(true, std::memory_order_release);
+    }
+
+private:
+    static void CUDART_CB wait(void* data)
+    {
+        auto& gate = *static_cast<StreamGate*>(data);
+        while (!gate.mRelease.load(std::memory_order_acquire))
+        {
+            std::this_thread::yield();
+        }
+    }
+
+    std::atomic<bool> mRelease{false};
+    cudaStream_t mStream{};
 };
 
 SharedPtr<CommittedPage> makeCommittedPage(KvCacheManager& manager, StorageManager& storage, CacheLevel level,
@@ -761,6 +847,436 @@ protected:
     std::vector<TokenIdExt> const mTokens{TokenIdExt{0}, TokenIdExt{1}, TokenIdExt{2}, TokenIdExt{3}};
     cudaStream_t mStream{};
 };
+
+class KvCacheManagerV2SparseOffloadTest : public KvCacheManagerV2PageLockTest
+{
+};
+
+TEST_F(KvCacheManagerV2SparseOffloadTest, BatchesCompleteCoalescedPagesAndCountsPhysicalCopies)
+{
+    auto config = makeSplitColdGroupingConfig();
+    config.enableStats = true;
+    for (auto& layerConfig : config.layers)
+    {
+        auto& layer = std::get<AttentionLayerConfig>(layerConfig);
+        layer.buffers.front().isSparse = true;
+        layer.buffers.push_back({.role = "value", .size = 2048, .tokensPerBlockOverride = 2, .isSparse = true});
+        layer.buffers.push_back({.role = "scale", .size = 128, .isSparse = true});
+    }
+    auto codec = std::make_unique<ObservingColdPageCodec>();
+    auto* observer = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(std::move(config), nullptr, std::move(codec));
+    auto const apiLock = manager->lockExclusive();
+    auto& storage = manager->storage();
+    ASSERT_EQ(storage.numLifeCycles(), LifeCycleId{2});
+    ASSERT_EQ(storage.numPoolGroups(kHotLevel), PoolGroupIndex{1});
+    ASSERT_GT(storage.numPools(PoolGroupIndex{0}), PoolIndex{1});
+    auto cache = manager->createKvCache();
+    auto closeCache = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(12, 8));
+
+    std::vector<SharedPtr<Page>> pages;
+    std::vector<std::vector<uint8_t>> expected;
+    for (int ordinal = 0; ordinal < 2; ++ordinal)
+    {
+        for (LifeCycleId lc{0}; lc < storage.numLifeCycles(); ++lc)
+        {
+            auto page = pageAt(*cache, ordinal, lc);
+            auto const pg = storage.getPoolGroupIndex(kHotLevel, lc);
+            auto const& sizes = storage.slotSize(kHotLevel, pg);
+            std::vector<uint8_t> bytes;
+            for (PoolIndex pool{0}; pool < sizes.size(); ++pool)
+            {
+                auto const pattern = static_cast<uint8_t>(17 * pages.size() + pool.value() + 1);
+                auto const address = std::get<MemAddress>(storage.slotAddress(kHotLevel, pg, page->slotId(), pool));
+                ASSERT_EQ(
+                    cudaMemsetAsync(reinterpret_cast<void*>(address), pattern, sizes[pool], mStream), cudaSuccess);
+                bytes.insert(bytes.end(), sizes[pool], pattern);
+            }
+            pages.push_back(std::move(page));
+            expected.push_back(std::move(bytes));
+        }
+    }
+    auto const gpuFree = storage.getStatistics(kHotLevel).free;
+    auto const hostFree = storage.getStatistics(kSparseHistoryLevel).free;
+    auto targets = pages;
+    targets.push_back(pages.front());
+    cache->offloadSparsePages(targets);
+    EXPECT_EQ(observer->encodeCalls, 1);
+    EXPECT_EQ(observer->encodedPages, pages.size());
+    EXPECT_EQ(observer->encodeStream, mStream);
+    EXPECT_EQ(storage.getStatistics(kHotLevel).free, gpuFree + pages.size());
+    EXPECT_EQ(storage.getStatistics(kSparseHistoryLevel).free, hostFree - pages.size());
+    EXPECT_EQ(cache->pageStorageVersion(), pages.size());
+
+    for (size_t i = 0; i < pages.size(); ++i)
+    {
+        auto const& page = pages[i];
+        EXPECT_EQ(page->cacheLevel, kSparseHistoryLevel);
+        EXPECT_EQ(page->status(), PageStatus::LOCKED);
+        EXPECT_FALSE(page->scheduledForEviction());
+        page->readyEvent.synchronize();
+        auto const pg = storage.getPoolGroupIndex(kSparseHistoryLevel, page->lifeCycle);
+        auto const address
+            = std::get<MemAddress>(storage.slotAddress(kSparseHistoryLevel, pg, page->slotId(), PoolIndex{0}));
+        EXPECT_EQ(std::memcmp(reinterpret_cast<void const*>(address), expected[i].data(), expected[i].size()), 0);
+    }
+    for (LifeCycleId lc{0}; lc < storage.numLifeCycles(); ++lc)
+    {
+        EXPECT_EQ(pageAt(*cache, 2, lc)->cacheLevel, kHotLevel);
+        auto const indices = cache->getBasePageIndices(lc);
+        for (int ordinal = 0; ordinal < 3; ++ordinal)
+        {
+            EXPECT_EQ(indices[ordinal], slotIdToPageIndexValue(pageAt(*cache, ordinal, lc)->slotId()));
+        }
+    }
+    auto const stats = manager->getAndResetIterationStats();
+    for (LifeCycleId lc{0}; lc < storage.numLifeCycles(); ++lc)
+    {
+        EXPECT_EQ(stats.at(lc).iterOffloadBlocks, 2);
+        EXPECT_EQ(stats.at(lc).iterOffloadBytes, 2 * expected.front().size());
+    }
+    cache->offloadSparsePages(targets);
+    EXPECT_EQ(observer->encodeCalls, 1);
+    EXPECT_EQ(cache->pageStorageVersion(), pages.size());
+    EXPECT_TRUE(manager->getAndResetIterationStats().empty());
+}
+
+TEST_F(KvCacheManagerV2SparseOffloadTest, SharedOwnersPublishHostIndicesAndKeepHistoryPinned)
+{
+    auto manager = std::make_shared<KvCacheManager>(sparseConfig());
+    auto const apiLock = manager->lockExclusive();
+    auto& storage = manager->storage();
+    auto page = seedPrefix(*manager, kHotLevel);
+    auto first = manager->createKvCache({}, tokens());
+    auto second = manager->createKvCache({}, tokens());
+    std::vector<int32_t> externalIndices(1, kBadPageIndex.value());
+    auto closeCaches = FuncGuard(
+        [&]()
+        {
+            first->close();
+            second->close();
+        });
+    ASSERT_TRUE(first->resume(stream()));
+    ASSERT_TRUE(second->resume(stream()));
+    second->setBasePageIndexBuf(kDefaultBeamIndex, LifeCycleId{0}, externalIndices.data(), externalIndices.size());
+    auto const gpuSlot = page->slotId();
+    auto hostBlockers = storage.newSlots(kSparseHistoryLevel, TypedVec<LifeCycleId, SlotCount>{1});
+    auto releaseBlockers = FuncGuard([&]()
+        { storage.releaseSlot(LifeCycleId{0}, kSparseHistoryLevel, std::move(hostBlockers[LifeCycleId{0}].front())); });
+
+    EXPECT_THROW(storage.batchedMigrate(kSparseHistoryLevel, {page}, {}), LogicError);
+    first->offloadSparsePages({page, page});
+    EXPECT_NE(page->slotId(), gpuSlot);
+    EXPECT_EQ(first->getBasePageIndices(LifeCycleId{0})[0], slotIdToPageIndexValue(page->slotId()));
+    EXPECT_EQ(externalIndices[0], slotIdToPageIndexValue(page->slotId()));
+    EXPECT_EQ(first->pageStorageVersion(), 1);
+    EXPECT_EQ(second->pageStorageVersion(), 1);
+    EXPECT_EQ(storage.getStatistics(kHotLevel).free, storage.getStatistics(kHotLevel).total);
+    EXPECT_FALSE(storage.isEvictable(*page));
+    EXPECT_THROW(storage.batchedMigrate(kHotLevel, {page}, {}), LogicError);
+    first->suspend();
+    EXPECT_EQ(page->status(), PageStatus::LOCKED);
+    ASSERT_TRUE(first->resume());
+    EXPECT_EQ(pageAt(*first), page);
+    second->close();
+    EXPECT_EQ(externalIndices[0], kBadPageIndex.value());
+    EXPECT_EQ(page->status(), PageStatus::LOCKED);
+    EXPECT_EQ(page->cacheLevel, kSparseHistoryLevel);
+}
+
+TEST_F(KvCacheManagerV2SparseOffloadTest, WaitsForLiveAndFinishedReadersBeforeRecyclingGpuSlot)
+{
+    for (bool const finishReader : {false, true})
+    {
+        SCOPED_TRACE(finishReader);
+        auto manager = std::make_shared<KvCacheManager>(sparseConfig());
+        auto const apiLock = manager->lockExclusive();
+        auto& storage = manager->storage();
+        cudaStream_t readerStream{};
+        ASSERT_EQ(cudaStreamCreateWithFlags(&readerStream, cudaStreamNonBlocking), cudaSuccess);
+        auto destroyReaderStream = FuncGuard([&]() { cudaStreamDestroy(readerStream); });
+        auto page = seedPrefix(*manager, kHotLevel);
+        auto first = manager->createKvCache({}, tokens());
+        auto second = manager->createKvCache({}, tokens());
+        auto closeCaches = FuncGuard(
+            [&]()
+            {
+                first->close();
+                second->close();
+            });
+        ASSERT_TRUE(first->resume(stream()));
+        ASSERT_TRUE(second->resume(reinterpret_cast<CUstream>(readerStream)));
+        auto const lc = page->lifeCycle;
+        auto const pg = storage.getPoolGroupIndex(kHotLevel, lc);
+        size_t const bytes = storage.slotSize(kHotLevel, pg)[PoolIndex{0}];
+        auto const gpuSlot = page->slotId();
+        auto const gpuAddress = std::get<MemAddress>(storage.slotAddress(kHotLevel, pg, gpuSlot, PoolIndex{0}));
+        constexpr uint8_t kPattern = 0xA6;
+        ASSERT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(gpuAddress), kPattern, bytes, mStream), cudaSuccess);
+        auto gpuBlocker = storage.newGpuSlots(TypedVec<LifeCycleId, SlotCount>{1});
+        auto hostScratch = storage.newSlots(kSparseHistoryLevel, TypedVec<LifeCycleId, SlotCount>{1});
+        auto releaseSlots = FuncGuard(
+            [&]()
+            {
+                storage.releaseSlot(lc, kHotLevel, std::move(gpuBlocker[lc].front()));
+                storage.releaseSlot(lc, kSparseHistoryLevel, std::move(hostScratch[lc].front()));
+            });
+        // Warm the codec's descriptor/index staging before deliberately blocking a stream.
+        storage.copySlotData(lc, kSparseHistoryLevel, kHotLevel, hostScratch[lc].front().slotId(), gpuSlot, stream());
+        ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+        auto const readback = std::get<MemAddress>(storage.slotAddress(kSparseHistoryLevel,
+            storage.getPoolGroupIndex(kSparseHistoryLevel, lc), hostScratch[lc].front().slotId(), PoolIndex{0}));
+        StreamGate gate;
+        ASSERT_EQ(gate.enqueue(readerStream), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(reinterpret_cast<void*>(readback), reinterpret_cast<void const*>(gpuAddress), bytes,
+                      cudaMemcpyDeviceToHost, readerStream),
+            cudaSuccess);
+        if (finishReader)
+        {
+            second->suspend();
+        }
+
+        first->offloadSparsePages({page});
+        EXPECT_FALSE(page->queryReady());
+        EXPECT_EQ(page->cacheLevel, kSparseHistoryLevel);
+        auto recycled = storage.newGpuSlots(TypedVec<LifeCycleId, SlotCount>{1});
+        auto releaseRecycled
+            = FuncGuard([&]() { storage.releaseSlot(lc, kHotLevel, std::move(recycled[lc].front())); });
+        EXPECT_EQ(recycled[lc].front().slotId(), gpuSlot);
+        EXPECT_FALSE(recycled[lc].front().queryReady());
+        recycled[lc].front().readyEvent.waitInStream(reinterpret_cast<CudaStream>(mStream));
+        ASSERT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(gpuAddress), 0, bytes, mStream), cudaSuccess);
+        gate.release();
+        ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+        auto const* readBytes = reinterpret_cast<uint8_t const*>(readback);
+        EXPECT_TRUE(std::all_of(readBytes, readBytes + bytes, [](uint8_t value) { return value == kPattern; }));
+        page->readyEvent.synchronize();
+        auto const hostAddress = std::get<MemAddress>(storage.slotAddress(
+            kSparseHistoryLevel, storage.getPoolGroupIndex(kSparseHistoryLevel, lc), page->slotId(), PoolIndex{0}));
+        auto const* hostBytes = reinterpret_cast<uint8_t const*>(hostAddress);
+        EXPECT_TRUE(std::all_of(hostBytes, hostBytes + bytes, [](uint8_t value) { return value == kPattern; }));
+    }
+}
+
+TEST_F(KvCacheManagerV2SparseOffloadTest, HostOomLeavesEntireBatchOnGpu)
+{
+    auto config = sparseConfig();
+    config.cacheTiers[1] = HostCacheTierConfig{2 << 20};
+    auto codec = std::make_unique<ObservingColdPageCodec>();
+    auto* observer = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(std::move(config), nullptr, std::move(codec));
+    auto const apiLock = manager->lockExclusive();
+    auto& storage = manager->storage();
+    auto cache = manager->createKvCache();
+    auto closeCache = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(8, 8));
+    auto first = pageAt(*cache);
+    auto second = pageAt(*cache, 1);
+    auto const firstSlot = first->slotId();
+    auto const secondSlot = second->slotId();
+    EXPECT_THROW(cache->offloadSparsePages({first, second}), OutOfPagesError);
+    EXPECT_EQ(observer->encodeCalls, 0);
+    EXPECT_EQ(first->cacheLevel, kHotLevel);
+    EXPECT_EQ(second->cacheLevel, kHotLevel);
+    EXPECT_EQ(first->slotId(), firstSlot);
+    EXPECT_EQ(second->slotId(), secondSlot);
+    EXPECT_EQ(first->status(), PageStatus::LOCKED);
+    EXPECT_EQ(second->status(), PageStatus::LOCKED);
+    EXPECT_EQ(cache->pageStorageVersion(), 0);
+    EXPECT_EQ(storage.getStatistics(kSparseHistoryLevel).free, 1);
+    EXPECT_EQ(storage.getStatistics(kHotLevel).free, 0);
+    EXPECT_EQ(cache->getBasePageIndices(LifeCycleId{0})[0], slotIdToPageIndexValue(firstSlot));
+    EXPECT_EQ(cache->getBasePageIndices(LifeCycleId{0})[1], slotIdToPageIndexValue(secondSlot));
+}
+
+TEST_F(KvCacheManagerV2SparseOffloadTest, AsynchronousRejectionFencesBothSlotsWithoutPublishingHostIndices)
+{
+    auto config = sparseConfig();
+    config.enableStats = true;
+    auto codec = std::make_unique<AsyncRejectingColdPageCodec>(AsyncRejectingColdPageCodec::Operation::kEncode);
+    auto* rejecting = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(std::move(config), nullptr, std::move(codec));
+    auto const apiLock = manager->lockExclusive();
+    auto& storage = manager->storage();
+    auto cache = manager->createKvCache();
+    auto closeCache = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(4, 4));
+    auto page = pageAt(*cache);
+    auto const gpuSlot = page->slotId();
+    auto const lc = page->lifeCycle;
+    auto blocker = storage.newSlots(kSparseHistoryLevel, TypedVec<LifeCycleId, SlotCount>{1});
+    auto releaseBlocker
+        = FuncGuard([&]() { storage.releaseSlot(lc, kSparseHistoryLevel, std::move(blocker[lc].front())); });
+    auto releaseCodec = FuncGuard([&]() { rejecting->release(); });
+    EXPECT_THROW(cache->offloadSparsePages({page}), TllmException);
+    ASSERT_TRUE(rejecting->launched());
+    EXPECT_EQ(page->cacheLevel, kHotLevel);
+    EXPECT_EQ(page->slotId(), gpuSlot);
+    EXPECT_EQ(page->status(), PageStatus::LOCKED);
+    EXPECT_FALSE(page->queryReady());
+    EXPECT_EQ(cache->pageStorageVersion(), 0);
+    EXPECT_EQ(cache->getBasePageIndices(lc)[0], slotIdToPageIndexValue(gpuSlot));
+    auto recycled = storage.newSlots(kSparseHistoryLevel, TypedVec<LifeCycleId, SlotCount>{1});
+    auto releaseRecycled
+        = FuncGuard([&]() { storage.releaseSlot(lc, kSparseHistoryLevel, std::move(recycled[lc].front())); });
+    EXPECT_FALSE(recycled[lc].front().queryReady());
+    EXPECT_TRUE(manager->getAndResetIterationStats().empty());
+    rejecting->release();
+    recycled[lc].front().readyEvent.synchronize();
+}
+
+TEST_F(KvCacheManagerV2SparseOffloadTest, LaterCodecBatchFailurePreservesAllSourcePages)
+{
+    auto config = makeSplitColdGroupingConfig();
+    for (auto& layer : config.layers)
+    {
+        std::get<AttentionLayerConfig>(layer).buffers.front().isSparse = true;
+    }
+    std::get<AttentionLayerConfig>(config.layers[1]).buffers.front().size *= 2;
+    auto codec = std::make_unique<ObservingColdPageCodec>();
+    auto* observer = codec.get();
+    observer->rejectEncodeCall = 2;
+    auto manager = std::make_shared<KvCacheManager>(std::move(config), nullptr, std::move(codec));
+    auto const apiLock = manager->lockExclusive();
+    auto& storage = manager->storage();
+    ASSERT_EQ(storage.numPoolGroups(kHotLevel), PoolGroupIndex{2});
+    auto cache = manager->createKvCache();
+    auto closeCache = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(4, 4));
+    auto first = pageAt(*cache, 0, LifeCycleId{0});
+    auto second = pageAt(*cache, 0, LifeCycleId{1});
+    auto const firstSlot = first->slotId();
+    auto const secondSlot = second->slotId();
+    EXPECT_THROW(cache->offloadSparsePages({first, second}), TllmException);
+    EXPECT_EQ(observer->encodeCalls, 2);
+    EXPECT_EQ(first->cacheLevel, kHotLevel);
+    EXPECT_EQ(second->cacheLevel, kHotLevel);
+    EXPECT_EQ(first->slotId(), firstSlot);
+    EXPECT_EQ(second->slotId(), secondSlot);
+    EXPECT_EQ(cache->pageStorageVersion(), 0);
+    EXPECT_EQ(storage.getStatistics(kSparseHistoryLevel).free, storage.getStatistics(kSparseHistoryLevel).total);
+    observer->rejectEncodeCall = 0;
+    cache->offloadSparsePages({first, second});
+    EXPECT_EQ(first->cacheLevel, kSparseHistoryLevel);
+    EXPECT_EQ(second->cacheLevel, kSparseHistoryLevel);
+}
+
+TEST_F(KvCacheManagerV2SparseOffloadTest, RejectsWritablePartialAndDensePagesBeforeAnyCopy)
+{
+    for (bool const sparse : {false, true})
+    {
+        for (int const history : {0, 2, 4})
+        {
+            SCOPED_TRACE(sparse);
+            SCOPED_TRACE(history);
+            auto config = sparse ? sparseConfig() : makeTieredConfig();
+            auto codec = std::make_unique<ObservingColdPageCodec>();
+            auto* observer = codec.get();
+            auto manager = std::make_shared<KvCacheManager>(std::move(config), nullptr, std::move(codec));
+            auto const apiLock = manager->lockExclusive();
+            auto cache = manager->createKvCache();
+            auto closeCache = FuncGuard([&]() { cache->close(); });
+            ASSERT_TRUE(cache->resume(stream()));
+            ASSERT_TRUE(cache->resize(8, history));
+            auto first = pageAt(*cache);
+            auto input = pageAt(*cache, 1);
+            EXPECT_THROW(cache->offloadSparsePages({first, input}), LogicError);
+            EXPECT_EQ(observer->encodeCalls, 0);
+            EXPECT_EQ(first->cacheLevel, kHotLevel);
+            EXPECT_EQ(input->cacheLevel, kHotLevel);
+            EXPECT_EQ(cache->pageStorageVersion(), 0);
+        }
+    }
+}
+
+TEST_F(KvCacheManagerV2SparseOffloadTest, RejectsPartialCommittedPagesAndNonOwners)
+{
+    auto config = sparseConfig();
+    config.commitMinSnapshot = true;
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    auto const apiLock = manager->lockExclusive();
+    auto cache = manager->createKvCache();
+    auto other = manager->createKvCache();
+    auto closeCaches = FuncGuard(
+        [&]()
+        {
+            cache->close();
+            other->close();
+        });
+    EXPECT_THROW(cache->offloadSparsePages({}), LogicError);
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(other->resume(stream()));
+    ASSERT_TRUE(cache->resize(4, 2));
+    cache->commit(tokens(2), /*isEnd=*/true);
+    auto partial = pageAt(*cache);
+    ASSERT_TRUE(partial->isCommitted());
+    EXPECT_THROW(cache->offloadSparsePages({partial}), LogicError);
+    EXPECT_EQ(partial->cacheLevel, kHotLevel);
+    ASSERT_TRUE(other->resize(4, 4));
+    auto complete = pageAt(*other);
+    EXPECT_THROW(cache->offloadSparsePages({complete}), LogicError);
+    EXPECT_EQ(complete->cacheLevel, kHotLevel);
+    EXPECT_THROW(other->offloadSparsePages({nullptr}), LogicError);
+}
+
+TEST_F(KvCacheManagerV2SparseOffloadTest, EmitsCommittedTierChangeEvenWhenSlotIndexIsUnchanged)
+{
+    auto events = std::make_shared<EventManager>(128);
+    auto manager = std::make_shared<KvCacheManager>(sparseConfig(), events);
+    auto const apiLock = manager->lockExclusive();
+    auto cache = manager->createKvCache();
+    auto closeCache = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(4, 4));
+    cache->commit(tokens());
+    auto page = pageAt(*cache);
+    ASSERT_TRUE(page->isCommitted());
+    auto const originalIndex = cache->getBasePageIndices(LifeCycleId{0})[0];
+    events->flushIterationEvents();
+    events->getLatestEvents(/*timeoutMs=*/0);
+
+    cache->offloadSparsePages({page, page});
+    EXPECT_EQ(cache->getBasePageIndices(LifeCycleId{0})[0], originalIndex);
+    EXPECT_EQ(cache->pageStorageVersion(), 1);
+    events->flushIterationEvents();
+    auto const updates = events->getLatestEvents(/*timeoutMs=*/0);
+    ASSERT_EQ(updates.size(), 1);
+    EXPECT_EQ(updates.front().layerGroupId, 0);
+    auto const* data = std::get_if<KVCacheUpdatedData>(&updates.front().data);
+    ASSERT_NE(data, nullptr);
+    ASSERT_TRUE(data->cacheLevel.has_value());
+    EXPECT_EQ(data->cacheLevel->oldValue, kHotLevel.value());
+    EXPECT_EQ(data->cacheLevel->newValue, kSparseHistoryLevel.value());
+}
+
+TEST_F(KvCacheManagerV2SparseOffloadTest, DemotedUncommittedHistoryCanCommitAndBeReused)
+{
+    auto manager = std::make_shared<KvCacheManager>(sparseConfig());
+    auto const apiLock = manager->lockExclusive();
+    auto cache = manager->createKvCache();
+    auto closeCache = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(4, 4));
+    cache->offloadSparsePages({pageAt(*cache)});
+    auto const hostSlot = pageAt(*cache)->slotId();
+    cache->commit(tokens());
+    auto committed = pageAt(*cache);
+    ASSERT_TRUE(committed->isCommitted());
+    EXPECT_EQ(committed->cacheLevel, kSparseHistoryLevel);
+    EXPECT_EQ(committed->slotId(), hostSlot);
+    auto reused = manager->createKvCache({}, tokens());
+    auto closeReused = FuncGuard([&]() { reused->close(); });
+    ASSERT_TRUE(reused->resume(stream()));
+    EXPECT_EQ(pageAt(*reused), committed);
+    cache->close();
+    EXPECT_EQ(committed->status(), PageStatus::LOCKED);
+    EXPECT_EQ(reused->getBasePageIndices(LifeCycleId{0})[0], slotIdToPageIndexValue(hostSlot));
+}
 
 TEST_F(KvCacheManagerV2PageLockTest, SparseHostPrefixStaysPinnedAcrossReuseAndResume)
 {

@@ -213,6 +213,22 @@ CacheLevel KvCache::_lockLevel(Page const& page, BlockOrdinal ordinal) const
     return readOnly ? page.queryLockLevel() : kHotLevel;
 }
 
+void KvCache::offloadSparsePages(std::vector<SharedPtr<Page>> const& pages)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    if (!isActive())
+    {
+        throw LogicError("Sparse history offload requires an active request");
+    }
+    MigrationRecorder const migrationRecorder
+        = [this](std::vector<SharedPtr<Page>> const& sources, std::vector<Slot> const& slots, CacheLevel srcLevel,
+              CacheLevel dstLevel) { _recordMigratedSlots(sources, slots, srcLevel, dstLevel); };
+    DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& dropped, CacheLevel level)
+    { _recordDroppedPages(dropped, level); };
+    storageManager()->offloadSparsePages(*this, pages, migrationRecorder, dropRecorder);
+}
+
 void KvCache::activate()
 {
     TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
