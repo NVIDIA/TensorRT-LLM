@@ -178,14 +178,24 @@ def test_tracing(client: openai.OpenAI, model_name: str, trace_service: FakeTrac
     assert len(request.resource_spans) == 1, (
         f"Expected 1 resource span, but got {len(request.resource_spans)}"
     )
-    assert len(request.resource_spans[0].scope_spans) == 1, (
-        f"Expected 1 scope span, but got {len(request.resource_spans[0].scope_spans)}"
+    # The BatchSpanProcessor can flush FastAPI's own auto-instrumented spans
+    # (e.g. from /health liveness polling) in the same export batch as the
+    # trt.llm span under test, so select by scope name instead of assuming
+    # trt.llm is the only (or the first) scope present.
+    llm_scope_spans = [
+        scope_spans
+        for scope_spans in request.resource_spans[0].scope_spans
+        if scope_spans.scope.name == "trt.llm"
+    ]
+    assert len(llm_scope_spans) == 1, (
+        f"Expected 1 trt.llm scope span, but got {len(llm_scope_spans)} "
+        f"(scopes present: {[s.scope.name for s in request.resource_spans[0].scope_spans]})"
     )
-    assert len(request.resource_spans[0].scope_spans[0].spans) == 1, (
-        f"Expected 1 span, but got {len(request.resource_spans[0].scope_spans[0].spans)}"
+    assert len(llm_scope_spans[0].spans) == 1, (
+        f"Expected 1 span, but got {len(llm_scope_spans[0].spans)}"
     )
 
-    attributes = decode_attributes(request.resource_spans[0].scope_spans[0].spans[0].attributes)
+    attributes = decode_attributes(llm_scope_spans[0].spans[0].attributes)
 
     assert (
         attributes.get(SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS)
