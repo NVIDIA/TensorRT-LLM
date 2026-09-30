@@ -490,6 +490,59 @@ def test_same_seed_and_offset_reproduce_the_same_tokens() -> None:
     assert torch.equal(first, second)
 
 
+@pytest.mark.parametrize("with_probs", [False, True], ids=["tokens", "with_probs"])
+@pytest.mark.parametrize("rows", [4, 32])
+@pytest.mark.parametrize("vocab", [4096, 65536])
+@pytest.mark.parametrize(
+    "filters",
+    [
+        pytest.param({}, id="neutral"),
+        pytest.param({"top_p": 0.9}, id="top_p"),
+        pytest.param({"top_k": 50}, id="top_k"),
+        pytest.param({"top_k": 50, "top_p": 0.9}, id="top_k_top_p"),
+        pytest.param({"min_p": 0.05}, id="min_p"),
+    ],
+)
+def test_per_row_rng_ignores_row_position(
+    filters: dict[str, Any], vocab: int, rows: int, with_probs: bool
+) -> None:
+    """Rows sharing logits, parameters and a per-row (seed, offset) draw the same token,
+    whichever row they occupy. Only positions within one launch are compared: the kernel
+    picks its algorithm by batch size, so a different row count may map the same draw
+    elsewhere."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    logits = (torch.randn(1, vocab, device=dev) * 2.0).expand(rows, vocab).contiguous()
+    temps, top_ks, top_ps, min_ps = _params(rows, device=dev, **filters)
+    op = fused.fused_sample_from_logits_with_probs if with_probs else fused.fused_sample_from_logits
+
+    out = op(
+        logits,
+        temps,
+        top_ks,
+        top_ps,
+        min_ps,
+        seed=torch.full((rows,), 1234, dtype=torch.int64, device=dev),
+        offset=torch.full((rows,), 64, dtype=torch.int64, device=dev),
+    )
+    tokens = out[0] if with_probs else out
+    assert torch.equal(tokens, tokens[:1].expand(rows))
+
+
+def test_shared_rng_separates_rows() -> None:
+    dev = "cuda"
+    torch.manual_seed(0)
+    rows = 32
+    logits = (torch.randn(1, 4096, device=dev) * 2.0).expand(rows, 4096).contiguous()
+    temps, top_ks, top_ps, min_ps = _params(rows, device=dev, top_p=0.95)
+    seed, offset = _rng(rows, dev, seed=1234)
+
+    tokens = fused.fused_sample_from_logits(
+        logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
+    )
+    assert tokens.unique().numel() > 1
+
+
 def test_sampling_follows_the_filtered_distribution() -> None:
     """Many draws over a small vocabulary should reproduce the probs the op reports.
 

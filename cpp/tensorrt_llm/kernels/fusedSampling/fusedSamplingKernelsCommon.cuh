@@ -775,7 +775,7 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
                 int const rngIdx = params.perRowRng ? row : 0;
                 uint64_t const seed = params.seed != nullptr ? params.seed[rngIdx] : 0ull;
                 uint64_t const offset = params.offset != nullptr ? params.offset[rngIdx] : 0ull;
-                curand_init(seed, static_cast<uint64_t>(row), offset, &sRejectRng);
+                curand_init(seed, params.perRowRng ? 0ull : static_cast<uint64_t>(row), offset, &sRejectRng);
                 // -1 admits every weight: w is an exp, so it is never negative.
                 sPivot = -1.0f;
                 sToken = -1;
@@ -1096,9 +1096,10 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
             uint64_t const seed = params.seed != nullptr ? params.seed[rngIdx] : 0ull;
             uint64_t const offset = params.offset != nullptr ? params.offset[rngIdx] : 0ull;
             curandStatePhilox4_32_10_t state;
-            // The row index is the subsequence, so rows draw independent streams from a
-            // shared seed -- and a seeded request stays reproducible via its own offset.
-            curand_init(seed, static_cast<uint64_t>(row), offset, &state);
+            // A shared seed/offset separates rows by making the row index the subsequence.
+            // Per-row entries use subsequence 0, so a row's stream depends only on its own
+            // seed/offset, whatever position it takes in the batch.
+            curand_init(seed, params.perRowRng ? 0ull : static_cast<uint64_t>(row), offset, &state);
             sTarget = curand_uniform(&state) * keptMass;
             sToken = -1;
         }

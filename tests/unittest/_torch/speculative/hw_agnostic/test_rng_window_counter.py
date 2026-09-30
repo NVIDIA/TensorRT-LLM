@@ -20,10 +20,14 @@ CUDA buffers the latter also fills.
 import types
 from typing import Optional
 
+import pytest
+
+from tensorrt_llm._torch.pyexecutor.sampler.ops.custom import MAX_DRAWS_PER_ROW
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 
 MAX_DRAFT_LEN = 3
-WINDOW = MAX_DRAFT_LEN + 1
+# One slot per target row, per draft step and for the acceptance kernel.
+WINDOW = ((MAX_DRAFT_LEN + 1) + MAX_DRAFT_LEN + 1) * MAX_DRAWS_PER_ROW
 
 
 def _meta(max_num_requests: int = 8) -> SpecMetadata:
@@ -180,3 +184,32 @@ def test_graph_copy_shares_the_counters() -> None:
     assert _offsets(meta, [_request(1)]) == [0]
     assert _offsets(graph_meta, [_request(1)]) == [WINDOW]
     assert _offsets(meta, [_request(1)]) == [2 * WINDOW]
+
+
+# --- the slots of one window --------------------------------------------------
+
+
+@pytest.mark.parametrize("is_tree", [False, True], ids=["linear", "tree"])
+def test_window_slots_do_not_overlap(is_tree: bool) -> None:
+    """Every row a request samples in one step draws from its own stretch of the
+    window, and no stretch reaches into the next step's window."""
+    meta = SpecMetadata(
+        max_num_requests=1,
+        max_draft_len=MAX_DRAFT_LEN,
+        max_total_draft_tokens=10 if is_tree else MAX_DRAFT_LEN,
+        is_spec_dec_tree=is_tree,
+    )
+    assert _offsets(meta, [_request(0, seed=7)]) == [0]
+    window = _offsets(meta, [_request(0, seed=7)])[0]
+
+    target_rows = (10 if is_tree else MAX_DRAFT_LEN) + 1
+    slots = list(range(target_rows))
+    slots += [meta.rng_draft_slot(step) for step in range(MAX_DRAFT_LEN)]
+    slots.append(meta.rng_accept_slot)
+
+    used: set[int] = set()
+    for slot in slots:
+        stretch = set(range(slot * MAX_DRAWS_PER_ROW, (slot + 1) * MAX_DRAWS_PER_ROW))
+        assert used.isdisjoint(stretch), f"slot {slot} overlaps another row's draws"
+        used |= stretch
+    assert max(used) < window
