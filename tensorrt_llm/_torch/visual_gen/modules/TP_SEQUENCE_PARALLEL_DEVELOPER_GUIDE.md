@@ -346,7 +346,10 @@ Inductor).
 - Dynamic-scale NVFP4 gather (all-reduce-max of the local amax, then quantize the shard)
   and static FP8 gather.
 - Composition with Ulysses / ring (nest the token shard inside the sequence shard).
-- Other models adopt through the helper and `_supports_tp_sequence_parallel`.
+- Other models: a declarative per-model plan (module-name patterns mapped to gather / scatter
+  styles, applied with hooks), so a model's own block forward runs unchanged on a per-sample
+  token layout; `_supports_tp_sequence_parallel` stays the opt-in. The explicit boundary ops
+  remain for paths that need fused norm + quantize (Wan today).
 - Coalescing the payload and scaling-factor all-gathers.
 - Symbolic plan sizes, so blocks stay shape-dynamic across `(B, S)`.
 

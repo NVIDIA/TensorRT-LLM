@@ -23,8 +23,6 @@ from .tp_sequence_parallel import (
     RowNorm,
     TokenShardPlan,
     TPSequenceParallel,
-    quantize_nvfp4,
-    regroup_swizzled_sf,
     static_nvfp4_input_scale,
 )
 
@@ -34,7 +32,5 @@ __all__ = [
     "RowNorm",
     "TokenShardPlan",
     "TPSequenceParallel",
-    "quantize_nvfp4",
-    "regroup_swizzled_sf",
     "static_nvfp4_input_scale",
 ]
