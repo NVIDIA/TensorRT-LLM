@@ -230,6 +230,7 @@ class _LogicalOutcomes:
         self._retirement = retirement
         self._terminal: Optional[_LogicalOutcome] = None
         self._results: list[Optional[_LogicalOutcome]] = []
+        self._sealed = False
         if retirement is not None:
             retirement.bind_timeout_outcome(self._timeout_locked)
 
@@ -255,9 +256,29 @@ class _LogicalOutcomes:
 
     def add_task(self) -> int:
         with self._lock:
+            if self._sealed:
+                raise RuntimeError("transfer session already registered its final piece")
             index = len(self._results)
             self._results.append(self._terminal)
             return index
+
+    def seal(self) -> None:
+        """Declare that every expected KV and AUX result has been registered."""
+        with self._lock:
+            self._sealed = True
+            self._complete_session_locked()
+
+    def _complete_session_locked(self) -> None:
+        if (
+            self._retirement is not None
+            and self._sealed
+            and self._results
+            and all(
+                result is not None and result.status is SessionStatus.TRANSFERRED
+                for result in self._results
+            )
+        ):
+            self._retirement.complete_pieces()
 
     def get(self, index: int) -> Optional[_LogicalOutcome]:
         with self._lock:
@@ -271,6 +292,7 @@ class _LogicalOutcomes:
                 self._retirement.check()
             if self._results[index] is None:
                 self._results[index] = _LogicalOutcome(SessionStatus.TRANSFERRED)
+            self._complete_session_locked()
 
     def fail(self, error: Exception) -> None:
         self._end(_LogicalOutcome(SessionStatus.ERROR, reason=str(error)))
@@ -1443,11 +1465,6 @@ class Sender(SenderBase):
             return
         self._get_result_dealer(write_meta.peer_endpoint).send(result_msg)
 
-        if timer:
-            timer.record_task_end(write_meta.peer_rank)
-        ri = self._registrar.self_rank_info
-        task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
-
         with task.lock:
             task.transferred_count += 1
             count = task.transferred_count
@@ -1466,6 +1483,17 @@ class Sender(SenderBase):
                 task.complete()
                 if all(t.status == TaskStatus.TRANSFERRED for t in session.kv_tasks):
                     session.transfer_end_time = tensorrt_llm.bindings.global_steady_clock_now()
+
+        # Diagnostics must not delay authoritative completion or turn it into failure.
+        try:
+            if timer:
+                timer.record_task_end(write_meta.peer_rank)
+            ri = self._registrar.self_rank_info
+            task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
+        except Exception as error:
+            logger.warning(
+                f"KV send perf logging failed for request {write_meta.unique_rid}: {error}"
+            )
 
         logger.debug(
             f"deliver_kv_to_agent completed: unique_rid={write_meta.unique_rid}, "
@@ -1553,11 +1581,6 @@ class Sender(SenderBase):
         if agent_result == AgentResult.IN_DOUBT:
             return
 
-        if timer:
-            timer.record_task_end(write_meta.peer_rank)
-        ri = self._registrar.self_rank_info
-        aux_task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
-
         with aux_task.lock:
             aux_task._transfer_count += 1
             count = aux_task._transfer_count
@@ -1571,6 +1594,16 @@ class Sender(SenderBase):
         elif count > write_meta.expected_transfers:
             session.set_exception(
                 f"aux task received more than {write_meta.expected_transfers} transfers"
+            )
+
+        try:
+            if timer:
+                timer.record_task_end(write_meta.peer_rank)
+            ri = self._registrar.self_rank_info
+            aux_task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
+        except Exception as error:
+            logger.warning(
+                f"AUX send perf logging failed for request {write_meta.unique_rid}: {error}"
             )
 
     @staticmethod
@@ -2254,6 +2287,9 @@ class TxSession(TxSessionBase):
             self.aux_task is not None and self.aux_task.status == TaskStatus.TRANSFERRED
         )
         if kv_all_transferred and aux_done:
+            retirement = getattr(self, "_retirement", None)
+            if retirement is not None and not retirement.is_complete:
+                return SessionStatus.TRANSFERRING
             return SessionStatus.TRANSFERRED
         if kv_all_transferred or (
             self.kv_tasks and any(t.status == TaskStatus.TRANSFERRING for t in self.kv_tasks)
@@ -2265,6 +2301,8 @@ class TxSession(TxSessionBase):
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
         with self.lock:
+            if self._retirement is not None and self._has_last_slice:
+                raise RuntimeError("cannot send another KV piece after the final slice")
             if not self.kv_tasks:
                 overall_timeout_s = self._overall_timeout_s
                 if overall_timeout_s is None or overall_timeout_s <= 0:
@@ -2282,6 +2320,9 @@ class TxSession(TxSessionBase):
             task.bind_logical_outcomes(self._logical_outcomes)
             self.kv_tasks.append(task)
             self._has_last_slice |= chunk.is_last
+            if self._retirement is not None and self._has_last_slice:
+                if not self._need_aux or self.aux_task is not None:
+                    self._logical_outcomes.seal()
             req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
         self._sender.dispatch_task(task, req_info_snapshot)
 
@@ -2290,6 +2331,8 @@ class TxSession(TxSessionBase):
         terminal_error: Optional[Exception] = None
         task: Optional[AuxSendTask] = None
         with self.lock:
+            if self._retirement is not None and self.aux_task is not None:
+                return self.aux_task
             # In the ownership bridge's generation-first no-retry profile,
             # prefill waits for every REQUEST_DATA, so this peer snapshot is sealed.
             req_info_snapshot = dict(self._sender._get_req_info(self.disagg_request_id) or {})
@@ -2306,6 +2349,8 @@ class TxSession(TxSessionBase):
                 task._unique_rid = self.disagg_request_id
                 task.bind_logical_outcomes(self._logical_outcomes)
                 self.aux_task = task
+                if self._retirement is not None and self._has_last_slice:
+                    self._logical_outcomes.seal()
         self._report_unsubmitted_aux_failures(aux_failures)
         if terminal_error is not None:
             raise terminal_error
@@ -2391,6 +2436,11 @@ class TxSession(TxSessionBase):
             else WaitResult.FAILED
         )
 
+    def _completed_wait_result(self) -> Optional[WaitResult]:
+        if getattr(self, "_retirement", None) is not None and not self.is_completed():
+            return None
+        return WaitResult.COMPLETED
+
     def cancel(self, by_peer: bool = False) -> bool:
         """Cancel the session and notify the remote receiver. ``True`` if the ask went out.
 
@@ -2468,7 +2518,9 @@ class TxSession(TxSessionBase):
                     return self._failed_wait_result()
                 if self.aux_task.status != TaskStatus.TRANSFERRED:
                     return None
-            return self._failed_wait_result() if self.has_failed() else WaitResult.COMPLETED
+            return (
+                self._failed_wait_result() if self.has_failed() else self._completed_wait_result()
+            )
 
         # send() normally anchors this once, at the first dispatched KV task.
         # Keep direct/internal TxSession construction bounded as well, and never
@@ -2544,7 +2596,7 @@ class TxSession(TxSessionBase):
         return (
             self._failed_wait_result()
             if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
-            else WaitResult.COMPLETED
+            else self._completed_wait_result()
         )
 
     def set_exception(self, reason: str = "") -> None:
@@ -3378,6 +3430,11 @@ class RxSession(RxSessionBase):
         self._publication_lock = threading.Lock()
         self.lock = threading.Lock()
         self._logical_outcomes = _LogicalOutcomes(self._retirement)
+        self._aux_logical_index = (
+            self._logical_outcomes.add_task()
+            if self._retirement is not None and self._need_aux
+            else None
+        )
         try:
             self._receiver.setup_session(self)
         except Exception:
@@ -3446,6 +3503,9 @@ class RxSession(RxSessionBase):
             kv_all_transferred = all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks)
             aux_done = not self._need_aux or self._aux_status == TaskStatus.TRANSFERRED
             if kv_all_transferred and aux_done:
+                retirement = getattr(self, "_retirement", None)
+                if retirement is not None and not retirement.is_complete:
+                    return SessionStatus.TRANSFERRING
                 return SessionStatus.TRANSFERRED
             if kv_all_transferred or any(
                 t.status == TaskStatus.TRANSFERRING for t in self._kv_tasks
@@ -3571,6 +3631,8 @@ class RxSession(RxSessionBase):
             task.bind_logical_outcomes(self._logical_outcomes)
             task.begin_publication()
             self._kv_tasks.append(task)
+            if self._retirement is not None and chunk.is_last:
+                self._logical_outcomes.seal()
             return task
 
     def dispatch_prepared_receive(self, task: KVRecvTask) -> None:
@@ -3732,6 +3794,10 @@ class RxSession(RxSessionBase):
                             return
                         if task.status == TaskStatus.ERROR:
                             return  # a concurrent FAILED writer already failed it; don't un-fail
+                        task.complete()
+                        # Record completion before best-effort diagnostics can block the worker.
+                        if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
+                            self.transfer_end_time = tensorrt_llm.bindings.global_steady_clock_now()
                         try:
                             if task._perf_timer is not None:
                                 task._perf_timer.record_task_end(peer_rank)
@@ -3741,12 +3807,6 @@ class RxSession(RxSessionBase):
                                 f"KV transfer perf logging failed for request {request_id} "
                                 f"slice={receiver_slice_id}: {e}"
                             )
-                        task.complete()
-                        # Transfer end for perf/time-sync: only meaningful once every slice has
-                        # landed. Plain attribute write (atomic under the GIL); consumers only read
-                        # it after wait_complete succeeds.
-                        if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
-                            self.transfer_end_time = tensorrt_llm.bindings.global_steady_clock_now()
                         logger.debug(
                             f"KV transfer complete for request {request_id} "
                             f"slice={receiver_slice_id}"
@@ -3840,6 +3900,9 @@ class RxSession(RxSessionBase):
                     self._aux_physical_owner is None and self._aux_count == task.expected_transfers
                 ):
                     self._aux_status = TaskStatus.TRANSFERRED
+                    aux_logical_index = getattr(self, "_aux_logical_index", None)
+                    if aux_logical_index is not None:
+                        self._logical_outcomes.complete(aux_logical_index)
                 elif self._aux_count > task.expected_transfers:
                     self._aux_status = TaskStatus.ERROR
                     self._exception = RuntimeError(
@@ -3977,6 +4040,11 @@ class RxSession(RxSessionBase):
             else None
         )
 
+    def _completed_wait_result(self) -> Optional[WaitResult]:
+        if getattr(self, "_retirement", None) is not None and not self.is_completed():
+            return None
+        return WaitResult.COMPLETED
+
     def wait_complete(self, blocking: bool = False) -> Optional[WaitResult]:
         """Poll or block until transfer completes.
 
@@ -4009,13 +4077,17 @@ class RxSession(RxSessionBase):
             while True:
                 status = self.status
                 if status == SessionStatus.TRANSFERRED:
-                    return self._failed_wait_result() if self.has_failed() else WaitResult.COMPLETED
+                    return (
+                        self._failed_wait_result()
+                        if self.has_failed()
+                        else self._completed_wait_result()
+                    )
                 elif status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
                     return self._failed_wait_result()
                 if not blocking:
                     return None  # KV done, aux still in flight; re-poll next cycle
                 time.sleep(0.001)
-        return self._failed_wait_result() if self.has_failed() else WaitResult.COMPLETED
+        return self._failed_wait_result() if self.has_failed() else self._completed_wait_result()
 
     def close(self) -> bool:
         if self._enforce_physical_ownership:

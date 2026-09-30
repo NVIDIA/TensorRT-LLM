@@ -7,6 +7,7 @@ from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base import Chunk, TokenRange
@@ -364,6 +365,361 @@ def _rx_session(receiver: transfer_mod.Receiver) -> transfer_mod.RxSession:
         timeout_s=5.0,
         retirement_watchdog=receiver._retirement_watchdog,
     )
+
+
+def _tx_session(watchdog: RetirementWatchdog, *, need_aux: bool = True) -> transfer_mod.TxSession:
+    """Use real session/admission logic with only queue and backend boundary doubles."""
+    sender = object.__new__(transfer_mod.Sender)
+    sender._retirement_watchdog = watchdog
+    sender._enforce_physical_ownership = True
+    sender._ownership_poisoned = None
+    sender._ownership_poison_lock = watchdog.lock
+    sender._sessions_lock = threading.Lock()
+    sender._sessions = {}
+    sender._pre_cancelled_rids = {}
+    sender._shutdown = True
+    sender._shutdown_requested = False
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_requests = {}
+    sender._peer_requests_timestamps = {}
+    sender.dispatch_task = Mock()
+    sender._agent = Mock()
+    sender._agent.submit_transfer_requests.return_value.wait.return_value = True
+    params = DisaggregatedParams(disagg_request_id=4)
+    if need_aux:
+        params.schedule_style = DisaggScheduleStyle.GENERATION_FIRST
+    return transfer_mod.TxSession(
+        4, params, sender, overall_timeout_s=5.0, retirement_watchdog=watchdog
+    )
+
+
+def _submit_piece(session: transfer_mod.TxSession, task: transfer_mod.SendTaskBase) -> None:
+    """Drive the real sender's submission, backend-DONE and delivery transitions."""
+    assert session._sender._begin_task_operation(task, 7)
+    assert session._sender._submit_transfer(task, 7, object()) == (True, None)
+    task.complete()
+
+
+@pytest.mark.parametrize("piece", ["kv", "aux"])
+@pytest.mark.parametrize("submit_at", [14.999, 15.0, 15.001])
+def test_idle_session_keeps_original_deadline_for_later_piece(piece: str, submit_at: float) -> None:
+    """An empty physical-claim gap never grants KV or AUX a fresh admission window."""
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    session = _tx_session(watchdog, need_aux=piece == "aux")
+    session.send(Chunk([], [], TokenRange(0, 16), piece == "aux"))
+    first = session.kv_tasks[0]
+    _submit_piece(session, first)
+    delivered = first.logical_outcome
+    assert not session._retirement._claims
+    # Queue the next piece before expiry; only backend admission decides whether
+    # it may cross the exposure boundary when its worker eventually runs.
+    clock.return_value = 14.0
+    if piece == "aux":
+        later = session.send_aux()
+    else:
+        session.send(Chunk([], [], TokenRange(16, 32), True))
+        later = session.kv_tasks[-1]
+    assert session._sender._begin_task_operation(later, 7)
+    clock.return_value = submit_at
+    if submit_at < 15.0:
+        assert session._sender._submit_transfer(later, 7, object()) == (True, None)
+        later.complete()
+        assert session.is_completed()
+    else:
+        with pytest.raises(transfer_mod._TransferNotSubmittedError):
+            session._sender._submit_transfer(later, 7, object())
+        assert (
+            later._physical_operations[7].state
+            is transfer_mod._PhysicalOperationState.NOT_SUBMITTED
+        )
+        assert later.logical_outcome.status is SessionStatus.ERROR
+        assert session._sender._agent.submit_transfer_requests.call_count == 1
+        assert not session._retirement._claims
+        assert session._retirement._drain_started == 15.0
+    assert first.logical_outcome is delivered
+    clock.return_value = 100.0
+    watchdog.progress()
+    assert watchdog.fatal is None
+    assert session.close()
+    watchdog.stop()
+
+
+def test_missing_aux_times_out_without_another_session_call() -> None:
+    """Metadata progress expires idle, incomplete sessions without inventing physical risk."""
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    session = _tx_session(watchdog)
+    session.send(Chunk([], [], TokenRange(0, 16), True))
+    task = session.kv_tasks[0]
+    _submit_piece(session, task)
+    delivered = task.logical_outcome
+    assert session.aux_task is None
+    assert not session._retirement._claims
+    clock.return_value = 100.0
+    watchdog.progress()
+    assert session._logical_outcomes._terminal.status is SessionStatus.ERROR
+    assert session._retirement._drain_started == 15.0
+    assert watchdog.fatal is None
+    assert task.logical_outcome is delivered
+    assert session.close()
+    watchdog.stop()
+
+
+@pytest.mark.parametrize("direction", ["send", "receive"])
+def test_complete_session_stops_deadline_before_delayed_consumer_poll(direction: str) -> None:
+    """Final runtime events close success; consumer polling and cleanup may happen much later."""
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    if direction == "send":
+        session = _tx_session(watchdog)
+        session.send(Chunk([], [], TokenRange(0, 16), True))
+        _submit_piece(session, session.kv_tasks[0])
+        auxiliary = session.send_aux()
+        _submit_piece(session, auxiliary)
+        assert session.send_aux() is auxiliary
+    else:
+        session, _, _ = _settled_rx_session(watchdog, succeeded=True)
+        session.process_aux_agent_result(7, transfer_mod.AgentResult.SUCCESS)
+    assert session._retirement._pieces_complete
+    assert not session._retirement._claims
+    clock.return_value = 100.0
+    watchdog.progress()
+    assert session.status is SessionStatus.TRANSFERRED
+    assert session.is_completed()
+    assert session._retirement._drain_started is None
+    assert watchdog.fatal is None
+    assert not session._retirement.expose(object())
+    assert session.close()
+    watchdog.stop()
+
+
+@pytest.mark.parametrize("final_piece", ["send_kv", "send_aux", "receive_kv"])
+def test_final_completion_precedes_delayed_perf_logging(final_piece: str, monkeypatch) -> None:
+    """Best-effort diagnostics cannot time out or fail a fully settled session."""
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    if final_piece == "receive_kv":
+        receiver = _receiver(watchdog)
+        receiver._bounce = NoBounceTransport()
+        receiver._registrar = SimpleNamespace(
+            self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
+        )
+        session = _rx_session(receiver)
+        task = session.prepare_receive(Chunk([], [], TokenRange(0, 16), True))
+        task.expected_transfers = 1
+        published = set()
+        assert session.try_begin_transfer(
+            0, {"sender"}, {7}, publish=lambda: published.add(7), published_writers=published
+        )
+        session.process_aux_agent_result(7, transfer_mod.AgentResult.SUCCESS)
+        finish = partial(
+            session.process_kv_agent_result, 7, 0, True, transfer_mod.AgentResult.SUCCESS
+        )
+    else:
+        need_aux = final_piece == "send_aux"
+        session = _tx_session(watchdog, need_aux=need_aux)
+        session.send(Chunk([], [], TokenRange(0, 16), True))
+        task = session.kv_tasks[0]
+        if need_aux:
+            _submit_piece(session, task)
+            task = session.send_aux()
+        sender = session._sender
+        sender._instance_rank = sender._device_id = 0
+        sender._bounce = NoBounceTransport()
+        sender._registrar = SimpleNamespace(
+            self_rank_info=SimpleNamespace(instance_name="sender", instance_rank=0)
+        )
+        sender._get_result_dealer = Mock()
+        assert sender._begin_task_operation(task, 7)
+        meta = transfer_mod.WriteMeta(
+            task,
+            1,
+            "receiver",
+            7,
+            "receiver",
+            4,
+            np.array([16], dtype=np.int64),
+            np.array([32], dtype=np.int64),
+            np.array([16], dtype=np.int64),
+            dst_device_id=0,
+            slice_id=0,
+            is_last_slice=True,
+            meta_type=transfer_mod.WriteMetaType.AUX if need_aux else transfer_mod.WriteMetaType.KV,
+        )
+        deliver = sender._deliver_aux_to_agent if need_aux else sender._deliver_kv_to_agent
+        finish = partial(deliver, meta)
+
+    def delayed_diagnostic(*args):
+        if final_piece.startswith("send"):
+            session._sender._get_result_dealer.return_value.send.assert_called_once()
+        clock.return_value = 100.0
+        watchdog.progress()
+        raise RuntimeError("diagnostic failure after transfer completion")
+
+    monkeypatch.setattr(task, "print_perf_info", delayed_diagnostic)
+    finish()
+    assert clock.return_value == 100.0
+    assert task.logical_outcome.status is SessionStatus.TRANSFERRED
+    assert session.is_completed()
+    assert session._retirement._drain_started is None
+    assert watchdog.fatal is None
+    assert session.close()
+    watchdog.stop()
+
+
+def test_logical_completion_cannot_stop_unresolved_physical_deadline() -> None:
+    """Delivered results remain stable while their outstanding access still requires containment."""
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    session = _tx_session(watchdog, need_aux=False)
+    session.send(Chunk([], [], TokenRange(0, 16), True))
+    task = session.kv_tasks[0]
+    assert session._sender._begin_task_operation(task, 7)
+    request, status = object(), Mock()
+    task.begin_backend_submission(7, request)
+    task.record_backend_submission(7, status)
+    task.complete()
+    delivered = task.logical_outcome
+    assert session._retirement._pieces_complete
+    assert session._retirement._claims
+    assert not session.is_completed()
+    assert session.wait_complete(blocking=False) is None
+    assert session.wait_complete(blocking=True) is None
+    clock.return_value = 15.0
+    watchdog.progress()
+    assert session.status is SessionStatus.ERROR
+    assert task.logical_outcome is delivered
+    clock.return_value = 20.0
+    watchdog.progress()
+    assert watchdog.fatal is not None
+    assert not task.retire_backend_done_physical_operation(7)
+    assert task._physical_operations[7].request is request
+    assert task._physical_operations[7].status is status
+    assert not session.close()
+
+
+@pytest.mark.parametrize("direction", ["send", "receive"])
+@pytest.mark.parametrize("blocking", [False, True])
+def test_finished_nonfinal_piece_does_not_complete_session(direction: str, blocking: bool) -> None:
+    """Consumer polling cannot mistake an idle gap for the producer's end-of-pieces signal."""
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    chunk = Chunk([], [], TokenRange(0, 16), False)
+    if direction == "send":
+        session = _tx_session(watchdog, need_aux=False)
+        session.send(chunk)
+        _submit_piece(session, session.kv_tasks[0])
+    else:
+        receiver = _receiver(watchdog)
+        receiver._bounce = NoBounceTransport()
+        receiver._registrar = SimpleNamespace(
+            self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
+        )
+        session = transfer_mod.RxSession(
+            4,
+            DisaggregatedParams(disagg_request_id=4),
+            receiver,
+            timeout_s=5.0,
+            retirement_watchdog=watchdog,
+        )
+        task = session.prepare_receive(chunk)
+        task.expected_transfers = 1
+        assert session.try_begin_transfer(0, {"sender"}, {7})
+        session.process_kv_agent_result(7, 0, True, transfer_mod.AgentResult.SUCCESS)
+    assert not session._retirement._claims
+    assert not session._retirement.is_complete
+    assert not session.is_completed()
+    assert session.wait_complete(blocking=blocking) is None
+    clock.return_value = 15.0
+    watchdog.progress()
+    assert session.status is SessionStatus.ERROR
+    assert watchdog.fatal is None
+    assert session.close()
+    watchdog.stop()
+
+
+def test_completion_at_transfer_deadline_cannot_replace_timeout() -> None:
+    """Physically safe completion at the request boundary still preserves logical timeout."""
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    session = _tx_session(watchdog)
+    session.send(Chunk([], [], TokenRange(0, 16), True))
+    _submit_piece(session, session.kv_tasks[0])
+    task = session.send_aux()
+    assert session._sender._begin_task_operation(task, 7)
+    assert session._sender._submit_transfer(task, 7, object()) == (True, None)
+    clock.return_value = 15.0
+    task.complete()
+    assert task.logical_outcome.status is SessionStatus.ERROR
+    assert session.status is SessionStatus.ERROR
+    assert not session._retirement._pieces_complete
+    assert session.close()
+    watchdog.stop()
+
+
+def test_expired_fanout_rejects_queued_peer_but_retains_submitted_sibling() -> None:
+    """A rejected peer never clears another peer's existing backend roots."""
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    session = _tx_session(watchdog, need_aux=False)
+    session.send(Chunk([], [], TokenRange(0, 16), True))
+    task = session.kv_tasks[0]
+    assert session._sender._begin_task_operation(task, 7)
+    task.begin_backend_submission(7, object())
+    task.record_backend_submission(7, Mock())
+    assert session._sender._begin_task_operation(task, 8)
+    clock.return_value = 15.0
+    with pytest.raises(transfer_mod._TransferNotSubmittedError):
+        session._sender._submit_transfer(task, 8, object())
+    session._sender._agent.submit_transfer_requests.assert_not_called()
+    assert task._physical_operations[8].state is transfer_mod._PhysicalOperationState.NOT_SUBMITTED
+    assert list(session._retirement._claims.values()) == [task._physical_operations[7]]
+    clock.return_value = 20.0
+    watchdog.progress()
+    assert watchdog.fatal is not None
+    assert not session.close()
+
+
+@pytest.mark.parametrize("need_aux", [False, True])
+def test_expired_second_receive_preserves_existing_claims(need_aux: bool) -> None:
+    """Reject an expired receive even when idle; retain any previously published AUX."""
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    receiver = _receiver(watchdog)
+    receiver._bounce = NoBounceTransport()
+    receiver._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
+    )
+    params = DisaggregatedParams(disagg_request_id=4)
+    if need_aux:
+        params.schedule_style = DisaggScheduleStyle.GENERATION_FIRST
+    session = transfer_mod.RxSession(
+        4, params, receiver, timeout_s=5.0, retirement_watchdog=watchdog
+    )
+    task = session.prepare_receive(Chunk([], [], TokenRange(0, 16), False))
+    task.expected_transfers = 1
+    assert session.try_begin_transfer(0, {"sender"}, {7})
+    session.process_kv_agent_result(7, 0, True, transfer_mod.AgentResult.SUCCESS)
+    second = session.prepare_receive(Chunk([], [], TokenRange(16, 32), True))
+    second.expected_transfers = 1
+    publish = Mock()
+    clock.return_value = 15.0
+    with pytest.raises(RuntimeError, match="retirement admission is closed"):
+        session.try_begin_transfer(1, {"sender"}, {7}, publish=publish, published_writers=set())
+    publish.assert_not_called()
+    assert second.cancel_unpublished()
+    assert second.resources_drained is not need_aux
+    expected_claims = [session._aux_physical_owner] if need_aux else []
+    assert list(session._retirement._claims.values()) == expected_claims
+    if need_aux:
+        assert not session._aux_physical_owner.resources_drained
+    clock.return_value = 20.0
+    watchdog.progress()
+    assert (watchdog.fatal is not None) is need_aux
+    assert session.close() is not need_aux
+    if not need_aux:
+        watchdog.stop()
 
 
 def _settled_rx_session(

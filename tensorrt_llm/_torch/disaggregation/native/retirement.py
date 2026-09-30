@@ -53,6 +53,7 @@ class RetirementDeadline:
         self._drain_started: float | None = None
         self._reason = ""
         self._claims: dict[int, object] = {}
+        self._pieces_complete = False
         self._closed = False
         self._timeout_outcome: Callable[[], None] | None = None
 
@@ -86,14 +87,42 @@ class RetirementDeadline:
             Whether this operation may cross the publication/submission boundary.
         """
         with self.lock:
-            self._check_locked(self.controller.clock())
-            if self._closed or self._drain_started is not None or self.controller.fatal is not None:
+            now = self.controller.clock()
+            self._check_locked(now)
+            if (
+                self._closed
+                or self._pieces_complete
+                or self._drain_started is not None
+                or self.controller.fatal is not None
+            ):
                 return False
             if self._request_deadline is None:
-                self._request_deadline = self.controller.clock() + self.timeout_s
+                self._request_deadline = now + self.timeout_s
             self._claims.update((id(owner), owner) for owner in owners)
             self.controller.wake.set()
             return True
+
+    def complete_pieces(self) -> None:
+        """Seal successful delivery of every expected piece, including required AUX.
+
+        Physical claims remain independently monitored until safe evidence settles
+        them; successful logical delivery alone cannot disable the deadline.
+        """
+        with self.lock:
+            self._check_locked(self.controller.clock())
+            self._pieces_complete = True
+
+    @property
+    def is_complete(self) -> bool:
+        """Return successful whole-session closure, not merely an idle claim set."""
+        with self.lock:
+            self._check_locked(self.controller.clock())
+            return (
+                self._pieces_complete
+                and not self._claims
+                and self._drain_started is None
+                and self.controller.fatal is None
+            )
 
     def request_drain(self, reason: str) -> None:
         """Record the first terminal trigger; later triggers cannot extend grace.
@@ -136,7 +165,7 @@ class RetirementDeadline:
         with self.lock:
             if self._closed:
                 return
-            # A fully settled session has no running request clock. Start grace
+            # A successfully completed session has no running request clock. Start grace
             # from this new ambiguity, but preserve any earlier drain trigger.
             self.request_drain(reason)
             self._claims[id(owner)] = owner
@@ -164,15 +193,20 @@ class RetirementDeadline:
         Args:
             now: Monotonic clock sample used for the expiry decision.
         """
-        if self._closed or not self._claims or self.controller.fatal is not None:
+        if self._closed or self.controller.fatal is not None:
             return
-        if self._drain_started is None and self._request_deadline is not None:
+        session_complete = self._pieces_complete and not self._claims
+        if (
+            not session_complete
+            and self._drain_started is None
+            and self._request_deadline is not None
+        ):
             if now >= self._request_deadline:
                 self._drain_started = self._request_deadline
                 self._reason = "transfer timeout"
                 if self._timeout_outcome is not None:
                     self._timeout_outcome()
-        if self._drain_started is not None:
+        if self._claims and self._drain_started is not None:
             deadline = self._drain_started + self.timeout_s
             if now >= deadline:
                 self.controller.fatal = QuiescenceFatalEvent(
