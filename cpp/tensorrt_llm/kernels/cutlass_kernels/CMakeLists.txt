@@ -281,6 +281,13 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   target_include_directories(
     moe_gemm_src
     PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
+else()
+  add_library(moe_routing_src STATIC ${MOE_CUTLASS_DIR}/moe_kernels.cu)
+  target_compile_definitions(moe_routing_src PRIVATE TLLM_MOE_ROUTING_ONLY)
+  add_cuda_architectures(moe_routing_src 89)
+  target_include_directories(
+    moe_routing_src
+    PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
 endif()
 
 if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
@@ -332,6 +339,10 @@ foreach(target_name ${TARGET_LIB})
 endforeach()
 
 list(APPEND ALL_KERNELS_LIB ${TARGET_LIB})
+
+if(NOT USING_OSS_CUTLASS_MOE_GEMM)
+  list(APPEND ALL_KERNELS_LIB moe_routing_src)
+endif()
 
 add_custom_target(cutlass_kernels DEPENDS ${ALL_KERNELS_LIB})
 

@@ -216,6 +216,8 @@ endif()
 if(USING_OSS_CUTLASS_MOE_GEMM)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} moe_gemm_src)
   message(STATUS "USING_OSS_CUTLASS_MOE_GEMM")
+else()
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} moe_routing_src)
 endif()
 
 if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)

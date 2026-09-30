@@ -634,6 +634,21 @@ and materialization enforces the same contract. CUTLASS opts in because its
 SwiGLU adaptor consumes the mode; its SM120 FP8-block-scale Triton fallback is
 rejected separately because that path does not.
 
+With `USING_OSS_CUTLASS_MOE_GEMM=OFF`, the Torch runner uses the bundled
+internal kernel archive's legacy interfaces. That build supports pre-SiLU
+SwiGLU clamping and rejects post-SiLU clamping, SiTu, Relu2, routed-expert LoRA,
+MXFP8 activations or weights, NVFP4 weight-only MoE, FP8-input W4A8,
+dynamic FC2 scaling, per-expert W4A8 activation scales,
+all-to-all, unpadded output, a separate valid-token count, and unswizzled
+input scales. These features require the open-source kernels. The shared
+MoE kernel tests use the public quantization utilities with either runner;
+post-SiLU, unpadded output, and MXFP8 x MXFP4 cases skip for the internal runner.
+The FP8-input W4A8 fixture and all-to-all variants require the OSS build. The Torch
+boundary translates public activation IDs to the internal enum values.
+When SwiGLU parameters are present, it supplies missing alpha/beta defaults
+as tensors so the legacy archive consumes the clamp limit.
+Public routing helpers remain available in either build.
+
 Declare `limit_when_absent` only when the ABI has no encoding for "no clamp":
 `CuteDslFusedMoE` passes `float("inf")` because its epilogue always applies the
 clamp functor. It is substituted *before* coercion, so a `PER_EXPERT_TENSOR`
