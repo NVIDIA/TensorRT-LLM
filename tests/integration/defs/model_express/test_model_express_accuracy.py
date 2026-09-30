@@ -14,9 +14,9 @@
 # limitations under the License.
 """Post-merge ModelExpress accuracy canaries.
 
-One reference-backed accuracy task per qualified model family runs on an MX
-receiver that starts from a metadata-only snapshot, so its weights can only
-have arrived through P2P from the live donor. The receiver worker evaluates the
+Reference-backed accuracy canaries run on an MX receiver that starts from a
+metadata-only snapshot, so its weights can only have arrived through P2P from
+the live donor. The receiver worker evaluates the
 task itself, in its own subprocess, after checking that every rank wrote its
 transfer manifest at the MX P2P success boundary, and writes the score to JSON.
 This module only launches processes, loads the accuracy reference YAMLs, and
@@ -140,31 +140,11 @@ class MxEvalSpec:
         return argv
 
 
+# Every row needs a bare BF16 entry for its task in `defs/accuracy/references/`
+# that was measured on the PyTorch backend with the task's default evaluator
+# settings, because the receiver's score is gated against it
+# (`test_mx_accuracy_cases_have_references` checks that the entry exists).
 _MX_ACCURACY_CASES = (
-    pytest.param(
-        MxAccuracyCase(
-            model_env="TRTLLM_MX_LLAMA3_8B_MODEL",
-            default_model_subdir="llama-models-v3/llama-v3-8b-instruct-hf",
-            repository_cache_prefix="models--trtllm-mx-acc--llama3-tp1",
-            tp_size=1,
-            model_name="meta-llama/Meta-Llama-3-8B-Instruct",
-            task="MMLU",
-        ),
-        id="llama3-8b-instruct-mmlu-tp1",
-        marks=pytest.mark.skip_less_device(2),
-    ),
-    pytest.param(
-        MxAccuracyCase(
-            model_env="TRTLLM_MX_QWEN25_MODEL",
-            default_model_subdir="Qwen2.5-7B-Instruct",
-            repository_cache_prefix="models--trtllm-mx-acc--qwen25-tp1",
-            tp_size=1,
-            model_name="Qwen/Qwen2.5-7B-Instruct",
-            task="MMLU",
-        ),
-        id="qwen2.5-7b-instruct-mmlu-tp1",
-        marks=pytest.mark.skip_less_device(2),
-    ),
     pytest.param(
         MxAccuracyCase(
             model_env="TRTLLM_MX_QWEN3_MODEL",

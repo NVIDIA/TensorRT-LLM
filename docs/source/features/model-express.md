@@ -218,9 +218,8 @@ representative row.
 
 ### Accuracy Canaries (Post-Merge)
 
-`tests/integration/defs/model_express/test_model_express_accuracy.py` runs one
-reference-backed accuracy task per qualified family on an MX receiver. The donor
-publishes exactly as in the smoke test and never evaluates; the receiver starts
+`tests/integration/defs/model_express/test_model_express_accuracy.py` runs
+reference-backed accuracy canaries on an MX receiver. The donor publishes exactly as in the smoke test and never evaluates; the receiver starts
 from the metadata-only snapshot, self-checks its own transfer logs before
 spending any evaluation time (a fallback exits with status 3), evaluates the
 task with `tensorrt_llm.evaluate` inside its own subprocess, and writes the
@@ -230,13 +229,16 @@ accuracy reference YAMLs, asserts the same hypothesis-testing threshold as
 evidence and the donor/receiver weight manifests to match. There is no paired
 HF baseline evaluation because the reference value is that baseline.
 
-Current rows (all TP=1, BF16, `references/*.yaml` hold the expected values):
+Current rows (TP=1, BF16; `references/*.yaml` holds the expected values):
 
 | Test ID | Model | Task | Model path override |
 | --- | --- | --- | --- |
-| `llama3-8b-instruct-mmlu-tp1` | `meta-llama/Meta-Llama-3-8B-Instruct` | MMLU | `TRTLLM_MX_LLAMA3_8B_MODEL` |
-| `qwen2.5-7b-instruct-mmlu-tp1` | `Qwen/Qwen2.5-7B-Instruct` | MMLU | `TRTLLM_MX_QWEN25_MODEL` |
 | `qwen3-8b-gsm8k-tp1` | `Qwen3/Qwen3-8B` | GSM8K | `TRTLLM_MX_QWEN3_MODEL` |
+
+A canary needs a bare BF16 reference for its task that was measured on the
+PyTorch backend. No in-envelope Llama, Qwen2, or Mistral checkpoint has one
+today, so those families are covered by their smoke rows until such a
+reference is added.
 
 The rows are registered as `stage: post_merge` entries in
 `tests/integration/test_lists/test-db/l0_model_express.yml`, so they run in
@@ -260,13 +262,14 @@ TRTLLM_MX_E2E_REQUIRED=1 \
 MODEL_EXPRESS_URL=http://127.0.0.1:8001 \
 LLM_MODELS_ROOT=/path/to/llm-models \
 pytest -v tests/integration/defs/model_express/test_model_express_accuracy.py \
-  -k llama3-8b-instruct-mmlu-tp1 --output-dir /path/to/artifacts
+  -k qwen3-8b-gsm8k-tp1 --output-dir /path/to/artifacts
 ```
 
 Adding a canary is one `MxAccuracyCase` row (the model must be inside the
-family's qualified runtime envelope and have a bare reference entry for the
-task), one line in the `post_merge` block of `l0_model_express.yml`, and a row
-in the table above.
+family's qualified runtime envelope and have a bare BF16 reference entry for
+the task, measured on the PyTorch backend with the task's default evaluator
+settings), one line in the `post_merge` block of `l0_model_express.yml`, and a
+row in the table above.
 
 ### Transform-Layout ABI Rules
 
