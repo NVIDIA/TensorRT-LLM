@@ -150,42 +150,74 @@ class Cell:
 
 
 class OpWrapper(ABC):
-    """Base for a catalog entry. Instances are callable and stateless.
+    """Base for a catalog entry.
 
-    Subclasses are instantiated once at module scope under the op's own name,
-    so a target writes `flashinfer_rmsnorm(x, w, eps)` and never sees the class.
+    An entry takes its arguments at three different times. Engine-construction
+    constants and the fixtures the op needs for its own signature are supplied
+    when the instance is built; the per-step batch state is rebound once a
+    forward; the runtime tensors arrive at the call. `__call__` merges the
+    three and hands the whole set to `raw_call`.
+
+    `raw_call` is the certified surface, and it takes everything explicitly --
+    it must not read any bound state off `self`. That is what keeps `CELLS`
+    covering the entry's whole input space regardless of what a target chose to
+    bind, and it is why `reference` and `is_valid` mirror `raw_call` rather
+    than `__call__`. A gate in the claims suite enforces it.
+
+    Instances are no longer stateless: binding is state, and an op that
+    manufactures its own fixture holds a device tensor. They are still
+    immutable after `bind_step`, and each target owns its own instances --
+    there is no module-level singleton to contend over, which is what makes
+    per-target binding safe. Two models genuinely disagree about values like
+    `num_heads`; a shared instance could only hold one of them.
     """
 
-    #: Architectures every cell below was driven on. This replaces the receipt
-    #: the contract document used to carry: the only part of a receipt a target
-    #: author acts on is which architectures the entry is good for, and an
-    #: attribute beats a line of front matter nothing reads.
     ARCHS: frozenset[Arch] = frozenset()
-
-    #: The configurations this entry is certified over.
     CELLS: tuple[Cell, ...] = ()
-
-    #: Whatever is neither computation nor precondition -- registration
-    #: conditions, inert arguments, behaviour of paths this entry does not
-    #: certify. Prose here is unverified by construction, which is the reason to
-    #: keep as little of it as possible.
     note: str = ""
 
-    @abstractmethod
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Make the op call. Nothing else: this is the hot path.
+    def __init__(self, **bound: Any) -> None:
+        """Freeze what is known once the engine exists and the weights are real.
 
-        Implemented on the subclass rather than inherited and delegating, so a
-        target pays one Python frame per op, the same as the plain function
-        this replaced. The test tree interposes validation by patching this
-        method on the subclass, which is why it has to live there.
+        Called from a target's post-load hook, never from its `__init__`: a
+        fixture needs a device, and parameters are meta tensors until the
+        engine materializes the registry.
+        """
+        self._bound: dict[str, Any] = bound
+        self._step: dict[str, Any] = {}
+
+    def bind_step(self, **step: Any) -> None:
+        """Rebind the per-forward batch state. Replaces, never merges.
+
+        Total replacement is deliberate. A forward that rebinds only some of
+        the projection would otherwise run on a mixture of this step's and the
+        last step's metadata -- wrong output, no error.
+        """
+        self._step = step
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Merge the three stages and make the call.
+
+        Later stages win: the call overrides the step, the step overrides
+        construction. A decode target states `num_ctx_tokens=0` at construction
+        precisely so the narrower claim survives the step projection.
+        """
+        return self.raw_call(*args, **{**self._bound, **self._step, **kwargs})
+
+    @abstractmethod
+    def raw_call(self, *args: Any, **kwargs: Any) -> Any:
+        """Make the op call, taking every argument explicitly. The hot path.
+
+        Must not read bound state off `self` -- see the class docstring. The
+        test tree interposes validation by patching this method on the
+        subclass, which is why it has to live there.
         """
 
     @abstractmethod
     def reference(self, *args: Any, **kwargs: Any) -> Any:
         """What the op is supposed to compute, in plain torch.
 
-        Mirrors `__call__`'s signature, parameter for parameter and name for
+        Mirrors `raw_call`'s signature, parameter for parameter and name for
         name, so the two can be driven from one cell's argument list. An
         argument this computation does not need keeps its name anyway: dropping
         it would hide that the op takes it, and renaming it would break every
@@ -211,7 +243,7 @@ class OpWrapper(ABC):
         rejects loudly does not belong here: restating it only swaps its error
         for a worse one.
 
-        Mirrors `__call__`'s signature, like `reference`, because `validating`
+        Mirrors `raw_call`'s signature, like `reference`, because `validating`
         forwards the call's arguments verbatim -- an override that accepts only
         the arguments it inspects raises TypeError on every call site that
         passes the others. Parameters keep the op's own names for the same

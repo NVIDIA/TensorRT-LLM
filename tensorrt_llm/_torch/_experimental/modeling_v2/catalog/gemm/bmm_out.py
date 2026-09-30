@@ -50,7 +50,7 @@ class _BmmOut(OpWrapper):
     `out` is written, not accumulated into: its prior contents are ignored.
     """
 
-    def __call__(self, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    def raw_call(self, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
         torch.ops.trtllm.bmm_out(a, b, out)
 
     def reference(self, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> torch.Tensor:

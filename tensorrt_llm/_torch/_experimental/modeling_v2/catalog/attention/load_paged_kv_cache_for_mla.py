@@ -91,7 +91,7 @@ class _LoadPagedKvCacheForMla(OpWrapper):
     target runs the fp8 pool, so it is not a cell.
     """
 
-    def __call__(
+    def raw_call(
         self,
         out_dtype: torch.dtype,
         num_contexts: int,

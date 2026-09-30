@@ -72,7 +72,7 @@ class _MlaRopeAppendPagedKvAssignQ(OpWrapper):
     nothing visible at this call site can tell. The test drives that directly.
     """
 
-    def __call__(
+    def raw_call(
         self,
         q: torch.Tensor,
         latent_cache: torch.Tensor,

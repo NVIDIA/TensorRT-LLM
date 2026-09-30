@@ -119,7 +119,7 @@ class _MlaRopeGeneration(OpWrapper):
     multi-layer pools.
     """
 
-    def __call__(
+    def raw_call(
         self,
         fused_q: torch.Tensor,
         q_pe: torch.Tensor,

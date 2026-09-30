@@ -36,19 +36,19 @@ def validating(*wrappers: OpWrapper) -> Iterator[None]:
     for w in wrappers:
         cls = type(w)
         assert isinstance(w, OpWrapper), f"{w!r} is not a catalog entry"
-        original = cls.__call__
+        original = cls.raw_call
         saved.append((cls, original))
 
         def guarded(self, *args, _original=original, **kwargs):
             self.is_valid(*args, **kwargs)
             return _original(self, *args, **kwargs)
 
-        cls.__call__ = guarded
+        cls.raw_call = guarded
     try:
         yield
     finally:
         for cls, original in reversed(saved):
-            cls.__call__ = original
+            cls.raw_call = original
 
 
 @pytest.fixture
@@ -84,7 +84,7 @@ def certifying():
         for w in wrappers:
             assert isinstance(w, OpWrapper), f"{w!r} is not a catalog entry"
             cls = type(w)
-            for name in ("__call__", "reference", "compare"):
+            for name in ("raw_call", "reference", "compare"):
                 original = getattr(cls, name)
                 # Whether the subclass owns it decides how to put it back:
                 # `compare` and `is_valid` have base defaults, and restoring an
@@ -95,7 +95,7 @@ def certifying():
 
                 def counted(self, *args, _o=original, _n=name, **kwargs):
                     seen[_n] = seen.get(_n, 0) + 1
-                    if _n == "__call__":
+                    if _n == "raw_call":
                         self.is_valid(*args, **kwargs)
                     return _o(self, *args, **kwargs)
 
@@ -111,7 +111,7 @@ def certifying():
 
     if not armed:
         return
-    missing = [n for n in ("__call__", "reference", "compare") if not seen.get(n)]
+    missing = [n for n in ("raw_call", "reference", "compare") if not seen.get(n)]
     assert not missing, (
         f"the entry was armed but {', '.join(missing)} never ran: a cell driven "
         f"without the entry's own reference and gate certifies nothing it claims"

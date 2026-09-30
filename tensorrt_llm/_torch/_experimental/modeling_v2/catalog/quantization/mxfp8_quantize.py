@@ -65,7 +65,7 @@ class _Mxfp8Quantize(OpWrapper):
     under the swizzled layout the collapsed rows are padded as one matrix.
     """
 
-    def __call__(
+    def raw_call(
         self,
         input: torch.Tensor,
         swizzled_layout: bool = True,

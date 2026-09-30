@@ -68,7 +68,7 @@ class _Reducescatter(OpWrapper):
     a cell axis.
     """
 
-    def __call__(
+    def raw_call(
         self,
         input: torch.Tensor,
         sizes: Optional[List[int]],

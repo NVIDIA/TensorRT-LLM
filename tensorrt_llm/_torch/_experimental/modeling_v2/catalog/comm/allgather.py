@@ -55,7 +55,7 @@ class _Allgather(OpWrapper):
     own named checks.
     """
 
-    def __call__(
+    def raw_call(
         self,
         input: torch.Tensor,
         sizes: Optional[List[int]],
