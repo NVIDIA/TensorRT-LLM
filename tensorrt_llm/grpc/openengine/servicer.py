@@ -17,7 +17,12 @@ from tensorrt_llm.logger import logger
 from .disagg import disaggregated_params_from_request
 from .errors import AbortFailedError, UnsupportedFeatureError
 from .formatting import _engine_error_response, _stop_texts
-from .request_mapping import _input_from_request, _trace_headers, sampling_params_from_request
+from .request_mapping import (
+    _input_from_request,
+    _trace_headers,
+    conversation_params_from_request,
+    sampling_params_from_request,
+)
 from .streaming import (
     RESPONSE_STALL_TIMEOUT_SECONDS,
     ActiveRequest,
@@ -121,6 +126,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
 
             inputs = _input_from_request(request)
             sampling_params = sampling_params_from_request(request, self._guided_backend)
+            conversation_params = conversation_params_from_request(request)
             trace_headers = _trace_headers(context)
             cache_salt = (
                 request.kv.cache_salt
@@ -154,6 +160,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 sampling_params=sampling_params,
                 streaming=True,
                 trace_headers=trace_headers,
+                conversation_params=conversation_params,
                 cache_salt=cache_salt,
                 priority=DEFAULT_REQUEST_PRIORITY,
                 disaggregated_params=disaggregated_params,

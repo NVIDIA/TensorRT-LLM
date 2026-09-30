@@ -817,6 +817,23 @@ def test_generate_context_only_ends_at_prefill_ready() -> None:
             prompt_token_ids=[1, 2], outputs=[streaming_output], cached_tokens=0, error=None
         ),
         SimpleNamespace(
+            prompt_token_ids=[1, 2],
+            outputs=[
+                SimpleNamespace(
+                    index=0,
+                    token_ids=[10],
+                    text="A",
+                    logprobs=[],
+                    finish_reason="length",
+                    stop_reason=None,
+                    disaggregated_params=None,
+                )
+            ],
+            cached_tokens=0,
+            error=None,
+            finished=False,
+        ),
+        SimpleNamespace(
             prompt_token_ids=[1, 2], outputs=[final_output], cached_tokens=0, error=None
         ),
     ]
@@ -1145,3 +1162,50 @@ def test_generate_aborts_the_engine_when_the_rpc_is_cancelled() -> None:
 
     assert llm.result_handle.aborted
     assert servicer.active_request_count() == 0
+
+
+@pytest.mark.parametrize("detokenize", [None, True, False])
+def test_generate_forwards_conversation_id(detokenize: bool | None) -> None:
+    """AgentX session affinity survives the OpenEngine transport boundary."""
+    output = SimpleNamespace(
+        index=0,
+        token_ids=[10],
+        text="" if detokenize is False else "A",
+        logprobs=[],
+        finish_reason="length",
+        stop_reason=None,
+    )
+    result = SimpleNamespace(prompt_token_ids=[1], outputs=[output], cached_tokens=0, error=None)
+    llm = _FakeLlm([result])
+    llm.args.enable_attention_dp = True
+    llm.args.tensor_parallel_size = 4
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext()
+    request = generation_pb2.GenerateRequest(
+        request_id="request-conversation",
+        model="test-model",
+        prompt="hello",
+    )
+    request.extra.update({"conversation_id": " agentx-session "})
+    if detokenize is not None:
+        request.extra.update({"detokenize": detokenize})
+
+    async def collect_responses() -> list[generation_pb2.GenerateResponse]:
+        return [response async for response in servicer.Generate(request, context)]
+
+    responses = asyncio.run(collect_responses())
+
+    assert llm.generate_kwargs["conversation_params"].conversation_id == "agentx-session"
+    assert llm.generate_kwargs["sampling_params"].detokenize is (detokenize is not False)
+    assert [response.WhichOneof("event") for response in responses] == ["token", "finished"]
+    assert [token.token_id for token in responses[0].token.tokens] == [10]
+    assert responses[0].token.text == output.text
+    assert responses[1].usage.completion_tokens == 1
+
+
+def test_detokenize_extension_rejects_string_boolean() -> None:
+    """A string 'false' must not silently enable detokenization through coercion."""
+    request = generation_pb2.GenerateRequest()
+    request.extra.update({"detokenize": "false"})
+    with pytest.raises(ValueError, match="extra.detokenize must be a boolean"):
+        sampling_params_from_request(request)
