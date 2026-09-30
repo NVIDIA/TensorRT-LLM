@@ -82,7 +82,7 @@ class _Reducescatter(OpWrapper):
     ) -> torch.Tensor:
         """The sum of what every rank sent to this rank's slice.
 
-        The documented exception to mirroring `__call__`, for the same reason as
+        The documented exception to mirroring `raw_call`, for the same reason as
         allgather: a collective's output is not a function of what the calling
         rank holds. It takes the one block each rank contributed to *this*
         position, in ascending rank order -- not their whole inputs, because a
