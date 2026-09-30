@@ -80,7 +80,7 @@ class _Fp4Quantize(OpWrapper):
     target uses it and this entry does not certify it.
     """
 
-    def __call__(
+    def raw_call(
         self,
         input: torch.Tensor,
         global_scale: Optional[torch.Tensor],

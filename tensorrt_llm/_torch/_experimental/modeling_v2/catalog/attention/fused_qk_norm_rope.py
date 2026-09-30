@@ -64,7 +64,7 @@ class _FusedQkNormRope(OpWrapper):
     the path works because the argument exists.
     """
 
-    def __call__(
+    def raw_call(
         self,
         qkv: torch.Tensor,
         num_heads_q: int,

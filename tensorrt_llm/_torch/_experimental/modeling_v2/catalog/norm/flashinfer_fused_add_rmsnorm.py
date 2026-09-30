@@ -59,7 +59,7 @@ class _FlashinferFusedAddRmsnorm(OpWrapper):
     is not certified by this entry.
     """
 
-    def __call__(
+    def raw_call(
         self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
     ) -> None:
         torch.ops.trtllm.flashinfer_fused_add_rmsnorm(x, residual, weight, eps)

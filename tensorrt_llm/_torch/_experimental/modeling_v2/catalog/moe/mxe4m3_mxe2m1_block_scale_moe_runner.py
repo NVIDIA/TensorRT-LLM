@@ -192,7 +192,7 @@ class _Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
     once through the trtllm preprocessing ops -- and compares them first.
     """
 
-    def __call__(
+    def raw_call(
         self,
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],

@@ -46,7 +46,7 @@ class _FlashinferSiluAndMul(OpWrapper):
     they are not cells.
     """
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+    def raw_call(self, x: torch.Tensor) -> torch.Tensor:
         return torch.ops.trtllm.flashinfer_silu_and_mul(x)
 
     def reference(self, x: torch.Tensor) -> torch.Tensor:
