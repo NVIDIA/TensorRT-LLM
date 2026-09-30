@@ -788,7 +788,7 @@ def test_background_reporter_keeps_initial_report_when_config_capture_fails(
 
     assert usage_lib.apply_usage_session_config()
 
-    monkeypatch.setattr(usage_lib, "_MAX_HEARTBEATS", 0)
+    monkeypatch.setattr(usage_lib._REPORTER_STOP, "wait", lambda timeout: True)
     monkeypatch.setattr(usage_lib, "_get_trtllm_version", lambda: "0.0.0-test")
     monkeypatch.setattr(
         usage_lib,
