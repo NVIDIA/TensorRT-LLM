@@ -1370,6 +1370,7 @@ else:
                     assert usage_lib.report_exit(
                         usage_lib.TerminalOutcome(termination_kind="unknown")
                     )
+                assert usage_lib._SESSION.terminal_completion.wait(timeout=2)
                 assert sent[-1]["events"][0]["name"] == "trtllm_exit_report"
                 assert not release.is_set()
             finally:
