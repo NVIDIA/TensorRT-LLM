@@ -19,13 +19,19 @@ The prompt checks behavioral compatibility involving the PR changes, including
 when head already contains target. It asks CodeRabbit to distinguish cross-branch
 interactions from PR-local compatibility defects and to verify how both sides'
 edits combine. An alleged caller/definition mismatch must remain after three-way
-merge analysis before it can support FAIL. Unresolved relevant
-textual conflicts must not be replaced with an assumed resolution.
+merge analysis before it can support FAIL. For textual conflicts, identify the
+specific unresolved choice that affects a finding. Assess unaffected regions
+independently, including within conflicted files, and inspect the combined order
+of operations on shared objects or bindings. A hypothetical additional repair
+during conflict resolution does not invalidate an established defect.
 
 FAIL needs a supported trigger, a reachable failure path and evidence that paired
 edits, feature gates or recovery logic do not prevent the problem. Unrelated
 pre-existing defects, missing tests alone and wording-only improvements do not
-support FAIL. Missing material evidence supports INCONCLUSIVE. Each reply must
+support FAIL. Intentional rejection of unmet prerequisites alone is not a
+compatibility defect; establish a supported scenario required to keep working.
+Different fallback policies in separate consumers do not establish that
+requirement. Missing material evidence supports INCONCLUSIVE. Each reply must
 include the advisory notice and put its fixed-revision citations inside the
 `SEMANTIC_REVIEW` section. These are instructions to the AI, not guarantees of
 its compliance or semantic accuracy.
