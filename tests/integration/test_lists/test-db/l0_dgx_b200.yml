@@ -220,6 +220,7 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu/test_parallel_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_ring_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_tp_attention.py
+  - unittest/_torch/visual_gen/multi_gpu/test_tp_sequence_parallel_collectives.py -k "nccl"
   - unittest/_torch/visual_gen/multi_gpu/test_ulysses_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_ulysses_async.py
   - unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py
@@ -227,6 +228,7 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu/test_wan_async_ulysses.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_pipeline_parallel.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py
+  - unittest/_torch/visual_gen/multi_gpu/test_wan_tp_sequence_parallel.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_transformer_parallel.py
 - condition:
     ranges:
@@ -340,6 +342,7 @@ l0_dgx_b200:
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_tp[cfg2_tp2]
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_tp[tp2_ulysses2]
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_tp[tp2_attn2d_2x1]
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_tp[cfg2_tp2_sp]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.5-fp8kv=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.5-fp8kv=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=False]

@@ -14,7 +14,7 @@
 # limitations under the License.
 """Base classes for VisualGen model components."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 import torch.nn as nn
@@ -30,8 +30,23 @@ if TYPE_CHECKING:
 class BaseDiffusionModel(nn.Module):
     """Base class for TRT-LLM VisualGen model components."""
 
+    # Models that implement parallel_config.tp_sequence_parallel (token-sharded residual
+    # stream inside the TP group, see modules/tp_sequence_parallel.py) set this to True.
+    _supports_tp_sequence_parallel: ClassVar[bool] = False
+
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__()
+        parallel = getattr(model_config, "parallel", None)
+        if (
+            getattr(parallel, "tp_sequence_parallel", None)
+            and not type(self)._supports_tp_sequence_parallel
+        ):
+            raise ValueError(
+                "parallel_config.tp_sequence_parallel=True is not implemented for "
+                f"{type(self).__name__} (the model does not set "
+                "_supports_tp_sequence_parallel = True). Unset tp_sequence_parallel to use "
+                "all-reduce tensor parallelism."
+            )
         self.model_config = model_config
         self.component_name = model_config.component_name
         self.pretrained_config = model_config.pretrained_config

@@ -282,6 +282,8 @@ class ParallelConfig(StrictBaseModel):
     Attention (a 1D mesh); these two are mutually exclusive. Either can be
     combined with Ulysses head-sharding to form an outer × inner sequence
     parallel mesh. See ``mapping.py`` for the underlying DeviceMesh layout.
+    ``tp_sequence_parallel`` additionally token-shards the transformer's residual
+    stream between projections inside each tensor-parallel group.
     """
 
     parallel_vae_size: int = Field(
@@ -346,6 +348,18 @@ class ParallelConfig(StrictBaseModel):
         status="prototype",
         description=("Tensor parallel group size. Heads are sharded across tp_size GPUs."),
     )
+    tp_sequence_parallel: Optional[bool] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Shard the transformer's tokens across the tensor-parallel group between "
+            "projections (Megatron-style sequence parallelism; unrelated to "
+            "ulysses/ring/attn2d): each all-reduce becomes a reduce-scatter plus an "
+            "all-gather (NVFP4 when the next projection has a static NVFP4 input scale). "
+            "Requires tp_size > 1 and no ulysses/ring/attn2d. None lets the engine decide "
+            "(currently disabled)."
+        ),
+    )
 
     @property
     def seq_parallel_size(self) -> int:
@@ -386,6 +400,26 @@ class ParallelConfig(StrictBaseModel):
                     "async_ulysses forces SEPARATE_QKV which bypasses the "
                     "RingAttention wrapper. Set ring_size=1 or async_ulysses=False "
                     f"(got ring_size={self.ring_size})."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_tp_sequence_parallel(self) -> "ParallelConfig":
+        # async_ulysses is excluded transitively (it requires ulysses_size > 1).
+        if self.tp_sequence_parallel:
+            if self.tp_size == 1:
+                raise ValueError(
+                    "parallel_config.tp_sequence_parallel=True requires tp_size > 1 "
+                    f"(got tp_size={self.tp_size}). Set tp_size > 1 or leave "
+                    "tp_sequence_parallel unset."
+                )
+            if self.seq_parallel_size > 1:
+                raise ValueError(
+                    "parallel_config.tp_sequence_parallel=True cannot be combined with "
+                    f"ulysses_size/ring_size/attn2d_size yet (got ulysses_size={self.ulysses_size}, "
+                    f"ring_size={self.ring_size}, attn2d_size={tuple(self.attn2d_size)}): both "
+                    "shard the token dimension of the transformer's residual stream. Use "
+                    "cfg_size x tp_size with tp_sequence_parallel, or unset it."
                 )
         return self
 
@@ -796,6 +830,22 @@ class VisualGenArgs(StrictBaseModel):
         if isinstance(data, dict) and data.get("quant_config", "_sentinel") is None:
             data = {**data, "quant_config": QuantConfig()}
         return data
+
+    @model_validator(mode="after")
+    def _validate_tp_sequence_parallel_cache(self) -> "VisualGenArgs":
+        # Cache-DiT skips blocks based on per-block hidden states, which are token-sharded
+        # under tp_sequence_parallel; TeaCache wraps the whole forward and composes.
+        if self.parallel_config.tp_sequence_parallel and isinstance(
+            self.cache_config, CacheDiTConfig
+        ):
+            raise ValueError(
+                "cache_config.cache_backend='cache_dit' is not supported with "
+                "parallel_config.tp_sequence_parallel=True: Cache-DiT decides which blocks to "
+                "skip from per-block hidden states, which are token-sharded across TP ranks, so "
+                "ranks could decide differently and deadlock. Use TeaCache "
+                "(cache_backend='teacache') or unset tp_sequence_parallel."
+            )
+        return self
 
     @property
     def cache_backend(self) -> Optional[CacheBackendName]:

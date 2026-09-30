@@ -60,9 +60,9 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **FLUX.1** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **FLUX.2** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes [^wan-tp-sp] | No |
 | **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes [^wan-tp-sp] | No |
 | **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
 | **MiniMax-H3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
@@ -72,6 +72,8 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 | **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
 | **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
+
+[^wan-tp-sp]: Wan also supports `tp_sequence_parallel` (sequence-parallel TP); see [Multi-GPU Parallelism](#multi-gpu-parallelism).
 
 ## Quick Start
 
@@ -411,6 +413,14 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
     - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (CP degree = `N · M`; total SP degree = `N · M · ulysses_size`).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
+    - **Sequence-parallel TP** (`tp_sequence_parallel: true` in `parallel_config`, prototype): Keeps the transformer's residual stream token-sharded across the TP group between projections, so each all-reduce becomes a reduce-scatter plus an all-gather and the norms, modulation and quantization in between run on `1/tp_size` of the tokens. It targets `tp_size ≥ 2` within one NVLink domain. With **static (calibrated) NVFP4** checkpoints the activations between projections are all-gathered as NVFP4 (about 3.5x fewer bytes than BF16); dynamic NVFP4 (`dynamic: true`), FP8 and BF16 models all-gather BF16. At `tp_size ≥ 8` NCCL's default reduce-scatter is slightly less precise than the all-reduce it replaces (see the developer guide). Supported for Wan 2.1/2.2 only; not combinable with `ulysses_size`/`ring_size`/`attn2d_size`, Cache-DiT or VSA. CFG parallelism composes; TeaCache is accepted but not yet tested at runtime. Token counts that do not split evenly over `tp_size` are padded per sample. See the [developer guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/modules/TP_SEQUENCE_PARALLEL_DEVELOPER_GUIDE.md).
+
+      ```yaml
+      parallel_config:
+        cfg_size: 2
+        tp_size: 4
+        tp_sequence_parallel: true
+      ```
 
 For multi-node execution, VisualGen relies on the external launcher to terminate
 the remaining ranks when any rank exits. `torchrun` provides this behavior. With
@@ -471,3 +481,7 @@ After these steps, the framework automatically handles:
 - Multi-GPU execution via `DiffusionExecutor`
 - Cache acceleration (if you call `self._setup_cache_acceleration(self.transformer, coefficients=...)` in `post_load_weights()`; supports both TeaCache and Cache-DiT via `VisualGenArgs.cache_config`)
 - Serving via `trtllm-serve` with the full endpoint set
+
+#### Using sequence-parallel TP in your own DiT
+
+`parallel_config.tp_sequence_parallel` is implemented by a model-neutral helper, `TPSequenceParallel` (`tensorrt_llm/_torch/visual_gen/modules/tp_sequence_parallel.py`), that a custom DiT can reuse without Wan code: build the tensor-parallel projections with `reduce_output=False`, shard the residual stream once per forward, and route each block boundary through `row_linear_residual_norm` / `column_linear` / `mlp_residual`. Models subclassing `BaseDiffusionModel` opt in with `_supports_tp_sequence_parallel = True`. The co-located [developer guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/modules/TP_SEQUENCE_PARALLEL_DEVELOPER_GUIDE.md) covers the layout, the building-block contracts, padding and modulation rules, quantization and the torch.compile / CUDA-graph rules.

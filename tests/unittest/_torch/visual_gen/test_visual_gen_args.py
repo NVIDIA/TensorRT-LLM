@@ -528,6 +528,71 @@ class TestParallelConfigValidation:
         assert pc.seq_parallel_size == 8
 
 
+class TestTPSequenceParallelConfig:
+    """parallel_config.tp_sequence_parallel validation and round trips."""
+
+    def test_default_is_none(self):
+        assert ParallelConfig().tp_sequence_parallel is None
+
+    @pytest.mark.parametrize("flag", [None, False])
+    def test_unset_or_false_accepted_without_tp(self, flag):
+        pc = ParallelConfig(tp_size=1, tp_sequence_parallel=flag)
+        assert pc.tp_sequence_parallel is flag
+
+    def test_requires_tp(self):
+        with pytest.raises(ValidationError, match=r"requires tp_size > 1 \(got tp_size=1\)"):
+            ParallelConfig(tp_sequence_parallel=True)
+
+    @pytest.mark.parametrize(
+        "seq_kwargs",
+        [{"ulysses_size": 2}, {"ring_size": 2}, {"attn2d_size": (2, 1)}],
+        ids=["ulysses", "ring", "attn2d"],
+    )
+    def test_rejects_sequence_sharding(self, seq_kwargs):
+        with pytest.raises(ValidationError, match="cannot be combined with ulysses_size"):
+            ParallelConfig(tp_size=2, tp_sequence_parallel=True, **seq_kwargs)
+
+    def test_composes_with_cfg(self):
+        pc = ParallelConfig(cfg_size=2, tp_size=2, tp_sequence_parallel=True)
+        assert pc.tp_sequence_parallel is True
+        assert pc.n_workers == 4
+
+    def test_invalid_type_rejected(self):
+        with pytest.raises(ValidationError):
+            ParallelConfig(tp_size=2, tp_sequence_parallel="sometimes")
+
+    def test_rejects_cache_dit(self):
+        with pytest.raises(ValidationError, match="cache_backend='cache_dit' is not supported"):
+            VisualGenArgs(
+                model="/tmp/model",
+                parallel_config=ParallelConfig(tp_size=2, tp_sequence_parallel=True),
+                cache_config=CacheDiTConfig(),
+            )
+
+    def test_teacache_accepted(self):
+        args = VisualGenArgs(
+            model="/tmp/model",
+            parallel_config=ParallelConfig(tp_size=2, tp_sequence_parallel=True),
+            cache_config=TeaCacheConfig(),
+        )
+        assert args.cache_backend == "teacache"
+
+    def test_yaml_roundtrip(self, tmp_path):
+        yaml_path = tmp_path / "config.yml"
+        yaml_path.write_text(
+            "model: /tmp/model\n"
+            "parallel_config:\n"
+            "  cfg_size: 2\n"
+            "  tp_size: 2\n"
+            "  tp_sequence_parallel: true\n"
+        )
+        args = VisualGenArgs.from_yaml(yaml_path)
+        assert args.parallel_config.tp_sequence_parallel is True
+        dumped = args.model_dump()
+        assert dumped["parallel_config"]["tp_sequence_parallel"] is True
+        assert VisualGenArgs(**dumped).parallel_config == args.parallel_config
+
+
 class TestVisualGenArgsPickle:
     """VisualGenArgs must survive pickle round-trip (mp.Process spawn)."""
 
