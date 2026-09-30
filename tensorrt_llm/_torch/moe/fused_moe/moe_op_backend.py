@@ -579,6 +579,9 @@ class FlashinferOpBackend(MoEOpBackend):
         self._activation_type = _flashinfer_activation_type
         self._routing_method_type = _flashinfer_routing_method_type
         self._fused_moe = _flashinfer_fused_moe
+        # Resolve once before warmup/capture; the legacy provider contract is
+        # retained unless the shared fix is explicitly enabled.
+        self._fp4_contract_fix_enabled = os.getenv("TRTLLM_FLASHINFER_FP4_CONTRACT_FIX", "0") == "1"
         self._fp4_quantize = _flashinfer_fp4_quantize
         self._mxfp8_quantize = _flashinfer_mxfp8_quantize
 
@@ -626,6 +629,16 @@ class FlashinferOpBackend(MoEOpBackend):
         is_sf_8x4_layout: bool = False,
         enable_pdl: Optional[bool] = None,
     ):
+        if self._fp4_contract_fix_enabled:
+            return self._fp4_quantize(
+                input,
+                global_scale=global_scale,
+                sf_vec_size=sf_vec_size,
+                sf_use_ue8m0=sf_use_ue8m0,
+                is_sf_swizzled_layout=is_sf_swizzled_layout,
+                is_sf_8x4_layout=is_sf_8x4_layout,
+                enable_pdl=enable_pdl,
+            )
         return self._fp4_quantize(
             input,
             global_scale,
@@ -777,6 +790,17 @@ class FlashinferOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
         use_dp=False,
     ):
+        # The native provider accepts flattened linear scale factors. The
+        # FlashInfer API requires their leading dimension to be num_tokens.
+        if (
+            self._fp4_contract_fix_enabled
+            and hidden_states_scale is not None
+            and hidden_states_scale.ndim == 1
+        ):
+            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
+            tokens = hidden_states.shape[0]
+            if tokens > 0:
+                hidden_states_scale = hidden_states_scale.view(tokens, -1)
         if router_logits is not None:
             outputs = self._fused_moe.trtllm_fp4_block_scale_moe(
                 router_logits,
