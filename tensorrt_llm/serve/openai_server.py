@@ -786,7 +786,18 @@ class OpenAIServer(_VideoRoutesMixin):
             # expect.
             if self.metrics_collector:
                 self.metrics_collector.log_request_error(http_code=400)
-            return JSONResponse(status_code=400, content={"error": str(exc)})
+            # pydantic echoes each failing item's `input` verbatim, and a
+            # rejected multimodal part carries megabytes of base64 -- which
+            # then travels into the client's retry logs and, for a Kernel
+            # Factory agent, into the campaign STOP_REASON (measured: a whole
+            # PNG in one). The locations are the diagnostic content; the
+            # payload is not. Truncation is by error, so short messages are
+            # untouched.
+            detail = str(exc)
+            if len(detail) > 4096:
+                detail = detail[:4096] + " ... [truncated %d bytes]" % (
+                    len(detail) - 4096)
+            return JSONResponse(status_code=400, content={"error": detail})
 
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \

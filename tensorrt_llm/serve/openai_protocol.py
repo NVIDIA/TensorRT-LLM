@@ -1533,11 +1533,56 @@ class ResponsesRequest(OpenAIBaseModel):
                 return {**part, "annotations": []}
             return part
 
+        def _degrade_image(part):
+            """Replace an image content part with a text placeholder.
+
+            The Codex CLI attaches screenshots as ``input_image`` parts -- an
+            agent that plots something and views it sends the PNG back as
+            base64. The models served here are text-only, and the vendored
+            input union has no image member, so validation fell through to
+            ``ResponseInputTextParam`` and failed the WHOLE request with
+            "Field required: text" -- with the full base64 body echoed into
+            the error. The client retries a deterministic 400 until its
+            backoff limit and the campaign dies: 2 of the first 182
+            Kernel-Trace campaigns went exactly this way (2026-09-22).
+
+            A placeholder keeps the turn -- and with it the session -- alive,
+            and says what was dropped instead of leaking megabytes of base64.
+            """
+            if isinstance(part, dict) and part.get("type") == "input_image":
+                url = part.get("image_url") or ""
+                kind = url.split(";", 1)[0].removeprefix("data:") or "image"
+                return {
+                    "type":
+                    "input_text",
+                    "text":
+                    "[image omitted: %s, %d bytes as sent; this "
+                    "model accepts text only]" % (kind, len(url)),
+                }
+            return part
+
         cleaned = []
         for item in value:
             # A client may send a bare content part as a top-level item, not
             # only nested inside a message.
-            item = _with_annotations(item)
+            item = _with_annotations(_degrade_image(item))
+            if isinstance(item, dict) and isinstance(item.get("content"), list):
+                item = {
+                    **item,
+                    "content":
+                    [_degrade_image(part) for part in item["content"]],
+                }
+            # Tool results carry their parts under "output", not "content"
+            # (custom_tool_call_output / function_call_output). An agent that
+            # plots something gets the PNG back through the tool and Codex
+            # ships it as an input_image part in there -- 114 Kernel-Trace
+            # campaigns died on exactly this shape (2026-09-23) after the
+            # content/top-level shapes were already handled.
+            if isinstance(item, dict) and isinstance(item.get("output"), list):
+                item = {
+                    **item,
+                    "output": [_degrade_image(part) for part in item["output"]],
+                }
             if isinstance(item, dict) and item.get("type") in (None, "message"):
                 role = item.get("role")
                 if "id" in item and role in _ID_STRIPPED_ROLES:

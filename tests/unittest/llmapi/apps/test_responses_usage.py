@@ -225,3 +225,114 @@ def test_usage_reports_the_reasoning_tokens_it_counts():
 def test_usage_still_defaults_to_zero_reasoning_tokens():
     usage = _create_usage(_generation())
     assert usage.output_tokens_details.reasoning_tokens == 0
+
+
+# ---------------------------------------------------------------------------
+# input_image degradation
+# ---------------------------------------------------------------------------
+
+
+def test_an_image_part_degrades_to_a_text_placeholder():
+    """Regression: an input_image part 400'd the whole request.
+
+    Codex attaches screenshots as `input_image` (base64). The input union has
+    no image member, so validation fell through to ResponseInputTextParam and
+    rejected the request -- deterministically, so the client's retries all
+    failed and the campaign died on its backoff limit. Measured: 2 of the
+    first 182 Kernel-Trace campaigns, each with the full base64 body echoed
+    into the stop reason.
+    """
+    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+
+    req = ResponsesRequest(
+        model="m",
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "look at this"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                ],
+            },
+            # And as a bare top-level part, which clients also send.
+            {"type": "input_image", "image_url": "data:image/png;base64,BB"},
+        ],
+    )
+    dumped = req.model_dump()["input"]
+    texts = []
+    for item in dumped:
+        parts = item.get("content") if isinstance(item.get("content"), list) else [item]
+        for p in parts:
+            assert p.get("type") != "input_image", "image part survived"
+            if isinstance(p.get("text"), str):
+                texts.append(p["text"])
+    assert any("image omitted" in t and "image/png" in t for t in texts)
+    # The placeholder must not carry the base64 payload.
+    assert not any("AAAA" in t for t in texts)
+
+
+def test_an_image_in_a_tool_output_degrades_too():
+    """Regression: tool results carry parts under "output", not "content".
+
+    An agent that plots something gets the PNG back through the tool: Codex
+    sends `custom_tool_call_output` whose `output` list ends with an
+    `input_image` part. The first degrade pass only walked `content` and the
+    top level, so this shape still 400'd the whole request -- measured at 114
+    Kernel-Trace campaigns in the 24h after the content/top-level fix went
+    live (2026-09-23). Shape taken verbatim from a traced rejected request.
+    """
+    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+
+    req = ResponsesRequest(
+        model="m",
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "plot it"},
+                ],
+            },
+            {
+                "type": "custom_tool_call",
+                "id": "ctc_1",
+                "call_id": "call_1",
+                "name": "exec",
+                "input": "python plot.py",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {"type": "input_text", "text": "Script completed\n"},
+                    {"type": "input_text", "text": "layout-a2 image"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,CCCC"},
+                ],
+            },
+        ],
+    )
+    out = req.model_dump()["input"][2]["output"]
+    assert all(p.get("type") != "input_image" for p in out), (
+        "image part survived inside tool output"
+    )
+    joined = " ".join(p.get("text", "") for p in out)
+    assert "image omitted" in joined and "image/png" in joined
+    assert "CCCC" not in joined
+    # A plain-string tool output must pass through untouched.
+    req2 = ResponsesRequest(
+        model="m",
+        input=[
+            {
+                "type": "custom_tool_call",
+                "id": "ctc_2",
+                "call_id": "call_2",
+                "name": "exec",
+                "input": "true",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_2",
+                "output": "Script completed\n",
+            },
+        ],
+    )
+    assert req2.model_dump()["input"][1]["output"] == "Script completed\n"
