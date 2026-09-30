@@ -4146,6 +4146,24 @@ class BlockReuseConfig(StrictBaseModel):
         "Only used when "
         "`policy` is 'per_conversation'.")
 
+    swa_endpoint_rewind_tokens: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description="Extra tokens before the final SWA window whose cache blocks "
+        "receive higher eviction priority, together with sink blocks. Zero "
+        "disables the entire endpoint-priority callback. Positive values require "
+        "KV cache manager v2, block reuse enabled, and policy='all_reusable'. "
+        "This preference does not guarantee residency or change attention windows "
+        "or prefix matching. Dummy and draft requests are excluded.")
+
+    @model_validator(mode="after")
+    def validate_swa_endpoint_policy(self) -> 'BlockReuseConfig':
+        if self.swa_endpoint_rewind_tokens > 0 and self.policy != "all_reusable":
+            raise ValueError(
+                "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                "block_reuse_config.policy='all_reusable'.")
+        return self
+
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
@@ -4490,6 +4508,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             update={
                 "periodic_snapshot_interval": self.mamba_state_cache_interval
             })
+        return self
+
+    @model_validator(mode='after')
+    def validate_swa_endpoint_rewind(self) -> 'KvCacheConfig':
+        if self.block_reuse_config.swa_endpoint_rewind_tokens > 0:
+            if not self.enable_block_reuse:
+                raise ValueError(
+                    "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                    "kv_cache_config.enable_block_reuse=True.")
+            if self.use_kv_cache_manager_v2 is False:
+                raise ValueError(
+                    "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                    "kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
     @model_validator(mode='after')

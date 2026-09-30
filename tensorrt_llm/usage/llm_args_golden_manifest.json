@@ -575,6 +575,11 @@
       "path": "kv_cache_config.block_reuse_config.policy"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_config.copy_on_partial_reuse"
