@@ -330,14 +330,35 @@ def pulseScanSourceCode(llmRepo, ref) {
         sh "mv nspect_scan_report.json ${outputDir}/vulns.json"
     }
 }
+def getImageScriptArgs() {
+    // Validate and shell-quote the arguments passed to get_image_key_to_tag.py
+    def pipelineName = params.postMergePipelineName?.trim()
+    def buildNumber = params.postMergeBuildNumber?.trim()
+    if (pipelineName && buildNumber) {
+        if (!(pipelineName ==~ /^[A-Za-z0-9_.\-\/]+$/) || pipelineName.contains("..")) {
+            error("Invalid postMergePipelineName: '${pipelineName}'")
+        }
+        if (!(buildNumber ==~ /^[0-9]+$/)) {
+            error("Invalid postMergeBuildNumber (must be an integer): '${buildNumber}'")
+        }
+        return "'${pipelineName}' '${buildNumber}'"
+    }
+    if (pipelineName || buildNumber) {
+        error("postMergePipelineName and postMergeBuildNumber must be set together")
+    }
+    def branch = params.ref?.trim()
+    if (!branch || !(branch ==~ /^[A-Za-z0-9_.\-\/]+$/) || branch.contains("..")) {
+        error("Invalid ref for image lookup: '${branch}'")
+    }
+    return "'${branch}'"
+}
+
 def pulseLicenseScanContainer(llmRepo, ref) {
     // imageTags: key -> [image: <full image:tag>, platform: <platform or empty>]
     def imageTags = [:]
     def token
     container("cpu") {
-        def imageScriptArgs = (params.postMergePipelineName?.trim() && params.postMergeBuildNumber?.trim())
-            ? "${params.postMergePipelineName} ${params.postMergeBuildNumber}"
-            : "${params.ref}"
+        def imageScriptArgs = getImageScriptArgs()
         def output = sh(
             script: "python3 /tmp/get_image_key_to_tag.py ${imageScriptArgs}",
             returnStdout: true
@@ -410,9 +431,7 @@ def pulseMalwareScanContainer(llmRepo, ref) {
     def imageTags = [:]
     def token
     container("cpu") {
-        def imageScriptArgs = (params.postMergePipelineName?.trim() && params.postMergeBuildNumber?.trim())
-            ? "${params.postMergePipelineName} ${params.postMergeBuildNumber}"
-            : "${params.ref}"
+        def imageScriptArgs = getImageScriptArgs()
         def output = sh(
             script: "python3 /tmp/get_image_key_to_tag.py ${imageScriptArgs}",
             returnStdout: true
