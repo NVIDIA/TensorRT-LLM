@@ -1306,6 +1306,22 @@ def test_config_file_merge_migrates_legacy_mamba_interval_without_mutating_input
 
 
 @pytest.mark.cpu_only
+def test_config_file_merge_preserves_null_for_field_validation() -> None:
+    merged = update_llm_args_with_extra_dict(
+        {"attention_dp_config": llm_args_mod.AttentionDpConfig()}, {
+            "attention_dp_config": None,
+            "moe_config": None
+        })
+
+    assert merged["attention_dp_config"] is None
+    assert merged["moe_config"] is None
+    with pytest.raises(ValidationError):
+        TypeAdapter(
+            TorchLlmArgs.model_fields["moe_config"].annotation).validate_python(
+                merged["moe_config"])
+
+
+@pytest.mark.cpu_only
 def test_config_file_merge_rejects_legacy_and_new_mamba_intervals():
     with pytest.raises(ValueError, match="Cannot set both"):
         update_llm_args_with_extra_dict(
@@ -3316,6 +3332,32 @@ class TestServeDefaults:
             if isinstance(multimodal_config, BaseModel):
                 multimodal_config = multimodal_config.model_dump()
             assert multimodal_config["video_pruning_rate"] == expected
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["attention_dp_config", "dwdp_config", "reorder_policy_config"])
+    @pytest.mark.parametrize("use_yaml", [False, True])
+    def test_serve_set_null_optional_config(self, tmp_path: Path,
+                                            field_name: str,
+                                            use_yaml: bool) -> None:
+        args = ["dummy/model", "--set", f"{field_name}=null"]
+        if use_yaml:
+            config_path = tmp_path / "config.yaml"
+            config_path.write_text(f"{field_name}: {{}}\n", encoding="utf-8")
+            args.extend(["--config", str(config_path)])
+
+        with (
+                patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                      return_value=False),
+                patch("tensorrt_llm.commands.serve.launch_server") as
+                mock_launch_server,
+        ):
+            serve_main(args=args, standalone_mode=False)
+
+        mock_launch_server.assert_called_once()
+        llm_args = mock_launch_server.call_args.args[2]
+        assert field_name in llm_args
+        assert llm_args[field_name] is None
 
     def test_serve_set_rejects_visual_gen(self) -> None:
         with (
