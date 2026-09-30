@@ -52,9 +52,11 @@ jobs:
           close-issue-message: 'This issue was closed because it has been 14 days without activity since it has been marked as stale.'
           days-before-issue-stale: 14
           days-before-issue-close: 14
-          # Pull requests are handled by the pr-feedback job above; -1 disables them here.
+          # Pull requests are handled by the pr-feedback job above: -1 disables marking
+          # and closing, and the flag below keeps already-stale PRs from being unstaled.
           days-before-pr-stale: -1
           days-before-pr-close: -1
+          remove-pr-stale-when-updated: false
           only-labels: 'waiting for feedback'
           labels-to-add-when-unstale: 'Investigating'
           labels-to-remove-when-unstale: 'stale,waiting for feedback'
