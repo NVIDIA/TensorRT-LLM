@@ -49,8 +49,8 @@ if IS_FLASHINFER_AVAILABLE:
 
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
-from ..utils import (ActivationType, deep_gemm_jit_warmup_buckets,
-                     fp4_scale_infer_shape,
+from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
+                     deep_gemm_jit_warmup_buckets, fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      get_power_of_2_num_tokens_buckets,
                      is_nvfp4_marlin_supported_sm, last_positive_power_of_2,
