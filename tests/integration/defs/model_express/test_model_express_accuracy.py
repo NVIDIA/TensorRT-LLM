@@ -16,12 +16,12 @@
 
 Reference-backed accuracy canaries run on an MX receiver that starts from a
 metadata-only snapshot, so its weights can only have arrived through P2P from
-the live donor. The receiver worker evaluates the
-task itself, in its own subprocess, after checking that every rank wrote its
-transfer manifest at the MX P2P success boundary, and writes the score to JSON.
-This module only launches processes, loads the accuracy reference YAMLs, and
-asserts the hypothesis-testing threshold. There is no paired HF-baseline
-evaluation: the reference value *is* the baseline.
+the live donor. The receiver worker evaluates the task itself, in its own
+subprocess, after checking that every rank wrote its transfer manifest at the
+MX P2P success boundary, and writes the score to JSON. This module only
+launches processes, loads the accuracy reference YAMLs, and asserts the
+hypothesis-testing threshold. There is no paired HF-baseline evaluation: the
+reference value *is* the baseline.
 """
 
 from __future__ import annotations

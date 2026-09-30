@@ -220,10 +220,11 @@ representative row.
 
 `tests/integration/defs/model_express/test_model_express_accuracy.py` runs
 reference-backed accuracy canaries on an MX receiver. The donor publishes exactly as in the smoke test and never evaluates; the receiver starts
-from the metadata-only snapshot, self-checks its own transfer logs before
-spending any evaluation time (a fallback exits with status 3), evaluates the
-task with `tensorrt_llm.evaluate` inside its own subprocess, and writes the
-score to JSON. The pytest process never constructs an `LLM`: it loads the
+from the metadata-only snapshot and, right after load, confirms that every rank
+wrote its transfer manifest at the MX P2P success boundary. If any rank did
+not, the receiver exits with status 3 before spending any evaluation time.
+Otherwise it evaluates the task with `tensorrt_llm.evaluate` inside its own
+subprocess and writes the score to JSON. The pytest process never constructs an `LLM`: it loads the
 accuracy reference YAMLs, asserts the same hypothesis-testing threshold as
 `tests/integration/defs/accuracy/`, and additionally requires the transfer
 evidence and the donor/receiver weight manifests to match. There is no paired
