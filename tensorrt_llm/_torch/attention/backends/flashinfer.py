@@ -1053,6 +1053,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         pools = getattr(self, '_host_pool_indices', None) or {
             0: getattr(self, '_host_paged_kv_indices', None)
         }
+        # _sanitize_swa_page_indices parks evicted out-of-window pages on page
+        # 0, or on the reserved guard page when there is one; repeats of those
+        # are expected and the window mask drops them.
+        guard = getattr(self.kv_cache_manager, 'guard_page_indices', None)
+        parked = {0} | (set(guard()) if guard is not None else set())
         host_pools = {
             pool_id:
             (indices.cpu().numpy() if torch.is_tensor(indices) else indices)
@@ -1066,6 +1071,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 kv_lens_host,
                 self.page_size,
                 pool_size=pool_size,
+                parked_pages=parked,
             )
         except Exception as exc:  # pragma: no cover - a diagnostic must not break a run
             cls._page_table_check_budget -= 1
