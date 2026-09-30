@@ -276,7 +276,7 @@ class _Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
     ) -> torch.Tensor:
         """The layer, in plain torch over dequantized weights, fp32 throughout.
 
-        The documented exception to mirroring: `__call__` takes the *prepared*
+        The documented exception to mirroring: `raw_call` takes the *prepared*
         operands -- packed e2m1 codes, shuffled and padded rows, swizzled
         scales -- and a reference given those would be re-deriving the layout
         rather than the computation. So this takes the per-expert

@@ -242,7 +242,7 @@ class _FusedMoe(OpWrapper):
         """What the op computes, in plain torch, fp32 through both GEMMs.
 
         Takes the arguments that change the result rather than mirroring
-        `__call__`. The other ~40 are inert on the certified path -- a
+        `raw_call`. The other ~40 are inert on the certified path -- a
         reference that accepted them would have to ignore them, which reads
         as coverage it does not have.
 

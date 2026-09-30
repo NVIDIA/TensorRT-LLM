@@ -10,7 +10,7 @@ single test going red.
 
 This is the executable form of that contract:
 
-    __call__    the op call a target makes
+    raw_call    the op call a target makes
     reference   what the op is supposed to compute, in plain torch
     is_valid    the inputs the op takes and answers wrongly
     compare     how close the two have to be, and why
@@ -19,7 +19,7 @@ This is the executable form of that contract:
     note        what is left, and nothing that could have been one of the above
 
 `reference` and `CELLS` are the part that cannot go stale: the entry's test
-drives every cell through both `__call__` and `reference` and gates them with
+drives every cell through both `raw_call` and `reference` and gates them with
 `compare`, so a claim that stops holding stops the build.
 
 `CELLS` is also the answer to "can my model use this op?". A target author
