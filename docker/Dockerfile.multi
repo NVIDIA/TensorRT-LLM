@@ -143,6 +143,12 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     fi && \
     bash /opt/docker/common/install_ci.sh
 
+# Allow MPI/PRTE to run as root inside the container
+ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    PRTE_ALLOW_RUN_AS_ROOT=1 \
+    PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1
+
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm
 COPY cpp cpp

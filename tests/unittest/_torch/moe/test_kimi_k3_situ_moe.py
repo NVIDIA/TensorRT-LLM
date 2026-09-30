@@ -1222,8 +1222,15 @@ def test_tp8_sharded_forward_matches_whole_expert(num_tokens):
         pytest.param(32, 16, id="experts32-top16"),
     ],
 )
+# 3072 is 512-aligned; 2304 clears DeepGEMM's real `% 128` host check but not
+# 512, so it exercises the two intermediate SF records whose TMA-alignment
+# asserts `3rdparty/patches/deepgemm_mega_moe_intermediate_sf_alignment.patch`
+# drops. Without both the patch and the relaxed `MegaMoEDeepGemm` guard, the
+# 2304 arm either hard-aborts in `get_symm_buffer_size_for_mega_moe` or silently
+# falls back to a non-MegaMoE backend and compares TRTLLM-Gen with itself.
+@pytest.mark.parametrize("intermediate_size", [3072, 2304], ids=lambda n: f"inter{n}")
 def test_megamoe_deepgemm_situ_matches_trtllm_gen(
-    num_tokens, num_experts, top_k, _single_rank_nccl_process_group
+    num_tokens, num_experts, top_k, intermediate_size, _single_rank_nccl_process_group
 ):
     """Compare SiTU kernels with identical packed MXFP4 weights and routing.
 
@@ -1232,21 +1239,27 @@ def test_megamoe_deepgemm_situ_matches_trtllm_gen(
     quantized graphs therefore need semantic, rather than elementwise,
     parity: high cosine similarity and bounded relative L2 error.
     """
-    bank = _make_packed_expert_bank(num_experts, _TP_INTERMEDIATE, _TP_HIDDEN)
+    bank = _make_packed_expert_bank(num_experts, intermediate_size, _TP_HIDDEN)
     gate = _make_test_gate(num_experts=num_experts, top_k=top_k)
 
     trtllm_gen = _load_bank(
-        _make_routed_moe(_TP_INTERMEDIATE, gate, num_experts=num_experts),
+        _make_routed_moe(intermediate_size, gate, num_experts=num_experts),
         bank,
     )
     mega_moe = _load_bank(
         _make_routed_moe(
-            _TP_INTERMEDIATE,
+            intermediate_size,
             gate,
             num_experts=num_experts,
             moe_backend="MEGAMOE_DEEPGEMM",
         ),
         bank,
+    )
+    # A fallback would compare TRTLLM-Gen against itself and pass vacuously.
+    mega_backend = type(mega_moe.backend)
+    assert "mega_moe" in mega_backend.__module__ and mega_backend is not type(trtllm_gen.backend), (
+        f"MEGAMOE_DEEPGEMM fell back to {mega_backend.__module__}."
+        f"{mega_backend.__name__} for intermediate_size={intermediate_size}"
     )
 
     torch.manual_seed(37)

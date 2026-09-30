@@ -220,7 +220,7 @@ class TestRankState:
 
     def test_serialize(self):
         state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
-        assert state.serialize() == [0, 5, 100, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0]
+        assert state.serialize() == [0, 5, 100, 0, *RankIterStatsPayload().serialize(), 0, 0]
 
     def test_deserialize(self):
         state = RankState.deserialize(data=[2, 3, 50])

@@ -543,6 +543,12 @@ def launch_server(
         internal_disagg_auth_key: Optional[str] = None,
         report_addr: Optional[str] = None):
 
+    # Publish an explicit serving role before constructing/spawning the model.
+    # Remote-tail context workers use it to omit generation-only weights.
+    if server_role is not None:
+        os.environ[
+            DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = server_role.name.lower()
+
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
 
@@ -1456,6 +1462,7 @@ def serve(
             assert (
                 server_role is not None
             ), "server_role is required when metadata_server_cfg or disagg_cluster_config is provided"
+        if server_role is not None:
             try:
                 server_role = ServerRole[server_role.upper()]
             except KeyError:

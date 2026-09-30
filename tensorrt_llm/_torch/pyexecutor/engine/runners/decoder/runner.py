@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import Breakable
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     CUDAGraphRunnerConfig,
+    KeyType,
     get_mrope_dummy_seq_slot,
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -56,6 +57,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import warmup_sampling_module
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase
 from tensorrt_llm._torch.pyexecutor.trace_log_utils import log_mem_snapshot
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer
@@ -66,6 +68,7 @@ from tensorrt_llm._torch.speculative import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
 )
+from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len, resolve_draft_len
@@ -453,7 +456,11 @@ class DecoderRunner(ScheduledModelRunner):
         self._dynamic_draft_len_mapping = self._compute_dynamic_draft_len_mapping()
 
     def _initialize_cuda_graph_runner(self) -> CUDAGraphRunner | None:
-        return CUDAGraphRunner(self._cuda_graph_runner_config())
+        cuda_graph_runner = CUDAGraphRunner(self._cuda_graph_runner_config())
+        register_hooks = getattr(self.model, "register_cuda_graph_pre_replay_hooks", None)
+        if register_hooks is not None:
+            register_hooks(cuda_graph_runner)
+        return cuda_graph_runner
 
     def _cuda_graph_runner_config(self) -> CUDAGraphRunnerConfig:
         return CUDAGraphRunnerConfig(
@@ -671,6 +678,8 @@ class DecoderRunner(ScheduledModelRunner):
             "sampling_module_prewarm", metrics=self._metrics, metric_name="sampling_warmup_seconds"
         ):
             warmup_sampling_module()
+            self._prewarm_engram_kernels(kv_cache_manager)
+            self._prewarm_csa2_sparse_indexer(kv_cache_manager)
 
         if kv_cache_manager is None:
             logger.info("Skipping warm up as no KV Cache manager allocated.")
@@ -816,8 +825,9 @@ class DecoderRunner(ScheduledModelRunner):
         # empty. Waiting for the first padded step can race KV saturation:
         # once the cache is full, the lazy allocation in _get_padded_batch
         # fails every step and padded batches silently run eager.
-        with self._warmup_timer.phase("preallocate_padding_dummies"):
-            self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
+        if getattr(kv_cache_manager, "context_swa_layer_limit", None) is None:
+            with self._warmup_timer.phase("preallocate_padding_dummies"):
+                self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
         log_mem_snapshot("warmup/after_preallocate_padding_dummies")
 
         # If this is a BOLT-instrumented build (the profile-gen job sets
@@ -1914,31 +1924,38 @@ class DecoderRunner(ScheduledModelRunner):
                 ):
                     return
 
-                from tensorrt_llm._torch.modules.linear import (
-                    MXFP8LinearMethod,
-                    flashinfer_mxfp8_autotune,
-                    flashinfer_mxfp8_decode_graph_capture,
+                kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+                context_only = (
+                    getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None
                 )
-
-                # The automatic MiniMax-M3 MXFP8 selection is decode-graph-only.
-                # Tune every generation graph shape during the warmup-only pass.
-                # Keep piecewise context/prefill capture on the native backend.
-                flashinfer_methods = [
-                    quant_method
-                    for module in self.model.modules()
-                    if isinstance(
-                        (quant_method := getattr(module, "quant_method", None)), MXFP8LinearMethod
+                # Context-only workers only use the separate prefill capture.
+                if not context_only:
+                    from tensorrt_llm._torch.modules.linear import (
+                        MXFP8LinearMethod,
+                        flashinfer_mxfp8_autotune,
+                        flashinfer_mxfp8_decode_graph_capture,
                     )
-                    and quant_method.needs_flashinfer_autotune
-                ]
-                flashinfer_autotune_context = (
-                    flashinfer_mxfp8_autotune()
-                    if is_warmup_only and flashinfer_methods
-                    else contextlib.nullcontext()
-                )
-                with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture():
-                    self._capture_generation_cuda_graphs(resource_manager)
-                self._capture_additional_cuda_graphs(resource_manager)
+
+                    # The automatic MiniMax-M3 MXFP8 selection is decode-graph-only.
+                    # Tune every generation graph shape during the warmup-only pass.
+                    # Keep piecewise context/prefill capture on the native backend.
+                    flashinfer_methods = [
+                        quant_method
+                        for module in self.model.modules()
+                        if isinstance(
+                            (quant_method := getattr(module, "quant_method", None)),
+                            MXFP8LinearMethod,
+                        )
+                        and quant_method.needs_flashinfer_autotune
+                    ]
+                    flashinfer_autotune_context = (
+                        flashinfer_mxfp8_autotune()
+                        if is_warmup_only and flashinfer_methods
+                        else contextlib.nullcontext()
+                    )
+                    with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture():
+                        self._capture_generation_cuda_graphs(resource_manager)
+                    self._capture_additional_cuda_graphs(resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the
         # whole-model attention workspace. Capture them only on the second pass.
         if not is_warmup_only:
@@ -2324,6 +2341,16 @@ class DecoderRunner(ScheduledModelRunner):
 
         if num_gen_requests > self._config.max_batch_size:
             return None
+        if (
+            num_gen_requests > 0
+            and getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None
+        ):
+            # Generic warmup also requests decode/mixed shapes. Exercise their
+            # token and batch bounds as fresh context rows on an encoder-only
+            # cache; actual generation requests remain invalid. Packing many
+            # requests preserves N one-token rows for the max-batch shape.
+            num_gen_requests = 0
+            least_requests = False
         num_gen_tokens = num_gen_requests * (1 + self._config.max_total_draft_tokens)
         if num_gen_tokens > self._config.max_num_tokens:
             return None
@@ -2337,8 +2364,7 @@ class DecoderRunner(ScheduledModelRunner):
         max_seq_len = self._config.max_seq_len - 1
         if max_seq_len < 1:
             return None
-        num_full_seqs = 0
-        num_left_over_tokens = 0
+        ctx_token_nums = []
 
         max_context_requests = self._config.max_batch_size - num_gen_requests
         if max_context_requests * max_seq_len < num_ctx_tokens:
@@ -2346,18 +2372,20 @@ class DecoderRunner(ScheduledModelRunner):
 
         if num_ctx_tokens > 0:
             if least_requests:
-                num_full_seqs = num_ctx_tokens // max_seq_len
-                num_left_over_tokens = num_ctx_tokens - num_full_seqs * max_seq_len
-
+                num_full_seqs, remainder = divmod(num_ctx_tokens, max_seq_len)
+                ctx_token_nums = [max_seq_len] * num_full_seqs
+                if remainder:
+                    ctx_token_nums.append(remainder)
             else:
                 max_bs = min(num_ctx_tokens, max_context_requests)
-                if num_ctx_tokens % max_bs == 0:
-                    num_full_seqs = max_bs
-                else:
-                    num_full_seqs = max_bs - 1
-                max_seq_len = num_ctx_tokens // num_full_seqs
-                num_left_over_tokens = num_ctx_tokens - max_seq_len * num_full_seqs
-            num_ctx_requests = num_full_seqs + (1 if num_left_over_tokens > 0 else 0)
+                # Keep every admitted request row while balancing lengths.
+                # This covers the largest batch without exceeding max_seq_len
+                # on uneven totals (five tokens in two rows become [3, 2]).
+                base_length, remainder = divmod(num_ctx_tokens, max_bs)
+                ctx_token_nums = [base_length + 1] * remainder + [base_length] * (
+                    max_bs - remainder
+                )
+            num_ctx_requests = len(ctx_token_nums)
 
         if num_ctx_requests + num_gen_requests > self._config.max_batch_size:
             return None  # Not enough batch size to fill the request
@@ -2378,9 +2406,9 @@ class DecoderRunner(ScheduledModelRunner):
 
         extra_ctx_tokens = getattr(kv_cache_manager, "num_extra_kv_tokens", 0) or 0
         extra_gen_tokens = extra_ctx_tokens + self._config.max_draft_loop_tokens
-        blocks_to_use = num_full_seqs * blocks_for_seq(max_seq_len + extra_ctx_tokens)
-        if num_left_over_tokens > 0:
-            blocks_to_use += blocks_for_seq(num_left_over_tokens + extra_ctx_tokens)
+        blocks_to_use = sum(
+            blocks_for_seq(token_num + extra_ctx_tokens) for token_num in ctx_token_nums
+        )
         blocks_to_use += (
             num_gen_requests * self._config.max_beam_width * blocks_for_seq(1 + extra_gen_tokens)
         )
@@ -2389,10 +2417,6 @@ class DecoderRunner(ScheduledModelRunner):
             return None
 
         if num_ctx_tokens > 0:
-            ctx_token_nums = [max_seq_len] * num_full_seqs
-            if num_left_over_tokens > 0:
-                ctx_token_nums.append(num_left_over_tokens)
-
             if chunk_alignment:
                 adjusted = self._apply_chunk_alignment(
                     ctx_token_nums, chunk_alignment, chunk_aligned
@@ -2472,6 +2496,8 @@ class DecoderRunner(ScheduledModelRunner):
         """Creates a dummy ScheduledRequests tailored for CUDA graph capture."""
         capture_sampling_params = NON_GREEDY_CAPTURE_SAMPLING_PARAMS if force_non_greedy else None
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        if getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None:
+            return None
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
 
         available_blocks = kv_cache_manager.get_num_free_blocks() // self._config.max_beam_width
@@ -2880,12 +2906,12 @@ class DecoderRunner(ScheduledModelRunner):
                 ),
                 gathered.T.tolist(),
             )
-        num_tokens = attn_metadata.num_tokens
+        counts = attn_metadata.get_adp_token_counts()
         if self.mapping.has_cp_helix():
-            num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
-        gathered = self.dist.tp_cp_allgather_int64([num_tokens, *spec_counts])
+            counts = [math.ceil(count / self.mapping.cp_size) for count in counts]
+        gathered = self.dist.tp_cp_allgather_int64([*counts, *spec_counts])
         cols = gathered.T.tolist()
-        return cols[0], cols[1:]
+        return (attn_metadata.set_adp_token_counts(cols[: len(counts)]), cols[len(counts) :])
 
     def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
         """All-gather the per-rank greedy flags and store the group AND.
@@ -3169,6 +3195,7 @@ class DecoderRunner(ScheduledModelRunner):
         enable_spec_decode: bool,
         runtime_draft_len: int,
         is_dummy: bool,
+        gather_context_logits: bool = False,
     ) -> tuple[dict[str, Any], torch.Tensor | None, int]:
         """
         Prepare inputs for Pytorch Model.
@@ -3266,6 +3293,10 @@ class DecoderRunner(ScheduledModelRunner):
             draft_lens.append(0)
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
+            if getattr(request, "py_ced_replay", None) is not None:
+                from tensorrt_llm._torch.pyexecutor.ced_replay import encoder_replay_tokens
+
+                begin_compute -= encoder_replay_tokens(request)
             if context_prompt_lookahead is not None:
                 context_prompt_lookahead.append(
                     _get_context_prompt_lookahead_token(request, end_compute)
@@ -3291,7 +3322,7 @@ class DecoderRunner(ScheduledModelRunner):
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num - request.py_num_compressed_tokens)
-            request.cached_tokens = past_seen_token_num
+            request.cached_tokens = request.context_current_position
             extra_inputs.add_context_request(request)
 
             # Embed mask is required only for partial iterations (chunked
@@ -3875,6 +3906,10 @@ class DecoderRunner(ScheduledModelRunner):
             previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
             return previous_slots
 
+        if scheduled_requests.is_attention_dp_phase_idle:
+            # Graph padding normally reuses an existing input buffer. An idle
+            # rank has no real row to initialize that buffer on its first step.
+            input_ids = [1] * len(position_ids)
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
         total_num_tokens = len(position_ids)
@@ -4015,8 +4050,7 @@ class DecoderRunner(ScheduledModelRunner):
                     )
                 if segment.shape[0] != 3 and segment.shape[-1] == 3:
                     logger.warning(
-                        "Transposing unexpected mrope_position_ids shape from "
-                        f"{tuple(segment.shape)}"
+                        f"Transposing unexpected mrope_position_ids shape from {tuple(segment.shape)}"
                     )
                     segment = segment.transpose(0, 2).contiguous()
                 if segment.shape[:2] != (3, 1):
@@ -4084,6 +4118,24 @@ class DecoderRunner(ScheduledModelRunner):
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = scheduled_requests.num_context_requests
+        remote_tail_modes = {
+            getattr(request, "py_csa2_remote_tail_mode", None)
+            for request in scheduled_requests.context_requests
+        }
+        remote_tail_modes.discard(None)
+        if remote_tail_modes:
+            if len(remote_tail_modes) != 1 or any(
+                getattr(request, "py_csa2_remote_tail_mode", None) is None
+                for request in scheduled_requests.context_requests
+            ):
+                raise ValueError("CSA2 remote-tail context batches must be homogeneous")
+            attn_metadata.csa2_remote_tail_mode = next(iter(remote_tail_modes))
+            attn_metadata.csa2_remote_tail_starts = [
+                request.py_csa2_remote_tail_start for request in scheduled_requests.context_requests
+            ]
+        else:
+            attn_metadata.csa2_remote_tail_mode = None
+            attn_metadata.csa2_remote_tail_starts = []
         # Use num_chunked_ctx_requests to record the number of extend context requests,
         # so that we can update the kv_lens_cuda correctly in _preprocess_inputs.
         attn_metadata.num_chunked_ctx_requests = 0
@@ -4115,6 +4167,14 @@ class DecoderRunner(ScheduledModelRunner):
         # pre-prepare counts so the steady-gen recording below stores values
         # that the per-step prepare() can re-clamp from scratch.
         num_cached_tokens_snapshot = list(num_cached_tokens_per_seq)
+        prepare_context_replay = getattr(attn_metadata, "prepare_context_replay", None)
+        if prepare_context_replay is not None:
+            prepare_context_replay(
+                scheduled_requests.context_requests,
+                allow_final_window=(
+                    self._config.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
+                ),
+            )
         attn_metadata.prepare()
         extra_model_inputs = extra_inputs.build(attn_metadata, resource_manager)
 
@@ -4142,8 +4202,30 @@ class DecoderRunner(ScheduledModelRunner):
             spec_metadata.num_generations = scheduled_requests.num_generation_requests
             spec_metadata.seq_lens = sequence_lengths
 
+        # Resolve row selection before the existing attention/spec count
+        # exchange. Prefill graph padding is selected collectively below and
+        # keeps the complete input shape on every rank.
+        attn_metadata.padded_num_tokens = None
+        prepare_adp_inputs = getattr(self.model, "prepare_adp_inputs", None)
+        if self._config.enable_attention_dp and prepare_adp_inputs is not None:
+            prepare_adp_inputs(
+                attn_metadata,
+                all_token_states_required=(
+                    gather_context_logits
+                    or (
+                        spec_metadata is not None
+                        and not isinstance(spec_metadata, DSparkSpecMetadata)
+                    )
+                ),
+                requests=scheduled_requests.context_requests,
+            )
+
         spec_all_rank_counts = None
-        if spec_metadata is not None and self._config.enable_attention_dp:
+        if scheduled_requests.attention_dp_phase is RemoteTailPhase.DECODE:
+            attn_all_rank_num_tokens = self._get_remote_tail_decode_rank_tokens(
+                attn_metadata, maybe_graph
+            )
+        elif spec_metadata is not None and self._config.enable_attention_dp:
             (attn_all_rank_num_tokens, spec_all_rank_counts) = (
                 self._get_all_rank_num_tokens_and_spec_counts(attn_metadata, spec_metadata)
             )
@@ -4161,7 +4243,12 @@ class DecoderRunner(ScheduledModelRunner):
                 attn_all_rank_num_tokens,
                 dist=self.dist,
                 enable_attention_dp=self._config.enable_attention_dp,
-                prefill_cuda_graph_backend=self._config.prefill_cuda_graph_backend,
+                prefill_cuda_graph_backend=(
+                    PrefillCudaGraphBackend.DISABLED
+                    if remote_tail_modes
+                    or scheduled_requests.attention_dp_phase is RemoteTailPhase.CONTEXT
+                    else self._config.prefill_cuda_graph_backend
+                ),
                 prefill_cuda_graph_num_tokens=self._config.prefill_cuda_graph_num_tokens,
             )
         )
@@ -4346,6 +4433,7 @@ class DecoderRunner(ScheduledModelRunner):
         enable_spec_decode: bool,
         runtime_draft_len: int,
         is_dummy: bool,
+        gather_context_logits: bool = False,
     ) -> tuple[dict[str, Any], torch.Tensor | None, int]:
         set_per_request_prefill_cuda_graph_flag(False)
         if self.mapping is not None and "cp_type" in self.mapping.cp_config:
@@ -4381,7 +4469,12 @@ class DecoderRunner(ScheduledModelRunner):
                         sa_manager.add_request(request.py_request_id, request.get_tokens(0))
                         sa_manager._initialized_requests.add(request.py_request_id)
 
-        return self._prepare_tp_inputs(
+        # Outside capture, before any steady-input early return in the TP path.
+        prepare_request_inputs = getattr(self.model, "prepare_request_inputs", None)
+        if prepare_request_inputs is not None:
+            prepare_request_inputs(scheduled_requests, attn_metadata, promoted_context_request_ids)
+
+        inputs, gather_ids, runtime_draft_len = self._prepare_tp_inputs(
             scheduled_requests,
             kv_cache_manager,
             attn_metadata,
@@ -4395,7 +4488,23 @@ class DecoderRunner(ScheduledModelRunner):
             enable_spec_decode=enable_spec_decode,
             runtime_draft_len=runtime_draft_len,
             is_dummy=is_dummy,
+            gather_context_logits=gather_context_logits,
         )
+        from tensorrt_llm._torch.pyexecutor.ced_replay import (
+            encoder_replay_tokens,
+            uses_private_decoder_cache,
+        )
+
+        if scheduled_requests.num_context_requests and (
+            (
+                self._config.enable_attention_dp
+                and getattr(self.model, "prepare_adp_inputs", None) is not None
+            )
+            or uses_private_decoder_cache(getattr(self.model, "model", None), kv_cache_manager)
+            or any(encoder_replay_tokens(req) for req in scheduled_requests.context_requests)
+        ):
+            inputs["context_requests"] = scheduled_requests.context_requests
+        return inputs, gather_ids, runtime_draft_len
 
     def _forward_warmup(
         self,
@@ -4430,6 +4539,8 @@ class DecoderRunner(ScheduledModelRunner):
         runtime_draft_len = forward_inputs.runtime_draft_len
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         assert kv_cache_manager is not None, "the legacy runner requires a KV cache manager"
+        semantic_requests = scheduled_requests
+        scheduled_requests = self._get_attention_dp_execution_batch(scheduled_requests)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
 
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager, draft_kv_cache_manager)
@@ -4452,6 +4563,11 @@ class DecoderRunner(ScheduledModelRunner):
             spec_metadata = None
 
         moe_load_balancer = self.moe_load_balancer
+        from tensorrt_llm._torch.pyexecutor.ced_replay import uses_private_decoder_cache
+
+        ced_enabled = uses_private_decoder_cache(
+            getattr(self.model, "model", None), kv_cache_manager
+        )
         graph_requests = scheduled_requests
         promoted_context_request_ids: frozenset[int] = frozenset()
         # Non-linear tree input preparation expands runtime_draft_len to the
@@ -4469,8 +4585,13 @@ class DecoderRunner(ScheduledModelRunner):
         # q_len=1 path. Encoder-decoder and non-LLM engines remain out of scope.
         if (
             scheduled_requests.num_context_requests > 0
+            and scheduled_requests.attention_dp_phase is not RemoteTailPhase.CONTEXT
+            # A physically pruned context cache cannot become a decode
+            # batch, including single-token synthetic prefill warmup rows.
+            and getattr(kv_cache_manager, "context_swa_layer_limit", None) is None
             and self.cuda_graph_runner.enabled
             and can_promote_spec_decode
+            and not ced_enabled
             and not self.use_beam_search
             and self._context_graph_promotion_supported
             # PLE owns recurrent n-gram and convolution state. Promoting a
@@ -4527,7 +4648,9 @@ class DecoderRunner(ScheduledModelRunner):
                 )
             )
 
-            can_run_graph = key is not None
+            can_run_graph = key is not None and not (
+                ced_enabled and scheduled_requests.num_context_requests > 0
+            )
             if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata
@@ -4568,21 +4691,26 @@ class DecoderRunner(ScheduledModelRunner):
                     execution_requests.generation_requests,
                 )
 
-            inputs, gather_ids, runtime_draft_len = self._prepare_inputs(
-                execution_requests,
-                kv_cache_manager,
-                attn_metadata,
-                spec_metadata,
-                new_tensors_device,
-                cache_indirection_buffer,
-                resource_manager,
-                can_run_graph,
-                execution_promoted_context_ids,
-                use_lora_graph=use_lora_graph,
+            with self._cuda_graph_metadata_prepare_scope(
+                attn_metadata, key, execution_requests, execution_promoted_context_ids,
                 enable_spec_decode=enable_spec_decode,
-                runtime_draft_len=runtime_draft_len,
-                is_dummy=is_dummy,
-            )
+            ):
+                inputs, gather_ids, runtime_draft_len = self._prepare_inputs(
+                    execution_requests,
+                    kv_cache_manager,
+                    attn_metadata,
+                    spec_metadata,
+                    new_tensors_device,
+                    cache_indirection_buffer,
+                    resource_manager,
+                    can_run_graph,
+                    execution_promoted_context_ids,
+                    use_lora_graph=use_lora_graph,
+                    enable_spec_decode=enable_spec_decode,
+                    runtime_draft_len=runtime_draft_len,
+                    is_dummy=is_dummy,
+                    gather_context_logits=gather_context_logits,
+                )
             if execution_promoted_context_ids:
                 self.iter_states["num_ctx_requests"] = scheduled_requests.num_context_requests
                 self.iter_states["num_ctx_tokens"] = sum(
@@ -4626,6 +4754,13 @@ class DecoderRunner(ScheduledModelRunner):
                         # real eager or BCG warmup or PCG
                         outputs = forward_step()
                 else:
+                    position_id_offsets = None
+                    if (
+                        enable_spec_decode
+                        and not self._config.disable_overlap_scheduler
+                        and attn_metadata.kv_cache_manager is not None
+                    ):
+                        position_id_offsets = self.previous_pos_id_offsets_cuda
                     needs_capture = self.cuda_graph_runner.needs_capture(key)
                     if needs_capture:
 
@@ -4664,7 +4799,9 @@ class DecoderRunner(ScheduledModelRunner):
                             attn_metadata, draft_kv_cache_manager
                         )
                         try:
-                            outputs = self.cuda_graph_runner.replay(key, inputs)
+                            outputs = self.cuda_graph_runner.replay(
+                                key, inputs, position_id_offsets=position_id_offsets
+                            )
                         finally:
                             restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
                     else:
@@ -4673,17 +4810,20 @@ class DecoderRunner(ScheduledModelRunner):
                         )
                         try:
                             with MoeLoadBalancerIterContext(moe_load_balancer):
-                                outputs = self.cuda_graph_runner.replay(key, inputs)
+                                outputs = self.cuda_graph_runner.replay(
+                                    key, inputs, position_id_offsets=position_id_offsets
+                                )
                         finally:
                             restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
-            self._execute_logit_post_processors(scheduled_requests, outputs)
+            self._execute_logit_post_processors(semantic_requests, outputs)
 
             if not isinstance(outputs, dict):
                 return outputs
+            outputs = self._restore_attention_dp_semantic_outputs(semantic_requests, outputs)
             return {**outputs, "runtime_draft_len": runtime_draft_len}
 
     def model_forward(self, *, is_dummy: bool, **kwargs):
@@ -4719,11 +4859,22 @@ class DecoderRunner(ScheduledModelRunner):
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
-        outputs = self.model_forward(
-            **inputs,
-            is_dummy=is_dummy,
-            return_context_logits=gather_ids is not None or gather_context_logits,
-        )
+        dspark_metadata = inputs.get("spec_metadata")
+        if isinstance(dspark_metadata, DSparkSpecMetadata):
+            # CED retains the final context row and all verification rows.
+            # Distinguish that sparse gather from a real all-context request.
+            dspark_metadata._requires_all_context_logits = bool(gather_context_logits)
+        try:
+            outputs = self.model_forward(
+                **inputs,
+                is_dummy=is_dummy,
+                return_context_logits=gather_ids is not None or gather_context_logits,
+            )
+        finally:
+            if isinstance(dspark_metadata, DSparkSpecMetadata):
+                # Do not let a later direct caller inherit engine-only proof
+                # that dropping non-final context rows is safe.
+                dspark_metadata._requires_all_context_logits = None
 
         if self._config.without_logits:
             return outputs
@@ -4837,3 +4988,140 @@ class DecoderRunner(ScheduledModelRunner):
     def _wait_for_decoder_input_copy(self) -> None:
         if self._prepare_inputs_event is not None:
             self._prepare_inputs_event.synchronize()
+
+    def _prewarm_engram_kernels(
+        self, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None
+    ) -> None:
+        """Compile Engram kernels before conditional model warmup."""
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
+            CSA2CacheManager,
+        )
+
+        if not isinstance(kv_cache_manager, CSA2CacheManager):
+            return
+
+        from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41Engram
+
+        with torch.inference_mode():
+            for module in self.model.modules():
+                if isinstance(module, DeepseekV41Engram):
+                    module.warmup_kernels()
+        torch.cuda.synchronize()
+        # Idle attention-DP ranks also finish JIT before collective forwards.
+        if self.mapping.tp_size > 1 and self.dist is not None:
+            self.dist.tp_allgather(1)
+        logger.info("Engram kernel prewarm complete")
+
+    def _prewarm_csa2_sparse_indexer(
+        self, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None
+    ) -> None:
+        """Compile the DeepGEMM sparse MQA-logits kernels of the CSA2 candidate
+        consumers before the first collective-bearing forward.
+
+        Like `_warmup_dg_paged_mqa_logits_metadata` for DSA, this moves
+        deep_gemm's JIT (nvcc/ptxas, several seconds per kernel) out of the
+        warm-up forwards, where it would count against the MoE all-to-all
+        completion deadline. The kernels are specialized on the candidate
+        geometry only, so one compile per kernel covers every layer and batch.
+        Best-effort: a failure here only defers the compile to the first use.
+        """
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
+            CSA2CacheManager,
+        )
+
+        if not isinstance(kv_cache_manager, CSA2CacheManager):
+            return
+
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import (
+            prewarm_sparse_candidate_kernels,
+        )
+
+        config = self.model.model_config.pretrained_config
+        with torch.inference_mode():
+            try:
+                compiled = prewarm_sparse_candidate_kernels(
+                    kv_cache_manager.layout,
+                    config.index_n_heads,
+                    config.index_head_dim,
+                    torch.device("cuda"),
+                )
+            except RuntimeError as e:
+                logger.warning(f"CSA2 sparse indexer prewarm skipped. {type(e).__name__}: {e}")
+                compiled = False
+        torch.cuda.synchronize()
+        if self.mapping.tp_size > 1 and self.dist is not None:
+            self.dist.tp_allgather(1)
+        if compiled:
+            logger.info("CSA2 sparse indexer prewarm complete")
+
+    def _cuda_graph_metadata_prepare_scope(
+        self,
+        attn_metadata: AttentionMetadata,
+        key,
+        scheduled_requests: ScheduledRequests,
+        promoted_context_request_ids: frozenset[int],
+        *,
+        enable_spec_decode: bool,
+    ):
+        """Allow derived outputs only when this forward owns a decode graph.
+
+        Both capture/warmup and replay execute _preprocess_inputs before model
+        consumers. Non-speculative overlap has the same ordering; speculative
+        acceptance corrections and draft-manager swaps keep full preparation.
+        """
+        defer = getattr(attn_metadata, "defer_cuda_graph_decode_outputs", None)
+        if (
+            defer is not None
+            and isinstance(key, KeyType)
+            and attn_metadata.is_cuda_graph is True
+            and key.num_contexts == 0
+            and key.draft_len == 0
+            and scheduled_requests.num_context_requests == 0
+            and scheduled_requests.num_generation_requests > 0
+            and not promoted_context_request_ids
+            and not enable_spec_decode
+            and not self.use_beam_search
+            and self._context_graph_promotion_supported
+            and self.mapping.cp_size == 1
+        ):
+            return defer()
+        return contextlib.nullcontext()
+
+    def _get_remote_tail_decode_rank_tokens(
+        self, attn_metadata: AttentionMetadata, can_run_graph: bool
+    ) -> list[int]:
+        """Require captured decode on every rank in the normal token-count vote."""
+        gathered = self.dist.tp_allgather_int64([attn_metadata.num_tokens, int(can_run_graph)])
+        if not gathered[:, 1].all():
+            raise RuntimeError(
+                "Conditional attention-DP decode requires a captured CUDA "
+                "graph on every rank; at least one rank missed its graph"
+            )
+        return gathered[:, 0].tolist()
+
+    def _get_attention_dp_execution_batch(
+        self, scheduled_requests: ScheduledRequests
+    ) -> ScheduledRequests:
+        """Give a phase-idle rank its retained graph row without admitting work."""
+        if not scheduled_requests.is_attention_dp_phase_idle:
+            return scheduled_requests
+        if scheduled_requests.batch_size or scheduled_requests.encoder_requests:
+            raise ValueError("An attention-DP phase-idle batch must be semantically empty")
+        dummy = self.cuda_graph_runner.padding_dummy_requests.get(0)
+        if dummy is None:
+            raise RuntimeError("The retained attention-DP execution row is missing")
+        execution_requests = ScheduledRequests()
+        execution_requests.attention_dp_phase = scheduled_requests.attention_dp_phase
+        execution_requests.is_attention_dp_phase_idle = True
+        execution_requests.generation_requests = [dummy]
+        return execution_requests
+
+    @staticmethod
+    def _restore_attention_dp_semantic_outputs(
+        scheduled_requests: ScheduledRequests, outputs: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not scheduled_requests.is_attention_dp_phase_idle:
+            return outputs
+        # The sampler sees the original empty batch, never the execution row.
+        # Copy the map because CUDA graph outputs are retained across replays.
+        return {**outputs, "logits": outputs["logits"][:0]}

@@ -37,6 +37,8 @@
 #include <limits>
 #include <memory>
 #include <thread>
+#include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -46,6 +48,249 @@ using namespace tensorrt_llm::batch_manager::kv_cache_manager_v2;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeConfig;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeTieredConfig;
 using tensorrt_llm::common::TllmException;
+
+KVCacheManagerConfig makeOptionalDiskConfig(bool hostTier)
+{
+    auto config = makeConfig();
+    if (hostTier)
+    {
+        config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
+    }
+    config.cacheTiers.emplace_back(DiskCacheTierConfig{4 << 20, "/tmp"});
+    for (int i = 1; i <= 2; ++i)
+    {
+        auto layer = std::get<AttentionLayerConfig>(config.layers.front());
+        layer.layerId = i;
+        layer.slidingWindowSize = i == 1 ? 4 : 2;
+        layer.reusePolicy = AttentionReusePolicy::OPTIONAL;
+        // Unequal buffer sizes exercise multiple physical pools per page.
+        layer.buffers.push_back(BufferConfig{"score", 1024, std::nullopt});
+        config.layers.emplace_back(std::move(layer));
+    }
+    return config;
+}
+
+// A custom lossless codec using host indices and ordinary CUDA copies. Its
+// padded representation deliberately differs from the default cold layout.
+class OptionalTestColdPageCodec final : public IKvCacheColdPageCodec
+{
+public:
+    bool configure(PoolGroupDesc const* groups, PoolGroupIndex count) noexcept override
+    {
+        for (int i = 0; i < count.value(); ++i)
+        {
+            for (auto const& variant : groups[i].slotDesc.variants)
+            {
+                mLayouts.emplace(variant.lifeCycleId.value(), groups[i]);
+            }
+        }
+        return true;
+    }
+
+    size_t queryColdPageBytes(LayerGroupId id) const noexcept override
+    {
+        auto const it = mLayouts.find(id.value());
+        if (it == mLayouts.end())
+        {
+            return 0;
+        }
+        size_t bytes = 64;
+        for (auto const& pool : it->second.pools)
+        {
+            bytes += pool.slotBytes;
+        }
+        return bytes;
+    }
+
+    PageIndexLocation queryPageIndexLocation(LayerGroupId) const noexcept override
+    {
+        return PageIndexLocation::kHost;
+    }
+
+    bool encode(
+        LayerGroupId id, void* cold, PageIndexPair const* indices, size_t count, cudaStream_t stream) noexcept override
+    {
+        ++encodeCalls;
+        return copy(id, cold, indices, count, stream, true);
+    }
+
+    bool decode(LayerGroupId id, void const* cold, PageIndexPair const* indices, size_t count,
+        cudaStream_t stream) noexcept override
+    {
+        ++decodeCalls;
+        return copy(id, const_cast<void*>(cold), indices, count, stream, false);
+    }
+
+    int encodeCalls = 0;
+    int decodeCalls = 0;
+
+private:
+    bool copy(LayerGroupId id, void* cold, PageIndexPair const* indices, size_t count, cudaStream_t stream,
+        bool encode) noexcept
+    {
+        auto const it = mLayouts.find(id.value());
+        if (it == mLayouts.end())
+        {
+            return false;
+        }
+        size_t const coldBytes = queryColdPageBytes(id);
+        for (size_t i = 0; i < count; ++i)
+        {
+            auto const hotIndex = encode ? indices[i].src : indices[i].dst;
+            auto const coldIndex = encode ? indices[i].dst : indices[i].src;
+            size_t offset = 64;
+            for (auto const& pool : it->second.pools)
+            {
+                auto* hotPtr = reinterpret_cast<char*>(pool.baseAddress) + hotIndex * pool.slotBytes;
+                auto* coldPtr = static_cast<char*>(cold) + coldIndex * coldBytes + offset;
+                auto const status = cudaMemcpyAsync(
+                    encode ? coldPtr : hotPtr, encode ? hotPtr : coldPtr, pool.slotBytes, cudaMemcpyDefault, stream);
+                if (status != cudaSuccess)
+                {
+                    return false;
+                }
+                offset += pool.slotBytes;
+            }
+        }
+        return true;
+    }
+
+    std::unordered_map<int, PoolGroupDesc> mLayouts;
+};
+
+class OptionalDiskCheckpointTest : public ::testing::TestWithParam<std::tuple<bool, bool>>
+{
+};
+
+TEST_P(OptionalDiskCheckpointTest, PayloadRestoreRetryAndIndependentEviction)
+{
+    auto const [hostTier, customCodec] = GetParam();
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    FuncGuard streamGuard([&] { cudaStreamDestroy(stream); });
+    auto codec = customCodec ? std::make_unique<OptionalTestColdPageCodec>() : nullptr;
+    auto* codecObserver = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(makeOptionalDiskConfig(hostTier), nullptr, std::move(codec));
+    auto& storage = manager->storage();
+    auto const global = manager->getLayerGroupId(LayerId{0});
+    auto const encoder = manager->getLayerGroupId(LayerId{1});
+    auto const peer = manager->getLayerGroupId(LayerId{2});
+    auto const hotGroup = storage.getPoolGroupIndex(kHotLevel, encoder);
+    auto const sizes = storage.slotSize(hotGroup);
+    ASSERT_EQ(sizes.size(), PoolIndex{2});
+    std::vector<TokenIdExt> tokens;
+    for (int i = 0; i < 8; ++i)
+    {
+        tokens.emplace_back(TokenId{i});
+    }
+    TokenSpan const span{tokens.data(), static_cast<int>(tokens.size())};
+    auto source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(stream));
+    ASSERT_TRUE(source->resize(8));
+    for (auto const id : {encoder, peer})
+    {
+        auto const slot = SlotId{source->getBasePageIndices(id)[1]};
+        for (int p = 0; p < sizes.size().value(); ++p)
+        {
+            auto const address = std::get<MemAddress>(storage.slotAddress(kHotLevel, hotGroup, slot, PoolIndex{p}));
+            ASSERT_EQ(
+                cudaMemsetAsync(reinterpret_cast<void*>(address), 31 + id.value() * 7 + p, sizes[PoolIndex{p}], stream),
+                cudaSuccess);
+        }
+    }
+    source->commit(span);
+    auto block = source->blocks()[BlockOrdinal{1}].treeBlock;
+    auto* globalPage = block->getPage(global);
+    auto const* encoderPage = block->getPage(encoder);
+    auto const* peerPage = block->getPage(peer);
+    source->close();
+
+    auto pressure = [&](CacheLevel level)
+    {
+        auto const group = storage.getPoolGroupIndex(level, encoder);
+        TypedVec<PoolGroupIndex, SlotCount> goals(storage.numPoolGroups(level), SlotCount{0});
+        goals[group] = storage.getStatistics(level, group).total;
+        storage.prepareFreeSlots(level, goals);
+    };
+    auto const diskLevel = CacheLevel{hostTier ? 2 : 1};
+    for (int level = 0; level < diskLevel.value(); ++level)
+    {
+        pressure(CacheLevel{level});
+        for (auto const id : {encoder, peer})
+        {
+            ASSERT_NE(block->getPage(id), nullptr);
+            EXPECT_EQ(block->getPage(id)->cacheLevel, CacheLevel{level + 1});
+        }
+        EXPECT_EQ(block->getPage(global), globalPage);
+        EXPECT_EQ(manager->radixTree().match({}, span).numTokens, 8);
+    }
+
+    auto reader = manager->createKvCache({}, span, 2);
+    ASSERT_TRUE(reader->reuseStatus()[encoder.value()].complete);
+    // Poison the entire hot Encoder group: a false restore cannot pass using
+    // stale bytes from the original slot after it was offloaded to disk.
+    for (int p = 0; p < sizes.size().value(); ++p)
+    {
+        auto const address = std::get<MemAddress>(storage.slotAddress(kHotLevel, hotGroup, SlotId{0}, PoolIndex{p}));
+        ASSERT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(address), 0xEE,
+                      sizes[PoolIndex{p}] * storage.getStatistics(kHotLevel, hotGroup).total, stream),
+            cudaSuccess);
+    }
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    auto reservations
+        = storage.newSlotsForPoolGroup(kHotLevel, hotGroup, storage.getStatistics(kHotLevel, hotGroup).free);
+    EXPECT_FALSE(reader->resume(stream, std::nullopt, std::vector<LifeCycleId>{encoder, peer}));
+    EXPECT_FALSE(reader->isActive());
+    EXPECT_EQ(reader->numCommittedTokens(), 8);
+    for (auto& slot : reservations)
+    {
+        storage.releaseSlot(encoder, kHotLevel, std::move(slot));
+    }
+    ASSERT_TRUE(reader->resume(stream, std::nullopt, std::vector<LifeCycleId>{encoder, peer}));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    EXPECT_EQ(block->getPage(encoder), encoderPage);
+    EXPECT_EQ(block->getPage(peer), peerPage);
+    for (auto const id : {encoder, peer})
+    {
+        auto const slot = SlotId{reader->getBasePageIndices(id)[1]};
+        EXPECT_EQ(slot, block->getPage(id)->slotId());
+        for (int p = 0; p < sizes.size().value(); ++p)
+        {
+            auto const address = std::get<MemAddress>(storage.slotAddress(kHotLevel, hotGroup, slot, PoolIndex{p}));
+            std::vector<uint8_t> bytes(sizes[PoolIndex{p}]);
+            ASSERT_EQ(
+                cudaMemcpy(bytes.data(), reinterpret_cast<void const*>(address), bytes.size(), cudaMemcpyDeviceToHost),
+                cudaSuccess);
+            EXPECT_TRUE(std::all_of(
+                bytes.begin(), bytes.end(), [&](uint8_t value) { return value == 31 + id.value() * 7 + p; }));
+        }
+    }
+    if (codecObserver)
+    {
+        EXPECT_GT(codecObserver->encodeCalls, 0);
+        EXPECT_GT(codecObserver->decodeCalls, 0);
+    }
+    reader->close();
+    for (int level = 0; level <= diskLevel.value(); ++level)
+    {
+        pressure(CacheLevel{level});
+    }
+    EXPECT_EQ(block->getPage(encoder), nullptr);
+    EXPECT_EQ(block->getPage(peer), nullptr);
+    ASSERT_EQ(block->getPage(global), globalPage);
+    EXPECT_EQ(manager->radixTree().match({}, span).numTokens, 8);
+    auto miss = manager->createKvCache({}, span, 3);
+    ASSERT_TRUE(miss->resume(stream));
+    EXPECT_EQ(miss->numCommittedTokens(), 8);
+    EXPECT_FALSE(miss->reuseStatus()[encoder.value()].complete);
+    miss->close();
+    block.reset();
+    manager->shutdown();
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    DefaultAndCustomCodec, OptionalDiskCheckpointTest, ::testing::Combine(::testing::Bool(), ::testing::Bool()));
 
 KVCacheManagerConfig makeDiskTieredConfig()
 {

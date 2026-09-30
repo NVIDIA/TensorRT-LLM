@@ -96,6 +96,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._utils import get_sm_version, is_sm_100f
+from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
@@ -491,6 +492,7 @@ def dspark_attention_forward(
     softmax_scale: float,
     freqs_cis: torch.Tensor,
     persist: bool = False,
+    q_b_norm_enabled: bool = True,
 ) -> torch.Tensor:
     """Captured-context DSpark draft attention (generation path, ``start_pos > 0``).
 
@@ -532,7 +534,8 @@ def dspark_attention_forward(
     q = F.linear(q, wq_b).unflatten(-1, (n_heads, head_dim))  # [b, block, h, head_dim]
     # Per-head RMS in the query dtype (matches the reference inline normalization,
     # which is NOT the fp32 RMSNorm path).
-    q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
+    if q_b_norm_enabled:
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
     q = _rope_last_dims(q, rd, blk_freqs)
 
     # Block K/V.
@@ -583,6 +586,7 @@ def dspark_attention_forward_batched(
     softmax_scale: float,
     freqs_cis: torch.Tensor,
     persist: bool = False,
+    q_b_norm_enabled: bool = True,
 ) -> torch.Tensor:
     """Batched, CUDA-graph-safe captured-context DSpark draft attention.
 
@@ -646,6 +650,7 @@ def dspark_attention_forward_batched(
         blk_freqs,
         num_heads=n_heads,
         apply_weight=False,
+        apply_rmsnorm=q_b_norm_enabled,
     )
 
     block_kv_input = F.linear(x, wkv)
@@ -1016,6 +1021,12 @@ class DSv4DSparkBlock(DeepseekV4DecoderLayer):
     and only the last stage owns the draft heads, matching the ``mtp.*`` schema.
     """
 
+    uses_hc_head = True
+
+    @staticmethod
+    def _capture_quant_config(model_config: ModelConfig) -> QuantConfig:
+        return model_config.get_quant_config()
+
     def __init__(
         self,
         model_config,
@@ -1063,7 +1074,7 @@ class DSv4DSparkBlock(DeepseekV4DecoderLayer):
                 config.hidden_size,
                 bias=False,
                 dtype=config.torch_dtype,
-                quant_config=model_config.get_quant_config(),
+                quant_config=self._capture_quant_config(model_config),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
             self.main_norm = RMSNorm(
@@ -1075,7 +1086,8 @@ class DSv4DSparkBlock(DeepseekV4DecoderLayer):
             self.norm = RMSNorm(
                 hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
             )
-            self.hc_head = HCHead(config.hc_mult, config.hidden_size)
+            if self.uses_hc_head:
+                self.hc_head = HCHead(config.hc_mult, config.hidden_size)
             self.markov_head = build_markov_head(
                 markov_head_type=self.markov_head_type,
                 vocab_size=config.vocab_size,
@@ -1132,6 +1144,11 @@ class DSv4DSparkDraftModel(nn.Module):
     builds the block input from the captured context; the per-stage backbone runs
     the 3 blocks; ``forward_head`` produces the block draft tokens + confidence.
     """
+
+    block_cls = DSv4DSparkBlock
+    uses_lagged_pre = False
+    checkpoint_fp8_block_size = 128
+    confidence_uses_normalized_hidden = True
 
     def __init__(
         self,
@@ -1205,7 +1222,7 @@ class DSv4DSparkDraftModel(nn.Module):
         )
         self.mtp_layers = nn.ModuleList(
             [
-                DSv4DSparkBlock(
+                self.block_cls(
                     draft_model_config,
                     base + s,
                     aux_stream_dict,
@@ -1303,7 +1320,11 @@ class DSv4DSparkDraftModel(nn.Module):
             def deq(name: str, fp8: bool) -> torch.Tensor:
                 w = src[f"{pref}{name}.weight"].to(dev)
                 if fp8:
-                    return self._block_dequant(w, src[f"{pref}{name}.scale"].to(dev))
+                    return self._block_dequant(
+                        w,
+                        src[f"{pref}{name}.scale"].to(dev),
+                        block=self.checkpoint_fp8_block_size,
+                    )
                 return w.to(torch.bfloat16)
 
             stage._dspark_attn = dict(
@@ -1636,7 +1657,8 @@ class DSv4DSparkDraftModel(nn.Module):
         slots: Optional[torch.Tensor] = None,
         valid_len: Optional[torch.Tensor] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
-    ) -> torch.Tensor:
+        pre_mix: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """One DSpark stage = reference ``Block.forward`` with captured-context attn.
 
         ``h`` is the mHC residual stream ``[T, block, hc_mult, hidden]``. The mHC
@@ -1660,7 +1682,12 @@ class DSv4DSparkDraftModel(nn.Module):
 
         # --- attention sub-block (captured-context, not paged-KV MLA) ---
         residual = h
-        post_mix, comb_mix, layer_input = stage.hc_attn.pre_mapping(residual)
+        if pre_mix is None:
+            post_mix, comb_mix, layer_input = stage.hc_attn.pre_mapping(residual)
+        else:
+            attn_pre, post_mix, comb_mix, layer_input = stage.hc_attn.pre_mapping_lagged(
+                residual, pre_mix
+            )
         layer_input = stage.input_layernorm(layer_input)  # [T, block, hidden]
         # Rolling-window cache: persist through the worker-owned ``stage_window``
         # for cross-step decode, else a fresh zero window for a single block.
@@ -1702,7 +1729,18 @@ class DSv4DSparkDraftModel(nn.Module):
                 **stage._dspark_attn,
                 **self._attn_params,
             )
-        if stage.enable_fused_hc:
+        if pre_mix is not None:
+            residual = stage.hc_attn.post_mapping(
+                x=attn,
+                residual=residual,
+                post_layer_mix=post_mix,
+                comb_res_mix=comb_mix,
+            )
+            ffn_pre, post_mix, comb_mix, layer_input = stage.hc_ffn.pre_mapping_lagged(
+                residual, attn_pre
+            )
+            layer_input = stage.post_attention_layernorm(layer_input)
+        elif stage.enable_fused_hc:
             residual, post_mix, comb_mix, layer_input = stage.hc_ffn.fused_hc(
                 x_prev=attn,
                 residual_prev=residual,
@@ -1754,7 +1792,7 @@ class DSv4DSparkDraftModel(nn.Module):
         h = stage.hc_ffn.post_mapping(
             x=moe_out, residual=residual, post_layer_mix=post_mix, comb_res_mix=comb_mix
         )
-        return h
+        return (h, ffn_pre) if pre_mix is not None else h
 
     def forward(
         self,
@@ -1798,6 +1836,7 @@ class DSv4DSparkDraftModel(nn.Module):
         moe_input_ids = draft_ids.reshape(-1)
 
         h = x
+        pre_mix = self._initial_pre_mix(x)
         for s, stage in enumerate(self.mtp_layers):
             stage_window = kv_windows[:, s] if kv_windows is not None else None
             h = self._forward_stage(
@@ -1809,7 +1848,10 @@ class DSv4DSparkDraftModel(nn.Module):
                 moe_input_ids,
                 stage_window,
                 all_rank_num_tokens=all_rank_num_tokens,
+                pre_mix=pre_mix,
             )
+            if self.uses_lagged_pre:
+                h, pre_mix = h
 
         return self.forward_head(
             h,
@@ -1817,6 +1859,7 @@ class DSv4DSparkDraftModel(nn.Module):
             temperature=temperature,
             confidence_threshold=confidence_threshold,
             return_logits=return_logits,
+            pre_mix=pre_mix,
         )
 
     def forward_batched(
@@ -1867,6 +1910,7 @@ class DSv4DSparkDraftModel(nn.Module):
         moe_input_ids = draft_ids.reshape(-1)
 
         h = x
+        pre_mix = self._initial_pre_mix(x)
         for s, stage in enumerate(self.mtp_layers):
             stage_window = kv_windows[:, s]  # [N, window_size, head_dim]
             h = self._forward_stage(
@@ -1880,7 +1924,10 @@ class DSv4DSparkDraftModel(nn.Module):
                 slots,
                 valid_len,
                 all_rank_num_tokens=all_rank_num_tokens,
+                pre_mix=pre_mix,
             )
+            if self.uses_lagged_pre:
+                h, pre_mix = h
 
         return self.forward_head(
             h,
@@ -1888,7 +1935,20 @@ class DSv4DSparkDraftModel(nn.Module):
             temperature=temperature,
             confidence_threshold=confidence_threshold,
             return_logits=return_logits,
+            pre_mix=pre_mix,
         )
+
+    def _initial_pre_mix(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        """V4.1 seeds the lagged input mix with a one-hot on residual stream 0."""
+        if not self.uses_lagged_pre:
+            return None
+        pre_mix = torch.zeros(
+            (*hidden_states.shape[:-1], 1),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        pre_mix[..., 0, :] = 1.0
+        return pre_mix
 
     def run_moe_lockstep_noop(
         self, all_rank_num_tokens: Optional[List[int]], device: torch.device
@@ -1937,6 +1997,7 @@ class DSv4DSparkDraftModel(nn.Module):
         temperature: float = 0.0,
         confidence_threshold: float = 0.0,
         return_logits: bool = False,
+        pre_mix: Optional[torch.Tensor] = None,
     ) -> tuple:
         """Block-draft head: hc_head + norm + lm_head -> markov refine + confidence.
 
@@ -1945,13 +2006,19 @@ class DSv4DSparkDraftModel(nn.Module):
         also returns the per-position draft logits [*, block, vocab] (§7.9 1-TV).
         """
         last = self.mtp_layers[-1]
-        h = last.hc_head(block_hidden)
-        h = last.norm(h)
-        base_logits = self.lm_head(h)
+        if self.uses_lagged_pre:
+            if pre_mix is None:
+                raise ValueError("V4.1 DSpark head requires the final FFN pre-mix")
+            h = last.hc_ffn.collapse(block_hidden, pre_mix)
+        else:
+            h = last.hc_head(block_hidden)
+        normalized = last.norm(h)
+        base_logits = self.lm_head(normalized)
+        proposal_hidden = normalized if self.confidence_uses_normalized_hidden else h
         return dspark_propose(
             base_logits,
             bonus_token_ids=bonus_token_ids,
-            block_hidden=h,
+            block_hidden=proposal_hidden,
             markov_head=last.markov_head,
             confidence_head=last.confidence_head,
             block_size=self.block_size,
@@ -1976,6 +2043,8 @@ class DSv4DSparkForCausalLM(nn.Module):
     attention weights from the in-memory state dict.
     """
 
+    draft_model_cls = DSv4DSparkDraftModel
+
     def __init__(
         self,
         draft_config,
@@ -1985,7 +2054,7 @@ class DSv4DSparkForCausalLM(nn.Module):
         draft_moe_backend: Optional[str] = None,
     ):
         super().__init__()
-        self.dspark_model = DSv4DSparkDraftModel(
+        self.dspark_model = self.draft_model_cls(
             draft_config,
             aux_stream_dict,
             num_stages=num_stages,
@@ -3403,7 +3472,12 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
     if draft_is_embedded_in_target(model_config):
         num_stages = count_dspark_stages(model_config.spec_config.speculative_model)
         validate_dspark_eplb_layer_base(model_config, draft_config)
-        return DSv4DSparkForCausalLM(
+        draft_cls = DSv4DSparkForCausalLM
+        if draft_config.pretrained_config.model_type in ("deepseek_v41", "deepseek_v41_text"):
+            from .modeling_dspark_v41 import DSv41DSparkForCausalLM
+
+            draft_cls = DSv41DSparkForCausalLM
+        return draft_cls(
             draft_config,
             getattr(model, "aux_stream_dict", None),
             num_stages=num_stages,

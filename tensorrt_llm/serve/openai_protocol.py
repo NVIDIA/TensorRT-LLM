@@ -308,6 +308,15 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
     ctx_usage: Optional[UsageInfo] = None
+    remote_tail_start: Optional[NonNegativeInt] = Field(
+        default=None,
+        description=
+        "Prompt-token boundary transferred by a remote-tail context worker.")
+    multimodal_positions: Optional[List[NonNegativeInt]] = Field(
+        default=None,
+        description="Prompt-token offset of each multimodal item.")
+    multimodal_lengths: Optional[List[PositiveInt]] = Field(
+        default=None, description="Prompt-token count of each multimodal item.")
     # TODO(TRTLLM-12407): Multimodal E/PD over trtllm-serve needs these protocol fields too:
     # encoder embedding handles, multimodal hashes, and optional mRoPE handles.
     # Add them here and in to_disaggregated_params()/to_llm_disaggregated_params()
@@ -319,6 +328,20 @@ class DisaggregatedParams(OpenAIBaseModel):
     # worker read off the prompt it rendered. The generation worker only sees
     # prompt_token_ids, so it cannot resolve this for itself.
     resolved_thinking: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def validate_multimodal_spans(self) -> "DisaggregatedParams":
+        if (self.multimodal_positions is None) != (self.multimodal_lengths
+                                                   is None):
+            raise ValueError(
+                "multimodal_positions and multimodal_lengths must be provided together"
+            )
+        if (self.multimodal_positions is not None and len(
+                self.multimodal_positions) != len(self.multimodal_lengths)):
+            raise ValueError(
+                "multimodal_positions and multimodal_lengths must have the same length"
+            )
+        return self
 
 
 class ConversationParams(OpenAIBaseModel):
@@ -1966,6 +1989,9 @@ def to_disaggregated_params(
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
         ctx_usage=ctx_usage,
+        remote_tail_start=tllm_disagg_params.remote_tail_start,
+        multimodal_positions=tllm_disagg_params.multimodal_positions,
+        multimodal_lengths=tllm_disagg_params.multimodal_lengths,
     )
 
 
@@ -1990,6 +2016,9 @@ def to_llm_disaggregated_params(
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
         ctx_usage=None if ctx_usage is None else ctx_usage.model_dump(),
+        remote_tail_start=disaggregated_params.remote_tail_start,
+        multimodal_positions=disaggregated_params.multimodal_positions,
+        multimodal_lengths=disaggregated_params.multimodal_lengths,
     )
 
 
