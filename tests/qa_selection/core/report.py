@@ -315,7 +315,7 @@ class Artifacts:
     @staticmethod
     def write_ids(path: Path, nodeids: List[str]) -> Path:
         """Write one identifier list: bare node ids, one per line."""
-        path.write_text("".join(f"{nodeid}\n" for nodeid in nodeids))
+        path.write_text("".join(f"{nodeid}\n" for nodeid in nodeids), encoding="utf-8")
         return path
 
     @staticmethod
