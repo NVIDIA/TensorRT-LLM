@@ -588,7 +588,7 @@ def apply_embedding_bias(
     #     Since read-caching is expected to help in typical cases, option (ii) is implemented here.
 
     if all(not req.py_embedding_bias for req in requests):
-        return None
+        return maybe_embedding_bias_cache
 
     vocab_size = logits.size(-1)
     if maybe_embedding_bias_cache is None:
