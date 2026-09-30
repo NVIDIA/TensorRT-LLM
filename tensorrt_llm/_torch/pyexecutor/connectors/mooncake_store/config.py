@@ -36,26 +36,23 @@ __all__ = [
     "CLIENT_CONFIG_NAME",
     "CONFIG_PATH_ENV",
     "MooncakeStoreConnectorConfig",
-    "ROLE_ENV",
-    "RUN_DIR_ENV",
     "SEGMENTS_DIR_NAME",
-    "STAGE_THROUGH_HOST_ENV",
     "StoreRole",
     "parse_size",
+    "pool_config",
     "provisioned_config_path",
 ]
 
+#: Mooncake's own variable for the client config path, read by the vLLM
+#: connector too. A deployment that provisions the pool outside the engine
+#: names it this way, and `master.provision_pool` exports it for the ranks the
+#: LLM constructor spawns.
 CONFIG_PATH_ENV = "MOONCAKE_CONFIG_PATH"
-#: Where a server keeps the client config it renders and the master's log. Set
-#: it to keep them after shutdown; otherwise they live in a temporary directory.
-RUN_DIR_ENV = "TRTLLM_MOONCAKE_RUN_DIR"
 #: Name the rendered client config takes in the run directory.
 CLIENT_CONFIG_NAME = "mooncake.json"
 #: Subdirectory of the run directory where each rank records the segment it
-#: mounted. Telemetry reads it instead of scraping logs; see `segment_ledger`.
+#: mounted. Telemetry reads it instead of scraping logs; see `ledger.py`.
 SEGMENTS_DIR_NAME = "segments"
-ROLE_ENV = "TRTLLM_MOONCAKE_STORE_ROLE"
-STAGE_THROUGH_HOST_ENV = "TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST"
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200
 #: Per-process Mooncake transfer buffer. Not pool capacity, and not worth a
@@ -69,9 +66,6 @@ DEFAULT_NAMESPACE = "trtllm"
 #: connstring is not one of the forms `store.setup` accepts, so a config that
 #: leaves the field out means this rather than meaning no metadata service.
 DEFAULT_METADATA_SERVER = "P2PHANDSHAKE"
-
-_TRUE = {"1", "true", "yes", "on"}
-_FALSE = {"0", "false", "no", "off"}
 
 #: Suffixes this parser reads as powers of 1000. vLLM's Mooncake config parser
 #: reads the same spellings as powers of 1024, so a file both engines may open
@@ -188,18 +182,27 @@ def parse_size(value: Any, *, strict_units: bool = False) -> int:
     return int(float(magnitude) * scale)
 
 
-def provisioned_config_path() -> Optional[str]:
-    """The client config a server on this node rendered, if there is one.
+def pool_config(llm_args: Any) -> Optional[Any]:
+    """The `mooncake_store` block of `llm_args`, if the deployment set one.
+
+    Every rank parses the same worker config, so this is how a rank reaches
+    settings the process that rendered the client config could not pass it.
+    """
+    connector = getattr(llm_args, "kv_connector_config", None)
+    return getattr(connector, "mooncake_store", None) if connector is not None else None
+
+
+def provisioned_config_path(run_dir: Optional[str]) -> Optional[str]:
+    """The client config a server rendered into `run_dir`, if there is one.
 
     `provision_pool` writes one and exports `MOONCAKE_CONFIG_PATH`, which the
     ranks the LLM constructor spawns inherit. Ranks an external launcher
     started, one task per rank, were already running by then and never see it,
     so they read the config back from the run directory instead.
 
-    Only possible when the deployment named that directory, since it otherwise
+    Only possible when the config named that directory, since it otherwise
     defaults to a per-process temporary one that no other rank could read.
     """
-    run_dir = os.getenv(RUN_DIR_ENV)
     if not run_dir:
         return None
     path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
@@ -289,46 +292,28 @@ class MooncakeStoreConnectorConfig:
         )
 
     @staticmethod
-    def from_env() -> "MooncakeStoreConnectorConfig":
-        """Load the JSON config, then apply the TensorRT-LLM env overrides."""
-        path = os.getenv(CONFIG_PATH_ENV) or provisioned_config_path()
+    def resolve(llm_args: Any) -> "MooncakeStoreConnectorConfig":
+        """The client config this rank should open, read from wherever it is.
+
+        An inherited `MOONCAKE_CONFIG_PATH` wins, since it names a pool the
+        deployment provisioned itself. Otherwise the config is the one this
+        server rendered into `mooncake_store.run_dir`, which is the only route
+        open to a rank an external launcher started.
+        """
+        pool = pool_config(llm_args)
+        run_dir = getattr(pool, "run_dir", None) if pool is not None else None
+        path = os.getenv(CONFIG_PATH_ENV) or provisioned_config_path(run_dir)
         if not path:
             raise ValueError(
                 f"The mooncake-store connector needs {CONFIG_PATH_ENV} set to a "
                 "Mooncake JSON config (metadata_server, master_server_address, "
                 "protocol, device_name, global_segment_size, local_buffer_size), "
                 "or kv_connector_config.mooncake_store set so the server renders "
-                f"one, into ${RUN_DIR_ENV} if this rank was started by the "
-                "launcher rather than spawned by the server."
+                "one. Set mooncake_store.run_dir as well if this rank was "
+                "started by the launcher rather than spawned by the server, "
+                "since it cannot inherit the path."
             )
-        config = MooncakeStoreConnectorConfig.from_file(path)
-        return config.with_env_overrides()
-
-    def with_env_overrides(self) -> "MooncakeStoreConnectorConfig":
-        """Apply `TRTLLM_MOONCAKE_STORE_*` on top of the file's settings."""
-        import dataclasses
-
-        updates: dict[str, Any] = {}
-        role = os.getenv(ROLE_ENV)
-        if role:
-            try:
-                updates["role"] = StoreRole(role.strip().lower())
-            except ValueError as exc:
-                known = ", ".join(member.value for member in StoreRole)
-                raise ValueError(f"{ROLE_ENV}={role!r} is not one of: {known}") from exc
-        staging = os.getenv(STAGE_THROUGH_HOST_ENV)
-        if staging:
-            normalized = staging.strip().lower()
-            if normalized in _TRUE:
-                updates["stage_through_host"] = True
-            elif normalized in _FALSE:
-                updates["stage_through_host"] = False
-            else:
-                known = ", ".join(sorted(_TRUE | _FALSE))
-                raise ValueError(
-                    f"{STAGE_THROUGH_HOST_ENV}={staging!r} is not a boolean; use one of: {known}"
-                )
-        return dataclasses.replace(self, **updates) if updates else self
+        return MooncakeStoreConnectorConfig.from_file(path)
 
     def resolve_model_key(self, model: Any) -> str:
         """The model identity to namespace keys by, given the configured model."""

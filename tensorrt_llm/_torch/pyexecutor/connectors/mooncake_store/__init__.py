@@ -52,9 +52,8 @@ Pointing `MOONCAKE_CONFIG_PATH` at a Mooncake JSON config directly also works,
 and wins over `mooncake_store`, so an externally managed pool stays reachable.
 
 By default the KV pools themselves are registered with Mooncake, which requires
-GPUDirect RDMA. Where that is unavailable, `"stage_through_host": true` in the
-JSON config, or `TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST=1`, routes pages
-through a pinned host buffer instead; see `staging.py`.
+GPUDirect RDMA. Where that is unavailable, `stage_through_host: true` routes
+pages through a pinned host buffer instead; see `staging.py`.
 """
 
 from .config import MooncakeStoreConnectorConfig, StoreRole, parse_size
@@ -63,7 +62,6 @@ from .master import (
     POOL_MANIFEST_NAME,
     PoolManifest,
     local_address,
-    master_timeout,
     maybe_provision_pool,
     provision_pool,
     resolve_device_name,
@@ -84,7 +82,6 @@ __all__ = [
     "StoreRole",
     "format_pool_report",
     "local_address",
-    "master_timeout",
     "maybe_provision_pool",
     "parse_size",
     "provision_pool",

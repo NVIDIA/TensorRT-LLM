@@ -210,20 +210,23 @@ Only `pool` is required. `pool` also accepts a bare `host:port` for joining a ma
 
 Sizes are written as binary units (`160GiB`) or byte counts. `GB` and friends are **refused** in anything both engines may read: this parser scales them by 1000 and vLLM's Mooncake parser by 1024, so `80GB` would name two different segments. The rendered client config always holds resolved integers for the same reason.
 
-`TRTLLM_MOONCAKE_MASTER_BINARY` overrides the binary the master command runs, and `TRTLLM_MOONCAKE_MASTER_TIMEOUT` (default 60s) sets how long a server waits for the manifest to appear and the master to accept connections. Without that wait, a master that is not there yet fails inside every rank after the model has loaded. Set `TRTLLM_MOONCAKE_RUN_DIR` to keep the generated client config and the segment records, which are otherwise in a temporary directory removed at shutdown.
+`master_timeout` (default 60s) is how long a server waits for the manifest to appear and the master to accept connections. Without that wait, a master that is not there yet fails inside every rank after the model has loaded. `run_dir` keeps the generated client config and the segment records, which are otherwise in a temporary directory removed at shutdown. The master command takes `--timeout` for the same wait and `--binary` to name the executable.
+
+There is no environment override for any of this. `MOONCAKE_CONFIG_PATH` is the one variable the connector reads, and it belongs to Mooncake rather than to TensorRT-LLM.
 
 #### Servers whose ranks the launcher starts
 
 Provisioning happens in the server process and reaches the ranks that open store handles by exporting `MOONCAKE_CONFIG_PATH` for them to inherit. That holds when the LLM constructor spawns them. It does not when the launcher starts one task per rank, as `trtllm-llmapi-launch` under a scheduler does, because those ranks were already running.
 
-Naming a run directory covers that case: the rendered config is read back from `$TRTLLM_MOONCAKE_RUN_DIR/mooncake.json` by any rank that inherited no path, so every rank of a multi-GPU server joins the pool its own leader provisioned. It has to be a directory all of that server's ranks see, which under a scheduler means a shared filesystem, and **one per server rather than one per job** — two servers sharing it would leave whichever started second in charge of both rendered configs, and the setting they differ in is `role`:
+Setting `run_dir` covers that case: the rendered config is read back from `<run_dir>/mooncake.json` by any rank that inherited no path, so every rank of a multi-GPU server joins the pool its own leader provisioned. It has to be a directory all of that server's ranks see, which under a scheduler means a shared filesystem, and **one per server rather than one per job**, since two servers sharing it render one client config between them:
 
-```bash
-export TRTLLM_MOONCAKE_RUN_DIR=/shared/run/$SLURM_JOB_ID/ctx0
-srun trtllm-llmapi-launch trtllm-serve "$model" --config ctx.yaml
+```yaml
+mooncake_store:
+  pool: file:///shared/run/pool.json
+  run_dir: /shared/run/ctx0
 ```
 
-Without it, a rank that inherited nothing fails during bringup naming `MOONCAKE_CONFIG_PATH`, rather than serving without a store.
+Because it comes from the worker config rather than the environment, every rank of the server reads the same value without the launch script having to export anything. Without it, a rank that inherited nothing fails during bringup naming `MOONCAKE_CONFIG_PATH`, rather than serving without a store.
 
 #### Reading bringup in the log
 
@@ -259,7 +262,7 @@ Keep `segment_size` the same on every server. Pool capacity is meant to be unifo
 
 #### What the pool actually was
 
-Every rank records the segment it mounted under `$TRTLLM_MOONCAKE_RUN_DIR/segments/`, and the run's capacity is read back from those records rather than from log lines. The report is given the pool's own directory — the one holding the manifest every participant named — and gathers the records from the tree beneath it, so a job whose servers each have a run directory of their own still totals up:
+Every rank records the segment it mounted under `<run_dir>/segments/`, and the run's capacity is read back from those records rather than from log lines. The report is given the pool's own directory — the one holding the manifest every participant named — and gathers the records from the tree beneath it, so a job whose servers each have a run directory of their own still totals up:
 
 ```bash
 trtllm-serve mooncake_pool_report --run_dir /shared/run/$SLURM_JOB_ID
@@ -295,12 +298,7 @@ Only `master_server_address` is required. `metadata_server` may be left out, in 
 
 An inherited `MOONCAKE_CONFIG_PATH` wins over `mooncake_store` and is logged as doing so, so an orchestrator that already provisions the pool keeps working unchanged.
 
-Two settings can be overridden per process from the environment:
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `TRTLLM_MOONCAKE_STORE_ROLE` | the config's | `producer` writes only, `consumer` reads only, `both` does both, `capacity` does neither. |
-| `TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST` | the config's | Force host staging on or off, overriding `stage_through_host`. |
+`role` and `stage_through_host` are read from that file too, so a hand-written config controls them the same way `mooncake_store` does.
 
 #### Partial block reuse is forced off
 

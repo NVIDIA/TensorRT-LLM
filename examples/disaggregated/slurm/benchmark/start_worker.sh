@@ -54,26 +54,11 @@ fi
 
 echo "config_file: ${config_file}"
 
-# The mooncake-store pool this server joins is named in its worker config, and
-# trtllm-serve renders the Mooncake client config during bringup. Anchoring the
-# run directory here keeps that client config and this server's segment records
-# in the job's log directory rather than in a temporary directory that shutdown
-# removes. It is also how the ranks srun started, which never inherited the
-# leader's environment, find the client config.
-#
-# One directory per server, not one per job. Every server that joins the pool
-# renders a client config, and the context and generation sides differ in
-# `role`, so sharing a directory would leave whichever started second in charge
-# of both. The pool report reads the segment records from the tree under the
-# job's log directory, so they still total up. An inherited
-# MOONCAKE_CONFIG_PATH wins, so an externally managed pool stays reachable.
-export TRTLLM_MOONCAKE_RUN_DIR="${log_dir}/mooncake_${role}_${instance_id}"
-
-# Every server waits for the manifest the job's mooncake_master step publishes.
-# That step is launched before these, but the wait spans container start on
-# another node, so it is given far more than the 60s default. Too short fails
-# the job; too long costs nothing when the manifest is already there.
-export TRTLLM_MOONCAKE_MASTER_TIMEOUT="${TRTLLM_MOONCAKE_MASTER_TIMEOUT:-900}"
+# Nothing here configures the mooncake-store pool: the worker config names it,
+# including mooncake_store.run_dir, which has to point inside the job's log
+# directory because the ranks srun started never inherit the leader's
+# environment and read the rendered client config back from there. See the
+# Mooncake section of README.md.
 
 # MiniMax-M3's MSA sparse attention JIT-compiles its FMHA kernels on first use,
 # from inside the attention forward pass. One TP rank runs ninja while the

@@ -1996,6 +1996,25 @@ class MooncakeStoreConfig(StrictBaseModel):
         "registering the KV pools with Mooncake. An escape hatch for a host "
         "whose HCA cannot pin GPU pages; costs a copy each way. Ignored when "
         "role is 'capacity', which registers no pages at all.")
+    run_dir: Optional[str] = Field(
+        None,
+        telemetry=False,
+        description="Where this server keeps the Mooncake client config it "
+        "renders and the record each of its ranks writes of the segment it "
+        "mounted. Required when a launcher starts one task per rank, as "
+        "trtllm-llmapi-launch does, since those ranks cannot inherit the "
+        "path from the process that rendered it. Servers sharing a directory "
+        "render one client config between them, so give the context and "
+        "generation sides separate ones. Defaults to a temporary directory "
+        "removed at shutdown, which loses the records the pool report reads.")
+    master_timeout: float = Field(
+        60.0,
+        telemetry=False,
+        description="Seconds to wait for the pool manifest to appear and the "
+        "master to accept connections. Raise it when the wait spans container "
+        "start on another node. Too short fails the server at startup, which "
+        "is the intent: a master that is not there fails inside every rank "
+        "after the model has loaded, as a bare status code.")
 
 
 class KvCacheConnectorConfig(StrictBaseModel):

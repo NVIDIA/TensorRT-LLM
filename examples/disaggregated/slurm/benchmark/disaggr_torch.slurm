@@ -207,7 +207,10 @@ if [ "${mooncake_enabled}" = "true" ]; then
     # run completes and merely reports no hits, which reads as a workload with
     # no reuse rather than as a broken deployment. The alternative to failing
     # here is discovering it while interpreting results.
-    mooncake_master_wait=${MOONCAKE_MASTER_WAIT_SECONDS:-300}
+    # Generous, because the wait spans container start on another node. It
+    # costs nothing when the manifest is already there, and the loop below
+    # exits early if the master dies.
+    mooncake_master_wait=900
     echo "Waiting up to ${mooncake_master_wait}s for the pool manifest at ${mooncake_pool_file}..."
     for _ in $(seq 1 ${mooncake_master_wait}); do
         [ -s "${mooncake_pool_file}" ] && break
@@ -217,7 +220,7 @@ if [ "${mooncake_enabled}" = "true" ]; then
         sleep 1
     done
     if [ ! -s "${mooncake_pool_file}" ]; then
-        cleanup_on_failure "No Mooncake pool manifest at ${mooncake_pool_file} after ${mooncake_master_wait}s, so no worker could have joined the pool. Check ${full_logdir}/2_mooncake_master_step.log and ${full_logdir}/mooncake_master.log; raise MOONCAKE_MASTER_WAIT_SECONDS if the master is only slow to start"
+        cleanup_on_failure "No Mooncake pool manifest at ${mooncake_pool_file} after ${mooncake_master_wait}s, so no worker could have joined the pool. Check ${full_logdir}/2_mooncake_master_step.log and ${full_logdir}/mooncake_master.log"
     fi
     echo "Mooncake pool manifest published:"
     cat "${mooncake_pool_file}"

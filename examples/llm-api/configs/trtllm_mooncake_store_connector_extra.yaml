@@ -29,20 +29,17 @@
 # parser scales it by 1000 and vLLM's Mooncake parser by 1024, so it would name
 # two different segments in a file both engines may read.
 #
-# Optional environment overrides:
-#   TRTLLM_MOONCAKE_STORE_ROLE              override `role` per process
-#   TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST  force host staging on or off
-#   TRTLLM_MOONCAKE_RUN_DIR                 keep the rendered client config and
-#                                           this run's segment records
-#   MOONCAKE_CONFIG_PATH                    point at a Mooncake JSON config
-#                                           directly; wins over the block below
+# Every setting is in the block below. The one environment variable the
+# connector reads is MOONCAKE_CONFIG_PATH, which is Mooncake's own and points
+# at a client config directly; it wins over this block, so an externally
+# provisioned pool stays reachable.
 #
 # Example:
 #   trtllm-serve <hf_model> --backend pytorch --host 0.0.0.0 --port 8000 \
 #     --extra_llm_api_options /path/to/this/file
 #
 # Afterwards, what the pool actually held:
-#   trtllm-serve mooncake_pool_report --run_dir $TRTLLM_MOONCAKE_RUN_DIR
+#   trtllm-serve mooncake_pool_report --run_dir /shared/run
 
 kv_cache_config:
   # The connector describes its pools through register_kv_cache_layout, which
@@ -67,3 +64,11 @@ kv_connector_config:
     # budget is checked at startup, since ranks_on_node x segment_size is what
     # this actually claims from host memory.
     segment_size: 32GiB
+    # Where this server keeps the client config it renders and the record each
+    # of its ranks writes. Needed whenever a launcher starts one task per rank,
+    # since those ranks cannot inherit the path, and one directory per server:
+    # two sharing it render one client config between them.
+    run_dir: /shared/run/ctx0
+    # Seconds to wait for the master's manifest and for the master itself.
+    # Raise it when the wait spans container start on another node.
+    master_timeout: 300

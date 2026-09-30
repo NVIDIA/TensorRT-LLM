@@ -24,7 +24,6 @@ Capacity is not here. Every rank that joins the pool lends the memory its own
 config asks for, so there is no separate process to run for it.
 """
 
-import os
 import signal
 import tempfile
 import threading
@@ -117,8 +116,23 @@ def _until_signalled() -> threading.Event:
     type=str,
     default=None,
     help="Where to keep the master's log and a copy of the "
-    "manifest. Defaults to $TRTLLM_MOONCAKE_RUN_DIR, else a "
-    "temporary directory.",
+    "manifest. Defaults to a temporary directory.",
+)
+@click.option(
+    "--binary",
+    type=str,
+    default="mooncake_master",
+    show_default=True,
+    help="The master executable to run, looked up on PATH. It "
+    "ships with the Mooncake runtime that "
+    "docker/common/install_mooncake.sh installs.",
+)
+@click.option(
+    "--timeout",
+    type=float,
+    default=60.0,
+    show_default=True,
+    help="Seconds to wait for the master to accept connections before giving up on it.",
 )
 @click.option(
     "--heartbeat_seconds",
@@ -136,6 +150,8 @@ def mooncake_master(
     metadata_server: str,
     namespace: str,
     run_dir: Optional[str],
+    binary: str,
+    timeout: float,
     heartbeat_seconds: int,
 ):
     """Own a Mooncake pool for as long as this command runs.
@@ -148,11 +164,7 @@ def mooncake_master(
     # connector package.
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import running_master
 
-    run_dir = (
-        run_dir
-        or os.getenv("TRTLLM_MOONCAKE_RUN_DIR")
-        or tempfile.mkdtemp(prefix="trtllm-mooncake-master-")
-    )
+    run_dir = run_dir or tempfile.mkdtemp(prefix="trtllm-mooncake-master-")
 
     stopping = _until_signalled()
     with running_master(
@@ -164,6 +176,8 @@ def mooncake_master(
         metadata_server=metadata_server,
         protocol=protocol,
         namespace=namespace,
+        binary=binary,
+        timeout=timeout,
     ) as master:
         logger.info(
             f"mooncake-store: this master owns the pool until this command "

@@ -115,8 +115,10 @@ worker_config:
       connector: mooncake-store
       mooncake_store:
         pool: file://__LOG_DIR__/pool.json
-        role: both           # reads and writes the pool
-        segment_size: 160GiB # per rank
+        role: both             # reads and writes the pool
+        segment_size: 160GiB   # per rank
+        run_dir: __LOG_DIR__/mooncake_ctx
+        master_timeout: 900
 
   gen:
     # ... parallelism as above ...
@@ -124,11 +126,17 @@ worker_config:
       connector: mooncake-store
       mooncake_store:
         pool: file://__LOG_DIR__/pool.json
-        role: capacity       # lends memory, transfers nothing
-        segment_size: 160GiB # the same per-rank figure
+        role: capacity         # lends memory, transfers nothing
+        segment_size: 160GiB   # the same per-rank figure
+        run_dir: __LOG_DIR__/mooncake_gen
+        master_timeout: 900
 ```
 
 `__LOG_DIR__` is substituted with the job's log directory, which is not known when the config is written.
+
+`run_dir` is where each server keeps the client config it renders and the record each of its ranks writes. It has to be inside the job's log directory, because the ranks `srun` starts never inherit the leader's environment and read that client config back from there. Give the two sides **separate** directories: servers sharing one render a single client config between them, and these two differ in `role`. The run's report gathers the records from the whole tree, so the pool still totals up.
+
+`master_timeout` is generous because the wait spans container start on another node. Too short fails the server at startup, which is the intent: a pool that never came up shows up only as an absence of cache hits.
 
 Both sides contribute the same amount per rank, so pool capacity is `total ranks x segment_size` and the generation side — which normally has far more ranks and far more host DRAM — supplies most of it. For 2 context servers at DP2 and 5 generation servers at TP4, that is 24 ranks and 3840 GiB, of which decode holds 83%.
 
@@ -142,7 +150,7 @@ After the run, `${full_logdir}/9_mooncake_summary.log` reports the capacity the 
 trtllm-serve mooncake_pool_report --run_dir <full_logdir>
 ```
 
-Set `MOONCAKE_MASTER_WAIT_SECONDS` (default 300) if the master is slow to start; the job fails rather than running without a pool, since a pool that never came up shows up only as an absence of cache hits.
+The job fails rather than running without a pool, so a master that never starts stops the run instead of quietly costing it every cache hit.
 
 ## Running the Benchmark
 

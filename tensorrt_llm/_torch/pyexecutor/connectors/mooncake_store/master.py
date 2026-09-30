@@ -54,7 +54,6 @@ from .config import (
     DEFAULT_LOCAL_BUFFER_SIZE,
     DEFAULT_METADATA_SERVER,
     DEFAULT_NAMESPACE,
-    RUN_DIR_ENV,
     StoreRole,
     parse_size,
 )
@@ -64,7 +63,6 @@ __all__ = [
     "PoolManifest",
     "local_address",
     "maybe_provision_pool",
-    "master_timeout",
     "provision_pool",
     "resolve_device_name",
     "resolve_pool",
@@ -72,11 +70,9 @@ __all__ = [
     "wait_for_master",
 ]
 
-#: Override the binary `running_master` runs.
-MASTER_BINARY_ENV = "TRTLLM_MOONCAKE_MASTER_BINARY"
-#: How long to wait for a master to accept connections, in seconds.
-MASTER_TIMEOUT_ENV = "TRTLLM_MOONCAKE_MASTER_TIMEOUT"
 DEFAULT_MASTER_BINARY = "mooncake_master"
+#: Seconds to wait for a master to publish its manifest and answer. Overridden
+#: per server by `mooncake_store.master_timeout` and per master by `--timeout`.
 DEFAULT_MASTER_TIMEOUT = 60.0
 MASTER_LOG_NAME = "mooncake_master.log"
 #: Name the pool manifest always takes in the run directory, so even a run that
@@ -118,19 +114,6 @@ def local_address() -> str:
         return socket.gethostbyname(socket.gethostname())
     except OSError:
         return "127.0.0.1"
-
-
-def master_timeout() -> float:
-    raw = os.getenv(MASTER_TIMEOUT_ENV)
-    if not raw:
-        return DEFAULT_MASTER_TIMEOUT
-    try:
-        timeout = float(raw)
-    except ValueError as exc:
-        raise ValueError(f"{MASTER_TIMEOUT_ENV}={raw!r} is not a number") from exc
-    if timeout <= 0:
-        raise ValueError(f"{MASTER_TIMEOUT_ENV}={raw!r} must be > 0")
-    return timeout
 
 
 def _split_address(address: str) -> Optional[Tuple[str, int]]:
@@ -223,7 +206,7 @@ def _wait_for_manifest(path: str, timeout: float) -> Dict[str, Any]:
     path, and waiting here doubles as waiting for the master to exist at all.
 
     A half-written file cannot be observed, since the writer renames into
-    place, but an empty or unparseable one is treated as not there yet rather
+    place, but an empty or unparsable one is treated as not there yet rather
     than as an error: that is what a reader racing a slow filesystem sees.
     """
     started = time.monotonic()
@@ -259,13 +242,13 @@ def _wait_for_manifest(path: str, timeout: float) -> Dict[str, Any]:
                 f"No Mooncake pool manifest appeared at {path} within "
                 f"{timeout:g}s. Start the pool's master with 'trtllm-serve "
                 f"mooncake_master --pool_file {path}', or name a reachable "
-                f"host:port in pool. Raise {MASTER_TIMEOUT_ENV} if the master "
-                "is only slow to start."
+                "host:port in pool. Raise mooncake_store.master_timeout if "
+                "the master is only slow to start."
             )
         time.sleep(0.5)
 
 
-def resolve_pool(pool: str, timeout: Optional[float] = None) -> PoolManifest:
+def resolve_pool(pool: str, timeout: float = DEFAULT_MASTER_TIMEOUT) -> PoolManifest:
     """The pool `pool` names, waiting for its manifest if it names a file.
 
     Args:
@@ -273,7 +256,7 @@ def resolve_pool(pool: str, timeout: Optional[float] = None) -> PoolManifest:
             of a master. The second form is for joining a master run without
             our CLI; it carries no pool-wide settings, so those take defaults
             and it is then on the deployment to keep them consistent.
-        timeout: Seconds to wait for a manifest. Defaults to `master_timeout`.
+        timeout: Seconds to wait for a manifest.
 
     Returns:
         The pool's manifest.
@@ -292,7 +275,6 @@ def resolve_pool(pool: str, timeout: Optional[float] = None) -> PoolManifest:
         return PoolManifest(master_server_address=pool)
 
     path = pool[len(POOL_FILE_SCHEME) :]
-    timeout = master_timeout() if timeout is None else timeout
     return PoolManifest.from_json(_wait_for_manifest(path, timeout), path)
 
 
@@ -334,8 +316,8 @@ def _wait_until_accepting(
         if now >= deadline:
             raise TimeoutError(
                 f"The Mooncake master at {host}:{port} did not accept "
-                f"connections within {timeout:g}s ({last_error}). Raise "
-                f"{MASTER_TIMEOUT_ENV} if it is only slow to start."
+                f"connections within {timeout:g}s ({last_error}). Raise the "
+                "timeout if it is only slow to start."
                 f"{_log_tail(log_path) if log_path else ''}"
             )
         if now - announced >= 5.0:
@@ -419,7 +401,9 @@ def resolve_device_name(protocol: str, configured: str, sysfs_root: Optional[str
     return joined
 
 
-def wait_for_master(master_address: str, timeout: Optional[float] = None) -> Optional[float]:
+def wait_for_master(
+    master_address: str, timeout: float = DEFAULT_MASTER_TIMEOUT
+) -> Optional[float]:
     """Block until the master at `master_address` accepts connections.
 
     Reaching a master that is not there otherwise fails deep inside
@@ -429,7 +413,6 @@ def wait_for_master(master_address: str, timeout: Optional[float] = None) -> Opt
     Returns how long it took, or `None` if the address was not in `host:port`
     form and could not be checked.
     """
-    timeout = master_timeout() if timeout is None else timeout
     endpoint = _split_address(master_address)
     if endpoint is None:
         logger.warning(
@@ -498,17 +481,18 @@ def _launch_master(
     rpc_port: int = DEFAULT_MASTER_PORT,
     metrics_port: int = DEFAULT_MASTER_METRICS_PORT,
     eviction_ratio: float = DEFAULT_MASTER_EVICTION_RATIO,
+    binary: str = DEFAULT_MASTER_BINARY,
+    timeout: float = DEFAULT_MASTER_TIMEOUT,
 ) -> LaunchedMaster:
     """Start a master on this host and wait for it to answer."""
-    binary = os.getenv(MASTER_BINARY_ENV) or DEFAULT_MASTER_BINARY
     resolved = shutil.which(binary)
     if resolved is None:
         raise FileNotFoundError(
             f"{binary!r} is not on PATH, so no Mooncake master can be started "
             "here. It ships with the Mooncake runtime, which "
-            "docker/common/install_mooncake.sh installs. Point "
-            f"{MASTER_BINARY_ENV} at the binary, or run the master elsewhere "
-            "and point the servers' pool at the manifest it publishes."
+            "docker/common/install_mooncake.sh installs. Name the binary with "
+            "--binary, or run the master elsewhere and point the servers' pool "
+            "at the manifest it publishes."
         )
 
     host = local_address()
@@ -539,9 +523,7 @@ def _launch_master(
         f"(GLOG_v={env['GLOG_v']}); waiting for it to accept connections"
     )
     try:
-        elapsed = _wait_until_accepting(
-            host, rpc_port, master_timeout(), process=process, log_path=log_path
-        )
+        elapsed = _wait_until_accepting(host, rpc_port, timeout, process=process, log_path=log_path)
     except BaseException:
         master.stop()
         raise
@@ -604,12 +586,14 @@ def running_master(
     metadata_server: str = DEFAULT_METADATA_SERVER,
     protocol: str = "rdma",
     namespace: str = DEFAULT_NAMESPACE,
+    binary: str = DEFAULT_MASTER_BINARY,
+    timeout: float = DEFAULT_MASTER_TIMEOUT,
 ) -> Iterator[LaunchedMaster]:
     """Run a master, and publish the manifest describing the pool it owns.
 
     The master is infrastructure: it outlives no single engine's startup and
     belongs to none of them, which is what lets several servers share one pool
-    and what keeps the pool-wide settings stated in one place.
+    and what keeps the pool's own settings stated in one place.
 
     `pool_file` receives the manifest once the master answers, so servers can
     name a path instead of an address nobody knows until the scheduler has
@@ -617,7 +601,12 @@ def running_master(
     """
     os.makedirs(run_dir, exist_ok=True)
     master = _launch_master(
-        run_dir, rpc_port=rpc_port, metrics_port=metrics_port, eviction_ratio=eviction_ratio
+        run_dir,
+        rpc_port=rpc_port,
+        metrics_port=metrics_port,
+        eviction_ratio=eviction_ratio,
+        binary=binary,
+        timeout=timeout,
     )
     manifest = PoolManifest(
         master_server_address=master.address,
@@ -670,8 +659,8 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
     Args:
         pool: A `MooncakeStoreConfig`.
         run_dir: Where to write the client config and the segment records.
-            Defaults to `TRTLLM_MOONCAKE_RUN_DIR`, else a temporary directory
-            that is removed on exit.
+            Defaults to `pool.run_dir`, else a temporary directory that is
+            removed on exit.
     """
     inherited = os.getenv(CONFIG_PATH_ENV)
     if inherited:
@@ -683,31 +672,39 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
         yield None
         return
 
-    keep_run_dir = bool(run_dir or os.getenv(RUN_DIR_ENV))
-    run_dir = run_dir or os.getenv(RUN_DIR_ENV) or tempfile.mkdtemp(prefix="trtllm-mooncake-")
+    run_dir = run_dir or getattr(pool, "run_dir", None)
+    keep_run_dir = bool(run_dir)
+    run_dir = run_dir or tempfile.mkdtemp(prefix="trtllm-mooncake-")
     os.makedirs(run_dir, exist_ok=True)
     if keep_run_dir:
         logger.info(f"mooncake-store: joining the pool, run directory {run_dir}")
     else:
         logger.info(
             f"mooncake-store: joining the pool with run directory {run_dir}, "
-            f"which is removed at shutdown along with this run's segment "
-            f"records; set {RUN_DIR_ENV} to keep them"
+            "which is removed at shutdown along with this run's segment "
+            "records; set mooncake_store.run_dir to keep them, which ranks an "
+            "external launcher started also need in order to find this config"
         )
 
+    timeout = float(getattr(pool, "master_timeout", DEFAULT_MASTER_TIMEOUT))
     exported = False
     try:
-        manifest = resolve_pool(pool.pool)
+        manifest = resolve_pool(pool.pool, timeout)
         # Checked before any rank opens a handle so an absent master is
         # reported as such, rather than as the status code store.setup returns
         # for every kind of failure, in every rank, after the model has loaded.
-        wait_for_master(manifest.master_server_address)
+        wait_for_master(manifest.master_server_address, timeout)
         logger.info(f"mooncake-store: joining the pool at {manifest.describe()}")
 
         config_path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
         config = _client_config(pool, manifest, resolve_device_name(manifest.protocol, ""))
-        with open(config_path, "w") as handle:
+        # Renamed into place so a rank reading it never sees half a config, and
+        # so two servers that share a run directory, having rendered the same
+        # config, cannot interleave their writes into a torn one.
+        staging = f"{config_path}.partial"
+        with open(staging, "w") as handle:
             json.dump(config, handle, indent=2)
+        os.replace(staging, config_path)
         # Inherited by the ranks the LLM constructor spawns. Ranks an external
         # launcher started were already running, so they read the config out of
         # the run directory instead; see provisioned_config_path.

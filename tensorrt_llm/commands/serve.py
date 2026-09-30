@@ -28,8 +28,7 @@ from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
 from tensorrt_llm.commands._serve_stability import stability_option
-from tensorrt_llm.commands.mooncake import (mooncake_master,
-                                            mooncake_pool_report)
+from tensorrt_llm.commands.mooncake import mooncake_master, mooncake_pool_report
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
@@ -536,8 +535,8 @@ def _provision_kv_cache_pool(llm_args: dict,
         yield
         return
 
-    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import (
-        maybe_provision_pool)
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import \
+        maybe_provision_pool
 
     connector_config = llm_args.get("kv_connector_config")
     if isinstance(connector_config, dict):

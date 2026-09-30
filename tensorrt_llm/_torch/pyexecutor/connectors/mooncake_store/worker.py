@@ -39,7 +39,6 @@ to the pool without its engine joining in, and without needing an HCA that can
 pin GPU pages.
 """
 
-import os
 import threading
 import traceback
 from collections import defaultdict
@@ -55,7 +54,7 @@ from tensorrt_llm.logger import logger
 from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
-from .config import CONFIG_PATH_ENV, RUN_DIR_ENV, MooncakeStoreConnectorConfig
+from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, pool_config
 from .keys import KeyNamespace
 from .ledger import record_segment
 from .metadata import MooncakeStoreMetadata, RequestTransfers
@@ -178,7 +177,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         super().__init__(llm_args)
 
         validate_llm_args(llm_args)
-        self._config = MooncakeStoreConnectorConfig.from_env()
+        self._config = MooncakeStoreConnectorConfig.resolve(llm_args)
+        # Where this rank records the segment it mounts. `None` when the
+        # deployment named no directory, which makes the run unreportable but
+        # not unworkable; see `ledger.record_segment`.
+        self._run_dir = getattr(pool_config(llm_args), "run_dir", None)
         self._rank = mpi_rank()
         self._world_size = mpi_world_size()
         # Each ADP owner holds a complete attention cache. Reusable content is
@@ -203,7 +206,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         self._store, self._segment_host = _open_store(self._config)
         record_segment(
-            os.getenv(RUN_DIR_ENV),
+            self._run_dir,
             host=self._segment_host,
             rank=self._rank,
             segment_size=self._config.global_segment_size,

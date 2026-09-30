@@ -92,17 +92,13 @@ class FakeMasterProcess:
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    """No ambient pool: these tests are about what joining does itself."""
-    for name in (
-        CONFIG_PATH_ENV,
-        master_module.MASTER_BINARY_ENV,
-        master_module.MASTER_TIMEOUT_ENV,
-        master_module.RUN_DIR_ENV,
-    ):
-        monkeypatch.delenv(name, raising=False)
-    # Nothing here is slow to start, so a wait that runs long is a failure
-    # rather than something that needs more time.
-    monkeypatch.setenv(master_module.MASTER_TIMEOUT_ENV, "10")
+    """No ambient pool: these tests are about what joining does itself.
+
+    Every wait below is given an explicit timeout, since nothing here is slow
+    to start and a wait that runs long is a failure rather than something that
+    needs more time.
+    """
+    monkeypatch.delenv(CONFIG_PATH_ENV, raising=False)
 
 
 @pytest.fixture
@@ -357,10 +353,9 @@ def test_a_bare_master_address_needs_no_manifest(live_master):
         assert written["metadata_server"] == "P2PHANDSHAKE"
 
 
-def test_joining_fails_before_the_model_loads_if_the_master_is_absent(monkeypatch, tmp_path):
-    monkeypatch.setenv(master_module.MASTER_TIMEOUT_ENV, "1")
+def test_joining_fails_before_the_model_loads_if_the_master_is_absent(tmp_path):
     absent = f"127.0.0.1:{free_port()}"
-    pool = MooncakeStoreConfig(pool=f"file://{manifest_file(tmp_path, absent)}")
+    pool = MooncakeStoreConfig(pool=f"file://{manifest_file(tmp_path, absent)}", master_timeout=1)
 
     with pytest.raises(TimeoutError, match="did not accept connections"):
         with provision_pool(pool):
@@ -368,7 +363,7 @@ def test_joining_fails_before_the_model_loads_if_the_master_is_absent(monkeypatc
     assert CONFIG_PATH_ENV not in os.environ
 
 
-def test_an_unparseable_master_address_is_left_to_the_workers(tmp_path):
+def test_an_unparsable_master_address_is_left_to_the_workers(tmp_path):
     """Not every address is host:port, so an unprobeable one passes through."""
     address = "unix:///var/run/mooncake"
     pool = MooncakeStoreConfig(pool=f"file://{manifest_file(tmp_path, address)}")
@@ -389,6 +384,39 @@ def test_an_inherited_config_path_wins(monkeypatch, tmp_path):
         assert os.environ[CONFIG_PATH_ENV] == str(harness_config)
 
     assert os.environ[CONFIG_PATH_ENV] == str(harness_config)
+
+
+def test_the_config_names_where_the_client_config_goes(live_master, tmp_path):
+    """The ranks a launcher started read it back from there, having inherited
+    nothing, so the path has to be something their own config states.
+    """
+    run_dir = tmp_path / "run"
+    pool = MooncakeStoreConfig(pool=live_master, run_dir=str(run_dir))
+
+    with provision_pool(pool) as config_path:
+        assert config_path == str(run_dir / master_module.CLIENT_CONFIG_NAME)
+
+    assert (run_dir / master_module.CLIENT_CONFIG_NAME).exists()
+
+
+def test_an_unnamed_run_directory_is_temporary(live_master):
+    """It keeps the connector working, but loses this run's segment records."""
+    pool = MooncakeStoreConfig(pool=live_master)
+
+    with provision_pool(pool) as config_path:
+        assert os.path.exists(config_path)
+
+    assert not os.path.exists(config_path)
+
+
+def test_a_half_written_client_config_is_never_read(live_master, tmp_path):
+    """Two servers sharing a run directory must not interleave into a torn one."""
+    run_dir = tmp_path / "run"
+    pool = MooncakeStoreConfig(pool=live_master, run_dir=str(run_dir))
+
+    with provision_pool(pool) as config_path:
+        assert not os.path.exists(f"{config_path}.partial")
+        assert json.loads(open(config_path).read())["master_server_address"] == live_master
 
 
 def test_a_run_dir_keeps_the_client_config(live_master, tmp_path):
@@ -466,7 +494,7 @@ def test_an_empty_manifest_file_is_not_taken_for_a_pool(tmp_path):
         resolve_pool(f"file://{path}", timeout=1.0)
 
 
-def test_an_unparseable_manifest_is_treated_as_not_there_yet(tmp_path):
+def test_an_unparsable_manifest_is_treated_as_not_there_yet(tmp_path):
     """What a reader racing a slow filesystem sees, not a reason to fail."""
     path = tmp_path / "pool.json"
     path.write_text("{not json")
@@ -595,14 +623,24 @@ def test_a_master_that_dies_during_startup_says_so(fake_master, tmp_path):
             pytest.fail("the master should not have come up")
 
 
-def test_a_master_that_never_listens_times_out(monkeypatch, fake_master, tmp_path):
-    monkeypatch.setenv(master_module.MASTER_TIMEOUT_ENV, "1")
+def test_a_master_that_never_listens_times_out(fake_master, tmp_path):
     fake_master.arm()
 
     with pytest.raises(TimeoutError, match="did not accept connections"):
-        with master_module.running_master(str(tmp_path / "run"), rpc_port=free_port()):
+        with master_module.running_master(str(tmp_path / "run"), rpc_port=free_port(), timeout=1):
             pytest.fail("the master should not have come up")
     assert fake_master.process.terminated
+
+
+def test_a_named_binary_is_the_one_that_runs(fake_master, tmp_path):
+    """An image may ship the master under another name or path."""
+    port = free_port()
+    fake_master.arm(listen_on=port)
+
+    with master_module.running_master(
+        str(tmp_path / "run"), rpc_port=port, binary="mooncake_master_next"
+    ):
+        assert fake_master.process.command[0].endswith("mooncake_master_next")
 
 
 def test_a_missing_master_binary_names_the_alternatives(monkeypatch, tmp_path):
@@ -647,13 +685,12 @@ def test_a_half_written_manifest_is_never_read(tmp_path):
 # ---- saying why bringup is stuck ----
 
 
-def test_an_absent_master_is_named_rather_than_left_to_store_setup(monkeypatch):
+def test_an_absent_master_is_named_rather_than_left_to_store_setup():
     """Otherwise the failure is a bare status code in every rank, after loading."""
-    monkeypatch.setenv(master_module.MASTER_TIMEOUT_ENV, "1")
     address = f"127.0.0.1:{free_port()}"
 
     with pytest.raises(TimeoutError, match=address):
-        master_module.wait_for_master(address)
+        master_module.wait_for_master(address, timeout=1)
 
 
 def test_an_address_of_a_shape_we_cannot_probe_is_not_fatal():
