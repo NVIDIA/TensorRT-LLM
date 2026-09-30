@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 from unittest.mock import Mock, patch
@@ -62,11 +61,14 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     BatchDesc,
+    BufferConfig,
+    GpuCacheTierConfig,
+    HostCacheTierConfig,
     KVCacheDesc,
+    KVCacheManagerConfig,
     PageIndexMode,
     _introspection,
 )
-from tensorrt_llm.runtime.kv_cache_manager_v2 import _config as kv_cache_config_module
 
 _RequestCache = Dict[
     Tuple[int, DeepseekV4AttentionType],  # (layer index, attention type)
@@ -343,13 +345,6 @@ def test_chunked_prefill_checked_from_scheduled_request(first, last, enabled):
             prepare.assert_called_once_with(batch)
 
 
-@dataclass(slots=True)
-class _SparseBufferConfig(kv_cache_config_module.BufferConfig):
-    """Test the declared sparse buffer contract before its runtime is available."""
-
-    is_sparse: bool = False
-
-
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("tokens_per_block", [128, 256])
@@ -376,25 +371,31 @@ def test_sparse_offload_cache_roles(
     manager.use_fp8_ds_mla = False
     manager._swa_window_size = 128
     manager._max_draft_len = 0
-    config = kv_cache_config_module.KVCacheManagerConfig(
+    config = KVCacheManagerConfig(
         tokens_per_block=tokens_per_block,
         cache_tiers=[
-            kv_cache_config_module.GpuCacheTierConfig(quota=1 << 20),
-            kv_cache_config_module.HostCacheTierConfig(quota=1 << 20),
+            GpuCacheTierConfig(quota=1 << 20),
+            HostCacheTierConfig(quota=1 << 20),
         ],
         layers=[],
     )
-    buffer_config = _SparseBufferConfig if enabled else kv_cache_config_module.BufferConfig
-    with (
-        patch.object(deepseek_v4_cache, "BufferConfig", buffer_config),
-        patch.object(
-            deepseek_v4_cache, "AttentionLayerConfig", kv_cache_config_module.AttentionLayerConfig
-        ),
-    ):
+
+    def make_buffer_config(*, role: str, size: int, is_sparse: bool = False) -> BufferConfig:
+        """Keep native buffers while the mock records the unsupported sparse flag."""
+        return BufferConfig(role=role, size=size)
+
+    with patch.object(
+        deepseek_v4_cache, "BufferConfig", side_effect=make_buffer_config
+    ) as create_buffer:
         result = manager._build_cache_config(config)
 
     assert result.tokens_per_block == tokens_per_block
     assert len(result.layers) == manager._num_manager_layers
+    sparse_flags = {}
+    buffers = [(layer.layer_id, buffer) for layer in result.layers for buffer in layer.buffers]
+    for (layer_id, buffer), call in zip(buffers, create_buffer.call_args_list, strict=True):
+        assert (buffer.role, buffer.size) == (call.kwargs["role"], call.kwargs["size"])
+        sparse_flags[layer_id, buffer.role] = call.kwargs.get("is_sparse", False)
     layers = {layer.layer_id: layer for layer in result.layers}
     for (model_layer, attn_type), layer_id in manager._layer_attn_to_layer_id.items():
         assert model_layer in pp_layers
@@ -405,10 +406,9 @@ def test_sparse_offload_cache_roles(
         buffer = next(b for b in layers[layer_id].buffers if b.role == attn_type.role)
         assert buffer.tokens_per_block_override is None
         ratio = manager._compress_ratios[model_layer]
-        if enabled:
-            assert buffer.is_sparse == (
-                ratio == 4 and attn_type == DeepseekV4AttentionType.COMPRESS
-            )
+        assert sparse_flags[layer_id, buffer.role] == (
+            enabled and ratio == 4 and attn_type == DeepseekV4AttentionType.COMPRESS
+        )
         if attn_type == DeepseekV4AttentionType.COMPRESS:
             assert buffer.size == tokens_per_block // ratio * manager.head_dim * bytes_per_element
             if ratio == 4:
