@@ -79,7 +79,24 @@ def validate_llm_args(llm_args: TorchLlmArgs) -> None:
 
 
 def _available_host_memory() -> Optional[int]:
-    """Host memory the kernel says is available, or `None` if unknowable."""
+    """Host memory the kernel says is available, or `None` if unknowable.
+
+    `MemAvailable` rather than free pages: weights read during startup fill
+    the page cache, which a segment allocation reclaims but `SC_AVPHYS_PAGES`
+    does not count. On a large node free pages understate what is usable by
+    hundreds of gigabytes, refusing segments that fit comfortably.
+    """
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    # "MemAvailable:   123456 kB"
+                    return int(line.split()[1]) * 1024
+    except (OSError, IndexError, ValueError):
+        pass
+    # Kernels before 3.14 and non-Linux hosts do not publish MemAvailable.
+    # Free pages understate what is usable, keeping the check conservative
+    # rather than unenforced.
     try:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
     except (ValueError, OSError):
