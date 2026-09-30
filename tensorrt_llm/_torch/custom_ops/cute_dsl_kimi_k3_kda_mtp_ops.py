@@ -53,6 +53,7 @@ allocation. Benchmark-tuned fast variants exist for ``N in (32, 128), H in
 (2, 12, 32), num_spec == 2``; other shapes compile the general variant.
 """
 
+from math import gcd
 from typing import Optional, Tuple
 
 import torch
@@ -265,6 +266,24 @@ def _require_stride_layout(
         raise ValueError(
             f"Expected recurrent_state shape [pool, {HV}, {V}, {K}] (V-first pool layout)."
         )
+    if recurrent_state.dtype != torch.float32:
+        # This kernel generation reads and writes the state pool as fp32. A
+        # bf16 pool (kv_cache_config.mamba_ssm_cache_dtype=bfloat16) is staged
+        # to fp32 for prefill and single-token decode, but the fused verify
+        # path updates the pool rows in place through ssm_state_indices and has
+        # no staging, so reject it here instead of reinterpreting the bytes.
+        # bf16 acceptance is a property of the tensor-core (tcgen05) kernel
+        # formulation, not a dtype switch: it derives the TMA box geometry from
+        # the element width (64 vs 32 state columns per 128 B row) and skips the
+        # hi/lo tf32 split GEMM that an fp32 state needs. This kernel generation
+        # is register-resident with no TMA or tcgen05 path to attach that to.
+        raise ValueError(
+            "kda_mtp_decode requires an fp32 recurrent_state pool; got "
+            f"{recurrent_state.dtype}. A bf16 KDA state pool is not supported "
+            "together with fused KDA MTP verify; set "
+            "kv_cache_config.mamba_ssm_cache_dtype=float32 (the Kimi K3 "
+            "default) to run speculative decoding."
+        )
     if qkg_cache.ndim != 4 or qkg_cache.shape[1:] != (num_spec, 3, H * K):
         raise ValueError(f"Expected qkg_cache shape [pool, {num_spec}, 3, {H * K}].")
     if v_cache.ndim != 3 or v_cache.shape[1:] != (num_spec, HV * V):
@@ -302,30 +321,50 @@ def _fits_32bit_stride(tensor: torch.Tensor) -> bool:
     return True
 
 
-def _from_dlpack_arg(tensor: torch.Tensor):
+def _from_dlpack_arg(tensor: torch.Tensor, *, assumed_align: int = 16):
     return from_dlpack(
         tensor,
-        assumed_align=16,
+        assumed_align=assumed_align,
         use_32bit_stride=_fits_32bit_stride(tensor),
     )
 
 
-def _dlpack_arg(tensor: torch.Tensor):
+def _beta_cache_assumed_align(beta_cache: torch.Tensor) -> int:
+    """Return the alignment shared by KDA per-layer beta-cache views.
+
+    The producer allocates ``[layers, slots, num_spec, local_heads]``. After
+    selecting a layer, ``slots * stride(0)`` is the physical layer span even
+    when the head rows are padded. Combine that span with the current pointer
+    and dtype, capped at the CuTe bridge's useful 16-byte guarantee.
+    """
+    layer_span_bytes = beta_cache.shape[0] * beta_cache.stride(0) * beta_cache.element_size()
+    return gcd(16, beta_cache.data_ptr(), layer_span_bytes)
+
+
+def _dlpack_arg(tensor: torch.Tensor, *, assumed_align: int):
+    # Alignment is deliberately mandatory: layout dynamism does not imply
+    # arbitrary pointer alignment. Each call site must state the guarantee
+    # provided by that tensor's producer and view pattern.
+    arg = _from_dlpack_arg(tensor, assumed_align=assumed_align)
     for dim, stride in enumerate(tensor.stride()):
         if stride == 1:
-            return _from_dlpack_arg(tensor).mark_layout_dynamic(dim)
-    return _from_dlpack_arg(tensor).mark_layout_dynamic()
+            return arg.mark_layout_dynamic(dim)
+    return arg.mark_layout_dynamic()
 
 
-def _layout_key(tensor: torch.Tensor, dynamic_layout: bool = False):
-    arg = _dlpack_arg(tensor) if dynamic_layout else _from_dlpack_arg(tensor)
+def _layout_key(tensor: torch.Tensor, dynamic_layout: bool = False, *, assumed_align: int = 16):
+    arg = (
+        _dlpack_arg(tensor, assumed_align=assumed_align)
+        if dynamic_layout
+        else _from_dlpack_arg(tensor, assumed_align=assumed_align)
+    )
     shape_mask = arg.dynamic_shapes_mask
     stride_mask = arg.dynamic_strides_mask
     shape = tuple(None if dynamic else size for size, dynamic in zip(tensor.shape, shape_mask))
     stride = tuple(
         None if dynamic else value for value, dynamic in zip(tensor.stride(), stride_mask)
     )
-    return (tensor.dtype, shape, stride, _fits_32bit_stride(tensor))
+    return (tensor.dtype, shape, stride, _fits_32bit_stride(tensor), assumed_align)
 
 
 # (device_index, enabled) -> persistent int32 [1] control tensor. Keys are
@@ -460,9 +499,6 @@ def kda_mtp_decode_impl(
         out = torch.zeros(1, T_total, HV, V_dim, dtype=x_q.dtype, device=x_q.device)
     if num_accepted_tokens.dtype != torch.int32:
         num_accepted_tokens = num_accepted_tokens.to(torch.int32)
-    if ssm_state_indices.data_ptr() % 16 != 0:
-        raise ValueError("ssm_state_indices must be 16-byte aligned before CuTe DLPack conversion")
-
     _require_stride_layout(
         x_q=x_q,
         x_k=x_k,
@@ -531,6 +567,7 @@ def kda_mtp_decode_impl(
         "buffer before enabling PROFILE_STAGES"
     )
     stage_timing_arg = out
+    beta_cache_assumed_align = _beta_cache_assumed_align(beta_cache)
 
     key = (
         x_q.dtype,
@@ -544,9 +581,9 @@ def kda_mtp_decode_impl(
         lower_bound,
         use_flat_layout,
         _layout_key(h0_arg),
-        _layout_key(x_q_arg, dynamic_layout=True),
-        _layout_key(x_k_arg, dynamic_layout=True),
-        _layout_key(x_v_arg, dynamic_layout=True),
+        _layout_key(x_q_arg, dynamic_layout=True, assumed_align=16),
+        _layout_key(x_k_arg, dynamic_layout=True, assumed_align=16),
+        _layout_key(x_v_arg, dynamic_layout=True, assumed_align=16),
         _layout_key(w_q),
         _layout_key(w_k),
         _layout_key(w_v),
@@ -554,16 +591,16 @@ def kda_mtp_decode_impl(
         _layout_key(cs_k),
         _layout_key(cs_v),
         _layout_key(A_log),
-        _layout_key(g, dynamic_layout=True),
+        _layout_key(g, dynamic_layout=True, assumed_align=16),
         _layout_key(dt_bias),
-        _layout_key(beta, dynamic_layout=True),
-        _layout_key(out, dynamic_layout=True),
+        _layout_key(beta, dynamic_layout=True, assumed_align=16),
+        _layout_key(out, dynamic_layout=True, assumed_align=16),
         _layout_key(qkg_cache),
         _layout_key(v_cache),
-        _layout_key(beta_cache),
-        _layout_key(ssm_state_indices, dynamic_layout=True),
-        _layout_key(cu_seqlens, dynamic_layout=True),
-        _layout_key(num_accepted_tokens, dynamic_layout=True),
+        _layout_key(beta_cache, assumed_align=beta_cache_assumed_align),
+        _layout_key(ssm_state_indices, dynamic_layout=True, assumed_align=4),
+        _layout_key(cu_seqlens, dynamic_layout=True, assumed_align=4),
+        _layout_key(num_accepted_tokens, dynamic_layout=True, assumed_align=4),
         use_setmaxreg,
         use_regular_metadata,
         use_reg_q_weights,
@@ -579,30 +616,30 @@ def kda_mtp_decode_impl(
         )
         _compiled_cache[key] = cute.compile(
             _run_kda_decode_mtp,
-            _from_dlpack_arg(h0_arg),
-            _dlpack_arg(x_q_arg),
-            _dlpack_arg(x_k_arg),
-            _dlpack_arg(x_v_arg),
-            _from_dlpack_arg(w_q),
-            _from_dlpack_arg(w_k),
-            _from_dlpack_arg(w_v),
-            _from_dlpack_arg(cs_q),
-            _from_dlpack_arg(cs_k),
-            _from_dlpack_arg(cs_v),
-            _from_dlpack_arg(A_log),
-            _dlpack_arg(g),
-            _from_dlpack_arg(dt_bias),
-            _dlpack_arg(beta),
-            _dlpack_arg(out),
-            _from_dlpack_arg(h0_arg),
-            _from_dlpack_arg(qkg_cache),
-            _from_dlpack_arg(v_cache),
-            _from_dlpack_arg(beta_cache),
-            _dlpack_arg(stage_timing_arg),
-            _dlpack_arg(ssm_state_indices),
-            _dlpack_arg(cu_seqlens),
-            _dlpack_arg(num_accepted_tokens),
-            _from_dlpack_arg(precompute_control),
+            _from_dlpack_arg(h0_arg, assumed_align=16),
+            _dlpack_arg(x_q_arg, assumed_align=16),
+            _dlpack_arg(x_k_arg, assumed_align=16),
+            _dlpack_arg(x_v_arg, assumed_align=16),
+            _from_dlpack_arg(w_q, assumed_align=16),
+            _from_dlpack_arg(w_k, assumed_align=16),
+            _from_dlpack_arg(w_v, assumed_align=16),
+            _from_dlpack_arg(cs_q, assumed_align=16),
+            _from_dlpack_arg(cs_k, assumed_align=16),
+            _from_dlpack_arg(cs_v, assumed_align=16),
+            _from_dlpack_arg(A_log, assumed_align=16),
+            _dlpack_arg(g, assumed_align=16),
+            _from_dlpack_arg(dt_bias, assumed_align=16),
+            _dlpack_arg(beta, assumed_align=16),
+            _dlpack_arg(out, assumed_align=16),
+            _from_dlpack_arg(h0_arg, assumed_align=16),
+            _from_dlpack_arg(qkg_cache, assumed_align=16),
+            _from_dlpack_arg(v_cache, assumed_align=16),
+            _from_dlpack_arg(beta_cache, assumed_align=beta_cache_assumed_align),
+            _dlpack_arg(stage_timing_arg, assumed_align=16),
+            _dlpack_arg(ssm_state_indices, assumed_align=4),
+            _dlpack_arg(cu_seqlens, assumed_align=4),
+            _dlpack_arg(num_accepted_tokens, assumed_align=4),
+            _from_dlpack_arg(precompute_control, assumed_align=16),
             scale=scale,
             HV=HV,
             K=K,
@@ -624,30 +661,30 @@ def kda_mtp_decode_impl(
         )
 
     _compiled_cache[key](
-        _dlpack_arg(h0_arg),
-        _dlpack_arg(x_q_arg),
-        _dlpack_arg(x_k_arg),
-        _dlpack_arg(x_v_arg),
-        _dlpack_arg(w_q),
-        _dlpack_arg(w_k),
-        _dlpack_arg(w_v),
-        _dlpack_arg(cs_q),
-        _dlpack_arg(cs_k),
-        _dlpack_arg(cs_v),
-        _dlpack_arg(A_log),
-        _dlpack_arg(g),
-        _dlpack_arg(dt_bias),
-        _dlpack_arg(beta),
-        _dlpack_arg(out),
-        _dlpack_arg(h0_arg),
-        _dlpack_arg(qkg_cache),
-        _dlpack_arg(v_cache),
-        _dlpack_arg(beta_cache),
-        _dlpack_arg(stage_timing_arg),
-        _dlpack_arg(ssm_state_indices),
-        _dlpack_arg(cu_seqlens),
-        _dlpack_arg(num_accepted_tokens),
-        _dlpack_arg(precompute_control),
+        _dlpack_arg(h0_arg, assumed_align=16),
+        _dlpack_arg(x_q_arg, assumed_align=16),
+        _dlpack_arg(x_k_arg, assumed_align=16),
+        _dlpack_arg(x_v_arg, assumed_align=16),
+        _dlpack_arg(w_q, assumed_align=16),
+        _dlpack_arg(w_k, assumed_align=16),
+        _dlpack_arg(w_v, assumed_align=16),
+        _dlpack_arg(cs_q, assumed_align=16),
+        _dlpack_arg(cs_k, assumed_align=16),
+        _dlpack_arg(cs_v, assumed_align=16),
+        _dlpack_arg(A_log, assumed_align=16),
+        _dlpack_arg(g, assumed_align=16),
+        _dlpack_arg(dt_bias, assumed_align=16),
+        _dlpack_arg(beta, assumed_align=16),
+        _dlpack_arg(out, assumed_align=16),
+        _dlpack_arg(h0_arg, assumed_align=16),
+        _dlpack_arg(qkg_cache, assumed_align=16),
+        _dlpack_arg(v_cache, assumed_align=16),
+        _dlpack_arg(beta_cache, assumed_align=beta_cache_assumed_align),
+        _dlpack_arg(stage_timing_arg, assumed_align=16),
+        _dlpack_arg(ssm_state_indices, assumed_align=4),
+        _dlpack_arg(cu_seqlens, assumed_align=4),
+        _dlpack_arg(num_accepted_tokens, assumed_align=4),
+        _dlpack_arg(precompute_control, assumed_align=16),
         N,
         stream,
     )

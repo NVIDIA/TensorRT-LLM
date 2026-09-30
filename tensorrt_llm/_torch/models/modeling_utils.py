@@ -8,8 +8,8 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import (Any, Callable, Dict, Generic, Iterator, List, Literal,
-                    Optional, Tuple, Type, TypeVar, Union)
+from typing import (Any, Callable, ClassVar, Dict, Generic, Iterator, List,
+                    Literal, Optional, Tuple, Type, TypeVar, Union)
 
 import torch
 from torch import nn
@@ -387,6 +387,9 @@ TModel = TypeVar("TModel", bound=DecoderModel)
 class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
+
+    # Keep FX optimizations for decode and prefill above the PCG capture ceiling.
+    use_fx_for_pcg_fallback: ClassVar[bool] = True
 
     @staticmethod
     def _checkpoint_has_lm_head_scale(config: ModelConfig[TConfig]) -> bool:
@@ -1512,6 +1515,17 @@ def run_concurrently(func,
                 raise
 
 
+#: Modules stored unfused in a checkpoint and fused in the module tree, mapped
+#: to the components they are built from. This is the table the mapper-less
+#: load path below uses; HfWeightMapper.map_weights installs the same pairs for
+#: the mapper path. Anything reasoning about what a checkpoint must provide has
+#: to read one of the two rather than keep a third copy.
+FUSED_MODULE_COMPONENTS = {
+    'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
+    'gate_up_proj': ['gate_proj', 'up_proj'],
+}
+
+
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
                        skip_modules: List[str] = [],
@@ -1538,10 +1552,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         model.config, 'num_key_value_heads'
     ) and model.config.num_key_value_heads is not None else model.config.num_attention_heads
 
-    params_map = {
-        'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-        'gate_up_proj': ['gate_proj', 'up_proj']
-    }
+    params_map = dict(FUSED_MODULE_COMPONENTS)
     device_id = local_mpi_rank()
 
     def load_single_module(name, module):

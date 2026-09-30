@@ -40,7 +40,8 @@ from tensorrt_llm.quantization.functional import \
 from tensorrt_llm.quantization.utils.fp4_utils import (
     float4_e2m1x2, float4_sf_dtype,
     get_reorder_rows_for_gated_act_gemm_row_indices,
-    get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices)
+    get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices,
+    nvfp4_scaling_vector_size)
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
@@ -2342,12 +2343,24 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
     def create_weights(self,
                        module: torch.nn.Module,
-                       weight_dtype,
-                       weight_vec_size,
-                       block_scales_dtype,
-                       block_scales_vec_size,
-                       scaling_vector_size=16,
-                       bias_dtype: Optional[torch.dtype] = None):
+                       weight_dtype: torch.dtype,
+                       weight_vec_size: int,
+                       block_scales_dtype: torch.dtype,
+                       block_scales_vec_size: int,
+                       scaling_vector_size: int = 16,
+                       bias_dtype: Optional[torch.dtype] = None) -> None:
+        # W4A8_NVFP4_FP8 uses a backend-fixed width of 32, independent of
+        # QuantConfig.group_size. Only these algorithms declare an NVFP4 width.
+        if module.quant_config is not None and module.quant_config.quant_algo in (
+                QuantAlgo.NVFP4, QuantAlgo.NVFP4_ARC, QuantAlgo.W4A16_NVFP4):
+            declared_scaling_vector_size = nvfp4_scaling_vector_size(
+                module.quant_config)
+            if declared_scaling_vector_size != scaling_vector_size:
+                raise NotImplementedError(
+                    f"{type(self).__name__} supports {scaling_vector_size}-element "
+                    "NVFP4 scale blocks, but the checkpoint declares group_size="
+                    f"{declared_scaling_vector_size}; wider blocks are only "
+                    "supported by the dense W4A16_NVFP4 Linear path.")
         from ...locality_domain_utils import get_current_locality_domain
         is_locality_domain_weights = get_current_locality_domain() is not None
         locality_domain_factor = 2 if is_locality_domain_weights else 1
@@ -3470,6 +3483,20 @@ class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     def transform_weights(self, module: torch.nn.Module) -> None:
         """Transform CUTLASS-format NVFP4 weights to Marlin tiled format."""
         from tensorrt_llm.quantization.utils import marlin_utils
+
+        # An AWQ-style checkpoint carries a per-channel pre-quant scale, which
+        # ``load_quant_scales`` turns into ``fc31_act_scale``. CutlassFusedMoE
+        # pre-multiplies the input by it; the Marlin kernel takes no activation
+        # scale and this family's ``run_moe`` never applies one, so serving such
+        # a checkpoint here would be silently wrong rather than merely slower.
+        # Checked at this stage because that parameter does not exist until the
+        # weights have been loaded, and refused rather than ignored.
+        if getattr(module, "fc31_act_scale", None) is not None:
+            raise ValueError(
+                f"{type(module).__name__} cannot serve a checkpoint with a "
+                "pre-quant activation scale (NVFP4_AWQ / NVFP4_ARC): the Marlin "
+                "kernel applies no activation scale. Select a backend that does, "
+                "e.g. moe_backend=CUTLASS.")
 
         # Standard CUTLASS loading (swizzles scales, computes alpha, etc.)
         super().transform_weights(module)

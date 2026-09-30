@@ -39,7 +39,7 @@ unquantized bf16 path is FlashInfer-only.
 
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from ..impl_contract import canonical_quant, normalize_quant
+from ..impl_contract import canonical_quant, check_quant_matches_identity, normalize_quant
 from ..impl_identity import MOE_IMPL_REGISTRY, MoEImplId
 from .base import TrtllmGenFusedMoEBase
 from .eligibility import (
@@ -48,7 +48,6 @@ from .eligibility import (
     check_mxfp4_flashinfer_shape,
     check_no_activation_constants,
     check_no_expert_bias,
-    check_quant_matches_identity,
     check_trtllm_gen_capabilities,
     check_trtllm_gen_leaf,
     nvfp4_needs_padded_method,

@@ -17,13 +17,13 @@
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Literal, Optional, Union
 
-import torch
 from pydantic import ConfigDict, model_validator
 from pydantic import Field as PydanticField
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
 from ..params import SparseParams, SparseRuntimeParams
+from ..timestep_phase import graph_phase_for_timestep
 
 _RESERVED_FORMULA_KEYS = frozenset({"formula", "target_sparsity"})
 _SKIP_SOFTMAX_ALGORITHMS = frozenset({"skip_softmax", "softmax_skip"})
@@ -352,47 +352,28 @@ class SkipSoftmaxScheduler:
             disabled_until_timestep=disabled_until_timestep,
         )
 
-    @staticmethod
-    def _as_float(value: Any) -> Optional[float]:
-        if value is None:
-            return None
-        if isinstance(value, torch.Tensor):
-            if value.numel() == 0:
-                return None
-            return float(value.flatten()[0].item())
-        return float(value)
-
-    @classmethod
-    def get_graph_phase_for_timestep(
-        cls,
-        timestep: Any,
-        *,
-        disabled_until_timestep: Optional[float],
-    ) -> Optional[int]:
-        """Return 1 after descending timesteps cross the cutoff, otherwise 0."""
-        if disabled_until_timestep is None:
-            return None
-        timestep_value = cls._as_float(timestep)
-        if timestep_value is None:
-            return None
-        return int(timestep_value < disabled_until_timestep)
-
     def get_runtime_params(
         self,
         *,
         runtime_params: Optional[SparseRuntimeParams] = None,
         timestep: Any = None,
+        graph_phase: Optional[int] = None,
     ) -> SparseRuntimeParams:
-        """Return runtime parameters with skip-softmax thresholds."""
+        """Return runtime parameters with skip-softmax thresholds.
+
+        ``graph_phase`` lets a caller that already resolved the dense-prefix
+        phase host-side (the CUDA-graph runner does, to build its key) pass it
+        in, so this never has to read ``timestep`` -- a ``.item()`` on a CUDA
+        tensor -- while a graph is being captured.
+        """
         if runtime_params is None:
             runtime_params = SparseRuntimeParams()
-        if (
-            self.get_graph_phase_for_timestep(
+        if graph_phase is None:
+            graph_phase = graph_phase_for_timestep(
                 timestep,
                 disabled_until_timestep=self.disabled_until_timestep,
             )
-            == 0
-        ):
+        if graph_phase == 0:
             return replace(
                 runtime_params,
                 threshold_scale_factor_prefill=0.0,
@@ -411,3 +392,9 @@ class SkipSoftmaxParams(SparseParams):
 
     algorithm: Literal["skip_softmax"] = field(init=False, default="skip_softmax")
     scheduler: SkipSoftmaxScheduler = field(default_factory=SkipSoftmaxScheduler)
+    uses_spcompress: bool = False
+
+    @property
+    def disabled_until_timestep(self) -> Optional[float]:
+        """Normalized timestep cutoff owned by the scheduler."""
+        return self.scheduler.disabled_until_timestep

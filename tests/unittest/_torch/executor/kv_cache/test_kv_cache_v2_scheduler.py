@@ -174,6 +174,7 @@ def make_kv_cache_manager(
     is_vswa=False,
 ):
     mgr = Mock()
+    mgr.kv_connector_manager = None
     mgr.tokens_per_block = tokens_per_block
     # A real policy, not an auto-created Mock attribute: the prefix-aware skip
     # is gated on ALL_REUSABLE (see _skip_pays_off_under_reuse_policy).
@@ -1059,15 +1060,46 @@ class TestKVCacheFailuresCtxChunked:
         out = sched.schedule_request(reqs, set())
         assert len(out.context_requests) == 0
 
-    def test_chunked_resize_fails(self):
+    @pytest.mark.parametrize("ctx_chunk_config", [None, (None, 64)], ids=["full", "chunked"])
+    def test_context_resize_failure_releases_caches_and_rewinds(
+        self, ctx_chunk_config: tuple | None
+    ) -> None:
         mgr = make_kv_cache_manager(
             tokens_per_block=64,
             resize_context_fn=lambda req, n: False,
         )
-        sched = make_scheduler(mgr, max_num_tokens=1000, ctx_chunk_config=(None, 64))
-        reqs = [make_ctx_request(0, context_remaining_length=500)]
-        out = sched.schedule_request(reqs, set())
+        draft_mgr = make_kv_cache_manager()
+        cross_mgr = make_kv_cache_manager()
+        managers = (mgr, draft_mgr, cross_mgr)
+        for manager in managers:
+            manager.kv_cache_map[0] = Mock(is_active=False)
+            manager.free_resources.side_effect = (
+                lambda req, manager=manager: manager.kv_cache_map.pop(req.py_request_id)
+            )
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            ctx_chunk_config=ctx_chunk_config,
+            draft_kv_cache_manager=draft_mgr,
+            cross_kv_cache_manager=cross_mgr,
+        )
+        req = make_ctx_request(0, context_remaining_length=256, prompt_len=512)
+        req.context_current_position = 256
+        req.context_chunk_size = 128
+        req.estimated_reusable_tokens = 256
+        req.py_ctx_pre_resize_cap = 64
+
+        out = sched.schedule_request([req], set())
+
         assert len(out.context_requests) == 0
+        for manager in managers:
+            manager.free_resources.assert_called_once_with(req)
+            assert not manager.kv_cache_map
+        req.set_prepopulated_prompt_len.assert_called_once_with(0, 64)
+        assert req.context_current_position == 0
+        assert req.context_chunk_size == req.prompt_len
+        assert req.estimated_reusable_tokens == 0
+        assert req.py_ctx_pre_resize_cap is None
 
     def test_chunked_fail_then_gen(self):
         mgr = make_kv_cache_manager(
@@ -3234,6 +3266,100 @@ class TestPrefixAwareSkip:
         out = sched.schedule_request(reqs, set())
         assert ids(out.context_requests) == [0]
 
+    @pytest.mark.parametrize("remaining_tokens", [0, 1, 63])
+    def test_token_budget_exhaustion_avoids_pending_prefix_probes(
+        self, remaining_tokens: int
+    ) -> None:
+        """After one chunk fills the budget, pending prompts need no radix walks."""
+        reqs = [make_ctx_request(0, 64)] + [make_ctx_request(i, 128) for i in range(1, 20)]
+        mgr = self._keyed_manager({i: str(i).encode() for i in range(20)})
+        sched = make_scheduler(
+            mgr, max_num_tokens=64 + remaining_tokens, ctx_chunk_config=(None, 64)
+        )
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.context_requests) == [0]
+        mgr.probe_first_new_block_key.assert_called_once_with(reqs[0])
+        mgr.prepare_context.assert_called_once_with(reqs[0])
+
+    def test_generation_exhausts_context_budget_before_any_probe(self) -> None:
+        mgr = self._keyed_manager({1: b"a", 2: b"b"})
+        sched = make_scheduler(mgr, max_num_tokens=1, ctx_chunk_config=(None, 64))
+        reqs = [make_gen_request(0), make_ctx_request(1, 128), make_ctx_request(2, 128)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.generation_requests) == [0]
+        assert not out.context_requests
+        mgr.probe_first_new_block_key.assert_not_called()
+        mgr.prepare_context.assert_not_called()
+
+    @pytest.mark.parametrize("policy", [None, ContextChunkingPolicy.FORCE_CHUNK])
+    def test_unlimited_chunk_budget_still_probes_and_schedules(
+        self, policy: ContextChunkingPolicy | None
+    ) -> None:
+        mgr = self._keyed_manager({0: b"a", 1: b"b"})
+        sched = make_scheduler(mgr, max_num_tokens=None, ctx_chunk_config=(policy, 64))
+        reqs = [make_ctx_request(0, 128), make_ctx_request(1, 128)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.context_requests) == [0, 1]
+        assert [req.context_chunk_size for req in reqs] == [128, 128]
+        assert mgr.probe_first_new_block_key.call_args_list == [call(req) for req in reqs]
+        assert mgr.prepare_context.call_args_list == [call(req) for req in reqs]
+
+    def test_budget_skip_preserves_existing_context_claim(self) -> None:
+        mgr = self._keyed_manager({1: b"a", 2: b"b"})
+        sched = make_scheduler(mgr, max_num_tokens=1, ctx_chunk_config=(None, 64))
+        req = make_ctx_request(1, 128, prompt_len=192)
+        req.context_current_position = 64
+        req.context_chunk_size = 64
+        cache = mgr.kv_cache_map[req.py_request_id]
+
+        out = sched.schedule_request([make_gen_request(0), req, make_ctx_request(2, 128)], set())
+
+        assert ids(out.generation_requests) == [0]
+        assert not out.context_requests
+        mgr.probe_first_new_block_key.assert_not_called()
+        mgr.prepare_context.assert_not_called()
+        mgr.free_resources.assert_not_called()
+        mgr.suspend_request.assert_not_called()
+        assert mgr.kv_cache_map[req.py_request_id] is cache
+        assert cache.is_active
+        assert not cache.mock_calls
+        assert req.context_current_position == 64
+        assert req.context_remaining_length == 128
+        assert req.context_chunk_size == 64
+        assert req.is_first_context_chunk
+        assert not req.mock_calls
+
+    def test_small_context_budget_still_allows_encoder_request(self) -> None:
+        mgr = self._keyed_manager({0: b"a", 1: b"b"})
+        sched = make_encoder_scheduler(mgr, max_num_tokens=16, ctx_chunk_config=(None, 64))
+        reqs = [make_ctx_request(0, 128), make_ctx_request(1, 128), make_encoder_request(2, 16)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert not out.context_requests
+        assert ids(out.encoder_requests) == [2]
+        mgr.probe_first_new_block_key.assert_not_called()
+
+    def test_force_chunk_probes_when_budget_is_smaller_than_chunk_unit(self) -> None:
+        mgr = self._keyed_manager({0: b"a", 1: b"b"})
+        sched = make_scheduler(
+            mgr, max_num_tokens=16, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        reqs = [make_ctx_request(0, 16), make_ctx_request(1, 16)]
+        reqs[0].expect_snapshot_points = [16]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.context_requests) == [0]
+        assert reqs[0].context_chunk_size == 16
+        mgr.probe_first_new_block_key.assert_called_once_with(reqs[0])
+
     def test_scheduled_chunk_continuation_defers_later_duplicate(self):
         """A continuation that is not yet in flight registers once scheduled, so
         a duplicate examined after it still defers."""
@@ -3331,3 +3457,110 @@ class TestPrefixAwareSkip:
         # on behalf of a request that this iteration paused.
         assert 1 not in ids(out.paused_requests)
         assert ids(out.context_requests) in ([1], [])
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_connector_credit_admits_another_request(chunked: bool) -> None:
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import BudgetTracker
+
+    def run_with_offer(offered_tokens: int) -> tuple[object, list[int], Mock]:
+        mgr = make_kv_cache_manager(tokens_per_block=32, enable_block_reuse=True)
+        mgr.is_draft = False
+        connector = Mock(prefix_reservations_enabled=True)
+        connector.should_add_sequence.return_value = True
+        connector.reserve_prefix.side_effect = lambda req, local_end: (
+            SimpleNamespace(start=local_end, end=local_end + offered_tokens)
+            if offered_tokens
+            else None
+        )
+        connector.trim_prefix_reservation.side_effect = lambda req, start, end: SimpleNamespace(
+            start=start, end=end
+        )
+        mgr.kv_connector_manager = connector
+        for name in (
+            "_connector_reservations_enabled",
+            "_connector_may_serve",
+            "_prepare_connector_prefix_reservation",
+        ):
+            setattr(mgr, name, getattr(KVCacheManagerV2, name).__get__(mgr))
+        mgr.prepare_context.side_effect = KVCacheManagerV2.prepare_context.__get__(mgr)
+        requests = [
+            LlmRequest(
+                request_id=request_id,
+                max_new_tokens=1,
+                input_tokens=list(range(request_id * 100, request_id * 100 + 96)),
+                sampling_config=SamplingConfig(1),
+                is_streaming=False,
+            )
+            for request_id in (1, 2)
+        ]
+        for req in requests:
+            mgr.kv_cache_map[req.request_id].num_committed_tokens = 0
+        scheduler = make_scheduler(
+            mgr,
+            max_num_tokens=64 if chunked else 128,
+            ctx_chunk_config=(None, 32) if chunked else None,
+        )
+        original_commit = BudgetTracker.commit
+        with patch.object(
+            BudgetTracker, "commit", autospec=True, side_effect=original_commit
+        ) as commit:
+            output = scheduler.schedule_request(requests, set())
+        charges = [entry.args[2] for entry in commit.call_args_list]
+        connector.accept_prefix_load.assert_not_called()
+        return output, charges, mgr
+
+    baseline, baseline_charges, _ = run_with_offer(0)
+    credited, credited_charges, manager = run_with_offer(64)
+
+    assert ids(baseline.context_requests) == [1]
+    assert baseline_charges == [64 if chunked else 96]
+    assert ids(credited.context_requests) == [1, 2]
+    assert credited_charges == [32, 32]
+    assert [call.args[1] for call in manager.resize_context.call_args_list] == [32, 32]
+
+
+def test_pending_connector_load_is_not_a_recompute_or_eviction_victim() -> None:
+    manager = make_kv_cache_manager(can_evict=True)
+    connector = Mock()
+    connector.has_pending_load.return_value = True
+    manager.kv_connector_manager = connector
+    request = make_gen_request(1)
+    scheduler = make_scheduler(manager)
+    assert not scheduler._is_evictable(request, set())
+    assert not scheduler._is_recompute_pause_candidate(request, set())
+
+
+def test_pending_connector_load_does_not_self_evict_or_report_deadlock() -> None:
+    manager = make_kv_cache_manager(
+        can_evict=True, try_allocate_generation_fn=lambda request: False
+    )
+    connector = Mock()
+    connector.has_pending_load.return_value = True
+    manager.kv_connector_manager = connector
+    request = make_gen_request(1)
+    scheduler = make_scheduler(manager)
+    output = scheduler.schedule_request([request], set())
+    assert output.generation_requests == []
+    assert output.paused_requests == []
+    assert output.recompute_paused_requests == []
+    manager.suspend_request.assert_not_called()
+    manager.free_resources.assert_not_called()
+
+
+def test_parked_connector_load_keeps_kv_pressure_retryable() -> None:
+    manager = make_kv_cache_manager(try_allocate_generation_fn=lambda request: False)
+    connector = Mock()
+    connector.has_pending_load.side_effect = lambda request: request.request_id == 1
+    manager.kv_connector_manager = connector
+    loading = make_filtered_request(1, state_value=DISAGG_GEN_TRANS_IN_PROGRESS)
+    generation = make_gen_request(2)
+    manager.kv_cache_map[2].is_active = False
+    scheduler = make_scheduler(manager)
+    output = scheduler.schedule_request([loading, generation], set())
+    assert output.generation_requests == []
+    assert output.recompute_paused_requests == []

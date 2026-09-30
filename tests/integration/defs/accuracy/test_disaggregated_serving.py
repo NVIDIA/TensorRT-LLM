@@ -26,6 +26,7 @@ import subprocess
 import tempfile
 import time
 from collections import namedtuple
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Union
 
@@ -33,18 +34,22 @@ import openai
 import pytest
 import requests
 import yaml
+from datasets import load_dataset
 from defs.common import wait_for_reported_addr
 
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
-from tensorrt_llm.llmapi.llm_args import (DSparkDecodingConfig, LlmArgs,
+from tensorrt_llm.llmapi.llm_args import (DSparkDecodingConfig,
+                                          Eagle3DecodingConfig, LlmArgs,
                                           MTPDecodingConfig)
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
+from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from ..trt_test_alternative import popen
-from .accuracy_core import (GSM8K, MMLU, LlmapiAccuracyTestHarness,
+from .accuracy_core import (GSM8K, MMLU, GSM8KInferenceX,
+                            LlmapiAccuracyTestHarness,
                             acceptance_length_from_iteration_stats,
                             assert_acceptance_length, get_accuracy_task)
 
@@ -231,6 +236,7 @@ def launch_disaggregated_llm(
     gen_extra_env: Optional[Dict[str, str]] = None,
     request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
     request_max_retries: Optional[int] = None,
+    assert_worker_log_contains: str | None = None,
 ):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
@@ -438,6 +444,27 @@ def launch_disaggregated_llm(
 
         gen_servers.append((env, gen_server_args))
 
+    worker_log_paths = []
+
+    @contextlib.contextmanager
+    def report_worker_logs_on_failure() -> Iterator[None]:
+        try:
+            yield
+        except BaseException:
+            # The server stack closes the log writers before this handler runs;
+            # the temporary directory is still alive. Preserve complete logs for
+            # startup, workload, and missing-marker failures in pytest capture.
+            for log_path in worker_log_paths:
+                try:
+                    with open(log_path, encoding="utf-8",
+                              errors="replace") as log_file:
+                        print(f"Worker log ({log_path}):")
+                        for line in log_file:
+                            print(line, end="")
+                except OSError as error:
+                    print(f"Could not read worker log {log_path}: {error}")
+            raise
+
     @contextlib.contextmanager
     def multi_popen(server_configs, server_name="", enable_redirect_log=False):
         processes = []
@@ -445,9 +472,12 @@ def launch_disaggregated_llm(
         try:
             for i, (env, args) in enumerate(server_configs):
                 if enable_redirect_log:
-                    f = open(f"output_{server_name}_{i}.log", "w+")
-                    proc = popen(args, env=env, stdout=f, stderr=f)
+                    log_path = os.path.join(temp_dir.name,
+                                            f"output_{server_name}_{i}.log")
+                    f = open(log_path, "w+", encoding="utf-8", errors="replace")
                     log_files.append(f)
+                    worker_log_paths.append(log_path)
+                    proc = popen(args, env=env, stdout=f, stderr=f)
                 else:
                     proc = popen(args, env=env)
                 processes.append(proc)
@@ -457,13 +487,14 @@ def launch_disaggregated_llm(
                     stack.enter_context(proc) for proc in processes
                 ]
                 yield opened_processes
-            for f in log_files:
-                f.close()
         except Exception as e:
             print(
                 f"Failed to start disaggregated server processes in multi_popen: {e}"
             )
             raise
+        finally:
+            for f in log_files:
+                f.close()
 
     server_cmd = [
         trtllm_serve_path, "disaggregated", "-c",
@@ -476,6 +507,7 @@ def launch_disaggregated_llm(
     with (
             MyThreadPoolExecutor(max_workers=max_workers) as thread_pool,
             temp_dir,
+            report_worker_logs_on_failure(),
             contextlib.ExitStack() as server_stack,
     ):
         server_processes = server_stack.enter_context(
@@ -487,9 +519,15 @@ def launch_disaggregated_llm(
         write_worker_configs(f"http://localhost:{serve_port}")
 
         ctx_processes = server_stack.enter_context(
-            multi_popen(ctx_servers, "ctx"))
+            multi_popen(ctx_servers,
+                        "ctx",
+                        enable_redirect_log=assert_worker_log_contains
+                        is not None))
         gen_processes = server_stack.enter_context(
-            multi_popen(gen_servers, "gen"))
+            multi_popen(gen_servers,
+                        "gen",
+                        enable_redirect_log=assert_worker_log_contains
+                        is not None))
 
         start_time = time.time()
         server_is_ready = False
@@ -598,9 +636,11 @@ def launch_disaggregated_llm(
                         print(line.strip())
 
         tokenizer = load_hf_tokenizer(model_name)
+        body_succeeded = False
         try:
             yield DuckLLM(args, tokenizer, generate_async,
                           f"http://localhost:{serve_port}")
+            body_succeeded = True
         finally:
             if enable_perf:
                 _show_kvcache_time(kv_cache_perf_dir)
@@ -628,6 +668,22 @@ def launch_disaggregated_llm(
                         pass  # already exited between timeout and kill
                 except OSError:
                     pass  # process already gone
+
+            # Finish process-tree cleanup before reading logs, while the
+            # temporary directory still exists. Preserve any workload failure.
+            if assert_worker_log_contains is not None:
+                server_stack.close()
+                if body_succeeded:
+                    marker_found = False
+                    for log_path in worker_log_paths:
+                        with open(log_path, encoding="utf-8",
+                                  errors="replace") as log_file:
+                            marker_found |= any(
+                                assert_worker_log_contains in line
+                                for line in log_file)
+                    assert marker_found, (
+                        f"No worker logged {assert_worker_log_contains!r}; "
+                        "the required transfer path was not exercised")
 
 
 def run_parallel_test(model_name: str,
@@ -766,7 +822,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     def test_gen_only_spec_dec(self):
         ctx_server_config = {"disable_overlap_scheduler": True}
-        gen_server_config = {"disable_overlap_scheduler": False}
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "enable_iter_perf_stats": True,
+            "iter_stats_max_iterations": -1,
+        }
         cache_transceiver_config = {
             "backend": "NIXL",
             "max_tokens_in_buffer": 4096,
@@ -794,6 +854,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH,
                                       tensor_parallel_size=4) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
+            assert_acceptance_length(
+                "disagg::TestDeepSeekV3Lite::test_gen_only_spec_dec",
+                compute_disagg_acceptance_length(llm.serve_url))
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
@@ -917,6 +980,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "decoding_type": "MTP",
                 "max_draft_len": mtp_nextn
             }
+            gen_server_config["enable_iter_perf_stats"] = True
+            gen_server_config["iter_stats_max_iterations"] = -1
         disaggregated_server_config = {
             "hostname": "localhost",
             "backend": "pytorch",
@@ -933,6 +998,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH,
                                       tensor_parallel_size=4) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
+            if mtp_nextn > 0:
+                assert_acceptance_length(
+                    "disagg::TestDeepSeekV3Lite::test_auto_dtype",
+                    compute_disagg_acceptance_length(llm.serve_url))
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
@@ -1034,6 +1103,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             }
             ctx_server_config["speculative_config"] = spec_config
             gen_server_config["speculative_config"] = spec_config
+            gen_server_config["enable_iter_perf_stats"] = True
+            gen_server_config["iter_stats_max_iterations"] = -1
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,
@@ -1052,6 +1123,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+            if mtp_nextn > 0:
+                assert_acceptance_length(
+                    "disagg::TestDeepSeekV3Lite::test_gen_first",
+                    compute_disagg_acceptance_length(llm.serve_url))
 
 
 @skip_pre_hopper
@@ -1204,11 +1279,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
         speculative_decoding_config = {
-            "decoding_type": "Eagle",
+            "decoding_type": "Eagle3",
             "max_draft_len": 3,
             "speculative_model":
             f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3",
-            "eagle3_one_model": True
         }
         ctx_server_config = {
             "disable_overlap_scheduler": True,
@@ -1637,6 +1711,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
         mocker.patch.object(GSM8K, "NUM_SAMPLES", 100)
         ctx_server_config = {
             "disable_overlap_scheduler": True,
+            "max_batch_size": 256,
             "trust_remote_code": True,
             "kv_cache_config": {
                 "enable_block_reuse": True
@@ -1648,6 +1723,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
+            "max_batch_size": 256,
             "trust_remote_code": True,
             "kv_cache_config": {
                 "enable_block_reuse": False
@@ -1928,6 +2004,8 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
             spec = {"decoding_type": "MTP", "max_draft_len": mtp_nextn}
             ctx_cfg["speculative_config"] = spec
             gen_cfg["speculative_config"] = spec
+            gen_cfg["enable_iter_perf_stats"] = True
+            gen_cfg["iter_stats_max_iterations"] = -1
         if block_reuse:
             ctx_cfg["kv_cache_config"]["enable_block_reuse"] = True
             gen_cfg["kv_cache_config"]["enable_block_reuse"] = True
@@ -1940,6 +2018,10 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+            if mtp_nextn > 0:
+                assert_acceptance_length(
+                    "disagg::TestNemotron3Super120B::test_auto_dtype",
+                    compute_disagg_acceptance_length(llm.serve_url))
 
     @pytest.mark.skip_less_device(8)
     def test_ctx_dp2_gen_tp4(self):
@@ -2630,3 +2712,198 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+
+@skip_pre_blackwell
+class TestMiniMaxM3(LlmapiAccuracyTestHarness):
+
+    @pytest.mark.skip_less_device(6)
+    @pytest.mark.skip_less_device_memory(140000)
+    def test_nvfp4_eagle3_disagg_head_mismatched_bounce(self) -> None:
+        """Check M3 Eagle3 accuracy and acceptance over C++ NIXL bounce."""
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import \
+            msa_package_available
+
+        assert msa_package_available(), "MSA kernels are required for this test"
+        model_name = "nvidia/MiniMax-M3-NVFP4"
+        model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        max_draft_len = 3
+        # CTX TP2/EP2 -> GEN TP4/EP1: two versus one KV heads per rank.
+        # Both workers use the Python V2 transceiver with the C++ NIXL agent.
+        speculative_config = {
+            "decoding_type": "Eagle3",
+            "max_draft_len": max_draft_len,
+            "speculative_model": f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
+        }
+        common_config = {
+            "speculative_config": speculative_config,
+            "sparse_attention_config": {
+                "algorithm": "minimax_m3",
+                "implementation": "msa",
+                "indexer_kv_dtype": "fp8",
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "agent_bounce_buffer_enable": True,
+                "kv_cache_bounce_size_mb": 512,
+                # Relax the admission gates for this short CI workload.
+                # The production defaults remain 1024 descriptors / 16 KiB.
+                "agent_bounce_params": {
+                    "min_descriptor_count": "1",
+                    "max_average_descriptor_size": "1MB",
+                },
+                "kv_transfer_timeout_ms": 600000,
+            },
+            "moe_config": {
+                "backend": "CUTLASS"
+            },
+            "scheduler_config": {
+                "capacity_scheduler_policy": "MAX_UTILIZATION"
+            },
+            "enable_autotuner": True,
+            # InferenceX thinking output needs a 16K sequence budget.
+            "max_seq_len": 16384,
+            "trust_remote_code": True,
+        }
+        kv_cache_common = {
+            "dtype": "fp8",
+            "tokens_per_block": 128,
+            "use_kv_cache_manager_v2": True,
+            "event_buffer_max_size": 0,
+            # Leave headroom for the graphs and bounce arena on B200.
+            "free_gpu_memory_fraction": 0.7,
+        }
+        ctx_server_config = {
+            **common_config,
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "disable_overlap_scheduler": False,
+            "enable_attention_dp": False,
+            "enable_chunked_prefill": True,
+            "kv_cache_config": {
+                **kv_cache_common, "enable_block_reuse": True
+            },
+            "max_batch_size": 4,
+            "max_num_tokens": 32768,
+            "cuda_graph_config": None,
+            # Validate bounce transfer with eager prefill until the MiniMax-M3
+            # PCG port is ready. Re-enable context PCG with that port.
+            "torch_compile_config": None,
+        }
+        gen_server_config = {
+            **common_config,
+            "tensor_parallel_size": 4,
+            "moe_expert_parallel_size": 1,
+            "disable_overlap_scheduler": False,
+            "enable_attention_dp": False,
+            "enable_lm_head_tp_in_adp": False,
+            "kv_cache_config": {
+                **kv_cache_common, "enable_block_reuse": False
+            },
+            "max_batch_size": 16,
+            # Decode-only token budget: (1 + draft_len) verify tokens per
+            # request x max_batch_size (the production sweep's value is
+            # its no-spec arm's).
+            "max_num_tokens": (1 + max_draft_len) * 16,
+            "num_postprocess_workers": 4,
+            "stream_interval": 100,
+            "enable_iter_perf_stats": True,
+            # Keep the entire acceptance probe if a metrics collector is enabled.
+            "iter_stats_max_iterations": -1,
+            "max_stats_len": -1,
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "batch_sizes": [1, 2, 4, 8, 16],
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                model_path,
+                extra_env={
+                    "TRTLLM_USE_PY_NIXL_KVCACHE": "0",
+                    "TRTLLM_KV_TRANSFER_NUM_THREADS": "4",
+                    "TLLM_LOG_LEVEL_BY_MODULE": "debug:executor",
+                },
+                assert_worker_log_contains="bounce path engaged",
+                server_waiting_timeout=1800) as llm:
+            # The launcher builds bare client LlmArgs, without the worker's
+            # FP8 KV or Eagle3 settings, and infers NVFP4 from the model name.
+            # Match the workers and checkpoint for accuracy reference lookup.
+            llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            llm.args.quant_config.kv_cache_quant_algo = "FP8"
+            llm.args.speculative_config = Eagle3DecodingConfig(
+                **speculative_config)
+            task = GSM8KInferenceX(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs={
+                              "chat_template_kwargs": {
+                                  "thinking_mode": "enabled"
+                              }
+                          })
+
+            # Match main's aggregated acceptance probe: 200 chat GSM8K
+            # questions, greedy decoding, 512 output tokens. Accuracy alone
+            # cannot detect a corrupted drafter cache: verification rejects it.
+            info = requests.get(f"{llm.serve_url}/cluster_info", timeout=30)
+            info.raise_for_status()
+            info = info.json()
+            gen_worker = info["current_workers"]["generation_servers"][0]
+            gen_url = f'{gen_worker["host"]}:{gen_worker["port"]}'
+            questions = [
+                r["question"]
+                for r in load_dataset(GSM8K.DATASET_DIR, "main", split="test")
+            ][:200]
+            chat_prompts = [
+                llm.tokenizer.apply_chat_template([{
+                    "role": "user",
+                    "content": q
+                }],
+                                                  tokenize=False,
+                                                  add_generation_prompt=True)
+                for q in questions
+            ]
+            # Drain the accuracy workload before starting the probe.
+            response = requests.get(f"http://{gen_url}/metrics", timeout=30)
+            response.raise_for_status()
+            probe_params = SamplingParams(max_tokens=512, temperature=0)
+            for future in [
+                    llm.generate_async(prompt, probe_params)
+                    for prompt in chat_prompts
+            ]:
+                future.result()
+            response = requests.get(f"http://{gen_url}/metrics", timeout=30)
+            response.raise_for_status()
+            records = response.json()
+            drafted = accepted = steps = 0
+            for record in records:
+                stats = record.get("specDecodingStats") or {}
+                drafted += stats.get("numDraftTokens", 0)
+                accepted += stats.get("numAcceptedTokens", 0)
+                steps += stats.get("numRequestsWithDraftTokens", 0)
+            assert drafted > 0 and steps > 0, "no speculative iterations in /metrics"
+            chat_rate = accepted / drafted
+            chat_length = 1 + accepted / steps
+            print(f"MiniMax-M3 Eagle3 disagg chat-GSM8K acceptance: rate="
+                  f"{chat_rate:.3f}, mean acceptance length="
+                  f"{chat_length:.3f} ({steps} spec iterations)")
+            assert chat_rate > 0.80, \
+                f"Eagle3 chat-GSM8K acceptance rate too low: " \
+                f"{chat_rate:.3f} (threshold 0.80, reference 0.839 from " \
+                f"the drafter card)"
+            assert chat_length > 3.4, \
+                f"Eagle3 chat-GSM8K acceptance length too low: " \
+                f"{chat_length:.3f} (threshold 3.4, reference 3.518 from " \
+                f"the drafter card)"

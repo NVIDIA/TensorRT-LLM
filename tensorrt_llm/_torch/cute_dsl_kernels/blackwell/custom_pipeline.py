@@ -48,23 +48,27 @@ from typing import Optional
 
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Boolean, if_generate
-# nvidia-cutlass-dsl 4.4.2 split the sync-object factory: sm90's
-# PipelineAsync._make_sync_object no longer accepts Blackwell ops like
-# TCGen05Mma/ClcLoad. The sm100 PipelineTmaUmma provides the expanded variant
-# that handles every op used by the custom pipelines below. Alias to avoid
-# colliding with the local PipelineTmaUmma defined in this module.
 from cutlass.pipeline import (Agent, CooperativeGroup, PipelineAsync,
-                              PipelineOp, PipelineState)
-from cutlass.pipeline import PipelineTmaUmma as _Sm100PipelineFactory
-from cutlass.pipeline import agent_sync
+                              PipelineOp, PipelineState, agent_sync)
 
-_make_sync_object = _Sm100PipelineFactory._make_sync_object
+_SM100_SYNC_FACTORY_ERROR = (
+    "Custom UMMA pipelines require "
+    "cutlass.pipeline.sm100.PipelineTmaUmma._make_sync_object with "
+    "PipelineOp.TCGen05Mma support. Install the CuTe DSL version specified "
+    "in this TensorRT-LLM checkout's requirements.txt. "
+    "PipelineAsync._make_sync_object cannot be used as a fallback.")
 
 try:
     from cutlass.pipeline.sm100 import PipelineTmaUmma as _Sm100PipelineTmaUmma
     _sm100_make_sync = _Sm100PipelineTmaUmma._make_sync_object
-except (ImportError, AttributeError):
-    _sm100_make_sync = PipelineAsync._make_sync_object
+except (ImportError, AttributeError) as exc:
+    raise ImportError(_SM100_SYNC_FACTORY_ERROR) from exc
+
+# A missing SM100 override can resolve to the inherited SM90 factory, which
+# does not support TCGen05Mma even though the attribute exists.
+if (not callable(_sm100_make_sync)
+        or _sm100_make_sync is PipelineAsync._make_sync_object):
+    raise ImportError(_SM100_SYNC_FACTORY_ERROR)
 
 
 def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
