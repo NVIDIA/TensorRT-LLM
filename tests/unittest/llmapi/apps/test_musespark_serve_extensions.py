@@ -30,8 +30,8 @@ from pydantic import ValidationError
 from tensorrt_llm.inputs.chat_template_guard import validate_chat_template_kwargs
 from tensorrt_llm.serve.harmony_adapter import maybe_transform_reasoning_effort
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesRequest
-from tensorrt_llm.serve.openai_server import _apply_musespark_chat_extensions
 from tensorrt_llm.serve.responses_utils import reasoning_chat_template_kwargs
+from tensorrt_llm.serve.serving_extensions import apply_model_chat_extensions
 
 # The L0 CPU stage invokes registered files with `-m cpu_only`; without this
 # marker every test is deselected and pytest exits with code 5.
@@ -64,7 +64,7 @@ class TestReasoningEffortSchema:
 class TestMuseSparkEffortRouting:
     def apply(self, model_type: str = "musespark_open_omni", **kwargs) -> ChatCompletionRequest:
         req = make_request(**kwargs)
-        _apply_musespark_chat_extensions(req, model_type)
+        apply_model_chat_extensions(req, model_type)
         return req
 
     def kwargs_of(self, req: ChatCompletionRequest) -> dict:
@@ -80,10 +80,11 @@ class TestMuseSparkEffortRouting:
         assert req.chat_template_kwargs is None
 
     def test_kimi_model_untouched(self) -> None:
-        # The kimi path has its own derivation; this one must not add a
-        # MuseSpark-style kwarg there.
+        # The registry dispatches kimi_k3 to its own extension, which derives
+        # `thinking_effort`; the MuseSpark-style `reasoning_effort` kwarg must
+        # not appear there.
         req = self.apply(model_type="kimi_k3", reasoning_effort="high")
-        assert req.chat_template_kwargs is None
+        assert "reasoning_effort" not in (req.chat_template_kwargs or {})
 
     def test_default_effort_not_derived(self) -> None:
         # The field defaults to LOW via pydantic; a client that never sent
