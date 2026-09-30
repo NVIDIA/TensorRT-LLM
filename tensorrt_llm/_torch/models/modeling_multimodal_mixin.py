@@ -459,6 +459,18 @@ class MultimodalModelMixin:
         """
         raise NotImplementedError
 
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        """Admission-time validation of one request's multimodal payload.
+
+        The executor calls this from ``PyExecutor._validate_request`` before a
+        request is activated. Raise ``ValueError`` to reject the request with
+        a request-scoped error response. Any input condition a model would
+        otherwise reject inside ``forward`` should be rejected here instead: a
+        forward-time failure is handled batch-wide, so one bad item fails
+        every request scheduled alongside it. Default: accept everything.
+        """
+        return None
+
     def prepare_multimodal_encoder_inputs(
         self,
         selected_items: Sequence[tuple[MultimodalParams, int]],
