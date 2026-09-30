@@ -54,6 +54,7 @@ from .config import (
     DEFAULT_LOCAL_BUFFER_SIZE,
     DEFAULT_METADATA_SERVER,
     DEFAULT_NAMESPACE,
+    RUN_DIR_OWNER_NAME,
     StoreRole,
     parse_size,
 )
@@ -61,6 +62,7 @@ from .config import (
 __all__ = [
     "POOL_MANIFEST_NAME",
     "PoolManifest",
+    "claim_run_dir",
     "local_address",
     "maybe_provision_pool",
     "provision_pool",
@@ -649,6 +651,63 @@ def _log_contribution(segment_size: int, role: str, run_dir: str) -> None:
     )
 
 
+def claim_run_dir(run_dir: str, role: str) -> None:
+    """Record that this server owns `run_dir`, or name the one that already does.
+
+    Two servers sharing a run directory write different client configs to the
+    same path, since each names its own role and its own node's RDMA devices.
+    The last writer wins for both, leaving a server that transfers over
+    another node's HCAs, or lends under another server's role, with nothing in
+    either log to say so. Sharing is rejected rather than serialized.
+
+    Raises:
+        ValueError: if another server already claimed this directory.
+    """
+    claim = {"host": socket.gethostname(), "pid": os.getpid(), "role": role}
+    path = os.path.join(run_dir, RUN_DIR_OWNER_NAME)
+    try:
+        # O_EXCL so the winner is decided by the filesystem and not by who
+        # happens to read before the other writes.
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        # Not fatal. The config write that follows reports an unwritable
+        # directory more precisely.
+        logger.warning(f"mooncake-store: could not claim {run_dir}: {exc}")
+        return
+    else:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(claim, handle)
+        return
+
+    try:
+        with open(path) as handle:
+            owner = json.load(handle)
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            f"mooncake-store: {path} exists but could not be read ({exc}), so "
+            "this server cannot tell whether another one is using "
+            f"{run_dir}; continuing."
+        )
+        return
+
+    # Re-entry within one process is not a conflict.
+    if owner.get("pid") == claim["pid"] and owner.get("host") == claim["host"]:
+        return
+
+    raise ValueError(
+        f"mooncake-store: run directory {run_dir} is already used by the "
+        f"server at {owner.get('host')} pid {owner.get('pid')} as "
+        f"role={owner.get('role')}, and this one is on {claim['host']} as "
+        f"role={claim['role']}. The rendered client config names the writing "
+        "server's role and its node's RDMA devices, so sharing a run "
+        "directory overwrites one server's config with another's. Give each "
+        "server its own mooncake_store.run_dir; they join the same pool "
+        "through mooncake_store.pool regardless."
+    )
+
+
 @contextlib.contextmanager
 def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optional[str]]:
     """Join the pool `pool` names and point this process's ranks at it.
@@ -698,13 +757,19 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
 
         config_path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
         config = _client_config(pool, manifest, resolve_device_name(manifest.protocol, ""))
-        # Renamed into place so a rank reading it never sees half a config, and
-        # so two servers that share a run directory, having rendered the same
-        # config, cannot interleave their writes into a torn one.
-        staging = f"{config_path}.partial"
-        with open(staging, "w") as handle:
-            json.dump(config, handle, indent=2)
-        os.replace(staging, config_path)
+        claim_run_dir(run_dir, config["role"])
+        # Renamed into place so a rank never reads half a config. The staging
+        # name carries this process's pid so that two writers, where a claim
+        # is stale or bypassed, cannot delete each other's staging file.
+        staging = f"{config_path}.partial.{os.getpid()}"
+        try:
+            with open(staging, "w") as handle:
+                json.dump(config, handle, indent=2)
+            os.replace(staging, config_path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(staging)
+            raise
         # Inherited by the ranks the LLM constructor spawns. Ranks an external
         # launcher started were already running, so they read the config out of
         # the run directory instead; see provisioned_config_path.

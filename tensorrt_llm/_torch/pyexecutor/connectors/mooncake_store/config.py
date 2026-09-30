@@ -50,6 +50,11 @@ __all__ = [
 CONFIG_PATH_ENV = "MOONCAKE_CONFIG_PATH"
 #: Name the rendered client config takes in the run directory.
 CLIENT_CONFIG_NAME = "mooncake.json"
+#: Records which server rendered the client config in a run directory. That
+#: config names the writing server's role and its node's RDMA devices, so a
+#: second server pointed at the same directory is a misconfiguration.
+#: See `master.claim_run_dir`.
+RUN_DIR_OWNER_NAME = "owner.json"
 #: Subdirectory of the run directory where each rank records the segment it
 #: mounted. Telemetry reads it instead of scraping logs; see `ledger.py`.
 SEGMENTS_DIR_NAME = "segments"
