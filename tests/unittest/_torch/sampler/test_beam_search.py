@@ -2030,6 +2030,7 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
         sampler=types.SimpleNamespace(validate_request=lambda _request: None),
         model_engine=types.SimpleNamespace(model=None),
         _validate_request_budget=lambda _request: None,
+        _validate_embedding_bias=lambda _request: None,
     )
     validate = functools.partial(
         PyExecutor._validate_request,
