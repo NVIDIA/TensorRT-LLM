@@ -91,6 +91,8 @@ if role == "server":
 elif role == "stop":
     if mode == "stop_hangs":
         hang()
+    if mode == "stop_fails":
+        sys.exit(23)
     send("stop_requested")
 else:
     receive("server_ready")
@@ -235,6 +237,21 @@ def test_launcher_deadline_covers_stop_helper_and_server(
     assert result.returncode == (task_status or 124), result.stderr
     assert "MPI Comm shutdown exceeded 1s" in result.stderr
     assert "stop" in _process_records(tmp_path)
+    _assert_exited(tmp_path)
+
+
+@pytest.mark.parametrize("task_status", [0, 7])
+def test_launcher_exits_promptly_when_stop_helper_fails(tmp_path: Path, task_status: int) -> None:
+    env = _launcher_env(tmp_path, "stop_fails")
+    env["LAUNCHER_TEST_TASK_STATUS"] = str(task_status)
+    # The outer timeout catches a launcher waiting for the server after its
+    # helper has already failed without sending a stop request.
+    env["TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT"] = "120"
+    result = _run_launcher(tmp_path, env)
+    assert result.returncode == (task_status or 23), result.stderr
+    assert "stop helper exit code: 23" in result.stderr
+    assert "MPI Comm shutdown exceeded" not in result.stderr
+    assert set(_process_records(tmp_path)) == {"task", "server", "stop"}
     _assert_exited(tmp_path)
 
 
