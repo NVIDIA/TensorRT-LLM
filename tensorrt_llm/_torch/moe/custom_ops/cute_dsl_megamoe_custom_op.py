@@ -1696,7 +1696,30 @@ if IS_MEGAMOE_OP_AVAILABLE:
         else:
             _evict_latched_tuning_workspaces()
 
-    def query_megamoe_kernel_properties(
+    def reset_megamoe_workspace_state() -> None:
+        """TEST/BENCH ONLY: drop ALL process-global MegaMoE workspace state.
+
+        PRECONDITION: every CUDA graph that replayed a MegaMoE launch is
+        destroyed and nothing will launch on the dropped workspaces. Fence /
+        captured-ptr sets are cleared TOGETHER with the buffer caches (stale
+        entries on recycled addresses would ABA-skip the fence or false-positive
+        the capture guard). Must run in lockstep on ALL EP ranks.
+        """
+        global _ACTIVE_MEGAMOE_PROFILING_SCRATCH
+        global _ACTIVE_MEGAMOE_PROFILING_SCRATCH_FACTORY
+        global _MEGAMOE_GRAPH_CAPTURE_SEEN
+        _ACTIVE_MEGAMOE_PROFILING_SCRATCH = None
+        _ACTIVE_MEGAMOE_PROFILING_SCRATCH_FACTORY = None
+        _MEGAMOE_PROFILING_SCRATCH_CACHE.clear()
+        _MEGAMOE_SYMM_PROVIDER_CACHE.clear()
+        _MEGAMOE_LOCAL_WORKSPACE_CACHE.clear()
+        _MEGAMOE_TUNING_WORKSPACE_KEYS.clear()
+        _MEGAMOE_FENCED_KEYS.clear()
+        _MEGAMOE_FENCED_KEY_WS_REFS.clear()
+        _MEGAMOE_CAPTURED_SHARED_PTRS.clear()
+        _MEGAMOE_GRAPH_CAPTURE_SEEN = False
+
+    def _probe_megamoe_default_kernel(
         *,
         world_size: int,
         num_topk: int,
@@ -1714,8 +1737,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
         situ_linear_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
-    ) -> Tuple[int, bool]:
-        """Probe workspace size and direct-input support of the default kernel."""
+    ):
+        """Construct (host-only, no compile) the kernel the runtime would
+        launch for this problem, for workspace-layout / size probing."""
 
         sm_version = get_sm_version()
         use_default_tactic = tactic is None
@@ -1827,8 +1851,75 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # The probe MUST build the SAME kernel that runs (same combine_format):
         # otherwise the provider carves an undersized shared region and the
         # combine staging writes OOB (single-rank IMA; EP>1 looks like a hang).
+        return probe
+
+    def query_megamoe_kernel_properties(**probe_kwargs) -> Tuple[int, bool]:
+        """Probe workspace size and direct-input support of the default kernel.
+
+        Accepts :func:`_probe_megamoe_default_kernel` keyword arguments.
+        """
+        probe = _probe_megamoe_default_kernel(**probe_kwargs)
         _, shared_bytes = probe.get_workspace_sizes()
         return int(shared_bytes), isinstance(probe, RubinInferenceGenphaseMegaMoE)
+
+    def query_megamoe_shared_workspace_bytes(
+        *,
+        world_size: int,
+        num_topk: int,
+        num_experts_per_rank: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        expand_intermediate_size_per_partition: int,
+        max_tokens_per_rank: int,
+        tactic: Optional[Tuple] = None,
+        apply_topk_in_fc1: bool = True,
+        gate_up_clamp: Optional[float] = None,
+        act_alpha: Optional[float] = None,
+        act_beta: Optional[float] = None,
+        in_kernel_fc2_reduce: bool = False,
+        combine_format: str = "bf16",
+    ) -> int:
+        """Shared-workspace byte count usable for ANY topk-application route
+        of this problem shape.
+
+        TEST/BENCH sizing helper (the backend uses
+        :func:`query_megamoe_kernel_properties`, which sizes for its one
+        fixed route). Callers of this helper allocate ONE buffer and launch
+        both ``apply_topk_in_fc1`` routes over it, but the kernel registers
+        its ``fc1_topk_scores`` plane in the SHARED workspace only when
+        folding, so the two routes need different byte counts: return the
+        max over both so neither launch overruns (the kernel only ever
+        addresses its own leading layout; an oversized tail is inert).
+        A route that is not constructible for this config just drops out of
+        the max.
+        """
+
+        def _shared_bytes(fold: bool) -> int:
+            probe = _probe_megamoe_default_kernel(
+                world_size=world_size,
+                num_topk=num_topk,
+                num_experts_per_rank=num_experts_per_rank,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=intermediate_size_per_partition,
+                expand_intermediate_size_per_partition=expand_intermediate_size_per_partition,
+                max_tokens_per_rank=max_tokens_per_rank,
+                tactic=tactic,
+                apply_topk_in_fc1=fold,
+                gate_up_clamp=gate_up_clamp,
+                situ_beta=act_alpha,
+                situ_linear_beta=act_beta,
+                in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                combine_format=combine_format,
+            )
+            _, shared = probe.get_workspace_sizes()
+            return int(shared)
+
+        nbytes = _shared_bytes(bool(apply_topk_in_fc1))
+        try:
+            nbytes = max(nbytes, _shared_bytes(not apply_topk_in_fc1))
+        except ValueError:
+            pass
+        return nbytes
 
     def query_megamoe_combine_quant_region(
         *,
@@ -1841,66 +1932,44 @@ if IS_MEGAMOE_OP_AVAILABLE:
         max_tokens_per_rank: int,
         combine_format: str = "bf16",
     ) -> Tuple[int, int]:
-        """Return ``(byte_offset, byte_size)`` of the ``combine_quant`` region
-        inside the kernel's shared workspace.
+        """Return ``(byte_offset, byte_size)`` of the per-topk combine staging
+        (the kernel's ``pre_reduced_activation`` plane) inside the shared
+        workspace.
 
         Deferred finalize (``skip_topk_reduce``) exposes this region to the
         caller as a ``(max_tokens_per_rank, num_topk, hidden)`` torch view.
-        The shared-region layout is tactic-invariant (it depends only on
-        world_size / num_experts_per_rank / num_topk / max_tokens_per_rank /
-        hidden / combine_format -- see ``_build_shared_region_specs``), so a
-        default-tactic probe kernel yields the offsets of every launch.
-        Form-A only: form-B (``in_kernel_fc2_reduce``) has no such region.
+        The region offset is tactic-invariant for a fixed route (every
+        workspace region depends only on world_size / num_experts_per_rank /
+        num_topk / max_tokens_per_rank / hidden / combine_format -- see
+        ``DeviceWorkspace.finalize``), so a default-tactic probe kernel
+        yields the offsets of every deferred launch. The probe pins the
+        deferred route explicitly: form-A only (form-B,
+        ``in_kernel_fc2_reduce``, never materializes the plane) and
+        ``apply_topk_in_fc1=False`` (folding adds a shared
+        ``fc1_topk_scores`` plane that would shift this offset; the backend
+        forces the non-folding route whenever deferred finalize is on).
         """
         if combine_format != "bf16":
             raise ValueError(
-                f"deferred finalize exposes combine_quant undequantized and "
-                f"therefore requires the bf16 combine format; got "
+                f"deferred finalize exposes the combine staging undequantized "
+                f"and therefore requires the bf16 combine format; got "
                 f"{combine_format!r}."
             )
-        tactic = default_megamoe_tactic(0)
-        (
-            mma_tiler,
-            cluster_shape,
-            group_hint,
-            load_balance_mode,
-            token_back_mode,
-            use_bulk_fc2_store,
-            flag_batch,
-            epi_flag_batch,
-        ) = _unpack_tactic(tactic)
-        mma_tiler = tuple(mma_tiler)
-        kernel_cls, CombineFormat = _import_megamoe_kernel()
-        probe = kernel_cls(
-            combine_format=CombineFormat.parse(combine_format),
-            mma_tiler_mnk=mma_tiler,
-            cluster_shape_mnk=tuple(cluster_shape),
-            use_2cta_instrs=bool(mma_tiler[0] == 256),
-            group_hint=int(group_hint),
-            token_padding_block=64,
-            sf_padding_block=SfPaddingBlock,
-            load_balance_mode=str(load_balance_mode),
-            static_expert_shape=(
-                num_experts_per_rank,
-                expand_intermediate_size_per_partition,
-                hidden_size,
-            ),
-            world_size=int(world_size),
-            num_topk=int(num_topk),
-            max_tokens_per_rank=int(max_tokens_per_rank),
-            hidden=int(hidden_size),
-            fc2_output_dtype=cutlass.BFloat16,
+        probe = _probe_megamoe_default_kernel(
+            world_size=world_size,
+            num_topk=num_topk,
+            num_experts_per_rank=num_experts_per_rank,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            expand_intermediate_size_per_partition=expand_intermediate_size_per_partition,
+            max_tokens_per_rank=max_tokens_per_rank,
+            apply_topk_in_fc1=False,
             in_kernel_fc2_reduce=False,
-            skip_topk_reduce=True,
-            token_back_mode=str(token_back_mode),
-            non_ubulk_fc2_store=(not bool(use_bulk_fc2_store)),
-            flag_batch=int(flag_batch),
-            epi_flag_batch=tuple(epi_flag_batch),
-            **_LOCKED_KERNEL_KWARGS,
+            combine_format=combine_format,
         )
-        offset = int(probe._shared_offsets["combine_quant"])
-        nbytes = int(probe._shared_region_by_name["combine_quant"].nbytes)
-        return offset, nbytes
+        region_name = probe.token_comm.pre_reduced_activation_region
+        workspace = probe._device_workspace
+        return int(workspace.offset(region_name)), int(workspace.nbytes(region_name))
 
     def _megamoe_autotune_num_tokens(shapes: List[torch.Size]) -> int:
         """Shape-derivation rule: the activation token count (input[0] dim0)
@@ -2276,7 +2345,15 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 apply_topk_in_fc1=self.apply_topk_in_fc1,
                 swiglu_alpha=self.swiglu_alpha,
                 swiglu_beta=self.swiglu_beta,
-                skip_topk_reduce=self.skip_topk_reduce,
+                # ``skip_topk_reduce`` is deliberately NOT forwarded: the
+                # cutedsl_megamoe kernels have no such knob, so a deferred
+                # launch runs the same form-A kernel, reduce included. The
+                # deferred contract still holds -- the separate TopkReduce
+                # only READS the pre-reduced plane the caller consumes (see
+                # query_megamoe_combine_quant_region) -- at the cost of a
+                # redundant reduce + combine_output write. The flag splits
+                # unique_id so deferred and default runs never share tactics
+                # or workspaces.
                 gate_up_clamp=self.gate_up_clamp,
                 situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta,

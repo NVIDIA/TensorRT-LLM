@@ -74,6 +74,7 @@ from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType, Ro
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ...models.modeling_utils import QuantConfig
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import (
     PositionalEmbeddingParams,
@@ -1761,32 +1762,37 @@ class MuseSparkOpenMoE(nn.Module):
         )
         # The checkpoint may quant-exclude whole layers ("model.layers.N." in
         # exclude_modules), leaving their experts BF16. Backend resolution
-        # only sees the global quant config, so a MEGAMOE-family request
-        # builds an NVFP4-only backend for those layers, which then rejects
-        # the BF16 config when the post-init exclusion pass re-creates
-        # weights; the family's BF16 fallback (CutlassFusedMoE) ignores
-        # ``do_finalize=False``, and the per-expert norm needs the unfinalized
-        # triple on every layer. Excluded layers therefore request the TRTLLM
-        # family, whose construct-then-requant path serves them:
-        # TRTLLMGenFusedMoE is constructed against the global config, the
-        # exclusion pass re-creates its weights as BF16, and its BF16 path
-        # honors ``do_finalize=False``, so the layer keeps this module's
-        # finalize. Gated to MEGAMOE requests so other routes are untouched.
+        # only sees the global quant config, so without help an excluded layer
+        # is resolved to an NVFP4 leaf and then fails that leaf's format check
+        # once the post-init exclusion pass rewrites its quant_config (the
+        # leaves carry one format each; there is no construct-then-requant
+        # path any more). Hand resolution the format the layer actually has,
+        # so it lands on the TRTLLM-Gen BF16 leaf, which honors
+        # ``do_finalize=False`` -- the per-expert norm needs the unfinalized
+        # triple on every layer, and the generic BF16 fallback
+        # (CutlassFusedMoE) does not provide it. The MEGAMOE families have no
+        # BF16 member at all, so those requests also drop to TRTLLM here.
         layer_model_config = model_config
+        layer_quant_config = None
         global_quant_config = model_config.quant_config
         if (
-            str(getattr(model_config, "moe_backend", "")).upper()
-            in ("MEGAMOE_CUTEDSL", "MEGAMOE_DEEPGEMM")
-            and global_quant_config is not None
+            global_quant_config is not None
             and global_quant_config.exclude_modules
             and global_quant_config.is_module_excluded_from_quantization(
                 f"model.layers.{layer_idx}"
             )
         ):
-            layer_model_config = copy.copy(model_config)
-            layer_model_config._frozen = False
-            layer_model_config.moe_backend = "TRTLLM"
-            layer_model_config._frozen = True
+            layer_quant_config = QuantConfig(
+                kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo
+            )
+            if str(getattr(model_config, "moe_backend", "")).upper() in (
+                "MEGAMOE_CUTEDSL",
+                "MEGAMOE_DEEPGEMM",
+            ):
+                layer_model_config = copy.copy(model_config)
+                layer_model_config._frozen = False
+                layer_model_config.moe_backend = "TRTLLM"
+                layer_model_config._frozen = True
         self.experts = create_moe(
             routing_method=MuseSparkOpenRoutingMethod(
                 top_k=self.top_k,
@@ -1804,6 +1810,7 @@ class MuseSparkOpenMoE(nn.Module):
             model_config=layer_model_config,
             aux_stream_dict=aux_stream_dict,
             layer_idx=layer_idx,
+            override_quant_config=layer_quant_config,
         )
         # Under attention DP the MoE layer acquires a cross-rank combine
         # between the expert GEMM and this module, and no combine can carry an

@@ -18,7 +18,7 @@ Covers the request-schema acceptance of the extended reasoning-effort scale
 (`minimal`/`xhigh`), the routing of a request-level `reasoning_effort`
 into the chat-template kwargs for musespark_open_omni deployments, whose chat
 template reads the effort from its kwargs only, and the Responses-API
-reasoning routing, which must not inject template kwargs the active
+reasoning routing, which must not inject template-only kwargs the active
 template never reads. No GPU or checkpoint required.
 """
 
@@ -125,6 +125,9 @@ TEMPLATE_EFFORT_AND_THINKING = (
     "{%- for message in messages %}{{ message['content'] }}{%- endfor %}"
 )
 
+# A template that implements no reasoning controls at all.
+TEMPLATE_PLAIN = "{%- for message in messages %}{{ message['content'] }}{%- endfor %}"
+
 
 def make_responses_request(**kwargs) -> ResponsesRequest:
     kwargs.setdefault("model", "musespark_open")
@@ -135,18 +138,34 @@ def make_responses_request(**kwargs) -> ResponsesRequest:
 class TestResponsesReasoningKwargsInjection:
     """/v1/responses reasoning routing is template-aware.
 
-    The routing maps `reasoning.effort` into chat_template_kwargs. It must
-    only inject keys the active template references: the render-site guard
-    rejects unreferenced kwargs with a 400, and a client cannot fix a 400
-    caused by a kwarg the serve itself constructed. A `/v1/responses` request
-    carrying `reasoning` against an effort-only template used to fail exactly
-    this way.
+    The routing maps `reasoning.effort` into chat_template_kwargs. Injected
+    keys the active template never reads are dropped before the render-site
+    guard sees them: the guard rejects unreferenced kwargs with a 400, and a
+    client cannot fix a 400 caused by a kwarg the serve itself constructed. A
+    `/v1/responses` request carrying `reasoning` against an effort-only
+    template used to fail exactly this way. The thinking-family keys
+    (`thinking`, `enable_thinking`) are exempt on both sides: the reasoning
+    parsers consume them from chat_template_kwargs after generation, so the
+    guard accepts them everywhere and the routing keeps them injected.
     """
 
-    def test_effort_only_template_gets_no_thinking_key(self):
+    def test_effort_only_template_keeps_effort_and_parser_consumed_thinking(self):
         req = make_responses_request(reasoning={"effort": "high"})
         kwargs = reasoning_chat_template_kwargs(req, template_source=TEMPLATE_EFFORT_ONLY)
-        assert kwargs == {"reasoning_effort": "high"}
+        # `thinking` survives even though the template never reads it: the
+        # reasoning parsers consume it post-generation, so the guard accepts
+        # it everywhere and dropping it could change the parser's mode.
+        assert kwargs == {"reasoning_effort": "high", "thinking": True}
+
+    def test_template_reading_neither_key_drops_the_template_only_one(self):
+        # The injection stays template-conditional for template-only keys:
+        # against a template that reads neither key, `reasoning_effort` is
+        # dropped (the guard would reject it as unreferenced), while the
+        # parser-consumed `thinking` is kept.
+        req = make_responses_request(reasoning={"effort": "high"})
+        kwargs = reasoning_chat_template_kwargs(req, template_source=TEMPLATE_PLAIN)
+        assert kwargs == {"thinking": True}
+        validate_chat_template_kwargs(TEMPLATE_PLAIN, kwargs)
 
     def test_effort_only_template_injection_passes_the_guard(self):
         # The previously failing path end to end: what the routing constructs
@@ -175,13 +194,19 @@ class TestResponsesReasoningKwargsInjection:
         # Filtering covers only the serve's own injection. A kwarg the client
         # sent is forwarded untouched, and the guard still rejects it when
         # the template never reads it - that rejection is correct and stays.
+        # `disable_reasoning` rather than `thinking` demonstrates it: the
+        # thinking-family keys are parser-consumed and accepted everywhere.
         req = SimpleNamespace(
-            chat_template_kwargs={"thinking": True},
+            chat_template_kwargs={"disable_reasoning": True},
             reasoning=SimpleNamespace(effort="high"),
         )
         kwargs = reasoning_chat_template_kwargs(req, template_source=TEMPLATE_EFFORT_ONLY)
-        assert kwargs == {"thinking": True, "reasoning_effort": "high"}
-        with pytest.raises(ValueError, match="thinking"):
+        assert kwargs == {
+            "disable_reasoning": True,
+            "reasoning_effort": "high",
+            "thinking": True,
+        }
+        with pytest.raises(ValueError, match="disable_reasoning"):
             validate_chat_template_kwargs(TEMPLATE_EFFORT_ONLY, kwargs)
 
     def test_request_without_reasoning_injects_nothing(self):
