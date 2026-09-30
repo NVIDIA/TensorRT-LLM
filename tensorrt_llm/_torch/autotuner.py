@@ -646,25 +646,27 @@ class AutoTunerProfilingCache:
             if cache_key in self.cache:
                 cached_runner_id, tactic, min_time = self.cache[cache_key]
                 return True, idx, tactic, min_time
-            # A fresh inference process has not probed CUPTI yet. It may reuse
-            # an explicitly tagged CUDA-event fallback entry when no preferred
-            # CUPTI entry exists. Tuning mode leaves this disabled so a
-            # CUPTI-capable process re-profiles instead of reusing event-ranked
-            # tactics.
-            if (allow_timer_fallback
-                    and not AutoTuner._torch_profiler_unavailable and
-                    r.profiling_timer_cache_key() == _TORCH_PROFILER_TIMER_KEY):
-                fallback_key = self.get_cache_key(
+            # A CUPTI-capable inference process may reuse an event-ranked
+            # entry. Once CUPTI becomes unavailable, an earlier CUPTI-ranked
+            # entry remains valid and must remain reachable as well.
+            if (r.profiling_timer_cache_key() == _TORCH_PROFILER_TIMER_KEY
+                    and (allow_timer_fallback
+                         or AutoTuner._torch_profiler_unavailable)):
+                alternate_timer_key = (
+                    _TORCH_PROFILER_TIMER_KEY
+                    if AutoTuner._torch_profiler_unavailable else
+                    _CUDA_EVENT_FALLBACK_TIMER_KEY)
+                alternate_key = self.get_cache_key(
                     custom_op,
                     r,
                     input_shapes,
                     tuning_config,
                     apply_map_to_tuning_buckets,
-                    timer_key_override=_CUDA_EVENT_FALLBACK_TIMER_KEY,
+                    timer_key_override=alternate_timer_key,
                 )
-                if fallback_key in self.cache:
+                if alternate_key in self.cache:
                     cached_runner_id, tactic, min_time = self.cache[
-                        fallback_key]
+                        alternate_key]
                     return True, idx, tactic, min_time
 
         return False, *self.fallback_entry()
