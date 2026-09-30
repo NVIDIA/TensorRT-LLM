@@ -489,7 +489,7 @@ TEST(KvCacheManagerV2ColdPageTest, AsyncDecodeRejectionFencesRecycledGpuSlot)
     auto cache = manager->createKvCache();
     std::vector<BatchedLockTarget> targets{{sourcePage, kDefaultBeamIndex, BlockOrdinal{0}, lifeCycle}};
 
-    EXPECT_THROW(storage.batchedMigrateToGpu(targets, *cache, {}), TllmException);
+    EXPECT_THROW(storage.batchedMigrateToGpu(targets, {}), TllmException);
     ASSERT_TRUE(codecPtr->launched());
     EXPECT_EQ(sourcePage->cacheLevel, coldLevel);
     EXPECT_EQ(sourcePage->slotId(), sourceSlotId);

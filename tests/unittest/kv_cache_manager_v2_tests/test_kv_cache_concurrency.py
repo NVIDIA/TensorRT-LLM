@@ -314,6 +314,15 @@ def test_stats_queries_do_not_block_a_concurrent_resize() -> None:
         def poll_stats() -> None:
             while not stop.is_set():
                 manager.get_and_reset_iteration_stats()
+                manager.get_and_reset_iteration_cached_tokens_by_level()
+                manager.get_and_reset_iteration_reused_blocks_by_level()
+                manager.get_and_reset_iteration_disk_prefetch_blocks()
+                manager.get_and_reset_iteration_peak_block_stats_by_level()
+                for stats in manager.get_storage_statistics():
+                    assert stats.total == stats.available + stats.unavailable
+                    assert stats.available == stats.free + stats.evictable
+                    assert stats.free >= 0 and stats.evictable >= 0 and stats.unavailable >= 0
+                assert manager.get_life_cycle_pool_group_indices() == [0]
                 manager.get_committed_stats()
                 manager.get_dirty_stats_kv_cache_ids()
                 manager.get_quota(GPU_LEVEL)
@@ -331,6 +340,82 @@ def test_stats_queries_do_not_block_a_concurrent_resize() -> None:
         assert counts["n"] > 0
     finally:
         manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("owner", "method"),
+    [
+        ("manager", "get_and_reset_iteration_cached_tokens_by_level"),
+        ("manager", "get_and_reset_iteration_reused_blocks_by_level"),
+        ("manager", "get_and_reset_iteration_disk_prefetch_blocks"),
+        ("manager", "get_and_reset_iteration_peak_block_stats_by_level"),
+        ("manager", "get_storage_statistics"),
+        ("cache", "drop_cached_token_attribution"),
+        ("cache", "drop_partial_block_cached_token_attribution"),
+    ],
+)
+def test_level_stats_wait_for_the_api_lock_without_holding_the_gil(owner: str, method: str) -> None:
+    """Force lock contention while the lock holder needs Python to let it proceed."""
+    manager = KVCacheManager(_make_config())
+    tokens = list(range(manager.tokens_per_block * 2))
+    seed = manager.create_kv_cache(None, tokens)
+    try:
+        seed.resume(CudaStream(torch.cuda.Stream().cuda_stream))
+        seed.resize(len(tokens))
+        seed.commit(tokens, is_end=True)
+    finally:
+        seed.close()
+    cache = manager.create_kv_cache(None, tokens[:-1])
+    assert cache.num_committed_tokens == len(tokens) - 1
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    call_started = threading.Event()
+    call_finished = threading.Event()
+
+    def priority(block_ordinal: int, life_cycle: object) -> int:
+        lock_held.set()
+        assert release_lock.wait(TIMEOUT_S), (
+            "stats binding prevented the lock holder from proceeding"
+        )
+        return 0
+
+    def hold_lock() -> None:
+        other = manager.create_kv_cache(None, [], custom_priority_callback=priority)
+        try:
+            other.resume(CudaStream(torch.cuda.Stream().cuda_stream))
+            other.resize(manager.tokens_per_block)
+        finally:
+            other.close()
+
+    def collect() -> None:
+        call_started.set()
+        target = manager if owner == "manager" else cache
+        getattr(target, method)()
+        call_finished.set()
+
+    holder = _worker(hold_lock)
+    reader = _worker(collect)
+    holder.start()
+    try:
+        assert lock_held.wait(TIMEOUT_S), "priority callback did not acquire the API lock"
+        reader.start()
+        assert call_started.wait(TIMEOUT_S)
+        # The callback keeps the API lock until this Python thread releases it. A binding with
+        # no lock finishes too early; one waiting with the GIL held trips the C watchdog instead.
+        assert not call_finished.wait(0.05), "stats operation bypassed the manager's API lock"
+    finally:
+        release_lock.set()
+        _join(holder)
+        if reader.ident is not None:
+            _join(reader)
+        if owner == "cache" and call_finished.is_set():
+            cache.commit_pending_stats()
+            counts = manager.get_and_reset_iteration_cached_tokens_by_level()
+            expected = manager.tokens_per_block if method.startswith("drop_partial_") else 0
+            assert sum(counts) == expected
+        cache.close()
+        manager.shutdown()
+    assert call_finished.is_set()
 
 
 def test_probe_reuse_runs_concurrently_with_a_background_resize() -> None:

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import copy
 import random
@@ -197,6 +200,29 @@ async def test_coordinator_select_does_not_retry_error_status():
         await router._post_select({"role": "generation"})
 
     assert session.post.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_coordinator_renew_posts_existing_request_id():
+    router = _delegating_router()
+    session = mock.MagicMock()
+    session.post = mock.MagicMock(return_value=_msgpack_response(200, {}))
+    session.close = mock.AsyncMock()
+    router._session = session
+    request = CompletionRequest(
+        model="m",
+        prompt="hi",
+        disaggregated_params=DisaggregatedParams(request_type="generation_only",
+                                                 ctx_request_id=123),
+    )
+
+    await router.renew_request(request)
+
+    assert msgpack.unpackb(session.post.call_args.kwargs["data"],
+                           raw=False) == {
+                               "role": "generation",
+                               "req_id": 123,
+                           }
 
 
 @pytest.mark.asyncio
@@ -2148,7 +2174,9 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs(router_class):
 
     tok = _mock_tokenizer()
     documents = [{"title": "Paris", "text": "Paris is in France."}]
-    chat_template = "{% for message in messages %}{{ message.content }}{% endfor %}"
+    chat_template = (
+        "{% if thinking %}<think>{% endif %}"
+        "{% for message in messages %}{{ message.content }}{% endfor %}")
     with mock.patch.object(router, "_get_tokenizer", return_value=tok):
         req = ChatCompletionRequest(
             model="TinyLlama",
@@ -2177,6 +2205,30 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs(router_class):
     assert kwargs.get("thinking") is True
     assert kwargs["documents"] == documents
     assert kwargs["chat_template"] == chat_template
+
+
+@pytest.mark.parametrize("router_class",
+                         [KvCacheAwareRouter, ConversationRouter])
+def test_tokenize_rejects_kwargs_the_template_never_reads(router_class):
+    router = router_class(server_role=None,
+                          servers=["server1"],
+                          use_tokens=False,
+                          max_batch_size=32,
+                          tokens_per_block=32)
+    tok = _mock_tokenizer()
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{
+            "role": "user",
+            "content": "hello"
+        }],
+        chat_template="{{ messages[0].content }}",
+        chat_template_kwargs={"disable_reasoning": True},
+    )
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        with pytest.raises(ValueError, match="disable_reasoning"):
+            router._tokenize(request)
+    tok.apply_chat_template.assert_not_called()
 
 
 @pytest.mark.parametrize("router_class",

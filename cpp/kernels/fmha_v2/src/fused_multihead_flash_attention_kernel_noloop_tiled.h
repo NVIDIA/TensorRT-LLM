@@ -66,26 +66,14 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     using Smem_tile_o = typename Kernel_traits::Smem_tile_o;
 
     // Do we use LDGSTS for Q, K or V?
-    enum
-    {
-        USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q
-    };
+    static constexpr int USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q;
 
-    enum
-    {
-        USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K
-    };
+    static constexpr int USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K;
 
-    enum
-    {
-        USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V
-    };
+    static constexpr int USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V;
 
     // Do we use LDGSTS for any of the 3 input matrices.
-    enum
-    {
-        USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V
-    };
+    static constexpr int USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V;
 
     // TODO ANT: assertions
     static_assert(USE_LDGSTS, "Supports only USE_LDGSTS = true");
@@ -95,27 +83,18 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     static_assert(!(USE_LDGSTS_K || USE_LDGSTS_V) || !Kernel_traits::SHARE_SMEM_FOR_K_AND_V, "");
 
     // Fragment double buffer (reduce register pressure)
-    enum
-    {
-        FRAGMENT_QK_SIZE_IN_K_DIM
-        = (Kernel_traits::LIMIT_QK_FRAGMENTS) *2 + !(Kernel_traits::LIMIT_QK_FRAGMENTS) *Mma_tile_p::MMAS_K
-    };
+    static constexpr int FRAGMENT_QK_SIZE_IN_K_DIM
+        = (Kernel_traits::LIMIT_QK_FRAGMENTS) *2 + !(Kernel_traits::LIMIT_QK_FRAGMENTS) *Mma_tile_p::MMAS_K;
 
     static_assert(!(Kernel_traits::SHARE_SMEM_FOR_K_AND_V
                       && (Kernel_traits::LIMIT_QK_FRAGMENTS || Kernel_traits::LIMIT_V_FRAGMENTS)),
         "");
 
-    enum
-    {
-        FRAGMENT_V_SIZE_IN_K_DIM
-        = (Kernel_traits::LIMIT_V_FRAGMENTS) *2 + !(Kernel_traits::LIMIT_V_FRAGMENTS) *Mma_tile_o::MMAS_K
-    };
+    static constexpr int FRAGMENT_V_SIZE_IN_K_DIM
+        = (Kernel_traits::LIMIT_V_FRAGMENTS) *2 + !(Kernel_traits::LIMIT_V_FRAGMENTS) *Mma_tile_o::MMAS_K;
 
     // Do we need to check if there are negative inf for softmax row_max ?
-    enum
-    {
-        CHECK_NEG_INF = Kernel_traits::SLIDING_WINDOW_ATTENTION || Kernel_traits::CUSTOM_MASK
-    };
+    static constexpr int CHECK_NEG_INF = Kernel_traits::SLIDING_WINDOW_ATTENTION || Kernel_traits::CUSTOM_MASK;
 
     // Shared memory.
     extern __shared__ char smem_[];
@@ -234,10 +213,7 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
 
     // Store/load P to/from memory (for debugging).
 #if defined(STORE_P)
-    enum
-    {
-        BITS_PER_ELT_P = sizeof(typename Traits_p::Accumulator_type) * 8
-    };
+    static constexpr int BITS_PER_ELT_P = sizeof(typename Traits_p::Accumulator_type) * 8;
 
     using Gmem_tile_p = fmha::Gmem_tile_p<Traits_p, Cta_tile_p, BITS_PER_ELT_P>;
     Gmem_tile_p gmem_p(params.p_ptr, params.p_stride_in_bytes, params.scale_bmm1, tidx,
@@ -246,10 +222,7 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
 
     // Store S to memory (for debugging). NOTE: We use A_type as C_type is int32 for IMMA???
 #if defined(STORE_S)
-    enum
-    {
-        BITS_PER_ELT_S = sizeof(typename Traits_p::A_type) * 8
-    };
+    static constexpr int BITS_PER_ELT_S = sizeof(typename Traits_p::A_type) * 8;
 
     using Gmem_tile_s = fmha::Gmem_tile_s<Traits_p, Cta_tile_p, BITS_PER_ELT_S>;
     Gmem_tile_s gmem_s(params.s_ptr, params.s_stride_in_bytes, params.scale_softmax, tidx,
@@ -263,26 +236,14 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     static_assert(!Softmax::USE_SHARED_MEMORY, "");
 
     // Prefetch next kv buffer to share memory
-    enum
-    {
-        PREFETCH_K_BUFFER_TO_SMEM = !Kernel_traits::LIMIT_QK_FRAGMENTS && !Softmax::USE_SHARED_MEMORY
-    };
+    static constexpr int PREFETCH_K_BUFFER_TO_SMEM = !Kernel_traits::LIMIT_QK_FRAGMENTS && !Softmax::USE_SHARED_MEMORY;
 
-    enum
-    {
-        PREFETCH_V_BUFFER_TO_SMEM = !Kernel_traits::SHARE_SMEM_FOR_K_AND_V
-    };
+    static constexpr int PREFETCH_V_BUFFER_TO_SMEM = !Kernel_traits::SHARE_SMEM_FOR_K_AND_V;
 
-    enum
-    {
-        PREFETCH_KV_BUFFER_TO_SMEM = PREFETCH_K_BUFFER_TO_SMEM && PREFETCH_V_BUFFER_TO_SMEM
-    };
+    static constexpr int PREFETCH_KV_BUFFER_TO_SMEM = PREFETCH_K_BUFFER_TO_SMEM && PREFETCH_V_BUFFER_TO_SMEM;
 
     // The number of threads per row.
-    enum
-    {
-        THREADS_PER_ROW = 32
-    };
+    static constexpr int THREADS_PER_ROW = 32;
 
     // Load the mask for that iteration.
     mask.load(Kernel_traits::CUSTOM_MASK || Kernel_traits::IS_MTP ? q_loop * Gmem_tile_q::ROWS : q_sequence_start);

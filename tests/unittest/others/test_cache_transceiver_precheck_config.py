@@ -144,6 +144,18 @@ def test_gen_only_no_context_skips():
     assert not pcfg.resolve_plan(cfg, benchmark_mode="e2e")["skip"]
 
 
+def test_gen_only_no_context_test_id_skips_over_an_ordinary_yaml():
+    """The primary entry path: the test id names the mode, the yaml does not."""
+    cfg = _disagg_yaml(benchmark={"mode": "e2e", "input_length": 1024})
+
+    plan = pcfg.resolve_plan(cfg, benchmark_mode="gen_only_no_context")
+    assert plan["skip"]
+    assert "gen_only_no_context" in plan["skip_reason"]
+
+    assert not pcfg.resolve_plan(cfg, benchmark_mode="gen_only")["skip"]
+    assert not pcfg.resolve_plan(cfg, benchmark_mode="e2e")["skip"]
+
+
 def test_backend_mismatch_raises():
     cfg = _disagg_yaml(
         gen_extra={"cache_transceiver_config": {"backend": "UCX", "max_tokens_in_buffer": 16384}}

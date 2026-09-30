@@ -473,7 +473,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
 
     def run_generation(self, params: FmhaParams) -> None:
         q = params.qkv_input
-        output_buffer = params.context_buf
+        output_buffer = params.output
         sequence_lengths = params.sequence_lengths
         assert q is not None and output_buffer is not None and sequence_lengths is not None
         metadata = params.meta

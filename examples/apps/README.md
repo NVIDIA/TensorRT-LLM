@@ -11,9 +11,8 @@ Please run `python3 ./chat.py --help` for more information on the arguments.
 
 Note that, the `model_dir` could accept the following formats:
 
-1. A path to a built TRT-LLM engine
-2. A path to a local HuggingFace model
-3. The name of a HuggingFace model such as "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+1. A path to a local HuggingFace model
+2. The name of a HuggingFace model such as "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 ## FastAPI server
 
@@ -35,11 +34,7 @@ Start the server with:
 python3 ./fastapi_server.py <model_dir>&
 ```
 
-Note that, the `model_dir` could accept same formats as in the chat example. If you are using an engine build with `trtllm-build`, remember to pass the tokenizer path:
-
-```
-python3 ./fastapi_server.py <model_dir> --tokenizer <tokenizer_dir>&
-```
+The `model_dir` accepts the same formats as in the chat example.
 
 To get more information on all the arguments, please run `python3 ./fastapi_server.py --help`.
 

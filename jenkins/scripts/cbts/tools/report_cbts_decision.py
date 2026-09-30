@@ -15,7 +15,8 @@
 """Post a CBTS decision to OpenSearch (CI-health monitoring).
 
 --status <pre_merge|post_merge|fallback|deferred|disabled> [--reason <text>]
-[--decision <main.py output>] [--pr-number <n>] [--repo-root <dir>].
+[--decision <main.py output>] [--pr-number <n>] [--repo-root <dir>]
+[--cbts-applied] [--coverage-pilot-eligible].
 Context + creds come from env. Exits 0 on failure (never blocks CI).
 """
 
@@ -186,6 +187,8 @@ def build_document(
     total_cases: int,
     multi_gpu_required: bool = False,
     multi_gpu_label_gate_open: bool = False,
+    cbts_applied: bool = False,
+    coverage_pilot_eligible: bool = False,
 ) -> dict:
     """Build the typed OpenSearch doc (field prefixes: s_=str, l_=int, d_=float, flat_=dict)."""
     scope = decision.get("scope")
@@ -235,6 +238,10 @@ def build_document(
         "b_case_skip_rate_valid": case_skip_rate_valid,
         "b_non_cbts_multi_gpu_required": multi_gpu_required,
         "b_multi_gpu_label_gate_open": multi_gpu_label_gate_open,
+        # A coverage decision may be evaluated in shadow mode without changing
+        # the stages or test DB used by this CI run.
+        "b_cbts_applied": cbts_applied,
+        "b_coverage_pilot_eligible": coverage_pilot_eligible,
         "flat_detail": {
             "hit_stages": affected,
             "scopes": list(decision.get("scopes") or []),
@@ -268,6 +275,18 @@ def main(argv: list[str] | None = None) -> int:
         default=False,
         help="Pass when the multi-GPU approval-label gate is open at CBTS decision time.",
     )
+    parser.add_argument(
+        "--cbts-applied",
+        action="store_true",
+        default=False,
+        help="Pass when this decision controls the stages or test DB used by the CI run.",
+    )
+    parser.add_argument(
+        "--coverage-pilot-eligible",
+        action="store_true",
+        default=False,
+        help="Pass when the PR author is eligible for coverage-tier application.",
+    )
     args = parser.parse_args(argv)
 
     # Lazy import: any failure surfaces here and is caught by the __main__
@@ -297,13 +316,18 @@ def main(argv: list[str] | None = None) -> int:
         total_cases,
         multi_gpu_required=args.multi_gpu_required,
         multi_gpu_label_gate_open=args.multi_gpu_label_gate_open,
+        cbts_applied=args.cbts_applied,
+        coverage_pilot_eligible=args.coverage_pilot_eligible,
     )
     OpenSearchDB.add_id_of_json(doc)
     ok = OpenSearchDB.postToOpenSearchDB(doc, CBTS_PROJECT_NAME)
     logger.info(
-        "CBTS report %s: status=%s hit_stages=%d case_skip=%s (cbts %d / total %d)",
+        "CBTS report %s: status=%s applied=%s coverage_pilot=%s "
+        "hit_stages=%d case_skip=%s (cbts %d / total %d)",
         "posted" if ok else "post returned False",
         doc["s_cbts_status"],
+        doc["b_cbts_applied"],
+        doc["b_coverage_pilot_eligible"],
         doc["l_hit_stages"],
         doc["d_case_skip_rate"],
         cbts_cases,

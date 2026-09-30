@@ -1,0 +1,18 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Context (prefill) worker. Pair with qwen3.8-flash-next-disagg-gen.yaml.
+# The handoff carries recurrent and PLE state, so both workers must set
+# cache_transceiver_config.transceiver_runtime to PYTHON.
+trust_remote_code: true
+max_batch_size: 16
+disable_overlap_scheduler: true
+moe_config:
+  backend: TRTLLM
+kv_cache_config:
+  free_gpu_memory_fraction: 0.5
+  mamba_ssm_cache_dtype: bfloat16
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  max_tokens_in_buffer: 8192

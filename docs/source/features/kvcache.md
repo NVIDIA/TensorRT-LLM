@@ -85,14 +85,28 @@ Models that select the V2 manager by default:
 
 | Model | Reason |
 | --- | --- |
-| Hybrid Mamba (NemotronH, Qwen3-Next) | Attention KV and Mamba state pools must be sized together |
+| Hybrid Mamba (NemotronH and its multimodal models, Qwen3-Next) | Attention KV and Mamba state pools must be sized together |
 | DeepSeek-V4 | Sparse attention attaches auxiliary per-layer buffers |
 | GPT-OSS | Sliding window on every other layer (VSWA), so the sliding-window and full-attention pools are sized independently |
 | Gemma3 / Gemma4 (text and multimodal) | Alternating sliding-window and full-attention layers (VSWA); same independent pool sizing |
+| Llama / Llama4 | Uniform KV pool layout; chunked attention does not partition the pools |
 
 Separately, Gemma4 hybrid attention and sparse-attention models are routed to
 V2 unconditionally: their per-layer buffer layouts cannot be represented by V1's
 unified pool, so `use_kv_cache_manager_v2` does not apply to them.
+
+For a model whose `layer_types` mixes sliding-window and full-attention layers
+and that publishes a single `sliding_window` (GPT-OSS, Gemma3), the V2 manager
+derives one attention window per layer from `layer_types` when
+`max_attention_window` is not set: sliding layers get `sliding_window`, full
+layers get `max_seq_len`, and the two window sizes form two layer groups whose
+pools are sized independently. The derived list is logged at startup. Set
+`max_attention_window` explicitly to override the derivation; a single entry
+restores one full-context pool for every layer. With derived windows,
+`pool_ratio` must carry one entry per layer group (two for such a model). If a
+configured `pool_ratio` does not match the derived group count, the manager
+logs a warning and keeps the single-window default, so existing configurations
+continue to run.
 
 For the native V2 cold-storage representation and codec extension contract, see
 [KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
@@ -138,7 +152,7 @@ layer group in layer-group ID order.
 If neither `avg_seq_len` nor an explicit `pool_ratio` is configured, hybrid
 Mamba models warn and fall back to half of `max_seq_len`, which can produce a
 suboptimal pool split. Exact explicit boundaries currently require
-`MambaHybridCacheManagerV2`, `max_beam_width=1`, and no KV connector. Hybrid
+`MambaHybridCacheManagerV2` and `max_beam_width=1`. Hybrid
 Mamba models select V2 by default (see
 [Selecting the KV Cache Manager](#selecting-the-kv-cache-manager)); set
 `use_kv_cache_manager_v2` to `false` to select the V1 C++
@@ -158,7 +172,7 @@ This isolation is enforced entirely by the block-key hash: the salt is mixed int
 
 When working with multimodal models (e.g., vision-language models), the KV cache system needs to identify which cached blocks correspond to which multimodal inputs (images, videos, etc.). By default, the system uses content-based hashing to generate unique identifiers for each multimodal input. However, this approach has limitations for cache management across sessions, as the same content must be re-processed to generate the same hash.
 
-To enable deterministic cache management, you can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. When provided, these UUIDs are returned in KV cache events instead of computed content hashes, while the cache key itself is computed from **both** the UUID and content together for correctness.
+You can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. Both cache managers compute the item digest from **both** the UUID and content together for correctness. V1 returns the original UUID in the KV cache event's `mm_keys[].hash` field when one is supplied. V2 returns the item digest as a hexadecimal string, including for items with UUIDs.
 
 **Usage Example:**
 
@@ -177,14 +191,16 @@ prompt = TextPrompt(
 
 - **Cache Correctness**: When a UUID is provided, the cache key is computed from both the UUID and content together using `BLAKE3(UUID || Content)`. This ensures different content always produces different cache entries, even with the same UUID.
 - **User Isolation**: Same content with different UUIDs produces different cache entries, enabling per-user or per-session cache isolation.
-- **Stable Event Identifiers**: The original UUID string is preserved and returned in KV cache events via `get_kv_cache_events()`, enabling deterministic external cache management.
+- **Stable Event Identifiers**: `get_kv_cache_events()` returns the original UUID for V1, or the item digest for V2. V2 consumers can use the same digest that appears in its cache-key token sequence.
 - **Partial UUID Support**: You can provide UUIDs for some items and use `None` for others to fall back to content-only hashing.
 - **Cross-Modality Support**: Different modalities (images, videos) can each have their own UUIDs.
 
 **UUID Format:**
 
 - Can be any string (e.g., "image-123", "user-session-img-a", database keys)
-- Original UUID strings are preserved and returned in KV cache events
+- Original UUID strings are preserved in request metadata and returned in V1 KV cache events
+
+V2 derives `mm_keys` directly from the cached token sequence. Each entry identifies a continuous multimodal segment within that block: `hash` is the item's digest, and `start_offset` is the segment's first token offset within the item. An item spanning multiple blocks retains the same digest with increasing offsets. Text may separate segments of the same item. Items are processed in prompt order; one item cannot resume after another item has started. The item digest is distinct from `block_hash`, which also depends on the preceding token sequence.
 
 
 ### Enable Offloading to Host Memory

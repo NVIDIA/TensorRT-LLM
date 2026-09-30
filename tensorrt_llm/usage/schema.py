@@ -199,7 +199,7 @@ class TrtllmHeartbeat(_LlmCounterSnapshot):
     """TRT-LLM heartbeat event parameters.
 
     Sent periodically to signal the session is still alive.
-    Contains a monotonically increasing sequence counter, process correlation
+    Contains a sequence counter saturating at uint32 max, process correlation
     fields, and the latest aggregate LLM lifecycle counter snapshot.
     """
 
@@ -208,7 +208,7 @@ class TrtllmHeartbeat(_LlmCounterSnapshot):
         ge=0,
         le=_UINT32_MAX,
         alias="seq",
-        description="Zero-based heartbeat sequence number for this session.",
+        description="Zero-based heartbeat sequence number, saturating at uint32 max.",
     )
     ingress_point: str = Field(
         default="",

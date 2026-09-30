@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Vendored Sources
 
 TensorRT-LLM keeps some upstream source trees in this repository so they can be
@@ -32,6 +35,33 @@ fail. Resolve it by discarding it with `sync`, recording a TensorRT-LLM-only
 adaptation with `patch`, or exporting an upstream-worthy change and pinning the
 resulting commit. `export` accepts this pending destination delta by default and
 does not change the lock or persistent patch.
+
+## Include patterns
+
+Each `include` pattern matches a complete path relative to `source` (or
+`destination` when checking local files). A file is selected when any pattern
+matches. Use `/` separators on every platform, including Windows; matching is
+case-sensitive and includes hidden files and directories.
+
+`*`, `?`, and character classes such as `[ab]` or `[!a]` match within one path
+component. A component consisting of `**` matches zero or more components.
+
+| Pattern | Selected files |
+|---------|----------------|
+| `*.py` | Python files directly in the source directory |
+| `**/*.py` | Python files in the source directory and all nested directories |
+| `*/*.py` | Python files exactly one directory below the source directory |
+| `*/**/*.py` | Python files at any nested depth, excluding the source directory |
+| `sub/*.py` | Python files directly in `sub` |
+| `sub/**/*.py` | Python files in `sub` and all its nested directories |
+| `a.py` | Only `a.py` directly in the source directory |
+| `**/*` | All files at every depth (the default for `create`) |
+
+Quote patterns in YAML and shell commands, for example `--include '**/*.py'`.
+Repeat `--include` to select multiple patterns.
+
+Earlier versions also matched nested paths with `*.py` and bare filenames.
+Use `**/*.py` or `**/a.py` when that recursive behavior is intended.
 
 ## Choose a command
 
