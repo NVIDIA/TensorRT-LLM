@@ -886,15 +886,15 @@ class CUDAGraphRunner:
                                          expected_ptrs: Dict[str, int]) -> None:
         """Raise if any tensor captured by _snapshot_graph_tensor_ptrs has moved.
 
-        Attributes listed in obj.draft_replay_swapped_attrs are skipped: they
-        are deliberately rebound to draft KV cache buffers for the duration of
-        a draft replay and restored afterwards.
+        Attributes in obj.draft_replay_swapped_attrs are deliberately rebound
+        to draft KV cache buffers for the duration of a draft replay, so their
+        live value is not the captured one. The target value saved before the
+        swap is checked in its place.
         """
-        swapped_attrs = getattr(obj, "draft_replay_swapped_attrs", frozenset())
+        swapped_attrs = getattr(obj, "draft_replay_swapped_attrs", {})
         for name, expected_ptr in expected_ptrs.items():
-            if name in swapped_attrs:
-                continue
-            value = getattr(obj, name, None)
+            value = (swapped_attrs[name] if name in swapped_attrs else getattr(
+                obj, name, None))
             if not isinstance(value, torch.Tensor):
                 raise RuntimeError(
                     f"CUDA graph metadata attribute `{type(obj).__name__}."

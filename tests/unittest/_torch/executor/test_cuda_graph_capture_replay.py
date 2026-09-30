@@ -35,9 +35,14 @@ import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor import cuda_graph_runner as cuda_graph_runner_module
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative.interface import (
+    prepare_attn_metadata_for_draft_replay,
+    restore_attn_metadata_after_draft_replay,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
@@ -340,6 +345,24 @@ class _MetadataStub:
         self.some_buf = torch.full((1,), value, device="cuda", dtype=torch.int32)
 
 
+class _DraftReplayMetadataStub(TrtllmAttentionMetadata):
+    """attn_metadata carrying the fields the draft-replay helpers swap.
+
+    Skips the dataclass __init__; prepare/restore_attn_metadata_*_draft_replay
+    only read and rebind the attributes set here.
+    """
+
+    def __init__(self, value: int):
+        self.draft_replay_swapped_attrs = {}
+        self.kv_cache_manager = object()
+        self.kv_cache_block_offsets = torch.full((1,), value, device="cuda", dtype=torch.int32)
+        self.host_kv_cache_block_offsets = torch.zeros(1, dtype=torch.int32)
+        self.draft_kv_cache_block_offsets = torch.full(
+            (1,), value + 1000, device="cuda", dtype=torch.int32
+        )
+        self.enable_flash_mla = False
+
+
 class TestStrictBufferCheck:
     """CUDAGraphRunner._STRICT_BUFFER_CHECK: attn_metadata/spec_metadata tensor
     attributes must keep the same data_ptr() from capture through every
@@ -434,10 +457,11 @@ class TestStrictBufferCheck:
         with pytest.raises(RuntimeError, match="some_buf"):
             runner.replay(key, inputs)
 
-    def test_replay_skips_draft_replay_swapped_attrs(self, monkeypatch):
-        """draft_replay_swapped_attrs skips only the pointer check; it doesn't
-        redirect the captured graph to the rebound tensor. Once cleared, the
-        same rebind is flagged again.
+    def test_replay_accepts_swapped_attr_with_unchanged_saved_target(self, monkeypatch):
+        """A draft swap rebinds the live attribute, but the check validates the
+        saved target tensor, which is unchanged, so replay is accepted and the
+        graph still reads the captured buffer. Once the swap is cleared, the
+        rebound live tensor is flagged.
         """
         runner, key, attn_metadata, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
 
@@ -450,14 +474,14 @@ class TestStrictBufferCheck:
         captured_buf = attn_metadata.some_buf
         attn_metadata.some_buf = torch.full((1,), 99, device="cuda", dtype=torch.int32)
 
-        attn_metadata.draft_replay_swapped_attrs = frozenset({"some_buf"})
+        attn_metadata.draft_replay_swapped_attrs = {"some_buf": captured_buf}
         output = runner.replay(key, inputs)
 
         # Graph kernels still read the buffer captured at address-bake time
         # (10), not the rebound tensor (99).
         assert output.item() == 10
 
-        attn_metadata.draft_replay_swapped_attrs = frozenset()
+        attn_metadata.draft_replay_swapped_attrs = {}
         with pytest.raises(RuntimeError, match="some_buf"):
             runner.replay(key, inputs)
         del captured_buf
@@ -493,12 +517,83 @@ class TestStrictBufferCheck:
 
         runner.capture(key, forward_fn, inputs)
 
+        captured_buf = attn_metadata.some_buf
         attn_metadata.some_buf = torch.full((1,), 99, device="cuda", dtype=torch.int32)
         attn_metadata.other_buf = torch.full((1,), 2, device="cuda", dtype=torch.int32)
 
-        attn_metadata.draft_replay_swapped_attrs = frozenset({"some_buf"})
+        attn_metadata.draft_replay_swapped_attrs = {"some_buf": captured_buf}
         with pytest.raises(RuntimeError, match="other_buf"):
             runner.replay(key, inputs)
+
+    def _make_draft_replay_runner_and_inputs(self, monkeypatch, value):
+        runner, key, _, inputs = self._make_runner_and_inputs(monkeypatch, value)
+        attn_metadata = _DraftReplayMetadataStub(value)
+        inputs["attn_metadata"] = attn_metadata
+        draft_kv_cache_manager = SimpleNamespace(
+            host_kv_cache_block_offsets=torch.zeros(1, dtype=torch.int32)
+        )
+        return runner, key, attn_metadata, inputs, draft_kv_cache_manager
+
+    @staticmethod
+    def _forward_reading_block_offsets(fn_inputs):
+        return fn_inputs["input_ids"].clone() + fn_inputs["attn_metadata"].kv_cache_block_offsets
+
+    def test_replay_rejects_target_buffer_replaced_before_draft_swap(self, monkeypatch):
+        """If the target kv_cache_block_offsets is replaced after capture, the
+        draft swap must not hide it: replay validates the saved target tensor
+        and raises instead of reading the stale captured buffer.
+        """
+        runner, key, attn_metadata, inputs, draft_mgr = self._make_draft_replay_runner_and_inputs(
+            monkeypatch, value=10
+        )
+        runner.capture(key, self._forward_reading_block_offsets, inputs)
+
+        # Keep the captured tensor alive so the graph doesn't read freed memory.
+        captured_buf = attn_metadata.kv_cache_block_offsets
+        attn_metadata.kv_cache_block_offsets = torch.full(
+            (1,), 99, device="cuda", dtype=torch.int32
+        )
+
+        saved = prepare_attn_metadata_for_draft_replay(attn_metadata, draft_mgr)
+        try:
+            with pytest.raises(RuntimeError, match="kv_cache_block_offsets"):
+                runner.replay(key, inputs)
+        finally:
+            restore_attn_metadata_after_draft_replay(attn_metadata, saved)
+        del captured_buf
+
+    def test_replay_accepts_draft_swap_with_unchanged_target(self, monkeypatch):
+        """With the target buffer untouched, the draft swap is accepted and the
+        graph still reads the captured target buffer, not the draft one.
+        """
+        runner, key, attn_metadata, inputs, draft_mgr = self._make_draft_replay_runner_and_inputs(
+            monkeypatch, value=10
+        )
+        runner.capture(key, self._forward_reading_block_offsets, inputs)
+
+        saved = prepare_attn_metadata_for_draft_replay(attn_metadata, draft_mgr)
+        try:
+            output = runner.replay(key, inputs)
+        finally:
+            restore_attn_metadata_after_draft_replay(attn_metadata, saved)
+
+        assert output.item() == 10
+
+    def test_restore_clears_swapped_attrs_and_target_buffer(self, monkeypatch):
+        """Restore leaves no swapped attrs behind and rebinds the target buffer."""
+        _, _, attn_metadata, _, draft_mgr = self._make_draft_replay_runner_and_inputs(
+            monkeypatch, value=10
+        )
+        target_buf = attn_metadata.kv_cache_block_offsets
+
+        saved = prepare_attn_metadata_for_draft_replay(attn_metadata, draft_mgr)
+        assert attn_metadata.draft_replay_swapped_attrs["kv_cache_block_offsets"] is target_buf
+        assert attn_metadata.kv_cache_block_offsets is attn_metadata.draft_kv_cache_block_offsets
+
+        restore_attn_metadata_after_draft_replay(attn_metadata, saved)
+
+        assert attn_metadata.draft_replay_swapped_attrs == {}
+        assert attn_metadata.kv_cache_block_offsets is target_buf
 
 
 class TestStrictBufferCheckEnvVar:

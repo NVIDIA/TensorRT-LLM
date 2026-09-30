@@ -231,9 +231,10 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     backend_saved = attn_metadata.prepare_for_draft_forward()
     if backend_saved is not None:
         saved['saved_backend_state'] = backend_saved
-    attn_metadata.draft_replay_swapped_attrs = frozenset(
-        {k[len('target_'):]
-         for k in saved if k.startswith('target_')} | set(backend_saved or ()))
+    attn_metadata.draft_replay_swapped_attrs = {
+        k[len('target_'):]: v
+        for k, v in saved.items() if k.startswith('target_')
+    } | (backend_saved or {})
     return saved
 
 
@@ -257,7 +258,7 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
         attn_metadata._flash_mla_metadata_valid = False
     attn_metadata.restore_after_draft_forward(
         saved_state.get('saved_backend_state'))
-    attn_metadata.draft_replay_swapped_attrs = frozenset()
+    attn_metadata.draft_replay_swapped_attrs = {}
 
 
 def get_force_num_accepted_tokens() -> int:
