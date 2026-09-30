@@ -55,6 +55,12 @@ def _install(monkeypatch, fake):
     return fake
 
 
+def test_allow_patterns_name_exactly_the_two_subtrees_the_guardrail_loads():
+    # The download tests compare calls against this constant, so they cannot
+    # notice it regressing to None or to the whole repo. Pin the literal here.
+    assert GUARDRAIL_ALLOW_PATTERNS == ["blocklist/*", "face_blur_filter/*"]
+
+
 class TestDownloadGuardrailCheckpoint:
     def test_cache_hit_makes_one_offline_call(self, monkeypatch, tmp_path):
         fake = _install(monkeypatch, _RecordingSnapshotDownload([str(tmp_path)]))
