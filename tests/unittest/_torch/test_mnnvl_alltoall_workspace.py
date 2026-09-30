@@ -701,6 +701,7 @@ def test_one_sided_checkpoint_rejects_destroyed_workspace(
     wrapper._workspace_lifecycle = Mock()
     wrapper._workspace_key = ("test",)
     wrapper._workspace_registered = True
+    wrapper._workspace_state = {}
     wrapper.destroy()
 
     with pytest.raises(RuntimeError, match="workspace has been destroyed"):
@@ -798,6 +799,7 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
     monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
     monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
     monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "CftMnnvlMemory", _Memory)
     monkeypatch.setattr(
         _MnnvlAlltoAllWorkspaceLifecycle,
         "get_or_create",
