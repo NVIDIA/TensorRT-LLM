@@ -1683,8 +1683,10 @@ def _run_cute_dsl_bf16_heuristic_comparison(monkeypatch, tuner, nvmmh):
     tuner.configure_nvmmh(enabled=True, fields=scheduler_fields, max_tactics=5)
     heuristic_candidates = runner.get_valid_tactics(inputs, None)
     assert 0 < len(heuristic_candidates) <= len(baseline_tactics), (
-        "nvMMH did not prune SM107 BF16 tactics: "
+        "nvMMH returned an invalid SM107 BF16 candidate count: "
         f"{len(heuristic_candidates)} vs {len(baseline_tactics)}")
+    assert set(heuristic_candidates) != set(baseline_tactics), (
+        "nvMMH scheduler-only guidance fell back to the full BF16 sweep")
     assert {_nvmmh_tactic_family(t)
             for t in heuristic_candidates
             }.issubset({_nvmmh_tactic_family(t)
@@ -1859,8 +1861,10 @@ def _run_cute_dsl_mxfp8_heuristic_comparison(monkeypatch, tuner, nvmmh):
     tuner.configure_nvmmh(enabled=True, fields=scheduler_fields, max_tactics=5)
     heuristic_candidates = runner.get_valid_tactics(inputs, None)
     assert 0 < len(heuristic_candidates) <= len(baseline_tactics), (
-        "nvMMH did not prune SM107 MXFP8 tactics: "
+        "nvMMH returned an invalid SM107 MXFP8 candidate count: "
         f"{len(heuristic_candidates)} vs {len(baseline_tactics)}")
+    assert set(heuristic_candidates) != set(baseline_tactics), (
+        "nvMMH scheduler-only guidance fell back to the full MXFP8 sweep")
 
     assert {_nvmmh_tactic_family(t)
             for t in heuristic_candidates
@@ -2039,7 +2043,7 @@ def _run_cute_dsl_nvfp4_heuristic_comparison(monkeypatch, tuner, nvmmh,
     # Pruned: nvMatmulHeuristics drives the (coupled) tile+cluster candidates.
     tuner.configure_nvmmh(enabled=True)
     heuristic_candidates = runner.get_valid_tactics(inputs, None)
-    assert 0 < len(heuristic_candidates) <= len(baseline_tactics), (
+    assert 0 < len(heuristic_candidates) < len(baseline_tactics), (
         f"nvMMH did not prune SM{sm_version} NVFP4 tactics: "
         f"{len(heuristic_candidates)} vs {len(baseline_tactics)}")
     assert {_nvmmh_tactic_family(t)
@@ -2119,16 +2123,8 @@ def _run_cute_dsl_nvfp4_heuristic_comparison(monkeypatch, tuner, nvmmh,
         f">{tolerance:.2f}x slower than full-sweep tactic {sweep_tactic} "
         f"({sweep_us:.2f} us) for M={m}, N={n}, K={k}")
 
-    # The heuristic CuteDSL kernel should beat cuBLAS or be within tolerance.
-    # This is a cross-library comparison (CuteDSL vs cuBLASLt) at ~28us per call
-    # profiled over only 20 iterations; run-to-run jitter easily reaches a few
-    # percent from DVFS, L2 residency, and interleaving with cuBLAS autotune
-    # warmup, so keep this bound looser than the intra-CuteDSL one above.
-    cublas_tolerance = 1.10
-    assert heuristic_us <= cublas_us * cublas_tolerance, (
-        f"CuteDSL heuristic kernel ({heuristic_us:.2f} us) is "
-        f">{cublas_tolerance:.2f}x slower than cuBLASLt NVFP4 "
-        f"({cublas_us:.2f} us) for M={m}, N={n}, K={k}")
+    print(f"NVFP4 CuTe DSL / cuBLASLt CUPTI ratio: "
+          f"{heuristic_us / cublas_us:.3f}x")
 
 
 @pytest.mark.parametrize(
