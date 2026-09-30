@@ -17,8 +17,12 @@ const {readFileSync} = require('node:fs');
 const {join} = require('node:path');
 
 const NAME = 'Semantic conflict with target branch';
-const notice = 'Advisory, non-required AI analysis of the recorded revisions. ' +
-  'CodeRabbit can miss problems or report false positives. Review the evidence.';
+const notice = 'Best-effort AI judgment for the recorded revisions. ' +
+  'PASS, FAIL and INCONCLUSIVE may be incomplete or incorrect. ' +
+  'PR authors and reviewers should independently verify the evidence and relevant behavior. ' +
+  'This semantic review and its status/workflow are advisory, not required merge checks ' +
+  'under current repository rules; other merge requirements still apply. ' +
+  'Advisory status does not make a confirmed defect safe to ignore.';
 const supported = ref => ref === 'main' || /^release\/[^\s]+$/.test(ref);
 const eligible = pr => pr.state === 'open' && !pr.draft && supported(pr.base.ref) &&
   (pr.auto_merge || pr.labels.some(label => label.name === 'ci: full pre-merge approved'));
@@ -29,6 +33,9 @@ const isReviewer = user => user?.login === 'coderabbitai[bot]' &&
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const sha = /^[a-f0-9]{40}$/;
 const identity = (number, request) => `semantic-review:${number}:${request.id}`;
+const statusContext = number => `${NAME} / PR #${number}`;
+const isPublisher = user => user?.login === 'github-actions[bot]' &&
+  user.id === 41898282 && user.type === 'Bot';
 
 function requests(comments) {
   return comments.filter(comment => isCommandUser(comment.user)).flatMap(comment => {
@@ -43,7 +50,8 @@ function requests(comments) {
         ![request.head, request.target, request.mergeBase].every(value => sha.test(value)) ||
         (request.automaticRetryOf !== undefined &&
           (typeof request.automaticRetryOf !== 'string' || !uuid.test(request.automaticRetryOf))) ||
-        !Number.isSafeInteger(request.checkId) || request.checkId <= 0) return [];
+        (request.checkId !== undefined &&
+          (!Number.isSafeInteger(request.checkId) || request.checkId <= 0))) return [];
     return [{...request, commentId: comment.id, created_at: comment.created_at}];
   }).sort((a, b) => b.commentId - a.commentId);
 }
@@ -58,7 +66,7 @@ function command(request) {
 }
 
 function awaiting(request) {
-  return {title: 'Awaiting CodeRabbit analysis (no verdict)',
+  return {title: 'Waiting for CodeRabbit response',
     summary: `Request ${request.id}. Head ${request.head}, target ${request.target}, ` +
       `merge base ${request.mergeBase}.\n\n${notice}`};
 }
@@ -106,11 +114,29 @@ async function reviewState({github, repo, number, comments, head}) {
   const owned = checks.filter(check => check.app?.slug === 'github-actions' &&
     check.name === NAME && refs.has(check.head_sha) &&
     check.external_id?.startsWith(`semantic-review:${number}:`));
-  const check = request ? owned.filter(check => check.head_sha === request.head &&
-    check.external_id === identity(number, request)).sort((a, b) => b.id - a.id)[0] : undefined;
-  const cleanup = owned.filter(item => item.status !== 'completed' && item.id !== check?.id);
-  if (!check) return {request, check, result: undefined, update: undefined, cleanup};
-  const publishedId = Number(check.output?.summary?.match(/<!-- semantic-review-source:(\d+) -->/)?.[1]);
+  const cleanup = owned.filter(item => item.status !== 'completed');
+  if (!request) return {cleanup};
+  const statuses = (await github.paginate(github.rest.repos.listCommitStatusesForRef,
+    {...repo, ref: request.head, per_page: 100}))
+    .filter(status => status.context === statusContext(number)).sort((a, b) => b.id - a.id);
+  const status = statuses[0];
+  const link = `https://github.com/${repo.owner}/${repo.repo}/pull/${number}`;
+  // Preserve the newest observed reply across deletion/edit events. The status URL
+  // carries this watermark because commit statuses have no private metadata field.
+  let publishedId;
+  for (const item of statuses.filter(status => isPublisher(status.creator))) {
+    let url;
+    try { url = new URL(item.target_url); } catch { continue; }
+    if (`${url.origin}${url.pathname}` !== link ||
+        url.searchParams.get('semantic_review_request') !== request.id) continue;
+    publishedId = Number(url.searchParams.get('semantic_review_source'));
+    break;
+  }
+  if (publishedId === undefined) {
+    const legacy = owned.filter(check => check.head_sha === request.head &&
+      check.external_id === identity(number, request)).sort((a, b) => b.id - a.id)[0];
+    publishedId = Number(legacy?.output?.summary?.match(/<!-- semantic-review-source:(\d+) -->/)?.[1]);
+  }
   const sourceId = Number.isSafeInteger(publishedId) && publishedId > request.commentId ? publishedId : 0;
   const replies = comments.filter(comment => isReviewer(comment.user) &&
     comment.id > request.commentId && (!sourceId || comment.id >= sourceId) &&
@@ -127,30 +153,27 @@ async function reviewState({github, repo, number, comments, head}) {
     }
   }
   const source = result?.comment.id || invalidSource?.id || sourceId;
-  const url = source ? `https://github.com/${repo.owner}/${repo.repo}/pull/${number}#issuecomment-${source}` : undefined;
+  const url = source ? `${link}#issuecomment-${source}` : undefined;
   const output = result ? {
     title: {PASS: 'No semantic conflict found (best effort)',
-      FAIL: 'Possible semantic conflict', INCONCLUSIVE: 'Semantic analysis inconclusive'}[result.verdict],
+      FAIL: 'Possible semantic conflict', INCONCLUSIVE: 'Review completed: inconclusive'}[result.verdict],
     summary: `Request ${request.id}. Head ${request.head}, target ${request.target}, ` +
       `merge base ${request.mergeBase}.\n\n` +
       `Result received ${result.comment.created_at}. [CodeRabbit analysis](${url}).\n\n` +
       (result.missingEvidence ? 'Missing fixed-revision source citations; no verified verdict.\n\n' : '') + notice,
   } : awaiting(request);
-  if (source) {
-    if (!result) output.summary += `\n\n[Reply without a valid result](${url}).`;
-    output.summary += `\n\n<!-- semantic-review-source:${source} -->`;
-  }
-  const desired = {status: result ? 'completed' : 'in_progress',
-    ...(result ? {conclusion: {PASS: 'success', FAIL: 'failure', INCONCLUSIVE: 'neutral'}[result.verdict]} : {}),
-    output};
-  const changed = check.status !== desired.status ||
-    (result ? check.conclusion !== desired.conclusion : check.conclusion != null) ||
-    check.output?.title !== output.title || check.output?.summary !== output.summary;
-  const create = !result && check.status === 'completed';
-  return {request, check, result, create, cleanup,
-    update: changed ? {...repo,
-      ...(create ? {head_sha: request.head, name: NAME, external_id: identity(number, request)} :
-        {check_run_id: check.id}), ...desired} : undefined};
+  if (source && !result) output.summary += `\n\n[Reply without a valid result](${url}).`;
+  const desired = {
+    state: result ? {PASS: 'success', FAIL: 'failure', INCONCLUSIVE: 'pending'}[result.verdict] : 'pending',
+    description: output.title,
+    target_url: `${link}?semantic_review_request=${request.id}` +
+      (source ? `&semantic_review_source=${source}` : '') +
+      `#issuecomment-${result ? result.comment.id : request.commentId}`,
+  };
+  const changed = !isPublisher(status?.creator) ||
+    Object.entries(desired).some(([key, value]) => status?.[key] !== value);
+  return {request, result, status, cleanup, output,
+    update: changed ? {...repo, sha: request.head, context: statusContext(number), ...desired} : undefined};
 }
 
 async function publish({github, context, core, number, comments, head}) {
@@ -160,16 +183,15 @@ async function publish({github, context, core, number, comments, head}) {
   }
   const state = await reviewState({github, repo: context.repo, number, comments, head});
   if (state?.update) {
-    if (state.create) await github.rest.checks.create(state.update);
-    else await github.rest.checks.update(state.update);
-    const {title, summary} = state.update.output;
+    await github.rest.repos.createCommitStatus(state.update);
+    const {title, summary} = state.output;
     await core.summary.addRaw(`${title}\n\n${summary}\n`).write();
   }
   for (const check of state?.cleanup || []) {
     await github.rest.checks.update({...context.repo, check_run_id: check.id,
       status: 'completed', conclusion: 'cancelled', output: {
-        title: 'Superseded or unrecorded semantic request',
-        summary: 'This pending check was superseded or has no current request record. ' +
+        title: 'Semantic review is published as a commit status',
+        summary: 'Semantic review results use the per-PR commit status. ' +
           'Cancellation clears the inactive check and does not assign an AI verdict.',
       }});
   }
@@ -177,4 +199,4 @@ async function publish({github, context, core, number, comments, head}) {
 }
 
 module.exports = {NAME, notice, supported, eligible, isCommandUser, isReviewer,
-  identity, requests, command, awaiting, parseResult, reviewState, publish};
+  identity, statusContext, requests, command, awaiting, parseResult, reviewState, publish};

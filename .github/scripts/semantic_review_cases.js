@@ -74,4 +74,28 @@ module.exports = [
     mergeBase: 'ee7525c0cd28225a64913d3f6dbe87a8a373c6aa',
     branch: 'main',
   },
+  {
+    name: 'paired-executor-edits',
+    pr: 19465,
+    head: '40db7c1bf62c477884a37084bbf254f1a4d9b0ee',
+    target: 'f00e9627fa9879a56544d5382f4e5193cb0cc2b2',
+    mergeBase: '25e9ddadcaf5fec7fedcad4d7aef128e94104667',
+    branch: 'main',
+  },
+  {
+    name: 'retained-mock-default',
+    pr: 19397,
+    head: '17cc8bdf433f4f5143184d936946d67c733feb44',
+    target: 'c2220eef33f407fd3d805a6ab8a2725f54bdd3c4',
+    mergeBase: '0816dd81b857db9ce379a6db7a68abdf234e0f50',
+    branch: 'main',
+  },
+  {
+    name: 'paired-warmup-edits',
+    pr: 18813,
+    head: '45035789c9a7fc3b92e4be3a37095a8355f288b0',
+    target: 'c2220eef33f407fd3d805a6ab8a2725f54bdd3c4',
+    mergeBase: '795805fffc8f9ab88eab901b05c83341f7c89256',
+    branch: 'main',
+  },
 ];
