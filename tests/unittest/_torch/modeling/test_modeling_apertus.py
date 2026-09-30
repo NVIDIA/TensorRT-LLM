@@ -192,6 +192,10 @@ class TestXIELU(unittest.TestCase):
 
 
 class TestApertus(unittest.TestCase):
+    def setUp(self):
+        if not torch.cuda.is_available():
+            self.skipTest("needs CUDA")
+
     def _build_models(self, backend: str):
         torch.random.manual_seed(0)
         generator = torch.Generator().manual_seed(1234)
@@ -466,6 +470,10 @@ class TestApertus1p5Config(unittest.TestCase):
 
 
 class TestApertus1p5(unittest.TestCase):
+    def setUp(self):
+        if not torch.cuda.is_available():
+            self.skipTest("needs CUDA")
+
     INPUT_VOCAB_SIZE = 2048
     OUTPUT_VOCAB_SIZE = 1024
 
