@@ -182,13 +182,23 @@ baseline worker, receiver worker, and donor-readiness wait; increase it for
 slow model storage or startup.
 
 The dedicated H100 CI stages own isolated Redis and ModelExpress 0.5.1
-sidecars. The two-GPU TP=1 stage is classified as multi-GPU: it runs
-automatically in post-merge pipelines or when a multi-GPU file changes, while
-direct pre-merge dispatch requires the `ci: full pre-merge approved` label.
-Trigger it directly with:
+sidecars. Coverage is tiered so that pull requests pay for one lightweight
+end-to-end canary while every qualified family still runs on each main commit:
+
+| Stage | When it runs | Rows |
+| --- | --- | --- |
+| `DGX_H100-2_GPUs-PyTorch-ModelExpress-1` | Pre-merge and post-merge | `llama-bf16-tp1` and `test_mx_source_identity_gate.py` |
+| `DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1` | Post-merge only | The other TP=1 family rows and the accuracy canaries below |
+| `DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1` | On demand only | Every TP=2 row |
+
+The two-GPU stages are classified as multi-GPU, so running either of them on a
+pull request requires the `ci: full pre-merge approved` label; the pre-merge
+stage is also selected automatically when a multi-GPU file changes. Trigger
+them directly with:
 
 ```text
 /bot run --stage-list "DGX_H100-2_GPUs-PyTorch-ModelExpress-1"
+/bot run --stage-list "DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1"
 ```
 
 TP=2 is the minimum evidence for adding or changing a parallel profile. Its
@@ -199,10 +209,12 @@ multi-GPU runs:
 /bot run --stage-list "DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1"
 ```
 
-Both stages set `TRTLLM_MX_E2E_REQUIRED=1`, so missing service, model, client,
-or NIXL prerequisites fail instead of skipping. Do not add every model profile
-to recurring coverage: use the harness for representative rows claimed by the
-support table and keep wider matrices in scheduled qualification.
+All three stages set `TRTLLM_MX_E2E_REQUIRED=1`, so missing service, model,
+client, or NIXL prerequisites fail instead of skipping. Do not grow pre-merge
+coverage with each new family: its TP=1 row belongs in the `post_merge` block of
+`tests/integration/test_lists/test-db/l0_model_express.yml` and its TP=2 row
+in the on-demand stage, while the pre-merge block keeps a single
+representative row.
 
 ### Accuracy Canaries (Post-Merge)
 
@@ -229,7 +241,8 @@ Current rows (all TP=1, BF16, `references/*.yaml` hold the expected values):
 The rows are registered as `stage: post_merge` entries in
 `tests/integration/test_lists/test-db/l0_model_express.yml`, so they run in
 `DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1` on every main commit and
-never in pre-merge pipelines. Trigger the stage on a pull request with:
+are never selected automatically in pre-merge pipelines. Trigger the stage on a
+pull request, which requires the `ci: full pre-merge approved` label, with:
 
 ```text
 /bot run --stage-list "DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1"
