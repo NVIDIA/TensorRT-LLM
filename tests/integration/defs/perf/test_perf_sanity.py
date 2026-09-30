@@ -86,6 +86,7 @@ DISAGG_CONFIG_MODES = DISAGG_BENCHMARK_MODES + AGGREGATED_DISAGG_YAML_MODES
 GEN_ONLY_MODES = ("gen_only", GEN_ONLY_NO_CONTEXT_MODE)
 
 GEN_ONLY_NO_CONTEXT_RUNTIME = "gen_only_no_context_server"
+GEN_ONLY_NO_CONTEXT_ENV = "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"
 
 DISAGG_CONFIG_RUNTIMES = ("multi_node_disagg_server", GEN_ONLY_NO_CONTEXT_RUNTIME)
 
@@ -3410,6 +3411,9 @@ class AggrGenOnlyNoContextCmds(NamedTuple):
             gen_env = copy.deepcopy(os.environ)
             if gen_cfg is not None:
                 gen_env.update(gen_cfg.to_env())
+            # With zero context servers, both the gen worker and the proxy must run
+            # in benchmark gen-only mode, whichever launcher started this test.
+            gen_env[GEN_ONLY_NO_CONTEXT_ENV] = "1"
             with open(gen_log_path, "a") as gen_ctx:
                 gen_proc = subprocess.Popen(
                     gen_cmd_with_port,
@@ -3431,6 +3435,7 @@ class AggrGenOnlyNoContextCmds(NamedTuple):
                 proxy_env = copy.deepcopy(os.environ)
                 if disagg_cfg is not None:
                     proxy_env.update(to_env_dict(disagg_cfg.server_env_var))
+                proxy_env[GEN_ONLY_NO_CONTEXT_ENV] = "1"
                 with open(proxy_log_path, "w") as proxy_ctx:
                     proxy_proc = subprocess.Popen(
                         proxy_cmd,
