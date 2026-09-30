@@ -29,6 +29,16 @@ from tensorrt_llm.llmapi import (
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.fixture(autouse=True)
+def _clear_escape_hatch(monkeypatch):
+    """Isolate every test from an inherited opt-in env value.
+
+    The escape-hatch tests set their own required value explicitly, so this
+    only guarantees the default-refusal tests see the env var unset.
+    """
+    monkeypatch.delenv(ALLOW_UNCORRECTED_OVERLAP_SPEC_ENV_VAR, raising=False)
+
+
 class _OptInCorrectionMetadata:
     """Stands in for metadata whose KV-length correction is opt-in."""
 
@@ -118,7 +128,19 @@ def test_escape_hatch_warns_instead_of_refusing(monkeypatch):
     # The configuration is still reported as uncorrected; only the reaction
     # changes.
     assert _overlap_spec_kv_lengths_uncorrected("FLASHINFER", config, False)
+    warnings = []
+    monkeypatch.setattr(
+        py_executor_creator.logger,
+        "warning_once",
+        lambda message, **kwargs: warnings.append((message, kwargs)),
+    )
+    # Returning without raising is not enough: the corruption warning has to
+    # actually fire so the operator is told the outputs are unreliable.
     _enforce_overlap_spec_kv_correction("FLASHINFER", config, False)
+    assert len(warnings) == 1
+    message, kwargs = warnings[0]
+    assert kwargs.get("key") == "uncorrected_overlap_spec"
+    assert ALLOW_UNCORRECTED_OVERLAP_SPEC_ENV_VAR in message
 
 
 def test_escape_hatch_requires_the_exact_opt_in(monkeypatch):
