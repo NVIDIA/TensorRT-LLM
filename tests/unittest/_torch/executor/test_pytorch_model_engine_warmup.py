@@ -838,7 +838,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine.model = SimpleNamespace(modules=lambda: [])
         model_engine.llm_args = SimpleNamespace(enable_autotuner=True)
-        model_engine.cuda_graph_lora_manager = object()
+        model_engine._lora = SimpleNamespace(cuda_graph_manager=object())
         model_engine.cuda_graph_runner = SimpleNamespace(
             enabled=True,
             is_warmup_only=False,
