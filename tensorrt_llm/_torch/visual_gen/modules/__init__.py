@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,8 +19,22 @@ This module provides modular neural network components for visual generation mod
 """
 
 from .attention import Attention, QKVMode
+from .tp_sequence_parallel import (
+    RowNorm,
+    TokenShardPlan,
+    TPSequenceParallel,
+    quantize_nvfp4,
+    regroup_swizzled_sf,
+    static_nvfp4_input_scale,
+)
 
 __all__ = [
     "Attention",
     "QKVMode",
+    "RowNorm",
+    "TokenShardPlan",
+    "TPSequenceParallel",
+    "quantize_nvfp4",
+    "regroup_swizzled_sf",
+    "static_nvfp4_input_scale",
 ]
