@@ -630,6 +630,14 @@ class StreamingKVCacheEventManager:
             f"window_size={self._max_window_size}"
         )
 
+    def add_created_event(
+        self,
+        num_blocks_per_cache_level: Any,
+        layer_group_ids: Any = None,
+    ) -> None:
+        """Accept the common manager notification; streaming publishes no creation event."""
+        return
+
     def flush_iteration_events(self) -> None:
         if self._closed:
             return
