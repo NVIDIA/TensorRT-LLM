@@ -686,16 +686,31 @@ def expected_gen_only_ngen(
     (every TP rank then sees the whole batch). num_gen_servers is always 1 for
     gen_only_no_context and hardware.num_gen_servers for gen_only.
 
-    Returns None when the inputs cannot determine a value.
+    The inputs are read from the configuration the worker actually receives
+    (the perf YAML merged over any extra_llm_api_config_path file), not from
+    ServerConfig's reporting defaults. Returns None -- so the caller falls back
+    to the modal bucket -- when that configuration cannot be loaded, does not
+    set max_batch_size or max_num_tokens, or otherwise cannot determine a value.
     """
     if gen_config is None or concurrency <= 0 or num_gen_servers <= 0:
         return None
-    tokens_per_request = 1 + max(int(gen_config.max_draft_len or 0), 0)
-    dp = gen_config.tp if gen_config.enable_attention_dp else 1
+    try:
+        llm_args = gen_config.merged_llm_api_config_data()
+    except (OSError, yaml.YAMLError) as e:
+        print_warning(f"Cannot load the gen worker config for the expected ngen: {e}")
+        return None
+    max_batch_size = llm_args.get("max_batch_size")
+    max_num_tokens = llm_args.get("max_num_tokens")
+    if max_batch_size is None or max_num_tokens is None:
+        return None
+    spec_config = llm_args.get("speculative_config") or {}
+    max_draft_len = spec_config.get("max_draft_len", spec_config.get("num_nextn_predict_layers", 0))
+    tokens_per_request = 1 + max(int(max_draft_len or 0), 0)
+    dp = int(llm_args.get("tensor_parallel_size", 1)) if llm_args.get("enable_attention_dp") else 1
     per_rank = min(
         math.ceil(concurrency / (num_gen_servers * max(dp, 1))),
-        gen_config.max_batch_size,
-        gen_config.max_num_tokens // tokens_per_request,
+        int(max_batch_size),
+        int(max_num_tokens) // tokens_per_request,
     )
     if per_rank <= 0:
         return None
@@ -1868,11 +1883,9 @@ class ServerConfig:
         }
         return db_data
 
-    def generate_extra_llm_api_config(self) -> str:
-        """Generate extra-llm-api-config.yml content."""
+    def merged_llm_api_config_data(self) -> dict:
+        """LLM API fields the worker receives: the perf YAML over the external config."""
         config_data = dict(self.extra_llm_api_config_data)
-
-        # Merge an external config if specified
         if self.extra_llm_api_config_path:
             config_path = self.extra_llm_api_config_path
             if not os.path.isabs(config_path):
@@ -1880,8 +1893,12 @@ class ServerConfig:
             with open(config_path, "r") as f:
                 external_config = yaml.safe_load(f) or {}
             # Fields in extra_llm_api_config_data (from perf YAML) take precedence
-            merged = {**external_config, **config_data}
-            config_data = merged
+            config_data = {**external_config, **config_data}
+        return config_data
+
+    def generate_extra_llm_api_config(self) -> str:
+        """Generate extra-llm-api-config.yml content."""
+        config_data = self.merged_llm_api_config_data()
 
         # Handle speculative_model path conversion
         if (
