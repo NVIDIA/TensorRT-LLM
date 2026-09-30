@@ -150,6 +150,7 @@ def test_import_deep_gemm_rejects_pre_situ_mega_moe_api(monkeypatch):
         transform_sf_into_required_layout=lambda: None,
         transform_weights_for_mega_moe=lambda: None,
         per_token_cast_to_fp8=per_token_cast_to_fp8,
+        set_barrier_timeout_seconds=lambda seconds: None,
     )
     monkeypatch.setattr(tensorrt_llm, "deep_gemm", deep_gemm)
 
@@ -158,6 +159,35 @@ def test_import_deep_gemm_rejects_pre_situ_mega_moe_api(monkeypatch):
         match="fp8_fp4_mega_moe does not accept.*situ_beta",
     ):
         quantization_module._import_deep_gemm()
+
+
+def test_import_deep_gemm_rejects_mega_moe_without_barrier_timeout(monkeypatch):
+    import tensorrt_llm
+    import tensorrt_llm._torch.moe.fused_moe.quantization as quantization_module
+
+    def fp8_fp4_mega_moe(*, situ_beta=None, situ_linear_beta=None):
+        pass
+
+    def per_token_cast_to_fp8(*, use_packed_ue8m0=False):
+        pass
+
+    deep_gemm = SimpleNamespace(
+        fp8_fp4_mega_moe=fp8_fp4_mega_moe,
+        get_symm_buffer_for_mega_moe=lambda: None,
+        transform_sf_into_required_layout=lambda: None,
+        transform_weights_for_mega_moe=lambda: None,
+        per_token_cast_to_fp8=per_token_cast_to_fp8,
+    )
+    monkeypatch.setattr(tensorrt_llm, "deep_gemm", deep_gemm)
+
+    with pytest.raises(
+        quantization_module._MegaMoEUnavailable,
+        match="lacks set_barrier_timeout_seconds",
+    ):
+        quantization_module._import_deep_gemm()
+
+    deep_gemm.set_barrier_timeout_seconds = lambda seconds: None
+    assert quantization_module._import_deep_gemm() is deep_gemm
 
 
 def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
