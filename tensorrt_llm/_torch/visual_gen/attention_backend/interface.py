@@ -80,3 +80,8 @@ class AttentionBackend(ABC):
     def support_lse(cls) -> bool:
         """Whether the backend supports returning the softmax log-sum-exp (LSE) of the attention weights."""
         return False
+
+    @classmethod
+    def supports_varlen(cls) -> bool:
+        """Whether the backend accepts ragged K/V via ``cu_seqlens_kv``/``max_seqlen_kv``."""
+        return False
