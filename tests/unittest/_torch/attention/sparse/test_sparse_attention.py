@@ -216,8 +216,18 @@ def test_prepare_sparse_runtime_params_schedules_skip_softmax_thresholds() -> No
             attention, torch.empty(0), None, None, None, forward_args
         )
 
-    schedule.assert_called_once_with(runtime_params=SparseRuntimeParams(), timestep=timestep)
+    schedule.assert_called_once_with(
+        runtime_params=SparseRuntimeParams(), timestep=timestep, graph_phase=None
+    )
     assert runtime_params == scheduler.get_runtime_params(timestep=timestep)
+
+    # A caller-resolved phase reaches the scheduler, which then never reads the timestep.
+    forward_args = AttentionForwardArgs(timestep=timestep, sparse_attn_phase=1)
+    with patch.object(
+        scheduler, "get_runtime_params", wraps=scheduler.get_runtime_params
+    ) as schedule:
+        prepare_sparse_runtime_params(attention, torch.empty(0), None, None, None, forward_args)
+    assert schedule.call_args.kwargs["graph_phase"] == 1
 
 
 def _make_block_sparse_inputs() -> BlockSparseForwardInputs:
