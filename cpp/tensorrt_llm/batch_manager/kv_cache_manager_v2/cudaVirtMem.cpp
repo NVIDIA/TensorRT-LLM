@@ -130,7 +130,18 @@ VirtMem::VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, size_t
     mAccessDesc.location.id = physMemAllocator.deviceId();
     mAccessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
 
-    extend(initNumPhysMem);
+    try
+    {
+        extend(initNumPhysMem);
+    }
+    catch (...)
+    {
+        // A constructor that throws never runs ~VirtMem, so the reservation above has to be
+        // released here or the address range stays held for the life of the process. extend()
+        // has already unmapped whatever it managed to map before failing.
+        KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
+        throw;
+    }
 }
 
 VirtMem::~VirtMem() noexcept

@@ -899,10 +899,6 @@ files = [
 mypy_path = ".:tests/unittest:tests/unittest/_torch/sampler"
 
 [[tool.mypy.overrides]]
-module = ["tensorrt_llm.runtime.kv_cache_manager_v2.*"]
-disallow_any_generics = false
-
-[[tool.mypy.overrides]]
 module = ["tensorrt_llm.bindings.*"]
 ignore_errors = true
 
