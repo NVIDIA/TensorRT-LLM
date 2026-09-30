@@ -363,3 +363,68 @@ class Qwen3ForTextEmbedding(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
         pooled = hidden_states[end_indices]
         normalized = torch.nn.functional.normalize(pooled.float(), p=2, dim=-1)
         return normalized.to(pooled.dtype)
+
+
+@register_auto_model("Qwen3ForTextReranking")
+class Qwen3ForTextReranking(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
+    """Qwen3-Reranker family (0.6B / 4B / 8B).
+
+    The Qwen3 decoder backbone used as a cross-encoder reranker: `forward`
+    projects only the last token of each (query, document) sequence through
+    the ordinary lm_head, then returns the scalar `yes_logit - no_logit`, per
+    the official Qwen3-Reranker scoring convention. This keeps the single
+    causal-LM forward pass and last-token lm_head projection that a normal
+    context phase already does, but skips the decode loop, sampling, and
+    detokenization a generation-path score would otherwise need.
+
+    `reranking_token_true_id`/`reranking_token_false_id` (the tokenizer's
+    "yes"/"no" token ids) must be present on `pretrained_config`; the
+    `trtllm-serve rerank` command resolves them from the model's tokenizer
+    and injects them via `model_kwargs` before this class is constructed
+    (see `commands/serve.py`).
+    """
+
+    def __init__(self, model_config: ModelConfig[Qwen3Config]):
+        super().__init__(
+            Qwen3Model(model_config),
+            config=model_config,
+            hidden_size=model_config.pretrained_config.hidden_size,
+            vocab_size=model_config.pretrained_config.vocab_size,
+        )
+
+        pretrained_config = model_config.pretrained_config
+        token_true_id = getattr(pretrained_config, "reranking_token_true_id",
+                                None)
+        token_false_id = getattr(pretrained_config,
+                                 "reranking_token_false_id", None)
+        if token_true_id is None or token_false_id is None:
+            raise ValueError(
+                "Qwen3ForTextReranking requires reranking_token_true_id and "
+                "reranking_token_false_id on pretrained_config (the "
+                "tokenizer's \"yes\"/\"no\" token ids). Construct this model "
+                "through `trtllm-serve rerank`, which resolves and injects "
+                "them via model_kwargs.")
+        self.token_true_id = token_true_id
+        self.token_false_id = token_false_id
+
+    def forward(self,
+                attn_metadata: AttentionMetadata,
+                input_ids: torch.IntTensor,
+                position_ids: Optional[torch.IntTensor] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None,
+                **kwargs) -> torch.Tensor:
+        assert attn_metadata.seq_lens is not None
+
+        hidden_states = self.model(attn_metadata,
+                                   input_ids,
+                                   position_ids=position_ids,
+                                   inputs_embeds=inputs_embeds)
+
+        # Last-token-only vocab projection (the same context-logits gather the
+        # generation path uses for its final token), then read out just the
+        # two rows this score needs.
+        logits = self.logits_processor(hidden_states,
+                                       self.lm_head,
+                                       attn_metadata,
+                                       return_context_logits=False)
+        return logits[:, self.token_true_id] - logits[:, self.token_false_id]

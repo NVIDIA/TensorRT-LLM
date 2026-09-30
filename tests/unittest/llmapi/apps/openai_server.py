@@ -265,3 +265,34 @@ class RemoteEmbeddingServer(RemoteOpenAIServer):
                                      stderr=self._get_output())
         self._wait_for_server(url=self.url_for("health"),
                               timeout=self.MAX_SERVER_START_WAIT_S)
+
+
+class RemoteRerankServer(RemoteOpenAIServer):
+    """Remote server for testing the /rerank, /v1/rerank, /v2/rerank
+    endpoints (encoder-only)."""
+
+    def __init__(self,
+                 model: str,
+                 cli_args: List[str] = None,
+                 port: int = None,
+                 log_path: Optional[str] = None) -> None:
+        self.host = "localhost"
+        self.port = port if port is not None else get_free_port()
+        self.rank = int(os.environ.get("SLURM_PROCID", 0))
+        self.log_path = log_path
+        self.log_file = None
+        self.role = None
+        self.extra_config_file = None
+
+        args = ["--host", f"{self.host}", "--port", f"{self.port}"]
+        if cli_args:
+            args += cli_args
+
+        # Use the `rerank` subcommand instead of the regular `serve`.
+        launch_cmd = ["trtllm-serve", "rerank"] + [model] + args
+
+        self.proc = subprocess.Popen(launch_cmd,
+                                     stdout=self._get_output(),
+                                     stderr=self._get_output())
+        self._wait_for_server(url=self.url_for("health"),
+                              timeout=self.MAX_SERVER_START_WAIT_S)
