@@ -31,6 +31,7 @@ scheduler reports such a request as saving asynchronously, which keeps its pages
 pinned until `get_finished` says the writes landed.
 """
 
+import os
 import threading
 import traceback
 from collections import defaultdict
@@ -47,6 +48,7 @@ from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig
+from .gpudirect import REGISTRATION_DEBUG_ENV, format_diagnosis
 from .keys import KeyNamespace
 from .metadata import MooncakeStoreMetadata, RequestTransfers
 from .staging import (
@@ -60,6 +62,8 @@ from .staging import sync_stream as _sync_stream
 from .validation import validate_layout, validate_llm_args
 
 __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
+
+_GIB = 1 << 30
 
 #: Set by the worker's constructor so the scheduler adapter, built in the same
 #: process on every ADP owner (rank 0 for TP), can reach the store handle without
@@ -239,17 +243,37 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if self._config.stage_through_host:
             self._open_staging(addressing)
         else:
-            for start, end in addressing.registration_ranges():
+            ranges = addressing.registration_ranges()
+            boundary = addressing.mapping_bytes
+            logger.info(
+                f"mooncake-store rank {self._rank} registering {len(ranges)} range(s) "
+                f"covering {sum(end - start for start, end in ranges) / _GIB:.1f} GiB, "
+                f"pool mapping boundary {boundary if boundary else 'unknown'}"
+            )
+            if boundary and not all(addressing.mapping_origins):
+                logger.warning(
+                    f"mooncake-store rank {self._rank} could not read the base of "
+                    "every KV pool reservation from the driver, so the mapping "
+                    "boundaries of those pools are taken to be the multiples of "
+                    f"{boundary}. A pool whose reservation is not aligned to that "
+                    "will fail registration below."
+                )
+            # One line per range, so only on request.
+            if os.getenv(REGISTRATION_DEBUG_ENV):
+                logger.info(format_diagnosis(ranges, self._rank, boundary))
+            for start, end in ranges:
                 status = self._store.register_buffer(start, end - start)
                 if status != 0:
+                    # Collected only on failure, so the common path pays nothing.
                     raise RuntimeError(
                         f"MooncakeDistributedStore.register_buffer failed with status "
                         f"{status} for [{start:#x}, {end:#x}). Without registration "
                         "the store cannot read or write these pages. Registering "
-                        "device memory needs GPUDirect RDMA (nvidia_peermem or "
-                        "dma-buf); where that is unavailable, set "
-                        "stage_through_host to pass pages through pinned host "
-                        "memory instead."
+                        "device memory needs GPUDirect RDMA, either nvidia_peermem "
+                        "(Mooncake's default, selected unless WITH_NVIDIA_PEERMEM=0) "
+                        "or dma-buf. Set stage_through_host to pass pages through "
+                        "pinned host memory instead.\n"
+                        f"{format_diagnosis(ranges, self._rank, boundary)}"
                     )
 
         self._addressing = addressing

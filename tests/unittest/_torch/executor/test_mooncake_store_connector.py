@@ -38,16 +38,27 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     KvCacheLayerGroupLayout,
     KvCacheLayout,
     KvCacheRegion,
+    _gpu_pool_mapping_bytes,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import addressing as addressing_module
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import gpudirect as gpudirect_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import worker as worker_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import (
     PageAddressing,
+    mapping_origin,
     merge_intervals,
+    split_at_boundaries,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     MooncakeStoreConnectorConfig,
     StoreRole,
+)
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.gpudirect import (
+    RangeFacts,
+    describe_range,
+    format_diagnosis,
+    reservation_start,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
     BlockHashChain,
@@ -117,7 +128,14 @@ class FakeStore:
         self.closed = True
 
 
-def make_layout(*, num_groups=1, regions_per_group=1, num_slots=8, window_size=None):
+def make_layout(
+    *,
+    num_groups=1,
+    regions_per_group=1,
+    num_slots=8,
+    window_size=None,
+    gpu_pool_mapping_bytes=None,
+):
     """A layout whose regions are laid out back to back in a fake address space."""
     groups = []
     base = 0x1000
@@ -144,7 +162,69 @@ def make_layout(*, num_groups=1, regions_per_group=1, num_slots=8, window_size=N
                 regions=tuple(regions),
             )
         )
-    return KvCacheLayout(tokens_per_block=TOKENS_PER_BLOCK, groups=tuple(groups))
+    return KvCacheLayout(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        groups=tuple(groups),
+        gpu_pool_mapping_bytes=gpu_pool_mapping_bytes,
+    )
+
+
+#: Small enough that a single page crosses it, so the splitting is visible in a
+#: layout built from plain integers. The real value is 2 to 32 MiB.
+MAPPING_BYTES = 256
+#: Mapping-aligned, so a page starting here ends 44 bytes into the next mapping.
+REGION_BASE = 0x1000
+REGION_SIZE = 300
+REGION_SLOTS = 4
+#: A reservation base that is not a multiple of the mapping size, which is what
+#: `cuMemAddressReserve` may return and what the multiples would get wrong.
+UNALIGNED_ORIGIN = REGION_BASE - MAPPING_BYTES // 4
+
+
+def make_mapped_layout(*, mapping_bytes=MAPPING_BYTES):
+    """One region wide enough to straddle `mapping_bytes`, packed slot to slot."""
+    return KvCacheLayout(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        groups=(
+            KvCacheLayerGroupLayout(
+                layer_group_id=0,
+                layer_ids=(0,),
+                window_size=None,
+                regions=(
+                    KvCacheRegion(
+                        base=REGION_BASE,
+                        size=REGION_SIZE,
+                        stride=REGION_SIZE,
+                        num_slots=REGION_SLOTS,
+                        buffers=(KvCacheBufferRef(layer_id=0, role="key"),),
+                    ),
+                ),
+            ),
+        ),
+        gpu_pool_mapping_bytes=mapping_bytes,
+    )
+
+
+@pytest.fixture(autouse=True)
+def unknown_reservation_base(monkeypatch):
+    """None of these fake addresses is in a reservation, so skip the driver.
+
+    Keeps the cuts the same whether or not the host running the tests has a
+    usable CUDA driver. Tests that care where a pool's mappings begin install a
+    base of their own with `reservation_base`.
+    """
+    monkeypatch.setattr(addressing_module, "reservation_start", lambda _address: None)
+
+
+@pytest.fixture
+def reservation_base(monkeypatch):
+    """Report a chosen reservation base for every address, as the driver would."""
+
+    def install(base):
+        monkeypatch.setattr(addressing_module, "reservation_start", lambda _address: base)
+        return base
+
+    return install
 
 
 @pytest.fixture
@@ -349,6 +429,157 @@ def test_page_addressing_registration_covers_every_slot_once():
     assert ranges == [(lowest, highest)]
 
 
+@pytest.mark.parametrize(
+    "start,size",
+    [
+        (0, MAPPING_BYTES),  # exactly one mapping
+        (0, 2 * MAPPING_BYTES),  # two whole mappings
+        (MAPPING_BYTES // 2, MAPPING_BYTES),  # straddles one boundary
+        (0, 3 * MAPPING_BYTES + 7),  # ragged tail
+        (MAPPING_BYTES + 8, 16),  # well inside one mapping
+        (REGION_BASE, REGION_SIZE),
+    ],
+    ids=["one_mapping", "two_mappings", "straddling", "ragged_tail", "interior", "region"],
+)
+def test_split_at_boundaries_preserves_the_bytes_and_their_order(start, size):
+    """A page's payload is the same concatenation however the range is cut."""
+    pieces = split_at_boundaries(start, size, MAPPING_BYTES)
+
+    assert sum(piece_size for _, piece_size in pieces) == size
+    address = start
+    for piece_address, piece_size in pieces:
+        assert piece_address == address
+        address += piece_size
+        # The point of splitting: no piece may cover two mappings.
+        assert piece_address % MAPPING_BYTES + piece_size <= MAPPING_BYTES
+
+
+@pytest.mark.parametrize("boundary", [None, 0], ids=["unknown", "zero"])
+def test_split_at_boundaries_leaves_the_range_whole_without_a_boundary(boundary):
+    assert split_at_boundaries(REGION_BASE, 4096, boundary) == [(REGION_BASE, 4096)]
+
+
+def test_split_at_boundaries_passes_an_empty_range_through():
+    assert split_at_boundaries(REGION_BASE, 0, MAPPING_BYTES) == [(REGION_BASE, 0)]
+
+
+@pytest.mark.parametrize(
+    "start,size",
+    [
+        (UNALIGNED_ORIGIN, MAPPING_BYTES),  # the first whole mapping
+        (UNALIGNED_ORIGIN, 3 * MAPPING_BYTES + 7),  # ragged tail
+        (REGION_BASE, REGION_SIZE),  # starts mid-mapping
+        (REGION_BASE, 8),  # well inside one mapping
+    ],
+    ids=["one_mapping", "ragged_tail", "region", "interior"],
+)
+def test_split_at_boundaries_counts_from_the_origin(start, size):
+    """An unaligned reservation is what the multiples of the size would miss."""
+    pieces = split_at_boundaries(start, size, MAPPING_BYTES, UNALIGNED_ORIGIN)
+
+    assert sum(piece_size for _, piece_size in pieces) == size
+    address = start
+    for piece_address, piece_size in pieces:
+        assert piece_address == address
+        address += piece_size
+        offset = piece_address - UNALIGNED_ORIGIN
+        assert offset % MAPPING_BYTES + piece_size <= MAPPING_BYTES
+
+
+def test_split_at_boundaries_on_an_unaligned_origin_cuts_elsewhere():
+    """Otherwise there would be nothing to tell the two apart."""
+    pieces = split_at_boundaries(REGION_BASE, REGION_SIZE, MAPPING_BYTES, UNALIGNED_ORIGIN)
+
+    assert pieces != split_at_boundaries(REGION_BASE, REGION_SIZE, MAPPING_BYTES)
+    first = MAPPING_BYTES - (REGION_BASE - UNALIGNED_ORIGIN)
+    assert pieces == [(REGION_BASE, first), (REGION_BASE + first, REGION_SIZE - first)]
+
+
+def test_page_addressing_splits_a_page_that_crosses_a_mapping_boundary():
+    addressing = PageAddressing(make_mapped_layout())
+    assert addressing.mapping_bytes == MAPPING_BYTES
+
+    addresses, sizes = addressing.buffers(0, 0)
+    assert list(zip(addresses, sizes)) == [
+        (REGION_BASE, MAPPING_BYTES),
+        (REGION_BASE + MAPPING_BYTES, REGION_SIZE - MAPPING_BYTES),
+    ]
+    # One region still contributes its whole payload, just in several buffers.
+    assert sum(sizes) == addressing.bytes_per_page(0)
+
+
+def test_page_addressing_registration_stays_inside_one_mapping():
+    ranges = PageAddressing(make_mapped_layout()).registration_ranges()
+    span_end = REGION_BASE + REGION_SIZE * REGION_SLOTS
+
+    # The same bytes as the unsplit span, handed over one mapping at a time.
+    assert len(ranges) > 1
+    assert sum(end - start for start, end in ranges) == span_end - REGION_BASE
+    previous_end = REGION_BASE
+    for start, end in ranges:
+        assert start == previous_end
+        previous_end = end
+        assert start % MAPPING_BYTES + (end - start) <= MAPPING_BYTES
+    assert previous_end == span_end
+
+
+def test_page_addressing_cuts_where_the_pool_reservation_puts_the_boundaries(reservation_base):
+    """A pool's mappings tile from its reservation base, wherever that lands."""
+    origin = reservation_base(UNALIGNED_ORIGIN)
+    addressing = PageAddressing(make_mapped_layout())
+    assert addressing.mapping_origins == (origin,)
+
+    first = MAPPING_BYTES - (REGION_BASE - origin) % MAPPING_BYTES
+    addresses, sizes = addressing.buffers(0, 0)
+    assert list(zip(addresses, sizes)) == [
+        (REGION_BASE, first),
+        (REGION_BASE + first, REGION_SIZE - first),
+    ]
+    assert sum(sizes) == addressing.bytes_per_page(0)
+
+
+def test_page_addressing_registers_inside_the_mappings_of_an_unaligned_pool(reservation_base):
+    origin = reservation_base(UNALIGNED_ORIGIN)
+    ranges = PageAddressing(make_mapped_layout()).registration_ranges()
+    span_end = REGION_BASE + REGION_SIZE * REGION_SLOTS
+
+    assert sum(end - start for start, end in ranges) == span_end - REGION_BASE
+    previous_end = REGION_BASE
+    for start, end in ranges:
+        assert start == previous_end
+        previous_end = end
+        assert (start - origin) % MAPPING_BYTES + (end - start) <= MAPPING_BYTES
+    assert previous_end == span_end
+
+
+def test_page_addressing_assumes_the_multiples_when_the_reservation_is_unknown():
+    """The behavior before the pools were split at all, and the worker warns."""
+    addressing = PageAddressing(make_mapped_layout())
+    assert addressing.mapping_origins == (0,)
+    assert addressing.buffers(0, 0) == (
+        [REGION_BASE, REGION_BASE + MAPPING_BYTES],
+        [MAPPING_BYTES, REGION_SIZE - MAPPING_BYTES],
+    )
+
+
+def test_mapping_origin_leaves_the_driver_alone_without_a_boundary(monkeypatch):
+    """Nothing to count from is needed when nothing is being cut."""
+    monkeypatch.setattr(
+        addressing_module, "reservation_start", lambda _address: pytest.fail("driver consulted")
+    )
+    assert mapping_origin(REGION_BASE, None) == 0
+
+
+def test_page_addressing_leaves_everything_whole_when_the_mapping_size_is_unknown():
+    """Without a granularity the pools are addressed and registered unsplit."""
+    addressing = PageAddressing(make_mapped_layout(mapping_bytes=None))
+    assert addressing.mapping_bytes is None
+    assert addressing.buffers(0, 1) == ([REGION_BASE + REGION_SIZE], [REGION_SIZE])
+    assert addressing.registration_ranges() == [
+        (REGION_BASE, REGION_BASE + REGION_SIZE * REGION_SLOTS)
+    ]
+
+
 def test_page_addressing_rejects_mixed_slot_counts():
     region_a = KvCacheRegion(base=0, size=8, stride=8, num_slots=4, buffers=())
     region_b = KvCacheRegion(base=64, size=8, stride=8, num_slots=8, buffers=())
@@ -365,6 +596,147 @@ def test_page_addressing_rejects_mixed_slot_counts():
     )
     with pytest.raises(ValueError, match="slot counts"):
         PageAddressing(layout)
+
+
+# ---- GPU pool mapping size ----
+
+
+def make_v2_impl(granularity):
+    """Just enough of a `KVCacheManagerV2` impl to read the GPU granularity from."""
+    return SimpleNamespace(
+        _storage=SimpleNamespace(
+            _levels=[SimpleNamespace(storage=SimpleNamespace(pool_size_granularity=granularity))]
+        )
+    )
+
+
+def test_gpu_pool_mapping_bytes_reads_the_granularity_of_the_gpu_level():
+    assert _gpu_pool_mapping_bytes(make_v2_impl(32 << 20)) == 32 << 20
+
+
+@pytest.mark.parametrize(
+    "impl",
+    [
+        SimpleNamespace(),
+        SimpleNamespace(_storage=SimpleNamespace(_levels=[])),
+        make_v2_impl(0),
+        make_v2_impl(-1),
+        make_v2_impl(None),
+        make_v2_impl("32MiB"),
+    ],
+    ids=["no_storage", "no_gpu_level", "zero", "negative", "none", "not_a_number"],
+)
+def test_gpu_pool_mapping_bytes_returns_none_rather_than_guessing(impl):
+    assert _gpu_pool_mapping_bytes(impl) is None
+
+
+# ---- GPUDirect diagnosis ----
+
+_GRANULARITY = 32 << 20
+_RESERVATION = 0x7F0000000000
+
+
+@pytest.fixture
+def stub_driver_facts(monkeypatch):
+    """Report chosen facts instead of asking a driver that may not be present."""
+
+    def install(*facts):
+        by_address = {fact.address: fact for fact in facts}
+        monkeypatch.setattr(
+            gpudirect_module, "describe_range", lambda address, _length: by_address[address]
+        )
+        return [(fact.address, fact.address + fact.length) for fact in facts]
+
+    return install
+
+
+def test_range_facts_detects_a_range_that_crosses_a_mapping_boundary():
+    inside = RangeFacts(
+        address=_RESERVATION + _GRANULARITY, length=_GRANULARITY, range_start=_RESERVATION
+    )
+    assert inside.fits_one_mapping(_GRANULARITY) is True
+
+    crossing = RangeFacts(
+        address=_RESERVATION + _GRANULARITY // 2, length=_GRANULARITY, range_start=_RESERVATION
+    )
+    assert crossing.fits_one_mapping(_GRANULARITY) is False
+
+
+@pytest.mark.parametrize(
+    "mapping_bytes,range_start",
+    [(None, _RESERVATION), (0, _RESERVATION), (_GRANULARITY, None)],
+    ids=["no_granularity", "zero_granularity", "no_reservation"],
+)
+def test_range_facts_will_not_judge_without_the_granularity_and_the_base(
+    mapping_bytes, range_start
+):
+    facts = RangeFacts(address=_RESERVATION, length=64, range_start=range_start)
+    assert facts.fits_one_mapping(mapping_bytes) is None
+
+
+def test_reservation_start_answers_nothing_for_an_address_the_driver_disowns():
+    """Callers get the documented fallback rather than an exception."""
+    assert reservation_start(_RESERVATION) is None
+
+
+def test_describe_range_reports_a_failure_instead_of_raising():
+    facts = describe_range(_RESERVATION, 1 << 20)
+    assert isinstance(facts, RangeFacts)
+    assert facts.address == _RESERVATION
+    assert facts.describe()
+
+
+def test_format_diagnosis_blames_the_missing_peermem_module(monkeypatch, stub_driver_facts):
+    monkeypatch.setattr(gpudirect_module, "peermem_loaded", lambda: False)
+    monkeypatch.delenv("WITH_NVIDIA_PEERMEM", raising=False)
+    ranges = stub_driver_facts(
+        RangeFacts(address=_RESERVATION, length=64, range_start=_RESERVATION)
+    )
+
+    report = format_diagnosis(ranges, rank=0, mapping_bytes=_GRANULARITY)
+    assert "ibv_reg_mr" in report
+    assert "nvidia_peermem is not loaded" in report
+
+
+def test_format_diagnosis_blames_the_boundary_on_the_dmabuf_path(monkeypatch, stub_driver_facts):
+    monkeypatch.setattr(gpudirect_module, "peermem_loaded", lambda: True)
+    monkeypatch.setenv("WITH_NVIDIA_PEERMEM", "0")
+    ranges = stub_driver_facts(
+        RangeFacts(
+            address=_RESERVATION + _GRANULARITY // 2,
+            length=_GRANULARITY,
+            range_start=_RESERVATION,
+        )
+    )
+
+    report = format_diagnosis(ranges, rank=3, mapping_bytes=_GRANULARITY)
+    assert "rank 3" in report
+    assert "1 range(s) cross a 32 MiB pool mapping boundary" in report
+    assert "EINVAL" in report
+
+
+def test_format_diagnosis_reports_memory_the_driver_withholds_from_rdma(
+    monkeypatch, stub_driver_facts
+):
+    monkeypatch.setattr(gpudirect_module, "peermem_loaded", lambda: True)
+    monkeypatch.setenv("WITH_NVIDIA_PEERMEM", "0")
+    ranges = stub_driver_facts(
+        RangeFacts(address=_RESERVATION, length=64, range_start=_RESERVATION, gdr_capable=False)
+    )
+
+    report = format_diagnosis(ranges, rank=0, mapping_bytes=_GRANULARITY)
+    assert "not GPUDirect-RDMA capable" in report
+
+
+def test_format_diagnosis_admits_when_it_explains_nothing(monkeypatch, stub_driver_facts):
+    monkeypatch.setattr(gpudirect_module, "peermem_loaded", lambda: True)
+    monkeypatch.setenv("WITH_NVIDIA_PEERMEM", "1")
+    ranges = stub_driver_facts(
+        RangeFacts(address=_RESERVATION, length=64, range_start=_RESERVATION, gdr_capable=True)
+    )
+
+    report = format_diagnosis(ranges, rank=0, mapping_bytes=_GRANULARITY)
+    assert "Nothing here explains a registration failure" in report
 
 
 # ---- config ----
@@ -546,6 +918,55 @@ def test_worker_registers_every_pool_range(store_config, fake_store):
             (start, end - start) for start, end in PageAddressing(layout).registration_ranges()
         ]
         assert worker.is_registered
+
+
+def test_worker_registers_each_pool_mapping_separately(store_config, fake_store):
+    with make_worker(fake_store, layout=make_mapped_layout()) as worker:
+        assert worker.is_registered
+        assert len(fake_store.registered) > 1
+        for address, size in fake_store.registered:
+            assert address % MAPPING_BYTES + size <= MAPPING_BYTES
+        assert sum(size for _, size in fake_store.registered) == REGION_SIZE * REGION_SLOTS
+
+
+def test_worker_registers_each_mapping_of_an_unaligned_pool(
+    store_config, fake_store, reservation_base
+):
+    origin = reservation_base(UNALIGNED_ORIGIN)
+    with make_worker(fake_store, layout=make_mapped_layout()) as worker:
+        assert worker.is_registered
+        for address, size in fake_store.registered:
+            assert (address - origin) % MAPPING_BYTES + size <= MAPPING_BYTES
+        assert sum(size for _, size in fake_store.registered) == REGION_SIZE * REGION_SLOTS
+
+
+def test_worker_says_when_it_is_assuming_where_the_mappings_begin(
+    store_config, fake_store, monkeypatch
+):
+    """Silence would leave a misplaced cut looking like a Mooncake failure."""
+    messages = []
+    monkeypatch.setattr(worker_module.logger, "warning", messages.append)
+
+    with make_worker(fake_store, layout=make_mapped_layout()):
+        pass
+    assert any("could not read the base" in message for message in messages)
+
+
+def test_worker_reports_the_driver_facts_only_on_request(store_config, fake_store, monkeypatch):
+    messages = []
+    # The logger does not propagate to the root logger, so caplog cannot see it.
+    monkeypatch.setattr(worker_module.logger, "info", messages.append)
+
+    monkeypatch.delenv(worker_module.REGISTRATION_DEBUG_ENV, raising=False)
+    with make_worker(fake_store, layout=make_mapped_layout()):
+        pass
+    assert not any("GPU registration diagnosis" in message for message in messages)
+
+    messages.clear()
+    monkeypatch.setenv(worker_module.REGISTRATION_DEBUG_ENV, "1")
+    with make_worker(fake_store, layout=make_mapped_layout()):
+        pass
+    assert any("GPU registration diagnosis" in message for message in messages)
 
 
 def test_worker_rejects_v1_pool_registration(store_config, fake_store):
