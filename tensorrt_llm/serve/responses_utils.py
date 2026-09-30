@@ -1462,12 +1462,19 @@ def _flush_tool_parser(
     that remainder; most inherit the no-op, which leaves it sitting in
     `_buffer`, so the buffer is drained and then inspected as well.
 
-    Unterminated markup is dropped rather than shown. Releasing it would
-    reintroduce exactly the leak this path was restructured to make
-    unreachable, only at a different moment - the bytes are not a message the
-    model meant to send, they are half of a call that never finished. It is
-    rare (1 of 3437 recorded responses) and the warning makes the loss visible
-    instead of silent.
+    Unterminated markup is released as ordinary text rather than dropped.
+    Dropping was the first design, on the grounds that half of a call is not
+    a message the model meant to send - but the final response never dropped
+    it: `_create_output_content` re-parses the whole text, its regex needs
+    the closing tag, and the fragment falls back into the message item. The
+    stream and the snapshot then told two different stories about the same
+    generation - trace tr_8f312e9973954fa784ae7dc8f45e9d3e ended in a
+    429-character unterminated call that the final response carried as
+    message text while the stream showed nothing at all. Of the two ways to
+    make the views agree, keeping the text wins: these turns are recorded as
+    training data, and silently losing model output is worse than showing a
+    call that never closed. It is rare (1 of 3437 recorded responses) and
+    the warning keeps the malformed turn visible in the log.
 
     A remainder with no markup in it is ordinary output that the parser was
     holding only until it could rule out a call, and is released. This matches
@@ -1512,20 +1519,28 @@ def _flush_tool_parser(
     calls.extend(result.calls)
     held = getattr(tool_parser, "_buffer", "")
 
-    dropped = 0
+    unterminated = 0
     for remainder in (result.normal_text, held):
         if not remainder:
             continue
         if tool_parser.has_tool_call(remainder):
-            dropped += len(remainder)
-        else:
-            released.append(remainder)
+            unterminated += len(remainder)
+        released.append(remainder)
 
-    if dropped:
+    if held:
+        # The buffer's bytes are being released here, so consume them: the
+        # executor can present the same finished output more than once, and a
+        # buffer left in place would release the same remainder into a second
+        # message item on the repeat. Dropping never had this problem - a
+        # drop repeated is still nothing.
+        tool_parser._buffer = ""
+
+    if unterminated:
         logger.warning(
-            f"Stream ended inside a tool call; dropped {dropped} characters "
-            f"of unterminated {type(tool_parser).__name__} markup rather than "
-            "reporting them as the assistant's message.")
+            f"Stream ended inside a tool call; releasing {unterminated} "
+            f"characters of unterminated {type(tool_parser).__name__} markup "
+            "as the assistant's message, matching the final response's "
+            "fallback for a call it cannot parse.")
 
     # `current_tool_name_sent` is the parser's own record of having announced a
     # call it has not yet closed, and `current_tool_id` numbers that call.
@@ -1581,6 +1596,7 @@ def _create_output_content(
     tools: Optional[list[Tool]] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
     streamed_tool_call_ids: Optional[list[Tuple[str, str]]] = None,
+    streamed_item_ids: Optional[list[Tuple[str, str]]] = None,
 ) -> Tuple[list[ResponseOutputItem], list[ChatCompletionMessageParam],
            list[str]]:
     output_items: list[ResponseOutputItem] = []
@@ -1590,6 +1606,39 @@ def _create_output_content(
     # whitespace around a reasoning block was generated too.
     reasoning_texts: list[str] = []
     available_tools = _get_chat_completion_function_tools(tools)
+
+    # The (item type, item id) pairs the stream published in
+    # `response.output_item.added/done`, in emission order. This rebuild is a
+    # second, independent pass over the generated text and used to mint fresh
+    # ids for the reasoning and message items it re-derives, so the snapshot
+    # named the very items the stream had already announced under different
+    # ids - 216 of 221 measured responses - and a client joining streamed
+    # items with the snapshot by id saw phantom items. Reuse is positional
+    # per item type, first-emitted first, because emission order is the only
+    # correspondence the two passes share. None means no stream ran (a
+    # non-streaming request) and every id is minted fresh, as before.
+    streamed_ids_by_type: dict[str, list[str]] = {
+        "reasoning": [],
+        "message": []
+    }
+    for item_type, item_id in streamed_item_ids or []:
+        if item_type in streamed_ids_by_type:
+            streamed_ids_by_type[item_type].append(item_id)
+    used_ids_by_type = {"reasoning": 0, "message": 0}
+
+    def _streamed_or_fresh_id(item_type: str) -> str:
+        # Running past the pool means this pass derived items the stream never
+        # opened - the two views already diverged structurally (a stream cut
+        # off inside a call whose text this pass keeps, say). A fresh id
+        # cannot hide that and must not try to: the count mismatch is warned
+        # about after the loop rather than silently papered over.
+        pool = streamed_ids_by_type[item_type]
+        index = used_ids_by_type[item_type]
+        used_ids_by_type[item_type] = index + 1
+        if index < len(pool):
+            return pool[index]
+        prefix = "rs" if item_type == "reasoning" else "msg"
+        return f"{prefix}_{_random_uuid()}"
 
     for output in final_res.outputs:
         calls = []
@@ -1626,7 +1675,7 @@ def _create_output_content(
         # snapshot fed the model its own thinking as a follow-up to its reply.
         if reasoning_text:
             reasoning_item = ResponseReasoningItem(
-                id=f"rs_{_random_uuid()}",
+                id=_streamed_or_fresh_id("reasoning"),
                 summary=[],
                 type="reasoning",
                 content=[
@@ -1646,7 +1695,7 @@ def _create_output_content(
             )
 
             text_item = ResponseOutputMessage(
-                id=f"msg_{_random_uuid()}",
+                id=_streamed_or_fresh_id("message"),
                 content=[output_text],
                 role="assistant",
                 status="completed",
@@ -1689,6 +1738,20 @@ def _create_output_content(
                 "tool_calls":
                 tool_calls_item,
             }))
+
+    # Checked against None, not truthiness: an empty list still means a
+    # stream ran and published nothing of this type, and a rebuild that then
+    # derives such an item is exactly the divergence worth saying out loud.
+    if streamed_item_ids is not None:
+        for item_type in ("reasoning", "message"):
+            streamed = len(streamed_ids_by_type[item_type])
+            rebuilt = used_ids_by_type[item_type]
+            if streamed != rebuilt:
+                logger.warning(
+                    "final response rebuilt %d %s item(s) but the stream "
+                    "published %d; the two views of this generation differ "
+                    "structurally and ids beyond the streamed ones are new",
+                    rebuilt, item_type, streamed)
 
     return output_items, output_messages, reasoning_texts
 
@@ -1982,6 +2045,7 @@ def _create_response(
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
     streamed_tool_call_ids: Optional[list[Tuple[str, str]]] = None,
+    streamed_item_ids: Optional[list[Tuple[str, str]]] = None,
     tokenizer: Optional[TokenizerBase] = None,
 ) -> tuple[ResponsesResponse, list[Message | ChatCompletionMessageParam]]:
     _responses_debug_log("================================================")
@@ -2006,7 +2070,8 @@ def _create_response(
             tool_parser,
             request.tools,
             chat_template_kwargs=reasoning_chat_template_kwargs(request),
-            streamed_tool_call_ids=streamed_tool_call_ids)
+            streamed_tool_call_ids=streamed_tool_call_ids,
+            streamed_item_ids=streamed_item_ids)
 
     finish_reason = final_res.outputs[0].finish_reason
     response = ResponsesResponse.from_request(
@@ -2056,6 +2121,7 @@ async def create_response(
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
     streamed_tool_call_ids: Optional[list[Tuple[str, str]]] = None,
+    streamed_item_ids: Optional[list[Tuple[str, str]]] = None,
     tokenizer: Optional[TokenizerBase] = None,
 ) -> ResponsesResponse:
 
@@ -2084,6 +2150,7 @@ async def create_response(
         tool_parser=tool_parser,
         num_prompt_tokens=num_prompt_tokens,
         streamed_tool_call_ids=streamed_tool_call_ids,
+        streamed_item_ids=streamed_item_ids,
         tokenizer=tokenizer,
     )
 
@@ -2106,6 +2173,7 @@ def create_response_non_store(
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
     streamed_tool_call_ids: Optional[list[Tuple[str, str]]] = None,
+    streamed_item_ids: Optional[list[Tuple[str, str]]] = None,
     tokenizer: Optional[TokenizerBase] = None,
 ) -> ResponsesResponse:
     response_creation_time = create_time if create_time is not None else int(
@@ -2123,6 +2191,7 @@ def create_response_non_store(
         tool_parser=tool_parser,
         num_prompt_tokens=num_prompt_tokens,
         streamed_tool_call_ids=streamed_tool_call_ids,
+        streamed_item_ids=streamed_item_ids,
         tokenizer=tokenizer,
     )
 
@@ -2168,6 +2237,18 @@ class ResponsesStreamingStateTracker:
         # A list here rather than a class attribute, for the reason above.
         self.emitted_tool_call_ids: list[Tuple[str, str]] = []
 
+        # (item type, item id) of every reasoning and message item this
+        # stream opened, in the order their `output_item.added` went out.
+        # The final response re-derives those items from the accumulated text
+        # and used to mint fresh ids for them, so the snapshot named the very
+        # items the stream had already announced under different ids - 216 of
+        # 221 measured responses - and a client joining streamed items with
+        # the snapshot by id saw phantom items. Same shape and cure as
+        # emitted_tool_call_ids above.
+        #
+        # A list here rather than a class attribute, for the reason above.
+        self.emitted_item_ids: list[Tuple[str, str]] = []
+
 
 class ResponsesStreamingEventsHelper:
 
@@ -2198,6 +2279,11 @@ class ResponsesStreamingEventsHelper:
     def emitted_tool_call_ids(self) -> list[Tuple[str, str]]:
         """(item id, call id) of the tool calls already streamed, in order."""
         return self.state_tracker.emitted_tool_call_ids
+
+    @property
+    def emitted_item_ids(self) -> list[Tuple[str, str]]:
+        """(item type, item id) of the reasoning/message items streamed, in order."""
+        return self.state_tracker.emitted_item_ids
 
     def record_emitted_tool_call(self, item) -> None:
         """Remember the ids a streamed call went out under.
@@ -2260,7 +2346,7 @@ class ResponsesStreamingEventsHelper:
             self, response: ResponsesResponse) -> ResponseCreatedEvent:
         return ResponseCreatedEvent(
             type="response.created",
-            sequence_number=-1,  # will set by _send_event function
+            sequence_number=-1,  # set by _send_event, restamped at egress
             response=response,
         )
 
@@ -2372,6 +2458,14 @@ class ResponsesStreamingEventsHelper:
         if not self.is_output_item_added_sent:
             self.is_output_item_added_sent = True
 
+            # Remember the id this item is announced under, at the one point
+            # where announcing actually happens. The final response is built
+            # by a second, independent pass over the generated text; handing
+            # it these lets it name the same items the same way instead of
+            # minting ids the client has never seen.
+            self.state_tracker.emitted_item_ids.append(
+                (output_item.type, output_item.id))
+
             if output_item.type == "message":
                 content_part = ResponseOutputText(
                     type="output_text",
@@ -2468,7 +2562,10 @@ def _assembled_tool_calls(
     client can parse or run, so it is dropped rather than reported. The
     non-streaming path reports no call at all for the same text, since its
     regex needs the closing tag, and the two endpoints have to agree about
-    what the model asked for.
+    what the model asked for. Only the *call* is dropped: the raw markup it
+    was read from reaches the client as message text on both views
+    (`_flush_tool_parser` releases it, the whole-text re-parse falls back to
+    it), so nothing the model generated is lost.
 
     A call whose assembled arguments are not valid JSON is dropped for the same
     reason, one test later. That test keys on the markup being unterminated;
@@ -2506,8 +2603,8 @@ def _assembled_tool_calls(
     for tool_index, fragment in fragments.items():
         if not fragment["name"] or tool_index == unfinished_tool_index:
             # No warning for the unfinished call: `_flush_tool_parser` has
-            # already reported that loss, and saying it twice would read as two
-            # calls lost.
+            # already warned and released its raw markup as message text, and
+            # a second warning would read as a second loss.
             continue
         arguments = fragment["parameters"]
         try:
@@ -2616,9 +2713,9 @@ def _generate_streaming_event(
         )
 
     # End of stream: the tool parser gets one last word before its state is
-    # discarded, so bytes it was still withholding are released or dropped by
-    # a decision rather than by nobody ever asking. Only computed here; what
-    # it releases is emitted further down, after the call in front of it has
+    # discarded, so bytes it was still withholding are released by a decision
+    # rather than lost because nobody ever asked. Only computed here; what it
+    # releases is emitted further down, after the call in front of it has
     # closed the item it belongs to.
     flushed_text, flushed_calls, unfinished_tool_index = "", [], None
     if finished_generation:
@@ -2989,7 +3086,12 @@ class ResponsesStreamingProcessor:
         self.tool_parser = tool_parser
 
     def _send_event(self, event: OpenAIBaseModel):
-        # Set sequence_number if the event has this attribute
+        # Set sequence_number if the event has this attribute. The number is
+        # provisional: with postprocessing workers a pickled copy of this
+        # processor builds the per-token frames in another process, counting
+        # from zero again, so the frontend restamps every frame at the egress
+        # (stamp_sse_sequence_number) and what is written here only has to be
+        # ordered within this process.
         if hasattr(event, 'sequence_number'):
             event.sequence_number = self.sequence_number
         self.sequence_number += 1
@@ -3039,6 +3141,9 @@ class ResponsesStreamingProcessor:
             # Name the calls the way the stream already named them.
             streamed_tool_call_ids=self.streaming_events_helper.
             emitted_tool_call_ids,
+            # And the reasoning/message items likewise: the snapshot has to
+            # answer to the ids the stream already announced.
+            streamed_item_ids=self.streaming_events_helper.emitted_item_ids,
             # Taken as an argument rather than held on this object: the
             # postproc-worker path pickles the processor across a process
             # boundary, and that worker already has its own tokenizer
@@ -3073,6 +3178,9 @@ class ResponsesStreamingProcessor:
             # Name the calls the way the stream already named them.
             streamed_tool_call_ids=self.streaming_events_helper.
             emitted_tool_call_ids,
+            # And the reasoning/message items likewise: the snapshot has to
+            # answer to the ids the stream already announced.
+            streamed_item_ids=self.streaming_events_helper.emitted_item_ids,
             # Taken as an argument rather than held on this object: the
             # postproc-worker path pickles the processor across a process
             # boundary, and that worker already has its own tokenizer
@@ -3244,6 +3352,47 @@ def stream_error_event(cause: str, detail: str,
     )
     return [(f"event: error\n"
              f"data: {event.model_dump_json(indent=None)}\n\n").encode("utf-8")]
+
+
+def stamp_sse_sequence_number(frame: str, sequence_number: int) -> str:
+    """Overwrite the ``sequence_number`` inside one serialized SSE frame.
+
+    Numbering cannot be left to the producers, because one response can have
+    two of them. With postprocessing workers enabled the opening
+    ``response.created``/``response.in_progress`` pair is built by the
+    frontend's streaming processor while every later frame comes from a
+    pickled copy of that processor in a worker process, each counting from
+    zero - so a single response's stream carried 0,1,0,1,2,... (221 of 221
+    measured responses). Only the egress point, where the frames converge
+    just before leaving the server, can hand out one monotonic sequence; it
+    restamps every frame with this and the producers' numbers are treated as
+    provisional.
+
+    The frame is parsed rather than patched with a substring replace: the
+    ``response.completed`` payload embeds the model's own output, which can
+    contain anything - including the literal ``"sequence_number":`` when the
+    model writes code against this very API. A frame with no data line, an
+    unparsable payload, or no sequence_number field is returned untouched;
+    no producer builds such a frame today, and inventing a field on one would
+    be worse than leaving its numbering alone.
+    """
+    head, sep, rest = frame.partition("data: ")
+    if not sep:
+        return frame
+    # The payload is one line: _send_event serializes with indent=None, and
+    # JSON strings carry newlines escaped.
+    payload_text, newline, tail = rest.partition("\n")
+    try:
+        payload = json.loads(payload_text)
+    except ValueError:
+        return frame
+    if not isinstance(payload, dict) or "sequence_number" not in payload:
+        return frame
+    payload["sequence_number"] = sequence_number
+    # Compact separators and raw unicode, matching model_dump_json, so the
+    # restamped frame differs from the produced one only in the number.
+    restamped = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    return f"{head}data: {restamped}{newline}{tail}"
 
 
 def _count_frames(chunk: Any, carry: Any) -> Tuple[int, Any]:

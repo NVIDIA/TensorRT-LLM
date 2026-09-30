@@ -126,6 +126,7 @@ from tensorrt_llm.serve.responses_utils import \
 from tensorrt_llm.serve.responses_utils import guard_responses_stream
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
+from tensorrt_llm.serve.responses_utils import stamp_sse_sequence_number
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.serving_extensions import apply_model_chat_extensions
@@ -3131,6 +3132,15 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_responses(self, request: ResponsesRequest,
                                raw_request: Request) -> Response:
+        """Serve one /v1/responses request, streaming or not.
+
+        ``parallel_tool_calls`` and, on the non-Harmony path, ``tool_choice``
+        are accepted for schema compatibility but not enforced: honouring
+        them would mean constraining or truncating what the model generated,
+        and these turns are recorded as training data, where a falsified
+        output is worse than an unconstrained one. A once-per-process warning
+        below says so instead of silently swallowing the option.
+        """
 
         async def create_response(
                 promise: RequestOutput,
@@ -3165,16 +3175,31 @@ class OpenAIServer(_VideoRoutesMixin):
                                              postproc_params: PostprocParams):
             post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
             streaming_processor = args.streaming_processor
+            # One monotonic counter per response, restamped onto every frame
+            # right before it leaves the server. The producers cannot number
+            # the stream themselves: with postprocessing workers enabled the
+            # two opening events below come from this process's streaming
+            # processor while every later frame is built by a pickled copy of
+            # it inside a worker, each counting from zero, so one response's
+            # stream carried 0,1,0,1,2,... (221 of 221 measured responses).
+            # Both configurations flow through this generator - workers hand
+            # back ready-made frames in _postprocess_result, the in-process
+            # path builds them via post_processor - so this is the one point
+            # where a response-wide sequence exists to be assigned.
+            sequence_number = 0
             initial_responses = streaming_processor.get_initial_responses()
             for initial_response in initial_responses:
-                yield initial_response
+                yield stamp_sse_sequence_number(initial_response,
+                                                sequence_number)
+                sequence_number += 1
 
             async for res in promise:
                 pp_results = res.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(
                         res, args)
                 for pp_res in pp_results:
-                    yield pp_res
+                    yield stamp_sse_sequence_number(pp_res, sequence_number)
+                    sequence_number += 1
             await self._extract_metrics(res, raw_request)
 
         try:
@@ -3205,6 +3230,23 @@ class OpenAIServer(_VideoRoutesMixin):
                     message=(f"'web_search' cannot be honoured: "
                              f"{web_search_error}."),
                 )
+
+            # Accepted-but-unenforced options, said once per process (see the
+            # handler docstring for why they are not enforced). Rejecting
+            # would break clients that always send them; enforcing would
+            # falsify the recorded output.
+            if request.parallel_tool_calls is False:
+                logger.warning_once(
+                    "Responses API: 'parallel_tool_calls=false' is accepted "
+                    "but not enforced; the model may still emit several tool "
+                    "calls in one turn.",
+                    key="responses_parallel_tool_calls_unenforced")
+            if not self.use_harmony and request.tool_choice != "auto":
+                logger.warning_once(
+                    "Responses API: 'tool_choice' is accepted but not "
+                    "enforced on this model path; generation is not "
+                    "constrained by it.",
+                    key="responses_tool_choice_unenforced")
 
             # Get prev response
             prev_response = None

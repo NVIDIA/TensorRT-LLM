@@ -47,7 +47,11 @@ pytestmark = pytest.mark.cpu_only
 _REASONING_PARSER = "glm47"
 _TOOL_PARSER = "glm47"
 
-# Markup that must never reach a client as assistant text.
+# Markup that must never reach a client as assistant text - with one
+# sanctioned exception: a stream that ends inside an unterminated call
+# releases the raw markup as message text, because the final response's
+# whole-text re-parse keeps it as message text too and the two views must
+# agree (see _flush_tool_parser and TestEndOfStream below).
 _MARKUP = ("<tool_call>", "</tool_call>", "<arg_key>", "<arg_value>")
 
 # One real GLM-4.7 response, verbatim, from a recorded agent run: eight stream
@@ -252,16 +256,40 @@ class TestTheDefect:
         assert len(_items(events, "response.output_item.done", "message")) == 1
 
     def test_no_prefix_of_the_response_leaks_markup(self):
-        """Feeding frames 0..k for every k must never publish markup.
+        """Feeding frames 0..k for every k must never *leak* markup.
 
         The failing window was narrow - it opened once one call had closed
         while another was still open - so the whole prefix family is replayed
         rather than just the end state.
+
+        One shape is a release, not a leak: a prefix that finishes inside an
+        unterminated call flushes the raw remainder as its trailing message
+        item, because the final response's whole-text re-parse keeps that
+        text too and the two views of one generation must agree (see
+        _flush_tool_parser). That remainder is pinned exactly - the bytes
+        from the last unclosed `<tool_call>` to the end - and everything
+        else still has to be clean; an unfinished stream (finish=False)
+        releases nothing at all.
         """
+
+        def pending_markup(accumulated):
+            start = accumulated.rfind("<tool_call>")
+            if start == -1 or "</tool_call>" in accumulated[start:]:
+                return None
+            return accumulated[start:]
+
         for k in range(1, len(_REAL_FRAMES) + 1):
             for finish in (False, True):
                 events = _drive(_REAL_FRAMES[:k], finish=finish)
-                _assert_no_markup(events)
+                released = pending_markup("".join(_REAL_FRAMES[:k])) if finish else None
+                for payload in _done_payloads(events):
+                    if released is not None and payload == released:
+                        continue
+                    for marker in _MARKUP:
+                        assert marker not in payload, (
+                            f"k={k} finish={finish}: {marker!r} reached the "
+                            f"client as assistant text: {payload!r}"
+                        )
 
     def test_done_payload_is_exactly_the_deltas_that_were_streamed(self):
         """The invariant, stated directly, for every prefix.
@@ -457,21 +485,35 @@ class TestTransitions:
 class TestEndOfStream:
     """Edge cases 6 and 7: streams that stop before the model was done."""
 
-    def test_stream_cut_off_mid_call_drops_the_markup(self):
+    def test_stream_cut_off_mid_call_releases_the_markup_as_text(self):
         """Edge case 6: the parser is still holding an unterminated call.
 
-        The old re-parse reported those bytes as the assistant's message,
-        which is the leak this change removes; dropping them is the deliberate
-        alternative. The text already streamed is unaffected.
+        Dropping those bytes was the first design, but the final response
+        never dropped them: its whole-text re-parse needs the closing tag,
+        fails to read the fragment as a call, and falls back to publishing it
+        as message text - so the snapshot carried a 429-character message the
+        stream never showed (trace tr_8f312e9973954fa784ae7dc8f45e9d3e). The
+        views have to agree, and of the two ways to agree, keeping the text
+        wins: these turns are recorded as training data, where silent loss is
+        worse than a call that visibly never closed. So the flush releases
+        the raw buffer as a trailing message item. The text already streamed
+        is unaffected, and the item carrying the fragment is separate because
+        the message item closed when the call was announced, chunks earlier.
         """
+        raw = "".join(_REAL_FRAMES[:3])
+        unterminated = raw[raw.index("<tool_call>") :]
+
         with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
             events = _drive(_REAL_FRAMES[:3])
 
-        _assert_no_markup(events)
-        assert _payloads(events, "response.output_text.done") == [_REAL_TEXT]
-        # The drop has to be visible in the log, not silent.
-        assert mock_logger.warning.called
-        assert "tool call" in mock_logger.warning.call_args[0][0]
+        assert _payloads(events, "response.output_text.done") == [
+            _REAL_TEXT,
+            unterminated,
+        ]
+        # The release has to be visible in the log, not silent: the model
+        # emitted a call it never finished, and someone reading the recorded
+        # turn should find that said somewhere.
+        assert any("tool call" in call.args[0] for call in mock_logger.warning.call_args_list)
 
     def test_stream_cut_off_mid_call_reports_no_half_built_call(self):
         """A call whose arguments never closed is not a call a client can run.
