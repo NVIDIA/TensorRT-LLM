@@ -5069,7 +5069,13 @@ class PyTorchModelEngine(ModelEngine):
                               past_seen_token_num + 1 + num_draft_tokens)))
                 num_cached_tokens_per_seq.append(
                     past_seen_token_num - request.py_num_compressed_tokens)
-                request.cached_tokens = past_seen_token_num
+                if is_promoted_context:
+                    # A one-token final context chunk on the decode path: this
+                    # is its context-phase forward, so latch the reused prefix
+                    # as the context branch does. Decode steps never write
+                    # cached_tokens: for a disagg generation-only request that
+                    # would be the first write and would report the prompt.
+                    request.cached_tokens = request.context_current_position
                 if _has_cp_helix:
                     # Verify group [base, base+group) in GLOBAL positions.
                     # On a helix gen worker the request's token list is the
@@ -5086,7 +5092,6 @@ class PyTorchModelEngine(ModelEngine):
                         _helix_local_len_host(base + group) - local_cached)
                     num_cached_tokens_per_seq[-1] = (
                         local_cached - request.py_num_compressed_tokens)
-                    request.cached_tokens = local_cached
                 # update batch index
                 request.py_batch_idx = request.py_seq_slot
             else:
@@ -5116,8 +5121,6 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(
                     past_seen_token_num + runtime_tokens_per_gen_step -
                     request.py_num_compressed_tokens)
-                request.cached_tokens = (past_seen_token_num +
-                                         runtime_tokens_per_gen_step)
                 if _has_cp_helix:
                     # In-flight predecessor: mirror the non-helix convention
                     # above -- positions are packed from the stale base (the
@@ -5132,7 +5135,6 @@ class PyTorchModelEngine(ModelEngine):
                     helix_owned_new_tokens.append(0)
                     num_cached_tokens_per_seq[-1] = (
                         local_full - request.py_num_compressed_tokens)
-                    request.cached_tokens = local_full
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
                     prompt_lengths.append(runtime_tokens_per_gen_step)
@@ -5299,7 +5301,10 @@ class PyTorchModelEngine(ModelEngine):
                         helix_owned_new_tokens.append(
                             0 if request.py_helix_is_inactive_rank else 1)
 
-                request.cached_tokens = past_seen_token_num
+                if is_promoted_context:
+                    # See the extend branch: only a promoted context chunk
+                    # latches cached_tokens on the decode path.
+                    request.cached_tokens = request.context_current_position
                 for beam in range(beam_width):
                     position_ids.append(position_id)
                     num_cached_tokens_per_seq.append(
