@@ -103,7 +103,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-      issues: read
+      issues: write
       statuses: write
       checks: write
     runs-on: ubuntu-latest
@@ -145,7 +145,7 @@ jobs:
       github.event.comment.user.type == 'Bot'
     permissions:
       contents: read
-      issues: read
+      issues: write
       statuses: write
       checks: write
     runs-on: ubuntu-latest

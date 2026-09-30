@@ -613,7 +613,9 @@ test('privileged jobs run trusted code and serialize request switches with publi
   assert.equal(workflow.match(/ref: \$\{\{ github.event.repository.default_branch \}\}/g).length, 3);
   assert.match(workflow, /types: \[created, edited, deleted\]/);
   assert.equal(workflow.match(/secrets\./g).length, 1);
-  assert.doesNotMatch(workflow.split('  publish:')[1], /SEMANTIC_COMMAND_TOKEN|issues: write/);
+  assert.doesNotMatch(workflow.split('  publish:')[1], /SEMANTIC_COMMAND_TOKEN/);
+  assert.equal(workflow.match(/issues: write/g).length, 2);
+  assert.doesNotMatch(workflow.split('  request:')[0], /issues: write/);
   assert.equal(workflow.match(/statuses: write/g).length, 2);
   assert.match(workflow, /statuses: read/);
 });

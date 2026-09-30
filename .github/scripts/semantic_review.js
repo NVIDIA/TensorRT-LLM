@@ -15,6 +15,7 @@
 
 const {readFileSync} = require('node:fs');
 const {join} = require('node:path');
+const {createHash} = require('node:crypto');
 
 const NAME = 'Semantic conflict with target branch';
 const notice = 'Best-effort AI judgment for the recorded revisions. ' +
@@ -23,7 +24,8 @@ const notice = 'Best-effort AI judgment for the recorded revisions. ' +
   'This semantic review and its status/workflow are advisory, not required merge checks ' +
   'under current repository rules; other merge requirements still apply. ' +
   'Advisory status does not make a confirmed defect safe to ignore.';
-const supported = ref => ref === 'main' || /^release\/[^\s]+$/.test(ref);
+const supported = ref => typeof ref === 'string' &&
+  (ref === 'main' || /^release\/[^\s]+$/.test(ref));
 const eligible = pr => pr.state === 'open' && !pr.draft && supported(pr.base.ref) &&
   (pr.auto_merge || pr.labels.some(label => label.name === 'ci: full pre-merge approved'));
 const isCommandUser = user => user?.login === 'trtllm-agent' &&
@@ -119,6 +121,128 @@ function replyDiagnostic(comment, inspected, request) {
     unbound: !refersToRequest(comment, request)};
 }
 
+const cleanupPending = '<!-- semantic-review-cleanup-pending -->';
+
+function commentPlan({comments, request, result, output, repo, number}) {
+  const history = requests(comments);
+  const replies = comments.filter(comment => isReviewer(comment.user)).flatMap(comment => {
+    const owner = history.find(item => comment.id > item.commentId &&
+      Date.parse(comment.created_at) >= Date.parse(item.created_at) &&
+      parseResult(comment, item, repo));
+    return owner ? [{comment, request: owner}] : [];
+  });
+  const previous = replies.filter(item => item.request.commentId < request.commentId)
+    .sort((a, b) => b.request.commentId - a.request.commentId || b.comment.id - a.comment.id)[0];
+  const visibleIds = new Set(result ? [result.comment.id] : [request.commentId,
+    previous?.comment.id]);
+  // Preserve a visible historical reply while waiting, but never resurrect one
+  // that was hidden after invalidation or by a maintainer.
+  const show = comments.filter(comment => comment.id === (result?.comment.id || request.commentId));
+  const completed = new Set(replies.map(item => item.request.commentId));
+  if (!result) completed.delete(request.commentId);
+  const hide = [
+    ...comments.filter(comment => completed.has(comment.id))
+      .map(comment => ({comment, classifier: 'RESOLVED'})),
+    ...replies.filter(item => !visibleIds.has(item.comment.id))
+      .map(({comment}) => ({comment, classifier: 'OUTDATED'})),
+  ].sort((a, b) => a.comment.id - b.comment.id);
+  const digest = createHash('sha256').update(JSON.stringify({
+    show: show.map(comment => [comment.id, comment.node_id]),
+    hide: hide.map(({comment, classifier}) => [comment.id, comment.node_id, classifier]),
+  })).digest('hex');
+  const marker = `<!-- semantic-review-summary:v1 ${repo.owner}/${repo.repo}#${number} -->`;
+  const summary = comments.filter(comment => isPublisher(comment.user) &&
+    (comment.body || '').split(/\r?\n/).includes(marker)).sort((a, b) => a.id - b.id)[0];
+  const link = `https://github.com/${repo.owner}/${repo.repo}`;
+  const branch = request.branch.replace(/[&<>@]/g,
+    char => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '@': '&#64;'}[char]));
+  const body = `${marker}\n<!-- semantic-review-comments:${digest} -->\n` +
+    `## ${NAME}\n\n**${result?.verdict || 'WAITING'}: ${output.title}**\n\nBranch: <code>${branch}</code>\n\n` +
+    `${output.summary}\n\n` +
+    `[Request](${link}/pull/${number}#issuecomment-${request.commentId}) · ` +
+    `[Head](${link}/commit/${request.head}) · [Target](${link}/commit/${request.target}) · ` +
+    `[Merge base](${link}/commit/${request.mergeBase})`;
+  return {summary, body, show, hide};
+}
+
+async function publishComments({github, repo, number, core, presentation}) {
+  if (!presentation || presentation.summary?.body === presentation.body) return;
+  let stage = 'summary publication';
+  let localReason;
+  const unavailable = reason => { localReason = reason; throw new Error(reason); };
+  try {
+    let summary = presentation.summary;
+    const pendingBody = `${presentation.body}\n\n${cleanupPending}`;
+    const write = async body => {
+      if (summary) {
+        if (summary.body === body) return;
+        await github.rest.issues.updateComment({...repo, comment_id: summary.id, body,
+          request: {retries: 0}});
+        summary = {...summary, body};
+      } else {
+        ({data: summary} = await github.rest.issues.createComment({...repo,
+          issue_number: number, body, request: {retries: 0}}));
+      }
+    };
+    // Record incomplete cleanup before moderating anything. A fresh scan can
+    // then repair an interrupted run even when the commit status is unchanged.
+    await write(pendingBody);
+    stage = 'comment visibility lookup';
+    const comments = [...presentation.show, ...presentation.hide.map(item => item.comment)];
+    if (comments.some(comment => !comment.node_id)) unavailable('missing comment node ID');
+    const ids = [...new Set(comments.map(comment => comment.node_id))];
+    const nodes = new Map();
+    for (let offset = 0; offset < ids.length; offset += 100) {
+      const response = await github.graphql(`query($ids: [ID!]!) {
+        nodes(ids: $ids) { ... on IssueComment {
+          id isMinimized viewerCanMinimize viewerCanUnminimize
+        } }
+      }`, {ids: ids.slice(offset, offset + 100)});
+      for (const node of response.nodes) if (node) nodes.set(node.id, node);
+    }
+    stage = 'current comment visibility';
+    for (const comment of presentation.show) {
+      const node = nodes.get(comment.node_id);
+      if (!node) unavailable('comment is deleted or unavailable');
+      if (!node.isMinimized) continue;
+      if (!node.viewerCanUnminimize) unavailable('token cannot restore the current comment');
+      const response = await github.graphql(`mutation($id: ID!) {
+        unminimizeComment(input: {subjectId: $id}) { unminimizedComment { isMinimized } }
+      }`, {id: node.id, request: {retries: 0}});
+      if (response.unminimizeComment?.unminimizedComment?.isMinimized !== false) {
+        unavailable('current comment visibility was not confirmed');
+      }
+    }
+    stage = 'superseded comment minimization';
+    let writes = 0;
+    let complete = true;
+    for (const {comment, classifier} of presentation.hide) {
+      const node = nodes.get(comment.node_id);
+      if (!node) unavailable('comment is deleted or unavailable');
+      if (node.isMinimized) continue;
+      if (writes >= 20) { complete = false; break; }
+      if (!node.viewerCanMinimize) unavailable('token cannot minimize the superseded comment');
+      const response = await github.graphql(`mutation($id: ID!) {
+        minimizeComment(input: {subjectId: $id, classifier: ${classifier}}) {
+          minimizedComment { isMinimized }
+        }
+      }`, {id: node.id, request: {retries: 0}});
+      if (response.minimizeComment?.minimizedComment?.isMinimized !== true) {
+        unavailable('comment minimization was not confirmed');
+      }
+      writes += 1;
+    }
+    if (complete) {
+      stage = 'summary completion';
+      await write(presentation.body);
+    }
+  } catch (error) {
+    core.warning?.(`PR #${number}: semantic review ${stage} incomplete ` +
+      `(${localReason || `HTTP ${Number.isInteger(error?.status) ? error.status : 'unknown'}`}); ` +
+      'a later scan can retry comment cleanup.');
+  }
+}
+
 async function reviewState({github, repo, number, comments, head}) {
   comments ??= await github.paginate(github.rest.issues.listComments,
     {...repo, issue_number: number, per_page: 100});
@@ -199,7 +323,9 @@ async function reviewState({github, repo, number, comments, head}) {
   };
   const changed = !isPublisher(status?.creator) ||
     Object.entries(desired).some(([key, value]) => status?.[key] !== value);
-  return {request, result, status, cleanup, output, diagnostics,
+  const presentation = commentPlan({comments, request, result, output, repo, number});
+  return {request, result, status, cleanup, output, diagnostics, presentation,
+    commentUpdate: presentation.summary?.body !== presentation.body,
     update: changed ? {...repo, sha: request.head, context: statusContext(number), ...desired} : undefined};
 }
 
@@ -248,6 +374,7 @@ async function publish({github, context, core, number, comments, head}) {
           'Cancellation clears the inactive check and does not assign an AI verdict.',
       }});
   }
+  await publishComments({github, repo: context.repo, number, core, presentation: state?.presentation});
   return state;
 }
 

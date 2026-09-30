@@ -84,8 +84,8 @@ directly request analysis. The scheduled scan observes those changes.
   that prevents the PR's first API request does not count as a visit. No visits
   means no cursor change. Cursor movement does not depend on worker completion
   or successful AI requests.
-- The scan also repairs result publication for the latest request on open PRs,
-  including drafts or PRs that no longer have approval/auto-merge. Repairs do
+- The scan also repairs result publication and the timeline summary for the
+  latest request on open PRs, including drafts or PRs that no longer have approval/auto-merge. Repairs do
   not consume AI request slots and cannot turn into new requests. The combined
   request/repair matrix fits GitHub's limit of 256 jobs per matrix.
 - Post the request comment before publishing its pending status. If the comment
@@ -235,6 +235,38 @@ audit of the final merge tree. Scheduled recovery covers open PRs; a missed
 publication on a closed PR requires a subsequent trusted reply event or a
 publisher job rerun.
 
+## PR timeline
+
+Each PR has one summary comment owned by `github-actions[bot]`, updated in place.
+It shows the latest request's waiting state or PASS/FAIL/INCONCLUSIVE result,
+fixed revisions, and links to the original request and evidence. A new request
+shows waiting until its own valid reply arrives; an older result is not carried
+forward. The summary contains no CodeRabbit command or mention.
+
+After publishing the status and summary, collapse completed production trigger
+comments and superseded semantic replies. INCONCLUSIVE is completed even though
+its commit status is pending. Keep the current accepted reply visible. While
+waiting, show the current trigger and leave the most recent valid previous reply
+uncollapsed if it is already visible. Hidden historical replies are not restored.
+Original bodies and links remain available in collapsed comments;
+nothing is deleted or rewritten as a different AI judgment. Human discussion,
+unbound replies, ordinary CodeRabbit reviews and fixed-input replay comments
+without production request markers are not collapsed.
+
+Comment authors and full request identities must pass the same validation used
+for publication. Only the publisher's own PR-specific summary marker can be
+updated. GitHub's per-comment moderation capabilities are checked before hiding
+or showing comments. Presentation failures produce stage-specific warnings and
+do not change the verdict, send an AI request or fail the workflow. A missing or
+outdated summary, or its incomplete-cleanup marker, schedules a repair on the
+next scan that visits the open PR. Each publication collapses at most 20 comments;
+remaining work continues through these repairs. The summary is written before
+any comments are collapsed, and unchanged summaries are not edited.
+
+This presentation policy preserves head/target/branch deduplication and the
+normal scan schedule. An unchanged PR patch or non-overlapping file changes do
+not establish compatibility with a new target revision.
+
 ## Correcting a disputed result
 
 Keep the original request and reply as evidence. Record the disputed finding and
@@ -268,7 +300,10 @@ and permit posting issue comments. It sends CodeRabbit commands and reads its
 own identity and quota; repository reads and commit status publication use
 `GITHUB_TOKEN`. Discovery has `statuses: read` and `checks: read`. Request and
 publication jobs have `statuses: write` and retain `checks: write` only to cancel
-incomplete semantic Check Runs. The publisher recognizes `coderabbitai[bot]`
+incomplete semantic Check Runs. They also have `issues: write` to maintain the
+summary and moderate the conversation with `GITHUB_TOKEN`; discovery remains
+read-only. If GitHub denies comment moderation, publication retains the evidence
+and reports a presentation warning. The publisher recognizes `coderabbitai[bot]`
 (user ID `136622811`). Keep semantic statuses non-required.
 
 ## Validation

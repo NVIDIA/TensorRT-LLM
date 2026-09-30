@@ -16,7 +16,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const timers = require('node:timers/promises');
-const { discover, run, requestOne, withReadRetries } = require('./semantic_review_request');
+const { discover, run, requestOne, withReadRetries, withReserve } = require('./semantic_review_request');
 const { NAME, statusContext, requests, publish } = require('./semantic_review');
 
 const HEAD = '1'.repeat(40);
@@ -44,6 +44,7 @@ function fixture(prs = [pull()], options = {}) {
     hooks: [], commandHooks: [], postAttempts: 0,
     commandRemaining: options.commandRemaining ?? 5000, postErrors: new Map(), comparisons: 0,
     now: NOW, nextCommentId: 1000, commentReads: new Map(), statusFailures: 0, summaryFailures: 0, readOrder: [],
+    stickyWrites: [], stickyFailures: 0, minimized: new Set(),
   };
   const hook = key => ({
     ...Object.fromEntries(['before', 'after', 'error', 'wrap'].map(kind =>
@@ -70,6 +71,16 @@ function fixture(prs = [pull()], options = {}) {
   };
   const github = {
     hook: hook('hooks'),
+    graphql: async (query, args) => {
+      if (args.ids) return {nodes: args.ids.map(id => ({id, __typename: 'IssueComment',
+        isMinimized: state.minimized.has(id), viewerCanMinimize: true, viewerCanUnminimize: true}))};
+      const id = args.id || args.input?.subjectId;
+      if (/unminimizeComment/.test(query)) state.minimized.delete(id);
+      else state.minimized.add(id);
+      return /unminimizeComment/.test(query) ?
+        {unminimizeComment: {unminimizedComment: {isMinimized: false}}} :
+        {minimizeComment: {minimizedComment: {isMinimized: true}}};
+    },
     paginate: async (method, args) => {
       const { data } = await method(args);
       return data.check_runs || data;
@@ -118,7 +129,24 @@ function fixture(prs = [pull()], options = {}) {
         state.commentReads.set(number, count);
         if (state.onListComments) state.onListComments(number, count);
         return state.comments.get(number) || [];
-      }) },
+      }),
+      createComment: api(args => {
+        state.stickyWrites.push(args);
+        if (state.stickyFailures-- > 0) throw httpError(502);
+        const id = state.nextCommentId++;
+        const comment = {id, node_id: `IC_${id}`, body: args.body,
+          user: {login: 'github-actions[bot]', id: 41898282, type: 'Bot'},
+          created_at: new Date(state.now).toISOString()};
+        state.comments.set(args.issue_number, [...(state.comments.get(args.issue_number) || []), comment]);
+        return comment;
+      }, false, 'POST'),
+      updateComment: api(args => {
+        state.stickyWrites.push(args);
+        if (state.stickyFailures-- > 0) throw httpError(502);
+        const comment = [...state.comments.values()].flat().find(item => item.id === args.comment_id);
+        comment.body = args.body;
+        return comment;
+      }, false, 'PATCH') },
       checks: {
         listForRef: api(({ ref, check_name: name }) => ({ check_runs: structuredClone(state.legacyChecks.filter(
           (check) => check.head_sha === ref && check.name === name)) })),
@@ -145,7 +173,8 @@ function fixture(prs = [pull()], options = {}) {
       if (errorMode === 'before') throw failure();
       state.posts.push(args);
       const comments = state.comments.get(args.issue_number) || [];
-      const comment = { id: state.nextCommentId++, user: SERVICE, body: args.body,
+      const id = state.nextCommentId++;
+      const comment = { id, node_id: `IC_${id}`, user: SERVICE, body: args.body,
         created_at: new Date(state.now).toISOString(),
         html_url: `https://github.com/NVIDIA/TensorRT-LLM/pull/${args.issue_number}#issuecomment-${state.nextCommentId - 1}` };
       state.comments.set(args.issue_number, comments.concat(comment));
@@ -178,7 +207,7 @@ function fixture(prs = [pull()], options = {}) {
         `head=${request.head} target=${request.target} merge_base=${request.mergeBase} verdict=${verdict}\n` +
         `https://github.com/NVIDIA/TensorRT-LLM/blob/${request.head}/head.py#L1\n` +
         `https://github.com/NVIDIA/TensorRT-LLM/blob/${request.target}/target.py#L1`;
-      const comment = { id, user: REVIEWER, body, created_at: new Date(state.now).toISOString(),
+      const comment = { id, node_id: `IC_${id}`, user: REVIEWER, body, created_at: new Date(state.now).toISOString(),
         html_url: `https://github.com/NVIDIA/TensorRT-LLM/pull/${number}#issuecomment-${id}`, ...changes };
       state.comments.set(number, [...(state.comments.get(number) || []), comment]);
       return comment;
@@ -247,6 +276,34 @@ test('each retry honors the reserve using failed response headers or conservativ
     assert.equal(f.state.postAttempts, 0);
     assert.equal(f.state.hooks.length, 0);
   }
+});
+
+test('GraphQL response headers cannot replenish the REST quota reserve', async () => {
+  const f = fixture([], {remaining: 1002});
+  await assert.rejects(withReserve(f.github, async () => {
+    const before = f.state.hooks.find(item => item.kind === 'before').callback;
+    const after = f.state.hooks.find(item => item.kind === 'after').callback;
+    before();
+    after({headers: {'x-ratelimit-resource': 'graphql', 'x-ratelimit-remaining': '4999'}});
+    before();
+    before();
+  }), error => error.semanticReviewQuota === true);
+  assert.equal(f.state.hooks.length, 0);
+});
+
+test('a failed timeline summary is repaired on an unchanged PR without another AI request', async () => {
+  const f = fixture();
+  f.state.stickyFailures = 1;
+  assert.equal((await f.worker()).status, 'requested');
+  assert.equal(f.state.statuses.length, 1);
+  assert.equal(f.state.failures.length, 0);
+  assert.equal(f.state.warnings.length, 1);
+  const scan = await f.scan();
+  assert.deepEqual(scan.jobs, [{number: 1, allowRequest: false}]);
+  assert.equal((await f.worker({...scan.jobs[0], commandGithub: undefined})).status, 'reconciled');
+  assert.equal(f.state.postAttempts, 1);
+  assert.equal(f.state.statuses.length, 1);
+  assert.deepEqual((await f.scan()).jobs, []);
 });
 
 test('quota reads use bounded retries and always remove their hooks', async () => {
