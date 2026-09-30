@@ -37,10 +37,6 @@ Sanity check the installation by running the following inside the container:
 python3 -c "import tensorrt_llm"
 ```
 
-The container carries the default dependency set. Features behind a `pip` extra, such as the Mooncake Python
-client, are not pre-installed and are added the same way as in a standalone installation; see
-[Install optional extras](#install-optional-extras).
-
 (linux)=
 ## Option 2: Install on Linux via `pip`
 
@@ -91,18 +87,6 @@ pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
 
 ```bash
 pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm
-```
-
-#### Install optional extras
-
-A few features are reached through `pip` extras rather than the default dependency set, so an installation
-that does not use them does not carry their dependencies either.
-
-The `mooncake` extra installs the Mooncake Python client, which the mooncake-store KV cache connector and the
-`trtllm-serve mooncake_master` and `trtllm-serve mooncake_donor` commands need:
-
-```bash
-pip3 install tensorrt_llm[mooncake]
 ```
 
 #### Install a nightly release

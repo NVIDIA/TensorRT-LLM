@@ -459,11 +459,11 @@ def _launch_master(pool: PoolSpec, run_dir: str) -> LaunchedMaster:
     if resolved is None:
         raise FileNotFoundError(
             f"{binary!r} is not on PATH, so launch_master cannot start a "
-            "Mooncake master. It comes from the Mooncake Python client, an "
-            "optional dependency: install it with "
-            "`pip install tensorrt-llm[mooncake]`. Otherwise point "
-            f"{MASTER_BINARY_ENV} at the binary, or drop launch_master and "
-            "set master_server_address to a master you run yourself."
+            "Mooncake master. It comes from the Mooncake Python client, which "
+            "`tensorrt-llm` pulls in as `mooncake-transfer-engine-cuda13`, so "
+            "reinstall that package if this environment dropped it. Otherwise "
+            f"point {MASTER_BINARY_ENV} at the binary, or drop launch_master "
+            "and set master_server_address to a master you run yourself."
         )
 
     host = local_address()
