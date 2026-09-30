@@ -164,13 +164,6 @@ _varlen_pure_cache = {}
 # single-seq cu_seqlens.
 _varlen_single_seqlen_cache = {}
 
-# id(tensor) -> cute_wrapper. The wrappers themselves are stateless views
-# over the tensor's storage, so they remain valid as long as the tensor's
-# data pointer / shape / strides don't change. Callers that reuse the same
-# tensor objects across iterations (typical benchmark pattern) hit the
-# cache; per-call fresh tensors (the executor runtime pattern) rebuild.
-_input_wrap_cache = {}
-
 
 def _prune_on_gc(cache, key, *keyobjs):
     """Drop ``cache[key]`` when any of ``keyobjs`` is garbage-collected.
@@ -187,23 +180,23 @@ def _prune_on_gc(cache, key, *keyobjs):
         weakref.finalize(o, cache.pop, key, None)
 
 
-def _ct_cached(t, etype):
-    """`_ct(t, etype)` with id(t)-based cache. Returns the same cute wrapper
-    for repeated calls with the same tensor object, avoiding per-call
+def _scratch_ct(cute_wrappers, name, t, etype):
+    """`_ct(t, etype)` for ``_get_buffers`` scratch, cached in the scratch's own
+    ``_buf_cache`` entry (its ``cute_wrappers`` dict) to avoid per-call
     `from_dlpack` overhead (~5-10us each).
 
-    ONLY use for tensors with process-long lifetime (module params, the
-    module-level scratch from ``_get_buffers``): the cached wrapper pins the
-    tensor's storage, so the weakref pruning never fires for the keyed
-    object and a per-call activation would be pinned forever (~100MB/call
-    leak in the executor runtime). Per-call tensors must use plain ``_ct``.
+    The wrapper pins the tensor's storage, so it must not outlive the entry:
+    ``_buf_cache`` is LRU-bounded and the executor runtime creates a new
+    batch shape on most prefill calls. A module-level id()-keyed cache kept
+    every evicted entry's scratch alive forever (tens of MB per new shape,
+    until CUDA OOM under serving load). Cached here, the wrapper is dropped
+    together with the entry.
     """
-    key = (id(t), etype)
-    w = _input_wrap_cache.get(key)
+    if cute_wrappers is None:
+        return _ct(t, etype)
+    w = cute_wrappers.get(name)
     if w is None:
-        w = _ct(t, etype)
-        _input_wrap_cache[key] = w
-        _prune_on_gc(_input_wrap_cache, key, t)
+        w = cute_wrappers[name] = _ct(t, etype)
     return w
 
 
@@ -531,8 +524,8 @@ def _launch_k4_persistent(
     o_ct = cute_wrappers["o_ct"]
     gk_ct = cute_wrappers["gk_ct"]
 
-    # v is a per-call activation — wrap fresh every call (never cache; see
-    # _ct_cached docstring).
+    # v is a per-call activation — wrap fresh every call (never cache; a
+    # cached wrapper would pin its storage, see _scratch_ct).
     v_view = v_beta.reshape(-1, H, V_dim) if v_beta.dim() == 4 else v_beta
     v_ct = from_dlpack(v_view, assumed_align=16).mark_layout_dynamic()
     v_ct.element_type = bf16
@@ -718,8 +711,9 @@ def _launch_fused_k123_inv(
     # Inputs are guaranteed contiguous by upstream linear projections.
     # A_log is fp32 model param; .float() is no-op when dtype already matches.
     # q/k/g/beta/cu/ci are per-call activations: plain _ct, never cached
-    # (see _ct_cached docstring). The _get_buffers scratch below is
-    # module-persistent, so caching its wrappers is safe and worthwhile.
+    # (a cached wrapper would pin their storage). The _get_buffers scratch
+    # below lives in an LRU-bounded _buf_cache entry, so its wrappers are
+    # cached in that entry and freed with it (see _scratch_ct).
     q_ct = _ct(q, cutlass.BFloat16)
     k_ct = _ct(k, cutlass.BFloat16)
     g_ct = _ct(g, cutlass.BFloat16)
@@ -731,14 +725,16 @@ def _launch_fused_k123_inv(
     else:
         raise ValueError(f"Kimi K3 KDA prefill beta must be float32 or bfloat16, got {beta.dtype}")
     beta_ct = _ct(beta, beta_etype)
-    beta_activated_ct = _ct_cached(beta_activated, cutlass.BFloat16)
+    beta_activated_ct = _scratch_ct(
+        cute_wrappers, "k123_beta_activated", beta_activated, cutlass.BFloat16
+    )
 
-    ks_ct = _ct_cached(k_scaled, cutlass.BFloat16)
-    kg_ct = _ct_cached(kg, cutlass.BFloat16)
-    qs_ct = _ct_cached(q_scaled, cutlass.BFloat16)
-    gk_ct = _ct_cached(gk_last_exp, cutlass.Float32)
-    aqk_ct = _ct_cached(A_qk, cutlass.BFloat16)
-    akk_ct = _ct_cached(A_kk_inv, cutlass.BFloat16)
+    ks_ct = _scratch_ct(cute_wrappers, "k123_k_scaled", k_scaled, cutlass.BFloat16)
+    kg_ct = _scratch_ct(cute_wrappers, "k123_kg", kg, cutlass.BFloat16)
+    qs_ct = _scratch_ct(cute_wrappers, "k123_q_scaled", q_scaled, cutlass.BFloat16)
+    gk_ct = _scratch_ct(cute_wrappers, "k123_gk_last_exp", gk_last_exp, cutlass.Float32)
+    aqk_ct = _scratch_ct(cute_wrappers, "k123_A_qk", A_qk, cutlass.BFloat16)
+    akk_ct = _scratch_ct(cute_wrappers, "k123_A_kk_inv", A_kk_inv, cutlass.BFloat16)
 
     if is_varlen:
         cu_ct = _ct(cu_seqlens, _cute_int_type(cu_seqlens.dtype))
@@ -824,7 +820,7 @@ def _launch_fused_k123_inv(
     else:
         akk_beta_etype = cutlass.BFloat16
     akk_beta_ct = (
-        _ct_cached(beta_for_akk, akk_beta_etype)
+        _scratch_ct(cute_wrappers, "akk_beta_activated", beta_for_akk, akk_beta_etype)
         if use_beta_sigmoid_in_kernel
         else _ct(beta_for_akk, akk_beta_etype)
     )
