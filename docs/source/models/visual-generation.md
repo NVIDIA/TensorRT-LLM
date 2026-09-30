@@ -163,7 +163,7 @@ The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/
 ## MiniMax-H3 Notes
 
 MiniMax-H3 parallel VAE uses independent spatial tiles via
-`parallel_config.parallel_vae_size`, with size 1 or the full Ulysses world size.
+`parallel_config.parallel_vae_size`, with size from 1 through the Ulysses world size.
 Tile geometry and blending follow the loaded Diffusers VAE.
 
 - Text-to-video (T2VA), first/last-frame-to-video (FL2VA), and reference-to-video
@@ -175,8 +175,6 @@ Tile geometry and blending follow the loaded Diffusers VAE.
   for input limits, ordering, and media dependencies.
 - MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
   model-specific restriction, not a general VisualGen backend requirement.
-- MiniMax-H3 Ulysses support is pure sequence parallelism with VANILLA attention;
-  CFG, tensor parallelism, Ring Attention, and Attention2D remain unsupported.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
 

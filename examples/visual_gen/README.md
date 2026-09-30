@@ -99,9 +99,10 @@ pipeline_config:
 Tile size and overlap are positive pixel counts aligned to the checkpoint's
 spatial compression ratio, with overlap smaller than tile size. Setting
 `parallel_config.parallel_vae_size: 1` retains sequential tiling. For H3,
-parallel VAE size must be 1 or equal to the full Ulysses world size; partial
-VAE groups are rejected. Setting `vae_use_tiling: false` disables spatial
-tiling for encode and decode, which changes the
+parallel VAE size can be any integer from 1 through the Ulysses world size;
+it does not need to divide that size. Only the first `parallel_vae_size`
+ranks decode, and rank 0 returns the generated video and audio. Setting
+`vae_use_tiling: false` disables spatial tiling for encode and decode, which changes the
 checkpoint's reference output and can increase memory and latency. Audio
-VAE processing is unaffected. Tile parallelism requires all ranks to decode
+VAE processing is unaffected. Tile parallelism requires all VAE-group ranks to decode
 the same video latents and uses the supported pure Ulysses configuration.
