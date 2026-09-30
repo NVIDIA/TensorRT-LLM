@@ -18,7 +18,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
@@ -127,6 +127,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
     beam_width: int = 1
+
+    # Plan caches of the FMHA libraries, keyed by library. A planned wrapper owns
+    # workspaces that CUDA graphs capture, so it lives exactly as long as this
+    # metadata; every layer that runs with this metadata reuses it.
+    fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
+                                              init=False,
+                                              repr=False)
 
     @property
     def effective_beam_width(self) -> int:
@@ -346,6 +353,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             or self.runtime_features.cache_reuse
             or self.runtime_features.has_speculative_draft_tokens
         ) if self.runtime_features is not None else False
+        # CUDA-graph metadata is a shallow copy that re-runs this method; give it
+        # its own plan caches so each captured batch size plans its own wrappers.
+        self.fmha_plan_caches = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
     def update_position_offsets_for_cpp(self, query_len: int) -> None:
