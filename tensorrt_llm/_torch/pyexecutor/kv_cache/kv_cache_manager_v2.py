@@ -90,6 +90,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     SwaScratchReuseConfig,
     TokenIdExt,
     _cpp_introspection,
+    _introspection,
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
@@ -3949,6 +3950,54 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             return False
         return self._resume_and_restore(req.py_request_id, kv_cache)
+
+    def has_active_cache(self, req: LlmRequest) -> bool:
+        """Whether *req* already holds an ACTIVE cache in this pool.
+
+        Cheap and side-effect-free. The scheduler uses it to prove that
+        re-running ``prepare_context`` for *req* would be a no-op (no fresh
+        reuse claim, no resume), which is one precondition for skipping the
+        request's per-iteration admission work entirely.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        return kv_cache is not None and kv_cache.is_active
+
+    def _resume_gate_refuses(self) -> bool:
+        """Side-effect-free preview of ``_KVCache.resume``'s utilization gate.
+
+        The exact first check ``resume`` makes on BOTH backends: the maximum
+        GPU-level pool-group utilization compared against
+        ``max_util_for_resume`` (python ``_core/_kv_cache.py::resume`` and C++
+        ``kvCache.cpp::KvCache::resume`` implement the same refusal).
+        ``storage_utilization`` dispatches to whichever backend is loaded, and
+        the threshold is read from the impl's own config so the comparison
+        uses the very value the gate compares against. Empty utilization (no
+        pool groups) mirrors the C++ treatment: not refused.
+        """
+        utilization = _introspection.storage_utilization(self.impl, GPU_LEVEL)
+        if not utilization:
+            return False
+        return max(utilization) > self.impl.init_config.max_util_for_resume
+
+    def mirror_admission_certainly_blocked(self, req: LlmRequest) -> bool:
+        """Whether ``admit_mirror(req)`` would certainly be refused right now.
+
+        A cheap O(1), side-effect-free preview for the scheduler: True only
+        when *req* already has a SUSPENDED mirror whose resume the
+        ``max_util_for_resume`` gate would refuse (``_resume_gate_refuses``).
+        False in every other case — no mirror yet (creating one is a side
+        effect the real admission must keep), mirror already active (admission
+        is a no-op success), or utilization at/below the gate (the resume
+        could succeed).
+
+        One-sided by construction: True implies ``admit_mirror`` would return
+        False, so a caller acting on it can never change a scheduling
+        decision — only skip work whose outcome is already determined.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None or kv_cache.is_active:
+            return False
+        return self._resume_gate_refuses()
 
     # ---- prepare_resources ----
 
