@@ -40,6 +40,16 @@ def validating(*wrappers: OpWrapper) -> Iterator[None]:
         saved.append((cls, original))
 
         def guarded(self, *args, _original=original, **kwargs):
+            if self._step:
+                from tensorrt_llm._torch._experimental.modeling_v2.catalog import _op
+
+                assert self._step_generation == _op._STEP_GENERATION, (
+                    f"{type(self).__name__} is running on step "
+                    f"{self._step_generation} while the engine is on "
+                    f"{_op._STEP_GENERATION}: a forward bound its step state and "
+                    "a later one did not, so this call is using the previous "
+                    "step's metadata -- wrong output, no error, outside validation"
+                )
             self.is_valid(*args, **kwargs)
             return _original(self, *args, **kwargs)
 
