@@ -589,8 +589,16 @@ def run_client_tests(example_dir,
             with open(output_file, 'r') as f:
                 content = f.read()
                 if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
+                    # Qwen3-0.6B (the default model since the TinyLlama
+                    # migration) answers the raw asyncio prompt with a
+                    # reasoning-style continuation on the chat endpoint too;
+                    # accept its phrasing alongside the original expectation.
                     expected_strings = [
-                        "Berlin", ["Asyncio is a", "Asyncio module in"]
+                        "Berlin",
+                        [
+                            "Asyncio is a", "Asyncio module in",
+                            "advantages of using asyncio"
+                        ]
                     ]
                 elif "gpt_oss_120b" in test_desc:
                     expected_strings = [
