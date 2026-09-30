@@ -120,6 +120,18 @@ def assert_within_ulp(
     assert rel_rms <= rms_ulp * ulp, f"relative RMS {rel_rms:.3e} exceeds {rms_ulp} ulp"
 
 
+#: Bumped once per engine step by the target that owns the entries. Only read
+#: when validation is on: outside it, nothing compares generations and the
+#: counter costs one integer increment a forward.
+_STEP_GENERATION = 0
+
+
+def advance_step_generation() -> None:
+    """Called once per forward, before any `bind_step`."""
+    global _STEP_GENERATION
+    _STEP_GENERATION += 1
+
+
 class Arch(str, enum.Enum):
     """A GPU architecture an entry can be certified on.
 
@@ -185,6 +197,7 @@ class OpWrapper(ABC):
         """
         self._bound: dict[str, Any] = bound
         self._step: dict[str, Any] = {}
+        self._step_generation = -1
 
     def bind_step(self, **step: Any) -> None:
         """Rebind the per-forward batch state. Replaces, never merges.
@@ -194,6 +207,7 @@ class OpWrapper(ABC):
         last step's metadata -- wrong output, no error.
         """
         self._step = step
+        self._step_generation = _STEP_GENERATION
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Merge the three stages and make the call.

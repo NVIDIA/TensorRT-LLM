@@ -78,3 +78,25 @@ def test_an_entry_must_implement_raw_call():
 
     with pytest.raises(TypeError, match="raw_call"):
         Incomplete()
+
+
+def test_a_stale_step_binding_is_caught_under_validation():
+    """The failure mode this design introduces, and the only place it is seen.
+
+    Outside validation nothing compares generations -- an entry running on last
+    forward's block offsets produces a wrong answer and no error. That is the
+    accepted cost of keeping the hot path free; this test is the record that
+    the check exists and fires.
+    """
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog import _op
+
+    __extra_import_path__ = [".."]  # noqa: F841 -- repo's file-scoped import hook
+    from _validating import validating
+
+    op = _Spy()
+    _op.advance_step_generation()
+    op.bind_step(a=1)
+    _op.advance_step_generation()  # a new forward that forgot to rebind
+    with pytest.raises(AssertionError, match="previous step's metadata"):
+        with validating(op):
+            op()

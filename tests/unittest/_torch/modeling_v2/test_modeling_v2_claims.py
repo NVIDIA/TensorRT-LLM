@@ -343,3 +343,109 @@ def test_every_core_ships_both_targets():
             if required not in classes:
                 missing.append(f"{path.relative_to(_ROOT)}: {required}")
     assert not missing, "core modules missing a target class: " + ", ".join(missing)
+
+
+# The binding layer is only safe because `raw_call` is independent of it. These
+# two gates are what keep that true; without them an entry can quietly start
+# reading bound state, and CELLS stops covering what the target actually runs.
+
+
+def _catalog_entries() -> list[tuple[Path, ast.ClassDef]]:
+    """Every OpWrapper subclass in the catalog, as (path, class node)."""
+    found = []
+    for path in sorted((_ROOT / "catalog").glob("*/*.py")):
+        if path.name == "__init__.py":
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(b, ast.Name) and b.id == "OpWrapper" for b in node.bases
+            ):
+                found.append((path, node))
+    return found
+
+
+def test_raw_call_reads_no_bound_state():
+    """`raw_call` takes every argument explicitly.
+
+    The moment it reads `self._bound`, `self._step`, or any other attribute,
+    the arguments a cell drives it with stop being the whole input -- and
+    `CELLS` silently narrows to whatever the last target happened to bind.
+    """
+    offenders = []
+    for path, cls in _catalog_entries():
+        for node in cls.body:
+            if not isinstance(node, ast.FunctionDef) or node.name != "raw_call":
+                continue
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Attribute)
+                    and isinstance(inner.value, ast.Name)
+                    and inner.value.id == "self"
+                ):
+                    offenders.append(f"{path.relative_to(_ROOT)}:{inner.lineno} self.{inner.attr}")
+    assert not offenders, (
+        "raw_call must take every argument explicitly; these read bound state: "
+        + ", ".join(offenders)
+    )
+
+
+def test_is_valid_accepts_everything_raw_call_accepts():
+    """`is_valid` must accept every argument `raw_call` accepts.
+
+    Not parameter-for-parameter mirroring -- an earlier version of this gate
+    demanded that, and it was wrong: it demanded a property the tree does not
+    have and does not need. `is_valid` may narrow to only the parameters it
+    actually inspects, as long as it also carries a `**kwargs` absorber.
+    `validating()` forwards the call's full, merged argument set to
+    `is_valid` verbatim, so the absorber is what keeps that forward from
+    raising `TypeError` on the arguments the guard does not name --
+    `thop_attention.is_valid` checks three of `raw_call`'s ~115 parameters
+    and absorbs the rest in `**unused_kwargs`; that is not a gap the gate
+    missed, it is the mechanism the tree chose so a 115-parameter signature
+    does not have to be restated to be validated. An entry with no `is_valid`
+    of its own inherits the base class's `(*args, **kwargs)` no-op, which
+    already accepts everything, so it is exempt from this check the same way.
+
+    `reference` is not checked here at all, and was wrong to check before.
+    It is driven by a cell's own explicit argument list, never by the merged
+    forward that reaches `is_valid`, so it never receives an argument it did
+    not declare -- there is nothing for it to absorb and nothing to mirror.
+    `thop_attention.reference` takes 16 of `raw_call`'s ~115 parameters on
+    purpose: a 115-parameter reference implementation would be unmaintainable,
+    and the cell driving it only ever supplies those 16. Eight entries narrow
+    `reference` this way; all eight are correct.
+
+    The `self`-is-first-parameter check is kept as-is: an entry once shipped
+    `raw_call` and `is_valid` both missing `self`, and a mirror check that
+    assumed the first parameter was `self` dropped a real argument from both
+    and reported a match.
+    """
+    problems = []
+    for path, cls in _catalog_entries():
+        funcs = {
+            n.name: n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name in ("raw_call", "reference", "is_valid")
+        }
+        raw_call = funcs.get("raw_call")
+        if raw_call is None:
+            continue
+        for name, fn in funcs.items():
+            params = [a.arg for a in fn.args.args]
+            if not params or params[0] != "self":
+                problems.append(
+                    f"{path.relative_to(_ROOT)}: {cls.name}.{name} first param is not self"
+                )
+
+        is_valid = funcs.get("is_valid")
+        if is_valid is None or is_valid.args.kwarg is not None:
+            continue  # inherits the base no-op, or absorbs the remainder itself
+        raw_names = {a.arg for a in raw_call.args.args + raw_call.args.kwonlyargs} - {"self"}
+        valid_names = {a.arg for a in is_valid.args.args + is_valid.args.kwonlyargs} - {"self"}
+        missing = sorted(raw_names - valid_names)
+        if missing:
+            problems.append(
+                f"{path.relative_to(_ROOT)}: {cls.name}.is_valid does not accept "
+                f"{missing} that raw_call accepts, and has no ** absorber"
+            )
+    assert not problems, "; ".join(problems)
