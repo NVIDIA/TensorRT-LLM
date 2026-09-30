@@ -62,6 +62,7 @@ from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
+from tensorrt_llm.serve.serving_extensions import structured_output_format_for
 from tensorrt_llm.visual_gen.params import MediaRole
 
 _LOGIT_BIAS_MIN = -100.0
@@ -485,48 +486,13 @@ def _response_format_to_guided_decoding_params(
     elif guided_decoding_params.grammar is not None:
         content = {"type": "grammar", "grammar": guided_decoding_params.grammar}
 
-    if reasoning_parser == "gpt_oss":
-        # Trigger user constraint by final channel
-        stag_format = {
-            "type":
-            "triggered_tags",
-            "triggers": ["<|start|>assistant<|channel|>final<|message|>"],
-            "tags": [
-                {
-                    "begin": "<|start|>assistant<|channel|>final<|message|>",
-                    "content": content,
-                    "end": "",
-                },
-            ],
-            "stop_after_first":
-            True,
-        }
-    elif reasoning_parser == "kimi_k3":
-        # K3 XTML: the generation prompt already ends inside the channel the
-        # model starts in. In thinking mode (the default) the response channel
-        # opens mid-generation, so trigger the user constraint on it
-        # (mirrors the gpt_oss final-channel handling). In non-thinking mode
-        # the prompt ends inside <|open|>response<|sep|>, the trigger would
-        # never be generated, and the raw grammar applies from the first
-        # generated token instead.
-        thinking = (chat_template_kwargs or {}).get("thinking",
-                                                    True) is not False
-        if not thinking:
+    extension_format = structured_output_format_for(reasoning_parser)
+    if extension_format is not None:
+        # A registered per-model serving extension owns the placement of the
+        # constraint relative to this model's reasoning markup.
+        stag_format = extension_format(content, chat_template_kwargs)
+        if stag_format is None:
             return guided_decoding_params
-        stag_format = {
-            "type":
-            "triggered_tags",
-            "triggers": ["<|open|>response<|sep|>"],
-            "tags": [
-                {
-                    "begin": "<|open|>response<|sep|>",
-                    "content": content,
-                    "end": "<|close|>response<|sep|>",
-                },
-            ],
-            "stop_after_first":
-            True,
-        }
     else:
         # Force thinking and then trigger user constraint
         parser = ReasoningParserFactory.create_reasoning_parser(
