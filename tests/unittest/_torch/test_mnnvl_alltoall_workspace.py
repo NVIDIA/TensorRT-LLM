@@ -25,7 +25,10 @@ import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
 import tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided as one_sided_module
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import (
+    MnnvlMoe,
+    NVLinkTwoSided,
+)
 
 
 class _Client:
@@ -479,9 +482,9 @@ def test_two_sided_checkpoint_prepare_rejects_active_shared_owner(
     instances = WeakSet()
     monkeypatch.setattr(NVLinkTwoSided, "_INSTANCES", instances)
     checkpoint_prepare = Mock()
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "checkpoint_prepare", checkpoint_prepare)
+    monkeypatch.setattr(MnnvlMoe, "checkpoint_prepare", checkpoint_prepare)
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_workspace",
         Mock(comm=_FakeComm()),
     )
@@ -507,15 +510,15 @@ def test_two_sided_repeated_checkpoint_prepare_skips_shared_preflight(
     instances = WeakSet()
     monkeypatch.setattr(NVLinkTwoSided, "_INSTANCES", instances)
     checkpoint_prepare = Mock()
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "checkpoint_prepare", checkpoint_prepare)
+    monkeypatch.setattr(MnnvlMoe, "checkpoint_prepare", checkpoint_prepare)
     comm = _FakeComm()
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_workspace",
         Mock(mapped=False, comm=comm),
     )
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_prepare_workspace",
         Mock(mapped=False),
     )
@@ -536,14 +539,14 @@ def test_two_sided_checkpoint_prepare_rejects_uninitialized_communicator(
     instances = WeakSet()
     monkeypatch.setattr(NVLinkTwoSided, "_INSTANCES", instances)
     checkpoint_prepare = Mock()
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "checkpoint_prepare", checkpoint_prepare)
+    monkeypatch.setattr(MnnvlMoe, "checkpoint_prepare", checkpoint_prepare)
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_workspace",
         Mock(mapped=True, comm=None),
     )
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_prepare_workspace",
         Mock(mapped=True),
     )
@@ -576,9 +579,9 @@ def test_two_sided_checkpoint_prepare_timeout_fails_closed(
     )
     main_workspace = Mock(mapped=True, comm=comm)
     prepare_workspace = Mock(mapped=True)
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_workspace", main_workspace)
+    monkeypatch.setattr(MnnvlMoe, "moe_workspace", main_workspace)
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_prepare_workspace",
         prepare_workspace,
     )
@@ -602,14 +605,14 @@ def test_two_sided_checkpoint_restore_resets_all_shared_owners(
     instances = WeakSet()
     monkeypatch.setattr(NVLinkTwoSided, "_INSTANCES", instances)
     checkpoint_restore = Mock()
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "checkpoint_restore", checkpoint_restore)
+    monkeypatch.setattr(MnnvlMoe, "checkpoint_restore", checkpoint_restore)
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_workspace",
         Mock(mapped=False),
     )
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_prepare_workspace",
         Mock(mapped=False),
     )
@@ -633,14 +636,14 @@ def test_two_sided_checkpoint_restore_noop_preserves_shared_owner_state(
     instances = WeakSet()
     monkeypatch.setattr(NVLinkTwoSided, "_INSTANCES", instances)
     checkpoint_restore = Mock()
-    monkeypatch.setattr(mnnvl.MnnvlMoe, "checkpoint_restore", checkpoint_restore)
+    monkeypatch.setattr(MnnvlMoe, "checkpoint_restore", checkpoint_restore)
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_workspace",
         Mock(mapped=True),
     )
     monkeypatch.setattr(
-        mnnvl.MnnvlMoe,
+        MnnvlMoe,
         "moe_prepare_workspace",
         Mock(mapped=True),
     )
