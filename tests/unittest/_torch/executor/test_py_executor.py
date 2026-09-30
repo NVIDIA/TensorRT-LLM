@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch import models as torch_models
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import GenTransferStatus
 from tensorrt_llm._torch.disaggregation.orchestration.admission import (
     DisaggTransferAdmissionController,
@@ -28,6 +29,7 @@ from tensorrt_llm._torch.disaggregation.orchestration.admission import (
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.interfaces import ExecutorEffects
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
@@ -58,6 +60,68 @@ from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfi
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("end_id", [None, -1, 0, 127])
+def test_validate_token_id_range_accepts_end_id(end_id) -> None:
+    model = Mock(spec=DecoderModelForCausalLM)
+    object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
+    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    request = types.SimpleNamespace(
+        py_end_id=end_id,
+        py_multimodal_data=None,
+        check_token_id_range=lambda _vocab_size: True,
+    )
+
+    PyExecutor._validate_token_id_range(executor, request)
+
+
+@pytest.mark.parametrize("end_id", [-2, 128])
+def test_validate_token_id_range_rejects_end_id(end_id) -> None:
+    model = Mock(spec=DecoderModelForCausalLM)
+    object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
+    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    request = types.SimpleNamespace(py_end_id=end_id)
+
+    with pytest.raises(ValueError, match=rf"EndId \({end_id}\) is not within acceptable range"):
+        PyExecutor._validate_token_id_range(executor, request)
+
+
+@pytest.mark.parametrize(
+    "model_class_name",
+    [
+        "BartForConditionalGeneration",
+        "T5ForConditionalGeneration",
+        "WhisperForConditionalGeneration",
+    ],
+)
+@pytest.mark.parametrize("end_id", [-1, 127])
+def test_validate_token_id_range_accepts_encoder_decoder_end_id(model_class_name, end_id) -> None:
+    model = Mock(spec=getattr(torch_models, model_class_name))
+    object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
+    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    request = types.SimpleNamespace(py_end_id=end_id)
+
+    PyExecutor._validate_token_id_range(executor, request)
+
+
+@pytest.mark.parametrize(
+    "model_class_name",
+    [
+        "BartForConditionalGeneration",
+        "T5ForConditionalGeneration",
+        "WhisperForConditionalGeneration",
+    ],
+)
+@pytest.mark.parametrize("end_id", [-2, 128])
+def test_validate_token_id_range_rejects_encoder_decoder_end_id(model_class_name, end_id) -> None:
+    model = Mock(spec=getattr(torch_models, model_class_name))
+    object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
+    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    request = types.SimpleNamespace(py_end_id=end_id)
+
+    with pytest.raises(ValueError, match=rf"EndId \({end_id}\) is not within acceptable range"):
+        PyExecutor._validate_token_id_range(executor, request)
 
 
 class _InflightRequestIds:

@@ -494,8 +494,6 @@ class BaseWorker(GenerationExecutor):
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
                 multimodal_input=multimodal_input,
-                # NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
-                multimodal_embedding=None,
                 mrope_config=None,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
