@@ -17,16 +17,14 @@ from types import SimpleNamespace
 from tensorrt_llm._torch.pyexecutor.llm_request import reported_cached_tokens
 
 
-def _request(gen_only: bool,
-             cached_tokens: int,
-             ctx_usage=None,
-             prepopulated_prompt_len: int = 0):
+def _request(gen_only: bool, cached_tokens: int, ctx_usage=None, prepopulated_prompt_len: int = 0):
     return SimpleNamespace(
         is_generation_only_request=lambda: gen_only,
         cached_tokens=cached_tokens,
         prepopulated_prompt_len=prepopulated_prompt_len,
-        py_disaggregated_params=SimpleNamespace(
-            ctx_usage=ctx_usage) if ctx_usage is not None else None,
+        py_disaggregated_params=SimpleNamespace(ctx_usage=ctx_usage)
+        if ctx_usage is not None
+        else None,
     )
 
 
@@ -39,35 +37,30 @@ def test_generation_only_without_ctx_usage_reports_local_reuse():
     # transferred KV, not a prefix-cache hit. Only the prefix this worker
     # reused from its own cache instead of transferring counts.
     assert reported_cached_tokens(_request(True, 4000)) == 0
-    assert reported_cached_tokens(
-        _request(True, 4000, prepopulated_prompt_len=256)) == 256
+    assert reported_cached_tokens(_request(True, 4000, prepopulated_prompt_len=256)) == 256
 
 
 def test_generation_only_adopts_ctx_usage_dict():
-    ctx = {
-        "prompt_tokens": 4000,
-        "prompt_tokens_details": {
-            "cached_tokens": 96
-        }
-    }
+    ctx = {"prompt_tokens": 4000, "prompt_tokens_details": {"cached_tokens": 96}}
     assert reported_cached_tokens(_request(True, 4000, ctx)) == 96
 
 
 def test_generation_only_adopts_ctx_usage_object():
     ctx = SimpleNamespace(
-        prompt_tokens=4000,
-        prompt_tokens_details=SimpleNamespace(cached_tokens=64))
+        prompt_tokens=4000, prompt_tokens_details=SimpleNamespace(cached_tokens=64)
+    )
     assert reported_cached_tokens(_request(True, 4000, ctx)) == 64
 
 
 def test_generation_only_ctx_usage_without_details_falls_back():
-    assert reported_cached_tokens(
-        _request(True,
-                 4000, {"prompt_tokens": 4000},
-                 prepopulated_prompt_len=128)) == 128
+    assert (
+        reported_cached_tokens(
+            _request(True, 4000, {"prompt_tokens": 4000}, prepopulated_prompt_len=128)
+        )
+        == 128
+    )
 
 
 def test_generation_only_ctx_usage_wins_over_local_reuse():
     ctx = {"prompt_tokens_details": {"cached_tokens": 96}}
-    assert reported_cached_tokens(
-        _request(True, 4000, ctx, prepopulated_prompt_len=256)) == 96
+    assert reported_cached_tokens(_request(True, 4000, ctx, prepopulated_prompt_len=256)) == 96
