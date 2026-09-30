@@ -2295,6 +2295,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     documents=request.documents,
                     chat_template=request.chat_template or self.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
+                    injected_chat_template_kwargs=request.
+                    injected_chat_template_kwargs,
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
@@ -2815,6 +2817,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     documents=request.documents,
                     chat_template=request.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
+                    injected_chat_template_kwargs=request.
+                    injected_chat_template_kwargs,
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
@@ -3555,6 +3559,26 @@ class OpenAIServer(_VideoRoutesMixin):
                                             args=(request.weights, ))
         return JSONResponse(content={"status": "success"})
 
+    async def _live_tokens_per_block(self) -> Optional[int]:
+        """Return the runtime's effective KV block size, or None if unknown.
+
+        The executor layer already turns RPC failures into an empty dict, so
+        the only failure left to absorb here is ``encode_only``, which rejects
+        the call outright. Generators without a KV cache (VisualGen) have no
+        such method. Both mean "fall back to the configured value".
+        """
+        get_capacity = getattr(self.generator, "get_kv_cache_capacity", None)
+        if get_capacity is None:
+            return None
+        try:
+            # Off-loop: the RPC blocks, and this worker's own heartbeat task
+            # shares this loop, so stalling it here can lapse its registration.
+            capacity = await asyncio.to_thread(get_capacity)
+        except RuntimeError as e:
+            logger.debug(f"Could not read live tokens_per_block: {e}")
+            return None
+        return capacity.get("tokensPerBlock") or None
+
     async def get_server_info(self) -> JSONResponse:
         # Note: calling self.generator.disaggregated_params and startup_metrics below
         # may trigger an RPC sync call, blocking the server event loop. Since this server_info
@@ -3573,6 +3597,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 if kv_cache_config.tokens_per_block is not None:
                     content[
                         "tokens_per_block"] = kv_cache_config.tokens_per_block
+            # The runtime may override the configured block size (e.g. FlashMLA
+            # forces 64) in the worker process, so args.kv_cache_config still
+            # holds the pre-override value here. A kv-cache-aware router hashes
+            # prompts in whatever block size this endpoint publishes, so a
+            # stale value makes every block hash miss. Prefer the live value.
+            live_tokens_per_block = await self._live_tokens_per_block()
+            if live_tokens_per_block is not None:
+                content["tokens_per_block"] = live_tokens_per_block
         content["startup_metrics"] = getattr(self.generator, "startup_metrics",
                                              {})
         return JSONResponse(content=content)
