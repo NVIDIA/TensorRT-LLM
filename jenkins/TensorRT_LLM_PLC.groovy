@@ -182,6 +182,7 @@ def savePipelineScripts() {
     checkout scm
     sh "cp -r jenkins/scripts/pulse_in_pipeline_scanning /tmp/pulse_in_pipeline_scanning"
     sh "cp scripts/generate_lock_file.py /tmp/generate_lock_file.py"
+    sh "cp jenkins/scripts/get_image_key_to_tag.py /tmp/get_image_key_to_tag.py"
 }
 
 def checkoutSource ()
@@ -338,7 +339,7 @@ def pulseLicenseScanContainer(llmRepo, ref) {
             ? "${params.postMergePipelineName} ${params.postMergeBuildNumber}"
             : "${params.ref}"
         def output = sh(
-            script: "python3 ./jenkins/scripts/get_image_key_to_tag.py ${imageScriptArgs}",
+            script: "python3 /tmp/get_image_key_to_tag.py ${imageScriptArgs}",
             returnStdout: true
         ).trim()
         println("Container image key-to-tag mapping for branch '${params.ref}':\n${output}")
@@ -413,7 +414,7 @@ def pulseMalwareScanContainer(llmRepo, ref) {
             ? "${params.postMergePipelineName} ${params.postMergeBuildNumber}"
             : "${params.ref}"
         def output = sh(
-            script: "python3 ./jenkins/scripts/get_image_key_to_tag.py ${imageScriptArgs}",
+            script: "python3 /tmp/get_image_key_to_tag.py ${imageScriptArgs}",
             returnStdout: true
         ).trim()
         println("Container image key-to-tag mapping for branch '${params.ref}':\n${output}")
