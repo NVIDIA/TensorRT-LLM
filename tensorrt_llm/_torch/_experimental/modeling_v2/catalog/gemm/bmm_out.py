@@ -56,7 +56,7 @@ class _BmmOut(OpWrapper):
     def reference(self, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """The product the op writes into `out`, fp32-accumulated.
 
-        `out` is named to mirror `__call__`: the op takes a destination,
+        `out` is named to mirror `raw_call`: the op takes a destination,
         the reference returns a value, and hiding the argument would hide that
         the op mutates one of its inputs.
 

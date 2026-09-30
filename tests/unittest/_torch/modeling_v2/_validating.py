@@ -8,9 +8,9 @@ nothing to gain from it: everything ``is_valid`` checks is a property of how a
 target calls the op, fixed when the target was written, and a guard of ours
 firing in production is our bug taking down a working deployment.
 
-So the wrapper's ``__call__`` goes straight to the kernel, and this interposes
+So the wrapper's ``raw_call`` goes straight to the kernel, and this interposes
 ``is_valid`` for the duration of a test. Patching is on the subclass rather
-than the instance: ``__call__`` is looked up on the type, and every entry has
+than the instance: ``raw_call`` is looked up on the type, and every entry has
 its own class, so one entry's guard never reaches another's.
 """
 

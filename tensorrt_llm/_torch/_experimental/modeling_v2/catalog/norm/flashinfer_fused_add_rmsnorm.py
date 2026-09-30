@@ -70,7 +70,7 @@ class _FlashinferFusedAddRmsnorm(OpWrapper):
         """The two values the op writes, as (x_out, residual_out).
 
         Returns rather than mutates so a cell can drive both sides from the
-        same inputs; the kernel's in-place write is what `__call__` does.
+        same inputs; the kernel's in-place write is what `raw_call` does.
         """
         h = x.float() + residual.float()
         normed = h * torch.rsqrt(h.pow(2).mean(dim=-1, keepdim=True) + eps)
