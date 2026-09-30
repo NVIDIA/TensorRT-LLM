@@ -220,8 +220,11 @@ def BOLT_CONSUME = "bolt_consume"
 // `targetArch: aarch64-linux-gnu` alone (see the BOLT-Profile-Gen stage below), so
 // main has no x86_64 bundle. The x86_64 build still asks and takes apply_latest.sh's
 // documented "nothing promoted" exit (3), which Build.groovy reports as a skip and
-// leaves un-BOLTed. It starts consuming on its own once an x86_64 bundle is promoted,
-// with no change here.
+// leaves un-BOLTed.
+//
+// Promoting an x86_64 bundle is necessary but not sufficient to start consuming on
+// that arch. The consume scope and the profile pin are both aarch64-specific, and
+// each has to grow an x86_64 entry alongside the producer.
 @Field
 def ENABLE_BOLT_PREMERGE_CONSUME = true
 
