@@ -7284,11 +7284,9 @@ class PyExecutor:
                     resource_mgr_type].prepare_resources(
                         disagg_gen_init_to_prepare)
 
-        # The context phase of these requests ran on another worker, so the
-        # context branch of _prepare_tp_inputs never latches cached_tokens
-        # for them. Latch the prefix this worker just matched in its own
-        # cache (the blocks it will not receive) where the allocation
-        # decided it, as the context branch does on its first forward.
+        # These requests skip the context branch of _prepare_tp_inputs (their
+        # context phase ran on another worker); latch cached_tokens from the
+        # prefix this worker just matched in its own cache.
         for req in requests:
             req.cached_tokens = req.prepopulated_prompt_len
 

@@ -4944,7 +4944,13 @@ class PyTorchModelEngine(ModelEngine):
         for request in scheduled_requests.generation_requests:
             is_promoted_context = (request.py_request_id
                                    in promoted_context_request_ids)
-            if not is_promoted_context:
+            if is_promoted_context:
+                # A promoted row is a one-token final context chunk riding
+                # the decode path: this is its context-phase forward, so
+                # latch the reused prefix as the context branch does.
+                # Ordinary decode rows never write cached_tokens.
+                request.cached_tokens = request.context_current_position
+            else:
                 all_gen_request_ids.append(request.py_request_id)
             # In speculative iterations, keep promoted rows ahead of existing
             # generation rows in the extend-request packing order. Although
@@ -5069,13 +5075,6 @@ class PyTorchModelEngine(ModelEngine):
                               past_seen_token_num + 1 + num_draft_tokens)))
                 num_cached_tokens_per_seq.append(
                     past_seen_token_num - request.py_num_compressed_tokens)
-                if is_promoted_context:
-                    # A one-token final context chunk on the decode path: this
-                    # is its context-phase forward, so latch the reused prefix
-                    # as the context branch does. Decode steps never write
-                    # cached_tokens: for a disagg generation-only request that
-                    # would be the first write and would report the prompt.
-                    request.cached_tokens = request.context_current_position
                 if _has_cp_helix:
                     # Verify group [base, base+group) in GLOBAL positions.
                     # On a helix gen worker the request's token list is the
@@ -5301,10 +5300,6 @@ class PyTorchModelEngine(ModelEngine):
                         helix_owned_new_tokens.append(
                             0 if request.py_helix_is_inactive_rank else 1)
 
-                if is_promoted_context:
-                    # See the extend branch: only a promoted context chunk
-                    # latches cached_tokens on the decode path.
-                    request.cached_tokens = request.context_current_position
                 for beam in range(beam_width):
                     position_ids.append(position_id)
                     num_cached_tokens_per_seq.append(
