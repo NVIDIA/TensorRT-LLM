@@ -54,3 +54,15 @@ def test_list_and_2d_array_prompts_are_unchanged():
     two_d = np.array([[1, 2], [3, 4]], dtype=np.int32)
     req = GenerationRequest(prompt_token_ids=two_d, sampling_params=SamplingParams(max_tokens=1))
     assert req.prompt_token_ids == [[1, 2], [3, 4]]
+
+
+def test_replacing_the_prompt_drops_the_int32_buffer():
+    req = GenerationRequest(prompt_token_ids=_ids(), sampling_params=SamplingParams(max_tokens=1))
+    req.prompt_token_ids = [6, 7, 8]
+    assert req.__dict__["_prompt_token_ids_i32"] is None
+    assert req.prompt_token_ids == [6, 7, 8]
+    clone = pickle.loads(pickle.dumps(req))
+    assert clone.prompt_token_ids == [6, 7, 8]
+    np.testing.assert_array_equal(
+        clone.__dict__["_prompt_token_ids_i32"], np.array([6, 7, 8], dtype=np.int32)
+    )

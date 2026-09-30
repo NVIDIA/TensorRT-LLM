@@ -226,6 +226,9 @@ class GenerationRequest:
     @prompt_token_ids.setter
     def prompt_token_ids(self, value):
         self._prompt_token_ids = value
+        # base_worker hands the int32 buffer to the engine when it exists, so a
+        # replaced prompt must not leave the old tokens behind in it.
+        self._prompt_token_ids_i32 = None
 
     @staticmethod
     def _enc_tokens(v):
