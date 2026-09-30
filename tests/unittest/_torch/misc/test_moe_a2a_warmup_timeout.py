@@ -1,20 +1,52 @@
-import unittest
-from unittest import mock
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The model engine must publish its warmup phase for MoE communication timeouts.
 
-from tensorrt_llm._torch.pyexecutor import model_engine
+A relaxed warmup budget that latches on into serving would leave hang detection permanently
+slow, and CUDA graphs record their launch arguments, so capture must run with serving budgets.
+See nvbugs/6482566.
+"""
+
+import contextlib
+from collections.abc import Iterator
+
+import pytest
+
+from tensorrt_llm._torch import execution_phase as phase_module
+from tensorrt_llm._torch.execution_phase import (
+    ExecutionPhase,
+    get_execution_phase,
+    set_execution_phase,
+)
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture(autouse=True)
+def isolated_phase_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(phase_module, "_current_phase", ExecutionPhase.SERVING)
+    monkeypatch.setattr(phase_module, "_listeners", [])
+    monkeypatch.setattr(phase_module, "_is_capturing_cuda_graph", lambda: False)
 
 
 class _WarmupFlagStub:
-    """Minimal object that reuses the engine's is_warmup property.
+    """Borrows the engine's ``is_warmup`` property without building a model.
 
-    Building a real PyTorchModelEngine needs a model and a device; the property
-    itself only touches _is_warmup, the MoE all-to-all budget selector, and
-    moe_load_balancer_iter_info (a no-op when moe_load_balancer is None), so a
-    stub exercises the real code path without either.
-
-    The stub borrows the property objects without inheriting, so it has to
-    declare moe_load_balancer itself.
+    The setter only touches ``_is_warmup``, the execution phase, and
+    ``moe_load_balancer_iter_info``, which is a no-op without a load balancer.
     """
 
     is_warmup = PyTorchModelEngine.is_warmup
@@ -22,61 +54,48 @@ class _WarmupFlagStub:
     moe_load_balancer = None
 
 
-class TestMoeA2AWarmupBudget(unittest.TestCase):
-    """The MoE all-to-all completion-flag budget must track the warmup phase.
+class _GraphRunnerStub:
+    def __init__(self) -> None:
+        self.is_warmup_only = False
+        self.padding_dummy_requests: dict[str, object] = {"stale": object()}
 
-    The kernel-side deadline is only safe if it is raised for warmup *and*
-    lowered again afterwards; a budget that latches on would leave the hang
-    watchdog permanently relaxed in steady state. See nvbugs/6482566.
-    """
-
-    def test_set_warmup_forwards_value_to_op(self):
-        with mock.patch.object(
-            model_engine.torch.ops.trtllm, "moe_a2a_set_warmup", create=True
-        ) as op:
-            model_engine._set_moe_a2a_warmup(True)
-            model_engine._set_moe_a2a_warmup(False)
-        self.assertEqual([c.args[0] for c in op.call_args_list], [True, False])
-
-    def test_missing_op_is_tolerated(self):
-        """An older C++ build without the op must not break startup."""
-        with mock.patch.object(
-            model_engine.torch.ops.trtllm,
-            "moe_a2a_set_warmup",
-            create=True,
-            side_effect=AttributeError("no such op"),
-        ):
-            model_engine._set_moe_a2a_warmup(True)  # must not raise
-
-    def test_capture_context_selects_steady_state_then_restores(self):
-        """CUDA graphs bake the budget in at capture time.
-
-        Capture runs inside the warmup window, so the context manager must hand
-        the kernel the steady-state budget and restore warmup afterwards.
-        """
-        seen = []
-        with mock.patch.object(model_engine, "_set_moe_a2a_warmup", side_effect=seen.append):
-            with model_engine._moe_a2a_steady_state_budget_for_capture():
-                self.assertEqual(seen, [False])
-            self.assertEqual(seen, [False, True])
-
-    def test_is_warmup_setter_switches_budget_both_ways(self):
-        """Regression: the budget must not latch on after warmup.
-
-        PyExecutor sets is_warmup=True before calling warmup() and False after,
-        both through this setter. Selecting the budget anywhere else (e.g. only
-        in set_warmup_flag) leaves the relaxed warmup budget in force for the
-        whole serving lifetime.
-        """
-        stub = _WarmupFlagStub()
-        seen = []
-        with mock.patch.object(model_engine, "_set_moe_a2a_warmup", side_effect=seen.append):
-            stub.is_warmup = True
-            stub.is_warmup = False
-
-        self.assertEqual(seen, [True, False])
-        self.assertFalse(stub.is_warmup)
+    @contextlib.contextmanager
+    def allow_capture(self) -> Iterator[None]:
+        yield
 
 
-if __name__ == "__main__":
-    unittest.main()
+class _CaptureEngineStub:
+    """Records the runner mode and execution phase of each CUDA-graph warmup pass."""
+
+    def __init__(self) -> None:
+        self.cuda_graph_runner = _GraphRunnerStub()
+        self.passes: list[tuple[bool, ExecutionPhase]] = []
+
+    @contextlib.contextmanager
+    def maybe_autotune_lora(self) -> Iterator[None]:
+        yield
+
+    def _run_cuda_graph_warmup(self, resource_manager: object) -> None:
+        self.passes.append((self.cuda_graph_runner.is_warmup_only, get_execution_phase()))
+
+
+def test_is_warmup_setter_publishes_the_phase_both_ways() -> None:
+    stub = _WarmupFlagStub()
+
+    stub.is_warmup = True
+    assert get_execution_phase() is ExecutionPhase.WARMUP
+
+    stub.is_warmup = False
+    assert get_execution_phase() is ExecutionPhase.SERVING
+    assert not stub.is_warmup
+
+
+def test_only_the_capturing_pass_runs_in_the_serving_phase() -> None:
+    engine = _CaptureEngineStub()
+    set_execution_phase(ExecutionPhase.WARMUP)
+
+    PyTorchModelEngine._warmup_and_capture_cuda_graphs(engine, resource_manager=None)
+
+    assert engine.passes == [(True, ExecutionPhase.WARMUP), (False, ExecutionPhase.SERVING)]
+    assert get_execution_phase() is ExecutionPhase.WARMUP
+    assert engine.cuda_graph_runner.padding_dummy_requests == {}

@@ -21,13 +21,18 @@ are created in ``communication/nccl_ep.py``. ``use_internal_fp8_dispatch`` gates
 the persistent FP8 scales receive buffer.
 """
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from packaging.version import InvalidVersion, Version
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+from .comm_timeout import register_moe_comm_timeout_sink, unregister_moe_comm_timeout_sink
+
+if TYPE_CHECKING:
+    from nccl.ep import Group
 
 _MIN_NCCL_EP_INT32_TOPK_VERSION = "0.2"
 _NCCL_RUNTIME_ERRORS = (RuntimeError, OSError)
@@ -83,6 +88,28 @@ def nccl_ep_supports_version(minimum_version: str) -> bool:
 def _nccl_ep_supports_int32_topk_idx() -> bool:
     """Return True when the loaded libnccl_ep supports int32 input topk_idx."""
     return nccl_ep_supports_version(_MIN_NCCL_EP_INT32_TOPK_VERSION)
+
+
+def nccl_ep_supports_group_timeout() -> bool:
+    """Return True when ``nccl.ep.Group`` can change its wait-loop timeout after creation."""
+    try:
+        from nccl.ep import Group
+    except _NCCL_AVAILABILITY_ERRORS:
+        return False
+    return hasattr(Group, "set_timeout_ns")
+
+
+class _NcclEpGroupTimeoutSink:
+    """Applies MoE communication timeouts to one NCCL EP group."""
+
+    name = "NcclEP"
+
+    def __init__(self, group: "Group") -> None:
+        self._group = group
+
+    def set_timeout_seconds(self, seconds: int | None) -> None:
+        # The group restores the timeout it resolved at creation for 0.
+        self._group.set_timeout_ns(0 if seconds is None else seconds * 1_000_000_000)
 
 
 # Singleton EP context keyed by (ep_size, ep_rank, max_tokens, num_experts,
@@ -226,6 +253,10 @@ class NcclEpContext:
             max_token_bytes=max_token_bytes,
         )
         self.ep_group = Group.create(self.comm, cfg)
+        # Held here because the timeout policy holds its sinks weakly; ``destroy`` unregisters
+        # the sink before the group goes away.
+        self._timeout_sink = _NcclEpGroupTimeoutSink(self.ep_group)
+        register_moe_comm_timeout_sink(self._timeout_sink)
 
         logger.info(
             f"NCCL EP group created: ep_size={self.ep_size}, "
@@ -361,6 +392,7 @@ class NcclEpContext:
         (the recommended nccl4py pattern), then ``Free`` on the MPI comm.
         """
         if self.ep_group is not None:
+            unregister_moe_comm_timeout_sink(self._timeout_sink)
             try:
                 self.ep_group.destroy()
             except _NCCL_RUNTIME_ERRORS as e:

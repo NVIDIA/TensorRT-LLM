@@ -52,6 +52,8 @@ from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
+from ..execution_phase import (ExecutionPhase, execution_phase,
+                               set_execution_phase)
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -334,35 +336,6 @@ def _configure_deep_gemm_pdl() -> None:
 
     deep_gemm.set_pdl(os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
     _DEEP_GEMM_PDL_CONFIGURED = True
-
-
-@contextlib.contextmanager
-def _moe_a2a_steady_state_budget_for_capture():
-    """Force the steady-state MoE all-to-all budget across CUDA-graph capture.
-
-    The budget is a kernel launch argument, so it is frozen into each captured
-    graph. Capture happens inside the warmup window, so without this a replay
-    would keep warmup's relaxed deadline for the life of the process.
-    """
-    _set_moe_a2a_warmup(False)
-    try:
-        yield
-    finally:
-        _set_moe_a2a_warmup(True)
-
-
-def _set_moe_a2a_warmup(in_warmup: bool) -> None:
-    """Select the MoE all-to-all completion-flag budget for the current phase.
-
-    No-op when the op is unavailable (older bindings).
-    """
-    try:
-        torch.ops.trtllm.moe_a2a_set_warmup(in_warmup)
-        logger.info(f"moe_a2a completion-flag budget: in_warmup={in_warmup}")
-    except (AttributeError, RuntimeError) as e:
-        logger.warning(
-            f"moe_a2a_set_warmup unavailable, the all-to-all timeout "
-            f"budget was not switched: {type(e).__name__}: {e}")
 
 
 class PyTorchModelEngine(ModelEngine):
@@ -1189,9 +1162,10 @@ class PyTorchModelEngine(ModelEngine):
         self._is_warmup = value
 
         # This setter is the one choke point every warmup transition passes
-        # through, including PyExecutor's, so select the MoE all-to-all budget
-        # here rather than in set_warmup_flag().
-        _set_moe_a2a_warmup(value)
+        # through, including PyExecutor's, so publish the execution phase here
+        # rather than in set_warmup_flag().
+        set_execution_phase(
+            ExecutionPhase.WARMUP if value else ExecutionPhase.SERVING)
 
         self.moe_load_balancer_iter_info = (not value, not value)
 
@@ -1588,24 +1562,8 @@ class PyTorchModelEngine(ModelEngine):
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
-        # Warm up every graph shape before capturing any graph. Attention
-        # kernels can switch implementations at smaller batch sizes and require
-        # a larger workspace, so the first pass grows the workspace to its
-        # maximum size. The second pass runs the final per-shape warmup and
-        # captures without resizing the workspace.
-        # Capture with the steady-state MoE all-to-all budget: the timeout is a
-        # launch argument and is baked into every later replay.
-        with self._warmup_timer.phase("cuda_graph_capture"), \
-                _moe_a2a_steady_state_budget_for_capture():
-            with self.cuda_graph_runner.allow_capture():
-                self.cuda_graph_runner.is_warmup_only = True
-                try:
-                    with self.maybe_autotune_lora():
-                        self._run_cuda_graph_warmup(resource_manager)
-                finally:
-                    self.cuda_graph_runner.is_warmup_only = False
-                self.cuda_graph_runner.padding_dummy_requests = {}
-                self._run_cuda_graph_warmup(resource_manager)
+        with self._warmup_timer.phase("cuda_graph_capture"):
+            self._warmup_and_capture_cuda_graphs(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
@@ -1778,7 +1736,8 @@ class PyTorchModelEngine(ModelEngine):
         completion-flag deadline. It is a partial mitigation only: other
         first-touch compiles remain inside collective-bearing forwards, and some
         sit on the all-to-all path itself and cannot be pre-compiled this way.
-        The runtime budget (``moeA2AGetTimeoutCycles``) covers the general case.
+        The warmup communication timeout budget (see ``comm_timeout.py``)
+        covers the general case.
 
         Only the fallback tactics are compiled -- what an eager, cache-miss
         forward selects. The runner's kernel cache key excludes m/n/k, so one
@@ -2665,6 +2624,29 @@ class PyTorchModelEngine(ModelEngine):
             draft_lengths.append(0)
         return [(bs, draft_len) for bs in cuda_graph_batch_sizes
                 for draft_len in draft_lengths]
+
+    def _warmup_and_capture_cuda_graphs(
+            self, resource_manager: ResourceManager) -> None:
+        """Warm up every CUDA-graph shape, then capture the graphs.
+
+        Attention kernels can switch implementations at smaller batch sizes and
+        require a larger workspace, so the first pass grows the workspace to its
+        maximum size without capturing. The second pass runs the final
+        per-shape warmup and captures without resizing the workspace.
+        """
+        with self.cuda_graph_runner.allow_capture():
+            self.cuda_graph_runner.is_warmup_only = True
+            try:
+                with self.maybe_autotune_lora():
+                    self._run_cuda_graph_warmup(resource_manager)
+            finally:
+                self.cuda_graph_runner.is_warmup_only = False
+            self.cuda_graph_runner.padding_dummy_requests = {}
+            # Captured graphs keep the communication timeouts that were current
+            # at capture, and serving replays them, so capture with serving
+            # budgets. The warmup-only pass above keeps the warmup budgets.
+            with execution_phase(ExecutionPhase.SERVING):
+                self._run_cuda_graph_warmup(resource_manager)
 
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):
         """Warm up or capture CUDA graphs for the configured graph shapes."""
