@@ -82,6 +82,9 @@ BOLT_PINNED_REF = (params.boltProfileRef ?: env.boltProfileRef ?: "").toString()
 // The branch the pin was resolved against. Only ever set together with the ref,
 // and authoritative when set -- see the hoist in launchStages.
 BOLT_PINNED_BRANCH = ""
+// The triple the pin was resolved for. This job runs for both architectures off
+// one globalVars, so the pin has to say who it is for; see applyLatestBolt.
+BOLT_PINNED_TRIPLE = ""
 
 // Literals for easier access.
 @Field
@@ -161,6 +164,8 @@ def BOLT_PROFILE_REF = "bolt_profile_ref"
 def BOLT_PUBLISH_VARIANT_KEY = "bolt_publish_variant"
 @Field
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+@Field
+def BOLT_PROFILE_TRIPLE = "bolt_profile_triple"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -177,6 +182,7 @@ def globalVars = [
     (BOLT_PROFILE_REF): "",
     (BOLT_PUBLISH_VARIANT_KEY): false,
     (BOLT_PROFILE_BRANCH): "",
+    (BOLT_PROFILE_TRIPLE): "",
 ]
 
 // TODO: Move common variables to an unified location
@@ -585,6 +591,20 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     // place and find nothing.
     def branch = BOLT_PINNED_BRANCH ?: (env.gitlabTargetBranch ?: env.branch_name ?: "main")
     def triple = is_linux_x86_64 ? "x86_64-linux-gnu" : "aarch64-linux-gnu"
+    // A pin addressed to another triple means this one has nothing to consume, so
+    // stop before doing any work to find that out. Only aarch64 has a profile
+    // producer, so the pin exists under aarch64-linux-gnu alone -- but this job
+    // runs for both architectures off one globalVars. Carrying on would stage
+    // llvm-bolt and then ask for a bundle that was never promoted, reaching a 404
+    // the pinned-miss check below rightly calls fatal: every post-merge x86_64
+    // build would fail. Keyed on the pin rather than the arch so pre-merge is
+    // untouched (pinning is post-merge only, so BOLT_PINNED_REF is empty there and
+    // this does not fire) and so no edit is needed once x86_64 has a producer.
+    if (BOLT_PINNED_REF && BOLT_PINNED_TRIPLE != triple) {
+        echo "[bolt-consume] pipeline pinned ${BOLT_PINNED_REF} for ${BOLT_PINNED_TRIPLE}; " +
+             "no bundle is pinned for ${triple}, skipping (build stays un-BOLTed)"
+        return
+    }
     // The bundle this pipeline pinned, or "" to take whatever `latest` is now.
     // Exported to apply_latest.sh, which passes it to artifactory.sh; also stamped
     // onto the published artifact so a consumer can verify what it received.
@@ -745,7 +765,9 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         if (globalVars[BOLT_PROFILE_REF]) {
             BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF].toString()
             BOLT_PINNED_BRANCH = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
-            echo "[bolt-consume] pinned to profile bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
+            BOLT_PINNED_TRIPLE = globalVars[BOLT_PROFILE_TRIPLE]?.toString() ?: ""
+            echo "[bolt-consume] pinned to profile bundle ${BOLT_PINNED_REF} on " +
+                 "${BOLT_PINNED_BRANCH} for ${BOLT_PINNED_TRIPLE}"
         }
         // Same reason as boltConsume directly above: boltPublishVariant is not
         // registered on the remote build jobs, so the Parameterized Remote

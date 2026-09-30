@@ -296,6 +296,14 @@ def BOLT_PUBLISH_VARIANT = "bolt_publish_variant"
 // branch with the ref means a pinned consumer never has to guess.
 @Field
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+// The target triple the pin was resolved for. Only aarch64 has a profile
+// producer, so the pin addresses an object under aarch64-linux-gnu and nowhere
+// else -- yet consumers are launched for both architectures off this one map.
+// Saying which triple the pin is for lets a consumer recognize a pin that is
+// not addressed to it and stay on `latest`, instead of demanding a bundle that
+// was never promoted. See applyLatestBolt in Build.groovy.
+@Field
+def BOLT_PROFILE_TRIPLE = "bolt_profile_triple"
 @Field
 def RELEASE_TARGET = "release_target"
 def globalVars = [
@@ -311,6 +319,7 @@ def globalVars = [
     (BOLT_PROFILE_REF): "",
     (BOLT_PUBLISH_VARIANT): (env.JOB_NAME ==~ /.*PostMerge.*/) && ENABLE_BOLT_POSTMERGE_VARIANT,
     (BOLT_PROFILE_BRANCH): "",
+    (BOLT_PROFILE_TRIPLE): "",
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // Compare against "true" rather than relying on Groovy truthiness: the bot phrase
@@ -622,11 +631,16 @@ def preparation(pipeline, testFilter, globalVars)
         // where the resolver's script lives.
         stage("Pin BOLT Profile Bundle") {
             def pinBranch = globalVars[BUILD_BRANCH]
-            def pinRef = resolveBoltProfileRef(pinBranch)
+            // Named here rather than left to the resolver's default so the pin and
+            // the triple published beside it cannot drift apart.
+            def pinTriple = "aarch64-linux-gnu"
+            def pinRef = resolveBoltProfileRef(pinBranch, pinTriple)
             globalVars[BOLT_PROFILE_REF] = pinRef
-            // Only meaningful alongside a ref, so it is left empty when the pin
-            // does not resolve -- a consumer cannot then half-honour a pin.
+            // Branch and triple are only meaningful alongside a ref, so both are
+            // left empty when the pin does not resolve -- a consumer cannot then
+            // half-honour a pin.
             globalVars[BOLT_PROFILE_BRANCH] = pinRef ? pinBranch : ""
+            globalVars[BOLT_PROFILE_TRIPLE] = pinRef ? pinTriple : ""
         }
         stage("Upload Build Info") {
             try {
@@ -2480,6 +2494,20 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 'targetArch': "aarch64-linux-gnu",
                                 'branch': globalVars[BUILD_BRANCH],
                                 'promote': "true",
+                                // Exactly ONE writer publishes a BOLTed build per
+                                // commit, and this launch site is where that choice
+                                // is made. The SBSA build stage is that writer (see
+                                // BOLT_PUBLISH_VARIANT): it publishes
+                                // bolted-<tarName> and leaves canonical un-BOLTed on
+                                // purpose, canonical being this job's own input and
+                                // what every consumer not yet migrated still
+                                // fetches. BoltProfileGen's canonical repush is the
+                                // other writer and would overwrite exactly that.
+                                // Already its default, but sent explicitly: the
+                                // default lives in a job config editable outside
+                                // this repo, and a flip there would silently put
+                                // both writers on the same object.
+                                'boltPublishCanonical': "false",
                             ]
                             launchJob(pipeline, "/LLM/helpers/BoltProfileGen", false, false, globalVars, "SBSA", additionalParameters)
                         }
