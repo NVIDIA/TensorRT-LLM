@@ -991,21 +991,17 @@ class RemoteMpiCommSessionServer():
         if grace <= 0:
             self.session.abort()
             return
-        executor = None
-        if (isinstance(self.session, MpiCommSession)
-                and self.session.mpi_pool is not None
-                and self.session.mpi_pool is MPINodeState._global_mpi_pool):
-            executor = MPINodeState._global_comm_executor
+        deadline = time.monotonic() + grace
+        uses_global_pool = (isinstance(self.session, MpiCommSession)
+                            and self.session.mpi_pool is not None
+                            and self.session.mpi_pool
+                            is MPINodeState._global_mpi_pool)
         finished = threading.Event()
         errors = []
 
         def shutdown():
             try:
                 self.session.shutdown()
-                if executor is not None:
-                    executor.__exit__(None, None, None)
-                    MPINodeState._global_comm_executor = None
-                    MPINodeState._global_mpi_pool = None
             except BaseException as error:
                 errors.append(error)
             finally:
@@ -1015,7 +1011,7 @@ class RemoteMpiCommSessionServer():
                                   name="RemoteMpiSessionShutdown",
                                   daemon=True)
         thread.start()
-        if not finished.wait(grace):
+        if not finished.wait(max(0.0, deadline - time.monotonic())):
             logger.error(f"Remote MPI shutdown exceeded {grace}s; aborting")
             self.session.abort()
         elif errors:
@@ -1023,6 +1019,13 @@ class RemoteMpiCommSessionServer():
             self.session.abort()
         else:
             thread.join()
+            if uses_global_pool:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.session.abort()
+                else:
+                    self._close_global_comm_executor(grace=remaining,
+                                                     abort=self.session.abort)
 
     def serve(self):
         """Handle completions and control messages without waiting on a rank.

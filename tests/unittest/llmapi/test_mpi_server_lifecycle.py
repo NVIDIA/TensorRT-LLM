@@ -231,15 +231,58 @@ def test_final_owner_shutdown_closes_shared_executor(monkeypatch, failure):
         assert mpi.MPINodeState._global_mpi_pool is None
 
 
-def test_unrelated_global_executor_is_not_closed(monkeypatch):
+@pytest.mark.parametrize("comm_session", [False, True])
+def test_unrelated_global_executor_is_not_closed(monkeypatch, comm_session):
     executor = Mock()
     executor.__exit__ = Mock()
     monkeypatch.setattr(mpi.MPINodeState, "_global_comm_executor", executor)
+    monkeypatch.setattr(mpi.MPINodeState, "_global_mpi_pool", object())
     server = object.__new__(mpi.RemoteMpiCommSessionServer)
-    server.session = SimpleNamespace(shutdown=Mock(), abort=Mock())
+    if comm_session:
+
+        class TestSession(mpi.MpiCommSession):
+            def __del__(self):
+                pass
+
+        server.session = object.__new__(TestSession)
+        server.session.mpi_pool = object()
+        server.session.shutdown = Mock()
+        server.session.abort = Mock()
+    else:
+        server.session = SimpleNamespace(shutdown=Mock(), abort=Mock())
     server._shutdown_session(1)
     executor.__exit__.assert_not_called()
     server.session.abort.assert_not_called()
+
+
+@pytest.mark.parametrize("shutdown_seconds", [7, 10])
+def test_global_executor_close_uses_remaining_session_deadline(monkeypatch, shutdown_seconds):
+    class TestSession(mpi.MpiCommSession):
+        def __del__(self):
+            pass
+
+    session = object.__new__(TestSession)
+    session.mpi_pool = object()
+    session.abort = Mock()
+    monkeypatch.setattr(mpi.MPINodeState, "_global_mpi_pool", session.mpi_pool)
+    now = [100.0]
+    monkeypatch.setattr(mpi.time, "monotonic", lambda: now[0])
+
+    def shutdown():
+        now[0] += shutdown_seconds
+        session.mpi_pool = None
+
+    session.shutdown = shutdown
+    server = object.__new__(mpi.RemoteMpiCommSessionServer)
+    server.session = session
+    server._close_global_comm_executor = Mock()
+    server._shutdown_session(10)
+    if shutdown_seconds == 7:
+        server._close_global_comm_executor.assert_called_once_with(grace=3, abort=session.abort)
+        session.abort.assert_not_called()
+    else:
+        server._close_global_comm_executor.assert_not_called()
+        session.abort.assert_called_once_with()
 
 
 def test_shutdown_timeout_aborts_the_world():
