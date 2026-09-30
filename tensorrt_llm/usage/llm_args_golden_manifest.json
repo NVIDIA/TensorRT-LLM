@@ -503,6 +503,11 @@
       "path": "guided_decoding_backend"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "iter_perf_stats_interval"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "iter_stats_max_iterations"

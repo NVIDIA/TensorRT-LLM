@@ -5861,6 +5861,20 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats.",
         status="prototype")
 
+    iter_perf_stats_interval: PositiveInt = Field(
+        default=1,
+        description=
+        "Build an iteration statistics record only every N executor iterations "
+        "when enable_iter_perf_stats is true, which reduces the host overhead "
+        "of collecting the statistics (including the per-request statistics of "
+        "enable_iter_req_stats). A value of 1 builds a record every iteration. "
+        "With N > 1, numCompletedRequests and numNewActiveRequests in each "
+        "record also include the iterations skipped since the previous record, "
+        "so their sums over all records stay exact, and one extra record is "
+        "emitted when the last active request finishes. All other fields "
+        "describe only the sampled iteration.",
+        status="prototype")
+
     print_iter_log: bool = Field(default=False,
                                  description="Print iteration logs.",
                                  status="beta")
