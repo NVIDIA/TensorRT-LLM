@@ -55,6 +55,7 @@ if _BACKEND == "python":
         BatchDesc,
         BufferConfig,
         CacheTierConfig,
+        ConstraintPolicy,
         DataRole,
         DiskCacheTierConfig,
         GpuCacheTierConfig,
@@ -164,6 +165,7 @@ else:
     AggregatedPageDesc = _cpp.AggregatedPageDesc
     AttentionLayerConfig = _cpp.AttentionLayerConfig
     BatchDesc = _cpp.BatchDesc
+    ConstraintPolicy = _cpp.ConstraintPolicy
     # BatchDesc is also consumed via dataclasses.replace(): MambaCacheManager's
     # _build_cache_config appends dummy KVCacheDesc slots to each constraint with
     # replace(batch, kv_caches=[...]). Like KVCacheManagerConfig below, the C++
@@ -178,8 +180,15 @@ else:
         kv_caches: object = None
         system_prompt_length: int = 0
 
+    @_dataclasses_bd.dataclass
+    class _KVCacheDescFieldSpec:
+        capacity: int = 0
+        history_length: int = 0
+        constraint_policy: object = None
+
     BatchDesc.__dataclass_fields__ = _BatchDescFieldSpec.__dataclass_fields__
-    del _BatchDescFieldSpec, _dataclasses_bd
+    _cpp.KVCacheDesc.__dataclass_fields__ = _KVCacheDescFieldSpec.__dataclass_fields__
+    del _BatchDescFieldSpec, _KVCacheDescFieldSpec, _dataclasses_bd
     BufferConfig = _cpp.BufferConfig
     BufferId = _cpp.BufferId
     CoalescedBuffer = _cpp.CoalescedBuffer
@@ -330,6 +339,7 @@ __all__ = [
     "BAD_PAGE_INDEX",
     "CACHE_LEVEL1",
     "BatchDesc",
+    "ConstraintPolicy",
     "BeamIndex",
     "BufferConfig",
     "BufferId",

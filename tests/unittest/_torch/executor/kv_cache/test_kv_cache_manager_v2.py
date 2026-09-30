@@ -56,6 +56,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BatchDesc,
     BufferConfig,
     CacheLevel,
+    ConstraintPolicy,
     CudaStream,
     DataRole,
     DiskCacheTierConfig,
@@ -844,13 +845,68 @@ def test_avg_seq_len_builds_warmup_constraints() -> None:
     assert config.constraints == [
         BatchDesc(
             [
-                KVCacheDesc(capacity=1024, history_length=1023),
+                KVCacheDesc(
+                    capacity=1024,
+                    history_length=1021,
+                    constraint_policy=ConstraintPolicy.FIT_TO_QUOTA,
+                ),
                 KVCacheDesc(capacity=3, history_length=0),
                 KVCacheDesc(capacity=3, history_length=0),
             ]
         ),
         BatchDesc([KVCacheDesc(capacity=2048, history_length=0)]),
     ]
+
+
+@pytest.mark.parametrize("is_estimating", [False, True], ids=["final", "estimation"])
+@pytest.mark.parametrize("budget_type", ["bytes", "tokens"])
+def test_long_constraint_fits_runtime_quota(
+    monkeypatch: pytest.MonkeyPatch, is_estimating: bool, budget_type: str
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    init_cuda_once()
+    monkeypatch.delenv("TRTLLM_KV_GUARD_PAGE", raising=False)
+    budget = {"max_gpu_total_bytes": 17 << 20} if budget_type == "bytes" else {"max_tokens": 8192}
+    config = KvCacheConfig(
+        use_kv_cache_manager_v2=True,
+        enable_block_reuse=False,
+        host_cache_size=0,
+        avg_seq_len=32768,
+        **budget,
+    )
+    manager = KVCacheManagerV2(
+        config,
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=131072,
+        max_batch_size=8,
+        max_num_tokens=2048,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        is_estimating_kv_cache=is_estimating,
+    )
+    try:
+        requested = manager.kv_cache_manager_py_config.cache_tiers[0].quota
+        assert 0 < manager.impl.get_quota(kv_cache_v2_module.GPU_LEVEL) <= requested
+        assert manager.max_num_tokens < manager.max_seq_len < 131072
+        requests = manager.add_dummy_requests(
+            [0], token_nums=[manager.max_num_tokens // 2], is_gen=False
+        )
+        assert requests is not None
+        try:
+            cache = manager.kv_cache_map[requests[0].py_request_id]
+            assert cache.resize(manager.max_num_tokens, history_length=0)
+            cache.suspend()
+            assert cache.resume(torch.cuda.current_stream().cuda_stream)
+        finally:
+            for request in requests:
+                manager.free_resources(request)
+    finally:
+        manager.shutdown()
 
 
 def test_avg_seq_len_updates_typical_step() -> None:

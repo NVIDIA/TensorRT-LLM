@@ -38,7 +38,7 @@ from .._common import (
     Priority,
     TokenIdExt,
 )
-from .._config import DataRole, KVCacheManagerConfig
+from .._config import BatchDesc, DataRole, KVCacheManagerConfig
 from .._exceptions import LogicError
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._page import Page, _PageHolder
@@ -1155,6 +1155,11 @@ class KVCacheManager:
     @property
     def init_config(self) -> KVCacheManagerConfig:
         return self._init_config
+
+    @property
+    def resolved_constraints(self) -> list[BatchDesc]:
+        """Initialization workloads selected by GPU quota planning."""
+        return deepcopy(self._storage.resolved_constraints)
 
     @property
     def commit_min_snapshot(self) -> bool:

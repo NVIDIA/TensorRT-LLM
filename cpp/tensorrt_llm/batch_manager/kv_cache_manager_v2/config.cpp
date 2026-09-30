@@ -18,6 +18,7 @@
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/exceptions.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <set>
 #include <stdexcept>
@@ -37,15 +38,38 @@ void DiskCacheTierConfig::assertValid() const
     }
 }
 
+void KVCacheDesc::validateConstraintPolicy() const
+{
+    if (constraintPolicy == ConstraintPolicy::kFixed)
+    {
+        return;
+    }
+    if (constraintPolicy != ConstraintPolicy::kFitToQuota)
+    {
+        throw std::invalid_argument("Unknown constraint policy");
+    }
+    if (capacity <= 0)
+    {
+        throw std::invalid_argument("FIT_TO_QUOTA requires positive capacity");
+    }
+}
+
 void KVCacheManagerConfig::validate() const
 {
     if (swaScratchReuse.has_value())
     {
         swaScratchReuse->validate();
     }
+    int flexibleCount = 0;
     for (auto const& batch : constraints)
     {
         batch.validate();
+        flexibleCount += std::count_if(batch.kvCaches.begin(), batch.kvCaches.end(),
+            [](KVCacheDesc const& request) { return request.constraintPolicy == ConstraintPolicy::kFitToQuota; });
+    }
+    if (flexibleCount > 1)
+    {
+        throw std::invalid_argument("Only one FIT_TO_QUOTA request is supported across initialization constraints");
     }
     if (typicalStep.has_value())
     {

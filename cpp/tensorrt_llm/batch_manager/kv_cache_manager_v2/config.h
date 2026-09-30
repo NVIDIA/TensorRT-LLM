@@ -187,21 +187,40 @@ using LayerConfig = std::variant<AttentionLayerConfig, SsmLayerConfig>;
 // KVCacheDesc — describes one KV cache request's capacity and history length.
 // Mirrors _config.py::KVCacheDesc.
 // ---------------------------------------------------------------------------
+enum class ConstraintPolicy
+{
+    //! Preserve legacy behavior, including growing GPU quota to fit fixed workloads.
+    kFixed,
+    //! Fit the full initialization envelope within the original hot GPU quota.
+    //! Reduce this request's capacity and history together; preserve all peers
+    //! and other constraints. The minimum capacity is max(1, capacity - history).
+    //! Search the original, minimum and block-aligned capacities. Reject infeasible
+    //! envelopes without allocating oversized pools. At most one request may opt in;
+    //! shared system prompts are unsupported for its batch.
+    kFitToQuota,
+};
+
 struct KVCacheDesc
 {
     int capacity = 0;
     int historyLength = 0;
+    // Only used when this descriptor belongs to an initialization constraint.
+    ConstraintPolicy constraintPolicy = ConstraintPolicy::kFixed;
 
     void validate() const
     {
         TLLM_CHECK(0 <= historyLength && historyLength <= capacity);
+        validateConstraintPolicy();
     }
+
+    void validateConstraintPolicy() const;
 
     // Value equality, mirroring the Python @dataclass(frozen=True) semantics the
     // bindings replace. Required so tests can compare descs by value.
     bool operator==(KVCacheDesc const& other) const noexcept
     {
-        return capacity == other.capacity && historyLength == other.historyLength;
+        return capacity == other.capacity && historyLength == other.historyLength
+            && constraintPolicy == other.constraintPolicy;
     }
 
     bool operator!=(KVCacheDesc const& other) const noexcept
@@ -225,6 +244,10 @@ struct BatchDesc
         for (auto const& desc : kvCaches)
         {
             desc.validate();
+            if (systemPromptLength != 0 && desc.constraintPolicy == ConstraintPolicy::kFitToQuota)
+            {
+                throw std::invalid_argument("FIT_TO_QUOTA does not support a shared system prompt");
+            }
         }
     }
 
