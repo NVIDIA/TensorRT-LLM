@@ -1470,8 +1470,8 @@ def report_usage(
     """Start background usage telemetry reporting.
 
     Call this once after model initialization. It starts an initial/heartbeat
-    daemon and a one-shot exit sender so shutdown cannot queue behind a blocked
-    heartbeat. Subsequent calls are no-ops (one pair per reporting process).
+    daemon and a one-shot exit report sender so shutdown cannot queue behind a
+    blocked heartbeat. Subsequent calls are no-ops (one pair per reporting process).
 
     This function is fail-silent -- it will never raise an exception or
     block the calling thread.
