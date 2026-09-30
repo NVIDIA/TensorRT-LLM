@@ -23,12 +23,14 @@ import pytest
 import torch
 
 import tensorrt_llm
+import tensorrt_llm._torch.pyexecutor.engine.model_call as model_call_module
 import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -283,18 +285,17 @@ def test_prefill_compile_scopes_whole_model_forward(
         observed.append(is_torch_compiling())
         return "done"
 
+    model = SimpleNamespace(model_config=SimpleNamespace(extra_attrs={}), forward=forward)
     engine = SimpleNamespace(
-        model=SimpleNamespace(model_config=SimpleNamespace(extra_attrs={}), forward=forward),
-        _torch_compile_backend=None,
-        _torch_compile_prefill_only=prefill_only,
+        _model_caller=ModelCaller(model, prefill_compile_only=prefill_only),
         _eager_workspace_reclaimer=None,
         is_warmup=False,
     )
-    monkeypatch.setattr(model_engine_module, "get_model_extra_attrs", lambda: {})
+    monkeypatch.setattr(model_call_module, "get_model_extra_attrs", lambda: {})
     monkeypatch.setattr(
-        model_engine_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
+        model_call_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
     )
-    monkeypatch.setattr(model_engine_module, "is_trace_enabled", lambda name: False)
+    monkeypatch.setattr(model_call_module, "is_trace_enabled", lambda name: False)
     with torch_compiling(True):
         if raises:
             with pytest.raises(RuntimeError, match="epilogue failure"):
@@ -376,6 +377,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _release_megamoe_profiling_scratch=Mock(),
         forward=Mock(),
     )
+    engine._model_caller = ModelCaller(engine.model, prefill_compile_only=prefill_only)
     cache = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
     resources = SimpleNamespace(
         get_resource_manager=lambda key: cache if key == "kv_cache" else None
@@ -387,14 +389,14 @@ def test_compiled_mxfp8_warmup_backend_selection(
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(model_engine_module, "clear_memory_buffers", lambda: None)
-    monkeypatch.setattr(model_engine_module, "get_model_extra_attrs", lambda: {})
-    monkeypatch.setattr(model_engine_module, "is_trace_enabled", lambda name: False)
+    monkeypatch.setattr(model_call_module, "get_model_extra_attrs", lambda: {})
+    monkeypatch.setattr(model_call_module, "is_trace_enabled", lambda name: False)
 
     def forward(batch: Mock, **kwargs: object) -> torch.Tensor:
-        # Stand in for input preparation, but use the real engine compile scope
+        # Stand in for input preparation, but use the real model-call compile scope
         # and linear dispatch for each prefill/generation warmup batch.
         monkeypatch.setattr(
-            model_engine_module,
+            model_call_module,
             "get_per_request_prefill_cuda_graph_flag",
             lambda: batch.num_gen_requests == 0,
         )
@@ -658,6 +660,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        model_engine._fallback_to_engine = False
         model_engine._runner = Mock(spec=NoKVCacheRunner)
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
@@ -669,7 +672,7 @@ class TestWarmupCleanup(unittest.TestCase):
 
         self.assertEqual(
             model_engine._runner.method_calls,
-            [call.warmup(resource_manager), call.capture_graphs(resource_manager)],
+            [call.warmup(resource_manager)],
         )
         warmup_sampling.assert_not_called()
 
@@ -679,7 +682,11 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        model_engine._fallback_to_engine = False
         model_engine._runner = Mock(spec=NoKVCacheRunner)
+        runner = model_engine._runner
+        runner._validate_resources = NoKVCacheRunner._validate_resources.__get__(runner)
+        runner.warmup.side_effect = NoKVCacheRunner.warmup.__get__(runner)
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = object()
 
@@ -689,7 +696,7 @@ class TestWarmupCleanup(unittest.TestCase):
         ):
             model_engine.warmup(resource_manager)
 
-        self.assertEqual(model_engine._runner.method_calls, [])
+        model_engine._runner.warmup.assert_called_once_with(resource_manager)
 
     @pytest.mark.cpu_only
     def test_legacy_warmup_skips_without_kv_cache(self):
@@ -699,6 +706,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.is_warmup = False
         model_engine.enable_in_graph_sampling = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        model_engine._fallback_to_engine = True
         model_engine._runner = None
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
@@ -728,7 +736,7 @@ class TestWarmupCleanup(unittest.TestCase):
 
         self.assertEqual(
             model_engine._runner.method_calls,
-            [call.warmup(resource_manager), call.capture_graphs(resource_manager)],
+            [call.warmup(resource_manager)],
         )
 
     def test_empty_cache_fires_immediately_after_autotuner(self):
