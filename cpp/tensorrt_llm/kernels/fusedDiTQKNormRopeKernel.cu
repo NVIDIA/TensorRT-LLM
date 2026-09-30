@@ -639,6 +639,190 @@ void launchFusedDiTQKNormRopeFullDim(void* qkv, int num_tokens, int num_heads_q,
 #undef LAUNCH
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Tensor-parallel full-dim path. The collective deliberately lives outside
+// these kernels so callers can use the process group's normal all-reduce.
+
+__global__ void ditQKNormRopeFullDimTpPrepareKernel(__nv_bfloat16 const* qkv, float* local_sums, int const num_tokens,
+    int const num_heads_q, int const num_heads_k, int const num_heads_v, int const head_dim)
+{
+    int const token = blockIdx.x;
+    if (token >= num_tokens)
+        return;
+
+    int const q_size = num_heads_q * head_dim;
+    int const k_size = num_heads_k * head_dim;
+    int const row_size = (num_heads_q + num_heads_k + num_heads_v) * head_dim;
+    int64_t const q_base = static_cast<int64_t>(token) * row_size;
+    int64_t const k_base = q_base + q_size;
+    float q_sum = 0.0f;
+    float k_sum = 0.0f;
+    for (int i = threadIdx.x; i < q_size; i += blockDim.x)
+    {
+        float const x = __bfloat162float(qkv[q_base + i]);
+        q_sum += x * x;
+    }
+    for (int i = threadIdx.x; i < k_size; i += blockDim.x)
+    {
+        float const x = __bfloat162float(qkv[k_base + i]);
+        k_sum += x * x;
+    }
+
+    q_sum = tensorrt_llm::common::warpReduceSum(q_sum);
+    k_sum = tensorrt_llm::common::warpReduceSum(k_sum);
+    __shared__ float warp_sums[16]; // two values for each of eight warps
+    int const lane = threadIdx.x & 31;
+    int const warp = threadIdx.x >> 5;
+    if (lane == 0)
+    {
+        warp_sums[2 * warp] = q_sum;
+        warp_sums[2 * warp + 1] = k_sum;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        float q_total = 0.0f;
+        float k_total = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+        {
+            q_total += warp_sums[2 * i];
+            k_total += warp_sums[2 * i + 1];
+        }
+        local_sums[2 * token] = q_total;
+        local_sums[2 * token + 1] = k_total;
+    }
+}
+
+template <int HEAD_DIM, bool INTERLEAVE, bool PER_HEAD_COS, typename CosT>
+__global__ void ditQKNormRopeFullDimTpApplyKernel(__nv_bfloat16* qkv, float const* global_sums, int const num_tokens,
+    int const num_heads_q, int const num_heads_k, int const num_heads_v, int const global_q_hidden_size,
+    int const global_k_hidden_size, float const eps, __nv_bfloat16 const* q_weight, __nv_bfloat16 const* k_weight,
+    CosT const* cos_emb, CosT const* sin_emb, int const cos_heads, int const cos_seq_per_batch)
+{
+    int const token = blockIdx.x;
+    int const qk_head = blockIdx.y;
+    int const total_qk_heads = num_heads_q + num_heads_k;
+    if (token >= num_tokens || qk_head >= total_qk_heads)
+        return;
+
+    bool const is_q = qk_head < num_heads_q;
+    int const head = is_q ? qk_head : qk_head - num_heads_q;
+    int const local_q_size = num_heads_q * HEAD_DIM;
+    int const row_size = (num_heads_q + num_heads_k + num_heads_v) * HEAD_DIM;
+    int64_t const row_base = static_cast<int64_t>(token) * row_size;
+    int64_t const head_base = row_base + (is_q ? head * HEAD_DIM : local_q_size + head * HEAD_DIM);
+    int const weight_base = head * HEAD_DIM;
+    float const denom = static_cast<float>(is_q ? global_q_hidden_size : global_k_hidden_size);
+    float const inv_rms = rsqrtf(global_sums[2 * token + (is_q ? 0 : 1)] / denom + eps);
+
+    int const dim = threadIdx.x;
+    bool const active = dim < HEAD_DIM;
+
+    // Every thread reads both members of its pair before any thread writes the
+    // head. This makes the in-place transform race-free for both RoPE layouts.
+    int partner_dim = 0;
+    float partner_sign = 0.0f;
+    float x = 0.0f;
+    float partner = 0.0f;
+    if (active)
+    {
+        if constexpr (INTERLEAVE)
+        {
+            partner_dim = dim ^ 1;
+            partner_sign = (dim & 1) ? 1.0f : -1.0f;
+        }
+        else
+        {
+            partner_dim = (dim < HEAD_DIM / 2) ? dim + HEAD_DIM / 2 : dim - HEAD_DIM / 2;
+            partner_sign = (dim < HEAD_DIM / 2) ? -1.0f : 1.0f;
+        }
+        x = __bfloat162float(qkv[head_base + dim]) * __bfloat162float((is_q ? q_weight : k_weight)[weight_base + dim])
+            * inv_rms;
+        partner = __bfloat162float(qkv[head_base + partner_dim])
+            * __bfloat162float((is_q ? q_weight : k_weight)[weight_base + partner_dim]) * inv_rms;
+    }
+    __syncthreads();
+    if (!active)
+        return;
+
+    int const cos_token = cos_seq_per_batch > 0 ? token % cos_seq_per_batch : token;
+    int64_t const cos_base = static_cast<int64_t>(cos_token) * (PER_HEAD_COS ? cos_heads * HEAD_DIM : HEAD_DIM)
+        + (PER_HEAD_COS ? head * HEAD_DIM : 0);
+    float c, s;
+    if constexpr (std::is_same_v<CosT, float>)
+    {
+        c = cos_emb[cos_base + dim];
+        s = sin_emb[cos_base + dim];
+    }
+    else
+    {
+        c = __bfloat162float(cos_emb[cos_base + dim]);
+        s = __bfloat162float(sin_emb[cos_base + dim]);
+    }
+    qkv[head_base + dim] = __float2bfloat16_rn(x * c + partner_sign * partner * s);
+}
+
+void launchDiTQKNormRopeFullDimTpPrepare(void const* qkv, float* local_sums, int num_tokens, int num_heads_q,
+    int num_heads_k, int num_heads_v, int head_dim, cudaStream_t stream)
+{
+    if (num_tokens == 0)
+        return;
+    ditQKNormRopeFullDimTpPrepareKernel<<<num_tokens, 256, 0, stream>>>(reinterpret_cast<__nv_bfloat16 const*>(qkv),
+        local_sums, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim);
+}
+
+void launchDiTQKNormRopeFullDimTpApply(void* qkv, float const* global_sums, int num_tokens, int num_heads_q,
+    int num_heads_k, int num_heads_v, int head_dim, int global_q_hidden_size, int global_k_hidden_size, float eps,
+    void const* q_weight, void const* k_weight, void const* cos_emb, void const* sin_emb, bool interleave,
+    bool per_head_cos, bool cos_is_bf16, int cos_heads, int cos_seq_per_batch, cudaStream_t stream)
+{
+    if (num_tokens == 0)
+        return;
+    dim3 const grid(num_tokens, num_heads_q + num_heads_k);
+#define LAUNCH_TP_APPLY(HEAD_DIM, INTERLEAVE, PER_HEAD, COS_T)                                                         \
+    ditQKNormRopeFullDimTpApplyKernel<HEAD_DIM, INTERLEAVE, PER_HEAD, COS_T><<<grid, 128, 0, stream>>>(                \
+        reinterpret_cast<__nv_bfloat16*>(qkv), global_sums, num_tokens, num_heads_q, num_heads_k, num_heads_v,         \
+        global_q_hidden_size, global_k_hidden_size, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),             \
+        reinterpret_cast<__nv_bfloat16 const*>(k_weight), reinterpret_cast<COS_T const*>(cos_emb),                     \
+        reinterpret_cast<COS_T const*>(sin_emb), cos_heads, cos_seq_per_batch)
+#define DISPATCH_TP_LAYOUT(HEAD_DIM, COS_T)                                                                            \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (interleave)                                                                                                \
+        {                                                                                                              \
+            if (per_head_cos)                                                                                          \
+                LAUNCH_TP_APPLY(HEAD_DIM, true, true, COS_T);                                                          \
+            else                                                                                                       \
+                LAUNCH_TP_APPLY(HEAD_DIM, true, false, COS_T);                                                         \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            if (per_head_cos)                                                                                          \
+                LAUNCH_TP_APPLY(HEAD_DIM, false, true, COS_T);                                                         \
+            else                                                                                                       \
+                LAUNCH_TP_APPLY(HEAD_DIM, false, false, COS_T);                                                        \
+        }                                                                                                              \
+    } while (0)
+#define DISPATCH_TP_DTYPE(HEAD_DIM)                                                                                    \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (cos_is_bf16)                                                                                               \
+            DISPATCH_TP_LAYOUT(HEAD_DIM, __nv_bfloat16);                                                               \
+        else                                                                                                           \
+            DISPATCH_TP_LAYOUT(HEAD_DIM, float);                                                                       \
+    } while (0)
+    switch (head_dim)
+    {
+    case 64: DISPATCH_TP_DTYPE(64); break;
+    case 128: DISPATCH_TP_DTYPE(128); break;
+    default: TLLM_THROW("Unsupported head_dim for TP full-dim Q/K RMSNorm + RoPE: %d", head_dim);
+    }
+#undef DISPATCH_TP_DTYPE
+#undef DISPATCH_TP_LAYOUT
+#undef LAUNCH_TP_APPLY
+}
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

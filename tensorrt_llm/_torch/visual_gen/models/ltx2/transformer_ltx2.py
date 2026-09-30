@@ -164,6 +164,9 @@ class LTX2Attention(Attention):
             bias=True,
             interleave=(rope_type == LTXRopeType.INTERLEAVED),
             fuse_qk_norm_rope=True,
+            # LTX-2 uses per-head RoPE. Keep TP on the unfused path until the
+            # staged TP kernel supports global per-head frequency indexing.
+            fuse_qk_norm_rope_tp=False,
             config=config,
             layer_idx=layer_idx,
             module_name=module_name,

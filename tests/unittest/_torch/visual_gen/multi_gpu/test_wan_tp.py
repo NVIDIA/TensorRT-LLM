@@ -303,6 +303,8 @@ def _logic_wan_t2v_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
     tp_config = _make_model_config(config_dict, tp_size=world_size)
     tp_model = WanTransformer3DModel(tp_config).to(device).to(compute_dtype)
     _copy_ref_weights_to_tp(ref_model, tp_model, rank, world_size, config_dict)
+    assert tp_model.blocks[0].attn1.fuse_qk_norm_rope
+    assert tp_model.blocks[0].attn1.fuse_qk_norm_rope_tp
 
     # Same inputs on all ranks
     torch.manual_seed(456)
@@ -478,6 +480,8 @@ def _logic_wan_i2v_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
     tp_config = _make_model_config(config_dict, tp_size=world_size)
     tp_model = WanTransformer3DModel(tp_config).to(device).to(compute_dtype)
     _copy_ref_weights_to_tp(ref_model, tp_model, rank, world_size, config_dict)
+    assert tp_model.blocks[0].attn1.fuse_qk_norm_rope
+    assert tp_model.blocks[0].attn1.fuse_qk_norm_rope_tp
 
     # Same inputs on all ranks
     torch.manual_seed(456)

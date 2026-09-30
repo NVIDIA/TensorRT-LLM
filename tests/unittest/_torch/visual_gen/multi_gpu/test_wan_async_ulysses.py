@@ -262,6 +262,12 @@ def _logic_async_vs_sync_parity(rank, world_size, backend):
         "test bug: sync and async models have identical qkv_mode "
         f"(both {sync_model.blocks[0].attn1.qkv_mode})"
     )
+    # Ulysses-only execution has TP=1, so the existing split-QKV fusion remains
+    # enabled even though the separate TP fused path is intentionally disabled.
+    assert async_model.blocks[0].attn1.fuse_qk_norm_rope
+    assert not async_model.blocks[0].attn1.fuse_qk_norm_rope_tp
+    assert sync_model.blocks[0].attn1.fuse_qk_norm_rope
+    assert sync_model.blocks[0].attn1.fuse_qk_norm_rope_tp
 
     hidden_states, encoder_hidden_states, timestep = _build_inputs(device, dtype)
 
