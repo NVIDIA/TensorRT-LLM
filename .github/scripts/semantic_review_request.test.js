@@ -15,7 +15,8 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { discover, run, requestOne } = require('./semantic_review_request');
+const timers = require('node:timers/promises');
+const { discover, run, requestOne, withReadRetries } = require('./semantic_review_request');
 const { NAME, statusContext, requests, publish } = require('./semantic_review');
 
 const HEAD = '1'.repeat(40);
@@ -28,6 +29,8 @@ const REVIEWER = { login: 'coderabbitai[bot]', id: 136622811, type: 'Bot' };
 const SERVICE = { login: 'trtllm-agent', id: 296075020, type: 'User' };
 const APPROVED = [{ name: 'ci: full pre-merge approved' }];
 
+test.beforeEach(t => t.mock.method(timers, 'setTimeout', async () => {}));
+
 function pull(number = 1, changes = {}) {
   return { number, state: 'open', draft: false, base: { ref: 'main' },
     head: { sha: HEAD }, labels: APPROVED, auto_merge: null, ...changes };
@@ -38,34 +41,44 @@ function fixture(prs = [pull()], options = {}) {
     prs, legacyChecks: [], statuses: [], comments: new Map(), posts: [], updates: [], warnings: [],
     failures: [], remaining: options.remaining ?? 5000, target: TARGET,
     mergeBase: BASE, service: SERVICE, readCounts: new Map(), refReads: 0,
-    before: [], after: [], commandBefore: [], commandAfter: [],
+    hooks: [], commandHooks: [], postAttempts: 0,
     commandRemaining: options.commandRemaining ?? 5000, postErrors: new Map(), comparisons: 0,
     now: NOW, nextCommentId: 1000, commentReads: new Map(), statusFailures: 0, readOrder: [],
   };
-  const api = (method, commandToken = false) => async (args) => {
+  const hook = key => ({
+    ...Object.fromEntries(['before', 'after', 'error', 'wrap'].map(kind =>
+      [kind, (_, callback) => state[key].push({kind, callback})])),
+    remove: (_, callback) => {state[key] = state[key].filter(item => item.callback !== callback);},
+  });
+  const api = (method, commandToken = false, httpMethod = 'GET', charged = true) => async (args = {}) => {
     const key = commandToken ? 'commandRemaining' : 'remaining';
-    for (const hook of commandToken ? state.commandBefore : state.before) await hook();
-    state[key] -= 1;
-    const response = { data: await method(args),
-      headers: { 'x-ratelimit-remaining': String(state[key]) } };
-    for (const hook of commandToken ? state.commandAfter : state.after) await hook(response);
-    return response;
+    const invoke = async args => {
+      if (charged) state[key] -= 1;
+      return {data: await method(args), headers: {'x-ratelimit-remaining': String(state[key])}};
+    };
+    const hooks = commandToken ? state.commandHooks : state.hooks;
+    return hooks.reduce((next, {kind, callback}) => async options => {
+      if (kind === 'wrap') return callback(next, options);
+      if (kind === 'error') {
+        try {return await next(options);} catch (error) {return callback(error, options);}
+      }
+      if (kind === 'before') await callback(options);
+      const result = await next(options);
+      if (kind === 'after') await callback(result, options);
+      return result;
+    }, invoke)({...args, method: httpMethod});
   };
   const github = {
-    hook: {
-      before: (_, callback) => state.before.push(callback),
-      after: (_, callback) => state.after.push(callback),
-      remove: (_, callback) => {
-        state.before = state.before.filter((hook) => hook !== callback);
-        state.after = state.after.filter((hook) => hook !== callback);
-      },
-    },
+    hook: hook('hooks'),
     paginate: async (method, args) => {
       const { data } = await method(args);
       return data.check_runs || data;
     },
     rest: {
-      rateLimit: { get: async () => ({ data: { resources: { core: { remaining: state.remaining } } } }) },
+      rateLimit: { get: api(() => {
+        state.onRateRead?.();
+        return {resources: {core: {remaining: state.remaining}}};
+      }, false, 'GET', false) },
       pulls: {
         list: api(() => structuredClone(state.prs)),
         get: api(({ pull_number: number }) => {
@@ -98,7 +111,7 @@ function fixture(prs = [pull()], options = {}) {
             created_at: new Date(state.now).toISOString() };
           state.statuses.push(status);
           return status;
-        }),
+        }, false, 'POST'),
       },
       issues: { listComments: api(({ issue_number: number }) => {
         const count = (state.commentReads.get(number) || 0) + 1;
@@ -115,21 +128,16 @@ function fixture(prs = [pull()], options = {}) {
           const check = state.legacyChecks.find((item) => item.id === args.check_run_id);
           Object.assign(check, args);
           return check;
-        }),
+        }, false, 'PATCH'),
       },
     },
   };
-  const commandGithub = { hook: {
-    before: (_, callback) => state.commandBefore.push(callback),
-    after: (_, callback) => state.commandAfter.push(callback),
-    remove: (_, callback) => {
-      state.commandBefore = state.commandBefore.filter((hook) => hook !== callback);
-      state.commandAfter = state.commandAfter.filter((hook) => hook !== callback);
-    },
-  }, rest: {
-    rateLimit: { get: async () => ({ data: { resources: { core: { remaining: state.commandRemaining } } } }) },
+  const commandGithub = { hook: hook('commandHooks'), rest: {
+    rateLimit: { get: api(() => ({resources: {core: {remaining: state.commandRemaining}}}),
+      true, 'GET', false) },
     users: { getAuthenticated: api(() => state.service, true) },
     issues: { createComment: api((args) => {
+      state.postAttempts += 1;
       assert.equal(args.request.retries, 0);
       const errorMode = state.postErrors.get(args.issue_number);
       state.postErrors.delete(args.issue_number);
@@ -144,7 +152,7 @@ function fixture(prs = [pull()], options = {}) {
       state.onPostComment?.(comment);
       if (errorMode === 'after') throw failure();
       return comment;
-    }, true) },
+    }, true, 'POST') },
   } };
   const context = { repo: { owner: 'NVIDIA', repo: 'TensorRT-LLM' }, eventName: 'schedule' };
   const core = {
@@ -171,6 +179,157 @@ function fixture(prs = [pull()], options = {}) {
     },
   };
 }
+
+function httpError(status, headers = {}) {
+  const error = Object.assign(new Error('API unavailable'), {status, response: {headers}});
+  Object.defineProperty(error, 'code', {get() {throw new Error('Deprecated error.code accessed');}});
+  return error;
+}
+
+test('transient GET failures recover within three attempts and send one AI request', async () => {
+  for (const status of [502, 503, 504]) {
+    const f = fixture([pull()], {readPR: (pr, count) => {
+      if (count < 3) throw httpError(status);
+      return pr;
+    }});
+    assert.equal((await f.worker()).status, 'requested');
+    assert.equal(f.state.readCounts.get(1), 4);
+    assert.equal(f.state.postAttempts, 1);
+    assert.equal(f.state.statuses.length, 1);
+    assert.equal(f.state.hooks.length + f.state.commandHooks.length, 0);
+  }
+  assert.deepEqual(timers.setTimeout.mock.calls.map(call => call.arguments[0]),
+    [1000, 2000, 1000, 2000, 1000, 2000]);
+});
+
+test('persistent GET failure stops after three attempts without sending AI or status writes', async () => {
+  const failure = httpError(504);
+  const f = fixture([pull()], {readPR: () => {throw failure;}});
+  assert.equal((await f.worker()).status, 'failed');
+  assert.equal(f.state.readCounts.get(1), 3);
+  assert.equal(f.state.postAttempts, 0);
+  assert.equal(f.state.statuses.length, 0);
+  assert.match(f.state.failures[0], /HTTP 504/);
+  assert.equal(f.state.hooks.length, 0);
+  await assert.rejects(f.github.rest.pulls.get({pull_number: 1}), error => error === failure);
+  assert.equal(f.state.readCounts.get(1), 4);
+});
+
+test('non-transient errors and rate limits are not retried or read through error.code', async () => {
+  for (const status of [400, 401, 403, 404, 422, 429, 500]) {
+    const f = fixture([pull()], {readPR: () => {
+      throw httpError(status, status === 403 ? {'retry-after': '60'} : {});
+    }});
+    assert.equal((await f.worker()).status, [403, 429].includes(status) ? 'limited' : 'failed');
+    assert.equal(f.state.readCounts.get(1), 1);
+    assert.equal(f.state.postAttempts, 0);
+    assert.equal(f.state.hooks.length, 0);
+  }
+  assert.equal(timers.setTimeout.mock.calls.length, 0);
+});
+
+test('each retry honors the reserve using failed response headers or conservative local accounting', async () => {
+  for (const [remaining, headers] of [[5000, {'x-ratelimit-remaining': '1000'}], [1001, {}]]) {
+    const f = fixture([pull()], {remaining, readPR: () => {throw httpError(504, headers);}});
+    assert.equal((await f.worker()).status, 'limited');
+    assert.equal(f.state.readCounts.get(1), 1);
+    assert.equal(f.state.postAttempts, 0);
+    assert.equal(f.state.hooks.length, 0);
+  }
+});
+
+test('quota reads use bounded retries and always remove their hooks', async () => {
+  for (const recover of [true, false]) {
+    const f = fixture();
+    let reads = 0;
+    const failure = httpError(503);
+    f.state.onRateRead = () => {if (++reads < 3 || !recover) throw failure;};
+    if (recover) assert.equal((await f.worker()).status, 'requested');
+    else {
+      assert.equal((await f.worker()).status, 'failed');
+      assert.equal(f.state.readCounts.size, 0);
+      assert.equal(f.state.postAttempts, 0);
+    }
+    assert.equal(reads, 3);
+    assert.equal(f.state.hooks.length + f.state.commandHooks.length, 0);
+  }
+});
+
+test('quota reached after a failed PR read still advances the cursor to that visited candidate', async () => {
+  for (const headers of [{}, {'x-ratelimit-remaining': '1000'}]) {
+    const f = fixture([pull(100), pull(90)], {remaining: 1002,
+      readPR: () => {throw httpError(504, headers);}});
+    const result = await f.scan({cursor: 100});
+    assert.equal(result.limited, true);
+    assert.equal(result.cursor, 90);
+    assert.deepEqual(f.state.readOrder, [90]);
+    assert.equal(result.failed, 0);
+    assert.deepEqual(result.jobs, []);
+    assert.equal(f.state.hooks.length, 0);
+  }
+});
+
+test('ambiguous comment delivery retries only its GET readback and never sends another POST', async () => {
+  const f = fixture();
+  f.state.postErrors.set(1, 'after');
+  f.state.onListComments = (_number, count) => {
+    if (count === 3 || count === 4) throw httpError(504);
+  };
+  assert.equal((await f.worker()).status, 'requested');
+  assert.equal(f.state.postAttempts, 1);
+  assert.equal(f.state.posts.length, 1);
+  assert.equal(f.state.statuses.length, 1);
+  assert.deepEqual(timers.setTimeout.mock.calls.map(call => call.arguments[0]), [1000, 2000]);
+});
+
+test('persistent delivery readback failure leaves the accepted request for reconciliation', async () => {
+  const f = fixture();
+  f.state.postErrors.set(1, 'after');
+  f.state.onListComments = (_number, count) => {
+    if (count >= 3 && count <= 5) throw httpError(504);
+  };
+  assert.equal((await f.worker()).status, 'failed');
+  assert.equal(f.state.postAttempts, 1);
+  assert.equal(f.state.statuses.length, 0);
+  assert.match(f.state.warnings[0], /delivery remains unknown/);
+  const scan = await f.scan();
+  assert.deepEqual(scan.jobs, [{number: 1, allowRequest: false}]);
+  assert.equal((await f.worker(scan.jobs[0])).status, 'reconciled');
+  assert.equal(f.state.postAttempts, 1);
+  assert.equal(f.state.statuses.length, 1);
+});
+
+test('result publication recovers GET errors below the reserve without retrying failed writes', async () => {
+  for (const worker of [true, false]) {
+    const f = fixture();
+    const first = await f.one();
+    f.reply(first.request);
+    f.state.remaining = 900;
+    let reads = 0;
+    f.state.onListComments = () => {if (++reads < 3) throw httpError(502);};
+    if (worker) assert.equal((await f.worker({allowRequest: false})).status, 'reconciled');
+    else await withReadRetries(f.github, () => f.publish());
+    assert.equal(f.state.statuses.at(-1).state, 'success');
+    assert.equal(reads, 3);
+    assert.equal(f.state.postAttempts, 1);
+    f.reply(first.request, 'FAIL');
+    f.state.statusFailures = 2;
+    await assert.rejects(withReadRetries(f.github, () => f.publish()), {status: 502});
+    assert.equal(f.state.statusFailures, 1);
+    assert.equal(f.state.statuses.at(-1).state, 'success');
+    assert.equal(f.state.hooks.length, 0);
+  }
+});
+
+test('writes with transient errors remain single attempts for both clients', async () => {
+  for (const mode of ['before', 'after']) {
+    const f = fixture();
+    f.state.postErrors.set(1, mode);
+    assert.equal((await f.worker()).status, mode === 'after' ? 'requested' : 'failed');
+    assert.equal(f.state.postAttempts, 1);
+    assert.equal(timers.setTimeout.mock.calls.length, 0);
+  }
+});
 
 test('eligibility accepts either approval or auto-merge and requires an open supported non-draft PR', async () => {
   for (const pr of [pull(), pull(1, { labels: [], auto_merge: { enabled_by: {} } }),
@@ -296,7 +455,7 @@ test('live head changes, branch changes and approval removal stop stale requests
 test('a token with the right login but wrong immutable service ID is rejected', async () => {
   const f = fixture();
   f.state.service = { ...SERVICE, id: 999 };
-  await assert.rejects(f.one(), { code: 'SEMANTIC_REVIEW_COMMAND_USER' });
+  await assert.rejects(f.one(), /command token must belong to the configured service account/);
   assert.equal(f.state.statuses.length, 0);
   assert.equal(f.state.posts.length, 0);
 });
@@ -383,7 +542,7 @@ test('discovery read errors consume slots and report failure while preserving ot
   const result = await f.scan();
   assert.equal(result.failed, 6);
   assert.equal(result.cursor, 11);
-  assert.equal(f.state.readOrder.length, 30);
+  assert.equal(f.state.readOrder.length, 42);
   assert.deepEqual(result.jobs, Array.from({ length: 24 }, (_, index) => ({ number: 34 - index, allowRequest: true })));
   assert.equal(f.state.warnings.length, 5);
   assert.equal(f.state.failures.length, 1);
@@ -431,8 +590,7 @@ test('discovery preserves 1000 REST requests and returns candidates already foun
   assert.deepEqual(f.state.readOrder, [2]);
   assert.equal(f.state.remaining, 1000);
   assert.equal(f.state.failures.length, 0);
-  assert.equal(f.state.before.length, 0);
-  assert.equal(f.state.after.length, 0);
+  assert.equal(f.state.hooks.length, 0);
 });
 
 test('worker preserves the 1000-request reserve independently for both tokens', async () => {
@@ -445,8 +603,7 @@ test('worker preserves the 1000-request reserve independently for both tokens', 
     assert.ok(f.state.commandRemaining >= 1000);
     assert.equal(f.state.statuses.length, 0);
     assert.equal(f.state.failures.length, 0);
-    assert.equal(f.state.before.length + f.state.after.length +
-      f.state.commandBefore.length + f.state.commandAfter.length, 0);
+    assert.equal(f.state.hooks.length + f.state.commandHooks.length, 0);
   }
   const f = fixture([pull()], { commandRemaining: 1002 });
   assert.equal((await f.worker()).status, 'requested');
@@ -473,8 +630,7 @@ test('worker operational errors fail its job, release quota hooks and never pass
   assert.equal(f.state.failures.length, 1);
   assert.equal(f.state.posts.length, 0);
   assert.equal(f.state.statuses.length, 0);
-  assert.equal(f.state.before.length + f.state.after.length +
-    f.state.commandBefore.length + f.state.commandAfter.length, 0);
+  assert.equal(f.state.hooks.length + f.state.commandHooks.length, 0);
 });
 
 test('manual dispatch validates input and forces any open supported PR, including drafts', async () => {
@@ -995,7 +1151,7 @@ test('a failed PR read advances the cursor to that attempted PR after the wrap',
   });
   const result = await f.scan({ cursor: 100 });
   assert.deepEqual(result.jobs, [{ number: 90, allowRequest: true }]);
-  assert.deepEqual(f.state.readOrder, [90, 110, 100]);
+  assert.deepEqual(f.state.readOrder, [90, 110, 100, 100, 100]);
   assert.equal(result.cursor, 100);
   assert.equal(result.failed, 1);
   assert.equal(result.skipped, 1);
@@ -1037,6 +1193,6 @@ test('quota exhaustion after a PR read records that PR even if later inspection 
     assert.deepEqual(f.state.readOrder, expectedReads);
     assert.equal(f.state.remaining, 1000);
     assert.equal(f.state.failures.length, 0);
-    assert.equal(f.state.before.length + f.state.after.length, 0);
+    assert.equal(f.state.hooks.length, 0);
   }
 });

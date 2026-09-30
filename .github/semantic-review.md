@@ -97,6 +97,14 @@ directly request analysis. The scheduled scan observes those changes.
   service PAT have separate quota checks. Repair-only jobs and comment-triggered
   publication do not require the service PAT or apply this reserve. Concurrent
   API users can spend quota between observations.
+- GitHub GET requests returning HTTP 502, 503 or 504 are retried at most twice,
+  after one and two seconds. This applies to cursor reads, discovery, requests
+  and result publication. Each attempt rechecks any applicable reserve, using
+  response quota headers or locally accounting for requests when headers are
+  absent. HTTP 403/429 and other errors are not retried. Comment, status and
+  Check writes are not automatically repeated. Exhausted reads retain the
+  normal failure and cursor rules; HTTP retries do not create additional AI
+  requests or consume additional selection slots.
 
 A scan first recovers any valid result already received for the latest request,
 then considers a new analysis. A reply received before the worker's final

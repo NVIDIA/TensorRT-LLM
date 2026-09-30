@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const { randomUUID } = require('node:crypto');
+const timers = require('node:timers/promises');
 const {
   supported, eligible, isCommandUser, requests, command, reviewState, publish,
 } = require('./semantic_review');
@@ -25,36 +26,67 @@ const MATRIX_LIMIT = 256;
 
 function isRateLimitError(error) {
   const headers = error.response?.headers || {};
-  return error.code === 'SEMANTIC_REVIEW_QUOTA' || error.status === 429 ||
+  return error.semanticReviewQuota === true || error.status === 429 ||
     (error.status === 403 && (headers['x-ratelimit-remaining'] === '0' ||
       headers['retry-after'] || /rate limit|abuse detection/i.test(error.message)));
 }
 
 function quotaError() {
   const error = new Error('Stopped to preserve the REST API reserve.');
-  error.code = 'SEMANTIC_REVIEW_QUOTA';
+  error.semanticReviewQuota = true;
   return error;
 }
 
+async function withReadRetries(github, operation) {
+  const retry = async (request, options) => {
+    let previousError;
+    for (let attempt = 0; ; attempt += 1) {
+      try { return await request(options); } catch (error) {
+        if (error.semanticReviewQuota && previousError) error.cause = previousError;
+        if (options.method !== 'GET' || ![502, 503, 504].includes(error.status) || attempt >= 2) {
+          throw error;
+        }
+        previousError = error;
+        await timers.setTimeout(1000 * (attempt + 1));
+      }
+    }
+  };
+  github.hook.wrap('request', retry);
+  try { return await operation(); } finally {
+    github.hook.remove('request', retry);
+  }
+}
+
 async function withReserve(github, operation) {
-  const { data: rate } = await github.rest.rateLimit.get();
+  const { data: rate } = await withReadRetries(github, () => github.rest.rateLimit.get());
   let remaining = rate.resources.core.remaining;
-  const before = () => {
+  const checkReserve = () => {
     if (remaining <= REST_RESERVE) throw quotaError();
+  };
+  const before = () => {
+    checkReserve();
+    remaining -= 1;
   };
   const after = (response) => {
     if (response.headers?.['x-ratelimit-remaining'] !== undefined) {
       remaining = Number(response.headers['x-ratelimit-remaining']);
     }
   };
+  const failed = (error) => {
+    if (error.response) after(error.response);
+    throw error;
+  };
   github.hook.before('request', before);
   github.hook.after('request', after);
+  github.hook.error('request', failed);
   try {
-    before();
-    return await operation();
+    checkReserve();
+    // The retry hook is outermost so every attempt passes the reserve hooks.
+    return await withReadRetries(github, operation);
   } finally {
     github.hook.remove('request', before);
     github.hook.remove('request', after);
+    github.hook.remove('request', failed);
   }
 }
 
@@ -68,7 +100,7 @@ async function pending({ github, context, number, manual, now = Date.now(), onVi
   try {
     ({ data: pr } = await github.rest.pulls.get({ ...repo, pull_number: number }));
   } catch (error) {
-    if (error.code !== 'SEMANTIC_REVIEW_QUOTA') onVisit?.();
+    if (!error.semanticReviewQuota || error.cause) onVisit?.();
     throw error;
   }
   onVisit?.();
@@ -121,9 +153,7 @@ async function requestOne({ github, commandGithub, context, core, number, manual
 
     const { data: user } = await commandGithub.rest.users.getAuthenticated();
     if (!isCommandUser(user)) {
-      const error = new Error('The command token must belong to the configured service account.');
-      error.code = 'SEMANTIC_REVIEW_COMMAND_USER';
-      throw error;
+      throw new Error('The command token must belong to the configured service account.');
     }
 
     const current = await pending({ github, context, number, manual, now });
@@ -219,7 +249,7 @@ async function run({ github, commandGithub, context, core, number, allowRequest 
   try {
     const operation = () => requestOne({ github, commandGithub, context, core, number,
       allowRequest, now, manual: context.eventName === 'workflow_dispatch' });
-    result = allowRequest ? await withReserve(github, operation) : await operation();
+    result = allowRequest ? await withReserve(github, operation) : await withReadRetries(github, operation);
   } catch (error) {
     if (isRateLimitError(error)) {
       result = { status: 'limited' };
@@ -234,4 +264,4 @@ async function run({ github, commandGithub, context, core, number, allowRequest 
   return result;
 }
 
-module.exports = { discover, run, requestOne, isRateLimitError, withReserve };
+module.exports = { discover, run, requestOne, isRateLimitError, withReserve, withReadRetries };
