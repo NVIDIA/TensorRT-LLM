@@ -49,7 +49,7 @@ class TiledAutoencoderKLMiniMaxH3(AutoencoderKLMiniMaxH3):
     """Distribute spatial decode tiles over an explicitly supplied process group.
 
     Every group member must decode the same latents. Each rank retains the
-    complete output, as required by the H3 pipeline. Small canvases with fewer
+    complete output. Ranks outside the group skip decoding. Small canvases with fewer
     tiles than ranks fall back to Diffusers without entering any collectives.
     Encoding retains the reference implementation and RNG behavior.
     """

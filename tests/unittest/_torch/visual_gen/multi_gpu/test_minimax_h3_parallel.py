@@ -17,6 +17,7 @@ from tensorrt_llm._torch.visual_gen.config import (
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.tiled_vae import (
     MINIMAX_H3_VAE_DEFAULTS,
     TiledAutoencoderKLMiniMaxH3,
@@ -135,6 +136,7 @@ def _worker(rank: int, port: int) -> None:
                 vae.tile_parallel_group = vgm.vae_group
                 actual_video = vae._decode_clip(z)
             torch.testing.assert_close(actual_video, expected_video, rtol=0, atol=0)
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 
@@ -145,3 +147,69 @@ def test_h3_ulysses_and_parallel_vae(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
     spawn_with_retry(lambda port: mp.spawn(_worker, args=(port,), nprocs=2, join=True))
+
+
+def _partial_vae_worker(rank: int, port: int) -> None:
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=4,
+        timeout=timedelta(seconds=180),
+    )
+    try:
+        device = torch.device("cuda", rank)
+        for size in (1, 2, 3, 4):
+            vgm = VisualGenMapping(world_size=4, rank=rank, ulysses_size=4, parallel_vae_size=size)
+            torch.manual_seed(43)
+            pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+            torch.nn.Module.__init__(pipeline)
+            pipeline.pipeline_config = SimpleNamespace(
+                parallel=SimpleNamespace(parallel_vae_size=size),
+                visual_gen_mapping=vgm,
+            )
+            pipeline.vae = _make_vae().to(device).eval()
+            pipeline._vae_tiling_options = MINIMAX_H3_VAE_DEFAULTS
+            pipeline.setup_parallel_vae()
+            assert pipeline._parallel_vae_enabled == (size > 1)
+            assert (pipeline.vae.tile_parallel_group is not None) == (size > 1 and rank < size)
+            for shape in ((2, 2), (10, 10), (7, 10)):
+                z = torch.randn(1, 1, 3, *shape, device=device)
+                calls = []
+
+                def decode_video(latents):
+                    calls.append("video")
+                    return pipeline.vae._decode_clip(latents)
+
+                def decode_audio(latents):
+                    calls.append("audio")
+                    return latents + 1
+
+                with torch.inference_mode():
+                    expected = AutoencoderKLMiniMaxH3._decode_clip(pipeline.vae, z)
+                    actual, audio = pipeline.decode_latents(
+                        z,
+                        decode_video,
+                        extra_latents={"audio": (z, decode_audio)},
+                    )
+                if rank < size:
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(audio, z + 1, rtol=0, atol=0)
+                    assert calls == ["video", "audio"]
+                else:
+                    assert actual is None and audio is None
+                    assert not calls
+                # Non-VAE ranks can finish early; all ranks must remain alive
+                # until the VAE group's collectives finish.
+                dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires four CUDA GPUs")
+def test_h3_partial_vae_groups(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ._visual_gen_dist_utils import spawn_with_retry
+
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+    spawn_with_retry(lambda port: mp.spawn(_partial_vae_worker, args=(port,), nprocs=4, join=True))

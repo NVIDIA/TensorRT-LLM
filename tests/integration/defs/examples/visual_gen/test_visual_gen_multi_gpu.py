@@ -426,8 +426,8 @@ def test_wan22_t2v_lpips_against_golden_tp(
     )
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA GPUs")
-def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path):
+@pytest.mark.parametrize("ulysses_size,vae_size", [(2, 2), (4, 3)])
+def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size):
     """Compare real Ulysses + tiled VAE collectives with a fresh one-GPU baseline."""
     from defs.examples.visual_gen.test_minimax_h3_e2e import (
         _mean_lpips_distance,
@@ -436,14 +436,16 @@ def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path):
 
     from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
 
+    if torch.cuda.device_count() < ulysses_size:
+        pytest.skip(f"Requires {ulysses_size} CUDA GPUs")
     prompt = "A woman smiles and waves in a sunlit park, with birds chirping."
-    videos = []
-    for size in (1, 2):
+    videos, audios = [], []
+    for size, decode_size in ((1, 1), (ulysses_size, 1), (ulysses_size, vae_size)):
         args = VisualGenArgs(
             model=_minimax_h3_checkpoint_path(),
-            parallel_config={"ulysses_size": size, "parallel_vae_size": size},
+            parallel_config={"ulysses_size": size, "parallel_vae_size": decode_size},
             attention_config={"backend": "VANILLA"},
-            torch_compile_config={"enable": False},
+            torch_compile_config={"enable": True},
             cuda_graph_config={"enable": False},
             compilation_config={"skip_warmup": True},
             pipeline_config={"vae_use_tiling": True, "vae_tile_size": 256, "vae_tile_overlap": 64},
@@ -453,22 +455,30 @@ def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path):
             output = engine.generate(
                 inputs=prompt,
                 params=VisualGenParams(
-                    height=384, width=384, num_frames=39, num_inference_steps=5, seed=42
+                    height=384, width=384, num_frames=124, num_inference_steps=28, seed=42
                 ),
             )
             video = torch.as_tensor(output.video).cpu()
             if video.ndim == 4:
                 video = video.unsqueeze(0)
-            assert video.shape == (1, 39, 384, 384, 3)
+            assert video.shape == (1, 124, 384, 384, 3)
             assert video.float().std() > 1
             assert torch.isfinite(torch.as_tensor(output.audio)).all()
-            torch.save({"video": video, "audio": output.audio}, tmp_path / f"h3_{size}gpu.pt")
+            torch.save(
+                {"video": video, "audio": output.audio},
+                tmp_path / f"h3_ulysses{size}_vae{decode_size}.pt",
+            )
             videos.append(video)
+            audios.append(torch.as_tensor(output.audio).cpu())
         finally:
             engine.shutdown()
+    torch.testing.assert_close(videos[2], videos[1], rtol=0, atol=0)
+    torch.testing.assert_close(audios[2], audios[1], rtol=0, atol=0)
     reference = videos[0].permute(0, 1, 4, 2, 3).float().div(255)
-    score = _mean_lpips_distance(videos[1], reference)
-    print(f"H3 Ulysses=2 + parallel_vae_size=2 vs single GPU: mean LPIPS={score:.6f}")
+    score = _mean_lpips_distance(videos[2], reference)
+    print(
+        f"H3 Ulysses={ulysses_size} + parallel_vae_size={vae_size} vs single GPU: mean LPIPS={score:.6f}"
+    )
     # Prior full-resolution 8-GPU measurement was 0.052; this bound allows
     # BF16 accumulation differences while guarding distributed layout errors.
     assert score < 0.10, f"H3 parallelism changed output: mean LPIPS={score:.6f} >= 0.10"

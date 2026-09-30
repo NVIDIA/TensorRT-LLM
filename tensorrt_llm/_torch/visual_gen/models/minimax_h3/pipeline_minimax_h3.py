@@ -151,13 +151,14 @@ class MiniMaxH3Pipeline(BasePipeline):
         return torch.Generator().manual_seed(seed)
 
     def __init__(self, pipeline_config: DiffusionPipelineConfig) -> None:
-        if pipeline_config.mapping.world_size != 1:
-            vgm = pipeline_config.visual_gen_mapping
+        vgm = pipeline_config.visual_gen_mapping
+        world_size = vgm.world_size if vgm is not None else pipeline_config.mapping.world_size
+        if world_size != 1:
             is_pure_ulysses = (
                 vgm is not None
                 and pipeline_config.mapping.tp_size == 1
                 and vgm.cfg_size == 1
-                and vgm.ulysses_size == pipeline_config.mapping.world_size
+                and vgm.ulysses_size == world_size
                 and vgm.cp_size == 1
                 and vgm.ring_size == 1
                 and vgm.attn2d_row_size == 1
@@ -204,9 +205,9 @@ class MiniMaxH3Pipeline(BasePipeline):
         }
         validate_vae_tiling_config(self._vae_tiling_options)
         vae_size = pipeline_config.parallel.parallel_vae_size
-        if vae_size not in (1, pipeline_config.mapping.world_size):
+        if not 1 <= vae_size <= world_size:
             raise ValueError(
-                "MiniMax-H3 parallel_vae_size must be 1 or equal ulysses_size=world_size."
+                "MiniMax-H3 parallel_vae_size must be between 1 and ulysses_size=world_size."
             )
         if vae_size > 1 and self._vae_tiling_options["vae_use_tiling"] is False:
             raise ValueError("parallel_vae_size > 1 requires VAE spatial tiling.")
@@ -218,15 +219,19 @@ class MiniMaxH3Pipeline(BasePipeline):
     def setup_parallel_vae(self) -> None:
         """Use the shared VAE group for independent spatial tile decoding."""
         size = self.pipeline_config.parallel.parallel_vae_size
-        if size == 1 or self.vae is None:
+        self._parallel_vae_enabled = size > 1 and self.vae is not None
+        if not self._parallel_vae_enabled:
             return
         vgm = self.pipeline_config.visual_gen_mapping
-        if vgm is None or vgm.vae_group is None:
+        if vgm is None:
+            raise RuntimeError("MiniMax-H3 parallel VAE requires a VisualGen mapping.")
+        if self.rank not in vgm.vae_ranks:
+            return
+        if vgm.vae_group is None:
             raise RuntimeError("MiniMax-H3 parallel VAE requires a VAE group.")
         if torch.distributed.get_world_size(vgm.vae_group) != size:
             raise RuntimeError("MiniMax-H3 VAE group size does not match parallel_vae_size.")
         self.vae.configure_tiling(self._vae_tiling_options, group=vgm.vae_group)
-        self._parallel_vae_enabled = True
         logger.info(f"MiniMax-H3 spatial VAE tile decode ranks={size}")
 
     @property
@@ -860,14 +865,19 @@ class MiniMaxH3Pipeline(BasePipeline):
         latents = torch.cat((condition_prefix, generated_latents), dim=1)[0]
         audio_latents = extra_latents["audio"][0]
         timer.mark_post_start()
-        video = self._decode_video(
+        video, audio = self.decode_latents(
             latents,
-            layout.num_condition_video_rows,
-            num_latent_frames,
-            latent_height,
-            latent_width,
+            decode_fn=lambda rows: self._decode_video(
+                rows,
+                layout.num_condition_video_rows,
+                num_latent_frames,
+                latent_height,
+                latent_width,
+            ),
+            extra_latents={
+                "audio": (audio_latents, lambda rows: self._decode_audio(rows, num_audio_latents))
+            },
         )
-        audio = self._decode_audio(audio_latents, num_audio_latents)
         timer.mark_end()
         logger.info(f"MiniMax-H3 inference completed in {time.time() - pipeline_start:.2f}s")
         return timer.fill(
