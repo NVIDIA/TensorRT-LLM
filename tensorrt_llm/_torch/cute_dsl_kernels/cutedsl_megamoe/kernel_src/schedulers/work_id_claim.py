@@ -372,6 +372,144 @@ def _claim_atomic_counter_work_id(
 
 
 @cute.jit
+def broadcast_atomic_counter_ready(
+    work_id_state: AtomicCounterWorkIdState,
+    counter_pointer: cute.Pointer,
+    ready_threshold: Int32,
+    ready_is_mask: bool = False,
+) -> Tuple[Boolean, AtomicCounterWorkIdState]:
+    """Load one global readiness counter on the leader and broadcast the predicate.
+
+    The scheduler makes publication decisions at preferred-cluster granularity,
+    so a CTA-local peek is not sufficient: the two scheduler warps must either
+    both defer or both publish their CTA halves of a work tile.  Reusing the
+    atomic work-ID broadcast channel gives the readiness decision the same
+    cluster-uniform ordering as a work-ID claim.
+    """
+    if cutlass.const_expr(not isinstance(ready_is_mask, bool)):
+        raise TypeError("ready_is_mask must be a Python bool.")
+
+    broadcast_tensor = cute.make_tensor(work_id_state.broadcast_pointer, cute.make_layout((1,)))
+    cluster_pipeline = work_id_state.cluster_pipeline
+
+    if work_id_state.is_leader_cta:
+        cluster_pipeline.producer_acquire(work_id_state.producer_state)
+        full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(
+            work_id_state.producer_state.index
+        )
+        thread_idx, _, _ = cute.arch.thread_idx()
+        lane_idx = thread_idx % Int32(32)
+        ready_payload = Int32(0)
+        if lane_idx == Int32(0):
+            observed = cute.arch.load(counter_pointer, Int32, sem="acquire", scope="gpu")
+            if cutlass.const_expr(ready_is_mask):
+                if (observed & ready_threshold) == ready_threshold:
+                    ready_payload = Int32(1)
+            else:
+                if observed >= ready_threshold:
+                    ready_payload = Int32(1)
+        ready_payload = cute.arch.shuffle_sync(
+            ready_payload, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31
+        )
+        if lane_idx < Int32(work_id_state.cluster_size):
+            store_i32_to_peer_cluster_smem_async(
+                work_id_state.broadcast_pointer,
+                ready_payload,
+                full_barrier_pointer,
+                lane_idx,
+            )
+            mbarrier_arrive_expect_tx_on_peer(full_barrier_pointer, Int32(4), lane_idx)
+    work_id_state.producer_state.advance()
+
+    cluster_pipeline.consumer_wait(work_id_state.consumer_state)
+    ready_payload = broadcast_tensor[0]
+    cute.arch.fence_acq_rel_cta()
+    cluster_pipeline.sync_object_empty.arrive(work_id_state.consumer_state.index, Int32(0))
+    work_id_state.consumer_state.advance()
+    return ready_payload != Int32(0), work_id_state
+
+
+@cute.jit
+def broadcast_atomic_counter_ready_or_claim(
+    work_id_state: AtomicCounterWorkIdState,
+    ready_counter_pointer: cute.Pointer,
+    ready_threshold: Int32,
+    atomic_counter_index=0,
+    ready_is_mask: bool = False,
+) -> Tuple[Boolean, Int32, AtomicCounterWorkIdState]:
+    """Probe readiness or claim one work ID in one cluster transaction.
+
+    The leader first performs the same acquire readiness load as
+    :func:`broadcast_atomic_counter_ready`.  When the counter is not ready it
+    immediately claims one ID from ``atomic_counter_index`` before broadcasting
+    the result.  A negative payload denotes readiness; valid work IDs are
+    non-negative, so the one-word cluster broadcast ABI remains unchanged.
+
+    This primitive is intentionally limited to a single claimed ID.  It is the
+    bundle-1 fast path used while a full-readiness-gated consumer is held
+    outside the execution FIFO.
+    """
+    if cutlass.const_expr(not isinstance(ready_is_mask, bool)):
+        raise TypeError("ready_is_mask must be a Python bool.")
+    invalid_static_index = isinstance(atomic_counter_index, int) and (
+        atomic_counter_index < 0 or atomic_counter_index >= work_id_state.counter_count
+    )
+    if cutlass.const_expr(invalid_static_index):
+        raise ValueError(
+            "atomic_counter_index must be in [0, "
+            f"{work_id_state.counter_count}), got {atomic_counter_index}."
+        )
+
+    broadcast_tensor = cute.make_tensor(work_id_state.broadcast_pointer, cute.make_layout((1,)))
+    cluster_pipeline = work_id_state.cluster_pipeline
+    selected_counter_pointer = work_id_state.counter_pointer + Int32(atomic_counter_index)
+
+    if work_id_state.is_leader_cta:
+        cluster_pipeline.producer_acquire(work_id_state.producer_state)
+        full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(
+            work_id_state.producer_state.index
+        )
+        thread_idx, _, _ = cute.arch.thread_idx()
+        lane_idx = thread_idx % Int32(32)
+        # -1 is the ready sentinel.  A failed probe replaces it with the
+        # non-negative ID returned by the Linear1 atomic counter.
+        payload = Int32(-1)
+        if lane_idx == Int32(0):
+            observed = cute.arch.load(ready_counter_pointer, Int32, sem="acquire", scope="gpu")
+            ready = Boolean(False)
+            if cutlass.const_expr(ready_is_mask):
+                ready = (observed & ready_threshold) == ready_threshold
+            else:
+                ready = observed >= ready_threshold
+            if not ready:
+                payload = cute.arch.atomic_add(selected_counter_pointer, Int32(1))
+        payload = Int32(
+            cute.arch.shuffle_sync(
+                payload,
+                offset=0,
+                mask=0xFFFFFFFF,
+                mask_and_clamp=31,
+            )
+        )
+        if lane_idx < Int32(work_id_state.cluster_size):
+            store_i32_to_peer_cluster_smem_async(
+                work_id_state.broadcast_pointer,
+                payload,
+                full_barrier_pointer,
+                lane_idx,
+            )
+            mbarrier_arrive_expect_tx_on_peer(full_barrier_pointer, Int32(4), lane_idx)
+    work_id_state.producer_state.advance()
+
+    cluster_pipeline.consumer_wait(work_id_state.consumer_state)
+    payload = broadcast_tensor[0]
+    cute.arch.fence_acq_rel_cta()
+    cluster_pipeline.sync_object_empty.arrive(work_id_state.consumer_state.index, Int32(0))
+    work_id_state.consumer_state.advance()
+    return payload == Int32(-1), payload, work_id_state
+
+
+@cute.jit
 def initialize_fixed_group_mixed_cga_work_id_state(
     work_id_state: FixedGroupMixedCgaAtomicCounterWorkIdState,
 ) -> FixedGroupMixedCgaAtomicCounterWorkIdState:
@@ -633,6 +771,8 @@ __all__ = [
     "FixedGroupMixedCgaAtomicCounterWorkIdState",
     "GridStrideWorkIdState",
     "GridWorkId",
+    "broadcast_atomic_counter_ready",
+    "broadcast_atomic_counter_ready_or_claim",
     "claim_work_id",
     "initialize_fixed_group_mixed_cga_work_id_state",
 ]

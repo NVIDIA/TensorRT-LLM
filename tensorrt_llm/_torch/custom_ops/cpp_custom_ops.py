@@ -16,6 +16,38 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 def _register_fake():
 
+    @torch.library.register_fake("trtllm::moe_rebalance_halo_q")
+    def _(
+        routes: torch.Tensor,
+        out_slots: torch.Tensor,
+        out_ids: torch.Tensor,
+        out_levels: torch.Tensor,
+        out_owners: torch.Tensor,
+        peer_bases: torch.Tensor,
+        status: torch.Tensor,
+        partial: torch.Tensor,
+        route_aux: torch.Tensor,
+        grid_sync: torch.Tensor,
+        plan_workspace: torch.Tensor,
+        route_prefix: torch.Tensor,
+        plan_channel_ptr: int,
+        ep: int,
+        experts: int,
+        helpers: int,
+        local_rank: int,
+        route_capacity: int,
+        ctas: int,
+        threads: int,
+        algorithm: int,
+        enable_pdl: bool,
+        spin_cycles: int,
+        plan_abi_version: int,
+        plan_channel_words: int,
+        route_features: int,
+        valid_route_count: int,
+    ) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(
         input: torch.Tensor,
@@ -539,7 +571,7 @@ def _register_fake():
                 activation.new_empty(scale_shape, dtype=activation.dtype))
 
     @torch.library.register_fake("trtllm::fp4_quantize")
-    def _(
+    def _fp4_quantize_fake(
         input: torch.Tensor,
         global_scale: torch.Tensor,
         sf_vec_size: int,
@@ -551,6 +583,18 @@ def _register_fake():
 
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
+
+    if hasattr(torch.ops.trtllm.fp4_quantize, "sm_budget"):
+
+        @torch.library.register_fake("trtllm::fp4_quantize.sm_budget")
+        def _(input: torch.Tensor,
+              global_scale: torch.Tensor,
+              sf_vec_size: int,
+              sf_use_ue8m0: bool = False,
+              swizzled_layout: bool = True,
+              reserved_sms: int = 0):
+            return _fp4_quantize_fake(input, global_scale, sf_vec_size,
+                                      sf_use_ue8m0, swizzled_layout)
 
     @torch.library.register_fake("trtllm::fp4_quantize_with_reorder_residual")
     def _(
@@ -985,8 +1029,10 @@ def _register_fake():
         return packed, scale
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_packed_ue8m0")
-    def _(input: torch.Tensor,
-          use_r128c4_layout: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+    def _fp8_quantize_packed_fake(
+        input: torch.Tensor,
+        use_r128c4_layout: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         m, k = input.shape[0], input.shape[1]
         num_n_blocks = (k + 127) // 128
         num_packed_sf_k = (num_n_blocks + 3) // 4
@@ -1000,6 +1046,15 @@ def _register_fake():
                                             (1, m_aligned),
                                             dtype=torch.int32)
         return torch.empty_like(input, dtype=torch.float8_e4m3fn), scale
+
+    if hasattr(torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0, "sm_budget"):
+
+        @torch.library.register_fake(
+            "trtllm::fp8_quantize_1x128_packed_ue8m0.sm_budget")
+        def _(input: torch.Tensor,
+              use_r128c4_layout: bool = True,
+              reserved_sms: int = 0):
+            return _fp8_quantize_packed_fake(input, use_r128c4_layout)
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_cutedsl_ue8m0")
     def _(input: torch.Tensor):

@@ -29,7 +29,7 @@ from .....helpers.utils import ceil_div, round_up, strides_equal_ignoring_single
 from .....quant_def import QuantKind
 from ....schedulers.base import SchedulerConsumer
 from ....schedulers.fc12_mapping import BlockPhase
-from ..mega.block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
+from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .local_routing import RoutingMetadata
 from .tma_gather import sm107_tma_gather4_load
 

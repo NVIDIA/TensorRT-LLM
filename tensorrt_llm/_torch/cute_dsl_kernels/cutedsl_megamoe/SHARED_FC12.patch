@@ -1,0 +1,10 @@
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_kernel.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_kernel.py
+@@ -6,7 +6,6 @@
+ from typing import ClassVar, Optional, Tuple
+ 
+ import cuda.bindings.driver as cuda
+-
+ import cutlass
+ import cutlass.cute as cute
+ import cutlass.pipeline as pipeline

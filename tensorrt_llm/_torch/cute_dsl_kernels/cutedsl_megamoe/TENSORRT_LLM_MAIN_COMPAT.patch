@@ -1,0 +1,1435 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/api.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/api.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/api.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/api.py
+@@ -10,7 +10,6 @@
+ from typing import Dict, Union, get_args, get_origin
+ 
+ from cutlass.cute.typing import SymInt
+-
+ 
+ RuntimeIntegerType = SymInt
+ StaticIntegerType = int
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/communication/nvlink_domain/symmetric_buffer.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/communication/nvlink_domain/symmetric_buffer.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/communication/nvlink_domain/symmetric_buffer.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/communication/nvlink_domain/symmetric_buffer.py
+@@ -5,8 +5,6 @@
+ 
+ from dataclasses import dataclass
+ from typing import Any, Optional
+-
+-from packaging.version import Version
+ 
+ import cutlass
+ import cutlass.cute as cute
+@@ -17,7 +15,7 @@
+ from cutlass.base_dsl.typing import get_c_pointers
+ from cutlass.cute.typing import AddressSpace
+ from cutlass.cutlass_dsl import Int32, Int64, dsl_user_op
+-
++from packaging.version import Version
+ 
+ try:
+     from cutlass.base_dsl.typing import MLIR_DYNAMIC_INDEX
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/communication/nvlink_domain/token_comm.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/communication/nvlink_domain/token_comm.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/communication/nvlink_domain/token_comm.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/communication/nvlink_domain/token_comm.py
+@@ -8,7 +8,6 @@
+ from typing import Callable, ClassVar, Literal, Optional, Tuple, Union
+ 
+ import cuda.bindings.driver as cuda
+-
+ import cutlass
+ import cutlass.cute as cute
+ import cutlass.pipeline as pipeline
+@@ -22,7 +21,6 @@
+ from ...helpers.dsl_helpers import mark_alignment, smem_exclusive_prefix
+ from ...helpers.flag_batch import make_flag_batch_tracker
+ from ...helpers.iket_compat import iket
+-from ...helpers.software_sync import NvlinkBarrier
+ from ...helpers.ptx_helpers import (
+     cp_async_bulk_s2g,
+     cp_reduce_async_bulk_add_bf16_s2g,
+@@ -35,11 +33,11 @@
+     tma_load_1d,
+ )
+ from ...helpers.smem_workspace import SmemWorkspace
++from ...helpers.software_sync import NvlinkBarrier
+ from ...helpers.utils import ceil_div, round_up
+ from ...quant_def import CombineFormat, QuantKind
+ from ..token_protocol import TokenSrcMetadata
+ from .symmetric_buffer import SymmetricBufferDevice
+-
+ 
+ TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
+ TokenBackScheduleMode = Literal["static", "atomic_counter"]
+@@ -115,7 +113,7 @@
+     sorted_metadata_region = "nvlink.token_comm.sorted_metadata"
+     sorted_scores_region = "nvlink.token_comm.sorted_scores"
+     pool_expert_base_region = "nvlink.token_comm.pool_expert_base"
+-    token_src_metadata_region = "nvlink.token_comm.token_src_metadata"
++    token_src_metadata_region = "nvlink.token_comm.token_src_metadata"  # nosec B105
+     fc1_topk_scores_region = "nvlink.token_comm.fc1_topk_scores"
+     source_expert_base_region = "nvlink.token_comm.source_expert_base"
+     push_destination_base_region = "nvlink.token_comm.push_destination_base"
+@@ -178,7 +176,8 @@
+         self.router_grid_cta_count = max(self.router_data_cta_count + 1, self.router_push_cta_count)
+         if self.router_grid_cta_count > self.promised_launchable_sm_count:
+             raise ValueError(
+-                "Router grid exceeds promised_launchable_sm_count; all metadata-push CTAs must be concurrently resident."
++                "Router grid exceeds promised_launchable_sm_count; "
++                "all metadata-push CTAs must be concurrently resident."
+             )
+         self.worst_case_token_count = self.worst_case_padded_tokens(self.token_padding_block)
+         self._router_smem_workspace = self._build_router_smem_workspace()
+@@ -1343,15 +1342,15 @@
+     fc2_activation_sf_region = "nvlink.token_comm.fc2_activation_sf"
+     pre_reduced_activation_region = "nvlink.token_comm.pre_reduced_activation"
+     pre_reduced_activation_sf_region = "nvlink.token_comm.pre_reduced_activation_sf"
+-    token_back_schedule_region = "nvlink.token_comm.token_back_schedule"
+-
+-    token_in_mbarrier_region = "nvlink.token_comm.main_smem.token_in_mbarriers"
+-    token_back_mbarrier_region = "nvlink.token_comm.main_smem.token_back_mbarriers"
++    token_back_schedule_region = "nvlink.token_comm.token_back_schedule"  # nosec B105
++
++    token_in_mbarrier_region = "nvlink.token_comm.main_smem.token_in_mbarriers"  # nosec B105
++    token_back_mbarrier_region = "nvlink.token_comm.main_smem.token_back_mbarriers"  # nosec B105
+     expert_sizes_smem_region = "nvlink.token_comm.main_smem.expert_sizes"
+-    token_in_activation_smem_region = "nvlink.token_comm.main_smem.token_in_activation"
+-    token_in_sf_smem_region = "nvlink.token_comm.main_smem.token_in_sf"
+-    token_back_activation_smem_region = "nvlink.token_comm.main_smem.token_back_activation"
+-    token_back_sf_smem_region = "nvlink.token_comm.main_smem.token_back_sf"
++    token_in_activation_smem_region = "nvlink.token_comm.main_smem.token_in_activation"  # nosec B105
++    token_in_sf_smem_region = "nvlink.token_comm.main_smem.token_in_sf"  # nosec B105
++    token_back_activation_smem_region = "nvlink.token_comm.main_smem.token_back_activation"  # nosec B105
++    token_back_sf_smem_region = "nvlink.token_comm.main_smem.token_back_sf"  # nosec B105
+ 
+     @classmethod
+     def problem_desc_require(cls) -> dict[str, type]:
+@@ -1518,7 +1517,7 @@
+ 
+     @property
+     def token_back_push_data(self) -> bool:
+-        return self.token_back_mode != "epi_warps"
++        return self.token_back_mode != "epi_warps"  # nosec B105
+ 
+     @property
+     def token_back_push_sf(self) -> bool:
+@@ -1747,7 +1746,7 @@
+                 buffer_space="local",
+                 byte_alignment=128,
+             )
+-        if self.token_back_enabled and self.token_back_schedule_mode == "atomic_counter":
++        if self.token_back_enabled and self.token_back_schedule_mode == "atomic_counter":  # nosec B105
+             workspace.register(
+                 self.token_back_schedule_region,
+                 cutlass.Int32,
+@@ -1806,14 +1805,14 @@
+         if not self.token_back_enabled:
+             return
+ 
+-        if self.token_back_mode == "standalone_warps":
++        if self.token_back_mode == "standalone_warps":  # nosec B105
+             token_back_lifetime = workspace.create_overlay(
+                 "nvlink.token_comm.main_smem.standalone_token_back"
+             ).add_lifetime("token_back")
+         else:
+             token_back_lifetime = transfer_overlay.add_lifetime("token_back")
+ 
+-        if self.token_back_mode == "standalone_warps":
++        if self.token_back_mode == "standalone_warps":  # nosec B105
+             available_bytes_per_warp = self.standalone_chunk_bytes
+         else:
+             activation_bytes = self.bytes_per_token
+@@ -1824,14 +1823,14 @@
+             bytes_per_output_token = (
+                 self.hidden_size * int(self.combine_format.act_dtype.width) // 8
+             )
+-            if self.token_back_mode == "standalone_warps":
++            if self.token_back_mode == "standalone_warps":  # nosec B105
+                 chunk_bytes = self.standalone_chunk_bytes
+             elif available_bytes_per_warp < bytes_per_output_token:
+                 chunk_bytes = self.bytes_per_token
+             else:
+                 chunk_bytes = bytes_per_output_token
+             if (
+-                self.token_back_mode != "standalone_warps"
++                self.token_back_mode != "standalone_warps"  # nosec B105
+                 and bytes_per_output_token % chunk_bytes != 0
+             ):
+                 raise ValueError("Token-back data chunk bytes must divide one row.")
+@@ -2002,7 +2001,7 @@
+         )
+         token_in_size_barrier.arrive_and_wait()
+         iket.range_pop()
+-        if cutlass.const_expr(self.token_back_mode == "standalone_warps"):
++        if cutlass.const_expr(self.token_back_mode == "standalone_warps"):  # nosec B105
+             sizes_ready_barrier = pipeline.NamedBarrier(
+                 barrier_id=self.standalone_size_barrier_id,
+                 num_threads=2 * self.transfer_thread_count,
+@@ -2165,7 +2164,7 @@
+         cute.arch.sync_warp()
+         iket.range_pop()
+         if cutlass.const_expr(
+-            self.token_back_enabled and self.token_back_mode != "standalone_warps"
++            self.token_back_enabled and self.token_back_mode != "standalone_warps"  # nosec B105
+         ):
+             iket.range_push("token_in.transfer_barrier")
+             transfer_lifetime_barrier = pipeline.NamedBarrier(
+@@ -2204,7 +2203,8 @@
+                 (average_window - current_window + Int32(3)) // Int32(4)
+             )
+         # with cute.arch.elect_one():
+-        #     cute.printf("avg_window: {}, current_window: {}, sleep_cycles: {}", average_window, current_window, sleep_cycles)
++        # cute.printf("avg_window: {}, current_window: {}, sleep_cycles: {}", average_window, current_window,
++        # sleep_cycles)
+         if sleep_cycles > Int32(self.adaptive_minimum_sleep_cycles):
+             nanosleep(sleep_cycles)
+         if average_window > Int32(high_window):
+@@ -2251,7 +2251,7 @@
+         cute.arch.sync_warp()
+ 
+         owned_sizes = smem_workspace.tensor(self.expert_sizes_smem_region, smem_base)
+-        if cutlass.const_expr(self.token_back_mode == "standalone_warps"):
++        if cutlass.const_expr(self.token_back_mode == "standalone_warps"):  # nosec B105
+             sizes_ready_barrier = pipeline.NamedBarrier(
+                 barrier_id=self.standalone_size_barrier_id,
+                 num_threads=2 * self.transfer_thread_count,
+@@ -2267,7 +2267,7 @@
+             activation_chunk_count = ceil_div(output_token_bytes, activation_chunk_bytes)
+             data_window_unit = activation_chunk_bytes * 2
+             reuse_data_pacing_enabled = (
+-                self.token_back_mode == "reuse_dispatch_warps"
++                self.token_back_mode == "reuse_dispatch_warps"  # nosec B105
+                 and data_window_unit > self.minimum_pacing_window_cycles
+             )
+             # Preserve the empirical low:initial:high ratio of 1:2.5:5.
+@@ -2282,7 +2282,7 @@
+             sf_chunk_count = ceil_div(output_sf_bytes, sf_chunk_bytes)
+             sf_window_unit = ceil_div(sf_chunk_bytes * 2, 3)
+             reuse_sf_pacing_enabled = (
+-                self.token_back_mode == "reuse_dispatch_warps"
++                self.token_back_mode == "reuse_dispatch_warps"  # nosec B105
+                 and sf_window_unit > self.minimum_pacing_window_cycles
+             )
+             sf_average_window = Int32(sf_window_unit)
+@@ -2290,7 +2290,7 @@
+             sf_high_window = sf_window_unit * 2
+ 
+         next_dense_token = global_worker_idx - global_worker_count
+-        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):
++        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):  # nosec B105
+             next_dense_token = Int32(0)
+         next_dense_token = self.next_token(next_dense_token)
+         expert_valid_begin = Int32(0)
+@@ -2377,7 +2377,7 @@
+                         current_chunk_bytes = Int32(chunk_bytes_this_round)
+                         current_window_unit = ceil_div(chunk_bytes_this_round * 2, 3)
+                         stateless_data_pacing_enabled = (
+-                            self.token_back_mode != "reuse_dispatch_warps"
++                            self.token_back_mode != "reuse_dispatch_warps"  # nosec B105
+                             and current_window_unit > self.minimum_pacing_window_cycles
+                         )
+                         round_start_clock = Int64(0)
+@@ -2466,7 +2466,7 @@
+                         current_chunk_bytes = Int32(chunk_bytes_this_round)
+                         current_window_unit = ceil_div(chunk_bytes_this_round * 2, 3)
+                         stateless_sf_pacing_enabled = (
+-                            self.token_back_mode != "reuse_dispatch_warps"
++                            self.token_back_mode != "reuse_dispatch_warps"  # nosec B105
+                             and current_window_unit > self.minimum_pacing_window_cycles
+                         )
+                         round_start_clock = Int64(0)
+@@ -2533,9 +2533,9 @@
+     def next_token(self, current_token: Int32) -> Int32:
+         global_worker_count = self.promised_launchable_sm_count * self.transfer_warp_count
+         schedule_counter = None
+-        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):
++        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):  # nosec B105
+             schedule_counter = self._device_workspace.ptr(self.token_back_schedule_region)
+-        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):
++        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):  # nosec B105
+             claimed_token = Int32(0)
+             if self._lane_idx == Int32(0):
+                 claimed_token = cute.arch.atomic_add(
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/cute_py_helpers.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/cute_py_helpers.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/cute_py_helpers.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/cute_py_helpers.py
+@@ -10,7 +10,6 @@
+ from cutlass.cute.nvgpu import OperandMajorMode
+ 
+ from .smem_workspace import SmemRegion
+-
+ 
+ # Every block-scaled tcgen05 MMA kind accumulates in F32 and no other accumulator is legal, so
+ # this belongs to the instruction family rather than being a caller choice.
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/device_workspace.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/device_workspace.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/device_workspace.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/device_workspace.py
+@@ -18,11 +18,10 @@
+     is_nested_shape,
+     is_power_of_two,
+     ordered_stride,
++    round_up,
+     row_major_stride,
+-    round_up,
+     validate_static_integer_tuple,
+ )
+-
+ 
+ BufferResetAttr = Literal["data", "zero_on_first_allocate", "tail_reset"]
+ BufferSpace = Literal["local", "shared"]
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/helper_weight_ready_gate.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/helper_weight_ready_gate.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/helper_weight_ready_gate.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/helper_weight_ready_gate.py
+@@ -28,7 +28,6 @@
+ from cutlass.cutlass_dsl import Int32, extract_mlir_values, new_from_mlir_values
+ 
+ from .ptx_helpers import nanosleep, read_globaltimer_ns
+-
+ 
+ HELPER_WEIGHT_READY_TERMINAL_ERROR_BIT = 1 << 63
+ HELPER_WEIGHT_READY_GENERATION_MASK = HELPER_WEIGHT_READY_TERMINAL_ERROR_BIT - 1
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/ptx_helpers.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/ptx_helpers.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/ptx_helpers.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/ptx_helpers.py
+@@ -11,7 +11,6 @@
+ from cutlass._mlir.dialects import arith, llvm, vector
+ from cutlass.cutlass_dsl import Float32, Int32, Int64, T, dsl_user_op
+ 
+-
+ TmaCacheHintEvictFirst = 0x12F0000000000000
+ 
+ 
+@@ -25,7 +24,7 @@
+ def nanosleep(
+     sleep_cycles: int, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
+ ) -> None:
+-    """Suspend the calling thread for approximately the requested nanoseconds."""
++    """Suspend the calling thread for up to the requested clock cycles."""
+     if cutlass.const_expr(hasattr(cute.arch, "nanosleep")):
+         cute.arch.nanosleep(sleep_time=sleep_cycles, loc=loc, ip=ip)
+         return
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/smem_workspace.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/smem_workspace.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/smem_workspace.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/smem_workspace.py
+@@ -12,11 +12,10 @@
+ from .utils import (
+     cosize_from_shape_stride_tuples,
+     is_power_of_two,
++    round_up,
+     row_major_stride,
+-    round_up,
+     validate_static_integer_tuple,
+ )
+-
+ 
+ SmemRegionKind = Literal["mbarrier", "tensor"]
+ SwizzleSpec = Tuple[int, int, int]
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/utils.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/utils.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/utils.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/helpers/utils.py
+@@ -6,7 +6,6 @@
+ from typing import Iterable, List, Tuple, Union
+ 
+ import cutlass
+-
+ 
+ IntegerType = Union[int, cutlass.Int32, cutlass.Int64, cutlass.Uint32, cutlass.Uint64]
+ 
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/custom_mix_cga_helpers.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/custom_mix_cga_helpers.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/custom_mix_cga_helpers.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/custom_mix_cga_helpers.py
+@@ -12,16 +12,15 @@
+ from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
+ from cutlass.cute.nvgpu import cpasync, tcgen05
+ from cutlass.cute.nvgpu.cpasync.copy import (
++    TMA_DESC_PTR_FIELD_NAME,
++    TMA_MBAR_PTR_FIELD_NAME,
++    TMA_MCAST_MASK_FIELD_NAME,
+     CopyBulkTensorTileG2SMulticastNonExecTrait,
+     CopyBulkTensorTileG2SMulticastTrait,
+     CopyBulkTensorTileG2SNonExecTrait,
+     CopyBulkTensorTileG2STrait,
+-    TMA_DESC_PTR_FIELD_NAME,
+-    TMA_MBAR_PTR_FIELD_NAME,
+-    TMA_MCAST_MASK_FIELD_NAME,
+ )
+ from cutlass.cutlass_dsl import Boolean, Int16, Int32
+-
+ 
+ TmaAtomOrPair = Union[cute.CopyAtom, Tuple[cute.CopyAtom, cute.CopyAtom]]
+ 
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_epilogue.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
+@@ -10,24 +10,19 @@
+ """
+ 
+ import dataclasses
+-import math
+ from typing import Any, Callable, ClassVar, List, Literal, Optional, Tuple, Type, Union
+ 
+ import cutlass
+ import cutlass.cute as cute
+-from cutlass.cutlass_dsl import Int64, T
++import cutlass.pipeline as pipeline
++import cutlass.utils as utils
++import cutlass.utils.blackwell_helpers as sm100_utils
++from cutlass._mlir import ir
++from cutlass._mlir.dialects import llvm, vector
+ from cutlass.cute.nvgpu import cpasync, tcgen05
+ from cutlass.cute.typing import AddressSpace
+-import cutlass.utils as utils
+-import cutlass.pipeline as pipeline
+-import cutlass.utils.blackwell_helpers as sm100_utils
+-
+-from cutlass._mlir import ir
+-from cutlass._mlir.dialects import llvm, vector
+-
+-from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
+-from .....communication.token_protocol import TokenSrcMetadata
+-from .....quant_def import CombineFormat, QuantKind
++from cutlass.cutlass_dsl import Int64, T
++
+ from .....api import (
+     ImplDesc,
+     KernelComponent,
+@@ -35,7 +30,9 @@
+     ProblemDesc,
+     StaticOrRuntimeIntegerType,
+ )
+-from .....helpers.constants import Nvfp4E2M1RcpLimit, Fp8E4M3RcpLimit, Fp8E5M2RcpLimit, Fp32Max
++from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
++from .....communication.token_protocol import TokenSrcMetadata
++from .....helpers.constants import Fp8E4M3RcpLimit, Fp8E5M2RcpLimit, Fp32Max, Nvfp4E2M1RcpLimit
+ from .....helpers.cute_py_helpers import tcgen05_block_scaled_acc_dtype
+ from .....helpers.dsl_helpers import mark_alignment
+ from .....helpers.flag_batch import GpuReleaseFlagBatchTracker
+@@ -47,8 +44,10 @@
+     red_add_relaxed_sys_v2_bf16x2,
+ )
+ from .....helpers.smem_workspace import SmemRegion, SmemWorkspace
++from .....quant_def import CombineFormat, QuantKind
+ from ....function_mapping import CoordinateSpace, FunctionMapping
+-from ....schedulers import BlockPhase, SchedulerConsumer, SwapAbFc12WorkTileInfo
++from ....schedulers.base import SchedulerConsumer
++from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo
+ from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
+ 
+ 
+@@ -1021,7 +1020,8 @@
+     fc2_alpha: Optional[cute.Tensor]
+     fc1_norm_const: Optional[cute.Tensor]
+     # -----------------------------------
+-    # MoE domain (token, topk), deepgemm graph only? for transformer graph, we want reduce kernel to perform the score mul.
++    # MoE domain (token, topk), deepgemm graph only? for transformer graph, we want reduce kernel to perform the
++    # score mul.
+     topk_scores: Optional[cute.Tensor]
+ 
+ 
+@@ -1067,6 +1067,8 @@
+             "intermediate_gateup_size": StaticOrRuntimeIntegerType,
+             "combine_format": CombineFormat,
+             "gate_up_clamp": Optional[float],
++            "swiglu_alpha": OptionalRequirement(Optional[float]),
++            "swiglu_beta": OptionalRequirement(Optional[float]),
+             # SiTU (Kimi K3) selects a different gated-activation core; optional so
+             # existing SwiGLU descriptors stay valid unchanged. See _resolve_situ_betas.
+             "situ_beta": OptionalRequirement(Optional[float]),
+@@ -1113,6 +1115,8 @@
+             raise ValueError(
+                 "SiTU does not support gate_up_clamp; the two activation variants are exclusive."
+             )
++        if problem_desc.get("swiglu_alpha") is not None:
++            raise ValueError("SiTU does not support SwiGLUBias constants.")
+         return float(beta), float(linear_beta)
+ 
+     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
+@@ -1124,6 +1128,13 @@
+         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
+         self.combine_format = problem_desc["combine_format"]
+         self.gate_up_clamp = problem_desc["gate_up_clamp"]
++        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
++        self.swiglu_beta = problem_desc.get("swiglu_beta")
++        if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
++            raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
++        if self.swiglu_alpha is not None:
++            self.swiglu_alpha = float(self.swiglu_alpha)
++            self.swiglu_beta = float(self.swiglu_beta)
+         self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(problem_desc)
+         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
+         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
+@@ -1817,7 +1828,8 @@
+             up_token_32_64 = cute.make_rmem_tensor((16,), cutlass.Float32)
+             # Although hardcode is not right, but since the whole tmem transpose is too tricky, I have to hardcode...
+             # (epi_tile_m, epi_tile_n) -> (warp_local_epi_tile_m, epi_tile_n)
+-            # tmem_subtile_tensor_per_warp = cute.logical_divide(tmem_subtile_tensor, (32, None))[(None, self.warp_idx), None]
++            # tmem_subtile_tensor_per_warp = cute.logical_divide(tmem_subtile_tensor, (32, None))[(None,
++            # self.warp_idx), None]
+             tmem_subtile_tensor_per_warp = cute.logical_divide(tmem_subtile_tensor, (32, None))[
+                 (None, 0), None
+             ]
+@@ -1962,7 +1974,8 @@
+         #        gate = min(gate, +limit)           (upper bound only)
+         #        up   = clamp(up, -limit, +limit)   (symmetric)
+         #   3. gated activation, either SwiGLU or SiTU (mutually exclusive; SiTU has no clamp):
+-        #        SwiGLU: out = up * gate * sigmoid(gate)
++        #        SwiGLU: out = (up + swiglu_beta) * gate * sigmoid(swiglu_alpha * gate)
++        #                Standard SwiGLU uses swiglu_alpha=1 and swiglu_beta=0.
+         #        SiTU:   out = beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)
+         #                sigmoid(x) = rcp(1 + exp2(-x * log2e))
+         #
+@@ -1974,8 +1987,15 @@
+         out = cute.make_rmem_tensor((n,), cutlass.Float32)
+         log2_e = 1.4426950408889634
+ 
+-        neg_log2e_pair = (cutlass.Float32(-log2_e), cutlass.Float32(-log2_e))
++        activation_alpha = 1.0 if self.swiglu_alpha is None else self.swiglu_alpha
++        neg_activation_alpha_log2e = -activation_alpha * log2_e
++        neg_log2e_pair = (
++            cutlass.Float32(neg_activation_alpha_log2e),
++            cutlass.Float32(neg_activation_alpha_log2e),
++        )
+         one_pair = (cutlass.Float32(1.0), cutlass.Float32(1.0))
++        if cutlass.const_expr(self.swiglu_beta is not None):
++            beta_pair = (cutlass.Float32(self.swiglu_beta), cutlass.Float32(self.swiglu_beta))
+         if cutlass.const_expr(self.gate_up_clamp is not None):
+             limit = cutlass.Float32(self.gate_up_clamp)
+ 
+@@ -2051,7 +2071,9 @@
+             sigmoid_pair = _sigmoid(g0, g1)
+ 
+             if cutlass.const_expr(self.situ_beta is None):
+-                # SwiGLU: out = up * gate * sigmoid(gate)
++                # The SwiGLUBias offset follows the up clamp.
++                if cutlass.const_expr(self.swiglu_beta is not None):
++                    u0, u1 = cute.arch.add_packed_f32x2((u0, u1), beta_pair)
+                 ug = cute.arch.mul_packed_f32x2((u0, u1), (g0, g1))
+                 out_pair = cute.arch.mul_packed_f32x2(ug, sigmoid_pair)
+             else:
+@@ -2621,7 +2643,8 @@
+         valid = cute.make_rmem_tensor((copy_iters,), cutlass.Int32)
+         dst_ptrs = cute.make_rmem_tensor((copy_iters,), cutlass.Int64)
+ 
+-        # Compiler should be able to optimize the same token_copy_group's offset add. (Fundamental cse + strength_reduce)
++        # Compiler should be able to optimize the same token_copy_group's offset add. (Fundamental cse +
++        # strength_reduce)
+         # We should check the SASS to ensure this happens.
+         for iter_idx in cutlass.range_constexpr(copy_iters):
+             coord = self.data_mapping.evaluate(epi_tid=self.epi_tid, iter_idx=iter_idx)
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_extension.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_extension.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_extension.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_extension.py
+@@ -15,7 +15,6 @@
+ 
+ from .....helpers.dsl_helpers import spin_peek, spin_wait
+ from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo, peek_ready_bit
+-
+ 
+ TensorRole = Literal["a", "b", "sfa", "sfb", "c", "sfc", "topk"]
+ 
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+@@ -4,11 +4,9 @@
+ """Fused pull-dispatch MegaMoE kernel composition for Blackwell."""
+ 
+ import hashlib
+-
+ from typing import ClassVar, Optional, Tuple
+ 
+ import cuda.bindings.driver as cuda
+-
+ import cutlass
+ import cutlass.cute as cute
+ import cutlass.pipeline as pipeline
+@@ -32,14 +30,14 @@
+ )
+ from .....helpers.device_workspace import DeviceWorkspace
+ from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
++from .....helpers.helper_weight_ready_gate import (
++    derive_helper_weight_ready_topology,
++    make_helper_weight_ready_generation_gate,
++)
+ from .....helpers.iket_compat import iket
+ from .....helpers.megamoe_aot import make_megamoe_aot_callable
+ from .....helpers.smem_workspace import SmemWorkspace
+ from .....helpers.utils import ceil_div, round_up
+-from .....helpers.helper_weight_ready_gate import (
+-    derive_helper_weight_ready_topology,
+-    make_helper_weight_ready_generation_gate,
+-)
+ from .....quant_def import CombineFormat, QuantKind
+ from ....schedulers.base import WorkIdAcquisitionMode
+ from ....schedulers.fc12_scheduler import (
+@@ -58,7 +56,6 @@
+ from .block_scaled_swap_ab_fc12_mainloop import BlockScaledSwapAbFc12Mainloop
+ from .topk_reduce import TopkReduce
+ 
+-
+ _aot_symbol_prefix = "blackwell_mega_moe_aot"
+ 
+ 
+@@ -90,6 +87,8 @@
+             "b_major_mode": OperandMajorMode,
+             "combine_format": CombineFormat,
+             "gate_up_clamp": Optional[float],
++            "swiglu_alpha": OptionalRequirement(Optional[float]),
++            "swiglu_beta": OptionalRequirement(Optional[float]),
+             "situ_beta": OptionalRequirement(Optional[float]),
+             "situ_linear_beta": OptionalRequirement(Optional[float]),
+             "world_size": int,
+@@ -144,6 +143,8 @@
+         self.b_major_mode = problem_desc["b_major_mode"]
+         self.combine_format = problem_desc["combine_format"]
+         self.gate_up_clamp = problem_desc["gate_up_clamp"]
++        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
++        self.swiglu_beta = problem_desc.get("swiglu_beta")
+         self.situ_beta = problem_desc.get("situ_beta")
+         self.situ_linear_beta = problem_desc.get("situ_linear_beta")
+         self.world_size = problem_desc["world_size"]
+@@ -185,8 +186,8 @@
+             # static M is required only when an S>0 helper boundary must be
+             # compiled into the scheduler gate.
+             self.home_expert_count = self.local_expert_count
+-        self.threads_per_cta = 16 * 32 if self.token_back_mode == "standalone_warps" else 12 * 32
+-        self.other_warp_register_count = 64 if self.token_back_mode == "standalone_warps" else 72
++        self.threads_per_cta = 16 * 32 if self.token_back_mode == "standalone_warps" else 12 * 32  # nosec B105
++        self.other_warp_register_count = 64 if self.token_back_mode == "standalone_warps" else 72  # nosec B105
+ 
+         self.mixed_cga_config = NonClcMixedCgaConfig(
+             preferred_cluster_shape=self.cluster_shape_mn,
+@@ -502,6 +503,7 @@
+             f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_ctas{self.mixed_cga_config.total_cta_cnt}_"
+             f"tokeninflag{self.token_in_flag_batch}_tokenback{self.token_back_mode}_"
+             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
++            f"swiglua{self.swiglu_alpha}_swiglub{self.swiglu_beta}_"
+             # The SiTU betas are codegen-time constants, so they must key the compiled kernel.
+             f"situ{self.situ_beta}x{self.situ_linear_beta}_"
+             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
+@@ -1150,7 +1152,7 @@
+             self.cluster_shape_mn, self.resolved_fallback_cluster_shape_mn, is_fallback_cluster
+         )
+         finalize_barrier_thread_count = (
+-            12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32
++            12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32  # nosec B105
+         )
+         finalize_barrier = pipeline.NamedBarrier(
+             barrier_id=13, num_threads=finalize_barrier_thread_count
+@@ -1287,7 +1289,7 @@
+                 iket.range_pop()
+                 if cutlass.const_expr(
+                     self.token_comm.token_back_enabled
+-                    and self.token_back_mode != "standalone_warps"
++                    and self.token_back_mode != "standalone_warps"  # nosec B105
+                 ):
+                     iket.range_push("mega.token_back")
+                     self.token_comm.token_back(self._smem_workspace, smem_base)
+@@ -1296,7 +1298,7 @@
+                 iket.range_push("mega.tail_reset")
+                 self.token_comm.reset_tail()
+                 iket.range_pop()
+-            elif cutlass.const_expr(self.token_back_mode == "standalone_warps"):
++            elif cutlass.const_expr(self.token_back_mode == "standalone_warps"):  # nosec B105
+                 iket.range_push("mega.token_back_standalone")
+                 self.token_comm.token_back(self._smem_workspace, smem_base)
+                 iket.range_pop()
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/dynamic_mainloop.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/dynamic_mainloop.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/dynamic_mainloop.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/dynamic_mainloop.py
+@@ -34,15 +34,12 @@
+ 
+ from typing import Optional
+ 
+-import cutlass
+ import cutlass.cute as cute
+-from cutlass.cutlass_dsl import dsl_user_op, Int32, Boolean
+ from cutlass._mlir import ir
+-from cutlass._mlir.dialects import builtin
+-from cutlass._mlir.dialects import llvm
++from cutlass._mlir.dialects import builtin, llvm
++from cutlass.cutlass_dsl import Boolean, Int32, dsl_user_op
+ 
+ from .....quant_def import QuantKind
+-
+ 
+ # =============================================================================
+ # Alignment policy (single source of truth)
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/topk_reduce.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/topk_reduce.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/topk_reduce.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/blackwell/inference/mega/topk_reduce.py
+@@ -23,22 +23,20 @@
+ from typing import ClassVar, Dict, Optional
+ 
+ import cuda.bindings.driver as cuda
+-
+ import cutlass
+ import cutlass.cute as cute
++from cutlass._mlir.dialects import llvm
+ from cutlass.cutlass_dsl import Float32, Int32, T
+-from cutlass._mlir.dialects import llvm
+-
+-from .....quant_def import CombineFormat
++
+ from .....helpers.constants import Nvfp4E2M1RcpLimit
+ from .....helpers.dsl_helpers import mark_alignment
+-
++from .....quant_def import CombineFormat
+ 
+ # ---------------------------------------------------------------------------
+ # fp4 (e2m1) -> fp32 register decode.
+ #
+ # Blackwell has no e2m1->f32 upconvert: the framework's ``term.load().to(f32)``
+ # lowers to an ALU subnormal-normalization path. Both helpers
+ # below force a table-driven decode instead; ``e2m1_reg`` (N e2m1 codes, N % 8
+ # == 0) is read as packed b32 words and N fp32 values are written into
+ # ``fp32_reg`` in code order. The 16 e2m1 values are exact in fp32, so the two
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/custom_mix_cga_helpers.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/custom_mix_cga_helpers.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/custom_mix_cga_helpers.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/custom_mix_cga_helpers.py
+@@ -13,7 +13,6 @@
+     select_tma_atom_for_cluster,
+ )
+ 
+-
+ __all__ = [
+     "PipelineTmaUmmaMixedCga",
+     "TmaAtomOrPair",
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_fc12_epilogue.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_fc12_epilogue.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_fc12_epilogue.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_fc12_epilogue.py
+@@ -19,17 +19,20 @@
+ from .....helpers.smem_workspace import SmemRegion, SmemWorkspace
+ from .....quant_def import QuantKind
+ from ....function_mapping import FunctionMapping
+-from ....schedulers import BlockPhase, SchedulerConsumer, SwapAbFc12WorkTileInfo
++from ....schedulers.base import SchedulerConsumer
++from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo
+ from ..mega.block_scaled_swap_ab_fc12_epilogue import (
+     GatedActEpilogueArgs,
+     SwapABFc1Epilogue,
+-    SwapABFc2Epilogue as _SharedSwapABFc2Epilogue,
+-    SwapABGatedActEpilogue as _SharedSwapABGatedActEpilogue,
+     make_fc2_redg_process_pipeline,
+     make_fc2_stg_process_pipeline,
+     make_fc2_ublk_process_pipeline,
+ )
+-from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
++from ..mega.block_scaled_swap_ab_fc12_epilogue import SwapABFc2Epilogue as _SharedSwapABFc2Epilogue
++from ..mega.block_scaled_swap_ab_fc12_epilogue import (
++    SwapABGatedActEpilogue as _SharedSwapABGatedActEpilogue,
++)
++from ..mega.block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
+ from .local_routing import RoutingMetadata
+ 
+ 
+@@ -63,6 +66,13 @@
+         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
+         self.combine_format = problem_desc["combine_format"]
+         self.gate_up_clamp = problem_desc["gate_up_clamp"]
++        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
++        self.swiglu_beta = problem_desc.get("swiglu_beta")
++        if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
++            raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
++        if self.swiglu_alpha is not None:
++            self.swiglu_alpha = float(self.swiglu_alpha)
++            self.swiglu_beta = float(self.swiglu_beta)
+         self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(problem_desc)
+         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
+         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_fc12_extension.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_fc12_extension.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_fc12_extension.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_fc12_extension.py
+@@ -6,5 +6,4 @@
+ # <<<MEGA_REPO_CONTROL : COPY_FROM_IMPORT>>>
+ from ..mega.block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension, TensorRole
+ 
+-
+ __all__ = ["BlockScaledSwapAbFc12Extension", "TensorRole"]
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_local_mega_moe_kernel.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_local_mega_moe_kernel.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_local_mega_moe_kernel.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_local_mega_moe_kernel.py
+@@ -4,11 +4,9 @@
+ """Local MegaMoE kernel composition for Rubin."""
+ 
+ import hashlib
+-
+ from typing import ClassVar, Optional, Tuple
+ 
+ import cuda.bindings.driver as cuda
+-
+ import cutlass
+ import cutlass.cute as cute
+ import cutlass.pipeline as pipeline
+@@ -32,23 +30,22 @@
+ )
+ from .....helpers.device_workspace import DeviceWorkspace
+ from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
++from .....helpers.helper_weight_ready_gate import (
++    derive_helper_weight_ready_topology,
++    make_helper_weight_ready_generation_gate,
++)
+ from .....helpers.iket_compat import iket
+ from .....helpers.megamoe_aot import make_megamoe_aot_callable
+ from .....helpers.smem_workspace import SmemWorkspace
+ from .....helpers.utils import ceil_div, round_up
+-from .....helpers.helper_weight_ready_gate import (
+-    derive_helper_weight_ready_topology,
+-    make_helper_weight_ready_generation_gate,
+-)
+ from .....quant_def import CombineFormat, QuantKind
++from ....blackwell.inference.mega.topk_reduce import TopkReduce
+ from ....schedulers.base import WorkIdAcquisitionMode
+ from ....schedulers.fc12_scheduler import BlackwellFusedFc12Scheduler, PhaseInterleavedFc12Scheduler
++from ..mega.block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
+ from .block_scaled_swap_ab_fc12_epilogue import GatedActEpilogueArgs, SwapABGatedActEpilogue
+-from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
+ from .block_scaled_swap_ab_fc12_mainloop import BlockScaledSwapAbFc12Mainloop
+ from .local_routing import LocalRouting, LocalRoutingArgs
+-from .topk_reduce import TopkReduce
+-
+ 
+ _aot_symbol_prefix = "rubin_local_mega_moe_aot"
+ 
+@@ -80,6 +77,8 @@
+             "a_major_mode": OperandMajorMode,
+             "b_major_mode": OperandMajorMode,
+             "gate_up_clamp": Optional[float],
++            "swiglu_alpha": OptionalRequirement(Optional[float]),
++            "swiglu_beta": OptionalRequirement(Optional[float]),
+             "situ_beta": OptionalRequirement(Optional[float]),
+             "situ_linear_beta": OptionalRequirement(Optional[float]),
+             "topk": int,
+@@ -127,6 +126,8 @@
+         self.b_major_mode = problem_desc["b_major_mode"]
+         self.combine_format = CombineFormat.parse("bf16")
+         self.gate_up_clamp = problem_desc["gate_up_clamp"]
++        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
++        self.swiglu_beta = problem_desc.get("swiglu_beta")
+         self.situ_beta = problem_desc.get("situ_beta")
+         self.situ_linear_beta = problem_desc.get("situ_linear_beta")
+         self.topk = problem_desc["topk"]
+@@ -183,7 +184,9 @@
+                 "promised_launchable_sm_count": (
+                     self.launch_cluster_count * self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
+                 ),
+-                "router_smem_limit_bytes": utils.get_smem_capacity_in_bytes(self.architecture),
++                "router_smem_limit_bytes": cutlass.memory.get_smem_capacity_in_bytes(
++                    self.architecture
++                ),
+             }
+         )
+         resolved_problem_desc = ProblemDesc(
+@@ -450,6 +453,7 @@
+             f"fc1epiflag{self.fc1_epi_flag_batch}_clusters{self.launch_cluster_count}_"
+             f"routingflag{self.routing_flag_batch}_"
+             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
++            f"swiglua{self.swiglu_alpha}_swiglub{self.swiglu_beta}_"
+             # The SiTU betas are codegen-time constants, so they must key the compiled kernel.
+             f"situ{self.situ_beta}x{self.situ_linear_beta}_"
+             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/local_routing.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/local_routing.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/local_routing.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/local_routing.py
+@@ -7,7 +7,6 @@
+ from typing import Callable, ClassVar, Optional, Tuple, Union
+ 
+ import cuda.bindings.driver as cuda
+-
+ import cutlass
+ import cutlass.cute as cute
+ import cutlass.pipeline as pipeline
+@@ -21,13 +20,7 @@
+ from .....helpers.dsl_helpers import mark_alignment
+ from .....helpers.flag_batch import make_flag_batch_tracker
+ from .....helpers.iket_compat import iket
+-from .....helpers.ptx_helpers import (
+-    cp_async_bulk_s2g,
+-    nanosleep,
+-    stg_b64,
+-    stg_f32,
+-    tma_load_1d,
+-)
++from .....helpers.ptx_helpers import cp_async_bulk_s2g, nanosleep, stg_b64, stg_f32, tma_load_1d
+ from .....helpers.smem_workspace import SmemWorkspace
+ from .....helpers.software_sync import SoftwareGridSync
+ from .....helpers.utils import ceil_div, round_up
+@@ -188,7 +181,7 @@
+     sorted_metadata_region = "local_mega.routing.sorted_metadata"
+     sorted_scores_region = "local_mega.routing.sorted_scores"
+     pool_expert_base_region = "local_mega.routing.pool_expert_base"
+-    token_src_metadata_region = "local_mega.routing.token_src_metadata"
++    token_src_metadata_region = "local_mega.routing.token_src_metadata"  # nosec B105
+     fc1_topk_scores_region = "local_mega.routing.fc1_topk_scores"
+     source_expert_base_region = "local_mega.routing.source_expert_base"
+     sorted_metadata_ready_region = "local_mega.routing.sorted_metadata_ready"
+@@ -246,7 +239,8 @@
+         self.router_grid_cta_count = max(self.router_data_cta_count + 1, self.router_push_cta_count)
+         if self.router_grid_cta_count > self.promised_launchable_sm_count:
+             raise ValueError(
+-                "Router grid exceeds promised_launchable_sm_count; all metadata-push CTAs must be concurrently resident."
++                "Router grid exceeds promised_launchable_sm_count; "
++                "all metadata-push CTAs must be concurrently resident."
+             )
+         self._router_smem_workspace = self._build_router_smem_workspace()
+ 
+@@ -1225,9 +1219,9 @@
+     fc1_activation_sf_region = "local_mega.routing.fc1_activation_sf"
+     pre_reduced_activation_region = "local_mega.routing.pre_reduced_activation"
+ 
+-    token_in_mbarrier_region = "local_mega.routing.main_smem.token_in_mbarriers"
++    token_in_mbarrier_region = "local_mega.routing.main_smem.token_in_mbarriers"  # nosec B105
+     expert_sizes_smem_region = "local_mega.routing.main_smem.expert_sizes"
+-    token_in_sf_smem_region = "local_mega.routing.main_smem.token_in_sf"
++    token_in_sf_smem_region = "local_mega.routing.main_smem.token_in_sf"  # nosec B105
+ 
+     @classmethod
+     def problem_desc_require(cls) -> dict[str, type]:
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/tma_gather.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/tma_gather.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/tma_gather.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/tma_gather.py
+@@ -9,7 +9,6 @@
+ from cutlass._mlir.dialects import llvm
+ from cutlass.cute.typing import AddressSpace
+ from cutlass.cutlass_dsl import dsl_user_op
+-
+ 
+ _CTA_GROUP_2_MBAR_MASK = 0xFEFFFFFF
+ 
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/topk_reduce.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/topk_reduce.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/topk_reduce.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/local_mega/topk_reduce.py
+@@ -5,5 +5,4 @@
+ # <<<MEGA_REPO_CONTROL : COPY_FROM_IMPORT>>>
+ from ....blackwell.inference.mega.topk_reduce import TopkReduce
+ 
+-
+ __all__ = ["TopkReduce"]
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
+@@ -10,24 +10,19 @@
+ """
+ 
+ import dataclasses
+-import math
+ from typing import Any, Callable, ClassVar, List, Literal, Optional, Tuple, Type, Union
+ 
+ import cutlass
+ import cutlass.cute as cute
+-from cutlass.cutlass_dsl import Int64, T
++import cutlass.pipeline as pipeline
++import cutlass.utils as utils
++import cutlass.utils.blackwell_helpers as sm100_utils
++from cutlass._mlir import ir
++from cutlass._mlir.dialects import llvm, vector
+ from cutlass.cute.nvgpu import cpasync, tcgen05
+ from cutlass.cute.typing import AddressSpace
+-import cutlass.utils as utils
+-import cutlass.pipeline as pipeline
+-import cutlass.utils.blackwell_helpers as sm100_utils
+-
+-from cutlass._mlir import ir
+-from cutlass._mlir.dialects import llvm, vector
+-
+-from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
+-from .....communication.token_protocol import TokenSrcMetadata
+-from .....quant_def import CombineFormat, QuantKind
++from cutlass.cutlass_dsl import Int64, T
++
+ from .....api import (
+     ImplDesc,
+     KernelComponent,
+@@ -35,7 +30,9 @@
+     ProblemDesc,
+     StaticOrRuntimeIntegerType,
+ )
+-from .....helpers.constants import Nvfp4E2M1RcpLimit, Fp8E4M3RcpLimit, Fp8E5M2RcpLimit, Fp32Max
++from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
++from .....communication.token_protocol import TokenSrcMetadata
++from .....helpers.constants import Fp8E4M3RcpLimit, Fp8E5M2RcpLimit, Fp32Max, Nvfp4E2M1RcpLimit
+ from .....helpers.cute_py_helpers import tcgen05_block_scaled_acc_dtype
+ from .....helpers.dsl_helpers import mark_alignment
+ from .....helpers.flag_batch import make_flag_batch_tracker
+@@ -47,8 +44,10 @@
+     red_add_relaxed_sys_v2_bf16x2,
+ )
+ from .....helpers.smem_workspace import SmemRegion, SmemWorkspace
++from .....quant_def import CombineFormat, QuantKind
+ from ....function_mapping import CoordinateSpace, FunctionMapping
+-from ....schedulers import BlockPhase, SchedulerConsumer, SwapAbFc12WorkTileInfo
++from ....schedulers.base import SchedulerConsumer
++from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo
+ from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
+ 
+ 
+@@ -949,7 +948,8 @@
+     fc2_alpha: Optional[cute.Tensor]
+     fc1_norm_const: Optional[cute.Tensor]
+     # -----------------------------------
+-    # MoE domain (token, topk), deepgemm graph only? for transformer graph, we want reduce kernel to perform the score mul.
++    # MoE domain (token, topk), deepgemm graph only? for transformer graph, we want reduce kernel to perform the
++    # score mul.
+     topk_scores: Optional[cute.Tensor]
+ 
+ 
+@@ -992,6 +992,8 @@
+             "intermediate_gateup_size": StaticOrRuntimeIntegerType,
+             "combine_format": CombineFormat,
+             "gate_up_clamp": Optional[float],
++            "swiglu_alpha": OptionalRequirement(Optional[float]),
++            "swiglu_beta": OptionalRequirement(Optional[float]),
+             # SiTU (Kimi K3) selects a different gated-activation core; optional so
+             # existing SwiGLU descriptors stay valid unchanged. See _resolve_situ_betas.
+             "situ_beta": OptionalRequirement(Optional[float]),
+@@ -1039,6 +1041,8 @@
+             raise ValueError(
+                 "SiTU does not support gate_up_clamp; the two activation variants are exclusive."
+             )
++        if problem_desc.get("swiglu_alpha") is not None:
++            raise ValueError("SiTU does not support SwiGLUBias constants.")
+         return float(beta), float(linear_beta)
+ 
+     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
+@@ -1050,6 +1054,13 @@
+         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
+         self.combine_format = problem_desc["combine_format"]
+         self.gate_up_clamp = problem_desc["gate_up_clamp"]
++        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
++        self.swiglu_beta = problem_desc.get("swiglu_beta")
++        if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
++            raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
++        if self.swiglu_alpha is not None:
++            self.swiglu_alpha = float(self.swiglu_alpha)
++            self.swiglu_beta = float(self.swiglu_beta)
+         self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(problem_desc)
+         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
+         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
+@@ -1682,7 +1693,8 @@
+         up_token_32_64 = cute.make_rmem_tensor((16,), cutlass.Float32)
+         # Although hardcode is not right, but since the whole tmem transpose is too tricky, I have to hardcode...
+         # (epi_tile_m, epi_tile_n) -> (warp_local_epi_tile_m, epi_tile_n)
+-        # tmem_subtile_tensor_per_warp = cute.logical_divide(tmem_subtile_tensor, (32, None))[(None, self.warp_idx), None]
++        # tmem_subtile_tensor_per_warp = cute.logical_divide(tmem_subtile_tensor, (32, None))[(None,
++        # self.warp_idx), None]
+         tmem_subtile_tensor_per_warp = cute.logical_divide(tmem_subtile_tensor, (32, None))[
+             (None, 0), None
+         ]
+@@ -1827,7 +1839,8 @@
+         #        gate = min(gate, +limit)           (upper bound only)
+         #        up   = clamp(up, -limit, +limit)   (symmetric)
+         #   3. gated activation, either SwiGLU or SiTU (mutually exclusive; SiTU has no clamp):
+-        #        SwiGLU: out = up * gate * sigmoid(gate)
++        #        SwiGLU: out = (up + swiglu_beta) * gate * sigmoid(swiglu_alpha * gate)
++        #                Standard SwiGLU uses swiglu_alpha=1 and swiglu_beta=0.
+         #        SiTU:   out = beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)
+         #                sigmoid(x) = rcp(1 + exp2(-x * log2e))
+         #
+@@ -1839,8 +1852,15 @@
+         out = cute.make_rmem_tensor((n,), cutlass.Float32)
+         log2_e = 1.4426950408889634
+ 
+-        neg_log2e_pair = (cutlass.Float32(-log2_e), cutlass.Float32(-log2_e))
++        activation_alpha = 1.0 if self.swiglu_alpha is None else self.swiglu_alpha
++        neg_activation_alpha_log2e = -activation_alpha * log2_e
++        neg_log2e_pair = (
++            cutlass.Float32(neg_activation_alpha_log2e),
++            cutlass.Float32(neg_activation_alpha_log2e),
++        )
+         one_pair = (cutlass.Float32(1.0), cutlass.Float32(1.0))
++        if cutlass.const_expr(self.swiglu_beta is not None):
++            beta_pair = (cutlass.Float32(self.swiglu_beta), cutlass.Float32(self.swiglu_beta))
+         if cutlass.const_expr(self.gate_up_clamp is not None):
+             limit = cutlass.Float32(self.gate_up_clamp)
+ 
+@@ -1916,7 +1936,9 @@
+             sigmoid_pair = _sigmoid(g0, g1)
+ 
+             if cutlass.const_expr(self.situ_beta is None):
+-                # SwiGLU: out = up * gate * sigmoid(gate)
++                # The SwiGLUBias offset follows the up clamp.
++                if cutlass.const_expr(self.swiglu_beta is not None):
++                    u0, u1 = cute.arch.add_packed_f32x2((u0, u1), beta_pair)
+                 ug = cute.arch.mul_packed_f32x2((u0, u1), (g0, g1))
+                 out_pair = cute.arch.mul_packed_f32x2(ug, sigmoid_pair)
+             else:
+@@ -2392,7 +2414,8 @@
+         valid = cute.make_rmem_tensor((copy_iters,), cutlass.Int32)
+         dst_ptrs = cute.make_rmem_tensor((copy_iters,), cutlass.Int64)
+ 
+-        # Compiler should be able to optimize the same token_copy_group's offset add. (Fundamental cse + strength_reduce)
++        # Compiler should be able to optimize the same token_copy_group's offset add. (Fundamental cse +
++        # strength_reduce)
+         # We should check the SASS to ensure this happens.
+         for iter_idx in cutlass.range_constexpr(copy_iters):
+             coord = self.data_mapping.evaluate(epi_tid=self.epi_tid, iter_idx=iter_idx)
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py
+@@ -15,7 +15,6 @@
+ 
+ from .....helpers.dsl_helpers import spin_peek, spin_wait
+ from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo, peek_ready_bit
+-
+ 
+ TensorRole = Literal["a", "b", "sfa", "sfb", "c", "sfc", "topk"]
+ 
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
+@@ -33,15 +33,15 @@
+ from .....helpers.smem_workspace import SmemWorkspace
+ from .....helpers.utils import ceil_div, round_up, strides_equal_ignoring_singletons
+ from .....quant_def import QuantKind
+-from ....schedulers.base import SchedulerConsumer
+-from ....schedulers.fc12_mapping import BlockPhase
+-from ...custom_mix_cga_helpers import (
++from ....blackwell.custom_mix_cga_helpers import (
+     PipelineTmaUmmaMixedCga,
+     TmaAtomOrPair,
+     bind_executable_tma_load_fields,
+     make_executable_tma_atom_or_pair,
+     select_tma_atom_for_cluster,
+ )
++from ....schedulers.base import SchedulerConsumer
++from ....schedulers.fc12_mapping import BlockPhase
+ from . import dynamic_mainloop
+ from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
+ 
+
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+@@ -4,11 +4,9 @@
+ """Fused pull-dispatch MegaMoE kernel composition for Rubin."""
+ 
+ import hashlib
+-
+ from typing import ClassVar, Optional, Tuple
+ 
+ import cuda.bindings.driver as cuda
+-
+ import cutlass
+ import cutlass.cute as cute
+ import cutlass.pipeline as pipeline
+@@ -25,10 +23,6 @@
+     StaticOrRuntimeIntegerType,
+ )
+ from .....communication.nvlink_domain.token_comm import TokenCommArgs, TokenCommNonDeterministic
+-from .....helpers.helper_weight_ready_gate import (
+-    derive_helper_weight_ready_topology,
+-    make_helper_weight_ready_generation_gate,
+-)
+ from .....helpers.cute_py_helpers import (
+     Tcgen05MmaInstruction,
+     make_tcgen05_tmem_plan,
+@@ -37,11 +31,21 @@
+ from .....helpers.device_workspace import DeviceWorkspace
+ from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
+ from .....helpers.fc2_ready_geometry import derive_fc2_ready_geometry
++from .....helpers.helper_weight_ready_gate import (
++    derive_helper_weight_ready_topology,
++    make_helper_weight_ready_generation_gate,
++)
+ from .....helpers.iket_compat import iket
+ from .....helpers.megamoe_aot import make_megamoe_aot_callable
+ from .....helpers.smem_workspace import SmemWorkspace
+ from .....helpers.utils import ceil_div, round_up
+ from .....quant_def import CombineFormat, QuantKind
++from ....blackwell.custom_mix_cga_helpers import (
++    TmaAtomOrPair,
++    pipeline_init_arrive_mixed_cga,
++    pipeline_init_wait_mixed_cga,
++)
++from ....blackwell.inference.mega.topk_reduce import TopkReduce
+ from ....schedulers.base import WorkIdAcquisitionMode
+ from ....schedulers.fc12_scheduler import (
+     BlackwellFusedFc12Scheduler,
+@@ -49,16 +53,9 @@
+     minimum_phase_interleave_hint,
+ )
+ from ....schedulers.non_clc_mixed_cga import NonClcMixedCgaConfig
+-from ...custom_mix_cga_helpers import (
+-    TmaAtomOrPair,
+-    pipeline_init_arrive_mixed_cga,
+-    pipeline_init_wait_mixed_cga,
+-)
+ from .block_scaled_swap_ab_fc12_epilogue import GatedActEpilogueArgs, SwapABGatedActEpilogue
+ from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
+ from .block_scaled_swap_ab_fc12_mainloop import BlockScaledSwapAbFc12Mainloop
+-from .topk_reduce import TopkReduce
+-
+ 
+ _aot_symbol_prefix = "rubin_mega_moe_aot"
+ 
+@@ -91,6 +88,8 @@
+             "b_major_mode": OperandMajorMode,
+             "combine_format": CombineFormat,
+             "gate_up_clamp": Optional[float],
++            "swiglu_alpha": OptionalRequirement(Optional[float]),
++            "swiglu_beta": OptionalRequirement(Optional[float]),
+             "situ_beta": OptionalRequirement(Optional[float]),
+             "situ_linear_beta": OptionalRequirement(Optional[float]),
+             "world_size": int,
+@@ -145,6 +144,8 @@
+         self.b_major_mode = problem_desc["b_major_mode"]
+         self.combine_format = problem_desc["combine_format"]
+         self.gate_up_clamp = problem_desc["gate_up_clamp"]
++        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
++        self.swiglu_beta = problem_desc.get("swiglu_beta")
+         self.situ_beta = problem_desc.get("situ_beta")
+         self.situ_linear_beta = problem_desc.get("situ_linear_beta")
+         self.world_size = problem_desc["world_size"]
+@@ -189,8 +190,8 @@
+             # static M is required only when an S>0 helper boundary must be
+             # compiled into the scheduler gate.
+             self.home_expert_count = self.local_expert_count
+-        self.threads_per_cta = 16 * 32 if self.token_back_mode == "standalone_warps" else 12 * 32
+-        self.other_warp_register_count = 64 if self.token_back_mode == "standalone_warps" else 72
++        self.threads_per_cta = 16 * 32 if self.token_back_mode == "standalone_warps" else 12 * 32  # nosec B105
++        self.other_warp_register_count = 64 if self.token_back_mode == "standalone_warps" else 72  # nosec B105
+ 
+         self.mixed_cga_config = NonClcMixedCgaConfig(
+             preferred_cluster_shape=self.cluster_shape_mn,
+@@ -260,7 +261,9 @@
+                 "token_back_schedule_mode": (
+                     "atomic_counter" if self.work_id_mode == "atomic_counter" else "static"
+                 ),
+-                "router_smem_limit_bytes": utils.get_smem_capacity_in_bytes(self.architecture),
++                "router_smem_limit_bytes": cutlass.memory.get_smem_capacity_in_bytes(
++                    self.architecture
++                ),
+             }
+         )
+         self.token_comm = TokenCommNonDeterministic(problem_desc, token_comm_impl_desc)
+@@ -609,6 +612,7 @@
+             f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_ctas{self.mixed_cga_config.total_cta_cnt}_"
+             f"tokeninflag{self.token_in_flag_batch}_tokenback{self.token_back_mode}_"
+             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
++            f"swiglua{self.swiglu_alpha}_swiglub{self.swiglu_beta}_"
+             # The SiTU betas are codegen-time constants, so they must key the compiled kernel.
+             f"situ{self.situ_beta}x{self.situ_linear_beta}_"
+             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
+@@ -1257,7 +1261,7 @@
+             self.cluster_shape_mn, self.resolved_fallback_cluster_shape_mn, is_fallback_cluster
+         )
+         finalize_barrier_thread_count = (
+-            12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32
++            12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32  # nosec B105
+         )
+         finalize_barrier = pipeline.NamedBarrier(
+             barrier_id=13, num_threads=finalize_barrier_thread_count
+@@ -1395,7 +1399,7 @@
+                 iket.range_pop()
+                 if cutlass.const_expr(
+                     self.token_comm.token_back_enabled
+-                    and self.token_back_mode != "standalone_warps"
++                    and self.token_back_mode != "standalone_warps"  # nosec B105
+                 ):
+                     iket.range_push("mega.token_back")
+                     self.token_comm.token_back(self._smem_workspace, smem_base)
+@@ -1404,7 +1408,7 @@
+                 iket.range_push("mega.tail_reset")
+                 self.token_comm.reset_tail()
+                 iket.range_pop()
+-            elif cutlass.const_expr(self.token_back_mode == "standalone_warps"):
++            elif cutlass.const_expr(self.token_back_mode == "standalone_warps"):  # nosec B105
+                 iket.range_push("mega.token_back_standalone")
+                 self.token_comm.token_back(self._smem_workspace, smem_base)
+                 iket.range_pop()
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
+@@ -30,7 +30,6 @@
+ from typing import ClassVar, Optional, Tuple
+ 
+ import cuda.bindings.driver as cuda
+-
+ import cutlass
+ import cutlass.cute as cute
+ import cutlass.pipeline as pipeline
+@@ -48,10 +47,6 @@
+     StaticOrRuntimeIntegerType,
+ )
+ from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
+-from .....helpers.helper_weight_ready_gate import (
+-    derive_helper_weight_ready_topology,
+-    make_helper_weight_ready_generation_gate,
+-)
+ from .....helpers.cute_py_helpers import (
+     Tcgen05MmaInstruction,
+     make_tcgen05_tmem_plan,
+@@ -60,12 +55,17 @@
+ from .....helpers.device_workspace import DeviceWorkspace
+ from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
+ from .....helpers.dsl_helpers import spin_wait
++from .....helpers.helper_weight_ready_gate import (
++    derive_helper_weight_ready_topology,
++    make_helper_weight_ready_generation_gate,
++)
+ from .....helpers.iket_compat import iket
+ from .....helpers.megamoe_aot import make_megamoe_aot_callable
+ from .....helpers.smem_workspace import SmemWorkspace
+ from .....helpers.software_sync import NvlinkBarrier
+ from .....helpers.utils import ceil_div, round_up
+ from .....quant_def import CombineFormat, QuantKind
++from ....blackwell.inference.mega.topk_reduce import TopkReduce
+ from ....schedulers.base import WorkIdAcquisitionMode
+ from ....schedulers.fc12_scheduler import BlackwellFusedFc12Scheduler, PhaseInterleavedFc12Scheduler
+ from .block_scaled_swap_ab_fc12_epilogue import GatedActEpilogueArgs, SwapABGatedActEpilogue
+@@ -74,8 +74,6 @@
+     BlockScaledSwapAbFc12MainloopGenSpecialized,
+ )
+ from .token_comm_gen_specialized import GenphaseTokenComm, GenphaseTokenCommArgs
+-from .topk_reduce import TopkReduce
+-
+ 
+ _aot_symbol_prefix = "rubin_genphase_mega_moe_aot"
+ 
+@@ -124,6 +122,8 @@
+             "quant_kind": str,
+             "combine_format": CombineFormat,
+             "gate_up_clamp": Optional[float],
++            "swiglu_alpha": OptionalRequirement(Optional[float]),
++            "swiglu_beta": OptionalRequirement(Optional[float]),
+             "world_size": int,
+             "topk": int,
+             "topk_index_dtype": type,
+@@ -187,6 +187,8 @@
+         self.acc_dtype = tcgen05_block_scaled_acc_dtype
+         self.combine_format = problem_desc["combine_format"]
+         self.gate_up_clamp = problem_desc["gate_up_clamp"]
++        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
++        self.swiglu_beta = problem_desc.get("swiglu_beta")
+         self.world_size = problem_desc["world_size"]
+         self.topk = problem_desc["topk"]
+         self.topk_index_dtype = problem_desc["topk_index_dtype"]
+@@ -601,6 +603,7 @@
+             f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_"
+             f"pusher{self.pusher_cta_count}_refine{self.refine_participant_groups}x{self.refine_output_stages}_"
+             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
++            f"swiglua{self.swiglu_alpha}_swiglub{self.swiglu_beta}_"
+             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
+             f"{'inkernel_reduce' if self.reduce_topk_in_kernel else 'separate_reduce'}_"
+             f"abstages{self._mainloop.num_weight_ab_stages}x{self._mainloop.num_token_ab_stages}"
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/dynamic_mainloop.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/dynamic_mainloop.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/dynamic_mainloop.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/dynamic_mainloop.py
+@@ -11,7 +11,6 @@
+ from cutlass.cutlass_dsl import Boolean, Int32, dsl_user_op
+ 
+ from .....quant_def import QuantKind
+-
+ 
+ _bit_k_size_upper = 3
+ _bit_b_sf_id = 4
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/tma_gather.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/tma_gather.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/tma_gather.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/tma_gather.py
+@@ -6,5 +6,4 @@
+ # <<<MEGA_REPO_CONTROL : COPY_FROM_IMPORT>>>
+ from ..local_mega.tma_gather import sm107_tma_gather4_load
+ 
+-
+ __all__ = ["sm107_tma_gather4_load"]
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/token_comm_gen_specialized.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/token_comm_gen_specialized.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/token_comm_gen_specialized.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/token_comm_gen_specialized.py
+@@ -47,10 +47,9 @@
+ """
+ 
+ import dataclasses
+-from typing import ClassVar, Optional, Tuple
++from typing import ClassVar, Optional
+ 
+ import cuda.bindings.driver as cuda
+-
+ import cutlass
+ import cutlass.cute as cute
+ import cutlass.utils
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/topk_reduce.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/topk_reduce.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/topk_reduce.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/rubin/inference/mega/topk_reduce.py
+@@ -5,5 +5,4 @@
+ # <<<MEGA_REPO_CONTROL : COPY_FROM_IMPORT>>>
+ from ....blackwell.inference.mega.topk_reduce import TopkReduce
+ 
+-
+ __all__ = ["TopkReduce"]
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/__init__.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/__init__.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/__init__.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/__init__.py
+@@ -14,7 +14,6 @@
+ from .fc12_scheduler import BlackwellFusedFc12Scheduler, PhaseInterleavedFc12Scheduler
+ from .non_clc_mixed_cga import NonClcMixedCgaConfig, NonClcMixedCgaSchedulerWorker
+ 
+-
+ __all__ = [
+     "BlackwellFusedFc12Scheduler",
+     "BlockPhase",
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/base.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/base.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/base.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/base.py
+@@ -14,7 +14,6 @@
+ from ...api import ImplDesc, KernelComponent, ProblemDesc
+ from ...helpers.device_workspace import DeviceWorkspace
+ from ...helpers.smem_workspace import SmemWorkspace
+-
+ 
+ WorkIdAcquisitionMode = Literal["grid_stride", "atomic_counter", "cluster_launch_control"]
+ 
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_mapping.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_mapping.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_mapping.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_mapping.py
+@@ -15,7 +15,6 @@
+ from ...helpers.iket_compat import iket
+ from ...helpers.utils import padded_expert_rows
+ from .base import SchedulerWorkTileBase
+-
+ 
+ phase_bits = 16
+ phase_mask = (1 << phase_bits) - 1
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_scheduler.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_scheduler.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_scheduler.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_scheduler.py
+@@ -825,10 +825,8 @@
+             fc1_counter_pointer = work_id_worker.get_atomic_counter_pointer(Int32(0))
+             minimum_claim_count = Int32(self.minimum_global_fc1_claims)
+             if not spin_peek(fc1_counter_pointer, lambda value: value >= minimum_claim_count):
+-                claim_target, stream_ends_before_target = (
+-                    resolve_phase_interleaved_fc1_claim_target(
+-                        minimum_claim_count, task_mapping_state
+-                    )
++                claim_target, _ = resolve_phase_interleaved_fc1_claim_target(
++                    minimum_claim_count, task_mapping_state
+                 )
+                 spin_wait(fc1_counter_pointer, lambda value: value >= claim_target)
+         return fc1_exhausted
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/non_clc_mixed_cga.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/non_clc_mixed_cga.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/non_clc_mixed_cga.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/non_clc_mixed_cga.py
+@@ -156,7 +156,7 @@
+     cluster_broadcast_region = "non_clc_mixed_cga.cluster_broadcast"
+     work_id_counter_region = "non_clc_mixed_cga.work_id_counters"
+     fallback_registration_counter_region = "non_clc_mixed_cga.fallback_registration_counter"
+-    fallback_group_token_region = "non_clc_mixed_cga.fallback_group_tokens"
++    fallback_group_token_region = "non_clc_mixed_cga.fallback_group_tokens"  # nosec B105
+ 
+     def __init__(
+         self,
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/quant_def.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/quant_def.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/quant_def.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/quant_def.py
+@@ -259,7 +259,8 @@
+         instruction_k_2x = kind.instruction_k("2x")
+         if instruction_k_2x != expected_instruction_k_2x:
+             raise AssertionError(
+-                f"QuantKind.{kind.name} derives 2x instruction K {instruction_k_2x}, expected {expected_instruction_k_2x}."
++                f"QuantKind.{kind.name} derives 2x instruction K {instruction_k_2x}, "
++                f"expected {expected_instruction_k_2x}."
+             )
+ 
+ 

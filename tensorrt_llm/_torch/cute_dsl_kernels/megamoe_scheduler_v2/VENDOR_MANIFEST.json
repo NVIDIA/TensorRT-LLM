@@ -1,0 +1,69 @@
+{
+  "commit": "fa6e81ed048a2afc023fda717fbfcf15514b0684",
+  "source_tree_dirty": false,
+  "kind": "complete scheduler package",
+  "retained_legacy_host": [],
+  "files": {
+    "__init__.py": "2077e75537e4128e5f02c51a45c13f6188b522ffddb0dfc63983ebcf7bc98daa",
+    "csrc/in_switch_copy/gpu_plan.h": "93284a2adf6a178bf7985a1a41abc85d51a1ff0bc9603ccc2bed3473cfde1e6b",
+    "csrc/in_switch_copy/gpu_plan_builder.cuh": "48a8b43b3e14d429776a7891436db46dc430c2956b8a9f0df341321a4a8cf8ff",
+    "csrc/in_switch_copy/plan_policy.cuh": "9b4779b78a5ebbaecd1791d2409fffc2c2d2e478af625a43418a29f3a2894e5b",
+    "csrc/in_switch_copy/sami_hierarchical_release.c": "1cba8b7381ad562bb5cd32efeebcdb22f4c96397d527ee42d5a93064869d5698",
+    "csrc/in_switch_copy/sami_shards.h": "59ed7b438d2b35a3ca1e82467f3dc7afc0bf89a579cffbaaba844c77150853fe",
+    "csrc/in_switch_copy/tma_copy.cu": "f2cf2ebc97b02cf5e14d7461c4450dd16d44025c1c65f90e4ffc616ad708b20f",
+    "csrc/in_switch_copy/tma_copy.h": "2b2a61ca32704b872736946a1a7fac4cad8b9bac50208c6647aa8a3ccb5a94ff",
+    "cuda_scheduler/__init__.py": "dfd129c1690f404c60185d67bf68aca0a58c813178e3583cf0aaf54ce043382a",
+    "cuda_scheduler/csrc/halo_q_scheduler.cu": "604a1fb3043c8094c8a0b247a7ed2422a7e9563f6cbe41b2f0853ec4cd95cd86",
+    "cuda_scheduler/multirank_dist.py": "235c89ebc641e56514ffe863849cfc185942ceebabfce644669b7362490d794a",
+    "cuda_scheduler/runtime.py": "192638cd7a4af18bb969e71150cfed7cee5a1defbd3cefa55bd2faf6759c711b",
+    "geometry.py": "74de927de618beffcffa69231f10d283dcf92f86f2aaf5f0ec59b56a15dae56c",
+    "integrations/__init__.py": "b50ff1b5e1bef5d171dff4c487e90477aaea02a726c921fff4c6f309e74141e4",
+    "integrations/megamoe/README.md": "677985d3d3d107f4ee624a3ae9337e648174f0277b02a8b7ceba5935fbcf76ce",
+    "integrations/megamoe/__init__.py": "6b95b6d9b3cc46e7eb21ab7f6f5250d65e2886a01f0dca1cea728e11b501744d",
+    "integrations/megamoe/direct_live_weight_bridge.py": "b94e358661fc9995b62163602d534e0ab5032efa551ce3be9615ba9ed3933ac2",
+    "integrations/megamoe/dynamic_load_balance.py": "e95cbecb9b5c093875d6a391b00d38281ee7ccd2e194d855fec3f45806d6702f",
+    "native.py": "9881424914f155c3339d9d1d7068c62d8cfb179dea8ddd77f4f086bc5be55bf1",
+    "sami/__init__.py": "47e138c48486d203f9169acb6f6d364bfcc86c4bc987cf0e483c9d82177a5845",
+    "sami/_util.py": "22ad1b52d8ba8811818a90180d81213ff253c5c6edc651cc9db51a23778d76d9",
+    "sami/arena.py": "a3ecaf8acf30fe35e9898b694dbf37ecd0f5d7196f264948d2bc37158037776f",
+    "sami/fabric.py": "e03374ff0638e456a77236ece7714240895e6d89d63ea1f47a14dcab33cee8c8",
+    "sami/geometry.py": "e39195802acbe498ab647fec84f651b230290432847a092a6ba31a0236781559",
+    "sami/hierarchical.py": "2ad2eca640d4534e83fb20616810d09972d92b442d508bee283fba827a5a2097"
+  },
+  "source_tree_dirty_scope": "Upstream checkout used for vendoring only; downstream changes are recorded separately.",
+  "downstream_modified": true,
+  "downstream_patches": [
+    {
+      "patch": "TRTLLM_STANDARD_THOP.patch",
+      "patch_sha256": "dbe3897dd7c4f7990f88759ee6500eb99a59544fe1b95025ed999418a29c4237",
+      "files": [
+        {
+          "file": "cuda_scheduler/runtime.py",
+          "unpatched_vendored_sha256": "be7c7518c8790b057f6ccf9a23a369015fec2dd696ff1f046f4979c19ffd293b",
+          "patched_sha256": "e8884a69111761d86d0a1d99b9af24dc450a2ae302dfead45d5c91964a35b28d"
+        },
+        {
+          "file": "sami/hierarchical.py",
+          "unpatched_vendored_sha256": "6d8e4ac4365bd11dcaf4c12f2d3c53b2e9b62ead3dfb0e0e6806f9645f8b60ca",
+          "patched_sha256": "2ad2eca640d4534e83fb20616810d09972d92b442d508bee283fba827a5a2097"
+        }
+      ]
+    },
+    {
+      "patch": "TRTLLM_RUNTIME_INVARIANTS.patch",
+      "patch_sha256": "1350c1d988939830e994e12df00798e61a3dbe65e29fc999f90858faf88ba4e4",
+      "file": "cuda_scheduler/runtime.py",
+      "unpatched_vendored_sha256": "be7c7518c8790b057f6ccf9a23a369015fec2dd696ff1f046f4979c19ffd293b",
+      "patched_sha256": "192638cd7a4af18bb969e71150cfed7cee5a1defbd3cefa55bd2faf6759c711b",
+      "description": "Keep workspace generations and plan publication on one static submit stream."
+    },
+    {
+      "patch": "TRTLLM_NATIVE_CACHE.patch",
+      "patch_sha256": "36d2f42adc2c7ada7fa7872b84ff318660f606bd790dc8690a8671df80f9d3cc",
+      "file": "native.py",
+      "unpatched_vendored_sha256": "472fc25a930121277e3b10aed2ca034f9538a84b8452384e3d40a5c6705c6936",
+      "patched_sha256": "9881424914f155c3339d9d1d7068c62d8cfb179dea8ddd77f4f086bc5be55bf1",
+      "description": "Use a private per-user node-local cache and reject unsafe native cache entries."
+    }
+  ]
+}

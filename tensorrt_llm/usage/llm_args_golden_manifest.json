@@ -933,6 +933,16 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "moe_config.rebalance.enabled"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.rebalance.helper_slots_per_rank"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "moe_config.use_low_precision_moe_combine"
     },
     {

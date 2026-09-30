@@ -4303,6 +4303,12 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         )
         module.register_parameter("fc1_norm_const", fc1_norm_const)
 
+        if getattr(module, "_rebalance_arena", None) is not None:
+            from .mega_moe.rebalance_slot_scheduler_v2 import \
+                bind_live_weight_planes
+
+            bind_live_weight_planes(self, module)
+
     def _materialize_source_params(self, module: torch.nn.Module):
         """Rematerialize this module's streamed source params (full shape)
         so the loader can fill them; no-op when already materialized.
@@ -4555,7 +4561,9 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     def _check_initial_aux_scale_coverage(self,
                                           module: torch.nn.Module) -> None:
         """Reject partially populated NVFP4 auxiliary-scale families."""
-        n_slots = module.expert_size_per_partition
+        n_slots = int(
+            getattr(module, "_rebalance_home_experts", None)
+            or module.expert_size_per_partition)
         # A whole-checkpoint load is handed every expert's input_scale, because
         # the weights dict holds the entire checkpoint; a streaming EP load
         # only ever reads its own rank's experts, so its complete answer is
@@ -4625,7 +4633,9 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         if module.w3_w1_weight.data.numel() == 0:
             return
 
-        n_slots = module.expert_size_per_partition
+        n_slots = int(
+            getattr(module, "_rebalance_home_experts", None)
+            or module.expert_size_per_partition)
         coverage = self._streamed_coverage(module)
         incomplete = {k: v for k, v in coverage.items() if v < n_slots}
         if incomplete:
@@ -4772,7 +4782,14 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
             raw_input_scales,
             module.initial_local_expert_ids,
             device=module.fc1_norm_const.device)
-        module.fc1_norm_const.data.copy_(routed_norm_const)
+        n_home = int(
+            getattr(module, "_rebalance_home_experts", None)
+            or module.expert_size_per_partition)
+        if routed_norm_const.numel() != n_home:
+            raise RuntimeError(
+                "MegaMoE-CuteDSL fc1_norm_const expected one entry per "
+                f"resident expert ({n_home}), got {routed_norm_const.numel()}.")
+        module.fc1_norm_const.data[:n_home].copy_(routed_norm_const)
 
         if self.need_load_shared_weights(module):
             local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(

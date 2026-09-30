@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+Subject: Preserve FC1 claim exhaustion and reject an unwired FC2 mode
+
+This patch keeps FC1 exhaustion tied to actual claim/map results and fails fast
+when deferred FC2 full-ready admission is requested before its scheduler-loop
+implementation is available.
+
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_scheduler.py b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_scheduler.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_scheduler.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/kernel_src/schedulers/fc12_scheduler.py
+@@ -547,6 +547,10 @@
+         if not isinstance(self.fuse_ready_probe_and_linear1_claim, bool):
+             raise TypeError(
+                 "fuse_ready_probe_and_linear1_claim must be a bool."
++            )
++        if self.defer_consumer_until_full_ready:
++            raise NotImplementedError(
++                "deferred FC2 full-ready admission is not wired into the kernel scheduler loop"
+             )
+         if (
+             self.defer_consumer_until_full_ready
+@@ -815,8 +819,6 @@
+                     minimum_claim_count, task_mapping_state
+                 )
+                 spin_wait(fc1_counter_pointer, lambda value: value >= claim_target)
+-                if stream_ends_before_target:
+-                    fc1_exhausted = Boolean(True)
+         return fc1_exhausted
+ 
+     @cute.jit

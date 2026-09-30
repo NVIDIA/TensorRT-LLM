@@ -71,7 +71,7 @@ from ..modules.engram import Engram, EngramConfig, EngramHashProvider
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import (
     DEFAULT_MOE_ACTIVATION,
@@ -1590,7 +1590,37 @@ class DeepseekV4MoE(nn.Module):
             shared_expert_intermediate_size, block_size
         )
 
-        self.shared_experts = GatedMLP(
+        # Warmup bypasses rebalance, so configure this before autotuning.
+        # Serving must use the same budget and tuning-cache identity.
+        shared_fc12_reserved_sms = 0
+        rebalance_backend = getattr(self.experts, "backend", self.experts)
+        if (
+            getattr(rebalance_backend, "_rebalance_slots_active", 0) > 0
+            and get_sm_version() == 107
+            and not model_config.use_cuda_graph
+            and os.environ.get("TRTLLM_MOE_REBALANCE_PLAN_GAP", "1") == "1"
+        ):
+            from ..moe.fused_moe.mega_moe.rebalance_slot_scheduler_v2 import TMA_COPY_SM_COUNT
+
+            shared_fc12_reserved_sms = TMA_COPY_SM_COUNT
+
+        shared_mlp_cls = GatedMLP
+        shared_mlp_kwargs = {}
+        descriptor = getattr(rebalance_backend, "descriptor", None)
+        if (
+            descriptor is not None
+            and descriptor.impl_id == "trtllm.cutedsl.mega_moe.nvfp4"
+            and get_sm_version() == 107
+            and model_config.get_quant_config().quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            and not model_config.use_cuda_graph
+        ):
+            from ..modules.megamoe_shared_mlp import MegaMoESharedMLP
+
+            # Use the same complete shared FC12 path for OFF and ON.
+            shared_mlp_cls = MegaMoESharedMLP
+            shared_mlp_kwargs["fc12_reserved_sms"] = shared_fc12_reserved_sms
+
+        self.shared_experts = shared_mlp_cls(
             hidden_size=hidden_size,
             intermediate_size=shared_expert_intermediate_size,
             bias=False,
@@ -1600,6 +1630,7 @@ class DeepseekV4MoE(nn.Module):
             reduce_output=False,
             use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             swiglu_limit=swiglu_limit,
+            **shared_mlp_kwargs,
         )
 
         self.allreduce = None
@@ -1731,13 +1762,52 @@ class DeepseekV4MoE(nn.Module):
 
         # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
 
-        routed_output, shared_output = maybe_execute_in_parallel(
-            _compute_routed_output,
-            _compute_shared_output,
-            self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared],
-            self.aux_stream,
+        # With helper slots enabled, the one-shot hook runs after MAIN has
+        # enqueued both HALO-Q and TMA copy on the shared high-priority stream.
+        # Shared experts then run on MAIN while helper weights are copied.
+        # Install identically across ranks and clear the hook on every exit.
+        _plan_gap_slots = getattr(
+            getattr(self.experts, "backend", self.experts), "_rebalance_slots_active", 0
         )
+        _plan_gap_default = "1" if type(_plan_gap_slots) is int and _plan_gap_slots > 0 else "0"
+        _plan_gap_installed = False
+        if (
+            self.shared_experts is not None
+            and not do_multi_stream()
+            and os.environ.get("TRTLLM_MOE_REBALANCE_PLAN_GAP", _plan_gap_default) == "1"
+        ):
+            _shared_box = {}
+
+            def _plan_gap_shared():
+                # Shared-expert scaling must run at most once per forward.
+                if "out" not in _shared_box:
+                    _shared_box["out"] = _compute_shared_output()
+
+            _experts = getattr(self, "experts", None)
+            if _experts is not None and hasattr(_experts, "__dict__"):
+                setattr(_experts, "_rebalance_plan_gap_hook", _plan_gap_shared)
+                _plan_gap_installed = True
+
+        if _plan_gap_installed:
+            try:
+                routed_output = _compute_routed_output()
+            finally:
+                # Clear the hook even when the routed path exits early.
+                _e = getattr(self, "experts", None)
+                if _e is not None:
+                    setattr(_e, "_rebalance_plan_gap_hook", None)
+            # Compute shared experts here if the routed path skipped the hook.
+            if "out" not in _shared_box:
+                _shared_box["out"] = _compute_shared_output()
+            shared_output = _shared_box["out"]
+        else:
+            routed_output, shared_output = maybe_execute_in_parallel(
+                _compute_routed_output,
+                _compute_shared_output,
+                self.event_dict[EventType.Main],
+                self.event_dict[EventType.MoeShared],
+                self.aux_stream,
+            )
 
         if not do_finalize:
             return [shared_output, *routed_output]

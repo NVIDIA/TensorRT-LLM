@@ -1650,6 +1650,28 @@ class MoeLoadBalancerConfig(StrictBaseModel):
         return assignments
 
 
+class MoeRebalanceConfig(StrictBaseModel):
+    """Configure opt-in prefill expert rebalancing.
+
+    Each rank retains H resident experts and allocates S runtime helper slots.
+    The seven live weight planes use the same H + S slot axis; weight transfers
+    publish a READY generation before the kernel reads a helper slot.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=
+        "Whether MoE prefill rebalance is enabled. When False, the MoE slot axis stays equal to the number of experts this rank owns and no helper slots are allocated."
+    )
+
+    helper_slots_per_rank: int = Field(
+        default=0,
+        ge=0,
+        description=
+        "Number of extra helper slots (S) each rank hosts on top of the experts it owns (H). Every live weight plane grows to M = H + S rows: [0, H) are the resident experts, [H, M) are runtime-only helper slots. 0 means no helper capacity, which is equivalent to leaving rebalance disabled."
+    )
+
+
 _MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "CUTEDSL_FC12", "TRTLLM",
                       "DEEPGEMM", "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
                       "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
@@ -1673,6 +1695,12 @@ class MoeConfig(StrictBaseModel):
         default=None,
         description="Configuration for MoE load balancing.",
         json_schema_extra={"type": "Union[MoeLoadBalancerConfig, dict, str]"})
+
+    rebalance: Optional[MoeRebalanceConfig] = Field(
+        default=None,
+        description=
+        "Configuration for MoE prefill rebalance. None (the default) leaves every rebalance code path short-circuited."
+    )
 
     disable_finalize_fusion: bool = Field(
         default=False,
@@ -6836,7 +6864,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_gms_moe_compat(self) -> 'TorchLlmArgs':
-        """Reject ``LoadFormat.GMS`` combined with a MoE load balancer.
+        """Reject ``LoadFormat.GMS`` combined with incompatible MoE features.
 
         The ``MoeLoadBalancer``'s ``register_weight_slots_after_to_cuda``
         and ``finalize_model`` run AFTER the GMS RW pool is closed and
@@ -6853,12 +6881,18 @@ class TorchLlmArgs(BaseLlmArgs):
         the (MoE, GMS) follow-up; see ``model_loader.py``'s
         ``TODO(GMS-MOE-LB)`` comment.
 
+        Active prefill rebalance is also incompatible with GMS. Its TMA
+        descriptors retain the weight addresses used when they are created,
+        while GMS can subsequently rebind parameters to its shared arena.
+        Using both would let weight copies target stale helper-slot storage.
+
         Returns:
             ``self`` (Pydantic ``model_validator`` contract).
 
         Raises:
             ValueError: When ``load_format == LoadFormat.GMS`` and
-                ``moe_config.load_balancer`` is set.
+                ``moe_config.load_balancer`` or active
+                ``moe_config.rebalance`` is set.
         """
         if (self.load_format == LoadFormat.GMS and self.moe_config is not None
                 and self.moe_config.load_balancer is not None):
@@ -6873,6 +6907,19 @@ class TorchLlmArgs(BaseLlmArgs):
                 "Tracked as the (MoE, GMS) follow-up at "
                 "tensorrt_llm/_torch/pyexecutor/model_loader.py "
                 "(see TODO(GMS-MOE-LB)).")
+
+        rebalance = (None
+                     if self.moe_config is None else self.moe_config.rebalance)
+        rebalance_active = (rebalance is not None and rebalance.enabled
+                            and rebalance.helper_slots_per_rank > 0)
+        if self.load_format == LoadFormat.GMS and rebalance_active:
+            raise ValueError(
+                "LoadFormat.GMS is incompatible with active "
+                "moe_config.rebalance. GMS can rebind model parameters after "
+                "the rebalance TMA descriptors capture their addresses, so "
+                "weight copies could target stale helper slots. Either "
+                "disable moe_config.rebalance, set helper_slots_per_rank=0, "
+                "or use LoadFormat.AUTO.")
         return self
 
     @model_validator(mode="after")

@@ -3,6 +3,7 @@
 
 """Fused pull-dispatch MegaMoE kernel composition for Rubin."""
 
+import hashlib
 from typing import ClassVar, Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -28,7 +29,14 @@ from .....helpers.cute_py_helpers import (
     tcgen05_block_scaled_acc_dtype,
 )
 from .....helpers.device_workspace import DeviceWorkspace
+from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
+from .....helpers.fc2_ready_geometry import derive_fc2_ready_geometry
+from .....helpers.helper_weight_ready_gate import (
+    derive_helper_weight_ready_topology,
+    make_helper_weight_ready_generation_gate,
+)
 from .....helpers.iket_compat import iket
+from .....helpers.megamoe_aot import make_megamoe_aot_callable
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.utils import ceil_div, round_up
 from .....quant_def import CombineFormat, QuantKind
@@ -111,11 +119,17 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "fallback_cluster_count": OptionalRequirement(Optional[int]),
             "token_in_flag_batch": int,
             "token_back_mode": str,
+            "token_back_ready_granularity": OptionalRequirement(str),
             "reduce_topk_in_kernel": bool,
+            "helper_expert_count": OptionalRequirement(int),
+            "total_helper_slots": OptionalRequirement(int),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
+        problem_desc, impl_desc = resolve_dlb_expert_counts(
+            problem_desc, impl_desc, world_size=problem_desc["world_size"]
+        )
 
         self.expert_count = problem_desc["expert_count"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
@@ -157,11 +171,25 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.launch_cluster_count = impl_desc["launch_cluster_count"]
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.token_back_mode = impl_desc["token_back_mode"]
+        self.token_back_ready_granularity = impl_desc.get("token_back_ready_granularity", "expert")
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
-
+        self.helper_expert_count = impl_desc.get("helper_expert_count", 0)
+        if type(self.helper_expert_count) is not int or self.helper_expert_count < 0:
+            raise ValueError("helper_expert_count must be a non-negative exact int")
         self.occupancy = 1
         self.architecture = "sm_107"
         self.local_expert_count = self.expert_count // self.world_size
+        if self.helper_expert_count > 0:
+            helper_topology = derive_helper_weight_ready_topology(
+                self.local_expert_count,
+                self.helper_expert_count,
+            )
+            self.home_expert_count = helper_topology.home_expert_count
+        else:
+            # Preserve the baseline's runtime-expert-count specialization.  A
+            # static M is required only when an S>0 helper boundary must be
+            # compiled into the scheduler gate.
+            self.home_expert_count = self.local_expert_count
         self.threads_per_cta = 16 * 32 if self.token_back_mode == "standalone_warps" else 12 * 32  # nosec B105
         self.other_warp_register_count = 64 if self.token_back_mode == "standalone_warps" else 72  # nosec B105
 
@@ -200,23 +228,33 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             sf_vec_size=self.sf_vec_size,
         )
         tmem_plan = make_tcgen05_tmem_plan(mma_instruction, self.architecture, self.mma_tiler_mnk)
-        tokens_per_fc1_ready_slot = self.mma_tiler_mnk[1] * self.cluster_shape_mn[1]
-        instruction_cta_m = self.mma_instruction_mnk[0] // mma_cta_count
-        instruction_m_repetitions = self.mma_tiler_mnk[0] // self.mma_instruction_mnk[0]
-        hidden_per_fc2_cluster_tile = (
-            instruction_cta_m * instruction_m_repetitions * self.cluster_shape_mn[0]
-        )
-        fc2_done_signals_per_token_tile = (
-            ceil_div(self.hidden_size, hidden_per_fc2_cluster_tile)
-            * self.cluster_shape_mn[0]
-            * self.cluster_shape_mn[1]
-        )
+        if self.token_back_ready_granularity == "token_tile":  # nosec B105 -- scheduler mode name, not a credential
+            tokens_per_fc1_ready_slot, fc2_done_signals_per_token_tile = derive_fc2_ready_geometry(
+                hidden_size=self.hidden_size,
+                mma_tiler_mnk=self.mma_tiler_mnk,
+                cluster_shape_mn=self.cluster_shape_mn,
+                use_2cta_instrs=self.use_2cta_instrs,
+                fallback_cluster_shape_mn=self.fallback_cluster_shape_mn,
+            )
+        else:
+            tokens_per_fc1_ready_slot = self.mma_tiler_mnk[1] * self.cluster_shape_mn[1]
+            instruction_cta_m = self.mma_instruction_mnk[0] // mma_cta_count
+            instruction_m_repetitions = self.mma_tiler_mnk[0] // self.mma_instruction_mnk[0]
+            hidden_per_fc2_cluster_tile = (
+                instruction_cta_m * instruction_m_repetitions * self.cluster_shape_mn[0]
+            )
+            fc2_done_signals_per_token_tile = (
+                ceil_div(self.hidden_size, hidden_per_fc2_cluster_tile)
+                * self.cluster_shape_mn[0]
+                * self.cluster_shape_mn[1]
+            )
         token_comm_impl_desc = ImplDesc(
             {
                 **impl_desc,
                 "fallback_cluster_shape_mn": self.fallback_cluster_shape_mn,
                 "preferred_cluster_count": self.preferred_cluster_count,
                 "fallback_cluster_count": self.fallback_cluster_count,
+                "token_back_ready_granularity": self.token_back_ready_granularity,
                 "tokens_per_fc1_ready_slot": tokens_per_fc1_ready_slot,
                 "fc2_done_signals_per_token_tile": fc2_done_signals_per_token_tile,
                 "promised_launchable_sm_count": self.mixed_cga_config.total_cta_cnt,
@@ -248,6 +286,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 "token_back_push_data": self.token_comm.token_back_push_data,
                 "fc1_epi_flag_batch": self.epi_flag_batches[0],
                 "fc2_epi_flag_batch": self.epi_flag_batches[1],
+                "token_back_ready_granularity": self.token_back_ready_granularity,
             }
         )
         scheduler_type = (
@@ -257,6 +296,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         )
         self.scheduler = scheduler_type(fc12_problem_desc, resolved_impl_desc)
         self.epilogue = SwapABGatedActEpilogue(fc12_problem_desc, resolved_impl_desc)
+        if self.token_back_ready_granularity == "token_tile":  # nosec B105 -- scheduler mode name, not a credential
+            self._validate_token_tile_ready_contract()
         if self.epilogue.fc1_output_dtype is not self.b_dtype:
             raise ValueError("Epilogue FC1 output dtype must match the Mainloop B dtype.")
         if self.epilogue.fc1_output_sf_dtype is not self.sf_dtype:
@@ -273,7 +314,56 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             else TopkReduce(self.hidden_size, self.topk, self.combine_format)
         )
 
+    def _validate_token_tile_ready_contract(self) -> None:
+        """Check the consumer target against the actual scheduler and publisher.
+
+        Both preferred clusters and a complete fallback group cover the same
+        logical CTA coordinates. Using active-cluster dimensions here would
+        permit token-back before the other fallback clusters finish their data.
+        """
+        if not self.epilogue.fc2_use_tma:
+            raise ValueError("token_tile return-ready requires FC2 TMA stores.")
+        mapping_tile = self.scheduler.mapping_cta_tile_shape_mnk
+        mapping_cluster = self.scheduler.mapping_cluster_shape_mn
+        if mapping_cluster != (1, self.cluster_shape_mn[0]) or mapping_tile[:2] != (
+            self.epilogue.cta_tile_n,
+            self.epilogue.cta_tile_m,
+        ):
+            raise ValueError(
+                "token_tile scheduler and epilogue must share the preferred logical CTA geometry."
+            )
+        expected_signals = (
+            ceil_div(self.hidden_size, mapping_tile[1] * mapping_cluster[1]) * mapping_cluster[1]
+        )
+        if (
+            self.token_comm.tokens_per_fc1_ready_slot != mapping_tile[0]
+            or self.token_comm.fc2_done_signals_per_token_tile != expected_signals
+        ):
+            raise ValueError(
+                "token_tile producer and consumer must share logical ready slots and completion counts."
+            )
+
     def _validate_geometry(self) -> None:
+        if self.token_back_ready_granularity not in ("expert", "token_tile"):
+            raise ValueError(
+                f"Unsupported token_back_ready_granularity {self.token_back_ready_granularity!r}."
+            )
+        if self.token_back_ready_granularity == "token_tile":  # nosec B105 -- scheduler mode name, not a credential
+            if not (
+                self.schedule_mode in ("grouped", "phase_interleave")
+                and self.work_id_mode == "atomic_counter"
+                and self.token_back_mode in ("standalone_warps", "reuse_dispatch_warps")
+                and self.use_2cta_instrs
+                and self.fc2_use_bulk
+                and self.quant_kind == QuantKind.nvfp4
+                and not self.reduce_topk_in_kernel
+            ):
+                raise ValueError(
+                    "token_tile return-ready requires grouped or phase_interleave/atomic_counter, "
+                    "standalone_warps or reuse_dispatch_warps, "
+                    "two-CTA MMA with hidden-only preferred/fallback clusters, "
+                    "FC2 TMA stores, NVFP4, and separate top-k reduction."
+                )
         static_expert_dimensions = (
             isinstance(self.expert_count, int),
             isinstance(self.intermediate_gateup_size, int),
@@ -383,7 +473,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError("mma_tiler K must be divisible by four scale-factor vectors.")
         if self.quant_kind == QuantKind.nvfp4 and (mma_n, mma_k) == (256, 512):
             raise ValueError(
-                "Rubin MegaMoE excludes NVFP4 N256 K512 because its multi-window path has no measured gain."
+                "Rubin MegaMoE excludes NVFP4 N256 K512 because that multi-window configuration is unsupported."
             )
         if self.quant_kind == QuantKind.mxfp4_mxfp8:
             sf_atom_size = self.sf_vec_size * 4
@@ -508,6 +598,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"{dtype_name(self.a_dtype)}_{dtype_name(self.b_dtype)}_{dtype_name(self.acc_dtype)}_"
             f"sfvec{self.sf_vec_size}_a{self.a_major_mode.name.lower()}_b{self.b_major_mode.name.lower()}_"
             f"e{self.expert_count}_ep{self.world_size}_topk{self.topk}_"
+            f"helpers{self.helper_expert_count}_"
             f"topkidx{dtype_name(self.topk_index_dtype)}_"
             f"h{self.hidden_size}_i{self.intermediate_gateup_size}_maxtoken{self.max_tokens_per_rank}_"
             f"inst{instruction}_{self.mma_k_mode}_tile{tile}_"
@@ -526,6 +617,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"situ{self.situ_beta}x{self.situ_linear_beta}_"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
+            "_dlb_v1"
+            + ("_fc2readytile_v1" if self.token_back_ready_granularity == "token_tile" else "")  # nosec B105 -- scheduler mode name, not a credential
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -621,25 +714,41 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 fc2_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
                 fc1_norm_const=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
             )
+        if self.helper_expert_count > 0:
+            fake_arguments.update(
+                hot_expert_weight_ready_flags=make_ptr(
+                    cutlass.Uint64,
+                    0,
+                    AddressSpace.gmem,
+                    assumed_align=8,
+                ),
+                hot_expert_weight_ready_generation=cutlass.Uint64(1),
+            )
 
         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake_arguments)
         if out_path is None:
             return compiled
         compiled.export_to_c(
-            out_path, function_name=_aot_symbol_prefix, export_only_tvm_ffi_symbols=True
+            out_path,
+            function_name=self._aot_symbol_name(),
+            export_only_tvm_ffi_symbols=True,
         )
         return out_path
 
-    @staticmethod
-    def load_compiled(path: str):
+    def _aot_symbol_name(self) -> str:
+        identity = hashlib.sha256(self.name().encode()).hexdigest()[:16]
+        return f"{_aot_symbol_prefix}_{identity}"
+
+    def load_compiled(self, path: str):
         from cutlass.cute.runtime import load_module
 
-        return load_module(path, enable_tvm_ffi=True)[_aot_symbol_prefix]
+        function = getattr(load_module(path, enable_tvm_ffi=True), self._aot_symbol_name())
+        return make_megamoe_aot_callable(function, self)
 
     def _build_mainloop_and_smem(
         self, problem_desc: ProblemDesc, resolved_impl_desc: ImplDesc
     ) -> Tuple[BlockScaledSwapAbFc12Mainloop, SmemWorkspace]:
-        smem_limit = cutlass.memory.get_smem_capacity_in_bytes(self.architecture) // self.occupancy
+        smem_limit = utils.get_smem_capacity_in_bytes(self.architecture) // self.occupancy
         smem_workspace = SmemWorkspace()
         self.token_comm.register_smem_regions(smem_workspace)
         self.scheduler.register_smem_regions(smem_workspace)
@@ -678,8 +787,28 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc2_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc1_norm_const: Optional[cute.Tensor] = None,  # (local_experts,)
+        hot_expert_weight_ready_flags: Optional[cute.Pointer] = None,  # uint64[EP]
+        hot_expert_weight_ready_generation: Optional[cutlass.Uint64] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
+
+        helper_ready_bundle = (
+            hot_expert_weight_ready_flags,
+            hot_expert_weight_ready_generation,
+        )
+        if cutlass.const_expr(
+            (
+                self.helper_expert_count > 0
+                and not all(value is not None for value in helper_ready_bundle)
+            )
+            or (
+                self.helper_expert_count == 0
+                and any(value is not None for value in helper_ready_bundle)
+            )
+        ):
+            raise ValueError(
+                "helper READY flags/generation must both be present iff helper_expert_count > 0"
+            )
 
         def rewrite_tensor_shape(tensor: cute.Tensor, shape: Tuple) -> cute.Tensor:
             return cute.make_tensor(tensor.iterator, cute.make_layout(shape, stride=tensor.stride))
@@ -933,6 +1062,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc1_alpha,
             fc2_alpha,
             fc1_norm_const,
+            hot_expert_weight_ready_flags,
+            hot_expert_weight_ready_generation,
         )
         if cutlass.const_expr(self.mixed_cga_config.is_mixed):
             kernel.launch(
@@ -1000,6 +1131,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_alpha: Optional[cute.Tensor],
         fc2_alpha: Optional[cute.Tensor],
         fc1_norm_const: Optional[cute.Tensor],
+        hot_expert_weight_ready_flags: Optional[cute.Pointer],
+        hot_expert_weight_ready_generation: Optional[cutlass.Uint64],
     ):
         """Compose TokenComm, Scheduler, Mainloop, and Epilogue."""
         self._mainloop.materialize_codegen_members()
@@ -1094,6 +1227,15 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc2_spin_threshold = (
             intermediate_gateup + self._mainloop.cta_tile_m - 1
         ) // self._mainloop.cta_tile_m
+        helper_weight_ready_gate = None
+        if cutlass.const_expr(self.helper_expert_count > 0):
+            helper_weight_ready_gate = make_helper_weight_ready_generation_gate(
+                memory_slot_count=self.local_expert_count,
+                helper_count=self.helper_expert_count,
+                source_count=self.world_size,
+                terminal_flags=hot_expert_weight_ready_flags,
+                expected_generation=hot_expert_weight_ready_generation,
+            )
         kernel_extension = BlockScaledSwapAbFc12Extension(
             sf_vec_size=self.sf_vec_size,
             fc1_done_counter_pointer=fc1_done_counter.iterator,
@@ -1138,9 +1280,17 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             iket.range_push("scheduler.gen_work")
             work_tile = scheduler.gen_next_work()
             iket.range_pop()
+            helper_ready_latched = Int32(0)
             while work_tile.is_valid_tile:
                 iket.range_push("scheduler.publish_work")
-                scheduler.publish_work(kernel_extension.prepare_work_tile(work_tile))
+                prepared_tile = kernel_extension.prepare_work_tile(work_tile)
+                if cutlass.const_expr(helper_weight_ready_gate is not None):
+                    helper_ready_latched = (
+                        helper_weight_ready_gate.wait_before_first_helper_publish(
+                            prepared_tile.expert_idx, helper_ready_latched
+                        )
+                    )
+                scheduler.publish_work(prepared_tile)
                 iket.range_pop()
                 iket.range_push("scheduler.gen_work")
                 work_tile = scheduler.gen_next_work()

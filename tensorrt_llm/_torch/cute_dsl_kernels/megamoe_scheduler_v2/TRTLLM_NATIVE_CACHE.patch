@@ -1,0 +1,152 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+Subject: Use a private per-user native build cache
+
+diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/native.py b/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/native.py
+--- a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/native.py
++++ b/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/native.py
+@@ -1,7 +1,7 @@
+ """Build and load the package's two native extensions.
+ 
+ Both are compiled on first use and cached per (source, argv, interpreter) key,
+-so a node compiles once and every later process loads the same .so.  Neither
++so a user compiles once per node and later processes load the same .so.  Neither
+ pulls in libtorch, CUTLASS or CuTe: the scheduler extension is ordinary CUDA
+ C++ and the SAMI submitter is C11, which is what keeps steady-state launch to
+ one short native call.
+@@ -18,7 +18,8 @@
+ import importlib.util
+ import os
+ from pathlib import Path
+-import subprocess
++import stat
++import subprocess  # nosec B404 -- compiler argv is validated and shell=False
+ import sys
+ import sysconfig
+ import tempfile
+@@ -45,6 +46,62 @@
+ _SUPPORTED_ARCHES = ("sm_100", "sm_100a", "sm_103", "sm_107", "sm_107a")
+ 
+ _NATIVE: dict[str, object] = {}
++_DEFAULT_BUILD_ROOT = Path(tempfile.gettempdir()) / f"tensorrt_llm-{os.getuid()}"
++
++
++def _secure_cache_directory(directory: Path) -> None:
++    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
++    info = directory.lstat()
++    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
++        raise RuntimeError(f"native cache directory is not owned by this user: {directory}")
++    if stat.S_IMODE(info.st_mode) != 0o700:
++        directory.chmod(0o700)
++        info = directory.lstat()
++        if (
++            not stat.S_ISDIR(info.st_mode)
++            or info.st_uid != os.getuid()
++            or stat.S_IMODE(info.st_mode) != 0o700
++        ):
++            raise RuntimeError(f"cannot secure native cache directory: {directory}")
++
++
++def _is_private_regular_file(path: Path) -> bool:
++    try:
++        info = path.lstat()
++    except FileNotFoundError:
++        return False
++    return (
++        stat.S_ISREG(info.st_mode)
++        and info.st_uid == os.getuid()
++        and stat.S_IMODE(info.st_mode) & 0o077 == 0
++        and info.st_nlink == 1
++    )
++
++
++def _remove_unsafe_cache_file(path: Path) -> None:
++    try:
++        info = path.lstat()
++    except FileNotFoundError:
++        return
++    if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
++        raise RuntimeError(f"unsafe native cache entry cannot be replaced: {path}")
++    path.unlink()
++
++
++def _open_cache_lock(path: Path):
++    if not _is_private_regular_file(path):
++        _remove_unsafe_cache_file(path)
++    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
++    descriptor = os.open(path, flags, 0o600)
++    try:
++        os.fchmod(descriptor, 0o600)
++        info = os.fstat(descriptor)
++        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
++            raise RuntimeError(f"native cache lock is not private: {path}")
++        return os.fdopen(descriptor, "a+b")
++    except BaseException:
++        os.close(descriptor)
++        raise
+ 
+ 
+ def _target_arch() -> str:
+@@ -166,14 +223,19 @@
+     cached = _NATIVE.get(module_name)
+     if cached is not None and not force:
+         return cached
+-    directory = Path(os.environ.get(build_dir_env, default_build_dir))
+-    directory.mkdir(parents=True, exist_ok=True)
++    directory = Path(os.environ.get(build_dir_env, default_build_dir)).expanduser()
++    if build_dir_env not in os.environ:
++        _secure_cache_directory(_DEFAULT_BUILD_ROOT)
++    _secure_cache_directory(directory)
+     key = _cache_key(argv, sources)
+     output = directory / f"{module_name}_{key}.so"
+     lock_path = directory / f"{module_name}_{key}.lock"
+-    with lock_path.open("a+b") as lock:
++    with _open_cache_lock(lock_path) as lock:
+         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+-        if force or not output.exists():
++        reusable_output = _is_private_regular_file(output)
++        if not reusable_output:
++            _remove_unsafe_cache_file(output)
++        if force or not reusable_output:
+             with tempfile.NamedTemporaryFile(
+                 dir=directory, suffix=".so", delete=False
+             ) as temporary:
+@@ -187,7 +249,10 @@
+                             + "\n--- stdout ---\n" + process.stdout
+                             + "\n--- stderr ---\n" + process.stderr
+                         )
++                temporary_path.chmod(0o600)
+                 os.replace(temporary_path, output)
++                if not _is_private_regular_file(output):
++                    raise RuntimeError(f"native build produced an unsafe cache file: {output}")
+             finally:
+                 temporary_path.unlink(missing_ok=True)
+                 if commands:
+@@ -226,7 +291,7 @@
+         argv=_sami_argv,
+         sources=(_SAMI_SOURCE, _SAMI_HEADER),
+         build_dir_env="MEGAMOE_SAMI_HIERARCHICAL_BUILD_DIR",
+-        default_build_dir="/tmp/megamoe_sami_hierarchical",
++        default_build_dir=str(_DEFAULT_BUILD_ROOT / "megamoe_sami_hierarchical"),
+         failure="hierarchical SAMI native build failed",
+         validate=_validate_sami,
+         force=force,
+@@ -241,7 +306,7 @@
+                  _COPY_POLICY_HEADER, _SAMI_SOURCE.with_name("gpu_plan.h"),
+                  _SAMI_SOURCE.with_name("gpu_plan_builder.cuh")),
+         build_dir_env="MEGAMOE_SAMI_TMA_BUILD_DIR",
+-        default_build_dir="/tmp/megamoe_sami_tma",
++        default_build_dir=str(_DEFAULT_BUILD_ROOT / "megamoe_sami_tma"),
+         failure="SM TMA copy build failed (CUDA 13.1+ required)",
+         validate=_validate_sami, force=force, commands=_tma_commands,
+     )
+@@ -255,7 +320,7 @@
+         argv=_halo_q_argv,
+         sources=(_HALO_Q_SOURCE, _COPY_POLICY_HEADER),
+         build_dir_env="MEGAMOE_HALO_Q_BUILD_DIR",
+-        default_build_dir="/tmp/megamoe_halo_q_cuda",
++        default_build_dir=str(_DEFAULT_BUILD_ROOT / "megamoe_halo_q_cuda"),
+         failure="pure-CUDA scheduler build failed",
+         validate=_validate_halo_q,
+         force=force,

@@ -1251,6 +1251,11 @@ class FusedCommMoEScheduler(MoEScheduler):
             moe.num_slots, token_selected_slots
         )
 
+        if getattr(moe.backend, "_rebalance_slots_active", 0):
+            from .mega_moe.rebalance_slot_scheduler_v2 import apply_rebalance_scheduler
+
+            token_selected_slots = apply_rebalance_scheduler(moe, token_selected_slots)
+
         # ----- quantize / prepare -----
         if getattr(moe.backend, "supports_fused_prepare", lambda: False)():
             # MegaMoE can fuse BF16->MXFP8 quantization with the SymmBuffer
