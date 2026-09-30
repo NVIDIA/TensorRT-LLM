@@ -1,5 +1,6 @@
 import dataclasses
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 from ..task_schema import cluster_ssh, remote_run_root
@@ -149,14 +150,41 @@ def build_perf_analyze_prompts(
     return bundle
 
 
+# Where the CLI snapshots the composed prompts inside the workspace.
+PROMPTS_DIRNAME = "prompts"
+
+
+def dump_prompt_bundle(bundle: Any, directory: Path) -> None:
+    """Write each role's composed system prompt to ``directory/<role>.md``.
+
+    Verbatim, so a snapshot can be diffed against the prompt modules or
+    pasted into a session. The directory is rewritten per launch, and
+    ``*.md`` left by an older one (a role since renamed) is dropped, so it
+    never shows two versions' prompts as one campaign's.
+
+    ``bundle`` is any workflow's ``PromptBundle``: the roles are read off
+    the dataclass, so this workflow's four and perf-optimize's eight are
+    the same code rather than two copies that drift.
+    """
+    roles = [field.name for field in dataclasses.fields(bundle)]
+    directory.mkdir(parents=True, exist_ok=True)
+    for stale in directory.glob("*.md"):
+        if stale.stem not in roles:
+            stale.unlink()
+    for role in roles:
+        (directory / f"{role}.md").write_text(getattr(bundle, role), encoding="utf-8")
+
+
 __all__ = [
     "ANALYZER_SYSTEM_PROMPT",
     "BENCHMARKER_SYSTEM_PROMPT",
     "DEFAULT_PROMPTS",
     "PROJECTOR_SYSTEM_PROMPT",
+    "PROMPTS_DIRNAME",
     "PromptBundle",
     "REPORTER_SYSTEM_PROMPT",
     "build_remote_execution_context",
     "build_perf_analyze_prompts",
     "build_projector_prompt",
+    "dump_prompt_bundle",
 ]
