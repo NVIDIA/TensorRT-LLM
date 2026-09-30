@@ -12,6 +12,7 @@ from .hooks import (
 )
 from .layers import AgentLayer
 from .module import Module, Sequential
+from .prompts import dump_prompt_bundle
 from .tools import ToolDefinition, tool
 from .types import (
     AgentRequest,
@@ -48,6 +49,7 @@ __all__ = [
     "ToolDefinition",
     "UsageInfo",
     "called_required_tool_this_turn",
+    "dump_prompt_bundle",
     "require_tool_call_stop_hook",
     "tool",
 ]

@@ -75,7 +75,6 @@ _DISAGG_ROLE_ENV = "TRTLLM_DISAGG_ROLE"
 _DISAGG_DEPLOYMENT_ID_ENV = "TRTLLM_DISAGG_DEPLOYMENT_ID"
 _DEFAULT_ENDPOINT = "https://events.gfe.nvidia.com/v1.1/events/json"
 _HTTP_TIMEOUT = 2.0
-_MAX_HEARTBEATS = 1000
 _TERMINAL_FLUSH_TIMEOUT = 0.5
 _ALLOWED_USAGE_CONTEXTS = frozenset(context.value for context in UsageContext)
 _ARCHITECTURE_HASH_DOMAIN = b"trtllm-architecture-class-v1\0"
@@ -743,10 +742,8 @@ def _background_reporter(
 
         # --- Heartbeat loop ---
         heartbeat_interval = _get_heartbeat_interval()
-        for seq in range(_MAX_HEARTBEATS):
-            if _REPORTER_STOP.wait(timeout=heartbeat_interval):
-                return  # stop requested
-
+        seq = 0
+        while not _REPORTER_STOP.wait(timeout=heartbeat_interval):
             try:
                 event_snapshot = _event_snapshot(usage_context)
                 heartbeat_event = schema.TrtllmHeartbeat(
@@ -761,6 +758,7 @@ def _background_reporter(
                 _send_if_session_active(session, heartbeat_payload)
             except (urllib.error.URLError, OSError, ValueError, TypeError):
                 pass  # fail-silent on individual heartbeat
+            seq = min(seq + 1, schema._UINT32_MAX)
 
     except Exception:
         pass  # fail-silent: entire background reporter
