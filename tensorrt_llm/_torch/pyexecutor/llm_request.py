@@ -1336,6 +1336,31 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.child_requests.append(py_request)
 
 
+def reported_cached_tokens(request: "LlmRequest") -> int:
+    """Prompt tokens served from a KV cache, as reported to clients.
+
+    For generation-only requests the prompt arrives through the KV transfer,
+    so ``request.cached_tokens`` (first set on the generation path to the
+    sequence length) would report the entire prompt as a cache hit. Prefer the
+    context side's usage when the disaggregated params carry it; otherwise
+    report the prefix this worker reused from its own cache instead of
+    transferring, which is the only reuse it can vouch for.
+    """
+    if not request.is_generation_only_request():
+        return request.cached_tokens
+    disagg_params = getattr(request, "py_disaggregated_params", None)
+    ctx_usage = getattr(disagg_params, "ctx_usage", None)
+    if ctx_usage is not None:
+        details = (ctx_usage.get("prompt_tokens_details")
+                   if isinstance(ctx_usage, dict) else getattr(
+                       ctx_usage, "prompt_tokens_details", None))
+        if details is not None:
+            cached = (details.get("cached_tokens") if isinstance(details, dict)
+                      else getattr(details, "cached_tokens", None))
+            return int(cached or 0)
+    return int(getattr(request, "prepopulated_prompt_len", 0) or 0)
+
+
 def _validate_optional_int_list(values: Any,
                                 field_name: str) -> Optional[List[int]]:
     if values is None:

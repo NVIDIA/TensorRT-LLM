@@ -101,7 +101,7 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           LlmRequest, LlmRequestState, LlmResponse,
                           MultimodalEncoderRequestError, get_draft_token_length,
                           initialize_multimodal_encoder_request,
-                          is_multimodal_encoder_ready)
+                          is_multimodal_encoder_ready, reported_cached_tokens)
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import PPCommTag
@@ -4015,7 +4015,7 @@ class PyExecutor:
             request.decoding_iter = request.py_decoding_iter
             response = request.create_response(False, self.dist.rank)
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
+                response.result.cached_tokens = reported_cached_tokens(request)
                 self._enqueue_responses([(request.py_request_id, response)])
         self.active_requests[:] = [
             req for req in self.active_requests if req is not request
@@ -8337,7 +8337,7 @@ class PyExecutor:
             response = request.create_response(False, self.dist.rank)
             if response is None:
                 continue
-            response.result.cached_tokens = request.cached_tokens
+            response.result.cached_tokens = reported_cached_tokens(request)
             self._maybe_attach_ctx_usage(request, response)
             if logits_snapshot is not None:
                 response.result.generation_logits = logits_snapshot
@@ -8444,7 +8444,8 @@ class PyExecutor:
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished
-                    response.result.cached_tokens = request.cached_tokens
+                    response.result.cached_tokens = reported_cached_tokens(
+                        request)
                     self._maybe_attach_ctx_usage(request, response)
                     response.result.per_pos_drafted = request.py_per_pos_drafted
                     response.result.per_pos_accepted = request.py_per_pos_accepted
