@@ -68,6 +68,47 @@ def test_native_block_key_hasher_matches_python_v1():
         parent = h
 
 
+@pytest.mark.parametrize("lora_task_id",
+                         [0, 7, 2**32 + 3, 2**63, 2**64 - 1, 2**64 + 5, -1])
+def test_native_block_key_hasher_matches_python_v1_with_lora(
+        lora_task_id) -> None:
+    """The native path must stay bit-exact with hash_v1_block_key for LoRA.
+
+    Ids outside [0, 2**64) are reduced modulo 2**64 on both paths, so an
+    out-of-range adapter id hashes the same way instead of raising in the
+    native binding.
+    """
+    rng = random.Random(lora_task_id)
+    for _ in range(100):
+        n = rng.choice([1, 2, 31, 32, 33, 64])
+        toks = [rng.randint(0, 300000) for _ in range(n)]
+        parent = rng.choice([None, 0, rng.randint(1, 2**64 - 1)])
+        ref = hash_v1_block_key(toks,
+                                parent_hash=0 if parent is None else parent,
+                                lora_task_id=lora_task_id)
+        assert block_key_hasher(toks, parent, lora_task_id=lora_task_id) == ref
+
+
+def test_block_key_hasher_python_fallback_only_for_cache_salt(
+        monkeypatch) -> None:
+    """LoRA-only requests take the native path; only a cache salt falls back."""
+    python_calls = []
+
+    def recording_hash_v1_block_key(*args, **kwargs):
+        python_calls.append(kwargs)
+        return hash_v1_block_key(*args, **kwargs)
+
+    monkeypatch.setattr("tensorrt_llm.serve.router_utils.hash_v1_block_key",
+                        recording_hash_v1_block_key)
+    toks = list(range(1, 33))
+
+    block_key_hasher(toks, None, lora_task_id=7)
+    assert python_calls == []
+
+    block_key_hasher(toks, None, cache_salt_id=123, lora_task_id=7)
+    assert len(python_calls) == 1
+
+
 def _make_mock_aiohttp_session(return_value=None):
     """Create a mock aiohttp.ClientSession whose .post() returns canned JSON."""
     if return_value is None:
