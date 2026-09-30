@@ -296,14 +296,25 @@ def BOLT_PUBLISH_VARIANT = "bolt_publish_variant"
 // branch with the ref means a pinned consumer never has to guess.
 @Field
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
-// The target triple the pin was resolved for. Only aarch64 has a profile
-// producer, so the pin addresses an object under aarch64-linux-gnu and nowhere
-// else -- yet consumers are launched for both architectures off this one map.
-// Saying which triple the pin is for lets a consumer recognize a pin that is
-// not addressed to it and stay on `latest`, instead of demanding a bundle that
-// was never promoted. See applyLatestBolt in Build.groovy.
+// The one triple with a BOLT profile producer. BoltProfileGen runs aarch64 only,
+// so this is the only triple with a promoted bundle to resolve or apply. Named
+// once because the pin resolver and the consume scope below must not disagree.
 @Field
-def BOLT_PROFILE_TRIPLE = "bolt_profile_triple"
+def BOLT_PRODUCER_TRIPLE = "aarch64-linux-gnu"
+// The triples BOLT consume applies to. Stated explicitly rather than inferred
+// from the pin: "which bundle" and "which architectures consume BOLT" are
+// independent questions, and answering the second from the first made the
+// x86_64 path behave differently depending on whether the pin happened to
+// resolve -- an unresolvable pin is non-fatal by design, so x86_64 would then
+// go on to stage llvm-bolt and request a bundle that does not exist before
+// giving up. Both consumers are launched for both architectures off this one
+// map, so the scope has to travel with it.
+//
+// Adding a triple here also needs a per-triple pin: BOLT_PROFILE_REF names one
+// bundle under one promote directory, so a second architecture reading it would
+// demand aarch64's bundle. Change the two together.
+@Field
+def BOLT_CONSUME_TRIPLES = "bolt_consume_triples"
 @Field
 def RELEASE_TARGET = "release_target"
 def globalVars = [
@@ -319,7 +330,7 @@ def globalVars = [
     (BOLT_PROFILE_REF): "",
     (BOLT_PUBLISH_VARIANT): (env.JOB_NAME ==~ /.*PostMerge.*/) && ENABLE_BOLT_POSTMERGE_VARIANT,
     (BOLT_PROFILE_BRANCH): "",
-    (BOLT_PROFILE_TRIPLE): "",
+    (BOLT_CONSUME_TRIPLES): BOLT_PRODUCER_TRIPLE,
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // Compare against "true" rather than relying on Groovy truthiness: the bot phrase
@@ -631,16 +642,13 @@ def preparation(pipeline, testFilter, globalVars)
         // where the resolver's script lives.
         stage("Pin BOLT Profile Bundle") {
             def pinBranch = globalVars[BUILD_BRANCH]
-            // Named here rather than left to the resolver's default so the pin and
-            // the triple published beside it cannot drift apart.
-            def pinTriple = "aarch64-linux-gnu"
-            def pinRef = resolveBoltProfileRef(pinBranch, pinTriple)
+            def pinRef = resolveBoltProfileRef(pinBranch, BOLT_PRODUCER_TRIPLE)
             globalVars[BOLT_PROFILE_REF] = pinRef
-            // Branch and triple are only meaningful alongside a ref, so both are
-            // left empty when the pin does not resolve -- a consumer cannot then
-            // half-honour a pin.
+            // The branch is only meaningful alongside a ref, so it is left empty
+            // when the pin does not resolve -- a consumer cannot then half-honour
+            // a pin. Which architectures consume BOLT is unaffected either way;
+            // that is BOLT_CONSUME_TRIPLES, decided independently of this.
             globalVars[BOLT_PROFILE_BRANCH] = pinRef ? pinBranch : ""
-            globalVars[BOLT_PROFILE_TRIPLE] = pinRef ? pinTriple : ""
         }
         stage("Upload Build Info") {
             try {
