@@ -516,14 +516,9 @@ class _StreamingEventSource:
             max_entries=max_entries,
             mm_token_id_offset=mm_token_id_offset,
         )
-        self.stored_blocks = 0
-        self.removed_blocks = 0
-        self.partial_blocks_suppressed = 0
-        self.non_target_life_cycles_ignored = 0
-        self.dropped_events = 0
 
     @property
-    def event_sink(self) -> object:
+    def event_sink(self) -> kv_cache_manager_v2_runtime.StreamingEventSink:
         return self._event_sink
 
     def set_target_life_cycle(self, life_cycle_id: int) -> None:
@@ -559,21 +554,7 @@ class _StreamingEventSource:
                 result.append(BlockRemoved(block_hashes=list(event.block_hashes), medium="GPU"))
             else:
                 raise TypeError(f"Unsupported native streaming KV event: {type(event)!r}")
-        self._sync_stats()
         return result
-
-    def _sync_stats(self) -> None:
-        # Native capture counters are snapshots refreshed at each drain, including
-        # an empty drain, rather than Python-owned counters updated inline.
-        stats = self._event_sink.stats
-        self.stored_blocks = stats.stored_blocks
-        self.removed_blocks = stats.removed_blocks
-        self.partial_blocks_suppressed = stats.partial_blocks_suppressed
-        self.non_target_life_cycles_ignored = stats.non_target_life_cycles_ignored
-        self.dropped_events = stats.dropped_events
-
-    def close(self) -> None:
-        self._sync_stats()
 
 
 class StreamingKVCacheEventManager:
@@ -604,23 +585,23 @@ class StreamingKVCacheEventManager:
 
     @property
     def stored_blocks(self) -> int:
-        return self._event_source.stored_blocks
+        return self.event_sink.stats.stored_blocks
 
     @property
     def removed_blocks(self) -> int:
-        return self._event_source.removed_blocks
+        return self.event_sink.stats.removed_blocks
 
     @property
     def partial_blocks_suppressed(self) -> int:
-        return self._event_source.partial_blocks_suppressed
+        return self.event_sink.stats.partial_blocks_suppressed
 
     @property
     def non_target_life_cycles_ignored(self) -> int:
-        return self._event_source.non_target_life_cycles_ignored
+        return self.event_sink.stats.non_target_life_cycles_ignored
 
     @property
     def dropped_events(self) -> int:
-        return self._event_source.dropped_events
+        return self.event_sink.stats.dropped_events
 
     def start(self) -> None:
         """Bind the publisher's sockets and start its background thread."""
@@ -649,13 +630,6 @@ class StreamingKVCacheEventManager:
             f"window_size={self._max_window_size}"
         )
 
-    def add_created_event(
-        self,
-        num_blocks_per_cache_level: Any,
-        layer_group_ids: Any = None,
-    ) -> None:
-        return
-
     def flush_iteration_events(self) -> None:
         if self._closed:
             return
@@ -681,7 +655,7 @@ class StreamingKVCacheEventManager:
             )
 
     @property
-    def event_sink(self) -> object:
+    def event_sink(self) -> kv_cache_manager_v2_runtime.StreamingEventSink:
         """Return the native sink installed in KVCacheManager."""
         return self._event_source.event_sink
 
@@ -696,16 +670,16 @@ class StreamingKVCacheEventManager:
             return
         self.flush_iteration_events()
         self._closed = True
-        self._event_source.close()
         self._publisher.shutdown()
+        stats = self.event_sink.stats
         logger.info(
             "Streaming KV event fast path "
             f"rank={self._rank} "
-            f"stored_blocks={self.stored_blocks} "
-            f"removed_blocks={self.removed_blocks} "
-            f"partial_blocks_suppressed={self.partial_blocks_suppressed} "
-            f"non_target_life_cycles_ignored={self.non_target_life_cycles_ignored} "
-            f"dropped_events={self.dropped_events} "
+            f"stored_blocks={stats.stored_blocks} "
+            f"removed_blocks={stats.removed_blocks} "
+            f"partial_blocks_suppressed={stats.partial_blocks_suppressed} "
+            f"non_target_life_cycles_ignored={stats.non_target_life_cycles_ignored} "
+            f"dropped_events={stats.dropped_events} "
             f"enqueued_batches={self.enqueued_batches} "
             f"dropped_batches={self.dropped_batches}"
         )

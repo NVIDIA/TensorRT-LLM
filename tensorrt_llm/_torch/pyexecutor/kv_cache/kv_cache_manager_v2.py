@@ -1616,10 +1616,13 @@ class KVCacheManagerV2(BaseResourceManager):
                     attention_only=isinstance(self.event_manager, StreamingKVCacheEventManager)
                 )
             )
-            self.event_manager.add_created_event(
-                self._get_event_num_blocks_per_cache_level(config.cache_tiers, tokens_per_block),
-                self._get_event_layer_group_ids(),
-            )
+            if not isinstance(self.event_manager, StreamingKVCacheEventManager):
+                self.event_manager.add_created_event(
+                    self._get_event_num_blocks_per_cache_level(
+                        config.cache_tiers, tokens_per_block
+                    ),
+                    self._get_event_layer_group_ids(),
+                )
 
         # Both backends build layer_grouping on demand, and the layer order
         # within a group is not part of its contract. Cache a stable physical-

@@ -287,6 +287,12 @@ def test_native_streaming_sink_to_python_wire_structs(real_block_factory):
         _add_streaming_stored_block(event_sink, partial)
         _add_streaming_stored_life_cycle(event_sink, second, 1)
         _add_streaming_stored_life_cycle(event_sink, second, 0)
+        # Native capture statistics are available before draining or publishing.
+        assert manager.stored_blocks == 2
+        assert manager.partial_blocks_suppressed == 1
+        assert manager.non_target_life_cycles_ignored == 1
+        assert manager.dropped_events == 0
+        assert published == []
         manager.flush_iteration_events()
 
         first_hash = int.from_bytes(_block_key(first)[:8], byteorder="big", signed=True)
@@ -301,6 +307,8 @@ def test_native_streaming_sink_to_python_wire_structs(real_block_factory):
         _add_streaming_removed_life_cycle(event_sink, second, 1)
         _add_streaming_removed_block(event_sink, first)
         _add_streaming_removed_life_cycle(event_sink, second, 0)
+        assert manager.removed_blocks == 2
+        assert manager.non_target_life_cycles_ignored == 2
         manager.flush_iteration_events()
 
         assert len(published) == 2
