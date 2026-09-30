@@ -44,7 +44,7 @@ namespace moe_comm
 //
 // No collective separates a rank's first-touch JIT/autotune work from its dispatch launch, so
 // this device-side budget is in effect a deadline on the slowest peer's host-side progress.
-// Python raises it during warmup (tensorrt_llm/_torch/moe/fused_moe/comm_timeout.py).
+// Python raises it during warmup (tensorrt_llm/_torch/moe/fused_moe/moe_comm_timeout_guard.py).
 static std::atomic<int64_t> gTimeoutCycles{tensorrt_llm::kernels::moe_comm::kDefaultTimeoutCycles};
 
 // Set the budget of subsequent launches in seconds; 0 restores the default.

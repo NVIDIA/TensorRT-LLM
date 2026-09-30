@@ -29,7 +29,10 @@ from packaging.version import InvalidVersion, Version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from .comm_timeout import register_moe_comm_timeout_sink, unregister_moe_comm_timeout_sink
+from .moe_comm_timeout_guard import (
+    register_moe_comm_timeout_proxy,
+    unregister_moe_comm_timeout_proxy,
+)
 
 if TYPE_CHECKING:
     from nccl.ep import Group
@@ -99,7 +102,7 @@ def nccl_ep_supports_group_timeout() -> bool:
     return hasattr(Group, "set_timeout_ns")
 
 
-class _NcclEpGroupTimeoutSink:
+class _NcclEpGroupTimeoutProxy:
     """Applies MoE communication timeouts to one NCCL EP group."""
 
     name = "NcclEP"
@@ -253,10 +256,10 @@ class NcclEpContext:
             max_token_bytes=max_token_bytes,
         )
         self.ep_group = Group.create(self.comm, cfg)
-        # Held here because the timeout policy holds its sinks weakly; ``destroy`` unregisters
-        # the sink before the group goes away.
-        self._timeout_sink = _NcclEpGroupTimeoutSink(self.ep_group)
-        register_moe_comm_timeout_sink(self._timeout_sink)
+        # Held here because the timeout guard holds its proxies weakly; ``destroy`` unregisters
+        # the proxy before the group goes away.
+        self._timeout_proxy = _NcclEpGroupTimeoutProxy(self.ep_group)
+        register_moe_comm_timeout_proxy(self._timeout_proxy)
 
         logger.info(
             f"NCCL EP group created: ep_size={self.ep_size}, "
@@ -392,7 +395,7 @@ class NcclEpContext:
         (the recommended nccl4py pattern), then ``Free`` on the MPI comm.
         """
         if self.ep_group is not None:
-            unregister_moe_comm_timeout_sink(self._timeout_sink)
+            unregister_moe_comm_timeout_proxy(self._timeout_proxy)
             try:
                 self.ep_group.destroy()
             except _NCCL_RUNTIME_ERRORS as e:

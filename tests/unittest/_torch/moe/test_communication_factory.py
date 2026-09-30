@@ -23,8 +23,7 @@ import pytest
 import torch
 from packaging.version import Version
 
-from tensorrt_llm._torch.execution_phase import ExecutionPhase
-from tensorrt_llm._torch.moe.fused_moe import comm_timeout, nccl_ep_utils
+from tensorrt_llm._torch.moe.fused_moe import moe_comm_timeout_guard, nccl_ep_utils
 from tensorrt_llm._torch.moe.fused_moe.communication import communication_factory
 from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided as one_sided_module
 from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_two_sided as two_sided_module
@@ -76,16 +75,14 @@ def test_create_strategy_rejects_invalid_comm_timeout_before_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Selection treats constructor errors as "unavailable", so validation must come first."""
-    policy = comm_timeout.MoECommTimeoutPolicy(
-        environ={comm_timeout.SERVING_TIMEOUT_ENV: "soon"},
-        get_phase=lambda: ExecutionPhase.SERVING,
-        add_phase_listener=lambda listener: None,
+    guard = moe_comm_timeout_guard.MoECommTimeoutGuard(
+        environ={moe_comm_timeout_guard.SERVING_TIMEOUT_ENV: "soon"}
     )
-    monkeypatch.setattr(comm_timeout, "_DEFAULT_POLICY", policy)
+    monkeypatch.setattr(moe_comm_timeout_guard, "_DEFAULT_GUARD", guard)
     one_sided = Mock(side_effect=AssertionError("backend construction reached"))
     monkeypatch.setattr(communication_factory, "NVLinkOneSided", one_sided)
 
-    with pytest.raises(ValueError, match=comm_timeout.SERVING_TIMEOUT_ENV):
+    with pytest.raises(ValueError, match=moe_comm_timeout_guard.SERVING_TIMEOUT_ENV):
         communication_factory.CommunicationFactory.create_strategy(
             _make_model_config(),
             num_experts=32,

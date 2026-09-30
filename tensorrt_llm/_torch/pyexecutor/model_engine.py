@@ -52,8 +52,6 @@ from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
-from ..execution_phase import (ExecutionPhase, execution_phase,
-                               set_execution_phase)
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -62,6 +60,8 @@ from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..moe.expert_statistic import ExpertStatistic
+from ..moe.fused_moe.moe_comm_timeout_guard import (moe_comm_serving_timeouts,
+                                                    set_moe_comm_warmup)
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                MoeLoadBalancerIterContext)
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
@@ -1162,10 +1162,9 @@ class PyTorchModelEngine(ModelEngine):
         self._is_warmup = value
 
         # This setter is the one choke point every warmup transition passes
-        # through, including PyExecutor's, so publish the execution phase here
-        # rather than in set_warmup_flag().
-        set_execution_phase(
-            ExecutionPhase.WARMUP if value else ExecutionPhase.SERVING)
+        # through, including PyExecutor's, so switch the MoE communication
+        # timeouts here rather than in set_warmup_flag().
+        set_moe_comm_warmup(value)
 
         self.moe_load_balancer_iter_info = (not value, not value)
 
@@ -1736,8 +1735,8 @@ class PyTorchModelEngine(ModelEngine):
         completion-flag deadline. It is a partial mitigation only: other
         first-touch compiles remain inside collective-bearing forwards, and some
         sit on the all-to-all path itself and cannot be pre-compiled this way.
-        The warmup communication timeout budget (see ``comm_timeout.py``)
-        covers the general case.
+        The warmup MoE communication timeout (see
+        ``moe_comm_timeout_guard.py``) covers the general case.
 
         Only the fallback tactics are compiled -- what an eager, cache-miss
         forward selects. The runner's kernel cache key excludes m/n/k, so one
@@ -2642,10 +2641,10 @@ class PyTorchModelEngine(ModelEngine):
             finally:
                 self.cuda_graph_runner.is_warmup_only = False
             self.cuda_graph_runner.padding_dummy_requests = {}
-            # Captured graphs keep the communication timeouts that were current
-            # at capture, and serving replays them, so capture with serving
-            # budgets. The warmup-only pass above keeps the warmup budgets.
-            with execution_phase(ExecutionPhase.SERVING):
+            # Captured graphs keep the MoE communication timeouts that were
+            # current at capture, and serving replays them, so capture with the
+            # serving timeouts. The warmup-only pass above keeps the warmup ones.
+            with moe_comm_serving_timeouts():
                 self._run_cuda_graph_warmup(resource_manager)
 
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):

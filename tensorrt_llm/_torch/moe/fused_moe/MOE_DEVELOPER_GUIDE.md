@@ -139,22 +139,22 @@ EPLB hooks fire only at the first/last chunk of the first/last `repeat_idx`. Mul
 
 No external `Communication.dispatch` / `.combine`. Zero-token chunks still launch the kernel so peer EP ranks can cross the in-kernel NVLink barrier.
 
-The DeepGEMM kernel's in-kernel barriers trap when a peer is late; their timeout follows the execution phase, see [Communication timeouts](#communication-timeouts).
+The DeepGEMM kernel's in-kernel barriers trap when a peer is late; their timeout is relaxed during warmup, see [Communication timeouts](#communication-timeouts).
 
 ### Communication timeouts
 
-Several MoE communication kernels wait for their peers inside the kernel and trap once a peer is late by more than a device-side timeout. The trap is a sticky CUDA error, so every waiting rank dies. During warmup, one-time per-rank work (kernel JIT, autotuning, module loading) can delay a healthy rank by minutes with no collective in between, so these timeouts follow the engine's execution phase:
+Several MoE communication kernels wait for their peers inside the kernel and trap once a peer is late by more than a device-side timeout. The trap is a sticky CUDA error, so every waiting rank dies. During warmup, one-time per-rank work (kernel JIT, autotuning, module loading) can delay a healthy rank by minutes with no collective in between, so these timeouts are relaxed while the engine warms up:
 
-- `tensorrt_llm/_torch/execution_phase.py` holds the process-wide `ExecutionPhase` (`WARMUP` or `SERVING`). The model engine's `is_warmup` setter publishes it. Only the CUDA-graph pass that captures runs in `SERVING`, because captured graphs keep the timeouts that were current at capture.
-- `comm_timeout.py` resolves one budget per phase and pushes it to every registered `MoECommTimeoutSink` on each transition: `TRTLLM_MOE_COMM_WARMUP_TIMEOUT_SEC` (default 1800 s) and `TRTLLM_MOE_COMM_TIMEOUT_SEC` (default: each library's native timeout). `CommunicationFactory.create_strategy` resolves the budgets before it tries any strategy, so an invalid value fails there instead of reading as an unavailable backend.
-- Each backend with such a timeout registers a sink when it is constructed:
+- `moe_comm_timeout_guard.py` owns the process-wide `MoECommTimeoutGuard`. It resolves two budgets, `TRTLLM_MOE_COMM_WARMUP_TIMEOUT_SEC` (default 1800 s) and `TRTLLM_MOE_COMM_TIMEOUT_SEC` (default: each library's native timeout), and on each transition pushes the current one to every registered `MoECommTimeoutProxy`. `CommunicationFactory.create_strategy` resolves the budgets before it tries any strategy, so an invalid value fails there instead of reading as an unavailable backend.
+- The model engine's `is_warmup` setter calls `set_moe_comm_warmup`. The CUDA-graph pass that captures runs inside `moe_comm_serving_timeouts()`, because captured graphs keep the timeouts that were current at capture. Switching while a CUDA graph is being captured raises.
+- Each backend with such a timeout registers a proxy when it is constructed. The guard holds proxies weakly, so the backend must keep its proxy alive:
 
-| Backend | Sink applies the timeout through | Native serving timeout |
-|---------|----------------------------------|------------------------|
+| Backend | Proxy applies the timeout through | Native serving timeout |
+|---------|-----------------------------------|------------------------|
 | NVLinkOneSided | `torch.ops.trtllm.moe_a2a_set_timeout`; copied into launch arguments | 300 s |
 | DeepGEMM MegaMoE | `deep_gemm.set_barrier_timeout_seconds` (`3rdparty/patches/deepgemm_configurable_barrier_timeout.patch`); a kernel argument | 60 s, or `DG_JIT_BARRIER_TIMEOUT_SECONDS` |
 | DeepEP normal kernels | `deep_ep.set_timeout_seconds` (`3rdparty/patches/deep_ep_runtime_timeout.patch`); a device variable read at execution | ~100 s |
-| NcclEP | `nccl.ep.Group.set_timeout_ns`, one sink per group (`3rdparty/patches/nccl_ep_group_timeout.patch`); copied into launch arguments | `NCCL_EP_TIMEOUT_MS`, else `GroupConfig.timeout_ns`, else ~100 s |
+| NcclEP | `nccl.ep.Group.set_timeout_ns`, one proxy per group (`3rdparty/patches/nccl_ep_group_timeout.patch`); copied into launch arguments | `NCCL_EP_TIMEOUT_MS`, else `GroupConfig.timeout_ns`, else ~100 s |
 
 Timeouts are nominal: NVLinkOneSided, DeepGEMM and DeepEP convert seconds at an assumed 2 GHz SM clock, while NcclEP uses the device's clock rate.
 
@@ -210,7 +210,7 @@ Still on old path (standalone, with embedded communication):
 | `impl_blocks.py` | The blocks `MoE` and `MoEImplBase` share — `MoEExecutionContractMixin` (scheduler-facing declarations, `forward_fake`) and `MoEWeightOwnerMixin` (`create_weights` / `load_weights` / `_check_configs`) |
 | `quantization.py` | Quantization method implementations (`FusedMoEMethod` subclasses: weight creation, loading, quant/dequant ops per quant mode) |
 | `routing.py` | Routing methods (`TopKRouting`, etc.) |
-| `comm_timeout.py` | Phase-aware device-side timeouts of communication kernels — budget resolution and `MoECommTimeoutSink` registration (see [Communication timeouts](#communication-timeouts)) |
+| `moe_comm_timeout_guard.py` | Device-side timeouts of communication kernels, relaxed during warmup — budget resolution and `MoECommTimeoutProxy` registration (see [Communication timeouts](#communication-timeouts)) |
 | `moe_load_balancer.py` | EPLB implementation |
 | `moe_op_backend.py` | Op backend registry for TRTLLMGen (flashinfer/trtllm ops) |
 
@@ -770,7 +770,7 @@ The `XXFusedMoE` names remain supported as module-level aliases — `DeepGemmFus
 - **Do NOT substitute a backend without recording it** — A degradation must be visible in the `MoEResolutionReport`, not only in a log line
 - **Do NOT pick `scheduler_kind` opportunistically** — Use `EXTERNAL_COMM` (default) unless your backend's fused kernel genuinely owns cross-rank exchange via SymmBuffer / equivalent in-kernel collective; `FUSED_COMM` brings hard invariants (no host comm, lockstep launches, no multi-stream overlap)
 - **Schedulers MUST NOT write `moe.repeat_idx`** — `repeat_idx` is wrapper state advanced once per `forward_impl` regardless of chunk count
-- **Do NOT switch a communication kernel's timeout from the model engine or through environment variables at runtime** — A backend whose kernels wait for peers under a timeout registers a `MoECommTimeoutSink` when it is constructed and unregisters it before releasing what the sink controls (see [Communication timeouts](#communication-timeouts)). Writing environment variables at runtime races with NCCL threads that read them
+- **Do NOT set a communication kernel's timeout directly or through environment variables at runtime** — A backend whose kernels wait for peers under a timeout registers a `MoECommTimeoutProxy` with the timeout guard when it is constructed and unregisters it before releasing what the proxy controls; only the guard decides the value (see [Communication timeouts](#communication-timeouts)). Writing environment variables at runtime races with NCCL threads that read them
 - **Do NOT allocate symmetric memory from `run_moe` in `FUSED_COMM` backends** — Symmetric-memory rendezvous is a build-time collective and is unsafe under PP / layer-skip or CUDA graph capture; allocate from `create_weights()` after `ConfigurableMoE` has synchronized EPLB-derived attributes. See `mega_moe/mega_moe_deepgemm.py` for the DG pattern and `mega_moe/mega_moe_cute_dsl.py:_alloc_symm_provider` for the NVSHMEM-equivalent provider.
 - **Do NOT add a new `FUSED_COMM` backend without a zero-token `quantize_input` regression test** — `FusedCommMoEScheduler` calls `quantize_input` for every chunk (including zero-token chunks) so each backend must return its own empty-tensor layout.
 - **Do NOT use a dataclass for an autotuner tactic without a tested `__repr__` round-trip** — `AutoTuner` serializes tactic values through `json.dumps`/`json.loads` and `eval(repr(tactic))`; a plain dataclass fails the `eval(repr(...))` check. Prefer a JSON-friendly **tuple of primitives or lists of primitives** (lists are JSON-friendly; tuples round-trip via `eval(repr(...))`). See the tactic-representation comment block in `tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py` for the 10-field tactic pattern (with legacy 8-field compatibility) (mma_tiler/cluster_shape as `list[int]`, `epi_flag_batch` as a nested `(int, int)` tuple, the rest as `bool`/`int`/`str`; `_unpack_tactic` is the single source of truth for the field order). The fallback tactic is the token-aware `default_megamoe_tactic(num_tokens)` helper, selected by `Sm100MegaMoENvfp4Runner.forward(tactic=-1)`, not a separate `fallback_tactic()` method.

@@ -28,7 +28,7 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.logger import logger
 
-from ..comm_timeout import get_moe_comm_timeout_budgets
+from ..moe_comm_timeout_guard import get_moe_comm_timeout_budgets
 from ..nccl_ep_utils import (
     is_nccl_ep_installed,
     nccl_ep_supports_group_timeout,

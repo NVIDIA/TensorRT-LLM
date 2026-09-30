@@ -47,7 +47,7 @@ from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
 
-from ..comm_timeout import register_moe_comm_timeout_sink
+from ..moe_comm_timeout_guard import register_moe_comm_timeout_proxy
 from .base import Communication
 
 _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
@@ -152,7 +152,7 @@ def _get_cft_max_batch_for_combine() -> int | None:
     return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_COMBINE_ENV, _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE)
 
 
-class _NVLinkOneSidedTimeoutSink:
+class _NVLinkOneSidedTimeoutProxy:
     """Applies MoE communication timeouts to the process-wide completion-flag budget."""
 
     name = "NVLinkOneSided"
@@ -162,7 +162,7 @@ class _NVLinkOneSidedTimeoutSink:
         torch.ops.trtllm.moe_a2a_set_timeout(0 if seconds is None else seconds)
 
 
-_TIMEOUT_SINK = _NVLinkOneSidedTimeoutSink()
+_TIMEOUT_PROXY = _NVLinkOneSidedTimeoutProxy()
 
 
 class NVLinkOneSided(Communication):
@@ -339,8 +339,8 @@ class NVLinkOneSided(Communication):
             raise RuntimeError(
                 f"NVLinkOneSided supports at most {self.MAX_RANKS} EP ranks, got ep_size={self.ep_size}."
             )
-        # The completion-flag budget is process-wide, so every instance shares one sink.
-        register_moe_comm_timeout_sink(_TIMEOUT_SINK)
+        # The completion-flag budget is process-wide, so every instance shares one proxy.
+        register_moe_comm_timeout_proxy(_TIMEOUT_PROXY)
 
         # Store needed parameters
         self.num_experts = num_slots

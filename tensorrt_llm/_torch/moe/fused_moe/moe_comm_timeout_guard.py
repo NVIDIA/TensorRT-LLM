@@ -12,38 +12,34 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Phase-aware device-side timeouts for MoE communication kernels.
+"""Warmup-aware device-side timeouts for MoE communication kernels.
 
 Several MoE communication kernels wait for their peers inside the kernel and trap once a peer is
 late by more than a device-side timeout. The trap is a sticky CUDA error, so every waiting rank
 dies. During warmup, one-time per-rank work (JIT compilation, autotuning, module loading) can
 delay a healthy rank by minutes, and no collective separates that work from the next launch.
 
-This module relaxes the timeout of every registered backend while the process is in
-``ExecutionPhase.WARMUP`` and applies the serving budget otherwise. Backends register a
-``MoECommTimeoutSink`` when they are constructed.
+The model engine reports each warmup transition here. The guard applies the warmup timeout to
+every registered backend while the engine warms up and the serving timeout otherwise. Each
+backend registers a ``MoECommTimeoutProxy`` when it is constructed.
 
 Environment variables (integer seconds in ``1..86400``):
-    TRTLLM_MOE_COMM_WARMUP_TIMEOUT_SEC: Warmup budget for every backend; defaults to 1800.
-    TRTLLM_MOE_COMM_TIMEOUT_SEC: Serving budget for every backend; when unset, each backend
+    TRTLLM_MOE_COMM_WARMUP_TIMEOUT_SEC: Warmup timeout for every backend; defaults to 1800.
+    TRTLLM_MOE_COMM_TIMEOUT_SEC: Serving timeout for every backend; when unset, each backend
         keeps its native timeout.
 """
 
+import contextlib
 import dataclasses
 import os
 import threading
 import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import Protocol
 
-from tensorrt_llm.logger import logger
+import torch
 
-from ...execution_phase import (
-    ExecutionPhase,
-    ExecutionPhaseListener,
-    add_execution_phase_listener,
-    get_execution_phase,
-)
+from tensorrt_llm.logger import logger
 
 __all__ = [
     "DEFAULT_WARMUP_TIMEOUT_SEC",
@@ -51,12 +47,14 @@ __all__ = [
     "SERVING_TIMEOUT_ENV",
     "WARMUP_TIMEOUT_ENV",
     "MoECommTimeoutBudgets",
-    "MoECommTimeoutPolicy",
-    "MoECommTimeoutSink",
+    "MoECommTimeoutGuard",
+    "MoECommTimeoutProxy",
     "get_moe_comm_timeout_budgets",
-    "register_moe_comm_timeout_sink",
+    "moe_comm_serving_timeouts",
+    "register_moe_comm_timeout_proxy",
     "resolve_moe_comm_timeout_budgets",
-    "unregister_moe_comm_timeout_sink",
+    "set_moe_comm_warmup",
+    "unregister_moe_comm_timeout_proxy",
 ]
 
 WARMUP_TIMEOUT_ENV = "TRTLLM_MOE_COMM_WARMUP_TIMEOUT_SEC"
@@ -71,8 +69,8 @@ _DEPRECATED_ENV_ALIASES: dict[str, str] = {
 }
 
 
-class MoECommTimeoutSink(Protocol):
-    """A MoE communication backend whose kernels wait for peers under a device-side timeout."""
+class MoECommTimeoutProxy(Protocol):
+    """Stands in for the device-side timeout of one MoE communication backend."""
 
     name: str
     """Backend name used in logs."""
@@ -88,7 +86,7 @@ class MoECommTimeoutSink(Protocol):
 
 @dataclasses.dataclass(frozen=True)
 class MoECommTimeoutBudgets:
-    """Timeouts per execution phase.
+    """Timeouts for warmup and for serving.
 
     Attributes:
         warmup_seconds: Timeout applied to every backend during warmup.
@@ -99,11 +97,9 @@ class MoECommTimeoutBudgets:
     warmup_seconds: int
     serving_seconds: int | None
 
-    def for_phase(self, phase: ExecutionPhase) -> int | None:
-        """Return the timeout for ``phase``; ``None`` selects native defaults."""
-        if phase is ExecutionPhase.WARMUP:
-            return self.warmup_seconds
-        return self.serving_seconds
+    def select(self, in_warmup: bool) -> int | None:
+        """Return the warmup or serving timeout; ``None`` selects native defaults."""
+        return self.warmup_seconds if in_warmup else self.serving_seconds
 
 
 def resolve_moe_comm_timeout_budgets(environ: Mapping[str, str]) -> MoECommTimeoutBudgets:
@@ -113,7 +109,7 @@ def resolve_moe_comm_timeout_budgets(environ: Mapping[str, str]) -> MoECommTimeo
         environ: The environment to read, usually ``os.environ``.
 
     Returns:
-        The budgets for both phases.
+        The budgets for warmup and serving.
 
     Raises:
         ValueError: If a value is not an integer in ``1..86400``, a deprecated alias conflicts
@@ -131,36 +127,38 @@ def resolve_moe_comm_timeout_budgets(environ: Mapping[str, str]) -> MoECommTimeo
     return MoECommTimeoutBudgets(warmup_seconds=warmup_seconds, serving_seconds=serving_seconds)
 
 
-class MoECommTimeoutPolicy:
-    """Pushes the timeout of the current execution phase to the registered sinks.
+def _is_capturing_cuda_graph() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
-    Budgets are resolved from the environment on first use and then stay fixed. Sinks are held
-    weakly; their owners keep them alive and unregister them before releasing the resources the
-    sinks control.
+
+class MoECommTimeoutGuard:
+    """Applies the warmup or serving timeout to every registered proxy.
+
+    The guard starts in serving. Budgets are resolved from the environment the first time a proxy
+    needs one and then stay fixed. Proxies are held weakly; their owners keep them alive and
+    unregister them before releasing the resources the proxies control.
 
     Args:
         environ: The environment holding the budget variables.
-        get_phase: Returns the current execution phase.
-        add_phase_listener: Subscribes a callback to execution-phase transitions.
+        is_capturing: Returns whether the current CUDA stream is capturing a graph.
     """
 
     def __init__(
         self,
         environ: Mapping[str, str],
-        get_phase: Callable[[], ExecutionPhase],
-        add_phase_listener: Callable[[ExecutionPhaseListener], None],
+        is_capturing: Callable[[], bool] = _is_capturing_cuda_graph,
     ) -> None:
         self._environ = environ
-        self._get_phase = get_phase
-        self._add_phase_listener = add_phase_listener
-        # Phase transitions call ``_on_phase_change`` under the execution-phase lock and then take
-        # ``_lock``. Subscribing takes the execution-phase lock, so it must not run under
-        # ``_lock``; it has its own lock instead.
+        self._is_capturing = is_capturing
         self._lock = threading.Lock()
-        self._subscribe_lock = threading.Lock()
-        self._subscribed = False
+        self._in_warmup = False
         self._budgets: MoECommTimeoutBudgets | None = None
-        self._sinks: weakref.WeakSet[MoECommTimeoutSink] = weakref.WeakSet()
+        self._proxies: weakref.WeakSet[MoECommTimeoutProxy] = weakref.WeakSet()
+
+    @property
+    def in_warmup(self) -> bool:
+        """Whether the warmup timeout is in effect."""
+        return self._in_warmup
 
     def budgets(self) -> MoECommTimeoutBudgets:
         """Return the budgets, resolving them from the environment on first use.
@@ -171,37 +169,73 @@ class MoECommTimeoutPolicy:
         with self._lock:
             return self._resolve_budgets()
 
-    def register(self, sink: MoECommTimeoutSink) -> None:
-        """Apply the current phase's timeout to ``sink`` and keep it updated on transitions.
+    def register(self, proxy: MoECommTimeoutProxy) -> None:
+        """Apply the current timeout to ``proxy`` and keep it updated on warmup transitions.
 
-        A sink whose setter raises is not registered, and the error propagates.
+        A proxy whose setter raises is not registered, and the error propagates.
 
         Args:
-            sink: The backend to control.
+            proxy: The backend to control.
 
         Raises:
             ValueError: If the budget environment variables are invalid.
         """
-        self._subscribe()
         with self._lock:
-            budgets = self._resolve_budgets()
-            sink.set_timeout_seconds(budgets.for_phase(self._get_phase()))
-            self._sinks.add(sink)
+            proxy.set_timeout_seconds(self._resolve_budgets().select(self._in_warmup))
+            self._proxies.add(proxy)
 
-    def unregister(self, sink: MoECommTimeoutSink) -> None:
-        """Stop updating ``sink``; unknown sinks are ignored.
+    def unregister(self, proxy: MoECommTimeoutProxy) -> None:
+        """Stop updating ``proxy``; unknown proxies are ignored.
 
         Args:
-            sink: The backend to release.
+            proxy: The backend to release.
         """
         with self._lock:
-            self._sinks.discard(sink)
+            self._proxies.discard(proxy)
 
-    def _subscribe(self) -> None:
-        with self._subscribe_lock:
-            if not self._subscribed:
-                self._add_phase_listener(self._on_phase_change)
-                self._subscribed = True
+    def set_warmup(self, in_warmup: bool) -> None:
+        """Apply the warmup or serving timeout to every registered proxy.
+
+        Args:
+            in_warmup: Whether the engine enters warmup.
+
+        Raises:
+            RuntimeError: If the current CUDA stream is capturing a graph. Proxies may issue
+                host-synchronizing CUDA calls, which are illegal during capture.
+            ValueError: If the budget environment variables are invalid.
+        """
+        if self._is_capturing():
+            raise RuntimeError(
+                "Cannot switch MoE communication timeouts while a CUDA graph is being captured"
+            )
+        with self._lock:
+            if in_warmup == self._in_warmup:
+                return
+            self._in_warmup = in_warmup
+            proxies = list(self._proxies)
+            if not proxies:
+                return
+            seconds = self._resolve_budgets().select(in_warmup)
+            for proxy in proxies:
+                proxy.set_timeout_seconds(seconds)
+        applied = "native defaults" if seconds is None else f"{seconds} s"
+        names = ", ".join(proxy.name for proxy in proxies)
+        stage = "warmup" if in_warmup else "serving"
+        logger.info(f"MoE communication timeouts for {stage}: {applied} ({names})")
+
+    @contextlib.contextmanager
+    def serving_timeouts(self) -> Iterator[None]:
+        """Apply the serving timeout in the enclosed block, then restore the previous timeout.
+
+        A captured CUDA graph keeps the timeouts that were current at capture, and serving
+        replays it, so the pass that captures uses the serving timeout even during warmup.
+        """
+        previous = self._in_warmup
+        self.set_warmup(False)
+        try:
+            yield
+        finally:
+            self.set_warmup(previous)
 
     def _resolve_budgets(self) -> MoECommTimeoutBudgets:
         if self._budgets is None:
@@ -212,17 +246,6 @@ class MoECommTimeoutPolicy:
                 f"serving={'native defaults' if serving is None else f'{serving} s'}"
             )
         return self._budgets
-
-    def _on_phase_change(self, phase: ExecutionPhase) -> None:
-        with self._lock:
-            seconds = self._resolve_budgets().for_phase(phase)
-            sinks = list(self._sinks)
-            for sink in sinks:
-                sink.set_timeout_seconds(seconds)
-        if sinks:
-            applied = "native defaults" if seconds is None else f"{seconds} s"
-            names = ", ".join(sink.name for sink in sinks)
-            logger.info(f"MoE communication timeouts for {phase.value}: {applied} ({names})")
 
 
 def _read_timeout_seconds(environ: Mapping[str, str], name: str) -> int | None:
@@ -256,11 +279,7 @@ def _parse_timeout_seconds(environ: Mapping[str, str], name: str) -> int | None:
     return seconds
 
 
-_DEFAULT_POLICY = MoECommTimeoutPolicy(
-    environ=os.environ,
-    get_phase=get_execution_phase,
-    add_phase_listener=add_execution_phase_listener,
-)
+_DEFAULT_GUARD = MoECommTimeoutGuard(environ=os.environ)
 
 
 def get_moe_comm_timeout_budgets() -> MoECommTimeoutBudgets:
@@ -272,22 +291,41 @@ def get_moe_comm_timeout_budgets() -> MoECommTimeoutBudgets:
     Raises:
         ValueError: If the budget environment variables are invalid.
     """
-    return _DEFAULT_POLICY.budgets()
+    return _DEFAULT_GUARD.budgets()
 
 
-def register_moe_comm_timeout_sink(sink: MoECommTimeoutSink) -> None:
-    """Register ``sink`` with the process-wide policy; see ``MoECommTimeoutPolicy.register``.
-
-    Args:
-        sink: The backend to control.
-    """
-    _DEFAULT_POLICY.register(sink)
-
-
-def unregister_moe_comm_timeout_sink(sink: MoECommTimeoutSink) -> None:
-    """Unregister ``sink`` from the process-wide policy.
+def register_moe_comm_timeout_proxy(proxy: MoECommTimeoutProxy) -> None:
+    """Register ``proxy`` with the process-wide guard; see ``MoECommTimeoutGuard.register``.
 
     Args:
-        sink: The backend to release.
+        proxy: The backend to control.
     """
-    _DEFAULT_POLICY.unregister(sink)
+    _DEFAULT_GUARD.register(proxy)
+
+
+def unregister_moe_comm_timeout_proxy(proxy: MoECommTimeoutProxy) -> None:
+    """Unregister ``proxy`` from the process-wide guard.
+
+    Args:
+        proxy: The backend to release.
+    """
+    _DEFAULT_GUARD.unregister(proxy)
+
+
+def set_moe_comm_warmup(in_warmup: bool) -> None:
+    """Switch the process-wide guard; see ``MoECommTimeoutGuard.set_warmup``.
+
+    Args:
+        in_warmup: Whether the engine enters warmup.
+    """
+    _DEFAULT_GUARD.set_warmup(in_warmup)
+
+
+@contextlib.contextmanager
+def moe_comm_serving_timeouts() -> Iterator[None]:
+    """Apply the serving timeouts in the enclosed block.
+
+    See ``MoECommTimeoutGuard.serving_timeouts``.
+    """
+    with _DEFAULT_GUARD.serving_timeouts():
+        yield
