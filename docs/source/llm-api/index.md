@@ -31,6 +31,38 @@ llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
 You can also use [quantized checkpoints](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) (FP4, FP8, etc) of popular models provided by NVIDIA in the same way.
 
+### Using a Model from ModelScope
+
+To resolve remote model IDs through [ModelScope](https://modelscope.cn/)
+instead of the Hugging Face Hub, install the optional client and enable the
+ModelScope download path before starting TensorRT-LLM:
+
+```console
+pip install 'modelscope>=1.20'
+export TRTLLM_USE_MODELSCOPE=true
+trtllm-serve Qwen/Qwen3-0.6B
+```
+
+The switch also applies to remote tokenizer and speculative-model IDs. Local
+paths are used as-is. Unset `TRTLLM_USE_MODELSCOPE`, or set it to `false`, to
+retain the default Hugging Face behavior.
+
+You can also install the client through the `tensorrt_llm[modelscope]` extra.
+ModelScope remains optional and is imported only when this switch is enabled.
+
+The integration routes TensorRT-LLM snapshot downloads through ModelScope and
+passes the resolved local directories to its tokenizer and configuration loaders.
+Explicit remote tokenizers download only tokenizer/configuration files, honoring
+`tokenizer_revision`. It deliberately does not call ModelScope's process-wide
+`patch_hub()`: unrelated Hugging Face consumers in the same process retain their
+own hub behavior. Applications that download additional assets outside these
+TensorRT-LLM paths must configure those consumers separately.
+
+The minimum client version, [ModelScope 1.20.0](https://github.com/modelscope/modelscope/blob/v1.20.0/modelscope/hub/snapshot_download.py),
+supports the `allow_patterns` and `ignore_patterns` glob arguments used here.
+The legacy `ignore_file_pattern` argument also interprets valid patterns as
+regular expressions; it is not interchangeable with the glob-only filter.
+
 ### 2. Using a Local Hugging Face Model
 
 To use a model from local storage, first download it manually:
