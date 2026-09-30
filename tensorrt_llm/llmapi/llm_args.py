@@ -5585,6 +5585,49 @@ _TORCH_LLMARGS_REMOVED_ARG_CHECKS: Dict[str, Callable[[Any], None]] = {
 TORCH_LLMARGS_REMOVED_ARGS = frozenset(_TORCH_LLMARGS_REMOVED_ARG_CHECKS)
 
 
+def disagg_dflash_error(
+    speculative_config: Optional[DecodingBaseConfig],
+    cache_transceiver_config: Optional[CacheTransceiverConfig]
+) -> Optional[str]:
+    """Refusal message for DFlash speculation on a disaggregated engine.
+
+    The DFlash drafter's pooled-context K/V buffers are filled only by a
+    local prefill forward (``DFlashWorker._store_prefill_context`` fires only
+    when the batch contains context requests), and they live in worker-local
+    CUDA buffers that the KV-cache transceiver never transfers. On a
+    disaggregated generation engine, requests arrive with their target-model
+    KV already transferred and skip straight to generation, so no request is
+    ever registered with the drafter: every request falls back to the single
+    shared dummy slot, whose contents the requests then cross-contaminate.
+    The target model still verifies every draft, so outputs stay correct and
+    nothing raises -- the failure is a silent acceptance-length collapse with
+    the full drafter overhead still paid on every step.
+
+    The engine cannot tell at config time whether it will serve the context
+    or the generation side (both sides carry the same
+    ``cache_transceiver_config``; the role is decided per request), so the
+    guard refuses the combination on any engine configured for
+    disaggregation. A context-side engine loses nothing: it never runs
+    generation steps, so a drafter there could never be exercised anyway.
+    """
+    if speculative_config is None or cache_transceiver_config is None:
+        return None
+    if cache_transceiver_config.backend is None:
+        return None
+    if not isinstance(speculative_config, DFlashDecodingConfig):
+        return None
+    return ("speculative_config.decoding_type=DFlash cannot be combined with "
+            "cache_transceiver_config (disaggregated serving). The DFlash "
+            "drafter builds its pooled context only during a local prefill "
+            "forward, and the KV-cache transceiver does not transfer that "
+            "worker-local state; on a disaggregated generation engine every "
+            "request would silently fall back to one shared dummy slot, "
+            "collapsing acceptance length while still paying the drafter "
+            "overhead. Remove speculative_config from the disaggregated "
+            "engine's options (run disaggregated without speculation), or run "
+            "aggregated (drop cache_transceiver_config) to use DFlash.")
+
+
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
     generation_config: Literal["auto", "trtllm"] = Field(
@@ -6586,6 +6629,13 @@ class TorchLlmArgs(BaseLlmArgs):
                         "unaffected; expect a lower acceptance rate than the "
                         "same configuration run aggregated.")
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
+                # DFlash on a disaggregated engine silently collapses
+                # acceptance (see disagg_dflash_error); refuse before touching
+                # the drafter checkpoint.
+                disagg_error = disagg_dflash_error(
+                    self.speculative_config, self.cache_transceiver_config)
+                if disagg_error is not None:
+                    raise ValueError(disagg_error)
                 # A Hugging Face repo id is not readable yet: both calls below
                 # then run without the drafter's config.json (the budget check
                 # covers only the token budget), and CachedModelLoader repeats
