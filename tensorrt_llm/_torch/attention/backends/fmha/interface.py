@@ -90,6 +90,24 @@ class Fmha(ABC):
         """
         return True
 
+    @classmethod
+    def validate_metadata(cls, metadata: "TrtllmAttentionMetadata") -> None:
+        """Reject a metadata configuration this library would serve incorrectly.
+
+        Called once per ``TrtllmAttentionMetadata`` construction for every
+        enabled library, before any request is served. Raise with an
+        actionable error when the configuration would make this library's
+        ``forward`` produce silently wrong results; return to accept. The
+        default accepts everything.
+
+        Unlike ``is_supported``, which selects between libraries per request
+        and can route around a False, this hook is for configurations no
+        selection policy can save: failures that happen inside the library's
+        own kernels and are invisible to selection. Refusing here yields a
+        construction-time error naming the cause and the remedy instead of a
+        generic no-library-supports-this failure at first forward.
+        """
+
     @final
     def is_supported(
         self,
