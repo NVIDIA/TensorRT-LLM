@@ -1054,8 +1054,12 @@ class KvCacheCreator:
             helix_cp_scale = self._mapping.cp_size
 
         def scaled(cost: CacheCost) -> CacheCost:
-            return CacheCost(slope=cost.slope * helix_cp_scale,
-                             intercept=cost.intercept)
+            # Rescale only the slope: every other cost component (e.g. the
+            # fixed intercept) is per-request rank-local bytes and stays
+            # unscaled. dataclasses.replace keeps any component the rescale
+            # does not touch, where rebuilding the CacheCost from named
+            # fields would silently drop it.
+            return dataclasses.replace(cost, slope=cost.slope * helix_cp_scale)
 
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
