@@ -499,12 +499,12 @@ class ModelingV2Core(DecoderModel):
     ) -> torch.Tensor:
         """Route the step, and nothing else.
 
-        The contract check runs here rather than inside a target for two
-        reasons: it is phase-independent, and it is what regrows `_rope` when
-        the engine admits a longer `max_seq_len` than the table was built for.
-        A target reading `_rope` before it had run would read the short table.
+        The contract check runs here rather than inside a target because it is
+        phase-independent: it does not vary by phase, so running it once in
+        the dispatcher is equivalent to duplicating it into both
+        `PrefillTarget` and `DecodeTarget` and checks nothing they would not.
         """
-        assert self._targets is not None, "load_weights must run before forward"
+        assert self._targets is not None, "_targets is unset; load_weights must run before forward"
         assert isinstance(attn_metadata, TrtllmAttentionMetadata)
         if self._contract_pending:
             self._check_step_contract(attn_metadata, kwargs.get("position_ids"))
@@ -533,10 +533,10 @@ class _GptOssTarget(Target):
     ) -> torch.Tensor:
         core = self.core
         assert core._layers is not None and core._call_tensors is not None, (
-            "load_weights must run before forward"
+            "_layers/_call_tensors are unset; load_weights must run before forward"
         )
         assert position_ids is not None
-        assert isinstance(attn_metadata, TrtllmAttentionMetadata)
+        # The dispatcher is the only way in and it has already checked this.
         # Inputs this target does not implement must fail loudly, not be
         # silently dropped (unlike runtime-owned features, which pass through).
         assert lora_params is None, "LoRA is not implemented by this target"

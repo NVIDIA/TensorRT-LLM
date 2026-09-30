@@ -89,5 +89,5 @@ class Target(ABC):
     @abstractmethod
     def forward(self, attn_metadata: Any, *args: Any, **kwargs: Any) -> Any:
         """Run one step. The core's `forward` dispatches here after running the
-        phase-independent contract check, which is also what regrows `_rope`
-        before a target could read it short."""
+        phase-independent contract check once, rather than duplicating it into
+        every target."""
