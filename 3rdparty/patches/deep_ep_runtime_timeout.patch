@@ -1,0 +1,95 @@
+--- a/csrc/deep_ep.cpp
++++ b/csrc/deep_ep.cpp
+@@ -1614,6 +1614,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+         .def("low_latency_combine_low_precision", &deep_ep::Buffer::low_latency_combine_low_precision)
+         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
+ 
++    m.def("set_timeout_seconds", &deep_ep::set_timeout_seconds);
++    m.def("get_timeout_seconds", &deep_ep::get_timeout_seconds);
+     m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
+     m.def("quantize_bf16_to_nvfp4", deep_ep::quantize_bf16_to_nvfp4);
+     m.def("dequantize_nvfp4_to_bf16", deep_ep::dequantize_nvfp4_to_bf16);
+--- a/csrc/kernels/api.cuh
++++ b/csrc/kernels/api.cuh
+@@ -4,6 +4,13 @@
+ 
+ namespace deep_ep {
+ 
++// Timeouts of the normal kernels and their CPU-side waits for subsequent launches on the current
++// device; 0 restores the compile-time defaults. The device timeout is read when a kernel runs, so
++// it also applies to replays of captured CUDA graphs. Must not be called while a stream captures.
++void set_timeout_seconds(int timeout_secs);
++
++int get_timeout_seconds();
++
+ // Intranode runtime
+ namespace intranode {
+ 
+--- a/csrc/kernels/configs.cuh
++++ b/csrc/kernels/configs.cuh
+@@ -10,12 +10,27 @@
+ #define NUM_WAIT_NANOSECONDS 500
+ 
+ #ifndef ENABLE_FAST_DEBUG
+-#define NUM_CPU_TIMEOUT_SECS 100
+-#define NUM_TIMEOUT_CYCLES 200000000000ull // 200G cycles ~= 100s
++#define DEFAULT_NUM_CPU_TIMEOUT_SECS 100
++#define DEFAULT_NUM_TIMEOUT_CYCLES 200000000000ull // 200G cycles ~= 100s
+ #else
+-#define NUM_CPU_TIMEOUT_SECS 10
+-#define NUM_TIMEOUT_CYCLES 20000000000ull // 20G cycles ~= 10s
++#define DEFAULT_NUM_CPU_TIMEOUT_SECS 10
++#define DEFAULT_NUM_TIMEOUT_CYCLES 20000000000ull // 20G cycles ~= 10s
+ #endif
++#define NUM_TIMEOUT_CYCLES_PER_SEC 2000000000ull
++
++// Both timeouts can change at runtime, see `set_timeout_seconds` in `runtime.cu`
++#define NUM_CPU_TIMEOUT_SECS (deep_ep::num_cpu_timeout_secs)
++#define NUM_TIMEOUT_CYCLES (deep_ep::num_timeout_cycles)
++
++namespace deep_ep {
++
++extern int num_cpu_timeout_secs;
++#ifdef __CUDACC__
++// NOTES: defined in `runtime.cu`, which requires relocatable device code
++extern __device__ unsigned long long num_timeout_cycles;
++#endif
++
++} // namespace deep_ep
+ 
+ #define LOW_LATENCY_SEND_PHASE 1
+ #define LOW_LATENCY_RECV_PHASE 2
+--- a/csrc/kernels/runtime.cu
++++ b/csrc/kernels/runtime.cu
+@@ -12,6 +12,23 @@
+ 
+ namespace deep_ep {
+ 
++int num_cpu_timeout_secs = DEFAULT_NUM_CPU_TIMEOUT_SECS;
++__device__ unsigned long long num_timeout_cycles = DEFAULT_NUM_TIMEOUT_CYCLES;
++
++void set_timeout_seconds(int timeout_secs) {
++    EP_HOST_ASSERT(0 <= timeout_secs and timeout_secs <= 86400);
++    const unsigned long long cycles = timeout_secs == 0 ? DEFAULT_NUM_TIMEOUT_CYCLES
++                                                        : static_cast<unsigned long long>(timeout_secs) * NUM_TIMEOUT_CYCLES_PER_SEC;
++    CUDA_CHECK(cudaMemcpyToSymbol(num_timeout_cycles, &cycles, sizeof(cycles)));
++    num_cpu_timeout_secs = timeout_secs == 0 ? DEFAULT_NUM_CPU_TIMEOUT_SECS : timeout_secs;
++}
++
++int get_timeout_seconds() {
++    unsigned long long cycles;
++    CUDA_CHECK(cudaMemcpyFromSymbol(&cycles, num_timeout_cycles, sizeof(cycles)));
++    return static_cast<int>(cycles / NUM_TIMEOUT_CYCLES_PER_SEC);
++}
++
+ namespace intranode {
+ 
+ template<int kNumRanks>
+--- a/deep_ep/__init__.py
++++ b/deep_ep/__init__.py
+@@ -4,4 +4,4 @@ from .utils import EventOverlap
+ from .buffer import Buffer
+ 
+ # noinspection PyUnresolvedReferences
+-from deep_ep_cpp import Config
++from deep_ep_cpp import Config, get_timeout_seconds, set_timeout_seconds
