@@ -35,7 +35,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (MapperKind,
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS, BlockReusePolicy, KVCacheManagerV2, Role)
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
-    KVCacheV2IterationStatsReport
+    KVCacheV2IterationStatsSnapshot
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -3695,33 +3695,43 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             points.add(point)
         request.expect_snapshot_points = sorted(points)
 
-    def get_iteration_stats(self) -> Optional[KVCacheV2IterationStatsReport]:
-        """Log recurrent-cache movement; this is KDA state for Kimi K3."""
-        report = super().get_iteration_stats()
-        if report is None:
+    def capture_iteration_stats(
+            self) -> Optional[KVCacheV2IterationStatsSnapshot]:
+        """Capture interval values and update recurrent-cache diagnostics."""
+        snapshot = super().capture_iteration_stats()
+        if snapshot is None:
             return None
 
+        pool_by_life_cycle = {
+            life_cycle_id: pool_id
+            for life_cycle_id, pool_id, _, _ in snapshot.metadata.life_cycles
+        }
         pool_group_ids = sorted({
-            pool_group_id
-            for pool_group_id, _, kind in
-            self._stats_life_cycle_metadata().values() if kind == "ssm"
+            pool_id
+            for _, pool_id, _, kind in snapshot.metadata.life_cycles
+            if kind == "ssm"
         })
         if not pool_group_ids:
-            return report
-        pool_group_reports = [
-            report.by_pool_group[pool_group_id]
-            for pool_group_id in pool_group_ids
-        ]
-
-        stats = [
-            pool_group_report.stats for pool_group_report in pool_group_reports
-        ]
-        evicted_blocks = sum(stat.iter_offload_blocks for stat in stats)
-        evicted_bytes = sum(stat.iter_offload_bytes for stat in stats)
-        onboarded_blocks = sum(stat.iter_onboard_blocks for stat in stats)
-        onboarded_bytes = sum(stat.iter_onboard_bytes for stat in stats)
-        dropped_blocks = sum(stat.iter_host_dropped_blocks for stat in stats)
-        dropped_bytes = sum(stat.iter_host_dropped_bytes for stat in stats)
+            return snapshot
+        movement = {
+            "iter_offload_blocks": 0,
+            "iter_offload_bytes": 0,
+            "iter_onboard_blocks": 0,
+            "iter_onboard_bytes": 0,
+            "iter_host_dropped_blocks": 0,
+            "iter_host_dropped_bytes": 0,
+        }
+        for life_cycle_id, delta in snapshot.deltas:
+            if pool_by_life_cycle[life_cycle_id] in pool_group_ids:
+                for name, value in delta:
+                    if name in movement:
+                        movement[name] += value
+        evicted_blocks = movement["iter_offload_blocks"]
+        evicted_bytes = movement["iter_offload_bytes"]
+        onboarded_blocks = movement["iter_onboard_blocks"]
+        onboarded_bytes = movement["iter_onboard_bytes"]
+        dropped_blocks = movement["iter_host_dropped_blocks"]
+        dropped_bytes = movement["iter_host_dropped_bytes"]
         has_movement = bool(evicted_blocks or onboarded_blocks
                             or dropped_blocks)
         if has_movement:
@@ -3730,6 +3740,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._recurrent_dropped_blocks_total += dropped_blocks
         if (self.mapping.rank == 0
                 and (has_movement or not self._recurrent_status_logged)):
+            pools = [
+                snapshot.pools_by_level[0][pool_id]
+                for pool_id in pool_group_ids
+            ]
+            # Cold pools have separate grouping and are not attributed to these hot pools.
             logger.debug(
                 f"[MambaHybridCacheManagerV2] recurrent cache status "
                 f"rank={self.mapping.rank} pool_group_ids={pool_group_ids} "
@@ -3746,18 +3761,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 f"total_dropped_recurrent_blocks="
                 f"{self._recurrent_dropped_blocks_total} "
                 f"gpu_used_recurrent_blocks="
-                f"{sum(stat.primary_used_num_blocks for stat in stats)} "
+                f"{sum(pool.total - pool.available for pool in pools)} "
                 f"gpu_free_recurrent_blocks="
-                f"{sum(stat.primary_free_num_blocks for stat in stats)} "
+                f"{sum(pool.available for pool in pools)} "
                 f"gpu_evictable_recurrent_blocks="
-                f"{sum(stat.primary_evictable_num_blocks for stat in stats)} "
+                f"{sum(pool.evictable for pool in pools)} "
                 f"host_used_recurrent_blocks="
-                f"{sum(stat.secondary_used_num_blocks for stat in stats)} "
+                "0 "
                 f"host_free_recurrent_blocks="
-                f"{sum(stat.secondary_free_num_blocks for stat in stats)} "
+                "0 "
                 f"{self._format_branch_snapshot_counters()}")
             self._recurrent_status_logged = True
-        return report
+        return snapshot
 
     @staticmethod
     def get_cache_size_per_token(model_config,

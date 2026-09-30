@@ -7,42 +7,25 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
-from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats, RequestStats
+from tensorrt_llm.executor.iteration_stats import (
+    IterationStatsSnapshot,
+    RankStatsSnapshot,
+    RequestStatsSnapshot,
+)
 from tensorrt_llm.logger import logger
 
 from .scheduler.adp_router import RankIterStatsPayload, RankState
 
-_ITERATION_STATS_SCALAR_FIELDS = (
-    "timestamp",
-    "iter",
-    "iter_latency_ms",
-    "new_active_requests_queue_latency_ms",
-    "num_new_active_requests",
-    "num_active_requests",
-    "num_queued_requests",
-    "num_completed_requests",
-    "max_num_active_requests",
-    "gpu_mem_usage",
-    "cpu_mem_usage",
-    "pinned_mem_usage",
-)
-
-_ITERATION_STATS_OPTIONAL_FIELDS = (
-    "kv_cache_stats",
-    "cross_kv_cache_stats",
-    "static_batching_stats",
-    "specdec_stats",
-)
-
 
 @dataclass
 class ADPIterStatsRecord:
-    """Append-ready stats row produced by Attention-DP fanout."""
+    """One completed iteration and its owned rank payloads."""
 
-    stats: IterationStats
-    req_stats: Optional[List[RequestStats]]
-    kv_iter_stats: Optional[Dict[int, object]]
-    attention_dp_rank: int
+    stats: IterationStatsSnapshot
+    req_stats: Optional[List[RequestStatsSnapshot]]
+    kv_iter_stats: object
+    rank_payloads: tuple[RankStatsSnapshot, ...]
+    attention_dp_rank: None = None
     # Per-loop CPU wall and GPU forward time captured on rank 0 alongside
     # the IterationStats at queue time. Currently broadcast unchanged to all
     # rank rows during fanout (true per-rank timing would require widening
@@ -68,22 +51,22 @@ class ADPIterStatsBuffer:
         # not real measured local stats.
         self._synthetic_iters: Set[int] = set()
         # Rank 0 only: full IterationStats objects waiting for ADP fanout.
-        self._rank0_iter_stats: Dict[int, IterationStats] = {}
+        self._rank0_iter_stats: Dict[int, IterationStatsSnapshot] = {}
         # Rank 0 only: per-request stats preserved for compatibility.
         # RequestStats remain rank-0-owned under Attention-DP.
-        self._rank0_req_stats: Dict[int, Optional[List[RequestStats]]] = {}
+        self._rank0_req_stats: Dict[int, Optional[List[RequestStatsSnapshot]]] = {}
         # Rank 0 only: KV iteration stats captured with pending IterationStats.
-        self._rank0_kv_iter_stats: Dict[int, Optional[Dict[int, object]]] = {}
+        self._rank0_kv_iter_stats: Dict[int, object] = {}
         # Rank 0 only: per-loop CPU and GPU timings captured with the
         # IterationStats. Broadcast to all rank rows at fanout (see
-        # _make_rank_iter_stats / finalize).
+        # finalize).
         self._rank0_host_step_time_ms: Dict[int, Optional[float]] = {}
         self._rank0_prev_device_step_time_ms: Dict[int, Optional[float]] = {}
         self._rank0_gpu_forward_time_ms: Dict[int, Optional[float]] = {}
         self._oldest_iter: Optional[int] = None
 
     @staticmethod
-    def make_payload(stats: IterationStats) -> RankIterStatsPayload:
+    def make_payload(stats: IterationStatsSnapshot) -> RankIterStatsPayload:
         """Pack local IterationStats fields for ADP allgather."""
         ifb = stats.inflight_batching_stats
         return RankIterStatsPayload(
@@ -100,10 +83,10 @@ class ADPIterStatsBuffer:
 
     def queue(
         self,
-        stats: IterationStats,
-        req_stats: Optional[List[RequestStats]] = None,
+        stats: IterationStatsSnapshot,
+        req_stats: Optional[List[RequestStatsSnapshot]] = None,
         *,
-        kv_iter_stats: Optional[Dict[int, object]] = None,
+        kv_iter_stats: object = None,
         is_rank0: bool,
         host_step_time_ms: Optional[float] = None,
         prev_device_step_time_ms: Optional[float] = None,
@@ -111,16 +94,8 @@ class ADPIterStatsBuffer:
     ) -> None:
         """Queue local stats; rank 0 also keeps objects needed for fanout."""
         payload = self.make_payload(stats)
+        self.queue_payload(payload)
         iter_id = payload.iter_stats_iter
-
-        if iter_id in self._payloads and iter_id not in self._synthetic_iters:
-            logger.warning(
-                f"Replacing duplicate attention-DP IterationStats payload for iter {iter_id}"
-            )
-
-        self._payloads[iter_id] = payload
-        self._synthetic_iters.discard(iter_id)
-        self._note_payload_insert(iter_id)
 
         if is_rank0:
             self._rank0_iter_stats[iter_id] = stats
@@ -129,6 +104,18 @@ class ADPIterStatsBuffer:
             self._rank0_host_step_time_ms[iter_id] = host_step_time_ms
             self._rank0_prev_device_step_time_ms[iter_id] = prev_device_step_time_ms
             self._rank0_gpu_forward_time_ms[iter_id] = gpu_forward_time_ms
+
+    def queue_payload(self, payload: RankIterStatsPayload) -> None:
+        """Retain only the counters needed by the distributed iteration join."""
+        iter_id = payload.iter_stats_iter
+        if iter_id in self._payloads and iter_id not in self._synthetic_iters:
+            logger.warning(
+                f"Replacing duplicate attention-DP IterationStats payload for iter {iter_id}"
+            )
+
+        self._payloads[iter_id] = payload
+        self._synthetic_iters.discard(iter_id)
+        self._note_payload_insert(iter_id)
 
     def next_payload(self) -> Optional[RankIterStatsPayload]:
         """Return the oldest pending stats payload to piggyback."""
@@ -186,66 +173,10 @@ class ADPIterStatsBuffer:
         if changed:
             self._recompute_oldest_iter()
 
-    @staticmethod
-    def _make_rank_iter_stats(
-        rank0_stats: IterationStats,
-        rank_state: RankState,
-    ) -> IterationStats:
-        """Build one IterationStats row for an ADP rank.
-
-        Attention-DP emits one stats row per rank so downstream FPM consumers
-        can see scheduling distribution and diagnose load imbalance. Scheduled
-        fields are rank-local. Queued fields remain rank-0/global because the
-        executor request queue lives on rank 0.
-        """
-        rank = rank_state.rank
-        payload = rank_state.iter_stats
-        source_ifb = rank0_stats.inflight_batching_stats
-
-        stats = IterationStats()
-        for attr in _ITERATION_STATS_SCALAR_FIELDS:
-            setattr(stats, attr, getattr(rank0_stats, attr))
-
-        # Optional nested stats are copied when present. KV iteration deltas
-        # are attached separately and remain rank-0-only to avoid double-logging
-        # global KV-cache deltas.
-        for attr in _ITERATION_STATS_OPTIONAL_FIELDS:
-            nested_stats = getattr(rank0_stats, attr)
-            if nested_stats is not None:
-                setattr(stats, attr, nested_stats)
-
-        ifb = InflightBatchingStats()
-        ifb.num_context_requests = payload.num_context_requests
-        ifb.num_ctx_tokens = payload.num_ctx_tokens
-        ifb.num_ctx_kv_tokens = payload.num_ctx_kv_tokens
-        ifb.num_gen_requests = payload.num_gen_requests
-        ifb.num_gen_kv_tokens = payload.num_gen_kv_tokens
-        ifb.num_paused_requests = payload.num_paused_requests
-        ifb.num_paused_kv_tokens = payload.num_paused_kv_tokens
-        ifb.num_scheduled_requests = ifb.num_context_requests + ifb.num_gen_requests
-
-        if source_ifb is not None:
-            ifb.micro_batch_id = source_ifb.micro_batch_id
-            ifb.avg_num_decoded_tokens_per_iter = source_ifb.avg_num_decoded_tokens_per_iter
-            if rank == 0:
-                ifb.num_queued_context_requests = source_ifb.num_queued_context_requests
-                ifb.num_queued_ctx_tokens = source_ifb.num_queued_ctx_tokens
-                ifb.num_queued_gen_requests = source_ifb.num_queued_gen_requests
-                ifb.num_queued_gen_kv_tokens = source_ifb.num_queued_gen_kv_tokens
-
-        if rank != 0:
-            stats.num_queued_requests = 0
-            stats.num_completed_requests = 0
-            stats.num_new_active_requests = 0
-            stats.new_active_requests_queue_latency_ms = 0.0
-
-        stats.inflight_batching_stats = ifb
-        return stats
-
     def finalize(
         self, all_rank_states: List[RankState], *, is_rank0: bool
     ) -> List[ADPIterStatsRecord]:
-        """Align payloads and return per-rank rows once all ranks are ready."""
+        """Return one snapshot once all rank payloads identify the same iteration."""
         pending_states = [s for s in all_rank_states if s.iter_stats.has_iter_stats]
         if not pending_states:
             return []
@@ -295,19 +226,20 @@ class ADPIterStatsBuffer:
             prev_device_step_time_ms = self._rank0_prev_device_step_time_ms.get(iter_stats_iter)
             gpu_forward_time_ms = self._rank0_gpu_forward_time_ms.get(iter_stats_iter)
 
-            for rank_state in sorted(matching_states, key=lambda s: s.rank):
-                rank = rank_state.rank
-                records.append(
-                    ADPIterStatsRecord(
-                        stats=self._make_rank_iter_stats(rank0_stats, rank_state),
-                        req_stats=req_stats if rank == 0 else None,
-                        kv_iter_stats=kv_iter_stats if rank == 0 else None,
-                        attention_dp_rank=rank,
-                        host_step_time_ms=host_step_time_ms,
-                        prev_device_step_time_ms=prev_device_step_time_ms,
-                        gpu_forward_time_ms=gpu_forward_time_ms,
-                    )
+            records.append(
+                ADPIterStatsRecord(
+                    stats=rank0_stats,
+                    req_stats=req_stats,
+                    kv_iter_stats=kv_iter_stats,
+                    rank_payloads=tuple(
+                        RankStatsSnapshot.capture(state.rank, state.iter_stats)
+                        for state in sorted(matching_states, key=lambda state: state.rank)
+                    ),
+                    host_step_time_ms=host_step_time_ms,
+                    prev_device_step_time_ms=prev_device_step_time_ms,
+                    gpu_forward_time_ms=gpu_forward_time_ms,
                 )
+            )
 
         self._clear_through(iter_stats_iter)
         return records

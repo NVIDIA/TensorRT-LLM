@@ -21,9 +21,10 @@ from ..llmapi.mpi_session import (MpiPoolSession, MpiSession,
 from ..llmapi.utils import logger_debug, print_colored
 from ..logger import logger
 from .executor import GenerationExecutor
+from .iteration_stats import materialize_stats_batch
 from .postproc_worker import PostprocWorkerConfig
 from .proxy import _check_collective_rpc_guard
-from .result import IterationResult
+from .result import IterationResult, _StatsBatchFetcher
 from .rpc.rpc_common import RPCError
 from .rpc_proxy_mixin import RpcExecutorMixin
 from .rpc_worker import RpcWorker
@@ -64,6 +65,7 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             is_llm_executor=is_llm_executor,
         )
 
+        self._stats_fetcher = _StatsBatchFetcher()
         self.model_world_size = model_world_size
         self._create_mpi_session(model_world_size, mpi_session)
 
@@ -110,13 +112,9 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         Returns:
             List[dict]: A list of runtime stats as dict.
         """
-        try:
-            stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote()
-            return [json.loads(s) if isinstance(s, str) else s for s in stats]
-        except Exception as e:
-            logger.debug(f"Error fetching stats via RPC: {e}")
-            return []
+        return self._stats_fetcher.get(
+            lambda: self.rpc_client.fetch_stats_wait_async(timeout=timeout).
+            remote_future(), materialize_stats_batch)
 
     def get_kv_cache_capacity(self) -> dict:
         """Get static primary/GPU KV cache capacity from the runtime via RPC."""
@@ -155,18 +153,15 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             from .executor import empty_async_iterable
             return empty_async_iterable()
 
-        # Fetch stats via RPC and populate the result
-        try:
-            stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote()
-        except Exception:
-            stats = []
+        async def fetch() -> None:
+            await self._stats_fetcher.aget(
+                lambda: self.rpc_client.fetch_stats_wait_async(timeout=timeout).
+                remote_future(), materialize_stats_batch)
 
-        for stat in stats:
-            self._iter_stats_result.queue.put(stat)
-
-        self._iter_stats_result.set_timeout(timeout)
-        return self._iter_stats_result
+        return IterationResult.from_async_fetch(
+            fetch,
+            self._stats_fetcher.results,
+            sync_fetch=lambda: self.get_stats(timeout))
 
     def get_kv_events(self, timeout: float) -> List[dict]:
         """Get iteration KV events from the runtime via RPC.

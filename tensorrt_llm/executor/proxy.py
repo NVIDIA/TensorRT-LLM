@@ -40,10 +40,11 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             enable_llm_debug, logger_debug, print_colored)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
+from .iteration_stats import materialize_stats_batch
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
                       StopProfileRequest)
-from .result import GenerationResult, IterationResult
+from .result import GenerationResult, IterationResult, _StatsBatchFetcher
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
 from .utils import (EngineDeadError, ErrorResponse, RequestError,
@@ -125,6 +126,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             is_llm_executor=is_llm_executor,
         )
 
+        self._stats_fetcher = _StatsBatchFetcher()
         self.workers_started = False
         self.worker_cls = worker_cls
 
@@ -1258,8 +1260,9 @@ class GenerationExecutorProxy(GenerationExecutor):
             logger.warning("RPC client not initialized, cannot get stats")
             return []
 
-        stats = self.rpc_client.fetch_stats_wait_async(timeout=timeout).remote()
-        return [json.loads(s) if isinstance(s, str) else s for s in stats]
+        return self._stats_fetcher.get(
+            lambda: self.rpc_client.fetch_stats_wait_async(timeout=timeout).
+            remote_future(), materialize_stats_batch)
 
     def get_kv_cache_capacity(self) -> dict:
         """Get static primary/GPU KV cache capacity from the runtime via RPC."""
@@ -1322,27 +1325,22 @@ class GenerationExecutorProxy(GenerationExecutor):
         Returns:
             IterationResult: An async iterable object containing runtime stats.
         """
-        # Initialize iteration result if needed
         self._maybe_initialize_iteration_results()
 
-        if self._iter_stats_result is None:
+        if self._iter_stats_result is None or self.rpc_client is None:
             logger.warning("Iteration statistics are not available yet.")
             from .executor import empty_async_iterable
             return empty_async_iterable()
 
-        # Fetch stats via RPC and populate the result
-        try:
-            stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote()
-        except Exception as e:
-            logger.debug(f"Error fetching stats via RPC: {e}")
-            stats = []
+        async def fetch() -> None:
+            await self._stats_fetcher.aget(
+                lambda: self.rpc_client.fetch_stats_wait_async(timeout=timeout).
+                remote_future(), materialize_stats_batch)
 
-        for stat in stats:
-            self._iter_stats_result.queue.put(stat)
-
-        self._iter_stats_result.set_timeout(timeout)
-        return self._iter_stats_result
+        return IterationResult.from_async_fetch(
+            fetch,
+            self._stats_fetcher.results,
+            sync_fetch=lambda: self.get_stats(timeout))
 
     def get_kv_events(self, timeout: float) -> List[dict]:
         """Get iteration KV events from the runtime via RPC.
@@ -1443,6 +1441,8 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
             postprocess_tokenizer_dir=postproc_worker_config.
             postprocess_tokenizer_dir,
             is_llm_executor=is_llm_executor)
+
+        self._stats_fetcher = _StatsBatchFetcher()
 
         # State consumed by methods inherited from GenerationExecutorProxy
         # (submit / check_health / collective_rpc). The engine lives with

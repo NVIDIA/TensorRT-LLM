@@ -15,9 +15,10 @@
 
 import array
 import os
+import pickle
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, PropertyMock, call, patch
 
 import numpy as np
 import pytest
@@ -33,6 +34,12 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _KVCacheManagerInitStatus,
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache_stats import (
+    KVCachePoolStatsSnapshot,
+    KVCacheStatsMetadata,
+    KVCacheV2IterationStatsSnapshot,
+    append_kv_cache_iteration_stats,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -1795,6 +1802,123 @@ def test_per_conversation_policy_ignores_overlapping_request(
         _free_if_active(manager, request_a)
 
 
+def _make_manager_with_cached_stats_metadata() -> tuple[
+    KVCacheManagerV2, PropertyMock, PropertyMock
+]:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.tokens_per_block = TOKENS_PER_BLOCK
+    manager._stats_metadata_cache = KVCacheStatsMetadata(
+        life_cycles=((0, 0, 32, "attention"), (1, 1, 64, "attention")),
+        cold_pool_groups=(),
+        cache_level_tiers=("gpu",),
+    )
+    manager.impl = Mock()
+    pool_descs = PropertyMock(side_effect=AssertionError("cached layout reread from backend"))
+    layer_grouping = PropertyMock(side_effect=AssertionError("cached grouping reread from backend"))
+    type(manager.impl).pool_group_descs = pool_descs
+    type(manager.impl).layer_grouping = layer_grouping
+    return manager, pool_descs, layer_grouping
+
+
+def test_cached_stats_metadata_avoids_backend_layout_reads() -> None:
+    manager, pool_descs, layer_grouping = _make_manager_with_cached_stats_metadata()
+
+    for _ in range(2):
+        assert manager._stats_life_cycle_metadata() == {
+            0: (0, 32, "attention"),
+            1: (1, 64, "attention"),
+        }
+    pool_descs.assert_not_called()
+    layer_grouping.assert_not_called()
+
+
+def test_cached_stats_metadata_keeps_pool_gauges_live() -> None:
+    manager, _, _ = _make_manager_with_cached_stats_metadata()
+    pools = [SimpleNamespace(total=10, available=8), SimpleNamespace(total=20, available=17)]
+    committed = SimpleNamespace(
+        alloc_total_blocks=4, alloc_new_blocks=3, reused_blocks=2, missed_blocks=1
+    )
+    manager.impl.get_storage_statistics.return_value = pools
+    manager.impl.get_committed_stats.return_value = committed
+    manager.impl.get_quota.return_value = 1024
+
+    before = manager.get_kv_cache_stats()
+    pools[0].available = 3
+    pools[1].total = 24
+    pools[1].available = 21
+    committed.alloc_total_blocks = 9
+    manager.impl.get_quota.return_value = 2048
+    after = manager.get_kv_cache_stats()
+
+    assert (before.max_num_blocks, before.free_num_blocks, before.used_num_blocks) == (30, 25, 5)
+    assert (after.max_num_blocks, after.free_num_blocks, after.used_num_blocks) == (34, 24, 10)
+    assert before.num_free_blocks_per_window_size == {32: 8, 64: 17}
+    assert after.num_free_blocks_per_window_size == {32: 3, 64: 21}
+    assert (before.alloc_total_blocks, after.alloc_total_blocks) == (4, 9)
+    assert (before.allocated_bytes, after.allocated_bytes) == (1024, 2048)
+    assert manager.impl.get_storage_statistics.call_args_list == [call(CacheLevel(0))] * 2
+    assert manager.impl.get_committed_stats.call_count == 2
+    assert manager.impl.get_quota.call_args_list == [call(CacheLevel(0))] * 2
+
+
+def test_cached_stats_metadata_returns_independent_dicts() -> None:
+    manager, _, _ = _make_manager_with_cached_stats_metadata()
+    first = manager._stats_life_cycle_metadata()
+    first[0] = (99, 1, "ssm")
+    first.pop(1)
+
+    assert manager._stats_life_cycle_metadata() == {
+        0: (0, 32, "attention"),
+        1: (1, 64, "attention"),
+    }
+    assert manager._stats_metadata_cache.life_cycles == (
+        (0, 0, 32, "attention"),
+        (1, 1, 64, "attention"),
+    )
+
+
+def test_stats_metadata_rebuilds_after_layout_cache_invalidation() -> None:
+    def backend(pool_id: int) -> Mock:
+        return Mock(
+            pool_group_descs=[
+                SimpleNamespace(
+                    pool_group_index=pool_id,
+                    slot_desc=SimpleNamespace(variants=[SimpleNamespace(layer_group_id=0)]),
+                )
+            ],
+            layer_grouping=((0,),),
+            cache_tier_list=["gpu", "host"],
+            get_life_cycle_pool_group_indices=Mock(return_value=[pool_id]),
+        )
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.impl = backend(0)
+    manager.max_seq_len = 128
+    manager.kv_cache_manager_py_config = SimpleNamespace(
+        layers=[AttentionLayerConfig(layer_id=0, buffers=[])]
+    )
+    manager._stats_metadata_cache = None
+    manager._cold_pool_group_membership_cache = None
+    before = manager._capture_stats_metadata()
+    assert before.life_cycles == ((0, 0, 128, "attention"),)
+    assert before.cold_pool_groups == ((0, (0,)),)
+
+    manager.impl = backend(1)
+    manager.kv_cache_manager_py_config = SimpleNamespace(
+        layers=[AttentionLayerConfig(layer_id=0, buffers=[], sliding_window_size=64)]
+    )
+    manager._stats_metadata_cache = None
+    manager._cold_pool_group_membership_cache = None
+    after = manager._capture_stats_metadata()
+
+    assert after.life_cycles == ((0, 1, 64, "attention"),)
+    assert after.cold_pool_groups == ((1, (0,)),)
+    assert manager._stats_life_cycle_metadata() == {0: (1, 64, "attention")}
+    assert before.life_cycles == ((0, 0, 128, "attention"),)
+    assert before.cold_pool_groups == ((0, (0,)),)
+    assert after is not before
+
+
 def test_live_storage_stats_use_the_manager_api() -> None:
     init_cuda_once()
     core = KVCacheManager(
@@ -1856,14 +1980,17 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
     manager._stats_life_cycle_metadata = lambda: {3: (1, None, "ssm")}
     manager._storage_pool_groups_by_window = lambda: {}
     manager._get_and_reset_iteration_peak_block_stats_by_level = lambda num_levels: [
-        [None, None] for _ in range(num_levels)
+        [SimpleNamespace(available=7, unavailable=4, evictable=2) for _ in range(2)]
+        for _ in range(num_levels)
     ]
-    manager._get_storage_statistics = lambda _level: [object(), object()]
-    manager._build_pool_group_iteration_stats = lambda pool_group_id, *_args: pool_group_id
+    manager._get_storage_statistics = lambda _level: [
+        SimpleNamespace(total=10, available=6, evictable=1, slot_sizes=(4096,)) for _ in range(2)
+    ]
 
     stats = manager.get_iteration_stats()
 
-    assert stats.by_pool_group == {0: 0, 1: 1}
+    assert set(stats.by_pool_group) == {0, 1}
+    assert stats.by_pool_group[1].stats.primary_used_num_blocks == 4
     ssm_stats = stats.by_life_cycle[3]
     assert ssm_stats.kind == "ssm"
     assert ssm_stats.pool_group_id == 1
@@ -2028,30 +2155,26 @@ def test_disagg_gen_init_drops_everything_in_gen_only_benchmark_mode(
 
 
 def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
-    manager = object.__new__(KVCacheManagerV2)
-    manager._cold_pool_group_membership = lambda: ((0, frozenset({0, 1})),)
-    life_cycle_metadata = {
-        0: (0, 32, "attention"),
-        1: (1, 64, "attention"),
-    }
-    secondary_stats_by_level = [
-        [SimpleNamespace(total=7, available=2, evictable=1, slot_sizes=(4096,))],
-        [SimpleNamespace(total=11, available=5, evictable=3, slot_sizes=(4096,))],
-    ]
-    secondary_peak_stats_by_level = [
-        [SimpleNamespace(available=1, unavailable=6, evictable=2)],
-        [SimpleNamespace(available=4, unavailable=7, evictable=3)],
-    ]
-
-    report = manager._build_cold_pool_group_iteration_stats(
-        life_cycle_metadata,
-        primary_stats=(),
-        secondary_stats_by_level=secondary_stats_by_level,
-        primary_peak_stats=(),
-        secondary_peak_stats_by_level=secondary_peak_stats_by_level,
+    snapshot = KVCacheV2IterationStatsSnapshot(
+        metadata=KVCacheStatsMetadata(
+            life_cycles=((0, 0, 32, "attention"), (1, 1, 64, "attention")),
+            cold_pool_groups=((0, (0, 1)),),
+            cache_level_tiers=("gpu", "host", "disk"),
+        ),
+        pools_by_level=(
+            (KVCachePoolStatsSnapshot(10, 5, 1, 7, 5, 2, (4096,)),) * 2,
+            (KVCachePoolStatsSnapshot(7, 2, 1, 1, 6, 2, (4096,)),),
+            (KVCachePoolStatsSnapshot(11, 5, 3, 4, 7, 3, (4096,)),),
+        ),
+        deltas=(),
+        ssm_deltas=(),
+        reused_blocks_by_level=(),
+        suspended_requests=0,
+        resumed_requests=0,
+        disk_prefetch_blocks=0,
+        cached_tokens_by_level=(),
     )
-
-    cold_group = report[0]
+    cold_group = snapshot.build_report().by_cold_pool_group[0]
     assert cold_group.slot_size == (4096,)
     assert cold_group.window_sizes == (32, 64)
     assert cold_group.stats.secondary_max_num_blocks == 18
@@ -2061,6 +2184,54 @@ def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
     assert cold_group.stats.secondary_peak_free_num_blocks == 5
     assert cold_group.stats.secondary_peak_used_num_blocks == 13
     assert cold_group.stats.secondary_peak_evictable_num_blocks == 5
+
+
+def test_iteration_stats_capture_owns_values_before_consumer_builds() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_stats = True
+    delta = SimpleNamespace(
+        **{name: 0 for name in kv_cache_v2_module.KV_CACHE_ITERATION_STATS_DELTA_FIELDS}
+    )
+    delta.iter_reused_blocks = 3
+    delta.iter_missed_blocks = 1
+    pool = SimpleNamespace(total=10, available=6, evictable=1, slot_sizes=[4096])
+    peak = SimpleNamespace(available=8, unavailable=7, evictable=2)
+    reused = SimpleNamespace(full=[2], partial=[1])
+    cached_tokens = [12]
+    manager.impl = SimpleNamespace(
+        cache_tier_list=[object()],
+        get_and_reset_iteration_stats=lambda: {0: delta},
+        get_and_reset_ssm_snapshot_iteration_stats=lambda: {},
+        get_and_reset_iteration_suspend_resume_stats=lambda: (2, 1),
+        get_and_reset_iteration_disk_prefetch_blocks=lambda: 7,
+        get_and_reset_iteration_cached_tokens_by_level=lambda: cached_tokens,
+        get_and_reset_iteration_reused_blocks_by_level=lambda: {0: reused},
+    )
+    manager._stats_life_cycle_metadata = Mock(return_value={0: (0, 32, "attention")})
+    manager._stats_cache_level_tier_names = lambda: ["gpu"]
+    manager._get_and_reset_iteration_peak_block_stats_by_level = lambda _levels: [[peak]]
+    manager._get_storage_statistics = lambda _level: [pool]
+    expected = {}
+    append_kv_cache_iteration_stats(expected, manager.get_iteration_stats())
+    with patch.object(KVCacheV2IterationStatsSnapshot, "build_report") as build_report:
+        snapshot = manager.capture_iteration_stats()
+        build_report.assert_not_called()
+    manager._stats_life_cycle_metadata.assert_called_once()
+
+    delta.iter_reused_blocks = 999
+    pool.available = 0
+    pool.slot_sizes[0] = 8192
+    peak.unavailable = 999
+    reused.full[0] = 999
+    cached_tokens[0] = 999
+    manager.impl = None
+
+    received = pickle.loads(pickle.dumps(snapshot))
+    actual = {}
+    append_kv_cache_iteration_stats(actual, received)
+    assert actual == expected
+    assert received.pools_by_level[0][0].slot_sizes == (4096,)
+    assert received.build_report().by_life_cycle[0].full_reused_blocks_by_level == [2]
 
 
 def test_disagg_role_mapper_kinds_default_to_indexed():

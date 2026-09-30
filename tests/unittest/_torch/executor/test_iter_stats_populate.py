@@ -43,13 +43,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.adp_iter_stats import (
-    _ITERATION_STATS_OPTIONAL_FIELDS,
-    _ITERATION_STATS_SCALAR_FIELDS,
-    ADPIterStatsBuffer,
-)
+from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload, RankState
-from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats, SpecDecodingStats
+from tensorrt_llm.bindings.executor import InflightBatchingStats as NativeInflightBatchingStats
+from tensorrt_llm.bindings.executor import IterationStats as NativeIterationStats
+from tensorrt_llm.executor.iteration_stats import InflightBatchingSnapshot as InflightBatchingStats
+from tensorrt_llm.executor.iteration_stats import IterationStatsFrame, materialize_stats_batch
+from tensorrt_llm.executor.iteration_stats import IterationStatsSnapshot as IterationStats
+from tensorrt_llm.executor.iteration_stats import SpecDecodingSnapshot as SpecDecodingStats
 
 pytestmark = pytest.mark.cpu_only
 
@@ -670,7 +671,12 @@ def test_specdec_excludes_dummy_generation_requests():
     assert sd.num_draft_tokens == 4
     assert sd.num_accepted_tokens == 3
     assert sd.num_requests_with_draft_tokens == 1
-    assert sd.acceptance_length == 4.0
+    assert (
+        materialize_stats_batch([IterationStatsFrame(stats)])[0]["specDecodingStats"][
+            "acceptanceLength"
+        ]
+        == 4.0
+    )
 
 
 def test_specdec_all_dummy_generation_requests_yield_zero():
@@ -689,7 +695,12 @@ def test_specdec_all_dummy_generation_requests_yield_zero():
     assert sd.num_draft_tokens == 0
     assert sd.num_accepted_tokens == 0
     assert sd.num_requests_with_draft_tokens == 0
-    assert sd.acceptance_length == 0.0
+    assert (
+        materialize_stats_batch([IterationStatsFrame(stats)])[0]["specDecodingStats"][
+            "acceptanceLength"
+        ]
+        == 0.0
+    )
 
 
 def test_specdec_aggregates_multiple_real_requests():
@@ -709,7 +720,12 @@ def test_specdec_aggregates_multiple_real_requests():
     assert sd.num_accepted_tokens == 4
     assert sd.num_requests_with_draft_tokens == 2
     # (total_accepted + num_requests_with_draft) / num_requests_with_draft
-    assert sd.acceptance_length == (4 + 2) / 2
+    assert (
+        materialize_stats_batch([IterationStatsFrame(stats)])[0]["specDecodingStats"][
+            "acceptanceLength"
+        ]
+        == (4 + 2) / 2
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -806,55 +822,37 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
 
     records = buffer.finalize([rank0_state, rank1_state], is_rank0=True)
 
-    assert len(records) == 2
-
-    rank0_record = records[0]
-    rank0_row = rank0_record.stats
-    rank0_ifb = rank0_row.inflight_batching_stats
-    assert rank0_record.attention_dp_rank == 0
-    assert rank0_row.iter_latency_ms == 12.5
-    assert rank0_ifb.num_context_requests == 1
-    assert rank0_ifb.num_ctx_tokens == 100
-    assert rank0_ifb.num_ctx_kv_tokens == 10
-    assert rank0_ifb.num_gen_requests == 2
-    assert rank0_ifb.num_gen_kv_tokens == 20
-    assert rank0_ifb.num_paused_requests == 1
-    assert rank0_ifb.num_paused_kv_tokens == 5
-    assert rank0_ifb.num_scheduled_requests == 3
-    assert rank0_ifb.num_queued_context_requests == 7
-    assert rank0_ifb.num_queued_ctx_tokens == 700
-    assert rank0_ifb.num_queued_gen_requests == 8
-    assert rank0_ifb.num_queued_gen_kv_tokens == 800
-    assert rank0_record.req_stats == ["req-stats"]
-    assert rank0_record.kv_iter_stats == {0: "pending-kv"}
-    assert rank0_record.host_step_time_ms == 11.0
-    assert rank0_record.prev_device_step_time_ms == 9.0
-    assert rank0_record.gpu_forward_time_ms == 7.0
-
-    rank1_record = records[1]
-    rank1_row = rank1_record.stats
-    rank1_ifb = rank1_row.inflight_batching_stats
-    assert rank1_record.attention_dp_rank == 1
-    assert rank1_row.iter_latency_ms == 12.5
-    assert rank1_ifb.num_context_requests == 3
-    assert rank1_ifb.num_ctx_tokens == 300
-    assert rank1_ifb.num_ctx_kv_tokens == 30
-    assert rank1_ifb.num_gen_requests == 4
-    assert rank1_ifb.num_gen_kv_tokens == 40
-    assert rank1_ifb.num_paused_requests == 2
-    assert rank1_ifb.num_paused_kv_tokens == 25
-    assert rank1_ifb.num_scheduled_requests == 7
-    # Expected to be zero/None because queued/request/KV stats are reported
-    # only on rank 0.
-    assert rank1_ifb.num_queued_context_requests == 0
-    assert rank1_ifb.num_queued_ctx_tokens == 0
-    assert rank1_ifb.num_queued_gen_requests == 0
-    assert rank1_ifb.num_queued_gen_kv_tokens == 0
-    assert rank1_record.req_stats is None
-    assert rank1_record.kv_iter_stats is None
-    assert rank1_record.host_step_time_ms == 11.0
-    assert rank1_record.prev_device_step_time_ms == 9.0
-    assert rank1_record.gpu_forward_time_ms == 7.0
+    assert len(records) == 1
+    record = records[0]
+    assert record.stats is rank0_stats
+    assert record.req_stats == ["req-stats"]
+    assert record.kv_iter_stats == {0: "pending-kv"}
+    assert record.host_step_time_ms == 11.0
+    assert record.prev_device_step_time_ms == 9.0
+    assert record.gpu_forward_time_ms == 7.0
+    rank1_state.iter_stats.num_ctx_tokens = 999
+    rows = materialize_stats_batch(
+        [
+            IterationStatsFrame(
+                stats=record.stats,
+                rank_payloads=record.rank_payloads,
+                host_step_time_ms=record.host_step_time_ms,
+                prev_device_step_time_ms=record.prev_device_step_time_ms,
+                gpu_forward_time_ms=record.gpu_forward_time_ms,
+            )
+        ]
+    )
+    assert [row["attentionDpRank"] for row in rows] == [0, 1]
+    assert [row["iterLatencyMS"] for row in rows] == [12.5, 12.5]
+    rank0_ifb, rank1_ifb = [row["inflightBatchingStats"] for row in rows]
+    assert rank0_ifb["numCtxTokens"] == 100
+    assert rank0_ifb["numQueuedContextRequests"] == 7
+    assert rank0_ifb["numQueuedGenKvTokens"] == 800
+    assert rank1_ifb["numCtxTokens"] == 300
+    assert rank1_ifb["numScheduledRequests"] == 7
+    assert rank1_ifb["numPausedKvTokens"] == 25
+    assert rank1_ifb["numQueuedContextRequests"] == 0
+    assert rank1_ifb["numQueuedGenKvTokens"] == 0
 
     assert buffer._payloads == {}
     assert buffer.next_payload() is None
@@ -952,22 +950,6 @@ def test_attention_dp_fanout_aligns_non_rank0_to_rank0_iter():
     assert 10 in buffer._payloads
 
 
-def test_attention_dp_fanout_copy_lists_cover_iteration_stats_fields():
-    """Guard the hardcoded field lists used when cloning rank-0 stats."""
-    actual_fields = {
-        field
-        for field in dir(IterationStats())
-        if not field.startswith("_") and field != "to_json_str"
-    }
-    copied_fields = (
-        set(_ITERATION_STATS_SCALAR_FIELDS)
-        | set(_ITERATION_STATS_OPTIONAL_FIELDS)
-        | {"inflight_batching_stats"}
-    )
-
-    assert copied_fields == actual_fields
-
-
 # ---------------------------------------------------------------------------
 # Serializer test: confirm the C++ NLOHMANN serializer exposes every new
 # InflightBatchingStats member under its expected camelCase key, nested
@@ -985,7 +967,7 @@ def test_to_json_str_roundtrip_includes_new_inflight_batching_stats_fields():
     """
     import json as _json
 
-    ifb = InflightBatchingStats()
+    ifb = NativeInflightBatchingStats()
     ifb.num_scheduled_requests = 12
     ifb.num_context_requests = 5
     ifb.num_gen_requests = 7
@@ -1001,7 +983,7 @@ def test_to_json_str_roundtrip_includes_new_inflight_batching_stats_fields():
     ifb.num_queued_gen_kv_tokens = 2345
     ifb.num_paused_kv_tokens = 1500
 
-    stats = IterationStats()
+    stats = NativeIterationStats()
     stats.inflight_batching_stats = ifb
 
     d = _json.loads(stats.to_json_str())
@@ -1048,8 +1030,8 @@ def test_update_iter_stats_does_not_overwrite_construction_iter():
     # accidental re-stamp would surface here.
     fake_self.iter_counter = 999
 
-    stats = IterationStats()
-    stats.inflight_batching_stats = InflightBatchingStats()
+    stats = NativeIterationStats()
+    stats.inflight_batching_stats = NativeInflightBatchingStats()
     # Construction-time stamp (what _get_init_iter_stats would have written
     # at iter 17, several loops ago under overlap scheduling).
     stats.iter = 17

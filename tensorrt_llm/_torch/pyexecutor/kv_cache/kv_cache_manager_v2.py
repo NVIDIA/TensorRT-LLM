@@ -39,7 +39,7 @@ from tensorrt_llm._utils import (
     prefer_pinned,
     str_dtype_to_torch,
 )
-from tensorrt_llm.bindings.internal.batch_manager import KvCacheIterationStats, KvCacheStats
+from tensorrt_llm.bindings.internal.batch_manager import KvCacheStats
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper,
     copy_batch_block_offsets_to_device,
@@ -68,7 +68,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     HostCacheTierConfig,
     KVCacheDesc,
     KVCacheEventManager,
-    KVCacheIterationStatsDelta,
     LayerId,
     LifeCycleId,
     PageIndexMode,
@@ -94,11 +93,10 @@ from ..config_utils import uses_vswa_kv_cache_layout
 from ..connectors.kv_cache_connector import KvCacheConnectorManager
 from ..kv_cache_events import StreamingKVCacheEventManager, validate_streaming_support
 from ..kv_cache_stats import (
+    KVCachePoolStatsSnapshot,
+    KVCacheStatsMetadata,
     KVCacheV2IterationStatsReport,
-    KVCacheV2LifeCycleIterationStats,
-    KVCacheV2PoolGroupIterationStats,
-    KVCacheV2SsmLifeCycleIterationStats,
-    KVCacheV2SsmSnapshotIterationStats,
+    KVCacheV2IterationStatsSnapshot,
 )
 from ..llm_request import (
     LlmRequest,
@@ -125,19 +123,6 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
-KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
-    "iter_reused_blocks",
-    "iter_full_reused_blocks",
-    "iter_partial_reused_blocks",
-    "iter_missed_blocks",
-)
-
-KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
-    field_name
-    for field_name in KV_CACHE_ITERATION_STATS_DELTA_FIELDS
-    if field_name not in KV_CACHE_ITERATION_STATS_REUSE_FIELDS
-)
-
 # Shared by capacity estimation and growth, in addition to speculative tokens.
 BASE_GENERATION_TOKEN_COUNT = 1
 
@@ -1109,6 +1094,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
+    _stats_metadata_cache: KVCacheStatsMetadata | None = None
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -1605,6 +1591,8 @@ class KVCacheManagerV2(BaseResourceManager):
         assert candidate is not None
         self.kv_cache_manager_py_config = config
         self.impl = candidate
+        self._stats_metadata_cache = None
+        self._cold_pool_group_membership_cache = None
         self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
@@ -4402,6 +4390,12 @@ class KVCacheManagerV2(BaseResourceManager):
         return [_CACHE_TIER_NAMES.get(tier, str(tier)) for tier in self.impl.cache_tier_list]
 
     def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
+        if self._stats_metadata_cache is not None:
+            return {
+                life_cycle_id: (pool_id, window_size, kind)
+                for life_cycle_id, pool_id, window_size, kind in self._stats_metadata_cache.life_cycles
+            }
+
         # life cycle (== layer group) -> pool group is static structure exposed by
         # the public pool_group_descs API; no introspection needed.
         pool_groups_by_life_cycle = {
@@ -4453,339 +4447,6 @@ class KVCacheManagerV2(BaseResourceManager):
             for level in range(num_cache_levels)
         ]
 
-    @staticmethod
-    def _windows_by_pool_group(
-        pool_groups_by_window: dict[int, set[int]],
-    ) -> dict[int, tuple[int, ...]]:
-        windows_by_pool_group: dict[int, set[int]] = defaultdict(set)
-        for window_size, pool_group_ids in pool_groups_by_window.items():
-            for pool_group_id in pool_group_ids:
-                windows_by_pool_group[pool_group_id].add(window_size)
-        return {
-            pool_group_id: tuple(sorted(window_sizes))
-            for pool_group_id, window_sizes in windows_by_pool_group.items()
-        }
-
-    @staticmethod
-    def _filter_iteration_stats_delta(delta, field_names) -> KVCacheIterationStatsDelta:
-        filtered = KVCacheIterationStatsDelta()
-        for field_name in field_names:
-            setattr(filtered, field_name, getattr(delta, field_name))
-        return filtered
-
-    @staticmethod
-    def _add_iteration_stats_delta(
-        bucket: dict[int, KVCacheIterationStatsDelta], key: int, delta: KVCacheIterationStatsDelta
-    ) -> None:
-        if delta.empty:
-            return
-        if key not in bucket:
-            bucket[key] = delta.copy()
-            return
-        bucket[key].add(delta)
-
-    @staticmethod
-    def _iteration_cache_hit_rate(stats) -> float:
-        total = stats.iter_reused_blocks + stats.iter_missed_blocks
-        if stats.iter_reused_blocks == 0 or total == 0:
-            return 0.0
-        return stats.iter_reused_blocks / total
-
-    @staticmethod
-    def _apply_iteration_stats_delta(
-        stats, delta, field_names=KV_CACHE_ITERATION_STATS_DELTA_FIELDS
-    ) -> None:
-        if delta is None:
-            return
-        for field_name in field_names:
-            setattr(stats, field_name, getattr(delta, field_name))
-        stats.iter_cache_hit_rate = KVCacheManagerV2._iteration_cache_hit_rate(stats)
-
-    @staticmethod
-    def _build_iteration_stats(
-        pool_group_ids: Iterable[int],
-        secondary_pool_group_ids: Sequence[tuple[int, ...]],
-        primary_stats,
-        secondary_stats_by_level,
-        primary_peak_stats,
-        secondary_peak_stats_by_level,
-        delta,
-        field_names=KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
-    ):
-        """Aggregate block stats over ``pool_group_ids`` at the hot level and ``secondary_pool_group_ids``
-        at each cold level.
-
-        Hot and cold levels number their pool groups independently, so a cold level cannot be indexed
-        with hot ids; ``secondary_pool_group_ids`` carries each cold level's own ids and must be
-        parallel to ``secondary_stats_by_level``. Only the cold-pool-group view reports cold blocks, so
-        the hot-keyed callers pass ``()`` here and leave the ``secondary_*`` fields at zero.
-        """
-        pool_group_ids = tuple(pool_group_ids)
-        stats = KvCacheIterationStats()
-        stats.primary_max_num_blocks = sum(
-            primary_stats[pool_group_id].total for pool_group_id in pool_group_ids
-        )
-        stats.primary_free_num_blocks = sum(
-            primary_stats[pool_group_id].available for pool_group_id in pool_group_ids
-        )
-        stats.primary_used_num_blocks = stats.primary_max_num_blocks - stats.primary_free_num_blocks
-        stats.primary_evictable_num_blocks = sum(
-            primary_stats[pool_group_id].evictable for pool_group_id in pool_group_ids
-        )
-        stats.primary_peak_free_num_blocks = sum(
-            primary_peak_stats[pool_group_id].available for pool_group_id in pool_group_ids
-        )
-        stats.primary_peak_used_num_blocks = sum(
-            primary_peak_stats[pool_group_id].unavailable for pool_group_id in pool_group_ids
-        )
-        stats.primary_peak_evictable_num_blocks = sum(
-            primary_peak_stats[pool_group_id].evictable for pool_group_id in pool_group_ids
-        )
-        secondary_levels = tuple(zip(secondary_stats_by_level, secondary_pool_group_ids))
-        secondary_peak_levels = tuple(zip(secondary_peak_stats_by_level, secondary_pool_group_ids))
-
-        stats.secondary_max_num_blocks = sum(
-            level_stats[pool_group_id].total
-            for level_stats, level_pool_group_ids in secondary_levels
-            for pool_group_id in level_pool_group_ids
-        )
-        stats.secondary_free_num_blocks = sum(
-            level_stats[pool_group_id].available
-            for level_stats, level_pool_group_ids in secondary_levels
-            for pool_group_id in level_pool_group_ids
-        )
-        stats.secondary_used_num_blocks = (
-            stats.secondary_max_num_blocks - stats.secondary_free_num_blocks
-        )
-        stats.secondary_evictable_num_blocks = sum(
-            level_stats[pool_group_id].evictable
-            for level_stats, level_pool_group_ids in secondary_levels
-            for pool_group_id in level_pool_group_ids
-        )
-        stats.secondary_peak_free_num_blocks = sum(
-            peak_stats[pool_group_id].available
-            for peak_stats, level_pool_group_ids in secondary_peak_levels
-            for pool_group_id in level_pool_group_ids
-        )
-        stats.secondary_peak_used_num_blocks = sum(
-            peak_stats[pool_group_id].unavailable
-            for peak_stats, level_pool_group_ids in secondary_peak_levels
-            for pool_group_id in level_pool_group_ids
-        )
-        stats.secondary_peak_evictable_num_blocks = sum(
-            peak_stats[pool_group_id].evictable
-            for peak_stats, level_pool_group_ids in secondary_peak_levels
-            for pool_group_id in level_pool_group_ids
-        )
-        KVCacheManagerV2._apply_iteration_stats_delta(stats, delta, field_names)
-        return stats
-
-    def _collect_iteration_stats_deltas(
-        self, raw_iteration_stats, life_cycle_metadata
-    ) -> tuple[dict, dict, dict, dict]:
-        reuse_deltas_by_window: dict[int, KVCacheIterationStatsDelta] = {}
-        reuse_deltas_by_life_cycle: dict[int, KVCacheIterationStatsDelta] = {}
-        pool_group_deltas_by_window: dict[int, KVCacheIterationStatsDelta] = {}
-        pool_group_deltas: dict[int, KVCacheIterationStatsDelta] = {}
-
-        for life_cycle_id, delta in raw_iteration_stats.items():
-            pool_group_id, window_size, _ = life_cycle_metadata[int(life_cycle_id)]
-
-            pool_group_delta = self._filter_iteration_stats_delta(
-                delta, KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS
-            )
-            self._add_iteration_stats_delta(pool_group_deltas, pool_group_id, pool_group_delta)
-            if window_size is not None:
-                self._add_iteration_stats_delta(
-                    pool_group_deltas_by_window, window_size, pool_group_delta
-                )
-
-            reuse_delta = self._filter_iteration_stats_delta(
-                delta, KV_CACHE_ITERATION_STATS_REUSE_FIELDS
-            )
-            if reuse_delta.empty:
-                continue
-            reuse_deltas_by_life_cycle[int(life_cycle_id)] = reuse_delta.copy()
-            if window_size is not None:
-                self._add_iteration_stats_delta(reuse_deltas_by_window, window_size, reuse_delta)
-
-        return (
-            reuse_deltas_by_window,
-            reuse_deltas_by_life_cycle,
-            pool_group_deltas_by_window,
-            pool_group_deltas,
-        )
-
-    def _build_window_iteration_stats(
-        self,
-        window_size: int,
-        pool_groups_by_window: dict[int, set[int]],
-        windows_by_pool_group: dict[int, tuple[int, ...]],
-        primary_stats,
-        secondary_stats_by_level,
-        primary_peak_stats,
-        secondary_peak_stats_by_level,
-        pool_group_delta,
-        reuse_delta,
-    ):
-        pool_group_ids = tuple(
-            pool_group_id
-            for pool_group_id in pool_groups_by_window.get(window_size, set())
-            if windows_by_pool_group.get(pool_group_id) == (window_size,)
-        )
-        stats = self._build_iteration_stats(
-            pool_group_ids,
-            (),
-            primary_stats,
-            secondary_stats_by_level,
-            primary_peak_stats,
-            secondary_peak_stats_by_level,
-            pool_group_delta,
-            KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS,
-        )
-        self._apply_iteration_stats_delta(stats, reuse_delta, KV_CACHE_ITERATION_STATS_REUSE_FIELDS)
-        return stats
-
-    def _build_pool_group_iteration_stats(
-        self,
-        pool_group_id: int,
-        windows_by_pool_group: dict[int, tuple[int, ...]],
-        primary_stats,
-        secondary_stats_by_level,
-        primary_peak_stats,
-        secondary_peak_stats_by_level,
-        pool_group_delta,
-    ) -> KVCacheV2PoolGroupIterationStats:
-        primary_pool_group_stats = primary_stats[pool_group_id]
-        return KVCacheV2PoolGroupIterationStats(
-            pool_group_id=pool_group_id,
-            slot_size=self._stats_slot_sizes(primary_pool_group_stats),
-            window_sizes=windows_by_pool_group.get(pool_group_id, ()),
-            stats=self._build_iteration_stats(
-                (pool_group_id,),
-                (),
-                primary_stats,
-                secondary_stats_by_level,
-                primary_peak_stats,
-                secondary_peak_stats_by_level,
-                pool_group_delta,
-                KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS,
-            ),
-        )
-
-    def _build_cold_pool_group_iteration_stats(
-        self,
-        life_cycle_metadata,
-        primary_stats,
-        secondary_stats_by_level,
-        primary_peak_stats,
-        secondary_peak_stats_by_level,
-    ) -> dict[int, KVCacheV2PoolGroupIterationStats]:
-        """Report every cold pool group in its own numbering, summed over all cold levels.
-
-        The window and hot-pool-group views drop a cold group that spans several hot groups, since
-        attributing it to any one of them would double count. This view has no such gap, so host and
-        disk blocks are always accounted for somewhere.
-
-        The returned ``pool_group_id`` is a *cold* pool-group index. It is unrelated to the hot index
-        of the same name in the by-pool-group view, because hot and cold levels number their groups
-        independently; ``window_sizes`` is the correlation key shared by both views.
-        """
-        # No cold tiers means nothing to report, and the pool-group mapping need not be queried.
-        if not secondary_stats_by_level:
-            return {}
-        cold_members = self._cold_pool_group_membership()
-        if not cold_members:
-            return {}
-        assert all(
-            len(level_stats) == len(cold_members) for level_stats in secondary_stats_by_level
-        )
-
-        report: dict[int, KVCacheV2PoolGroupIterationStats] = {}
-        for cold_pool_group_id, life_cycles in cold_members:
-            level_ids = [(cold_pool_group_id,) for _ in secondary_stats_by_level]
-            cold_stats = secondary_stats_by_level[0][cold_pool_group_id]
-            window_sizes = {
-                life_cycle_metadata[life_cycle_id][1]
-                for life_cycle_id in life_cycles
-                if life_cycle_metadata.get(life_cycle_id, (None, None, None))[1] is not None
-            }
-            report[cold_pool_group_id] = KVCacheV2PoolGroupIterationStats(
-                pool_group_id=cold_pool_group_id,
-                slot_size=self._stats_slot_sizes(cold_stats),
-                window_sizes=tuple(sorted(window_sizes)),
-                stats=self._build_iteration_stats(
-                    (),
-                    level_ids,
-                    primary_stats,
-                    secondary_stats_by_level,
-                    primary_peak_stats,
-                    secondary_peak_stats_by_level,
-                    None,
-                    KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS,
-                ),
-            )
-        return report
-
-    def _build_attention_life_cycle_iteration_stats(
-        self,
-        life_cycle_id: int,
-        life_cycle_metadata,
-        primary_stats,
-        secondary_stats_by_level,
-        primary_peak_stats,
-        secondary_peak_stats_by_level,
-        reuse_delta,
-        reused_blocks_by_level=None,
-    ) -> KVCacheV2LifeCycleIterationStats:
-        pool_group_id, window_size, kind = life_cycle_metadata[life_cycle_id]
-        assert kind == "attention"
-        return KVCacheV2LifeCycleIterationStats(
-            life_cycle_id=life_cycle_id,
-            pool_group_id=pool_group_id,
-            window_size=window_size,
-            kind=kind,
-            stats=self._build_iteration_stats(
-                (),
-                (),
-                primary_stats,
-                secondary_stats_by_level,
-                primary_peak_stats,
-                secondary_peak_stats_by_level,
-                reuse_delta,
-                KV_CACHE_ITERATION_STATS_REUSE_FIELDS,
-            ),
-            full_reused_blocks_by_level=(
-                list(reused_blocks_by_level.full) if reused_blocks_by_level is not None else []
-            ),
-            partial_reused_blocks_by_level=(
-                list(reused_blocks_by_level.partial) if reused_blocks_by_level is not None else []
-            ),
-        )
-
-    @staticmethod
-    def _build_ssm_life_cycle_iteration_stats(
-        life_cycle_id: int,
-        life_cycle_metadata,
-        snapshot_delta,
-    ) -> KVCacheV2SsmLifeCycleIterationStats:
-        pool_group_id, window_size, kind = life_cycle_metadata[life_cycle_id]
-        assert kind == "ssm"
-        assert window_size is None
-        return KVCacheV2SsmLifeCycleIterationStats(
-            life_cycle_id=life_cycle_id,
-            pool_group_id=pool_group_id,
-            snapshot_stats=KVCacheV2SsmSnapshotIterationStats(
-                iter_snapshot_lookups=snapshot_delta.iter_snapshot_lookups,
-                iter_snapshot_hits=snapshot_delta.iter_snapshot_hits,
-                iter_snapshot_misses=snapshot_delta.iter_snapshot_misses,
-                iter_reused_tokens=snapshot_delta.iter_reused_tokens,
-                iter_unreused_tokens=snapshot_delta.iter_unreused_tokens,
-                iter_aligned_snapshot_hits=snapshot_delta.iter_aligned_snapshot_hits,
-                iter_unaligned_snapshot_hits=snapshot_delta.iter_unaligned_snapshot_hits,
-            ),
-        )
-
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()
         pool_group_stats = self._get_storage_statistics(GPU_LEVEL)
@@ -4836,114 +4497,103 @@ class KVCacheManagerV2(BaseResourceManager):
     def streaming_kv_events_enabled(self) -> bool:
         return isinstance(self.event_manager, StreamingKVCacheEventManager)
 
-    def get_iteration_stats(self):
+    def _capture_stats_metadata(self) -> KVCacheStatsMetadata:
+        # Layout is fixed once initialization has selected the backend and cache tiers.
+        # Capture lazily so subclass configuration and initialization are complete.
+        if self._stats_metadata_cache is None:
+            self._stats_metadata_cache = KVCacheStatsMetadata(
+                life_cycles=tuple(
+                    (int(life_cycle_id), int(pool_id), window, kind)
+                    for life_cycle_id, (
+                        pool_id,
+                        window,
+                        kind,
+                    ) in self._stats_life_cycle_metadata().items()
+                ),
+                cold_pool_groups=tuple(
+                    (int(pool_id), tuple(sorted(int(member) for member in members)))
+                    for pool_id, members in self._cold_pool_group_membership()
+                ),
+                cache_level_tiers=tuple(self._stats_cache_level_tier_names()),
+            )
+        return self._stats_metadata_cache
+
+    def capture_iteration_stats(self) -> KVCacheV2IterationStatsSnapshot | None:
+        """Drain interval counters and copy gauges while the executor owns the manager."""
         if not self.enable_stats:
             return None
 
         disk_prefetch_blocks = self.impl.get_and_reset_iteration_disk_prefetch_blocks()
         cached_tokens_by_level = self.impl.get_and_reset_iteration_cached_tokens_by_level()
         reused_blocks_by_level = self.impl.get_and_reset_iteration_reused_blocks_by_level()
-
-        life_cycle_metadata = self._stats_life_cycle_metadata()
-        pool_groups_by_window = self._storage_pool_groups_by_window()
-        windows_by_pool_group = self._windows_by_pool_group(pool_groups_by_window)
+        metadata = self._capture_stats_metadata()
         raw_iteration_stats = self.impl.get_and_reset_iteration_stats()
         raw_ssm_snapshot_iteration_stats = self.impl.get_and_reset_ssm_snapshot_iteration_stats()
         suspended_requests, resumed_requests = (
             self.impl.get_and_reset_iteration_suspend_resume_stats()
         )
         num_cache_levels = len(self.impl.cache_tier_list)
-        peak_stats_by_level = self._get_and_reset_iteration_peak_block_stats_by_level(
-            num_cache_levels
+        peaks = self._get_and_reset_iteration_peak_block_stats_by_level(num_cache_levels)
+        pools_by_level = tuple(
+            tuple(
+                KVCachePoolStatsSnapshot(
+                    total=int(stats.total),
+                    available=int(stats.available),
+                    evictable=int(stats.evictable),
+                    peak_available=int(peaks[level][pool_id].available),
+                    peak_unavailable=int(peaks[level][pool_id].unavailable),
+                    peak_evictable=int(peaks[level][pool_id].evictable),
+                    slot_sizes=tuple(int(size) for size in self._stats_slot_sizes(stats)),
+                )
+                for pool_id, stats in enumerate(self._get_storage_statistics(CacheLevel(level)))
+            )
+            for level in range(num_cache_levels)
         )
-        primary_peak_stats = peak_stats_by_level[GPU_LEVEL]
-        secondary_peak_stats_by_level = list(peak_stats_by_level[GPU_LEVEL + 1 :])
-        (
-            reuse_deltas_by_window,
-            reuse_deltas_by_life_cycle,
-            pool_group_deltas_by_window,
-            pool_group_deltas,
-        ) = self._collect_iteration_stats_deltas(raw_iteration_stats, life_cycle_metadata)
-
-        windows = set(pool_groups_by_window)
-        windows.update(reuse_deltas_by_window)
-        windows.update(pool_group_deltas_by_window)
-        primary_stats = self._get_storage_statistics(GPU_LEVEL)
-        secondary_stats_by_level = [
-            self._get_storage_statistics(CacheLevel(level)) for level in range(1, num_cache_levels)
-        ]
-
-        stats_by_window = {
-            window_size: self._build_window_iteration_stats(
-                window_size,
-                pool_groups_by_window,
-                windows_by_pool_group,
-                primary_stats,
-                secondary_stats_by_level,
-                primary_peak_stats,
-                secondary_peak_stats_by_level,
-                pool_group_deltas_by_window.get(window_size),
-                reuse_deltas_by_window.get(window_size),
-            )
-            for window_size in sorted(windows)
-        }
-
-        all_pool_group_ids = set(range(len(primary_stats)))
-        pool_group_ids = sorted(
-            all_pool_group_ids | set(windows_by_pool_group) | set(pool_group_deltas)
-        )
-        stats_by_pool_group = {
-            pool_group_id: self._build_pool_group_iteration_stats(
-                pool_group_id,
-                windows_by_pool_group,
-                primary_stats,
-                secondary_stats_by_level,
-                primary_peak_stats,
-                secondary_peak_stats_by_level,
-                pool_group_deltas.get(pool_group_id),
-            )
-            for pool_group_id in pool_group_ids
-        }
-
-        stats_by_life_cycle = {
-            life_cycle_id: self._build_attention_life_cycle_iteration_stats(
-                life_cycle_id,
-                life_cycle_metadata,
-                primary_stats,
-                secondary_stats_by_level,
-                primary_peak_stats,
-                secondary_peak_stats_by_level,
-                reuse_delta,
-                reused_blocks_by_level.get(life_cycle_id),
-            )
-            for life_cycle_id, reuse_delta in sorted(reuse_deltas_by_life_cycle.items())
-        }
-        for life_cycle_id, snapshot_delta in sorted(raw_ssm_snapshot_iteration_stats.items()):
-            assert int(life_cycle_id) not in stats_by_life_cycle
-            stats_by_life_cycle[int(life_cycle_id)] = self._build_ssm_life_cycle_iteration_stats(
-                int(life_cycle_id),
-                life_cycle_metadata,
-                snapshot_delta,
-            )
-        stats_by_life_cycle = dict(sorted(stats_by_life_cycle.items()))
-
-        return KVCacheV2IterationStatsReport(
-            stats_by_window,
-            stats_by_pool_group,
-            stats_by_life_cycle,
-            self._build_cold_pool_group_iteration_stats(
-                life_cycle_metadata,
-                primary_stats,
-                secondary_stats_by_level,
-                primary_peak_stats,
-                secondary_peak_stats_by_level,
+        return KVCacheV2IterationStatsSnapshot(
+            metadata=metadata,
+            pools_by_level=pools_by_level,
+            deltas=tuple(
+                (
+                    int(life_cycle_id),
+                    tuple(
+                        (name, int(getattr(delta, name)))
+                        for name in KV_CACHE_ITERATION_STATS_DELTA_FIELDS
+                    ),
+                )
+                for life_cycle_id, delta in raw_iteration_stats.items()
             ),
-            suspended_requests=suspended_requests,
-            resumed_requests=resumed_requests,
-            disk_prefetch_blocks=disk_prefetch_blocks,
-            cached_tokens_by_level=list(cached_tokens_by_level),
-            cache_level_tiers=self._stats_cache_level_tier_names(),
+            ssm_deltas=tuple(
+                (
+                    int(life_cycle_id),
+                    (
+                        int(delta.iter_snapshot_lookups),
+                        int(delta.iter_snapshot_hits),
+                        int(delta.iter_snapshot_misses),
+                        int(delta.iter_reused_tokens),
+                        int(delta.iter_unreused_tokens),
+                        int(delta.iter_aligned_snapshot_hits),
+                        int(delta.iter_unaligned_snapshot_hits),
+                    ),
+                )
+                for life_cycle_id, delta in raw_ssm_snapshot_iteration_stats.items()
+            ),
+            reused_blocks_by_level=tuple(
+                (
+                    int(life_cycle_id),
+                    tuple(int(v) for v in values.full),
+                    tuple(int(v) for v in values.partial),
+                )
+                for life_cycle_id, values in reused_blocks_by_level.items()
+            ),
+            suspended_requests=int(suspended_requests),
+            resumed_requests=int(resumed_requests),
+            disk_prefetch_blocks=int(disk_prefetch_blocks),
+            cached_tokens_by_level=tuple(int(count) for count in cached_tokens_by_level),
         )
+
+    def get_iteration_stats(self) -> KVCacheV2IterationStatsReport | None:
+        snapshot = self.capture_iteration_stats()
+        return snapshot.build_report() if snapshot is not None else None
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)

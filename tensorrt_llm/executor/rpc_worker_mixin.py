@@ -287,7 +287,9 @@ class RpcWorkerMixin:
             if (time.time() - start) >= timeout:
                 break
             await asyncio.sleep(0.1)
-        return [self._stats_serializer(s) for s in stats]
+        from .iteration_stats import prepare_stats_batch
+
+        return prepare_stats_batch(stats)
 
     async def fetch_kv_cache_events_wait_async(self, timeout: Optional[float] = None) -> list:
         """Poll for KV cache events until available or timeout.
@@ -306,14 +308,11 @@ class RpcWorkerMixin:
         return [self._kv_cache_events_serializer(e) for e in events]
 
     async def fetch_stats_async(self, timeout: Optional[float] = None) -> list:
-        """Async version of fetch_stats using asyncio.to_thread.
-
-        This method is exposed via RPC and can be called directly by the proxy.
-        Returns serialized stats (JSON strings) that can be sent over RPC.
-        """
+        """Return owned statistics records suitable for RPC transport."""
         stats = await asyncio.to_thread(self.fetch_stats)
-        # Serialize stats before sending over RPC (IterationStats objects are not picklable)
-        return [self._stats_serializer(s) for s in stats]
+        from .iteration_stats import prepare_stats_batch
+
+        return prepare_stats_batch(stats)
 
     async def fetch_kv_cache_capacity_async(self) -> str:
         """Async version of fetch_kv_cache_capacity using asyncio.to_thread."""
