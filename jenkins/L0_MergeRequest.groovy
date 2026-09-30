@@ -263,6 +263,8 @@ def BUILD_BRANCH = "build_branch"
 def BOLT_CONSUME_BUILD = "bolt_consume_build"
 @Field
 def RELEASE_TARGET = "release_target"
+@Field
+def JOB_TYPE = "job_type"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
@@ -273,6 +275,7 @@ def globalVars = [
     (RUN_MODE): runMode,
     (RELEASE_TARGET): runMode == "nightly_release" ?
         normalizeReleaseTargets(gitlabParamsFromBot.get(RELEASE_TARGET, null)) : [],
+    (JOB_TYPE): env.JOB_BASE_NAME,
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // Compare against "true" rather than relying on Groovy truthiness: the bot phrase
