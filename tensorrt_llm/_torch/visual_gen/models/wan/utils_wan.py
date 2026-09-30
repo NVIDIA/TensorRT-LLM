@@ -23,10 +23,6 @@ from typing import NamedTuple, Optional, Sequence
 import torch
 
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
-from tensorrt_llm._torch.visual_gen.modules.fused_norm_quant import (  # noqa: F401
-    apply_fused_layernorm_adaln_quant,
-    apply_fused_layernorm_affine_quant,
-)
 
 try:
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell.pertoken_adaln import (

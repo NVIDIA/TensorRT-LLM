@@ -1,0 +1,752 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Multi-GPU tests for Wan with parallel_config.tp_sequence_parallel (SP-TP).
+
+SP-TP token-shards the residual stream inside the TP group (reduce-scatter +
+all-gather instead of all-reduce). Every model/block case compares three things with
+the same weights:
+
+* SP-TP vs the all-reduce TP model whose three row-parallel all-reduces are replaced by
+  the helper's own reduce-scatter + all-gather (``_EmulatedAllReduce``): both paths then
+  reduce identically, so the transformer blocks' output must match bitwise and any wiring
+  difference (modulation tables, per-token rows, padding, norms, FP4 gathers) shows up;
+* SP-TP vs the single-GPU model (relative L2, against rank 0's reference), with a
+  self-check that the bound is well below the effect of a modulation mix-up;
+* SP-TP vs the real all-reduce TP model / an fp32-exact all-reduce (the only remaining
+  difference is the collective's reduction order and algorithm).
+
+Assertions are rank-lockstep (the verdict is all-reduced before asserting), so a failure
+on one rank does not leave its peers waiting in a collective.
+
+Run with (needs >= 4 GPUs; the TP8 block case needs 8):
+    pytest tests/unittest/_torch/visual_gen/multi_gpu/test_wan_tp_sequence_parallel.py -v
+"""
+
+import os
+
+os.environ["TLLM_DISABLE_MPI"] = "1"
+
+import functools
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+
+from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    DiffusionModelConfig,
+    TorchCompileConfig,
+)
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.visual_gen.args import ParallelConfig
+
+from .test_wan_tp import (
+    _WAN_I2V_TEST_CONFIG,
+    _WAN_T2V_TEST_CONFIG,
+    _copy_ref_weights_to_tp,
+    _make_model_config,
+    _stabilize_model_weights,
+    run_test_in_distributed,
+)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_mpi_env():
+    yield
+    os.environ.pop("TLLM_DISABLE_MPI", None)
+
+
+def _rel_l2(a, b):
+    return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+
+def _check(ok, msg):
+    """Assert on every rank together (a rank-local failure must not strand the peers in
+    the next collective); the failing rank's message is reported."""
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device="cuda")
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    assert ok and flag.item() == 1, (
+        f"rank {dist.get_rank()}: {msg if not ok else 'another rank failed'}"
+    )
+
+
+class _EmulatedAllReduce(nn.Module):
+    """A row-parallel Linear's all-reduce done as the helper's reduce-scatter + all-gather.
+
+    Put into an all-reduce TP model, it makes that model reduce exactly like SP-TP, so
+    the two must agree bitwise. Needs ``sp.begin(B, S)`` for the forward's shape.
+    """
+
+    def __init__(self, sp):
+        super().__init__()
+        self.sp = sp
+
+    def uses_nccl_symmetric_memory_window(self):
+        return False
+
+    def forward(self, output, all_reduce_params=None):
+        rows = self.sp.reduce_scatter(output.reshape(-1, output.shape[-1]))
+        return self.sp.all_gather(rows).reshape(output.shape)
+
+
+class _ExactAllReduce(nn.Module):
+    """fp32 all-reduce of the bf16 partials, rounded once (a ~correctly rounded sum)."""
+
+    def uses_nccl_symmetric_memory_window(self):
+        return False
+
+    def forward(self, output, all_reduce_params=None):
+        y = output.float()
+        dist.all_reduce(y)
+        return y.to(output.dtype)
+
+
+def _replace_all_reduce(blocks, make):
+    """Replace the three row-parallel all-reduces of every WanBlock with ``make()``."""
+    for blk in blocks:
+        for lin in (blk.attn1.to_out[0], blk.attn2.to_out[0], blk.ffn.down_proj):
+            assert lin.all_reduce is not None
+            lin.all_reduce = make()
+
+
+def _capture_head_input(model):
+    """Record the input of the output head (the transformer blocks' output)."""
+    box = {}
+
+    def hook(mod, args):
+        box["x"] = args[0].detach().clone()
+
+    model.norm_out.register_forward_pre_hook(hook)
+    return box
+
+
+def _use_eager_per_token_adaln(model):
+    """Make an all-reduce Wan model run per-token AdaLN eagerly, as SP-TP does.
+
+    The fused per-token AdaLN kernel (SM100, hidden size % 256 == 0) is an optimization of
+    the all-reduce path only; SP-TP applies per-token modulation on the shard with the
+    model's LayerNorm module, so the bitwise wiring check compares like with like.
+    """
+    for blk in model.blocks:
+        blk._pertoken_adaln._eligible = False
+    model._pertoken_adaln_runtime._runtime_key = None  # re-resolve eligibility
+
+
+def _amplify_modulation(model, seed=11):
+    """Make the per-block modulation and the block branches matter.
+
+    ``_stabilize_model_weights`` makes every block nearly the identity (all Linears with
+    gain ~0.01) and the modulation ~0.01, so a modulation mix-up changes the output by
+    less than bf16 noise. Unit-scale AdaLN tables, a ~0.35-gain block and a time path
+    that depends visibly on the timestep keep activations bounded but make a wrong
+    table an O(10%) error.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for blk in model.blocks:
+            table = blk.scale_shift_table
+            table.copy_((torch.randn(table.shape, generator=gen) * 0.3).to(table.dtype))
+            for p in blk.parameters():
+                if p.ndim == 2:
+                    p.mul_(30)
+        emb = model.condition_embedder
+        for lin in (emb.time_embedder.linear_1, emb.time_embedder.linear_2, emb.time_proj):
+            lin.weight.mul_(50)
+
+
+def _build_models(rank, world_size, config_dict):
+    """Single-GPU reference, SP-TP model and all-reduce TP model with the same weights."""
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
+
+    device = torch.device(f"cuda:{rank}")
+    torch.manual_seed(123)
+    ref = WanTransformer3DModel(_make_model_config(config_dict, tp_size=1))
+    ref = ref.to(device).to(torch.bfloat16)
+    _stabilize_model_weights(ref)
+    _amplify_modulation(ref)
+    torch.manual_seed(123)
+    sp_cfg = _make_model_config(config_dict, tp_size=world_size, tp_sequence_parallel=True)
+    sp_model = WanTransformer3DModel(sp_cfg).to(device).to(torch.bfloat16)
+    _copy_ref_weights_to_tp(ref, sp_model, rank, world_size, config_dict)
+    assert sp_model._sp_tp is not None and sp_model._sp_tp.tp_size == world_size
+    torch.manual_seed(123)
+    ar_cfg = _make_model_config(config_dict, tp_size=world_size)
+    ar_model = WanTransformer3DModel(ar_cfg).to(device).to(torch.bfloat16)
+    _copy_ref_weights_to_tp(ref, ar_model, rank, world_size, config_dict)
+    assert ar_model._sp_tp is None
+    return ref, sp_model, ar_model
+
+
+def _inputs(device, batch, thw, timestep, image_dim=None, seed=456):
+    t, h, w = thw
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    inputs = dict(
+        hidden_states=(torch.randn(batch, 16, t, h, w, generator=gen) * 0.1).to(
+            device, torch.bfloat16
+        ),
+        timestep=timestep.to(device, torch.bfloat16),
+        encoder_hidden_states=(torch.randn(batch, 8, 128, generator=gen) * 0.1).to(
+            device, torch.bfloat16
+        ),
+    )
+    if image_dim is not None:
+        inputs["encoder_hidden_states_image"] = (
+            torch.randn(batch, 4, image_dim, generator=gen) * 0.1
+        ).to(device, torch.bfloat16)
+    return inputs
+
+
+# =============================================================================
+# D1-D5. SP-TP vs emulated / real all-reduce TP and vs single GPU
+# =============================================================================
+
+# SP-TP vs single GPU (rel-L2). A modulation mix-up must move the reference by more than
+# _SENSITIVITY x this bound.
+_SINGLE_GPU_REL_L2 = 2e-2
+_SENSITIVITY = 10
+# SP-TP vs the real all-reduce TP model (reduction order of the collectives only).
+_ALL_REDUCE_REL_L2 = 5e-3
+
+
+def _logic_vs_single_gpu(
+    rank,
+    world_size,
+    *,
+    config_dict,
+    batch,
+    thw,
+    timestep,
+    image_dim=None,
+    mixed_up_timestep=None,
+    case="",
+):
+    """One case. ``mixed_up_timestep``: timesteps whose reference output stands for a
+    modulation mix-up (per-sample timesteps swapped, per-token made uniform)."""
+    device = torch.device(f"cuda:{rank}")
+    ref, sp_model, ar_model = _build_models(rank, world_size, config_dict)
+    inputs = _inputs(device, batch, thw, timestep, image_dim)
+    with torch.no_grad():
+        # The tp=1 reference is only trusted on rank 0: without a device mesh its Mapping
+        # reports the global rank as tp_rank, so on other ranks the (always row-parallel)
+        # ffn.down_proj drops its bias. Every rank compares against rank 0's output.
+        ref_out = ref(**inputs)
+        dist.broadcast(ref_out, 0)
+        sp_blocks = _capture_head_input(sp_model)
+        sp_out = sp_model(**inputs)  # also begins the helper's plan for this shape
+        ar_out = ar_model(**inputs)
+        _use_eager_per_token_adaln(ar_model)
+        _replace_all_reduce(ar_model.blocks, lambda: _EmulatedAllReduce(sp_model._sp_tp))
+        emu_blocks = _capture_head_input(ar_model)
+        emu_out = ar_model(**inputs)
+        mixed_err = None
+        if mixed_up_timestep is not None:
+            mixed = dict(inputs, timestep=mixed_up_timestep.to(device, torch.bfloat16))
+            mixed_out = ref(**mixed)
+            dist.broadcast(mixed_out, 0)
+            mixed_err = _rel_l2(mixed_out, ref_out)
+    ok = sp_out.shape == ref_out.shape == inputs["hidden_states"].shape
+    _check(ok and bool(torch.isfinite(sp_out).all()), f"{case}: shape/finite {sp_out.shape}")
+    # SP-TP only changes the transformer blocks: their output must be bitwise equal. The
+    # replicated output head may still round differently when the all-reduce path hands it
+    # a differently strided tensor (expand_timesteps broadcasts temb per token there).
+    _check(
+        torch.equal(sp_blocks["x"], emu_blocks["x"]),
+        f"{case}: SP-TP blocks != all-reduce TP blocks with the same collectives (rel-L2 "
+        f"{_rel_l2(sp_blocks['x'], emu_blocks['x']):.3e})",
+    )
+    err = _rel_l2(sp_out, emu_out)
+    _check(err <= 1e-3, f"{case}: output vs all-reduce TP with the same collectives {err:.3e}")
+    err = _rel_l2(sp_out, ref_out)
+    _check(err <= _SINGLE_GPU_REL_L2, f"{case}: SP-TP vs single GPU rel-L2 {err:.3e}")
+    if mixed_err is not None:
+        _check(
+            mixed_err >= _SENSITIVITY * _SINGLE_GPU_REL_L2,
+            f"{case}: a modulation mix-up moves the reference only by rel-L2 {mixed_err:.3e}",
+        )
+    err = _rel_l2(sp_out, ar_out)
+    _check(err <= _ALL_REDUCE_REL_L2, f"{case}: SP-TP vs all-reduce TP rel-L2 {err:.3e}")
+
+
+def _logic_cases(rank, world_size, cases):
+    """Several cases in one spawn (the spawn and import dominate the cost).
+
+    Each case starts without a device mesh, as a fresh spawn does: the tp=1 reference's
+    VisualGenMapping derives its TP rank from the process-global mesh the previous case's
+    TP models built, and would otherwise get an invalid rank.
+    """
+    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+
+    for kwargs in cases:
+        DeviceMeshTopologyImpl.device_mesh = None
+        DeviceMeshTopologyImpl.tp_mesh = None
+        _logic_vs_single_gpu(rank, world_size, **kwargs)
+
+
+_T2V_EXPAND = dict(_WAN_T2V_TEST_CONFIG, expand_timesteps=True)
+
+
+def _per_token_timesteps(thw):
+    """[1, S] per-token timesteps: a ramp, so every token has its own modulation."""
+    t, h, w = thw
+    return torch.linspace(0.0, 0.9, t * (h // 2) * (w // 2))[None]
+
+
+_TP2_CASES = [
+    # D1: T2V, B=1.
+    dict(
+        case="D1_t2v_b1",
+        config_dict=_WAN_T2V_TEST_CONFIG,
+        batch=1,
+        thw=(2, 4, 4),
+        timestep=torch.tensor([0.5]),
+    ),
+    # D4: I2V image cross-attention through _cross_attention.
+    dict(
+        case="D4_i2v",
+        config_dict=_WAN_I2V_TEST_CONFIG,
+        batch=1,
+        thw=(2, 4, 4),
+        timestep=torch.tensor([0.5]),
+        image_dim=_WAN_I2V_TEST_CONFIG["image_dim"],
+    ),
+    # D5: 2-D per-token timesteps (temb [B, S, 6, D]), unpadded (S=8) and padded (S=9).
+    *[
+        dict(
+            case=f"D5_per_token_S{thw[0] * thw[1] * thw[2] // 4}",
+            config_dict=_T2V_EXPAND,
+            batch=1,
+            thw=thw,
+            timestep=_per_token_timesteps(thw),
+            mixed_up_timestep=_per_token_timesteps(thw).flip(-1),
+        )
+        for thw in ((2, 4, 4), (1, 6, 6))
+    ],
+    # D5b: expand_timesteps=True with 1-D per-sample timesteps (SP-TP keeps temb [B, 6, D]).
+    dict(
+        case="D5b_expand_uniform",
+        config_dict=_T2V_EXPAND,
+        batch=2,
+        thw=(2, 4, 4),
+        timestep=torch.tensor([0.3, 0.7]),
+        mixed_up_timestep=torch.tensor([0.7, 0.3]),
+    ),
+]
+
+
+class TestWanTPSequenceParallel:
+    def test_tp2_cases(self):
+        """D1 (T2V B=1), D4 (I2V), D5 (per-token temb, S=8 and padded S=9), D5b
+        (expand_timesteps with per-sample temb), TP2, in one spawn."""
+        run_test_in_distributed(
+            world_size=2, test_fn=functools.partial(_logic_cases, cases=_TP2_CASES)
+        )
+
+    def test_t2v_tp3_b2_distinct_timesteps(self):
+        """D2: B=2 with distinct per-sample timesteps, TP3 (uneven heads 2+1+1).
+
+        S=8 -> S_pad=9; rank 1 straddles the two samples, so a sample mix-up in the
+        per-shard modulation table breaks the bitwise check and the single-GPU bound.
+        """
+        run_test_in_distributed(
+            world_size=3,
+            test_fn=functools.partial(
+                _logic_vs_single_gpu,
+                case="D2_tp3_b2",
+                config_dict=_WAN_T2V_TEST_CONFIG,
+                batch=2,
+                thw=(2, 4, 4),
+                timestep=torch.tensor([0.3, 0.7]),
+                mixed_up_timestep=torch.tensor([0.7, 0.3]),
+            ),
+        )
+
+    def test_t2v_tp4_b2_interior_padding(self):
+        """D3: B=2, TP4, S=9 -> t'=2, S_pad=10: interior per-sample padding."""
+        run_test_in_distributed(
+            world_size=4,
+            test_fn=functools.partial(
+                _logic_vs_single_gpu,
+                case="D3_tp4_b2_padded",
+                config_dict=_WAN_T2V_TEST_CONFIG,
+                batch=2,
+                thw=(1, 6, 6),
+                timestep=torch.tensor([0.3, 0.7]),
+                mixed_up_timestep=torch.tensor([0.7, 0.3]),
+            ),
+        )
+
+
+# =============================================================================
+# D6. Blocks compiled as the pipeline does (torch.compile per block)
+# =============================================================================
+
+
+def _compiled_break_reasons(model, all_inputs):
+    """Compile every block as the pipeline does; run the inputs; return the outputs and
+    the set of graph-break reasons."""
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+
+    torch._dynamo.reset()
+    counters.clear()
+    model.blocks = nn.ModuleList(
+        [torch.compile(b, dynamic=None, fullgraph=False) for b in model.blocks]
+    )
+    with torch.no_grad():
+        outs = [model(**inp) for inp in all_inputs]
+    return outs, {str(k) for k in counters["graph_break"]}
+
+
+def _logic_compiled_blocks(rank, world_size):
+    device = torch.device(f"cuda:{rank}")
+    _, sp_model, ar_model = _build_models(rank, world_size, _WAN_T2V_TEST_CONFIG)
+    shapes = [(2, 4, 4), (1, 6, 6), (2, 4, 4)]  # S=8, S=9 (padded at TP2, B=1), revisit
+    all_inputs = [
+        _inputs(device, 1, thw, torch.tensor([0.5]), seed=10 + i) for i, thw in enumerate(shapes)
+    ]
+    with torch.no_grad():
+        eager = [sp_model(**inp) for inp in all_inputs]
+    outs, sp_reasons = _compiled_break_reasons(sp_model, all_inputs)
+    for i, (out, ref) in enumerate(zip(outs, eager)):
+        err = _rel_l2(out, ref)
+        _check(err <= 1e-2, f"compiled vs eager SP-TP, input {i}: rel-L2 {err:.3e}")
+    # SP-TP adds no graph break of its own: every break reason also occurs on the
+    # all-reduce path (the pre-existing QK-norm all-reduce / mesh lookup break).
+    _, ar_reasons = _compiled_break_reasons(ar_model, all_inputs)
+    _check(sp_reasons <= ar_reasons, f"SP-TP-only graph breaks: {sp_reasons - ar_reasons}")
+
+
+class TestWanTPSequenceParallelCompile:
+    def test_compiled_blocks_tp2(self):
+        """D6: per-block torch.compile (fullgraph=False), two shapes and a revisit, TP2:
+        matches eager SP-TP and adds no graph break beyond the all-reduce path's."""
+        run_test_in_distributed(world_size=2, test_fn=_logic_compiled_blocks)
+
+
+# =============================================================================
+# D7. CUDAGraphRunner-wrapped forward
+# =============================================================================
+
+
+def _logic_cuda_graph(rank, world_size):
+    from tensorrt_llm._torch.visual_gen.cuda_graph_runner import (
+        CUDAGraphRunner,
+        CUDAGraphRunnerConfig,
+    )
+
+    device = torch.device(f"cuda:{rank}")
+    _, sp_model, _ = _build_models(rank, world_size, _WAN_T2V_TEST_CONFIG)
+    # Key A: B=2, S=8 (unpadded); key B: B=1, S=9 (padded at TP2). Each key is captured
+    # on first use and replayed after switching keys.
+    key_a = [_inputs(device, 2, (2, 4, 4), torch.tensor([0.3, 0.7]), seed=s) for s in (1, 2)]
+    key_b = [_inputs(device, 1, (1, 6, 6), torch.tensor([0.4]), seed=s) for s in (3, 4)]
+    inputs = [key_a[0], key_a[1], key_b[0], key_a[0], key_b[1], key_b[0]]
+    eager_forward = sp_model.forward
+    runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+    sp_model.forward = runner.wrap(sp_model.forward)
+    try:
+        with torch.no_grad():
+            for i, inp in enumerate(inputs):
+                graph_out = sp_model(**inp).clone()
+                eager_out = eager_forward(**inp)
+                _check(
+                    torch.equal(graph_out, eager_out),
+                    f"call {i}: graph vs eager rel-L2 {_rel_l2(graph_out, eager_out):.3e}",
+                )
+        _check(len(runner.graphs) == 2, f"{len(runner.graphs)} graphs captured")
+    finally:
+        # As BasePipeline.cleanup(): release the graphs (they hold the NCCL communicator's
+        # collectives) before the process group is destroyed.
+        runner.clear()
+        torch.cuda.synchronize()
+
+
+class TestWanTPSequenceParallelCudaGraph:
+    def test_cuda_graph_tp2(self):
+        """D7: CUDAGraphRunner-wrapped forward, two keys (one padded) with switches and
+        revisits, TP2 == eager SP-TP (bitwise)."""
+        run_test_in_distributed(world_size=2, test_fn=_logic_cuda_graph)
+
+
+# =============================================================================
+# D8. One D=5120 WanBlock with static NVFP4 (FP4 all-gather) vs the all-reduce block
+# =============================================================================
+
+_D5120_BLOCK = dict(
+    num_attention_heads=40,
+    attention_head_dim=128,
+    ffn_dim=13824,
+    eps=1e-6,
+    cross_attn_norm=True,
+)
+_E2M1_MAX, _FP8_MAX = 6.0, 448.0
+_ATTN1_QKV = ("attn1.to_q", "attn1.to_k", "attn1.to_v")  # fused into attn1.qkv_proj
+
+
+def _block_config(vgm, quant, tp_sequence_parallel):
+    world_size = vgm.tp_size
+    cfg = DiffusionModelConfig(
+        pretrained_config=SimpleNamespace(**_D5120_BLOCK),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4) if quant else QuantConfig(),
+        torch_compile=TorchCompileConfig(enable=False),
+        attention=AttentionConfig(backend="VANILLA"),
+        visual_gen_mapping=vgm,
+        parallel=ParallelConfig(tp_size=world_size, tp_sequence_parallel=tp_sequence_parallel),
+        skip_create_weights_in_init=False,
+    )
+    cfg.mapping = vgm.to_llm_mapping()
+    return cfg
+
+
+def _full_block_weights(d, ffn):
+    """Unsharded bf16 weights for one WanBlock (checkpoint names), seeded identically."""
+    gen = torch.Generator().manual_seed(2026)
+
+    def lin(n, k):
+        return {
+            "weight": (torch.randn(n, k, generator=gen) * k**-0.5).to(torch.bfloat16),
+            "bias": (torch.randn(n, generator=gen) * 0.02).to(torch.bfloat16),
+        }
+
+    w = {f"attn{i}.{p}": lin(d, d) for i in (1, 2) for p in ("to_q", "to_k", "to_v", "to_out.0")}
+    w["ffn.up_proj"] = lin(ffn, d)
+    w["ffn.down_proj"] = lin(d, ffn)
+    params = {
+        "scale_shift_table": torch.randn(1, 6, d, generator=gen) * d**-0.5,
+        "norm2.weight": 1.0 + 0.1 * torch.randn(d, generator=gen),
+        "norm2.bias": 0.1 * torch.randn(d, generator=gen),
+    }
+    for i in (1, 2):
+        for n in ("norm_q", "norm_k"):
+            params[f"attn{i}.{n}.weight"] = 1.0 + 0.1 * torch.randn(d, generator=gen)
+    return w, params
+
+
+def _to_nvfp4(entry, act_amax, weight_amax=None):
+    """ModelOpt static-NVFP4 checkpoint entry for a bf16 Linear (1-pass amax calibration).
+
+    weight_amax: shared amax for projections fused at load time (ModelOpt calibrates
+    q/k/v with one weight_scale_2).
+    """
+    weight = entry["weight"].cuda()
+    if weight_amax is None:
+        weight_amax = weight.float().abs().amax()
+    weight_scale_2 = (weight_amax.float().cuda() / (_FP8_MAX * _E2M1_MAX)).reshape(1)
+    fp4, sf = torch.ops.trtllm.fp4_quantize(weight, 1.0 / weight_scale_2, 16, False, False)
+    return {
+        "weight": fp4.cpu(),
+        "weight_scale": sf.view(torch.float8_e4m3fn).reshape(weight.shape[0], -1).cpu(),
+        "weight_scale_2": weight_scale_2.cpu(),
+        "input_scale": (act_amax.float().cpu() / (_FP8_MAX * _E2M1_MAX)).reshape(1),
+        "bias": entry["bias"],
+    }
+
+
+def _load_block(block, linear_weights, params, sp_tp=False):
+    from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import get_nvfp4_input_scale
+    from tensorrt_llm._torch.visual_gen.modules.tp_sequence_parallel import static_nvfp4_input_scale
+
+    for name, module in block.named_modules():
+        if not isinstance(module, Linear):
+            continue
+        if name == "attn1.qkv_proj":
+            module.load_weights([linear_weights[f"attn1.to_{p}"] for p in ("q", "k", "v")])
+        else:
+            module.load_weights([linear_weights[name]])
+        module.post_load_weights()
+    for name, value in params.items():
+        if ".norm_q." in name or ".norm_k." in name:
+            owner = block.get_submodule(name.rsplit(".", 1)[0])
+            owner.load_weights({"weight": value})
+        else:
+            block.get_parameter(name).data.copy_(value)
+    # Same wiring as WanTransformer3DModel.post_load_weights.
+    fp4_input_scale = static_nvfp4_input_scale if sp_tp else get_nvfp4_input_scale
+    block._norm1_fp4_scale = fp4_input_scale(block.attn1.qkv_proj)
+    block._norm2_fp4_scale = fp4_input_scale(block.attn2.to_q)
+    block._norm3_fp4_scale = fp4_input_scale(block.ffn.up_proj)
+
+
+def _calibrate_amax(vgm, device, bf16_weights, params, block_inputs):
+    """One bf16 all-reduce-TP pass recording each Linear's input amax (max over ranks)."""
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanBlock
+
+    block = WanBlock(_block_config(vgm, False, False), 0).to(device)
+    _load_block(block, bf16_weights, params)
+    amax = {}
+
+    def record(name):
+        def hook(mod, args):
+            a = args[0].float().abs().amax()
+            amax[name] = torch.maximum(amax.get(name, a), a)
+
+        return hook
+
+    handles = [
+        m.register_forward_pre_hook(record(n))
+        for n, m in block.named_modules()
+        if isinstance(m, Linear)
+    ]
+    # The fused up-projection + GELU path does not call up_proj as a module.
+    handles.append(block.ffn.register_forward_pre_hook(record("ffn.up_proj")))
+    with torch.no_grad():
+        block(*block_inputs)
+    for h in handles:
+        h.remove()
+    for v in amax.values():
+        dist.all_reduce(v, op=dist.ReduceOp.MAX)  # row-parallel inputs are rank-local
+    amax["attn1.to_q"] = amax["attn1.to_k"] = amax["attn1.to_v"] = amax["attn1.qkv_proj"]
+    return amax
+
+
+def _logic_nvfp4_block(rank, world_size, *, batch, thw):
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import (
+        WanBlock,
+        WanRotaryPosEmbed,
+    )
+    from tensorrt_llm._torch.visual_gen.modules.tp_sequence_parallel import TPSequenceParallel
+
+    device = torch.device(f"cuda:{rank}")
+    d, ffn, text_len = 5120, _D5120_BLOCK["ffn_dim"], 64
+    t, h, w = thw
+    seq = t * h * w
+    gen = torch.Generator().manual_seed(7)
+    x = torch.randn(batch, seq, d, generator=gen).to(device, torch.bfloat16)
+    enc = (torch.randn(batch, text_len, d, generator=gen) * 0.5).to(device, torch.bfloat16)
+    temb = (torch.randn(batch, 6, d, generator=gen) * 0.1).to(device)  # distinct per sample
+    rope = WanRotaryPosEmbed(128, (1, 2, 2), max_seq_len=1024).to(device)
+    freqs_cos, freqs_sin = rope(torch.empty(batch, 16, t, 2 * h, 2 * w, device=device))
+    timestep = torch.full((batch,), 0.5, device=device)
+    block_inputs = (x, enc, temb, freqs_cos, freqs_sin, timestep)
+
+    vgm = VisualGenMapping(world_size=world_size, rank=rank, tp_size=world_size)
+    bf16_weights, params = _full_block_weights(d, ffn)
+    amax = _calibrate_amax(vgm, device, bf16_weights, params, block_inputs)
+    qkv_amax = max(bf16_weights[f"attn1.to_{p}"]["weight"].float().abs().amax() for p in "qkv")
+    fp4_weights = {
+        name: _to_nvfp4(entry, amax[name], qkv_amax if name in _ATTN1_QKV else None)
+        for name, entry in bf16_weights.items()
+    }
+
+    ar_block = WanBlock(_block_config(vgm, True, False), 0).to(device)
+    _load_block(ar_block, fp4_weights, params)
+    sp_cfg = _block_config(vgm, True, True)
+    sp = TPSequenceParallel.from_model_config(sp_cfg)
+    sp_block = WanBlock(sp_cfg, 0, sp_tp=sp).to(device)
+    _load_block(sp_block, fp4_weights, params, sp_tp=True)
+    for blk in (ar_block, sp_block):
+        assert all(
+            s is not None
+            for s in (blk._norm1_fp4_scale, blk._norm2_fp4_scale, blk._norm3_fp4_scale)
+        )
+
+    # A silent BF16 fallback must fail: every consumer receives an Fp4QuantizedTensor.
+    seen = {}
+
+    def expect_fp4(name):
+        def hook(mod, args):
+            seen.setdefault(name, []).append(type(args[0]).__name__)
+
+        return hook
+
+    # ffn: the fused GELU path calls up_proj's quant method directly (no module call),
+    # so the check sits on the MLP input.
+    for name, mod in (
+        ("attn1.qkv_proj", sp_block.attn1.qkv_proj),
+        ("attn2.to_q", sp_block.attn2.to_q),
+        ("ffn", sp_block.ffn),
+    ):
+        mod.register_forward_pre_hook(expect_fp4(name))
+
+    with torch.no_grad():
+        ref = ar_block(*block_inputs)
+        sp.begin(batch, seq)
+        out = sp.unshard(sp_block(sp.shard(x), *block_inputs[1:]))
+        _replace_all_reduce([ar_block], lambda: _EmulatedAllReduce(sp))
+        emu = ar_block(*block_inputs)
+        _replace_all_reduce([ar_block], _ExactAllReduce)
+        exact = ar_block(*block_inputs)
+    fp4 = ["Fp4QuantizedTensor"]
+    expected = {"attn1.qkv_proj": fp4, "attn2.to_q": fp4, "ffn": fp4}
+    _check(seen == expected, f"boundary inputs {seen}")
+    desc = f"tp={world_size} B={batch} S={seq} padded={sp.plan.is_padded}"
+    _check(torch.equal(out, emu), f"{desc}: SP-TP != emulated all-reduce block")
+    cos = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.float().flatten(), dim=0)
+    err = _rel_l2(out, ref)
+    _check(
+        cos.item() >= 0.999 and err <= 2e-2, f"{desc}: vs all-reduce cos={cos:.6f} rel-L2={err:.3e}"
+    )
+    # Precision against a correctly rounded all-reduce: SP-TP's reduce-scatter may use a
+    # different NCCL algorithm than the all-reduce (ring vs NVLS at TP8), but must stay
+    # within 1.5x of the all-reduce block's error.
+    sp_err, ar_err = _rel_l2(out, exact), _rel_l2(ref, exact)
+    _check(
+        sp_err <= 1.5 * ar_err + 1e-6,
+        f"{desc}: vs fp32-exact all-reduce: SP-TP rel-L2 {sp_err:.3e}, all-reduce TP {ar_err:.3e}",
+    )
+
+
+class TestWanTPSequenceParallelNVFP4Block:
+    @pytest.mark.parametrize(
+        "world_size,batch,thw",
+        [(2, 2, (1, 16, 16)), (3, 2, (3, 5, 7)), (4, 2, (3, 5, 7)), (8, 2, (4, 15, 16))],
+        ids=["tp2_S256", "tp3_S105", "tp4_S105_padded", "tp8_S960"],
+    )
+    def test_static_nvfp4_block(self, world_size, batch, thw):
+        """D8: D=5120 static-NVFP4 WanBlock (FP4 all-gathers): bitwise vs the emulated
+        all-reduce block, close to the real one, within 1.5x of its fp32-exact error."""
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("NVFP4 requires SM100+")
+        run_test_in_distributed(
+            world_size=world_size,
+            test_fn=functools.partial(_logic_nvfp4_block, batch=batch, thw=thw),
+        )
+
+
+# =============================================================================
+# D9. VSA is rejected
+# =============================================================================
+
+
+def _logic_vsa_rejected(rank, world_size):
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
+    from tensorrt_llm.visual_gen.sparse_attention import VideoSparseAttentionConfig
+
+    cfg = _make_model_config(
+        dict(_WAN_T2V_TEST_CONFIG, attention_head_dim=128),
+        tp_size=world_size,
+        backend="CUTEDSL",
+        tp_sequence_parallel=True,
+    )
+    cfg.attention = AttentionConfig(
+        backend="CUTEDSL", sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9)
+    )
+    with pytest.raises(ValueError, match="does not support Video Sparse Attention"):
+        WanTransformer3DModel(cfg)
+
+
+class TestWanTPSequenceParallelRejections:
+    def test_vsa_rejected(self):
+        """D9: tp_sequence_parallel + VSA raises."""
+        run_test_in_distributed(world_size=2, test_fn=_logic_vsa_rejected)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

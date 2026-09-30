@@ -32,12 +32,19 @@ from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
     WanPerTokenAdaLN,
     WanPerTokenAdaLNRuntime,
-    apply_fused_layernorm_adaln_quant,
-    apply_fused_layernorm_affine_quant,
     get_nvfp4_input_scale,
 )
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.modules.fused_norm_quant import (
+    apply_fused_layernorm_adaln_quant,
+    apply_fused_layernorm_affine_quant,
+)
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
+from tensorrt_llm._torch.visual_gen.modules.tp_sequence_parallel import (
+    RowNorm,
+    TPSequenceParallel,
+    static_nvfp4_input_scale,
+)
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
@@ -289,9 +296,23 @@ class WanBlock(nn.Module):
         model_config: DiffusionModelConfig,
         _layer_idx: int,
         added_kv_proj_dim: int = None,
+        sp_tp: Optional[TPSequenceParallel] = None,
     ):
+        """Build one Wan transformer block.
+
+        Args:
+            model_config: The transformer's DiffusionModelConfig.
+            _layer_idx: Block index.
+            added_kv_proj_dim: Input dim of the I2V image K/V projections, or None.
+            sp_tp: The transformer's TPSequenceParallel helper when
+                parallel_config.tp_sequence_parallel is on (the residual stream is then
+                token-sharded across the TP group and the three row-parallel projections
+                return partial sums); None for the all-reduce TP path.
+        """
         super().__init__()
         config = model_config.pretrained_config
+        # Plain reference (not a submodule): the helper holds no parameters or tensors.
+        self._sp_tp = sp_tp
 
         if hasattr(config, "hidden_size"):
             hidden_size = config.hidden_size
@@ -352,6 +373,7 @@ class WanBlock(nn.Module):
             layer_idx=_layer_idx,
             async_ulysses=self._use_async_ulysses,
             module_name=f"blocks.{_layer_idx}.attn1",
+            reduce_output=sp_tp is None,
         )
 
         # Cross-attention with separate Q, K, V
@@ -366,6 +388,7 @@ class WanBlock(nn.Module):
             layer_idx=_layer_idx,
             module_name=f"blocks.{_layer_idx}.attn2",
             enable_sequence_parallel=False,
+            reduce_output=sp_tp is None,
         )
 
         if cross_attn_norm:
@@ -403,7 +426,7 @@ class WanBlock(nn.Module):
             dtype=dtype,
             config=model_config,
             layer_idx=_layer_idx,
-            reduce_output=(tp_size != 1),
+            reduce_output=(tp_size != 1) and sp_tp is None,
         )
 
         # VSA gates (CUTEDSL backend, sparse_attention_config.algorithm == "vsa").
@@ -418,6 +441,13 @@ class WanBlock(nn.Module):
             and _sa_cfg is not None
             and getattr(_sa_cfg, "algorithm", None) == "vsa"
         )
+        if _is_vsa and sp_tp is not None:
+            raise ValueError(
+                "tp_sequence_parallel does not support Video Sparse Attention "
+                "(sparse_attention_config.algorithm='vsa') yet: the VSA gates are projected "
+                "from the block input, which is token-sharded across TP ranks. Unset "
+                "tp_sequence_parallel or disable VSA."
+            )
         if _is_vsa:
             q_dim = num_heads * head_dim
             gate_tp_mode = TensorParallelMode.COLUMN if tp_size > 1 else None
@@ -541,6 +571,10 @@ class WanBlock(nn.Module):
         freqs_sin,
         timestep=None,
     ):
+        if self._sp_tp is not None:
+            return self._forward_sp_tp(
+                x, encoder_hidden_states, temb, freqs_cos, freqs_sin, timestep
+            )
         pertoken_adaln = self._pertoken_adaln.prepare(x, temb, self.scale_shift_table)
         if pertoken_adaln is None:
             if temb.ndim == 4:
@@ -623,46 +657,10 @@ class WanBlock(nn.Module):
             else:
                 norm_x = self.norm2(x.float()).to(x.dtype)
 
-        # I2V: Split encoder_hidden_states into image and text parts if needed
-        encoder_hidden_states_img = None
-        encoder_hidden_states_text = encoder_hidden_states
-        if self.add_k_proj is not None:
-            image_context_length = encoder_hidden_states.shape[1] - 512
-            encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
-            encoder_hidden_states_text = encoder_hidden_states[:, image_context_length:]
-
-        # Text cross-attention
-        batch_size, seq_len = norm_x.shape[:2]
-        q, k, v = self.attn2.get_qkv(norm_x, encoder_hidden_states_text)
-        q, k = self.attn2.apply_qk_norm(q, k)
-        attn2_output = self.attn2._attn_impl(
-            q,
-            k,
-            v,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            kv_seq_len=encoder_hidden_states_text.shape[1],
-            timestep=timestep,
+        # Text (+ I2V image) cross-attention; to_out once on the combined output.
+        attn2_proj = self.attn2.to_out[0](
+            self._cross_attention(self.attn2.to_q(norm_x), encoder_hidden_states, timestep)
         )
-
-        # I2V: image cross-attention
-        if encoder_hidden_states_img is not None:
-            key_img = self.add_k_proj(encoder_hidden_states_img)
-            value_img = self.add_v_proj(encoder_hidden_states_img)
-            key_img = self.norm_added_k(key_img)
-            attn_img_output = self.attn2._attn_impl(
-                q,
-                key_img,
-                value_img,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                kv_seq_len=encoder_hidden_states_img.shape[1],
-                timestep=timestep,
-            )
-            attn2_output = attn2_output + attn_img_output
-
-        # Apply to_out once to the combined (text + image) attention output
-        attn2_proj = self.attn2.to_out[0](attn2_output)
 
         # 3. Feed-forward. Mirrors norm1: fused LN+AdaLN (with optional NVFP4
         # quant) reshaped back to [B, S, D]; self.ffn consumes it.
@@ -696,9 +694,134 @@ class WanBlock(nn.Module):
 
         return x
 
+    def _cross_attention(
+        self,
+        q: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Text (+ I2V image) cross-attention from projected queries q [B, S, H_local * Dh].
+
+        Returns the attention output before attn2.to_out (shared by the all-reduce and the
+        sequence-parallel TP paths).
+        """
+        # I2V: Split encoder_hidden_states into image and text parts if needed
+        encoder_hidden_states_img = None
+        encoder_hidden_states_text = encoder_hidden_states
+        if self.add_k_proj is not None:
+            image_context_length = encoder_hidden_states.shape[1] - 512
+            encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
+            encoder_hidden_states_text = encoder_hidden_states[:, image_context_length:]
+
+        # Text cross-attention (same projections/order as Attention.get_qkv, SEPARATE_QKV)
+        batch_size, seq_len = q.shape[:2]
+        k = self.attn2.to_k(encoder_hidden_states_text)
+        v = self.attn2.to_v(encoder_hidden_states_text)
+        q, k = self.attn2.apply_qk_norm(q, k)
+        attn2_output = self.attn2._attn_impl(
+            q,
+            k,
+            v,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            kv_seq_len=encoder_hidden_states_text.shape[1],
+            timestep=timestep,
+        )
+
+        # I2V: image cross-attention
+        if encoder_hidden_states_img is not None:
+            key_img = self.add_k_proj(encoder_hidden_states_img)
+            value_img = self.add_v_proj(encoder_hidden_states_img)
+            key_img = self.norm_added_k(key_img)
+            attn_img_output = self.attn2._attn_impl(
+                q,
+                key_img,
+                value_img,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                kv_seq_len=encoder_hidden_states_img.shape[1],
+                timestep=timestep,
+            )
+            attn2_output = attn2_output + attn_img_output
+        return attn2_output
+
+    def _forward_sp_tp(
+        self,
+        x: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        freqs_cos: Optional[torch.Tensor],
+        freqs_sin: Optional[torch.Tensor],
+        timestep: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Sequence-parallel TP block (parallel_config.tp_sequence_parallel).
+
+        x: this TP rank's [local_rows, D] rows of the token-sharded residual stream;
+        returns the updated rows. attn1/attn2 to_out and ffn.down_proj were built with
+        reduce_output=False, so each boundary is a reduce-scatter, row-local residual and
+        norm (+ static NVFP4 quantize), then an all-gather into the next projection.
+        Attention always sees the full [B, S] tokens (heads sharded as in plain TP).
+        """
+        sp = self._sp_tp
+        if temb.ndim == 4:  # per-token modulation [B, S, 6, D] (TI2V / 2-D timesteps)
+            mod = self.scale_shift_table.float() + sp.shard_rows(temb).float()  # [m, 6, D]
+        else:  # per-sample modulation [B, 6, D]
+            mod = sp.per_sample_table(self.scale_shift_table.float() + temb.float())  # [n, 6, D]
+        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = mod.unbind(1)
+        freqs = (freqs_cos, freqs_sin) if freqs_cos is not None and freqs_sin is not None else None
+
+        h = sp.norm(
+            x,
+            RowNorm(
+                eps=self.norm1.variance_epsilon,
+                scale=scale_msa,
+                shift=shift_msa,
+                quant_scale=self._norm1_fp4_scale,
+                module=self.norm1,
+            ),
+        )
+        q, k, v = self.attn1.split_qkv(sp.column_linear(self.attn1.qkv_proj, h))
+        attn1_out = self.attn1.attend(q, k, v, freqs=freqs, timestep=timestep)
+        # Boundary A: attn1.to_out -> reduce-scatter -> gated residual -> norm2 (+quant)
+        x, h = sp.row_linear_residual_norm(
+            self.attn1.to_out[0], attn1_out, x, gate=gate_msa, norm=self._sp_tp_norm2()
+        )
+        attn2_out = self._cross_attention(
+            sp.column_linear(self.attn2.to_q, h), encoder_hidden_states, timestep
+        )
+        # Boundary B: attn2.to_out -> reduce-scatter -> residual add -> norm3 + AdaLN (+quant)
+        x, h = sp.row_linear_residual_norm(
+            self.attn2.to_out[0],
+            attn2_out,
+            x,
+            norm=RowNorm(
+                eps=self.norm3.variance_epsilon,
+                scale=c_scale_msa,
+                shift=c_shift_msa,
+                quant_scale=self._norm3_fp4_scale,
+                module=self.norm3,
+            ),
+        )
+        # Boundary C: ffn (up + GELU, down) -> reduce-scatter -> gated residual; the next
+        # block's norm1 reads these rows.
+        return sp.mlp_residual(self.ffn, h, x, gate=c_gate_msa)
+
+    def _sp_tp_norm2(self) -> RowNorm:
+        if isinstance(self.norm2, LayerNorm):
+            return RowNorm(
+                eps=self.norm2.variance_epsilon,
+                weight=self.norm2.weight,
+                bias=self.norm2.bias,
+                quant_scale=self._norm2_fp4_scale,
+                module=self.norm2,
+            )
+        # cross_attn_norm=False: no norm, but still quantize for a static NVFP4 to_q.
+        return RowNorm(identity=True, quant_scale=self._norm2_fp4_scale)
+
 
 class WanTransformer3DModel(BaseDiffusionModel):
     _supports_gradient_checkpointing = True
+    _supports_tp_sequence_parallel = True
 
     def __init__(
         self,
@@ -710,6 +833,8 @@ class WanTransformer3DModel(BaseDiffusionModel):
 
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 12)
         self.sharder = SequenceSharder.from_vgm(vgm, num_attention_heads=num_heads)
+        # Sequence-parallel TP (parallel_config.tp_sequence_parallel); None when off.
+        self._sp_tp = TPSequenceParallel.from_model_config(model_config)
 
         config = model_config.pretrained_config
 
@@ -784,6 +909,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
                     model_config=model_config,
                     _layer_idx=i,
                     added_kv_proj_dim=added_kv_proj_dim,
+                    sp_tp=self._sp_tp,
                 )
                 for i in range(num_layers)
             ]
@@ -894,6 +1020,12 @@ class WanTransformer3DModel(BaseDiffusionModel):
         rope = self.sharder.shard_rope((freqs_cos, freqs_sin), seq_len=seq_len, seq_dim=1)
         if rope is not None:
             freqs_cos, freqs_sin = rope
+        # Sequence-parallel TP: the residual stream becomes this TP rank's [rows, D] token
+        # shard; RoPE, text embeddings and temb stay replicated (attention sees all tokens).
+        sp_tp = self._sp_tp
+        if sp_tp is not None:
+            sp_tp.begin(B, seq_len)
+            x = sp_tp.shard(x)
 
         # Time and text/image embeddings. WAN timestep embeddings use the
         # scheduler's 1000-step scale internally.
@@ -922,7 +1054,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
         else:
             # batch_size, 6, hidden_size
             temb_proj = temb_proj.unflatten(1, (6, self.config.hidden_size))
-            if self.config.expand_timesteps:
+            if self.config.expand_timesteps and sp_tp is None:
                 # x is already sequence-sharded; uniform T2V timesteps only need
                 # a local broadcast view for fused AdaLN.
                 temb_proj = temb_proj.unsqueeze(1).expand(-1, x.shape[1], -1, -1)
@@ -941,7 +1073,8 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 [encoder_hidden_states_image, encoder_hidden_states], dim=1
             )
 
-        x = self._pertoken_adaln_runtime.prepare(x, temb_proj)
+        if sp_tp is None:
+            x = self._pertoken_adaln_runtime.prepare(x, temb_proj)
 
         # Transformer blocks (attention handles distributed communication internally)
         for block in self.blocks:
@@ -953,6 +1086,9 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 freqs_sin,
                 timestep=timestep,
             )
+
+        if sp_tp is not None:  # [rows, D] -> [B, S, D], once per forward
+            x = sp_tp.unshard(x)
 
         # All-gather sequence from all ranks: [B, S/P] -> [B, S] (no-op when inactive).
         x = self.sharder.gather(x, dim=1)
@@ -1057,11 +1193,32 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 module.post_load_weights()
 
         # Wire each norm's fp4_scale from the first downstream Linear that consumes its output.
+        # The SP-TP path all-gathers these activations as NVFP4, so it uses the helper's
+        # documented eligibility rule (static_nvfp4_input_scale, which also requires NVFP4
+        # activation quantization); both rules agree for every current quant method.
+        fp4_input_scale = (
+            static_nvfp4_input_scale if self._sp_tp is not None else get_nvfp4_input_scale
+        )
         for block in self.blocks:
             if not isinstance(block, WanBlock):
                 continue
             # qkv_proj exists in FUSE_QKV mode; fall back to to_q in SEPARATE_QKV (async Ulysses).
             attn1_qkv = getattr(block.attn1, "qkv_proj", None) or getattr(block.attn1, "to_q", None)
-            block._norm1_fp4_scale = get_nvfp4_input_scale(attn1_qkv)
-            block._norm2_fp4_scale = get_nvfp4_input_scale(getattr(block.attn2, "to_q", None))
-            block._norm3_fp4_scale = get_nvfp4_input_scale(getattr(block.ffn, "up_proj", None))
+            block._norm1_fp4_scale = fp4_input_scale(attn1_qkv)
+            block._norm2_fp4_scale = fp4_input_scale(getattr(block.attn2, "to_q", None))
+            block._norm3_fp4_scale = fp4_input_scale(getattr(block.ffn, "up_proj", None))
+
+        if self._sp_tp is not None:
+            scales = [
+                getattr(block, f"_norm{i}_fp4_scale")
+                for block in self.blocks
+                if isinstance(block, WanBlock)
+                for i in (1, 2, 3)
+            ]
+            n_fp4 = sum(scale is not None for scale in scales)
+            logger.info_once(
+                f"tp_sequence_parallel: {n_fp4}/{len(scales)} block-boundary activations are "
+                "all-gathered as NVFP4 (static input_scale); the rest are gathered as BF16 "
+                "(dynamic, AWQ, FP8 or unquantized consumers).",
+                key=("tp_sequence_parallel_fp4_gather", n_fp4, len(scales)),
+            )

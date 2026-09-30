@@ -379,6 +379,13 @@ def test_capability_gate():
         )
 
 
+def test_wan_opts_in():
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
+
+    assert WanTransformer3DModel._supports_tp_sequence_parallel is True
+    assert BaseDiffusionModel._supports_tp_sequence_parallel is False
+
+
 def _stub_config(flag, tp_size=2, ulysses=1, ring=1, attn2d=(1, 1), cache_backend=None):
     vgm = SimpleNamespace(
         tp_size=tp_size,

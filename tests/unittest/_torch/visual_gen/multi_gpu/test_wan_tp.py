@@ -42,6 +42,7 @@ from tensorrt_llm._torch.visual_gen.config import (
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import ParallelConfig
 
 from .tp_shard_utils import copy_tp_parameter
 
@@ -154,8 +155,13 @@ _WAN_I2V_UNEVEN_TP3_CONFIG = dict(_WAN_I2V_TEST_CONFIG)
 # =============================================================================
 
 
-def _make_model_config(pretrained_dict, tp_size=1, ulysses_size=1, backend="VANILLA"):
-    """Create DiffusionModelConfig for testing with TP and/or Ulysses."""
+def _make_model_config(
+    pretrained_dict, tp_size=1, ulysses_size=1, backend="VANILLA", tp_sequence_parallel=False
+):
+    """Create DiffusionModelConfig for testing with TP and/or Ulysses.
+
+    tp_sequence_parallel=True enables parallel_config.tp_sequence_parallel (needs tp_size > 1).
+    """
     pretrained_config = SimpleNamespace(**pretrained_dict)
     ws = tp_size * ulysses_size
     if ws > 1 and dist.is_initialized():
@@ -171,6 +177,11 @@ def _make_model_config(pretrained_dict, tp_size=1, ulysses_size=1, backend="VANI
         torch_compile=TorchCompileConfig(enable=False),
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
+        parallel=ParallelConfig(
+            tp_size=tp_size,
+            ulysses_size=ulysses_size,
+            tp_sequence_parallel=tp_sequence_parallel,
+        ),
         cache=None,
         attention_metadata_state=(
             create_attention_metadata_state() if backend.upper() == "TRTLLM" else None
