@@ -735,7 +735,7 @@ def deepgemm_fp8_group_blockwise_gemm(
 
     # Transform SFA and SFB into compute-required layout
 
-    deep_gemm.fp8_m_grouped_gemm_nt_masked((a, sfa), (b, sfb),
+    deep_gemm.m_grouped_fp8_gemm_nt_masked((a, sfa), (b, sfb),
                                            d,
                                            masked_m,
                                            expected_m,

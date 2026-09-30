@@ -689,6 +689,7 @@ def _check_dp_encoder_replay_case(
         return result
 
     def check_floor(metadata: CSA2TrtllmMetadata, layer: int, floor: int) -> None:
+        metadata._ensure_swa_slots()
         logical = metadata.csa2_positions[:, None] - _REPLAY_WINDOW + 1
         logical = logical + torch.arange(_REPLAY_WINDOW, device="cuda")
         assert (metadata.csa2_swa_indices[layer][logical < floor] == -1).all()
@@ -768,6 +769,7 @@ def _check_dp_encoder_replay_case(
             reference_metadata.set_decoder_query_boundary(1)
             reference_metadata.prepare()
             reference_metadata.csa2_precomputed_kv_layers = {1}
+            reference_metadata._ensure_swa_slots()
             logical = reference_metadata.csa2_positions[:, None] - _REPLAY_WINDOW + 1
             logical = logical + torch.arange(_REPLAY_WINDOW, device="cuda")
             reference_metadata.csa2_swa_indices[1].masked_fill_(logical < decoder_start, -1)
