@@ -88,8 +88,9 @@ from .gpu_keepalive import GpuKeepalive
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
-from .hang_detector import (HangDetector, hard_kill_on_rank_crash,
-                            propagate_hard_kill, start_rank_crash_kill_watchdog)
+from .hang_detector import (HangDetector, all_ranks_crashed,
+                            hard_kill_on_rank_crash, propagate_hard_kill,
+                            start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
@@ -311,17 +312,34 @@ def _distributed_warmup_guard(dist: Distributed,
     the launcher is already acting on, and an MPI_Abort on top would turn a
     clean Ctrl-C into exit 137.
 
+    A SYMMETRIC crash -- every rank raising out of warmup, e.g. an OOM every
+    rank hits at the same allocation -- arms no watchdog at all: the
+    ``all_ranks_crashed`` probe proves nobody is stranded in a collective, so
+    the error can propagate through the worker's setup/RPC path and the serve
+    front end can tear the world down cleanly. This matters because the kill
+    armed here (``error_delivered=None``) cannot be suppressed, and in the
+    launcher-spawned (mgmn) deployment the rank processes host a persistent
+    MPI task loop that legitimately outlives a failed engine.
+
     Peer count spans the model communicator and ``MPI.COMM_WORLD``: DWDP
     peers live only in the latter, while a TorchDist launch can have several
-    model ranks in a single-process MPI world.
+    model ranks in a single-process MPI world. The symmetric-crash probe only
+    trusts a communicator that spans the whole peer count, so a DWDP mismatch
+    falls back to arming the watchdog.
     """
     try:
         yield
     except Exception:
         if dist.world_size > 1 or mapping.dwdp_enabled:
-            start_rank_crash_kill_watchdog(max(dist.world_size,
-                                               global_mpi_size()),
-                                           error_delivered=None)
+            world = max(dist.world_size, global_mpi_size())
+            if all_ranks_crashed(world):
+                logger.error(
+                    f"Warmup failed on all {world} ranks (symmetric crash): "
+                    "no peer is stranded in a collective, so the cross-rank "
+                    "hard kill is not armed and the error propagates to a "
+                    "clean shutdown.")
+            else:
+                start_rank_crash_kill_watchdog(world, error_delivered=None)
         raise
 
 
@@ -7634,18 +7652,14 @@ class PyExecutor:
             f"[Executor] _forward_step {self.iter_counter}: {scheduled_requests.num_context_requests} ctx reqs, {num_ctx_tokens} ctx tokens, {scheduled_requests.num_generation_requests} gen reqs"
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
-                    gather_context_logits, cache_indirection_buffer):
+                    cache_indirection_buffer):
             return self.model_engine.forward(
                 scheduled_requests,
                 resource_manager,
                 new_tensors_device,
-                gather_context_logits=gather_context_logits,
                 cache_indirection_buffer=cache_indirection_buffer)
 
         try:
-            gather_context_logits = any(
-                a.py_return_context_logits
-                for a in scheduled_requests.context_requests)
             cache_indirection_buffer = self.sampler.get_cache_indirection()
 
             # Run model forward on the execution stream for proper synchronization
@@ -7654,8 +7668,7 @@ class PyExecutor:
             self._attach_encoder_output_to_execution_stream(scheduled_requests)
             with torch.cuda.stream(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
-                                  new_tensors_device, gather_context_logits,
-                                  cache_indirection_buffer)
+                                  new_tensors_device, cache_indirection_buffer)
                 self._maybe_record_hang_diagnostic_phase(
                     "forward_returned",
                     scheduled_requests,
