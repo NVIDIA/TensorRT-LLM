@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
+from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
@@ -188,12 +189,14 @@ class DummyModelEngine(PyTorchModelEngine):
         llm_args: TorchLlmArgs,
         dtype: torch.dtype,
         spec_config: DecodingBaseConfig | None = None,
+        is_generation: bool = True,
     ) -> None:
         self.dtype = dtype
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
                           tp_size=tensorrt_llm.mpi_world_size(),
                           rank=tensorrt_llm.mpi_rank())
         model = DummyModel(self.dtype)
+        model.model_config.is_generation = is_generation
         super().__init__(model_path="dummy",
                          mapping=mapping,
                          model=model,
@@ -1481,92 +1484,37 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         self.assertEqual(attn_metadata.on_update_kv_lens.call_count, 2)
 
-    def test_allocate_decoder_buffers_keeps_shapes_and_gates(self) -> None:
-        for is_spec_decode in (False, True):
-            for use_mrope in (False, True):
-                for max_beam_width in (1, 2):
-                    with self.subTest(is_spec_decode=is_spec_decode,
-                                      use_mrope=use_mrope,
-                                      max_beam_width=max_beam_width):
-                        engine = object.__new__(PyTorchModelEngine)
-                        engine.is_spec_decode = is_spec_decode
-                        engine.max_draft_loop_tokens = 3
-                        engine.batch_size = 2
-                        engine.max_num_tokens = 8
-                        engine.max_seq_len = 16
-                        engine.max_beam_width = max_beam_width
-                        engine.model = SimpleNamespace(
-                            model_config=SimpleNamespace(
-                                pretrained_config=SimpleNamespace(
-                                    rope_scaling={"type": "mrope"}
-                                    if use_mrope else None)))
-                        engine.cache_indirection_attention = None
+    def test_decoder_buffers_are_allocated_only_for_engine_decoder(
+            self) -> None:
+        llm_args = TorchLlmArgs(
+            model="dummy",
+            max_batch_size=4,
+            max_num_tokens=64,
+            max_beam_width=2,
+            cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4]))
+        decoder_only = ("input_ids_cuda", "position_ids_cuda",
+                        "previous_batch_indices_cuda",
+                        "_steady_gen_positions_pinned", "_steady_gen_cache",
+                        "_prepare_inputs_event", "_lora")
+        for is_generation in (True, False):
+            with self.subTest(is_generation=is_generation):
+                engine = DummyModelEngine(llm_args,
+                                          torch.half,
+                                          is_generation=is_generation)
 
-                        engine._allocate_decoder_buffers()
-
-                        expected = {
-                            "previous_batch_indices_cuda": (8, ),
-                            "input_ids_cuda": (8, ),
-                            "position_ids_cuda": (8, ),
-                        }
-                        spec_buffers = {
-                            "draft_tokens_cuda": (6, ),
-                            "gather_ids_cuda": (8, ),
-                            "num_accepted_draft_tokens_cuda": (2, ),
-                            "previous_pos_indices_cuda": (8, ),
-                            "previous_pos_id_offsets_cuda": (8, ),
-                            "previous_kv_lens_offsets_cuda": (2, ),
-                        }
-                        if is_spec_decode:
-                            expected.update(spec_buffers)
-                        if use_mrope:
-                            expected["mrope_position_ids_cuda"] = (3, 1, 8)
-                        if max_beam_width > 1:
-                            expected["cache_indirection_attention"] = (2, 2, 16)
-                        for name, shape in expected.items():
-                            buffer = getattr(engine, name)
-                            self.assertEqual(tuple(buffer.shape), shape, name)
-                            self.assertEqual(buffer.device.type, "cuda", name)
-                        if max_beam_width > 1:
-                            self.assertEqual(
-                                engine.cache_indirection_attention.dtype,
-                                torch.int32)
-                        else:
-                            self.assertIsNone(
-                                engine.cache_indirection_attention)
-                        for name in set(spec_buffers) - set(expected):
-                            self.assertFalse(hasattr(engine, name), name)
-                        self.assertEqual(
-                            hasattr(engine, "mrope_position_ids_cuda"),
-                            use_mrope)
-                        pinned = engine._steady_gen_positions_pinned
-                        self.assertEqual(
-                            (tuple(pinned.shape), pinned.device.type),
-                            ((8, ), "cpu"))
-
-    def test_init_decoder_state_sets_decoder_only_defaults(self) -> None:
-        engine = object.__new__(PyTorchModelEngine)
-        engine.spec_config = None
-        engine.attn_backend = Mock()
-        engine._cuda_graph_batch_sizes = [1, 2]
-
-        with patch.dict("os.environ",
-                        {"TLLM_LOG_CACHED_KV_TOKENS_PER_REQ": "1"}):
-            engine._init_decoder_state()
-
-        self.assertEqual(engine._encoder_decoder_host_buffer_pool, [])
-        for name in ("_encoder_decoder_input_fast_path_static_eligible",
-                     "_encoder_decoder_position_id_offset",
-                     "_encoder_decoder_staged_request_ids",
-                     "_cross_attn_stable_cached_tokens",
-                     "_cross_attn_stable_request_ids",
-                     "_eager_workspace_reclaimer", "_steady_gen_cache",
-                     "_force_lora_graph_for_capture", "_prepare_inputs_event",
-                     "_cuda_graph_mem_pool", "_dynamic_draft_len_mapping"):
-            self.assertIsNone(getattr(engine, name), name)
-        self.assertTrue(engine._log_cached_kv_tokens_per_req)
-        self.assertFalse(engine._trtllm_gen_jit_warmup)
-        self.assertIsNone(engine._lora.cuda_graph_manager)
+                self.assertEqual(engine._fallback_to_engine, is_generation)
+                if is_generation:
+                    self.assertIsNone(engine._runner)
+                    self.assertIsNotNone(engine.cuda_graph_runner)
+                    self.assertEqual(
+                        tuple(engine.cache_indirection_attention.shape),
+                        (4, 2, engine.max_seq_len))
+                else:
+                    self.assertIsInstance(engine._runner, PoolingRunner)
+                    self.assertIsNone(engine.cuda_graph_runner)
+                    self.assertIsNone(engine.cache_indirection_attention)
+                for name in decoder_only:
+                    self.assertEqual(hasattr(engine, name), is_generation, name)
 
     def test_runner_engine_shared_entries_skip_decoder_state(self) -> None:
         runner = Mock()

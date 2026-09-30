@@ -9,7 +9,6 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.engine.runners import common
 from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
-    ModelTraitsMixin,
     apply_position_id_offset,
     get_all_rank_num_tokens,
     get_padding_params,
@@ -231,35 +230,3 @@ def test_make_scheduled_inputs_gathers_context_logits_from_context_requests(
     assert inputs.cache_indirection_buffer is None
     assert inputs.gather_context_logits is returns_context_logits
     assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 3)
-
-
-class _Traits(ModelTraitsMixin):
-    def __init__(self, model: object, max_beam_width: int) -> None:
-        self.model = model
-        self.input_processor = None
-        self.max_beam_width = max_beam_width
-
-
-def test_model_traits_mixin_reads_only_model_processor_and_beam_width() -> None:
-    model = SimpleNamespace(
-        model_config=SimpleNamespace(
-            is_encoder_decoder=True,
-            pretrained_config=SimpleNamespace(rope_scaling={"type": "mrope"}),
-        ),
-        has_ple=True,
-    )
-    traits = _Traits(model, max_beam_width=2)
-
-    assert traits.use_mrope
-    assert traits.use_beam_search
-    assert traits._is_encoder_decoder_model()
-    assert traits._model_uses_ple_recurrent_state
-    assert not traits.is_multimodal
-    assert not traits._mm_encoder_cache_enabled
-
-    plain = _Traits(SimpleNamespace(), max_beam_width=1)
-
-    assert not plain.use_mrope
-    assert not plain.use_beam_search
-    assert not plain._is_encoder_decoder_model()
-    assert not plain._model_uses_ple_recurrent_state

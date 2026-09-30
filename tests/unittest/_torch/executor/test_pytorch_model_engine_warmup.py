@@ -438,7 +438,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
 
 
 @pytest.mark.parametrize("config_cls", [DraftTargetDecodingConfig, PARDDecodingConfig])
-def test_warmup_draft_length_resolution_leaves_engine_length(config_cls):
+def test_draft_length_resolution_resyncs_dynamic_buffers(config_cls):
     config = config_cls(max_draft_len=3, speculative_model="dummy", draft_len_schedule={1: 3, 4: 2})
     engine = SimpleNamespace(
         spec_config=config,
@@ -463,10 +463,9 @@ def test_warmup_draft_length_resolution_leaves_engine_length(config_cls):
     assert engine.runtime_draft_len == 2
     assert all(request.py_draft_tokens[:2] == [7, 8] for request in requests)
     # Each explicit warmup shape resynchronizes the buffers and returns its
-    # length, even when the batch size is unchanged, without touching the engine.
+    # length, even when the batch size is unchanged.
     for draft_len in (0, 3, 1):
         assert resolve(draft_len=draft_len) == draft_len
-        assert engine.runtime_draft_len == 2
         assert all(
             len(request.py_draft_tokens) == config.get_runtime_tokens_per_gen_step(draft_len) - 1
             for request in requests
@@ -650,6 +649,62 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
     assert forward_warmup.call_args_list == expected_calls
     assert (engine.enable_spec_decode, engine.runtime_draft_len) == (True, 5)
     assert engine._force_lora_graph_for_capture is None
+
+
+@pytest.mark.parametrize("phase", ["general", "attention", "mamba", "prefill"])
+def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
+    engine, resource_manager = _build_engine_and_resource_manager()
+    assert not engine.is_spec_decode
+    # Serving values that no warmup phase may read.
+    engine.enable_spec_decode = True
+    engine.runtime_draft_len = 5
+    batch = ScheduledRequests()
+    forward_warmup = Mock()
+    kv_cache_manager = resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            patch.object(engine, "_create_warmup_request", Mock(return_value=batch))
+        )
+        stack.enter_context(
+            patch.object(
+                engine,
+                "_release_batch_context",
+                side_effect=lambda request, resources: contextlib.nullcontext(request),
+            )
+        )
+        stack.enter_context(patch.object(engine, "_forward_warmup", forward_warmup))
+        if phase == "general":
+            engine._general_warmup_impl(resource_manager, [(4, 0)])
+        elif phase == "attention":
+            engine._run_attention_warmup(resource_manager)
+        elif phase == "mamba":
+            stack.enter_context(
+                patch.object(model_engine_module, "MambaHybridCacheManager", type(kv_cache_manager))
+            )
+            stack.enter_context(
+                patch.object(kv_cache_manager, "get_num_available_tokens", return_value=8)
+            )
+            stack.enter_context(
+                patch.object(engine, "llm_args", SimpleNamespace(enable_autotuner=False))
+            )
+            engine._run_mamba_hybrid_warmup(resource_manager)
+        else:
+            stack.enter_context(
+                patch.object(
+                    engine, "prefill_cuda_graph_backend", PrefillCudaGraphBackend.BREAKABLE
+                )
+            )
+            stack.enter_context(patch.object(engine, "_prefill_cuda_graph_num_tokens", [4]))
+            engine._capture_prefill_cuda_graphs(resource_manager)
+
+    assert forward_warmup.call_count > 0
+    assert (
+        forward_warmup.call_args_list
+        == [call(batch, resource_manager, enable_spec_decode=False, runtime_draft_len=0)]
+        * forward_warmup.call_count
+    )
+    assert (engine.enable_spec_decode, engine.runtime_draft_len) == (True, 5)
 
 
 class _Tracker:

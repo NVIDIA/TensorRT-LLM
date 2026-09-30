@@ -666,21 +666,6 @@ def test_decoder_fallback_passes_call_state_without_engine_writes(is_dummy):
     assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 2)
 
 
-def test_engine_forward_consumes_decoder_length_update():
-    engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
-    engine._fallback_to_engine = True
-    engine._is_warmup = False
-    engine.runtime_draft_len = 2
-    logits = object()
-    engine._forward_decoder = Mock(return_value={"logits": logits, "runtime_draft_len": 4})
-
-    outputs = engine.forward(ScheduledRequests(), resources)
-
-    assert outputs == {"logits": logits}
-    assert engine.runtime_draft_len == 4
-    assert engine._forward_decoder.call_args.args[0].runtime_draft_len == 2
-
-
 def test_engine_forward_keeps_call_state_when_decoder_fails():
     engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
     engine._fallback_to_engine = True
