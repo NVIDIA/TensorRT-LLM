@@ -62,6 +62,8 @@ Two API layers:
 * GEMM-owning boundary ops: ``column_linear``, ``row_linear``,
   ``row_linear_residual_norm``, ``mlp_residual``. These are the only call sites a
   communication/compute overlap or a fused GEMM+collective kernel has to replace.
+
+See ``TP_SEQUENCE_PARALLEL_DEVELOPER_GUIDE.md`` next to this file.
 """
 
 import math
