@@ -4213,9 +4213,7 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
                     "fc1_weight_block": backend.quant_scales.fc1_weight_block.untyped_storage().data_ptr(),
                     "fc2_weight_block": backend.quant_scales.fc2_weight_block.untyped_storage().data_ptr(),
                 }
-            # The locality domain split only runs in the backend's post_load_weights.
-            # TODO: Follow-up PR to move it into the staged hooks and call moe.post_load_weights().
-            backend.post_load_weights()
+            moe.post_load_weights()
             moe.cuda()
             return moe, source_storage_ptrs
 
@@ -4303,7 +4301,7 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_rubin():
         pretrained_config.intermediate_size = intermediate_size
         pretrained_config.torch_dtype = dtype
 
-        def create_module(enable_locality_domains: bool):
+        def create_module(enable_locality_domains: bool, post_load: bool = True):
             model_config = ModelConfig(
                 pretrained_config=pretrained_config,
                 quant_config=quant_config,
@@ -4334,9 +4332,8 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_rubin():
                     backend.w3_w1_weight.untyped_storage().data_ptr(),
                     backend.w2_weight.untyped_storage().data_ptr(),
                 )
-            # The locality domain split only runs in the backend's post_load_weights.
-            # TODO: Follow-up PR to move it into the staged hooks and call moe.post_load_weights().
-            backend.post_load_weights()
+            if post_load:
+                moe.post_load_weights()
             moe.cuda()
             return moe, full_w3_w1, full_w2, source_storage_ptrs
 
@@ -4357,6 +4354,10 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_rubin():
         assert locality_domain_backend.w3_w1_weight.numel() == 0
         assert locality_domain_backend.w2_weight.numel() == 0
 
+        # The split is a one-time transform: a repeated post-load keeps the shards.
+        locality_domain_moe.post_load_weights()
+        assert locality_domain_backend._locality_domain_weight_shards is shards
+
         # Keep the production-shape lifecycle and public ConfigurableMoE
         # forward integration here. Broad accuracy, autotune, capture, and
         # outer-tile replay are covered by the unified backend matrix.
@@ -4366,6 +4367,11 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_rubin():
 
         torch.cuda.synchronize()
         torch.testing.assert_close(base_output, locality_domain_output, rtol=1e-2, atol=0.15)
+
+        # A staged load skips transform_weights and only refreshes derived state.
+        staged_moe, _, _, _ = create_module(True, post_load=False)
+        with pytest.raises(NotImplementedError, match="staged loads"):
+            staged_moe.cache_derived_state()
 
 
 @pytest.mark.skipif(
