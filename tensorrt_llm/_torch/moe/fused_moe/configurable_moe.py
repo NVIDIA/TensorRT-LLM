@@ -207,6 +207,26 @@ class ConfigurableMoE(MoE):
         # ========== Create Communication Strategy ==========
         self.comm = self._create_comm_strategy_auto()
 
+        # ========== Model-owned finalize for do_finalize=False + comm ==========
+        # A model that needs a per-(token, expert) transform applied to each
+        # expert output before the top-k sum calls this layer with
+        # ``do_finalize=False`` and finalizes the returned triple itself. That
+        # works only while ``self.comm is None``: no ``Communication.combine``
+        # accepts an unfinalized output. A model that must also run under
+        # attention DP assigns its finalize here, and
+        # ``ExternalCommMoEScheduler`` runs it on the dispatched rows just
+        # before the combine. Signature:
+        #
+        #     fn(*, gemm2_output, expanded_idx_to_permuted_idx,
+        #        routing_weights, num_tokens) -> [num_tokens, hidden_size]
+        #
+        # It must be a per-row function, so that combining the per-rank
+        # finalized partials equals finalizing after the combine. ``None`` for
+        # every model that does not need it, which makes the unsupported
+        # combination a named refusal in the scheduler rather than an
+        # ``AttributeError`` several frames deeper, inside the comm layer.
+        self.unfinalized_combine_fn = None
+
         # ========== Chunking Configuration ==========
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
         # The default value is max_num_tokens * dp_size

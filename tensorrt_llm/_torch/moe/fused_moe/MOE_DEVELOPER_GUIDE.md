@@ -118,7 +118,8 @@ comprehensive early-validation layer for every incompatible feature.
 ```text
 [EPLB start_wait_gpu] → routing → [EPLB done_wait_gpu + update_statistic + route]
   → [comm.prepare_dispatch (NVLink2-sided)] → quantize/dispatch (adaptive order)
-  → backend.run_moe → [EPLB start_set_cpu] → comm.combine → [EPLB done_set_cpu]
+  → backend.run_moe → [EPLB start_set_cpu] → [unfinalized_combine_fn]
+  → comm.combine → [EPLB done_set_cpu]
 
 Adaptive quantize/dispatch order (gated by comm.supports_post_quant_dispatch()):
   Post-quant flow: quantize_input() → comm.dispatch()   (send quantized data)
@@ -126,6 +127,8 @@ Adaptive quantize/dispatch order (gated by comm.supports_post_quant_dispatch()):
 ```
 
 EPLB hooks fire only at the first/last chunk of the first/last `repeat_idx`. Multi-stream chunk overlap is enabled when `not enable_alltoall and aux_stream is not None`.
+
+`unfinalized_combine_fn` runs only when `do_finalize=False` **and** a comm strategy is active. Every `Communication.combine` is typed for a dense per-token tensor, so the backend's unfinalized `(gemm2_output, expert_weights, expanded_idx_to_permuted_idx)` triple cannot cross one. A model that needs a per-`(token, expert)` transform applied to each expert output *before* the top-k sum registers its finalize on `ConfigurableMoE`; the scheduler runs it on the dispatched rows, and the combine then reduces already-finalized partials — equal to finalizing after the combine, because each term depends on one row alone and non-local slots contribute exact zeros. Leaving the attribute unset turns that combination into a named refusal instead of a crash inside the comm layer.
 
 ### Fused-comm execution flow (MegaMoE-style)
 
