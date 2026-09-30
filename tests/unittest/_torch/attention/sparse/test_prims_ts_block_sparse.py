@@ -149,6 +149,7 @@ def _contiguous_case():
         helix_position_offsets=None,
         kv_cache_manager=None,
         seq_lens=torch.tensor([64, 64], dtype=torch.int32),
+        fmha_plan_caches={},
     )
     args = AttentionForwardArgs(
         output=torch.empty_like(q),
@@ -187,6 +188,7 @@ def _paged_metadata():
         host_kv_cache_pool_pointers=torch.tensor([[1234, 5678]], dtype=torch.int64),
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
         kv_cache_manager=manager,
+        fmha_plan_caches={},
     )
 
 
@@ -320,7 +322,7 @@ def test_block_sparse_support_rejects_invalid_static_kernel_profile(
 
 
 def test_contiguous_wrappers_cache_static_profile_and_keep_routes_live(monkeypatch) -> None:
-    _attention, fmha, q, k, v, _metadata, args = _contiguous_case()
+    _attention, fmha, q, k, v, metadata, args = _contiguous_case()
     wrapper = Mock()
     factory = Mock(return_value=wrapper)
     monkeypatch.setattr(block_sparse_fmha, "_BlockSparseTSWrapper", factory)
@@ -337,12 +339,12 @@ def test_contiguous_wrappers_cache_static_profile_and_keep_routes_live(monkeypat
     ]
     for inputs in bsr_inputs:
         _set_block_sparse_inputs(args, inputs)
-        fmha._forward_contiguous(q, k, v, args)
+        fmha._forward_contiguous(q, k, v, metadata, args)
 
     proxy_inputs = [_bitmask_inputs(proxy=True), _bitmask_inputs(proxy=True)]
     for inputs in proxy_inputs:
         _set_block_sparse_inputs(args, inputs)
-        fmha._forward_contiguous(q, k, v, args)
+        fmha._forward_contiguous(q, k, v, metadata, args)
 
     assert factory.call_count == 2
     assert wrapper.plan.call_count == 2
@@ -385,23 +387,25 @@ def test_block_sparse_plan_key_includes_attention_head_topology() -> None:
     assert _key(first) != _key(second)
 
 
-def test_block_sparse_plan_cache_is_shared_only_when_explicitly_bound() -> None:
-    first = block_sparse_fmha.PrimsTSBlockSparseFmha(_Attention())
-    second = block_sparse_fmha.PrimsTSBlockSparseFmha(_Attention())
+def test_block_sparse_plan_cache_lives_on_the_metadata(monkeypatch) -> None:
+    """Layers that run with one metadata object share its planned wrappers."""
+    wrapper = Mock()
+    factory = Mock(return_value=wrapper)
+    monkeypatch.setattr(block_sparse_fmha, "_BlockSparseTSWrapper", factory)
+    _attention, first, q, k, v, metadata, args = _contiguous_case()
+    second_attention = _Attention()
+    second = block_sparse_fmha.PrimsTSBlockSparseFmha(second_attention)
 
-    assert first._contiguous_wrappers is not second._contiguous_wrappers
-    assert first._paged_wrappers is not second._paged_wrappers
+    first._forward_contiguous(q, k, v, metadata, args)
+    second._forward_contiguous(q, k, v, metadata, args)
+    assert factory.call_count == 1
+    assert list(metadata.fmha_plan_caches) == [
+        block_sparse_fmha.PrimsTSBlockSparseFmha.PLAN_CACHE_KEY
+    ]
 
-    cache_state = {}
-    first.bind_plan_cache(cache_state)
-    second.bind_plan_cache(cache_state)
-
-    assert first._contiguous_wrappers is second._contiguous_wrappers
-    assert first._paged_wrappers is second._paged_wrappers
-    assert cache_state == {
-        "contiguous_wrappers": {},
-        "paged_wrappers": {},
-    }
+    other_metadata = SimpleNamespace(**{**vars(metadata), "fmha_plan_caches": {}})
+    second._forward_contiguous(q, k, v, other_metadata, args)
+    assert factory.call_count == 2
 
 
 def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch) -> None:
@@ -541,6 +545,7 @@ def test_prepare_workspace_checks_capture_before_resize(monkeypatch) -> None:
         max_num_requests=2,
         tokens_per_block=64,
         num_generations=2,
+        fmha_plan_caches={},
     )
     workspace = torch.empty(0, dtype=torch.uint8)
     monkeypatch.setattr(
@@ -654,6 +659,7 @@ def test_real_gpu_proxy_adapter_replays_live_routes_and_summaries() -> None:
         is_cross=False,
         kv_cache_manager=None,
         seq_lens=torch.tensor([64], dtype=torch.int32),
+        fmha_plan_caches={},
     )
     flat_q, flat_k, flat_v = (tensor.flatten(0, 2) for tensor in (q, k, v))
 
