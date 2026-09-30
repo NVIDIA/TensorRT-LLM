@@ -82,8 +82,7 @@ pipeline filters with `awk`, a JSON record, and a terminal summary. Nothing is w
 
 Six criteria, one module each. Every expected value was derived from the production decorators
 before the plugin was run, so a test states a command line and the answer expected back — what
-the plugin decides, and how to drive it. The criteria in full, with those derivations, are in
-`openspec/changes/pytest-plugin-test/`.
+the plugin decides, and how to drive it.
 
 ```bash
 pytest tests/qa_selection/tests      # 29 tests, no GPU, no container, no wheel

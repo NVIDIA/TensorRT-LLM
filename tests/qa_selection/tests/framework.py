@@ -100,7 +100,7 @@ class SelectionRun:
             if rung is None
             else self.RUNG_IDS.format(machine=self.machine, rung=rung)
         )
-        return self.artifact(name).read_text().splitlines()
+        return self.artifact(name).read_text(encoding="utf-8").splitlines()
 
     @property
     def written(self) -> List[str]:
