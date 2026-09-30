@@ -40,10 +40,7 @@ GPU_LEVEL: Final[CacheLevel]
 CACHE_LEVEL1: Final[CacheLevel]
 
 class CorruptedError(Exception):
-    """Raised by every public entry point once a broken invariant has been recorded.
-
-    Only the C++ backend has the latch that raises this; the pure-Python backend never does.
-    """
+    """Raised by every public entry point once a broken invariant has been recorded."""
 
 class CuError(Exception):
     """A CUDA driver call failed; carries the driver's own status code."""
@@ -371,7 +368,7 @@ class KVCacheEventManager:
     def flush_iteration_events(self) -> None: ...
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]: ...
 
-# Backend-neutral key builders (native C++ under the C++ backend, pure-Python otherwise).
+# Native key builders, shared with the radix tree so routing hashes match the engine's.
 def gen_multimodal_cache_key_tokens(
     id_offset: int,
     multi_modal_data_digest: bytes,
@@ -587,7 +584,6 @@ class KVCacheManager:
         self,
         config: KVCacheManagerConfig,
         event_manager: KVCacheEventManager | None = None,
-        # C++ backend only; the pure-Python backend does not accept this parameter.
         cold_page_codec: IKvCacheColdPageCodec | None = None,
     ) -> None: ...
     def __del__(self) -> None: ...
