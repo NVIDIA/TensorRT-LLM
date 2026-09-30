@@ -514,18 +514,14 @@ class BaseLLM:
         """Capture optional startup context without affecting model construction."""
         try:
             from tensorrt_llm.usage import record_llm_initialization_attempt
-            from tensorrt_llm.usage.usage_lib import (_capture_startup_context,
-                                                      _mark_llm_startup)
+            from tensorrt_llm.usage.usage_lib import _capture_startup_context
 
             args = context.get("llm_args")
-            if (args is not None and hasattr(self, "_usage_startup_token")
+            if (args is not None and hasattr(self, "_usage_attempt_tracked")
                     and not self._usage_attempt_tracked):
                 self._usage_attempt_tracked = record_llm_initialization_attempt(
                     args.telemetry_config)
-                if self._usage_attempt_tracked:
-                    _mark_llm_startup(self._usage_startup_token)
-            _capture_startup_context(
-                getattr(self, "_usage_startup_token", None), **context)
+            _capture_startup_context(**context)
         except Exception as exc:
             logger.debug("Usage telemetry startup capture failed: %s", exc)
 
@@ -1860,7 +1856,6 @@ class _TorchLLM(BaseLLM):
 
         backend = kwargs.pop("backend", "pytorch")
 
-        self._usage_startup_token = object()
         if self._usage_attempt_tracked:
             self._capture_usage_startup(
                 requested=dict(kwargs,

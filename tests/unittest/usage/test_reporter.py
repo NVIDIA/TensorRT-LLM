@@ -66,13 +66,11 @@ def test_startup_context_is_correlated_and_conservative(
     usage_lib.apply_usage_session_config(
         default_usage_context="cli_serve", lifecycle_phase="config_validation"
     )
-    token = object()
     if not attempts:
         usage_lib._mark_llm_startup()
     for _ in range(attempts):
         usage_lib.record_llm_initialization_attempt()
     usage_lib._capture_startup_context(
-        token,
         requested={
             "backend": "pytorch",
             "tensor_parallel_size": 2,
@@ -156,15 +154,10 @@ def test_startup_context_capture_does_not_enable_reporting(enable_telemetry, mar
 
 
 @pytest.mark.parametrize("requested_snapshot", [False, True])
-def test_startup_context_validated_snapshot_and_stale_token(
-    monkeypatch, enable_telemetry, requested_snapshot
-):
+def test_startup_context_validated_snapshot(enable_telemetry, requested_snapshot):
     usage_lib.record_llm_initialization_attempt()
-    token = object()
     if requested_snapshot:
-        usage_lib._capture_startup_context(token, requested={"backend": "pytorch"})
-    else:
-        usage_lib._mark_llm_startup(token)
+        usage_lib._capture_startup_context(requested={"backend": "pytorch"})
 
     class Args(BaseModel):
         backend: Literal["pytorch"] = "pytorch"
@@ -172,10 +165,7 @@ def test_startup_context_validated_snapshot_and_stale_token(
         model: str = "/home/private/model"
 
     args = Args()
-    usage_lib._capture_startup_context(token, llm_args=args)
-    usage_lib._capture_startup_context(
-        object(), pretrained_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
-    )
+    usage_lib._capture_startup_context(llm_args=args)
     fields = usage_lib._SESSION.startup_context
     assert fields["dtype"] == "float16"
     assert json.loads(fields["llmApiConfigJson"]) == {"backend": "pytorch", "dtype": "float16"}
@@ -184,9 +174,32 @@ def test_startup_context_validated_snapshot_and_stale_token(
     assert json.loads(fields["llmApiConfigMetaJson"])["source"] == "validated_pre_initialization"
     assert "architectureClassName" not in fields
     usage_lib._capture_startup_context(
-        token, pretrained_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+        pretrained_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
     )
     assert fields["architectureClassName"] == "LlamaForCausalLM"
+
+
+@pytest.mark.parametrize("stop", ["second_attempt", "initialized", "terminal", "disabled"])
+def test_startup_context_rejects_late_capture(monkeypatch, enable_telemetry, stop):
+    usage_lib.record_llm_initialization_attempt()
+    usage_lib._capture_startup_context(requested={"backend": "pytorch"})
+    session = usage_lib._SESSION
+
+    def collect_architecture(config):
+        if stop == "second_attempt":
+            session.record_llm_initialization_attempt()
+        elif stop == "initialized":
+            session.record_llm_initialized()
+        elif stop == "terminal":
+            session.claim_terminal(usage_lib.TerminalOutcome("exception"))
+        else:
+            session.disable()
+        return "LlamaForCausalLM", ""
+
+    monkeypatch.setattr(usage_lib, "_architecture_telemetry_fields", collect_architecture)
+    usage_lib._capture_startup_context(pretrained_config=object())
+    usage_lib._capture_startup_context(requested={"backend": "tensorrt"})
+    assert session.startup_context == ({} if stop == "second_attempt" else {"backend": "pytorch"})
 
 
 @pytest.fixture
