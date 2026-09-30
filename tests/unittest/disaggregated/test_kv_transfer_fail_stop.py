@@ -201,6 +201,71 @@ def test_deadline_hard_kill_bypasses_blocking_diagnostic_helpers(
     log.assert_not_called()
 
 
+@pytest.mark.parametrize("exposure", ["never_exposed", "settled_before_grace", "unresolved"])
+def test_peer_loss_fails_closed_only_for_unsettled_exposure(exposure: str) -> None:
+    """Peer loss is not a broadcast kill; each world evaluates its own claims.
+
+    This tests containment decisions, not NIXL/RDMA revocation or the launcher's
+    physical blast radius. The existing communicator test covers kill dispatch.
+    """
+    now = [10.0]
+    contain = Mock()
+    unaffected_contain = Mock()
+    watchdog = RetirementWatchdog(contain, clock=lambda: now[0])
+    unaffected = RetirementWatchdog(unaffected_contain, clock=lambda: now[0])
+    owner = watchdog.create_owner(12, "receive", 1.0)
+    operation = object()
+    if exposure != "never_exposed":
+        assert owner.expose(operation)
+    owner.request_drain("peer lost")
+    assert not owner.expose(object())
+
+    now[0] = 10.5
+    watchdog.progress()
+    contain.assert_not_called()
+    if exposure == "settled_before_grace":
+        assert owner.settle(operation)
+        assert owner.settle(operation)  # Repeated safe evidence is idempotent.
+        assert owner.can_retire()
+    elif exposure == "unresolved":
+        assert not owner.can_retire()
+
+    # The same peer-loss trigger has a different result only when this world's
+    # own exposed claim is still unproven at its fixed grace deadline.
+    now[0] = 11.0
+    watchdog.progress()
+    watchdog.progress()
+    if exposure == "unresolved":
+        contain.assert_called_once_with(watchdog.fatal)
+        assert watchdog.fatal is not None
+        assert watchdog.fatal.reason == "peer lost"
+        assert not owner.settle(operation)
+        assert not owner.can_retire()
+        assert not owner.close()
+        with pytest.raises(RuntimeError, match="admission is closed"):
+            watchdog.create_owner(13, "receive", 1.0)
+        with pytest.raises(RuntimeError, match="retained owners"):
+            watchdog.stop()
+    else:
+        contain.assert_not_called()
+        assert watchdog.fatal is None
+        assert owner.can_retire()
+        assert owner.close()
+        assert owner.close()
+        assert watchdog.create_owner(13, "receive", 1.0).close()
+        watchdog.stop()
+
+    # An independent world with no unresolved exposure remains usable. It could
+    # fail later only if one of its own transfers acquires an unproven claim.
+    unaffected.progress()
+    unaffected_contain.assert_not_called()
+    new_owner = unaffected.create_owner(14, "send", 1.0)
+    assert new_owner.expose(operation)
+    assert new_owner.settle(operation)
+    assert new_owner.close()
+    unaffected.stop()
+
+
 @pytest.mark.parametrize("kill_raises", [False, True])
 def test_failed_termination_cannot_reopen_admission_or_retire_roots(
     monkeypatch: pytest.MonkeyPatch, kill_raises: bool
