@@ -20,21 +20,12 @@ when head already contains target. It asks CodeRabbit to distinguish cross-branc
 interactions from PR-local compatibility defects and to verify how both sides'
 edits combine. An alleged caller/definition mismatch must remain after three-way
 merge analysis before it can support FAIL. Unresolved relevant
-textual conflicts must not be replaced with an assumed resolution. Assess
-unaffected code regions independently even within a conflicted file; a possible
-future repair does not invalidate an established defect. Independent operations
-added by both branches must also work together, including outside conflict hunks.
+textual conflicts must not be replaced with an assumed resolution.
 
 FAIL needs a supported trigger, a reachable failure path and evidence that paired
 edits, feature gates or recovery logic do not prevent the problem. Unrelated
 pre-existing defects, missing tests alone and wording-only improvements do not
-support FAIL. Intentional rejection of unmet prerequisites needs evidence of a
-broken supported contract before it supports FAIL. Resource-exhaustion findings
-compare baseline and combined demand, capacity and recovery, quantifying them
-where available. Source evidence of a reachable failure can support FAIL without
-runtime reproduction. A specific risk whose capacity or recovery remains
-materially unresolved belongs under INCONCLUSIVE, with the missing evidence
-stated; lack of that evidence does not establish PASS. Each reply must
+support FAIL. Missing material evidence supports INCONCLUSIVE. Each reply must
 include the advisory notice and put its fixed-revision citations inside the
 `SEMANTIC_REVIEW` section. These are instructions to the AI, not guarantees of
 its compliance or semantic accuracy.
