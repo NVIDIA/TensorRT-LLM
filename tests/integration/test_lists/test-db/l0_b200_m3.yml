@@ -20,7 +20,7 @@ l0_b200_m3:
   - unittest/_torch/attention/sparse/test_minimax_m3_sparse_attn_decode.py
   - unittest/_torch/executor/test_kv_cache_v2_scheduler.py
   - unittest/_torch/executor/test_mooncake_store_connector.py
-  - unittest/_torch/executor/test_mooncake_store_donor.py
+  - unittest/_torch/executor/test_mooncake_store_ledger.py
   - unittest/_torch/executor/test_mooncake_store_master.py
   - unittest/_torch/executor/test_seq_slot_sizing.py
   - unittest/_torch/models/test_minimax_m3.py

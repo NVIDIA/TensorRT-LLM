@@ -108,7 +108,7 @@ class BlockHashChain:
 class KeyNamespace:
     """The part of a store key that is fixed for one shard and layer group."""
 
-    cache_prefix: str
+    namespace: str
     model_key: str
     #: Attention shard rank and count. Under ADP all owners use rank 0 of 1,
     #: since each holds complete attention KV. TP keeps distinct shard keys:
@@ -123,7 +123,7 @@ class KeyNamespace:
     def prefix(self) -> str:
         """The literal string every key in this namespace starts with."""
         return (
-            f"{self.cache_prefix}/{self.model_key}"
+            f"{self.namespace}/{self.model_key}"
             f"/w{self.world_size}r{self.rank}"
             f"/lg{self.layer_group_id}"
             f"/t{self.tokens_per_block}b{self.bytes_per_page}"

@@ -807,6 +807,18 @@
       "path": "kv_connector_config.connector"
     },
     {
+      "allowed_values": [
+        "both",
+        "producer",
+        "consumer",
+        "capacity"
+      ],
+      "annotation": "Literal['both', 'producer', 'consumer', 'capacity']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_connector_config.mooncake_store.role"
+    },
+    {
       "allowed_values": [],
       "annotation": "Optional[List[int]]",
       "converter": "",
