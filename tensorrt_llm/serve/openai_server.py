@@ -3135,11 +3135,15 @@ class OpenAIServer(_VideoRoutesMixin):
         """Serve one /v1/responses request, streaming or not.
 
         ``parallel_tool_calls`` and, on the non-Harmony path, ``tool_choice``
-        are accepted for schema compatibility but not enforced: honouring
-        them would mean constraining or truncating what the model generated,
-        and these turns are recorded as training data, where a falsified
-        output is worse than an unconstrained one. A once-per-process warning
-        below says so instead of silently swallowing the option.
+        values other than "auto" and "none" are accepted for schema
+        compatibility but not enforced: honouring them would mean constraining
+        or truncating what the model generated, and these turns are recorded
+        as training data, where a falsified output is worse than an
+        unconstrained one. A once-per-process warning below says so instead
+        of silently swallowing the option. ``tool_choice="none"`` is the
+        exception because it can be honoured losslessly - the tool parser is
+        bypassed and any call markup stays in the visible text verbatim (see
+        responses_utils._effective_tool_parser).
         """
 
         async def create_response(
@@ -3241,11 +3245,14 @@ class OpenAIServer(_VideoRoutesMixin):
                     "but not enforced; the model may still emit several tool "
                     "calls in one turn.",
                     key="responses_parallel_tool_calls_unenforced")
-            if not self.use_harmony and request.tool_choice != "auto":
+            # "none" is excluded: it is honoured by bypassing the tool parser
+            # (responses_utils._effective_tool_parser), which loses nothing.
+            if not self.use_harmony and request.tool_choice not in ("auto",
+                                                                    "none"):
                 logger.warning_once(
-                    "Responses API: 'tool_choice' is accepted but not "
-                    "enforced on this model path; generation is not "
-                    "constrained by it.",
+                    "Responses API: 'tool_choice' values other than 'auto' "
+                    "and 'none' are accepted but not enforced on this model "
+                    "path; generation is not constrained by them.",
                     key="responses_tool_choice_unenforced")
 
             # Get prev response

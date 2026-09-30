@@ -21,6 +21,7 @@ from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseCustomToolCall, ResponseErrorEvent,
                                     ResponseFailedEvent,
                                     ResponseFunctionToolCall,
+                                    ResponseIncompleteEvent,
                                     ResponseInProgressEvent, ResponseOutputItem,
                                     ResponseOutputItemAddedEvent,
                                     ResponseOutputItemDoneEvent,
@@ -730,10 +731,26 @@ def _item_text(item: dict) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = [
-            part.get("text") for part in content
-            if isinstance(part, dict) and part.get("text")
-        ]
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if not text and part.get("type") == "encrypted_content":
+                # The KF client serializes a sub-agent task payload inside an
+                # agent_message as a part typed `encrypted_content` whose
+                # same-named field holds the plain readable task text - the
+                # field name is historical, not a description of the value.
+                # Dropping the part delivered the task header ("Payload:")
+                # with no payload behind it; one measured request lost a
+                # 721-character task this way. Only a string is taken at face
+                # value: a non-string here really is opaque, and guessing at
+                # it would fabricate input, so those stay dropped as before.
+                value = part.get("encrypted_content")
+                if isinstance(value, str):
+                    text = value
+            if text:
+                parts.append(text)
         return "\n".join(parts)
     return item.get("text") or ""
 
@@ -868,15 +885,26 @@ def _response_output_item_to_chat_completion_message(
                 raise ValueError(
                     f"Input item of type {item_type!r} has empty or missing 'content'"
                 )
-            # Join every text part. Taking content[0] silently dropped the rest
-            # of a multi-part message.
-            parts = []
-            for part in content:
-                text = part.get("text") if isinstance(part, dict) else getattr(
-                    part, "text", None)
-                if text:
-                    parts.append(text)
-            text = "".join(parts)
+            if isinstance(content, str):
+                # The API accepts `content` as one plain string, and the
+                # untyped branch above already preserves that shape - `type`
+                # merely defaults to "message" there. Walking the string as a
+                # list of parts iterates its characters, none of which carry a
+                # `text` field, so an explicit {"type": "message", "content":
+                # "hello"} converted to an empty message while the identical
+                # item without `type` survived. The two spellings mean the
+                # same thing and must convert the same way.
+                text = content
+            else:
+                # Join every text part. Taking content[0] silently dropped the
+                # rest of a multi-part message.
+                parts = []
+                for part in content:
+                    text = part.get("text") if isinstance(
+                        part, dict) else getattr(part, "text", None)
+                    if text:
+                        parts.append(text)
+                text = "".join(parts)
             if item_type == "reasoning":
                 # Reasoning is always the assistant's.
                 return {"role": "assistant", "reasoning": text}
@@ -1555,6 +1583,26 @@ def _flush_tool_parser(
     return "".join(released), calls, unfinished
 
 
+def _effective_tool_parser(tool_parser_id: Optional[str],
+                           request) -> Optional[str]:
+    """The tool parser this request may run, honouring ``tool_choice="none"``.
+
+    "none" is the one tool_choice value that can be enforced without
+    falsifying anything the model generated: not parsing leaves any tool-call
+    markup in the visible text verbatim, so nothing is truncated or invented -
+    where "required" or a named function would need sampling-level
+    constraints, which this path does not apply. Both the streaming event
+    generator and the final rebuild resolve their parser through here, because
+    the two views of one generation must agree on whether a call exists.
+
+    Read with getattr for the same reason reasoning_chat_template_kwargs
+    does: unit tests drive the event generator with stand-in request objects.
+    """
+    if getattr(request, "tool_choice", None) == "none":
+        return None
+    return tool_parser_id
+
+
 def _apply_tool_parser(
     tool_parser_id: Optional[str],
     tools: Optional[list[Tool]],
@@ -1595,7 +1643,7 @@ def _create_output_content(
     tool_parser: Optional[str] = None,
     tools: Optional[list[Tool]] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
-    streamed_tool_call_ids: Optional[list[Tuple[str, str]]] = None,
+    streamed_tool_call_ids: Optional[list[Optional[Tuple[str, str]]]] = None,
     streamed_item_ids: Optional[list[Tuple[str, str]]] = None,
 ) -> Tuple[list[ResponseOutputItem], list[ChatCompletionMessageParam],
            list[str]]:
@@ -1706,22 +1754,46 @@ def _create_output_content(
 
         if calls:
             tool_resolution = _tool_resolution(tools)
-            # Reuse the ids the streaming path already published, positionally:
-            # both passes enumerate the same parsed calls in the same order.
-            # Running out means this pass found calls the stream never emitted
-            # (a cut-off stream, say); those get fresh ids, and the mismatch is
-            # said out loud rather than silently producing ids the client has
-            # no way to match.
+            # Reuse the ids the streaming path already published. The stream's
+            # record holds one entry per call the parser announced, in
+            # announcement order - None where assembly dropped the call for
+            # invalid-JSON arguments - and this pass enumerates the same
+            # markup in the same order, so when the counts agree each call is
+            # paired with its own entity's entry. Pairing over the *filtered*
+            # list instead is how a dropped call A used to donate its position:
+            # the whole-text parse still reports A (with empty arguments), A
+            # consumed the id the stream had published for B, and B's identity
+            # in the snapshot matched nothing the client had seen.
             reusable = list(streamed_tool_call_ids or [])
-            if reusable and len(reusable) != len(calls):
+            entity_aligned = len(reusable) == len(calls)
+            if reusable and not entity_aligned:
+                # Counts disagreeing means the two passes did not see the same
+                # calls (a cut-off stream, say), so per-entity pairing is
+                # unknowable. Say so, then fall back to reusing the ids that
+                # actually reached the wire, in order; placeholders name no
+                # wire identity and are worth nothing to a client.
                 logger.warning(
-                    "final response rebuilt %d tool call(s) but %d were "
-                    "streamed; ids beyond the streamed ones are new and will "
+                    "final response rebuilt %d tool call(s) but the stream "
+                    "saw %d; ids beyond the streamed ones are new and will "
                     "not match the client's tool outputs", len(calls),
                     len(reusable))
+                reusable = [ids for ids in reusable if ids is not None]
             tool_calls_item = []
             for index, call in enumerate(calls):
                 ids = reusable[index] if index < len(reusable) else (None, None)
+                if entity_aligned and ids is None:
+                    # This entity is the call the stream dropped: its
+                    # arguments never assembled into valid JSON and no id was
+                    # published for it. The snapshot must describe the stream,
+                    # so it is not delivered here either - the placeholder is
+                    # consumed by the drop instead of shifting onto the next
+                    # call.
+                    logger.warning(
+                        "final response drops the tool call to %r: the stream "
+                        "assembled its arguments into invalid JSON and never "
+                        "delivered it, so the snapshot does not deliver it "
+                        "either", call.name)
+                    continue
                 tool_calls_item.append(
                     _tool_call_output_item(call,
                                            tool_resolution,
@@ -2044,7 +2116,7 @@ def _create_response(
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
-    streamed_tool_call_ids: Optional[list[Tuple[str, str]]] = None,
+    streamed_tool_call_ids: Optional[list[Optional[Tuple[str, str]]]] = None,
     streamed_item_ids: Optional[list[Tuple[str, str]]] = None,
     tokenizer: Optional[TokenizerBase] = None,
 ) -> tuple[ResponsesResponse, list[Message | ChatCompletionMessageParam]]:
@@ -2067,7 +2139,9 @@ def _create_response(
         output_content, output_messages, reasoning_texts = _create_output_content(
             final_res,
             reasoning_parser,
-            tool_parser,
+            # tool_choice="none" bypasses the parser here exactly as the
+            # streaming events do, so both views keep the markup as text.
+            _effective_tool_parser(tool_parser, request),
             request.tools,
             chat_template_kwargs=reasoning_chat_template_kwargs(request),
             streamed_tool_call_ids=streamed_tool_call_ids,
@@ -2120,7 +2194,7 @@ async def create_response(
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
-    streamed_tool_call_ids: Optional[list[Tuple[str, str]]] = None,
+    streamed_tool_call_ids: Optional[list[Optional[Tuple[str, str]]]] = None,
     streamed_item_ids: Optional[list[Tuple[str, str]]] = None,
     tokenizer: Optional[TokenizerBase] = None,
 ) -> ResponsesResponse:
@@ -2172,7 +2246,7 @@ def create_response_non_store(
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
-    streamed_tool_call_ids: Optional[list[Tuple[str, str]]] = None,
+    streamed_tool_call_ids: Optional[list[Optional[Tuple[str, str]]]] = None,
     streamed_item_ids: Optional[list[Tuple[str, str]]] = None,
     tokenizer: Optional[TokenizerBase] = None,
 ) -> ResponsesResponse:
@@ -2234,8 +2308,15 @@ class ResponsesStreamingStateTracker:
         # echo the streamed id, match nothing. Measured before the fix: 671 of
         # 671 calls across three campaigns.
         #
+        # One entry per call the parser announced, in announcement order: None
+        # holds the place of a call that was assembled but dropped for
+        # invalid-JSON arguments. The rebuild enumerates the same markup in
+        # the same order, so the placeholder is what lets a drop consume its
+        # own position instead of shifting the streamed identities onto the
+        # calls behind it.
+        #
         # A list here rather than a class attribute, for the reason above.
-        self.emitted_tool_call_ids: list[Tuple[str, str]] = []
+        self.emitted_tool_call_ids: list[Optional[Tuple[str, str]]] = []
 
         # (item type, item id) of every reasoning and message item this
         # stream opened, in the order their `output_item.added` went out.
@@ -2276,8 +2357,12 @@ class ResponsesStreamingEventsHelper:
         self.state_tracker.emitted_tool_calls = count
 
     @property
-    def emitted_tool_call_ids(self) -> list[Tuple[str, str]]:
-        """(item id, call id) of the tool calls already streamed, in order."""
+    def emitted_tool_call_ids(self) -> list[Optional[Tuple[str, str]]]:
+        """(item id, call id) of the tool calls already streamed, in order.
+
+        None entries hold the place of calls the stream assembled and then
+        dropped for invalid-JSON arguments; see the state tracker.
+        """
         return self.state_tracker.emitted_tool_call_ids
 
     @property
@@ -2293,6 +2378,18 @@ class ResponsesStreamingEventsHelper:
         way instead of minting new ids the client has never seen.
         """
         self.state_tracker.emitted_tool_call_ids.append((item.id, item.call_id))
+
+    def record_dropped_tool_call(self) -> None:
+        """Hold a dropped call's place in the emission record.
+
+        A call whose assembled arguments were invalid JSON is never streamed,
+        but the final rebuild's whole-text parse still reports the entity (the
+        markup is well-formed; only the arguments are unusable). Recording the
+        drop keeps the record aligned with the parser's announcement order, so
+        in the rebuild the drop consumes its own position instead of handing
+        the next call an identity the stream published for a different one.
+        """
+        self.state_tracker.emitted_tool_call_ids.append(None)
 
     def append_text(self, delta: str) -> None:
         self.state_tracker.text_buffer += delta
@@ -2534,11 +2631,18 @@ def _accumulate_tool_call_fragments(fragments: dict[int, dict[str, Any]],
 
     Keyed by the parser's own `tool_index`, which numbers the calls in the
     order it saw them start; a dict preserves that order.
+
+    The call id is minted when the parser first announces the call - before
+    anyone can know whether its arguments will assemble into something
+    deliverable - so the identity belongs to the call entity itself. A call
+    that is later dropped dies holding its own id instead of donating it to
+    the next call in line, which is the positional swap this prevents.
     """
     for call in calls:
         fragment = fragments.setdefault(call.tool_index, {
             "name": None,
             "parameters": "",
+            "call_id": f"call_{_random_uuid()}",
         })
         # Only a call's first fragment carries the name; every later one
         # carries None, which must not erase the name already recorded.
@@ -2610,12 +2714,18 @@ def _assembled_tool_calls(
         try:
             json.loads(arguments)
         except ValueError as exc:
+            # The drop consumes the call's own id (minted when the parser
+            # announced it) and the log says which, so the retired identity
+            # is auditable and can never be mistaken for the next call's.
+            consumed = fragment.get("call_id")
+            consumed_note = (f" The drop consumes its call id {consumed!r}, "
+                             "which is retired with it." if consumed else "")
             logger.warning(
                 f"Dropping the tool call to {fragment['name']!r}: its "
                 f"arguments did not assemble into valid JSON ({exc}). The "
                 "model emitted a malformed tool call, and reporting it would "
                 "hand the client arguments it can only reject. Assembled: "
-                f"{arguments[:200]!r}")
+                f"{arguments[:200]!r}.{consumed_note}")
             continue
         calls.append(
             ToolCallItem(tool_index=tool_index,
@@ -2677,6 +2787,11 @@ def _generate_streaming_event(
     tool_parser_dict: Optional[dict[int, BaseToolParser]] = None,
 ):
     available_tools = _get_chat_completion_function_tools(request.tools)
+    # tool_choice="none" is honoured by not parsing at all, so the model's
+    # markup stays in the visible text verbatim. The final rebuild resolves
+    # its parser the same way (see _create_response); the two views of one
+    # generation must agree on whether a call exists.
+    tool_parser_id = _effective_tool_parser(tool_parser_id, request)
     output_idx = output.index
     delta_text = output.text_diff
     calls = []
@@ -2916,17 +3031,41 @@ def _generate_streaming_event(
     # Emitted after any open item has been closed, so a call item is never
     # nested inside a message item. The counter keeps emission idempotent: it
     # guarded against the old per-chunk re-parse re-reporting the same calls,
-    # and now guards against a finished output being presented twice.
+    # and now guards against a finished output being presented twice. It
+    # counts the parser's announced call entities, kept or dropped, because
+    # a drop has to be accounted exactly once too.
     if finished_generation:
-        assembled_calls = _assembled_tool_calls(call_fragments,
-                                                unfinished_tool_index)
-        pending = assembled_calls[streaming_events_helper.emitted_tool_calls:]
+        entities = list(call_fragments.items())
+        pending = entities[streaming_events_helper.emitted_tool_calls:]
         if pending:
+            keep = {
+                call.tool_index: call
+                for call in _assembled_tool_calls(call_fragments,
+                                                  unfinished_tool_index)
+            }
             tool_resolution = _tool_resolution(request.tools)
-            for call in pending:
-                tool_call_item = _tool_call_output_item(call,
-                                                        tool_resolution,
-                                                        status="completed")
+            # Walked in entity order, not kept-list order: a call dropped for
+            # invalid-JSON arguments consumes its own slot in the emission
+            # record, so the final rebuild pairs each surviving call with the
+            # identity the stream actually gave it rather than the one that
+            # belonged to the call in front of it. Nameless and unfinished
+            # entities take no slot - the rebuild's whole-text re-parse does
+            # not report those as calls either, so a placeholder for them
+            # would misalign the record.
+            for tool_index, fragment in pending:
+                call = keep.get(tool_index)
+                if call is None:
+                    if (fragment.get("name")
+                            and tool_index != unfinished_tool_index):
+                        streaming_events_helper.record_dropped_tool_call()
+                    continue
+                tool_call_item = _tool_call_output_item(
+                    call,
+                    tool_resolution,
+                    status="completed",
+                    # The id minted when the parser announced this call; see
+                    # _accumulate_tool_call_fragments.
+                    call_id=fragment.get("call_id"))
                 streaming_events_helper.item_id = tool_call_item.id
                 yield streaming_events_helper.get_output_item_added_event(
                     tool_call_item)
@@ -2934,7 +3073,7 @@ def _generate_streaming_event(
                     tool_call_item)
                 streaming_events_helper.record_emitted_tool_call(tool_call_item)
                 streaming_events_helper.output_index_increment()
-            streaming_events_helper.emitted_tool_calls = len(assembled_calls)
+            streaming_events_helper.emitted_tool_calls = len(entities)
             streaming_events_helper.is_output_item_added_sent = False
 
 
@@ -3054,6 +3193,44 @@ def _generate_streaming_event_harmony(
                 parser.last_content_delta)
 
 
+def _stream_terminal_event(
+    final_response: ResponsesResponse,
+    finish_reason: Optional[str],
+    sequence_number: int = -1,
+) -> Union[ResponseCompletedEvent, ResponseIncompleteEvent]:
+    """The terminal event for a stream that ran to completion, by status.
+
+    ``finish_reason_mapping`` marks a generation the engine cut off at its
+    token budget as status "incomplete", and the terminal event used to say
+    ``response.completed`` around it - an event whose name asserts the one
+    thing its payload denies, so a client believed the truncated answer was
+    the whole one. The Responses spec pairs the status with its own terminal
+    event, ``response.incomplete``, and explains it in
+    ``incomplete_details.reason``; "length" is the token budget, spelled
+    ``max_output_tokens``, and any other cause is left unstated rather than
+    guessed at.
+
+    ``incomplete_details`` is set on the dump rather than on
+    ResponsesResponse, whose field is commented out - the same route
+    ``get_stream_failed_events`` takes for ``error``: the event re-validates
+    the dict against the SDK's Response, which does carry the field.
+    """
+    payload = final_response.model_dump()
+    if final_response.status == "incomplete":
+        if finish_reason == "length":
+            payload["incomplete_details"] = {"reason": "max_output_tokens"}
+        return ResponseIncompleteEvent(
+            type="response.incomplete",
+            sequence_number=sequence_number,
+            response=payload,
+        )
+    return ResponseCompletedEvent(
+        type="response.completed",
+        sequence_number=sequence_number,
+        response=payload,
+    )
+
+
 class ResponsesStreamingProcessor:
 
     def __init__(
@@ -3153,11 +3330,8 @@ class ResponsesStreamingProcessor:
         )
 
         return self._send_event(
-            ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=final_response.model_dump(),
-            ))
+            _stream_terminal_event(final_response,
+                                   final_res.outputs[0].finish_reason))
 
     def get_final_response_non_store(
         self,
@@ -3190,11 +3364,8 @@ class ResponsesStreamingProcessor:
         )
 
         return self._send_event(
-            ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=final_response.model_dump(),
-            ))
+            _stream_terminal_event(final_response,
+                                   final_res.outputs[0].finish_reason))
 
     def process_single_output(self, res: GenerationResult) -> list[str]:
         event_generator = None
@@ -3292,12 +3463,17 @@ STREAM_TERMINATION_ENGINE_ERROR = "engine_error"
 STREAM_TERMINATION_UPSTREAM_ERROR = "upstream_error"
 STREAM_TERMINATION_INTERNAL_ERROR = "internal_error"
 
-# The terminal event of a stream that ran to completion. Matched as a substring
+# The terminal events of a stream that ran to completion - a truncated
+# generation ends in `response.incomplete`, everything else in
+# `response.completed` (see _stream_terminal_event). Matched as substrings
 # because a relayed stream arrives as transport-sized chunks that may carry
 # several events, not as one frame per event. Kept in both encodings so the
 # scan never has to decode a relayed chunk just to look at it.
 _COMPLETED_EVENT_MARKER = "event: response.completed"
-_COMPLETED_EVENT_MARKER_BYTES = _COMPLETED_EVENT_MARKER.encode("utf-8")
+_INCOMPLETE_EVENT_MARKER = "event: response.incomplete"
+_TERMINAL_EVENT_MARKERS = (_COMPLETED_EVENT_MARKER, _INCOMPLETE_EVENT_MARKER)
+_TERMINAL_EVENT_MARKERS_BYTES = tuple(
+    marker.encode("utf-8") for marker in _TERMINAL_EVENT_MARKERS)
 
 _SSE_EVENT_DELIMITER = "\n\n"
 _SSE_EVENT_DELIMITER_BYTES = _SSE_EVENT_DELIMITER.encode("utf-8")
@@ -3419,11 +3595,12 @@ async def guard_responses_stream(
     Without this such a stream simply ends: the generator raises, the ASGI
     server abandons a half-written chunked body, and nothing in the bytes
     distinguishes that from a stream still in flight. Everything the turn
-    produced survives only as deltas, because ``response.completed`` is the one
-    event that repeats the full text.
+    produced survives only as deltas, because only the terminal event repeats
+    the full text.
 
-    Frames are forwarded untouched and nothing is added once
-    ``response.completed`` has gone out, so a stream that completes normally is
+    Frames are forwarded untouched and nothing is added once a terminal event
+    (``response.completed``, or ``response.incomplete`` for a truncated
+    generation) has gone out, so a stream that completes normally is
     byte-for-byte what it was.
 
     The two abnormal endings are handled differently on purpose:
@@ -3445,9 +3622,9 @@ async def guard_responses_stream(
             if not completed:
                 frames, carry = _count_frames(chunk, carry)
                 events_sent += frames
-                completed = (_COMPLETED_EVENT_MARKER_BYTES in chunk
-                             if isinstance(chunk, bytes) else
-                             _COMPLETED_EVENT_MARKER in chunk)
+                markers = (_TERMINAL_EVENT_MARKERS_BYTES if isinstance(
+                    chunk, bytes) else _TERMINAL_EVENT_MARKERS)
+                completed = any(marker in chunk for marker in markers)
             yield chunk
     except (asyncio.CancelledError, GeneratorExit) as exc:
         if on_termination is not None:
@@ -3638,8 +3815,13 @@ async def responses_done_generator(
 
     Used when a request finishes without ever reaching a generation worker.
     The Responses protocol has no ``[DONE]`` sentinel - a client watches for
-    ``response.completed`` - so emitting the completions-style terminator here
+    a terminal event - so emitting the completions-style terminator here
     would leave a streaming client waiting for an event that never arrives.
+
+    The terminal event is chosen by the response's status, like every other
+    completed stream (_stream_terminal_event): a replayed response that was
+    cut off at its token budget must end in ``response.incomplete``, not in a
+    ``response.completed`` that contradicts the status it carries.
     """
     payload = response.model_dump()
     yield _sse_event(
@@ -3654,12 +3836,12 @@ async def responses_done_generator(
             response=payload,
             sequence_number=1,
         ))
+    # finish_reason is carried on context-only responses, which is the only
+    # kind this generator replays; None simply leaves the reason unstated.
     yield _sse_event(
-        ResponseCompletedEvent(
-            type="response.completed",
-            response=payload,
-            sequence_number=2,
-        ))
+        _stream_terminal_event(response,
+                               response.finish_reason,
+                               sequence_number=2))
 
 
 UCompletionResponseOrGenerator = Union[UCompletionResponse,

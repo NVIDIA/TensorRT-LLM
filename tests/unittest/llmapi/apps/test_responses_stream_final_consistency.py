@@ -45,6 +45,7 @@ from tensorrt_llm.serve.responses_utils import (
     _create_output_content,
     stamp_sse_sequence_number,
 )
+from tensorrt_llm.serve.tool_parser.core_types import StreamingParseResult, ToolCallItem
 
 # The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
 # test in the file is deselected, which pytest reports as exit code 5 and the
@@ -69,9 +70,15 @@ def _exec_tool():
     )
 
 
-def _processor(tools=None, reasoning_parser="glm", tool_parser=None):
+def _processor(tools=None, reasoning_parser="glm", tool_parser=None, tool_choice="auto"):
     """A processor built exactly as the server builds one."""
-    request = ResponsesRequest(model="test-model", input="hi", stream=True, tools=list(tools or []))
+    request = ResponsesRequest(
+        model="test-model",
+        input="hi",
+        stream=True,
+        tools=list(tools or []),
+        tool_choice=tool_choice,
+    )
     return ResponsesStreamingProcessor(
         request=request,
         sampling_params=request.to_sampling_params(),
@@ -392,3 +399,189 @@ def test_the_unterminated_fragment_keeps_the_streamed_ids_it_can():
     assert (final[0]["type"], final[0]["id"]) == streamed[0]
     assert (final[1]["type"], final[1]["id"]) == streamed[1]
     assert mock_logger.warning.called
+
+
+# ---------------------------------------------------------------------------
+# A dropped call must not donate its streamed identity to the next call
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedToolParser:
+    """A parser whose verdicts this test controls.
+
+    The identity plumbing under test is parser-agnostic; what matters is the
+    exact disagreement GLM-4.7 produces for an `<arg_value>` that never closes
+    (test_tool_parsers.py, "the non-streaming path is unchanged"): the
+    streaming pass assembles a first call whose arguments are invalid JSON -
+    which `_assembled_tool_calls` drops - and a second, valid one, while the
+    whole-text pass reports *both*, the first with empty arguments. Scripting
+    that shape pins the test to the disagreement itself rather than to one
+    parser's markup dialect.
+    """
+
+    def __init__(self):
+        self._buffer = ""
+        self._reported = False
+        self.current_tool_name_sent = False
+
+    def parse_streaming_increment(self, text, tools):
+        if self._reported or not text:
+            return StreamingParseResult(normal_text=text, calls=[])
+        self._reported = True
+        return StreamingParseResult(
+            normal_text="Run them. ",
+            calls=[
+                ToolCallItem(tool_index=0, name="exec", parameters='{"cmd": }'),
+                ToolCallItem(tool_index=1, name="exec", parameters='{"cmd": "ls"}'),
+            ],
+        )
+
+    def finish(self, tools):
+        return StreamingParseResult()
+
+    def has_tool_call(self, text):
+        return False
+
+    def detect_and_parse(self, text, tools):
+        return StreamingParseResult(
+            normal_text="Run them. ",
+            calls=[
+                ToolCallItem(tool_index=0, name="exec", parameters="{}"),
+                ToolCallItem(tool_index=1, name="exec", parameters='{"cmd": "ls"}'),
+            ],
+        )
+
+
+def _function_call_items(output):
+    return [item for item in output if item["type"] == "function_call"]
+
+
+def test_a_dropped_call_does_not_donate_its_identity_to_the_next_one():
+    """Two calls parsed, the first one's arguments invalid JSON.
+
+    The stream delivers only the second call. The final rebuild's whole-text
+    parse still reports both - the first with empty arguments - and pairing
+    the streamed ids positionally over the *filtered* list handed the first
+    call the identity the stream had published for the second; the client's
+    tool output, keyed on that call_id, then answered a call with different
+    arguments. The record now holds one entry per announced call, a drop
+    consumes its own slot (and logs the id it retired), and the final response
+    both drops what the stream dropped and names the survivor what the stream
+    named it.
+    """
+    processor = _processor(tools=[_exec_tool()], reasoning_parser=None, tool_parser="scripted")
+    with (
+        patch(
+            "tensorrt_llm.serve.responses_utils.ToolParserFactory.create_tool_parser",
+            side_effect=lambda _parser_id: _ScriptedToolParser(),
+        ),
+        patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger,
+    ):
+        frames, result = _stream(processor, ["Run them. <two calls>"])
+        streamed_calls = [
+            data["item"]
+            for data in map(_event_data, frames)
+            if data.get("type") == "response.output_item.done"
+            and data["item"]["type"] == "function_call"
+        ]
+        # The stream refused the malformed call, and the drop named the id it
+        # consumed - which is the dropped call's own, not the survivor's.
+        assert [json.loads(c["arguments"]) for c in streamed_calls] == [{"cmd": "ls"}]
+        drop_warnings = [
+            str(call.args[0])
+            for call in mock_logger.warning.call_args_list
+            if "valid JSON" in str(call.args[0])
+        ]
+        assert len(drop_warnings) == 1
+        assert "call_" in drop_warnings[0]
+        assert streamed_calls[0]["call_id"] not in drop_warnings[0]
+
+        final_calls = _function_call_items(_final_output(processor, result))
+
+        # The two views agree on membership, so no structural-divergence
+        # warning fires; the rebuild-side drop is said out loud instead.
+        warnings = [str(call.args[0]) for call in mock_logger.warning.call_args_list]
+        assert not any("the stream saw" in text for text in warnings)
+        assert any("drops the tool call" in text for text in warnings)
+
+    # The final view matches the stream: one call, carrying the identity the
+    # stream published for *it* - not one shifted off the rejected call.
+    assert [(c["id"], c["call_id"]) for c in final_calls] == [
+        (streamed_calls[0]["id"], streamed_calls[0]["call_id"])
+    ]
+    assert json.loads(final_calls[0]["arguments"]) == {"cmd": "ls"}
+
+
+# ---------------------------------------------------------------------------
+# tool_choice="none": no call anywhere, the markup stays as text everywhere
+# ---------------------------------------------------------------------------
+
+_WHOLE_CALL = "<tool_call>exec<arg_key>input</arg_key><arg_value>ls</arg_value></tool_call>"
+
+
+def test_tool_choice_none_keeps_the_markup_as_text_in_both_views():
+    """tool_choice="none" is enforced by not parsing, which loses nothing.
+
+    The model's markup stays in the visible text verbatim - stream and
+    snapshot alike, or the two views would disagree about whether a call
+    exists - and neither view reports a tool call item. The other tool_choice
+    values stay unenforced (honouring them needs sampling-level constraints);
+    "none" is the one value where enforcement is lossless.
+    """
+    processor = _processor(
+        tools=[_exec_tool()],
+        reasoning_parser="glm47",
+        tool_parser="glm47",
+        tool_choice="none",
+    )
+    frames, result = _stream(processor, ["Plan it.", "</think>Calling: ", _WHOLE_CALL])
+
+    assert all(item_type != "function_call" for item_type, _ in _streamed_items(frames))
+    streamed_text = "".join(_message_texts(frames))
+    assert streamed_text == "Calling: " + _WHOLE_CALL
+
+    final = _final_output(processor, result)
+    assert [item["type"] for item in final] == ["reasoning", "message"]
+    assert final[1]["content"][0]["text"] == streamed_text
+
+
+# ---------------------------------------------------------------------------
+# A truncated generation must end in a terminal that agrees with itself
+# ---------------------------------------------------------------------------
+
+
+def test_a_max_token_truncated_stream_ends_with_a_consistent_terminal():
+    """Status, terminal event and incomplete_details must tell one story.
+
+    finish_reason="length" maps to status "incomplete", and the terminal
+    event used to say `response.completed` around it - an event whose name
+    asserts the one thing its payload denies, so a client believed the
+    truncated answer was the whole one. The spec-correct pairing:
+    `response.incomplete`, status "incomplete", and
+    incomplete_details.reason naming the token budget.
+    """
+    processor = _processor(reasoning_parser=None)
+    result = _generation_chunk("Partial answer", "Partial answer", True)
+    result.outputs[0].finish_reason = "length"
+    frames = processor.process_single_output(result)
+    assert all(_event_data(f).get("type") != "response.completed" for f in frames)
+
+    frame = processor.get_final_response_non_store(result)
+    assert _event_type(frame) == "response.incomplete"
+    payload = _event_data(frame)
+    assert payload["type"] == "response.incomplete"
+    assert payload["response"]["status"] == "incomplete"
+    assert payload["response"]["incomplete_details"] == {"reason": "max_output_tokens"}
+    # The truncated text itself still ships in the snapshot.
+    messages = [i for i in payload["response"]["output"] if i["type"] == "message"]
+    assert messages and messages[0]["content"][0]["text"] == "Partial answer"
+
+
+def test_a_completed_stream_still_ends_with_response_completed():
+    """The happy path is untouched: stop means completed, and no details."""
+    processor = _processor(reasoning_parser=None)
+    _frames, result = _stream(processor, ["Done."])
+
+    frame = processor.get_final_response_non_store(result)
+    assert _event_type(frame) == "response.completed"
+    assert _event_data(frame)["response"]["incomplete_details"] is None

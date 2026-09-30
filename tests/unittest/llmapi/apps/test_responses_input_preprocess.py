@@ -104,6 +104,81 @@ def test_empty_content_is_rejected():
         )
 
 
+def test_typed_and_untyped_string_content_convert_identically():
+    """The auditor's positive control: `type` must not change the meaning.
+
+    An item with a role and no `type` is EasyInputMessage, where `type`
+    *defaults* to "message" - so spelling it out is the same item. The typed
+    branch walked string content as if it were a list of parts, iterating its
+    characters and keeping none of them, so the explicit spelling converted
+    to an empty message while the implicit one survived.
+    """
+    untyped = _response_output_item_to_chat_completion_message({"role": "user", "content": "hello"})
+    typed = _response_output_item_to_chat_completion_message(
+        {"type": "message", "role": "user", "content": "hello"}
+    )
+    assert typed["content"] == "hello"
+    assert (typed["role"], typed["content"]) == (untyped["role"], untyped["content"])
+
+
+def test_a_typed_reasoning_item_accepts_string_content_too():
+    """Same shape, one branch over: the walk is shared with "message"."""
+    msg = _response_output_item_to_chat_completion_message(
+        {"type": "reasoning", "content": "thinking"}
+    )
+    assert msg == {"role": "assistant", "reasoning": "thinking"}
+
+
+def test_agent_message_keeps_the_encrypted_content_payload():
+    """The KF sub-agent task contract: readable text under a misleading name.
+
+    The client serializes a task payload as a content part typed
+    `encrypted_content` whose same-named field holds plain readable text -
+    the field name is historical. Dropping the part delivered the task header
+    with no payload behind it; one measured request lost a 721-character task
+    this way. The fixture is a real request's body.input[6], trimmed.
+    """
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "agent_message",
+            "id": "amsg_01a0",
+            "author": "/root",
+            "recipient": "/root/final3",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "Message Type: NEW_TASK\nTask name: /root/final3\nSender: /root\nPayload:\n",
+                },
+                {
+                    "type": "encrypted_content",
+                    "encrypted_content": "Write solution.json and evaluate it with cudagym.",
+                },
+            ],
+        }
+    )
+    assert msg["role"] == "user"
+    assert "Message Type: NEW_TASK" in msg["content"]
+    assert msg["content"].endswith("Write solution.json and evaluate it with cudagym.")
+
+
+def test_non_string_encrypted_content_stays_dropped():
+    """Only a string is readable by contract; anything else is truly opaque.
+
+    Guessing at a structured or binary value would fabricate input, so the
+    header survives and the opaque part is dropped, exactly as before.
+    """
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "agent_message",
+            "content": [
+                {"type": "input_text", "text": "header"},
+                {"type": "encrypted_content", "encrypted_content": {"blob": "aGk="}},
+            ],
+        }
+    )
+    assert msg == {"role": "user", "content": "header"}
+
+
 def test_function_call_output_keeps_call_id():
     msg = _response_output_item_to_chat_completion_message(
         {
@@ -566,14 +641,17 @@ def test_additional_tools_item_becomes_tools():
 def test_hoisted_tools_are_offered_to_the_template_namespaced():
     """The nested tools have to reach the prompt under qualified names.
 
-    `_namespaced_tool_names` maps a reply's call back to its namespace, so a
-    tool that never made it into `tools` would come back as an unsupported
-    call even if the model somehow guessed it.
+    `_tool_resolution` maps a reply's call back to its namespace (under both
+    the qualified and, when unambiguous, the bare spelling), so a tool that
+    never made it into `tools` would come back as an unsupported call even if
+    the model somehow guessed it. This test referenced the helper the
+    resolution map replaced (`_namespaced_tool_names`) and had been failing
+    on import since that refactor - nothing in CI ran this file.
     """
     from tensorrt_llm.serve.openai_protocol import ResponsesRequest
     from tensorrt_llm.serve.responses_utils import (
         _get_chat_completion_function_tools,
-        _namespaced_tool_names,
+        _tool_resolution,
     )
 
     request = ResponsesRequest(
@@ -607,9 +685,11 @@ def test_hoisted_tools_are_offered_to_the_template_namespaced():
 
     offered = [t.function.name for t in _get_chat_completion_function_tools(request.tools)]
     assert offered == ["collaboration.spawn_agent"]
-    assert _namespaced_tool_names(request.tools) == {
-        "collaboration.spawn_agent": ("collaboration", "spawn_agent"),
-    }
+    # Both spellings resolve: the qualified one the template offered, and the
+    # bare one the model writes back anyway (measured 247-of-281 calls).
+    resolution = _tool_resolution(request.tools)
+    assert resolution["collaboration.spawn_agent"] == ("collaboration", "spawn_agent", False)
+    assert resolution["spawn_agent"] == ("collaboration", "spawn_agent", False)
 
 
 def test_tools_already_in_the_tools_field_are_kept():
