@@ -86,6 +86,26 @@ def captured_exit_payloads(monkeypatch, enable_telemetry):
     usage_lib._PENDING_TERMINAL = None
 
 
+@pytest.mark.parametrize(
+    "command", ["throughput", "latency", "prepare-dataset", "visual-gen", "invalid"]
+)
+def test_bench_startup_context_command_scope(captured_exit_payloads, command):
+    cli = _telemetry.TelemetryGroup(
+        name="bench", telemetry_usage_context=UsageContext.CLI_BENCH, telemetry_component="llm"
+    )
+    for name in ("throughput", "latency", "prepare-dataset", "visual-gen"):
+        cli.add_command(click.Command(name))
+    with patch.object(usage_lib, "bounded_gpu_fields", return_value={}) as collect:
+        with pytest.raises(SystemExit) as exc:
+            cli.main(args=[command, "--invalid-option"])
+    assert exc.value.code == 2
+    expected = ["trtllm_exit_report"]
+    if command in ("throughput", "latency"):
+        expected.insert(0, "trtllm_initial_report")
+    assert [event["name"] for event in captured_exit_payloads[0]["events"]] == expected
+    assert collect.called is (command in ("throughput", "latency"))
+
+
 @pytest.fixture
 def terminal_mocks():
     """Provide the standard fail-silent session boundary dependencies."""

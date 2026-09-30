@@ -67,6 +67,8 @@ def test_startup_context_is_correlated_and_conservative(
         default_usage_context="cli_serve", lifecycle_phase="config_validation"
     )
     token = object()
+    if not attempts:
+        usage_lib._mark_llm_startup()
     for _ in range(attempts):
         usage_lib.record_llm_initialization_attempt()
     usage_lib._capture_startup_context(
@@ -126,7 +128,7 @@ def test_startup_context_delivery_guards(monkeypatch, enable_telemetry, case):
     usage_lib.apply_usage_session_config(
         default_usage_context="cli_serve", lifecycle_phase="config_validation"
     )
-    usage_lib._capture_startup_context(requested={})
+    usage_lib._mark_llm_startup()
     outcome = usage_lib.TerminalOutcome(
         "clean" if case == "help" else "exception",
         reporting_source="supervisor" if case == "supervisor" else "self",
@@ -140,10 +142,29 @@ def test_startup_context_delivery_guards(monkeypatch, enable_telemetry, case):
         assert len(sent[0]["events"]) == (1 if case == "supervisor" else 2)
 
 
-def test_startup_context_validated_snapshot_and_stale_token(monkeypatch, enable_telemetry):
+@pytest.mark.parametrize("mark_startup", [False, True])
+def test_startup_context_capture_does_not_enable_reporting(enable_telemetry, mark_startup):
+    usage_lib.apply_usage_session_config(lifecycle_phase="config_validation")
+    usage_lib._capture_startup_context(requested={"backend": "pytorch"})
+    if mark_startup:
+        usage_lib._mark_llm_startup()
+        usage_lib._mark_llm_startup()
+    snapshot, _ = usage_lib._SESSION.claim_terminal(usage_lib.TerminalOutcome("exception"))
+    assert ("startup_context" in snapshot) is mark_startup
+    if mark_startup:
+        assert snapshot["startup_context"] == {"backend": "pytorch"}
+
+
+@pytest.mark.parametrize("requested_snapshot", [False, True])
+def test_startup_context_validated_snapshot_and_stale_token(
+    monkeypatch, enable_telemetry, requested_snapshot
+):
     usage_lib.record_llm_initialization_attempt()
     token = object()
-    usage_lib._capture_startup_context(token, requested={"backend": "pytorch"})
+    if requested_snapshot:
+        usage_lib._capture_startup_context(token, requested={"backend": "pytorch"})
+    else:
+        usage_lib._mark_llm_startup(token)
 
     class Args(BaseModel):
         backend: Literal["pytorch"] = "pytorch"

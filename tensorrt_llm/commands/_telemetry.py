@@ -277,9 +277,9 @@ class TelemetryGroup(click.Group):
             "latency",
         ):
             try:
-                from tensorrt_llm.usage.usage_lib import _capture_startup_context
+                from tensorrt_llm.usage.usage_lib import _mark_llm_startup
 
-                _capture_startup_context(requested={})
+                _mark_llm_startup()
             except Exception:
                 pass
         return result

@@ -514,7 +514,8 @@ class BaseLLM:
         """Capture optional startup context without affecting model construction."""
         try:
             from tensorrt_llm.usage import record_llm_initialization_attempt
-            from tensorrt_llm.usage.usage_lib import _capture_startup_context
+            from tensorrt_llm.usage.usage_lib import (_capture_startup_context,
+                                                      _mark_llm_startup)
 
             args = context.get("llm_args")
             if (args is not None and hasattr(self, "_usage_startup_token")
@@ -522,8 +523,7 @@ class BaseLLM:
                 self._usage_attempt_tracked = record_llm_initialization_attempt(
                     args.telemetry_config)
                 if self._usage_attempt_tracked:
-                    _capture_startup_context(self._usage_startup_token,
-                                             requested={})
+                    _mark_llm_startup(self._usage_startup_token)
             _capture_startup_context(
                 getattr(self, "_usage_startup_token", None), **context)
         except Exception as exc:

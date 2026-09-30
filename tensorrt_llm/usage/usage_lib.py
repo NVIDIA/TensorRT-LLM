@@ -820,7 +820,8 @@ class _TelemetrySession:
         self.disabled = False
         self.initial_reported = False
         self.terminal_reported = False
-        self.startup_context: Optional[dict] = None
+        self.llm_startup = False
+        self.startup_context: dict = {}
         self.startup_token: object = None
         self.lock = threading.Lock()
         self.refresh_metadata()
@@ -876,6 +877,7 @@ class _TelemetrySession:
             if self.disabled or self.terminal_reported:
                 return False
             self.llm_initialization_attempts = self._increment(self.llm_initialization_attempts)
+            self.llm_startup = True
             # Multiple attempts cannot be attributed from a process-exit snapshot.
             self.startup_context = {}
             self.startup_token = None
@@ -985,7 +987,7 @@ class _TelemetrySession:
             if lifecycle_phase is not None:
                 snapshot["lifecyclePhase"] = lifecycle_phase
             if (
-                self.startup_context is not None
+                self.llm_startup
                 and not self.initial_reported
                 and self.llm_instances_created == 0
                 and outcome.reporting_source == "self"
@@ -1002,6 +1004,15 @@ class _TelemetrySession:
                 )
             return snapshot, outcome
 
+    def mark_llm_startup(self, token: object = None) -> None:
+        """Enable partial LLM startup reporting and optionally bind a construction token."""
+        with self.lock:
+            if self.disabled or self.terminal_reported or self.llm_instances_created:
+                return
+            self.llm_startup = True
+            if token is not None and self.llm_initialization_attempts <= 1:
+                self.startup_token = token
+
     def capture_startup(self, token: object, fields: dict, *, begin: bool) -> None:
         """Keep sanitized context only for the sole attributable construction attempt."""
         with self.lock:
@@ -1012,7 +1023,7 @@ class _TelemetrySession:
             if begin:
                 self.startup_token = token
                 self.startup_context = {}
-            if self.startup_context is not None and token is self.startup_token:
+            if token is self.startup_token:
                 self.startup_context.update(fields)
 
     def claim_initial(self) -> bool:
@@ -1324,6 +1335,11 @@ def record_llm_initialization_attempt(
 def record_llm_initialization_failure() -> None:
     """Record a handled Python exception from an LLM constructor."""
     _session_call(lambda session: session.record_llm_initialization_failure(), None)
+
+
+def _mark_llm_startup(token: object = None) -> None:
+    """Mark an existing session as an LLM startup path without collecting any data."""
+    _session_call(lambda session: session.mark_llm_startup(token), None)
 
 
 def _capture_startup_context(
