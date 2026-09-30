@@ -1346,7 +1346,7 @@ def reported_cached_tokens(request: "LlmRequest") -> int:
     report the prefix this worker reused from its own cache instead of
     transferring, which is the only reuse it can vouch for.
     """
-    if not request.is_generation_only_request():
+    if not request.is_generation_only_request:
         return request.cached_tokens
     disagg_params = getattr(request, "py_disaggregated_params", None)
     ctx_usage = getattr(disagg_params, "ctx_usage", None)

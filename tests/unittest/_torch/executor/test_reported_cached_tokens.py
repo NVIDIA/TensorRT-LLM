@@ -19,7 +19,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import reported_cached_tokens
 
 def _request(gen_only: bool, cached_tokens: int, ctx_usage=None, prepopulated_prompt_len: int = 0):
     return SimpleNamespace(
-        is_generation_only_request=lambda: gen_only,
+        is_generation_only_request=gen_only,
         cached_tokens=cached_tokens,
         prepopulated_prompt_len=prepopulated_prompt_len,
         py_disaggregated_params=SimpleNamespace(ctx_usage=ctx_usage)
