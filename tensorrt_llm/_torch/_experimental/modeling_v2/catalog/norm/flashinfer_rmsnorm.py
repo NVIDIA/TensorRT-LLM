@@ -73,7 +73,7 @@ class _FlashinferRmsnorm(OpWrapper):
     certify that path.
     """
 
-    def __call__(self, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    def raw_call(self, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
         return torch.ops.trtllm.flashinfer_rmsnorm(x, weight, eps)
 
     def reference(self, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:

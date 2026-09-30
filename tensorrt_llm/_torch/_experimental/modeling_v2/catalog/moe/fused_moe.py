@@ -81,7 +81,7 @@ class _FusedMoe(OpWrapper):
     tuner\'s behaviour, and `misc/test_autotuner.py` owns it.
     """
 
-    def __call__(
+    def raw_call(
         self,
         input: torch.Tensor,
         token_selected_experts: torch.Tensor,

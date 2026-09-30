@@ -152,7 +152,7 @@ class _Fp4BlockScaleMoeRunner(OpWrapper):
     trtllm preprocessing ops, and compares them before either reaches the op.
     """
 
-    def __call__(
+    def raw_call(
         self,
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],

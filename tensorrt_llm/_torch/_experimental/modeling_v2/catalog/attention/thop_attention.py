@@ -116,7 +116,7 @@ class _ThopAttention(OpWrapper):
     thing.
     """
 
-    def __call__(
+    def raw_call(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
