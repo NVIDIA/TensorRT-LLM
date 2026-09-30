@@ -1617,7 +1617,7 @@ def _create_generation_inputs(s: GenerationScenario) -> _GenerationInputs:
         metadata.spec_decoding_generation_lengths = torch.tensor(
             [s.query_len] * s.batch_size, dtype=torch.int32, device=device
         )
-        metadata.update_position_offsets_for_cpp(s.max_query_len)
+        metadata.spec_decoding_query_len = s.max_query_len
         metadata.spec_decoding_param_prepare_for_blackwell()
     metadata.prepare()
 

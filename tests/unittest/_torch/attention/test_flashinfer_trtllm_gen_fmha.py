@@ -21,6 +21,7 @@ from fmha_test_utils import FakeAttention
 
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
+    _get_generation_workspace_size,
 )
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -29,6 +30,48 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
+
+
+@pytest.mark.parametrize("max_num_sequences", [None, 64])
+@pytest.mark.parametrize("warmup_tokens", [1, 64])
+def test_flashinfer_workspace_covers_sequence_capacity(
+    monkeypatch: pytest.MonkeyPatch, max_num_sequences: int | None, warmup_tokens: int
+) -> None:
+    attn = FakeAttention()
+    attn.num_heads = attn.num_kv_heads = 16
+    attn.head_dim = 64
+    attn.rope_dim = 0
+    attn.quant_mode = 0
+    fmha = FlashInferTrtllmGenFmha(attn)
+    monkeypatch.setattr(fmha, "_get_multi_processor_count", lambda _: 148)
+    metadata = SimpleNamespace(
+        max_num_requests=16,
+        max_num_sequences=max_num_sequences,
+        max_context_length=1,
+        num_ctx_tokens=0,
+        is_cuda_graph=False,
+    )
+    workspace = torch.empty(0, dtype=torch.uint8)
+    q = torch.empty((warmup_tokens, 16 * 64), dtype=torch.bfloat16)
+    forward_args = AttentionForwardArgs(
+        output=torch.empty_like(q), attention_input_type=AttentionInputType.generation_only
+    )
+    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
+
+    num_sequences = max_num_sequences or metadata.max_num_requests
+    required = _get_generation_workspace_size(
+        torch.bfloat16, num_sequences, num_sequences, 16, 64, 16, 0
+    )
+    assert workspace.nbytes >= required
+
+    # Capture must reuse the allocation reserved by a smaller warmup batch.
+    q = torch.empty((num_sequences, 16 * 64), dtype=torch.bfloat16)
+    forward_args.output = torch.empty_like(q)
+    workspace_ptr = workspace.data_ptr()
+    metadata.is_cuda_graph = True
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
+    assert workspace.data_ptr() == workspace_ptr
 
 
 def test_flashinfer_fp8_mode_remains_implementation_local() -> None:

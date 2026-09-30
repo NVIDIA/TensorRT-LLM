@@ -192,7 +192,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             start_idx = 0
             end_idx = metadata.num_tokens
 
-        sparse_args = forward_args.sparse_runtime_params
+        sparse_args = replace(forward_args.sparse_runtime_params)
+        forward_args.sparse_runtime_params = sparse_args
         sparse_args.sparse_attn_kv_lens = metadata.sparse_mla_topk_lens[self.compress_ratio][
             start_idx:end_idx
         ]

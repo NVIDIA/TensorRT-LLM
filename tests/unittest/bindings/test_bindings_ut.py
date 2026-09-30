@@ -11,7 +11,17 @@ import torch
 
 import tensorrt_llm.bindings as _tb
 import tensorrt_llm.bindings.executor as _tbe
+from tensorrt_llm.bindings.internal import thop
+from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
+
+
+def test_position_embedding_type_deferred() -> None:
+    config = thop.StaticAttentionConfig()
+    config.position_embedding_type = PositionEmbeddingType.deferred
+
+    assert config.position_embedding_type == _tb.PositionEmbeddingType.DEFERRED
+    assert config.position_embedding_type.value == 10
 
 
 def test_quant_mode():

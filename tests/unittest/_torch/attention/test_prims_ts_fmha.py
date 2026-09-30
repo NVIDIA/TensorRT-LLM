@@ -39,6 +39,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention.backends.sparse.params import SparseRuntimeParams
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
@@ -70,6 +71,8 @@ class _TensorSpec:
 
 
 class _Attention:
+    out_head_size = TrtllmAttention.out_head_size
+
     def __init__(
         self,
         *,
@@ -86,6 +89,7 @@ class _Attention:
         self.qk_rope_head_dim = 64 if is_mla else None
         self.qk_nope_head_dim = 128 if is_mla else None
         self.v_head_dim = 128 if is_mla else None
+        self.rope_append = True
         self.predicted_tokens_per_seq = 1
         self.sparse_params = None
         self.skip_correction_threshold = 0.0
@@ -2226,12 +2230,20 @@ def test_workspace_cannot_grow_during_capture(monkeypatch: pytest.MonkeyPatch) -
         (AttentionInputType.generation_only, True, False, False),
     ],
 )
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.uint8])
+@pytest.mark.parametrize(
+    "is_spec_decoding_enabled,use_spec_decoding",
+    [(False, False), (False, True), (True, False), (True, True)],
+)
 def test_phased_forward_routes_query_and_qkv_by_phase(
     monkeypatch: pytest.MonkeyPatch,
     input_type: AttentionInputType,
     is_mla: bool,
     is_fused_qkv: bool,
     has_kv: bool,
+    output_dtype: torch.dtype,
+    is_spec_decoding_enabled: bool,
+    use_spec_decoding: bool,
 ) -> None:
     attn = _Attention(is_mla=is_mla)
     fmha = PrimsTSFmha(attn)
@@ -2260,7 +2272,8 @@ def test_phased_forward_routes_query_and_qkv_by_phase(
         if input_type == AttentionInputType.generation_only
         else fmha.context_out_head_size
     )
-    output = torch.empty((num_tokens, attn.num_heads * out_head_size))
+    stored_head_size = out_head_size // 2 if output_dtype == torch.uint8 else out_head_size
+    output = torch.empty((num_tokens, attn.num_heads * stored_head_size), dtype=output_dtype)
     metadata = SimpleNamespace(
         kv_cache_block_offsets=torch.empty(1),
         effective_workspace=torch.empty(0, dtype=torch.int8),
@@ -2274,7 +2287,14 @@ def test_phased_forward_routes_query_and_qkv_by_phase(
         kv_lens_runtime=torch.tensor([3, 65, 97], dtype=torch.int32),
         prompt_lens_cuda_runtime=torch.tensor([3, 1, 1], dtype=torch.int32),
         prompt_lens_cpu_runtime=torch.tensor([3, 1, 1], dtype=torch.int32),
-        is_spec_decoding_enabled=False,
+        is_spec_decoding_enabled=is_spec_decoding_enabled,
+        use_spec_decoding=use_spec_decoding,
+        spec_decoding_generation_lengths=torch.ones(2, dtype=torch.int32),
+        spec_decoding_position_offsets=torch.zeros((2, 1), dtype=torch.int32),
+        spec_decoding_packed_mask=torch.zeros((2, 1, 1), dtype=torch.int32),
+        spec_decoding_bl_tree_mask_offset=torch.zeros(2, dtype=torch.int64),
+        spec_decoding_bl_tree_mask=torch.zeros(2, dtype=torch.uint32),
+        spec_bl_tree_first_sparse_mask_offset_kv=torch.zeros(2, dtype=torch.int32),
         is_cross=False,
         kv_cache_manager=None,
     )
@@ -2287,6 +2307,25 @@ def test_phased_forward_routes_query_and_qkv_by_phase(
     )
 
     fmha.forward(q, k, v, metadata, forward_args)
+
+    spec_fields = (
+        "spec_decoding_generation_lengths",
+        "spec_decoding_packed_mask",
+        "spec_decoding_bl_tree_mask_offset",
+        "spec_decoding_bl_tree_mask",
+        "spec_bl_tree_first_sparse_mask_offset_kv",
+    )
+    for phase_calls, spec_active in (
+        (context_calls, False),
+        (generation_calls, is_spec_decoding_enabled and use_spec_decoding),
+    ):
+        for params in phase_calls:
+            assert params.use_spec_decoding == spec_active
+            for name in spec_fields:
+                source = getattr(metadata, name)
+                assert getattr(params, name) is (source if spec_active else None)
+            offsets = metadata.spec_decoding_position_offsets if spec_active else None
+            assert params.spec_decoding_position_offsets is offsets
 
     if input_type == AttentionInputType.generation_only:
         run_context.assert_not_called()
@@ -2328,5 +2367,5 @@ def test_phased_forward_routes_query_and_qkv_by_phase(
         else:
             assert params.key_input is None
             assert params.value_input is None
-        assert params.output.shape == (params.num_tokens, attn.num_heads, out_head_size)
+        assert params.output.shape == (params.num_tokens, attn.num_heads, stored_head_size)
         assert params.output.data_ptr() == output[token_slice].data_ptr()

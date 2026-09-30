@@ -312,6 +312,11 @@ class FmhaManager:
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
 
+    def release(self) -> None:
+        """Release each owned implementation, including those used by CombinedFmha."""
+        for fmha in self.fmha_libs:
+            fmha.release()
+
     def _make_cache_key(
         self,
         q: torch.Tensor,
