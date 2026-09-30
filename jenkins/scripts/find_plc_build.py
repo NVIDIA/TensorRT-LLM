@@ -33,6 +33,7 @@ import urllib.error
 import urllib.request
 
 REUSABLE_RESULTS = ("SUCCESS", "UNSTABLE")
+REQUEST_TIMEOUT_SECONDS = 120
 
 
 def fetch_json(url):
@@ -42,7 +43,7 @@ def fetch_json(url):
     if user and token:
         credentials = base64.b64encode(f"{user}:{token}".encode()).decode()
         request.add_header("Authorization", f"Basic {credentials}")
-    with urllib.request.urlopen(request) as response:
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
         return json.loads(response.read())
 
 
