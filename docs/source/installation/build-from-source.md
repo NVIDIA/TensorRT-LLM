@@ -103,7 +103,6 @@ With `--build_root <dir>` set, the following default under `<dir>` instead of th
 | Build virtual environment | `venv-<python version>` | run inside an activated venv, or `--no-venv` |
 | Wheel staging tree and `*.egg-info` | `wheel-staging` | `TRTLLM_WHEEL_STAGING_DIR` |
 | ccache directory (with `--use_ccache`) | `ccache` | `CCACHE_DIR` |
-| Intermediate extension-module objects | `kv_cache_manager_v2-temp` | — |
 
 Conan's `cpp/CMakeUserPresets.json` convenience file is also skipped in this mode, since it would reference the (possibly ephemeral) out-of-tree build directory.
 
