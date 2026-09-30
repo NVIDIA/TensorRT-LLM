@@ -1,3 +1,6 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 version: 0.0.1
 l0_b200:
 - condition:
@@ -120,6 +123,13 @@ l0_b200:
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
+  # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
+  - unittest/_torch/modeling/test_modeling_deepseekv41.py
+  - unittest/_torch/modules/test_engram_decode_hash.py
+  - unittest/_torch/modules/test_engram_history_uploads.py
+  - unittest/_torch/modules/test_engram_replay.py
+  - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
+  - unittest/disaggregated/test_csa2_kv_transfer.py
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
   - unittest/_torch/modeling/test_kimi_k3_checkpoint.py TIMEOUT (15)
   - unittest/_torch/modeling/test_kimi_k3_mla.py TIMEOUT (15)
