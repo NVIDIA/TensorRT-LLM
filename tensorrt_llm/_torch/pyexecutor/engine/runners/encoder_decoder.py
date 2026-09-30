@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Encoder-phase runner for encoder-decoder models."""
+"""Encoder-decoder runner: an encoder stage composed with the decoder runner."""
 
 from __future__ import annotations
 
@@ -23,34 +23,32 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
+from ..cuda_graph import resolve_cuda_graph_batch_sizes
 from .common import apply_position_id_offset, get_top_level_model
+from .decoder import DecoderRunner, DecoderRunnerConfig
 from .encoder import EncoderConfigMixin, EncoderMixin, EncoderPreparedInputs
-from .interface import RunnerConfig, ScheduledInputs, ScheduledModelRunner
+from .interface import RunnerConfig, ScheduledInputs
 
 
 @dataclass(frozen=True)
-class EncoderDecoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
-    """Configuration for the Encoder-Decoder model runner.
-
-    Add ``DecoderConfigMixin`` when the decoder runner is introduced; that
-    mixin belongs with the decoder implementation rather than this module.
-    """
+class EncoderStageConfig(EncoderConfigMixin, RunnerConfig):
+    """Configuration for the encoder stage of an encoder-decoder model."""
 
 
-class EncoderDecoderRunner(EncoderMixin, ScheduledModelRunner):
+class EncoderStage(EncoderMixin):
     """Run the independent encoder phase of an encoder-decoder model."""
 
     def __init__(
         self,
         model: nn.Module,
-        config: EncoderDecoderRunnerConfig,
+        config: EncoderStageConfig,
         *,
         mapping: Mapping,
         dist: Distributed | None,
         moe_load_balancer: MoeLoadBalancer | None,
     ) -> None:
         if not config.is_encoder_decoder:
-            raise ValueError("EncoderDecoderRunner requires an encoder-decoder model.")
+            raise ValueError("EncoderStage requires an encoder-decoder model.")
         self._initialize_encoder(
             model, config, mapping=mapping, dist=dist, moe_load_balancer=moe_load_balancer
         )
@@ -412,3 +410,64 @@ class EncoderDecoderRunner(EncoderMixin, ScheduledModelRunner):
                 "encoder_seq_lens": inputs["seq_lens"],
             }
         )
+
+
+class EncoderDecoderRunner(DecoderRunner):
+    """Run an encoder-decoder model: the encoder stage, then the decoder."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        config: DecoderRunnerConfig,
+        *,
+        encoder_config: EncoderStageConfig,
+        mapping: Mapping,
+        dist: Distributed | None,
+        moe_load_balancer: MoeLoadBalancer | None,
+        **decoder_services: Any,
+    ) -> None:
+        # Mixed decoder graphs are planned from the encoder graph shapes.
+        self._encoder_stage = EncoderStage(
+            model,
+            encoder_config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=moe_load_balancer,
+        )
+        super().__init__(
+            model,
+            config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=moe_load_balancer,
+            encoder_graph_shapes=self._encoder_stage._encoder_graph_shapes,
+            **decoder_services,
+        )
+
+    def forward_encoder(
+        self,
+        inputs: ScheduledInputs,
+        *,
+        resource_manager: ResourceManager,
+        is_dummy: bool = False,
+    ) -> dict[str, Any]:
+        """Run the encoder phase for ``inputs.batch.encoder_requests``."""
+        return self._encoder_stage.forward(
+            inputs, resource_manager=resource_manager, is_dummy=is_dummy
+        )
+
+    def warmup_encoder(self, resource_manager: ResourceManager) -> None:
+        """Warm up and capture the encoder graph shapes."""
+        self._encoder_stage.warmup(resource_manager)
+
+    def encoder_graph_batch_sizes(self, max_batch_size: int) -> tuple[int, ...]:
+        """Return the encoder graph batch sizes usable up to ``max_batch_size``."""
+        return resolve_cuda_graph_batch_sizes(
+            self._encoder_stage._encoder_graph_batch_sizes,
+            max_batch_size,
+            pad_to_limit=self._encoder_stage._encoder_graph_pad_to_limit,
+        )
+
+    def release_graphs(self) -> None:
+        self._encoder_stage.release_graphs()
+        super().release_graphs()

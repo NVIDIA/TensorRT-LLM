@@ -29,6 +29,7 @@ from tensorrt_llm._torch.disaggregation.orchestration.admission import (
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.interfaces import ExecutorEffects
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledModelRunner
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
@@ -86,7 +87,6 @@ def test_forward_step_carries_context_logits_request_to_runner(request_flags, ex
     engine = object.__new__(PyTorchModelEngine)
     engine.model = types.SimpleNamespace(extra_attrs={})
     engine._runner = runner
-    engine._fallback_to_engine = False
     engine.enable_spec_decode = False
     engine.runtime_draft_len = 0
     resources = object()
@@ -234,6 +234,15 @@ def _make_async_encoder_executor(future):
     return executor
 
 
+def _encoder_decoder_runner(batch_sizes, *, pad_to_limit):
+    runner = object.__new__(EncoderDecoderRunner)
+    runner._encoder_stage = types.SimpleNamespace(
+        _encoder_graph_batch_sizes=tuple(batch_sizes),
+        _encoder_graph_pad_to_limit=pad_to_limit,
+    )
+    return runner
+
+
 def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8):
     """Build a PyExecutor stub wired for token-path encoder batch-wait admission."""
     executor = object.__new__(PyExecutor)
@@ -250,8 +259,7 @@ def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8
     )
     executor.model_engine = object.__new__(PyTorchModelEngine)
     executor.model_engine._cleanup_done = True
-    executor.model_engine._encoder_graph_batch_sizes = tuple(batch_sizes)
-    executor.model_engine._encoder_graph_pad_to_limit = True
+    executor.model_engine._runner = _encoder_decoder_runner(batch_sizes, pad_to_limit=True)
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     return executor
@@ -274,10 +282,9 @@ def _make_feature_encoder_batch_wait_executor(
     )
     executor.model_engine = object.__new__(PyTorchModelEngine)
     executor.model_engine._cleanup_done = True
-    executor.model_engine._encoder_graph_batch_sizes = (
-        tuple(runner_batch_sizes) if runner_enabled else ()
+    executor.model_engine._runner = _encoder_decoder_runner(
+        runner_batch_sizes if runner_enabled else (), pad_to_limit=False
     )
-    executor.model_engine._encoder_graph_pad_to_limit = False
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     return executor

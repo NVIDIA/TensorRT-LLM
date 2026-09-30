@@ -15,10 +15,10 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer, WorkspaceShrinkPolicy
 
-_ENGINE_MODULE = "tensorrt_llm._torch.pyexecutor.model_engine"
+_RUNNER_MODULE = "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner"
 pytestmark = pytest.mark.cpu_only
 
 
@@ -168,7 +168,7 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
 
 class TestEagerWorkspaceEngine(unittest.TestCase):
     def setUp(self) -> None:
-        self.engine = object.__new__(PyTorchModelEngine)
+        self.engine = object.__new__(DecoderRunner)
         self.engine._eager_workspace_reclaimer = None
         self.engine.is_spec_decode = False
         self.engine.mapping = SimpleNamespace(cp_size=1)
@@ -184,15 +184,13 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
             model_config=SimpleNamespace(extra_attrs={}), forward=Mock(return_value=42)
         )
         self.engine._model_caller = ModelCaller(self.engine.model)
-        reclaimer_patch = patch(f"{_ENGINE_MODULE}.EagerWorkspaceReclaimer", autospec=True)
+        reclaimer_patch = patch(f"{_RUNNER_MODULE}.EagerWorkspaceReclaimer", autospec=True)
         self.reclaimer_class = reclaimer_patch.start()
         self.addCleanup(reclaimer_patch.stop)
 
     def freeze(self, *, is_encoder_decoder: bool = False) -> None:
-        with patch.object(
-            self.engine, "_is_encoder_decoder_model", return_value=is_encoder_decoder
-        ):
-            self.engine._freeze_eager_workspace_floor()
+        self.engine.is_encoder_decoder = is_encoder_decoder
+        self.engine._freeze_eager_workspace_floor()
 
     def call(self, *, is_dummy: bool = False) -> int:
         with (

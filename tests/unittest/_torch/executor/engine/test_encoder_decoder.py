@@ -3,13 +3,18 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.engine.runners import encoder_decoder as encoder_decoder_module
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderPreparedInputs
-from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
+    EncoderDecoderRunner,
+    EncoderStage,
+)
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInputs
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
@@ -24,7 +29,7 @@ def _scheduled_encoder_requests(*requests: object) -> ScheduledRequests:
 
 def test_token_encoder_preparation_preserves_request_order_and_position_offset() -> None:
     prepared = EncoderPreparedInputs({}, sequence_lengths=[2, 3])
-    runner = object.__new__(EncoderDecoderRunner)
+    runner = object.__new__(EncoderStage)
     runner._model = SimpleNamespace(position_id_offset=4)
     runner._config = SimpleNamespace(max_num_tokens=8)
     runner._prepare_packed_token_inputs = Mock(return_value=prepared)
@@ -47,7 +52,7 @@ def test_token_encoder_preparation_preserves_request_order_and_position_offset()
 
 
 def test_encoder_decoder_rejects_mixed_token_and_feature_batch() -> None:
-    runner = object.__new__(EncoderDecoderRunner)
+    runner = object.__new__(EncoderStage)
     scheduled_requests = _scheduled_encoder_requests(
         SimpleNamespace(py_encoder_input_features=torch.empty(1)),
         SimpleNamespace(py_encoder_input_features=None),
@@ -64,7 +69,7 @@ def test_token_encoder_stack_applies_shared_embedding_scale_and_positions() -> N
     embedding = Mock(side_effect=lambda input_ids: input_ids.to(torch.float32).unsqueeze(1))
     expected = torch.tensor([[2.0], [4.0], [6.0]])
     encoder = Mock(return_value=expected)
-    runner = object.__new__(EncoderDecoderRunner)
+    runner = object.__new__(EncoderStage)
     runner._model = SimpleNamespace(
         encoder=encoder,
         model=SimpleNamespace(shared_embedding=embedding, embed_scale=2.0),
@@ -92,7 +97,7 @@ def test_token_encoder_stack_applies_shared_embedding_scale_and_positions() -> N
 def test_feature_encoder_stack_uses_feature_model_contract() -> None:
     expected = torch.arange(6).reshape(3, 2)
     encoder = Mock(return_value=expected)
-    runner = object.__new__(EncoderDecoderRunner)
+    runner = object.__new__(EncoderStage)
     runner._model = SimpleNamespace(encoder=encoder)
     features = torch.arange(12).reshape(3, 4)
     metadata = object()
@@ -122,7 +127,7 @@ def test_graph_execution_restores_variant_specific_output_layout(feature_mode: b
         get_graph_pool=Mock(return_value=object()),
         restore_encoder_decoder_output=Mock(return_value=torch.full((5, 2), -1)),
     )
-    runner = object.__new__(EncoderDecoderRunner)
+    runner = object.__new__(EncoderStage)
     runner._encoder_cuda_graph_runner = graph_runner
     runner._execute_encoder_cuda_graph = Mock(return_value=graph_output)
 
@@ -148,7 +153,7 @@ def test_graph_execution_restores_variant_specific_output_layout(feature_mode: b
 def test_encoder_decoder_forward_returns_hidden_states_with_prepared_lengths() -> None:
     prepared = EncoderPreparedInputs({}, sequence_lengths=[2, 3])
     hidden_states = torch.arange(10).reshape(5, 2)
-    runner = object.__new__(EncoderDecoderRunner)
+    runner = object.__new__(EncoderStage)
     runner.prepare_inputs = Mock(return_value=prepared)
     runner._execute_prepared = Mock(return_value=hidden_states)
     scheduled_requests = ScheduledRequests()
@@ -168,3 +173,75 @@ def test_encoder_decoder_forward_returns_hidden_states_with_prepared_lengths() -
         resource_manager=resource_manager,
     )
     runner._execute_prepared.assert_called_once_with(prepared)
+
+
+def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
+    model = object()
+    config = object()
+    encoder_config = object()
+    mapping = object()
+    dist = object()
+    input_processor = object()
+    shapes = frozenset({(1, 16)})
+
+    with (
+        patch.object(encoder_decoder_module, "EncoderStage") as stage_type,
+        patch.object(DecoderRunner, "__init__", return_value=None) as decoder_init,
+    ):
+        stage_type.return_value._encoder_graph_shapes = shapes
+        runner = EncoderDecoderRunner(
+            model,
+            config,
+            encoder_config=encoder_config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=None,
+            input_processor=input_processor,
+        )
+
+    assert runner._encoder_stage is stage_type.return_value
+    stage_type.assert_called_once_with(
+        model, encoder_config, mapping=mapping, dist=dist, moe_load_balancer=None
+    )
+    decoder_init.assert_called_once_with(
+        model,
+        config,
+        mapping=mapping,
+        dist=dist,
+        moe_load_balancer=None,
+        encoder_graph_shapes=shapes,
+        input_processor=input_processor,
+    )
+
+
+def test_encoder_decoder_runner_delegates_encoder_entries_to_stage() -> None:
+    runner = object.__new__(EncoderDecoderRunner)
+    runner._encoder_stage = Mock(spec=EncoderStage)
+    runner._encoder_stage._encoder_graph_batch_sizes = (1, 2, 8)
+    runner._encoder_stage._encoder_graph_pad_to_limit = True
+    inputs = ScheduledInputs(batch=_scheduled_encoder_requests(object()))
+    resource_manager = object()
+
+    outputs = runner.forward_encoder(inputs, resource_manager=resource_manager, is_dummy=True)
+    runner.warmup_encoder(resource_manager)
+
+    assert outputs is runner._encoder_stage.forward.return_value
+    runner._encoder_stage.forward.assert_called_once_with(
+        inputs, resource_manager=resource_manager, is_dummy=True
+    )
+    runner._encoder_stage.warmup.assert_called_once_with(resource_manager)
+    assert runner.encoder_graph_batch_sizes(4) == (1, 2, 4)
+
+
+def test_encoder_decoder_runner_releases_stage_before_decoder_graphs() -> None:
+    runner = object.__new__(EncoderDecoderRunner)
+    calls = Mock()
+    runner._encoder_stage = calls.stage
+    runner._release_decoder_graphs = calls.decoder
+
+    runner.release_graphs()
+
+    assert calls.mock_calls == [
+        call.stage.release_graphs(),
+        call.decoder(),
+    ]
