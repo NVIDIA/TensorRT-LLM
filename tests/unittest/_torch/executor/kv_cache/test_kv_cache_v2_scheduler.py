@@ -204,6 +204,9 @@ def make_kv_cache_manager(
     mgr.try_allocate_draft_context.side_effect = lambda req, n: True
     mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
+    # An unpaired draft pool is created-and-resumed through this during
+    # admission; a real manager answers False when either step fails.
+    mgr.admit_mirror.side_effect = lambda req: True
     mgr._resume_and_restore.return_value = True
 
     def create_kv_cache(request_id, *_args, **_kwargs):
@@ -830,6 +833,95 @@ class TestKVCacheFailuresGen:
         # → gen1 self-evicts, victim is not in paused list from eviction
         assert ids(out.generation_requests) == [0]
         assert 99 not in ids(out.paused_requests)
+
+
+class TestUnpairedDraftAdmission:
+    """A draft pool the scheduler suspends but never used to re-admit.
+
+    ``_joint_draft_manager`` is None whenever joint KV cache reuse is off, and
+    for a hidden-state drafter it always is: ``draft_prompt_lookahead`` is
+    unestablished there, so ``_joint_reuse_supported`` refuses the pairing.
+    ``_suspend_request`` nonetheless suspends that pool on every eviction,
+    because it keys on ``draft_kv_cache_manager`` rather than on the pairing.
+
+    The asymmetry is the whole defect: nothing brought the mirror up, so it
+    reached the draft manager's ``prepare_resources`` suspended, and the only
+    thing that method can do there is raise -- the target is already prepared
+    and the request is already in the batch. These tests hold the admission on
+    the scheduler side, where a refusal is still a rollback.
+
+    "Admission", not "resume", because a mirror is equally unusable when it has
+    never been created: a fresh ``_KVCache`` is born SUSPENDED, so a
+    first-sight request's mirror needs its first resume just as much as an
+    evicted one does, and that resume can be refused under pool pressure.
+    """
+
+    def test_generation_admission_admits_an_unpaired_draft_mirror(self):
+        mgr = make_kv_cache_manager()  # joint reuse off
+        draft_mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=100, draft_kv_cache_manager=draft_mgr)
+        req = make_gen_request(0)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.generation_requests) == [0]
+        draft_mgr.admit_mirror.assert_called_once_with(req)
+        # An unpaired pool still sizes itself in prepare_resources, not here.
+        draft_mgr.try_allocate_generation.assert_not_called()
+
+    def test_a_refused_unpaired_admission_rolls_the_target_back(self):
+        """The refusal has to look like any other KV shortage, not like a crash."""
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        draft_mgr.admit_mirror.side_effect = lambda req: False
+        sched = make_scheduler(mgr, max_num_tokens=100, draft_kv_cache_manager=draft_mgr)
+        req = make_gen_request(0)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.generation_requests) == []
+        mgr.try_allocate_generation.assert_called_once_with(req)
+        mgr.revert_allocate_generation.assert_called_once_with(req)
+
+    def test_context_admission_admits_an_unpaired_draft_mirror(self):
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=1000, draft_kv_cache_manager=draft_mgr)
+        req = make_ctx_request(0, context_remaining_length=100)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        draft_mgr.admit_mirror.assert_called_once_with(req)
+
+    def test_a_refused_unpaired_admission_keeps_the_context_request_unscheduled(self):
+        """The forward is what must not happen: an inactive mirror's page table
+        is stale, and the draft writes context K/V straight through it."""
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        draft_mgr.admit_mirror.side_effect = lambda req: False
+        sched = make_scheduler(mgr, max_num_tokens=1000, draft_kv_cache_manager=draft_mgr)
+        req = make_ctx_request(0, context_remaining_length=100)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == []
+        # Refused before the pool was grown for a chunk that will not run.
+        mgr.resize_context.assert_not_called()
+
+    def test_a_joint_draft_pool_is_left_to_its_own_admission(self):
+        """Pairing already resumes the draft cache inside its own calls; going
+        through the unpaired path as well would resume it twice."""
+        mgr = make_kv_cache_manager(enable_joint_kv_cache_reuse=True)
+        draft_mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=100, draft_kv_cache_manager=draft_mgr)
+        req = make_gen_request(0)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.generation_requests) == [0]
+        draft_mgr.admit_mirror.assert_not_called()
+        draft_mgr.try_allocate_generation.assert_called_once_with(req)
 
 
 class TestKVCacheFailuresCtx:
