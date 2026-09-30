@@ -5,11 +5,12 @@ import sys
 from pathlib import Path
 
 from agent_flow.agent_runtime import resolve_agent_config
+from agent_flow.prompts import dump_prompt_bundle
 from agent_flow.workflows.perf_analyze.sol_methodology import resolve_sol_methodology
 from agent_flow.workflows.perf_analyze.task_schema import casebook_enabled
 
 from .disagg import has_disagg
-from .prompts import PROMPTS_DIRNAME, build_perf_optimize_prompts, dump_prompt_bundle
+from .prompts import PROMPTS_DIRNAME, build_perf_optimize_prompts
 from .state import STATE_FILENAME
 from .task_schema import (
     TaskSchemaError,

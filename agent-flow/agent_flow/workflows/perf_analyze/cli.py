@@ -5,8 +5,9 @@ import sys
 from pathlib import Path
 
 from agent_flow.agent_runtime import resolve_agent_config
+from agent_flow.prompts import dump_prompt_bundle
 
-from .prompts import PROMPTS_DIRNAME, build_perf_analyze_prompts, dump_prompt_bundle
+from .prompts import PROMPTS_DIRNAME, build_perf_analyze_prompts
 from .sol_methodology import resolve_sol_methodology
 from .state import STATE_FILENAME
 from .task_schema import (

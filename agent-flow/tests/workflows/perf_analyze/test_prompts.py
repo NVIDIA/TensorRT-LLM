@@ -17,7 +17,6 @@ from agent_flow.workflows.perf_analyze.prompts import (
     REPORTER_SYSTEM_PROMPT,
     build_perf_analyze_prompts,
     build_projector_prompt,
-    dump_prompt_bundle,
 )
 from agent_flow.workflows.perf_analyze.prompts._common import (
     BOTTLENECK_TAXONOMY,
@@ -1109,30 +1108,3 @@ def test_casebook_control_adds_an_explicit_override():
     bundle = build_perf_analyze_prompts(include_casebook=False)
     assert "This run intentionally disables `perf-optimization-casebook`" in bundle.benchmarker
     assert "This run intentionally disables `perf-optimization-casebook`" in bundle.analyzer
-
-
-# ---------------------------------------------------- the workspace prompt snapshot
-
-
-_SNAPSHOT_ROLES = ("benchmarker", "projector", "analyzer", "reporter")
-
-
-def test_dump_writes_every_role_verbatim(tmp_path):
-    """A snapshot a reader can diff against the source module."""
-    bundle = build_perf_analyze_prompts(include_sol=True)
-    dump_prompt_bundle(bundle, tmp_path / "prompts")
-
-    written = {p.stem: p.read_text(encoding="utf-8") for p in tmp_path.glob("prompts/*.md")}
-    assert written == {role: getattr(bundle, role) for role in _SNAPSHOT_ROLES}
-
-
-def test_dump_clears_a_previous_launch_stale_role(tmp_path):
-    """Two versions' prompts in one directory would read as one campaign's."""
-    directory = tmp_path / "prompts"
-    directory.mkdir()
-    (directory / "retired_role.md").write_text("from an older version\n", encoding="utf-8")
-
-    dump_prompt_bundle(build_perf_analyze_prompts(), directory)
-
-    assert not (directory / "retired_role.md").exists()
-    assert (directory / "analyzer.md").is_file()

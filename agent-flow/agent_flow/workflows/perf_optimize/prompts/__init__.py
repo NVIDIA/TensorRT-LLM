@@ -5,7 +5,6 @@ from typing import Any, Mapping, Sequence
 from agent_flow.workflows.perf_analyze.prompts import (
     PROMPTS_DIRNAME,
     build_remote_execution_context,
-    dump_prompt_bundle,
 )
 from agent_flow.workflows.perf_analyze.prompts._common import CASEBOOK_DISABLED
 
@@ -257,5 +256,4 @@ __all__ = [
     "REPORTER_SYSTEM_PROMPT",
     "build_perf_optimize_prompts",
     "build_projector_prompt",
-    "dump_prompt_bundle",
 ]
