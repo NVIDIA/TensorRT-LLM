@@ -1341,6 +1341,9 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender._ownership_poisoned, sender._ownership_poison_lock = None, threading.Lock()
     sender._loaded_remote_agents_lock, sender._loaded_remote_agents = threading.Lock(), set()
     sender._instance_rank = 0
+    sender._num_threads = 1
+    sender._pending_settlements = [{}]
+    sender._send_task_queues = [queue.Queue()]
     return sender
 
 
@@ -1401,6 +1404,7 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
 def test_sender_failed_result_routes_messages_directly_in_order(monkeypatch) -> None:
     rid = 98
     sender = object.__new__(transfer_mod.Sender)
+    sender._enforce_physical_ownership = False
     sender._instance_rank = 5
     sender._registrar = SimpleNamespace(
         get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="receiver"))
@@ -1601,12 +1605,14 @@ def test_terminal_sender_settles_known_unsubmitted_aux_peer_once() -> None:
     session._enforce_physical_ownership = True
     session._need_aux = True
     session._reported_aux_peer_ranks = set()
+    session._logical_outcomes = transfer_mod._LogicalOutcomes()
     session.kv_tasks = []
     session.lock = threading.Lock()
     session._exception = None
     session._terminal_status = None
     session._closed = False
     session.aux_task = transfer_mod.AuxSendTask(params, slot=0)
+    session.aux_task.bind_logical_outcomes(session._logical_outcomes)
     assert session.aux_task.begin_physical_operation(active_info.instance_rank)
 
     session.set_exception("request failed before auxiliary submission")

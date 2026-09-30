@@ -16,8 +16,15 @@
 
 import torch
 
-from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem, MoERunContext
+from ..impl_contract import (
+    MoEDeployment,
+    MoEEligibility,
+    MoEProblem,
+    MoERejectReason,
+    MoERunContext,
+)
 from ..impl_identity import register_moe_impl
+from ..interface import _reject
 from ..quantization import W4A8NVFP4FP8TRTLLMGenFusedMoEMethod
 from .base import TrtllmGenFusedMoEBase
 from .eligibility import check_no_activation_constants, check_no_expert_bias, check_trtllm_gen_leaf
@@ -44,10 +51,21 @@ class TrtllmTrtllmGenW4a8Nvfp4Fp8Impl(TrtllmGenFusedMoEBase):
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        # The E2m1-weight x E4m3-activation batchedGemm drop is sm_100a/sm_103a
+        # only, with no family-compatible sm_100f build, so SM107 has no kernel.
+        sm_gate = (
+            _reject(
+                MoERejectReason.SM_UNSUPPORTED,
+                f"{cls.__name__} ships cubins for SM100/SM103 only, got SM{d.env.sm}",
+            )
+            if d.env.sm not in (100, 103)
+            else None
+        )
         return check_trtllm_gen_leaf(
             cls,
             p,
             d,
+            sm_gate,
             check_no_expert_bias(cls, p),
             check_no_activation_constants(cls, p),
         )

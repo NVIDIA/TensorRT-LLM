@@ -13,7 +13,7 @@ fi
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html#rel-26-08
-TORCH_VERSION="2.13.0"
+TORCH_VERSION="2.14.0"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 
 prepare_environment() {

@@ -21,6 +21,7 @@ import torch
 import triton
 
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
 from .fp4_mla_kernels import _fp8_mla_context_block_table_kernel
@@ -34,7 +35,6 @@ if TYPE_CHECKING:
 
 _FP8_CONTEXT_SUPPORTED_SMS = {90, 100, 103, 107, 120}
 _FP8_CONTEXT_SCRATCH_ATTR = "_fp4_mla_fp8_context_scratch"
-_FP8_CONTEXT_ATTN_ATTR = "_fp4_mla_fp8_context_attn"
 
 
 def require_fp4_mla_fp8_context_support() -> None:
@@ -67,12 +67,21 @@ def _execute_fp8_context_with_cache_update(
     start_event.record(current_stream)
     # Launch the auxiliary work first so the main stream cannot drain the
     # attention queue before the cache update has been submitted.
-    with torch.cuda.stream(aux_stream):
-        aux_stream.wait_event(start_event)
-        cache_update_fn()
-        done_event.record(aux_stream)
-    attention_fn()
-    current_stream.wait_event(done_event)
+    joined = False
+    try:
+        with torch.cuda.stream(aux_stream):
+            aux_stream.wait_event(start_event)
+            cache_update_fn()
+            done_event.record(aux_stream)
+        attention_fn()
+        current_stream.wait_event(done_event)
+        joined = True
+    finally:
+        if not joined:
+            # Either callback may enqueue work before raising, and done_event
+            # may not have been recorded. Drain before scratch or KV pages can
+            # be released/reused; the successful path stays asynchronous.
+            aux_stream.synchronize()
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +93,7 @@ class _Fp8MlaContextCacheManagerView:
     kv_cache_pool_pointers: torch.Tensor
     kv_cache_pool_mapping: torch.Tensor
     layer_offsets: Tuple[int, ...]
+    dtype: DataType = DataType.FP8
 
 
 @dataclass
@@ -299,18 +309,19 @@ class _Fp8MlaContextScratch:
 
 def _build_fp8_mla_context_attn(attn: "TrtllmAttention") -> "TrtllmAttention":
     """Build a direct-attribute FP8 view without per-access Python forwarding."""
+    from ..fmha.manager import FmhaManager
+
     fp8_attn = copy.copy(attn)
     fp8_attn.quant_mode = int(QuantMode(0).set_fp8_kv_cache())
     fp8_attn.has_fp4_kv_cache = False
     fp8_attn.has_fp8_kv_cache = True
-    # FMHA instances hold weak references to their owning attention object.
-    # Do not reuse instances copied from the FP4 attention; the caller binds
-    # this FP8 view explicitly to TRTLLM's regular FMHA implementation.
-    fp8_attn.fmha_libs = []
     fp8_attn.local_layer_idx = 0
     # This branch resolves local cache layers through layer_idx. The
     # disposable cache has exactly one layer, so bind the copied view to it.
     fp8_attn.layer_idx = 0
+    # Finalize the view before capability selection. FMHA instances must hold
+    # weak references to this FP8 view, not to the original FP4 attention.
+    fp8_attn._fmha_manager = FmhaManager(fp8_attn)
     return fp8_attn
 
 
@@ -327,7 +338,7 @@ def _build_fp8_mla_context_metadata(
     if kv_lens_cpu is None:
         kv_lens_cpu = meta.prompt_lens_cpu_runtime[: meta.num_contexts]
     fp8_meta = copy.copy(meta)
-    fp8_meta._fp4_mla_fp8_context_state = None
+    fp8_meta.fp4_mla_state = None
     fp8_meta.kv_cache_manager = scratch.cache_manager_view
     fp8_meta.kv_cache_block_offsets = scratch.block_offsets
     fp8_meta.block_ids_per_seq = scratch.block_ids_per_seq
@@ -343,7 +354,7 @@ def _build_fp8_mla_context_metadata(
     # Scratch lengths intentionally start from zero. Preserve the actual
     # absolute positions for Q/K RoPE through the native kernel's explicit
     # per-token position-offset input.
-    fp8_meta.helix_position_offsets = meta.positions[: meta.num_ctx_tokens]
+    fp8_meta.helix_position_offsets = meta.fp4_mla_state.positions[: meta.num_ctx_tokens]
     return fp8_meta
 
 
@@ -352,11 +363,11 @@ def _get_fp8_mla_context_metadata(
     scratch: _Fp8MlaContextScratch,
 ) -> "TrtllmAttentionMetadata":
     """Prepare and reuse one direct metadata view for all layers in a step."""
-    state = meta._fp4_mla_fp8_context_state
+    state = meta.fp4_mla_state.fp8_context_state
     if state is not None and state[0] is scratch:
         return state[1]
 
     scratch.prepare(meta)
     fp8_meta = _build_fp8_mla_context_metadata(meta, scratch)
-    meta._fp4_mla_fp8_context_state = (scratch, fp8_meta)
+    meta.fp4_mla_state.fp8_context_state = (scratch, fp8_meta)
     return fp8_meta

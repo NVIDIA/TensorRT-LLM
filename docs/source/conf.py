@@ -73,7 +73,6 @@ extensions = [
     'sphinxcontrib.autodoc_pydantic',
     'sphinx_togglebutton',
     'sphinxcontrib.mermaid',
-    'trtllm_auto_deploy',
     'llmapi_config_telemetry',
     'trtllm_config_selector',
 ]
