@@ -65,41 +65,23 @@ inline __device__ void device_flash_attention(Params const& params)
     using Smem_tile_o = typename Kernel_traits::Smem_tile_o;
 
     // Do we use LDGSTS for Q, K or V?
-    enum
-    {
-        USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q
-    };
+    static constexpr int USE_LDGSTS_Q = Kernel_traits::USE_LDGSTS_Q;
 
-    enum
-    {
-        USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K
-    };
+    static constexpr int USE_LDGSTS_K = Kernel_traits::USE_LDGSTS_K;
 
-    enum
-    {
-        USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V
-    };
+    static constexpr int USE_LDGSTS_V = Kernel_traits::USE_LDGSTS_V;
 
-    enum
-    {
-        USE_LDGSTS_KV = Kernel_traits::USE_LDGSTS_K || Kernel_traits::USE_LDGSTS_V
-    };
+    static constexpr int USE_LDGSTS_KV = Kernel_traits::USE_LDGSTS_K || Kernel_traits::USE_LDGSTS_V;
 
     // Do we use LDGSTS for any of the 3 input matrices.
-    enum
-    {
-        USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V
-    };
+    static constexpr int USE_LDGSTS = USE_LDGSTS_Q || USE_LDGSTS_K || USE_LDGSTS_V;
 
     // If either K or V uses LDGSTS, they cannot share a buffer.
     static_assert(!(USE_LDGSTS_K || USE_LDGSTS_V) || !Kernel_traits::SHARE_SMEM_FOR_K_AND_V, "");
 
     // Fragment double buffer (reduce register pressure)
-    enum
-    {
-        FRAGMENT_K_SIZE_IN_K_DIM
-        = (Kernel_traits::LIMIT_QK_FRAGMENTS) *2 + !(Kernel_traits::LIMIT_QK_FRAGMENTS) *Mma_tile_p::MMAS_K
-    };
+    static constexpr int FRAGMENT_K_SIZE_IN_K_DIM
+        = (Kernel_traits::LIMIT_QK_FRAGMENTS) *2 + !(Kernel_traits::LIMIT_QK_FRAGMENTS) *Mma_tile_p::MMAS_K;
 
     static_assert(!(Kernel_traits::LIMIT_QK_FRAGMENTS && USE_LDGSTS_K), "");
 
@@ -227,10 +209,7 @@ inline __device__ void device_flash_attention(Params const& params)
 
     // Store/load P to/from memory (for debugging).
 #if defined(STORE_P)
-    enum
-    {
-        BITS_PER_ELT_P = sizeof(typename Traits_p::Accumulator_type) * 8
-    };
+    static constexpr int BITS_PER_ELT_P = sizeof(typename Traits_p::Accumulator_type) * 8;
 
     using Gmem_tile_p = fmha::Gmem_tile_p<Traits_p, Cta_tile_p, BITS_PER_ELT_P>;
     Gmem_tile_p gmem_p(params.p_ptr, params.p_stride_in_bytes, params.scale_bmm1, tidx);
@@ -238,10 +217,7 @@ inline __device__ void device_flash_attention(Params const& params)
 
     // Store S to memory (for debugging). NOTE: We use A_type as C_type is int32 for IMMA???
 #if defined(STORE_S)
-    enum
-    {
-        BITS_PER_ELT_S = sizeof(typename Traits_p::A_type) * 8
-    };
+    static constexpr int BITS_PER_ELT_S = sizeof(typename Traits_p::A_type) * 8;
 
     using Gmem_tile_s = fmha::Gmem_tile_s<Traits_p, Cta_tile_p, BITS_PER_ELT_S>;
     Gmem_tile_s gmem_s(params.s_ptr, params.s_stride_in_bytes, params.scale_softmax, tidx);
@@ -252,30 +228,18 @@ inline __device__ void device_flash_attention(Params const& params)
     Softmax softmax(params, &smem_[Smem_tile_q::BYTES_PER_TILE], bidb, tidx);
 
     // Prefetch next kv buffer to share memory
-    enum
-    {
-        PREFETCH_K_BUFFER_TO_SMEM = !Kernel_traits::LIMIT_QK_FRAGMENTS && !Softmax::USE_SHARED_MEMORY
-    };
+    static constexpr int PREFETCH_K_BUFFER_TO_SMEM = !Kernel_traits::LIMIT_QK_FRAGMENTS && !Softmax::USE_SHARED_MEMORY;
 
-    enum
-    {
-        PREFETCH_V_BUFFER_TO_SMEM = !Kernel_traits::SHARE_SMEM_FOR_K_AND_V
-    };
+    static constexpr int PREFETCH_V_BUFFER_TO_SMEM = !Kernel_traits::SHARE_SMEM_FOR_K_AND_V;
 
-    enum
-    {
-        PREFETCH_KV_BUFFER_TO_SMEM = PREFETCH_K_BUFFER_TO_SMEM && PREFETCH_V_BUFFER_TO_SMEM
-    };
+    static constexpr int PREFETCH_KV_BUFFER_TO_SMEM = PREFETCH_K_BUFFER_TO_SMEM && PREFETCH_V_BUFFER_TO_SMEM;
 
     // The number of threads per row.
     // enum { THREADS_PER_ROW = Cta_tile_p::WARPS_N * 8 };
     // DEBUG.
     // static_assert(THREADS_PER_ROW == 32, "");
     // END OF DEBUG.
-    enum
-    {
-        THREADS_PER_ROW = 32
-    };
+    static constexpr int THREADS_PER_ROW = 32;
 
     int const q_loop_bound = ((binfo.actual_seqlen + Cta_tile_p::M - 1) / Cta_tile_p::M) * Cta_tile_p::M;
 

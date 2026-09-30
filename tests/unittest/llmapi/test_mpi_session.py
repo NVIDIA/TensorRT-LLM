@@ -45,6 +45,70 @@ def test_mpi_session_basic():
     assert results == [2, 2, 2, 2], results
 
 
+def rendezvous_environment_probe():
+    from mpi4py import MPI
+
+    MPI.COMM_WORLD.barrier()
+    return os.environ.get("MASTER_ADDR"), os.environ.get("MASTER_PORT")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
+def test_mpi_pool_session_forwards_current_rendezvous(monkeypatch):
+    # The MPI launcher may outlive a pool and retain its original environment.
+    for address, port in [("127.0.0.1", "33271"), ("localhost", "51003")]:
+        monkeypatch.setenv("MASTER_ADDR", address)
+        monkeypatch.setenv("MASTER_PORT", port)
+        session = MpiPoolSession(n_workers=2, wait_shutdown=True)
+        try:
+            assert session.submit_sync(rendezvous_environment_probe) == [
+                (address, port), (address, port)
+            ]
+        finally:
+            session.shutdown()
+
+
+def flashinfer_environment_probe():
+    """Return this worker's FlashInfer isolation paths."""
+    # Keep importing this from initializing MPI in the submitting process.
+    from mpi4py import MPI
+
+    MPI.COMM_WORLD.barrier()
+    return (
+        os.environ.get("FLASHINFER_WORKSPACE_BASE"),
+        os.environ.get("FLASHINFER_CUBIN_DIR"),
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
+def test_mpi_pool_session_flashinfer_workspace_isolation(monkeypatch):
+    # A singleton spawn reuses OpenMPI's already-running DVM once one exists in
+    # this process, so a spawned worker's HOME can't be relied on to follow a
+    # monkeypatched HOME set here; compare against the real home directory
+    # instead.
+    monkeypatch.delenv("FLASHINFER_WORKSPACE_BASE", raising=False)
+    monkeypatch.delenv("FLASHINFER_CUBIN_DIR", raising=False)
+    monkeypatch.delenv("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", raising=False)
+
+    session = MpiPoolSession(n_workers=2, wait_shutdown=True)
+    try:
+        worker_envs = session.submit_sync(flashinfer_environment_probe)
+    finally:
+        session.shutdown()
+
+    workspaces = {workspace for workspace, _ in worker_envs}
+    cubin_dirs = {cubin_dir for _, cubin_dir in worker_envs}
+    assert None not in workspaces
+    assert len(workspaces) == 2
+    workspace_root = Path.home() / ".cache" / "tensorrt_llm" / "flashinfer"
+    assert all(
+        Path(workspace).parent == workspace_root for workspace in workspaces)
+    # Unset means FlashInfer derives the artifact cache from each worker's
+    # isolated workspace, keeping downloaded compiler inputs per-rank.
+    assert cubin_dirs == {None}
+
+
 def simple_task(x):
     print(f"** simple_task {x} returns {x * 2}\n", "green")
     res = x * 2
@@ -497,3 +561,123 @@ def test_prefetch_fallback_identity_timeout_matches_mpi_default():
     from test_common.session_prefetcher import _FALLBACK_IDENTITY_TIMEOUT
 
     assert _FALLBACK_IDENTITY_TIMEOUT == _DEFAULT_IDENTITY_TIMEOUT
+
+
+class _FakeCommExecutor:
+    """Stand-in for the entered MPICommExecutor context manager."""
+
+    def __init__(self, block: bool = False, fail: bool = False):
+        self.block = block
+        self.fail = fail
+        self.release = threading.Event()
+        self.exited = threading.Event()
+
+    def __exit__(self, exc_type, exc_value, tb):
+        if self.block:
+            # A wedged worker rank: the join does not return until the test
+            # releases it (so the closer thread does not leak past the test).
+            self.release.wait(30)
+        self.exited.set()
+        if self.fail:
+            raise RuntimeError("simulated executor close failure")
+
+
+def _wait_closer_thread_gone(timeout: float = 5.0) -> None:
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if not any(t.name == "MpiCommExecutorCloser"
+                   for t in threading.enumerate()):
+            return
+        _time.sleep(0.02)
+    raise AssertionError("MpiCommExecutorCloser remained alive after "
+                         f"{timeout}s")
+
+
+@pytest.fixture
+def _global_executor_state():
+    """Snapshot/restore the module-global executor slots around a test."""
+    saved = (MPINodeState._global_comm_executor, MPINodeState._global_mpi_pool)
+    yield
+    (MPINodeState._global_comm_executor, MPINodeState._global_mpi_pool) = saved
+
+
+@pytest.mark.cpu_only
+def test_server_close_releases_the_global_comm_executor(_global_executor_state):
+    """The server's final shutdown must close the shared COMM_WORLD executor.
+
+    ``MpiCommSession.shutdown()`` deliberately leaves the shared pool running
+    (multiple LLM instances reuse it), so without this close the non-leader
+    ranks stay blocked in the executor's task loop after the client is gone
+    -- the teardown hang behind a serve that could only die by hard kill.
+    """
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    fake = _FakeCommExecutor()
+    MPINodeState._global_comm_executor = fake
+    MPINodeState._global_mpi_pool = object()
+    aborted = []
+
+    RemoteMpiCommSessionServer._close_global_comm_executor(
+        grace=5.0, abort=lambda: aborted.append(True))
+
+    assert fake.exited.is_set()
+    assert not aborted
+    _wait_closer_thread_gone()
+    assert MPINodeState._global_comm_executor is None
+    assert MPINodeState._global_mpi_pool is None
+
+
+@pytest.mark.cpu_only
+def test_server_close_escalates_to_abort_when_the_join_wedges(
+        _global_executor_state):
+    """A worker stranded in a collective must not block teardown forever."""
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    fake = _FakeCommExecutor(block=True)
+    MPINodeState._global_comm_executor = fake
+    aborted = []
+
+    RemoteMpiCommSessionServer._close_global_comm_executor(
+        grace=0.2, abort=lambda: aborted.append(True))
+
+    assert aborted == [True]
+    # Release the wedged join so the closer thread ends inside the test
+    # (pytest-threadleak checks for leaked threads per test).
+    fake.release.set()
+    fake.exited.wait(5)
+    _wait_closer_thread_gone()
+
+
+@pytest.mark.cpu_only
+def test_server_close_escalates_to_abort_when_exit_raises(
+        _global_executor_state):
+    """Escalate to abort when the executor's ``__exit__`` raises.
+
+    A raised ``__exit__`` means the executor did not cleanly release, so peers
+    can stay blocked; the global refs are already cleared, so nothing else will
+    close them -- escalate the same way a timeout does.
+    """
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    fake = _FakeCommExecutor(fail=True)
+    MPINodeState._global_comm_executor = fake
+    aborted = []
+
+    RemoteMpiCommSessionServer._close_global_comm_executor(
+        grace=5.0, abort=lambda: aborted.append(True))
+
+    assert fake.exited.is_set()
+    assert aborted == [True]
+    _wait_closer_thread_gone()
+    assert MPINodeState._global_comm_executor is None
+
+
+@pytest.mark.cpu_only
+def test_server_close_is_a_noop_without_a_global_executor(
+        _global_executor_state):
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
+
+    MPINodeState._global_comm_executor = None
+    # Must not touch MPI at all (no abort callable is even constructed).
+    RemoteMpiCommSessionServer._close_global_comm_executor(grace=0.1)

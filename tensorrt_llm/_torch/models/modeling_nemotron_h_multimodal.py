@@ -55,6 +55,7 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
+from ..peft.lora.config import LoraConfig
 from ..speculative import SpecMetadata
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_mixin import (
@@ -64,6 +65,7 @@ from .modeling_multimodal_mixin import (
 )
 from .modeling_multimodal_utils import (
     _is_mm_disagg,
+    filter_mm_token_from_input_ids,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_attached_multimodal_embeddings,
@@ -87,6 +89,14 @@ VIDEO_MAX_NUM_TILES = 1
 IMAGE_PLACEHOLDER = "<image>"
 VIDEO_PLACEHOLDER = "<video>"
 AUDIO_PLACEHOLDER = "<so_embedding>"
+
+
+def _resolve_video_context_token_id(config: transformers.PretrainedConfig) -> int:
+    """Resolve the internal marker replaced by image tokens during EVS merge."""
+    token_id = getattr(config, "video_context_token_id", None)
+    # Tokenizer IDs are nonnegative. This marker stays in evs_ids and is
+    # replaced before token embedding, so it needs no vocabulary entry.
+    return -1 if token_id is None else token_id
 
 
 def _compute_aspect_preserving_size(
@@ -1182,7 +1192,7 @@ class NemotronHMultimodalInputProcessor(
         self.video_pruning_rate = video_pruning_rate
         self.img_context_token = self.config.img_context_token
         self.video_context_token = self.config.video_context_token
-        self.video_context_token_id = self.config.video_context_token_id
+        self.video_context_token_id = _resolve_video_context_token_id(self.config)
         # Nemotron 3.5 Super VL carries only `img_context_token`; fall back to the
         # InternVL `<img>`/`</img>` pair its processor uses.
         self.img_start_token = getattr(self.config, "img_start_token", "<img>")
@@ -1200,11 +1210,9 @@ class NemotronHMultimodalInputProcessor(
         )
         # Pre-tokenize the user-facing "<video>" placeholder string. NOTE this may
         # be a multi-token BPE sequence (e.g. [1060, 24073, 1062]) rather than
-        # `video_context_token_id`, because `<video>` is typically NOT registered
-        # as an added special token in the HF tokenizer (unlike `<image>` /
-        # `<so_embedding>`). `video_context_token_id` is instead a reserved
-        # extended-vocab ID that the model uses internally as the per-tubelet EVS
-        # placeholder; the tokenizer cannot produce it from user text. The fast
+        # `video_context_token_id`, because `<video>` is typically not registered
+        # as an added special token in the HF tokenizer. The per-tubelet EVS
+        # marker is resolved separately from the user-facing placeholder. The fast
         # path (token IDs & MM data) searches for this subsequence in the
         # caller's `prompt_token_ids`.
         self._video_placeholder_token_ids = self.tokenizer.encode(
@@ -2836,7 +2844,7 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         self.vocab_size = llm_model_config.pretrained_config.vocab_size
         self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
         self.img_context_token_id = config.img_context_token_id
-        self.video_context_token_id = config.video_context_token_id
+        self.video_context_token_id = _resolve_video_context_token_id(config)
         self.sound_context_token_id = getattr(config, "sound_context_token_id", None)
         self.post_config()
         # Expose the in-vocab context tokens to the model engine so
@@ -2953,6 +2961,15 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         # use llm.config as config for pytorch model engine
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+
+    @classmethod
+    def lora_config(cls, model_dir: str) -> LoraConfig:
+        """Return the decoder's LoRA target configuration.
+
+        Callers supply adapter paths and capacity through this configuration
+        and select adapters with per-prompt LoRARequest objects.
+        """
+        return NemotronHForCausalLM.lora_config(model_dir)
 
     def _build_evs_adjusted_context_ids(
         self,
@@ -3385,6 +3402,9 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         )
 
         multimodal_params = kwargs.get("multimodal_params", [])
+        mm_token_indices = kwargs.get("mm_token_indices")
+        text_token_indices = kwargs.get("text_token_indices")
+        evs_layout_updated = False
         mm_embedding = []
         if len(multimodal_params) > 0:
             ctx_params = multimodal_params[:num_context_requests]
@@ -3444,8 +3464,29 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
                     multimodal_params=ctx_params,
                     input_ids=input_ids,
                 )
+                evs_layout_updated = any(
+                    param.multimodal_data.get("modality_type") == "video" for param in ctx_params
+                )
 
             mm_embedding = find_input_mm_embeds(mm_embedding, ctx_params)
+
+        if evs_layout_updated and mm_embedding:
+            # EVS rewrites context positions after the executor builds indices.
+            # Appended generation and draft tokens remain text positions.
+            num_ctx_tokens = attn_metadata.num_ctx_tokens
+            text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
+                input_ids[:num_ctx_tokens],
+                vocab_size=self.llm.model.embed_tokens.num_embeddings,
+                mm_token_ids=self.mm_token_ids,
+            )
+            if num_ctx_tokens < input_ids.numel():
+                generation_indices = torch.arange(
+                    num_ctx_tokens,
+                    input_ids.numel(),
+                    dtype=text_token_indices.dtype,
+                    device=input_ids.device,
+                )
+                text_token_indices = torch.cat([text_token_indices, generation_indices])
 
         # `fuse_input_embeds` returns input_ids=None whenever it produced fused
         # embeddings, so the MTP drafter downstream would lose the prompt
@@ -3457,8 +3498,8 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
             input_ids,
             mm_embedding,
             mm_token_ids=self.mm_token_ids,
-            mm_token_indices=kwargs.get("mm_token_indices"),
-            text_token_indices=kwargs.get("text_token_indices"),
+            mm_token_indices=mm_token_indices,
+            text_token_indices=text_token_indices,
         )
 
         output_prob = self.llm.forward(

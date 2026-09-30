@@ -199,6 +199,30 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         expertCount += expertTokenCount;
     }
 
+    // `expertCount` and `expertOffset` above describe the routing decision for every expert,
+    // local or not: the permutation section below needs them to tell whether a token was routed
+    // at all, so that tokens landing on a remote expert still get the `-1` sentinel written to
+    // `mPtrExpandedIdxToPermutedIdx`.
+    //
+    // Capacity is a different question. Only experts owned by this rank materialize rows, so only
+    // they may contribute CTAs and padded tokens; `localExpertCount` is the count restricted to
+    // those experts and is what all capacity arithmetic below uses.
+    int32_t const localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+    int32_t localExpertCount[ExpertsPerThread];
+    int32_t mappedLocalExpertIdx[ExpertsPerThread];
+    bool isLocalExpertPerExpert[ExpertsPerThread];
+#pragma unroll
+    for (int ii = 0; ii < ExpertsPerThread; ++ii)
+    {
+        auto const expertIdx = static_cast<int32_t>(threadIdx.x) * ExpertsPerThread + ii;
+        auto const localExpertIdx = expertIdx - params.mLocalExpertsStartIdx;
+        auto const isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent
+            && (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+        isLocalExpertPerExpert[ii] = isLocalExpert;
+        mappedLocalExpertIdx[ii] = localExpertIdx >> params.mLocalExpertsStrideLog2;
+        localExpertCount[ii] = isLocalExpert ? getBits(expertCount, ii) : 0;
+    }
+
     // at this point, we are ready for the scan across all experts to get the
     // thread-wise offsets across experts
     // first, we need to reduce across our 4 experts into `numCta`
@@ -206,7 +230,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
 #pragma unroll
     for (int ii = 0; ii < ExpertsPerThread; ++ii)
     {
-        auto count = getBits(expertCount, ii);
+        auto count = localExpertCount[ii];
         int32_t num;
         if (params.mIsPow2)
         {
@@ -229,7 +253,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
 #pragma unroll
     for (int ii = 0; ii < ExpertsPerThread; ++ii)
     {
-        auto count = getBits(expertCount, ii);
+        auto count = localExpertCount[ii];
         int32_t finalNumCta;
         if (params.mIsPow2)
         {
@@ -239,10 +263,11 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         {
             finalNumCta = divUpTileN<int32_t>(count, params.mTileTokensDim);
         }
-        auto expertIdx = threadIdx.x * ExpertsPerThread + ii;
+        // `finalNumCta` is zero unless this expert is local, so the batch index below is the index
+        // into this rank's weight tensors, which have `mNumLocalExperts` rows.
         for (int cta = 0; cta < finalNumCta; ++cta)
         {
-            params.mPtrCtaIdxXyToBatchIdx[ctaOffsetExp + cta] = expertIdx;
+            params.mPtrCtaIdxXyToBatchIdx[ctaOffsetExp + cta] = mappedLocalExpertIdx[ii];
             int32_t mnLimit1;
             int32_t mnLimit2;
             if (params.mIsPow2)
@@ -290,7 +315,6 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     // for this, we perform a scan similar to the one directly after the warp-scan:
     // here, we keep the local offset for each of the thread's experts in a field
     // of registers
-    auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
     int32_t finalExpertOffset[ExpertsPerThread];
     if (params.mIsPow2)
     {
@@ -306,11 +330,11 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         int32_t tmp;
         if (params.mIsPow2)
         {
-            tmp = divUpMulLog2<int32_t>(getBits(expertCount, ii - 1), params.mPaddingLog2);
+            tmp = divUpMulLog2<int32_t>(localExpertCount[ii - 1], params.mPaddingLog2);
         }
         else
         {
-            tmp = divUpMulTileN<int32_t>(getBits(expertCount, ii - 1), params.mTileTokensDim);
+            tmp = divUpMulTileN<int32_t>(localExpertCount[ii - 1], params.mTileTokensDim);
         }
         finalExpertOffset[ii] = finalExpertOffset[ii - 1] + tmp;
     }
@@ -333,11 +357,8 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
             // determine whether the offset for this expert and token changes
             auto localOffsetToken = getBits(expertOffset[tokenIdx], ii);
             auto isTokenRouted = getBits(expertOffset[tokenIdx + 1], ii) > localOffsetToken;
-            // the expert index of this expert
-            auto expertIdx = threadIdx.x * ExpertsPerThread + ii;
-            auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
-            auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent
-                && (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+            // whether this expert is local to our GPU at all
+            auto isLocalExpert = isLocalExpertPerExpert[ii];
             // the permuted index: we add the local offset relative to this expert and token
             // to the global offset from the scan for this expert
             auto permutedIdx = isLocalExpert ? finalExpertOffset[ii] + localOffsetToken : int32_t{-1};

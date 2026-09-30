@@ -15,6 +15,7 @@ to PyExecutor, including:
 import threading
 import time
 import types
+from contextlib import nullcontext
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
@@ -28,6 +29,7 @@ from tensorrt_llm._torch.disaggregation.orchestration.admission import (
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.interfaces import ExecutorEffects
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledModelRunner
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
@@ -36,6 +38,8 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
     LlmRequestState,
     LlmResponse,
+    LlmResult,
+    PyResult,
     SamplingConfig,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
@@ -56,6 +60,69 @@ from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfi
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    "request_flags, expected_gather",
+    [
+        ([False], False),
+        ([True], True),
+        ([False, False], False),
+        ([False, True], True),
+        ([True, False], True),
+    ],
+)
+def test_forward_step_carries_context_logits_request_to_runner(request_flags, expected_gather):
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [
+        types.SimpleNamespace(context_chunk_size=3, py_return_context_logits=flag)
+        for flag in request_flags
+    ]
+    logits = torch.arange(len(request_flags) * 12).reshape(-1, 4)
+    runner = Mock(spec=ScheduledModelRunner)
+    runner.forward.side_effect = lambda inputs, **kwargs: {
+        "logits": logits if inputs.gather_context_logits else logits[2::3]
+    }
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = types.SimpleNamespace(extra_attrs={})
+    engine._runner = runner
+    engine._fallback_to_engine = False
+    engine.enable_spec_decode = False
+    engine.runtime_draft_len = 0
+    resources = object()
+    cache_indirection = object()
+    new_tensors = object()
+    executor = types.SimpleNamespace(
+        model_engine=engine,
+        resource_manager=resources,
+        iter_counter=0,
+        sampler=Mock(get_cache_indirection=Mock(return_value=cache_indirection)),
+        execution_stream=Mock(),
+        _iter_adp_dummy_ctx_tokens=0,
+        _iter_adp_dummy_gen_tokens=0,
+        _compute_adp_dummy_tokens=PyExecutor._compute_adp_dummy_tokens,
+        _maybe_record_hang_diagnostic_phase=Mock(),
+        _attach_encoder_output_to_execution_stream=Mock(),
+        _mark_cross_kv_projection_consumed=Mock(),
+        _kv_connector_wait_for_save=Mock(),
+        _handle_errors=Mock(),
+    )
+    with (
+        patch("torch.cuda.current_stream", return_value=Mock()),
+        patch("torch.cuda.stream", return_value=nullcontext()),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter"),
+    ):
+        outputs = PyExecutor._forward_step(executor, batch, new_tensors)
+
+    executor._handle_errors.assert_not_called()
+    runner.forward.assert_called_once()
+    inputs = runner.forward.call_args.args[0]
+    assert inputs.batch is batch
+    assert inputs.gather_context_logits is expected_gather
+    assert inputs.new_tensors_device is new_tensors
+    assert inputs.cache_indirection_buffer is cache_indirection
+    assert runner.forward.call_args.kwargs["resource_manager"] is resources
+    torch.testing.assert_close(outputs["logits"], logits if expected_gather else logits[2::3])
 
 
 class _InflightRequestIds:
@@ -3040,3 +3107,109 @@ def test_non_last_pp_rank_drains_every_relay_send():
 
     waited = sorted(call.args[1] for call in executor.wait_on_pp_send_handles.call_args_list)
     assert waited == [0, 1, 2, 3]
+
+
+# -- first-token logprobs and logits transferred from prefill -----------------
+
+
+def _prepared_gen_request(rid: int, py_result: PyResult, **disagg_params) -> types.SimpleNamespace:
+    """Generation request at its first decoding step, carrying what the
+    context side transferred for the first token."""
+    transferred = {"first_gen_log_probs": None, "first_gen_logits": None, **disagg_params}
+    request = types.SimpleNamespace(
+        py_request_id=rid,
+        py_decoding_iter=1,
+        py_result=py_result,
+        py_disaggregated_params=types.SimpleNamespace(**transferred),
+    )
+    request.create_response = lambda _use_fast_logits, _rank: LlmResponse(
+        request_id=rid, result=LlmResult(b"", py_result)
+    )
+    return request
+
+
+def _first_token_executor(*, overlap: bool) -> PyExecutor:
+    """Bare single-rank executor whose first-token response path runs for real."""
+    executor = object.__new__(PyExecutor)
+    executor.should_exclude_last_generation_logits = overlap
+    executor.dist = types.SimpleNamespace(
+        rank=0, world_size=1, mapping=types.SimpleNamespace(tp_group=[0])
+    )
+    executor.enable_attention_dp = False
+    executor.gather_all_responses = False
+    executor.response_cv = threading.Condition()
+    executor.responses = {}
+    executor.result_wait_queues = {}
+    return executor
+
+
+class _CpuPlacedTorch:
+    """``torch`` as py_executor sees it, with device placement pinned to the CPU."""
+
+    def __getattr__(self, name):
+        return getattr(torch, name)
+
+    @staticmethod
+    def device(*_args, **_kwargs):
+        return torch.device("cpu")
+
+
+def test_prefill_logprobs_lead_the_generation_logprobs_one_entry_per_token():
+    """The first token was sampled on the context side; its logprob arrives in
+    the disaggregated params and is prepended before any decode step, so the
+    generation side reports exactly one entry per generated token. Beam search
+    does not carry per-beam first-token logprobs and prepends nothing."""
+    executor = object.__new__(PyExecutor)
+    py_result = PyResult(prompt_len=4, max_new_tokens=4, return_log_probs=True)
+    first_token = {7: types.SimpleNamespace(logprob=-0.5, rank=None)}
+    request = _prepared_gen_request(1, py_result, first_gen_log_probs=[first_token])
+
+    executor._maybe_prepend_logprobs_and_logits(request, beam_width=1)
+    second_token = {9: types.SimpleNamespace(logprob=-1.0, rank=None)}
+    py_result.append_log_probs([[second_token]])  # the first decode step
+
+    assert py_result.log_probs == [[first_token, second_token]]
+    assert py_result.cum_log_probs == [-1.5]
+
+    beam_result = PyResult(prompt_len=4, max_new_tokens=4, return_log_probs=True)
+    beam_request = _prepared_gen_request(2, beam_result, first_gen_log_probs=[first_token])
+    executor._maybe_prepend_logprobs_and_logits(beam_request, beam_width=2)
+    assert beam_result.log_probs is None
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["overlap_off", "overlap_on"])
+def test_first_token_response_carries_the_prefill_logits(monkeypatch, overlap):
+    """The logits prefill produced for the first token arrive in the
+    disaggregated params, are prepended by the executor, and the first
+    streaming response must report them. Under the overlap scheduler the
+    latest chunk is normally excluded and it is the only chunk at this point,
+    so the executor snapshots it onto the response; that snapshot must survive
+    the next decode step appending its own logits."""
+    executor = _first_token_executor(overlap=overlap)
+    executor.device_id = 0
+    # The prepend moves each transferred tensor onto the executor's CUDA
+    # device; on this CPU-only test that placement resolves to the CPU.
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.torch", _CpuPlacedTorch())
+    py_result = PyResult(
+        prompt_len=4,
+        max_new_tokens=4,
+        use_device_memory=False,
+        streaming=True,
+        return_generation_logits=True,
+        exclude_last_generation_logits=overlap,
+        use_chunked_generation_logits=False,
+    )
+    first_logits = torch.arange(6, dtype=torch.float32).reshape(1, 1, 6)
+    request = _prepared_gen_request(1, py_result, first_gen_logits=[first_logits])
+
+    executor._maybe_prepend_logprobs_and_logits(request, beam_width=1)
+    executor._handle_first_token_response(types.SimpleNamespace(generation_requests=[request]))
+
+    (response,) = executor.responses[1]
+    assert torch.equal(response.result.generation_logits, first_logits.transpose(0, 1))
+    if overlap:
+        # Read through the shared result the excluded latest chunk is invisible;
+        # only the snapshot on the response carries it.
+        assert py_result.generation_logits is None
+        py_result.append_generation_logits(first_logits + 10)  # the next decode step lands
+        assert torch.equal(response.result.generation_logits, first_logits.transpose(0, 1))

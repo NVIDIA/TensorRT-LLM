@@ -19,7 +19,7 @@ own dependencies, pure-CPU pytest suite) with a single dedicated CI stage
 imports nothing from the TRT-LLM wheel, so an agent-flow-only change needs
 exactly that one CPU stage and none of the GPU test-db stages.
 
-Unlike the AutoDeploy / VisualGen rules, this stage is not driven by any
+Unlike the VisualGen rule, this stage is not driven by any
 test-db YAML, so there are no blocks to resolve — the rule contributes the
 stage name literally. ``AGENT_FLOW_STAGE`` MUST stay in sync with the
 matching stage key in ``jenkins/L0_Test.groovy`` (``agentFlowTestConfigs``);
