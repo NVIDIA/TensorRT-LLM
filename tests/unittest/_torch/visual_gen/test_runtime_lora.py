@@ -309,7 +309,7 @@ def test_runtime_lora_does_not_map_minimax_aliases_for_non_turbo_lora(
         str(lora_path),
     )
 
-    with pytest.raises(ValueError, match="No Runtime LoRA modules"):
+    with pytest.raises(ValueError, match="Runtime LoRA skipped 3 adapter target"):
         apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
 
 
@@ -332,7 +332,7 @@ def test_runtime_lora_does_not_map_minimax_aliases_for_other_turbo_lora(
         str(lora_path),
     )
 
-    with pytest.raises(ValueError, match="No Runtime LoRA modules"):
+    with pytest.raises(ValueError, match="Runtime LoRA skipped 3 adapter target"):
         apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
 
 
