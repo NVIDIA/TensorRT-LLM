@@ -120,6 +120,7 @@ blocks are resolved and the normalized spec is written to
 workspace/perf-analyze/<name>/
 ├── .perf_analyze_state.json   # checkpoint
 ├── task.yaml                         # resolved spec (defaults filled in)
+├── prompts/<role>.md                 # composed system prompt per role, snapshotted at launch
 ├── serve.log, serve.pid              # server run artifacts
 ├── benchmark_results.md              # ← benchmarker
 ├── <backend>-...json                 # raw benchmark_serving result

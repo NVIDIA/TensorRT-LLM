@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 import pytest
 import torch
 
@@ -87,9 +85,6 @@ def test_stats_delta_arithmetic() -> None:
 
 
 def test_cpp_stats_types_are_native() -> None:
-    if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "cpp":
-        pytest.skip("C++ backend only")
-
     from tensorrt_llm.bindings.internal.batch_manager import kv_cache_manager_v2 as cpp
 
     assert KVCacheStatsDelta is cpp.KVCacheStatsDelta
@@ -108,9 +103,6 @@ def test_cpp_stats_types_are_native() -> None:
 
 
 def test_native_cold_page_codec_is_consumed_after_failure() -> None:
-    if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "cpp":
-        pytest.skip("C++ backend only")
-
     from tensorrt_llm.bindings.internal.batch_manager import kv_cache_manager_v2 as cpp
     from tensorrt_llm.runtime.kv_cache_manager_v2 import create_default_kv_cache_cold_page_codec
 
@@ -127,9 +119,6 @@ def test_native_cold_page_codec_is_consumed_after_failure() -> None:
 
 
 def test_native_cold_page_codec_rejects_wrong_type() -> None:
-    if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "cpp":
-        pytest.skip("C++ backend only")
-
     with pytest.raises(TypeError, match="IKvCacheColdPageCodec instance or None"):
         KVCacheManager(_make_config(), cold_page_codec=5)
 
