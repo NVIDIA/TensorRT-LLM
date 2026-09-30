@@ -1139,6 +1139,58 @@ def _settle_context_cursor(req: LlmRequest, reuse: int, tokens_per_block: int) -
     req.context_chunk_size = req.context_remaining_length
 
 
+def _spec_recompute_target(
+    req: LlmRequest,
+    committed: int,
+    *,
+    tail: int,
+    tokens_per_block: int,
+    is_draft: bool,
+) -> int:
+    """Cap the reuse start position so a prompt tail is recomputed.
+
+    Hidden-state-conditioned drafters (DFlash/DSpark) capture target
+    hidden states only for tokens that physically pass through a target
+    forward. A prefix-cache hit skips the reused tokens, so the drafter's
+    cross-attention context never sees them and acceptance length drops
+    (measured -15% AL at a 100% prefix-hit rate). Rewinding the context
+    position keeps the blocks reused (the allocation/dedup win stays, and
+    the recompute rewrites them with identical values; try_commit_blocks
+    skips re-commit below the committed watermark) while restoring the
+    drafter's inputs.
+
+    ``tail`` is the manager's ``_spec_recompute_tail``, resolved at
+    construction from the spec config's ``context_recompute_tail`` (which the
+    draft model config fills when unset): each cache-hit request starts its
+    context at a block-aligned position leaving at least that many prompt
+    tokens to recompute. For a drafter whose context attention
+    is windowed (e.g. DFlash2 ``swa_window_size``), a tail of the window
+    size reproduces the no-reuse drafter inputs exactly; ``-1`` forces a
+    full re-prefill for non-windowed drafters. The scheduler reads
+    ``context_remaining_length`` after ``prepare_context``, so budget and
+    chunk sizing account for the recomputed tail natively.
+
+    A module-level function taking the manager scalars explicitly, like the
+    cursor helpers above: no-op cases (nothing committed, draft pool, dummy
+    request) are decided from the request alone, before ``tail`` is read.
+    """
+    if committed <= 0 or is_draft or req.is_dummy or not tail:
+        return committed
+    prompt_len = req.prompt_len
+    if tail < 0:
+        target = 0
+    else:
+        if prompt_len - committed >= tail:
+            return committed  # already recomputing at least the tail
+        target = max(
+            0,
+            (prompt_len - tail) // tokens_per_block * tokens_per_block,
+        )
+    if target >= committed:
+        return committed
+    return target
+
+
 class KVCacheManagerV2(BaseResourceManager):
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
@@ -1215,6 +1267,15 @@ class KVCacheManagerV2(BaseResourceManager):
         block_reuse_config = kv_cache_config.block_reuse_config
         self.block_reuse_policy = BlockReusePolicy(block_reuse_config.policy)
         self._swa_endpoint_rewind = block_reuse_config.swa_endpoint_rewind_tokens
+        # Recompute tail for hidden-state-conditioned drafters with block
+        # reuse: rewind cache-hit context requests so at least this many
+        # prompt tokens pass through the target forward. Resolved from the
+        # draft model config (or set explicitly) on the spec config; see
+        # _spec_recompute_target for why drafters need it. None means the
+        # auto value never resolved; recompute everything rather than
+        # silently serving a degraded drafter.
+        tail = getattr(spec_config, "context_recompute_tail", 0)
+        self._spec_recompute_tail = -1 if tail is None else int(tail)
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {idx: offset for offset, idx in enumerate(self.pp_layers)}
         self.max_beam_width = max_beam_width
@@ -3634,6 +3695,15 @@ class KVCacheManagerV2(BaseResourceManager):
         # First chunk only: num_committed_tokens holds at the initial prefix
         # until context end, so reapplying later would rewind the cursor.
         if req.is_first_context_chunk and self.enable_block_reuse:
+            # Hidden-state drafters need a recomputed prompt tail; cap the
+            # reuse start (blocks stay reused, the cursor rewinds further).
+            reused = _spec_recompute_target(
+                req,
+                reused,
+                tail=self._spec_recompute_tail,
+                tokens_per_block=self.tokens_per_block,
+                is_draft=self.is_draft,
+            )
             _settle_context_cursor(req, reused, self.tokens_per_block)
         self._prepare_connector_prefix_reservation(req)
         return True
@@ -3720,6 +3790,13 @@ class KVCacheManagerV2(BaseResourceManager):
         reused = self.prepare_context_cache(req)
         if reused is None:
             return False
+        # Deliberately NO _spec_recompute_target here: the context-recompute
+        # tail applies at local prefill only. A disagg generation-init request
+        # receives its prompt KV from the context worker and never runs a
+        # target prefill forward on this engine, so there are no drafter
+        # hidden states to recover by rewinding. Speculative decoding on a
+        # disaggregated engine is guard-refused anyway (disagg_dflash_error),
+        # making this site unreachable for hidden-state drafters.
         if self.enable_block_reuse:
             _settle_context_cursor(req, reused, self.tokens_per_block)
 
@@ -4345,7 +4422,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     # offsets copy succeeds, the forward proceeds, and the
                     # drafter writes context K/V through the inactive cache's
                     # stale page table -- a crash traded for silent corruption.
-                    # This was tried and reverted; see the deferred lead.
+                    # An earlier iteration deferred the resume here and hit
+                    # exactly that corruption; the deferral was reverted.
                     #
                     # Deferring it safely means not forwarding the request this
                     # iteration, which is an admission decision and belongs to
