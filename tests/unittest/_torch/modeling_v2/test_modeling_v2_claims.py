@@ -17,6 +17,7 @@ gate records are for.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -247,3 +248,77 @@ def test_every_entry_with_cells_has_a_test_that_drives_them():
         f"{len(undriven)} entry(ies) declare cells that no test drives: "
         f"{', '.join(undriven)}. Parametrize the entry's test off its CELLS."
     )
+
+
+# The phase a step runs at is resolved once, at the dispatcher, and a target is
+# what runs after that resolution. These two gates are what keep that true:
+# without them a later edit can put `if md.num_contexts:` back inside a decode
+# body and nothing goes red.
+_PHASE_FIELDS = ("num_contexts", "num_ctx_tokens")
+
+
+# Cores not yet on the target layer. An entry is deleted when that core is
+# migrated, so finishing the migration is a visible diff rather than a gate
+# that quietly stopped covering anything.
+_NOT_YET_ON_THE_TARGET_LAYER = frozenset({"r1_0528_nvfp4__sm_103__dep4"})
+
+
+def _core_modules() -> list[Path]:
+    """Every target module the routing tables can reach and this layer covers."""
+    modules = []
+    for arch in _ARCHS:
+        routing = routing_module(arch)
+        for dotted in routing.TARGET_MODULES.values():
+            path = _module_path(dotted)
+            if path.parent.name in _NOT_YET_ON_THE_TARGET_LAYER:
+                continue
+            modules.append(path)
+    return modules
+
+
+def test_a_decode_target_never_reads_the_phase_back():
+    """Decode is routed to only when there are no context rows. Reading the
+    count back inside it is not a redundancy, it is the design being violated:
+    the value is a per-capture constant, so a branch on it inside a captured
+    graph is frozen at whatever the capturing batch happened to carry.
+
+    Prefill is deliberately exempt -- it holds the mixed batch and genuinely
+    needs `num_ctx_tokens` to split it. The asymmetry is the design (2.2), not
+    an oversight.
+
+    Read by parsing rather than by importing, like everything else in this
+    file: no GPU, no built extensions.
+    """
+    offenders = []
+    for path in _core_modules():
+        if not path.is_file():
+            continue
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef) or node.name != "DecodeTarget":
+                continue
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Attribute) and inner.attr in _PHASE_FIELDS:
+                    offenders.append(f"{path.relative_to(_ROOT)}:{inner.lineno} .{inner.attr}")
+    assert not offenders, "a decode target reads the phase it was routed on: " + ", ".join(
+        offenders
+    )
+
+
+def test_every_core_ships_both_targets():
+    """A core with one target routes half its steps into a KeyError.
+
+    Names, not a table: the gate above finds the decode body by class name, so
+    the name is load-bearing and is pinned here rather than left to convention.
+    """
+    missing = []
+    for path in _core_modules():
+        if not path.is_file():
+            continue
+        classes = {
+            n.name for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.ClassDef)
+        }
+        for required in ("PrefillTarget", "DecodeTarget"):
+            if required not in classes:
+                missing.append(f"{path.relative_to(_ROOT)}: {required}")
+    assert not missing, "core modules missing a target class: " + ", ".join(missing)
