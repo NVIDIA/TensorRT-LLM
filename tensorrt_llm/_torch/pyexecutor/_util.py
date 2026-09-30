@@ -1467,6 +1467,7 @@ class KvCacheCreator:
             self._kv_cache_config.avg_seq_len = self._max_seq_len
             if self._is_kv_cache_manager_v2:
                 free_mem, _ = torch.cuda.mem_get_info()
+                free_mem -= self._get_unallocated_draft_staging_bytes()
                 max_gpu_total_bytes = int(
                     self._kv_cache_config.free_gpu_memory_fraction * free_mem)
                 if (self._max_gpu_total_bytes_in is not None
@@ -1499,6 +1500,7 @@ class KvCacheCreator:
             return
         fraction = self._kv_cache_config.free_gpu_memory_fraction
         free_mem, _total = torch.cuda.mem_get_info()
+        free_mem -= self._get_unallocated_draft_staging_bytes()
         budget_bytes = int(free_mem * fraction)
         if budget_bytes <= 0:
             raise ValueError(
@@ -1641,6 +1643,15 @@ class KvCacheCreator:
                 f"Reserving {mem_gb:.2f} GiB for multimodal encoder memory "
                 "not materialized by the profiling run.")
 
+        # Profiling normally materializes VANILLA's dense draft staging. When
+        # it does not, reserve it separately from the manager-owned draft pages.
+        draft_staging_bytes = self._get_unallocated_draft_staging_bytes()
+        peak_memory += draft_staging_bytes
+        if draft_staging_bytes > 0:
+            logger.info(
+                f"Reserving {draft_staging_bytes / GB:.2f} GiB for draft KV "
+                "staging not materialized by the profiling run.")
+
         # calculate max memory from peak memory and free gpu memory fraction
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
                                                    total_gpu_memory, fraction,
@@ -1779,7 +1790,7 @@ class KvCacheCreator:
             model_engine, kv_cache_config)
 
         # Keep the target layer layout separate from standalone draft layouts.
-        # Legacy modes construct a separate manager; unified standalone DSpark
+        # Legacy modes construct a separate manager; unified standalone drafters
         # passes an explicit draft layout to the target's owner instead.
         # We still pass spec_config so that num_extra_kv_tokens is calculated.
         spec_dec_layer_mask = None
@@ -1844,12 +1855,12 @@ class KvCacheCreator:
 
         return kv_cache_manager
 
-    def _is_standalone_dspark(self) -> bool:
+    def _is_standalone_draft(self) -> bool:
         spec_config = self._speculative_config
         return (spec_config is not None
-                and spec_config.spec_dec_mode.is_dspark()
-                and not spec_config.draft_is_embedded_in_target
-                and not spec_config._use_shared_kv_cache)
+                and (spec_config.spec_dec_mode.is_dflash()
+                     or (spec_config.spec_dec_mode.is_dspark()
+                         and not spec_config.draft_is_embedded_in_target)))
 
     def _is_embedded_dspark(self) -> bool:
         spec_config = self._speculative_config
@@ -1858,7 +1869,7 @@ class KvCacheCreator:
                 and spec_config.draft_is_embedded_in_target)
 
     def _uses_unified_standalone_draft_cache(self) -> bool:
-        if (not (self._is_standalone_dspark() or self._is_embedded_dspark())
+        if (not (self._is_standalone_draft() or self._is_embedded_dspark())
                 or not self._is_kv_cache_manager_v2):
             return False
         # Disaggregation validates unified support; aggregate may use legacy state.
@@ -1866,11 +1877,19 @@ class KvCacheCreator:
                 or self._unified_draft_cache_unsupported_reason() is None)
 
     def _validate_standalone_draft_cache(self) -> None:
-        """Validate manager-owned DSpark history for disaggregated serving."""
-        if (not (self._is_standalone_dspark() or self._is_embedded_dspark())
+        """Resolve unified draft history versus legacy disaggregated serving."""
+        if (not (self._is_standalone_draft() or self._is_embedded_dspark())
                 or not self._is_disagg):
             return
         if not self._is_kv_cache_manager_v2:
+            if self._speculative_config.spec_dec_mode.is_dflash():
+                logger.warning(
+                    "DFlash disaggregated serving with the legacy KV cache "
+                    "manager transfers only target KV; the generation worker "
+                    "starts without the drafter's prompt context, reducing "
+                    "acceptance. Draft history transfer requires KV cache "
+                    "manager V2 on both workers.")
+                return
             raise ValueError("DSpark disaggregation requires "
                              "kv_cache_config.use_kv_cache_manager_v2=True "
                              "on both workers.")
@@ -1880,9 +1899,9 @@ class KvCacheCreator:
 
     def _unified_draft_cache_unsupported_reason(self) -> Optional[str]:
         """Shared admission requirements for unified aggregate and disagg KV."""
-        if (self._is_standalone_dspark()
+        if (self._is_standalone_draft()
                 and is_mla(self._draft_config.pretrained_config)):
-            return "Unified DSpark KV cache does not yet support MLA drafters."
+            return "Unified draft KV cache does not yet support MLA drafters."
         return None
 
     def _get_draft_mapping(self) -> Mapping:
@@ -1931,6 +1950,38 @@ class KvCacheCreator:
                                              "max_position_embeddings", None)
                                      if draft_model_config else None),
         )
+
+    def _get_unallocated_draft_staging_bytes(self) -> int:
+        """Dense local staging in addition to transferable manager-owned pages."""
+        if not self._uses_unified_standalone_draft_cache():
+            return 0
+        layout = self._get_standalone_draft_layout()
+        if layout.attention_backend != "VANILLA":
+            return 0
+
+        from ..speculative.dflash import compute_dflash_ctx_buffer_bytes
+
+        draft = self._model_engine.model.draft_model
+        worker = self._model_engine.model.spec_worker
+        max_ctx_len = self._max_seq_len
+        if layout.max_position_embeddings is not None:
+            max_ctx_len = min(max_ctx_len, layout.max_position_embeddings)
+        required_bytes = compute_dflash_ctx_buffer_bytes(
+            max_batch_size=self._max_batch_size,
+            max_ctx_len=max_ctx_len,
+            block_size=worker._draft_block_width(draft),
+            num_attn_layers=layout.num_layers,
+            num_kv_heads_per_rank=layout.num_kv_heads,
+            head_dim=layout.head_dim,
+            dtype_bytes=layout.dtype.itemsize,
+            kv_factor=layout.kv_factor,
+            paged=False,
+        )
+        allocated_bytes = sum(
+            buf.numel() * buf.element_size()
+            for buf in (worker._ctx_k_buf, worker._ctx_v_buf)
+            if buf is not None)
+        return max(required_bytes - allocated_bytes, 0)
 
     def _should_create_separate_draft_kv_cache(self) -> bool:
         """

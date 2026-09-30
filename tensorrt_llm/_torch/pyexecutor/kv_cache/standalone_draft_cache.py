@@ -32,8 +32,6 @@ class StandaloneDraftLayout:
             raise ValueError("Standalone draft cache dimensions must be positive")
         if self.extra_tokens < 0:
             raise ValueError("Standalone draft scratch capacity must be nonnegative")
-        if self.dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError("Standalone draft KV supports FP16 and BF16 storage")
         if self.kv_factor not in (1, 2):
             raise ValueError("Draft KV storage requires one or two planes")
         if self.window_size is not None and self.window_size <= 0:
@@ -61,9 +59,11 @@ class StandaloneDraftLayout:
             "num_kv_heads": self.total_num_kv_heads or self.num_kv_heads,
             "head_dim": self.head_dim,
             "dtype": str(self.dtype),
-            # VANILLA and TRTLLM share post-RoPE keys and projected values.
+            # These backends share post-RoPE keys and projected values in HND pages.
             "attention_backend": (
-                "VANILLA" if self.attention_backend == "TRTLLM" else self.attention_backend
+                "VANILLA"
+                if self.attention_backend in ("TRTLLM", "FA4")
+                else self.attention_backend
             ),
             "kv_factor": self.kv_factor,
             "window_size": self.window_size,

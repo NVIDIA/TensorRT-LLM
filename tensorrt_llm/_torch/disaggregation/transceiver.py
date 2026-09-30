@@ -542,7 +542,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             expected_length = min(history["valid_length"], max_positions)
         if history["valid_length"] != expected_length or history["position"] != prompt_len:
             raise ValueError(
-                "DSpark transfer requires valid draft history and sequence position "
+                "Draft KV transfer requires valid draft history and sequence position "
                 f"covering the complete prompt ({prompt_len} tokens, "
                 f"{expected_length} retained)."
             )
@@ -562,13 +562,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if history is None:
             if has_draft:
                 raise ValueError(
-                    "Standalone DSpark generation requires draft history from a prefill worker "
+                    "Standalone draft generation requires draft history from a prefill worker "
                     "with matching speculative configuration; draft history metadata is missing."
                 )
             return
         if not has_draft:
             raise ValueError(
-                "Received standalone DSpark draft history without a manager-owned draft cache."
+                "Received standalone draft history without a manager-owned draft cache."
             )
         self._validate_draft_history_range(req, history)
         # K/V already occupies receiver-local pages; restore only validity and position.

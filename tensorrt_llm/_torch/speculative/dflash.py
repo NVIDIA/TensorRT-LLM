@@ -984,10 +984,7 @@ class DFlashWorker(SpecWorkerBase):
         unified storage supplies draft block indices directly.
         """
         if draft_kv_cache_manager is None:
-            # No separate draft KV cache. Attention DP alone does NOT disable
-            # it: _util.py skips that bail for an external drafter, which is
-            # what DSpark is, so this drafter does get a manager under DP. The
-            # reachable cases are the two-model paths, which never build one.
+            # Legacy configurations without a draft manager use a private arena.
             return None
         unified = getattr(draft_kv_cache_manager, "draft_layout", None) is not None
         get_buffers = (
@@ -1004,7 +1001,7 @@ class DFlashWorker(SpecWorkerBase):
             if tuple(layer.shape[1:]) != expected or layer.dtype != dtype:
                 if unified:
                     raise ValueError(
-                        "Unified DSpark draft pool does not match the drafter KV layout"
+                        "Unified draft KV pool does not match the drafter KV layout"
                     )
                 # Fall back rather than fail: the private arena is what every
                 # DFlash model shipped with, so an unrecognized pool costs the
@@ -1283,7 +1280,7 @@ class DFlashWorker(SpecWorkerBase):
                     tokens_per_block=page_size,
                     has_context_attention=has_context_attention,
                 )
-            elif not unified and self._dflash_attention_backend == "FA4":
+            elif self._dflash_attention_backend == "FA4":
                 validate_dflash_fa4_runtime(dtype=dtype, head_dim=hd)
             # Settle the block table before committing to the pool: it is the
             # last thing that can rule the pool out, and falling back after
@@ -1412,7 +1409,7 @@ class DFlashWorker(SpecWorkerBase):
         if req_id not in self._req_to_slot:
             if not self._free_slots:
                 if self._has_unified_draft_cache():
-                    raise RuntimeError("Unified DSpark has no free request staging slot")
+                    raise RuntimeError("Unified draft KV cache has no free request staging slot")
                 return None
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
@@ -1746,7 +1743,7 @@ class DFlashWorker(SpecWorkerBase):
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
         if getattr(draft_kv_cache_manager, "draft_layout", None) is not None:
             if not self._ctx_buf_inited or self._ctx_kv_manager is not draft_kv_cache_manager:
-                raise RuntimeError("Unified DSpark draft inputs must be prepared before forward")
+                raise RuntimeError("Unified draft KV inputs must be prepared before forward")
         else:
             self._lazy_init_ctx_buffers(
                 draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager
