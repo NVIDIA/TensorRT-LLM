@@ -1860,7 +1860,8 @@ class KvCacheCreator:
         return (spec_config is not None
                 and (spec_config.spec_dec_mode.is_dflash()
                      or (spec_config.spec_dec_mode.is_dspark()
-                         and not spec_config.draft_is_embedded_in_target)))
+                         and not spec_config.draft_is_embedded_in_target))
+                and not spec_config._use_shared_kv_cache)
 
     def _is_embedded_dspark(self) -> bool:
         spec_config = self._speculative_config
@@ -1961,8 +1962,9 @@ class KvCacheCreator:
 
         from ..speculative.dflash import compute_dflash_ctx_buffer_bytes
 
-        draft = self._model_engine.model.draft_model
-        worker = self._model_engine.model.spec_worker
+        speculative_model = self._model_engine.get_speculative_model()
+        draft = speculative_model.draft_model
+        worker = speculative_model.spec_worker
         max_ctx_len = self._max_seq_len
         if layout.max_position_embeddings is not None:
             max_ctx_len = min(max_ctx_len, layout.max_position_embeddings)

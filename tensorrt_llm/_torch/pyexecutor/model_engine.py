@@ -1045,6 +1045,15 @@ class PyTorchModelEngine(ModelEngine):
         self.cuda_graph_runner.register_sample_type_resolver(resolver)
         self._stage_in_graph_sampling = stage
 
+    def get_speculative_model(self) -> Optional[SpecDecOneEngineForCausalLM]:
+        """Return the one-engine speculative model, including inside a VLM."""
+        if not self.is_spec_decode:
+            return None
+        model = self.model
+        if isinstance(model, MultimodalModelMixin):
+            model = model.language_model
+        return model if isinstance(model, SpecDecOneEngineForCausalLM) else None
+
     def get_kv_cache_dtype_byte_size(self) -> float:
         """
         Returns the size (in bytes) occupied by kv cache type.
@@ -6126,13 +6135,13 @@ class PyTorchModelEngine(ModelEngine):
                 can_run_graph,
                 execution_promoted_context_ids,
                 use_lora_graph=use_lora_graph)
-            spec_worker = (self.model.spec_worker if isinstance(
-                self.model, SpecDecOneEngineForCausalLM) else None)
+            speculative_model = self.get_speculative_model()
+            spec_worker = (speculative_model.spec_worker
+                           if speculative_model is not None else None)
             if spec_worker is not None:
-                spec_worker.prepare_managed_draft_cache(self.model.draft_model,
-                                                        spec_metadata,
-                                                        attn_metadata,
-                                                        resource_manager)
+                spec_worker.prepare_managed_draft_cache(
+                    speculative_model.draft_model, spec_metadata, attn_metadata,
+                    resource_manager)
             if execution_promoted_context_ids:
                 self.iter_states[
                     'num_ctx_requests'] = scheduled_requests.num_context_requests

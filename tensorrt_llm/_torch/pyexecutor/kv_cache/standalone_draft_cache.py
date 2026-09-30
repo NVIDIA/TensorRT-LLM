@@ -32,6 +32,8 @@ class StandaloneDraftLayout:
             raise ValueError("Standalone draft cache dimensions must be positive")
         if self.extra_tokens < 0:
             raise ValueError("Standalone draft scratch capacity must be nonnegative")
+        if self.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("Standalone draft KV supports FP16 and BF16 storage")
         if self.kv_factor not in (1, 2):
             raise ValueError("Draft KV storage requires one or two planes")
         if self.window_size is not None and self.window_size <= 0:
