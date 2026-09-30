@@ -1265,3 +1265,328 @@ class TestMambaEffectiveTpSize:
         assert params.get_states_bytes_per_layer(
             replicated
         ) == 16 * params.get_states_bytes_per_layer(helix)
+
+
+def _v2_model_config(num_layers=24, layer_types=None, sliding_window=None):
+    """Minimal model config the V2 static estimators accept."""
+    pretrained = SimpleNamespace(
+        num_hidden_layers=num_layers,
+        hidden_size=2880,
+        num_attention_heads=64,
+        num_key_value_heads=8,
+        head_dim=64,
+    )
+    if layer_types is not None:
+        pretrained.layer_types = layer_types
+    if sliding_window is not None:
+        pretrained.sliding_window = sliding_window
+    return SimpleNamespace(
+        is_encoder_decoder=False,
+        quant_config=None,
+        pretrained_config=pretrained,
+        get_num_attention_layers=lambda: num_layers,
+    )
+
+
+def _v2_mapping(num_layers=24):
+    mapping = Mock(enable_attention_dp=False, tp_size=2)
+    mapping.pp_layers.return_value = list(range(num_layers))
+    mapping.is_last_pp_rank.return_value = True
+    return mapping
+
+
+class TestCacheBytesPerRequest:
+    """KVCacheManagerV2.get_cache_bytes_per_request estimates per-request spend."""
+
+    # kv_factor(2) * head_dim(64) * kv heads(8) / tp(2) * 2 bytes (no quant)
+    LAYER_BYTES = 1024
+    TPB = 64
+    MSL = 65536
+
+    @staticmethod
+    def _window_tokens(window, headroom, tpb=64):
+        return (math.ceil((window + headroom - 2) / tpb) + 1) * tpb
+
+    @staticmethod
+    def _full_tokens(msl, headroom, tpb=64):
+        return math.ceil((msl + headroom) / tpb) * tpb
+
+    def _call(self, model_config, **kwargs):
+        args = dict(
+            tokens_per_block=self.TPB,
+            kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+            max_seq_len=self.MSL,
+            spec_config=None,
+        )
+        args.update(kwargs)
+        return KVCacheManagerV2.get_cache_bytes_per_request(model_config, _v2_mapping(), **args)
+
+    def test_explicit_windows_bound_per_request_spend(self):
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+            BASE_GENERATION_TOKEN_COUNT,
+        )
+
+        bytes_per_request = self._call(
+            _v2_model_config(),
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False, max_attention_window=[128, self.MSL]
+            ),
+        )
+        headroom = BASE_GENERATION_TOKEN_COUNT
+        expected = 12 * self.LAYER_BYTES * self._window_tokens(128, headroom) + (
+            12 * self.LAYER_BYTES * self._full_tokens(self.MSL, headroom)
+        )
+        assert bytes_per_request == expected
+
+    def test_windows_derive_from_layer_types_like_runtime_creation(self):
+        """No config windows, but the model schedule bounds runtime retention."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+            BASE_GENERATION_TOKEN_COUNT,
+        )
+
+        bytes_per_request = self._call(
+            _v2_model_config(
+                layer_types=["sliding_attention", "full_attention"] * 12,
+                sliding_window=512,
+            )
+        )
+        headroom = BASE_GENERATION_TOKEN_COUNT
+        expected = 12 * self.LAYER_BYTES * self._window_tokens(512, headroom) + (
+            12 * self.LAYER_BYTES * self._full_tokens(self.MSL, headroom)
+        )
+        assert bytes_per_request == expected
+
+    def test_draft_mirrors_are_budgeted_full_length(self):
+        """The drafter's own windows must not bound the estimate: every draft
+        mirror is reserved at the request's full context length."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+            BASE_GENERATION_TOKEN_COUNT,
+        )
+
+        bytes_per_request = self._call(
+            _v2_model_config(
+                layer_types=["sliding_attention", "full_attention"] * 12,
+                sliding_window=512,
+            ),
+            is_draft=True,
+        )
+        headroom = BASE_GENERATION_TOKEN_COUNT
+        expected = 24 * self.LAYER_BYTES * self._full_tokens(self.MSL, headroom)
+        assert bytes_per_request == expected
+
+    def test_uniform_full_attention_declines(self):
+        """Per-request spend proportional to the slope reports None so the
+        split keeps its per-token weighting."""
+        assert self._call(_v2_model_config()) is None
+
+    def test_unknown_max_seq_len_declines(self):
+        assert (
+            self._call(
+                _v2_model_config(
+                    layer_types=["sliding_attention", "full_attention"] * 12,
+                    sliding_window=512,
+                ),
+                max_seq_len=None,
+            )
+            is None
+        )
+
+
+class TestPerRequestWeightedSplit:
+    """The GPU budget split weighs managers by per-request spend when known."""
+
+    def _creator(self, total, *, target, draft, max_batch_size=1 << 20):
+        c = _make_creator(
+            max_gpu_total_bytes=total,
+            total_kv_per_token=target.slope + draft.slope,
+            target_kv_per_token=target.slope,
+        )
+        c._max_batch_size = max_batch_size
+        c._kv_cache_manager_cls.get_cache_size_per_token = Mock(
+            return_value=(target.slope, target.intercept)
+        )
+        c._kv_cache_manager_cls.get_cache_bytes_per_request = Mock(
+            return_value=target.bytes_per_request
+        )
+        c._get_draft_cache_cost = Mock(return_value=draft)
+        return c
+
+    def test_per_request_weighting_overrides_slope_split(self):
+        c = self._creator(
+            1_000,
+            target=CacheCost(slope=80, bytes_per_request=400),
+            draft=CacheCost(slope=20, bytes_per_request=600),
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        # Slope weighting would give the draft 200; per-request spend says the
+        # draft pool empties three times as fast per request.
+        assert draft_config.max_gpu_total_bytes == 600
+        assert target_config.max_gpu_total_bytes == 400
+
+    def test_draft_share_capped_at_max_batch_size_mirrors(self):
+        c = self._creator(
+            1_000,
+            target=CacheCost(slope=80, bytes_per_request=400),
+            draft=CacheCost(slope=20, bytes_per_request=300),
+            max_batch_size=1,
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        # Weighted share would be 1000 * 300 // 700 = 428, but the pool can
+        # never hold more than max_batch_size full-length mirrors.
+        assert draft_config.max_gpu_total_bytes == 300
+        assert target_config.max_gpu_total_bytes == 700
+
+    def test_missing_request_cost_falls_back_to_slope_weighting(self):
+        c = self._creator(
+            10 * GB,
+            target=CacheCost(slope=80),
+            draft=CacheCost(slope=20, bytes_per_request=600),
+        )
+        c._kv_cache_manager_cls.get_cache_bytes_per_request = Mock(return_value=None)
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        assert target_config.max_gpu_total_bytes == 8 * GB
+        assert draft_config.max_gpu_total_bytes == 2 * GB
+
+    def test_offload_budget_keeps_slope_weighting(self):
+        """Only the GPU pool caps live concurrency; offload tiers keep the
+        per-token proportional split."""
+        c = self._creator(
+            0,
+            target=CacheCost(slope=80, bytes_per_request=400),
+            draft=CacheCost(slope=20, bytes_per_request=600),
+        )
+        c._kv_cache_config.max_gpu_total_bytes = 0
+        c._kv_cache_config.host_cache_size = 1_000
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("host_cache_size")
+
+        assert target_config.host_cache_size == 800
+        assert draft_config.host_cache_size == 200
+
+    def test_vswa_target_with_full_length_draft_mirrors_end_to_end(self, mocker):
+        """A windowed target + full-length draft mirrors re-weighs the split.
+
+        This is the draft-pool concurrency-cap arrangement in miniature. The
+        per-token split equalizes TOKEN capacity; the per-request weights
+        equalize ADMITTED REQUEST counts. With the derived-layer-type-windows
+        costing the slope itself is window-aware (sliding layers are charged
+        as fixed per-request retention in the intercept, not as growing
+        tokens), so the two splits land close -- but only the per-request
+        weights charge the target the window retention each of its requests
+        pins, and only that split admits equal request counts.
+        """
+        recorded = {}
+
+        class RecordingV2(KVCacheManagerV2):
+            @classmethod
+            def get_cache_size_per_token(cls, model_config, mapping, *args, **kwargs):
+                key = "draft_token" if kwargs.get("is_draft") else "target_token"
+                recorded[key] = KVCacheManagerV2.get_cache_size_per_token(
+                    model_config, mapping, *args, **kwargs
+                )
+                return recorded[key]
+
+            @classmethod
+            def get_cache_bytes_per_request(cls, model_config, mapping, *args, **kwargs):
+                key = "draft_req" if kwargs.get("is_draft") else "target_req"
+                recorded[key] = KVCacheManagerV2.get_cache_bytes_per_request(
+                    model_config, mapping, *args, **kwargs
+                )
+                return recorded[key]
+
+        max_seq_len = 65536
+        total_budget = 40 * GB
+        c = _make_creator(max_gpu_total_bytes=total_budget)
+        del c._get_draft_cache_cost
+        c._kv_cache_config.enable_block_reuse = False
+        # No max_attention_window override: like the measured posture, the
+        # windows exist only in the model's layer_types schedule. Both the
+        # affine costing (via _derive_v2_layer_type_attention_windows) and the
+        # per-request estimate derive them from there.
+        c._kv_cache_manager_cls = RecordingV2
+        c._max_seq_len = max_seq_len
+        c._max_batch_size = 256
+        c._max_num_tokens = 8192
+        c._max_beam_width = 1
+        c._mapping = _v2_mapping()
+        c._mapping.has_cp_helix.return_value = False
+        c._speculative_config = SimpleNamespace(
+            spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
+            max_draft_len=3,
+            max_total_draft_tokens=3,
+            tokens_per_gen_step=4,
+            use_dynamic_tree=False,
+            _use_shared_kv_cache=False,
+        )
+        c._model_engine.model.model_config = SimpleNamespace(
+            is_encoder_decoder=False,
+            quant_config=None,
+            pretrained_config=SimpleNamespace(
+                num_hidden_layers=24,
+                hidden_size=2880,
+                num_attention_heads=64,
+                num_key_value_heads=8,
+                head_dim=64,
+                layer_types=["sliding_attention", "full_attention"] * 12,
+                sliding_window=2048,
+            ),
+            get_num_attention_layers=lambda: 24,
+        )
+        c._draft_model_engine = None
+        c._get_effective_draft_config = Mock(
+            return_value=SimpleNamespace(
+                quant_config=None,
+                sparse_attention_config=None,
+                pretrained_config=SimpleNamespace(
+                    num_hidden_layers=1,
+                    hidden_size=2880,
+                    num_attention_heads=64,
+                    num_key_value_heads=4,
+                    head_dim=64,
+                ),
+            )
+        )
+        c._get_num_draft_layers = Mock(return_value=1)
+        # The draft manager class is resolved from the draft config via
+        # get_kv_cache_manager_cls; route it through the recorder too.
+        mocker.patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+            autospec=True,
+            return_value=RecordingV2,
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        assert draft_config is not None
+        assert target_config.max_gpu_total_bytes + draft_config.max_gpu_total_bytes == total_budget
+
+        target_req = recorded["target_req"]
+        draft_req = recorded["draft_req"]
+        assert target_req is not None and draft_req is not None
+        target_slope, target_intercept = recorded["target_token"]
+        draft_slope, draft_intercept = recorded["draft_token"]
+        slope_budget = total_budget - target_intercept - draft_intercept
+        expected_draft_share = min(
+            slope_budget * draft_req // (target_req + draft_req),
+            c._max_batch_size * draft_req,
+        )
+        assert draft_config.max_gpu_total_bytes == draft_intercept + expected_draft_share
+
+        # The point of the re-weighting: the per-token split equalizes token
+        # capacity and ignores the window retention each TARGET request
+        # additionally pins (the sliding layers' fixed blocks live in
+        # target_req but not in target_slope), so it over-serves the draft
+        # relative to what the target can actually admit. The per-request
+        # split charges it, handing the draft strictly less than the
+        # token-proportional share and equalizing admitted request counts.
+        slope_share = slope_budget * draft_slope // (target_slope + draft_slope)
+        assert draft_config.max_gpu_total_bytes < draft_intercept + slope_share
+        target_requests = (target_config.max_gpu_total_bytes - target_intercept) // target_req
+        draft_requests = (draft_config.max_gpu_total_bytes - draft_intercept) // draft_req
+        assert abs(target_requests - draft_requests) <= 1

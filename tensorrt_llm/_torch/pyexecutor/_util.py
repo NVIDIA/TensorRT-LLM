@@ -436,9 +436,15 @@ class CacheCost:
     """Affine KV cache budget: ``bytes = slope * tokens + intercept``.
 
     The legacy proportional case is just ``intercept = 0``.
+
+    ``bytes_per_request`` is an optional worst-case per-request spend estimate
+    (``get_cache_bytes_per_request``). It refines how the target/draft budget
+    split weighs the two managers; it is not part of the affine cost model, so
+    arithmetic (``__add__``) drops it.
     """
     slope: int
     intercept: int = 0
+    bytes_per_request: Optional[int] = None
 
     @classmethod
     def from_raw(cls, raw) -> "CacheCost":
@@ -457,10 +463,12 @@ class CacheCost:
                          intercept=self.intercept + other.intercept)
 
     def __str__(self) -> str:
-        if self.intercept == 0:
-            return f"{self.slope} bytes/token"
-        else:
-            return f"{self.slope} bytes/token + {self.intercept} bytes fixed cost"
+        text = f"{self.slope} bytes/token"
+        if self.intercept != 0:
+            text += f" + {self.intercept} bytes fixed cost"
+        if self.bytes_per_request is not None:
+            text += f", {self.bytes_per_request} bytes/request"
+        return text
 
     def tokens_for_budget(self, budget: int) -> int:
         """Memory budget -> max tokens. Clamps a negative result to 0."""
@@ -970,6 +978,7 @@ class KvCacheCreator:
                                 *,
                                 is_draft: bool = False,
                                 mapping=None,
+                                include_request_cost: bool = False,
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
@@ -983,7 +992,7 @@ class KvCacheCreator:
                 # pools. The draft manager never derives (see there).
                 kv_cache_config = kv_cache_config.model_copy(
                     update={"max_attention_window": derived_windows})
-        return CacheCost.from_raw(
+        cost = CacheCost.from_raw(
             manager_cls.get_cache_size_per_token(
                 model_config,
                 mapping if mapping is not None else self._mapping,
@@ -995,6 +1004,51 @@ class KvCacheCreator:
                 spec_config=self._speculative_config,
                 is_draft=is_draft,
                 **extra_kwargs))
+        if include_request_cost and cost.bytes_per_request is None:
+            bytes_per_request = self._per_manager_request_cost(
+                manager_cls,
+                model_config,
+                kv_cache_config,
+                is_draft=is_draft,
+                **extra_kwargs)
+            if bytes_per_request is not None:
+                cost = dataclasses.replace(cost,
+                                           bytes_per_request=bytes_per_request)
+        return cost
+
+    def _per_manager_request_cost(self,
+                                  manager_cls,
+                                  model_config,
+                                  kv_cache_config: KvCacheConfig,
+                                  *,
+                                  is_draft: bool = False,
+                                  **extra_kwargs) -> Optional[int]:
+        """Worst-case pool bytes one max-length request pins, or None.
+
+        None when the manager class does not model per-request spend (only
+        ``KVCacheManagerV2`` and subclasses do) or declines because the
+        estimate would be proportional to the per-token slope anyway.
+        """
+        get_bytes_per_request = getattr(manager_cls,
+                                        "get_cache_bytes_per_request", None)
+        if get_bytes_per_request is None:
+            return None
+        bytes_per_request = get_bytes_per_request(
+            model_config,
+            self._mapping,
+            tokens_per_block=self._tokens_per_block,
+            max_seq_len=self._max_seq_len,
+            max_batch_size=self._max_batch_size,
+            max_num_tokens=self._max_num_tokens,
+            kv_cache_config=kv_cache_config,
+            spec_config=self._speculative_config,
+            is_draft=is_draft,
+            **extra_kwargs)
+        # Mocked manager classes in tests return non-int sentinels; treat
+        # anything but a positive int as "no estimate".
+        if isinstance(bytes_per_request, int) and bytes_per_request > 0:
+            return bytes_per_request
+        return None
 
     def _get_one_model_draft_layer_mask(self) -> List[bool]:
         """Return the same draft-only mask used by runtime construction."""
@@ -1038,6 +1092,7 @@ class KvCacheCreator:
         kv_cache_config: KvCacheConfig,
         *,
         use_separate_draft_kv_cache: bool,
+        include_request_cost: bool = False,
     ) -> Optional[CacheCost]:
         """Return the draft manager's standalone cache cost, if it has one.
 
@@ -1066,10 +1121,12 @@ class KvCacheCreator:
             draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
                 self._draft_model_engine, kv_cache_config)
             return scaled(
-                self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                             draft_model_config,
-                                             kv_cache_config,
-                                             mapping=draft_mapping))
+                self._per_manager_cache_cost(
+                    draft_kv_cache_manager_cls,
+                    draft_model_config,
+                    kv_cache_config,
+                    mapping=draft_mapping,
+                    include_request_cost=include_request_cost))
         if use_separate_draft_kv_cache:
             # One-model draft with separate KV cache layout.
             # Pass num_layers explicitly since the HF config may report a
@@ -1096,11 +1153,13 @@ class KvCacheCreator:
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
                 return scaled(
-                    self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                                 effective_draft_config,
-                                                 draft_kv_cache_config,
-                                                 mapping=draft_mapping,
-                                                 is_draft=True))
+                    self._per_manager_cache_cost(
+                        draft_kv_cache_manager_cls,
+                        effective_draft_config,
+                        draft_kv_cache_config,
+                        mapping=draft_mapping,
+                        is_draft=True,
+                        include_request_cost=include_request_cost))
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 return scaled(
@@ -1110,7 +1169,8 @@ class KvCacheCreator:
                         draft_kv_cache_config,
                         mapping=draft_mapping,
                         num_layers=self._get_num_draft_layers(),
-                        is_draft=True))
+                        is_draft=True,
+                        include_request_cost=include_request_cost))
         return None
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
@@ -2100,8 +2160,16 @@ class KvCacheCreator:
     def _get_target_and_draft_cache_costs(
         self,
         kv_cache_config: Optional[KvCacheConfig] = None,
+        *,
+        include_request_cost: bool = False,
     ) -> Optional[tuple[CacheCost, CacheCost]]:
-        """Per-manager KV cache costs for target and draft layers."""
+        """Per-manager KV cache costs for target and draft layers.
+
+        ``include_request_cost`` additionally attaches the optional worst-case
+        per-request spend estimate (``CacheCost.bytes_per_request``) to each
+        cost. Only the GPU budget split weighs by it; default callers keep the
+        plain affine costs.
+        """
         target_kv_cache_config = (kv_cache_config if kv_cache_config is not None
                                   else self._kv_cache_config)
         use_separate_draft_kv_cache = (
@@ -2110,12 +2178,14 @@ class KvCacheCreator:
             self._kv_cache_manager_cls,
             self._model_engine.model.model_config,
             target_kv_cache_config,
-            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+            include_request_cost=include_request_cost)
         # Estimate the draft component directly so its independently modelled
         # affine intercept is preserved exactly.
         draft_kv = self._get_draft_cache_cost(
             target_kv_cache_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+            include_request_cost=include_request_cost,
         )
         if draft_kv is None:
             return None
@@ -2131,7 +2201,22 @@ class KvCacheCreator:
         target_kv: CacheCost,
         draft_kv: CacheCost,
     ) -> Optional[tuple[int, int]]:
-        """Split *total_budget* into (target_budget, draft_budget) byte shares."""
+        """Split *total_budget* into (target_budget, draft_budget) byte shares.
+
+        The split weighs the two managers by worst-case per-request spend
+        (``CacheCost.bytes_per_request``) when both report it, and by per-token
+        cost otherwise. The per-token weighting hands both pools the same token
+        capacity, which under-budgets the draft pool whenever the target bounds
+        retention with attention windows while every draft mirror is reserved
+        at the request's full context length: the draft pool then caps
+        concurrency while the target pool sits mostly idle. Weighting by
+        per-request spend sizes both pools for the same worst-case request
+        count instead.
+
+        Under per-request weighting the draft share is additionally capped at
+        ``max_batch_size`` full-length mirrors — the pool can never hold more
+        than the scheduler admits, so any excess share stays with the target.
+        """
         intercept_total = target_kv.intercept + draft_kv.intercept
         slope_budget = total_budget - intercept_total
         slope_total = target_kv.slope + draft_kv.slope
@@ -2147,8 +2232,21 @@ class KvCacheCreator:
                 f"the fixed cache cost {intercept_total}; cannot split "
                 f"between target and draft with a per-token cache cost.")
             return None
-        draft_slope_share = (slope_budget * draft_kv.slope //
-                             slope_total if slope_total > 0 else 0)
+        per_request_weighted = ((target_kv.bytes_per_request or 0) > 0
+                                and (draft_kv.bytes_per_request or 0) > 0)
+        if per_request_weighted:
+            target_weight = target_kv.bytes_per_request
+            draft_weight = draft_kv.bytes_per_request
+        else:
+            target_weight = target_kv.slope
+            draft_weight = draft_kv.slope
+        weight_total = target_weight + draft_weight
+        draft_slope_share = (slope_budget * draft_weight //
+                             weight_total if weight_total > 0 else 0)
+        if per_request_weighted and self._max_batch_size > 0:
+            max_useful_draft_bytes = (self._max_batch_size *
+                                      draft_kv.bytes_per_request)
+            draft_slope_share = min(draft_slope_share, max_useful_draft_bytes)
         draft_budget = draft_kv.intercept + draft_slope_share
         target_budget = total_budget - draft_budget
         return target_budget, draft_budget
@@ -2193,7 +2291,7 @@ class KvCacheCreator:
             return target_kv_cache_config, draft_kv_cache_config
 
         cache_costs = self._get_target_and_draft_cache_costs(
-            target_kv_cache_config)
+            target_kv_cache_config, include_request_cost=True)
         if cache_costs is None:
             return target_kv_cache_config, draft_kv_cache_config
         target_kv, draft_kv = cache_costs
@@ -2202,7 +2300,9 @@ class KvCacheCreator:
         # state; it does not consume host offload memory. When splitting a
         # non-GPU budget (e.g. host_cache_size), drop the intercept so the split
         # stays proportional to the per-token (slope) cost instead of being
-        # spuriously starved by a GPU-only fixed cost.
+        # spuriously starved by a GPU-only fixed cost. The per-request spend
+        # estimate is dropped with it: only the GPU pool caps live concurrency,
+        # so offload tiers keep the per-token proportional split.
         if budget_attr != "max_gpu_total_bytes":
             target_kv = CacheCost(slope=target_kv.slope)
             draft_kv = CacheCost(slope=draft_kv.slope)
