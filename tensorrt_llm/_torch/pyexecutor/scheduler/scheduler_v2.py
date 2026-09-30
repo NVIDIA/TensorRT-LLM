@@ -20,7 +20,12 @@ from typing import Optional
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
 
-from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from ..llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    get_draft_token_length,
+    rewind_context_after_cache_drop,
+)
 from .scheduler import (
     RequestList,
     RequestScheduler,
@@ -455,6 +460,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         for req in pending_ctx:
             if budget.requests_full:
                 break
+            # A radix probe cannot affect admission once the chunk token budget
+            # is exhausted. Keep scanning: an encoder request may still fit.
+            if (
+                self.chunking_enabled
+                and req.state_value == self._context_init_state_value
+                and not self._has_context_chunk_budget(budget)
+            ):
+                continue
             # Probe context requests before peft_pages_needed and before
             # _try_schedule_context so that a deferral costs nothing: KV pages
             # are allocated inline, so a skip decided after prepare_context
@@ -520,21 +533,37 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if r.is_generation_in_progress_state
                 and not r.is_generation_to_complete_state
                 and r.request_id not in inflight_request_ids
+                and not self._has_pending_connector_load(r)
             )
             if (
                 num_gen_candidates > 0
                 and not evicted
                 and not recompute_paused
                 and not inflight_request_ids
+                and not any(self._has_pending_connector_load(r) for r in active_requests)
             ):
+                # A connector rejects every tier below GPU at bring-up
+                # (`PyExecutor._reject_non_gpu_cache_tiers`), so offering those
+                # two settings there is advice the user cannot act on.
+                if getattr(self.kv_cache_manager, "kv_connector_manager", None) is not None:
+                    remedy = (
+                        "A KV connector is attached, which requires a GPU-only cache, "
+                        "so no secondary tier can be configured. Increase "
+                        "kv_cache_config.max_tokens or kv_cache_config."
+                        "free_gpu_memory_fraction, or lower max_num_tokens to hand "
+                        "memory back to the KV pool."
+                    )
+                else:
+                    remedy = (
+                        "Configure kv_cache_config.host_cache_size or "
+                        "kv_cache_config.disk_cache_size, or increase "
+                        "kv_cache_config.max_tokens."
+                    )
                 raise RuntimeError(
                     f"V2 scheduler deadlock: {num_gen_candidates} generation "
                     f"request(s) active but none could be scheduled or "
                     f"evicted or recompute-paused. KV cache pool is likely exhausted with no "
-                    f"secondary cache tier for suspend/resume offload. "
-                    f"Configure kv_cache_config.host_cache_size or "
-                    f"kv_cache_config.disk_cache_size, or increase "
-                    f"kv_cache_config.max_tokens."
+                    f"secondary cache tier for suspend/resume offload. {remedy}"
                 )
 
         return (
@@ -689,8 +718,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         """Try to schedule a disagg generation init request.
 
         Disagg gen init requests bypass normal state gating but still need
-        KV cache allocation inline (V2 prepare_resources is a no-op for
-        the primary manager).  Aligned with C++ CapacityScheduler which
+        KV cache allocation inline. Aligned with C++ CapacityScheduler which
         treats disagg_gen_init identically to context_init for block/PEFT/
         maxNumRequests accounting.
 
@@ -712,10 +740,30 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         Returns ``(action, tokens, chunking_flag)``.  *tokens* and
         *chunking_flag* are meaningful only when *action* is ``SCHEDULED``.
+
+        Source reservations advance the prefix before budget checks. Destination
+        pages are allocated here; loads are accepted after the final batch trims.
+        A loading request remains outside the schedulable state range.
         """
+        first_chunk = req.is_first_context_chunk
         if self.chunking_enabled:
-            return self._try_schedule_context_chunked(req, budget)
-        return self._try_schedule_context_full(req, budget)
+            result = self._try_schedule_context_chunked(req, budget)
+        else:
+            result = self._try_schedule_context_full(req, budget)
+
+        if first_chunk and result[0] is not ScheduleAction.SCHEDULED:
+            # Failed admission must not retain prefix-reuse holds. Suspension
+            # alone cannot release them when the last cache tier is full.
+            for manager in (
+                self.kv_cache_manager,
+                self.draft_kv_cache_manager,
+                self.cross_kv_cache_manager,
+            ):
+                if manager is not None and req.py_request_id in manager.kv_cache_map:
+                    manager.free_resources(req)
+            rewind_context_after_cache_drop(req, self.tokens_per_block)
+
+        return result
 
     def _try_schedule_context_full(
         self, req: LlmRequest, budget: BudgetTracker
@@ -766,6 +814,16 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         return ScheduleAction.SCHEDULED, req_tokens, False
 
+    def _has_context_chunk_budget(self, budget: BudgetTracker) -> bool:
+        remaining = budget.remaining_tokens
+        return remaining is None or (
+            remaining > 0
+            and (
+                self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
+                or remaining >= self.chunk_unit_size
+            )
+        )
+
     def _try_schedule_context_chunked(
         self, req: LlmRequest, budget: BudgetTracker
     ) -> tuple[ScheduleAction, int, bool]:
@@ -781,11 +839,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         pre_prepare_context_remaining = req.context_remaining_length
         force_chunk = self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
 
-        if remaining_budget is not None:
-            no_budget = remaining_budget <= 0
-            fcfs_under_min = not force_chunk and remaining_budget < self.chunk_unit_size
-            if no_budget or fcfs_under_min:
-                return ScheduleAction.SKIP, 0, False
+        if not self._has_context_chunk_budget(budget):
+            return ScheduleAction.SKIP, 0, False
 
         # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self._prepare_context_pair(req):
@@ -828,10 +883,6 @@ class KVCacheV2Scheduler(RequestScheduler):
             chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
 
         if chunk_size <= 0:
-            # TODO: consider suspending first-chunk KVCache to release
-            # GPU pages. Currently we skip without suspend to avoid
-            # pathological suspend/resume cycles. suspend_request is
-            # only called from eviction (_try_evict_for_gen).
             return ScheduleAction.SKIP, 0, False
 
         chunk_size = self._align_chunk_to_mm_block(
@@ -891,6 +942,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     def _prepare_context_pair(self, req: LlmRequest) -> bool:
         """Prepare target/draft caches with one verified logical reuse depth."""
+        from ..kv_cache.kv_cache_manager_v2 import _settle_context_cursor
+
         draft_manager = self._joint_draft_manager
         if draft_manager is None:
             return self.kv_cache_manager.prepare_context(req)
@@ -935,11 +988,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # No enable_block_reuse guard: reaching here means a paired draft pool
         # exists, and KvCacheCreator only pairs when block reuse is on.
-        if common_reuse < req.context_current_position:
-            # setPrepopulatedPromptLen only moves forward, so a match shallower
-            # than a previous attempt's has to be rewound by hand.
-            req.context_current_position = common_reuse
-        req.set_prepopulated_prompt_len(common_reuse, self.kv_cache_manager.tokens_per_block)
+        _settle_context_cursor(req, common_reuse, self.kv_cache_manager.tokens_per_block)
         return True
 
     def _try_allocate_context(self, req: LlmRequest, num_tokens: int) -> bool:
@@ -1267,7 +1316,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         # GPU pages so other requests can resume().
         # Skip if already suspended — suspending again is a no-op
         # that frees no pages.
-        if self.kv_cache_manager.is_request_active(req.py_request_id):
+        if self.kv_cache_manager.is_request_active(
+            req.py_request_id
+        ) and not self._has_pending_connector_load(req):
             logger.debug(
                 f"[V2Scheduler] Self-evicting request {req.py_request_id} "
                 f"(state={req.state.name}) to free GPU pages"
@@ -1329,6 +1380,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.free_resources(req)
 
+    def _has_pending_connector_load(self, req: LlmRequest) -> bool:
+        connector = self.kv_cache_manager.kv_connector_manager
+        return connector is not None and connector.has_pending_load(req)
+
     def _is_evictable(self, req: LlmRequest, inflight_request_ids: set[int]) -> bool:
         """A started request whose KV cache is still active on GPU.
 
@@ -1339,12 +1394,16 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         if not self._is_started_request(req):
             return False
+        if self._has_pending_connector_load(req):
+            return False
         return self.kv_cache_manager.is_request_active(req.py_request_id)
 
     def _is_recompute_pause_candidate(
         self, req: LlmRequest, inflight_request_ids: set[int]
     ) -> bool:
         if req.request_id in inflight_request_ids:
+            return False
+        if self._has_pending_connector_load(req):
             return False
         # is_generation_in_progress_state also includes GENERATION_TO_COMPLETE,
         # which is outside the schedulable range and may still be finalizing.

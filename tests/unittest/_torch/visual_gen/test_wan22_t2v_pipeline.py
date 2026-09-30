@@ -32,6 +32,7 @@ import torch
 import torch.nn.functional as F
 from diffusers import DiffusionPipeline
 from utils.llm_data import get_checkpoint
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
 from tensorrt_llm.visual_gen.args import (
@@ -239,6 +240,7 @@ def _assert_pipeline_matches_hf(
 # ============================================================================
 
 
+@skip_pre_blackwell
 @pytest.mark.integration
 @pytest.mark.wan_t2v
 class TestWan22_A14B_PipelineCorrectness:
@@ -362,6 +364,7 @@ class TestWan22TwoStageFeatures:
 # =============================================================================
 
 
+@skip_pre_blackwell
 class TestWan22T2VBatchGeneration:
     """Batch generation tests for Wan 2.2 T2V pipeline.
 
@@ -421,6 +424,7 @@ class TestWan22T2VBatchGeneration:
 # =============================================================================
 
 
+@skip_pre_blackwell
 @pytest.mark.integration
 @pytest.mark.wan_t2v
 class TestWan22T2VCombinedOptimizations:

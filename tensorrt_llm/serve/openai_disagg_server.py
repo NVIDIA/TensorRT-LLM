@@ -32,6 +32,8 @@ from pydantic import ValidationError
 
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
+from tensorrt_llm.inputs.chat_template_guard import \
+    UnusedChatTemplateKwargsError
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
@@ -254,7 +256,8 @@ class OpenAIDisaggServer:
                 self._config, self._create_client,
                 metadata_config=self._metadata_server_cfg,
                 server_preparation_func=self._sync_server_clock,
-                server_start_timeout_secs=self._server_start_timeout_secs)
+                server_start_timeout_secs=self._server_start_timeout_secs,
+                request_timeout_secs=self._req_timeout_secs)
         self._ctx_router = self._coordinator.ctx_router
         self._gen_router = self._coordinator.gen_router
 
@@ -535,6 +538,13 @@ class OpenAIDisaggServer:
             self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())
             raise exception
+        elif isinstance(exception, UnusedChatTemplateKwargsError):
+            # Raised while this server tokenizes a chat request for routing.
+            # It is a client mistake (a chat_template_kwargs key the template
+            # never reads), not a server fault, so it must not fall through to
+            # the generic 500 below.
+            self._perf_metrics_collector.http_exceptions.inc()
+            raise HTTPException(status_code=400, detail=str(exception)) from exception
         else:
             self._perf_metrics_collector.internal_errors.inc()
             logger.error("Internal server error: ", traceback.format_exc())

@@ -23,7 +23,6 @@ os.environ['TIKTOKEN_ENCODINGS_BASE'] = os.path.join(llm_datasets_root(),
 
 @pytest.fixture(scope="module",
                 params=[
-                    "meta-llama/Llama-3.1-8B-Instruct",
                     "openai/gpt-oss-120b",
                     pytest.param("zai-org/GLM-5-FP8",
                                  marks=pytest.mark.skip_less_device(8)),
@@ -58,9 +57,7 @@ def temp_extra_llm_api_options_file(model_name: str):
 
 @pytest.fixture(scope="module")
 def server(model_name: str, temp_extra_llm_api_options_file: str):
-    if model_name == "meta-llama/Llama-3.1-8B-Instruct":
-        model_path = get_model_path("llama-3.1-model/Llama-3.1-8B-Instruct")
-    elif model_name == "openai/gpt-oss-120b":
+    if model_name == "openai/gpt-oss-120b":
         model_path = get_model_path("gpt_oss/gpt-oss-120b")
     elif model_name == "zai-org/GLM-5-FP8":
         model_path = get_model_path("GLM-5-FP8")

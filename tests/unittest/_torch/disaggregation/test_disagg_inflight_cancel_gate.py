@@ -121,7 +121,6 @@ def _make_reap_coordinator(*, requests_in_transfer, inflight_cancel_supported=Tr
         registry=_registry_over([]),
         enable_attention_dp=False,
         force_terminate_ctx_for_partial_reuse=False,
-        delegates=Mock(),
     )
     return coordinator, transceiver, effects
 

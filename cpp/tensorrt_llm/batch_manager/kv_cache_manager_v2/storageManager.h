@@ -192,8 +192,10 @@ public:
     // Migrate a batch of pages to GPU (used by batchedLockToGpu).
     void batchedMigrateToGpu(std::vector<BatchedLockTarget> const& targets, MigrationRecorder const& migrationRecorder);
 
-    // Best-effort migration of grouped pages to a destination cache level.
-    void prefetch(
+    // Best-effort migration of grouped pages to a destination cache level. Returns how many pages
+    // it moved off the disk tier, counted per migrated batch rather than per page. A throw reports
+    // nothing, which in practice means slot preparation failed before anything moved.
+    int64_t prefetch(
         CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
 
     // ---- Query helpers -----------------------------------------------------

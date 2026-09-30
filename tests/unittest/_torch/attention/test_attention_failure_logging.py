@@ -163,6 +163,8 @@ def test_trtllm_forward_logs_and_reraises_kernel_failure(monkeypatch) -> None:
     original = RuntimeError("CUDA error: an illegal memory access was encountered")
 
     class _ThrowingFmha:
+        supports_workspace_reclamation = False
+
         def forward(self, *args, **kwargs):
             raise original
 
@@ -184,8 +186,9 @@ def test_trtllm_forward_logs_and_reraises_kernel_failure(monkeypatch) -> None:
     seq_lens = torch.tensor([2047, 1, 1], dtype=torch.int32)
     metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
     # `is_cross` is `seq_lens is not seq_lens_kv`; share the object to stay self.
-    metadata.seq_lens = seq_lens
-    metadata.seq_lens_kv = seq_lens
+    # Bypass the setters, which copy sequence lengths to CUDA.
+    metadata._seq_lens = seq_lens
+    metadata._seq_lens_kv = seq_lens
     metadata.kv_lens_runtime = torch.tensor([2047, 2048, 5], dtype=torch.int32)
     metadata.kv_lens_cuda_runtime = torch.tensor([2047, 2048, 5], dtype=torch.int32)
     metadata.prompt_lens_cuda_runtime = torch.zeros(batch, dtype=torch.int32)

@@ -138,7 +138,8 @@ SLURM_NON_TERMINAL_STATES = [
 BOLT_WORKLOADS = [
     [name: "dsr1_agg_1k1k_c2",     testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_tp4_mtp3_1k1k]"],
     [name: "dsr1_agg_8k1k_c2",     testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_tp4_mtp3_8k1k]"],
-    [name: "dsr1_agg_1k1k_c1024",  testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]"],
+    // re-enable after TRTLLMINF-443
+    //[name: "dsr1_agg_1k1k_c1024",  testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]"],
     // --- disagg (multi-node): OUT OF SCOPE for this PR, left commented out.
     //     Disagg gen-worker bring-up under BOLT instrumentation is still flaky
     //     (servers hang / a gen worker crashes at startup), and the fan-out is

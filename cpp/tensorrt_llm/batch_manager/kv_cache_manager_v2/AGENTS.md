@@ -248,7 +248,12 @@ the manager, the storage manager, or the radix tree.
 - Purely per-object accessors (`stopCommitting`, `updateBasePageIndex`, ...) do
   not take it.
 - A wrapper whose only shared-state access is a call to an already-locking API
-  (`setCapacity` -> `resize`) does not take it either.
+  (`setCapacity` -> `resize`, or the cached-token attribution drop methods ->
+  `markStatsDirty`/`clearStatsDirty`) does not take it either.
+- Internal statistics accumulators (`commitStats`, `commitSsmSnapshotIterationStats`,
+  `commitReusedBlocksByLevel`, `commitCachedTokensByLevel`, and `recordDiskPrefetchBlocks`)
+  use the caller's exclusive lock. `commitPendingStats()` and `prefetch()` provide it;
+  direct C++ callers, including tests, must do the same.
 - `std::shared_mutex` is not recursive, but public APIs call each other freely
   here. `ReentrantSharedMutex` compares the owning thread before it looks at the
   requested mode, so on a thread that already holds the lock **exclusively**
@@ -279,6 +284,7 @@ Two exposed accessors look like they might leak shared state and do not:
   state, the eviction lists, or the stats aggregates. Accessors that read only
   state fixed at construction are lock-free: `num_layers`, `layer_ids`,
   `tokens_per_block`, `cache_tier_list`, `all_buffer_ids`, `get_layer_group_id`,
+  `get_life_cycle_pool_group_indices`,
   `get_page_stride`, `get_page_index_scale`, `get_page_index_converter`,
   `get_mem_pool_base_address`, `supports_index_mode`, `init_config`, and the
   config flags. `get_page_index_upper_bound` resembles that group but reads a
@@ -368,7 +374,16 @@ Two rules follow for code that touches events:
   under the shared lock can be reissued by a concurrent reader, so handles stay
   exclusive-only as above.
 
-**Introspection is out of scope.** The `_introspection` submodule (`StorageStatistics`,
+**Storage statistics use the manager API.** `get_storage_statistics(cache_level)`
+samples all pools in the requested level under the manager's shared lock and
+returns independent value copies. The binding releases the GIL before acquiring
+the lock. `get_life_cycle_pool_group_indices(cache_level)` returns a copied
+lifecycle-to-pool mapping in that level's numbering without locking: the mapping
+and its level bounds are fixed at construction.
+Production code and tests must use these manager APIs for storage statistics and
+lifecycle-to-pool mappings. To query one lifecycle, index the returned mapping.
+
+**Introspection is out of scope.** The `_introspection` submodule (`storage_utilization`,
 `set_target_ratio_list_gpu`, `reuse_match_pages`, test block/codec helpers, ...)
 reaches private members directly, by design, and takes no locks. It is
 test/white-box only and is **not thread-safe**. Do not call it concurrently with
@@ -453,11 +468,12 @@ Use extra review and tests for changes involving:
   `radixBlockTreeTest.cpp`, `kvCacheManagerTest.cpp`,
   `kvCacheManagerV2DigestPoolTest.cpp`, `kvCacheManagerV2HostMemTest.cpp`,
   `kvCacheManagerV2StatsTest.cpp`, and `kvCacheManagerV2TypedIndexTest.cpp`.
-- Python behavior and backend-parity tests are in
-  `tests/unittest/kv_cache_manager_v2_tests/`. During development, prefer the
-  fast path below: set `PYTHONPATH` to `tensorrt_llm/runtime/` and execute the
-  test file directly with `python`. Do not use `pytest` for this fast path; the
-  file's test runner avoids importing the full `tensorrt_llm` package.
+- Python behavior tests are in `tests/unittest/kv_cache_manager_v2_tests/`, and
+  drive this C++ implementation through the nanobind bindings. During
+  development, prefer the fast path below: set `PYTHONPATH` to
+  `tensorrt_llm/runtime/` and execute the test file directly with `python`. Do
+  not use `pytest` for this fast path; the file's test runner avoids importing
+  the full `tensorrt_llm` package.
 
   ```bash
   REPO_ROOT="$(git rev-parse --show-toplevel)"

@@ -1253,6 +1253,9 @@ class TestLTX2TwoStageLoRAHelpers:
             def forward(self, x):
                 return self.lin(x)
 
+            def register_cuda_graph_extra_key_fns(self, runner):
+                self.registered_runner = runner
+
         pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
         # __init__ is bypassed here; BasePipeline.device now reads self._device
         # (set in __init__), so initialize it explicitly for the warmup path.
@@ -1310,8 +1313,13 @@ class TestLTX2TwoStageLoRAHelpers:
         """CUDA graph setup runs before the two-stage model_config is assigned."""
 
         class TinyTransformer:
+            registered_runner = None
+
             def forward(self, *args, **kwargs):
                 return args, kwargs
+
+            def register_cuda_graph_extra_key_fns(self, runner):
+                self.registered_runner = runner
 
         pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
         pipeline.pipeline_config = DiffusionPipelineConfig(
@@ -1328,7 +1336,81 @@ class TestLTX2TwoStageLoRAHelpers:
         runner = pipeline._cuda_graph_runners["transformer"]
         assert isinstance(runner, ltx2_two_stages._LTX2TwoStageCUDAGraphRunner)
         assert runner._lora_state_getter() == "original"
+        # Same contract as the single-stage pipeline: the transformer's extra
+        # CUDA-graph keys (skip-softmax / Sol-Attn phase) must be registered.
+        assert pipeline.transformer.registered_runner is runner
         assert pipeline.transformer.forward.__wrapped__.__self__ is pipeline.transformer
+
+    def test_two_stage_cuda_graph_setup_keys_sparse_phase(self):
+        """Dense and sparse SOL phases must never reuse one CUDA graph."""
+        from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
+        from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
+        from tensorrt_llm.visual_gen.args import SolAttentionConfig
+
+        class TinySolTransformer(BaseDiffusionModel):
+            def __init__(self):
+                super().__init__(
+                    DiffusionModelConfig(
+                        attention=AttentionConfig(
+                            backend="TRTLLM",
+                            sparse_attention_config=SolAttentionConfig(disabled_until_timestep=0.6),
+                        )
+                    )
+                )
+                self.active_topology = "default"
+
+            def forward(self, video, audio, *, text_cache, timestep=None, step_index=None):
+                del audio, text_cache, timestep, step_index
+                return video.latent, None
+
+        pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        torch.nn.Module.__init__(pipeline)
+        pipeline.pipeline_config = DiffusionPipelineConfig(
+            cuda_graph=CudaGraphConfig(enable=True),
+            torch_compile=TorchCompileConfig(enable=False),
+        )
+        pipeline.transformer = TinySolTransformer()
+        pipeline._cuda_graph_runners = {}
+        pipeline._setup_cuda_graphs()
+        runner = pipeline._cuda_graph_runners["transformer"]
+
+        captured_keys = []
+
+        def fake_capture(key, fn, args, kwargs):
+            del fn, args, kwargs
+            captured_keys.append(key)
+            runner.graphs[key] = object()
+
+        runner.capture = fake_capture
+        runner.replay = lambda key, args, kwargs: key
+
+        video = Modality(
+            latent=torch.empty(1, 2, 4),
+            timesteps=torch.tensor([0.5]),
+            positions=torch.empty(1, 3, 2),
+            context=torch.empty(1, 3, 4),
+        )
+
+        def run(timestep, step_index):
+            return pipeline.transformer(
+                video=video,
+                audio=None,
+                text_cache=None,
+                timestep=torch.tensor([timestep]),
+                step_index=step_index,
+            )
+
+        dense_key = run(0.8, 0)
+        sparse_key = run(0.2, 1)
+        dense_replay_key = run(0.8, 2)
+
+        assert "sparse_attn_phase" in runner._extra_key_fns
+        assert ("sparse_attn_phase", 0) in dense_key
+        assert ("sparse_attn_phase", 1) in sparse_key
+        assert dense_key != sparse_key
+        assert dense_replay_key == dense_key
+        assert captured_keys == [dense_key, sparse_key]
 
     def test_cuda_graph_rejects_nonpersistent_lora_bindings(self):
         """CUDA graph is valid only when distilled LoRA uses persistent bindings."""

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import replace
 from typing import Any, AsyncIterator, Callable
 
 import anyio
-from claude_agent_sdk import tool
 
 from .backends import create_backend
 from .backends.base import Backend, BackendClient, ResultEvent
@@ -24,9 +24,11 @@ from .console import (
     print_tool_call,
     print_user_prompt,
 )
+from .hooks import RequiredToolCallError, RequiredToolPolicy
 from .logger import Logger, get_logger
 from .module import Module
 from .runtime import PortalRunner, build_request
+from .tools import tool
 from .types import (
     AgentRequest,
     AgentResponse,
@@ -41,6 +43,37 @@ from .types import (
 )
 
 PromptBuilder = Callable[[str], AgentRequest]
+
+
+def _merge_turn_usage(previous: UsageInfo | None, current: UsageInfo | None) -> UsageInfo | None:
+    """Sum per-SDK-turn accounting and keep the final context snapshot.
+
+    Backends normalize cumulative upstream counters to turn deltas before
+    yielding ResultEvent. Context occupancy is a snapshot, not an expense,
+    and must not be summed across the initial and corrective turns.
+    """
+    if previous is None:
+        return current
+    if current is None:
+        return previous
+    additive = (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_tokens",
+        "cache_read_tokens",
+        "total_tokens",
+        "cost_usd",
+        "num_turns",
+        "duration_ms",
+    )
+    totals = {}
+    for field in additive:
+        before, after = getattr(previous, field), getattr(current, field)
+        totals[field] = None if before is None and after is None else (before or 0) + (after or 0)
+    estimate = current.estimated_thread_cost_usd
+    if estimate is None:
+        estimate = previous.estimated_thread_cost_usd
+    return replace(current, **totals, estimated_thread_cost_usd=estimate)
 
 
 def _read_stdin(prompt: str = "> ") -> str:
@@ -296,21 +329,25 @@ class AgentLayer(Module):
 
         return ask_human
 
+    def _client_options(self, system_prompt: str | None) -> dict[str, Any]:
+        """Resolve the same client configuration for either session mode."""
+        return {
+            "system_prompt": system_prompt or "",
+            "model": self.config.backend.model,
+            "tools": self._resolve_tools(),
+            "hooks": self.config.backend.hooks,
+            "disallowed_tools": self._resolve_disallowed_tools(),
+            "extra_mcp_servers": self.config.backend.extra_mcp_servers,
+            "cwd": self.config.backend.cwd,
+        }
+
     @asynccontextmanager
     async def _temporary_client(
         self, system_prompt: str | None
     ) -> AsyncIterator[tuple[Backend, BackendClient]]:
         backend = create_backend(self.config.backend)
         async with backend:
-            async with backend.create_client(
-                system_prompt=system_prompt or "",
-                model=self.config.backend.model,
-                tools=self._resolve_tools(),
-                hooks=self.config.backend.hooks,
-                disallowed_tools=self._resolve_disallowed_tools(),
-                extra_mcp_servers=self.config.backend.extra_mcp_servers,
-                cwd=self.config.backend.cwd,
-            ) as client:
+            async with backend.create_client(**self._client_options(system_prompt)) as client:
                 yield backend, client
 
     async def _ensure_persistent_client(
@@ -322,9 +359,7 @@ class AgentLayer(Module):
         baseline only on the session's very first turn (later turns of a
         persistent session already carry conversation history).
         """
-        if self._persistent_system_prompt is None:
-            self._persistent_system_prompt = system_prompt
-        elif self._persistent_system_prompt != system_prompt:
+        if self._persistent_client is not None and self._persistent_system_prompt != system_prompt:
             raise ValueError("Persistent AgentLayer sessions require a stable system prompt.")
 
         created = False
@@ -333,18 +368,11 @@ class AgentLayer(Module):
             stack = AsyncExitStack()
             await stack.__aenter__()
             client = await stack.enter_async_context(
-                backend.create_client(
-                    system_prompt=system_prompt or "",
-                    model=self.config.backend.model,
-                    tools=self._resolve_tools(),
-                    hooks=self.config.backend.hooks,
-                    disallowed_tools=self._resolve_disallowed_tools(),
-                    extra_mcp_servers=self.config.backend.extra_mcp_servers,
-                    cwd=self.config.backend.cwd,
-                )
+                backend.create_client(**self._client_options(system_prompt))
             )
             self._persistent_client = client
             self._persistent_client_stack = stack
+            self._persistent_system_prompt = system_prompt
             created = True
         return self._persistent_client, created
 
@@ -364,6 +392,7 @@ class AgentLayer(Module):
         sink = logger.console
         result_text = ""
         usage: UsageInfo | None = None
+        policy = RequiredToolPolicy(self.config.required_tools)
 
         def observe(kind: str, event: Any) -> None:
             """Forward one event to the config's observer, if any.
@@ -380,40 +409,62 @@ class AgentLayer(Module):
             except Exception:  # noqa: BLE001 - an observer cannot fail the run
                 pass
 
-        async for event in client.send_message(request.content):
-            if isinstance(event, ResultEvent):
-                result_text = event.text
-                usage = event.usage
-            elif isinstance(event, ToolCallEvent):
-                observe("tool", event)
-                if self.config.print_activity:
-                    print_tool_call(self.layer_name, event, sink)
-            elif isinstance(event, ServerToolCallEvent):
-                observe("server_tool", event)
-                if self.config.print_activity:
-                    print_server_tool_call(self.layer_name, event, sink)
-            elif isinstance(event, ThinkingEvent):
-                observe("thinking", event)
-                if self.config.print_activity:
-                    print_thinking(self.layer_name, event, sink)
-            elif isinstance(event, AgentTextEvent):
-                observe("text", event)
-                if self.config.print_activity:
-                    print_agent_text(self.layer_name, event, sink)
-            elif isinstance(event, SessionInitEvent):
-                observe("session", event)
-                if self.config.print_activity:
-                    print_session_init(self.layer_name, event, sink)
-            elif isinstance(event, RateLimitWarningEvent):
-                observe("rate_limit", event)
-                if self.config.print_activity:
-                    print_rate_limit(self.layer_name, event, sink)
-            elif isinstance(event, CompactBoundaryEvent):
-                observe("compact", event)
-                if self.config.print_activity:
-                    print_compact_boundary(self.layer_name, event, sink)
-            else:
-                raise TypeError(f"Unexpected backend event: {type(event).__name__}")
+        # A correction is a second SDK turn, after the original turn has
+        # completed. Keep the same client even for a stateless invocation:
+        # its history contains the work needed to finish missing calls.
+        # The policy survives this correction, but never another invocation.
+        message = request.content
+        for attempt in range(2):
+            turn_usage: UsageInfo | None = None
+            async for event in client.send_message(message):
+                if isinstance(event, ResultEvent):
+                    if event.is_error:
+                        raise RuntimeError(
+                            "; ".join(event.errors) or event.text or "Agent turn failed"
+                        )
+                    result_text = event.text
+                    turn_usage = event.usage
+                elif isinstance(event, ToolCallEvent):
+                    policy.record(event)
+                    observe("tool", event)
+                    if self.config.print_activity:
+                        print_tool_call(self.layer_name, event, sink)
+                elif isinstance(event, ServerToolCallEvent):
+                    observe("server_tool", event)
+                    if self.config.print_activity:
+                        print_server_tool_call(self.layer_name, event, sink)
+                elif isinstance(event, ThinkingEvent):
+                    observe("thinking", event)
+                    if self.config.print_activity:
+                        print_thinking(self.layer_name, event, sink)
+                elif isinstance(event, AgentTextEvent):
+                    observe("text", event)
+                    if self.config.print_activity:
+                        print_agent_text(self.layer_name, event, sink)
+                elif isinstance(event, SessionInitEvent):
+                    observe("session", event)
+                    if self.config.print_activity:
+                        print_session_init(self.layer_name, event, sink)
+                elif isinstance(event, RateLimitWarningEvent):
+                    observe("rate_limit", event)
+                    if self.config.print_activity:
+                        print_rate_limit(self.layer_name, event, sink)
+                elif isinstance(event, CompactBoundaryEvent):
+                    observe("compact", event)
+                    if self.config.print_activity:
+                        print_compact_boundary(self.layer_name, event, sink)
+                else:
+                    raise TypeError(f"Unexpected backend event: {type(event).__name__}")
+            usage = _merge_turn_usage(usage, turn_usage)
+            if not policy.missing:
+                break
+            if attempt:
+                missing = ", ".join(policy.missing)
+                raise RequiredToolCallError(
+                    f"{self.layer_name} did not call required tools after one corrective turn: "
+                    f"{missing}"
+                )
+            message = policy.correction_message()
 
         return AgentResponse(
             content=result_text,
@@ -558,20 +609,12 @@ class AgentLayer(Module):
         model call), so it works wherever the CLI is available. Backends
         without a pre-input breakdown return ``None``.
 
-        Some backends only populate the breakdown after the session has
-        streamed at least once; when the first query comes back empty we
-        bootstrap with a minimal ``ping`` turn and re-query. That makes
-        this the one inspection helper that can cost a turn —
-        ``fetch_available_skills`` never does.
+        This inspection never sends a model turn. A backend without a
+        pre-input breakdown cannot provide a baseline by adding input.
         """
 
         async def run() -> UsageInfo | None:
             async with self._temporary_client(self.config.system_prompt) as (_, client):
-                usage = await client.get_context_usage()
-                if usage is not None and usage.context_percentage is not None:
-                    return usage
-                async for _ in client.send_message("ping"):
-                    pass
                 return await client.get_context_usage()
 
         return anyio.run(run)

@@ -765,9 +765,11 @@ def test_selfsampling_route_sm103_large_batch_k2048_register_rung() -> None:
 
 @pytest.mark.skipif(getSMVersion() != 103, reason="requires an SM103 GPU")
 def test_selfsampling_sm103_b512_k2048_cuda_graph() -> None:
-    """Exercise the B300-only register plan through warmup and graph replay."""
+    """Exercise the 148-SM SM103 register plan through warmup and graph replay."""
     rows, n, npad, top_k = 512, 4111, 4160, 2048
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if properties.multi_processor_count != 148:
+        pytest.skip("requires an SM103 GPU with 148 SMs")
     plan = ss_host.route(
         rows,
         n,

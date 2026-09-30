@@ -49,12 +49,17 @@ MAP_BY_SOCKET = None
 
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
 
+# Models served with the Nemotron reasoning/tool parsers, a long max model len
+# and a longer server-start timeout. "nano-v3" and "nemotron-v3" are two
+# registered names for the same reasoning parser, so Lightning belongs here too.
 NEMOTRON_SUPER_MODELS = {
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
     "nemotron_3_ultra_550b_nvfp4",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
+    "nemotron_3.5_lightning_30b_nvfp4_mtp",
+    "nemotron_3.5_lightning_30b_bf16_mtp",
 }
 
 KIMI_K3_MODELS = {"kimi_k3"}
@@ -64,8 +69,6 @@ QWEN38_MTP_MODELS = {
     "qwen3.8_flash_next_fp4_mtp",
 }
 KIMI_K3_SERVER_ENV = {
-    "KIMI_K3_FP8_WEIGHT_READ": "1",
-    "KIMI_K3_FP8_WEIGHT_READ_GATE_UP": "1",
     "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING": "1",
 }
 
@@ -83,6 +86,8 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "qwen3.6_35b_a3b_fp4_mtp",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
+    "nemotron_3.5_lightning_30b_nvfp4_mtp",
+    "nemotron_3.5_lightning_30b_bf16_mtp",
     "nemotron_nano_12b_v2",
 }
 
@@ -104,6 +109,8 @@ OPENAI_CHAT_BACKEND_MODELS = {
 # Spec-dec models real dataset in serve perf tests.
 SPEC_DEC_REAL_DATASET_MODELS = {
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
+    "nemotron_3.5_lightning_30b_nvfp4_mtp": "cnn_dailymail",
+    "nemotron_3.5_lightning_30b_bf16_mtp": "cnn_dailymail",
 }
 
 # All spec-decoding models (MTP, Eagle3, etc.). Used to skip --ignore-eos in
@@ -118,11 +125,6 @@ SPEC_DEC_MODELS = {
     "gpt_oss_120b_eagle3_throughput",
     "qwen3.6_35b_a3b_fp4_mtp",
     *SPEC_DEC_REAL_DATASET_MODELS,
-}
-
-# Autodeploy model configs - maps model name to config file path (relative to TRT-LLM root)
-AUTODEPLOY_MODEL_CONFIGS = {
-    "nemotron_nano_3_30b_fp8": "examples/auto_deploy/nano_v3.yaml",
 }
 
 
@@ -226,9 +228,6 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     re.compile(r"Average time-to-first-token \[TTFT\] \(ms\):\s+([\d\.]+)"),
     PerfMetricType.OUTPUT_TOKEN_TIME:
     re.compile(r"Average time-per-output-token \[TPOT\] \(ms\):\s+([\d\.]+)"),
-    # AutoDeploy builds its KVCacheManager from the same shared C++ class (see
-    # tensorrt_llm/_torch/auto_deploy/shim/interface.py), so its post-resize
-    # capacity also logs this line (max() below picks that final value).
     PerfMetricType.KV_CACHE_SIZE:
     KV_CACHE_SIZE_LOG_QUERY,
     PerfMetricType.PER_USER_OUTPUT_THROUGHPUT:
@@ -451,10 +450,6 @@ class PerfTestConfig:
         pp_size: int = 1,
         num_gpus: int = 1,
         moe_backend: str | None = None,
-        # _autodeploy backend specific parameters
-        ad_compile_backend: str = "torch-cudagraph",
-        extra_runtime: str = "trtllm",
-        skip_loading_weights: bool = False,
     ):
         # The model name.
         self.model_name = model_name
@@ -462,7 +457,7 @@ class PerfTestConfig:
         self.runtime = runtime
         # API Type: only executor is allowed
         self.api = api
-        # Backend type: pytorch or _autodeploy
+        # Backend type: pytorch
         self.backend = backend
         # Streaming responses
         self.streaming = streaming
@@ -505,25 +500,16 @@ class PerfTestConfig:
         # Number of GPUs.
         self.num_gpus = num_gpus
         self.moe_backend = moe_backend
-        # _autodeploy backend specific parameters
-        self.ad_compile_backend = ad_compile_backend
-        self.extra_runtime = extra_runtime
-        self.skip_loading_weights = skip_loading_weights
 
     def to_string(self,
                   custom_server_name: str = None,
                   custom_client_name: str = None,
                   custom_bs: int = None,
                   custom_input_len: int = None,
-                  custom_output_len: int = None,
-                  device_subtype: str = None) -> str:
+                  custom_output_len: int = None) -> str:
 
         # First, add the model name.
         entries = [self.model_name]
-
-        # Add device subtype if provided (for autodeploy tests)
-        if device_subtype:
-            entries.append(f"subtype:{device_subtype}")
 
         if self.runtime == "serve":
             entries.append("serve")
@@ -535,8 +521,6 @@ class PerfTestConfig:
             entries.append("bench")
             if self.backend == 'pytorch':
                 entries.append("pytorch")
-            elif self.backend == '_autodeploy':
-                entries.append("_autodeploy")
             if self.streaming == "streaming":
                 entries.append("streaming")
 
@@ -645,18 +629,12 @@ class PerfTestConfig:
 
         self.model_name = labels.pop(0)
 
-        # Check if device subtype is present (for autodeploy tests)
-        self.device_subtype = None
-        if len(labels) > 0 and labels[0].startswith("subtype:"):
-            self.device_subtype = labels.pop(0).replace("subtype:", "")
-
         assert labels[0] in ["serve", "bench"], \
             f"Unsupported runtime '{labels[0]}'; only 'serve' and 'bench' are supported."
         self.runtime = labels.pop(0)
 
         self.api = labels.pop(0) if labels[0] == "exe" else ""
-        self.backend = labels.pop(0) if labels[0] in ["pytorch", "_autodeploy"
-                                                      ] else "pytorch"
+        self.backend = labels.pop(0) if labels[0] == "pytorch" else "pytorch"
         self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
         self.data_type = labels.pop(0)
         if labels[0].startswith("gwp"):
@@ -765,7 +743,7 @@ class PerfTestConfig:
         VALID_RUNTIMES = ["serve", "bench"]
         assert self.runtime in VALID_RUNTIMES, \
             f"Unsupported runtime '{self.runtime}'; only 'serve' and 'bench' are supported."
-        assert self.backend in ["pytorch", "_autodeploy"], \
+        assert self.backend == "pytorch", \
             f"Unsupported backend '{self.backend}'."
         if self.runtime == "serve":
             assert self.backend == "pytorch", \
@@ -1188,37 +1166,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 # If guided_decoding_backend is set, we need to initialize tokenizer
                 if config.get('guided_decoding_backend') is not None:
                     benchmark_cmd += ["--no_skip_tokenizer_init"]
-        elif self._config.backend == "_autodeploy":
-            autodeploy_config_path = os.path.join(engine_dir,
-                                                  "extra_llm_api_options.yaml")
-            if not os.path.exists(autodeploy_config_path):
-                os.makedirs(os.path.dirname(autodeploy_config_path),
-                            exist_ok=True)
-
-            # Default autodeploy config
-            autodeploy_config = {
-                'transforms': {
-                    'compile_model': {
-                        'backend': self._config.ad_compile_backend
-                    },
-                },
-                'runtime': self._config.extra_runtime,
-                'skip_loading_weights': self._config.skip_loading_weights
-            }
-
-            # If model has a curated config, use it instead
-            if self._config.model_name in AUTODEPLOY_MODEL_CONFIGS:
-                config_file = os.path.join(
-                    self._llm_root,
-                    AUTODEPLOY_MODEL_CONFIGS[self._config.model_name])
-                if os.path.exists(config_file):
-                    with open(config_file, 'r') as f:
-                        autodeploy_config = yaml.safe_load(f)
-
-            print_info(f"_autodeploy model config: {autodeploy_config}")
-            with open(autodeploy_config_path, 'w') as f:
-                yaml.dump(autodeploy_config, f, default_flow_style=False)
-            benchmark_cmd += [f"--config={autodeploy_config_path}"]
         # for sampler options
         sampler_options_path = os.path.join(engine_dir, "sampler_options.yml")
         if not os.path.exists(sampler_options_path):
@@ -1476,6 +1423,12 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 server_timeout = 3600
             elif self._config.model_name in KIMI_K3_MODELS:
                 server_timeout = 5400
+            elif self._config.model_name == "deepseek_v4_pro_base_fp8":
+                # Allow time for model loading and executor warmup.
+                server_timeout = 1800
+            elif self._config.model_name == "minimax_m3_fp4":
+                # Cold MSA JIT compilation can exceed the default 10 minutes.
+                server_timeout = 1800
             else:
                 server_timeout = 600
             return PerfServeScriptTestCmds(server_cmd=server_cmd,
@@ -1484,7 +1437,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                            server_env=server_env,
                                            server_timeout=server_timeout)
 
-        # PyTorch and AutoDeploy load model checkpoints directly.
+        # PyTorch loads model checkpoints directly.
         build_cmd = []
         if self._config.runtime != "bench":
             pytest.skip("only support trtllm-bench and serve runtime")
@@ -1750,7 +1703,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 f"Skip building process for {self._config.model_name} as serve handles model loading"
             )
         elif self._config.runtime == "bench":
-            if self._config.backend in ["pytorch", "_autodeploy"]:
+            if self._config.backend == "pytorch":
                 print_info(
                     f"Skip building process for {self._config.model_name} as it is {self._config.backend} backend"
                 )
@@ -1824,15 +1777,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         Construct the metric name for given metric_type, bs, input_len, and output_len.
         """
 
-        # Get device subtype for autodeploy tests
-        device_subtype = None
-        if (hasattr(self, '_gpu_clock_lock') and self._gpu_clock_lock
-                and self._config.backend == "_autodeploy"):
-            device_subtype = self._gpu_clock_lock.get_device_subtype()
-
         if metric_type in BUILDER_METRICS:
             # We build one engine for all benchmark runs, so add all bs and seq lens to the metric name.
-            metric_label = self._config.to_string(device_subtype=device_subtype)
+            metric_label = self._config.to_string()
         elif self._config.runtime == "aggr_server":
             metric_label = self._config.to_string(
                 custom_server_name=server_name,
@@ -1847,7 +1794,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 custom_bs=bs,
                 custom_input_len=input_len,
                 custom_output_len=output_len,
-                device_subtype=device_subtype,
             )
         metric_name = f"test_perf_metric_{metric_type.lower()}"
         return self._test_domain_name + "::" + metric_name + "[" + metric_label + "]"

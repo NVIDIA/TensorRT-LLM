@@ -266,6 +266,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         "--periodic-junit",
         "--periodic-batch-size=1",
         "--periodic-save-unfinished-test",
+        "--periodic-hang-traceback",
     ]
     if test_prefix:
         command += [f"--test-prefix={test_prefix}"]

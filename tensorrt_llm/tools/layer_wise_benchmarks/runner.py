@@ -413,7 +413,7 @@ class Runner:
     ) -> None:
         super().__init__()
 
-        checkpoint_loader = _construct_checkpoint_loader("pytorch", None, "HF")
+        checkpoint_loader = _construct_checkpoint_loader(None, "HF")
         # Please refer to `tensorrt_llm/_torch/pyexecutor/model_loader.py` for effective args
         llm_args = TorchLlmArgs(
             model=pretrained_model_name_or_path,

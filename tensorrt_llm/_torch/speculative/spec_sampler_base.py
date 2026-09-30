@@ -73,12 +73,15 @@ UNSUPPORTED_TOP_P_DECAY_MSG = (
     "speculative decoding."
 )
 UNSUPPORTED_MIN_P_MSG = (
-    "min_p is not supported with one-model speculative decoding. "
-    "Drop min_p from the request, or disable speculative decoding."
+    "min_p requires 'advanced_sampling_mode: full' in the speculative decoding "
+    "config when using one-model speculative decoding. Restore that default, "
+    "drop min_p from the request, or disable speculative decoding."
 )
 
 
-def one_model_sampling_rejection_reason(sampling_params: Optional[SamplingParams]) -> Optional[str]:
+def one_model_sampling_rejection_reason(
+    sampling_params: Optional[SamplingParams], *, fused_sampling: bool = False
+) -> Optional[str]:
     """Why ``sampling_params`` cannot be served by the one-model speculative path.
 
     ``SpecSampler.validate_request`` is the authoritative check, but it runs on
@@ -113,8 +116,10 @@ def one_model_sampling_rejection_reason(sampling_params: Optional[SamplingParams
     # mean one thing here and another in the sampler.
     if SamplingParams.params_imply_top_p_decay_active(sampling_params.top_p_decay):
         return UNSUPPORTED_TOP_P_DECAY_MSG
+    # The one filter whose support depends on the deploy config rather than on
+    # sampling_params, so the caller has to supply it.
     min_p = sampling_params.min_p
-    if min_p and min_p > 0.0:
+    if min_p and min_p > 0.0 and not fused_sampling:
         return UNSUPPORTED_MIN_P_MSG
     return None
 
@@ -165,15 +170,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     def validate_request(self, request: LlmRequest) -> None:
         """Reject sampling parameters the one-model speculative path cannot honor.
 
-        The one-model sampling kernels take only temperature/top_k/top_p (see
-        SpecMetadata.populate_sampling_params_for_one_model); min_p has no
-        buffer there, so it would be silently dropped and the request would
-        decode from a different distribution than the user asked for. Threading
-        it through costs measurable throughput on the rejection path, so reject
-        instead. This sampler also does not return context logits, generation
-        logits, or log probabilities. Raised from validate_request (request
-        admission), so only the offending request fails rather than the whole
-        executor step.
+        The fused backend supports min_p; other one-model sampling backends do
+        not. This sampler also does not return context logits, generation logits,
+        or log probabilities. Raised during request admission, so only the
+        offending request fails rather than the whole executor step.
         """
         requested_outputs = (
             ("return_context_logits / prompt_logprobs", request.py_return_context_logits),
@@ -191,9 +191,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         sampling_config = request.sampling_config
         if sampling_config is None:
             return
-        # min_p lives on the C++ SamplingConfig as an optional scalar.
         min_p = sampling_config.min_p
-        if min_p and min_p > 0.0:
+        if min_p and min_p > 0.0 and not self._fused_sampling:
             raise ValueError(UNSUPPORTED_MIN_P_MSG)
         self._validate_unsupported_logits_processors(request)
         # The occurrence penalties need a [slots, vocab_size] workspace that is only
@@ -216,9 +215,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         if not self._penalty_supported:
             raise ValueError(
                 "repetition_penalty / presence_penalty / frequency_penalty are not "
-                "supported with tree speculative decoding (eagle_choices / dynamic "
-                "tree) yet. Drop the penalties, use a linear speculation mode, or "
-                "disable speculative decoding."
+                "supported with tree speculative decoding (dynamic tree) yet. Drop "
+                "the penalties, use a linear speculation mode, or disable "
+                "speculative decoding."
             )
 
     @staticmethod
@@ -263,27 +262,25 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self,
         args: TorchSampler.Args,
         *,
-        accepted_path_len: Optional[int] = None,
         enable_penalty: bool = False,
         penalty_supported: bool = True,
+        fused_sampling: bool = False,
     ):
         """
         Initialize the speculative sampler.
 
         Args:
             args: TorchSampler.Args with max_num_sequences, max_seq_len, etc.
-            accepted_path_len: Upper bound on the number of tokens a single step
-                can accept, used to size new_tokens. Defaults to
-                ``args.max_draft_len + 1``; see the store comment below for the
-                one mode that has to override it.
             enable_penalty: whether the deploy enabled the occurrence penalties.
                 Only used to decide whether a request asking for them is admitted;
                 the penalties themselves are applied inside the worker.
             penalty_supported: whether this speculation mode's row layout is one
                 the penalties can map (linear modes yes, tree modes not yet).
+            fused_sampling: whether the configured sampler supports min_p.
         """
         self._enable_penalty = enable_penalty
         self._penalty_supported = penalty_supported
+        self._fused_sampling = fused_sampling
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.max_seq_len = args.max_seq_len
@@ -298,23 +295,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         assert self.max_beam_width == 1, "beam width must be 1 for speculative decoding"
 
         # new_tokens holds the accepted tokens only, so it is sized to how many
-        # a step can accept rather than to the wire width. Normally that is
-        # max_draft_len + 1: the drafter advances max_draft_len times, and the
-        # golden token the target always accepts adds one. Verified against
-        # Eagle3 dynamic tree (K=6, T=60), MTP dynamic tree, PARD (T=2K-1) and
-        # the linear modes -- none exceed it.
-        #
-        # The exception is the deprecated eagle_choices static tree. There the
-        # one-model drafter ignores the tree and runs _forward_draft_loop, a
-        # linear loop over runtime_draft_len == max_total_draft_tokens, so a
-        # step can accept up to max_total_draft_tokens + 1 tokens even though
-        # max_draft_len only describes the depth of a tree that is never built.
-        # (Tree-aware acceptance lives in TorchSampler, i.e. the two-model
-        # path.) get_spec_decoder passes the wire width for that mode; both it
-        # and this workaround go away with the feature in release 1.4.
-        self.max_accepted_path_len = (
-            accepted_path_len if accepted_path_len is not None else args.max_draft_len + 1
-        )
+        # a step can accept rather than to the wire width: max_draft_len + 1,
+        # because the drafter advances max_draft_len times and the golden token
+        # the target always accepts adds one. Verified against Eagle3 dynamic
+        # tree (K=6, T=60), MTP dynamic tree, PARD (T=2K-1) and the linear
+        # modes -- none exceed it.
+        self.max_accepted_path_len = args.max_draft_len + 1
         self.store = self.Store(
             new_tokens=int_tensor((self.max_accepted_path_len, seq_slots, self.max_beam_width)),
             next_new_tokens=int_tensor(

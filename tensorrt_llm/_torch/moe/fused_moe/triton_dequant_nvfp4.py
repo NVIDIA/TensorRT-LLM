@@ -142,7 +142,9 @@ def dequant_nvfp4_active_triton(
         weight_scale_2: ``[E]`` float32 -- per-tensor scale.
         active_mask: ``[E]`` uint8 -- 1 for experts that need dequanting.
         target_dtype: ``torch.bfloat16`` or ``torch.float16``.
-        sf_vec_size: NVFP4 per-block scale vector size (fixed at 16).
+        sf_vec_size: NVFP4 per-block scale vector size. The MoE path is
+            16-only (``NVFP4FusedMoEMethod.create_weights`` rejects wider
+            blocks); only the 2D Linear path below also accepts 32.
         block_n, block_k: Triton tile shape. ``block_k`` should be a
             multiple of ``sf_vec_size`` so each tile covers an integer
             number of scale blocks.
@@ -153,7 +155,7 @@ def dequant_nvfp4_active_triton(
         are never read by the downstream MoE kernel.
     """
     assert packed_weight.dim() == 3, "packed_weight must be 3D [E, N, K/2]"
-    assert sf_vec_size == 16, "NVFP4 fixed at 16-element blocks"
+    assert sf_vec_size == 16, "NVFP4 MoE dequant is fixed at 16-element blocks"
     assert block_k % sf_vec_size == 0, (
         f"block_k={block_k} must be a multiple of sf_vec_size={sf_vec_size}"
     )
@@ -280,7 +282,7 @@ def dequant_nvfp4_2d_triton(
         weight_scale_2: per-tensor FP32 scale (any shape with a single
             element; only ``data_ptr()`` is consumed by the kernel).
         target_dtype: BF16 or FP16.
-        sf_vec_size: NVFP4 per-block size (16).
+        sf_vec_size: NVFP4 per-block size (16, or 32 for weight-only checkpoints).
         block_n, block_k: Triton tile shape. ``block_k`` must be a multiple
             of ``sf_vec_size``.
 
@@ -288,7 +290,7 @@ def dequant_nvfp4_2d_triton(
         ``[N, K]`` in ``target_dtype``.
     """
     assert packed_weight.dim() == 2, "packed_weight must be 2D [N, K/2]"
-    assert sf_vec_size == 16, "NVFP4 fixed at 16-element blocks"
+    assert sf_vec_size in (16, 32), f"sf_vec_size must be 16 or 32, got {sf_vec_size}"
     assert block_k % sf_vec_size == 0, (
         f"block_k={block_k} must be a multiple of sf_vec_size={sf_vec_size}"
     )

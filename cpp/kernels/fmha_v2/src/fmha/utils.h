@@ -157,10 +157,7 @@ struct Col
 template <int M, int N>
 struct Round_up
 {
-    enum
-    {
-        VALUE = (M + N - 1) / N * N
-    };
+    static constexpr int VALUE = (M + N - 1) / N * N;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -168,12 +165,9 @@ struct Round_up
 template <int N_, int H_, int W_>
 struct Tile_nhw
 {
-    enum
-    {
-        N = N_,
-        H = H_,
-        W = W_
-    };
+    static constexpr int N = N_;
+    static constexpr int H = H_;
+    static constexpr int W = W_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -186,217 +180,145 @@ struct Next_power_of_two
 template <int M>
 struct Next_power_of_two<M, true>
 {
-    enum
-    {
-        VALUE = M
-    };
+    static constexpr int VALUE = M;
 };
 
 template <>
 struct Next_power_of_two<3, false>
 {
-    enum
-    {
-        VALUE = 4
-    };
+    static constexpr int VALUE = 4;
 };
 
 template <>
 struct Next_power_of_two<5, false>
 {
-    enum
-    {
-        VALUE = 8
-    };
+    static constexpr int VALUE = 8;
 };
 
 template <>
 struct Next_power_of_two<6, false>
 {
-    enum
-    {
-        VALUE = 8
-    };
+    static constexpr int VALUE = 8;
 };
 
 template <>
 struct Next_power_of_two<7, false>
 {
-    enum
-    {
-        VALUE = 8
-    };
+    static constexpr int VALUE = 8;
 };
 
 template <>
 struct Next_power_of_two<9, false>
 {
-    enum
-    {
-        VALUE = 16
-    };
+    static constexpr int VALUE = 16;
 };
 
 template <>
 struct Next_power_of_two<10, false>
 {
-    enum
-    {
-        VALUE = 16
-    };
+    static constexpr int VALUE = 16;
 };
 
 template <>
 struct Next_power_of_two<11, false>
 {
-    enum
-    {
-        VALUE = 16
-    };
+    static constexpr int VALUE = 16;
 };
 
 template <>
 struct Next_power_of_two<12, false>
 {
-    enum
-    {
-        VALUE = 16
-    };
+    static constexpr int VALUE = 16;
 };
 
 template <>
 struct Next_power_of_two<13, false>
 {
-    enum
-    {
-        VALUE = 16
-    };
+    static constexpr int VALUE = 16;
 };
 
 template <>
 struct Next_power_of_two<14, false>
 {
-    enum
-    {
-        VALUE = 16
-    };
+    static constexpr int VALUE = 16;
 };
 
 template <>
 struct Next_power_of_two<15, false>
 {
-    enum
-    {
-        VALUE = 16
-    };
+    static constexpr int VALUE = 16;
 };
 
 template <>
 struct Next_power_of_two<24, false>
 {
-    enum
-    {
-        VALUE = 32
-    };
+    static constexpr int VALUE = 32;
 };
 
 template <>
 struct Next_power_of_two<40, false>
 {
-    enum
-    {
-        VALUE = 64
-    };
+    static constexpr int VALUE = 64;
 };
 
 template <>
 struct Next_power_of_two<48, false>
 {
-    enum
-    {
-        VALUE = 64
-    };
+    static constexpr int VALUE = 64;
 };
 
 template <>
 struct Next_power_of_two<72, false>
 {
-    enum
-    {
-        VALUE = 128
-    };
+    static constexpr int VALUE = 128;
 };
 
 template <>
 struct Next_power_of_two<80, false>
 {
-    enum
-    {
-        VALUE = 128
-    };
+    static constexpr int VALUE = 128;
 };
 
 template <>
 struct Next_power_of_two<96, false>
 {
-    enum
-    {
-        VALUE = 128
-    };
+    static constexpr int VALUE = 128;
 };
 
 template <>
 struct Next_power_of_two<104, false>
 {
-    enum
-    {
-        VALUE = 128
-    };
+    static constexpr int VALUE = 128;
 };
 
 template <>
 struct Next_power_of_two<112, false>
 {
-    enum
-    {
-        VALUE = 128
-    };
+    static constexpr int VALUE = 128;
 };
 
 template <>
 struct Next_power_of_two<144, false>
 {
-    enum
-    {
-        VALUE = 256
-    };
+    static constexpr int VALUE = 256;
 };
 
 template <>
 struct Next_power_of_two<160, false>
 {
-    enum
-    {
-        VALUE = 256
-    };
+    static constexpr int VALUE = 256;
 };
 
 template <>
 struct Next_power_of_two<192, false>
 {
-    enum
-    {
-        VALUE = 256
-    };
+    static constexpr int VALUE = 256;
 };
 
 template <>
 struct Next_power_of_two<576, false>
 {
-    enum
-    {
-        VALUE = 1024
-    };
+    static constexpr int VALUE = 1024;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -409,46 +331,31 @@ struct Prev_power_of_two
 template <int N>
 struct Prev_power_of_two<N, true>
 {
-    enum
-    {
-        VALUE = N
-    };
+    static constexpr int VALUE = N;
 };
 
 template <>
 struct Prev_power_of_two<3, false>
 {
-    enum
-    {
-        VALUE = 2
-    };
+    static constexpr int VALUE = 2;
 };
 
 template <>
 struct Prev_power_of_two<5, false>
 {
-    enum
-    {
-        VALUE = 4
-    };
+    static constexpr int VALUE = 4;
 };
 
 template <>
 struct Prev_power_of_two<6, false>
 {
-    enum
-    {
-        VALUE = 4
-    };
+    static constexpr int VALUE = 4;
 };
 
 template <>
 struct Prev_power_of_two<7, false>
 {
-    enum
-    {
-        VALUE = 4
-    };
+    static constexpr int VALUE = 4;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -457,22 +364,13 @@ template <int BYTES_PER_ROW, int SKEW>
 struct Compute_skew
 {
     // The size of a transaction.
-    enum
-    {
-        BYTES_PER_TRX = 128
-    };
+    static constexpr int BYTES_PER_TRX = 128;
 
     // The remainder of the row without skew.
-    enum
-    {
-        REMAINDER = BYTES_PER_ROW % BYTES_PER_TRX
-    };
+    static constexpr int REMAINDER = BYTES_PER_ROW % BYTES_PER_TRX;
 
     // The value.
-    enum
-    {
-        VALUE = REMAINDER <= SKEW ? SKEW - REMAINDER : BYTES_PER_TRX + SKEW - REMAINDER
-    };
+    static constexpr int VALUE = REMAINDER <= SKEW ? SKEW - REMAINDER : BYTES_PER_TRX + SKEW - REMAINDER;
 
     // Make sure the math works ;)
     static_assert((BYTES_PER_ROW + VALUE) % BYTES_PER_TRX == SKEW, "");
@@ -484,10 +382,7 @@ template <int BYTES_PER_ROW>
 struct Compute_skew<BYTES_PER_ROW, 128>
 {
     // No skew!
-    enum
-    {
-        VALUE = 0
-    };
+    static constexpr int VALUE = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -495,10 +390,7 @@ struct Compute_skew<BYTES_PER_ROW, 128>
 template <int M, int N>
 struct Div_up
 {
-    enum
-    {
-        VALUE = (M + N - 1) / N
-    };
+    static constexpr int VALUE = (M + N - 1) / N;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -506,10 +398,7 @@ struct Div_up
 template <int A, int B>
 struct Max
 {
-    enum
-    {
-        VALUE = A >= B ? A : B
-    };
+    static constexpr int VALUE = A >= B ? A : B;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -517,10 +406,7 @@ struct Max
 template <int A, int B, int C>
 struct Max_3
 {
-    enum
-    {
-        VALUE = Max<Max<A, B>::VALUE, C>::VALUE
-    };
+    static constexpr int VALUE = Max<Max<A, B>::VALUE, C>::VALUE;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -528,10 +414,7 @@ struct Max_3
 template <int A, int B>
 struct Min
 {
-    enum
-    {
-        VALUE = A <= B ? A : B
-    };
+    static constexpr int VALUE = A <= B ? A : B;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -593,188 +476,137 @@ struct Warp_masks
 template <>
 struct Warp_masks<8, 1, 1>
 {
-    enum
-    {
-        M = 0xe0,
-        N = 0x00,
-        K = 0x00
-    };
+    static constexpr int M = 0xe0;
+    static constexpr int N = 0x00;
+    static constexpr int K = 0x00;
 };
 
 template <>
 struct Warp_masks<4, 2, 1>
 {
-    enum
-    {
-        M = 0x60,
-        N = 0x80,
-        K = 0x00
-    };
+    static constexpr int M = 0x60;
+    static constexpr int N = 0x80;
+    static constexpr int K = 0x00;
 };
 
 template <>
 struct Warp_masks<4, 1, 2>
 {
-    enum
-    {
-        M = 0x60,
-        N = 0x00,
-        K = 0x80
-    };
+    static constexpr int M = 0x60;
+    static constexpr int N = 0x00;
+    static constexpr int K = 0x80;
 };
 
 template <>
 struct Warp_masks<4, 1, 1>
 {
-    enum
-    {
-        M = 0x60,
-        N = 0x00,
-        K = 0x00
-    };
+    static constexpr int M = 0x60;
+    static constexpr int N = 0x00;
+    static constexpr int K = 0x00;
 };
 
 template <>
 struct Warp_masks<2, 4, 1>
 {
-    enum
-    {
-        M = 0x20,
-        N = 0xc0,
-        K = 0x00
-    };
+    static constexpr int M = 0x20;
+    static constexpr int N = 0xc0;
+    static constexpr int K = 0x00;
 };
 
 template <>
 struct Warp_masks<2, 2, 2>
 {
-    enum
-    {
-        M = 0x20,
-        N = 0x40,
-        K = 0x80
-    };
+    static constexpr int M = 0x20;
+    static constexpr int N = 0x40;
+    static constexpr int K = 0x80;
 };
 
 template <>
 struct Warp_masks<2, 2, 1>
 {
-    enum
-    {
-        M = 0x20,
-        N = 0x40,
-        K = 0x00
-    };
+    static constexpr int M = 0x20;
+    static constexpr int N = 0x40;
+    static constexpr int K = 0x00;
 };
 
 template <>
 struct Warp_masks<2, 1, 2>
 {
-    enum
-    {
-        M = 0x20,
-        N = 0x00,
-        K = 0x40
-    };
+    static constexpr int M = 0x20;
+    static constexpr int N = 0x00;
+    static constexpr int K = 0x40;
 };
 
 template <>
 struct Warp_masks<2, 1, 1>
 {
-    enum
-    {
-        M = 0x20,
-        N = 0x00,
-        K = 0x00
-    };
+    static constexpr int M = 0x20;
+    static constexpr int N = 0x00;
+    static constexpr int K = 0x00;
 };
 
 template <>
 struct Warp_masks<1, 8, 1>
 {
-    enum
-    {
-        M = 0x00,
-        N = 0xe0,
-        K = 0x00
-    };
+    static constexpr int M = 0x00;
+    static constexpr int N = 0xe0;
+    static constexpr int K = 0x00;
 };
 
 template <>
 struct Warp_masks<1, 4, 2>
 {
-    enum
-    {
-        M = 0x00,
-        N = 0x60,
-        K = 0x80
-    };
+    static constexpr int M = 0x00;
+    static constexpr int N = 0x60;
+    static constexpr int K = 0x80;
 };
 
 template <>
 struct Warp_masks<1, 4, 1>
 {
-    enum
-    {
-        M = 0x00,
-        N = 0x60,
-        K = 0x00
-    };
+    static constexpr int M = 0x00;
+    static constexpr int N = 0x60;
+    static constexpr int K = 0x00;
 };
 
 template <>
 struct Warp_masks<1, 2, 2>
 {
-    enum
-    {
-        M = 0x00,
-        N = 0x20,
-        K = 0x40
-    };
+    static constexpr int M = 0x00;
+    static constexpr int N = 0x20;
+    static constexpr int K = 0x40;
 };
 
 template <>
 struct Warp_masks<1, 2, 1>
 {
-    enum
-    {
-        M = 0x00,
-        N = 0x20,
-        K = 0x00
-    };
+    static constexpr int M = 0x00;
+    static constexpr int N = 0x20;
+    static constexpr int K = 0x00;
 };
 
 template <>
 struct Warp_masks<1, 1, 4>
 {
-    enum
-    {
-        M = 0x00,
-        N = 0x00,
-        K = 0x60
-    };
+    static constexpr int M = 0x00;
+    static constexpr int N = 0x00;
+    static constexpr int K = 0x60;
 };
 
 template <>
 struct Warp_masks<1, 1, 2>
 {
-    enum
-    {
-        M = 0x00,
-        N = 0x00,
-        K = 0x20
-    };
+    static constexpr int M = 0x00;
+    static constexpr int N = 0x00;
+    static constexpr int K = 0x20;
 };
 
 template <>
 struct Warp_masks<1, 1, 1>
 {
-    enum
-    {
-        M = 0x00,
-        N = 0x00,
-        K = 0x00
-    };
+    static constexpr int M = 0x00;
+    static constexpr int N = 0x00;
+    static constexpr int K = 0x00;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1661,22 +1493,16 @@ inline __device__ void clear(uint4& dst)
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-enum
-{
-    BYTES_PER_REG = 4,
-    PREDS_PER_BYTE = 4,
-    PREDS_PER_REG = BYTES_PER_REG * PREDS_PER_BYTE
-};
+static constexpr int BYTES_PER_REG = 4;
+static constexpr int PREDS_PER_BYTE = 4;
+static constexpr int PREDS_PER_REG = BYTES_PER_REG * PREDS_PER_BYTE;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int LDGS>
 struct Compute_number_of_pred_regs
 {
-    enum
-    {
-        VALUE = Div_up<LDGS, PREDS_PER_REG>::VALUE
-    };
+    static constexpr int VALUE = Div_up<LDGS, PREDS_PER_REG>::VALUE;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1689,28 +1515,19 @@ inline __device__ void pack_predicates(uint32_t (&preds)[M], uint32_t const (&p)
     static_assert(Compute_number_of_pred_regs<N>::VALUE == M, "");
 
     // The number of complete steps (where we use all the predicates in a byte).
-    enum
-    {
-        COMPLETE_BYTES = N / PREDS_PER_BYTE
-    };
+    static constexpr int COMPLETE_BYTES = N / PREDS_PER_BYTE;
 
     // Make sure we allocated enough predicate registers.
     static_assert(Div_up<COMPLETE_BYTES, BYTES_PER_REG>::VALUE <= M, "");
 
     // The remainder.
-    enum
-    {
-        REMAINDER = N - COMPLETE_BYTES * PREDS_PER_BYTE
-    };
+    static constexpr int REMAINDER = N - COMPLETE_BYTES * PREDS_PER_BYTE;
 
     // Make sure we got the math right and the remainder is between 0 and 3.
     static_assert(REMAINDER >= 0 && REMAINDER <= 3, "");
 
     // The mask to extract the predicates.
-    enum
-    {
-        COMPLETE_MASK = (1 << PREDS_PER_BYTE) - 1
-    };
+    static constexpr int COMPLETE_MASK = (1 << PREDS_PER_BYTE) - 1;
 
     // Run complete steps.
 #pragma unroll
@@ -1756,10 +1573,7 @@ inline __device__ void pack_predicates(uint32_t (&preds)[M], uint32_t const (&p)
         {
 
             // The mask to extract the predicates.
-            enum
-            {
-                REMAINDER_MASK = (1 << REMAINDER) - 1
-            };
+            static constexpr int REMAINDER_MASK = (1 << REMAINDER) - 1;
 
             // Prepare the array of predicates.
             bool tmp[PREDS_PER_BYTE];
@@ -1806,28 +1620,19 @@ inline __device__ void ldgsts_(Functor& fct, uint32_t const (&preds)[M])
 {
 
     // The number of complete bytes (where we use all the predicates in a byte).
-    enum
-    {
-        COMPLETE = N / PREDS_PER_BYTE
-    };
+    static constexpr int COMPLETE = N / PREDS_PER_BYTE;
 
     // Make sure we did allocate enough predicates.
     static_assert(Div_up<COMPLETE, BYTES_PER_REG>::VALUE <= M, "");
 
     // The remainder.
-    enum
-    {
-        REMAINDER = N - COMPLETE * PREDS_PER_BYTE
-    };
+    static constexpr int REMAINDER = N - COMPLETE * PREDS_PER_BYTE;
 
     // Make sure we got the math right and the remainder is between 0 and 3.
     static_assert(REMAINDER >= 0 && REMAINDER <= 3, "");
 
     // The mask to extract the predicates.
-    enum
-    {
-        COMPLETE_MASK = (1 << PREDS_PER_BYTE) - 1
-    };
+    static constexpr int COMPLETE_MASK = (1 << PREDS_PER_BYTE) - 1;
 
 // Clear the fetch registers.
 #pragma unroll
@@ -1866,10 +1671,7 @@ inline __device__ void ldgsts_(Functor& fct, uint32_t const (&preds)[M])
     {
 
         // The mask to extract the predicates.
-        enum
-        {
-            REMAINDER_MASK = (1 << REMAINDER) - 1
-        };
+        static constexpr int REMAINDER_MASK = (1 << REMAINDER) - 1;
 
         // The predicate register.
         uint32_t reg = preds[COMPLETE / BYTES_PER_REG];

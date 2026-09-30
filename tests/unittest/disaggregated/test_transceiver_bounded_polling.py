@@ -36,6 +36,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TransferWorker,
     TransferWorkerConfig,
     TxSession,
+    _LogicalOutcomes,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm.bindings import LlmRequestState
@@ -171,6 +172,7 @@ def _make_tx_session(
     deadline_monotonic_s: Optional[float] = None,
 ) -> TxSession:
     session = object.__new__(TxSession)
+    session._logical_outcomes = _LogicalOutcomes()
     session._timeout_s = timeout_s
     session._overall_timeout_s = None
     session._deadline_monotonic_s = deadline_monotonic_s
@@ -415,7 +417,7 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver._recv_reqs = {}
     transceiver._gen_consensus = Mock(return_value=[])
     transceiver._build_to_process = Mock(return_value=[])
-    transceiver._gen_consensus_outcome = Mock(return_value=([], [], []))
+    transceiver._gen_consensus_outcome = Mock(return_value=([], [], [], set()))
     transceiver._close_failed_sessions = Mock()
 
     status = transceiver.check_gen_transfer_status(at_least_request_num=0)
@@ -426,6 +428,8 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     assert failed == []
     assert cancelled == []
     transceiver._gen_consensus.assert_called_once_with([])
+    # to_process, cancelled, failed, completed, locally_verified
+    transceiver._gen_consensus_outcome.assert_called_once_with([], [], [], [], [])
 
 
 def test_consensus_outcome_uses_single_batched_allgather() -> None:
@@ -762,11 +766,11 @@ def test_tx_session_first_send_anchors_deadline_once(monkeypatch) -> None:
     )
 
     assert session._deadline_monotonic_s is None
-    session.send(Mock(is_last_slice=False))
+    session.send(Mock(is_last=False))
     assert session._deadline_monotonic_s == 12.0
 
     clock.advance(0.5)
-    session.send(Mock(is_last_slice=False))
+    session.send(Mock(is_last=False))
     assert session._deadline_monotonic_s == 12.0
     assert sender.dispatch_task.call_count == 2
     session.close()
@@ -827,8 +831,14 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
     )
     monkeypatch.setattr(KvCacheTransceiverV2, "_init_sync_policy", lambda _self: None)
     monkeypatch.setattr(KvCacheTransceiverV2, "_exchange_rank_info", lambda _self: None)
+    # Everything the constructor can reach, not only what it reaches with these values: the
+    # world-size and helix reads sit behind an env check, a monkeypatch and `cp_size == 1`.
     mapping = SimpleNamespace(
         cp_size=1,
+        world_size=1,
+        pp_size=1,
+        has_cp_helix=lambda: False,
+        cp_config={},
         tp_rank=0,
         tp_size=1,
         enable_attention_dp=False,
@@ -1084,7 +1094,7 @@ def test_generation_first_tx_session_nonblocking_missing_aux_stays_pending() -> 
     session = _make_tx_session([task], need_aux=True)
 
     assert session.wait_complete(blocking=False) is None
-    assert session.status == SessionStatus.KV_TRANSFERRED
+    assert session.status == SessionStatus.TRANSFERRING
     assert session.exception is None
     assert task.wait_calls == []
 

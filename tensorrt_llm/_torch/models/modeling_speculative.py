@@ -13,6 +13,7 @@ from transformers import LlamaConfig, PretrainedConfig
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ...functional import PositionEmbeddingType
 from ..attention.attention import Attention
@@ -21,7 +22,7 @@ from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.mla import MLA
 from ..model_config import ModelConfig, TConfig
 from ..modules.decoder_layer import DecoderLayer
-from ..modules.embedding import Embedding
+from ..modules.embedding import Embedding, get_masked_input_and_mask
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
@@ -52,6 +53,20 @@ def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
         "Set 'draft_vocab_size' explicitly if the draft head uses a different vocabulary."
     )
     config.draft_vocab_size = config.vocab_size
+
+
+def _set_draft_kv_cache_quant_algo(draft_config: ModelConfig,
+                                   target_config: ModelConfig) -> None:
+    """Inherit the target KV dtype unless the model requests a draft override."""
+    algo = target_config.quant_config.kv_cache_quant_algo
+    override = target_config.extra_attrs.get(
+        "draft_kv_cache_quant_algo_override")
+    if override is not None:
+        algo = QuantAlgo(override)
+    draft_config.quant_config.kv_cache_quant_algo = algo
+    if override is not None and draft_config.quant_config_dict is not None:
+        for layer_quant_config in draft_config.quant_config_dict.values():
+            layer_quant_config.kv_cache_quant_algo = algo
 
 
 def _slice_spec_position_ids(position_ids: Optional[torch.Tensor],
@@ -92,6 +107,27 @@ def greedy_or_sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     return sampled.view(probs.shape[:-1])
 
 
+def markov_prev_embeddings(prev_tokens: torch.Tensor,
+                           markov_w1: torch.Tensor) -> torch.Tensor:
+    """``markov_w1[prev_tokens]`` with out-of-vocab anchors masked to zero.
+
+    The anchor is the last accepted token, which on the one-model rejection path
+    comes from flashinfer's ``chain_speculative_sampling``: it pads non-accepted
+    positions with ``-1`` and returns an out-of-range id for a row whose
+    ``relu(target - draft)`` residual has no mass. Mask like modules/embedding.py
+    does, so such a row contributes no bias instead of tripping a device assert.
+
+    Args:
+        prev_tokens: previous token ids (draft vocab), any shape.
+        markov_w1: [vocab, rank].
+    Returns:
+        ``prev_tokens.shape + (rank,)`` in ``markov_w1``'s dtype.
+    """
+    prev_tokens, invalid = get_masked_input_and_mask(prev_tokens.long(), 0,
+                                                     markov_w1.shape[0])
+    return F.embedding(prev_tokens, markov_w1).masked_fill(invalid, 0)
+
+
 def dspark_markov_step_bias(prev_tokens: torch.Tensor, markov_w1: torch.Tensor,
                             markov_w2: torch.Tensor) -> torch.Tensor:
     """Vanilla Markov head logit bias for one intra-block draft step.
@@ -109,7 +145,7 @@ def dspark_markov_step_bias(prev_tokens: torch.Tensor, markov_w1: torch.Tensor,
     Returns:
         [B, vocab_or_shard] bias in the markov weights' dtype.
     """
-    return F.linear(F.embedding(prev_tokens, markov_w1), markov_w2)
+    return F.linear(markov_prev_embeddings(prev_tokens, markov_w1), markov_w2)
 
 
 def dspark_markov_chain(
@@ -226,7 +262,7 @@ class VanillaMarkov(nn.Module):
                                    bias=False)
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return F.embedding(token_ids.long(), self.markov_w1.weight)
+        return markov_prev_embeddings(token_ids, self.markov_w1.weight)
 
     def project_bias(self,
                      latent_states: torch.Tensor,
@@ -1286,6 +1322,9 @@ class MTPForCausalLM(nn.Module):
             case "deepseek_v4":
                 from .modeling_deepseekv4 import DeepseekV4MTP
                 mtp_layer = DeepseekV4MTP
+            case "glm5_next" | "glm5_next_text":
+                from .modeling_glm5_next import Glm5NextMTP
+                mtp_layer = Glm5NextMTP
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
@@ -1405,6 +1444,10 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         spec_config=None,  # Avoid recursive spec-dec
         max_num_tokens=model_config.max_num_tokens,
         moe_max_num_tokens=model_config.moe_max_num_tokens,
+        # The user's value, NOT the engine's: py_executor_creator raises it past
+        # this and never writes back, so drafters read _runtime_position_ceiling.
+        # None sizes position tables from max_position_embeddings: 1M for K3.
+        max_seq_len=model_config.max_seq_len,
     )
     # Only the embedded DSpark draft shares the target's EPLB namespace (its
     # stages are target decoder blocks registered into the target's balancer).
@@ -1590,8 +1633,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         raise ValueError(
                             f"Unsupported eagle3 model architecture for draft model: {spec_config.eagle3_model_arch}"
                         )
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                    model_config.quant_config.kv_cache_quant_algo
+                    _set_draft_kv_cache_quant_algo(self.draft_config,
+                                                   model_config)
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
                 elif spec_config.uses_external_draft_model:
@@ -1604,8 +1647,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                        model_config.quant_config.kv_cache_quant_algo
+                    _set_draft_kv_cache_quant_algo(self.draft_config,
+                                                   model_config)
                     self.draft_config.extra_attrs = model_config.extra_attrs
                     self.draft_config.extra_attrs[
                         _SPECULATIVE_POSITION_HEADROOM] = (
@@ -1616,8 +1659,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         model_config.spec_config.speculative_model,
                         **external_drafter_config_kwargs(
                             model_config, spec_config))
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                        model_config.quant_config.kv_cache_quant_algo
+                    _set_draft_kv_cache_quant_algo(self.draft_config,
+                                                   model_config)
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(

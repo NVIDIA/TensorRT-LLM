@@ -209,7 +209,6 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_max_draft_len', type=int, default=1)
     parser.add_argument('--draft_model_dir', type=str, default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
-    parser.add_argument('--eagle_choices', type=str, default=None)
     parser.add_argument('--use_dynamic_tree',
                         default=False,
                         action='store_true')
@@ -313,7 +312,6 @@ def setup_llm(args, **kwargs):
         spec_config = Eagle3DecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             speculative_model=args.draft_model_dir,
-            eagle_choices=args.eagle_choices,
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
             eagle3_model_arch=args.eagle3_model_arch,
