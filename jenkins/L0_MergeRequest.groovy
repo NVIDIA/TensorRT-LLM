@@ -225,10 +225,17 @@ def ENABLE_BOLT_PREMERGE_CONSUME = false
 // So post-merge publishes BOTH -- canonical untouched, plus bolted-<tarName>
 // carrying a bolt.ref property naming the bundle applied.
 //
-// Off until the consumers that read bolted-<tarName> land, so flipping it on is
-// a reviewed code change rather than a side effect of this one.
+// On means post-merge SBSA also runs its tests against bolted-<tarName> instead
+// of only publishing it. Turning it off stops both the extra publish and the
+// test-side switch; the canonical tarball is never touched either way, so a
+// post-merge run with this off is byte-for-byte what it is today.
+//
+// This is deliberately not the pre-merge switch above. Post-merge is scoped to
+// one branch and one arch, and it exercises the same apply-to-tarball path a
+// pre-merge build would, which is what makes it the smoke test for flipping
+// ENABLE_BOLT_PREMERGE_CONSUME afterwards.
 @Field
-def ENABLE_BOLT_POSTMERGE_VARIANT = false
+def ENABLE_BOLT_POSTMERGE_VARIANT = true
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
