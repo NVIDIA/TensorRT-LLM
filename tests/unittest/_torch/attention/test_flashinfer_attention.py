@@ -22,11 +22,15 @@ from tensorrt_llm._torch.attention.backends.flashinfer import (
 from tensorrt_llm._torch.attention.backends.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor import (cuda_graph_runner, resource_manager,
+                                            scheduler)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 
@@ -1125,6 +1129,367 @@ class TestFlashInferAttention(unittest.TestCase):
                                        rtol=0)
 
         kv_cache_manager.shutdown()
+
+    @parameterized.expand([(num_kv_heads, batch_size, fp8_kv)
+                           for num_kv_heads in ([4, 4], [2, 2])
+                           for batch_size in (1, 4)
+                           for fp8_kv in (False, True)])
+    @torch.no_grad()
+    def test_cuda_graph_replay_refreshes_fa2_schedule(self,
+                                                      num_kv_heads: list[int],
+                                                      batch_size: int,
+                                                      fp8_kv: bool) -> None:
+        """Refresh each captured FA2 schedule as request page counts change."""
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+        torch.manual_seed(0)
+        page_size, max_pages = 32, 256
+        num_heads, head_dim = 8, 128
+        dtype = torch.bfloat16
+        quant_config = QuantConfig(
+            kv_cache_quant_algo=QuantAlgo.FP8) if fp8_kv else None
+        manager = KVCacheManager(
+            # Leave one page for the graph runner's own padding request.
+            KvCacheConfig(max_tokens=(2 * batch_size * max_pages + 1) *
+                          page_size),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=len(num_kv_heads),
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=page_size,
+            max_seq_len=max_pages * page_size,
+            max_batch_size=2 * batch_size + 1,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            dtype=(tensorrt_llm.bindings.DataType.FP8
+                   if fp8_kv else tensorrt_llm.bindings.DataType.BF16),
+        )
+        self.addCleanup(manager.shutdown)
+        requests = manager.add_dummy_requests(list(range(
+            2 * batch_size)), [max_pages * page_size] * (2 * batch_size),
+                                              is_gen=True)
+        layers = [
+            FlashInferAttention(layer_idx=i,
+                                num_heads=num_heads,
+                                num_kv_heads=kv_heads,
+                                head_dim=head_dim,
+                                quant_config=quant_config,
+                                flashinfer_backend="fa2")
+            for i, kv_heads in enumerate(num_kv_heads)
+        ]
+        kv_buffers = [manager.get_buffers(layer.layer_idx) for layer in layers]
+        for buffer in kv_buffers:
+            buffer.copy_(torch.randn(buffer.shape, dtype=dtype, device="cuda"))
+        inputs = [
+            tuple(
+                torch.randn(
+                    batch_size, heads * head_dim, dtype=dtype, device="cuda")
+                for heads in [num_heads, kv_heads, kv_heads])
+            for kv_heads in num_kv_heads
+        ]
+
+        # Grow beyond the captured history, not just within a preplanned maximum.
+        initial_length = page_size - 1
+        metadata_args = dict(
+            seq_lens=torch.ones(batch_size, dtype=torch.int),
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[initial_length] * batch_size),
+            max_num_requests=batch_size,
+            max_num_tokens=batch_size,
+            kv_cache_manager=manager,
+            request_ids=list(range(batch_size)),
+        )
+        eager = FlashInferAttentionMetadata(**metadata_args)
+        captured = FlashInferAttentionMetadata(is_cuda_graph=True,
+                                               **metadata_args)
+        eager.prepare()
+        captured.prepare()
+        self.assertIsNone(captured._vswa_layer_to_pool)
+
+        def run(metadata, active_rows=None):
+            # Gemma3 has distinct sliding/global plans with the same head geometry.
+            return [
+                layer.forward(q[:active_rows],
+                              k[:active_rows],
+                              v[:active_rows],
+                              metadata,
+                              attention_window_size=1024
+                              if layer.layer_idx == 0 else None)
+                for layer, (q, k, v) in zip(layers, inputs)
+            ]
+
+        # Use the production backend selection: "fa2" on Hopper, "auto"
+        # elsewhere. The plain (non-tensor-core) decode plan keeps "auto".
+        for _ in range(2):
+            run(eager)
+            run(captured)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = run(captured)
+        wrappers = captured._plan_params_to_wrappers
+        self.assertEqual(len(wrappers), len(layers))
+        # 8 query heads: [4, 4] BF16 uses the plain FA2 decode kernel, while
+        # [2, 2] (GQA ratio 4) and FP8 KV use the tensor-core plan path.
+        expects_tensor_cores = fp8_kv or num_kv_heads[0] == 2
+        for wrapper in wrappers.values():
+            self.assertIn(wrapper.decode_wrapper._backend, ("fa2", "auto"))
+            self.assertEqual(wrapper.decode_wrapper.use_tensor_cores,
+                             expects_tensor_cores)
+            self.assertIsNotNone(wrapper.fa2_plan_num_blocks)
+        lengths = [page_size * (i + 1) for i in range(batch_size)]
+        transitions = [
+            # Change only page ownership while retaining the captured lengths.
+            (list(range(batch_size,
+                        2 * batch_size)), [initial_length] * batch_size),
+            (list(range(batch_size)), [length - 1 for length in lengths]),
+            (list(range(batch_size)), lengths),
+            (list(range(batch_size)), [length + 1 for length in lengths]),
+            # Same page counts, new ownership: existing page-index updates
+            # must remain correct without rebuilding the FA2 schedule.
+            (list(range(batch_size,
+                        2 * batch_size)), [length + 1 for length in lengths]),
+            (list(range(batch_size)), [page_size * 192] * batch_size),
+        ]
+        for request_ids, cached_lengths in transitions:
+            with self.subTest(request_ids=request_ids, lengths=cached_lengths):
+                for tensors in inputs:
+                    for tensor in tensors:
+                        tensor.normal_()
+                before_kv = [buffer.clone() for buffer in kv_buffers]
+                for metadata in [eager, captured]:
+                    metadata.request_ids = request_ids
+                    metadata.kv_cache_params = KVCacheParams(
+                        use_cache=True,
+                        num_cached_tokens_per_seq=cached_lengths)
+                    metadata.prepare()
+                expected = run(eager)
+                expected_kv = [buffer.clone() for buffer in kv_buffers]
+                for buffer, before in zip(kv_buffers, before_kv):
+                    buffer.copy_(before)
+
+                # No Python attention forward or re-capture after prepare().
+                graph.replay()
+                for result, reference in zip(actual, expected):
+                    torch.testing.assert_close(result,
+                                               reference,
+                                               atol=1e-2,
+                                               rtol=0)
+                for buffer, reference in zip(kv_buffers, expected_kv):
+                    torch.testing.assert_close(buffer.view(torch.uint8),
+                                               reference.view(torch.uint8),
+                                               atol=0,
+                                               rtol=0)
+
+        if batch_size == 1:
+            return
+
+        # Use the real padding API and its KV-owned dummy. This covers the
+        # padding/attention integration, not the complete model scheduler.
+        runner = cuda_graph_runner.CUDAGraphRunner(
+            cuda_graph_runner.CUDAGraphRunnerConfig(
+                use_cuda_graph=True,
+                cuda_graph_padding_enabled=True,
+                cuda_graph_batch_sizes=[batch_size],
+                max_cuda_graph_batch_size=batch_size,
+                batch_size=batch_size,
+                max_beam_width=1,
+                max_num_tokens=batch_size,
+                use_mrope=False,
+                spec_config=None,
+                cuda_graph_mem_pool=None,
+                enable_attention_dp=False,
+                original_max_draft_len=0,
+                original_max_total_draft_tokens=0,
+                is_draft_model=False,
+                is_encoder_decoder=False,
+                mapping=Mapping(),
+                dist=None,
+                kv_cache_manager_key=resource_manager.ResourceManagerType.
+                KV_CACHE_MANAGER))
+        resources = resource_manager.ResourceManager(
+            {resource_manager.ResourceManagerType.KV_CACHE_MANAGER: manager})
+        for active_rows in (batch_size // 2, 1, batch_size):
+            with self.subTest(replay_active_rows=active_rows):
+                batch = scheduler.ScheduledRequests()
+                batch.generation_requests = list(requests[:active_rows])
+                for tensors in inputs:
+                    for tensor in tensors:
+                        tensor.normal_()
+                        tensor[active_rows:].zero_()
+                with runner.pad_batch(batch, resources) as padded:
+                    self.assertEqual(padded.batch_size, batch_size)
+                    request_ids = [
+                        request.py_request_id
+                        for request in padded.generation_requests
+                    ]
+                    cached_lengths = [
+                        page_size * (i + 1) for i in range(active_rows)
+                    ] + [0] * (batch_size - active_rows)
+                    before_kv = [buffer.clone() for buffer in kv_buffers]
+                    # Eager really shrinks; only graph execution retains G rows.
+                    eager.seq_lens = torch.ones(active_rows, dtype=torch.int32)
+                    eager.request_ids = request_ids[:active_rows]
+                    eager.kv_cache_params = KVCacheParams(
+                        use_cache=True,
+                        num_cached_tokens_per_seq=cached_lengths[:active_rows])
+                    eager.prepare()
+                    captured.request_ids = request_ids
+                    captured.kv_cache_params = KVCacheParams(
+                        use_cache=True,
+                        num_cached_tokens_per_seq=cached_lengths)
+                    captured.prepare()
+                    expected = run(eager, active_rows)
+                    if active_rows < batch_size:
+                        self.assertTrue(
+                            padded.generation_requests[-1].is_cuda_graph_dummy)
+                        # Repeated dummy rows have identical K/V. Account for
+                        # their writes once, separately from active requests.
+                        dummy = FlashInferAttentionMetadata(
+                            seq_lens=torch.ones(1, dtype=torch.int32),
+                            num_contexts=0,
+                            kv_cache_params=KVCacheParams(
+                                use_cache=True, num_cached_tokens_per_seq=[0]),
+                            max_num_requests=1,
+                            max_num_tokens=1,
+                            kv_cache_manager=manager,
+                            request_ids=[request_ids[-1]],
+                        )
+                        dummy.prepare()
+                        for layer, (q, k, v) in zip(layers, inputs):
+                            layer.forward(q[active_rows:active_rows + 1],
+                                          k[active_rows:active_rows + 1],
+                                          v[active_rows:active_rows + 1],
+                                          dummy,
+                                          attention_window_size=1024
+                                          if layer.layer_idx == 0 else None)
+                    expected_kv = [buffer.clone() for buffer in kv_buffers]
+                    for buffer, before in zip(kv_buffers, before_kv):
+                        buffer.copy_(before)
+                    graph.replay()
+                    for output, reference in zip(actual, expected):
+                        torch.testing.assert_close(output[:active_rows],
+                                                   reference,
+                                                   atol=1e-2,
+                                                   rtol=0)
+                    for buffer, reference in zip(kv_buffers, expected_kv):
+                        torch.testing.assert_close(buffer.view(torch.uint8),
+                                                   reference.view(torch.uint8),
+                                                   atol=0,
+                                                   rtol=0)
+                    self.assertEqual(captured.num_generations, batch_size)
+                    self.assertEqual(eager.num_generations, active_rows)
+                self.assertEqual(batch.batch_size, active_rows)
+
+    @parameterized.expand([
+        (is_cuda_graph, kv_heads, fp8_kv, backend)
+        for is_cuda_graph in (False, True)
+        for kv_heads, fp8_kv, backend in ((4, False, "fa2"), (2, False, "fa2"),
+                                          (4, True, "fa2"), (4, False, "auto"))
+    ])
+    def test_decode_plan_batch_contract(self, is_cuda_graph: bool,
+                                        kv_heads: int, fp8_kv: bool,
+                                        backend: str) -> None:
+        """Graph plans keep their fixed rows; eager plans keep active rows."""
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+        batch_size, page_size, max_pages = 4, 32, 8
+        manager = KVCacheManager(
+            KvCacheConfig(max_tokens=batch_size * max_pages * page_size),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=kv_heads,
+            head_dim=128,
+            tokens_per_block=page_size,
+            max_seq_len=max_pages * page_size,
+            max_batch_size=batch_size,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            dtype=(tensorrt_llm.bindings.DataType.FP8
+                   if fp8_kv else tensorrt_llm.bindings.DataType.BF16),
+        )
+        self.addCleanup(manager.shutdown)
+        manager.add_dummy_requests(list(range(batch_size)),
+                                   [max_pages * page_size] * batch_size)
+        metadata = TestingFlashInferAttentionMetadata(
+            seq_lens=torch.ones(batch_size, dtype=torch.int32),
+            num_contexts=0,
+            is_cuda_graph=is_cuda_graph,
+            kv_cache_params=KVCacheParams(use_cache=True,
+                                          num_cached_tokens_per_seq=[0] *
+                                          batch_size),
+            max_num_requests=batch_size,
+            max_num_tokens=batch_size,
+            kv_cache_manager=manager,
+            request_ids=list(range(batch_size)),
+        )
+        metadata.prepare()
+
+        def plan_all() -> list[PlanParams]:
+            return [
+                metadata.plan(
+                    num_heads=8,
+                    num_kv_heads=kv_heads,
+                    head_dim=128,
+                    q_dtype=torch.bfloat16,
+                    kv_dtype=torch.float8_e4m3fn if fp8_kv else torch.bfloat16,
+                    attention_mask_type=AttentionMaskType.causal.value,
+                    attention_window_size=window,
+                    flashinfer_backend=backend,
+                ) for window in (None, 1023)
+            ]
+
+        params = plan_all()
+        wrappers = [metadata.get_decode_wrapper(pp) for pp in params]
+        buffers = (metadata.paged_kv_indptr_decode,
+                   metadata._paged_kv_last_page_len)
+        pointers = [buffer.data_ptr() for buffer in buffers]
+        for wrapper in wrappers:
+            self.assertIn(wrapper._backend, ("fa2", "auto"))
+        for counts in ([2, 1], [1], [1, 2, 3, 4], [1, 2, 3, 4]):
+            active_rows = len(counts)
+            with self.subTest(counts=counts):
+                if is_cuda_graph:
+                    # Metadata-only boundary, as in the stale-row regression:
+                    # retain the graph buffers while shortening the CPU view.
+                    # This is not a replay with undersized Q/K/V; the runner
+                    # must supply real padding requests for an actual replay.
+                    metadata._seq_lens = torch.ones(active_rows,
+                                                    dtype=torch.int32)
+                    metadata.on_update()
+                else:
+                    metadata.seq_lens = torch.ones(active_rows,
+                                                   dtype=torch.int32)
+                metadata.request_ids = list(range(active_rows))
+                metadata.kv_cache_params = KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=[(n - 1) * page_size
+                                               for n in counts])
+                metadata.prepare()
+                self.assertEqual(plan_all(), params)
+                self.assertEqual(
+                    [metadata.get_decode_wrapper(pp) for pp in params],
+                    wrappers)
+                self.assertEqual([buffer.data_ptr() for buffer in buffers],
+                                 pointers)
+                # Append metadata continues to describe only the active rows.
+                self.assertEqual(metadata.paged_kv_indptr.numel(),
+                                 active_rows + 1)
+                self.assertEqual(metadata.paged_kv_last_page_len.numel(),
+                                 active_rows)
+                expected_indptr = [0]
+                for count in counts:
+                    expected_indptr.append(expected_indptr[-1] + count)
+                plan_rows = batch_size if is_cuda_graph else active_rows
+                expected_indptr += [sum(counts)] * (plan_rows - active_rows)
+                self.assertEqual(buffers[0][:plan_rows + 1].tolist(),
+                                 expected_indptr)
+                self.assertEqual(buffers[1][:plan_rows].tolist(),
+                                 [1] * active_rows + [0] *
+                                 (plan_rows - active_rows))
+                if is_cuda_graph:
+                    for wrapper in wrappers:
+                        self.assertEqual(wrapper._fixed_batch_size, batch_size)
 
     def test_ragged_prefill_no_kv_cache_uses_cudnn_plan(self) -> None:
         """Ragged QKV with ``kv_cache_manager=None`` plans via cuDNN (``_plan_ragged_cudnn_no_kv``)."""
