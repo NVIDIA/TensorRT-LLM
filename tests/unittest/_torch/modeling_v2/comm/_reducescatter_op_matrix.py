@@ -1539,8 +1539,12 @@ def _run_wedge_rank() -> int:
 
 def _mpirun(world_size: int, flag: str, env: Optional[Dict[str, str]] = None) -> Any:
     """Start one mpirun job in its own process group, so it can be killed."""
+    # The flag, not the OMPI_ALLOW_RUN_AS_ROOT* env pair, is what lets a root
+    # container launch: single-node CI unsets every OMPI_* variable, and
+    # prterun invoked as mpirun does not honor the PRTE_* pair that survives.
     command = [
         "mpirun",
+        "--allow-run-as-root",
         "-n",
         str(world_size),
         sys.executable,
