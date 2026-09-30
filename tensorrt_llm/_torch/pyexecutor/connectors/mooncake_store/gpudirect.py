@@ -35,6 +35,10 @@ whole reservation, and `cuMemGetHandleForAddressRange` exports a dma-buf over
 all of it, so both look healthy on a pool that cannot be registered in one
 call. They are reported here as context; the bound itself is the cache
 manager's granularity, which the caller supplies.
+
+`CU_POINTER_ATTRIBUTE_RANGE_START_ADDR` does matter, and not only as context:
+the mappings tile the reservation from its base, so that address is where the
+boundaries are counted from. `reservation_start` reads it for that purpose.
 """
 
 import os
@@ -47,6 +51,7 @@ __all__ = [
     "describe_range",
     "format_diagnosis",
     "peermem_loaded",
+    "reservation_start",
 ]
 
 #: Dump the per-range facts below at registration time, not only after a
@@ -70,6 +75,39 @@ def _driver():
         except ImportError:
             return None
     return driver
+
+
+def _pointer_attribute(driver, address: int, name: str):
+    """One `cuPointerGetAttribute`, or None where the driver will not answer."""
+    try:
+        enum = getattr(driver.CUpointer_attribute, name)
+    except AttributeError:
+        return None
+    status, value = driver.cuPointerGetAttribute(enum, driver.CUdeviceptr(address))
+    return None if int(status) != 0 else value
+
+
+def reservation_start(address: int) -> Optional[int]:
+    """Base of the virtual reservation holding `address`, or None if unreadable.
+
+    This is where the mappings of a V2 GPU pool begin, and therefore where a
+    caller cutting ranges on mapping boundaries has to count from. Nothing puts
+    it at a multiple of the mapping size: `VirtMem` reserves with
+    `cuMemAddressReserve(size, 0, 0, 0)`, and the driver satisfies a default
+    alignment with its minimum granularity, which is smaller than a mapping
+    whenever `pool_size_granularity` is more than 2 MiB.
+    """
+    driver = _driver()
+    if driver is None:
+        return None
+    try:
+        value = _pointer_attribute(driver, address, "CU_POINTER_ATTRIBUTE_RANGE_START_ADDR")
+    except Exception:  # noqa: BLE001
+        # An address the driver does not recognize, or no context on this
+        # thread. Either way the caller has a documented fallback, and a
+        # question about a pointer must not be what fails startup.
+        return None
+    return None if value is None else int(value)
 
 
 def peermem_loaded() -> Optional[bool]:
@@ -150,12 +188,7 @@ def describe_range(address: int, length: int) -> RangeFacts:
         return RangeFacts(address, length, error="cuda.bindings.driver unavailable")
 
     def attribute(name: str):
-        try:
-            enum = getattr(driver.CUpointer_attribute, name)
-        except AttributeError:
-            return None
-        status, value = driver.cuPointerGetAttribute(enum, driver.CUdeviceptr(address))
-        return None if int(status) != 0 else value
+        return _pointer_attribute(driver, address, name)
 
     try:
         memory_type = attribute("CU_POINTER_ATTRIBUTE_MEMORY_TYPE")
