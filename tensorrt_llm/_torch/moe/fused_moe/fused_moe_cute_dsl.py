@@ -341,6 +341,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                  output_dtype: torch.dtype = torch.bfloat16,
                  scaling_vector_size: int = 16,
                  use_direct_expert_metadata: bool = False,
+                 use_locality_domain: bool = False,
                  workload_identity: Optional[Tuple] = None):
         super().__init__()
         self.forward_impl = forward_impl
@@ -351,6 +352,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.enable_finalize_fusion = enable_finalize_fusion
         self.enable_alltoall = enable_alltoall
         self.use_direct_expert_metadata = use_direct_expert_metadata
+        self.use_locality_domain = use_locality_domain
 
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
@@ -471,13 +473,15 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             deep_ep_expert_capacity = num_rows // self.num_local_experts
         else:
             deep_ep_expert_capacity = None
-        return self.forward_impl(
-            *forward_inputs,
-            enable_alltoall=self.enable_alltoall,
-            tile_size=tile_size,
+        # The locality-domain impl does not take the count-native arguments.
+        count_native_kwargs = {} if self.use_locality_domain else dict(
             recv_expert_count=recv_expert_count,
             deep_ep_expert_capacity=deep_ep_expert_capacity,
             use_count_native_expert_metadata=self.use_direct_expert_metadata)
+        return self.forward_impl(*forward_inputs,
+                                 enable_alltoall=self.enable_alltoall,
+                                 tile_size=tile_size,
+                                 **count_native_kwargs)
 
     @AutoTuner.TacticsCapture.register_runner_tactic_comb_checker
     @staticmethod
@@ -761,7 +765,7 @@ class CuteDslFusedMoE(MoEImplBase):
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        """CuteDSL grouped GEMM: NVFP4 on SM100/SM103, bfloat16 activations."""
+        """CuteDSL grouped GEMM: NVFP4 on SM100/SM103/SM107, bfloat16 activations."""
         sm_version = d.env.sm
         quant_algo = p.quant_algo
 
@@ -852,7 +856,7 @@ class CuteDslFusedMoE(MoEImplBase):
         # exists, but its GEMM is ``cute_dsl_fp8_group_blockwise_gemm_ref`` --
         # an fp32 einsum-per-expert reference, not a CuteDSL kernel -- so
         # claiming the algorithm here would advertise a reference path as a
-        # backend. DeepGemm / TRTLLMGen own it on SM100/103, Cutlass on
+        # backend. DeepGemm / TRTLLMGen own it on SM100/103/107, Cutlass on
         # SM90/SM120. See the FP8-block note in MOE_DEVELOPER_GUIDE.md.
         return _reject(
             MoERejectReason.QUANT_UNSUPPORTED,
@@ -920,9 +924,9 @@ class CuteDslFusedMoE(MoEImplBase):
 
         self.scaling_vector_size = 16
         # locality domain: fork/join with _locality_domain kernel variants + shared output buffers.
-        # Weight splitting happens in post_load_weights after normal loading.
+        # Weight splitting happens in transform_weights after normal loading.
         self._locality_domain_runtime = None
-        self._locality_domain_weight_shards = None  # set in post_load_weights
+        self._locality_domain_weight_shards = None  # set in transform_weights
         planner = LocalityDomainExecutionPlanner(
             model_config.locality_domain_policy)
         self._locality_domain_plan = planner.plan_moe(
@@ -1162,6 +1166,7 @@ class CuteDslFusedMoE(MoEImplBase):
             enable_alltoall=enable_alltoall,
             workload_identity=workload_identity,
             use_direct_expert_metadata=use_direct_expert_metadata,
+            use_locality_domain=use_locality_domain,
         )
 
         if use_direct_expert_metadata:
@@ -1350,7 +1355,7 @@ class CuteDslFusedMoE(MoEImplBase):
                 if use_rubin else torch.ops.trtllm.
                 cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell)
 
-            finalize_inplace_op(
+            finalize_inplace_kwargs = dict(
                 input=x.view(torch.float4_e2m1fn_x2),
                 weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
                 input_scale=x_sf.view(torch.uint8),
@@ -1368,11 +1373,25 @@ class CuteDslFusedMoE(MoEImplBase):
                 local_expert_offset=slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
-                expert_counts=(recv_expert_count
-                               if use_count_native_expert_metadata else None),
-                expert_capacity=(deep_ep_expert_capacity
-                                 if use_count_native_expert_metadata else 0),
             )
+            if use_rubin:
+                # The Rubin op has no count-native variant, so it does not
+                # accept the expert-count arguments at all. Reaching here with
+                # count-native metadata would mean can_use_deep_ep_direct_metadata
+                # stopped excluding SM107.
+                if use_count_native_expert_metadata:
+                    raise NotImplementedError(
+                        "Count-native DeepEP expert metadata is not supported "
+                        "by the Rubin (SM107) fused-finalize grouped GEMM.")
+            else:
+                finalize_inplace_kwargs["expert_counts"] = (
+                    recv_expert_count
+                    if use_count_native_expert_metadata else None)
+                finalize_inplace_kwargs["expert_capacity"] = (
+                    deep_ep_expert_capacity
+                    if use_count_native_expert_metadata else 0)
+
+            finalize_inplace_op(**finalize_inplace_kwargs)
         else:
             if use_rubin:
                 # Rubin does not have a basic grouped GEMM kernel (without
@@ -2021,21 +2040,34 @@ class CuteDslFusedMoE(MoEImplBase):
                              allow_partial_loading=allow_partial_loading)
         # Keep DWDP registration after base weight loading. This preserves
         # loaded tensors for collector setup and remains compatible with the
-        # later locality domain post_load_weights splitting flow.
+        # later locality domain transform_weights splitting flow.
         dwdp_handle_collector = getattr(self, "dwdp_handle_collector", None)
         if dwdp_handle_collector is not None:
             dwdp_handle_collector.register_weights(self)
 
-    def post_load_weights(self):
-        super().post_load_weights()
+    def transform_weights(self) -> None:
+        if getattr(self, "_weights_transformed", False):
+            return
+        super().transform_weights()
         # Split full weights into per-partition halves on localized memory
         if self._locality_domain_runtime is not None:
             self._locality_domain_weight_shards = self._split_weights_for_locality_domain(
             )
+            self._release_full_weights_after_locality_domain_split()
+
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        if self._locality_domain_runtime is not None:
+            # Staged loads (e.g. GMS read-only, MX receiver) skip transform_weights,
+            # which builds the shards, and do not carry them over from the source.
+            if self._locality_domain_weight_shards is None:
+                raise NotImplementedError(
+                    "Locality domain CuteDslFusedMoE requires transform_weights() "
+                    "to build its weight shards; staged loads that skip it are "
+                    "not supported")
             # Weight splitting initializes the process-lifetime locality domain resource.
             # Resolve the borrowed remainder stream now, never during capture.
             self._get_reserved_moe_output_memset_stream()
-            self._release_full_weights_after_locality_domain_split()
 
     def _release_full_weights_after_locality_domain_split(self):
         """Release full tensors that are replaced by localized locality domain shards."""
@@ -2058,7 +2090,7 @@ class CuteDslFusedMoE(MoEImplBase):
     def _split_weights_for_locality_domain(self):
         """Split full N-dimension weights into per-partition halves.
 
-        After normal load_weights + post_load_weights, the full weights
+        After normal load_weights + the base transform_weights, the full weights
         are on self. Split them along dim=1 (N) and allocate halves on
         each locality domain partition's localized memory.
         """

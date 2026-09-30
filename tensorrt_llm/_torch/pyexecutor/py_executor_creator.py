@@ -17,6 +17,7 @@ import torch
 from strenum import StrEnum
 
 import tensorrt_llm
+from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version, global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
@@ -35,7 +36,8 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
-                           get_spec_resource_manager)
+                           get_spec_resource_manager,
+                           should_use_separate_draft_kv_cache)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     compute_max_num_sequences, create_py_executor_instance,
@@ -43,7 +45,7 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     validate_feature_combination)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
-                           uses_vswa_kv_cache_layout)
+                           uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager, get_global_dwdp_manager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -60,6 +62,7 @@ _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
+FP4_MLA_TOKENS_PER_BLOCK = 128
 
 
 class _ExecutorMemoryMonitor:
@@ -191,6 +194,24 @@ class _ExecutorMemoryMonitor:
                 ))
 
 
+def _flashinfer_one_engine_spec_supported(attn_backend: str,
+                                          spec_config) -> bool:
+    """Whether this speculation is qualified on the FlashInfer target backend.
+
+    DFlash remains unqualified regardless of its draft attention backend or
+    cache ownership. Its VANILLA and FA4 backends own private context buffers,
+    but that does not establish FlashInfer serving-scale qualification.
+
+    Other speculative modes are admitted when they do not need a separate
+    draft KV cache manager.
+    """
+    if spec_config is None or attn_backend != "FLASHINFER":
+        return True
+    if spec_config.spec_dec_mode.is_dflash():
+        return False
+    return not should_use_separate_draft_kv_cache(spec_config)
+
+
 def _set_model_engines_cache_reuse(model_engines, cache_reuse: bool):
     for engine in model_engines:
         if engine is None:
@@ -258,7 +279,6 @@ def _load_config_and_create_checkpoint_loader(
         llm_args: TorchLlmArgs, checkpoint_dir: Optional[str] = None):
     torch.cuda.set_per_process_memory_fraction(1.0)
     checkpoint_loader = _construct_checkpoint_loader(
-        llm_args.backend,
         llm_args.checkpoint_loader,
         llm_args.checkpoint_format,
         mx_config=llm_args.mx_config,
@@ -328,6 +348,7 @@ def log_memory_usage(stage: str):
 
 def _create_py_executor_impl(
     llm_args: TorchLlmArgs,
+    _startup_timer: _StartupTimer,
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
@@ -440,12 +461,18 @@ def _create_py_executor_impl(
             )
             llm_args.disable_overlap_scheduler = True
 
-    if (spec_config is not None and llm_args.attn_backend == "FLASHINFER"
-            and spec_config.spec_dec_mode.use_one_engine()
-            and not spec_config._use_shared_kv_cache):
+    if not _flashinfer_one_engine_spec_supported(llm_args.attn_backend,
+                                                 spec_config):
+        if spec_config.spec_dec_mode.is_dflash():
+            raise ValueError(
+                "FLASHINFER target attention is not qualified for DFlash, "
+                "regardless of the draft attention backend or cache ownership. "
+                "Use TRTLLM target attention for DFlash.")
         raise ValueError(
-            "FLASHINFER attention backend supports one-engine speculative "
-            "decoding only when the draft model shares the target KV cache.")
+            f"FLASHINFER target attention is not qualified for "
+            f"{spec_config.spec_dec_mode.name}: this one-engine speculative "
+            "mode needs a separate draft KV cache manager, which FLASHINFER "
+            "does not support. Use TRTLLM target attention.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
@@ -563,11 +590,21 @@ def _create_py_executor_impl(
         dwdp_manager.__enter__()
         logger.info(f"Dwdp Manager initialized. Config: {llm_args.dwdp_config}")
 
+    _startup_timer.mark_initialization("configuration_and_distributed_init")
     mem_monitor = _ExecutorMemoryMonitor()
 
     @contextmanager
     def allocation_scope(current_stage: ExecutorMemoryType):
-        with mem_monitor.observe_creation_stage(current_stage):
+        timing_name = {
+            ExecutorMemoryType.INIT_KV_CACHE: "profiling_kv_cache_allocation",
+            ExecutorMemoryType.INIT_EXTRA_RESOURCES:
+            "profiling_executor_creation",
+            ExecutorMemoryType.MODEL_EXTRA: "memory_profiling_and_capacity",
+            ExecutorMemoryType.KV_CACHE: "final_kv_cache_allocation",
+            ExecutorMemoryType.EXTRA_RESOURCES: "final_executor_creation",
+        }.get(current_stage, current_stage.value)
+        with _startup_timer.phase(
+                timing_name), mem_monitor.observe_creation_stage(current_stage):
             stage = current_stage.value
             if not enable_sleep or stage.startswith("_no_capture"):
                 yield
@@ -643,7 +680,20 @@ def _create_py_executor_impl(
             enable_overlap_headroom=getattr(model_engine,
                                             "_enable_overlap_headroom", False))
     if is_mla(config):
-        if model_engine.model.model_config.enable_flash_mla:
+        if uses_fp4_mla_attention(model_engine.model.model_config):
+            tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
+            kv_cache_config.tokens_per_block = tokens_per_block
+            logger.info(
+                f"Change tokens_per_block to: {tokens_per_block} for using FP4 MLA attention"
+            )
+            if kv_cache_config.enable_block_reuse:
+                logger.warning(
+                    "FP4 MLA cached-context attention is not supported yet; "
+                    "disabling KV cache block reuse.")
+                kv_cache_config.enable_block_reuse = False
+                _set_model_engines_cache_reuse(
+                    [model_engine, draft_model_engine], False)
+        elif model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
             # Propagate the override back to kv_cache_config so any consumer
             # that later reads llm_args.kv_cache_config.tokens_per_block sees
@@ -954,6 +1004,10 @@ def _create_py_executor_impl(
                                    spec_resource_manager=spec_resource_manager,
                                    guided_decoder=guided_decoder)
 
+    for engine in (model_engine, draft_model_engine):
+        if engine is not None:
+            engine._warmup_timer.purpose = "memory_profiling" if estimating_kv_cache else "final_executor"
+
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES
             if estimating_kv_cache else ExecutorMemoryType.EXTRA_RESOURCES):
@@ -996,27 +1050,30 @@ def _create_py_executor_impl(
         with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
             kv_cache_creator.configure_kv_cache_capacity(py_executor)
 
-        # Shut down the transceiver before tearing down KV cache managers so
-        # that NIXL-registered (pinned) GPU memory is deregistered first;
-        # otherwise the old KV cache memory stays pinned and the subsequent
-        # KV cache allocation will OOM.
-        try:
-            if hasattr(py_executor, 'kv_cache_transceiver'
-                       ) and py_executor.kv_cache_transceiver is not None:
-                py_executor.kv_cache_transceiver.shutdown()
-        finally:
-            kv_cache_creator.teardown_managers(resources)
+        with _startup_timer.phase("profiling_resource_teardown"):
+            # Shut down the transceiver before tearing down KV cache managers so
+            # that NIXL-registered (pinned) GPU memory is deregistered first;
+            # otherwise the old KV cache memory stays pinned and the subsequent
+            # KV cache allocation will OOM.
+            try:
+                if hasattr(py_executor, 'kv_cache_transceiver'
+                           ) and py_executor.kv_cache_transceiver is not None:
+                    with _startup_timer.phase("profiling_transceiver_shutdown"):
+                        py_executor.kv_cache_transceiver.shutdown()
+            finally:
+                with _startup_timer.phase("profiling_kv_cache_teardown"):
+                    kv_cache_creator.teardown_managers(resources)
 
-        # configure_kv_cache_capacity shuts down the Phase-1 executor, which
-        # releases its CUDA graphs before its resource managers. Only the
-        # profiling attention metadata remains to be discarded here.
-        for eng in [model_engine, draft_model_engine]:
-            if eng is not None:
-                eng.attn_metadata = None
+            # configure_kv_cache_capacity shuts down the Phase-1 executor, which
+            # releases its CUDA graphs before its resource managers. Only the
+            # profiling attention metadata remains to be discarded here.
+            for eng in [model_engine, draft_model_engine]:
+                if eng is not None:
+                    eng.attn_metadata = None
 
-        del py_executor  # free before constructing new
-        gc.collect()
-        torch.cuda.empty_cache()
+            del py_executor  # free before constructing new
+            gc.collect()
+            torch.cuda.empty_cache()
 
         with allocation_scope(ExecutorMemoryType.KV_CACHE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using
@@ -1024,6 +1081,10 @@ def _create_py_executor_impl(
             # the original value before creating the final KV cache.
             kv_cache_creator._max_seq_len = model_engine_max_seq_len
             kv_cache_creator.build_managers(resources, False)
+
+        for engine in (model_engine, draft_model_engine):
+            if engine is not None:
+                engine._warmup_timer.purpose = "final_executor"
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 
@@ -1063,7 +1124,8 @@ def _create_py_executor_impl(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
-    py_executor.start_worker()
+    with _startup_timer.phase("executor_start_worker"):
+        py_executor.start_worker()
 
     return py_executor
 
@@ -1079,8 +1141,10 @@ def create_py_executor(
     """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
     previous_dwdp_manager = get_global_dwdp_manager()
     try:
-        with monitor_executor_initialization():
+        with monitor_executor_initialization(), _StartupTimer(
+                "executor_creation") as startup_timer:
             return _create_py_executor_impl(
+                _startup_timer=startup_timer,
                 llm_args=llm_args,
                 checkpoint_dir=checkpoint_dir,
                 tokenizer=tokenizer,

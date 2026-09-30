@@ -28,7 +28,6 @@ so it never reaches the join.
 
 import faulthandler
 import itertools
-import os
 import threading
 import time
 
@@ -45,17 +44,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManagerConfig,
 )
 
-KV_CACHE_MANAGER_V2_BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
-
-pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
-    # The pure-Python backend is not thread-safe: it relies on the GIL and has no API lock, so
-    # these tests would race against it rather than exercise the property they assert.
-    pytest.mark.skipif(
-        KV_CACHE_MANAGER_V2_BACKEND != "cpp",
-        reason="GIL-free API locking exists only in the C++ backend",
-    ),
-]
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 # Generous relative to the work each test does (milliseconds); tight enough that a deadlock fails
 # the run in reasonable time rather than hanging it.

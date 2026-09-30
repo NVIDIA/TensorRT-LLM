@@ -33,6 +33,8 @@ _HARD_KILL_EXIT_CODE = 137
 RANK_CRASH_KILL_GRACE_ENV = "TLLM_RANK_CRASH_HARD_KILL_GRACE"
 _RANK_CRASH_KILL_GRACE_DEFAULT = 10.0
 
+_SYMMETRIC_CRASH_PROBE_POLL_S = 0.05
+
 
 def _best_effort_flush_streams() -> None:
     """Flush stdout/stderr without ever raising; diagnostics must not block hard kill."""
@@ -160,6 +162,68 @@ def _wait_out_kill_grace(remaining: float, cancelled: Optional[threading.Event])
             time.sleep(remaining)
         return True
     return not cancelled.wait(remaining)
+
+
+def all_ranks_crashed(world_size: int, timeout: Optional[float] = None) -> bool:
+    """Best-effort probe: did EVERY rank crash out of the same phase?
+
+    A crashed rank cannot tell locally whether its peers are stranded in a
+    collective (the case the cross-rank hard kill exists for) or crashed the
+    same way (a symmetric failure -- a bad config, an OOM every rank hits).
+    This probe answers it: every rank that crashed posts a nonblocking
+    barrier, so the barrier completes within ``timeout`` if and only if all
+    ranks reached their crash handler. A stranded peer never posts, the
+    probe times out, and the caller arms the kill exactly as before.
+
+    Returns True only on a proven symmetric crash. Every uncertain state --
+    single rank, MPI unavailable or not thread-safe to call from here, a
+    communicator that does not span ``world_size``, the hard kill disabled, a
+    probe error, a timeout -- returns False, so the failure mode of the probe
+    itself is "kill as before", never "leave stranded peers unkilled".
+
+    On timeout the barrier request is left outstanding: the caller is about
+    to arm the hard kill, and the world it would desynchronize is being torn
+    down.
+
+    ``timeout`` defaults to half the crash-kill grace, so a False verdict
+    still leaves the grace's error-reporting window mostly intact.
+    """
+    try:
+        if world_size <= 1:
+            return False
+        if not ENABLE_MULTI_DEVICE or mpi_disabled():
+            return False
+        from mpi4py import MPI
+
+        if not MPI.Is_initialized() or MPI.Query_thread() != MPI.THREAD_MULTIPLE:
+            return False
+        comm = mpi_comm()
+        if comm.Get_size() != world_size:
+            # Peers outside this communicator (e.g. DWDP ranks counted via
+            # COMM_WORLD) cannot be probed here; stay on the kill path.
+            return False
+        grace = _rank_crash_kill_grace()
+        if grace is None:
+            # The hard kill is disabled, so no kill follows a False verdict to
+            # tear the world down. Posting Ibarrier here would leave it
+            # outstanding in a surviving world (start_rank_crash_kill_watchdog
+            # likewise declines), desynchronizing later collectives -- so skip
+            # the probe entirely and stay on the (disabled) kill path.
+            return False
+        if timeout is None:
+            timeout = grace / 2.0
+        request = comm.Ibarrier()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if request.Test():
+                return True
+            time.sleep(_SYMMETRIC_CRASH_PROBE_POLL_S)
+        return False
+    except Exception as e:  # noqa: BLE001 - probe must fail toward the kill
+        _best_effort_log_error(
+            f"all_ranks_crashed probe failed (treating crash as asymmetric): {e!r}"
+        )
+        return False
 
 
 def hard_kill_on_rank_crash(
