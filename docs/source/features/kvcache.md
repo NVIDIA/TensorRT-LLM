@@ -278,7 +278,14 @@ Events are buffered per rank, gathered onto rank 0 under attention data parallel
 pulled per iteration through `LLM.get_kv_cache_events()` / `LLM.get_kv_cache_events_async()`,
 or over the `/kv_cache_events` endpoint of `trtllm-serve`.
 
-#### Streaming path (prototype)
+#### Streaming path (unsupported)
+
+```{note}
+The streaming path has no implementation: `kv_cache_config.kv_events_config` is rejected
+at startup. Use the buffered path via `kv_cache_config.event_buffer_max_size` instead. The
+wire format and endpoint convention below describe the contract a future native event sink
+must satisfy.
+```
 
 Configured with ```kv_cache_config.kv_events_config```. Each rank encodes its own events and
 publishes them directly over a ZeroMQ `PUB` socket from a background thread, so there is no
@@ -297,12 +304,10 @@ kv_cache_config = KvCacheConfig(
 )
 ```
 
-**Constraints.** The streaming path requires KV cache manager V2 running on its Python
-backend (`TLLM_KV_CACHE_MANAGER_V2_BACKEND=python`); the default `cpp` backend cannot
-consume the Python event sink and raises an error naming this variable. Pipeline
-parallelism and context parallelism are rejected. Events are not published for draft
-models or during KV-cache-size estimation. When streaming is enabled the buffered pull API
-returns an empty list rather than raising.
+**Constraints.** Enabling the streaming path raises at startup. A Python event sink cannot
+serve it, because the KV cache manager V2 radix tree calls its sink natively rather than
+through Python; re-enabling it needs a native sink. Pipeline parallelism and context
+parallelism are rejected independently.
 
 **Endpoint convention.** Every attention-DP rank binds `base_port + rank` using its
 **global** rank, so `N` ranks occupy `[base_port, base_port + N - 1]` cluster-wide and
