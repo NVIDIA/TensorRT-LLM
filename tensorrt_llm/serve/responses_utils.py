@@ -31,6 +31,7 @@ from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseReasoningTextDoneEvent,
                                     ResponseTextDeltaEvent,
                                     ResponseTextDoneEvent)
+from openai.types.responses.response import IncompleteDetails
 from openai.types.responses.response_content_part_added_event import \
     PartReasoningText
 from openai.types.responses.response_content_part_done_event import \
@@ -1013,10 +1014,26 @@ async def _create_input_messages(
         })
 
     # Prepend the conversation history.
-    # Skip the reasoning output.
+    #
+    # Reasoning is stripped on replay to save tokens, but a stored turn is
+    # more than its reasoning: the store writer attaches the turn's tool
+    # calls to the reasoning message, so discarding the whole message for its
+    # "reasoning" key also discarded the calls - and the tool RESULT the
+    # client sends next then replayed with no call before it, an orphan the
+    # model cannot pair with anything. Strip the reasoning, keep the calls.
+    # A turn that was only reasoning still vanishes, and a message without
+    # the key passes through exactly as stored.
     for msg in prev_msgs:
         if "reasoning" not in msg:
             messages.append(msg)
+            continue
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": tool_calls,
+            })
 
     # Append the new input.
     # Responses API supports simple text inputs without chat format.
@@ -1060,7 +1077,13 @@ def _create_output_messages(
     """
     Convert output contents to chat completion messages for conversation store.
 
-    Reasoning content is not included in the output messages to reduce the token usage.
+    Reasoning is stored here and stripped on replay instead
+    (_create_input_messages), which keeps the token saving while letting the
+    replay keep the tool calls the reasoning message carries. Tool calls are
+    stored on whichever assistant message the turn produced - reasoning
+    first, else the text message, else a bare assistant tool-call message -
+    because a turn's calls must survive storage no matter what else the turn
+    contained.
 
     Input:
         output_contents: dict[str, str]
@@ -1073,12 +1096,25 @@ def _create_output_messages(
     """
     messages: list[ChatCompletionMessageParam] = []
 
+    tool_calls = output_contents.get("tool_calls") or []
+    tool_call_msgs = [{
+        "id": call.call_id,
+        "function": {
+            "arguments": _stored_tool_arguments(call),
+            "name": _stored_tool_name(call),
+        },
+        "type": "function",
+    } for call in tool_calls]
+    _responses_debug_log(f"tool_call_msgs: {tool_call_msgs}")
+
     text_content = output_contents.get("text_content", None)
+    text_msg: Optional[ChatCompletionMessageParam] = None
     if text_content:
-        messages.append({
+        text_msg = {
             "role": "assistant",
             "content": text_content,
-        })
+        }
+        messages.append(text_msg)
 
     reasoning_content = output_contents.get("reasoning_content", None)
     if reasoning_content:
@@ -1086,21 +1122,25 @@ def _create_output_messages(
             role="assistant",
             reasoning=reasoning_content,
         )
-
-        tool_calls = output_contents.get("tool_calls", [])
-        tool_call_msgs = [{
-            "id": call.call_id,
-            "function": {
-                "arguments": _stored_tool_arguments(call),
-                "name": _stored_tool_name(call),
-            },
-            "type": "function",
-        } for call in tool_calls]
-
-        _responses_debug_log(f"tool_call_msgs: {tool_call_msgs}")
         reasoning_msg["tool_calls"] = tool_call_msgs
-
         messages.append(reasoning_msg)
+    elif tool_call_msgs:
+        # The calls used to be stored only on the reasoning message, so a
+        # turn that called tools without reasoning lost them - and a turn
+        # that was *nothing but* tool calls stored no assistant message at
+        # all, leaving the client's tool RESULT to replay against a call
+        # that was never in the history. A tool-call-bearing turn is an
+        # assistant turn whether or not any text or reasoning came with it:
+        # attach the calls to the text message when there is one, store a
+        # bare assistant tool-call message when there is not.
+        if text_msg is not None:
+            text_msg["tool_calls"] = tool_call_msgs
+        else:
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": tool_call_msgs,
+            })
 
     return messages
 
@@ -1704,8 +1744,19 @@ def _create_output_content(
         reasoning_texts.append(reasoning_text or "")
 
         if text:
+            parsed_source = text
             text, calls = _apply_tool_parser(tool_parser, available_tools,
                                              output.index, text, False)
+            if calls and streamed_tool_call_ids is None:
+                # No stream ran, so no per-entity record says which calls the
+                # streamed assembly would have refused - the check the pairing
+                # below performs for streamed requests. An empty-argument call
+                # is the shape the whole-text parse gets wrong on its own (it
+                # reports `{}` for argument markup it could not read), so it
+                # is verified against a streamed replay of the same text; see
+                # the reconciler for why the two views must agree here.
+                text, calls = _verify_empty_calls_against_streaming(
+                    tool_parser, available_tools, parsed_source, text, calls)
 
         text_item = None
         reasoning_item = None
@@ -1773,10 +1824,9 @@ def _create_output_content(
                 # actually reached the wire, in order; placeholders name no
                 # wire identity and are worth nothing to a client.
                 logger.warning(
-                    "final response rebuilt %d tool call(s) but the stream "
-                    "saw %d; ids beyond the streamed ones are new and will "
-                    "not match the client's tool outputs", len(calls),
-                    len(reusable))
+                    f"final response rebuilt {len(calls)} tool call(s) but the "
+                    f"stream saw {len(reusable)}; ids beyond the streamed ones "
+                    f"are new and will not match the client's tool outputs")
                 reusable = [ids for ids in reusable if ids is not None]
             tool_calls_item = []
             for index, call in enumerate(calls):
@@ -1789,10 +1839,10 @@ def _create_output_content(
                     # consumed by the drop instead of shifting onto the next
                     # call.
                     logger.warning(
-                        "final response drops the tool call to %r: the stream "
-                        "assembled its arguments into invalid JSON and never "
-                        "delivered it, so the snapshot does not deliver it "
-                        "either", call.name)
+                        f"final response drops the tool call to {call.name!r}: "
+                        f"the stream assembled its arguments into invalid JSON "
+                        f"and never delivered it, so the snapshot does not "
+                        f"deliver it either")
                     continue
                 tool_calls_item.append(
                     _tool_call_output_item(call,
@@ -1820,10 +1870,10 @@ def _create_output_content(
             rebuilt = used_ids_by_type[item_type]
             if streamed != rebuilt:
                 logger.warning(
-                    "final response rebuilt %d %s item(s) but the stream "
-                    "published %d; the two views of this generation differ "
-                    "structurally and ids beyond the streamed ones are new",
-                    rebuilt, item_type, streamed)
+                    f"final response rebuilt {rebuilt} {item_type} item(s) but "
+                    f"the stream published {streamed}; the two views of this "
+                    f"generation differ structurally and ids beyond the "
+                    f"streamed ones are new")
 
     return output_items, output_messages, reasoning_texts
 
@@ -1940,9 +1990,9 @@ def _tool_call_output_item(
         # logs "Model attempted to call undefined function" at the equivalent
         # point; borrowing that is most of the value of this change.
         logger.warning(
-            "tool call %r matches no declared tool; reporting it as a function "
-            "call. If it is in fact a custom tool, the client will reject it.",
-            name)
+            f"tool call {name!r} matches no declared tool; reporting it as a "
+            f"function call. If it is in fact a custom tool, the client will "
+            f"reject it.")
 
     if is_custom:
         # Unwrap the single string argument the tool was described with. A
@@ -2160,6 +2210,17 @@ def _create_response(
                             tokenizer=tokenizer,
                             reasoning_texts=reasoning_texts),
     )
+    # A generation the engine cut off at its token budget has status
+    # "incomplete", and the spec explains that status in
+    # incomplete_details.reason - "max_output_tokens". The streaming terminal
+    # event has said so since the response.incomplete fix; setting it here
+    # makes the non-streaming JSON body tell the same story. Only "length" is
+    # explained: "not_finished" (a disaggregated context worker handing the
+    # request off) also maps to "incomplete", and naming a public reason for
+    # an internal handoff would be a guess presented as fact.
+    if finish_reason == "length":
+        response.incomplete_details = IncompleteDetails(
+            reason="max_output_tokens")
     # Disaggregated serving. A context-only response is read by the
     # orchestrator, never by a client: it carries the KV-cache handle, the
     # first generated token and the tokenized prompt so a generation worker can
@@ -2695,13 +2756,19 @@ def _assembled_tool_calls(
     command is worse than executing none. The warning is what keeps the loss
     from being silent.
 
-    The non-streaming path needs no equivalent - `parse_base_json` builds its
-    arguments with `json.dumps`, so they always parse - but it is not silent
-    about this text either: its pair regex reads nothing out of the block and
-    it reports the call with empty arguments. `{}` is something a client can
-    run, so the two paths do differ here, and settling that means deciding
-    what a call whose markup could not be read should be. A different
-    question, left alone.
+    The non-streaming path cannot reuse this validity test - `parse_base_json`
+    builds its arguments with `json.dumps`, so they always parse - and its
+    pair regex reads nothing out of such a block, reporting the call with
+    empty arguments: a call the model never made, delivered as runnable.
+    That is settled now, one layer up: when no stream ran,
+    `_verify_empty_calls_against_streaming` replays the text through this
+    streaming machinery, and a `{}`-argument call this assembly would have
+    refused is not reported there either - its markup falls back into the
+    message text instead. What still differs is a call whose markup yielded
+    *some* readable pairs: the whole-text parse delivers what it read, the
+    stream drops the call whose tail it could not assemble. That is a real
+    divergence with no obviously right answer and it stays open, documented
+    at the reconciler.
     """
     calls: list[ToolCallItem] = []
     for tool_index, fragment in fragments.items():
@@ -2732,6 +2799,108 @@ def _assembled_tool_calls(
                          name=fragment["name"],
                          parameters=arguments))
     return calls
+
+
+def _verify_empty_calls_against_streaming(
+    tool_parser_id: Optional[str],
+    tools: Optional[list[ChatCompletionToolsParam]],
+    source_text: str,
+    normal_text: str,
+    calls: list[ToolCallItem],
+) -> Tuple[str, list[ToolCallItem]]:
+    r"""Drop whole-text `{}`-argument calls whose markup could not be read.
+
+    Only for a request no stream ran for. A streamed request already settles
+    this per call entity in `_create_output_content` - the stream's id record
+    carries a None where assembly dropped a call, and the rebuild consumes it.
+
+    The whole-text parse reports `{}` for two markups it cannot tell apart: a
+    genuine zero-argument call (`<tool_call>get_time</tool_call>`) and a call
+    whose argument markup its pair regex read nothing out of - GLM-4.7
+    opening an `<arg_value>` it never closes, ending `</think></tool_call>`
+    instead. The streaming machinery *can* tell them apart, because it
+    assembles exactly the JSON it read and `_assembled_tool_calls` refuses
+    what does not parse: the zero-argument call streams as a valid `{}`, the
+    unreadable one as `{"cmd": }` and is dropped. So when the whole-text
+    parse reports an empty-argument call, the same text is replayed through a
+    fresh streaming parser and the two views are paired positionally - the
+    same premise the id reuse in `_create_output_content` rests on, both
+    passes enumerating the same markup in the same order. An empty call the
+    streamed assembly would have refused is a call the model never made, and
+    it is not delivered here either.
+
+    The markup is not discarded with it: when the refused call was everything
+    the parse found, the original text goes back verbatim - these turns are
+    recorded as training data, and the raw markup as message text is the same
+    fallback both views already use for an unterminated call. Alongside calls
+    that really were made, the surrounding text keeps its parsed form and only
+    the refused call is dropped, which is what the streamed view of the same
+    text delivers.
+
+    Any disagreement about what the call entities *are* - a replay error, or
+    the two passes finding different numbers of calls - leaves the whole-text
+    result untouched: this is a cross-check, not the parse of record, and
+    guessing at a pairing would trade a known defect for an unknowable one.
+    """
+    empty_positions = {
+        index
+        for index, call in enumerate(calls)
+        if _parses_to_empty_object(call.parameters)
+    }
+    if not empty_positions or tool_parser_id is None or tools is None:
+        return normal_text, calls
+
+    fragments: dict[int, dict[str, Any]] = {}
+    try:
+        replay_parser = ToolParserFactory.create_tool_parser(tool_parser_id)
+        increment = replay_parser.parse_streaming_increment(source_text, tools)
+        _accumulate_tool_call_fragments(fragments, increment.calls)
+        _, flushed, unfinished = _flush_tool_parser(
+            tools=tools,
+            output_index=0,
+            tool_parser_dict={0: replay_parser},
+        )
+        _accumulate_tool_call_fragments(fragments, flushed)
+        assembled = _assembled_tool_calls(fragments, unfinished)
+    except Exception as exc:  # noqa: BLE001 - cross-check must not fail the parse
+        logger.warning(
+            f"Could not replay the generation through the streaming tool "
+            f"parser to verify its empty-argument calls ({exc}); delivering "
+            "the whole-text parse as is.")
+        return normal_text, calls
+
+    if len(fragments) != len(calls):
+        return normal_text, calls
+
+    delivered = {call.tool_index for call in assembled}
+    entity_order = list(fragments)
+    phantoms = {
+        index
+        for index in empty_positions if entity_order[index] not in delivered
+    }
+    if not phantoms:
+        return normal_text, calls
+
+    for index in sorted(phantoms):
+        logger.warning(
+            f"Dropping the tool call to {calls[index].name!r} from the "
+            "whole-text parse: it reports no arguments only because its "
+            "argument markup could not be read, and the streamed assembly of "
+            "the same text refuses the call. The model emitted a malformed "
+            "tool call, and an invented '{}' would run the tool with "
+            "arguments the model never wrote.")
+    if len(phantoms) == len(calls):
+        return source_text, []
+    return normal_text, [
+        call for index, call in enumerate(calls) if index not in phantoms
+    ]
+
+
+def _parses_to_empty_object(parameters: Optional[str]) -> bool:
+    try:
+        return json.loads(parameters or "") == {}
+    except ValueError:
+        return False
 
 
 def _close_open_item(helper):
@@ -3197,7 +3366,8 @@ def _stream_terminal_event(
     final_response: ResponsesResponse,
     finish_reason: Optional[str],
     sequence_number: int = -1,
-) -> Union[ResponseCompletedEvent, ResponseIncompleteEvent]:
+) -> Union[ResponseCompletedEvent, ResponseIncompleteEvent,
+           ResponseFailedEvent]:
     """The terminal event for a stream that ran to completion, by status.
 
     ``finish_reason_mapping`` marks a generation the engine cut off at its
@@ -3210,10 +3380,20 @@ def _stream_terminal_event(
     ``max_output_tokens``, and any other cause is left unstated rather than
     guessed at.
 
-    ``incomplete_details`` is set on the dump rather than on
-    ResponsesResponse, whose field is commented out - the same route
-    ``get_stream_failed_events`` takes for ``error``: the event re-validates
-    the dict against the SDK's Response, which does carry the field.
+    ``incomplete_details`` now lives on ResponsesResponse and the response
+    builder (see ``_create_response``) sets it for a token-budget cut, so the
+    dump usually carries it already; setting it here as well keeps this event
+    right for any snapshot that did not pass through that builder. The
+    dump-level route is the same one ``get_stream_failed_events`` takes for
+    ``error``, whose field is still commented out.
+
+    A status of "failed" is a generation the engine gave up on (a timeout),
+    and it ships under ``response.failed`` - the spec's terminal event for
+    that status - not under a ``response.completed`` whose name promises the
+    opposite. "cancelled" stays under ``response.completed`` on purpose: the
+    cancellation was client-initiated, the Responses spec pairs no terminal
+    event with it, and inventing one would hand SDK clients an event type
+    they cannot parse.
     """
     payload = final_response.model_dump()
     if final_response.status == "incomplete":
@@ -3221,6 +3401,12 @@ def _stream_terminal_event(
             payload["incomplete_details"] = {"reason": "max_output_tokens"}
         return ResponseIncompleteEvent(
             type="response.incomplete",
+            sequence_number=sequence_number,
+            response=payload,
+        )
+    if final_response.status == "failed":
+        return ResponseFailedEvent(
+            type="response.failed",
             sequence_number=sequence_number,
             response=payload,
         )
@@ -3464,14 +3650,18 @@ STREAM_TERMINATION_UPSTREAM_ERROR = "upstream_error"
 STREAM_TERMINATION_INTERNAL_ERROR = "internal_error"
 
 # The terminal events of a stream that ran to completion - a truncated
-# generation ends in `response.incomplete`, everything else in
-# `response.completed` (see _stream_terminal_event). Matched as substrings
-# because a relayed stream arrives as transport-sized chunks that may carry
-# several events, not as one frame per event. Kept in both encodings so the
-# scan never has to decode a relayed chunk just to look at it.
+# generation ends in `response.incomplete`, a failed one in `response.failed`,
+# everything else in `response.completed` (see _stream_terminal_event; the
+# guard's own abnormal-termination path emits `response.failed` too). Matched
+# as substrings because a relayed stream arrives as transport-sized chunks
+# that may carry several events, not as one frame per event. Kept in both
+# encodings so the scan never has to decode a relayed chunk just to look at
+# it.
 _COMPLETED_EVENT_MARKER = "event: response.completed"
 _INCOMPLETE_EVENT_MARKER = "event: response.incomplete"
-_TERMINAL_EVENT_MARKERS = (_COMPLETED_EVENT_MARKER, _INCOMPLETE_EVENT_MARKER)
+_FAILED_EVENT_MARKER = "event: response.failed"
+_TERMINAL_EVENT_MARKERS = (_COMPLETED_EVENT_MARKER, _INCOMPLETE_EVENT_MARKER,
+                           _FAILED_EVENT_MARKER)
 _TERMINAL_EVENT_MARKERS_BYTES = tuple(
     marker.encode("utf-8") for marker in _TERMINAL_EVENT_MARKERS)
 
@@ -3599,9 +3789,10 @@ async def guard_responses_stream(
     the full text.
 
     Frames are forwarded untouched and nothing is added once a terminal event
-    (``response.completed``, or ``response.incomplete`` for a truncated
-    generation) has gone out, so a stream that completes normally is
-    byte-for-byte what it was.
+    (``response.completed``, ``response.incomplete`` for a truncated
+    generation, or ``response.failed`` for one the engine gave up on) has
+    gone out, so a stream that completes normally is byte-for-byte what it
+    was.
 
     The two abnormal endings are handled differently on purpose:
 

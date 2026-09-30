@@ -514,6 +514,12 @@ models:
         default: null
         status: stable
         required: true
+      parallel_tool_calls:
+        kind: openai
+        type: Optional[bool]
+        default: null
+        status: stable
+        required: false
       prompt_token_ids:
         kind: extension
         type: Optional[List[int]]
@@ -1045,6 +1051,18 @@ models:
         default: false
         status: stable
         required: false
+      conversation_params:
+        kind: extension
+        type: Optional[ConversationParams]
+        default: null
+        status: prototype
+        required: false
+      disaggregated_params:
+        kind: extension
+        type: Optional[DisaggregatedParams]
+        default: null
+        status: prototype
+        required: false
       include:
         kind: openai
         type: Optional[list[Literal['code_interpreter_call.outputs', 'computer_call_output.output.image_url', 'file_search_call.results', 'message.input_image.image_url', 'message.output_text.logprobs', 'reasoning.encrypted_content'],]]
@@ -1104,6 +1122,18 @@ models:
         type: Optional[ResponsePrompt]
         default: null
         status: stable
+        required: false
+      prompt_token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: prototype
+        required: false
+      prompt_token_ids_b64:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
         required: false
       reasoning:
         kind: openai
@@ -1192,6 +1222,18 @@ models:
 
   ResponsesResponse:
     fields:
+      disaggregated_params:
+        kind: extension
+        type: Optional[DisaggregatedParams]
+        default: null
+        status: prototype
+        required: false
+      finish_reason:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
+        required: false
       id:
         kind: openai
         type: str
@@ -1202,6 +1244,12 @@ models:
         kind: openai
         type: int
         default: <factory:<lambda>>
+        status: stable
+        required: false
+      incomplete_details:
+        kind: openai
+        type: Optional[IncompleteDetails]
+        default: null
         status: stable
         required: false
       instructions:
@@ -1240,6 +1288,18 @@ models:
         default: null
         status: stable
         required: true
+      prompt_token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: prototype
+        required: false
+      prompt_token_ids_b64:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
+        required: false
       temperature:
         kind: openai
         type: float

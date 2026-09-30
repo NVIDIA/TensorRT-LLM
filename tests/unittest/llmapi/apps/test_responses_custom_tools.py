@@ -29,10 +29,10 @@ import pytest
 
 from tensorrt_llm.serve.responses_utils import (
     CUSTOM_TOOL_INPUT_ARG,
-    _custom_tool_names,
     _get_chat_completion_function_tools,
     _response_output_item_to_chat_completion_message,
     _tool_call_output_item,
+    _tool_resolution,
 )
 
 # The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
@@ -66,12 +66,19 @@ def test_custom_tool_is_offered_with_a_named_string_parameter():
 
 
 def test_custom_tool_names_are_collected():
+    """A custom tool classifies custom; a plain function does not.
+
+    The resolution map replaced _custom_tool_names; this file referenced the
+    removed helper and failed on import ever since - nothing in CI ran it.
+    """
     tools = [_custom_tool(), SimpleNamespace(type="function", name="shell")]
-    assert _custom_tool_names(tools) == {"apply_patch"}
+    resolution = _tool_resolution(tools)
+    assert resolution["apply_patch"][2] is True
+    assert resolution["shell"][2] is False
 
 
 def test_no_tools_yields_no_custom_names():
-    assert _custom_tool_names(None) == set()
+    assert _tool_resolution(None) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -79,9 +86,16 @@ def test_no_tools_yields_no_custom_names():
 # ---------------------------------------------------------------------------
 
 
+# _tool_call_output_item takes the resolution map (every spelling ->
+# (namespace, bare, custom)) since the tool-resolution refactor; these tests
+# were written against the removed set/map pair and failed on import or call
+# ever since - nothing in CI ran this file.
+_CUSTOM_RES = {"apply_patch": (None, "apply_patch", True)}
+
+
 def test_custom_tool_call_carries_the_freeform_payload():
     item = _tool_call_output_item(
-        _call("apply_patch", json.dumps({CUSTOM_TOOL_INPUT_ARG: PATCH})), {"apply_patch"}
+        _call("apply_patch", json.dumps({CUSTOM_TOOL_INPUT_ARG: PATCH})), _CUSTOM_RES
     )
     assert item.type == "custom_tool_call"
     assert item.input == PATCH
@@ -90,26 +104,24 @@ def test_custom_tool_call_carries_the_freeform_payload():
 
 def test_unknown_argument_name_is_still_forwarded():
     """A payload under an unexpected key beats dropping the call."""
-    item = _tool_call_output_item(
-        _call("apply_patch", json.dumps({"patch": PATCH})), {"apply_patch"}
-    )
+    item = _tool_call_output_item(_call("apply_patch", json.dumps({"patch": PATCH})), _CUSTOM_RES)
     assert item.input == PATCH
 
 
 def test_non_json_arguments_are_passed_through_verbatim():
-    item = _tool_call_output_item(_call("apply_patch", PATCH), {"apply_patch"})
+    item = _tool_call_output_item(_call("apply_patch", PATCH), _CUSTOM_RES)
     assert item.input == PATCH
 
 
 def test_ordinary_tools_are_still_function_calls():
-    item = _tool_call_output_item(_call("shell", '{"cmd": "ls"}'), {"apply_patch"})
+    item = _tool_call_output_item(_call("shell", '{"cmd": "ls"}'), _CUSTOM_RES)
     assert item.type == "function_call"
     assert item.arguments == '{"cmd": "ls"}'
 
 
 def test_custom_and_function_calls_get_distinct_id_prefixes():
-    custom = _tool_call_output_item(_call("apply_patch", PATCH), {"apply_patch"})
-    function = _tool_call_output_item(_call("shell", "{}"), {"apply_patch"})
+    custom = _tool_call_output_item(_call("apply_patch", PATCH), _CUSTOM_RES)
+    function = _tool_call_output_item(_call("shell", "{}"), _CUSTOM_RES)
     assert custom.id.startswith("ctc_")
     assert function.id.startswith("fc_")
 
@@ -168,18 +180,14 @@ def test_namespaced_call_reports_the_namespace_separately():
     namespace field. A call named "collaboration.spawn_agent" matches
     nothing it knows, so the whole capability is unusable.
     """
-    from tensorrt_llm.serve.responses_utils import _namespaced_tool_names
-
     tools = [_namespace_tool()]
-    item = _tool_call_output_item(
-        _call("collaboration.spawn_agent", "{}"), set(), _namespaced_tool_names(tools)
-    )
+    item = _tool_call_output_item(_call("collaboration.spawn_agent", "{}"), _tool_resolution(tools))
     assert item.name == "spawn_agent"
     assert item.namespace == "collaboration"
 
 
 def test_unnamespaced_call_has_no_namespace():
-    item = _tool_call_output_item(_call("shell", "{}"), set(), {})
+    item = _tool_call_output_item(_call("shell", "{}"), {})
     assert item.namespace is None
 
 
@@ -192,7 +200,10 @@ def test_namespaced_custom_tool_is_recognised():
             tools=[SimpleNamespace(type="custom", name="apply_patch", description=None)],
         )
     ]
-    assert _custom_tool_names(tools) == {"edit.apply_patch"}
+    resolution = _tool_resolution(tools)
+    assert resolution["edit.apply_patch"] == ("edit", "apply_patch", True)
+    # The bare spelling resolves too when unambiguous - the model writes both.
+    assert resolution["apply_patch"] == ("edit", "apply_patch", True)
 
 
 def test_namespaced_call_replays_under_its_qualified_name():
@@ -265,7 +276,7 @@ def test_history_records_a_custom_tool_call():
     """
     from tensorrt_llm.serve.responses_utils import _stored_tool_arguments, _stored_tool_name
 
-    item = _tool_call_output_item(_call("apply_patch", PATCH), {"apply_patch"})
+    item = _tool_call_output_item(_call("apply_patch", PATCH), _CUSTOM_RES)
     assert json.loads(_stored_tool_arguments(item)) == {CUSTOM_TOOL_INPUT_ARG: PATCH}
     assert _stored_tool_name(item) == "apply_patch"
 
@@ -273,15 +284,15 @@ def test_history_records_a_custom_tool_call():
 def test_history_records_a_function_call_unchanged():
     from tensorrt_llm.serve.responses_utils import _stored_tool_arguments
 
-    item = _tool_call_output_item(_call("shell", '{"cmd": "ls"}'), set())
+    item = _tool_call_output_item(_call("shell", '{"cmd": "ls"}'), {})
     assert _stored_tool_arguments(item) == '{"cmd": "ls"}'
 
 
 def test_history_requalifies_a_namespaced_call():
-    from tensorrt_llm.serve.responses_utils import _namespaced_tool_names, _stored_tool_name
+    from tensorrt_llm.serve.responses_utils import _stored_tool_name
 
     item = _tool_call_output_item(
-        _call("collaboration.spawn_agent", "{}"), set(), _namespaced_tool_names([_namespace_tool()])
+        _call("collaboration.spawn_agent", "{}"), _tool_resolution([_namespace_tool()])
     )
     assert _stored_tool_name(item) == "collaboration.spawn_agent"
 
@@ -289,7 +300,7 @@ def test_history_requalifies_a_namespaced_call():
 def test_a_custom_tool_inside_a_namespace_is_described_with_its_input_arg():
     """Regression: the input and output paths must agree on the schema.
 
-    _custom_tool_names classifies a namespaced custom tool under its qualified
+    _tool_resolution classifies a namespaced custom tool under its qualified
     name, so the output path looks for CUSTOM_TOOL_INPUT_ARG. If the namespace
     branch described the tool with an empty object schema, the model would
     never be told that argument exists and would invent its own name - the

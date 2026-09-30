@@ -43,7 +43,7 @@ from openai.types.responses import (
     ResponseReasoningTextDoneEvent, ResponseStatus, ResponseTextConfig,
     ResponseWebSearchCallCompletedEvent, ResponseWebSearchCallInProgressEvent,
     ResponseWebSearchCallSearchingEvent)
-from openai.types.responses.response import ToolChoice
+from openai.types.responses.response import IncompleteDetails, ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
@@ -1845,7 +1845,11 @@ class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{str(uuid.uuid4().hex)}")
     created_at: int = Field(default_factory=lambda: int(time.time()))
     # error: Optional[ResponseError] = None
-    # incomplete_details: Optional[IncompleteDetails] = None
+    # The SDK's own shape: reason is an enum naming why the response stopped
+    # short. Set by the response builder when a generation was cut at its
+    # token budget, so the non-streaming JSON body explains its "incomplete"
+    # status the way the streaming terminal event already does.
+    incomplete_details: Optional[IncompleteDetails] = None
     instructions: Optional[str] = None
     metadata: Optional[Metadata] = None
     model: str

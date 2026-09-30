@@ -43,6 +43,7 @@ from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
     ResponsesStreamingProcessor,
     _create_output_content,
+    create_response_non_store,
     stamp_sse_sequence_number,
 )
 from tensorrt_llm.serve.tool_parser.core_types import StreamingParseResult, ToolCallItem
@@ -222,7 +223,7 @@ def test_rebuilding_items_the_stream_never_opened_is_said_out_loud():
         )
     assert items[0].id.startswith("msg_")
     assert mock_logger.warning.called
-    assert "message" in mock_logger.warning.call_args[0]
+    assert "message" in mock_logger.warning.call_args[0][0]
 
 
 def test_streamed_items_the_rebuild_drops_are_said_out_loud_too():
@@ -585,3 +586,82 @@ def test_a_completed_stream_still_ends_with_response_completed():
     frame = processor.get_final_response_non_store(result)
     assert _event_type(frame) == "response.completed"
     assert _event_data(frame)["response"]["incomplete_details"] is None
+
+
+def _non_streaming_response(finish_reason):
+    """The JSON body a non-streaming request gets, for one finish reason."""
+    request = ResponsesRequest(model="test-model", input="hi", stream=False)
+    result = _generation_chunk("Partial answer", "Partial answer", True)
+    result.outputs[0].finish_reason = finish_reason
+    return create_response_non_store(
+        generation_result=result,
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="test-model",
+        use_harmony=False,
+        num_prompt_tokens=2,
+    )
+
+
+def test_a_non_streaming_truncated_response_carries_incomplete_details():
+    """The JSON body must explain its status the way the stream already does.
+
+    The streaming terminal event has paired status "incomplete" with
+    incomplete_details.reason="max_output_tokens" since the response.incomplete
+    fix, but the non-streaming body said only "incomplete" - the field was
+    commented out of ResponsesResponse - so a client polling the JSON body had
+    the status without the reason the spec promises alongside it.
+    """
+    payload = _non_streaming_response("length").model_dump()
+    assert payload["status"] == "incomplete"
+    assert payload["incomplete_details"] == {"reason": "max_output_tokens"}
+
+
+def test_a_non_streaming_completed_response_has_no_details():
+    payload = _non_streaming_response("stop").model_dump()
+    assert payload["status"] == "completed"
+    assert payload["incomplete_details"] is None
+
+
+def test_a_disagg_handoff_gets_no_invented_reason():
+    """A "not_finished" incomplete explains nothing, on purpose.
+
+    finish_reason "not_finished" also maps to "incomplete", but it is a
+    context worker handing the request off, not a token budget; naming a
+    public reason for an internal handoff would be a guess presented as fact.
+    """
+    payload = _non_streaming_response("not_finished").model_dump()
+    assert payload["status"] == "incomplete"
+    assert payload["incomplete_details"] is None
+
+
+def test_a_failed_generation_terminates_with_response_failed():
+    """A failed response must not ship under response.completed.
+
+    A timeout maps to status "failed"; an event named response.completed
+    around it asserts the one thing its payload denies. The spec pairs the
+    status with response.failed.
+    """
+    processor = _processor(reasoning_parser=None)
+    result = _generation_chunk("Partial answer", "Partial answer", True)
+    result.outputs[0].finish_reason = "timeout"
+    frame = processor.get_final_response_non_store(result)
+    assert _event_type(frame) == "response.failed"
+    payload = _event_data(frame)
+    assert payload["type"] == "response.failed"
+    assert payload["response"]["status"] == "failed"
+
+
+def test_a_cancelled_generation_still_ends_with_response_completed():
+    """Deliberate, not an oversight.
+
+    Cancellation is client-initiated and the Responses spec pairs no terminal
+    event with it, so inventing one would hand SDK clients an event type they
+    cannot parse. See _stream_terminal_event.
+    """
+    processor = _processor(reasoning_parser=None)
+    result = _generation_chunk("Partial answer", "Partial answer", True)
+    result.outputs[0].finish_reason = "cancelled"
+    frame = processor.get_final_response_non_store(result)
+    assert _event_type(frame) == "response.completed"
+    assert _event_data(frame)["response"]["status"] == "cancelled"

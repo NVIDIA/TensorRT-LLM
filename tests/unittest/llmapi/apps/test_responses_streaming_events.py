@@ -778,3 +778,103 @@ def test_nothing_streamed_means_fresh_ids_rather_than_a_crash():
     assert calls
     assert calls[0]["call_id"].startswith("call_")
     assert calls[0]["call_id"] != "call_streamed"
+
+
+# ---------------------------------------------------------------------------
+# Non-streaming rebuild: no phantom {}-argument calls
+# ---------------------------------------------------------------------------
+#
+# The whole-text parse reports arguments `{}` both for a genuine zero-argument
+# call and for a call whose argument markup its pair regex could not read - a
+# GLM-4.7 block that opens <arg_value> and never closes it. The streamed
+# assembly of the same text refuses the second (its arguments assemble to
+# `{"cmd": }`), so a non-streaming request used to deliver a call the model
+# never made while a streaming request of the same text delivered none.
+# _verify_empty_calls_against_streaming reconciles the two when no stream ran.
+
+
+def _glm47_tools():
+    from openai.types.responses.tool import FunctionTool
+
+    return [
+        FunctionTool(
+            name="exec_command",
+            description="Run a command.",
+            parameters={"type": "object", "properties": {"cmd": {"type": "string"}}},
+            strict=False,
+            type="function",
+        ),
+        FunctionTool(
+            name="get_time", description="Now.", parameters=None, strict=False, type="function"
+        ),
+    ]
+
+
+def _glm47_snapshot(text, streamed_tool_call_ids=None):
+    from tensorrt_llm.serve.responses_utils import _create_output_content
+
+    items, _messages, _reasoning_texts = _create_output_content(
+        _FakeRequestOutput(text),
+        reasoning_parser=None,
+        tool_parser="glm47",
+        tools=_glm47_tools(),
+        streamed_tool_call_ids=streamed_tool_call_ids,
+    )
+    calls = [(i.name, i.arguments) for i in items if i.type == "function_call"]
+    texts = [i.content[0].text for i in items if i.type == "message"]
+    return calls, texts
+
+
+_UNREADABLE_ARGS = (
+    "<tool_call>exec_command<arg_key>cmd</arg_key><arg_value>ls -la</think></tool_call>"
+)
+
+
+def test_non_streaming_unreadable_arg_markup_is_text_not_an_empty_call():
+    """The auditor's shape: terminated call, <arg_value> never closed.
+
+    The pair regex reads nothing out of the block, so the call used to ship
+    with arguments `{}` - and the client ran the tool with arguments the model
+    never wrote. The streamed view refuses the call; the whole-text view now
+    agrees, and the markup falls back into the message text so nothing the
+    model generated is lost.
+    """
+    calls, texts = _glm47_snapshot("Let me check. " + _UNREADABLE_ARGS)
+    assert calls == []
+    assert texts and "<arg_value>ls -la</think>" in texts[0]
+    assert texts[0].startswith("Let me check.")
+
+
+def test_non_streaming_unterminated_markup_stays_text():
+    """Pin: markup with no closing tag already fell back to text on both views."""
+    unterminated = "<tool_call>exec_command<arg_key>cmd</arg_key><arg_value>ls -la"
+    calls, texts = _glm47_snapshot(unterminated)
+    assert calls == []
+    assert texts == [unterminated]
+
+
+def test_non_streaming_zero_argument_call_is_still_delivered():
+    """Pin: `{}` from a genuinely argument-free call is the model's own call."""
+    calls, texts = _glm47_snapshot("<tool_call>get_time</tool_call>")
+    assert calls == [("get_time", "{}")]
+    assert texts == []
+
+
+def test_non_streaming_real_call_survives_a_phantom_neighbor():
+    good = (
+        "<tool_call>exec_command<arg_key>cmd</arg_key><arg_value>pytest -q</arg_value></tool_call>"
+    )
+    calls, _texts = _glm47_snapshot(good + _UNREADABLE_ARGS)
+    assert calls == [("exec_command", '{"cmd": "pytest -q"}')]
+
+
+def test_a_streamed_rebuild_is_untouched_by_the_reconciler():
+    """A streamed request keeps its entity-pairing semantics.
+
+    When a stream ran, the per-entity id record already settles the drop, and
+    the snapshot must keep describing the stream - which showed neither the
+    call nor its markup.
+    """
+    calls, texts = _glm47_snapshot(_UNREADABLE_ARGS, streamed_tool_call_ids=[None])
+    assert calls == []
+    assert texts == []
