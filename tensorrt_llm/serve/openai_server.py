@@ -91,18 +91,19 @@ from tensorrt_llm.serve.disagg_auth import (
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
+from tensorrt_llm.serve.extensions.kimi_k3 import dynamic_tool_dicts
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionMessageParam, ChatCompletionNamedToolChoiceParam,
-    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
+    ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
+    ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionToolsParam, ChatMessage, CompletionRequest,
     CompletionResponse, CompletionResponseChoice, EmbeddingRequest,
     EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
     ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
     ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
     ResponseFormat, ResponsesRequest, ResponsesResponse, StartProfileRequest,
-    StreamOptions, TokenizeRequest, TokenizeResponse, UpdateWeightsRequest,
-    UsageInfo, ensure_request_chat_template_allowed, to_llm_conversation_params,
+    TokenizeRequest, TokenizeResponse, UpdateWeightsRequest, UsageInfo,
+    ensure_request_chat_template_allowed, to_llm_conversation_params,
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
@@ -124,6 +125,7 @@ from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
+from tensorrt_llm.serve.serving_extensions import apply_model_chat_extensions
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
@@ -217,183 +219,6 @@ def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
         "a relayed mode from a context worker. Reasoning content will not be "
         "separated correctly. Check that the context worker is running a "
         "build that relays 'resolved_thinking'.")
-
-
-def _enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
-    """Enforce Kimi's immutable sampling-parameter policy (KVV params suite).
-
-    Kimi's API pins top_p, the penalties, and n, and bounds temperature to
-    [0, 1]; out-of-policy values must fail fast with HTTP 400 rather than
-    generate. top_p unset or the OpenAI-default 1.0 is coerced to the pinned
-    0.95 instead of rejected. Off by default so existing K3 deployments keep
-    accepting the requests they accept today (review feedback); a Kimi
-    Vendor Verifier certification run must opt in with
-    TRTLLM_KIMI_PARAM_POLICY=1.
-    """
-    if os.getenv("TRTLLM_KIMI_PARAM_POLICY", "0") != "1":
-        return
-    if request.top_p is None or request.top_p == 1.0:
-        # Kimi pins top_p at 0.95. None would fall back to 1.0 in
-        # to_sampling_params; an explicit 1.0 is the OpenAI SDK default many
-        # clients send unconditionally — coerce both to the pinned value
-        # rather than rejecting (review feedback).
-        request.top_p = 0.95
-    if request.temperature is not None and not (0.0 <= request.temperature <=
-                                                1.0):
-        raise ValueError("temperature must be within [0, 1] for this model; "
-                         f"got {request.temperature}.")
-    if request.top_p is not None and request.top_p != 0.95:
-        raise ValueError(
-            f"top_p is fixed at 0.95 for this model; got {request.top_p}.")
-    if request.presence_penalty:
-        raise ValueError("presence_penalty is fixed at 0 for this model; "
-                         f"got {request.presence_penalty}.")
-    if request.frequency_penalty:
-        raise ValueError("frequency_penalty is fixed at 0 for this model; "
-                         f"got {request.frequency_penalty}.")
-    if request.n != 1:
-        raise ValueError(f"n is fixed at 1 for this model; got {request.n}.")
-
-
-# Valid function-tool name: no leading digit, word chars/dash only, at most
-# 256 chars (Kimi Vendor Verifier contract for message-level tools).
-_DYNAMIC_TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,255}\Z")
-
-
-def _dynamic_tool_dicts(
-        messages: Optional[List[ChatCompletionMessageParam]]) -> list[dict]:
-    """Collect message-level (dynamic) tool declarations from system messages."""
-    tools: list[dict] = []
-    for msg in messages or []:
-        if isinstance(
-                msg, dict) and msg.get("role") == "system" and msg.get("tools"):
-            tools.extend(msg["tools"])
-    return tools
-
-
-def _validate_kimi_dynamic_tools(request: ChatCompletionRequest) -> None:
-    """Validate message-level (dynamic) tool declarations for kimi_k3.
-
-    Kimi-style dynamic tools ride on system messages. Enforce the contract
-    checked by the Kimi Vendor Verifier: system-only carrier, empty content,
-    function-typed tools with valid unique names (unique also against
-    request-level tools). Only called for kimi_k3 deployments; other models
-    keep ignoring the key as before.
-    """
-    seen_names = set()
-    for tool in request.tools or []:
-        seen_names.add(tool.function.name)
-    for message in request.messages or []:
-        # A null tools key is treated as absent (some SDKs serialize
-        # optional fields as null); only declared tools are validated.
-        if not isinstance(message, dict) or message.get("tools") is None:
-            continue
-        if message.get("role") != "system":
-            raise ValueError(
-                "Message-level `tools` are only allowed on system messages.")
-        if message.get("content"):
-            raise ValueError(
-                "A system message carrying `tools` must have empty content.")
-        message_tools = message["tools"]
-        if not isinstance(message_tools, list):
-            raise ValueError("Message-level `tools` must be an array.")
-        for tool in message_tools:
-            if not isinstance(tool, dict):
-                raise ValueError("Each message-level tool must be an object.")
-            if tool.get("type") != "function":
-                raise ValueError(f"Unsupported message-level tool type: "
-                                 f"{tool.get('type')!r}.")
-            function = tool.get("function")
-            if not isinstance(function, dict):
-                raise ValueError(
-                    "Message-level tools must carry a `function` object.")
-            name = function.get("name")
-            if not isinstance(name,
-                              str) or not _DYNAMIC_TOOL_NAME_RE.match(name):
-                raise ValueError(f"Invalid message-level tool name: {name!r}.")
-            if name in seen_names:
-                raise ValueError(f"Duplicate tool name: {name!r}.")
-            seen_names.add(name)
-
-
-def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
-                                model_type: Optional[str]) -> None:
-    """Apply Kimi/Moonshot API semantics to a chat request for kimi_k3.
-
-    The kimi_k3 checkpoint template natively renders control messages for
-    thinking effort, tool_choice, and response_format, but only reads them
-    from chat-template kwargs. Derive those kwargs from the request-level
-    fields so the OpenAI-style API surface drives the template; explicit
-    client-supplied `chat_template_kwargs` win over derived values. The
-    merged kwargs also steer the kimi_k3 reasoning parser's initial channel,
-    the guided-decoding structural tag, and the thinking-budget logits
-    processor downstream.
-
-    Kimi's API also reports usage in the final streaming chunk without the
-    client opting in, so default `stream_options` for streaming requests.
-    """
-    if model_type != "kimi_k3":
-        return
-    _validate_kimi_dynamic_tools(request)
-    _enforce_kimi_param_policy(request)
-    if request.stream and request.stream_options is None:
-        # StreamOptions defaults: include_usage=True, continuous off.
-        request.stream_options = StreamOptions()
-    derived: dict[str, Any] = {}
-    if request.thinking is not None:
-        enabled = request.thinking.type != "disabled"
-        derived["thinking"] = enabled
-        if enabled and request.thinking.effort is not None:
-            derived["thinking_effort"] = request.thinking.effort
-    if ("reasoning_effort" in request.model_fields_set
-            and request.reasoning_effort is not None
-            and "thinking_effort" not in derived and
-        (request.thinking is None or request.thinking.type != "disabled")):
-        # Kimi semantics: an explicit thinking.effort wins, and an explicit
-        # thinking object also wins the on/off axis — reasoning_effort only
-        # supplies the effort when thinking.effort is absent, and
-        # reasoning_effort="none" only disables thinking when no thinking
-        # object was sent. No effort is ever derived for an explicitly
-        # disabled request. (KVV test_reasoning_effort_ignored_when_effort_
-        # present / test_reasoning_effort_effective_when_effort_absent.)
-        effort = getattr(request.reasoning_effort, "value",
-                         request.reasoning_effort).lower()
-        if effort == "none":
-            if request.thinking is None:
-                derived["thinking"] = False
-        elif effort in ("low", "high", "max"):
-            derived["thinking_effort"] = effort
-        # Other efforts (e.g. harmony's "medium") have no K3 equivalent;
-        # leave the template default.
-    if ("tool_choice" in request.model_fields_set
-            and (request.tools or _dynamic_tool_dicts(request.messages))
-            and request.tool_choice in ("required", "none")):
-        derived["tool_choice"] = request.tool_choice
-    response_format = request.response_format
-    if response_format is not None and response_format.type in ("json_object",
-                                                                "json_schema"):
-        derived["response_format"] = response_format.type
-        if response_format.type == "json_schema":
-            # Kimi requires the OpenAI wrapper shape: {name, schema[, strict]}.
-            json_schema = response_format.json_schema
-            if not isinstance(json_schema, dict) or not isinstance(
-                    json_schema.get("name"), str) or not json_schema["name"]:
-                raise ValueError(
-                    "response_format.json_schema requires a non-empty "
-                    "`name` string.")
-            if not isinstance(json_schema.get("schema"), dict):
-                raise ValueError(
-                    "response_format.json_schema requires a `schema` object.")
-            if "strict" in json_schema and not isinstance(
-                    json_schema["strict"], bool):
-                raise ValueError(
-                    "response_format.json_schema.strict must be a boolean.")
-            derived["response_schema"] = json_schema["schema"]
-    if derived:
-        request.chat_template_kwargs = {
-            **derived,
-            **(request.chat_template_kwargs or {}),
-        }
 
 
 def _configure_parser_special_token_decoding(
@@ -2022,7 +1847,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, self.allow_request_chat_template)
             model_type = resolve_top_level_model_type(self.model_config)
             is_kimi_k3 = model_type == "kimi_k3"
-            _apply_kimi_chat_extensions(request, model_type)
+            apply_model_chat_extensions(request, model_type)
             if request.tool_choice == "required" and not is_kimi_k3:
                 # Schema-accepting "required" everywhere but enforcing it only
                 # for kimi_k3 would silently degrade to "auto" elsewhere;
@@ -2144,7 +1969,7 @@ class OpenAIServer(_VideoRoutesMixin):
             # Message-level (dynamic) tools are a Kimi API extension; only
             # kimi_k3 templates render them, so other models keep ignoring
             # the key entirely.
-            dynamic_tools = _dynamic_tool_dicts(
+            dynamic_tools = dynamic_tool_dicts(
                 request.messages) if is_kimi_k3 else []
             dynamic_tool_params: List[ChatCompletionToolsParam] = []
             if dynamic_tools:
