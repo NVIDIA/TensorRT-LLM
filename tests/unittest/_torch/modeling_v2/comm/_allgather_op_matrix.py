@@ -975,8 +975,12 @@ def _spawn_ranks() -> None:
     assert world_size >= 2, (
         f"CUDA_VISIBLE_DEVICES names {world_size} device(s); a collective test needs at least 2"
     )
+    # The flag, not the OMPI_ALLOW_RUN_AS_ROOT* env pair, is what lets a root
+    # container launch: single-node CI unsets every OMPI_* variable, and
+    # prterun invoked as mpirun does not honor the PRTE_* pair that survives.
     command = [
         "mpirun",
+        "--allow-run-as-root",
         "-n",
         str(world_size),
         sys.executable,
