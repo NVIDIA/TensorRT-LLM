@@ -280,6 +280,7 @@ def fused_moe(
     gated_slot_lora_ranks: Optional[torch.Tensor] = None,
     gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
     token_to_slot: Optional[torch.Tensor] = None,
+    swiglu_clamp_after_silu: bool = False,
 ) -> List[torch.Tensor]:
     tuner = AutoTuner.get()
     # Only the non-alltoall case is considered for profiling in the warmup phase.
@@ -380,6 +381,7 @@ def fused_moe(
             fc2_slot_lora_ranks, fc2_slot_lora_weight_ptrs,
             gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot
         ]
+    run_moe_args.append(swiglu_clamp_after_silu)
     try:
         output = run_moe(*run_moe_args)
     except RuntimeError as e:
@@ -453,7 +455,8 @@ def _(input: torch.Tensor,
       fc2_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
       gated_slot_lora_ranks: Optional[torch.Tensor] = None,
       gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
-      token_to_slot: Optional[torch.Tensor] = None):
+      token_to_slot: Optional[torch.Tensor] = None,
+      swiglu_clamp_after_silu: bool = False):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:
         # Note: The weight shape for INT8 weight only quantization is different, i.e.,
