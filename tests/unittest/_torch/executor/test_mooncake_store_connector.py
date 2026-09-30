@@ -73,7 +73,8 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
     MooncakeStoreConnectorWorker,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.registry import uses_connector
-from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
+from tensorrt_llm._torch.pyexecutor.py_executor_creator import _disable_native_kv_offload
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 TOKENS_PER_BLOCK = 4
@@ -711,6 +712,52 @@ def test_uses_connector_rejects_an_unknown_preset():
     config = KvCacheConnectorConfig(connector="mooncake-store")
     with pytest.raises(ValueError, match="Unknown connector preset"):
         uses_connector(config, "mooncake-stroe")
+
+
+# ---- native offload tiers ----
+#
+# The pool is the deployment's offload tier, so a native one would claim a
+# second share of the same node's DRAM.
+
+
+def test_default_cache_sizes_are_pinned_to_zero():
+    """Unset is not the same as no tier: None asks V2 to size one itself."""
+    config = KvCacheConfig()
+    assert config.host_cache_size is None
+    assert config.disk_cache_size is None
+
+    _disable_native_kv_offload(config)
+
+    assert config.host_cache_size == 0
+    assert config.disk_cache_size == 0
+
+
+def test_an_explicitly_sized_host_tier_is_overridden():
+    config = KvCacheConfig(host_cache_size=64 * 1024**3)
+    _disable_native_kv_offload(config)
+    assert config.host_cache_size == 0
+
+
+def test_an_explicitly_sized_disk_tier_is_overridden():
+    config = KvCacheConfig(disk_cache_size=64 * 1024**3, disk_cache_path="/tmp/kv")
+    _disable_native_kv_offload(config)
+    assert config.disk_cache_size == 0
+
+
+def test_overriding_an_explicit_size_says_so(caplog):
+    """Silently dropping a memory budget someone sized on purpose is a trap."""
+    config = KvCacheConfig(host_cache_size=64 * 1024**3)
+    with caplog.at_level("WARNING"):
+        _disable_native_kv_offload(config)
+    assert "host_cache_size" in caplog.text
+    assert "segment_size" in caplog.text
+
+
+def test_leaving_the_defaults_alone_warns_about_nothing(caplog):
+    """There is no budget to report having ignored."""
+    with caplog.at_level("WARNING"):
+        _disable_native_kv_offload(KvCacheConfig())
+    assert caplog.text == ""
 
 
 # ---- worker ----

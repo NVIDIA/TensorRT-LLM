@@ -320,6 +320,44 @@ def create_encoder_executor(
     )
 
 
+def _disable_native_kv_offload(kv_cache_config: KvCacheConfig) -> None:
+    """Turn off this engine's own host and disk cache tiers for Mooncake.
+
+    The pool is the deployment's offload tier, and its pages live in host
+    memory the ranks have already lent it. A native tier alongside it claims a
+    second share of the same node's DRAM, which the connector's node budget
+    check cannot account for because the KV cache manager provisions it later.
+
+    Applies to every role. A capacity role registers no page addresses, so it
+    escapes the restrictions that protect them, but not the memory it lent.
+
+    Both fields are pinned to 0 rather than left unset, since a host_cache_size
+    of None asks KVCacheManagerV2 to size a host tier automatically. Call this
+    before the KV cache manager is built, which reads both to decide its tiers.
+    """
+    explicit = {
+        name: value
+        for name, value in (("host_cache_size",
+                             kv_cache_config.host_cache_size),
+                            ("disk_cache_size",
+                             kv_cache_config.disk_cache_size)) if value
+    }
+    if explicit:
+        requested = ", ".join(f"{name}={value}"
+                              for name, value in explicit.items())
+        logger.warning(
+            f"Ignoring kv_cache_config {requested}: the mooncake-store "
+            "connector is this deployment's offload tier. Put the memory into "
+            "mooncake_store.segment_size instead, where every server on the "
+            "node can reuse what any of them stored.")
+    else:
+        logger.info(
+            "Native KV cache offloading is off: the mooncake-store connector "
+            "provides the offload tier.")
+    kv_cache_config.host_cache_size = 0
+    kv_cache_config.disk_cache_size = 0
+
+
 def log_memory_usage(stage: str):
     GB = 1 << 30
     torch.cuda.empty_cache()
@@ -900,6 +938,9 @@ def create_py_executor(
             logger.error(f"Error instantiating connector: {e}")
             raise e
 
+        if uses_connector(kv_connector_config, "mooncake-store"):
+            _disable_native_kv_offload(kv_cache_config)
+
         # Both restrictions below exist because a connector registers page
         # addresses and moves KV against them, which a capacity-only connector
         # does not. Asked here so the worker itself can answer, and still
@@ -926,8 +967,7 @@ def create_py_executor(
             logger.info(
                 "KV connector is capacity-only: it registers no KV cache pages "
                 "and transfers nothing, so this engine keeps its capacity "
-                "scheduler policy, its cache tiers and its block reuse "
-                "settings unchanged.")
+                "scheduler policy and its block reuse settings unchanged.")
     else:
         kv_connector_manager = None
 

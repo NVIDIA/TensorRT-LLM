@@ -166,7 +166,8 @@ This is a **different component** from the Mooncake transfer engine that the C++
 * `KVCacheManagerV2` (`kv_cache_config.use_kv_cache_manager_v2: true`), since that is the manager that can describe its pools through `register_kv_cache_layout`. Not needed for `role: capacity`, which describes no pools.
 * The Mooncake Python bindings: `pip install mooncake-transfer-engine`. These are installed in the release container; the source build of the C++ transfer engine does not provide them.
 * A reachable Mooncake master (and metadata server, unless using `P2PHANDSHAKE`), run as `trtllm-serve mooncake_master`. See the [Mooncake documentation](https://kvcache-ai.github.io/Mooncake/).
-* GPU-only KV cache tiers: set `kv_cache_config.host_cache_size: 0` and `disk_cache_size: 0`. A page evicted to another tier has its GPU slot reassigned, which would invalidate the addresses registered with the store. Does not apply to `role: capacity`, which registers no addresses, so such a server keeps its tiers as configured.
+
+The connector also forces `kv_cache_config.host_cache_size` and `disk_cache_size` to 0, overriding any configured value with a warning. A page evicted to another tier has its GPU slot reassigned, which would invalidate the addresses registered with the store, and the pool is already the deployment's offload tier. Give that memory to `segment_size` instead, where every server on the node can reuse what any of them stored.
 
 #### The master is infrastructure
 
@@ -238,7 +239,7 @@ Both waits report progress every five seconds, since waiting for a master in ano
 
 Capacity comes from processes that open a store handle, and every rank that joins contributes `segment_size`. Pool capacity is therefore the sum over participating ranks, and grows with the deployment's parallelism by design.
 
-In a disaggregated deployment you want the generation side in that sum. Its nodes hold most of the deployment's host DRAM, and a pool built only from context ranks is prefill's DRAM caching prefill's GPUs, largely duplicating what `kv_cache_config.host_cache_size` already does. But a generation engine has no use for the pool's contents: it receives prompt KV over the cache transceiver, so its lookups would nearly all miss.
+In a disaggregated deployment you want the generation side in that sum. Its nodes hold most of the deployment's host DRAM, and a pool built only from context ranks is prefill's DRAM caching prefill's GPUs, which is close to what a native host tier would have done for those ranks alone. But a generation engine has no use for the pool's contents: it receives prompt KV over the cache transceiver, so its lookups would nearly all miss.
 
 `role: capacity` is that combination — contribute memory, drive no traffic:
 
@@ -254,7 +255,9 @@ kv_connector_config:
 
 Such a rank opens its handle, mounts its segment, and stops. It runs no prefix lookup, issues no load or save, starts no background save thread, and **registers no KV cache with Mooncake** — which also means it needs no GPUDirect RDMA, so a host whose HCA cannot pin GPU pages can still lend memory.
 
-Because it moves no KV, the restrictions a connector normally brings do not apply to it. Such a server keeps its capacity scheduler policy, its cache tiers, its partial block reuse and its per-layer forward hooks exactly as configured. This is what lets the generation side stay on `MAX_UTILIZATION` with its host cache tier intact while lending the pool memory.
+Because it moves no KV, the restrictions that exist to protect registered page addresses do not apply to it. Such a server keeps its capacity scheduler policy, its partial block reuse and its per-layer forward hooks exactly as configured, which is what lets the generation side stay on `MAX_UTILIZATION` while lending the pool memory.
+
+Its native cache tiers are the exception, and are turned off as they are for every other role. Not because of page addresses, which a capacity rank does not register, but because a local tier would compete for the DRAM that rank lent the pool. With no tier to spill to, the V2 scheduler reclaims pages by preemption rather than suspension.
 
 Contribution is per rank, which is the right interface: capacity then tracks the hardware in the deployment. Host DRAM, however, is a per-node limit, and the ranks sharing a node each claim the segment independently. A tensor-parallel-4 generation server on a 4-GPU node claims `4 x segment_size`; under attention DP with 8 owners it claims eight times. The connector checks this at startup and refuses a segment the node cannot afford, because the failure otherwise is not an allocation error but the OOM killer arriving minutes later, while weights are still loading, naming no cause.
 

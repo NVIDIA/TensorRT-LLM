@@ -109,8 +109,6 @@ worker_config:
     # ... parallelism as above ...
     kv_cache_config:
       use_kv_cache_manager_v2: true
-      host_cache_size: 0
-      disk_cache_size: 0
     kv_connector_config:
       connector: mooncake-store
       mooncake_store:
@@ -138,9 +136,11 @@ worker_config:
 
 `master_timeout` is generous because the wait spans container start on another node. Too short fails the server at startup, which is the intent: a pool that never came up shows up only as an absence of cache hits.
 
+Neither side sets `host_cache_size` or `disk_cache_size`, because the connector forces both to 0 for every role, `capacity` included. The pool is the deployment's offload tier, and a native one would claim a second share of the same node's DRAM, which on the generation side is the DRAM it just lent the pool. Size `segment_size` against the whole node's memory on that basis.
+
 Both sides contribute the same amount per rank, so pool capacity is `total ranks x segment_size` and the generation side — which normally has far more ranks and far more host DRAM — supplies most of it. For 2 context servers at DP2 and 5 generation servers at TP4, that is 24 ranks and 3840 GiB, of which decode holds 83%.
 
-The roles differ only in traffic. `capacity` drives none: those ranks mount their segment and never look up, load or save, and they register no KV cache with Mooncake, so they need no GPUDirect RDMA and keep their scheduler policy, cache tiers and block reuse unchanged.
+The roles differ only in traffic. `capacity` drives none: those ranks mount their segment and never look up, load or save, and they register no KV cache with Mooncake, so they need no GPUDirect RDMA and keep their scheduler policy and block reuse unchanged.
 
 Keep `segment_size` identical in both sections. Each server sees only its own value, so a mismatch is otherwise invisible; the run's report names the distinct sizes it finds. Note also that `segment_size` is claimed **per rank**, so a node's demand is `ranks_on_node x segment_size` — 4 x 160 GiB on a 4-GPU TP4 node. The connector checks this against available host memory and refuses at startup rather than letting the OOM killer arrive during weight loading.
 

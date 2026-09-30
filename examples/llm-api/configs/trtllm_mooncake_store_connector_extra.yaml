@@ -47,12 +47,10 @@ kv_cache_config:
   use_kv_cache_manager_v2: true
   # Local reuse still runs first; the store serves whatever the device missed.
   enable_block_reuse: true
-  # GPU-only tiers are required wherever the connector registers pages: one
-  # evicted to host or disk has its GPU slot reassigned, which would invalidate
-  # the registered addresses. A role: capacity server registers nothing and can
-  # keep its tiers.
-  host_cache_size: 0
-  disk_cache_size: 0
+  # host_cache_size and disk_cache_size are left unset: the connector forces
+  # both to 0 for every role, overriding any value with a warning. The pool is
+  # the offload tier, so a native one would claim a second share of the same
+  # node's DRAM. Put that memory into segment_size below.
 
 kv_connector_config:
   connector: mooncake-store

@@ -139,9 +139,8 @@ def _open_store(config: MooncakeStoreConnectorConfig):
             f"global_segment_size={config.global_segment_size}). The master "
             "must already be accepting connections; the protocol and device "
             "must be usable from this host; and this node must have the "
-            "segment's worth of memory to spare, which it does not if its own "
-            f"kv_cache_config.host_cache_size has claimed it. Check the "
-            f"config named by {CONFIG_PATH_ENV}."
+            "segment's worth of memory to spare once every rank on it has "
+            f"claimed one. Check the config named by {CONFIG_PATH_ENV}."
         )
     return store, hostname
 
