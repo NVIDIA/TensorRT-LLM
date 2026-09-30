@@ -127,6 +127,51 @@ class TestGmsCrossFieldWarning:
             assert relevant == []
 
 
+class TestGmsMoeCompatibility:
+    def test_rejects_gms_with_active_rebalance(self):
+        with pytest.raises(
+            ValueError,
+            match=r"LoadFormat\.GMS.*active moe_config\.rebalance",
+        ):
+            _make_args(
+                load_format=LoadFormat.GMS,
+                moe_config={
+                    "rebalance": {
+                        "enabled": True,
+                        "helper_slots_per_rank": 3,
+                    }
+                },
+            )
+
+    @pytest.mark.parametrize(
+        "load_format, rebalance",
+        [
+            pytest.param(LoadFormat.GMS, None, id="no-rebalance"),
+            pytest.param(
+                LoadFormat.GMS,
+                {"enabled": False, "helper_slots_per_rank": 3},
+                id="disabled",
+            ),
+            pytest.param(
+                LoadFormat.GMS,
+                {"enabled": True, "helper_slots_per_rank": 0},
+                id="zero-helper-slots",
+            ),
+            pytest.param(
+                LoadFormat.AUTO,
+                {"enabled": True, "helper_slots_per_rank": 3},
+                id="active-without-gms",
+            ),
+        ],
+    )
+    def test_accepts_compatible_rebalance(self, load_format, rebalance):
+        args = _make_args(
+            load_format=load_format,
+            moe_config={"rebalance": rebalance},
+        )
+        assert args.load_format == load_format
+
+
 class TestLoadFormatGms:
     def test_gms_enum_present(self):
         assert LoadFormat.GMS.name == "GMS"

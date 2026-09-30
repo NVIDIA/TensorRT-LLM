@@ -7160,7 +7160,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_gms_moe_compat(self) -> 'TorchLlmArgs':
-        """Reject ``LoadFormat.GMS`` combined with a MoE load balancer.
+        """Reject ``LoadFormat.GMS`` combined with incompatible MoE features.
 
         The ``MoeLoadBalancer``'s ``register_weight_slots_after_to_cuda``
         and ``finalize_model`` run AFTER the GMS RW pool is closed and
@@ -7177,12 +7177,18 @@ class TorchLlmArgs(BaseLlmArgs):
         the (MoE, GMS) follow-up; see ``model_loader.py``'s
         ``TODO(GMS-MOE-LB)`` comment.
 
+        Active prefill rebalance is also incompatible with GMS. Its TMA
+        descriptors retain the weight addresses used when they are created,
+        while GMS can subsequently rebind parameters to its shared arena.
+        Using both would let weight copies target stale helper-slot storage.
+
         Returns:
             ``self`` (Pydantic ``model_validator`` contract).
 
         Raises:
             ValueError: When ``load_format == LoadFormat.GMS`` and
-                ``moe_config.load_balancer`` is set.
+                ``moe_config.load_balancer`` or active
+                ``moe_config.rebalance`` is set.
         """
         if (self.load_format == LoadFormat.GMS and self.moe_config is not None
                 and self.moe_config.load_balancer is not None):
@@ -7197,6 +7203,19 @@ class TorchLlmArgs(BaseLlmArgs):
                 "Tracked as the (MoE, GMS) follow-up at "
                 "tensorrt_llm/_torch/pyexecutor/model_loader.py "
                 "(see TODO(GMS-MOE-LB)).")
+
+        rebalance = (None
+                     if self.moe_config is None else self.moe_config.rebalance)
+        rebalance_active = (rebalance is not None and rebalance.enabled
+                            and rebalance.helper_slots_per_rank > 0)
+        if self.load_format == LoadFormat.GMS and rebalance_active:
+            raise ValueError(
+                "LoadFormat.GMS is incompatible with active "
+                "moe_config.rebalance. GMS can rebind model parameters after "
+                "the rebalance TMA descriptors capture their addresses, so "
+                "weight copies could target stale helper slots. Either "
+                "disable moe_config.rebalance, set helper_slots_per_rank=0, "
+                "or use LoadFormat.AUTO.")
         return self
 
     @model_validator(mode="after")
