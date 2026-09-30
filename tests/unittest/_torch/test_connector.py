@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -293,6 +293,40 @@ def test_the_manager_reports_whether_its_worker_moves_kv():
                                        scheduler=MagicMock()).capacity_only
     assert KvCacheConnectorManager(CapacityWorker(MagicMock()),
                                    scheduler=MagicMock()).capacity_only
+
+
+def test_a_capacity_only_manager_builds_no_scheduler_output():
+    """A capacity-only manager skips the per-iteration scheduler output, and a
+    transferring one still builds it."""
+
+    class CapacityWorker(MinimalWorker):
+        capacity_only = True
+
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [
+        MagicMock(is_dummy_request=False,
+                  request_id=7,
+                  state=LlmRequestState.GENERATION_IN_PROGRESS)
+    ]
+
+    # Attention DP keeps this to one process: `_run_on_leader` runs locally
+    # with it, and broadcasts the TP leader's result without it.
+    capacity = KvCacheConnectorManager(CapacityWorker(MagicMock()),
+                                       scheduler=MagicMock(),
+                                       enable_attention_dp=True)
+    capacity.build_scheduler_output(scheduled_batch, MagicMock())
+    # With no output built, handle_metadata binds nothing to the worker.
+    capacity.handle_metadata()
+    capacity.scheduler.build_connector_meta.assert_not_called()
+    assert capacity.worker.get_connector_meta() is None
+
+    # The transferring role needs the output and must be unaffected.
+    transferring = KvCacheConnectorManager(MinimalWorker(MagicMock()),
+                                           scheduler=MagicMock(),
+                                           enable_attention_dp=True)
+    transferring.build_scheduler_output(scheduled_batch, MagicMock())
+    transferring.handle_metadata()
+    transferring.scheduler.build_connector_meta.assert_called_once()
 
 
 def test_scheduler_output_num_scheduled_tokens_with_mtp():

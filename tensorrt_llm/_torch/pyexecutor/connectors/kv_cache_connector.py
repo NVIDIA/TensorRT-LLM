@@ -701,6 +701,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def build_scheduler_output(
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
     ):
+        if self.capacity_only:
+            # A capacity-only connector registers no pages, so any scheduler
+            # output would describe no loads and no saves. Both KV cache
+            # managers call this once per iteration from `prepare_resources`,
+            # which on a generation server is inter-token latency.
+            # `handle_metadata` returns early when no output was built.
+            return
         self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
             scheduled_batch, self.new_async_requests, kv_cache_manager
         )
