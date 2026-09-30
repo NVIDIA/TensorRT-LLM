@@ -563,7 +563,7 @@ def test_cache_salt_id_derivation_matches_worker_path() -> None:
     hashes with ``get_cache_salt_id``, so the two derivations must be
     byte-identical or salted requests silently score zero cache hits.
     """
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import \
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
         KVCacheManagerV2
 
     # sha256("abc")[:8] little-endian; must never drift from the engine.
@@ -599,7 +599,7 @@ def test_router_block_hashes_round_trip_worker_event_hashes(
     code path (``_v1_hash_from_radix_block``) over a radix chain seeded with
     the worker's ``ReuseScope``.
     """
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import \
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
         KVCacheManagerV2
     from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import \
         KVCacheEventManager
@@ -673,7 +673,7 @@ def test_routing_key_sync_carries_lora_and_salt_to_block_hashes(
     and compares its ``block_hashes_by_algo`` with the worker-side hashes for
     the same LoRA (and optionally salted) request.
     """
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import \
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
         KVCacheManagerV2
     from tensorrt_llm.executor.request import LoRARequest
 
