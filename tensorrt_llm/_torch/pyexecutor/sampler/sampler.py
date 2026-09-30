@@ -76,6 +76,7 @@ from .sampler_common import (
 )
 from .sampler_features import (
     AsyncWorkerMixin,
+    EmbeddingBiasCache,
     SamplerEvent,
     _PackedStepIndexer,
     _UnpackedStepIndexer,
@@ -589,6 +590,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # Owns max_topk_logprobs / batch_max_topk_logprobs / TOPK_LOGPROBS_SHAPE;
         # constructed before _create_store, which reads the shape.
         self._log_probs = LogProbsHandler(self)
+
+        self._embedding_bias_cache: EmbeddingBiasCache | None = None
 
         # The Torch sampler hard-depends on flashinfer. Enforce it once here, at
         # construction, so the check stays out of the CUDA-graph-captured
@@ -2688,8 +2691,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         seq_lens_cuda = seq_lens_host.to(device="cuda", non_blocking=True)
 
         # Handle embedding bias
-        apply_embedding_bias(
-            logits_cuda, sampling_requests, sampling_requests_metadata.req_num_steps
+        self._embedding_bias_cache = apply_embedding_bias(
+            logits_cuda,
+            sampling_requests,
+            sampling_requests_metadata.req_num_steps,
+            max_num_sequences=self.max_num_sequences,
+            maybe_embedding_bias_cache=self._embedding_bias_cache,
         )
 
         # Apply repetition/presence/frequency penalties in place, before the greedy fast

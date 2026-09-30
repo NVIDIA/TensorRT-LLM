@@ -41,7 +41,7 @@ from concurrent import futures
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import repeat
-from typing import Any, Iterator, Optional, cast
+from typing import Any, Final, Iterator, Optional, cast
 
 import torch
 
@@ -50,6 +50,7 @@ from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import EmbeddingBias
 
 from ..llm_request import LlmRequest
+from .ops.vanilla import Fusions
 from .sampler_common import DEFAULT_BEAM_IDX
 
 if sys.version_info[:2] >= (3, 12):
@@ -459,11 +460,111 @@ def fast_greedy_sample_kernel(
     return next_tokens
 
 
+class EmbeddingBiasCache:
+    def __init__(
+        self, *, logit_dtype: torch.dtype, vocab_size: int, max_seq_slots: int, device: torch.device
+    ):
+        self._flat_cache = torch.empty(
+            (max_seq_slots, vocab_size), dtype=logit_dtype, device=device
+        )
+        self._device = device
+        self._logit_dtype = logit_dtype
+        self._vocab_size = vocab_size
+        self.CACHE_SENTINEL_ATTR_NAME: Final[str] = "_py_has_cached_embedding_bias"
+
+    def update(self, reqs: list[LlmRequest]) -> None:
+        # NB: This could be extended to allow reuse of equivalent rows in _flat_cache
+        #     (potentially relevant for output sequence length <~ batch size).
+
+        reqs_needing_update = [
+            req
+            for req in reqs
+            if req.py_embedding_bias and not getattr(req, self.CACHE_SENTINEL_ATTR_NAME, None)
+        ]
+
+        if not reqs_needing_update:
+            return
+
+        _next_bias_index = 0
+
+        def provision_bias_index() -> int:
+            nonlocal _next_bias_index
+            bias_index = _next_bias_index
+            _next_bias_index += 1
+            return bias_index
+
+        # Indices of unique bias rows
+        bias_to_index: dict[EmbeddingBias, int] = defaultdict(provision_bias_index)
+
+        # Source indices for bias cache update
+        bias_gather_indices: list[int] = []
+        # Destination indices for bias cache update
+        bias_scatter_indices: list[int] = []
+
+        # Collect bias information
+        for req in reqs_needing_update:
+            req_bias = req.py_embedding_bias
+            assert req_bias is not None
+            bias_gather_indices.append(bias_to_index[req_bias])
+            seq_slot = req.py_seq_slot
+            assert seq_slot is not None
+            bias_scatter_indices.append(seq_slot)
+
+        bias_gather_indices_cuda = torch.tensor(
+            bias_gather_indices, pin_memory=prefer_pinned(), dtype=torch.int32
+        ).to(self._device, non_blocking=True)
+        bias_scatter_indices_cuda = torch.tensor(
+            bias_scatter_indices, pin_memory=prefer_pinned(), dtype=torch.int32
+        ).to(self._device, non_blocking=True)
+
+        unique_biases_tensor_cuda = torch.zeros(
+            (len(bias_to_index), self._vocab_size),
+            dtype=self._logit_dtype,
+            device=self._device,
+        )
+        unique_biases_flat_idx_cuda = torch.tensor(
+            [
+                self._vocab_size * unique_bias_idx + logit_idx
+                for sparse_bias, unique_bias_idx in bias_to_index.items()
+                for (logit_idx, bias_value) in sparse_bias
+            ],
+            pin_memory=prefer_pinned(),
+            dtype=torch.int32,
+        ).to(self._device, non_blocking=True)
+        unique_biases_flat_values_cuda = torch.tensor(
+            [
+                bias_value
+                for sparse_bias, unique_bias_idx in bias_to_index.items()
+                for (logit_idx, bias_value) in sparse_bias
+            ],
+            pin_memory=prefer_pinned(),
+            dtype=self._logit_dtype,
+        ).to(self._device, non_blocking=True)
+
+        unique_biases_tensor_cuda.view(-1).scatter_(
+            dim=0,
+            index=unique_biases_flat_idx_cuda,
+            src=unique_biases_flat_values_cuda,
+        )
+
+        self._flat_cache[bias_scatter_indices_cuda, :] = unique_biases_tensor_cuda[
+            bias_gather_indices_cuda, :
+        ]
+
+        for req in reqs_needing_update:
+            setattr(req, self.CACHE_SENTINEL_ATTR_NAME, True)
+
+    def get(self) -> torch.Tensor:
+        return self._flat_cache
+
+
 def apply_embedding_bias(
     logits: torch.Tensor,
     requests: list[LlmRequest],
     request_steps: torch.Tensor,
-) -> None:
+    max_num_sequences: int,
+    maybe_embedding_bias_cache: EmbeddingBiasCache | None = None,
+) -> EmbeddingBiasCache | None:
     """Apply embedding bias (aka logit bias) to logits.
 
     Arguments:
@@ -486,19 +587,23 @@ def apply_embedding_bias(
     #              and low reuse).
     #     Since read-caching is expected to help in typical cases, option (ii) is implemented here.
 
+    if all(not req.py_embedding_bias for req in requests):
+        return None
+
+    vocab_size = logits.size(-1)
+    if maybe_embedding_bias_cache is None:
+        embedding_bias_cache = EmbeddingBiasCache(
+            logit_dtype=logits.dtype,
+            vocab_size=vocab_size,
+            max_seq_slots=max_num_sequences,
+            device=logits.device,
+        )
+    else:
+        embedding_bias_cache = maybe_embedding_bias_cache
+
     # Track which logits require logit bias application
     request_steps_list = request_steps.tolist()
     logits_bias_masks = [False] * logits.size(0)
-    _next_bias_index = 0
-
-    def provision_bias_index() -> int:
-        nonlocal _next_bias_index
-        bias_index = _next_bias_index
-        _next_bias_index += 1
-        return bias_index
-
-    # Indices of unique bias rows
-    bias_to_index: dict[EmbeddingBias, int] = defaultdict(provision_bias_index)
 
     # Source indices for bias application
     bias_gather_indices: list[int] = []
@@ -507,20 +612,22 @@ def apply_embedding_bias(
     #
     # NB: the mask indexes rows of 'logits', not requests: a request contributes
     #     'steps' consecutive rows (> 1 under speculative decoding), so the offset
-    #     has to accumulate 'steps' rather than track the request index. It must
-    #     stay in step with 'bias_gather_indices', which is built in row order.
+    #     has to accumulate 'steps' rather than track the request index.
     row_offset = 0
+    reqs_using_bias = []
     for req, steps in zip(requests, request_steps_list):
         req_bias = req.py_embedding_bias
-        if req_bias is not None:
+        if req_bias:
+            reqs_using_bias.append(req)
             for j in range(row_offset, row_offset + steps):
                 logits_bias_masks[j] = True
-            req_bias_index = bias_to_index[req_bias]
-            bias_gather_indices.extend(repeat(req_bias_index, steps))
+            seq_slot = req.py_seq_slot
+            assert seq_slot is not None
+            bias_gather_indices.extend(repeat(seq_slot, steps))
         row_offset += steps
 
-    if not bias_to_index:
-        return
+    embedding_bias_cache.update(reqs_using_bias)
+    biases_by_slot_cuda = embedding_bias_cache.get()  # indexed by seq_slot
 
     bias_gather_indices_cuda = torch.tensor(
         bias_gather_indices, pin_memory=prefer_pinned(), dtype=torch.int32
@@ -529,44 +636,14 @@ def apply_embedding_bias(
         logits_bias_masks, pin_memory=prefer_pinned(), dtype=torch.bool
     ).to(logits.device, non_blocking=True)
 
-    vocab_size = logits.size(-1)
-    unique_biases_tensor_cuda = torch.zeros(
-        (len(bias_to_index), vocab_size),
-        dtype=logits.dtype,
-        device=logits.device,
-    )
-    unique_biases_flat_idx_cuda = torch.tensor(
-        [
-            vocab_size * unique_bias_idx + logit_idx
-            for sparse_bias, unique_bias_idx in bias_to_index.items()
-            for (logit_idx, bias_value) in sparse_bias
-        ],
-        pin_memory=prefer_pinned(),
-        dtype=torch.int32,
-    ).to(logits.device, non_blocking=True)
-    unique_biases_flat_values_cuda = torch.tensor(
-        [
-            bias_value
-            for sparse_bias, unique_bias_idx in bias_to_index.items()
-            for (logit_idx, bias_value) in sparse_bias
-        ],
-        pin_memory=prefer_pinned(),
-        dtype=logits.dtype,
-    ).to(logits.device, non_blocking=True)
-    unique_biases_tensor_cuda.view(-1).scatter_(
-        dim=0,
-        index=unique_biases_flat_idx_cuda,
-        src=unique_biases_flat_values_cuda,
+    Fusions.gather_masked_inplace_add(
+        summands_cuda=biases_by_slot_cuda,
+        summand_indices_cuda=bias_gather_indices_cuda,
+        output_cuda=logits,
+        output_mask_cuda=logits_bias_mask_cuda,
     )
 
-    biases_tensor_cuda = torch.index_select(unique_biases_tensor_cuda, 0, bias_gather_indices_cuda)
-
-    # NB: Avoiding logits[bias_scatter_indices] += biases_tensor (and torch.Tensor.scatter_add_), because it
-    #     is unclear if this allows for repeated indices, cf.
-    #         https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.index_put_.html#torch-tensor-index-put
-    #     and thus introduces read-after-write dependencies (including possible false
-    #     sharing).
-    logits[logits_bias_mask_cuda] += biases_tensor_cuda
+    return embedding_bias_cache
 
 
 # --------------------------------------------------------------------------
