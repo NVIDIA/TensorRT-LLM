@@ -102,6 +102,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
         _setupForReuse(*reuseMatch);
     }
 
+    _collectReuseCandidates();
     _refreshGenerationAllocReady();
 
     mAvgHistoryLength.update(static_cast<double>(mHistoryLength));
@@ -150,6 +151,128 @@ StorageManager* KvCache::storageManager() const
     return &mManager->storage();
 }
 
+void KvCache::_collectReuseCandidates()
+{
+    auto const end = numCommittedTokens();
+    auto const& lifeCycles = mManager->lifeCycles();
+    mOptionalCandidates.resize(lifeCycles.size());
+    for (LifeCycleId lc{0}; lc < lifeCycles.size(); ++lc)
+    {
+        auto const* attention = std::get_if<AttnLifeCycle>(&lifeCycles[lc]);
+        auto const policy = attention ? attention->reusePolicy : AttentionReusePolicy::REQUIRED;
+        ReuseGroupStatus status{lc, policy, end, end > 0 && policy == AttentionReusePolicy::REQUIRED, {}};
+        if (status.complete)
+        {
+            if (!attention)
+            {
+                status.coverage.emplace_back(end, end); // Exact recurrent-state endpoint.
+            }
+            else
+            {
+                auto stale = getStaleRange(lifeCycles[lc], end, mTokensPerBlock);
+                if (stale.beg > BlockOrdinal{0})
+                {
+                    status.coverage.emplace_back(0, std::min(end, stale.beg.value() * mTokensPerBlock));
+                }
+                if (stale.end.value() * mTokensPerBlock < end)
+                {
+                    status.coverage.emplace_back(stale.end.value() * mTokensPerBlock, end);
+                }
+            }
+        }
+        // OPTIONAL checks coverage at the REQUIRED endpoint without shortening it.
+        // Use the ordinary SWA live ranges, including sinks and multi-page windows.
+        if (attention && attention->allowsCheckpoint() && end > 0 && end % mTokensPerBlock == 0
+            && attention->windowSize)
+        {
+            auto const stale = getStaleRange(lifeCycles[lc], end, mTokensPerBlock);
+            auto& candidates = mOptionalCandidates[lc];
+            status.complete = true;
+            auto collectRange = [&](BlockOrdinal beg, BlockOrdinal limit)
+            {
+                for (auto ordinal = beg; ordinal < limit; ++ordinal)
+                {
+                    auto const& block = mBlocks[ordinal].treeBlock;
+                    auto* page = block && !block->isOrphan() ? block->getPage(lc) : nullptr;
+                    if (!page || page->numTokensInBlock < mTokensPerBlock)
+                    {
+                        status.complete = false;
+                        return;
+                    }
+                    candidates.emplace_back(ordinal, page->hold());
+                }
+                if (beg < limit)
+                {
+                    status.coverage.emplace_back(beg.value() * mTokensPerBlock, limit.value() * mTokensPerBlock);
+                }
+            };
+            collectRange(BlockOrdinal{0}, stale.beg);
+            if (status.complete)
+            {
+                collectRange(stale.end, BlockOrdinal{end / mTokensPerBlock});
+            }
+            if (!status.complete)
+            {
+                candidates.clear();
+                status.coverage.clear();
+            }
+        }
+        mReuseStatus.push_back(std::move(status));
+    }
+}
+
+bool KvCache::_needsFreshPrefixPages(LifeCycleId lc) const
+{
+    return !requiresPrefixCoverage(mManager->lifeCycles()[lc])
+        && std::find(mSelectedOptionalGroups.begin(), mSelectedOptionalGroups.end(), lc)
+        == mSelectedOptionalGroups.end();
+}
+
+void KvCache::_selectOptionalGroups(std::vector<LifeCycleId> const& groups)
+{
+    // Validate everything before touching the previous attempt's mappings.
+    for (auto lc : groups)
+    {
+        if (lc < LifeCycleId{0} || lc >= mOptionalCandidates.size()
+            || mReuseStatus[lc.value()].policy != AttentionReusePolicy::OPTIONAL || !mReuseStatus[lc.value()].complete)
+        {
+            throw std::invalid_argument("Selected OPTIONAL group has no reusable state at the claimed prefix");
+        }
+    }
+    for (auto lc : mSelectedOptionalGroups)
+    {
+        for (auto const& [ordinal, holder] : mOptionalCandidates[lc])
+        {
+            mBlocks[ordinal].pages[kDefaultBeamIndex][lc] = std::monostate{};
+        }
+    }
+    for (auto lc : groups)
+    {
+        auto const stale = _getStaleRange(mHistoryLength, mManager->lifeCycles()[lc]);
+        for (auto const& [ordinal, holder] : mOptionalCandidates[lc])
+        {
+            if (!stale.contains(ordinal))
+            {
+                mBlocks[ordinal].pages[kDefaultBeamIndex][lc] = holder;
+            }
+        }
+    }
+    mSelectedOptionalGroups = groups;
+    std::sort(mSelectedOptionalGroups.begin(), mSelectedOptionalGroups.end());
+    mSelectedOptionalGroups.erase(
+        std::unique(mSelectedOptionalGroups.begin(), mSelectedOptionalGroups.end()), mSelectedOptionalGroups.end());
+    for (LifeCycleId lc{0}; lc < mOptionalCandidates.size(); ++lc)
+    {
+        if (std::find(groups.begin(), groups.end(), lc) == groups.end()
+            && mReuseStatus[lc.value()].policy == AttentionReusePolicy::OPTIONAL)
+        {
+            mOptionalCandidates[lc].clear();
+            mReuseStatus[lc.value()].complete = false;
+            mReuseStatus[lc.value()].coverage.clear();
+        }
+    }
+}
+
 std::vector<KvCache::ActivePage> KvCache::_activePages() const
 {
     std::vector<ActivePage> result;
@@ -172,6 +295,10 @@ std::vector<KvCache::ActivePage> KvCache::_activePages() const
 
         // Attention lifecycle: yield non-stale blocks (sink + window).
         LifeCycle const& lc = lcs.getLifeCycle(lcId);
+        if (mNeverResumed && _needsFreshPrefixPages(lcId))
+        {
+            continue; // Allocated by first resume; private pages are never claimed from the tree.
+        }
         auto staleRange = _getStaleRange(mHistoryLength, lc);
         BlockOrdinal staleBeg = staleRange.beg;
         BlockOrdinal staleEnd = staleRange.end;
@@ -378,7 +505,8 @@ void KvCache::activate()
     }
 }
 
-bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecoding)
+bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecoding,
+    std::optional<std::vector<LifeCycleId>> optionalReuseGroups)
 {
     KVCM2_API_GUARD();
     TLLM_CHECK(mStatus == Status::SUSPENDED);
@@ -397,6 +525,14 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
         throw std::invalid_argument("Cannot return a decoding cache to prefill");
     auto restorePhase = FuncGuard([&]() { mIsDecoding = oldIsDecoding; });
     mIsDecoding = isDecoding.value_or(mIsDecoding);
+    if (mNeverResumed)
+    {
+        _selectOptionalGroups(optionalReuseGroups.value_or(std::vector<LifeCycleId>{}));
+    }
+    else if (optionalReuseGroups.has_value())
+    {
+        throw std::invalid_argument("OPTIONAL reuse selection is only valid before the first resume");
+    }
 
     // Check utilization against threshold.
     auto const utilizations = mManager->storage().getUtilization(kHotLevel);
@@ -409,6 +545,26 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     auto& storageMgr = mManager->storage();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     LifeCycleId numLc = storageMgr.numLifeCycles();
+
+    // Snapshot source levels before allocation or activation can migrate the selected pages.
+    ReusedBlocksByLevelByLifeCycle optionalReusedByLevel;
+    if (mNeverResumed && _shouldRecordStats())
+    {
+        for (auto lc : mSelectedOptionalGroups)
+        {
+            auto& byLevel = optionalReusedByLevel[lc];
+            byLevel.full = CountsByLevel(storageMgr.numCacheLevels(), 0);
+            byLevel.partial = CountsByLevel(storageMgr.numCacheLevels(), 0);
+            auto const stale = _getStaleRange(mHistoryLength, mManager->lifeCycles()[lc]);
+            for (auto const& [ordinal, holder] : mOptionalCandidates[lc])
+            {
+                if (!stale.contains(ordinal))
+                {
+                    ++byLevel.full.at(holder->page->cacheLevel);
+                }
+            }
+        }
+    }
 
     // Pre-allocate GPU slots for deferred copies (partial blocks + SSM) and scratch slots
     // before locking, so we never end up in a state where pages are locked but we can't allocate.
@@ -432,6 +588,22 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
                 }
             }
         });
+    TypedVec<LifeCycleId, std::vector<BlockOrdinal>> privateOrdinals(numLc);
+    TypedVec<LifeCycleId, std::vector<Slot>> privateSlots(numLc);
+    auto releasePrivateSlots = FuncGuard(
+        [&]()
+        {
+            for (LifeCycleId lc{0}; lc < numLc; ++lc)
+            {
+                for (auto& slot : privateSlots[lc])
+                {
+                    if (slot.hasValidSlot())
+                    {
+                        storageMgr.releaseSlot(lc, kHotLevel, std::move(slot));
+                    }
+                }
+            }
+        });
 
     // Compute scratch slot deltas UNCONDITIONALLY (mirrors Python: _take_excess_scratch_slots
     // is called outside _never_resumed).
@@ -448,8 +620,24 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             bool isSsm = ssmLcId.has_value() && lc == *ssmLcId;
-            if (isSsm || hasPartial)
+            auto const& lifeCycle = mManager->lifeCycles()[lc];
+            if (_needsFreshPrefixPages(lc))
+            {
+                auto const stale = _getStaleRange(mHistoryLength, lifeCycle);
+                for (BlockOrdinal ord{0}; ord < stale.beg; ++ord)
+                {
+                    privateOrdinals[lc].push_back(ord);
+                }
+                for (BlockOrdinal ord = stale.end; ord < mBlocks.size(); ++ord)
+                {
+                    privateOrdinals[lc].push_back(ord);
+                }
+                numSlotsNeeded[lc] += static_cast<SlotCount>(privateOrdinals[lc].size());
+            }
+            else if (isSsm || hasPartial)
+            {
                 numSlotsNeeded[lc] += 1;
+            }
         }
     }
 
@@ -486,7 +674,14 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
             if (!tmpSlots[lc].empty())
             {
                 // Mirrors Python: `if self._never_resumed and (... SsmLifeCycle or has_partial):`
-                bool needsDeferred = mNeverResumed && ((ssmLcId.has_value() && lc == *ssmLcId) || hasPartial);
+                bool const isPrivate = _needsFreshPrefixPages(lc);
+                bool needsDeferred
+                    = mNeverResumed && !isPrivate && ((ssmLcId.has_value() && lc == *ssmLcId) || hasPartial);
+                for (size_t i = 0; i < privateOrdinals[lc].size(); ++i)
+                {
+                    privateSlots[lc].push_back(std::move(tmpSlots[lc].back()));
+                    tmpSlots[lc].pop_back();
+                }
                 if (needsDeferred)
                 {
                     // Python uses pop() here: reserve one slot for deferred copy, then treat the rest as scratch.
@@ -523,6 +718,35 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     }
     mStatus = Status::ACTIVE;
     auto rollbackActivation = FuncGuard([&]() { _deactivate(); });
+
+    // Private recovery pages have no reusable source. Their contents are
+    // initialized by the caller before inference, after all allocations succeed.
+    std::vector<CUevent> privateReadyEvents;
+    for (auto const& slots : privateSlots)
+    {
+        for (auto const& slot : slots)
+        {
+            privateReadyEvents.push_back(slot.readyEvent.handle());
+        }
+    }
+    streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), std::move(privateReadyEvents));
+    for (LifeCycleId lc{0}; lc < numLc; ++lc)
+    {
+        for (size_t i = 0; i < privateSlots[lc].size(); ++i)
+        {
+            auto const ordinal = privateOrdinals[lc][i];
+            auto page = makeShared<UncommittedPage>(*this, ordinal, lc, kHotLevel, kDefaultBeamIndex);
+            page->setSlot(privateSlots[lc][i]);
+            mBlocks[ordinal].pages[kDefaultBeamIndex][lc]
+                = page->lock(*this, kDefaultBeamIndex, ordinal, lc, /*skipWait=*/true);
+            if (mPendingStats.recordAllocationRange(lc, ordinal, ordinal + 1,
+                    /*beamWidth=*/1, /*countAsMissed=*/true, /*countAsGeneration=*/false, _shouldRecordManagerStats(),
+                    _shouldRecordRequestStats()))
+            {
+                mManager->markStatsDirty(id);
+            }
+        }
+    }
 
     // Deferred copy: for partial blocks and SSM, copy from now-locked source pages
     // to pre-allocated GPU slots, then unlock sources and replace with new pages.
@@ -637,6 +861,19 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
             mBlocks[lastOrdinal].treeBlock = nullptr;
     }
 
+    if (mNeverResumed && _shouldRecordStats())
+    {
+        for (auto const& [lc, byLevel] : optionalReusedByLevel)
+        {
+            int const reused = static_cast<int>(countsByLevelTotal(byLevel.full));
+            if (mPendingStats.recordReuse(
+                    lc, reused, 0, byLevel, _shouldRecordManagerStats(), _shouldRecordRequestStats()))
+            {
+                mManager->markStatsDirty(id);
+            }
+        }
+    }
+    mOptionalCandidates.clear();
     // Deferred copies survive a failed decode admission and must not be repeated on retry.
     mNeverResumed = false;
     if (mIsDecoding)
@@ -719,6 +956,7 @@ void KvCache::suspend()
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
+    mOptionalCandidates.clear();
     TLLM_CHECK_DEBUG(_checkSanity());
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
@@ -776,6 +1014,7 @@ void KvCache::close()
     if (mStatus == Status::CLOSED)
         return;
 
+    mOptionalCandidates.clear();
     discardPendingStats();
     stopCommitting();
     TLLM_CHECK_DEBUG(_checkSanity());
@@ -1221,7 +1460,10 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
     std::vector<LifeCycleId> attachedLcs;
     for (auto const& [lcIdx, attn] : mManager->lifeCycles().attentionLifeCycles())
     {
-        (void) attn;
+        if (!attn->requiresPrefixCoverage())
+        {
+            continue;
+        }
         auto& bp = beamBlock[lcIdx];
         if (blockPageIsNull(bp) || treeBlock->pageCoverage(lcIdx) >= numTokens)
         {
@@ -1874,8 +2116,13 @@ std::vector<KvCache::StaleBackup> KvCache::_unlockStaleBlocks(int newHistoryLeng
         {
             auto& sb = mBlocks[ord];
             bool isCommitted = sb.isCommitted();
-            bool holdForCommit
-                = !mManager->commitMinSnapshot() && !isCommitted && (mCommitState == CommitState::ALLOWED);
+            // A partial tail can expire pages still needed at the preceding
+            // aligned checkpoint. Keep its entire live window until publication.
+            int const alignedEnd = newHistoryLength / mTokensPerBlock * mTokensPerBlock;
+            bool const keepAlignedCheckpoint = alc.allowsCheckpoint()
+                && ord < BlockOrdinal{alignedEnd / mTokensPerBlock} && !_getStaleRange(alignedEnd, lc).contains(ord);
+            bool holdForCommit = !alc.isPrivate() && (!mManager->commitMinSnapshot() || keepAlignedCheckpoint)
+                && !isCommitted && (mCommitState == CommitState::ALLOWED);
 
             for (BeamIndex bi{0}; bi < sb.pages.size(); ++bi)
             {
@@ -1923,8 +2170,10 @@ TypedVec<LifeCycleId, KvCache::TakenPage> KvCache::_takeUncommittedPage(
     TypedVec<LifeCycleId, TakenPage> result(numLc, TakenPage{nullptr, false});
     for (LifeCycleId lc{0}; lc < numLc; ++lc)
     {
-        if (skipLc.has_value() && lc == *skipLc)
+        if ((skipLc.has_value() && lc == *skipLc) || isPrivateLifeCycle(mManager->lifeCycles()[lc]))
+        {
             continue;
+        }
         auto& bp = sb.pages[beamIdx][lc];
         if (auto* lock = std::get_if<SharedPageLock>(&bp))
         {
@@ -2042,6 +2291,10 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
         {
             if (ssmLcId.has_value() && lc == *ssmLcId)
                 continue;
+            if (isPrivateLifeCycle(mManager->lifeCycles()[lc]))
+            {
+                continue;
+            }
             auto& bp = sb.pages[kDefaultBeamIndex][lc];
             if (blockPageIsNull(bp))
                 continue;
@@ -2580,6 +2833,10 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
         if (ssmLcId.has_value() && lcId == *ssmLcId)
             continue;
 
+        if (!requiresPrefixCoverage(allLc[lcId]))
+        {
+            continue;
+        }
         auto staleRange = getStaleRange(allLc[lcId], numTokens, mTokensPerBlock);
         BlockOrdinal staleStart = staleRange.beg;
         BlockOrdinal staleEnd = staleRange.end;
@@ -2746,8 +3003,19 @@ SharedPtr<Block> const& KvCache::_getTreeBlock(BlockOrdinal ordinal) const
                 auto page = blockPageGetPage(beamBlock[lcId]);
                 // committed->block may differ from `ret`: a page can be moved to a longer
                 // sibling block, or replaced there by one with larger token coverage.
-                auto committed = dynamicPointerCast<CommittedPage>(page);
-                TLLM_CHECK(committed);
+                auto const* attention = std::get_if<AttnLifeCycle>(&mManager->lifeCycles()[lcId]);
+                if (attention && attention->allowsCheckpoint())
+                {
+                    TLLM_CHECK(dynamicPointerCast<UncommittedPage>(page) || dynamicPointerCast<CommittedPage>(page));
+                }
+                else if (!requiresPrefixCoverage(mManager->lifeCycles()[lcId]))
+                {
+                    TLLM_CHECK(dynamicPointerCast<UncommittedPage>(page));
+                }
+                else
+                {
+                    TLLM_CHECK(dynamicPointerCast<CommittedPage>(page));
+                }
             }
         }
     }
@@ -2804,6 +3072,12 @@ bool KvCache::_checkSanity() const
 
                 auto const& staleRange = staleRanges[lc];
                 auto const& scratchRange = scratchRangesVec[lc];
+                bool const isPrivate = !requiresPrefixCoverage(lcs[lc]);
+                if (_needsFreshPrefixPages(lc) && mNeverResumed)
+                {
+                    TLLM_CHECK_DEBUG(blockPageIsNull(bp));
+                    continue;
+                }
 
                 if (scratchRange.contains(ordinal))
                 {
@@ -2812,7 +3086,7 @@ bool KvCache::_checkSanity() const
                 }
                 else if (staleRange.beg <= ordinal && ordinal < staleRange.end)
                 {
-                    if (isCommitted || mCommitState != CommitState::ALLOWED)
+                    if (isPrivateLifeCycle(lcs[lc]) || isCommitted || mCommitState != CommitState::ALLOWED)
                     {
                         TLLM_CHECK_DEBUG(blockPageIsNull(bp));
                     }
@@ -2841,7 +3115,17 @@ bool KvCache::_checkSanity() const
                 if (!blockPageIsNull(bp))
                 {
                     auto page = blockPageGetPage(bp);
-                    TLLM_CHECK_DEBUG(isCommitted == (dynamicPointerCast<CommittedPage>(page) != nullptr));
+                    auto const* attention = std::get_if<AttnLifeCycle>(&lcs[lc]);
+                    auto committed = dynamicPointerCast<CommittedPage>(page);
+                    if (attention && attention->allowsCheckpoint() && committed)
+                    {
+                        TLLM_CHECK_DEBUG(isCommitted && committed->numTokensInBlock > 0
+                            && committed->numTokensInBlock <= mTokensPerBlock);
+                    }
+                    else
+                    {
+                        TLLM_CHECK_DEBUG((isCommitted && !isPrivate) == (committed != nullptr));
+                    }
                 }
             }
         }

@@ -220,6 +220,10 @@ class OpenAIDisaggregatedService(OpenAIService):
             return ctx_response
 
     def _need_gen(self, response: UCompletionResponse) -> bool:
+        if response:
+            params = response.choices[0].disaggregated_params
+            if params is not None and params.remote_tail_start is not None:
+                return True
         if response and response.choices[0].finish_reason not in _GEN_PENDING_FINISH_REASONS:
             del response.choices[0].disaggregated_params
             return False
@@ -323,8 +327,14 @@ class OpenAIDisaggregatedService(OpenAIService):
             gen_server, info = await self._gen_router.get_next_server(request, req_id=req_id)
             match_length = info["match_length"]
             total_length = info["num_tokens"]
+            # V4.1 remote-tail deployments can safely prefill a short cold
+            # request entirely on generation. Preserve the existing cold-miss
+            # policy for every other deployment.
+            cold_miss_requires_context = (
+                match_length == 0 and not self._config.bounded_replay_on_generation
+            )
             need_ctx_decision = (
-                match_length == 0
+                cold_miss_requires_context
                 or total_length - match_length
                 > self.conditional_disagg_config.max_local_prefill_length
             )
@@ -393,7 +403,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                 # sets up the KV-cache handoff, so ctx_request_id/disagg_request_id
                 # stay None. Only enforce them when a GEN handoff is still pending --
                 # mirroring _need_gen, which skips the handoff for these responses.
-                if choice.finish_reason in _GEN_PENDING_FINISH_REASONS:
+                remote_tail = choice.disaggregated_params.remote_tail_start is not None
+                if choice.finish_reason in _GEN_PENDING_FINISH_REASONS or remote_tail:
                     if choice.disaggregated_params.ctx_request_id is None:
                         raise ValueError(
                             f"Invalid disaggregated params: ctx_request_id is None for choice {idx}."
@@ -465,6 +476,18 @@ class OpenAIDisaggregatedService(OpenAIService):
 
             consume_task: asyncio.Task = asyncio.create_task(_consume_gen())
 
+            async def _close_gen_response() -> None:
+                if not consume_task.done():
+                    consume_task.cancel()
+                try:
+                    await consume_task
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    # Cancellation can occur before _consume_gen ever starts,
+                    # so waiting for its task does not necessarily close GEN.
+                    await gen_response.aclose()
+
             # Now send ctx request — gen server has received its request
             try:
                 await self._ctx_client.send_request(
@@ -473,16 +496,14 @@ class OpenAIDisaggregatedService(OpenAIService):
                     hooks=hooks,
                     req_id=disagg_request_id,
                 )
-            except Exception:
-                consume_task.cancel()
-                try:
-                    await consume_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            except (Exception, asyncio.CancelledError):
+                await _close_gen_response()
                 raise
 
             async def _yield_from_queue():
                 try:
+                    # Prime the cleanup scope before giving ownership to callers.
+                    yield None
                     while True:
                         item = await queue.get()
                         if item is None:
@@ -491,14 +512,11 @@ class OpenAIDisaggregatedService(OpenAIService):
                             raise item
                         yield item
                 finally:
-                    if not consume_task.done():
-                        consume_task.cancel()
-                    try:
-                        await consume_task
-                    except asyncio.CancelledError:
-                        pass
+                    await _close_gen_response()
 
-            return _yield_from_queue()
+            response = _yield_from_queue()
+            await response.__anext__()
+            return response
         else:
             # Non-streaming or no ctx needed: both HTTP POSTs fire eagerly
             # through generator consumption, so asyncio.gather works fine.

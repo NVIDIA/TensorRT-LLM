@@ -1,6 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import struct
 import types
+from copy import deepcopy
+from pathlib import Path
 
 import pytest
 import torch
@@ -231,6 +236,69 @@ def test_deepseek_v4_base_checkpoint_detection(
 
     assert ModelConfig._detect_deepseek_v4_routed_moe_layout(str(tmp_path)) == expected_layout
     assert ModelConfig._is_deepseek_v4_base_checkpoint(str(tmp_path)) is expected_is_base
+
+
+@pytest.mark.parametrize("sidecar", [True, False], ids=["modelopt-file", "modelopt-inline"])
+def test_deepseek_v41_nvfp4_checkpoint_quantization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sidecar: bool
+) -> None:
+    """Resolve dense FP8 separately from the checkpoint's NVFP4 expert policy."""
+    from tensorrt_llm._torch import model_config as model_config_module
+    from tensorrt_llm._torch.configs.deepseek_v41 import DeepseekV41Config
+
+    quantization = {
+        "quant_algo": "MIXED_PRECISION",
+        "group_size": 16,
+        "kv_cache_quant_algo": "FP8",
+        "exclude_modules": ["*.attn.*", "*.ffn.shared_experts.*", "head", "mtp.*"],
+        "quantized_layers": {
+            "layers.0.ffn.experts": {"quant_algo": "NVFP4", "group_size": 16},
+            "model.layers.0.self_attn.o_proj": {
+                "quant_algo": "FP8_BLOCK_SCALES",
+                "group_size": 128,
+            },
+        },
+    }
+    inline = {
+        **deepcopy(quantization),
+        "producer": {"name": "modelopt"},
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [32, 32],
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4",
+        "modules_to_not_convert": ["*engram*"],
+    }
+    pretrained = DeepseekV41Config(
+        architectures=["DeepseekV41ForCausalLM"], quantization_config=deepcopy(inline)
+    )
+    monkeypatch.setattr(
+        model_config_module, "load_pretrained_config", lambda *args, **kwargs: pretrained
+    )
+    _write_safetensors_header(tmp_path, "U8", [2304, 2560])
+    if sidecar:
+        # The file's explicit null must win over the inline KV policy.
+        quantization["kv_cache_quant_algo"] = None
+        (tmp_path / "hf_quant_config.json").write_text(
+            json.dumps({"producer": inline["producer"], "quantization": quantization})
+        )
+
+    model_config = ModelConfig.from_pretrained(str(tmp_path), moe_backend="CUTLASS")
+    dense = model_config.quant_config
+    assert dense.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert dense.group_size == 128
+    assert dense.kv_cache_quant_algo == (None if sidecar else QuantAlgo.FP8)
+    assert dense.is_module_excluded_from_quantization("model.layers.1.engram.kv_proj")
+    assert not dense.is_module_excluded_from_quantization("model.layers.0.mlp.shared_experts")
+    for layer in range(pretrained.num_hidden_layers):
+        expert = model_config.quant_config_dict[f"model.layers.{layer}.mlp.experts"]
+        assert expert.quant_algo == QuantAlgo.NVFP4
+        assert expert.group_size == 16
+    explicit = model_config.quant_config_dict["model.layers.0.self_attn.o_proj"]
+    assert explicit.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert explicit.group_size == 128
+    assert explicit.kv_cache_quant_algo == dense.kv_cache_quant_algo
+    assert pretrained.quantization_config == inline
 
 
 def test_deepseek_v4_missing_compress_ratios_raises(tmp_path, monkeypatch):

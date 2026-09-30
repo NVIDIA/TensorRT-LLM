@@ -334,6 +334,37 @@ generation_servers:
 A fleet worker fails fast if its coordinator is unreachable: on startup it probes the coordinator's `/cluster_info` with bounded retry (up to `--server_start_timeout` seconds) and exits with an error rather than coming up and returning `Cluster is not ready` for every request.
 ```
 
+### DeepSeek-V4.1 context decoder weights
+
+Set `bounded_replay_on_generation: true` at the top level of the
+disaggregated serving YAML. The orchestrator passes it to both workers;
+`trtllm-serve serve ... --server_role context` then omits decoder weights on the
+context worker. The flag defaults to `false` and does not require conditional
+disaggregation. Python API deployments must set `TRTLLM_DISAGG_ROLE=context`
+before creating the model. Generation workers retain the complete model.
+
+The context worker keeps the encoder prefix and the boundary layer's GLOBAL
+KV/index projections. It skips the boundary query/output/MoE weights, subsequent
+decoder layers, final normalization and language-model head. Pruning happens
+before GPU weight materialization; the standard HF loader reads only retained
+checkpoint tensors. Logical layer numbering remains unchanged. The context
+cache allocator also omits the decoder's unused SWA buffers, while retaining
+encoder SWA and all GLOBAL KV, index and compressor-state buffers. The
+generation worker retains its complete cache layout; transfer matches the
+retained buffers by their model-layer identities.
+For prompts shorter than the replay window, generation replays the entire prompt.
+
+Both runtime capacity accounting and the static cache estimator use the same
+validated boundary as the model. Weight savings already enter the KV budget
+through measured post-load memory usage and are not added a second time.
+
+This experimental path uses the same approximate bounded-replay semantics as
+remote-tail replay. It requires text-only context requests, a KV transceiver,
+beam width one, block reuse disabled, and non-pipelined transfer. Context logits
+and speculative decoding on the context worker are unsupported. Saved weight
+memory is available to KV cache or larger batches/token budgets, subject to the
+remaining runtime memory requirements.
+
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.

@@ -655,6 +655,7 @@ def test_terminate_request_releases_multimodal_cache_references_idempotently():
     executor.enable_attention_dp = False
     executor.global_rank = 0
     executor.model_engine = SimpleNamespace(mm_encoder_cache=cache)
+    executor.draft_model_engine = None
     executor.resource_manager = SimpleNamespace(free_resources=freed.append)
     executor._prefetched_request_ids = {request.py_request_id}
     executor._disagg_coordinator = Mock()

@@ -100,15 +100,24 @@ def _reference_q_norm_fused_fp8(
     nope_dim: int,
     eps: float,
     quant_scale_qkv: float,
+    apply_norm: bool = True,
 ):
     """Reference: per-row RMSNorm in fp32; split last column-axis into nope/rope;
     nope path multiplied by quant_scale_qkv then cast to fp8_e4m3; rope path cast
     back to input dtype.
+
+    `apply_norm=False` is the norm-less model (V4.1 deleted V4's per-head query
+    norm). The norm carries no learned weight -- it is one per-row scalar -- so
+    skipping it is exactly an inverse-RMS of 1, and the rest of the fold is
+    unchanged.
     """
     num_tokens = q.shape[0]
     rope_dim = head_dim - nope_dim
     q_view = q.view(num_tokens * num_heads, head_dim).float()
-    inv_rms = torch.rsqrt(q_view.pow(2).mean(dim=-1, keepdim=True) + eps)
+    if apply_norm:
+        inv_rms = torch.rsqrt(q_view.pow(2).mean(dim=-1, keepdim=True) + eps)
+    else:
+        inv_rms = 1.0
     normalized = q_view * inv_rms
 
     nope_fp32 = normalized[:, :nope_dim] * quant_scale_qkv
@@ -117,6 +126,30 @@ def _reference_q_norm_fused_fp8(
     quant_q_nope = nope_fp32.to(torch.float8_e4m3fn).view(num_tokens, num_heads * nope_dim)
     q_pe = rope_fp32.to(q.dtype).view(num_tokens, num_heads * rope_dim)
     return quant_q_nope, q_pe
+
+
+def _count_fp8_mismatches(quant_q_nope: torch.Tensor, ref_quant_q_nope: torch.Tensor) -> int:
+    """Mismatching FP8 codes, after allowing each one 1 ULP.
+
+    FP8 nope is bit-identical to torch's reference except at FP8 grid midpoints
+    where the kernel's PTX cvt (round-to-nearest-even) and torch's
+    round-half-away-from-zero disagree by exactly 1 ULP. Anything beyond that is
+    a real per-row bug and fails here; the caller caps how many 1-ULP
+    disagreements it will tolerate.
+    """
+    quant_q_nope_f32 = quant_q_nope.to(torch.float32)
+    ref_quant_q_nope_f32 = ref_quant_q_nope.to(torch.float32)
+    diff = quant_q_nope_f32 - ref_quant_q_nope_f32
+    n_mismatched = int((diff != 0.0).sum().item())
+    if n_mismatched > 0:
+        ref_abs = ref_quant_q_nope_f32.abs().clamp(min=2**-6)
+        krn_abs = quant_q_nope_f32.abs().clamp(min=2**-6)
+        step = torch.maximum(ref_abs, krn_abs).log2().floor().exp2() * (2**-3)
+        n_beyond_1ulp = int((diff.abs() > step * 1.001).sum().item())
+        assert n_beyond_1ulp == 0, (
+            f"FP8 nope: {n_beyond_1ulp}/{n_mismatched} mismatches exceed 1 FP8 ULP"
+        )
+    return n_mismatched
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 129])
@@ -166,24 +199,55 @@ def test_deepseek_v4_q_norm_fused_fp8_matches_reference(
     rtol_pe = 8e-3 if dtype == torch.bfloat16 else 5e-3
     torch.testing.assert_close(q_pe, ref_q_pe, atol=atol_pe, rtol=rtol_pe)
 
-    # FP8 nope is bit-identical to torch's reference except at FP8 grid
-    # midpoints where the kernel's PTX cvt (round-to-nearest-even) and torch's
-    # round-half-away-from-zero disagree by exactly 1 ULP. Allow up to 1 ULP
-    # per element, with a hard cap so a real per-row bug still fires.
-    quant_q_nope_f32 = quant_q_nope.to(torch.float32)
-    ref_quant_q_nope_f32 = ref_quant_q_nope.to(torch.float32)
-    diff = quant_q_nope_f32 - ref_quant_q_nope_f32
-    n_mismatched = int((diff != 0.0).sum().item())
-    if n_mismatched > 0:
-        ref_abs = ref_quant_q_nope_f32.abs().clamp(min=2**-6)
-        krn_abs = quant_q_nope_f32.abs().clamp(min=2**-6)
-        step = torch.maximum(ref_abs, krn_abs).log2().floor().exp2() * (2**-3)
-        n_beyond_1ulp = int((diff.abs() > step * 1.001).sum().item())
-        assert n_beyond_1ulp == 0, (
-            f"FP8 nope: {n_beyond_1ulp}/{n_mismatched} mismatches exceed 1 FP8 ULP"
-        )
+    n_mismatched = _count_fp8_mismatches(quant_q_nope, ref_quant_q_nope)
     assert n_mismatched <= 16, (
         f"FP8 nope: {n_mismatched} mismatched elements exceeds 16-element cap"
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 129])
+@pytest.mark.parametrize("num_heads", [1, 16, 128])
+def test_deepseek_v4_q_norm_fused_fp8_without_the_norm(num_tokens, num_heads):
+    """`apply_norm=False` gives V4.1 the fold without V4's per-head query norm.
+
+    Both directions are checked. Matching the un-normalized reference says the
+    identity scale is applied everywhere the norming one was; *not* matching the
+    normalized reference says the flag reached the kernel at all, which a
+    default-valued trailing argument makes easy to get silently wrong.
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    head_dim, nope_dim, eps = 512, 448, 1e-6
+    rope_dim = head_dim - nope_dim
+    q = torch.randn(num_tokens, num_heads * head_dim, dtype=torch.bfloat16, device=device)
+    scale_tensor = torch.tensor([0.5], dtype=torch.float32, device=device)
+
+    quant_q_nope = q.new_empty((num_tokens, num_heads * nope_dim), dtype=torch.float8_e4m3fn)
+    q_pe = q.new_empty((num_tokens, num_heads * rope_dim))
+    torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
+        q.contiguous(),
+        quant_q_nope,
+        q_pe,
+        num_heads,
+        head_dim,
+        nope_dim,
+        eps,
+        scale_tensor,
+        apply_norm=False,
+    )
+
+    ref_nope, ref_pe = _reference_q_norm_fused_fp8(
+        q, num_heads, head_dim, nope_dim, eps, 0.5, apply_norm=False
+    )
+    torch.testing.assert_close(q_pe, ref_pe, atol=3.2e-2, rtol=8e-3)
+    n_mismatched = _count_fp8_mismatches(quant_q_nope, ref_nope)
+    assert n_mismatched <= 16, (
+        f"FP8 nope: {n_mismatched} mismatched elements exceeds 16-element cap"
+    )
+
+    normed_nope, _ = _reference_q_norm_fused_fp8(q, num_heads, head_dim, nope_dim, eps, 0.5)
+    assert not torch.equal(quant_q_nope.to(torch.float32), normed_nope.to(torch.float32)), (
+        "apply_norm=False produced the normalized result -- the flag is inert"
     )
 
 

@@ -1751,6 +1751,8 @@ class Sender(SenderBase):
         # Send ownership is per pool: replicated pools elect one fan-in
         # owner, sharded pools keep head-duplication routing.
         for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
+            if (self_lg, self_pi) in task._chunk.excluded_pool_views:
+                continue
             if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
                 continue
 
