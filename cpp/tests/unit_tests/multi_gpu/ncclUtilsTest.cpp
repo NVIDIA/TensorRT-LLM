@@ -655,6 +655,56 @@ TEST_F(NCCLWindowAllocatorTest, FailureCacheDoesNotDisableReusableBuffers)
     testComm.reset();
 }
 
+TEST_F(NCCLWindowAllocatorTest, FailureCachePreservesCaptureFallbackAndReuse)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto testComm = createSplitComm(*mComm, 0, mRank);
+    constexpr size_t kBufferSize = 512 * 1024;
+    constexpr int64_t kOwner = 404;
+    auto const captureStream = at::cuda::getStreamFromPool();
+    c10::cuda::CUDAStreamGuard const streamGuard{captureStream};
+    auto const stream = captureStream.stream();
+
+    auto eagerBuffer = allocator.requestBuffer(*testComm, kBufferSize);
+    ASSERT_TRUE(eagerBuffer.isValid());
+    allocator.releaseBuffer(*testComm, eagerBuffer.ptr);
+    nccl_util::NCCLWindowAllocatorTestAccess::recordSymmetricFailure(allocator, *testComm, kBufferSize);
+    std::vector<float> values(2 * kBufferSize / sizeof(float), 1.0F);
+    float* plainBuffer = nullptr;
+    TLLM_CUDA_CHECK(cudaMalloc(&plainBuffer, 2 * kBufferSize));
+    TLLM_CUDA_CHECK(cudaMemcpyAsync(plainBuffer, values.data(), 2 * kBufferSize, cudaMemcpyHostToDevice, stream));
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    cudaGraph_t graph = nullptr;
+    allocator.setGraphPoolOwner(kOwner);
+    TLLM_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    auto reusedBuffer = allocator.requestBuffer(*testComm, kBufferSize);
+    EXPECT_EQ(reusedBuffer.ptr, eagerBuffer.ptr);
+    // Assertions remain enabled: known allocation failure must not be a lifecycle warning.
+    EXPECT_FALSE(allocator.requestBuffer(*testComm, kBufferSize).isValid());
+    allocator.releaseBuffer(*testComm, reusedBuffer.ptr);
+    auto failedBuffer = allocator.requestBuffer(*testComm, 2 * kBufferSize);
+    EXPECT_FALSE(failedBuffer.isValid());
+    TLLM_NCCL_CHECK(ncclAllReduce(plainBuffer, plainBuffer, values.size(), ncclFloat, ncclSum, *testComm, stream));
+    TLLM_CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    allocator.setGraphPoolOwner(-1);
+
+    cudaGraphExec_t executable = nullptr;
+    TLLM_CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    TLLM_CUDA_CHECK(cudaGraphLaunch(executable, stream));
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+    TLLM_CUDA_CHECK(cudaMemcpy(values.data(), plainBuffer, 2 * kBufferSize, cudaMemcpyDeviceToHost));
+    for (auto const value : values)
+    {
+        EXPECT_EQ(value, static_cast<float>(mWorldSize));
+    }
+    TLLM_CUDA_CHECK(cudaFree(plainBuffer));
+    TLLM_CUDA_CHECK(cudaGraphExecDestroy(executable));
+    TLLM_CUDA_CHECK(cudaGraphDestroy(graph));
+    allocator.releaseGraphPoolOwner(kOwner);
+    testComm.reset();
+}
+
 TEST_F(NCCLWindowAllocatorTest, FailureCacheKeepsSmallestFailureSize)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();

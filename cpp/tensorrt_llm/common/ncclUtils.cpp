@@ -572,6 +572,18 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
         return bestFit->buffer;
     }
 
+    // If a previous allocateAndRegisterBuffer call collectively failed for this comm at a size
+    // no larger than this request, do not retry the known-failing new allocation path. Smaller
+    // requests and already-pooled buffers can still use NCCL windows. During capture, this
+    // known resource failure also uses plain NCCL without reporting a lifecycle violation.
+    auto const failureIt = mMinSymmetricFailureSize.find(comm);
+    if (failureIt != mMinSymmetricFailureSize.end() && size >= failureIt->second)
+    {
+        TLLM_LOG_DEBUG("[NCCLUtil] Skipping NCCL window allocation for comm %p, size=%zu; known failure threshold=%zu",
+            static_cast<void*>(comm), size, failureIt->second);
+        return NCCLWindowBuffer();
+    }
+
     // Registration is not capture-safe. A capture without a suitable dedicated/eager buffer must
     // use the existing unregistered fallback path. Successful production capture lifecycles, window
     // requests, tensor-scope exits, and explicit graph-owner releases execute in identical SPMD order.
@@ -596,17 +608,6 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
                 "%p (requested: %zu); using an unregistered buffer.",
                 graphOwner, static_cast<void*>(comm), size);
         }
-        return NCCLWindowBuffer();
-    }
-
-    // If a previous allocateAndRegisterBuffer call collectively failed for this comm at a size
-    // no larger than this request, do not retry the known-failing new allocation path. Smaller
-    // requests and already-pooled buffers can still use NCCL windows.
-    auto const failureIt = mMinSymmetricFailureSize.find(comm);
-    if (failureIt != mMinSymmetricFailureSize.end() && size >= failureIt->second)
-    {
-        TLLM_LOG_DEBUG("[NCCLUtil] Skipping NCCL window allocation for comm %p, size=%zu; known failure threshold=%zu",
-            static_cast<void*>(comm), size, failureIt->second);
         return NCCLWindowBuffer();
     }
 
