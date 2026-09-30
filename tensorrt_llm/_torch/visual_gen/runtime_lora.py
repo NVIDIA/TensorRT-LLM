@@ -36,7 +36,6 @@ _DEFAULT_STRIP_PREFIXES = (
     "model.",
     "dit.",
 )
-_MINIMAX_H3_TURBO_LORA_NAME = "MiniMax-H3-Turbo-Lora"
 
 
 @dataclass(frozen=True)
@@ -134,7 +133,7 @@ def _prepare_runtime_lora(
     strip_prefixes = _dedupe_prefixes(
         tuple(config.strip_prefixes) + tuple(default_strip_prefixes) + _DEFAULT_STRIP_PREFIXES
     )
-    if _is_minimax_h3_turbo_lora(config.path, pairs):
+    if _is_minimax_h3_turbo_lora(modules, pairs, strip_prefixes=strip_prefixes):
         pairs = _normalize_minimax_h3_turbo_pairs(pairs)
 
     qkv_groups: Dict[str, Dict[str, _LoRAPair]] = {}
@@ -582,10 +581,23 @@ def _candidate_names(
                 yield normalized
 
 
-def _is_minimax_h3_turbo_lora(path: str, pairs: Iterable[_LoRAPair]) -> bool:
-    if _MINIMAX_H3_TURBO_LORA_NAME not in Path(path).parts:
+def _is_minimax_h3_turbo_lora(
+    modules: Dict[str, nn.Module],
+    pairs: Iterable[_LoRAPair],
+    *,
+    strip_prefixes: Tuple[str, ...],
+) -> bool:
+    if not all(
+        name in modules
+        for name in (
+            "transformer_blocks",
+            "token_refiner.refiner_blocks",
+            "norm_out.linear",
+        )
+    ):
         return False
-    names = {pair.name for pair in pairs}
+
+    names = {_strip_known_prefix(pair.name, strip_prefixes) for pair in pairs}
     return (
         "final_layer.adaln_proj.linear" in names
         and any(name.startswith("blocks.") for name in names)

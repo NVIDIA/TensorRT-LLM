@@ -246,9 +246,9 @@ def test_runtime_lora_maps_minimax_h3_turbo_names(tmp_path: Path) -> None:
             if isinstance(module, nn.Linear):
                 module.weight.zero_()
 
-    lora_dir = tmp_path / "MiniMax-H3-Turbo-Lora"
+    lora_dir = tmp_path / "renamed_adapter"
     lora_dir.mkdir()
-    lora_path = lora_dir / "minimax_h3_turbo_v4_step600_ema.safetensors"
+    lora_path = lora_dir / "adapter.safetensors"
     tensors: dict[str, torch.Tensor] = {}
     qkv_targets = ("blocks.0.attn", "token_refiner.blocks.0.attn")
     for prefix in qkv_targets:
@@ -292,32 +292,11 @@ def test_runtime_lora_maps_minimax_h3_turbo_names(tmp_path: Path) -> None:
     )
 
 
-def test_runtime_lora_does_not_map_minimax_aliases_for_non_turbo_lora(
+def test_runtime_lora_does_not_map_minimax_aliases_for_other_transformers(
     tmp_path: Path,
 ) -> None:
-    model = TinyMiniMaxH3Transformer()
-    lora_path = tmp_path / "adapter.safetensors"
-    save_file(
-        {
-            "blocks.0.mlp.fc1.lora_A.weight": torch.tensor([[1.0, 0.0]]),
-            "blocks.0.mlp.fc1.lora_B.weight": torch.ones(3, 1),
-            "token_refiner.blocks.0.mlp.fc1.lora_A.weight": torch.tensor([[1.0, 0.0]]),
-            "token_refiner.blocks.0.mlp.fc1.lora_B.weight": torch.ones(3, 1),
-            "final_layer.adaln_proj.linear.lora_A.weight": torch.tensor([[1.0, 0.0]]),
-            "final_layer.adaln_proj.linear.lora_B.weight": torch.ones(3, 1),
-        },
-        str(lora_path),
-    )
-
-    with pytest.raises(ValueError, match="Runtime LoRA skipped 3 adapter target"):
-        apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
-
-
-def test_runtime_lora_does_not_map_minimax_aliases_for_other_turbo_lora(
-    tmp_path: Path,
-) -> None:
-    model = TinyMiniMaxH3Transformer()
-    lora_dir = tmp_path / "Other-H3-Turbo-Lora"
+    model = TinyTransformer()
+    lora_dir = tmp_path / "MiniMax-H3-Turbo-Lora"
     lora_dir.mkdir()
     lora_path = lora_dir / "adapter.safetensors"
     save_file(
