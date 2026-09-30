@@ -292,7 +292,6 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
     # cleanup as well as the MPI server. Neither child can block this supervisor.
     shutdown_deadline=$((SECONDS + stop_timeout))
     stop_pid=
-    stop_exit_code=0
     if kill -0 "$server_pid" 2>/dev/null; then
         exec_without_mpi_environment python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop &
         stop_pid=$!
@@ -300,8 +299,21 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
     fi
 
     shutdown_timed_out=0
-    while kill -0 "$server_pid" 2>/dev/null || \
-        { [ -n "$stop_pid" ] && kill -0 "$stop_pid" 2>/dev/null; }; do
+    while true; do
+        if [ -n "$stop_pid" ] && ! kill -0 "$stop_pid" 2>/dev/null; then
+            wait "$stop_pid"
+            stop_exit_code=$?
+            stop_pid=
+            log_stderr "Rank${mpi_rank} stop helper exit code: $stop_exit_code"
+            # A failed helper cannot be relied on to stop the server.
+            if [ "$stop_exit_code" -ne 0 ]; then
+                [ "$task_exit_code" -ne 0 ] && exit "$task_exit_code"
+                exit "$stop_exit_code"
+            fi
+        fi
+        if ! kill -0 "$server_pid" 2>/dev/null && [ -z "$stop_pid" ]; then
+            break
+        fi
         if [ "$SECONDS" -ge "$shutdown_deadline" ]; then
             log_stderr "MPI Comm shutdown exceeded ${stop_timeout}s; terminating owned processes"
             shutdown_timed_out=1
@@ -314,18 +326,12 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         [ "$task_exit_code" -ne 0 ] && exit "$task_exit_code"
         exit 124
     fi
-    if [ -n "$stop_pid" ]; then
-        wait "$stop_pid"
-        stop_exit_code=$?
-        log_stderr "Rank${mpi_rank} stop helper exit code: $stop_exit_code"
-    fi
     wait "$server_pid"
     server_exit_code=$?
     log_stderr "Rank${mpi_rank} MPI Comm server exit code: $server_exit_code"
 
     # Preserve the original task failure; otherwise surface teardown failures.
     [ "$task_exit_code" -ne 0 ] && exit "$task_exit_code"
-    [ "$stop_exit_code" -ne 0 ] && exit "$stop_exit_code"
     exit "$server_exit_code"
 
 else
