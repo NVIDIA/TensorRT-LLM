@@ -250,6 +250,14 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 f"covering {sum(end - start for start, end in ranges) / _GIB:.1f} GiB, "
                 f"pool mapping boundary {boundary if boundary else 'unknown'}"
             )
+            if boundary and not all(addressing.mapping_origins):
+                logger.warning(
+                    f"mooncake-store rank {self._rank} could not read the base of "
+                    "every KV pool reservation from the driver, so the mapping "
+                    "boundaries of those pools are taken to be the multiples of "
+                    f"{boundary}. A pool whose reservation is not aligned to that "
+                    "will fail registration below."
+                )
             # One line per range, so only on request.
             if os.getenv(REGISTRATION_DEBUG_ENV):
                 logger.info(format_diagnosis(ranges, self._rank, boundary))

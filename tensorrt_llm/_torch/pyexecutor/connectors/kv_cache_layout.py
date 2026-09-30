@@ -138,11 +138,13 @@ class KvCacheLayout:
     #:
     #: V2 builds each GPU pool by reserving a virtual span and mapping one
     #: `cuMemCreate` handle per `pool_size_granularity` bytes into it. The
-    #: mappings tile from the reservation base, so the boundaries are the
-    #: multiples of this value. A connector passing these addresses to an RDMA
-    #: NIC must keep every registration and every transfer buffer inside a
-    #: single mapping, because a dma-buf memory region cannot span two.
-    #: Connectors that only read the buffers from the device can ignore it.
+    #: mappings tile from the reservation base, so a boundary falls every
+    #: `pool_size_granularity` bytes counted from that base -- not at every
+    #: multiple of it, since the reservation is made with the driver's default
+    #: alignment. A connector passing these addresses to an RDMA NIC must keep
+    #: every registration and every transfer buffer inside a single mapping,
+    #: because a dma-buf memory region cannot span two. Connectors that only
+    #: read the buffers from the device can ignore it.
     gpu_pool_mapping_bytes: Optional[int] = None
 
     def group(self, layer_group_id: int) -> KvCacheLayerGroupLayout:

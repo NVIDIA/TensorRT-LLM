@@ -40,11 +40,13 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     KvCacheRegion,
     _gpu_pool_mapping_bytes,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import addressing as addressing_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import gpudirect as gpudirect_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import worker as worker_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import (
     PageAddressing,
+    mapping_origin,
     merge_intervals,
     split_at_boundaries,
 )
@@ -56,6 +58,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.gpudirect import (
     RangeFacts,
     describe_range,
     format_diagnosis,
+    reservation_start,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
     BlockHashChain,
@@ -173,6 +176,9 @@ MAPPING_BYTES = 256
 REGION_BASE = 0x1000
 REGION_SIZE = 300
 REGION_SLOTS = 4
+#: A reservation base that is not a multiple of the mapping size, which is what
+#: `cuMemAddressReserve` may return and what the multiples would get wrong.
+UNALIGNED_ORIGIN = REGION_BASE - MAPPING_BYTES // 4
 
 
 def make_mapped_layout(*, mapping_bytes=MAPPING_BYTES):
@@ -197,6 +203,28 @@ def make_mapped_layout(*, mapping_bytes=MAPPING_BYTES):
         ),
         gpu_pool_mapping_bytes=mapping_bytes,
     )
+
+
+@pytest.fixture(autouse=True)
+def unknown_reservation_base(monkeypatch):
+    """None of these fake addresses is in a reservation, so skip the driver.
+
+    Keeps the cuts the same whether or not the host running the tests has a
+    usable CUDA driver. Tests that care where a pool's mappings begin install a
+    base of their own with `reservation_base`.
+    """
+    monkeypatch.setattr(addressing_module, "reservation_start", lambda _address: None)
+
+
+@pytest.fixture
+def reservation_base(monkeypatch):
+    """Report a chosen reservation base for every address, as the driver would."""
+
+    def install(base):
+        monkeypatch.setattr(addressing_module, "reservation_start", lambda _address: base)
+        return base
+
+    return install
 
 
 @pytest.fixture
@@ -435,6 +463,38 @@ def test_split_at_boundaries_passes_an_empty_range_through():
     assert split_at_boundaries(REGION_BASE, 0, MAPPING_BYTES) == [(REGION_BASE, 0)]
 
 
+@pytest.mark.parametrize(
+    "start,size",
+    [
+        (UNALIGNED_ORIGIN, MAPPING_BYTES),  # the first whole mapping
+        (UNALIGNED_ORIGIN, 3 * MAPPING_BYTES + 7),  # ragged tail
+        (REGION_BASE, REGION_SIZE),  # starts mid-mapping
+        (REGION_BASE, 8),  # well inside one mapping
+    ],
+    ids=["one_mapping", "ragged_tail", "region", "interior"],
+)
+def test_split_at_boundaries_counts_from_the_origin(start, size):
+    """An unaligned reservation is what the multiples of the size would miss."""
+    pieces = split_at_boundaries(start, size, MAPPING_BYTES, UNALIGNED_ORIGIN)
+
+    assert sum(piece_size for _, piece_size in pieces) == size
+    address = start
+    for piece_address, piece_size in pieces:
+        assert piece_address == address
+        address += piece_size
+        offset = piece_address - UNALIGNED_ORIGIN
+        assert offset % MAPPING_BYTES + piece_size <= MAPPING_BYTES
+
+
+def test_split_at_boundaries_on_an_unaligned_origin_cuts_elsewhere():
+    """Otherwise there would be nothing to tell the two apart."""
+    pieces = split_at_boundaries(REGION_BASE, REGION_SIZE, MAPPING_BYTES, UNALIGNED_ORIGIN)
+
+    assert pieces != split_at_boundaries(REGION_BASE, REGION_SIZE, MAPPING_BYTES)
+    first = MAPPING_BYTES - (REGION_BASE - UNALIGNED_ORIGIN)
+    assert pieces == [(REGION_BASE, first), (REGION_BASE + first, REGION_SIZE - first)]
+
+
 def test_page_addressing_splits_a_page_that_crosses_a_mapping_boundary():
     addressing = PageAddressing(make_mapped_layout())
     assert addressing.mapping_bytes == MAPPING_BYTES
@@ -461,6 +521,53 @@ def test_page_addressing_registration_stays_inside_one_mapping():
         previous_end = end
         assert start % MAPPING_BYTES + (end - start) <= MAPPING_BYTES
     assert previous_end == span_end
+
+
+def test_page_addressing_cuts_where_the_pool_reservation_puts_the_boundaries(reservation_base):
+    """A pool's mappings tile from its reservation base, wherever that lands."""
+    origin = reservation_base(UNALIGNED_ORIGIN)
+    addressing = PageAddressing(make_mapped_layout())
+    assert addressing.mapping_origins == (origin,)
+
+    first = MAPPING_BYTES - (REGION_BASE - origin) % MAPPING_BYTES
+    addresses, sizes = addressing.buffers(0, 0)
+    assert list(zip(addresses, sizes)) == [
+        (REGION_BASE, first),
+        (REGION_BASE + first, REGION_SIZE - first),
+    ]
+    assert sum(sizes) == addressing.bytes_per_page(0)
+
+
+def test_page_addressing_registers_inside_the_mappings_of_an_unaligned_pool(reservation_base):
+    origin = reservation_base(UNALIGNED_ORIGIN)
+    ranges = PageAddressing(make_mapped_layout()).registration_ranges()
+    span_end = REGION_BASE + REGION_SIZE * REGION_SLOTS
+
+    assert sum(end - start for start, end in ranges) == span_end - REGION_BASE
+    previous_end = REGION_BASE
+    for start, end in ranges:
+        assert start == previous_end
+        previous_end = end
+        assert (start - origin) % MAPPING_BYTES + (end - start) <= MAPPING_BYTES
+    assert previous_end == span_end
+
+
+def test_page_addressing_assumes_the_multiples_when_the_reservation_is_unknown():
+    """The behavior before the pools were split at all, and the worker warns."""
+    addressing = PageAddressing(make_mapped_layout())
+    assert addressing.mapping_origins == (0,)
+    assert addressing.buffers(0, 0) == (
+        [REGION_BASE, REGION_BASE + MAPPING_BYTES],
+        [MAPPING_BYTES, REGION_SIZE - MAPPING_BYTES],
+    )
+
+
+def test_mapping_origin_leaves_the_driver_alone_without_a_boundary(monkeypatch):
+    """Nothing to count from is needed when nothing is being cut."""
+    monkeypatch.setattr(
+        addressing_module, "reservation_start", lambda _address: pytest.fail("driver consulted")
+    )
+    assert mapping_origin(REGION_BASE, None) == 0
 
 
 def test_page_addressing_leaves_everything_whole_when_the_mapping_size_is_unknown():
@@ -565,6 +672,11 @@ def test_range_facts_will_not_judge_without_the_granularity_and_the_base(
 ):
     facts = RangeFacts(address=_RESERVATION, length=64, range_start=range_start)
     assert facts.fits_one_mapping(mapping_bytes) is None
+
+
+def test_reservation_start_answers_nothing_for_an_address_the_driver_disowns():
+    """Callers get the documented fallback rather than an exception."""
+    assert reservation_start(_RESERVATION) is None
 
 
 def test_describe_range_reports_a_failure_instead_of_raising():
@@ -815,6 +927,29 @@ def test_worker_registers_each_pool_mapping_separately(store_config, fake_store)
         for address, size in fake_store.registered:
             assert address % MAPPING_BYTES + size <= MAPPING_BYTES
         assert sum(size for _, size in fake_store.registered) == REGION_SIZE * REGION_SLOTS
+
+
+def test_worker_registers_each_mapping_of_an_unaligned_pool(
+    store_config, fake_store, reservation_base
+):
+    origin = reservation_base(UNALIGNED_ORIGIN)
+    with make_worker(fake_store, layout=make_mapped_layout()) as worker:
+        assert worker.is_registered
+        for address, size in fake_store.registered:
+            assert (address - origin) % MAPPING_BYTES + size <= MAPPING_BYTES
+        assert sum(size for _, size in fake_store.registered) == REGION_SIZE * REGION_SLOTS
+
+
+def test_worker_says_when_it_is_assuming_where_the_mappings_begin(
+    store_config, fake_store, monkeypatch
+):
+    """Silence would leave a misplaced cut looking like a Mooncake failure."""
+    messages = []
+    monkeypatch.setattr(worker_module.logger, "warning", messages.append)
+
+    with make_worker(fake_store, layout=make_mapped_layout()):
+        pass
+    assert any("could not read the base" in message for message in messages)
 
 
 def test_worker_reports_the_driver_facts_only_on_request(store_config, fake_store, monkeypatch):
