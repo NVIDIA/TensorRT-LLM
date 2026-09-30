@@ -70,7 +70,7 @@ def test_both_gpu_markers_are_credited(selection):
     """Both GPU markers are read, and equal bounds credit both.
 
     The shape at `tests/integration/defs/examples/test_deepseek_v4_pro.py:138,140`.
-    Ranks are measured one per GPU; see `ref/mpi-world-size.md`.
+    Ranks are measured one per GPU.
     """
     run = selection.run(
         BothGpuMarkers.MODULE,
