@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from enum import Enum
 from typing import Optional, Tuple
 
@@ -37,7 +51,14 @@ def apply_rotary_emb(
 
 
 class Attention(nn.Module):
-    """Attention module for visual generation models."""
+    """Attention module for visual generation models.
+
+    With ``tp_size > 1`` the output projection ``to_out`` is row-parallel and
+    all-reduces its output. Built with ``reduce_output=False`` it returns this rank's
+    K-partial sums instead (bias on tp_rank 0 only) and the caller owns the reduction,
+    e.g. ``TPSequenceParallel.row_linear``; ``split_qkv()`` / ``attend()`` then let the
+    caller run the projections itself.
+    """
 
     def __init__(
         self,
@@ -58,6 +79,7 @@ class Attention(nn.Module):
         enable_sequence_parallel: bool = True,
         async_ulysses: bool = False,
         separate_qkv_is_self_attention: bool = False,
+        reduce_output: bool = True,
     ):
         super().__init__()
 
@@ -202,7 +224,7 @@ class Attention(nn.Module):
                     skip_create_weights_in_init=self.skip_create_weights_in_init,
                     force_dynamic_quantization=self.force_dynamic_quantization,
                     tensor_parallel_mode=TensorParallelMode.ROW if self.tp_size > 1 else None,
-                    reduce_output=(self.tp_size > 1),
+                    reduce_output=(self.tp_size > 1 and reduce_output),
                     allreduce_strategy=self.allreduce_strategy,
                     override_tp_sharding=(self.local_q_dim_start, self.local_q_dim_end),
                 )
@@ -401,8 +423,7 @@ class Attention(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.qkv_mode == QKVMode.FUSE_QKV:
-            qkv = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
+            q, k, v = self.split_qkv(self.qkv_proj(hidden_states))
         else:
             kv_source = (
                 encoder_hidden_states if encoder_hidden_states is not None else hidden_states
@@ -411,6 +432,10 @@ class Attention(nn.Module):
             k = self.to_k(kv_source)
             v = self.to_v(kv_source)
         return q, k, v
+
+    def split_qkv(self, qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split a fused (FUSE_QKV) projection output [..., q + 2 * kv] into this rank's q, k, v."""
+        return qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.qk_norm:
@@ -606,10 +631,6 @@ class Attention(nn.Module):
         # fused norm+quant kernel; downstream Linear accepts either.
         if not isinstance(hidden_states, Fp4QuantizedTensor):
             assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
-        batch_size, seq_len = hidden_states.shape[:2]
-        kv_seq_len = (
-            encoder_hidden_states.shape[1] if encoder_hidden_states is not None else seq_len
-        )
 
         # Fused path: QKV projection → fused QK norm + RoPE → attention
         if (
@@ -621,16 +642,37 @@ class Attention(nn.Module):
             qkv = self.qkv_proj(hidden_states)
             freqs_cos, freqs_sin = freqs
             self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
-            q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
+            q, k, v = self.split_qkv(qkv)
             out = self._attn_impl(q, k, v, timestep=timestep, **kwargs)
             return self.to_out[0](out)
 
-        # Unfused path: separate QK norm → separate RoPE → attention
+        # Unfused path: projections, then separate QK norm → separate RoPE → attention
         q, k, v = self.get_qkv(hidden_states, encoder_hidden_states)
+        return self.to_out[0](self.attend(q, k, v, freqs=freqs, timestep=timestep, **kwargs))
+
+    def attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        timestep: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """QK-norm → RoPE (when ``freqs`` is given) → attention on projected q/k/v.
+
+        q/k/v are this rank's [B, S, H_local * head_dim] / [B, S_kv, KV_local * head_dim]
+        projections (e.g. from ``get_qkv`` or ``split_qkv``). Returns the attention output
+        [B, S, H_local * head_dim] *before* ``to_out``, so callers that own the output
+        projection (e.g. ``TPSequenceParallel.row_linear``) can apply it themselves.
+        """
         q, k = self.apply_qk_norm(q, k)
 
         # Apply RoPE if provided (model handles RoPE, not attention backend)
         if freqs is not None:
+            batch_size, seq_len = q.shape[:2]
+            kv_seq_len = k.shape[1]
             freqs_cos, freqs_sin = freqs
             q = q.view(
                 batch_size, seq_len, self.local_num_attention_heads, self.head_dim
@@ -641,9 +683,7 @@ class Attention(nn.Module):
             q = q.flatten(2)
             k = k.flatten(2)
 
-        out = self._attn_impl(q, k, v, timestep=timestep, **kwargs)
-        out = self.to_out[0](out)
-        return out
+        return self._attn_impl(q, k, v, timestep=timestep, **kwargs)
 
     def forward_async(
         self,
