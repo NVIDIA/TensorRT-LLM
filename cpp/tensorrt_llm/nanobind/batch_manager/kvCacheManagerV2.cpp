@@ -23,6 +23,7 @@
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/eventManager.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/hostPageCopy.h"
 #include "kv_cache_manager_v2/introspection.h"
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
@@ -1552,6 +1553,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("buffers", &kv::AttentionLayerConfig::buffers)
         .def_rw("sliding_window_size", &kv::AttentionLayerConfig::slidingWindowSize)
         .def_rw("num_sink_tokens", &kv::AttentionLayerConfig::numSinkTokens)
+        .def_rw("_residency_group", &kv::AttentionLayerConfig::residencyGroup)
         .def_prop_ro("window_size", &kv::AttentionLayerConfig::windowSize) DEF_COPY(kv::AttentionLayerConfig);
 
     nb::enum_<kv::LayerType>(m, "LayerType")
@@ -1697,8 +1699,174 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::PlannedDropHandle>(m, "PlannedDropHandle")
         .def("drop", &kv::PlannedDropHandle::drop, nb::call_guard<nb::gil_scoped_release>());
 
+    // HostSourceView borrows mapped table storage; obtaining a view never refreshes it.
+    nb::class_<kv::HostSourceView>(m, "HostSourceView")
+        .def_ro("max_requests", &kv::HostSourceView::maxRequests)
+        .def_ro("max_beams", &kv::HostSourceView::maxBeams)
+        .def_ro("num_life_cycles", &kv::HostSourceView::numLifeCycles)
+        .def_ro("max_pages", &kv::HostSourceView::maxPages)
+        .def_ro("num_levels", &kv::HostSourceView::numLevels)
+        .def_ro("tokens_per_block", &kv::HostSourceView::tokensPerBlock)
+        .def_prop_ro(
+            "request_ids",
+            [](kv::HostSourceView const& self)
+            {
+                return nb::ndarray<nb::numpy, uint64_t const>(
+                    self.requestIds, {static_cast<size_t>(self.maxRequests)}, nb::handle());
+            },
+            nb::rv_policy::reference)
+        .def_prop_ro(
+            "request_ids_address", [](kv::HostSourceView const& self) { return self.gpuAddress(self.requestIds); })
+        .def_prop_ro(
+            "generations",
+            [](kv::HostSourceView const& self)
+            {
+                return nb::ndarray<nb::numpy, uint64_t const>(
+                    self.generations, {static_cast<size_t>(self.maxRequests)}, nb::handle());
+            },
+            nb::rv_policy::reference)
+        .def_prop_ro(
+            "generations_address", [](kv::HostSourceView const& self) { return self.gpuAddress(self.generations); })
+        .def_prop_ro(
+            "request_valid",
+            [](kv::HostSourceView const& self)
+            {
+                return nb::ndarray<nb::numpy, int32_t const>(
+                    self.requestValid, {static_cast<size_t>(self.maxRequests)}, nb::handle());
+            },
+            nb::rv_policy::reference)
+        .def_prop_ro(
+            "request_valid_address", [](kv::HostSourceView const& self) { return self.gpuAddress(self.requestValid); })
+        .def_prop_ro(
+            "slot_ids",
+            [](kv::HostSourceView const& self)
+            {
+                return nb::ndarray<nb::numpy, int64_t const>(self.slotIds,
+                    {static_cast<size_t>(self.maxRequests), static_cast<size_t>(self.maxBeams),
+                        static_cast<size_t>(self.numLifeCycles), static_cast<size_t>(self.maxPages)},
+                    nb::handle());
+            },
+            nb::rv_policy::reference)
+        .def_prop_ro("slot_ids_address", [](kv::HostSourceView const& self) { return self.gpuAddress(self.slotIds); })
+        .def_prop_ro(
+            "host_levels",
+            [](kv::HostSourceView const& self)
+            {
+                return nb::ndarray<nb::numpy, int32_t const>(self.hostLevels,
+                    {static_cast<size_t>(self.maxRequests), static_cast<size_t>(self.maxBeams),
+                        static_cast<size_t>(self.numLifeCycles), static_cast<size_t>(self.maxPages)},
+                    nb::handle());
+            },
+            nb::rv_policy::reference)
+        .def_prop_ro(
+            "host_levels_address", [](kv::HostSourceView const& self) { return self.gpuAddress(self.hostLevels); })
+        .def_prop_ro(
+            "completed_tokens",
+            [](kv::HostSourceView const& self)
+            {
+                return nb::ndarray<nb::numpy, int32_t const>(self.completedTokens,
+                    {static_cast<size_t>(self.maxRequests), static_cast<size_t>(self.maxBeams),
+                        static_cast<size_t>(self.numLifeCycles), static_cast<size_t>(self.maxPages)},
+                    nb::handle());
+            },
+            nb::rv_policy::reference)
+        .def_prop_ro("completed_tokens_address",
+            [](kv::HostSourceView const& self) { return self.gpuAddress(self.completedTokens); })
+        .def_prop_ro(
+            "pool_metadata",
+            [](kv::HostSourceView const& self)
+            {
+                return nb::ndarray<nb::numpy, uint64_t const>(self.poolMetadata,
+                    {static_cast<size_t>(self.numLevels), static_cast<size_t>(self.numLifeCycles), 4}, nb::handle());
+            },
+            nb::rv_policy::reference)
+        .def_prop_ro(
+            "pool_metadata_address", [](kv::HostSourceView const& self) { return self.gpuAddress(self.poolMetadata); });
+
+    nb::class_<kv::HostSourceRead>(m, "_HostSourceRead")
+        .def("close", &kv::HostSourceRead::close, nb::call_guard<nb::gil_scoped_release>());
+
+    // Host readers own the host slot until close, then protect reuse with a CUDA event.
+    nb::class_<kv::HostPageRead>(m, "_HostPageRead")
+        .def("close", &kv::HostPageRead::close, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("ready", &kv::HostPageRead::ready, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("completed_tokens", &kv::HostPageRead::completedTokens, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "valid_tokens",
+            [](kv::HostPageRead const& self)
+            {
+                auto const apiLock = self.lockShared();
+                return self.copy().validTokens();
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "cache_level",
+            [](kv::HostPageRead const& self)
+            {
+                auto const apiLock = self.lockShared();
+                return self.copy().level().value();
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "pool_group_index",
+            [](kv::HostPageRead const& self)
+            {
+                auto const apiLock = self.lockShared();
+                return self.copy().poolGroup().value();
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "slot_id",
+            [](kv::HostPageRead const& self)
+            {
+                auto const apiLock = self.lockShared();
+                return self.copy().slotId().value();
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "address",
+            [](kv::HostPageRead const& self)
+            {
+                auto const apiLock = self.lockShared();
+                return self.copy().address();
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "pool_base_address",
+            [](kv::HostPageRead const& self)
+            {
+                auto const apiLock = self.lockShared();
+                return self.copy().poolBaseAddress();
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "page_bytes",
+            [](kv::HostPageRead const& self)
+            {
+                auto const apiLock = self.lockShared();
+                return self.copy().pageBytes();
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "pool_bytes",
+            [](kv::HostPageRead const& self)
+            {
+                auto const apiLock = self.lockShared();
+                return self.copy().poolBytes();
+            },
+            nb::call_guard<nb::gil_scoped_release>());
+
     // ---- KvCache -----------------------------------------------------------
     nb::class_<kv::KvCache>(m, "_KVCache")
+        .def(
+            "_bind_host_source_row", [](kv::KvCache& self, int row) { self.manager().bindHostSourceRow(self, row); },
+            nb::arg("row"), nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "_host_source_ref", [](kv::KvCache const& self) { return self.manager().hostSourceRef(self); },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "_host_source_row", [](kv::KvCache const& self) { return self.manager().hostSourceSlot(self); },
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "resume",
             [](kv::KvCache& self, nb::object stream)
@@ -1711,6 +1879,39 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("cuda_stream") = nb::none())
         .def("suspend", &kv::KvCache::suspend, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "_set_residency_window",
+            [](kv::KvCache& self, int layerGroupId, std::optional<int> windowSize, int numSinkTokens)
+            { self.setResidencyWindow(kv::LayerGroupId{layerGroupId}, windowSize, numSinkTokens); },
+            nb::arg("layer_group_id"), nb::arg("window_size").none(), nb::arg("num_sink_tokens") = 0,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "_backup_to_host",
+            [](kv::KvCache& self, int group, int ordinal, int validTokens, int level, int beam)
+            {
+                self.backupToHost(kv::LayerGroupId{group}, kv::BlockOrdinal{ordinal}, validTokens,
+                    kv::CacheLevel{level}, kv::BeamIndex{beam});
+            },
+            nb::arg("layer_group_id"), nb::arg("block_ordinal"), nb::arg("valid_tokens"), nb::arg("host_level") = 1,
+            nb::arg("beam") = 0, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "_invalidate_host_copy",
+            [](kv::KvCache& self, int group, int ordinal, int beam)
+            { self.invalidateHostCopy(kv::LayerGroupId{group}, kv::BlockOrdinal{ordinal}, kv::BeamIndex{beam}); },
+            nb::arg("layer_group_id"), nb::arg("block_ordinal"), nb::arg("beam") = 0,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "_offload_to_host",
+            [](kv::KvCache& self, int group, int ordinal, int beam)
+            { self.offloadToHost(kv::LayerGroupId{group}, kv::BlockOrdinal{ordinal}, kv::BeamIndex{beam}); },
+            nb::arg("layer_group_id"), nb::arg("block_ordinal"), nb::arg("beam") = 0,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "_acquire_host_copy",
+            [](kv::KvCache& self, int group, int ordinal, int beam)
+            { return self.acquireHostCopy(kv::LayerGroupId{group}, kv::BlockOrdinal{ordinal}, kv::BeamIndex{beam}); },
+            nb::arg("layer_group_id"), nb::arg("block_ordinal"), nb::arg("beam") = 0,
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
             nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
@@ -1835,7 +2036,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "cuda_stream",
             [](kv::KvCache const& self) -> intptr_t { return reinterpret_cast<intptr_t>(self.cudaStream()); },
             [](kv::KvCache& self, intptr_t stream) { self.setCudaStream(reinterpret_cast<CUstream>(stream)); })
-        .def_rw("id", &kv::KvCache::id)
+        .def_prop_rw(
+            "id", [](kv::KvCache const& self) { return self.id; }, &kv::KvCache::setId,
+            nb::for_setter(nb::arg("value").none()), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
             "manager", [](kv::KvCache& self) -> kv::KvCacheManager& { return self.manager(); },
             nb::rv_policy::reference_internal)
@@ -1907,6 +2110,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- Introspection -------------------------------------------------------
     auto mIntrospection = m.def_submodule("_introspection", "KV cache manager v2 introspection helpers");
+    mIntrospection.def(
+        "refresh_host_source_table", [](kv::KvCacheManager& manager) { manager.refreshHostSourceTableForTest(); },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "create_test_padding_cold_page_codec",
         [](std::map<int, size_t> coldPageBytesByLayer) -> std::unique_ptr<kv::IKvCacheColdPageCodec>
@@ -2237,6 +2443,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- KvCacheManager ----------------------------------------------------
     nb::class_<kv::KvCacheManager>(m, "KVCacheManager")
+        .def("_initialize_host_source_table", &kv::KvCacheManager::initializeHostSourceTable, nb::arg("max_requests"),
+            nb::arg("max_pages"), nb::arg("max_beams") = 1, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("_host_source_view", &kv::KvCacheManager::hostSourceView, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "_acquire_host_sources",
+            [](kv::KvCacheManager& self, std::vector<kv::HostSourceRow> const& rows, kv::CudaStream stream)
+            { return self.acquireHostSources(rows, reinterpret_cast<CUstream>(stream)); },
+            nb::arg("rows"), nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>())
         .def(
             "__init__",
             [](kv::KvCacheManager* self, kv::KVCacheManagerConfig const& config, nb::object eventManager,

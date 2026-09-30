@@ -40,13 +40,14 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 class KvCacheIntrospection;
 class KvCacheManager;
 class StorageManager;
+class HostPageRead;
 struct ScratchDesc;
 
 // ---------------------------------------------------------------------------
 // BlockPage — what a SeqBlock holds per (beamIndex, lifeCycleId):
 //   - nullptr             → no page (block not allocated for this lifecycle/beam)
 //   - SharedPageLock      → locked (ACTIVE inference)
-//   - shared_ptr<PageHolder> → held (suspended, waiting for activation)
+//   - shared_ptr<PageHolder> → held (suspended or cold history)
 // ---------------------------------------------------------------------------
 using BlockPage = std::variant<std::monostate, // nullptr
     SharedPageLock,                            // locked
@@ -185,16 +186,41 @@ public:
 
     // ---- State machine -----------------------------------------------------
 
-    // Resume: check utilization and lock all pages to GPU.
+    // Resume: check utilization and lock required pages to GPU.
     // Optionally sets a new CUDA stream; if nullopt, uses the existing one.
     // Returns false if utilization too high or out of memory.
     bool resume(std::optional<CUstream> stream = std::nullopt);
+
+    // Internal sparse-residency opt-in for a full-history attention group. A positive
+    // window keeps the local window, sinks, and all writable pages GPU-locked; older
+    // history stays held and may migrate. nullopt restores full GPU residency.
+    // Call only after prior GPU use has been submitted to cudaStream(). Logical
+    // history is retained independently of commitment. The caller must configure
+    // a separate group for data whose residency requirements differ.
+    // Updating an active cache acquires newly required locks before releasing old
+    // ones; allocation failure preserves the previous residency requirements.
+    void setResidencyWindow(LayerGroupId group, std::optional<int> windowSize, int numSinkTokens = 0);
+
+    //! Backup a written attention-page prefix on the request stream. Host capacity
+    //! must already be configured. May restore a cold page through one GPU slot.
+    void backupToHost(LayerGroupId group, BlockOrdinal ordinal, int validTokens, CacheLevel hostLevel = CacheLevel{1},
+        BeamIndex beam = kDefaultBeamIndex);
+    //! Call before writing an existing uncommitted GPU page with a host copy.
+    void invalidateHostCopy(LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam = kDefaultBeamIndex);
+    //! Release a cold held page's GPU storage after arranging its host backup.
+    void offloadToHost(LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam = kDefaultBeamIndex);
+    //! Keep a copy's addresses alive through operations on the request stream.
+    std::unique_ptr<HostPageRead> acquireHostCopy(
+        LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam = kDefaultBeamIndex);
 
     // Suspend: detach from CUDA stream, unlock pages → PageHolder.
     void suspend();
 
     // Close: release all blocks back to KvCacheManager.
     void close();
+
+    //! Update request identity and its host-source row together.
+    void setId(std::optional<RequestIdType> requestId);
 
     // Commit or discard request-local statistics accumulated since the previous scheduler commit.
     KVCacheStatsDelta commitPendingStats();
@@ -235,6 +261,7 @@ public:
     Span<int const> getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx = kDefaultBeamIndex) const;
 
     // Get aggregated (slot-level) page indices for one layer group + beam.
+    // Includes held pages in any cache tier; these are not necessarily GPU addresses.
     // Returns one entry per block; bad blocks yield kBadPageIndex.
     // If valid_only=true, bad-index blocks are skipped entirely.
     std::vector<int> getAggregatedPageIndices(
@@ -460,7 +487,7 @@ private:
     friend std::vector<SharedPageLock> batchedLockToGpu(
         KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
 
-    // Activate: lock all pages to GPU. mCudaStream must already be set.
+    // Activate: lock required pages to GPU. mCudaStream must already be set.
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
     void activate();
 
@@ -506,7 +533,11 @@ private:
     // Unlock stale SWA blocks. Returns backup holders for rollback.
     std::vector<StaleBackup> _unlockStaleBlocks(int historyLength);
 
-    // Re-lock previously unlocked stale blocks (rollback on OOM).
+    // Release cold full-history pages without making them stale or dropping them.
+    std::vector<StaleBackup> _unlockColdBlocks(int historyLength);
+    bool _requiresGpuLock(BlockOrdinal ordinal, LifeCycleId lifeCycle, int historyLength) const;
+
+    // Re-lock previously unlocked stale/cold blocks (rollback on OOM).
     void _lockHeldBlocks(std::vector<StaleBackup> const& backup);
 
     // Iterator over (ordinal, beamIdx, lcIdx) tuples for active (non-stale) pages.
@@ -609,6 +640,9 @@ private:
     void _checkPageIndexBufferCapacity(BlockOrdinal newNumBlocks) const;
     void _resizePageIndexBuffers(BlockOrdinal newNumBlocks);
 
+    SharedPtr<Page> const& hostCopyPage(LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam) const;
+    int writtenTokensInPage(Page const& page, BlockOrdinal ordinal) const;
+
     std::shared_ptr<KvCacheManager> mManager;
     ReuseScope mReuseScope;
     PriorityCb mPriorityCb;
@@ -627,6 +661,10 @@ private:
     using LifeCyclePageIndexBuffers = TypedVec<LifeCycleId, PageIndexBuf>;
     using BeamPageIndexBuffers = TypedVec<BeamIndex, LifeCyclePageIndexBuffers>;
     BeamPageIndexBuffers mBasePageIndices;
+
+    // Per-request residency windows; nullopt retains the default full GPU residency.
+    // These affect locks only, never the logical lifecycle's stale range.
+    TypedVec<LifeCycleId, std::optional<AttnLifeCycle>> mResidencyWindows;
 
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
 

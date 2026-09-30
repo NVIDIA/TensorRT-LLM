@@ -40,6 +40,7 @@ struct AttnLifeCycle
 {
     std::optional<int> windowSize; // nullopt = no sliding window
     int numSinkBlocks = 0;         // divUp(numSinkTokens, tokensPerBlock)
+    int residencyGroup = 0;        // separates independently managed pages
 
     HalfOpenRange<BlockOrdinal> getStaleRange(int historyLength, int tokensPerBlock) const
     {
@@ -56,14 +57,16 @@ struct AttnLifeCycle
 
     bool operator==(AttnLifeCycle const& o) const noexcept
     {
-        return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks;
+        return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks && residencyGroup == o.residencyGroup;
     }
 
     bool operator<(AttnLifeCycle const& o) const noexcept
     {
         if (windowSize != o.windowSize)
             return windowSize < o.windowSize;
-        return numSinkBlocks < o.numSinkBlocks;
+        if (numSinkBlocks != o.numSinkBlocks)
+            return numSinkBlocks < o.numSinkBlocks;
+        return residencyGroup < o.residencyGroup;
     }
 
     static AttnLifeCycle make(std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock)

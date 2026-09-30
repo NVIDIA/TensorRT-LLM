@@ -38,6 +38,7 @@ class KvCache;
 class PageHolder;
 class UniqPageLock;
 class SharedPageLock;
+class HostPageCopy;
 
 // ---------------------------------------------------------------------------
 // Page — base class for all KV-cache pages.
@@ -60,6 +61,18 @@ public:
 
     virtual ~Page();
 
+    std::shared_ptr<HostPageCopy> const& hostCopy() const noexcept
+    {
+        return mHostCopy;
+    }
+
+private:
+    friend class StorageManager;
+    friend class UncommittedPage;
+    friend class PageHolder;
+    std::shared_ptr<HostPageCopy> mHostCopy;
+
+public:
     virtual bool isCommitted() const = 0;
 
     PageStatus status() const noexcept;

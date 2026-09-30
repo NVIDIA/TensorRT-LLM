@@ -148,6 +148,10 @@ struct AttentionLayerConfig
     // nullopt or 0 = no sink tokens.
     std::optional<int> numSinkTokens;
 
+    // Layers with different residency groups must not share a lifecycle/page.
+    // Model adapters use separate layer descriptors for independently managed data.
+    int residencyGroup = 0;
+
     [[nodiscard]] std::optional<int> windowSize() const noexcept
     {
         return slidingWindowSize;
@@ -156,6 +160,8 @@ struct AttentionLayerConfig
     void validate() const
     {
         detail::validateNoDuplicateBufferRoles(buffers);
+        if (residencyGroup < 0)
+            throw std::invalid_argument("residencyGroup must be non-negative");
     }
 };
 
