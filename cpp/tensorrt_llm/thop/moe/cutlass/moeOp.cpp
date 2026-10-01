@@ -2626,7 +2626,7 @@ TORCH_LIBRARY(trtllm, m)
 #if defined(USING_OSS_CUTLASS_MOE_GEMM)
             return true;
 #else
-        return false;
+            return false;
 #endif
         });
     m.class_<tensorrt_llm::torch_ext::FusedMoeRunner>("FusedMoeRunner")
