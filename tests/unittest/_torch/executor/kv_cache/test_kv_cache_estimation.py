@@ -535,6 +535,9 @@ def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
     creator = _make_reserve_creator(model_cls(encoder_cache_max_bytes))
 
     assert creator._get_multimodal_encoder_memory_reserve() == expected_reserve
+    # Inline encoding keeps its batch output beside the cache's copies, so the
+    # profiled batch output cannot stand in for cache-owned bytes.
+    assert creator._get_multimodal_encoder_memory_reserve(64) == expected_reserve
 
 
 def test_kv_cache_estimation_skips_multimodal_reserve_when_encoder_disabled():
