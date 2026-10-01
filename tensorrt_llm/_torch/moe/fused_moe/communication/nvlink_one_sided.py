@@ -865,12 +865,26 @@ class NVLinkOneSided(Communication):
         """Identify wrappers sharing the same MNNVL workspace lifecycle."""
         return id(self._require_workspace_lifecycle())
 
+    def checkpoint_blocked_reason(self) -> Optional[str]:
+        """Block checkpointing while CFT counted writes are in use.
+
+        CFT binds logical endpoints to the workspace for the life of the
+        process, and detaching the backing memory would strand them.
+        """
+        if self.can_use_cft_counted_writes:
+            return (
+                "the MoE All-to-All workspace uses CFT counted writes, which pin "
+                "the workspace for the lifetime of the process. Set "
+                "TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 to select fence-based "
+                "dispatch and enable sleep/wakeup"
+            )
+        return None
+
     def checkpoint_prepare(self) -> None:
         """Collectively detach handles after every shared owner is idle."""
-        if self.can_use_cft_counted_writes:
-            raise RuntimeError(
-                "Checkpointing a CFT-backed MoE All-to-All workspace is not supported"
-            )
+        reason = self.checkpoint_blocked_reason()
+        if reason is not None:
+            raise RuntimeError(f"Cannot checkpoint the MoE All-to-All workspace: {reason}")
         self._require_workspace_lifecycle().checkpoint_prepare()
 
     def checkpoint_restore(
