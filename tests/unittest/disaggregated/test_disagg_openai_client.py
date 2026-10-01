@@ -889,19 +889,28 @@ class TestDisaggIdRegenOnRetry:
             ),
         )
 
-        await client.send_request(request)
+        if role == ServerRole.GENERATION:
+            with pytest.raises(aiohttp.ClientError, match="transient"):
+                await client.send_request(request)
+            assert request.disaggregated_params.disagg_request_id == 42
+            client._router.renew_request.assert_not_awaited()
+            if regenerate_id:
+                client._disagg_id_generator.assert_not_awaited()
+            expected_ids = [42]
+        else:
+            await client.send_request(request)
+            expected_ids = [42, 1000 if regenerate_id else 42]
 
-        # Bytes and per-attempt header dicts retain the first request's ID even
-        # though the original request object is mutated before the second POST.
-        assert session.post.call_count == 2
+        # Serialized attempts retain their own IDs when a context retry
+        # regenerates the request ID; a paired generation handoff is not retried.
+        assert session.post.call_count == len(expected_ids)
         bodies = [
             msgspec.msgpack.decode(call.kwargs["data"]) for call in session.post.call_args_list
         ]
         headers = [dict(call.kwargs["headers"]) for call in session.post.call_args_list]
-        assert [body["disaggregated_params"]["disagg_request_id"] for body in bodies] == [
-            42,
-            1000 if regenerate_id else 42,
-        ]
+        assert [
+            body["disaggregated_params"]["disagg_request_id"] for body in bodies
+        ] == expected_ids
         wire_requests = [CompletionRequest.model_validate(body) for body in bodies]
         for body, wire_request, attempt_headers in zip(bodies, wire_requests, headers):
             assert "subagent_affinity_id" not in body["conversation_params"]
@@ -913,10 +922,11 @@ class TestDisaggIdRegenOnRetry:
             if role == ServerRole.GENERATION:
                 validate_internal_disagg_request("secret", wire_request, attempt_headers)
         if role == ServerRole.GENERATION:
-            assert (
-                headers[0][INTERNAL_DISAGG_AUTH_HEADER] == headers[1][INTERNAL_DISAGG_AUTH_HEADER]
-            )
-        if regenerate_id:
+            altered_request = wire_requests[0].model_copy(deep=True)
+            altered_request.disaggregated_params.disagg_request_id = 1000
+            with pytest.raises(ValueError, match="Invalid internal subagent"):
+                validate_subagent_affinity("secret", altered_request, role, headers[0])
+        elif regenerate_id:
             assert (
                 headers[0][SUBAGENT_AFFINITY_AUTH_HEADER]
                 != headers[1][SUBAGENT_AFFINITY_AUTH_HEADER]

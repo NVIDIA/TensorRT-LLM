@@ -104,7 +104,7 @@ def test_v4_runtime_maps_gather_physical_cache_bytes(
     indexer_dtype: str, phase: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     context, fused = phase == "context", phase == "decode-fused"
-    monkeypatch.setenv("TRTLLM_FUSED_DSA_METADATA", "1" if fused else "0")
+    monkeypatch.setenv("TRTLLM_DISABLE_FUSED_DSA_METADATA", "0" if fused else "1")
     _fused_dsa_meta_enabled.cache_clear()
     cached, lengths = [12, 20], [5, 6] if context else [1, 1]
     try:
