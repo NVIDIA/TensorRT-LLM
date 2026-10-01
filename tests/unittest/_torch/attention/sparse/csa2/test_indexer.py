@@ -269,12 +269,13 @@ def test_prepared_hierarchy_and_graph():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_prepared_bmm_fallback(monkeypatch):
-    indexer = _prepared_indexer(8)
+@pytest.mark.parametrize("heads", [8, 32, 64])
+def test_prepared_bmm_fallback(monkeypatch, heads):
+    indexer = _prepared_indexer(heads)
     torch.manual_seed(7)
-    q = pack_rows(torch.randn(2, 8, 128, device="cuda"), "index")
+    q = pack_rows(torch.randn(2, heads, 128, device="cuda"), "index")
     k = pack_rows(torch.randn(2, 33, 128, device="cuda"), "index")
-    weights = torch.rand(2, 8, device="cuda")
+    weights = torch.rand(2, heads, device="cuda")
     lengths = torch.tensor([33, 3], dtype=torch.int32, device="cuda")
     positions = torch.arange(33, device="cuda").expand(2, -1)
     monkeypatch.setattr(
@@ -282,10 +283,17 @@ def test_prepared_bmm_fallback(monkeypatch):
     )
     scores = []
     actual = _prepared(indexer, q, k, weights, lengths, positions, scores.append)
-    dots = torch.bmm(unpack_rows(q, 128, "index"), unpack_rows(k, 128, "index").transpose(1, 2))
-    expected_scores = (dots.relu() * weights.bfloat16().unsqueeze(-1)).sum(1).float()
+    dots = torch.bmm(
+        unpack_rows(q, 128, "index", torch.float32),
+        unpack_rows(k, 128, "index", torch.float32).transpose(1, 2),
+    )
+    expected_scores = (dots.relu() * weights.unsqueeze(-1)).sum(1)
     expected = _reference_select_topk_positions(expected_scores, positions, lengths, 32)
     torch.testing.assert_close(actual, expected)
+    expected_scores.masked_fill_(
+        torch.arange(k.shape[1], device=k.device)[None, :] >= lengths[:, None], -torch.inf
+    )
+    torch.testing.assert_close(scores[0], expected_scores)
     for _ in range(3):
         _prepared(indexer, q, k, weights, lengths, positions)
     graph = torch.cuda.CUDAGraph()
@@ -294,8 +302,11 @@ def test_prepared_bmm_fallback(monkeypatch):
     lengths.copy_(torch.tensor([0, 17], dtype=torch.int32, device="cuda"))
     k[..., :64].bitwise_xor_(0x88)
     graph.replay()
-    dots = torch.bmm(unpack_rows(q, 128, "index"), unpack_rows(k, 128, "index").transpose(1, 2))
-    expected_scores = (dots.relu() * weights.bfloat16().unsqueeze(-1)).sum(1).float()
+    dots = torch.bmm(
+        unpack_rows(q, 128, "index", torch.float32),
+        unpack_rows(k, 128, "index", torch.float32).transpose(1, 2),
+    )
+    expected_scores = (dots.relu() * weights.unsqueeze(-1)).sum(1)
     expected = _reference_select_topk_positions(expected_scores, positions, lengths, 32)
     torch.testing.assert_close(replayed, expected)
 
