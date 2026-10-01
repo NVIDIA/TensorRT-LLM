@@ -6,13 +6,17 @@ import ast
 import asyncio
 import multiprocessing
 import time
+from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import zmq
 import zmq.asyncio
 
+from tensorrt_llm.bench import benchmark as benchmark_module
+from tensorrt_llm.bench.benchmark import low_latency
 from tensorrt_llm.bench.benchmark.utils import asynchronous, processes
 
 pytestmark = pytest.mark.cpu_only
@@ -54,7 +58,14 @@ def _scenario(case: str, directory: str) -> None:
     processes._ITERATION_WRITER_JOIN_TIMEOUT_SEC = 1.0
     if case in ("dead_small", "dead_full", "no_requests"):
         count = 2000 if case == "dead_full" else 5
-        asyncio.run(_produce(f"ipc://{root / 'absent.sock'}", count, case != "no_requests"))
+        if case == "no_requests":
+            with patch.object(asynchronous.logger, "warning") as warning:
+                asyncio.run(_produce(f"ipc://{root / 'absent.sock'}", count, False))
+            warning.assert_called_once_with(
+                "Iteration logging timed out; the iteration log may be incomplete."
+            )
+        else:
+            asyncio.run(_produce(f"ipc://{root / 'absent.sock'}", count))
     elif case in ("healthy", "missing_parent", "empty", "body_error"):
         log = (
             root / "nested" / "iterations.log"
@@ -174,3 +185,78 @@ def test_iteration_logging_shutdown(case: str, tmp_path: Path) -> None:
             process.kill()
             process.join(timeout=3)
         process.close()
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_latency_command_forwards_iteration_log(enabled: bool, tmp_path: Path) -> None:
+    """Latency configuration enables iteration statistics only when requested."""
+    iteration_log = tmp_path / "iterations.log" if enabled else None
+    dataset = tmp_path / "dataset.jsonl"
+    dataset.write_text("{}\n")
+
+    iteration_writer = MagicMock()
+    iteration_writer.capture.return_value = nullcontext()
+    iteration_writer.full_address = "ipc://iteration-log" if enabled else None
+    options = SimpleNamespace(
+        backend="pytorch",
+        beam_width=1,
+        checkpoint_path=tmp_path,
+        concurrency=1,
+        dataset_path=dataset,
+        duration=None,
+        iteration_log=iteration_log,
+        iteration_writer=iteration_writer,
+        kv_cache_percent=0.5,
+        max_input_len=128,
+        max_seq_len=128,
+        modality=None,
+        model="test-model",
+        model_type="decoder",
+        num_requests=1,
+        output_json=None,
+        report_json=None,
+        request_json=None,
+        warmup=0,
+    )
+    bench_env = SimpleNamespace(
+        checkpoint_path=tmp_path,
+        model="test-model",
+        revision=None,
+        telemetry_config=None,
+    )
+    metadata = MagicMock(max_sequence_length=128)
+    tokenizer = MagicMock(eos_token_id=0, pad_token_id=0)
+    runtime_config = MagicMock(
+        backend="pytorch",
+        iteration_log=iteration_log,
+    )
+    runtime_config.get_llm_args.return_value = {}
+    runtime_config.decoding_config.decoding_mode = low_latency.SpeculativeDecodingMode.NONE
+    llm = MagicMock(startup_metrics={})
+    settings = {
+        "settings_config": {
+            "max_num_tokens": 128,
+        },
+        "performance_options": {},
+    }
+
+    with (
+        patch.object(low_latency, "get_general_cli_options", return_value=options),
+        patch.object(low_latency, "initialize_tokenizer", return_value=tokenizer),
+        patch.object(low_latency, "create_dataset_from_stream", return_value=(metadata, [])),
+        patch.object(low_latency, "get_settings", return_value=settings),
+        patch.object(low_latency, "collect_explicit_cli_keys", return_value=set()),
+        patch.object(
+            low_latency, "RuntimeConfig", return_value=runtime_config
+        ) as runtime_config_cls,
+        patch.object(benchmark_module, "PyTorchLLM", return_value=llm) as llm_cls,
+        patch.object(low_latency, "async_benchmark", new=AsyncMock(return_value=[])),
+        patch.object(low_latency, "SamplingParams"),
+        patch.object(low_latency, "ReportUtility"),
+        patch.object(low_latency, "generate_json_report"),
+    ):
+        low_latency.latency_command.callback.__wrapped__(bench_env, sampler_options=None)
+
+    assert runtime_config_cls.call_args.kwargs["iteration_log"] == iteration_log
+    llm_kwargs = llm_cls.call_args.kwargs
+    assert llm_kwargs.get("enable_iter_perf_stats", False) is enabled

@@ -34,7 +34,10 @@ from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 
-_ITERATION_LOG_DRAIN_TIMEOUT_SEC = 5.0
+_ITERATION_STATS_TIMEOUT_SEC = 2.0
+# Shutdown may finish one in-flight stats read and then perform a final read.
+# RPC-backed reads can spend the timeout in both fetch and iteration.
+_ITERATION_LOG_DRAIN_TIMEOUT_SEC = 2 * 2 * _ITERATION_STATS_TIMEOUT_SEC + 1.0
 _ITERATION_LOG_LINGER_MS = 1000
 
 
@@ -339,7 +342,8 @@ class LlmManager:
 
             # Continuously send statistics data while the stop signal is not set
             while not self._stop.is_set():
-                async for stats in self.llm.get_stats_async(2):
+                async for stats in self.llm.get_stats_async(
+                        _ITERATION_STATS_TIMEOUT_SEC):
                     await socket.send_json(stats)
                 # NOTE: This is a WAR to force this loop to relinquish control
                 # that was preventing other async tasks from holding the event
@@ -348,7 +352,8 @@ class LlmManager:
 
             # Wrap up by sending any remaining statistics data
             logger.debug("Iteration log worker wrapping up...")
-            async for stats in self.llm.get_stats_async(2):
+            async for stats in self.llm.get_stats_async(
+                    _ITERATION_STATS_TIMEOUT_SEC):
                 await socket.send_json(stats)
             await socket.send_json({"end": True})
         except asyncio.CancelledError:
