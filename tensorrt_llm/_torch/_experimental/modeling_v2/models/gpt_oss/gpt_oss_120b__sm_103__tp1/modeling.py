@@ -452,7 +452,7 @@ class _GptOssTarget(Target):
 
         `Target.__init__` only stores `self.core`; everything below is this
         target's own addition, and is why gpt_oss needed one. Per-layer
-        weight tables go into each catalog entry's `layered=`, built once
+        weight tables go into each catalog entry's `bind_layered`, built once
         here from `core.w` and keeping the `.t()` views the hot-path GEMMs
         already used (zero-copy). Config scalars that `core` still carries
         (because weights.py's load() reads them separately) come from
@@ -482,9 +482,11 @@ class _GptOssTarget(Target):
         next_norm = tuple(w[f"l{i + 1}_norm1"] if i + 1 < n else w["final_norm"] for i in range(n))
         layer_idx = tuple(range(n))
 
-        self._norm0 = type(flashinfer_rmsnorm)(weight=w["l0_norm1"], eps=cfg.rms_norm_eps)
+        self._norm0 = type(flashinfer_rmsnorm)()
+        self._norm0.bind_const(weight=w["l0_norm1"], eps=cfg.rms_norm_eps)
 
-        self._qkv = type(cublas_mm)(layered=dict(mat_b=t_table("qkv"), bias=table("qkv_bias")))
+        self._qkv = type(cublas_mm)()
+        self._qkv.bind_layered(mat_b=t_table("qkv"), bias=table("qkv_bias"))
 
         # fused_qk_norm_rope requires valid q/k norm weight tensors even with
         # is_qk_norm=False, where their values are unused; built from the
@@ -495,7 +497,8 @@ class _GptOssTarget(Target):
         # a third attribute name for the same value (see
         # `ModelingV2Core.__init__`).
         no_qk_norm = torch.zeros(core.head_dim, dtype=dtype, device=device)
-        self._qk_rope = type(fused_qk_norm_rope)(
+        self._qk_rope = type(fused_qk_norm_rope)()
+        self._qk_rope.bind_const(
             num_heads_q=core.heads_q,
             num_heads_k=core.heads_kv,
             num_heads_v=core.heads_kv,
@@ -521,27 +524,27 @@ class _GptOssTarget(Target):
         # thop_attention reads out of the pool mapping), not the binding
         # mechanism's own index, and layering it here means the call site
         # states `layer=i` once instead of the same `i` under two names.
-        self._attn = type(thop_attention)(
-            layered=dict(attention_sinks=table("sinks"), local_layer_idx=layer_idx),
+        self._attn = type(thop_attention)()
+        self._attn.bind_layered(attention_sinks=table("sinks"), local_layer_idx=layer_idx)
+        self._attn.bind_const(
             num_heads=core.heads_q,
             num_kv_heads=core.heads_kv,
             head_size=core.head_dim,
             **_CALL_CONSTANTS,
         )
 
-        self._o_proj = type(cublas_mm)(layered=dict(mat_b=t_table("o"), bias=table("o_bias")))
+        self._o_proj = type(cublas_mm)()
+        self._o_proj.bind_layered(mat_b=t_table("o"), bias=table("o_bias"))
 
-        self._norm2 = type(flashinfer_fused_add_rmsnorm)(
-            layered=dict(weight=table("norm2")), eps=cfg.rms_norm_eps
-        )
+        self._norm2 = type(flashinfer_fused_add_rmsnorm)()
+        self._norm2.bind_layered(weight=table("norm2"))
+        self._norm2.bind_const(eps=cfg.rms_norm_eps)
 
-        self._router = type(cublas_mm)(
-            layered=dict(mat_b=t_table("router"), bias=table("router_bias"))
-        )
+        self._router = type(cublas_mm)()
+        self._router.bind_layered(mat_b=t_table("router"), bias=table("router_bias"))
 
-        self._quant = type(mxfp8_quantize)(
-            swizzled_layout=_LINEAR_SCALE_LAYOUT, alignment=_FC1_K_ALIGN
-        )
+        self._quant = type(mxfp8_quantize)()
+        self._quant.bind_const(swizzled_layout=_LINEAR_SCALE_LAYOUT, alignment=_FC1_K_ALIGN)
 
         # Per-expert activation scalars the MoE op's clamped GLU epilogue
         # reads, sized by local_num_experts. This target runs tp1, so every
@@ -553,15 +556,16 @@ class _GptOssTarget(Target):
         limit = torch.full(
             (core.num_experts,), float(cfg.swiglu_limit), dtype=torch.float32, device=device
         )
-        self._moe = type(mxe4m3_mxe2m1_block_scale_moe_runner)(
-            layered=dict(
-                gemm1_weights=table("fc1_w"),
-                gemm1_weights_scale=table("fc1_s"),
-                gemm1_bias=table("fc1_b"),
-                gemm2_weights=table("fc2_w"),
-                gemm2_weights_scale=table("fc2_s"),
-                gemm2_bias=table("fc2_b"),
-            ),
+        self._moe = type(mxe4m3_mxe2m1_block_scale_moe_runner)()
+        self._moe.bind_layered(
+            gemm1_weights=table("fc1_w"),
+            gemm1_weights_scale=table("fc1_s"),
+            gemm1_bias=table("fc1_b"),
+            gemm2_weights=table("fc2_w"),
+            gemm2_weights_scale=table("fc2_s"),
+            gemm2_bias=table("fc2_b"),
+        )
+        self._moe.bind_const(
             # The router bias rides the router GEMM's own epilogue instead
             # (see the call site): routing_bias is bound to None here so a
             # reader never has to find a bare positional None at the call and
@@ -584,9 +588,9 @@ class _GptOssTarget(Target):
             act_type=_ACT_TYPE_SWIGLU,
         )
 
-        self._norm_next = type(flashinfer_fused_add_rmsnorm)(
-            layered=dict(weight=next_norm), eps=cfg.rms_norm_eps
-        )
+        self._norm_next = type(flashinfer_fused_add_rmsnorm)()
+        self._norm_next.bind_layered(weight=next_norm)
+        self._norm_next.bind_const(eps=cfg.rms_norm_eps)
 
     def forward(
         self,
@@ -599,11 +603,11 @@ class _GptOssTarget(Target):
     ) -> torch.Tensor:
         core = self.core
 
-        # advance_step_generation must run before any bind_step this forward
+        # advance_step_generation must run before any bind_const this forward
         # makes: it is what lets validating() catch a target that forgot to
         # rebind and is running an op against last step's metadata.
         advance_step_generation()
-        self._attn.bind_step(**self.step_args(attn_metadata))
+        self._attn.bind_const(**self.step_args(attn_metadata))
 
         # attention_window_size cannot be a construction-time per-layer table
         # like attention_sinks: its full-attention value is

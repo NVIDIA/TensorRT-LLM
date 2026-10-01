@@ -367,7 +367,7 @@ def _catalog_entries() -> list[tuple[Path, ast.ClassDef]]:
 def test_raw_call_reads_no_bound_state():
     """`raw_call` takes every argument explicitly.
 
-    The moment it reads `self._bound`, `self._step`, or any other attribute,
+    The moment it reads `self._const`, `self._layered`, or any other attribute,
     the arguments a cell drives it with stop being the whole input -- and
     `CELLS` silently narrows to whatever the last target happened to bind.
     """

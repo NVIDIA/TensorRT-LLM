@@ -40,16 +40,24 @@ def validating(*wrappers: OpWrapper) -> Iterator[None]:
         saved.append((cls, original))
 
         def guarded(self, *args, _original=original, **kwargs):
-            if self._step:
-                from tensorrt_llm._torch._experimental.modeling_v2.catalog import _op
+            from tensorrt_llm._torch._experimental.modeling_v2.catalog import _op
 
-                assert self._step_generation == _op._STEP_GENERATION, (
-                    f"{type(self).__name__} is running on step "
-                    f"{self._step_generation} while the engine is on "
-                    f"{_op._STEP_GENERATION}: a forward bound its step state and "
-                    "a later one did not, so this call is using the previous "
-                    "step's metadata -- wrong output, no error, outside validation"
-                )
+            # A key's generation stays 0 forever if it is only ever bound
+            # before the first forward -- a construction-time constant can
+            # never be flagged. A key bound mid-forward is flagged the
+            # moment a later forward advances the counter without rebinding
+            # it: its stamp is then behind the engine's current generation.
+            stale = sorted(
+                key
+                for key, gen in self._generation.items()
+                if gen >= 1 and gen < _op._STEP_GENERATION
+            )
+            assert not stale, (
+                f"{type(self).__name__} bound {stale} during a forward and did "
+                f"not rebind {'it' if len(stale) == 1 else 'them'} this one: "
+                "this call is using the previous step's metadata -- wrong "
+                "output, no error, outside validation"
+            )
             self.is_valid(*args, **kwargs)
             return _original(self, *args, **kwargs)
 
