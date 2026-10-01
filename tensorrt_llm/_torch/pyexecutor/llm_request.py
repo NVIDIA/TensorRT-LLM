@@ -1396,7 +1396,8 @@ def initialize_multimodal_encoder_request(
 
     Raises `ValueError` (failing only this request) when raw encoder inputs
     have missing or empty item metadata, an atomic item is larger than the
-    effective encoder token budget, or — when the encoder-output budget is
+    effective encoder token budget, the items' embedding rows do not match
+    the prompt's embedding slots, or — when the encoder-output budget is
     supplied — the request's complete embedding footprint could never fit.
     Prefill currently waits for every item, so the complete footprint must
     remain resident until the request becomes LLM-eligible.
@@ -1431,6 +1432,16 @@ def initialize_multimodal_encoder_request(
         if embedding_lengths is None:
             raise ValueError("Multimodal item scheduling requires "
                              "multimodal_embedding_lengths")
+        # Prefill slices the cached item outputs by the prompt's embedding
+        # slots, so the items must declare exactly one row per slot.
+        embed_mask_cumsum = mm_data.get("multimodal_embed_mask_cumsum")
+        if embed_mask_cumsum is not None:
+            num_embedding_slots = int(embed_mask_cumsum[-1])
+            if sum(embedding_lengths) != num_embedding_slots:
+                raise ValueError(
+                    f"Multimodal items declare {sum(embedding_lengths)} "
+                    "embedding rows but the prompt has "
+                    f"{num_embedding_slots} embedding slots")
         if (max_output_bytes is not None and bytes_per_encoder_embedding > 0):
             total_bytes = (sum(embedding_lengths) * bytes_per_encoder_embedding)
             if total_bytes > max_output_bytes:
