@@ -73,9 +73,6 @@ cleanup() {
 
 init_ubuntu() {
   apt-get update
-  # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package
-  apt remove -y ibverbs-providers libibverbs1
-  apt-get --reinstall install -y libibverbs-dev
   apt-get install -y --no-install-recommends \
     libtool \
     autoconf \
@@ -91,6 +88,7 @@ init_ubuntu() {
     libstdc++-14-dev \
     libnuma1 \
     libnuma-dev \
+    libhwloc-dev \
     python3-dev \
     python3-pip \
     python-is-python3 \
