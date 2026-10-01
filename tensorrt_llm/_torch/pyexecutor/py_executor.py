@@ -6106,6 +6106,11 @@ class PyExecutor:
                 "CSA2 disaggregated remote-tail replay window exceeds max_context_length"
             )
 
+        if (request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+                and params.remote_tail_start is None and params.schedule_style
+                == DisaggScheduleStyle.GENERATION_FIRST):
+            params.remote_tail_start = max(0, request.prompt_len - window)
+
         if request_type == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
             mode = "source"
             remote_tail_start = max(0, request.prompt_len - window)
