@@ -579,6 +579,10 @@ class MultimodalItemScheduler:
             segments.append(segment)
 
         multimodal_data = dict(request.py_multimodal_data or {})
+        # Requests served only by cache hits skip `forward_items`, so their raw
+        # inputs are still attached. Drop them from this copy to keep them off
+        # the device; the cached outputs replace them.
+        strip_mm_encoder_inputs(multimodal_data)
         start = runtime.num_cached_mm_tokens if runtime is not None else 0
         end = start + runtime.num_mm_tokens_in_chunk if runtime is not None else None
         # Slice before joining: a long request must not copy all of its

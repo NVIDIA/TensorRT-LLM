@@ -343,3 +343,42 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(
     assert "multimodal_embedding_is_chunk" not in request.py_multimodal_data
     assert "multimodal_embedding" not in request.py_multimodal_data
     assert mm_item_scheduler.encoder_cache.current_bytes == 40
+
+
+def test_cache_hit_only_request_omits_raw_inputs_from_llm_payload() -> None:
+    class _Model(MultimodalModelMixin):
+        embedding_dtype = torch.float32
+
+    mm_item_scheduler = bare_mm_item_scheduler(_Model())
+    mm_item_scheduler.bytes_per_embedding = 8
+    request = make_llm_request(
+        1,
+        multimodal_data={
+            "image": {
+                "pixel_values": torch.arange(2).unsqueeze(1),
+                "image_grid_thw": torch.tensor([[1, 1, 2]]),
+            },
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+                item_refs=[("image", 0)],
+                encoder_token_lengths=[2],
+                output_embedding_lengths=[2],
+            ),
+            "multimodal_embedding_lengths": [2],
+        },
+    )
+    initialize_multimodal_encoder_request(request, max_num_tokens=8)
+    # Bind the item to an already committed entry, as a scheduler cache hit
+    # does, without running `forward_items`.
+    encoder_cache = mm_item_scheduler.encoder_cache
+    cache_key = make_mm_encoder_transient_cache_key(request.request_id, 0)
+    assert encoder_cache.acquire(cache_key, 16, retain_after_release=False)
+    encoder_cache.commit(cache_key, torch.ones(2, 2))
+    request.py_mm_encoder_state.set_item_cache_key(0, cache_key, ready=True)
+    assert is_multimodal_encoder_ready(request)
+
+    multimodal_data = mm_item_scheduler.build_multimodal_data_for_llm(request)
+
+    assert "image" not in multimodal_data
+    torch.testing.assert_close(multimodal_data["multimodal_embedding"], torch.ones(2, 2))
+    # Only the per-forward payload drops the raw inputs.
+    assert "image" in request.py_multimodal_data
