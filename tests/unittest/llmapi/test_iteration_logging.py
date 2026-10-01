@@ -50,8 +50,8 @@ async def _produce(address: str, count: int, request_seen: bool = True) -> None:
 def _scenario(case: str, directory: str) -> None:
     root = Path(directory)
     # Shorten drain/join deadlines, but retain real sockets and finite linger.
-    asynchronous._ITERATION_LOG_DRAIN_TIMEOUT = 0.5
-    processes._ITERATION_WRITER_JOIN_TIMEOUT = 1.0
+    asynchronous._ITERATION_LOG_DRAIN_TIMEOUT_SEC = 0.5
+    processes._ITERATION_WRITER_JOIN_TIMEOUT_SEC = 1.0
     if case in ("dead_small", "dead_full", "no_requests"):
         count = 2000 if case == "dead_full" else 5
         asyncio.run(_produce(f"ipc://{root / 'absent.sock'}", count, case != "no_requests"))

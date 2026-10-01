@@ -24,7 +24,7 @@ from zmq import POLLIN, PULL, Context
 
 from tensorrt_llm import logger
 
-_ITERATION_WRITER_JOIN_TIMEOUT = 5.0
+_ITERATION_WRITER_JOIN_TIMEOUT_SEC = 5.0
 _ITERATION_WRITER_POLL_MS = 100
 
 
@@ -128,7 +128,7 @@ class IterationWriter:
                 yield
             finally:
                 stop.set()
-                process.join(timeout=_ITERATION_WRITER_JOIN_TIMEOUT)
+                process.join(timeout=_ITERATION_WRITER_JOIN_TIMEOUT_SEC)
                 if process.is_alive():
                     logger.warning("Iteration writer timed out; the iteration "
                                    "log may be incomplete.")

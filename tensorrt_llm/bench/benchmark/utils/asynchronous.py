@@ -34,7 +34,7 @@ from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 
-_ITERATION_LOG_DRAIN_TIMEOUT = 5.0
+_ITERATION_LOG_DRAIN_TIMEOUT_SEC = 5.0
 _ITERATION_LOG_LINGER_MS = 1000
 
 
@@ -369,7 +369,7 @@ class LlmManager:
         if self._iteration_log_task:
             try:
                 await asyncio.wait_for(self._iteration_log_task,
-                                       timeout=_ITERATION_LOG_DRAIN_TIMEOUT)
+                                       timeout=_ITERATION_LOG_DRAIN_TIMEOUT_SEC)
             except asyncio.TimeoutError:
                 logger.warning("Iteration logging timed out; the iteration log "
                                "may be incomplete.")
