@@ -51,7 +51,10 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
-  - unittest/_torch/models/test_minimax_m3.py::test_validate_fused_projection_requires_fp8_main_kv_cache
+  - unittest/_torch/models/test_minimax_m3.py::test_validate_sparse_attention_runtime_config_backend_selection
+  - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_cache_fused_layout_validation
+  - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage
+  - unittest/_torch/models/test_minimax_m3.py::test_validate_fused_projection_requires_quantized_main_kv_cache
   - unittest/_torch/models/test_minimax_m3.py::test_fused_qkv_index_projection_preserves_index_head_groups
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shards_index_rows
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_tp_matches_unsharded_reference
@@ -87,12 +90,16 @@ l0_cpu:
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_mapping.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_multinode.py
-  - unittest/_torch/visual_gen/sparse_attention/test_skip_softmax.py
+  - unittest/_torch/visual_gen/sparse_attention/skip_softmax/test_skip_softmax.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_attention.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_predictor.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_predictor_kernels.py
   - unittest/_torch/visual_gen/test_attention_flashinfer.py::test_flashinfer_backend_is_registered
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_executor_lifecycle.py
   - unittest/_torch/visual_gen/test_flux_infer.py
+  - unittest/_torch/visual_gen/test_cosmos3_guardrails.py
   - unittest/evaluate/visual_gen/test_generation_evaluation_pipeline.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
   - unittest/_torch/visual_gen/test_minimax_h3_pipeline.py
@@ -126,6 +133,7 @@ l0_cpu:
   - unittest/executor/test_spec_dec_perf_metrics.py
   - unittest/executor/test_stop_word_side_output_trim.py
   - unittest/executor/test_ray_stub.py
+  - unittest/executor/test_generation_request_array_prompt.py
   - unittest/grpc/openengine/test_control.py
   - unittest/grpc/openengine/test_openengine.py
   - unittest/grpc/openengine/test_servicer.py
@@ -135,7 +143,9 @@ l0_cpu:
   - unittest/llmapi/apps/test_anthropic_batches.py
   - unittest/llmapi/apps/test_anthropic_gateway.py
   - unittest/llmapi/apps/test_anthropic_routes.py
+  - unittest/llmapi/apps/test_chat_template_kwargs_guard.py
   - unittest/llmapi/apps/test_chat_utils.py
+  - unittest/llmapi/apps/test_context_length_error.py
   - unittest/llmapi/apps/test_harmony_channel_validation.py
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
@@ -152,9 +162,11 @@ l0_cpu:
   - unittest/llmapi/apps/test_responses_streaming_events.py
   - unittest/llmapi/apps/test_responses_streaming_tool_calls.py
   - unittest/llmapi/apps/test_responses_usage.py
+  - unittest/llmapi/apps/test_serving_extensions.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_web_search_shared.py
   - unittest/llmapi/test_bench_async.py
+  - unittest/llmapi/test_config_overrides.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
   - unittest/llmapi/test_executor.py
   - unittest/llmapi/test_gc_utils.py

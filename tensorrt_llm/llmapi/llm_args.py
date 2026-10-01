@@ -927,7 +927,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "also use a horizontal norm/RoPE/cache-insertion producer for prefill, "
         "mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path "
         "requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 "
-        "main KV cache.",
+        "or NVFP4 main KV cache.",
         status="prototype",
     )
     num_attention_heads: Optional[int] = Field(
@@ -945,9 +945,10 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     implementation: Literal["triton", "msa"] = Field(
         default="triton",
         description=
-        "Sparse attention implementation: 'triton' reference (default) or 'msa' "
-        "(fmha_sm100 kernels). The 'msa' implementation requires an SM100 GPU, "
-        "the fmha_sm100 package, and sparse_block_size == 128.",
+        "Sparse attention implementation: 'triton' legacy reference (default) "
+        "or the recommended 'msa' backend. MSA requires an SM100 or SM103 GPU, "
+        "the fmha_sm100 package, and sparse_block_size == 128. NVFP4 KV cache "
+        "requires 'msa'; it uses MSA prefill and Triton sparse decode kernels.",
         status="prototype",
     )
 
@@ -1365,6 +1366,14 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         description="The sliding window size in tokens for SWA layers.")
     index_topk: Optional[int] = Field(default=512,
                                       description="The top-k for the indexer.")
+    enable_kv_cache_offload: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Offload ratio-4 compressed attention KV history to host memory with "
+        "KV cache manager v2. The indexer and sliding-window caches remain on "
+        "GPU. This feature is under development and currently cannot be "
+        "enabled for inference.")
 
     @field_validator("index_head_dim")
     @classmethod
@@ -1382,6 +1391,19 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         if any(ratio < 0 for ratio in compress_ratios):
             raise ValueError("compress_ratios must be non-negative.")
         return [1 if ratio == 0 else ratio for ratio in compress_ratios]
+
+    @model_validator(mode="after")
+    def validate_kv_cache_offload(self) -> "DeepSeekV4SparseAttentionConfig":
+        if self.enable_kv_cache_offload:
+            if 4 not in self.compress_ratios:
+                raise ValueError(
+                    "DeepSeek-V4 KV cache offload requires a ratio-4 attention layer."
+                )
+            if self.index_topk is None or self.index_topk <= 0:
+                raise ValueError(
+                    "DeepSeek-V4 KV cache offload requires a positive index_topk."
+                )
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -1420,6 +1442,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             indexer_k_dtype=self.indexer_k_dtype,
             compress_ratios=self.compress_ratios,
             window_size=self.window_size,
+            enable_kv_cache_offload=self.enable_kv_cache_offload,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1449,6 +1472,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             q_split_threshold=self.q_split_threshold,
             compress_ratios=self.compress_ratios,
             window_size=self.window_size,
+            enable_kv_cache_offload=self.enable_kv_cache_offload,
         )
 
 
@@ -7080,6 +7104,9 @@ def update_llm_args_with_extra_dict(
             if not isinstance(base_mm, dict):
                 base_mm = {}
             merged = dict(base_mm) | dict(yaml_mm)
+            if ("video_pruning_rate" in explicit_cli_keys
+                    and "video_pruning_rate" in base_mm):
+                merged["video_pruning_rate"] = base_mm["video_pruning_rate"]
             llm_args_dict['multimodal_config'] = merged
 
     # Drop YAML keys claimed by explicit CLI flags so the outer merge below
@@ -7115,10 +7142,14 @@ def update_llm_args_with_extra_dict(
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
-            llm_args_dict[field_name] = field_type(**llm_args_dict[field_name])
+            # Preserve explicit nulls; LlmArgs validates whether the field is optional.
+            if llm_args_dict[field_name] is not None:
+                llm_args_dict[field_name] = field_type(
+                    **llm_args_dict[field_name])
             if field_name in llm_args:
                 extra_llm_str = f" because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
-                logger.info(f"YAML overrides {field_name}{extra_llm_str}")
+                logger.info(
+                    f"Configuration overrides {field_name}{extra_llm_str}")
 
     llm_args = llm_args | llm_args_dict
 

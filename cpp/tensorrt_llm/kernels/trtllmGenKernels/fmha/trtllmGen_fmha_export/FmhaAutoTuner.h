@@ -47,9 +47,7 @@ public:
 
 public:
   // Get the mmaOpsPerClk.
-  static int32_t getMmaOpsPerClk(FmhaOptions const& options,
-                                 KernelTraits const& kernelTraits,
-                                 bool isBmm1 = true);
+  static int32_t getMmaOpsPerClk(FmhaOptions const& options, bool isBmm1 = true);
 
   // Select the GQA generation kernel.
   void selectGqaGenerationKernel();
