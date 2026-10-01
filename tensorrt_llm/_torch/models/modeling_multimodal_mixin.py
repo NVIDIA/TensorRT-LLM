@@ -118,7 +118,11 @@ class EncoderGroup:
     encoder_fn: Callable[..., torch.Tensor]
     """Encoder call invoked as `encoder_fn(**build_batched_input(params))`.
     Returns a single tensor with one row per embedding, laid out per the
-    contract above."""
+    contract above. When those rows are already in prompt order, the
+    framework may return a row slice of this tensor without a copy, so it
+    must not alias storage that a later call overwrites (for example, a CUDA
+    graph's static output buffer); clone such outputs before returning
+    them."""
 
     build_batched_input: Callable[[List[MultimodalParams]], Dict[str, Any]]
     """Builds the kwargs dict passed to `encoder_fn`. Responsible for
@@ -179,7 +183,33 @@ def _reorder_embeds_by_manifest(
     per_modality_embeds: Dict[str, torch.Tensor],
     per_modality_lengths: Dict[str, List[int]],
 ) -> torch.Tensor:
-    """Slice per-modality tensors item-by-item and concat in prompt order."""
+    """Slice per-modality tensors item-by-item and concat in prompt order.
+
+    If only one modality has items and every request lists them in encoder
+    order, that modality's tensor is returned as is, without a copy.
+    """
+    populated_modalities = [
+        (modality, embedding)
+        for modality, embedding in per_modality_embeds.items()
+        if per_modality_lengths.get(modality)
+    ]
+    if len(populated_modalities) == 1:
+        modality, embedding = populated_modalities[0]
+        prompt_order_matches_encoder = True
+        for mp in multimodal_params:
+            manifest = mp.mm_item_order or _synthesize_single_modality_manifest(
+                mp, per_modality_embeds.keys()
+            )
+            item_indices = [entry["index"] for entry in manifest if entry["modality"] == modality]
+            if item_indices != list(range(len(item_indices))):
+                prompt_order_matches_encoder = False
+                break
+        if prompt_order_matches_encoder:
+            # A group with one populated modality already emits request and
+            # item rows in prompt order. Empty peer modalities (for example,
+            # video in an image-only Qwen batch) do not require a reorder.
+            return embedding
+
     per_modality_row_starts: Dict[str, List[int]] = {
         m: list(itertools.accumulate(lens, initial=0)) for m, lens in per_modality_lengths.items()
     }
