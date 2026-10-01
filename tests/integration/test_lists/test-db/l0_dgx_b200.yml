@@ -80,7 +80,8 @@ l0_dgx_b200:
   # ------------- NVBug 6025177: trtllm-serve cross-request KV contamination (OpenAI) ---------------
   - test_e2e.py::test_openai_kv_cache_contamination TIMEOUT (120)
   # ------------- DSA FP4 indexer (Blackwell-only) ---------------
-  - unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py::test_fused_cat_fp4_matches_deepgemm
+  - unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py::test_fused_cat_fp4_matches_reference
+  - unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py::test_fused_cat_fp4_midpoint_rounding
   - unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py::test_fused_cat_fp4_shape_dispatch
   - unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py::test_fused_cat_fp4_noncontiguous_split
   - unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py::test_fused_cat_fp4_dsv32_prefill_shape

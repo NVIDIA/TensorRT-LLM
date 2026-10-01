@@ -200,6 +200,11 @@ def _make_cache_config_for_test(
     cache_manager.dtype = dtype
     cache_manager.head_dim_per_layer = [128] * len(pp_layers)
     cache_manager.enable_swa_scratch_reuse = False
+    cache_manager.enable_partial_reuse = kv_cache_v2_module._effective_partial_reuse(
+        kv_cache_config.enable_partial_reuse,
+        cache_manager._supports_partial_reuse,
+        type(cache_manager).__name__,
+    )
     cache_manager.num_extra_kv_tokens = num_extra_kv_tokens
     cache_manager.enable_stats = False
     cache_manager.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_config.policy)

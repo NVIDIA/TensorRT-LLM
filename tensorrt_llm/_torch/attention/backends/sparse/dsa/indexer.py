@@ -1497,14 +1497,15 @@ class Indexer(nn.Module):
                 if q.is_cuda:
                     from tensorrt_llm._torch.custom_ops import bmm_out
 
-                    q, k = q.to(torch.bfloat16), k.to(torch.bfloat16)
                     dots = torch.empty(
                         (q.shape[0], q.shape[1], k.shape[0]), dtype=q.dtype, device=q.device
                     )
                     bmm_out(q, k.T.unsqueeze(0).expand(q.shape[0], -1, -1), dots)
-                    logits = (dots.relu() * weights.to(q.dtype).unsqueeze(-1)).sum(1).float()
                 else:
-                    logits = (torch.matmul(q, k.T).relu() * weights.unsqueeze(-1)).sum(1)
+                    dots = torch.matmul(q, k.T)
+                # Keep decoded dot products and head-weight reductions in FP32;
+                # rounding either to BF16 can change the exact Top-K selection.
+                logits = (dots.relu() * weights.float().unsqueeze(-1)).sum(1)
                 columns = torch.arange(k.shape[0], device=q.device)[None, :]
                 return logits.masked_fill(
                     (columns < cu_seqlen_ks[:, None]) | (columns >= cu_seqlen_ke[:, None]),

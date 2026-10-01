@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 methods:
   __init__:
     parameters:
@@ -255,6 +258,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      bounded_replay_on_generation:
+        annotation: bool
+        default: False
+        status: prototype
       torch_compile_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.TorchCompileConfig]
         default: null
@@ -308,7 +315,7 @@ methods:
         default: null
         status: prototype
       sparse_attention_config:
-        annotation: Union[tensorrt_llm.llmapi.llm_args.QSASparseAttentionConfig, tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig, NoneType]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.QSASparseAttentionConfig, tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig, tensorrt_llm.llmapi.llm_args.CSA2SparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig, NoneType]
         default: null
         status: prototype
       kv_cache_compression_config:

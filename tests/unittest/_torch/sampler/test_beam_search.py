@@ -1969,25 +1969,19 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     # and py_beam_width is the array maximum either way.
     assert request.py_beam_width == max(beam_width_array)
 
-    # Drive the real admission check rather than a local re-implementation:
-    # _validate_request only reads self.max_beam_width, so a stub carrying it
-    # is enough to reach the beam_width_array branch without standing up an
-    # executor. A test that mirrored the predicate would keep passing if the
-    # production check were deleted.
-    # Everything _validate_request touches besides the beam checks runs after
-    # them and needs a live engine/sampler/KV cache manager, so stub those out;
-    # the beam width and beam_width_array branches are reached with the real
-    # code.
+    # Exercise the real beam admission checks while stubbing validation steps
+    # that need a live engine, sampler, or KV cache manager.
     executor = types.SimpleNamespace(
         max_beam_width=request.py_beam_width,
         kv_cache_transceiver=None,
+        _configure_csa2_remote_tail=lambda _request: None,
         _validate_token_id_range=lambda _request: None,
         sampler=types.SimpleNamespace(validate_request=lambda _request: None),
         _validate_request_budget=lambda _request: None,
     )
     validate = functools.partial(
         PyExecutor._validate_request,
-        executor,  # type: ignore[arg-type]  # stub: only max_beam_width is read
+        executor,  # type: ignore[arg-type]  # stub for unrelated admission checks
     )
 
     if accepted:
