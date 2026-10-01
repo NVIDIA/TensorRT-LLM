@@ -15,7 +15,8 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { discover, run, requestOne } = require('./semantic_review_request');
+const timers = require('node:timers/promises');
+const { discover, run, requestOne, withReadRetries, withReserve } = require('./semantic_review_request');
 const { NAME, statusContext, requests, publish } = require('./semantic_review');
 
 const HEAD = '1'.repeat(40);
@@ -28,6 +29,8 @@ const REVIEWER = { login: 'coderabbitai[bot]', id: 136622811, type: 'Bot' };
 const SERVICE = { login: 'trtllm-agent', id: 296075020, type: 'User' };
 const APPROVED = [{ name: 'ci: full pre-merge approved' }];
 
+test.beforeEach(t => t.mock.method(timers, 'setTimeout', async () => {}));
+
 function pull(number = 1, changes = {}) {
   return { number, state: 'open', draft: false, base: { ref: 'main' },
     head: { sha: HEAD }, labels: APPROVED, auto_merge: null, ...changes };
@@ -36,36 +39,57 @@ function pull(number = 1, changes = {}) {
 function fixture(prs = [pull()], options = {}) {
   const state = {
     prs, legacyChecks: [], statuses: [], comments: new Map(), posts: [], updates: [], warnings: [],
-    failures: [], remaining: options.remaining ?? 5000, target: TARGET,
+    failures: [], summaries: [], remaining: options.remaining ?? 5000, target: TARGET,
     mergeBase: BASE, service: SERVICE, readCounts: new Map(), refReads: 0,
-    before: [], after: [], commandBefore: [], commandAfter: [],
+    hooks: [], commandHooks: [], postAttempts: 0,
     commandRemaining: options.commandRemaining ?? 5000, postErrors: new Map(), comparisons: 0,
-    now: NOW, nextCommentId: 1000, commentReads: new Map(), statusFailures: 0, readOrder: [],
+    now: NOW, nextCommentId: 1000, commentReads: new Map(), statusFailures: 0, summaryFailures: 0, readOrder: [],
+    stickyWrites: [], stickyFailures: 0, minimized: new Set(),
   };
-  const api = (method, commandToken = false) => async (args) => {
+  const hook = key => ({
+    ...Object.fromEntries(['before', 'after', 'error', 'wrap'].map(kind =>
+      [kind, (_, callback) => state[key].push({kind, callback})])),
+    remove: (_, callback) => {state[key] = state[key].filter(item => item.callback !== callback);},
+  });
+  const api = (method, commandToken = false, httpMethod = 'GET', charged = true) => async (args = {}) => {
     const key = commandToken ? 'commandRemaining' : 'remaining';
-    for (const hook of commandToken ? state.commandBefore : state.before) await hook();
-    state[key] -= 1;
-    const response = { data: await method(args),
-      headers: { 'x-ratelimit-remaining': String(state[key]) } };
-    for (const hook of commandToken ? state.commandAfter : state.after) await hook(response);
-    return response;
+    const invoke = async args => {
+      if (charged) state[key] -= 1;
+      return {data: await method(args), headers: {'x-ratelimit-remaining': String(state[key])}};
+    };
+    const hooks = commandToken ? state.commandHooks : state.hooks;
+    return hooks.reduce((next, {kind, callback}) => async options => {
+      if (kind === 'wrap') return callback(next, options);
+      if (kind === 'error') {
+        try {return await next(options);} catch (error) {return callback(error, options);}
+      }
+      if (kind === 'before') await callback(options);
+      const result = await next(options);
+      if (kind === 'after') await callback(result, options);
+      return result;
+    }, invoke)({...args, method: httpMethod});
   };
   const github = {
-    hook: {
-      before: (_, callback) => state.before.push(callback),
-      after: (_, callback) => state.after.push(callback),
-      remove: (_, callback) => {
-        state.before = state.before.filter((hook) => hook !== callback);
-        state.after = state.after.filter((hook) => hook !== callback);
-      },
+    hook: hook('hooks'),
+    graphql: async (query, args) => {
+      if (args.ids) return {nodes: args.ids.map(id => ({id, __typename: 'IssueComment',
+        isMinimized: state.minimized.has(id), viewerCanMinimize: true, viewerCanUnminimize: true}))};
+      const id = args.id || args.input?.subjectId;
+      if (/unminimizeComment/.test(query)) state.minimized.delete(id);
+      else state.minimized.add(id);
+      return /unminimizeComment/.test(query) ?
+        {unminimizeComment: {unminimizedComment: {isMinimized: false}}} :
+        {minimizeComment: {minimizedComment: {isMinimized: true}}};
     },
     paginate: async (method, args) => {
       const { data } = await method(args);
       return data.check_runs || data;
     },
     rest: {
-      rateLimit: { get: async () => ({ data: { resources: { core: { remaining: state.remaining } } } }) },
+      rateLimit: { get: api(() => {
+        state.onRateRead?.();
+        return {resources: {core: {remaining: state.remaining}}};
+      }, false, 'GET', false) },
       pulls: {
         list: api(() => structuredClone(state.prs)),
         get: api(({ pull_number: number }) => {
@@ -98,14 +122,31 @@ function fixture(prs = [pull()], options = {}) {
             created_at: new Date(state.now).toISOString() };
           state.statuses.push(status);
           return status;
-        }),
+        }, false, 'POST'),
       },
       issues: { listComments: api(({ issue_number: number }) => {
         const count = (state.commentReads.get(number) || 0) + 1;
         state.commentReads.set(number, count);
         if (state.onListComments) state.onListComments(number, count);
         return state.comments.get(number) || [];
-      }) },
+      }),
+      createComment: api(args => {
+        state.stickyWrites.push(args);
+        if (state.stickyFailures-- > 0) throw httpError(502);
+        const id = state.nextCommentId++;
+        const comment = {id, node_id: `IC_${id}`, body: args.body,
+          user: {login: 'github-actions[bot]', id: 41898282, type: 'Bot'},
+          created_at: new Date(state.now).toISOString()};
+        state.comments.set(args.issue_number, [...(state.comments.get(args.issue_number) || []), comment]);
+        return comment;
+      }, false, 'POST'),
+      updateComment: api(args => {
+        state.stickyWrites.push(args);
+        if (state.stickyFailures-- > 0) throw httpError(502);
+        const comment = [...state.comments.values()].flat().find(item => item.id === args.comment_id);
+        comment.body = args.body;
+        return comment;
+      }, false, 'PATCH') },
       checks: {
         listForRef: api(({ ref, check_name: name }) => ({ check_runs: structuredClone(state.legacyChecks.filter(
           (check) => check.head_sha === ref && check.name === name)) })),
@@ -115,21 +156,16 @@ function fixture(prs = [pull()], options = {}) {
           const check = state.legacyChecks.find((item) => item.id === args.check_run_id);
           Object.assign(check, args);
           return check;
-        }),
+        }, false, 'PATCH'),
       },
     },
   };
-  const commandGithub = { hook: {
-    before: (_, callback) => state.commandBefore.push(callback),
-    after: (_, callback) => state.commandAfter.push(callback),
-    remove: (_, callback) => {
-      state.commandBefore = state.commandBefore.filter((hook) => hook !== callback);
-      state.commandAfter = state.commandAfter.filter((hook) => hook !== callback);
-    },
-  }, rest: {
-    rateLimit: { get: async () => ({ data: { resources: { core: { remaining: state.commandRemaining } } } }) },
+  const commandGithub = { hook: hook('commandHooks'), rest: {
+    rateLimit: { get: api(() => ({resources: {core: {remaining: state.commandRemaining}}}),
+      true, 'GET', false) },
     users: { getAuthenticated: api(() => state.service, true) },
     issues: { createComment: api((args) => {
+      state.postAttempts += 1;
       assert.equal(args.request.retries, 0);
       const errorMode = state.postErrors.get(args.issue_number);
       state.postErrors.delete(args.issue_number);
@@ -137,20 +173,27 @@ function fixture(prs = [pull()], options = {}) {
       if (errorMode === 'before') throw failure();
       state.posts.push(args);
       const comments = state.comments.get(args.issue_number) || [];
-      const comment = { id: state.nextCommentId++, user: SERVICE, body: args.body,
+      const id = state.nextCommentId++;
+      const comment = { id, node_id: `IC_${id}`, user: SERVICE, body: args.body,
         created_at: new Date(state.now).toISOString(),
         html_url: `https://github.com/NVIDIA/TensorRT-LLM/pull/${args.issue_number}#issuecomment-${state.nextCommentId - 1}` };
       state.comments.set(args.issue_number, comments.concat(comment));
       state.onPostComment?.(comment);
       if (errorMode === 'after') throw failure();
       return comment;
-    }, true) },
+    }, true, 'POST') },
   } };
   const context = { repo: { owner: 'NVIDIA', repo: 'TensorRT-LLM' }, eventName: 'schedule' };
   const core = {
     warning: (message) => state.warnings.push(message), info: () => {},
     setFailed: (message) => state.failures.push(message),
-    summary: { addRaw: () => ({ write: async () => {} }) },
+    summary: { addRaw: (message) => ({ write: async () => {
+      if (state.summaryFailures > 0) {
+        state.summaryFailures -= 1;
+        throw new Error('Summary write unavailable');
+      }
+      state.summaries.push(message);
+    } }) },
   };
   const args = { github, commandGithub, context, core };
   return { ...args, state,
@@ -164,13 +207,250 @@ function fixture(prs = [pull()], options = {}) {
         `head=${request.head} target=${request.target} merge_base=${request.mergeBase} verdict=${verdict}\n` +
         `https://github.com/NVIDIA/TensorRT-LLM/blob/${request.head}/head.py#L1\n` +
         `https://github.com/NVIDIA/TensorRT-LLM/blob/${request.target}/target.py#L1`;
-      const comment = { id, user: REVIEWER, body, created_at: new Date(state.now).toISOString(),
+      const comment = { id, node_id: `IC_${id}`, user: REVIEWER, body, created_at: new Date(state.now).toISOString(),
         html_url: `https://github.com/NVIDIA/TensorRT-LLM/pull/${number}#issuecomment-${id}`, ...changes };
       state.comments.set(number, [...(state.comments.get(number) || []), comment]);
       return comment;
     },
   };
 }
+
+function httpError(status, headers = {}) {
+  const error = Object.assign(new Error('API unavailable'), {status, response: {headers}});
+  Object.defineProperty(error, 'code', {get() {throw new Error('Deprecated error.code accessed');}});
+  return error;
+}
+
+test('transient GET failures recover within three attempts and send one AI request', async () => {
+  for (const status of [502, 503, 504]) {
+    const f = fixture([pull()], {readPR: (pr, count) => {
+      if (count < 3) throw httpError(status);
+      return pr;
+    }});
+    assert.equal((await f.worker()).status, 'requested');
+    assert.equal(f.state.readCounts.get(1), 4);
+    assert.equal(f.state.postAttempts, 1);
+    assert.equal(f.state.statuses.length, 1);
+    assert.equal(f.state.hooks.length + f.state.commandHooks.length, 0);
+  }
+  assert.deepEqual(timers.setTimeout.mock.calls.map(call => call.arguments[0]),
+    [1000, 2000, 1000, 2000, 1000, 2000]);
+});
+
+test('persistent GET failure stops after three attempts without sending AI or status writes', async () => {
+  const failure = httpError(504);
+  failure.request = {method: 'GET', url: 'https://example.test/?secret=do-not-log',
+    headers: {authorization: 'do-not-log'}, body: 'do-not-log'};
+  failure.message = 'do-not-log';
+  const f = fixture([pull()], {readPR: () => {throw failure;}});
+  assert.equal((await f.worker()).status, 'failed');
+  assert.equal(f.state.readCounts.get(1), 3);
+  assert.equal(f.state.postAttempts, 0);
+  assert.equal(f.state.statuses.length, 0);
+  assert.equal(f.state.failures[0], 'PR #1: semantic review preparing/reading PR failed ' +
+    '(HTTP 504 GET; new command delivery not attempted).');
+  assert.equal(f.state.summaries.at(-1), f.state.failures[0]);
+  assert.equal(f.state.hooks.length, 0);
+  await assert.rejects(f.github.rest.pulls.get({pull_number: 1}), error => error === failure);
+  assert.equal(f.state.readCounts.get(1), 4);
+});
+
+test('non-transient errors and rate limits are not retried or read through error.code', async () => {
+  for (const status of [400, 401, 403, 404, 422, 429, 500]) {
+    const f = fixture([pull()], {readPR: () => {
+      throw httpError(status, status === 403 ? {'retry-after': '60'} : {});
+    }});
+    assert.equal((await f.worker()).status, [403, 429].includes(status) ? 'limited' : 'failed');
+    assert.equal(f.state.readCounts.get(1), 1);
+    assert.equal(f.state.postAttempts, 0);
+    assert.equal(f.state.hooks.length, 0);
+  }
+  assert.equal(timers.setTimeout.mock.calls.length, 0);
+});
+
+test('each retry honors the reserve using failed response headers or conservative local accounting', async () => {
+  for (const [remaining, headers] of [[5000, {'x-ratelimit-remaining': '1000'}], [1001, {}]]) {
+    const f = fixture([pull()], {remaining, readPR: () => {throw httpError(504, headers);}});
+    assert.equal((await f.worker()).status, 'limited');
+    assert.equal(f.state.readCounts.get(1), 1);
+    assert.equal(f.state.postAttempts, 0);
+    assert.equal(f.state.hooks.length, 0);
+  }
+});
+
+test('GraphQL response headers cannot replenish the REST quota reserve', async () => {
+  const f = fixture([], {remaining: 1002});
+  await assert.rejects(withReserve(f.github, async () => {
+    const before = f.state.hooks.find(item => item.kind === 'before').callback;
+    const after = f.state.hooks.find(item => item.kind === 'after').callback;
+    before();
+    after({headers: {'x-ratelimit-resource': 'graphql', 'x-ratelimit-remaining': '4999'}});
+    before();
+    before();
+  }), error => error.semanticReviewQuota === true);
+  assert.equal(f.state.hooks.length, 0);
+});
+
+test('a failed timeline summary is repaired on an unchanged PR without another AI request', async () => {
+  const f = fixture();
+  f.state.stickyFailures = 1;
+  assert.equal((await f.worker()).status, 'requested');
+  assert.equal(f.state.statuses.length, 1);
+  assert.equal(f.state.failures.length, 0);
+  assert.equal(f.state.warnings.length, 1);
+  const scan = await f.scan();
+  assert.deepEqual(scan.jobs, [{number: 1, allowRequest: false}]);
+  assert.equal((await f.worker({...scan.jobs[0], commandGithub: undefined})).status, 'reconciled');
+  assert.equal(f.state.postAttempts, 1);
+  assert.equal(f.state.statuses.length, 1);
+  assert.deepEqual((await f.scan()).jobs, []);
+});
+
+test('quota reads use bounded retries and always remove their hooks', async () => {
+  for (const recover of [true, false]) {
+    const f = fixture();
+    let reads = 0;
+    const failure = httpError(503);
+    f.state.onRateRead = () => {if (++reads < 3 || !recover) throw failure;};
+    if (recover) assert.equal((await f.worker()).status, 'requested');
+    else {
+      assert.equal((await f.worker()).status, 'failed');
+      assert.equal(f.state.readCounts.size, 0);
+      assert.equal(f.state.postAttempts, 0);
+    }
+    assert.equal(reads, 3);
+    assert.equal(f.state.hooks.length + f.state.commandHooks.length, 0);
+  }
+});
+
+test('quota reached after a failed PR read still advances the cursor to that visited candidate', async () => {
+  for (const headers of [{}, {'x-ratelimit-remaining': '1000'}]) {
+    const f = fixture([pull(100), pull(90)], {remaining: 1002,
+      readPR: () => {throw httpError(504, headers);}});
+    const result = await f.scan({cursor: 100});
+    assert.equal(result.limited, true);
+    assert.equal(result.cursor, 90);
+    assert.deepEqual(f.state.readOrder, [90]);
+    assert.equal(result.failed, 0);
+    assert.deepEqual(result.jobs, []);
+    assert.equal(f.state.hooks.length, 0);
+  }
+});
+
+test('ambiguous comment delivery retries only its GET readback and never sends another POST', async () => {
+  const f = fixture();
+  f.state.postErrors.set(1, 'after');
+  f.state.onListComments = (_number, count) => {
+    if (count === 3 || count === 4) throw httpError(504);
+  };
+  assert.equal((await f.worker()).status, 'requested');
+  assert.equal(f.state.postAttempts, 1);
+  assert.equal(f.state.posts.length, 1);
+  assert.equal(f.state.statuses.length, 1);
+  assert.deepEqual(timers.setTimeout.mock.calls.map(call => call.arguments[0]), [1000, 2000]);
+});
+
+test('persistent delivery readback failure leaves the accepted request for reconciliation', async () => {
+  const f = fixture();
+  f.state.postErrors.set(1, 'after');
+  f.state.onListComments = (_number, count) => {
+    if (count >= 3 && count <= 5) throw httpError(504);
+  };
+  assert.equal((await f.worker()).status, 'failed');
+  assert.equal(f.state.postAttempts, 1);
+  assert.equal(f.state.statuses.length, 0);
+  const request = requests(f.state.comments.get(1))[0];
+  assert.equal(f.state.warnings[0], 'PR #1: request delivery remains unknown ' +
+    `(HTTP 504; request ID ${request.id}).`);
+  assert.equal(f.state.failures[0], 'PR #1: semantic review command delivery failed ' +
+    `(HTTP 502; new command delivery unknown; request ID ${request.id}).`);
+  assert.equal(f.state.summaries.at(-1), f.state.failures[0]);
+  const scan = await f.scan();
+  assert.deepEqual(scan.jobs, [{number: 1, allowRequest: false}]);
+  assert.equal((await f.worker(scan.jobs[0])).status, 'reconciled');
+  assert.equal(f.state.postAttempts, 1);
+  assert.equal(f.state.statuses.length, 1);
+});
+
+test('accepted delivery remains confirmed when publication fails, including after POST readback', async () => {
+  for (const publication of ['GET', 'POST']) {
+    for (const lostResponse of [false, true]) {
+      const f = fixture();
+      if (lostResponse) f.state.postErrors.set(1, 'after');
+      if (publication === 'POST') f.state.statusFailures = 2;
+      else f.state.onListComments = (_number, count) => {
+        if (count >= (lostResponse ? 4 : 3)) throw httpError(502);
+      };
+      assert.equal((await f.worker()).status, 'failed');
+      const request = requests(f.state.comments.get(1))[0];
+      assert.equal(f.state.failures[0], 'PR #1: semantic review result publication failed ' +
+        `(HTTP 502; new command delivery confirmed; request ID ${request.id}).`);
+      assert.equal(f.state.summaries.at(-1), f.state.failures[0]);
+      assert.equal(f.state.postAttempts, 1);
+      assert.equal(f.state.statuses.length, 0);
+      assert.equal(f.state.warnings.length, 0);
+      assert.equal(f.state.statusFailures, publication === 'POST' ? 1 : 0);
+      assert.equal(f.state.commentReads.get(1), (lostResponse ? 1 : 0) +
+        (publication === 'GET' ? 5 : 3));
+      f.state.statusFailures = 0;
+      delete f.state.onListComments;
+      f.reply(request);
+      await withReadRetries(f.github, () => f.publish());
+      assert.equal(f.state.statuses.at(-1).state, 'success');
+      assert.equal(f.state.postAttempts, 1);
+      assert.deepEqual((await f.scan()).jobs, []);
+    }
+  }
+});
+
+test('a summary failure after writing the status preserves confirmed command delivery', async () => {
+  const f = fixture();
+  f.state.summaryFailures = 1;
+  assert.equal((await f.worker()).status, 'failed');
+  const request = requests(f.state.comments.get(1))[0];
+  assert.equal(f.state.failures[0], 'PR #1: semantic review result publication failed ' +
+    `(HTTP unknown; new command delivery confirmed; request ID ${request.id}).`);
+  assert.equal(f.state.summaries.at(-1), f.state.failures[0]);
+  assert.equal(f.state.statuses.length, 1);
+  assert.equal(f.state.statuses[0].state, 'pending');
+  assert.equal(f.state.postAttempts, 1);
+});
+
+test('result publication recovers GET errors below the reserve without retrying failed writes', async () => {
+  for (const worker of [true, false]) {
+    const f = fixture();
+    const first = await f.one();
+    f.reply(first.request);
+    f.state.remaining = 900;
+    let reads = 0;
+    f.state.onListComments = () => {if (++reads < 3) throw httpError(502);};
+    if (worker) assert.equal((await f.worker({allowRequest: false})).status, 'reconciled');
+    else await withReadRetries(f.github, () => f.publish());
+    assert.equal(f.state.statuses.at(-1).state, 'success');
+    assert.equal(reads, 3);
+    assert.equal(f.state.postAttempts, 1);
+    f.reply(first.request, 'FAIL');
+    f.state.statusFailures = 2;
+    await assert.rejects(withReadRetries(f.github, () => f.publish()), {status: 502});
+    assert.equal(f.state.statusFailures, 1);
+    assert.equal(f.state.statuses.at(-1).state, 'success');
+    assert.equal(f.state.hooks.length, 0);
+  }
+});
+
+test('writes with transient errors remain single attempts for both clients', async () => {
+  for (const mode of ['before', 'after']) {
+    const f = fixture();
+    f.state.postErrors.set(1, mode);
+    assert.equal((await f.worker()).status, mode === 'after' ? 'requested' : 'failed');
+    if (mode === 'before') {
+      assert.match(f.state.failures[0], /command delivery failed \(HTTP 502; new command delivery unknown; request ID [a-f0-9-]+\)\./);
+      assert.equal(f.state.posts.length, 0);
+    }
+    assert.equal(f.state.postAttempts, 1);
+    assert.equal(timers.setTimeout.mock.calls.length, 0);
+  }
+});
 
 test('eligibility accepts either approval or auto-merge and requires an open supported non-draft PR', async () => {
   for (const pr of [pull(), pull(1, { labels: [], auto_merge: { enabled_by: {} } }),
@@ -296,7 +576,7 @@ test('live head changes, branch changes and approval removal stop stale requests
 test('a token with the right login but wrong immutable service ID is rejected', async () => {
   const f = fixture();
   f.state.service = { ...SERVICE, id: 999 };
-  await assert.rejects(f.one(), { code: 'SEMANTIC_REVIEW_COMMAND_USER' });
+  await assert.rejects(f.one(), /command token must belong to the configured service account/);
   assert.equal(f.state.statuses.length, 0);
   assert.equal(f.state.posts.length, 0);
 });
@@ -383,7 +663,7 @@ test('discovery read errors consume slots and report failure while preserving ot
   const result = await f.scan();
   assert.equal(result.failed, 6);
   assert.equal(result.cursor, 11);
-  assert.equal(f.state.readOrder.length, 30);
+  assert.equal(f.state.readOrder.length, 42);
   assert.deepEqual(result.jobs, Array.from({ length: 24 }, (_, index) => ({ number: 34 - index, allowRequest: true })));
   assert.equal(f.state.warnings.length, 5);
   assert.equal(f.state.failures.length, 1);
@@ -431,8 +711,7 @@ test('discovery preserves 1000 REST requests and returns candidates already foun
   assert.deepEqual(f.state.readOrder, [2]);
   assert.equal(f.state.remaining, 1000);
   assert.equal(f.state.failures.length, 0);
-  assert.equal(f.state.before.length, 0);
-  assert.equal(f.state.after.length, 0);
+  assert.equal(f.state.hooks.length, 0);
 });
 
 test('worker preserves the 1000-request reserve independently for both tokens', async () => {
@@ -445,8 +724,7 @@ test('worker preserves the 1000-request reserve independently for both tokens', 
     assert.ok(f.state.commandRemaining >= 1000);
     assert.equal(f.state.statuses.length, 0);
     assert.equal(f.state.failures.length, 0);
-    assert.equal(f.state.before.length + f.state.after.length +
-      f.state.commandBefore.length + f.state.commandAfter.length, 0);
+    assert.equal(f.state.hooks.length + f.state.commandHooks.length, 0);
   }
   const f = fixture([pull()], { commandRemaining: 1002 });
   assert.equal((await f.worker()).status, 'requested');
@@ -471,10 +749,11 @@ test('worker operational errors fail its job, release quota hooks and never pass
   f.state.service = { ...SERVICE, id: 999 };
   assert.equal((await f.worker()).status, 'failed');
   assert.equal(f.state.failures.length, 1);
+  assert.equal(f.state.failures[0], 'PR #1: semantic review preparing/reading PR failed ' +
+    '(HTTP unknown; new command delivery not attempted).');
   assert.equal(f.state.posts.length, 0);
   assert.equal(f.state.statuses.length, 0);
-  assert.equal(f.state.before.length + f.state.after.length +
-    f.state.commandBefore.length + f.state.commandAfter.length, 0);
+  assert.equal(f.state.hooks.length + f.state.commandHooks.length, 0);
 });
 
 test('manual dispatch validates input and forces any open supported PR, including drafts', async () => {
@@ -588,6 +867,23 @@ test('a failed status write is retried from the reply rather than asking AI agai
   assert.equal((await f.worker({ commandGithub: undefined })).status, 'unchanged');
   assert.equal(f.state.statuses.at(-1).state, 'failure');
   assert.equal(f.state.posts.length, 1);
+});
+
+test('repair publication failure reports no new command attempt', async () => {
+  for (const allowRequest of [true, false]) {
+    const f = fixture();
+    const first = await f.one();
+    f.reply(first.request);
+    f.state.statusFailures = 1;
+    assert.equal((await f.worker({allowRequest})).status, 'failed');
+    assert.equal(f.state.failures[0], 'PR #1: semantic review result publication failed ' +
+      '(HTTP 502; new command delivery not attempted).');
+    assert.equal(f.state.postAttempts, 1);
+    assert.equal(f.state.statuses.at(-1).state, 'pending');
+    assert.equal((await f.worker({allowRequest})).status, allowRequest ? 'unchanged' : 'reconciled');
+    assert.equal(f.state.statuses.at(-1).state, 'success');
+    assert.equal(f.state.postAttempts, 1);
+  }
 });
 
 test('an accepted comment whose initial status write fails is repaired without another AI request', async () => {
@@ -995,7 +1291,7 @@ test('a failed PR read advances the cursor to that attempted PR after the wrap',
   });
   const result = await f.scan({ cursor: 100 });
   assert.deepEqual(result.jobs, [{ number: 90, allowRequest: true }]);
-  assert.deepEqual(f.state.readOrder, [90, 110, 100]);
+  assert.deepEqual(f.state.readOrder, [90, 110, 100, 100, 100]);
   assert.equal(result.cursor, 100);
   assert.equal(result.failed, 1);
   assert.equal(result.skipped, 1);
@@ -1037,6 +1333,6 @@ test('quota exhaustion after a PR read records that PR even if later inspection 
     assert.deepEqual(f.state.readOrder, expectedReads);
     assert.equal(f.state.remaining, 1000);
     assert.equal(f.state.failures.length, 0);
-    assert.equal(f.state.before.length + f.state.after.length, 0);
+    assert.equal(f.state.hooks.length, 0);
   }
 });

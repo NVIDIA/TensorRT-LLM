@@ -19,13 +19,19 @@ The prompt checks behavioral compatibility involving the PR changes, including
 when head already contains target. It asks CodeRabbit to distinguish cross-branch
 interactions from PR-local compatibility defects and to verify how both sides'
 edits combine. An alleged caller/definition mismatch must remain after three-way
-merge analysis before it can support FAIL. Unresolved relevant
-textual conflicts must not be replaced with an assumed resolution.
+merge analysis before it can support FAIL. For textual conflicts, identify the
+specific unresolved choice that affects a finding. Assess unaffected regions
+independently, including within conflicted files, and inspect the combined order
+of operations on shared objects or bindings. A hypothetical additional repair
+during conflict resolution does not invalidate an established defect.
 
 FAIL needs a supported trigger, a reachable failure path and evidence that paired
 edits, feature gates or recovery logic do not prevent the problem. Unrelated
 pre-existing defects, missing tests alone and wording-only improvements do not
-support FAIL. Missing material evidence supports INCONCLUSIVE. Each reply must
+support FAIL. Intentional rejection of unmet prerequisites alone is not a
+compatibility defect; establish a supported scenario required to keep working.
+Different fallback policies in separate consumers do not establish that
+requirement. Missing material evidence supports INCONCLUSIVE. Each reply must
 include the advisory notice and put its fixed-revision citations inside the
 `SEMANTIC_REVIEW` section. These are instructions to the AI, not guarantees of
 its compliance or semantic accuracy.
@@ -78,8 +84,8 @@ directly request analysis. The scheduled scan observes those changes.
   that prevents the PR's first API request does not count as a visit. No visits
   means no cursor change. Cursor movement does not depend on worker completion
   or successful AI requests.
-- The scan also repairs result publication for the latest request on open PRs,
-  including drafts or PRs that no longer have approval/auto-merge. Repairs do
+- The scan also repairs result publication and the timeline summary for the
+  latest request on open PRs, including drafts or PRs that no longer have approval/auto-merge. Repairs do
   not consume AI request slots and cannot turn into new requests. The combined
   request/repair matrix fits GitHub's limit of 256 jobs per matrix.
 - Post the request comment before publishing its pending status. If the comment
@@ -91,6 +97,25 @@ directly request analysis. The scheduled scan observes those changes.
   service PAT have separate quota checks. Repair-only jobs and comment-triggered
   publication do not require the service PAT or apply this reserve. Concurrent
   API users can spend quota between observations.
+- GitHub GET requests returning HTTP 502, 503 or 504 are retried at most twice,
+  after one and two seconds. This applies to cursor reads, discovery, requests
+  and result publication. Each attempt rechecks any applicable reserve, using
+  response quota headers or locally accounting for requests when headers are
+  absent. HTTP 403/429 and other errors are not retried. Comment, status and
+  Check writes are not automatically repeated. Exhausted reads retain the
+  normal failure and cursor rules; HTTP retries do not create additional AI
+  requests or consume additional selection slots.
+
+Worker failure annotations and summaries identify the stage: preparing/reading
+the PR, command delivery, or result publication. Result publication covers
+reading review state, writing the status and job summary, and legacy Check
+cleanup. The diagnostics include the HTTP status,
+request method when available, and allocated request ID. The separate
+`new command delivery` field records `not attempted`, `unknown`, or `confirmed`
+for this attempt. A publication failure can follow confirmed delivery; an
+ambiguous POST whose read-back cannot confirm delivery remains `unknown`.
+Repairing an earlier request does not count as sending a new command. Logs omit
+raw request URLs, headers, bodies and error messages.
 
 A scan first recovers any valid result already received for the latest request,
 then considers a new analysis. A reply received before the worker's final
@@ -131,7 +156,7 @@ after partial selection failures or quota exhaustion if at least one PR was
 visited. Upload failure is reported and prevents dispatching that batch's PR
 jobs. Cursor maintenance does not change the version deduplication rules.
 
-Artifacts use a 90-day retention request, subject to repository limits. If no
+Artifacts use a 14-day retention request, subject to repository limits. If no
 trusted cursor artifact is retained, log initialization and start with the
 newest PR. This includes first use and deletion of all retained cursor artifacts;
 artifact storage cannot distinguish those cases. Do not delete these artifacts
@@ -166,6 +191,18 @@ eligible for the bounded timeout retry. A correctly bound PASS/FAIL without the
 required fixed-revision source citations completes as INCONCLUSIVE. This does
 not establish the semantic correctness of those citations or the AI's findings.
 
+Publication logs and job summaries explain why a result was not accepted and
+link the observed comment. A known CodeRabbit service-error message, a missing
+or malformed result record, mismatched request IDs or revisions, and missing
+source citations have distinct diagnostics. A comment without the request's
+identity is an unverified observation, not proof that it answers that request.
+These diagnostics do not complete requests, change verdicts or request retries.
+Diagnostic publication does not depend on a status write. Scheduled scans do
+not create repair jobs solely to emit diagnostics for unchanged PRs. Ordinary
+unrelated bot comments do not create an analysis result.
+If a status update fails, publication still attempts the diagnostic summary,
+marks the status update as unconfirmed and rethrows the original status error.
+
 Publication uses only the latest request and its matching replies. A new request
 updates the same PR context on its requested head commit; an old request's late
 reply cannot replace the current result. Status history remains available.
@@ -197,6 +234,38 @@ analysis may finish after merging and publish its recorded snapshot, not an
 audit of the final merge tree. Scheduled recovery covers open PRs; a missed
 publication on a closed PR requires a subsequent trusted reply event or a
 publisher job rerun.
+
+## PR timeline
+
+Each PR has one summary comment owned by `github-actions[bot]`, updated in place.
+It shows the latest request's waiting state or PASS/FAIL/INCONCLUSIVE result,
+fixed revisions, and links to the original request and evidence. A new request
+shows waiting until its own valid reply arrives; an older result is not carried
+forward. The summary contains no CodeRabbit command or mention.
+
+After publishing the status and summary, collapse completed production trigger
+comments and superseded semantic replies. INCONCLUSIVE is completed even though
+its commit status is pending. Keep the current accepted reply visible. While
+waiting, show the current trigger and leave the most recent valid previous reply
+uncollapsed if it is already visible. Hidden historical replies are not restored.
+Original bodies and links remain available in collapsed comments;
+nothing is deleted or rewritten as a different AI judgment. Human discussion,
+unbound replies, ordinary CodeRabbit reviews and fixed-input replay comments
+without production request markers are not collapsed.
+
+Comment authors and full request identities must pass the same validation used
+for publication. Only the publisher's own PR-specific summary marker can be
+updated. GitHub's per-comment moderation capabilities are checked before hiding
+or showing comments. Presentation failures produce stage-specific warnings and
+do not change the verdict, send an AI request or fail the workflow. A missing or
+outdated summary, or its incomplete-cleanup marker, schedules a repair on the
+next scan that visits the open PR. Each publication collapses at most 20 comments;
+remaining work continues through these repairs. The summary is written before
+any comments are collapsed, and unchanged summaries are not edited.
+
+This presentation policy preserves head/target/branch deduplication and the
+normal scan schedule. An unchanged PR patch or non-overlapping file changes do
+not establish compatibility with a new target revision.
 
 ## Correcting a disputed result
 
@@ -231,7 +300,10 @@ and permit posting issue comments. It sends CodeRabbit commands and reads its
 own identity and quota; repository reads and commit status publication use
 `GITHUB_TOKEN`. Discovery has `statuses: read` and `checks: read`. Request and
 publication jobs have `statuses: write` and retain `checks: write` only to cancel
-incomplete semantic Check Runs. The publisher recognizes `coderabbitai[bot]`
+incomplete semantic Check Runs. They also have `issues: write` to maintain the
+summary and moderate the conversation with `GITHUB_TOKEN`; discovery remains
+read-only. If GitHub denies comment moderation, publication retains the evidence
+and reports a presentation warning. The publisher recognizes `coderabbitai[bot]`
 (user ID `136622811`). Keep semantic statuses non-required.
 
 ## Validation
@@ -243,9 +315,10 @@ node --test .github/scripts/semantic_review*.test.js
 ```
 
 `semantic_review_cases.js` freezes three real incidents in divergent,
-already-integrated and repaired states, plus three paired-edit controls, for
-analysis replay. Integrated inputs use the actual defective merge commits to
-exercise `merge_base == target`;
+already-integrated and repaired states, three paired-edit controls, and five
+fixed inputs covering release prerequisites, resource allocation, integrated
+test patches, symbol bindings and test attributes. Integrated inputs use the
+actual defective merge commits to exercise `merge_base == target`;
 they are not newly synthesized rebases. Repair controls compare each historical
 fix with its immediate parent to exclude unrelated intervening changes. Build
 each request with the same `command()` used by the workflow:
@@ -262,11 +335,23 @@ preserves the paired edits. #19397 also has textual conflicts, so rejecting that
 specific false finding does not require an overall PASS. Fixtures carry no
 expected answer into `command()`.
 
-Replay all twelve inputs with the final prompt, retaining request IDs, input SHAs,
-raw replies, concrete findings and timings, including missed/inconclusive results.
+The additional inputs use PRs #19429, #19213, #19397, #18813 and #19418. Assess
+release-policy and resource findings against their supported trigger, rather
+than requiring an overall PASS. For the known incompatible inputs, require at
+least one independently supported incompatibility; also record whether the
+specific duplicate-operation, binding or test-attribute defect was found.
+
+Use the seventeen fixed inputs for real prompt evaluation. For focused changes,
+declare the affected cases, a known incompatible input and its repaired control,
+and repeat counts before sending requests. Compare old and new prompts on the
+same fixed revisions and report which cases were actually run. Retain request
+IDs, prompt hashes, input SHAs, raw replies, concrete findings and timings,
+including missed/inconclusive results; do not replace an unfavorable reply with
+an unreported rerun.
 Use an independent context without giving the incident explanation or a repair.
-If the hosting discussion reveals the answer, label the run as a replay rather
-than a blind evaluation. Fixed repeats characterize variability; production
+If the hosting discussion or shared CodeRabbit Learnings reveal relevant context,
+label the run as a replay rather than a blind evaluation and do not attribute
+changes solely to the prompt. Fixed repeats characterize variability; production
 uses one initial request and at most one automatic timeout retry per version.
 Assess known defect detection and repair false positives separately; a narrow
 repair control does not establish general accuracy.

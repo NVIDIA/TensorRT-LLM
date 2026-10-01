@@ -17,7 +17,10 @@ const assert = require('node:assert/strict');
 const { readdirSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const test = require('node:test');
+const timers = require('node:timers/promises');
 const { findCursorArtifact, parseCursor, restoreCursor } = require('./semantic_review_cursor');
+
+test.beforeEach(context => context.mock.method(timers, 'setTimeout', async () => {}));
 
 const ARTIFACT = 'semantic-review-cursor';
 const NEXT_ARTIFACT = 'semantic-review-cursor-next';
@@ -40,27 +43,45 @@ const trustedRun = (extra = {}) => ({ event: 'schedule',
   head_repository: { full_name: 'NVIDIA/TensorRT-LLM' }, ...extra });
 
 function fixture(pages = [[]], options = {}) {
-  const state = { calls: [], rateReads: 0, before: [], after: [],
+  const state = { calls: [], rateReads: 0, hooks: [],
     remaining: options.remaining ?? 5000 };
-  const api = (kind, operation) => async (args) => {
-    for (const hook of state.before) await hook();
-    state.calls.push({ kind, ...args });
-    state.remaining -= 1;
-    if (options.errors?.[kind] && (!options.errorName || options.errorName === args.name)) {
-      throw options.errors[kind];
+  const api = (kind, operation) => async (args = {}) => {
+    let request = async () => {
+      if (kind === 'rate') state.rateReads += 1;
+      else {
+        state.calls.push({ kind, ...args });
+        state.remaining -= 1;
+      }
+      if (!options.errorName || options.errorName === args.name) {
+        const configured = options.errors?.[kind];
+        const failure = Array.isArray(configured) ? configured.shift() : configured;
+        if (failure) throw failure;
+      }
+      return { data: operation(args),
+        headers: { 'x-ratelimit-remaining': String(state.remaining) } };
+    };
+    for (const { type, callback } of state.hooks) {
+      const inner = request;
+      request = async (requestOptions) => {
+        if (type === 'wrap') return callback(inner, requestOptions);
+        if (type === 'before') await callback(requestOptions);
+        if (type === 'error') {
+          try { return await inner(requestOptions); }
+          catch (error) { return callback(error, requestOptions); }
+        }
+        const response = await inner(requestOptions);
+        if (type === 'after') await callback(response, requestOptions);
+        return response;
+      };
     }
-    const response = { data: operation(args),
-      headers: { 'x-ratelimit-remaining': String(state.remaining) } };
-    for (const hook of state.after) await hook(response);
-    return response;
+    return request({ method: 'GET', ...args });
   };
   const github = {
     hook: {
-      before: (_, callback) => state.before.push(callback),
-      after: (_, callback) => state.after.push(callback),
+      ...Object.fromEntries(['before', 'after', 'error', 'wrap'].map(type =>
+        [type, (_, callback) => state.hooks.push({ type, callback })])),
       remove: (_, callback) => {
-        state.before = state.before.filter(hook => hook !== callback);
-        state.after = state.after.filter(hook => hook !== callback);
+        state.hooks = state.hooks.filter(hook => hook.callback !== callback);
       },
     },
     paginate: async (method, args) => {
@@ -73,10 +94,7 @@ function fixture(pages = [[]], options = {}) {
       return all;
     },
     rest: {
-      rateLimit: { get: async () => {
-        state.rateReads += 1;
-        return { data: { resources: { core: { remaining: state.remaining } } } };
-      } },
+      rateLimit: { get: api('rate', () => ({ resources: { core: { remaining: state.remaining } } })) },
       actions: {
         listArtifactsForRepo: api('list', ({ page, name }) =>
           ({ artifacts: pages[page - 1].filter(item => item.name === name) })),
@@ -168,30 +186,57 @@ test('absent artifacts return no cursor without reading a workflow run', async (
 
 test('artifact-list and workflow-run API failures propagate rather than resetting the cursor', async () => {
   for (const kind of ['list', 'run']) {
-    for (const status of [403, 404, 429, 500, 503]) {
+    for (const status of [403, 404, 429, 500, 502, 503, 504]) {
       const failure = Object.assign(new Error('API unavailable'), { status });
       const f = fixture([[artifact(1), artifact(2)]], { errors: { [kind]: failure } });
       await assert.rejects(f.find(), error => error === failure);
-      assert.equal(f.state.calls.filter(call => call.kind === kind).length, 1);
-      assert.equal(f.state.before.length + f.state.after.length, 0);
+      assert.equal(f.state.calls.filter(call => call.kind === kind).length,
+        [502, 503, 504].includes(status) ? 3 : 1);
+      assert.equal(f.state.hooks.length, 0);
     }
+  }
+});
+
+test('transient artifact reads recover without resetting or falling back to an older cursor', async () => {
+  for (const kind of ['list', 'run', 'download']) {
+    const failures = [502, 504].map(status => Object.assign(new Error('Temporarily unavailable'), { status }));
+    const f = fixture([[artifact(1), artifact(2)]], { errors: { [kind]: failures } });
+    assert.deepEqual(await f.restore(), { cursor: 19621, nextArtifact: NEXT_ARTIFACT });
+    assert.equal(f.state.calls.filter(call => call.kind === kind &&
+      (kind !== 'list' || call.name === ARTIFACT)).length, 3);
+    assert.ok(f.state.calls.filter(call => call.kind === 'download').every(call => call.artifact_id === 2));
+    assert.equal(f.state.hooks.length, 0);
+  }
+  assert.deepEqual(timers.setTimeout.mock.calls.map(call => call.arguments[0]),
+    [1000, 2000, 1000, 2000, 1000, 2000]);
+});
+
+test('failed artifact reads stop at the reserve before another retry can spend quota', async () => {
+  for (const headers of [{ 'x-ratelimit-remaining': '1000' }, undefined]) {
+    const failure = Object.assign(new Error('Gateway timeout'), { status: 504,
+      ...(headers ? { response: { headers } } : {}) });
+    const f = fixture([[artifact(1)]], { remaining: headers ? 5000 : 1001,
+      errors: { list: failure } });
+    await assert.rejects(f.restore(), { semanticReviewQuota: true });
+    assert.deepEqual(f.state.calls.map(call => call.kind), ['list']);
+    assert.equal(f.state.hooks.length, 0);
   }
 });
 
 test('quota reserve stops lookup before spending the last 1000 requests', async () => {
   for (const remaining of [999, 1000]) {
     const f = fixture([[artifact(1)]], { remaining });
-    await assert.rejects(f.find(), { code: 'SEMANTIC_REVIEW_QUOTA' });
+    await assert.rejects(f.find(), { semanticReviewQuota: true });
     assert.equal(f.state.rateReads, 1);
     assert.deepEqual(f.state.calls, []);
-    assert.equal(f.state.before.length + f.state.after.length, 0);
+    assert.equal(f.state.hooks.length, 0);
   }
   const during = fixture([[artifact(1)]], { remaining: 1001 });
-  await assert.rejects(during.find(), { code: 'SEMANTIC_REVIEW_QUOTA' });
+  await assert.rejects(during.find(), { semanticReviewQuota: true });
   assert.equal(during.state.remaining, 1000);
   assert.deepEqual(during.state.calls.map(call => call.kind), ['list']);
   const beforeRun = fixture([[artifact(1)]], { remaining: 1002 });
-  await assert.rejects(beforeRun.find(), { code: 'SEMANTIC_REVIEW_QUOTA' });
+  await assert.rejects(beforeRun.find(), { semanticReviewQuota: true });
   assert.deepEqual(beforeRun.state.calls.map(call => call.kind), ['list', 'list']);
   const enough = fixture([[artifact(1)]], { remaining: 1003 });
   assert.equal((await enough.find()).id, 1);
@@ -234,22 +279,23 @@ test('invalid ZIPs, missing entries, broken JSON and invalid cursors fail withou
 });
 
 test('restore propagates download API errors and releases its quota hooks', async () => {
-  for (const status of [403, 404, 429, 500, 503]) {
+  for (const status of [403, 404, 429, 500, 502, 503, 504]) {
     const failure = Object.assign(new Error('Download failed'), { status });
     const f = fixture([[artifact(1)]], { errors: { download: failure } });
     await assert.rejects(f.restore(), error => error === failure);
-    assert.equal(f.state.calls.filter(call => call.kind === 'download').length, 1);
-    assert.equal(f.state.before.length + f.state.after.length, 0);
+    assert.equal(f.state.calls.filter(call => call.kind === 'download').length,
+      [502, 503, 504].includes(status) ? 3 : 1);
+    assert.equal(f.state.hooks.length, 0);
   }
 });
 
 test('restore rechecks quota after lookup and does not download at the 1000-request reserve', async () => {
   const f = fixture([[artifact(1)]], { remaining: 1003 });
-  await assert.rejects(f.restore(), { code: 'SEMANTIC_REVIEW_QUOTA' });
+  await assert.rejects(f.restore(), { semanticReviewQuota: true });
   assert.equal(f.state.remaining, 1000);
   assert.equal(f.state.rateReads, 2);
   assert.deepEqual(f.state.calls.map(call => call.kind), ['list', 'list', 'run']);
-  assert.equal(f.state.before.length + f.state.after.length, 0);
+  assert.equal(f.state.hooks.length, 0);
   const enough = fixture([[artifact(1)]], { remaining: 1004 });
   assert.deepEqual(await enough.restore(), { cursor: 19621, nextArtifact: NEXT_ARTIFACT });
   assert.equal(enough.state.remaining, 1000);
@@ -259,7 +305,7 @@ test('a failure listing the second slot propagates even when the first has a val
   const failure = Object.assign(new Error('Second slot unavailable'), { status: 503 });
   const f = fixture([[artifact(1)]], { errors: { list: failure }, errorName: NEXT_ARTIFACT });
   await assert.rejects(f.restore(), error => error === failure);
-  assert.deepEqual(f.state.calls.map(call => call.name), [ARTIFACT, NEXT_ARTIFACT]);
+  assert.deepEqual(f.state.calls.map(call => call.name), [ARTIFACT, NEXT_ARTIFACT, NEXT_ARTIFACT, NEXT_ARTIFACT]);
 });
 
 test('either slot can be newest and successful subsequent saves alternate the target name', async () => {
