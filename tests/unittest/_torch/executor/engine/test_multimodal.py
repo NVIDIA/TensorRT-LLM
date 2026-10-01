@@ -190,10 +190,17 @@ def test_item_encoder_translates_model_contract_errors(failure_stage: str) -> No
     mm_item_scheduler = bare_mm_item_scheduler(_Model())
     request = make_mm_request(1, [4])
     _bind_items(mm_item_scheduler, request)
+    # A follower of the scheduled entry keeps its reference to produce it later.
+    follower = make_mm_request(2, [4])
+    shared_key = request.py_mm_encoder_state.item_cache_keys[0]
+    assert mm_item_scheduler.encoder_cache.acquire(shared_key, 8, retain_after_release=False)
+    follower.py_mm_encoder_state.set_item_cache_key(0, shared_key, ready=False)
 
     expected = "bad request metadata" if failure_stage == "prepare" else "bad encoder output rows"
-    with pytest.raises(MultimodalEncoderRequestError, match=expected):
-        mm_item_scheduler.forward_items([request], {request.request_id: [0]})
+    with pytest.raises(MultimodalEncoderRequestError, match=expected) as error:
+        mm_item_scheduler.forward_items([request, follower], {request.request_id: [0]})
+
+    assert error.value.request_ids == {request.request_id}
 
 
 @pytest.mark.parametrize("failure_stage", ["prepare", "forward"])
