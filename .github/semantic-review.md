@@ -175,7 +175,9 @@ After publication, a tidy job maintains one sticky summary comment per PR
 reviewState logic as the commit status, plus a per-request history table linking
 each request and reply. It then minimizes (classifier `OUTDATED`) request/reply
 pairs that have a recorded verdict or were superseded by a newer request; the
-active request stays visible while waiting. Minimized comments remain
+active request stays visible while waiting, and is restored (unminimized) if
+its recorded verdict is later revoked by a reply edit or deletion. Minimized
+comments remain
 expandable and link-addressable, so status deep links keep working. The sticky
 comment never contains a live reviewer mention and is written only from
 validated fields (request IDs, revision SHAs, comment IDs, verdicts), never raw

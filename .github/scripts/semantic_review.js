@@ -260,19 +260,34 @@ async function tidy({github, context, core, number, comments}) {
   }
   // A request/reply pair is audit trail once its verdict is recorded or a newer
   // request supersedes it. Minimization is best-effort display cleanup, never
-  // a result override, and must not fail the sticky summary above.
+  // a result override, and must not fail the sticky summary above. An active
+  // request whose verdict was revoked (reply edited or deleted) was minimized
+  // while it had a result, so it is restored to keep the waiting request
+  // visible.
   const nodes = new Map(comments.map(comment => [comment.id, comment.node_id]));
+  const restore = new Set(entries.filter(entry => entry.active && !entry.result)
+    .map(entry => nodes.get(entry.request.commentId)).filter(Boolean));
   const targets = [...new Set(entries.filter(entry => entry.result || !entry.active)
     .flatMap(entry => [nodes.get(entry.request.commentId), entry.result &&
       nodes.get(entry.result.comment.id)]).filter(Boolean))];
-  if (!targets.length) return {entries, minimized: []};
+  if (!targets.length && !restore.size) return {entries, minimized: [], restored: []};
   const minimized = [];
+  const restored = [];
   try {
     const visible = await github.graphql(
       'query($ids: [ID!]!) { nodes(ids: $ids) { id ... on Minimizable { isMinimized } } }',
-      {ids: targets});
+      {ids: [...targets, ...restore]});
     for (const node of visible.nodes || []) {
-      if (!node || node.isMinimized !== false) continue;
+      if (!node) continue;
+      if (restore.has(node.id)) {
+        if (node.isMinimized !== true) continue;
+        await github.graphql(
+          'mutation($id: ID!) { unminimizeComment(input: {subjectId: $id}) ' +
+          '{ unminimizedComment { isMinimized } } }', {id: node.id});
+        restored.push(node.id);
+        continue;
+      }
+      if (node.isMinimized !== false) continue;
       await github.graphql(
         'mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) ' +
         '{ minimizedComment { isMinimized } } }', {id: node.id});
@@ -281,7 +296,7 @@ async function tidy({github, context, core, number, comments}) {
   } catch (error) {
     core.warning(`PR #${number}: comment minimization failed (${error.message}).`);
   }
-  return {entries, minimized};
+  return {entries, minimized, restored};
 }
 
 module.exports = {NAME, notice, supported, eligible, isCommandUser, isReviewer,

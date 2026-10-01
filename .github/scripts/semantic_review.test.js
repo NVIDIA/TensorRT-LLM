@@ -33,11 +33,17 @@ const legacy = (r = request(), extra = {}) => ({id: 100, name: NAME, head_sha: r
 function harness(r = request()) {
   const state = {comments: [record(10, r)], writes: [], updates: [], summaries: [], reads: 0,
     refs: [], updateFailures: new Set(), statusFailures: 0, statusErrorCode: 503, statuses: [], checks: [],
-    commentWrites: [], commentEdits: [], minimized: [], graphqlFailures: 0, warnings: []};
+    commentWrites: [], commentEdits: [], minimized: [], restored: [], graphqlFailures: 0,
+    warnings: []};
   const github = {
     graphql: async (query, variables) => {
       if (state.graphqlFailures-- > 0) {
         throw Object.assign(new Error('GraphQL failed'), {status: 502});
+      }
+      if (query.includes('unminimizeComment')) {
+        state.minimized.splice(state.minimized.indexOf(variables.id), 1);
+        state.restored.push(variables.id);
+        return {unminimizeComment: {unminimizedComment: {isMinimized: false}}};
       }
       if (query.includes('minimizeComment')) {
         state.minimized.push(variables.id);
@@ -531,6 +537,26 @@ test('the sticky summary follows a revoked verdict instead of an older PASS', as
   await tidy();
   assert.match(sticky().body, /Waiting for CodeRabbit response/);
   assert.doesNotMatch(sticky().body, /No semantic conflict found/);
+});
+
+test('a revoked verdict restores the minimized active request to visible', async () => {
+  const r = request();
+  const {state, sticky, tidy} = harness(r);
+  const verdict = reply(20, r);
+  state.comments.push(verdict);
+  await tidy();
+  assert.deepEqual(state.minimized.sort(), ['IC_10', 'IC_20']);
+  state.comments.splice(state.comments.indexOf(verdict), 1);
+  state.graphqlFailures = 1;
+  await tidy();
+  assert.match(sticky().body, /Waiting for CodeRabbit response/);
+  assert.deepEqual(state.restored, []);
+  assert.equal(state.warnings.length, 1);
+  await tidy();
+  assert.deepEqual(state.restored, ['IC_10']);
+  assert.deepEqual(state.minimized, ['IC_20']);
+  await tidy();
+  assert.deepEqual(state.restored, ['IC_10']);
 });
 
 test('minimization failures warn without blocking the sticky summary, then heal', async () => {
