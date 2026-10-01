@@ -1613,14 +1613,14 @@ class Qwen2_5_VLVisionAttention(Attention):
         k = k.view(seq_len, -1, self.head_dim)
         v = v.view(seq_len, -1, self.head_dim)
         if _flash_attn_apply_rotary is None:
-            q = RotaryEmbedding.apply_rotary_pos_emb(q.unsqueeze(0),
-                                                     cos,
-                                                     sin,
-                                                     unsqueeze_dim=1).squeeze(0)
-            k = RotaryEmbedding.apply_rotary_pos_emb(k.unsqueeze(0),
-                                                     cos,
-                                                     sin,
-                                                     unsqueeze_dim=1).squeeze(0)
+            # Rotate in place, like the FlashInfer and flash_attn paths, so
+            # `forward` can pass the fused QKV projection buffer directly.
+            q.copy_(
+                RotaryEmbedding.apply_rotary_pos_emb(
+                    q.unsqueeze(0), cos, sin, unsqueeze_dim=1).squeeze(0))
+            k.copy_(
+                RotaryEmbedding.apply_rotary_pos_emb(
+                    k.unsqueeze(0), cos, sin, unsqueeze_dim=1).squeeze(0))
         else:
             # flash_attn Triton kernel: single launch per tensor. cos/sin
             # are expected as `[seqlen, head_dim/2]`. The PyTorch path
@@ -1661,7 +1661,10 @@ class Qwen2_5_VLVisionAttention(Attention):
         q, k, v = self.split_qkv(q, k, v)
 
         q, k, v = self.apply_rope(q, k, v, position_ids, position_embeddings)
-        q, k, v = self.convert_qkv(q, k, v)
+        if self.support_fused_qkv:
+            # RoPE updates Q/K in their views of the fused projection. Reuse
+            # that buffer instead of copying Q/K/V back together every layer.
+            q, k, v = qkv, None, None
 
         output = self.forward_impl(
             q=q,
