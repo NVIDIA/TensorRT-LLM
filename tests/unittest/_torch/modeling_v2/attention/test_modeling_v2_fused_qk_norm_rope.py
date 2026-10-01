@@ -39,7 +39,8 @@ def test_certified_cells(cell) -> None:
     qkv, kwargs = _build(cell.spec, seed=abs(hash(cell.why)) % 2**31)
     ref = op.reference(qkv, **kwargs)
     with validating(op):
-        assert op(qkv, **kwargs) is None, "the op writes in place"
+        out = op(qkv, **kwargs)
+        assert out is qkv, "the op writes in place"
     op.compare(qkv, ref)
 
 
