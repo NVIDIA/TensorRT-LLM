@@ -133,3 +133,12 @@ def test_gated_mlp_bf16_epilogue_is_opt_in_and_excludes_bias_quant_and_tp(monkey
         use_quack_swiglu_epilogue=True,
     )
     assert not mlp._can_fuse_gate_up_swiglu_bf16()  # intermediate size not a multiple of 128
+    mlp = GatedMLP(
+        hidden_size=16,
+        intermediate_size=128,
+        bias=False,
+        dtype=torch.bfloat16,
+        use_quack_swiglu_epilogue=True,
+    )
+    monkeypatch.setattr(mlp.gate_up_proj, "use_cute_dsl_bf16_gemm", True, raising=False)
+    assert not mlp._can_fuse_gate_up_swiglu_bf16()  # another GEMM provider was selected

@@ -14,10 +14,14 @@ from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor
-from .gate_up_swiglu_quack import (gate_up_swiglu_quack_available,
-                                   gate_up_swiglu_quack_bf16)
-from .linear import (Linear, TensorParallelMode, WeightMode,
-                     WeightsLoadingConfig, is_static_nvfp4_input_eligible)
+from .gate_up_swiglu_quack import gate_up_swiglu_quack_available, gate_up_swiglu_quack_bf16
+from .linear import (
+    Linear,
+    TensorParallelMode,
+    WeightMode,
+    WeightsLoadingConfig,
+    is_static_nvfp4_input_eligible,
+)
 from .swiglu import swiglu
 
 
@@ -254,9 +258,9 @@ class GatedMLP(nn.Module):
         Requires ``use_quack_swiglu_epilogue=True`` at construction, plain
         SwiGLU (no limit, alpha or beta), an unquantized BF16 ``gate_up_proj``
         without bias and without tensor parallelism, K a multiple of 8 and an
-        intermediate size that is a multiple of 128 (QuACK tile alignment), on
-        an SM100/SM103 GPU with QuACK importable. Evaluated in forward, after
-        the weights exist.
+        intermediate size that is a multiple of 128 (QuACK tile alignment), no
+        other GEMM provider selected on the projection, on an SM100/SM103 GPU
+        with QuACK importable. Evaluated in forward, after the weights exist.
         """
         if not self.use_quack_swiglu_epilogue:
             return False
@@ -271,6 +275,11 @@ class GatedMLP(nn.Module):
                 or getattr(proj, "bias", None) is not None or weight is None
                 or weight.dtype != torch.bfloat16 or weight.shape[1] % 8
                 or weight.shape[0] % 256):
+            return False
+        # The epilogue path replaces Linear.apply for gate_up_proj, so a projection
+        # that selected another GEMM provider keeps that provider.
+        if (getattr(proj, "use_cute_dsl_bf16_gemm", False)
+                or getattr(proj, "use_custom_cublas_mm", False)):
             return False
         return gate_up_swiglu_quack_available()
 
