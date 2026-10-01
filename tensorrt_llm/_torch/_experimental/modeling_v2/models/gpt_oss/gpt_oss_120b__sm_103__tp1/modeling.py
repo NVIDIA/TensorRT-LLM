@@ -241,17 +241,17 @@ class ModelingV2Core(DecoderModel):
         dt = model_config.torch_dtype
 
         # These scalars have two readers below, neither of them `forward`:
-        # this method's own weight-shape declarations, and `_GptOssTarget`'s
-        # construction in `build_layer_views`, which binds each one into the
-        # catalog-entry instances it builds once the weights are real. The
-        # two exceptions are `window` and `sliding`, still read every forward
-        # -- see the comment at their read site for why they cannot move.
+        # this method's own weight-shape declarations, and weights.py's
+        # load(), a separate module reached through `core.X` at a separate
+        # time (load_weights, before `build_layer_views`), which is why they
+        # stay instance attributes rather than becoming locals here. The two
+        # exceptions are `window` and `sliding`, still read every forward --
+        # see the comment at their read site for why they cannot move.
         self.num_layers = cfg.num_hidden_layers
         self.hidden = cfg.hidden_size
         self.heads_q = cfg.num_attention_heads
         self.heads_kv = cfg.num_key_value_heads
         self.head_dim = cfg.head_dim
-        self.eps = cfg.rms_norm_eps
 
         # RoPE: YaRN over the full head_dim, half-split (neox) pairs. The
         # engine hands this checkpoint the transformers-5.x migrated rope
@@ -259,9 +259,23 @@ class ModelingV2Core(DecoderModel):
         # a checkpoint written before that migration keeps the flat field,
         # so both shapes are resolved here and every scalar the ramp
         # depends on is asserted rather than defaulted.
+        #
+        # Unlike the block above, nothing but `_GptOssTarget.__init__` (via
+        # `build_layer_views`) reads `theta` or the four `yarn_*` once this
+        # method returns -- they exist solely to bind `fused_qk_norm_rope`.
+        # They stay attributes anyway, rather than becoming a second copy of
+        # this derivation inside the target: the ramp has real failure modes
+        # (a missing rope key raises KeyError; `math.log` of a non-positive
+        # `theta` or `orig_max` raises ValueError), and catching those here,
+        # before the weight load, is cheaper than catching them afterward or
+        # duplicating ~20 lines of math to catch them in two places. Nothing
+        # downstream of `self.head_dim` has that problem -- `rotary_dim`
+        # equals it exactly for this checkpoint -- so the target binds
+        # `rotary_dim=core.head_dim` directly instead of reading a third name
+        # for the same value.
         rope = getattr(cfg, "rope_scaling", None) or getattr(cfg, "rope_parameters", None)
         self.theta = float(rope.get("rope_theta", getattr(cfg, "rope_theta", 0.0)))
-        self.rotary_dim = self.head_dim
+        rotary_dim = self.head_dim
         self.yarn_factor = float(rope["factor"])
         beta_fast = float(rope["beta_fast"])
         beta_slow = float(rope["beta_slow"])
@@ -270,7 +284,7 @@ class ModelingV2Core(DecoderModel):
 
         def correction_dim(rotations: float) -> float:
             return (
-                self.rotary_dim
+                rotary_dim
                 * math.log(orig_max / (rotations * 2.0 * math.pi))
                 / (2.0 * math.log(self.theta))
             )
@@ -280,7 +294,7 @@ class ModelingV2Core(DecoderModel):
         if truncate:
             low, high = math.floor(low), math.ceil(high)
         self.yarn_low = max(low, 0.0)
-        self.yarn_high = min(high, self.rotary_dim - 1.0)
+        self.yarn_high = min(high, rotary_dim - 1.0)
         self.yarn_attn_factor = (
             0.1 * math.log(self.yarn_factor) + 1.0 if self.yarn_factor > 1.0 else 1.0
         )
@@ -293,11 +307,13 @@ class ModelingV2Core(DecoderModel):
         self.sliding = [t == "sliding_attention" for t in layer_types]
         self.window = cfg.sliding_window
 
-        # Sparse MoE on every layer; no dense MLP branch exists.
+        # Sparse MoE on every layer; no dense MLP branch exists. `topk` and
+        # `swiglu_limit` are not kept as attributes the way `num_experts` is:
+        # weights.py never reads them, so (like `eps`, this checkpoint's
+        # `rms_norm_eps`) the target reads each straight off `cfg` at its one
+        # call site instead -- see `_GptOssTarget.__init__`.
         self.num_experts = cfg.num_local_experts
-        self.topk = cfg.num_experts_per_tok
         self.inter = cfg.intermediate_size
-        self.glu_limit = float(cfg.swiglu_limit)
 
         # Kernel bounds the geometry must fit: fused_qk_norm_rope's head_dim
         # set, thop_attention's GQA rule, and the MoE op's padded operand
@@ -367,12 +383,14 @@ class ModelingV2Core(DecoderModel):
         """Construct the per-phase targets, now that the weights are real.
 
         Used to also derive per-layer GEMM views and the MoE/RoPE call
-        tensors itself, into `self._layers` / `self._call_tensors`. Both are
-        gone: each target's `__init__` (via `Target.__init__` -> the shared
-        `_GptOssTarget`) now binds its own per-layer weight tables and
-        op-owned fixtures straight into the catalog-entry instances it holds,
-        so there is no longer a parallel copy here for a call site to read
-        out of -- and nothing else reads `self.w` through this method.
+        tensors itself, holding them in two attributes (a per-layer tuple
+        and a call-tensor dict) that this class no longer declares. Both are
+        deleted outright, not just unused: each target's `__init__` (via
+        `Target.__init__` -> the shared `_GptOssTarget`) now binds its own
+        per-layer weight tables and op-owned fixtures straight into the
+        catalog-entry instances it holds, so there is no longer a parallel
+        copy here for a call site to read out of -- and nothing else reads
+        `self.w` through this method.
 
         Meta is over by the time this runs, so real tensors may be built and
         `.t()`'d; never called from `__init__`, where the shell's containers
@@ -436,17 +454,20 @@ class _GptOssTarget(Target):
         target's own addition, and is why gpt_oss needed one. Per-layer
         weight tables go into each catalog entry's `layered=`, built once
         here from `core.w` and keeping the `.t()` views the hot-path GEMMs
-        already used (zero-copy). Config scalars that used to live on `core`
-        so `forward` could read them now go into `bound=` instead, read off
-        `core` here, once, for the same reason `core` still carries them --
-        see the comment in `ModelingV2Core.__init__`. The two op-owned
-        fixtures -- `fused_qk_norm_rope`'s inert q/k norm weight and the MoE
-        runner's per-expert activation vectors -- are built here too, rather
-        than in a model-owned `core._call_tensors` (now gone): they are
-        inputs an op needs to satisfy its own signature, not state the model
-        computes.
+        already used (zero-copy). Config scalars that `core` still carries
+        (because weights.py's load() reads them separately) come from
+        `core`; the ones nothing but this binding needs (`eps`, `top_k`,
+        the clamp limit) are read straight off `cfg` instead -- see the
+        comment in `ModelingV2Core.__init__` for why each one landed where
+        it did. The two op-owned fixtures -- `fused_qk_norm_rope`'s inert
+        q/k norm weight and the MoE runner's per-expert activation vectors
+        -- are built here too, rather than in the model-owned call-tensor
+        dict `ModelingV2Core` used to carry (deleted, not just unused): they
+        are inputs an op needs to satisfy its own signature, not state the
+        model computes.
         """
         super().__init__(core)
+        cfg = core.model_config.pretrained_config
         w = core.w
         device = w["final_norm"].device
         dtype = w["final_norm"].dtype
@@ -459,8 +480,9 @@ class _GptOssTarget(Target):
             return tuple(w[f"l{i}_{key}"].t() for i in range(n))
 
         next_norm = tuple(w[f"l{i + 1}_norm1"] if i + 1 < n else w["final_norm"] for i in range(n))
+        layer_idx = tuple(range(n))
 
-        self._norm0 = type(flashinfer_rmsnorm)(weight=w["l0_norm1"], eps=core.eps)
+        self._norm0 = type(flashinfer_rmsnorm)(weight=w["l0_norm1"], eps=cfg.rms_norm_eps)
 
         self._qkv = type(cublas_mm)(layered=dict(mat_b=t_table("qkv"), bias=table("qkv_bias")))
 
@@ -468,15 +490,18 @@ class _GptOssTarget(Target):
         # is_qk_norm=False, where their values are unused; built from the
         # scalars the op needs (head_dim, dtype, device) rather than copied
         # off a reference tensor, which would tie this fixture to whichever
-        # tensor happened to be handy when it was written.
+        # tensor happened to be handy when it was written. rotary_dim is
+        # core.head_dim directly -- equal for this checkpoint, and not worth
+        # a third attribute name for the same value (see
+        # `ModelingV2Core.__init__`).
         no_qk_norm = torch.zeros(core.head_dim, dtype=dtype, device=device)
         self._qk_rope = type(fused_qk_norm_rope)(
             num_heads_q=core.heads_q,
             num_heads_k=core.heads_kv,
             num_heads_v=core.heads_kv,
             head_dim=core.head_dim,
-            rotary_dim=core.rotary_dim,
-            eps=core.eps,
+            rotary_dim=core.head_dim,
+            eps=cfg.rms_norm_eps,
             q_weight=no_qk_norm,
             k_weight=no_qk_norm,
             base=core.theta,
@@ -490,9 +515,14 @@ class _GptOssTarget(Target):
 
         # attention_window_size is deliberately absent here -- see the
         # comment at its read site in `forward` for why it cannot be a
-        # construction-time per-layer table.
+        # construction-time per-layer table. local_layer_idx is layered
+        # rather than passed at the call site even though it is exactly
+        # `layer`'s own value: it is a genuine op argument (the row
+        # thop_attention reads out of the pool mapping), not the binding
+        # mechanism's own index, and layering it here means the call site
+        # states `layer=i` once instead of the same `i` under two names.
         self._attn = type(thop_attention)(
-            layered=dict(attention_sinks=table("sinks")),
+            layered=dict(attention_sinks=table("sinks"), local_layer_idx=layer_idx),
             num_heads=core.heads_q,
             num_kv_heads=core.heads_kv,
             head_size=core.head_dim,
@@ -502,7 +532,7 @@ class _GptOssTarget(Target):
         self._o_proj = type(cublas_mm)(layered=dict(mat_b=t_table("o"), bias=table("o_bias")))
 
         self._norm2 = type(flashinfer_fused_add_rmsnorm)(
-            layered=dict(weight=table("norm2")), eps=core.eps
+            layered=dict(weight=table("norm2")), eps=cfg.rms_norm_eps
         )
 
         self._router = type(cublas_mm)(
@@ -517,10 +547,12 @@ class _GptOssTarget(Target):
         # reads, sized by local_num_experts. This target runs tp1, so every
         # expert is local and these three vectors are the whole table -- not
         # a per-layer one, since every layer shares the same checkpoint
-        # constants (alpha, beta) and config scalar (glu_limit).
+        # constants (alpha, beta) and config scalar (swiglu_limit).
         alpha = torch.full((core.num_experts,), _GLU_ALPHA, dtype=torch.float32, device=device)
         beta = torch.full((core.num_experts,), _GLU_BETA, dtype=torch.float32, device=device)
-        limit = torch.full((core.num_experts,), core.glu_limit, dtype=torch.float32, device=device)
+        limit = torch.full(
+            (core.num_experts,), float(cfg.swiglu_limit), dtype=torch.float32, device=device
+        )
         self._moe = type(mxe4m3_mxe2m1_block_scale_moe_runner)(
             layered=dict(
                 gemm1_weights=table("fc1_w"),
@@ -530,11 +562,16 @@ class _GptOssTarget(Target):
                 gemm2_weights_scale=table("fc2_s"),
                 gemm2_bias=table("fc2_b"),
             ),
+            # The router bias rides the router GEMM's own epilogue instead
+            # (see the call site): routing_bias is bound to None here so a
+            # reader never has to find a bare positional None at the call and
+            # wonder what it is.
+            routing_bias=None,
             gemm1_alpha=alpha,
             gemm1_beta=beta,
             gemm1_clamp_limit=limit,
             num_experts=core.num_experts,
-            top_k=core.topk,
+            top_k=cfg.num_experts_per_tok,
             n_group=None,
             topk_group=None,
             intermediate_size=core.inter_pad,
@@ -548,7 +585,7 @@ class _GptOssTarget(Target):
         )
 
         self._norm_next = type(flashinfer_fused_add_rmsnorm)(
-            layered=dict(weight=next_norm), eps=core.eps
+            layered=dict(weight=next_norm), eps=cfg.rms_norm_eps
         )
 
     def forward(
@@ -602,19 +639,24 @@ class _GptOssTarget(Target):
                 q=qkv,
                 output=attn_out,
                 layer=i,
-                local_layer_idx=i,
                 attention_window_size=core.window if core.sliding[i] else full_window,
             )
             o = self._o_proj(attn_out, layer=i)
             o, residual = self._norm2(o, residual, layer=i)
             # The router bias rides the GEMM epilogue: the MoE op silently
-            # ignores routing_bias on this routing method.
+            # ignores routing_bias on this routing method -- routing_bias
+            # itself is bound to None on self._moe (see __init__).
             router_logits = self._router(o, layer=i)
             # The quantizer owns the hidden widening 2880 -> fc1_k_pad: it
             # zero-fills the padded columns and their scale bytes, which
             # multiply zero-valued padded weights.
             hidden_fp8, hidden_sf = self._quant(o)
-            moe = self._moe(router_logits, None, hidden_fp8, hidden_sf, layer=i)
+            moe = self._moe(
+                routing_logits=router_logits,
+                hidden_states=hidden_fp8,
+                hidden_states_scale=hidden_sf,
+                layer=i,
+            )
             moe, residual = self._norm_next(moe, residual, layer=i)
             x = moe
         return x
