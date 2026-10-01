@@ -120,11 +120,31 @@ def _prepare_qwen_vl_vision_attn_metadata(
 
     attn_metadata.num_contexts = num_segments
     attn_metadata.request_ids = list(range(1, num_segments + 1))
-    attn_metadata.seq_lens = seq_lens_torch
+    prepare_graph_replay = getattr(attn_metadata,
+                                   "prepare_encoder_cuda_graph_replay", None)
+    is_cuda_graph = getattr(attn_metadata, "is_cuda_graph", False)
+    if is_cuda_graph and callable(prepare_graph_replay):
+        prepare_graph_replay(seq_lens, sum(seq_lens))
+        # The replay helper refreshes only the host lengths, but the captured
+        # attention op also reads the device lengths; update them in place.
+        attn_metadata.seq_lens_cuda[:num_segments].copy_(seq_lens_torch,
+                                                         non_blocking=True)
+    else:
+        attn_metadata.seq_lens = seq_lens_torch
     cu_seqlens = cu_seqlens.to(device=attn_metadata.seq_lens_cuda.device,
                                non_blocking=True)
-    attn_metadata.cu_q_seqlens = cu_seqlens
-    attn_metadata.cu_kv_seqlens = cu_seqlens
+    if (is_cuda_graph
+            and getattr(attn_metadata, "cu_q_seqlens", None) is not None
+            and attn_metadata.cu_q_seqlens.shape == cu_seqlens.shape):
+        # CUDA graph capture bakes these addresses into attention kernels.
+        # Refresh their contents without replacing the captured buffers.
+        attn_metadata.cu_q_seqlens.copy_(cu_seqlens, non_blocking=True)
+        if (attn_metadata.cu_kv_seqlens.data_ptr()
+                != attn_metadata.cu_q_seqlens.data_ptr()):
+            attn_metadata.cu_kv_seqlens.copy_(cu_seqlens, non_blocking=True)
+    else:
+        attn_metadata.cu_q_seqlens = cu_seqlens
+        attn_metadata.cu_kv_seqlens = cu_seqlens
     # Keep the native attention-op cache key stable across image resolutions.
     # Actual segment lengths remain available through seq_lens / cu_seqlens.
     attn_metadata.max_seq_len = max_seq_len
