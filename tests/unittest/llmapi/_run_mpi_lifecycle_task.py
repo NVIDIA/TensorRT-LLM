@@ -98,7 +98,6 @@ def main() -> int:
     address = get_spawn_proxy_process_ipc_addr_env()
     key = get_spawn_proxy_process_ipc_hmac_key_env()
     client = RemoteMpiCommSessionClient(address, hmac_key=key)
-    client.SYNC_IDLE_INTERVAL = 0.01
 
     def run_sync(scenario: str, batch: int) -> object:
         return client.submit_sync(remote_task, str(directory), scenario, batch, args.ranks)
