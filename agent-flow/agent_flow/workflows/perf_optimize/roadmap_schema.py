@@ -158,6 +158,11 @@ def _validate_metric_ref(data: Mapping[str, Any], key: str, errors: list[str]) -
     source = block.get("source")
     if not isinstance(source, str) or not source.strip():
         errors.append(f"'{key}.source' must be a non-empty string, got {source!r}")
+    direction = block.get("direction")
+    if direction is not None and direction not in ("higher", "lower"):
+        errors.append(
+            f"'{key}.direction' must be 'higher' or 'lower' when present, got {direction!r}"
+        )
     if block.get("curve") is not None:
         _validate_curve(key, block["curve"], errors)
 

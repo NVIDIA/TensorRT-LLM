@@ -489,11 +489,20 @@ the same recipe:
   and latency keys `mean_ttft_ms` / `median_ttft_ms` / `p99_ttft_ms`
   (likewise `*_tpot_ms`, `*_itl_ms`, `*_e2el_ms`). The active target is
   `optimize.target_metric` in `task.yaml`.
-- **Direction rule:** throughput metrics are better when higher; `*_ms`
-  latency metrics are better when lower. Always report `gain_pct`
-  normalized so **positive = improvement**:
-  - throughput: `gain_pct = (new − reference) / reference × 100`
-  - latency (`*_ms`): `gain_pct = (reference − new) / reference × 100`
+- **Direction rule:** classify the target metric by *what it measures*, not
+  by how it is spelled.
+  - **Throughput / rate → HIGHER is better.** Output token throughput,
+    total token throughput, request throughput.
+  - **Latency / time / duration → LOWER is better.** End-to-end latency,
+    TTFT, TPOT, ITL, per-iteration time, device step time.
+
+  Always report `gain_pct` normalized so **positive = improvement**:
+  - higher-is-better: `gain_pct = (new − reference) / reference × 100`
+  - lower-is-better: `gain_pct = (reference − new) / reference × 100`
+
+  **State the direction you used** next to the first gain you report. A
+  metric whose name carries no unit suffix is exactly the case where an
+  unstated assumption turns a regression into an apparent win.
 - State which reference you compared against (baseline vs current best)
   next to every gain you report. In curve mode, gains are per point
   (same-concurrency reference entry) and aggregate as the **mean** —
