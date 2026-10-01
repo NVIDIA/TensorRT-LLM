@@ -34,6 +34,7 @@ from fastapi.responses import (FileResponse, JSONResponse, Response,
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from starlette.routing import Mount
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from transformers import AutoProcessor
 
 from tensorrt_llm._startup import _StartupTimer
@@ -50,6 +51,8 @@ from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import (ConversationMessage,
                                        MultimodalDataTooLargeError,
+                                       _cpu_storage_bytes,
+                                       _release_shared_cpu_tensors,
                                        async_apply_chat_template)
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
@@ -160,6 +163,77 @@ def _is_visual_gen_instance(obj) -> bool:
     return visual_gen is not None and isinstance(obj, visual_gen.VisualGen)
 
 # yapf: enable
+
+
+class _MultimodalRequestBodyLimitMiddleware:
+    """Reject oversized MM-capable request bodies before FastAPI parses them."""
+
+    _PATHS = frozenset(
+        {"/v1/chat/completions", "/v1/messages", "/v1/responses"})
+
+    def __init__(self, app: ASGIApp, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def _reject(self, scope: Scope, receive: Receive, send: Send) -> None:
+        message = (f"Request body exceeds the {self.max_bytes}-byte "
+                   "multimodal CPU limit")
+        if scope["path"] == "/v1/messages":
+            response = anthropic_error_response(
+                message, "request_too_large",
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        else:
+            response = JSONResponse(
+                status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                content=ErrorResponse(
+                    message=message,
+                    type="RequestTooLargeError",
+                    code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE).model_dump(),
+            )
+        await response(scope, receive, send)
+
+    async def __call__(self, scope: Scope, receive: Receive,
+                       send: Send) -> None:
+        if (scope["type"] != "http" or scope.get("method") != "POST"
+                or scope.get("path") not in self._PATHS):
+            await self.app(scope, receive, send)
+            return
+
+        content_length = dict(scope.get("headers", [])).get(b"content-length")
+        if content_length is not None:
+            try:
+                declared_bytes = int(content_length)
+            except ValueError:
+                # The HTTP server rejects malformed Content-Length headers.
+                declared_bytes = 0
+            if declared_bytes > self.max_bytes:
+                await self._reject(scope, receive, send)
+                return
+
+        received_bytes = 0
+        body_too_large = False
+
+        async def receive_with_limit() -> Message:
+            nonlocal body_too_large, received_bytes
+            message = await receive()
+            if message["type"] == "http.request":
+                received_bytes += len(message.get("body", b""))
+                scope.setdefault(
+                    "state",
+                    {})["multimodal_request_body_bytes"] = received_bytes
+                if received_bytes > self.max_bytes:
+                    body_too_large = True
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def send_if_within_limit(message: Message) -> None:
+            if not body_too_large:
+                await send(message)
+
+        await self.app(scope, receive_with_limit, send_if_within_limit)
+        if body_too_large:
+            await self._reject(scope, receive, send)
+
 
 _msgpack_decoder = msgspec.msgpack.Decoder()
 
@@ -800,6 +874,14 @@ class OpenAIServer(_VideoRoutesMixin):
                                     adjusted_clock=self._adjusted_steady_clock)
         self.app.add_middleware(ServerArrivalTimeMiddleware,
                                 adjusted_clock=self._adjusted_steady_clock)
+        if (self.multimodal_server_config is not None
+                and self.multimodal_server_config.max_cpu_bytes_per_request
+                is not None):
+            self.app.add_middleware(
+                _MultimodalRequestBodyLimitMiddleware,
+                max_bytes=self.multimodal_server_config.
+                max_cpu_bytes_per_request,
+            )
 
     def _init_visual_gen(self):
         self.processor = None
@@ -1863,6 +1945,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise
 
         mm_cpu_slot_acquired = False
+        request_body_bytes = (0 if raw_request is None else getattr(
+            raw_request.state, "multimodal_request_body_bytes", 0))
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
@@ -2106,6 +2190,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs,
                     resolve_media=resolve_media,
+                    initial_cpu_bytes=request_body_bytes,
                 )
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
@@ -2117,6 +2202,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs,
                     resolve_media=resolve_media,
+                    initial_cpu_bytes=request_body_bytes,
                 )
 
             # Media loads have not started yet; reserve CPU before they do.
@@ -2236,6 +2322,24 @@ class OpenAIServer(_VideoRoutesMixin):
                     self._input_proc_executor,
                     functools.partial(preprocess_fn, prompt, sampling_params,
                                       disaggregated_params))
+                max_cpu_bytes = (
+                    self.multimodal_server_config.max_cpu_bytes_per_request
+                    if self.multimodal_server_config is not None else None)
+                if max_cpu_bytes is not None and has_multimodal_data:
+                    processed_mm = getattr(generate_inputs, "multimodal_params",
+                                           None)
+                    materialized_bytes = request_body_bytes + _cpu_storage_bytes(
+                        (mm_data, processed_mm))
+                    if materialized_bytes > max_cpu_bytes:
+                        # No worker will consume the handles preprocess
+                        # exported, so free their shared memory here.
+                        if processed_mm is not None:
+                            _release_shared_cpu_tensors(
+                                processed_mm.multimodal_data)
+                        raise MultimodalDataTooLargeError(
+                            "Multimodal request materialized at least "
+                            f"{materialized_bytes} CPU bytes, exceeding the "
+                            f"per-request limit of {max_cpu_bytes} bytes")
 
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
@@ -2255,6 +2359,11 @@ class OpenAIServer(_VideoRoutesMixin):
             if mm_cpu_slot_acquired:
                 self._mm_cpu_request_slots.release()
                 mm_cpu_slot_acquired = False
+            # The request is handed off; drop this frame's references to the
+            # decoded media so a non-streaming request does not keep it alive
+            # until generation completes.
+            prompt = generate_inputs = mm_data = mm_embeddings = None
+            processed_mm = None
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
@@ -2340,6 +2449,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 message = "Internal server error"
             err_type = ("invalid_request_error"
                         if 400 <= status < 500 else "api_error")
+            if status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE:
+                # Same type as the request body limit's 413 on this route.
+                err_type = "request_too_large"
             return anthropic_error_response(message, err_type, status)
 
         try:

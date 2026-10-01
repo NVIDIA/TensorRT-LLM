@@ -1229,9 +1229,11 @@ def launch_visual_gen_server(
     "--max_multimodal_cpu_bytes_per_request",
     type=str,
     default=None,
-    help=("Maximum decoded CPU storage for one multimodal request. Accepts "
-          "byte values such as '1GiB'. Defaults to the total multimodal CPU "
-          "limit when that limit is set."),
+    help=("Maximum CPU storage for one multimodal request: its raw HTTP body "
+          "plus decoded media and processed multimodal tensors. Chat, "
+          "Messages, and Responses request bodies above this size are "
+          "rejected with HTTP 413. Accepts byte values such as '1GiB'. "
+          "Defaults to the total multimodal CPU limit when that limit is set."),
     status="prototype")
 @stability_option("--video_pruning_rate",
                   type=float,

@@ -448,6 +448,7 @@ def parse_chat_messages_coroutines(
     request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
     model_type_override: Optional[str] = None,
     resolve_media: bool = True,
+    initial_cpu_bytes: int = 0,
 ) -> Tuple[List[ConversationMessage], Coroutine[Any, Any, tuple[Optional[Dict[
         str, List[Any]]], Optional[Dict[str, List[Any]]]]], list[dict[str,
                                                                       int]]]:
@@ -468,6 +469,9 @@ def parse_chat_messages_coroutines(
         resolve_media: When False the returned coroutine closes the
             pending loads instead of running them and yields
             `(None, None)`.
+        initial_cpu_bytes: CPU bytes already held by the request (e.g.
+            its raw body), charged against
+            `multimodal_server_config.max_cpu_bytes_per_request`.
 
     Returns:
         `(conversation, mm_coroutine, mm_placeholder_counts)` where
@@ -481,7 +485,8 @@ def parse_chat_messages_coroutines(
     mm_data_tracker = MultimodalDataTracker(
         model_type,
         multimodal_server_config,
-        request_media_io_kwargs=request_media_io_kwargs)
+        request_media_io_kwargs=request_media_io_kwargs,
+        initial_cpu_bytes=initial_cpu_bytes)
 
     # Determine content format to decide placeholder strategy.
     #
