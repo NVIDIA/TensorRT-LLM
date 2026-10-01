@@ -92,6 +92,14 @@ def _scenario(case: str, directory: str) -> None:
                     pass
                 warning.assert_called_once()
                 assert "failed" in warning.call_args.args[0]
+    elif case == "missing_end":
+        writer = processes.IterationWriter(root / "iterations.log")
+        stop = multiprocessing.Event()
+        stop.set()
+        with patch.object(processes.logger, "warning") as warning:
+            processes.IterationWriter.run(writer.full_address, writer.log_path, stop)
+            warning.assert_called_once()
+            assert "without receiving the end marker" in warning.call_args.args[0]
     elif case == "invalid_parent":
         parent = root / "not_a_directory"
         parent.write_text("existing file")
@@ -148,6 +156,7 @@ def _scenario(case: str, directory: str) -> None:
         "disabled",
         "stalled_writer",
         "failed_writer",
+        "missing_end",
     ],
 )
 def test_iteration_logging_shutdown(case: str, tmp_path: Path) -> None:

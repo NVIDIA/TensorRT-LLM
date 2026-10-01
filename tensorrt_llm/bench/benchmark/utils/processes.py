@@ -175,6 +175,10 @@ class IterationWriter:
                 while True:
                     if not socket.poll(_ITERATION_WRITER_POLL_MS, POLLIN):
                         if stop_event.is_set():
+                            logger.warning(
+                                "Iteration writer stopped without receiving the "
+                                "end marker; the iteration log may be incomplete."
+                            )
                             break
                         continue
                     message = socket.recv_json()
