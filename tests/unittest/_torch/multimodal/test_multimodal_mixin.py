@@ -608,10 +608,11 @@ def test_assemble_full_embedding_preserves_item_order():
     # are cache entries, which `TensorLRUCache.get` returns as aliases of
     # cache-owned tensors; handing one straight to a request would leave the two
     # sharing storage and the cache's byte accounting short by an entry it can
-    # no longer actually free.
+    # no longer actually free. A detached view would be a new tensor over the
+    # same storage, so compare storage rather than tensor identity.
     single = per_item[1]
     assembled = _assemble_multimodal_encoder_embeddings({0: single}, 1)
-    assert assembled is not single
+    assert assembled.untyped_storage().data_ptr() != single.untyped_storage().data_ptr()
     torch.testing.assert_close(assembled, single)
 
 

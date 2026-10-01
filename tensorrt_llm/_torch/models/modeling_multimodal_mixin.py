@@ -74,17 +74,9 @@ def _assemble_multimodal_encoder_embeddings(
             "MM encoder items for one request must have matching output shape, dtype, and device"
         )
 
-    embeddings = torch.empty(
-        (sum(output.shape[0] for output in ordered), *first.shape[1:]),
-        dtype=first.dtype,
-        device=first.device,
-    )
-    start = 0
-    for output in ordered:
-        end = start + output.shape[0]
-        embeddings[start:end].copy_(output.detach())
-        start = end
-    return embeddings
+    # The copy is intentional even for one item: cache hits alias cache-owned
+    # storage, while this result must be independently owned by the request.
+    return torch.cat([output.detach() for output in ordered], dim=0)
 
 
 @dataclass(frozen=True)
