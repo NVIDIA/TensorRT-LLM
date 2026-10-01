@@ -44,6 +44,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
 from tensorrt_llm._torch._experimental.modeling_v2._target import Phase, Target, phase_of
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import advance_step_generation
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
     fused_qk_norm_rope,
 )
@@ -239,6 +240,12 @@ class ModelingV2Core(DecoderModel):
         # and the value quant_mode=0 must agree with.
         dt = model_config.torch_dtype
 
+        # These scalars have two readers below, neither of them `forward`:
+        # this method's own weight-shape declarations, and `_GptOssTarget`'s
+        # construction in `build_layer_views`, which binds each one into the
+        # catalog-entry instances it builds once the weights are real. The
+        # two exceptions are `window` and `sliding`, still read every forward
+        # -- see the comment at their read site for why they cannot move.
         self.num_layers = cfg.num_hidden_layers
         self.hidden = cfg.hidden_size
         self.heads_q = cfg.num_attention_heads
@@ -349,8 +356,6 @@ class ModelingV2Core(DecoderModel):
         w["embed"] = P(cfg.vocab_size, self.hidden)
         self.w = w
 
-        self._layers: list | None = None
-        self._call_tensors: dict | None = None
         self._targets: dict[Phase, Target] | None = None
         # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it: read once here
         # rather than per forward, and False for the whole life of a served
@@ -359,52 +364,19 @@ class ModelingV2Core(DecoderModel):
         self._contract_pending = step_contract_enabled()
 
     def build_layer_views(self) -> None:
-        """Post-load derivation: per-layer tuples of column-major GEMM views,
-        norm weights and expert operands (kills hot-path dict lookups; .t()
-        is zero-copy), plus the constant fp32 call tensors the MoE and RoPE
-        calls require. Meta is over here, so real tensors may be created."""
-        w = self.w
-        device = w["final_norm"].device
-        # Per-expert activation scalars, sized by local_num_experts.
-        self._call_tensors = {
-            "alpha": torch.full(
-                (self.num_experts,), _GLU_ALPHA, dtype=torch.float32, device=device
-            ),
-            "beta": torch.full((self.num_experts,), _GLU_BETA, dtype=torch.float32, device=device),
-            "limit": torch.full(
-                (self.num_experts,), self.glu_limit, dtype=torch.float32, device=device
-            ),
-            # fused_qk_norm_rope requires valid q/k norm weight tensors even
-            # with is_qk_norm=False, where their values are unused.
-            "no_qk_norm": torch.zeros(self.head_dim, dtype=w["final_norm"].dtype, device=device),
-        }
-        layers = []
-        for i in range(self.num_layers):
-            next_norm = w[f"l{i + 1}_norm1"] if i + 1 < self.num_layers else w["final_norm"]
-            layers.append(
-                (
-                    w[f"l{i}_qkv"].t(),
-                    w[f"l{i}_qkv_bias"],
-                    w[f"l{i}_sinks"],
-                    w[f"l{i}_o"].t(),
-                    w[f"l{i}_o_bias"],
-                    w[f"l{i}_norm2"],
-                    w[f"l{i}_router"].t(),
-                    w[f"l{i}_router_bias"],
-                    w[f"l{i}_fc1_w"],
-                    w[f"l{i}_fc1_s"],
-                    w[f"l{i}_fc1_b"],
-                    w[f"l{i}_fc2_w"],
-                    w[f"l{i}_fc2_s"],
-                    w[f"l{i}_fc2_b"],
-                    next_norm,
-                )
-            )
-        self._layers = layers
+        """Construct the per-phase targets, now that the weights are real.
 
-        # After the weights are real, never in __init__: the shell builds its
-        # containers while every parameter is still a meta tensor, and the
-        # engine materializes the registry by replacing those tensor objects.
+        Used to also derive per-layer GEMM views and the MoE/RoPE call
+        tensors itself, into `self._layers` / `self._call_tensors`. Both are
+        gone: each target's `__init__` (via `Target.__init__` -> the shared
+        `_GptOssTarget`) now binds its own per-layer weight tables and
+        op-owned fixtures straight into the catalog-entry instances it holds,
+        so there is no longer a parallel copy here for a call site to read
+        out of -- and nothing else reads `self.w` through this method.
+
+        Meta is over by the time this runs, so real tensors may be built and
+        `.t()`'d; never called from `__init__`, where the shell's containers
+        are still meta."""
         self._targets = {
             Phase.PREFILL: PrefillTarget(self),
             Phase.DECODE: DecodeTarget(self),
@@ -457,6 +429,128 @@ class _GptOssTarget(Target):
     materializes K and V -- overrides `forward` itself instead.
     """
 
+    def __init__(self, core: ModelingV2Core) -> None:
+        """Bind every op this target calls, once, against the real weights.
+
+        `Target.__init__` only stores `self.core`; everything below is this
+        target's own addition, and is why gpt_oss needed one. Per-layer
+        weight tables go into each catalog entry's `layered=`, built once
+        here from `core.w` and keeping the `.t()` views the hot-path GEMMs
+        already used (zero-copy). Config scalars that used to live on `core`
+        so `forward` could read them now go into `bound=` instead, read off
+        `core` here, once, for the same reason `core` still carries them --
+        see the comment in `ModelingV2Core.__init__`. The two op-owned
+        fixtures -- `fused_qk_norm_rope`'s inert q/k norm weight and the MoE
+        runner's per-expert activation vectors -- are built here too, rather
+        than in a model-owned `core._call_tensors` (now gone): they are
+        inputs an op needs to satisfy its own signature, not state the model
+        computes.
+        """
+        super().__init__(core)
+        w = core.w
+        device = w["final_norm"].device
+        dtype = w["final_norm"].dtype
+        n = core.num_layers
+
+        def table(key: str) -> tuple:
+            return tuple(w[f"l{i}_{key}"] for i in range(n))
+
+        def t_table(key: str) -> tuple:
+            return tuple(w[f"l{i}_{key}"].t() for i in range(n))
+
+        next_norm = tuple(w[f"l{i + 1}_norm1"] if i + 1 < n else w["final_norm"] for i in range(n))
+
+        self._norm0 = type(flashinfer_rmsnorm)(weight=w["l0_norm1"], eps=core.eps)
+
+        self._qkv = type(cublas_mm)(layered=dict(mat_b=t_table("qkv"), bias=table("qkv_bias")))
+
+        # fused_qk_norm_rope requires valid q/k norm weight tensors even with
+        # is_qk_norm=False, where their values are unused; built from the
+        # scalars the op needs (head_dim, dtype, device) rather than copied
+        # off a reference tensor, which would tie this fixture to whichever
+        # tensor happened to be handy when it was written.
+        no_qk_norm = torch.zeros(core.head_dim, dtype=dtype, device=device)
+        self._qk_rope = type(fused_qk_norm_rope)(
+            num_heads_q=core.heads_q,
+            num_heads_k=core.heads_kv,
+            num_heads_v=core.heads_kv,
+            head_dim=core.head_dim,
+            rotary_dim=core.rotary_dim,
+            eps=core.eps,
+            q_weight=no_qk_norm,
+            k_weight=no_qk_norm,
+            base=core.theta,
+            is_neox=True,
+            factor=core.yarn_factor,
+            low=core.yarn_low,
+            high=core.yarn_high,
+            attention_factor=core.yarn_attn_factor,
+            is_qk_norm=False,
+        )
+
+        # attention_window_size is deliberately absent here -- see the
+        # comment at its read site in `forward` for why it cannot be a
+        # construction-time per-layer table.
+        self._attn = type(thop_attention)(
+            layered=dict(attention_sinks=table("sinks")),
+            num_heads=core.heads_q,
+            num_kv_heads=core.heads_kv,
+            head_size=core.head_dim,
+            **_CALL_CONSTANTS,
+        )
+
+        self._o_proj = type(cublas_mm)(layered=dict(mat_b=t_table("o"), bias=table("o_bias")))
+
+        self._norm2 = type(flashinfer_fused_add_rmsnorm)(
+            layered=dict(weight=table("norm2")), eps=core.eps
+        )
+
+        self._router = type(cublas_mm)(
+            layered=dict(mat_b=t_table("router"), bias=table("router_bias"))
+        )
+
+        self._quant = type(mxfp8_quantize)(
+            swizzled_layout=_LINEAR_SCALE_LAYOUT, alignment=_FC1_K_ALIGN
+        )
+
+        # Per-expert activation scalars the MoE op's clamped GLU epilogue
+        # reads, sized by local_num_experts. This target runs tp1, so every
+        # expert is local and these three vectors are the whole table -- not
+        # a per-layer one, since every layer shares the same checkpoint
+        # constants (alpha, beta) and config scalar (glu_limit).
+        alpha = torch.full((core.num_experts,), _GLU_ALPHA, dtype=torch.float32, device=device)
+        beta = torch.full((core.num_experts,), _GLU_BETA, dtype=torch.float32, device=device)
+        limit = torch.full((core.num_experts,), core.glu_limit, dtype=torch.float32, device=device)
+        self._moe = type(mxe4m3_mxe2m1_block_scale_moe_runner)(
+            layered=dict(
+                gemm1_weights=table("fc1_w"),
+                gemm1_weights_scale=table("fc1_s"),
+                gemm1_bias=table("fc1_b"),
+                gemm2_weights=table("fc2_w"),
+                gemm2_weights_scale=table("fc2_s"),
+                gemm2_bias=table("fc2_b"),
+            ),
+            gemm1_alpha=alpha,
+            gemm1_beta=beta,
+            gemm1_clamp_limit=limit,
+            num_experts=core.num_experts,
+            top_k=core.topk,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=core.inter_pad,
+            valid_hidden_size=core.hidden,
+            valid_intermediate_size=core.inter,
+            local_expert_offset=0,
+            local_num_experts=core.num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=_ROUTING_METHOD_RENORMALIZE,
+            act_type=_ACT_TYPE_SWIGLU,
+        )
+
+        self._norm_next = type(flashinfer_fused_add_rmsnorm)(
+            layered=dict(weight=next_norm), eps=core.eps
+        )
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -468,13 +562,25 @@ class _GptOssTarget(Target):
     ) -> torch.Tensor:
         core = self.core
 
-        step = self.step_args(attn_metadata)
-        # Full-attention layers take the no-window value; sliding layers take
-        # the checkpoint's window. Both are host-derived per-capture constants
-        # (max_seq_len is an engine-construction constant).
+        # advance_step_generation must run before any bind_step this forward
+        # makes: it is what lets validating() catch a target that forgot to
+        # rebind and is running an op against last step's metadata.
+        advance_step_generation()
+        self._attn.bind_step(**self.step_args(attn_metadata))
+
+        # attention_window_size cannot be a construction-time per-layer table
+        # like attention_sinks: its full-attention value is
+        # attn_metadata.max_seq_len, which reads the KV cache manager's
+        # *resolved* max_seq_len. That is not known until the cache is sized,
+        # well after `_GptOssTarget.__init__` runs at post-load, and it is not
+        # guaranteed to equal the engine's requested max_seq_len --
+        # resource_manager.py's window validation can clamp it down under
+        # memory pressure, and a value baked in at construction would then
+        # silently diverge from the one the engine actually runs with. So
+        # this stays a per-forward computation, read fresh off the metadata
+        # every step like it was before per-layer tables existed.
         full_window = attn_metadata.max_seq_len
-        const = core._call_tensors
-        no_qk_norm = const["no_qk_norm"]
+
         pos = torch.reshape(position_ids, [-1])
 
         if inputs_embeds is None:
@@ -487,95 +593,29 @@ class _GptOssTarget(Target):
             [num_tokens, core.heads_q * core.head_dim], dtype=dt, device=h.device
         )
 
-        x = flashinfer_rmsnorm(h, core.w["l0_norm1"], core.eps)
+        x = self._norm0(h)
         residual = h
         for i in range(core.num_layers):
-            (
-                w_qkv,
-                b_qkv,
-                sinks,
-                w_o,
-                b_o,
-                w_n2,
-                w_rt,
-                b_rt,
-                fc1_w,
-                fc1_s,
-                fc1_b,
-                fc2_w,
-                fc2_s,
-                fc2_b,
-                w_next,
-            ) = core._layers[i]
-            qkv = cublas_mm(x, w_qkv, b_qkv)
-            fused_qk_norm_rope(
-                qkv,
-                num_heads_q=core.heads_q,
-                num_heads_k=core.heads_kv,
-                num_heads_v=core.heads_kv,
-                head_dim=core.head_dim,
-                rotary_dim=core.rotary_dim,
-                eps=core.eps,
-                q_weight=no_qk_norm,
-                k_weight=no_qk_norm,
-                base=core.theta,
-                is_neox=True,
-                position_ids=pos,
-                factor=core.yarn_factor,
-                low=core.yarn_low,
-                high=core.yarn_high,
-                attention_factor=core.yarn_attn_factor,
-                is_qk_norm=False,
-            )
-            thop_attention(
+            qkv = self._qkv(x, layer=i)
+            qkv = self._qk_rope(qkv, position_ids=pos)
+            attn_out = self._attn(
                 q=qkv,
                 output=attn_out,
+                layer=i,
                 local_layer_idx=i,
-                num_heads=core.heads_q,
-                num_kv_heads=core.heads_kv,
-                head_size=core.head_dim,
-                attention_sinks=sinks,
                 attention_window_size=core.window if core.sliding[i] else full_window,
-                **step,
-                **_CALL_CONSTANTS,
             )
-            o = cublas_mm(attn_out, w_o, b_o)
-            flashinfer_fused_add_rmsnorm(o, residual, w_n2, core.eps)
+            o = self._o_proj(attn_out, layer=i)
+            o, residual = self._norm2(o, residual, layer=i)
             # The router bias rides the GEMM epilogue: the MoE op silently
             # ignores routing_bias on this routing method.
-            router_logits = cublas_mm(o, w_rt, b_rt)
+            router_logits = self._router(o, layer=i)
             # The quantizer owns the hidden widening 2880 -> fc1_k_pad: it
             # zero-fills the padded columns and their scale bytes, which
             # multiply zero-valued padded weights.
-            hidden_fp8, hidden_sf = mxfp8_quantize(o, _LINEAR_SCALE_LAYOUT, _FC1_K_ALIGN)
-            moe = mxe4m3_mxe2m1_block_scale_moe_runner(
-                router_logits,
-                None,
-                hidden_fp8,
-                hidden_sf,
-                fc1_w,
-                fc1_s,
-                fc1_b,
-                const["alpha"],
-                const["beta"],
-                const["limit"],
-                fc2_w,
-                fc2_s,
-                fc2_b,
-                core.num_experts,
-                core.topk,
-                None,
-                None,
-                core.inter_pad,
-                core.hidden,
-                core.inter,
-                0,
-                core.num_experts,
-                None,
-                _ROUTING_METHOD_RENORMALIZE,
-                _ACT_TYPE_SWIGLU,
-            )
-            flashinfer_fused_add_rmsnorm(moe, residual, w_next, core.eps)
+            hidden_fp8, hidden_sf = self._quant(o)
+            moe = self._moe(router_logits, None, hidden_fp8, hidden_sf, layer=i)
+            moe, residual = self._norm_next(moe, residual, layer=i)
             x = moe
         return x
 
