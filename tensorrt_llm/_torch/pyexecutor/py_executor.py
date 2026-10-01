@@ -3729,10 +3729,13 @@ class PyExecutor:
         any_rank_terminal_no_fit = any(status[1] for status in all_rank_status)
         return all_ranks_fetched and any_rank_terminal_no_fit
 
-    def _prepare_and_schedule_batch(self):
+    def _prepare_and_schedule_batch(
+            self
+    ) -> tuple[Optional[ScheduledRequests], Optional[IterationStats]]:
         self._poll_encoder_steps()
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
+            self._kv_connector_drain_shutdown()
             return None, None
 
         self._handle_control_request()
@@ -4010,11 +4013,13 @@ class PyExecutor:
             return loading_context
         return []
 
-    def _kv_connector_terminate_requests(self,
-                                         *,
-                                         synchronize: bool = True) -> None:
+    def _kv_connector_terminate_requests(
+            self,
+            *,
+            synchronize: bool = True,
+            wait_for_pending: bool = False) -> bool:
         if self.kv_connector_manager is None:
-            return
+            return False
         error: Optional[str] = None
         try:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
@@ -4027,7 +4032,22 @@ class PyExecutor:
         if self.enable_attention_dp and synchronize:
             # Both executor loops call this once per iteration on every owner,
             # even when no batch could run. Recovery polls use their own gate.
-            self._kv_connector_sync_status(False, error)
+            waiting = (wait_for_pending and bool(
+                self.kv_connector_manager.get_pending_transfer_requests()))
+            return self._kv_connector_sync_status(waiting, error)
+        return False
+
+    def _kv_connector_drain_shutdown(self) -> None:
+        """Drain ADP transfers at the rank-aligned executor-loop exit."""
+        if not self.enable_attention_dp or self.kv_connector_manager is None:
+            return
+        # Finished requests can leave active_requests while their saves still
+        # own KV memory. Every owner must poll/vote here, including owners with
+        # no local transfer, until all saves finish or the control grace expires.
+        # Stay on the executor thread: shutdown() runs after its collectives end.
+        while self._kv_connector_terminate_requests(wait_for_pending=True):
+            self.hang_detector.checkpoint()
+            time.sleep(0.001)
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:

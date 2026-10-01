@@ -336,6 +336,13 @@ they cannot interrupt a running forward pass or blocking callback. Both settings
 must be positive and finite, apply only to ADP, and can be increased for slower
 backends. Control grace never extends an existing transfer deadline.
 
+Shutdown continues polling outstanding saves after the last compute request
+finishes. All ADP owners participate until transfers drain, then the executor
+joins its worker and performs normal resource teardown. Cancellation likewise
+waits for transfer completion before releasing a request's KV memory. If the
+transfer exceeds the control grace, even a single canceled request can require
+an executor restart; configure the grace for the backend's expected drain time.
+
 A timeout or polling exception fails all owners through a rank-synchronized
 gate. Exceptions inside forward/layer hooks fail through the executor's crash
 supervisor, since peers may still be inside model collectives. Ordinary error

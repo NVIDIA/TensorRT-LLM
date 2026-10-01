@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from functools import partial
-from threading import Barrier
+from threading import Barrier, Event
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
@@ -520,6 +520,177 @@ def test_connector_failure_shutdown_retains_registered_pools() -> None:
     executor.shutdown_event.wait.assert_called_once()
     executor.resource_manager.shutdown.assert_not_called()
     executor.model_engine._release_cuda_graphs.assert_not_called()
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("outcome", ["complete", "timeout", "poll_error", "empty"])
+@pytest.mark.parametrize("transfer_timeout", [0.05, 1.0])
+def test_shutdown_drains_save_before_loop_exit(
+    forbid_connector_collectives: None, overlap: bool, outcome: str, transfer_timeout: float
+) -> None:
+    """Both real loops drain a nonzero owner's save before normal teardown."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    collective = _OwnerCollective()
+    executors: list[PyExecutor] = []
+    engines: list[MagicMock] = []
+    resources: list[MagicMock] = []
+    request = _request(42)
+    for rank in range(2):
+        executor = object.__new__(PyExecutor)
+        _configure_recovery_controls(executor)
+        executor.dist.tp_size = 2
+        executor.dist.pp_size = 1
+        executor.dist.tp_allgather.side_effect = partial(collective.gather, rank)
+        executor.dist.tp_allgather_int64.side_effect = partial(collective.gather_int64, rank)
+        executor.kv_connector_manager = _manager(rank)
+        executor._kv_connector_config.transfer_timeout_sec = transfer_timeout
+        executor._kv_connector_config.control_grace_sec = 0.2
+        executor.active_requests = []
+        executor.waiting_queue = []
+        executor.device_id = 0
+        executor.is_benchmark_disagg = False
+        executor.enable_iter_perf_stats = False
+        executor._resource_governor_enabled = False
+        executor._is_kv_manager_v2 = False
+        executor._profiler = lambda: nullcontext(MagicMock())
+        executor.hang_detector = MagicMock()
+        executor.hang_detector.detected.return_value = False
+        executor.disagg = MagicMock()
+        executor._poll_encoder_steps = MagicMock()
+        executor._wait_for_model_engine_input_copy = MagicMock()
+        executor._flush_pending_transfer_responses = MagicMock()
+        executor._release_transfer = MagicMock()
+        executor.shutdown_event = Event()
+        executor.worker_thread = MagicMock()
+        executor._profile_manager = MagicMock()
+        executor._shutdown_sleep_wakeup_listeners = MagicMock()
+        executor.model_engine = MagicMock()
+        executor.draft_model_engine = None
+        executor.virtual_memory_pools = {}
+        executor.sampler = None
+        executor.dwdp_manager = None
+        executor.resource_manager = MagicMock()
+        resource = MagicMock()
+        executor.resource_manager.resource_managers = {"kv": resource}
+        engines.append(executor.model_engine)
+        resources.append(resource)
+        executors.append(executor)
+
+    if outcome != "empty":
+        executors[1].kv_connector_manager.request_finished(request, [3])
+        assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+    polls = 0
+
+    def poll(finished_ids: list[int], loading_ids: list[int]) -> tuple[list[int], list[int]]:
+        nonlocal polls
+        polls += 1
+        if outcome == "poll_error":
+            raise OSError("save poll failed")
+        if outcome == "complete" and polls == 2:
+            return [42], []
+        return [], []
+
+    executors[1].kv_connector_manager.worker.get_finished.side_effect = poll
+
+    def run(executor: PyExecutor) -> str | None:
+        # Model the broadcast shutdown sentinel, retaining the real scheduling
+        # exit and both loop bodies. No compute or waiting requests remain.
+        executor.executor_request_queue.enqueue_shutdown_request()
+
+        def fetch() -> list[MagicMock]:
+            item = executor.executor_request_queue.request_queue.get_nowait()
+            return executor._handle_special_queue_items([item])
+
+        executor._fetch_and_activate_new_requests = fetch
+        try:
+            loop = executor._executor_loop_overlap if overlap else executor._executor_loop
+            loop()
+        except RuntimeError as exc:
+            return str(exc)
+        finally:
+            executor.shutdown_event.set()
+        return None
+
+    ticks = itertools.count(step=0.005)
+    clock = SimpleNamespace(monotonic=lambda: next(ticks), time=lambda: 0.0, sleep=MagicMock())
+    with (
+        patch("torch.cuda.set_device"),
+        patch("torch.cuda.is_available", return_value=False),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.cudart"),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT"),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.time", clock),
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        results = [f.result(timeout=10) for f in [pool.submit(run, e) for e in executors]]
+        for executor in executors:
+            executor.shutdown()
+
+    if outcome in ("complete", "empty"):
+        assert results == [None, None]
+        for executor, engine, resource in zip(executors, engines, resources):
+            assert executor._event_loop_completed
+            assert not executor._kv_connector_failed
+            assert not executor.kv_connector_manager.get_pending_transfer_requests()
+            assert not executor._kv_connector_deadlines
+            executor.worker_thread.join.assert_called_once()
+            engine._release_cuda_graphs.assert_called_once()
+            resource.shutdown.assert_called_once()
+        if outcome == "complete":
+            assert polls == 2
+            executors[1]._release_transfer.assert_called_once_with(request)
+    else:
+        assert results[0] == results[1]
+        reason = (
+            "save poll failed"
+            if outcome == "poll_error"
+            else "Timed out"
+            if transfer_timeout < 0.2
+            else "Shutdown requested"
+        )
+        assert results[0] is not None and reason in results[0]
+        assert executors[1].kv_connector_manager.has_pending_transfers(42)
+        for executor, engine, resource in zip(executors, engines, resources):
+            assert executor._kv_connector_failed
+            executor._release_transfer.assert_not_called()
+            executor.worker_thread.join.assert_not_called()
+            engine._release_cuda_graphs.assert_not_called()
+            resource.shutdown.assert_not_called()
+    executors[0]._release_transfer.assert_not_called()
+    assert executors[0].kv_connector_manager.worker.get_finished.call_count == polls
+
+
+def test_cancellation_completes_normally_within_control_grace(
+    forbid_connector_collectives: None,
+) -> None:
+    """A canceled load keeps its pages until completion, then cancels normally."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = object.__new__(PyExecutor)
+    _configure_recovery_controls(executor)
+    executor.kv_connector_manager = _manager()
+    executor.waiting_queue = MagicMock()
+    request = _request(8)
+    executor.active_requests = [request]
+    executor.canceled_req_ids = [8]
+    executor.kv_cache_transceiver = None
+    executor.kv_connector_manager.get_num_new_matched_tokens(request, 0)
+    with patch("tensorrt_llm._torch.pyexecutor.py_executor.time.monotonic", return_value=0.0):
+        executor._kv_connector_terminate_requests()
+    executor._handle_canceled_requests()
+    request.finish_by_reason.assert_not_called()
+    assert executor.canceled_req_ids == [8]
+    assert executor._kv_connector_deadlines[8].expires_at == 1.0
+
+    executor.kv_connector_manager.worker.get_finished.return_value = ([], [8])
+    with patch("tensorrt_llm._torch.pyexecutor.py_executor.time.monotonic", return_value=0.5):
+        executor._kv_connector_terminate_requests()
+    executor._handle_canceled_requests()
+    request.finish_by_reason.assert_called_once()
+    assert not executor.canceled_req_ids
+    assert not executor._kv_connector_failed
+    assert not executor._kv_connector_deadlines
 
 
 def test_adp_v2_query_commit_and_grouped_callbacks(forbid_connector_collectives: None) -> None:
