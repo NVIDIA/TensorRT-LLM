@@ -5650,6 +5650,21 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if max_seq_len is None or int(max_seq_len) <= 0:
             return None
+        if num_layers is None:
+            # Hybrid recurrent/attention models (attention layers are a strict
+            # subset of the hidden layers) decline: the static component
+            # helper distributes the attention-only layer count over the
+            # full-model pp partition without a hybrid layer mask, so
+            # ``Mapping.pp_layers`` rejects an explicit ``pp_partition`` and
+            # even divisions place the layers wrong. The hybrid managers'
+            # per-request recurrent-state spend is already carried as the
+            # affine intercept, so the per-token split stays in effect.
+            total_hidden_layers = getattr(model_config.pretrained_config, "num_hidden_layers", None)
+            if (
+                total_hidden_layers is not None
+                and model_config.get_num_attention_layers() != total_hidden_layers
+            ):
+                return None
         max_seq_len = int(max_seq_len)
         tokens_per_block = int(tokens_per_block)
         layer_sizes, attention_windows = _get_static_cache_size_layer_components(

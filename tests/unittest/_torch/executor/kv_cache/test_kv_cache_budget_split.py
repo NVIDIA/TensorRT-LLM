@@ -1391,6 +1391,33 @@ class TestCacheBytesPerRequest:
             is None
         )
 
+    def test_hybrid_attention_layer_subset_declines(self):
+        """Hybrid recurrent/attention models (e.g. a MambaHybridCacheManagerV2
+        target) decline before touching the pp partition: the static component
+        helper has no hybrid layer mask, so its attention-only layer count
+        cannot be distributed over the full-model partition."""
+        model_config = _v2_model_config(
+            layer_types=["sliding_attention", "full_attention"] * 12,
+            sliding_window=512,
+        )
+        # 12 attention layers among 24 hidden layers.
+        model_config.get_num_attention_layers = lambda: 12
+        mapping = _v2_mapping()
+        # An explicit pp_partition posture: distributing a layer count that
+        # does not sum to the partition raises. The decline must come first.
+        mapping.pp_layers.side_effect = ValueError
+        assert (
+            KVCacheManagerV2.get_cache_bytes_per_request(
+                model_config,
+                mapping,
+                tokens_per_block=self.TPB,
+                kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+                max_seq_len=self.MSL,
+                spec_config=None,
+            )
+            is None
+        )
+
 
 class TestPerRequestWeightedSplit:
     """The GPU budget split weighs managers by per-request spend when known."""
