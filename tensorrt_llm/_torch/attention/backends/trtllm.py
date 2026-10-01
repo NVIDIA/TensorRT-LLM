@@ -230,8 +230,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_block_ids_per_seq: Optional[torch.Tensor] = None
     draft_block_ids_per_seq: Optional[torch.Tensor] = None
     draft_kv_block_ids_per_seq: Optional[torch.Tensor] = None
-    # Attributes swapped to draft KV buffers during draft replay, mapped to their
-    # target values; the strict buffer check validates those instead.
+    # Originals of attributes swapped for draft replay, recorded by
+    # swap_for_draft; the strict buffer check validates these instead.
     draft_replay_swapped_attrs: Dict[str, Any] = field(default_factory=dict,
                                                        init=False,
                                                        repr=False,
@@ -874,6 +874,22 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                          out=self.mla_ctx_cu_q_seqlens[1:num_ctx + 1])
             self._mla_ctx_cu_seqlens_valid = True
         return self.mla_ctx_cu_q_seqlens[:num_ctx + 1]
+
+    def record_draft_swap(self, name: str) -> None:
+        """Record name's current value so restore_draft_swaps can rebind it."""
+        self.draft_replay_swapped_attrs.setdefault(name,
+                                                   getattr(self, name, None))
+
+    def swap_for_draft(self, name: str, draft_value: Any) -> None:
+        """Rebind name to draft_value, recording the original first."""
+        self.record_draft_swap(name)
+        setattr(self, name, draft_value)
+
+    def restore_draft_swaps(self) -> None:
+        """Rebind every recorded attribute to its original and clear the record."""
+        for name, original in self.draft_replay_swapped_attrs.items():
+            setattr(self, name, original)
+        self.draft_replay_swapped_attrs = {}
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Prepare backend state shared by draft-forward execution paths."""

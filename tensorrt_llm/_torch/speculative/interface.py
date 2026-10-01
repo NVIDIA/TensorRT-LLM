@@ -216,12 +216,15 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
         saved['target_block_ids_per_seq'] = attn_metadata.block_ids_per_seq
         saved[
             'target_kv_block_ids_per_seq'] = attn_metadata.kv_block_ids_per_seq
-        attn_metadata.block_ids_per_seq = attn_metadata.draft_block_ids_per_seq
-        attn_metadata.kv_block_ids_per_seq = (
-            attn_metadata.draft_kv_block_ids_per_seq)
-    attn_metadata.kv_cache_manager = draft_kv_cache_manager
-    attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
-    attn_metadata.host_kv_cache_block_offsets = (
+        attn_metadata.swap_for_draft('block_ids_per_seq',
+                                     attn_metadata.draft_block_ids_per_seq)
+        attn_metadata.swap_for_draft('kv_block_ids_per_seq',
+                                     attn_metadata.draft_kv_block_ids_per_seq)
+    attn_metadata.swap_for_draft('kv_cache_manager', draft_kv_cache_manager)
+    attn_metadata.swap_for_draft('kv_cache_block_offsets',
+                                 attn_metadata.draft_kv_cache_block_offsets)
+    attn_metadata.swap_for_draft(
+        'host_kv_cache_block_offsets',
         draft_kv_cache_manager.host_kv_cache_block_offsets)
     if attn_metadata.enable_flash_mla:
         attn_metadata.prepare_flash_mla()
@@ -231,10 +234,6 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     backend_saved = attn_metadata.prepare_for_draft_forward()
     if backend_saved is not None:
         saved['saved_backend_state'] = backend_saved
-    attn_metadata.draft_replay_swapped_attrs = {
-        k[len('target_'):]: v
-        for k, v in saved.items() if k.startswith('target_')
-    } | (backend_saved or {})
     return saved
 
 
@@ -242,23 +241,14 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
     """Restore attention metadata after draft replay. No-op if saved_state is None."""
     if saved_state is None:
         return
-    attn_metadata.kv_cache_manager = saved_state['target_kv_cache_manager']
-    attn_metadata.kv_cache_block_offsets = (
-        saved_state['target_kv_cache_block_offsets'])
-    attn_metadata.host_kv_cache_block_offsets = (
-        saved_state['target_host_kv_cache_block_offsets'])
+    attn_metadata.restore_draft_swaps()
     if attn_metadata.enable_flash_mla:
-        attn_metadata.block_ids_per_seq = saved_state[
-            'target_block_ids_per_seq']
-        attn_metadata.kv_block_ids_per_seq = saved_state[
-            'target_kv_block_ids_per_seq']
         # Target and draft block-ID buffers are independent. Restoring only
         # needs to invalidate the scheduler metadata; refreshing the unchanged
         # target buffers would repeat request-specific H2D work.
         attn_metadata._flash_mla_metadata_valid = False
     attn_metadata.restore_after_draft_forward(
         saved_state.get('saved_backend_state'))
-    attn_metadata.draft_replay_swapped_attrs = {}
 
 
 def get_force_num_accepted_tokens() -> int:
