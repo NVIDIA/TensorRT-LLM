@@ -80,8 +80,6 @@ Buf documents the package naming and version format in its [Python-generated SDK
 
 The OpenEngine contributor community owns this adapter, its tests, protocol version updates, and integration bugs. TensorRT-LLM internal APIs do not provide compatibility guarantees to protocol adapters. Adapter updates must follow core runtime changes and must not block normal TensorRT-LLM development or releases.
 
-### AgentX without KV events
+### Token-only output and conversation affinity
 
 For token-only clients, send boolean `extra["detokenize"] = false`. Forward the same stable `extra["conversation_id"]` on prefill and decode requests and across conversation turns. TensorRT-LLM performs conversation placement and per-conversation cache reuse; these extensions do not require KV-event discovery, publication, or routing-load snapshots. Omitted detokenize retains normal text output.
-
-Use explicit `sampling.temperature = 0` in both benchmark arms and the same native protobuf implementation (`PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb`) to avoid sampling and serialization mismatches. Disable worker KV-event publication and frontend KV-event use for the AgentX comparison.

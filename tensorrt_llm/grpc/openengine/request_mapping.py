@@ -187,7 +187,7 @@ def sampling_params_from_request(
 def conversation_params_from_request(
     request: generation_pb2.GenerateRequest,
 ) -> ConversationParams | None:
-    """Translate Dynamo's stable AgentX session identity, when supplied."""
+    """Translate the caller's stable conversation identity, when supplied."""
     if not request.HasField("extra"):
         return None
     conversation_id = request.extra.fields.get(_CONVERSATION_ID_EXTRA_KEY)

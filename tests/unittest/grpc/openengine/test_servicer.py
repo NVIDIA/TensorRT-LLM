@@ -1166,7 +1166,7 @@ def test_generate_aborts_the_engine_when_the_rpc_is_cancelled() -> None:
 
 @pytest.mark.parametrize("detokenize", [None, True, False])
 def test_generate_forwards_conversation_id(detokenize: bool | None) -> None:
-    """AgentX session affinity survives the OpenEngine transport boundary."""
+    """Conversation affinity survives the OpenEngine transport boundary."""
     output = SimpleNamespace(
         index=0,
         token_ids=[10],
@@ -1186,7 +1186,7 @@ def test_generate_forwards_conversation_id(detokenize: bool | None) -> None:
         model="test-model",
         prompt="hello",
     )
-    request.extra.update({"conversation_id": " agentx-session "})
+    request.extra.update({"conversation_id": " conversation-session "})
     if detokenize is not None:
         request.extra.update({"detokenize": detokenize})
 
@@ -1195,7 +1195,7 @@ def test_generate_forwards_conversation_id(detokenize: bool | None) -> None:
 
     responses = asyncio.run(collect_responses())
 
-    assert llm.generate_kwargs["conversation_params"].conversation_id == "agentx-session"
+    assert llm.generate_kwargs["conversation_params"].conversation_id == "conversation-session"
     assert llm.generate_kwargs["sampling_params"].detokenize is (detokenize is not False)
     assert [response.WhichOneof("event") for response in responses] == ["token", "finished"]
     assert [token.token_id for token in responses[0].token.tokens] == [10]
