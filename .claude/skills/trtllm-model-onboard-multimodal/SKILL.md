@@ -54,7 +54,10 @@ metadata:
     Context:    build MultimodalRuntimeData (positions / lengths / chunk bounds).
                 For item-scheduled models, reserve space in the model's one
                 TensorLRUCache. Reuse ready outputs and encode each missing item only
-                once, within the encoder item / token / output-byte limits.
+                once, within the encoder item / token / output-byte limits. Then
+                join the request's cached item outputs in prompt order, keeping only
+                the current chunk's rows, into a multimodal_embedding flagged
+                multimodal_embedding_is_chunk.
                 Legacy models stage the request payload here as before. H2D obeys
                 multimodal_data_device_paths and uses pinned, non-blocking copies.
     Generation (mRoPE only): strip everything except mrope_position_deltas.
@@ -62,11 +65,14 @@ metadata:
                 raw MM fields so they don't ride along in decode.
 
 [5] Model.forward(attn_metadata, input_ids, position_ids, multimodal_params=…)
-    MultimodalModelMixin.prepare_multimodal_inputs: concatenates prompt-ordered
-       cache-owned item outputs once into the existing embedding-tensor contract;
-       the legacy path still uses get_multimodal_embeddings and its
-       full-request/partial-hit behavior.
-    find_input_mm_embeds: slices active chunk rows from that tensor.
+    MultimodalModelMixin.prepare_multimodal_inputs: the legacy path looks up
+       the persistent cache and encodes partial-hit misses;
+       get_multimodal_embeddings then encodes the remaining full misses and
+       joins every request's rows into one batch tensor. If any request is
+       chunk-local, full-request peers are cut to their current-chunk rows
+       before that join.
+    find_input_mm_embeds: returns chunk-local rows unchanged; slices
+       full-request rows down to the active chunk.
     prepare_mrope_config (mRoPE models): one-shot mrope_rotary_cos_sin per
        request from the staged mrope_position_ids buffer.
     fuse_input_embeds: merges text and MM rows through the existing precomputed
@@ -99,6 +105,10 @@ This item-scheduled cache path currently applies only when the encoder and LLM
 run in the same process. `mm_encoder_only` / EPD keeps its existing
 shared-handle transfer path. Item scheduling also rejects side-stream encoder
 prefetch today, and LLM prefill waits until every item in a request is ready.
+Item scheduling does not support pipeline parallelism yet: with
+`pipeline_parallel_size > 1`, `encoder_scheduling_policy=DEFAULT` (also the
+value when unset) logs a warning and falls back to the inline encoder path,
+`EAGER` raises `ValueError`, and `DISABLED` keeps the inline path.
 Side-stream support and item/LLM prefill overlap are separate follow-ups.
 
 ### Templates to study
@@ -303,6 +313,8 @@ class {Name}Model(MultimodalModelMixin, PreTrainedModel):
 
     @property
     def embedding_dim(self) -> int:
+        # Width of one cached encoder-output row. Override when the encoder
+        # folds extra features into each row (Qwen3-VL deepstack).
         return self.text_embedding_layer.embedding_dim
 
     @property
@@ -323,6 +335,10 @@ class {Name}Model(MultimodalModelMixin, PreTrainedModel):
   `embedding_dim`, and `embedding_dtype`. The encoder must return one tensor whose first
   dimension equals the processor-declared aggregate output length. The item path validates and
   splits it per item; the legacy path retains its existing full-request behavior.
+  `embedding_dim` and `embedding_dtype` describe one cached encoder-output row, not the text
+  embedding: include any extra features folded into each row (Qwen3-VL deepstack returns
+  `hidden * (deepstack_num_level + 1)`). Item scheduling sizes cache entries from them and
+  rejects item outputs with any other width or dtype.
 - Set `supports_mm_encoder_item_scheduling=True` only when the input processor emits valid atomic
   item metadata and the model can slice and batch selected items. Set `supports_encoder_cache=True`
   only when the production forward consumes the mixin cache path. Do not construct or mutate a
