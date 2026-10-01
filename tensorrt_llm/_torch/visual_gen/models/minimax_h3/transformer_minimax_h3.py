@@ -293,6 +293,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             config=model_config,
             layer_idx=layer_idx,
             reduce_output=model_config.mapping.tp_size > 1,
+            use_quack_swiglu_epilogue=True,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -386,6 +387,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             config=model_config,
             layer_idx=layer_idx,
             reduce_output=model_config.mapping.tp_size > 1,
+            use_quack_swiglu_epilogue=True,
         )
         self.adaln_proj = MiniMaxH3AdaLayerNormModulation(
             time_embed_dim=time_embed_dim,

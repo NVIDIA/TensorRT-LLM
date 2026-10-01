@@ -29,7 +29,8 @@ import functools
 
 import torch
 
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 
 
 @functools.lru_cache(maxsize=1)
@@ -39,14 +40,19 @@ def _quack_gemm_act():
 
         install_cutlass_dsl_compatibility()  # CuTe aliases the pinned QuACK release still imports
         from quack.gemm_interface import gemm_act
-    except ImportError:
+    except (ImportError, AttributeError, RuntimeError) as exc:
+        logger.warning(f"QuACK gemm_act unavailable; GatedMLP keeps the unfused SwiGLU path: {exc}")
         return None
     return gemm_act
 
 
 def gate_up_swiglu_quack_available() -> bool:
-    """True on SM100-family GPUs with QuACK importable."""
-    return torch.cuda.is_available() and is_sm_100f() and _quack_gemm_act() is not None
+    """True on SM100/SM103 GPUs with QuACK importable (the kernel is not validated on SM107)."""
+    return (
+        torch.cuda.is_available()
+        and get_sm_version() in (100, 103)
+        and _quack_gemm_act() is not None
+    )
 
 
 @torch.library.custom_op("trtllm::gate_up_swiglu_quack_bf16", mutates_args=(), device_types="cuda")

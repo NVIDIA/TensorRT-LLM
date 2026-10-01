@@ -65,7 +65,13 @@ def test_fused_epilogue_rejects_invalid_inputs():
 @requires_kernel
 def test_gated_mlp_dispatches_bf16_epilogue(monkeypatch):
     torch.manual_seed(1)
-    mlp = GatedMLP(hidden_size=256, intermediate_size=512, bias=False, dtype=torch.bfloat16).cuda()
+    mlp = GatedMLP(
+        hidden_size=256,
+        intermediate_size=512,
+        bias=False,
+        dtype=torch.bfloat16,
+        use_quack_swiglu_epilogue=True,
+    ).cuda()
     for p in mlp.parameters():
         p.data.normal_(std=0.05)
     # GatedMLP consumes 2-D [tokens, hidden] activations (the SwiGLU kernel requires it).
@@ -91,14 +97,39 @@ def test_gated_mlp_dispatches_bf16_epilogue(monkeypatch):
     ).abs().max() <= unfused_out.float().abs().max() * 2**-6
 
 
-def test_gated_mlp_bf16_epilogue_excludes_bias_quant_and_tp(monkeypatch):
-    mlp = GatedMLP(hidden_size=16, intermediate_size=32, bias=True, dtype=torch.bfloat16)
+def test_gated_mlp_bf16_epilogue_is_opt_in_and_excludes_bias_quant_and_tp(monkeypatch):
     monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_available", lambda: True)
+    mlp = GatedMLP(hidden_size=16, intermediate_size=128, bias=False, dtype=torch.bfloat16)
+    assert (
+        not mlp._can_fuse_gate_up_swiglu_bf16()
+    )  # default off: every other model keeps cuBLAS + SwiGLU
+    mlp = GatedMLP(
+        hidden_size=16,
+        intermediate_size=128,
+        bias=True,
+        dtype=torch.bfloat16,
+        use_quack_swiglu_epilogue=True,
+    )
     assert not mlp._can_fuse_gate_up_swiglu_bf16()  # bias
-    mlp = GatedMLP(hidden_size=16, intermediate_size=32, bias=False, dtype=torch.bfloat16)
+    mlp = GatedMLP(
+        hidden_size=16,
+        intermediate_size=128,
+        bias=False,
+        dtype=torch.bfloat16,
+        use_quack_swiglu_epilogue=True,
+    )
     assert mlp._can_fuse_gate_up_swiglu_bf16()
     monkeypatch.setattr(mlp.gate_up_proj, "tp_size", 2)
     assert not mlp._can_fuse_gate_up_swiglu_bf16()  # tensor parallel
     monkeypatch.setattr(mlp.gate_up_proj, "tp_size", 1)
     mlp.swiglu_limit = 7.0
     assert not mlp._can_fuse_gate_up_swiglu_bf16()  # clamped SwiGLU stays on the Triton kernel
+    mlp.swiglu_limit = None
+    mlp = GatedMLP(
+        hidden_size=16,
+        intermediate_size=96,
+        bias=False,
+        dtype=torch.bfloat16,
+        use_quack_swiglu_epilogue=True,
+    )
+    assert not mlp._can_fuse_gate_up_swiglu_bf16()  # intermediate size not a multiple of 128

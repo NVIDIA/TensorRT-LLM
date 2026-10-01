@@ -42,6 +42,7 @@ class GatedMLP(nn.Module):
         swiglu_limit: Optional[float] = None,
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
+        use_quack_swiglu_epilogue: bool = False,
     ):
 
         super().__init__()
@@ -50,6 +51,8 @@ class GatedMLP(nn.Module):
         self.intermediate_size = intermediate_size
         self.activation = activation
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
+        # Opt-in BF16 gate/up GEMM with SwiGLU in the epilogue (QuACK, SM100/SM103).
+        self.use_quack_swiglu_epilogue = use_quack_swiglu_epilogue
         self.swiglu_limit = float(
             swiglu_limit) if swiglu_limit is not None else None
         # SwiGLU-OAI shape parameters, left None for plain SwiGLU, where the
@@ -246,16 +249,17 @@ class GatedMLP(nn.Module):
         return is_static_nvfp4_input_eligible(self.down_proj)
 
     def _can_fuse_gate_up_swiglu_bf16(self) -> bool:
-        """Check whether the BF16 gate/up GEMM can apply SwiGLU in its epilogue.
+        """Check whether the opt-in BF16 gate/up GEMM + SwiGLU epilogue applies.
 
-        The QuACK SM100 GEMM replaces the ``[M, 2I]`` BF16 intermediate and the
-        separate SwiGLU kernel with one GEMM whose epilogue computes
-        ``silu(gate) * up`` on the FP32 accumulators. Plain SwiGLU only (no
-        limit, alpha or beta), unquantized BF16 weights without bias, and no
-        tensor parallelism: with TP the local ``[gate; up]`` shard layout is the
-        same, but the path is kept to the measured configuration until it is
-        validated with TP collectives.
+        Requires ``use_quack_swiglu_epilogue=True`` at construction, plain
+        SwiGLU (no limit, alpha or beta), an unquantized BF16 ``gate_up_proj``
+        without bias and without tensor parallelism, K a multiple of 8 and an
+        intermediate size that is a multiple of 128 (QuACK tile alignment), on
+        an SM100/SM103 GPU with QuACK importable. Evaluated in forward, after
+        the weights exist.
         """
+        if not self.use_quack_swiglu_epilogue:
+            return False
         if not (self.activation == F.silu and self._is_plain_swiglu()):
             return False
         if self.swiglu_limit is not None and self.swiglu_limit != float("inf"):
@@ -265,7 +269,8 @@ class GatedMLP(nn.Module):
         if (getattr(proj, "has_any_quant", True)
                 or getattr(proj, "tp_size", 1) != 1
                 or getattr(proj, "bias", None) is not None or weight is None
-                or weight.dtype != torch.bfloat16):
+                or weight.dtype != torch.bfloat16 or weight.shape[1] % 8
+                or weight.shape[0] % 256):
             return False
         return gate_up_swiglu_quack_available()
 
@@ -381,10 +386,7 @@ class GatedMLP(nn.Module):
         elif self._can_fuse_gate_up_swiglu():
             h2 = self._fused_gate_up_swiglu(x)
         elif self._can_fuse_gate_up_swiglu_bf16() and isinstance(
-                x, torch.Tensor) and x.dtype == torch.bfloat16:
-            if x.dim() > 2:
-                fused_output_shape = x.shape[:-1]
-                x = x.reshape(-1, x.shape[-1])
+                x, torch.Tensor) and x.dtype == torch.bfloat16 and x.dim() == 2:
             h2 = gate_up_swiglu_quack_bf16(x, self.gate_up_proj.weight)
         else:
             h1 = self.gate_up_proj(x)
