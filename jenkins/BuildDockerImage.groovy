@@ -66,8 +66,8 @@ BOLT_PROFILES_REQUIRED = (params.boltProfilesRequired ?: env.boltProfilesRequire
 // installs it. Kept independent so it can be rolled back on its own.
 BOLT_OPTIMIZE_WHEEL = (params.boltOptimizeWheel ?: env.boltOptimizeWheel ?: "false").toString() == "true"
 // The bundle this pipeline pinned, hoisted out of globalVars in launchBuildJobs
-// because prepareWheelFromBuildStage runs well below the scope globalVars is
-// passed into. Empty means unpinned, i.e. take whatever `latest` is.
+// because overlayBoltBundle runs well below the scope globalVars is passed into.
+// Empty means unpinned, i.e. take whatever `latest` is.
 BOLT_PINNED_REF = ""
 // The branch that pin lives under. Set only together with the ref.
 BOLT_PINNED_BRANCH = ""
