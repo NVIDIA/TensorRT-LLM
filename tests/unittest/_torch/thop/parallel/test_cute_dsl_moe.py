@@ -57,6 +57,29 @@ from tensorrt_llm._torch.utils import (
 from tensorrt_llm._utils import get_sm_version
 
 
+def _nvfp4_quantize_fp32_ref(
+    x: torch.Tensor, inverse_global_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize without the BF16 rounding absent from the fused FP32 epilogue."""
+    m, n = x.shape
+    blocks = x.reshape(m, n // 16, 16)
+    scales = (blocks.abs().amax(dim=-1) / 6 * inverse_global_scale).to(torch.float8_e4m3fn)
+    inverse_scales = (inverse_global_scale / scales.float()).clamp(
+        max=torch.finfo(torch.float32).max
+    )
+    normalized = (blocks * inverse_scales.unsqueeze(-1)).reshape(m, n)
+    magnitudes = normalized.abs().contiguous()
+    # E2M1 magnitudes are 0, 0.5, 1, 1.5, 2, 3, 4, 6. At midpoint ties,
+    # choose the even code, matching round-to-nearest-even conversion.
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
+    codes = torch.bucketize(magnitudes, midpoints)
+    for index in (1, 3, 5):
+        codes += (magnitudes == midpoints[index]).to(codes.dtype)
+    codes = codes.to(torch.uint8) | (torch.signbit(normalized).to(torch.uint8) << 3)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed, swizzle_sf(scales.view(torch.uint8), m, n)
+
+
 def swiglu_ref(x: torch.Tensor, swiglu_limit: float = float("inf")) -> torch.Tensor:
     x, gate = x.chunk(2, dim=-1)
     if swiglu_limit != float("inf"):
@@ -1276,8 +1299,12 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
 
-    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
-    a_sf_gathered = torch.empty(
+    # Padding participates in the reference GEMM and output-scale reduction.
+    # Initialize both FP4 values and scales so padding cannot introduce NaNs.
+    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
+        a.dtype
+    )
+    a_sf_gathered = torch.zeros(
         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
     )
     for i in range(num_valid_permuted_tokens):
@@ -1482,8 +1509,12 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
 
-    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
-    a_sf_gathered = torch.empty(
+    # Padding participates in the reference GEMM and output-scale reduction.
+    # Initialize both FP4 values and scales so padding cannot introduce NaNs.
+    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
+        a.dtype
+    )
+    a_sf_gathered = torch.zeros(
         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
     )
     for i in range(num_valid_permuted_tokens):
@@ -1511,12 +1542,15 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
         tile_idx_to_group_idx,
         num_non_exiting_tiles,
         tile_size=tile_size,
-        output_dtype=torch.bfloat16,
+        output_dtype=torch.float32 if activation_type == ActivationType.Relu2 else torch.bfloat16,
         scaling_vector_size=sf_vec_size,
     )
     c_ref = apply_activation_ref(c_ref, activation_type)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
-    c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
+    if activation_type == ActivationType.Relu2:
+        c_ref, c_sf_ref = _nvfp4_quantize_fp32_ref(c_ref, 1 / global_sf)
+    else:
+        c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
     # Call Rubin gather kernel
     c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
@@ -1653,8 +1687,12 @@ def test_nvfp4_gather_grouped_gemm_situ_rubin(tile_size: int):
     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
 
-    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
-    a_sf_gathered = torch.empty(
+    # Padding participates in the reference GEMM and output-scale reduction.
+    # Initialize both FP4 values and scales so padding cannot introduce NaNs.
+    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
+        a.dtype
+    )
+    a_sf_gathered = torch.zeros(
         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
     )
     for i in range(num_valid_permuted_tokens):
@@ -1876,12 +1914,13 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin_small_tokens(
     )
     num_valid_permuted_tokens = n_tiles * tile_size
     for i in range(min(num_valid_permuted_tokens, max_num_permuted_tokens)):
+        # Routing metadata defines valid rows; expanded index zero is valid.
+        if i >= tile_idx_to_mn_limit[i // tile_size].item():
+            continue
         expanded_idx = permuted_idx_to_expanded_idx[i].item()
-        if expanded_idx > 0 or i == 0:
-            token_id = expanded_idx // top_k
-            if token_id < num_tokens:
-                a_gathered[i] = a[token_id]
-                a_sf_gathered[i] = a_sf_unswizzled[token_id]
+        token_id = expanded_idx // top_k
+        a_gathered[i] = a[token_id]
+        a_sf_gathered[i] = a_sf_unswizzled[token_id]
 
     a_sf_gathered_swizzled = swizzle_sf(
         a_sf_gathered.view(max_num_permuted_tokens, hidden_size // sf_vec_size),
@@ -2741,6 +2780,9 @@ def test_cute_dsl_nvfp4_quantize_empty_input_rubin():
 
     assert x.shape == (0, hidden_size // 2)
     assert x_sf.shape == (0, hidden_size // scaling_vector_size)
+    # The empty input must not leave a pending CUDA error for the next launch.
+    torch.ones(1, device="cuda").add_(1)
+    torch.cuda.synchronize()
 
 
 def test_sm107_nvfp4_tile512_fallback_uses_two_cta_cluster():
