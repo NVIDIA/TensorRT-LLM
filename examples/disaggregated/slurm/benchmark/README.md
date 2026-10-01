@@ -116,7 +116,8 @@ worker_config:
         pool: file://__LOG_DIR__/pool.json
         role: both             # reads and writes the pool
         segment_size: 160GiB   # per rank
-        run_dir: __LOG_DIR__/mooncake_ctx
+        model_key: minimax-m3-fp4
+        run_dir: __MOONCAKE_RUN_DIR__
         master_timeout: 900
 
   gen:
@@ -127,11 +128,16 @@ worker_config:
         pool: file://__LOG_DIR__/pool.json
         role: capacity         # lends memory, transfers nothing
         segment_size: 160GiB   # the same per-rank figure
-        run_dir: __LOG_DIR__/mooncake_gen
+        model_key: minimax-m3-fp4
+        run_dir: __MOONCAKE_RUN_DIR__
         master_timeout: 900
 ```
 
-`__LOG_DIR__` is substituted with the job's log directory, which is not known when the config is written.
+`__LOG_DIR__` is substituted with the job's log directory, which is not known when the config is written. `pool` stays the same across both roles and every server: one master publishes one manifest there, and joining it is what puts them all on the same pool.
+
+`__MOONCAKE_RUN_DIR__` is substituted per server, by `start_worker.sh`, with `<log dir>/mooncake_<role>_<instance>`. It cannot be written as a `__LOG_DIR__` path because that is one directory for the whole job, while each server needs its own: two servers sharing a run directory render one client config between them, and the last writer wins for both. With more than one context or generation server, a shared path fails at startup with a message naming the other server's claim.
+
+`model_key` is required and has to read the same on every server, since it is what the pool's keys identify this checkpoint by.
 
 `run_dir` is where each server keeps the client config it renders and the record each of its ranks writes. It has to be inside the job's log directory, because the ranks `srun` starts never inherit the leader's environment and read that client config back from there. Give the two sides **separate** directories: servers sharing one render a single client config between them, and these two differ in `role`. The run's report gathers the records from the whole tree, so the pool still totals up.
 

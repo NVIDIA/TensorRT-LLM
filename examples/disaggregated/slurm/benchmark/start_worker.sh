@@ -76,11 +76,27 @@ fi
 
 echo "config_file: ${config_file}"
 
-# Nothing here configures the mooncake-store pool: the worker config names it,
-# including mooncake_store.run_dir, which has to point inside the job's log
-# directory because the ranks srun started never inherit the leader's
-# environment and read the rendered client config back from there. See the
-# Mooncake section of README.md.
+# The mooncake-store pool is named by the worker config, including
+# mooncake_store.run_dir, which has to point inside the job's log directory
+# because the ranks srun started never inherit the leader's environment and
+# read the rendered client config back from there.
+#
+# run_dir also has to differ per server: two sharing one render a single client
+# config between them, leaving a server transferring over another node's HCAs
+# or lending under another's role. The worker config is shared by every server
+# of a role and can only carry __LOG_DIR__, which is the whole job's, so the
+# per-server part is substituted here, where the role and the instance are
+# known. Each rank renders its own copy of the config, from the same value, so
+# that they do not race over one file. See the Mooncake section of README.md.
+if grep -q '__MOONCAKE_RUN_DIR__' "${config_file}"; then
+    role_lower=$(echo "${role}" | tr '[:upper:]' '[:lower:]')
+    mooncake_run_dir="${log_dir}/mooncake_${role_lower}_${instance_id}"
+    rendered_config="${log_dir}/config_${role}_${instance_id}_rank${SLURM_PROCID}.yaml"
+    sed "s|__MOONCAKE_RUN_DIR__|${mooncake_run_dir}|g" \
+        "${config_file}" > "${rendered_config}"
+    config_file="${rendered_config}"
+    echo "mooncake_store.run_dir: ${mooncake_run_dir} (config ${config_file})"
+fi
 
 # MiniMax-M3's MSA sparse attention JIT-compiles its FMHA kernels on first use,
 # from inside the attention forward pass. One TP rank runs ninja while the

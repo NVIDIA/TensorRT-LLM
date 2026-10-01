@@ -219,6 +219,15 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         state = self._requests.pop(request.request_id, None)
         return bool(state is not None and state.emitted_saves)
 
+    def request_reset(self, request: LlmRequest) -> None:
+        """Forget a request whose pages were released for it to run again.
+
+        `pages` and `saved_upto` describe the allocation that has just been
+        freed, and the tokens and hash chain are rebuilt by the lookup that
+        precedes the next attempt, so none of the state survives.
+        """
+        self._requests.pop(request.request_id, None)
+
     # ---- internals ----
 
     def _require_worker(self) -> MooncakeStoreConnectorWorker:

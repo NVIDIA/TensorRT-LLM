@@ -2369,6 +2369,14 @@ class MooncakeStoreConfig(StrictBaseModel):
         description="Key namespace, isolating this deployment's cache from "
         "others on the same pool. Bump it after any change to page layout or "
         "contents. Defaults to the pool manifest's.")
+    model_key: str = Field(
+        ...,
+        telemetry=False,
+        description="What the pool keys identify this checkpoint by. Two "
+        "engines share cache only when they agree on it, and two that "
+        "disagree read each other's pages as their own, so it has no default. "
+        "A model path is a poor choice, since 'org-a/model' and 'org-b/model' "
+        "share a directory name while meaning different weights.")
     stage_through_host: bool = Field(
         False,
         telemetry=False,

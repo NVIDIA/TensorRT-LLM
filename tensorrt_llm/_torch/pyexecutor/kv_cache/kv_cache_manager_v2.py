@@ -1760,9 +1760,6 @@ class KVCacheManagerV2(BaseResourceManager):
         # Requests whose pages a connector is still reading from, so the
         # release half of `preempt_request` has to wait.
         self._pending_preemption: Dict[int, LlmRequest] = {}
-        # Requests whose pages a connector is still reading from, so the
-        # release half of `preempt_request` has to wait.
-        self._pending_preemption: Dict[int, LlmRequest] = {}
         self._prepare_page_table_tensor(index_mapper_capacity)
 
         self._log_kv_cache_pool_lifecycle_mapping()

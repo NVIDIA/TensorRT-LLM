@@ -1176,6 +1176,30 @@ def test_scheduler_request_finished_is_false_without_saves(store_config):
     assert scheduler.request_finished(request, []) is False
 
 
+def test_scheduler_saves_a_replayed_request_from_its_new_pages(store_config):
+    """Rollback frees the pages the first attempt recorded, and another request
+    may own them by the time the replay saves.
+    """
+    scheduler = make_scheduler(store_config, hit_blocks=0)
+    tokens = list(range(2 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+
+    scheduler.get_num_new_matched_tokens(request, 0)
+    first = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, [4, 5])])
+    )
+    assert [page.page_index for page in first.saves[0].pages] == [4, 5]
+
+    scheduler.request_reset(request)
+
+    # The replay is admitted to different pages and must save from those.
+    scheduler.get_num_new_matched_tokens(request, 0)
+    replay = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, [9, 10])])
+    )
+    assert [page.page_index for page in replay.saves[0].pages] == [9, 10]
+
+
 def test_scheduler_isolates_requests_by_cache_salt(store_config):
     scheduler = make_scheduler(store_config, hit_blocks=1)
     tokens = list(range(3 * TOKENS_PER_BLOCK))

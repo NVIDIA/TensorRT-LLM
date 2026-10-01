@@ -392,11 +392,8 @@ def test_a_capacity_only_manager_builds_no_scheduler_output():
                   state=LlmRequestState.GENERATION_IN_PROGRESS)
     ]
 
-    # Attention DP keeps this to one process: `_run_on_leader` runs locally
-    # with it, and broadcasts the TP leader's result without it.
     capacity = KvCacheConnectorManager(CapacityWorker(MagicMock()),
-                                       scheduler=MagicMock(),
-                                       enable_attention_dp=True)
+                                       scheduler=MagicMock())
     capacity.build_scheduler_output(scheduled_batch, MagicMock())
     # With no output built, handle_metadata binds nothing to the worker.
     capacity.handle_metadata()
@@ -405,11 +402,24 @@ def test_a_capacity_only_manager_builds_no_scheduler_output():
 
     # The transferring role needs the output and must be unaffected.
     transferring = KvCacheConnectorManager(MinimalWorker(MagicMock()),
-                                           scheduler=MagicMock(),
-                                           enable_attention_dp=True)
+                                           scheduler=MagicMock())
     transferring.build_scheduler_output(scheduled_batch, MagicMock())
     transferring.handle_metadata()
     transferring.scheduler.build_connector_meta.assert_called_once()
+
+
+def test_releasing_an_allocation_for_replay_tells_the_connector():
+    """The connector's per-request state is keyed to the pages being freed."""
+    scheduler = MagicMock()
+    manager = KvCacheConnectorManager(MinimalWorker(MagicMock()),
+                                      scheduler=scheduler)
+
+    req = MagicMock()
+    req.request_id = 11
+
+    manager.reset_request_state(req)
+
+    scheduler.request_reset.assert_called_once_with(req)
 
 
 def test_scheduler_output_num_scheduled_tokens_with_mtp():

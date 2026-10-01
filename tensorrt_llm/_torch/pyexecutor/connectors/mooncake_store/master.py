@@ -449,6 +449,7 @@ def _client_config(pool: Any, manifest: PoolManifest, device_name: str) -> Dict[
         # ---- this node's ----
         "device_name": device_name,
         # ---- this server's ----
+        "model_key": pool.model_key,
         "global_segment_size": parse_size(pool.segment_size, strict_units=True),
         "local_buffer_size": DEFAULT_LOCAL_BUFFER_SIZE,
         "role": StoreRole(pool.role).value,
@@ -652,6 +653,54 @@ def _log_contribution(segment_size: int, role: str, run_dir: str) -> None:
     )
 
 
+def _claim_is_live(owner: Dict[str, Any], host: str) -> bool:
+    """Whether the server that wrote `owner` could still be running.
+
+    Only a claim from this host can be checked, since a pid means nothing on
+    another one. Anything that cannot be established counts as live, so an
+    unclear answer keeps the directory rather than taking it.
+    """
+    if owner.get("host") != host:
+        return True
+    pid = owner.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # Alive but not ours to signal, or unknowable from here.
+        return True
+    return True
+
+
+def _write_claim(path: str, claim: Dict[str, Any]) -> None:
+    """Replace the claim at `path` atomically, so it is never read half-written."""
+    staging = f"{path}.claim.{claim['pid']}"
+    with open(staging, "w") as handle:
+        json.dump(claim, handle)
+    os.replace(staging, path)
+
+
+def _release_run_dir(run_dir: str) -> None:
+    """Drop this process's claim so the directory can be used again.
+
+    A claim that outlives its server is read by the next start as another
+    server's. Only a claim naming this process is removed, so a directory
+    taken over in the meantime is left to whoever holds it.
+    """
+    path = os.path.join(run_dir, RUN_DIR_OWNER_NAME)
+    try:
+        with open(path) as handle:
+            owner = json.load(handle)
+    except (OSError, ValueError):
+        return
+    if owner.get("pid") == os.getpid() and owner.get("host") == socket.gethostname():
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
 def claim_run_dir(run_dir: str, role: str) -> None:
     """Record that this server owns `run_dir`, or name the one that already does.
 
@@ -695,6 +744,18 @@ def claim_run_dir(run_dir: str, role: str) -> None:
 
     # Re-entry within one process is not a conflict.
     if owner.get("pid") == claim["pid"] and owner.get("host") == claim["host"]:
+        return
+
+    # A claim from this host whose process is gone was left by a server killed
+    # before it could release the directory. Refusing it would make a restart
+    # against a configured run_dir need a manual delete first.
+    if not _claim_is_live(owner, claim["host"]):
+        logger.info(
+            f"mooncake-store: {run_dir} was claimed by pid {owner.get('pid')} "
+            f"on this host as role={owner.get('role')}, which is no longer "
+            "running, so this server is taking the directory over."
+        )
+        _write_claim(path, claim)
         return
 
     raise ValueError(
@@ -785,7 +846,9 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
     finally:
         if exported:
             os.environ.pop(CONFIG_PATH_ENV, None)
-        if not keep_run_dir:
+        if keep_run_dir:
+            _release_run_dir(run_dir)
+        else:
             shutil.rmtree(run_dir, ignore_errors=True)
 
 

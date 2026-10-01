@@ -35,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.connectors import mooncake_store
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import master as master_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     CONFIG_PATH_ENV,
+    RUN_DIR_OWNER_NAME,
     MooncakeStoreConnectorConfig,
     StoreRole,
 )
@@ -178,7 +179,15 @@ def manifest_file(tmp_path, address, **overrides):
 def test_a_pool_must_be_named():
     """Without it there is no master to reach and nothing to join."""
     with pytest.raises(ValueError):
-        MooncakeStoreConfig()
+        MooncakeStoreConfig(model_key="m")
+
+
+def test_a_model_key_must_be_named():
+    """The worker resolves it at startup with no default, so an optional field
+    would fail the server once it has loaded weights.
+    """
+    with pytest.raises(ValueError):
+        MooncakeStoreConfig(pool="host:50051")
 
 
 def test_pool_is_rejected_unless_the_connector_is_mooncake_store():
@@ -186,25 +195,25 @@ def test_pool_is_rejected_unless_the_connector_is_mooncake_store():
     with pytest.raises(ValueError, match="mooncake_store describes a Mooncake pool"):
         KvCacheConnectorConfig(
             connector="lmcache",
-            mooncake_store=MooncakeStoreConfig(pool="host:50051"),
+            mooncake_store=MooncakeStoreConfig(model_key="m", pool="host:50051"),
         )
     # Naming the module rather than the preset selects the same connector.
     KvCacheConnectorConfig(
         connector_module="tensorrt_llm._torch.pyexecutor.connectors.mooncake_store",
         connector_scheduler_class="MooncakeStoreConnectorScheduler",
         connector_worker_class="MooncakeStoreConnectorWorker",
-        mooncake_store=MooncakeStoreConfig(pool="host:50051"),
+        mooncake_store=MooncakeStoreConfig(model_key="m", pool="host:50051"),
     )
 
 
 @pytest.mark.parametrize("role", ["both", "producer", "consumer", "capacity"])
 def test_every_role_is_configurable(role):
-    assert MooncakeStoreConfig(pool="host:50051", role=role).role == role
+    assert MooncakeStoreConfig(model_key="m", pool="host:50051", role=role).role == role
 
 
 def test_an_unknown_role_is_refused():
     with pytest.raises(ValueError):
-        MooncakeStoreConfig(pool="host:50051", role="donor")
+        MooncakeStoreConfig(model_key="m", pool="host:50051", role="donor")
 
 
 # ---- the manifest ----
@@ -251,6 +260,7 @@ def test_client_config_is_what_the_connector_reads_back(tmp_path):
         role="capacity",
         segment_size="64GiB",
         namespace="trtllm-m3",
+        model_key="minimax-m3-fp4",
         stage_through_host=True,
         transfer_batch_size=32,
     )
@@ -272,11 +282,13 @@ def test_client_config_is_what_the_connector_reads_back(tmp_path):
     assert parsed.role is StoreRole.CAPACITY
     assert parsed.stage_through_host is True
     assert parsed.transfer_batch_size == 32
+    # The worker resolves this from the rendered config while starting up.
+    assert parsed.resolve_model_key("/models/ignored") == "minimax-m3-fp4"
 
 
 def test_the_pool_supplies_what_the_server_does_not(tmp_path):
     """Pool-wide settings come from the manifest, not from each worker config."""
-    pool = MooncakeStoreConfig(pool="file:///shared/pool.json")
+    pool = MooncakeStoreConfig(model_key="m", pool="file:///shared/pool.json")
     manifest = PoolManifest(
         master_server_address="10.9.9.9:50051",
         metadata_server="http://meta:8080/metadata",
@@ -293,14 +305,14 @@ def test_the_pool_supplies_what_the_server_does_not(tmp_path):
 
 def test_a_server_may_override_the_pools_namespace():
     """Isolating one deployment's keys is the server's business, not the pool's."""
-    pool = MooncakeStoreConfig(pool="h:1", namespace="mine")
+    pool = MooncakeStoreConfig(model_key="m", pool="h:1", namespace="mine")
     manifest = PoolManifest(master_server_address="h:1", namespace="shared")
     assert master_module._client_config(pool, manifest, "")["namespace"] == "mine"
 
 
 def test_sizes_reach_the_client_config_as_resolved_integers():
     """vLLM reads this file too, and reads 'GB' as a power of 1024, not 1000."""
-    pool = MooncakeStoreConfig(pool="h:1", segment_size="160GiB")
+    pool = MooncakeStoreConfig(model_key="m", pool="h:1", segment_size="160GiB")
     manifest = PoolManifest(master_server_address="h:1")
     written = master_module._client_config(pool, manifest, "")
     assert written["global_segment_size"] == 160 * 1024**3
@@ -309,7 +321,7 @@ def test_sizes_reach_the_client_config_as_resolved_integers():
 
 def test_an_ambiguous_segment_size_is_refused():
     """It would name two different sizes to the two engines sharing the pool."""
-    pool = MooncakeStoreConfig(pool="h:1", segment_size="160GB")
+    pool = MooncakeStoreConfig(model_key="m", pool="h:1", segment_size="160GB")
     manifest = PoolManifest(master_server_address="h:1")
     with pytest.raises(ValueError, match="160GiB"):
         master_module._client_config(pool, manifest, "")
@@ -332,7 +344,7 @@ def test_master_addresses_are_split_or_declined(address, expected):
 
 
 def test_joining_points_the_workers_at_the_pools_master(live_master, tmp_path):
-    pool = MooncakeStoreConfig(pool=f"file://{manifest_file(tmp_path, live_master)}")
+    pool = MooncakeStoreConfig(model_key="m", pool=f"file://{manifest_file(tmp_path, live_master)}")
 
     with provision_pool(pool) as config_path:
         # The workers are spawned inside this window and are told about the
@@ -347,7 +359,7 @@ def test_joining_points_the_workers_at_the_pools_master(live_master, tmp_path):
 
 def test_a_bare_master_address_needs_no_manifest(live_master):
     """Joining a master run without this CLI still has to work."""
-    pool = MooncakeStoreConfig(pool=live_master)
+    pool = MooncakeStoreConfig(model_key="m", pool=live_master)
 
     with provision_pool(pool) as config_path:
         written = json.loads(open(config_path).read())
@@ -357,7 +369,9 @@ def test_a_bare_master_address_needs_no_manifest(live_master):
 
 def test_joining_fails_before_the_model_loads_if_the_master_is_absent(tmp_path):
     absent = f"127.0.0.1:{free_port()}"
-    pool = MooncakeStoreConfig(pool=f"file://{manifest_file(tmp_path, absent)}", master_timeout=1)
+    pool = MooncakeStoreConfig(
+        model_key="m", pool=f"file://{manifest_file(tmp_path, absent)}", master_timeout=1
+    )
 
     with pytest.raises(TimeoutError, match="did not accept connections"):
         with provision_pool(pool):
@@ -368,7 +382,7 @@ def test_joining_fails_before_the_model_loads_if_the_master_is_absent(tmp_path):
 def test_an_unparsable_master_address_is_left_to_the_workers(tmp_path):
     """Not every address is host:port, so an unprobeable one passes through."""
     address = "unix:///var/run/mooncake"
-    pool = MooncakeStoreConfig(pool=f"file://{manifest_file(tmp_path, address)}")
+    pool = MooncakeStoreConfig(model_key="m", pool=f"file://{manifest_file(tmp_path, address)}")
 
     with provision_pool(pool) as config_path:
         assert json.loads(open(config_path).read())["master_server_address"] == address
@@ -379,7 +393,7 @@ def test_an_inherited_config_path_wins(monkeypatch, tmp_path):
     harness_config = tmp_path / "harness.json"
     harness_config.write_text("{}")
     monkeypatch.setenv(CONFIG_PATH_ENV, str(harness_config))
-    pool = MooncakeStoreConfig(pool="file:///nowhere/pool.json")
+    pool = MooncakeStoreConfig(model_key="m", pool="file:///nowhere/pool.json")
 
     with provision_pool(pool) as config_path:
         assert config_path is None
@@ -393,7 +407,7 @@ def test_the_config_names_where_the_client_config_goes(live_master, tmp_path):
     nothing, so the path has to be something their own config states.
     """
     run_dir = tmp_path / "run"
-    pool = MooncakeStoreConfig(pool=live_master, run_dir=str(run_dir))
+    pool = MooncakeStoreConfig(model_key="m", pool=live_master, run_dir=str(run_dir))
 
     with provision_pool(pool) as config_path:
         assert config_path == str(run_dir / master_module.CLIENT_CONFIG_NAME)
@@ -403,7 +417,7 @@ def test_the_config_names_where_the_client_config_goes(live_master, tmp_path):
 
 def test_an_unnamed_run_directory_is_temporary(live_master):
     """It keeps the connector working, but loses this run's segment records."""
-    pool = MooncakeStoreConfig(pool=live_master)
+    pool = MooncakeStoreConfig(model_key="m", pool=live_master)
 
     with provision_pool(pool) as config_path:
         assert os.path.exists(config_path)
@@ -414,16 +428,18 @@ def test_an_unnamed_run_directory_is_temporary(live_master):
 def test_a_half_written_client_config_is_never_read(live_master, tmp_path):
     """Two servers sharing a run directory must not interleave into a torn one."""
     run_dir = tmp_path / "run"
-    pool = MooncakeStoreConfig(pool=live_master, run_dir=str(run_dir))
+    pool = MooncakeStoreConfig(model_key="m", pool=live_master, run_dir=str(run_dir))
 
     with provision_pool(pool) as config_path:
-        assert not os.path.exists(f"{config_path}.partial")
+        # The staging name carries the writer's pid, so a glob is what shows
+        # the rename happened.
+        assert list(run_dir.glob(f"{master_module.CLIENT_CONFIG_NAME}.partial.*")) == []
         assert json.loads(open(config_path).read())["master_server_address"] == live_master
 
 
 def test_a_run_dir_keeps_the_client_config(live_master, tmp_path):
     run_dir = tmp_path / "run"
-    pool = MooncakeStoreConfig(pool=live_master)
+    pool = MooncakeStoreConfig(model_key="m", pool=live_master)
 
     with provision_pool(pool, run_dir=str(run_dir)) as config_path:
         assert config_path == str(run_dir / master_module.CLIENT_CONFIG_NAME)
@@ -431,6 +447,86 @@ def test_a_run_dir_keeps_the_client_config(live_master, tmp_path):
     # An explicit run directory outlives the run that filled it, since the
     # segment records in it are what the run's capacity is reported from.
     assert (run_dir / master_module.CLIENT_CONFIG_NAME).exists()
+
+
+# ---- who owns a run directory ----
+
+
+def owner_claim(run_dir):
+    return json.loads((run_dir / RUN_DIR_OWNER_NAME).read_text())
+
+
+def test_two_servers_may_not_share_a_run_directory(live_master, tmp_path):
+    """Each renders its own role and its own node's HCAs to the same path."""
+    run_dir = tmp_path / "run"
+    pool = MooncakeStoreConfig(model_key="m", pool=live_master, run_dir=str(run_dir))
+
+    with provision_pool(pool):
+        # A claim naming another live process is what a second server sees.
+        master_module._write_claim(
+            str(run_dir / RUN_DIR_OWNER_NAME),
+            {"host": socket.gethostname(), "pid": os.getpid() + 1, "role": "capacity"},
+        )
+        with pytest.raises(ValueError, match="already used by the server"):
+            master_module.claim_run_dir(str(run_dir), "both")
+
+
+def test_a_server_can_restart_against_the_run_directory_it_was_given(live_master, tmp_path):
+    """Its own claim must not outlive it, or the next start reads it as another's."""
+    run_dir = tmp_path / "run"
+    pool = MooncakeStoreConfig(model_key="m", pool=live_master, run_dir=str(run_dir))
+
+    with provision_pool(pool):
+        assert owner_claim(run_dir)["pid"] == os.getpid()
+
+    assert not (run_dir / RUN_DIR_OWNER_NAME).exists()
+    # The restart, which has to get as far as writing its own claim.
+    with provision_pool(pool):
+        assert owner_claim(run_dir)["pid"] == os.getpid()
+
+
+def test_a_claim_left_by_a_dead_process_is_taken_over(tmp_path):
+    """A server killed before releasing would otherwise need a manual delete."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    # A pid this host is not running, as a crashed predecessor leaves behind.
+    master_module._write_claim(
+        str(run_dir / RUN_DIR_OWNER_NAME),
+        {"host": socket.gethostname(), "pid": 2**22 - 1, "role": "capacity"},
+    )
+
+    master_module.claim_run_dir(str(run_dir), "both")
+
+    assert owner_claim(run_dir) == {
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "role": "both",
+    }
+
+
+def test_a_claim_from_another_host_is_not_second_guessed(tmp_path):
+    """A pid means nothing on another node, so the conflict stands."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    master_module._write_claim(
+        str(run_dir / RUN_DIR_OWNER_NAME),
+        {"host": "some-other-node", "pid": 2**22 - 1, "role": "capacity"},
+    )
+
+    with pytest.raises(ValueError, match="already used by the server"):
+        master_module.claim_run_dir(str(run_dir), "both")
+
+
+def test_releasing_leaves_another_servers_claim_alone(tmp_path):
+    """Taken over in the meantime, the directory belongs to whoever holds it."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    theirs = {"host": socket.gethostname(), "pid": os.getpid() + 1, "role": "capacity"}
+    master_module._write_claim(str(run_dir / RUN_DIR_OWNER_NAME), theirs)
+
+    master_module._release_run_dir(str(run_dir))
+
+    assert owner_claim(run_dir) == theirs
 
 
 # ---- the entry point servers call ----
@@ -454,7 +550,7 @@ def test_joining_is_a_no_op_unless_a_pool_is_described(config):
 def test_a_described_pool_is_joined(live_master):
     config = KvCacheConnectorConfig(
         connector="mooncake-store",
-        mooncake_store=MooncakeStoreConfig(pool=live_master),
+        mooncake_store=MooncakeStoreConfig(model_key="m", pool=live_master),
     )
     with maybe_provision_pool(config):
         written = json.loads(open(os.environ[CONFIG_PATH_ENV]).read())
@@ -666,7 +762,7 @@ def test_a_server_joins_a_master_it_was_never_given_the_address_of(fake_master, 
     with master_module.running_master(
         str(tmp_path / "run"), pool_file=str(pool_file), rpc_port=port
     ) as master:
-        worker = MooncakeStoreConfig(pool=f"file://{pool_file}")
+        worker = MooncakeStoreConfig(model_key="m", pool=f"file://{pool_file}")
         with provision_pool(worker) as config_path:
             # Mooncake cannot dial a file:// URL, so what reaches the workers
             # has to be the address it resolved to.
@@ -857,6 +953,7 @@ def test_the_user_facing_pool_settings_reach_provisioning(monkeypatch):
             role="capacity",
             segment_size="4GiB",
             namespace="tenant-a",
+            model_key="tenant-a-model",
             transfer_batch_size=8,
         ),
     )
@@ -867,4 +964,5 @@ def test_the_user_facing_pool_settings_reach_provisioning(monkeypatch):
     pool = provisioned[0]
     assert (pool.pool, pool.role) == ("file:///shared/pool.json", "capacity")
     assert (pool.segment_size, pool.namespace) == ("4GiB", "tenant-a")
+    assert pool.model_key == "tenant-a-model"
     assert pool.transfer_batch_size == 8
