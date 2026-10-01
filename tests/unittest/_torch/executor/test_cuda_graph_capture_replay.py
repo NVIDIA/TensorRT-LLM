@@ -615,6 +615,20 @@ class TestStrictBufferCheck:
         assert attn_metadata.kv_cache_block_offsets is target_buf
         assert attn_metadata.some_alias is target_buf
 
+    def test_cuda_graph_metadata_copy_has_own_swap_record(self):
+        """A swap restored on a graph copy does not leak into the eager metadata's restore."""
+        eager = TrtllmAttentionMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=None)
+        graph = eager.create_cuda_graph_metadata(1)
+        assert graph.draft_replay_swapped_attrs is not eager.draft_replay_swapped_attrs
+
+        eager_buf = eager.kv_lens_cuda
+        graph.swap_for_draft("kv_lens_cuda", torch.zeros_like(graph.kv_lens_cuda))
+        graph.restore_draft_swaps()
+        eager.swap_for_draft("kv_lens_cuda", torch.zeros_like(eager_buf))
+        eager.restore_draft_swaps()
+
+        assert eager.kv_lens_cuda is eager_buf
+
 
 class TestStrictBufferCheckEnvVar:
     """TLLM_CUDA_GRAPH_STRICT_BUFFERS must actually control

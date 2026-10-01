@@ -366,6 +366,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # CUDA-graph metadata is a shallow copy that re-runs this method; give it
         # its own plan caches so each captured batch size plans its own wrappers.
         self.fmha_plan_caches = {}
+        # Each copy records and restores its own draft swaps.
+        self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
     def update_position_offsets_for_cpp(self, query_len: int) -> None:
