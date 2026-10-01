@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import builtins
 import sys
 from enum import IntEnum
 from types import SimpleNamespace
@@ -917,13 +918,22 @@ def test_nccl_ep_group_init_failure_releases_preflight_resources(
 
 
 @pytest.mark.parametrize("forced", [False, True])
-def test_nccl_ep_missing_gpunetio_falls_back_only_for_auto_selection(
+@pytest.mark.parametrize("failure", ["gpunetio", "communicator"])
+def test_nccl_ep_setup_failure_falls_back_only_for_auto_selection(
     nccl_preflight_runtime,
     monkeypatch: pytest.MonkeyPatch,
     forced: bool,
+    failure: str,
 ) -> None:
     runtime = nccl_preflight_runtime
-    runtime.loader.side_effect = OSError("cannot load GPUNetIO")
+    if failure == "communicator":
+        from nccl.bindings.nccl import NCCLError
+
+        runtime.core.Communicator.init.side_effect = NCCLError("communicator init failed")
+        error_match = "communicator initialization failed"
+    else:
+        runtime.loader.side_effect = OSError("cannot load GPUNetIO")
+        error_match = "NCCL_GIN_GPUNETIO_PATH"
     _mock_nccl_ep_v02(monkeypatch)
     monkeypatch.setattr(communication_factory, "is_nccl_ep_installed", lambda: True)
     monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
@@ -936,7 +946,7 @@ def test_nccl_ep_missing_gpunetio_falls_back_only_for_auto_selection(
     )
 
     if forced:
-        with pytest.raises(RuntimeError, match="NCCL_GIN_GPUNETIO_PATH"):
+        with pytest.raises(RuntimeError, match=error_match):
             communication_factory.CommunicationFactory._create_forced_method(
                 "NCCL_EP",
                 model_config,
@@ -951,7 +961,11 @@ def test_nccl_ep_missing_gpunetio_falls_back_only_for_auto_selection(
         )
         assert isinstance(strategy, AllGatherReduceScatter)
     runtime.group_create.assert_not_called()
-    runtime.comm.destroy.assert_called_once()
+    runtime.mpi.Free.assert_called_once()
+    if failure == "communicator":
+        runtime.comm.destroy.assert_not_called()
+    else:
+        runtime.comm.destroy.assert_called_once()
 
 
 @pytest.mark.parametrize("native_error", [False, True])
@@ -978,10 +992,47 @@ def test_nccl_ep_topology_query_failure_is_collective(
     runtime.loader.assert_not_called()
 
 
-def test_nccl_ep_communicator_init_failure_releases_mpi(nccl_preflight_runtime) -> None:
+@pytest.mark.parametrize("native_error", [False, True])
+def test_nccl_ep_communicator_init_failure_releases_mpi(
+    nccl_preflight_runtime,
+    native_error: bool,
+) -> None:
+    from nccl.bindings.nccl import NCCLError
+
     runtime = nccl_preflight_runtime
-    runtime.core.Communicator.init.side_effect = RuntimeError("communicator init failed")
-    with pytest.raises(RuntimeError, match="communicator init failed"):
+    error_type = NCCLError if native_error else RuntimeError
+    error = error_type("communicator init failed")
+    runtime.core.Communicator.init.side_effect = error
+    with pytest.raises(RuntimeError, match="communicator init failed") as caught:
         nccl_ep_utils.get_nccl_ep_context(runtime.mapping, 32, 128, 4096, 8)
+    if native_error:
+        assert caught.value.__cause__ is error
+    else:
+        assert caught.value is error
     runtime.mpi.Free.assert_called_once()
+    runtime.comm.destroy.assert_not_called()
+    assert not nccl_ep_utils._ep_group_cache
+
+
+@pytest.mark.parametrize("module", ["nccl.core", "nccl.bindings.nccl"])
+def test_nccl_ep_communicator_import_failure_preserves_cause(
+    nccl_preflight_runtime,
+    monkeypatch: pytest.MonkeyPatch,
+    module: str,
+) -> None:
+    runtime = nccl_preflight_runtime
+    error = ImportError("NCCL module unavailable")
+    original_import = builtins.__import__
+
+    def fail_nccl_import(name, *args, **kwargs):
+        if name == module:
+            raise error
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_nccl_import)
+    with pytest.raises(RuntimeError, match="communicator imports failed") as caught:
+        nccl_ep_utils.get_nccl_ep_context(runtime.mapping, 32, 128, 4096, 8)
+    assert caught.value.__cause__ is error
+    runtime.core.Communicator.init.assert_not_called()
+    runtime.mpi.Free.assert_not_called()
     assert not nccl_ep_utils._ep_group_cache

@@ -222,7 +222,11 @@ class NcclEpContext:
                 self.destroy()
 
     def _initialize_communicator(self) -> None:
-        import nccl.core as nccl_core
+        try:
+            import nccl.core as nccl_core
+            from nccl.bindings.nccl import NCCLError
+        except ImportError as error:
+            raise RuntimeError(f"NCCL-EP communicator imports failed: {error}") from error
 
         from tensorrt_llm._utils import mpi_comm
 
@@ -239,11 +243,14 @@ class NcclEpContext:
         ep_world_size = self._ep_mpi_comm.Get_size()
         unique_id = nccl_core.get_unique_id() if ep_world_rank == 0 else None
         unique_id = self._ep_mpi_comm.bcast(unique_id, root=0)
-        self.comm = nccl_core.Communicator.init(
-            nranks=ep_world_size,
-            rank=ep_world_rank,
-            unique_id=unique_id,
-        )
+        try:
+            self.comm = nccl_core.Communicator.init(
+                nranks=ep_world_size,
+                rank=ep_world_rank,
+                unique_id=unique_id,
+            )
+        except NCCLError as error:
+            raise RuntimeError(f"NCCL-EP communicator initialization failed: {error}") from error
 
     def initialize(self) -> None:
         """Create the EP group and receive tensors once, outside MetaInitMode."""
