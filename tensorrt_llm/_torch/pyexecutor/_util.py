@@ -1745,7 +1745,8 @@ class KvCacheCreator:
                 f"max_gpu_total_bytes={self._max_gpu_total_bytes_in / (GB):.2f} GiB is provided. New max memory is {kv_cache_max_memory / (GB):.2f} GiB"
             )
 
-        if self._is_kv_cache_manager_v2 and self._max_kv_tokens_in is None:
+        if (self._is_kv_cache_manager_v2 and self._max_kv_tokens_in is None
+                and self._should_create_separate_draft_kv_cache()):
             # The max_tokens block above restores the user's value, which is
             # None here, so V2 would size purely from max_gpu_total_bytes. That
             # cap is a byte budget for the TARGET's per-token footprint. A
