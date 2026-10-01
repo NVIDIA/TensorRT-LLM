@@ -8,12 +8,12 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import grpc
-from openengine.v1 import error_pb2, generation_pb2, openengine_pb2_grpc
 
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.logger import logger
 
+from .bindings import error_pb2, generation_pb2, openengine_pb2_grpc
 from .disagg import disaggregated_params_from_request
 from .errors import AbortFailedError, UnsupportedFeatureError
 from .formatting import _engine_error_response, _stop_texts
