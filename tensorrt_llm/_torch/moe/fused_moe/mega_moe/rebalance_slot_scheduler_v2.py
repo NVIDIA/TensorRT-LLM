@@ -170,8 +170,6 @@ class RebalanceSlotSchedulerGroupV2:
             topk=self.topk,
             local_rank=ep_rank,
             ctas=(int(ctas_env) if ctas_env else TMA_COPY_SM_COUNT),
-            # HALO-Q is the supported scheduler algorithm.
-            algorithm=os.environ.get("TRTLLM_MOE_REBALANCE_ALGO", "halo_q"),
         )
         cfg.validate()
         if cfg.ctas > TMA_COPY_SM_COUNT:

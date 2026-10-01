@@ -141,11 +141,9 @@ __host__ __device__ __forceinline__ int hierarchy_depth(int ep)
 
 /* Distinct experts and total receive capacity independently bound broadcasts.
  * Actual S is retained in the public outputs; only scratch uses this bound. */
-__host__ __device__ __forceinline__ int broadcast_capacity(int ep, int experts, int helpers, int algorithm)
+__host__ __device__ __forceinline__ int broadcast_capacity(int ep, int experts, int helpers)
 {
     int const bounded_helpers = helpers < experts ? helpers : experts;
-    if (algorithm == 0)
-        return bounded_helpers;
     /* Every hierarchy level divides ep exactly. This cancels two integer
      * divisions without changing capacity, including non-power-of-two EP. */
     int const groups = 1 << (hierarchy_depth(ep) - 1);
@@ -400,196 +398,6 @@ __device__ bool exchange_counts(unsigned long long const* peer_bases, int const*
     }
     __syncthreads();
     return true;
-}
-
-__device__ void integer_waterfill(int const* lower, int* target, int ep, int total)
-{
-    int order[kMaxEp];
-    for (int rank = 0; rank < ep; ++rank)
-    {
-        target[rank] = lower[rank];
-        int position = rank;
-        while (position > 0)
-        {
-            int previous = order[position - 1];
-            if (lower[previous] < lower[rank] || (lower[previous] == lower[rank] && previous < rank))
-                break;
-            order[position] = previous;
-            --position;
-        }
-        order[position] = rank;
-    }
-    int sum = 0;
-    for (int rank = 0; rank < ep; ++rank)
-        sum += lower[rank];
-    int remaining = total - sum;
-    int active = 1;
-    int level = lower[order[0]];
-    bool finished = false;
-    for (int position = 1; position < ep; ++position)
-    {
-        int next_level = lower[order[position]];
-        int64_t cost = static_cast<int64_t>(next_level - level) * active;
-        if (remaining < cost)
-        {
-            int quotient = remaining / active;
-            int remainder = remaining - quotient * active;
-            for (int index = 0; index < active; ++index)
-                target[order[index]] += quotient;
-            for (int rank = 0; rank < ep && remainder; ++rank)
-            {
-                bool is_active = false;
-                for (int index = 0; index < active; ++index)
-                    is_active |= order[index] == rank;
-                if (is_active)
-                {
-                    ++target[rank];
-                    --remainder;
-                }
-            }
-            remaining = 0;
-            finished = true;
-            break;
-        }
-        for (int index = 0; index < active; ++index)
-            target[order[index]] = next_level;
-        remaining -= static_cast<int>(cost);
-        level = next_level;
-        ++active;
-    }
-    if (!finished)
-    {
-        int quotient = remaining / active;
-        int remainder = remaining - quotient * active;
-        for (int index = 0; index < active; ++index)
-            target[order[index]] += quotient;
-        for (int rank = 0; rank < ep && remainder; ++rank)
-        {
-            bool is_active = false;
-            for (int index = 0; index < active; ++index)
-                is_active |= order[index] == rank;
-            if (is_active)
-            {
-                ++target[rank];
-                --remainder;
-            }
-        }
-    }
-}
-
-__device__ int plan_legacy(int const* counts, int const* histogram, int const* load, int* quota, int const* candidates,
-    int* plan, int ep, int experts, int helpers)
-{
-    int const home = experts / ep;
-    int residual[kMaxEp];
-    int target[kMaxEp];
-    int chosen[kMaxBroadcasts];
-    int next_index[kMaxEp] = {0};
-    int total = 0;
-    for (int rank = 0; rank < ep; ++rank)
-    {
-        residual[rank] = load[rank];
-        total += load[rank];
-    }
-    int const candidate_count = imin(helpers, home);
-    int const wanted = imin(helpers, experts);
-    int selected = 0;
-    for (; selected < wanted; ++selected)
-    {
-        int owner = -1;
-        for (int rank = 0; rank < ep; ++rank)
-            if (next_index[rank] < candidate_count && (owner < 0 || residual[rank] > residual[owner]))
-                owner = rank;
-        if (owner < 0)
-            break;
-        int best = candidates[owner * candidate_count + next_index[owner]++];
-        chosen[selected] = best;
-        residual[owner] -= histogram[best];
-    }
-    for (int i = 1; i < selected; ++i)
-    {
-        int value = chosen[i];
-        int position = i;
-        while (position && chosen[position - 1] > value)
-        {
-            chosen[position] = chosen[position - 1];
-            --position;
-        }
-        chosen[position] = value;
-    }
-
-    int* p_expert = plan_field(plan, kPlanExpert);
-    int* p_level = plan_field(plan, kPlanLevel);
-    int* p_begin = plan_field(plan, kPlanGroupBegin);
-    int* p_size = plan_field(plan, kPlanGroupSize);
-    int* p_owner = plan_field(plan, kPlanOwner);
-    int* p_helper = plan_field(plan, kPlanHelper);
-    int selected_by_owner[kMaxEp] = {0};
-    for (int slot = 0; slot < selected; ++slot)
-    {
-        int expert = chosen[slot];
-        int owner = expert / home;
-        p_expert[slot] = expert;
-        p_level[slot] = 0;
-        p_begin[slot] = 0;
-        p_size[slot] = ep;
-        p_owner[slot] = owner;
-        p_helper[slot] = slot;
-        selected_by_owner[owner] += histogram[expert];
-    }
-    for (int rank = 0; rank < ep; ++rank)
-        residual[rank] = load[rank] - selected_by_owner[rank];
-    integer_waterfill(residual, target, ep, total);
-    int demand[kMaxEp];
-    for (int rank = 0; rank < ep; ++rank)
-        demand[rank] = target[rank] - residual[rank];
-    for (int slot = 0; slot < selected; ++slot)
-        for (int rank = 0; rank < ep; ++rank)
-            quota[slot * ep + rank] = 0;
-
-    int source_total[kMaxEp] = {0};
-    for (int rank = 0; rank < ep; ++rank)
-        for (int slot = 0; slot < selected; ++slot)
-            source_total[rank] += counts[rank * experts + chosen[slot]];
-    for (int destination = 0; destination < ep; ++destination)
-    {
-        int left = imin(source_total[destination], demand[destination]);
-        for (int slot = 0; slot < selected; ++slot)
-        {
-            int amount = imin(counts[destination * experts + chosen[slot]], left);
-            quota[slot * ep + destination] += amount;
-            left -= amount;
-        }
-    }
-    int supply_left[kMaxBroadcasts];
-    int demand_left[kMaxEp];
-    for (int slot = 0; slot < selected; ++slot)
-    {
-        int used = 0;
-        for (int rank = 0; rank < ep; ++rank)
-            used += quota[slot * ep + rank];
-        supply_left[slot] = histogram[chosen[slot]] - used;
-    }
-    for (int rank = 0; rank < ep; ++rank)
-    {
-        int used = 0;
-        for (int slot = 0; slot < selected; ++slot)
-            used += quota[slot * ep + rank];
-        demand_left[rank] = demand[rank] - used;
-    }
-    for (int slot = 0; slot < selected; ++slot)
-    {
-        for (int destination = 0; destination < ep; ++destination)
-        {
-            int amount = imin(supply_left[slot], demand_left[destination]);
-            quota[slot * ep + destination] += amount;
-            supply_left[slot] -= amount;
-            demand_left[destination] -= amount;
-            if (!supply_left[slot])
-                break;
-        }
-    }
-    return selected;
 }
 
 __device__ void prepare_halo_m_sparse8(int const* counts, int* histogram, int* load, int* candidates, int experts)
@@ -1917,18 +1725,16 @@ __device__ void materialize_worker_routes(int const* routes, int* output, int co
     }
 }
 
-template <int FixedEp, int FixedExperts, int FixedHelpers, int FixedAlgorithm>
+template <int FixedEp, int FixedExperts, int FixedHelpers>
 __global__ __launch_bounds__(512, 1) void halo_q_scheduler_kernel(int const* routes, int* out_slots, int* out_ids,
     int* out_levels, int* out_owners, unsigned long long const* peer_bases, int* status, int* partial, int* route_aux,
     int* grid_sync, int* plan, int* route_prefix, int* plan_channel, int runtime_ep, int runtime_experts,
-    int runtime_helpers, int local_rank, int route_capacity, int ctas, int runtime_algorithm, int enable_pdl,
-    unsigned long long spin_cycles, int plan_abi_version, int plan_channel_words, int route_features, int capacity,
-    int route_count)
+    int runtime_helpers, int local_rank, int route_capacity, int ctas, int enable_pdl, unsigned long long spin_cycles,
+    int plan_abi_version, int plan_channel_words, int route_features, int capacity, int route_count)
 {
     int const ep = FixedEp > 0 ? FixedEp : runtime_ep;
     int const experts = FixedExperts > 0 ? FixedExperts : runtime_experts;
     int const helpers = FixedHelpers > 0 ? FixedHelpers : runtime_helpers;
-    int const algorithm = FixedAlgorithm >= 0 ? FixedAlgorithm : runtime_algorithm;
     (void) plan_channel_words; // Validated by the host launch wrapper.
     /* The scheduler grid is deliberately residency-safe (one CTA per SM and
      * CTA count <= SM count), so signal as soon as every CTA starts.  The
@@ -1984,16 +1790,11 @@ __global__ __launch_bounds__(512, 1) void halo_q_scheduler_kernel(int const* rou
                 peer_bases, partial, shared, ep, experts, local_rank, ctas, epoch, spin_cycles, status);
         if (!exchange_ok)
             return;
-        /* HALO-Q EP8 keeps only its candidate masses; GAR-N and other EPs
-         * retain the dense histogram required by their planner paths. */
-        if (algorithm == 1 && ep == 8 && helpers == 4 && experts >= 32)
+        /* EP8 keeps only its candidate masses; other EPs retain the dense
+         * histogram required by the generic planner path. */
+        if (ep == 8 && helpers == 4 && experts >= 32)
         {
             prepare_halo_m_sparse8(counts, histogram, load, selected_flags, experts);
-        }
-        else if (ep == 8 && helpers == 4 && experts >= 32)
-        {
-            prepare_halo_m<8, 4>(counts, histogram, load, selected_flags, recv_used, send_used, next_index, frozen, ep,
-                experts, helpers);
         }
         else
         {
@@ -2002,15 +1803,7 @@ __global__ __launch_bounds__(512, 1) void halo_q_scheduler_kernel(int const* rou
         }
 
         int broadcasts = 0;
-        if (algorithm == 0)
-        {
-            if (threadIdx.x == 0)
-            {
-                broadcasts = plan_legacy(counts, histogram, load, quota, selected_flags, plan, ep, experts, helpers);
-                plan[1] = broadcasts;
-            }
-        }
-        else if (threadIdx.x < (ep <= 8 ? 8 : 32))
+        if (threadIdx.x < (ep <= 8 ? 8 : 32))
         {
             // These short-circuit bounds keep helpers*ep <= 120.
             if (ep <= 8 && helpers <= 15 && helpers * ep <= experts)
@@ -2050,13 +1843,10 @@ __global__ __launch_bounds__(512, 1) void halo_q_scheduler_kernel(int const* rou
         if (threadIdx.x == 8 * 32)
             color_and_publish_local(
                 plan, broadcasts, ep, helpers, local_rank, recv_used, out_ids, out_levels, out_owners, status, epoch);
-        if (algorithm == 1)
-        {
-            if (ep == 8)
-                run_halo_q<8>(counts, quota, plan, broadcasts, ep, experts, ring, order, host_mask);
-            else
-                run_halo_q<0>(counts, quota, plan, broadcasts, ep, experts, ring, order, host_mask);
-        }
+        if (ep == 8)
+            run_halo_q<8>(counts, quota, plan, broadcasts, ep, experts, ring, order, host_mask);
+        else
+            run_halo_q<0>(counts, quota, plan, broadcasts, ep, experts, ring, order, host_mask);
         if (ctas > 1)
         {
             int const warp = threadIdx.x >> 5;
@@ -2128,8 +1918,7 @@ __global__ __launch_bounds__(512, 1) void halo_q_scheduler_kernel(int const* rou
         routes, out_slots, route_prefix, plan, status, route_count, ep, experts, helpers, 0, 1, epoch);
 }
 
-bool validPlanChannelLaunch(
-    std::uintptr_t pointer, int abiVersion, int words, int features, int ep, int helpers, int algorithm)
+bool validPlanChannelLaunch(std::uintptr_t pointer, int abiVersion, int words, int features, int ep, int helpers)
 {
     if (pointer == 0)
     {
@@ -2141,8 +1930,8 @@ bool validPlanChannelLaunch(
     }
     auto const stride = (static_cast<std::int64_t>(helpers) + 3) & ~std::int64_t{3};
     auto const expected = 4 + 7 * stride;
-    return abiVersion == 6 && ep >= 2 && ep <= kMaxEp && ep % 2 == 0
-        && (features == 0 || (features == 1 && algorithm == 1)) && expected <= INT_MAX && words == expected;
+    return abiVersion == 6 && ep >= 2 && ep <= kMaxEp && ep % 2 == 0 && (features == 0 || features == 1)
+        && expected <= INT_MAX && words == expected;
 }
 
 } // namespace
@@ -2159,33 +1948,32 @@ void invokeMoeRebalanceHaloQ(MoeRebalanceHaloQParams const& params, cudaStream_t
             && params.localRank >= 0 && params.localRank < params.ep && params.validRouteCount >= 0
             && params.validRouteCount <= params.routeCapacity && params.routeCapacity > 0
             && params.routeCapacity <= INT_MAX / params.ep && params.routeCapacity <= INT_MAX - params.ctas
-            && params.ctas > 0 && params.ctas <= 128 && params.threads == 512
-            && (params.algorithm == 0 || params.algorithm == 1),
-        "Invalid GAR-N/HALO-Q scheduler launch parameters");
+            && params.ctas > 0 && params.ctas <= 128 && params.threads == 512,
+        "Invalid HALO-Q scheduler launch parameters");
     TLLM_CHECK_WITH_INFO(
         validPlanChannelLaunch(reinterpret_cast<std::uintptr_t>(params.planChannel), params.planAbiVersion,
-            params.planChannelWords, params.routeFeatures, params.ep, params.helpers, params.algorithm),
+            params.planChannelWords, params.routeFeatures, params.ep, params.helpers),
         "Invalid HALO-Q PlanChannel launch ABI");
 
     int const warps = params.threads / 32;
     int const passInts = warps * (params.experts + 1);
     int const workerInts = passInts + params.experts;
-    int capacity = broadcast_capacity(params.ep, params.experts, params.helpers, params.algorithm);
+    int capacity = broadcast_capacity(params.ep, params.experts, params.helpers);
     int const plannerInts = params.ep * params.experts + params.experts + params.ep + capacity * params.ep
         + params.experts + (kHelperMaskWords + 4) * params.ep + 2 * capacity;
     std::size_t const sharedBytes
         = static_cast<std::size_t>(workerInts > plannerInts ? workerInts : plannerInts) * sizeof(int);
 
-    void const* kernel = reinterpret_cast<void const*>(&halo_q_scheduler_kernel<0, 0, 0, -1>);
-    if (params.algorithm == 1 && params.experts == 384 && params.helpers == 4)
+    void const* kernel = reinterpret_cast<void const*>(&halo_q_scheduler_kernel<0, 0, 0>);
+    if (params.experts == 384 && params.helpers == 4)
     {
         if (params.ep == 8)
         {
-            kernel = reinterpret_cast<void const*>(&halo_q_scheduler_kernel<8, 384, 4, 1>);
+            kernel = reinterpret_cast<void const*>(&halo_q_scheduler_kernel<8, 384, 4>);
         }
         else if (params.ep == 4)
         {
-            kernel = reinterpret_cast<void const*>(&halo_q_scheduler_kernel<4, 384, 4, 1>);
+            kernel = reinterpret_cast<void const*>(&halo_q_scheduler_kernel<4, 384, 4>);
         }
     }
     if (sharedBytes > 48 * 1024)
@@ -2213,17 +2001,16 @@ void invokeMoeRebalanceHaloQ(MoeRebalanceHaloQParams const& params, cudaStream_t
     int localRank = params.localRank;
     int routeCapacity = params.routeCapacity;
     int ctas = params.ctas;
-    int algorithm = params.algorithm;
     int enablePdl = params.enablePdl ? 1 : 0;
     std::uint64_t spinCycles = params.spinCycles;
     int planAbiVersion = params.planAbiVersion;
     int planChannelWords = params.planChannelWords;
     int routeFeatures = params.routeFeatures;
     int validRouteCount = params.validRouteCount;
-    void* arguments[] = {&routes, &outSlots, &outIds, &outLevels, &outOwners, &peerBases, &status, &partial, &routeAux,
-        &gridSync, &planWorkspace, &routePrefix, &planChannel, &ep, &experts, &helpers, &localRank, &routeCapacity,
-        &ctas, &algorithm, &enablePdl, &spinCycles, &planAbiVersion, &planChannelWords, &routeFeatures, &capacity,
-        &validRouteCount};
+    void* arguments[]
+        = {&routes, &outSlots, &outIds, &outLevels, &outOwners, &peerBases, &status, &partial, &routeAux, &gridSync,
+            &planWorkspace, &routePrefix, &planChannel, &ep, &experts, &helpers, &localRank, &routeCapacity, &ctas,
+            &enablePdl, &spinCycles, &planAbiVersion, &planChannelWords, &routeFeatures, &capacity, &validRouteCount};
     TLLM_CUDA_CHECK(
         cudaLaunchKernel(kernel, dim3(ctas, 1, 1), dim3(params.threads, 1, 1), arguments, sharedBytes, stream));
 }

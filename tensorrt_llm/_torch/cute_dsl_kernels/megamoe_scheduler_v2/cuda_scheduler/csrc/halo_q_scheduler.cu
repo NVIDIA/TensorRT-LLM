@@ -1,7 +1,7 @@
 /* Pure-CUDA fused physical-slot scheduler for supported architectures.
  *
  * One launch performs stable local-route ordinal counting, an in-kernel
- * peer-visible histogram exchange, either legacy GAR-N or HALO-M + HALO-Q,
+ * peer-visible histogram exchange, HALO-M placement plus HALO-Q repair,
  * mapped PlanChannel publication, and final physical-slot materialization.
  * Every CTA triggers CUDA Programmatic Dependent Launch at kernel entry.  The
  * remaining scheduler work stays on its small grid while an independent
@@ -2035,7 +2035,7 @@ PyMethodDef methods[] = {
 PyModuleDef module = {
     PyModuleDef_HEAD_INIT,
     "megamoe_halo_q_cuda",
-    "Pure-CUDA legacy/HALO-Q physical-slot scheduler.",
+    "Pure-CUDA HALO-Q physical-slot scheduler.",
     -1,
     methods,
 };

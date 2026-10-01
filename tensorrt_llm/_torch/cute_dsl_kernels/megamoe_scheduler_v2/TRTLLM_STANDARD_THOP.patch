@@ -1,17 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+Subject: Use TensorRT-LLM native operators and enforce one static scheduler stream.
+
 diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_scheduler/runtime.py b/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_scheduler/runtime.py
-index 2ead121..5a4bf86 100644
 --- a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_scheduler/runtime.py
 +++ b/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_scheduler/runtime.py
-@@ -1,4 +1,4 @@
--"""Host runtime for the pure-CUDA HALO-Q scheduler."""
-+"""Host runtime for the pure-CUDA GAR-N and HALO-Q schedulers."""
- 
- from __future__ import annotations
- 
-@@ -7,7 +7,6 @@ import threading
+@@ -7,7 +7,6 @@
  
  import torch
  
@@ -19,7 +14,55 @@ index 2ead121..5a4bf86 100644
  from ..geometry import MAX_EP, MIN_EP, hierarchy_group_sizes
  
  
-@@ -170,11 +169,8 @@ class CudaSchedulerConfig:
+@@ -17,15 +16,14 @@
+ SPIN_CYCLES = 8_000_000_000
+ 
+ def _plan_channel_word_count(*, abi_version: int, channel_words: int | None,
+-                             route_features: int, ep: int, helpers: int,
+-                             algorithm: str) -> int:
++                             route_features: int, ep: int, helpers: int) -> int:
+     """Validate an explicitly negotiated private publication allocation."""
+     if type(abi_version) is not int or type(route_features) is not int:
+         raise ValueError("plan channel ABI and features must be exact integers")
+     if abi_version != 6:
+         raise ValueError("CUDA scheduler requires PlanChannel ABI6")
+-    if route_features not in (0, 1) or (route_features and algorithm != "halo_q"):
+-        raise ValueError("external-owner routes require HALO-Q capability")
++    if route_features not in (0, 1):
++        raise ValueError("plan channel route features must be 0 or 1")
+     if type(ep) is not int or not MIN_EP <= ep <= MAX_EP or ep % 2:
+         raise ValueError("plan channel requires even EP in [2,32]")
+     if type(helpers) is not int or helpers <= 0:
+@@ -47,7 +45,7 @@
+     topk: int = 6,
+     threads: int = 512,
+ ) -> int:
+-    """Return the measured pure-CUDA CTA policy without importing CuTe."""
++    """Return the bounded pure-CUDA CTA policy without importing CuTe."""
+ 
+     for name, value in {
+         "ep_size": ep_size,
+@@ -61,9 +59,8 @@
+         raise ValueError("the pure-CUDA scheduler currently requires threads=512")
+     routes = max_tokens_per_rank * topk
+     if ep_size == 8:
+-        # The latency-oriented EP8 policy uses at most 32 CTAs. At the
+-        # acceptance shape (T=8192, K=6), this fixes the grid at 32 while
+-        # leaving at least 120 of GB200's 152 SMs unoccupied.
++        # Bound scheduler occupancy so independent same-stream work retains
++        # launch capacity.
+         workers = min(31, max(1, (routes + 3 * threads - 1) // (3 * threads)))
+         return 1 + workers
+     target_rounds = max(3, (96 + (ep_size + 6) // 2) // (ep_size + 6))
+@@ -91,7 +88,6 @@
+     local_rank: int = 0
+     threads: int = 512
+     ctas: int | None = None
+-    algorithm: str = "halo_q"
+     enable_pdl: bool = True
+ 
+     def __post_init__(self) -> None:
+@@ -170,11 +166,6 @@
              raise ValueError("the pure-CUDA scheduler currently requires threads=512")
          if not 1 <= self.ctas <= MAX_CTAS:
              raise ValueError(f"ctas must be in [1,{MAX_CTAS}]")
@@ -28,12 +71,10 @@ index 2ead121..5a4bf86 100644
 -            # gone, so selecting it now would be silently choosing an unexercised
 -            # path. Reject rather than ignore.
 -            raise ValueError("algorithm must be 'halo_q' (legacy was removed)")
-+        if self.algorithm not in ("legacy", "halo_q"):
-+            raise ValueError("algorithm must be 'legacy' or 'halo_q'")
          if type(self.enable_pdl) is not bool:
              raise ValueError("enable_pdl must be bool")
  
-@@ -246,7 +242,6 @@ class CudaPhysicalSlotScheduler:
+@@ -246,7 +237,6 @@
          # Everything the kernel takes between `routes` and `stream` is fixed for
          # the endpoint's lifetime.  Cache it so a submission does not rebuild 13
          # data_ptr() calls and ~11 config lookups every generation.
@@ -41,7 +82,7 @@ index 2ead121..5a4bf86 100644
          self.partial = torch.zeros(
              config.ctas * config.logical_expert_count,
              dtype=torch.int32,
-@@ -295,9 +290,6 @@ class CudaPhysicalSlotScheduler:
+@@ -295,9 +285,6 @@
              device=scheduler_device,
          )
          self._connected = config.ep_size == 1
@@ -51,7 +92,16 @@ index 2ead121..5a4bf86 100644
          self._plan_channel_lock = threading.Lock()
          self._plan_channel_ptr = 0
          self._plan_channel_abi_version = 0
-@@ -387,7 +379,6 @@ class CudaPhysicalSlotScheduler:
+@@ -372,7 +359,7 @@
+             words = _plan_channel_word_count(
+                 abi_version=abi_version, channel_words=channel_words,
+                 route_features=route_features, ep=self.cfg.ep_size,
+-                helpers=self.cfg.extra_slots_per_rank, algorithm=self.cfg.algorithm,
++                helpers=self.cfg.extra_slots_per_rank,
+             )
+             if self._plan_channel_bound:
+                 raise RuntimeError("plan channel binding is single-assignment")
+@@ -387,7 +374,6 @@
              self._plan_channel_abi_version = abi_version
              self._plan_channel_words = words
              self._plan_channel_route_features = route_features
@@ -59,7 +109,7 @@ index 2ead121..5a4bf86 100644
              self._plan_channel_stream_handle = handle
              self._plan_channel_bound = True
  
-@@ -410,7 +401,6 @@ class CudaPhysicalSlotScheduler:
+@@ -410,7 +396,6 @@
              self._plan_channel_abi_version = 0
              self._plan_channel_words = 0
              self._plan_channel_route_features = 0
@@ -67,7 +117,7 @@ index 2ead121..5a4bf86 100644
              self._plan_channel_stream_handle = handle
              self._plan_channel_bound = True
              self._gpu_direct_bound = True
-@@ -448,45 +438,55 @@ class CudaPhysicalSlotScheduler:
+@@ -448,45 +433,54 @@
                      "CUDA scheduler uses one static stream because its workspace "
                      "and reset-free generations are shared"
                  )
@@ -147,7 +197,6 @@ index 2ead121..5a4bf86 100644
 +                self.cfg.route_count,
 +                self.cfg.ctas,
 +                self.cfg.threads,
-+                0 if self.cfg.algorithm == "legacy" else 1,
 +                self.cfg.enable_pdl,
 +                SPIN_CYCLES,
 +                self._plan_channel_abi_version,
@@ -158,7 +207,39 @@ index 2ead121..5a4bf86 100644
  
      def submit(
          self, routes: torch.Tensor, stream_handle: int, *,
-@@ -543,17 +543,10 @@ class CudaPhysicalSlotScheduler:
+@@ -510,20 +504,22 @@
+         with changing pointers/lengths use eager submit; stage()+launch() remains
+         available for a fixed-capacity graph input buffer.
+         """
+-        if self._gpu_direct_bound:
+-            with self._plan_channel_lock:
++        with self._plan_channel_lock:
++            if self._plan_channel_bound:
+                 if self._plan_channel_pending:
+                     raise RuntimeError("plan publication is still pending")
+                 if stream_handle != self._plan_channel_stream_handle:
+                     raise RuntimeError("bound plan channel requires its static stream")
+-                if self._launch_stream_handle is None:
+-                    self._launch_stream_handle = stream_handle
+-                elif stream_handle != self._launch_stream_handle:
+-                    raise RuntimeError("CUDA scheduler requires its existing static stream")
+-                self._submit_routes(routes, stream_handle, valid_tokens=valid_tokens)
++            if self._launch_stream_handle is None:
++                self._launch_stream_handle = stream_handle
++            elif stream_handle != self._launch_stream_handle:
++                raise RuntimeError(
++                    "CUDA scheduler uses one static stream because its workspace "
++                    "and reset-free generations are shared"
++                )
++            self._submit_routes(routes, stream_handle, valid_tokens=valid_tokens)
++            if self._plan_channel_bound:
+                 self._plan_channel_pending = True
+-        else:
+-            self._submit_routes(routes, stream_handle, valid_tokens=valid_tokens)
+         return self.outputs
+ 
+     def _submit_routes(
+@@ -543,17 +539,10 @@
              valid_tokens = routes.shape[0]
          if type(valid_tokens) is not int or not 0 <= valid_tokens <= routes.shape[0]:
              raise ValueError("valid_tokens must be an int in [0,T]")
@@ -180,10 +261,9 @@ index 2ead121..5a4bf86 100644
  
      def run(
 diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hierarchical.py b/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hierarchical.py
-index 5662b5a..cb2b2ef 100644
 --- a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hierarchical.py
 +++ b/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hierarchical.py
-@@ -11,7 +11,7 @@ from typing import Protocol, runtime_checkable
+@@ -11,18 +11,15 @@
  import torch
  from cuda.bindings import driver as cuda
  
@@ -192,7 +272,21 @@ index 5662b5a..cb2b2ef 100644
  from .arena import BoundLiveWeightArena, LiveWeightArena, _TensorIdentity
  from ._util import check_cuda
  from ..geometry import hierarchy_group_sizes
-@@ -389,7 +389,12 @@ class HierarchicalSamiWeightBroadcast:
+ from .geometry import BundleLayout
+ 
+-# Bound on waiting for every peer to publish its mapped plan.
+-#
+-# Steady state keeps the original 2 s: that is what makes a lost peer surface
+-# quickly. The first generation gets 120 s because the S>0 arm JIT-compiles the
+-# M = H + S MegaMoE shape inside the rendezvous, which takes seconds and skews
+-# arrival across ranks. See HierarchicalCopyEndpoint.submit.
++# Bound on waiting for every peer to publish its mapped plan. Steady state
++# surfaces a lost peer promptly; the first generation allows for compilation
++# inside the rendezvous and the resulting arrival skew.
+ _DEFAULT_PLAN_TIMEOUT_NS = 2_000_000_000
+ _DEFAULT_FIRST_PLAN_TIMEOUT_NS = 120_000_000_000
+ 
+@@ -389,7 +386,12 @@
              factors = comm.allgather(self.tma_source_load_factor)
              if any(value != self.tma_source_load_factor for value in factors):
                  raise ValueError("tma_source_load_factor must agree across all ranks")
@@ -206,7 +300,7 @@ index 5662b5a..cb2b2ef 100644
  
          live = arena_provider.build_hierarchical_live_arena(
              world=world,
-@@ -430,7 +435,9 @@ class HierarchicalSamiWeightBroadcast:
+@@ -430,7 +432,9 @@
                               else HierarchicalPlanChannel(helper_count))
          plan_stride = (helper_count + 3) // 4 * 4
          plan_words = 4 + 7 * plan_stride
@@ -217,7 +311,7 @@ index 5662b5a..cb2b2ef 100644
          tma_kwargs = {}
          if copy_backend == "tma":
              tma_kwargs = dict(tma_sm_count=tma_sm_count or 0, tma_warps=tma_warps or 0,
-@@ -450,34 +457,66 @@ class HierarchicalSamiWeightBroadcast:
+@@ -450,34 +454,66 @@
          for index, pointer in enumerate(self.arena.group_destination_ptrs):
              self._destination_table[index] = pointer
          self._group_sizes = _i32_array(self.arena.group_sizes)
@@ -310,7 +404,7 @@ index 5662b5a..cb2b2ef 100644
              raise RuntimeError("hierarchical SAMI context is not fresh")
  
          self._lock = threading.Lock()
-@@ -653,15 +692,24 @@ class HierarchicalSamiWeightBroadcast:
+@@ -653,15 +689,24 @@
                          workspace.device != scheduler_device or workspace.dtype != torch.int32 or
                          not workspace.is_contiguous() or tuple(workspace.shape) != (2 + 6 * capacity,)):
                      raise ValueError("GPU-direct requires the original CUDA scheduler plan workspace")
@@ -338,7 +432,46 @@ index 5662b5a..cb2b2ef 100644
                  else:
                      bind(self.plan_channel.dev_ptr, handle,
                           abi_version=self.plan_channel.ABI_VERSION,
-@@ -854,7 +902,22 @@ class HierarchicalSamiWeightBroadcast:
+@@ -808,32 +853,12 @@
+         correctness barrier, so widening it costs only how long a genuine hang
+         takes to surface.
+ 
+-        ``timeout_ns=None`` picks the bound automatically, and the first
+-        generation gets a much larger one. Reason: the first forward of an S>0
+-        arm compiles the M = H + S MegaMoE shape *inside* this rendezvous --
+-        ``_prime_ladder`` warms only the S=0 shape, as its own comment states.
+-        That JIT runs for seconds (the autotuner alone reports ~4.4 s for a
+-        single op), so ranks reach ``submit()`` seconds apart on frame 1 and a
+-        steady-state bound fires on whichever arrive first. Observed at EP8 on
+-        VR200 before this was handled: ranks 2,3,4,5 raised
+-
+-            TimeoutError: hierarchical scheduler plan publication timed out
+-
+-        on the very first forward, and the surviving ranks then hung in the
+-        collective. Startup skew, not a lost peer -- so the fix belongs in the
+-        default, not in something the caller has to know to set.
+-
+-        Steady-state generations keep the tight bound, which is what makes a
+-        real lost peer surface quickly. ``MEGAMOE_SAMI_PLAN_TIMEOUT_NS`` raises
+-        both and is only an escape hatch: it cannot lower the first generation
+-        below the 120 s floor, so it is not a way to make a suspected frame-1
+-        hang fail fast. Pass ``timeout_ns`` explicitly for that.
+-
+-        Note the widening is per broadcaster, and the consumer builds one per
+-        layer, so a model with L layers can spend L x 120 s in the worst case
+-        before the first forward gives up. The wait is a pause-spin with no
+-        sleep (see wait_plan in sami_hierarchical_release.c), so those seconds
+-        are a busy core per rank, competing with the very JIT being waited on.
++        ``timeout_ns=None`` selects a wider first-generation bound because
++        ranks can enter the rendezvous at different times while required kernels are
++        compiled. Later generations use the steady-state bound so a lost peer surfaces
++        promptly. ``MEGAMOE_SAMI_PLAN_TIMEOUT_NS`` can raise both defaults; callers may
++        pass ``timeout_ns`` explicitly when a different diagnostic bound is required.
++        The timeout is an error bound, not a correctness barrier.
+         """
+ 
+         if timeout_ns is None:
+@@ -854,7 +879,22 @@
                  raise RuntimeError("outputs are not from the bound CUDA scheduler")
              self._require_live_bank_reusable()
              try:
@@ -362,7 +495,7 @@ index 5662b5a..cb2b2ef 100644
                      commands = int(
                          self.mod.submit(
                              self.ctx,
-@@ -896,7 +959,11 @@ class HierarchicalSamiWeightBroadcast:
+@@ -896,7 +936,11 @@
          This opt-in diagnostic must stay outside the submission/timing path.
          """
  

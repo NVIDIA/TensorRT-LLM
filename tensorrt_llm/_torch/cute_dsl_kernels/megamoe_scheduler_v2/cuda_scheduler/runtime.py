@@ -1,4 +1,4 @@
-"""Host runtime for the pure-CUDA GAR-N and HALO-Q schedulers."""
+"""Host runtime for the pure-CUDA HALO-Q scheduler."""
 
 from __future__ import annotations
 
@@ -16,15 +16,14 @@ MAX_BROADCASTS = MAX_EXPERTS
 SPIN_CYCLES = 8_000_000_000
 
 def _plan_channel_word_count(*, abi_version: int, channel_words: int | None,
-                             route_features: int, ep: int, helpers: int,
-                             algorithm: str) -> int:
+                             route_features: int, ep: int, helpers: int) -> int:
     """Validate an explicitly negotiated private publication allocation."""
     if type(abi_version) is not int or type(route_features) is not int:
         raise ValueError("plan channel ABI and features must be exact integers")
     if abi_version != 6:
         raise ValueError("CUDA scheduler requires PlanChannel ABI6")
-    if route_features not in (0, 1) or (route_features and algorithm != "halo_q"):
-        raise ValueError("external-owner routes require HALO-Q capability")
+    if route_features not in (0, 1):
+        raise ValueError("plan channel route features must be 0 or 1")
     if type(ep) is not int or not MIN_EP <= ep <= MAX_EP or ep % 2:
         raise ValueError("plan channel requires even EP in [2,32]")
     if type(helpers) is not int or helpers <= 0:
@@ -89,7 +88,6 @@ class CudaSchedulerConfig:
     local_rank: int = 0
     threads: int = 512
     ctas: int | None = None
-    algorithm: str = "halo_q"
     enable_pdl: bool = True
 
     def __post_init__(self) -> None:
@@ -168,8 +166,6 @@ class CudaSchedulerConfig:
             raise ValueError("the pure-CUDA scheduler currently requires threads=512")
         if not 1 <= self.ctas <= MAX_CTAS:
             raise ValueError(f"ctas must be in [1,{MAX_CTAS}]")
-        if self.algorithm not in ("legacy", "halo_q"):
-            raise ValueError("algorithm must be 'legacy' or 'halo_q'")
         if type(self.enable_pdl) is not bool:
             raise ValueError("enable_pdl must be bool")
 
@@ -363,7 +359,7 @@ class CudaPhysicalSlotScheduler:
             words = _plan_channel_word_count(
                 abi_version=abi_version, channel_words=channel_words,
                 route_features=route_features, ep=self.cfg.ep_size,
-                helpers=self.cfg.extra_slots_per_rank, algorithm=self.cfg.algorithm,
+                helpers=self.cfg.extra_slots_per_rank,
             )
             if self._plan_channel_bound:
                 raise RuntimeError("plan channel binding is single-assignment")
@@ -478,7 +474,6 @@ class CudaPhysicalSlotScheduler:
                 self.cfg.route_count,
                 self.cfg.ctas,
                 self.cfg.threads,
-                0 if self.cfg.algorithm == "legacy" else 1,
                 self.cfg.enable_pdl,
                 SPIN_CYCLES,
                 self._plan_channel_abi_version,

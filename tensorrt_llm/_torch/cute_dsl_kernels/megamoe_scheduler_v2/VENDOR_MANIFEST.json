@@ -1,5 +1,11 @@
 {
   "commit": "fa6e81ed048a2afc023fda717fbfcf15514b0684",
+  "upstream_followups": [
+    {
+      "commit": "812b7a560205070fd5642a7a88b0a4541e20ce81",
+      "description": "Remove GAR-N and retain HALO-Q as the only scheduler planner."
+    }
+  ],
   "source_tree_dirty": false,
   "kind": "complete scheduler package",
   "retained_legacy_host": [],
@@ -13,9 +19,9 @@
     "csrc/in_switch_copy/tma_copy.cu": "f2cf2ebc97b02cf5e14d7461c4450dd16d44025c1c65f90e4ffc616ad708b20f",
     "csrc/in_switch_copy/tma_copy.h": "2b2a61ca32704b872736946a1a7fac4cad8b9bac50208c6647aa8a3ccb5a94ff",
     "cuda_scheduler/__init__.py": "dfd129c1690f404c60185d67bf68aca0a58c813178e3583cf0aaf54ce043382a",
-    "cuda_scheduler/csrc/halo_q_scheduler.cu": "604a1fb3043c8094c8a0b247a7ed2422a7e9563f6cbe41b2f0853ec4cd95cd86",
+    "cuda_scheduler/csrc/halo_q_scheduler.cu": "86aa782ec21232aadf3af99476b7efafcaff891f95b4b79f0248811e54c985fb",
     "cuda_scheduler/multirank_dist.py": "235c89ebc641e56514ffe863849cfc185942ceebabfce644669b7362490d794a",
-    "cuda_scheduler/runtime.py": "192638cd7a4af18bb969e71150cfed7cee5a1defbd3cefa55bd2faf6759c711b",
+    "cuda_scheduler/runtime.py": "452640d92ec69842d3ef49b121bcda610d91afd28ee0816641ae5a1e00e80496",
     "geometry.py": "74de927de618beffcffa69231f10d283dcf92f86f2aaf5f0ec59b56a15dae56c",
     "integrations/__init__.py": "b50ff1b5e1bef5d171dff4c487e90477aaea02a726c921fff4c6f309e74141e4",
     "integrations/megamoe/README.md": "677985d3d3d107f4ee624a3ae9337e648174f0277b02a8b7ceba5935fbcf76ce",
@@ -35,12 +41,12 @@
   "downstream_patches": [
     {
       "patch": "TRTLLM_STANDARD_THOP.patch",
-      "patch_sha256": "dbe3897dd7c4f7990f88759ee6500eb99a59544fe1b95025ed999418a29c4237",
+      "patch_sha256": "43ede28a58ab49d2b6a31e3c147178353f8e7420ad75efe234042fd744d2cc73",
       "files": [
         {
           "file": "cuda_scheduler/runtime.py",
           "unpatched_vendored_sha256": "be7c7518c8790b057f6ccf9a23a369015fec2dd696ff1f046f4979c19ffd293b",
-          "patched_sha256": "e8884a69111761d86d0a1d99b9af24dc450a2ae302dfead45d5c91964a35b28d"
+          "patched_sha256": "452640d92ec69842d3ef49b121bcda610d91afd28ee0816641ae5a1e00e80496"
         },
         {
           "file": "sami/hierarchical.py",
@@ -48,14 +54,6 @@
           "patched_sha256": "2ad2eca640d4534e83fb20616810d09972d92b442d508bee283fba827a5a2097"
         }
       ]
-    },
-    {
-      "patch": "TRTLLM_RUNTIME_INVARIANTS.patch",
-      "patch_sha256": "1350c1d988939830e994e12df00798e61a3dbe65e29fc999f90858faf88ba4e4",
-      "file": "cuda_scheduler/runtime.py",
-      "unpatched_vendored_sha256": "be7c7518c8790b057f6ccf9a23a369015fec2dd696ff1f046f4979c19ffd293b",
-      "patched_sha256": "192638cd7a4af18bb969e71150cfed7cee5a1defbd3cefa55bd2faf6759c711b",
-      "description": "Keep workspace generations and plan publication on one static submit stream."
     },
     {
       "patch": "TRTLLM_NATIVE_CACHE.patch",

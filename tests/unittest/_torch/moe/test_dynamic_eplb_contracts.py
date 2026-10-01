@@ -194,6 +194,49 @@ def test_launch_queue_is_on_only_and_reaches_process_entrypoints(monkeypatch):
             assert setup_line < min(node.lineno for node in boundary_calls), (relative, boundary)
 
 
+def test_halo_q_is_the_only_scheduler_planner():
+    sources = {
+        "runtime": _TORCH_ROOT / "cute_dsl_kernels/megamoe_scheduler_v2/cuda_scheduler/runtime.py",
+        "integration": _TORCH_ROOT / "moe/fused_moe/mega_moe/rebalance_slot_scheduler_v2.py",
+        "kernel": _ROOT
+        / "cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQ.cu",
+        "kernel_header": _ROOT
+        / "cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQ.h",
+        "torch_op": _ROOT / "cpp/tensorrt_llm/thop/moe/loadBalance/moeRebalanceHaloQOp.cpp",
+    }
+    retired = (
+        "plan_legacy",
+        "TRTLLM_MOE_REBALANCE_ALGO",
+        "algorithmValue",
+        "params.algorithm",
+    )
+    for name, path in sources.items():
+        text = path.read_text()
+        assert all(token not in text for token in retired), name
+
+    runtime_tree = ast.parse(sources["runtime"].read_text())
+    config = next(
+        node
+        for node in runtime_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "CudaSchedulerConfig"
+    )
+    fields = {
+        node.target.id
+        for node in config.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    assert "algorithm" not in fields
+
+    launch = next(
+        node
+        for node in ast.walk(runtime_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "moe_rebalance_halo_q"
+    )
+    assert len(launch.args) == 26
+
+
 def test_direct_submit_orders_generations_and_defers_the_route_wait():
     trace = []
     state = SimpleNamespace(device=0, thread=7)

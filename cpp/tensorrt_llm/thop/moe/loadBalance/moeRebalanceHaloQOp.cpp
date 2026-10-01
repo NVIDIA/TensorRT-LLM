@@ -56,9 +56,8 @@ void moeRebalanceHaloQ(torch::Tensor const& routes, torch::Tensor& outSlots, tor
     torch::Tensor& partial, torch::Tensor& routeAux, torch::Tensor& gridSync, torch::Tensor& planWorkspace,
     torch::Tensor& routePrefix, std::int64_t planChannelPtr, std::int64_t epValue, std::int64_t expertsValue,
     std::int64_t helpersValue, std::int64_t localRankValue, std::int64_t routeCapacityValue, std::int64_t ctasValue,
-    std::int64_t threadsValue, std::int64_t algorithmValue, bool enablePdl, std::int64_t spinCycles,
-    std::int64_t planAbiVersionValue, std::int64_t planChannelWordsValue, std::int64_t routeFeaturesValue,
-    std::int64_t validRouteCountValue)
+    std::int64_t threadsValue, bool enablePdl, std::int64_t spinCycles, std::int64_t planAbiVersionValue,
+    std::int64_t planChannelWordsValue, std::int64_t routeFeaturesValue, std::int64_t validRouteCountValue)
 {
     int const ep = checkedInt(epValue, "ep");
     int const experts = checkedInt(expertsValue, "experts");
@@ -67,7 +66,6 @@ void moeRebalanceHaloQ(torch::Tensor const& routes, torch::Tensor& outSlots, tor
     int const routeCapacity = checkedInt(routeCapacityValue, "route_capacity");
     int const ctas = checkedInt(ctasValue, "ctas");
     int const threads = checkedInt(threadsValue, "threads");
-    int const algorithm = checkedInt(algorithmValue, "algorithm");
     int const planAbiVersion = checkedInt(planAbiVersionValue, "plan_abi_version");
     int const planChannelWords = checkedInt(planChannelWordsValue, "plan_channel_words");
     int const routeFeatures = checkedInt(routeFeaturesValue, "route_features");
@@ -82,7 +80,6 @@ void moeRebalanceHaloQ(torch::Tensor const& routes, torch::Tensor& outSlots, tor
         validRouteCount >= 0 && validRouteCount <= routeCapacity, "valid_route_count must be in [0, route_capacity]");
     TORCH_CHECK(ctas > 0 && ctas <= 128 && routeCapacity <= INT_MAX - ctas, "invalid ctas");
     TORCH_CHECK(threads == 512, "threads must be 512");
-    TORCH_CHECK(algorithm == 0 || algorithm == 1, "algorithm must be 0 (GAR-N) or 1 (HALO-Q)");
     TORCH_CHECK(spinCycles >= 0, "spin_cycles cannot be negative");
     TORCH_CHECK(planChannelPtr >= 0, "plan_channel_ptr cannot be negative");
 
@@ -129,7 +126,6 @@ void moeRebalanceHaloQ(torch::Tensor const& routes, torch::Tensor& outSlots, tor
         routeCapacity,
         ctas,
         threads,
-        algorithm,
         enablePdl,
         static_cast<std::uint64_t>(spinCycles),
         planAbiVersion,
@@ -154,7 +150,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor(h!) grid_sync, Tensor(i!) plan_workspace, Tensor(j!) "
         "route_prefix, int plan_channel_ptr, int ep, "
         "int experts, int helpers, int local_rank, int route_capacity, int "
-        "ctas, int threads, int algorithm, bool enable_pdl, "
+        "ctas, int threads, bool enable_pdl, "
         "int spin_cycles, int plan_abi_version, int plan_channel_words, int "
         "route_features, "
         "int valid_route_count) -> ()");
