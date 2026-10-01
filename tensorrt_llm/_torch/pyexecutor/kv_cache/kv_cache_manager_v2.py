@@ -1339,34 +1339,6 @@ class _BasePageTableMaterializer:
         gather_base_page_rows(self._host_block_offsets, rows, copy_idx, num_blocks)
         return rows
 
-    def copy_rows_to_device(
-        self,
-        dst_tensor: torch.Tensor,
-        copy_idx: torch.Tensor,
-        *,
-        stream: Optional[torch.cuda.Stream] = None,
-    ) -> int:
-        """Snapshot active base rows into the front of a device staging table."""
-        assert self._use_device_staging, "CPU row staging is reserved for the device-staging path"
-        assert dst_tensor.ndim == 4 and dst_tensor.is_cuda
-        num_pools, row_capacity, kv_factor, max_blocks_per_seq = dst_tensor.shape
-        assert num_pools == self._num_pools and row_capacity >= copy_idx.shape[0]
-        assert kv_factor == 2
-        assert max_blocks_per_seq == self._max_blocks_per_seq
-        num_seqs = copy_idx.shape[0]
-        if num_seqs == 0:
-            return 0
-        host_rows = self._gather_host_rows(copy_idx)
-        stream = torch.cuda.current_stream(dst_tensor.device) if stream is None else stream
-        with torch.cuda.stream(stream):
-            copy_base_page_rows_to_device(
-                host_rows,
-                dst_tensor,
-                num_seqs,
-                stream.cuda_stream,
-            )
-        return num_seqs
-
     def _get_device_conversion_metadata(self) -> Tuple[torch.Tensor, torch.Tensor]:
         # These immutable copies are built before any CUDA graph capture and
         # may therefore be consumed safely from every materialization stream.
@@ -2916,28 +2888,17 @@ class KVCacheManagerV2(BaseResourceManager):
             self.host_kv_cache_block_offsets,
             device=device,
         )
-        if self._page_table_materializer.uses_device_staging:
-            # Device staging uploads only the active rows, but the compiled SWA
-            # gather uses a capacity-sized identity index. Keep its inactive
-            # source rows defined even though their outputs are not consumed.
-            self._device_kv_cache_block_offsets_input.zero_()
-            self._device_copy_idx_staging = torch.arange(
-                staging_capacity,
-                dtype=torch.long,
-                device=device,
-            )
-        else:
-            self._device_copy_idx_staging = torch.zeros(
-                staging_capacity,
-                dtype=torch.long,
-                device=device,
-            )
         self._device_attention_op_block_offsets_staging = torch.empty(
             self.num_attention_op_pools,
             staging_capacity,
             2,
             self.max_blocks_per_seq,
             dtype=torch.int32,
+            device=device,
+        )
+        self._device_copy_idx_staging = torch.zeros(
+            staging_capacity,
+            dtype=torch.long,
             device=device,
         )
         self._device_num_contexts = torch.empty((), dtype=torch.int32, device=device)
@@ -3058,19 +3019,11 @@ class KVCacheManagerV2(BaseResourceManager):
         num_contexts: int,
         num_seqs: int,
     ) -> None:
-        # Preserve the established non-CC full-table upload and GPU gather.
-        if self._page_table_materializer.uses_device_staging:
-            self._page_table_materializer.copy_rows_to_device(
-                self._device_kv_cache_block_offsets_input,
-                copy_idx,
-            )
-            device_copy_idx = self._device_copy_idx_staging
-        else:
-            device_copy_idx = self._copy_idx_to_device(copy_idx)
-            self._device_kv_cache_block_offsets_input.copy_(
-                self.host_kv_cache_block_offsets,
-                non_blocking=True,
-            )
+        device_copy_idx = self._copy_idx_to_device(copy_idx)
+        self._device_kv_cache_block_offsets_input.copy_(
+            self.host_kv_cache_block_offsets,
+            non_blocking=True,
+        )
         scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(
             request_ids,
             num_contexts,
