@@ -1220,6 +1220,15 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         if config.initial_pool_ratio is None:
             # DeepSeek-V4's windowed and compressed pools must also support
             # the longest decode request alongside the short decode requests.
+            constraint_batch_size = self._get_generation_request_capacity()
+            if (
+                self.max_cuda_graph_batch_size is not None
+                and self.max_cuda_graph_batch_size > 0
+                and self.is_estimating_kv_cache
+                and all(window is None for window in self.max_attention_window_vec)
+            ):
+                constraint_batch_size = min(constraint_batch_size, self.max_cuda_graph_batch_size)
+            constraint_batch_size = max(1, constraint_batch_size)
             min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
             constraints.append(
                 BatchDesc(
@@ -1230,7 +1239,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                         )
                     ]
                     + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
-                    * (self.max_batch_size - 1)
+                    * (constraint_batch_size - 1)
                 )
             )
         return replace(

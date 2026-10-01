@@ -454,7 +454,24 @@ def test_typical_seq_len_preserves_deepseek_v4_fallback(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("pool_ratio", [None, [1.0]])
-def test_build_cache_config_long_decode_constraint(pool_ratio: list[float] | None) -> None:
+@pytest.mark.parametrize(
+    "estimating,graph_batch_size,window,expected_batch_size",
+    [
+        (False, 2, None, 3),
+        (True, 2, None, 2),
+        (True, None, None, 3),
+        (True, 0, None, 3),
+        (True, 4, None, 3),
+        (True, 2, 128, 3),
+    ],
+)
+def test_build_cache_config_long_decode_constraint(
+    pool_ratio: list[float] | None,
+    estimating: bool,
+    graph_batch_size: int | None,
+    window: int | None,
+    expected_batch_size: int,
+) -> None:
     manager = object.__new__(DeepseekV4CacheManager)
     manager.pp_layers = [0]
     manager._compress_ratios = [1]
@@ -468,6 +485,9 @@ def test_build_cache_config_long_decode_constraint(pool_ratio: list[float] | Non
     manager.tokens_per_block = 128
     manager.max_seq_len = 1024
     manager.max_batch_size = 3
+    manager.is_estimating_kv_cache = estimating
+    manager.max_cuda_graph_batch_size = graph_batch_size
+    manager.max_attention_window_vec = [window]
     manager.max_draft_len = manager._max_draft_len = 4
     manager.num_extra_kv_tokens = 3
 
@@ -486,11 +506,8 @@ def test_build_cache_config_long_decode_constraint(pool_ratio: list[float] | Non
         assert config.constraints == [
             context_constraint,
             BatchDesc(
-                [
-                    KVCacheDesc(capacity=1024, history_length=1023),
-                    KVCacheDesc(capacity=8, history_length=0),
-                    KVCacheDesc(capacity=8, history_length=0),
-                ]
+                [KVCacheDesc(capacity=1024, history_length=1023)]
+                + [KVCacheDesc(capacity=8, history_length=0)] * (expected_batch_size - 1)
             ),
         ]
         assert base_config.constraints == [context_constraint]
@@ -2481,19 +2498,23 @@ class TestDeepseekV4CacheManager:
         finally:
             cache_manager.shutdown()
 
-    def test_dummy_generation_requests_with_swa_scratch_reuse(self):
+    @pytest.mark.parametrize("compress_ratios", [[1], [1, 4, 128]])
+    @pytest.mark.parametrize("long_token_num", [127, 128, 129, 513])
+    def test_dummy_generation_requests_with_swa_scratch_reuse(
+        self, compress_ratios: list[int], long_token_num: int
+    ) -> None:
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=2,
             max_seq_len=1024,
-            compress_ratios=[1],
+            compress_ratios=compress_ratios,
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
             enable_swa_scratch_reuse=True,
         )
 
         requests = []
-        token_nums = [1, self.tokens_per_block * 4 + 1]
+        token_nums = [1, long_token_num]
         try:
             requests = cache_manager.add_dummy_requests(
                 request_ids=[0, 1],
@@ -2508,9 +2529,9 @@ class TestDeepseekV4CacheManager:
             assert not short_kv_cache.enable_swa_scratch_reuse
             assert not long_kv_cache.enable_swa_scratch_reuse
             assert short_kv_cache.history_length == 0
-            assert short_kv_cache.capacity == token_nums[0] + 1
+            assert short_kv_cache.capacity == token_nums[0]
             assert long_kv_cache.history_length == token_nums[1] - 1
-            assert long_kv_cache.capacity == token_nums[1] + 1
+            assert long_kv_cache.capacity == token_nums[1]
         finally:
             for req in requests:
                 cache_manager.free_resources(req)
