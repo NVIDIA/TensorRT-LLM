@@ -314,7 +314,7 @@ commands:
         - "--num_postprocess_workers"
       num_serve_frontends:
         type: int
-        default: 1
+        default: 8
         status: prototype
         required: false
         multiple: false

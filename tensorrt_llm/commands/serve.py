@@ -499,6 +499,46 @@ def _init_multi_frontend_mode(llm_args: dict,
     return mode
 
 
+# Default for the plain `trtllm-serve` subcommand. At high concurrency one
+# serving process is host-bound (a single asyncio loop parses every request
+# and writes every streamed chunk), so several frontends per executor pay off
+# by default. The LlmArgs field itself keeps default 1: a bare LLM() has no
+# HTTP frontends to fan out to, and only trtllm-serve can spawn them.
+DEFAULT_NUM_SERVE_FRONTENDS = 8
+
+
+def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
+                                         port: int, grpc: bool,
+                                         report_addr: Optional[str]) -> None:
+    """Fall back to one frontend when the *default* count cannot be honored.
+
+    Multi-frontend mode only exists on the classic IPC executor path behind
+    the OpenAI HTTP server on a fixed port. When the user did not ask for a
+    specific count (neither on the CLI nor in the --config YAML) and the
+    configuration can only run a single frontend, run one instead of failing
+    at startup. An explicit request keeps the loud error from the guard that
+    owns the incompatibility (gRPC / port 0 / orchestrator_type / governor).
+    """
+    num_frontends = llm_args.get("num_serve_frontends", 1)
+    if requested or num_frontends <= 1:
+        return
+    if grpc:
+        reason = "--grpc"
+    elif port == 0 or report_addr:
+        reason = "--port 0 / --report_addr"
+    elif llm_args.get("orchestrator_type") is not None:
+        reason = f"orchestrator_type={llm_args['orchestrator_type']!r}"
+    elif llm_args.get("enable_resource_governor"):
+        reason = "enable_resource_governor"
+    else:
+        return
+    logger.info(
+        f"num_serve_frontends defaults to {num_frontends}, but {reason} "
+        "supports a single serving frontend only; running 1 frontend. Pass "
+        "--num_serve_frontends explicitly to override.")
+    llm_args["num_serve_frontends"] = 1
+
+
 def _spawn_attached_frontends(llm, num_frontends: int) -> list:
     """Spawn num_frontends - 1 attached serving frontend processes.
 
@@ -662,7 +702,8 @@ def launch_server(
             logger.warning(
                 "num_serve_frontends > 1: stateful Responses API storage "
                 "(store/previous_response_id) is disabled; the per-frontend "
-                "in-memory store cannot be shared across frontends.")
+                "in-memory store cannot be shared across frontends. Pass "
+                "--num_serve_frontends 1 to keep it.")
         os.environ["TRTLLM_RESPONSES_API_DISABLE_STORE"] = "1"
 
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
@@ -1104,10 +1145,14 @@ def launch_visual_gen_server(
                   status="prototype")
 @stability_option("--num_serve_frontends",
                   type=click.IntRange(min=1, max=MAX_NUM_FRONTENDS),
-                  default=1,
+                  default=DEFAULT_NUM_SERVE_FRONTENDS,
                   help="Number of HTTP frontend processes serving one "
                   "executor; values > 1 share the serving port via "
-                  "SO_REUSEPORT (classic IPC executor path only).",
+                  "SO_REUSEPORT (classic IPC executor path only). The "
+                  "default falls back to 1 for configurations that support "
+                  "a single frontend only (--grpc, --port 0/--report_addr, "
+                  "orchestrator_type, enable_resource_governor); an explicit "
+                  "value fails instead.",
                   status="prototype")
 @stability_option("--num_input_processor_workers",
                   type=click.IntRange(min=1),
@@ -1462,6 +1507,16 @@ def serve(
         llm_args = update_llm_args_with_extra_dict(
             llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
+        # The multi-frontend default only applies where it can run; an
+        # explicit CLI flag or YAML key is honored as-is (and may fail loudly).
+        _resolve_default_num_serve_frontends(
+            llm_args,
+            requested=("num_serve_frontends" in explicit_cli_keys
+                       or "num_serve_frontends" in llm_args_extra_dict),
+            port=port,
+            grpc=grpc,
+            report_addr=report_addr)
+
         _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
 
         metadata_server_cfg = parse_metadata_server_config_file(
@@ -1498,7 +1553,7 @@ def serve(
             media_io_kwargs=parsed_media_io_kwargs)
 
         if grpc:
-            if num_serve_frontends != 1:
+            if llm_args.get("num_serve_frontends", 1) != 1:
                 raise click.UsageError(
                     "--num_serve_frontends must be 1 when --grpc is enabled.")
 
