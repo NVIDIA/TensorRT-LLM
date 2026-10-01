@@ -534,9 +534,14 @@ class MultimodalItemScheduler:
                 or output.shape != (expected_rows, expected_width)
                 or output.dtype != expected_dtype
             ):
+                actual = (
+                    f"a {output.dtype} tensor with shape {tuple(output.shape)}"
+                    if isinstance(output, torch.Tensor)
+                    else type(output).__name__
+                )
                 raise MultimodalEncoderRequestError(
                     f"MM item {item_idx} must produce a {expected_dtype} tensor "
-                    f"with shape ({expected_rows}, {expected_width})",
+                    f"with shape ({expected_rows}, {expected_width}), got {actual}",
                     request_ids=requests_using_cache_keys({cache_key}),
                 )
 

@@ -243,6 +243,13 @@ def test_item_encoder_validates_all_outputs_before_commit(invalid_output: str) -
         "rank": torch.ones(4, dtype=torch.bfloat16),
         "type": None,
     }[invalid_output]
+    actual = {
+        "rows": "a torch.bfloat16 tensor with shape (2, 4)",
+        "width": "a torch.bfloat16 tensor with shape (1, 3)",
+        "dtype": "a torch.float16 tensor with shape (1, 4)",
+        "rank": "a torch.bfloat16 tensor with shape (4,)",
+        "type": "NoneType",
+    }[invalid_output]
     scheduler = bare_mm_item_scheduler(_Model())
     scheduler.bytes_per_embedding = 8
     producers = [make_mm_request(request_id, [4]) for request_id in (1, 2, 3)]
@@ -258,6 +265,7 @@ def test_item_encoder_validates_all_outputs_before_commit(invalid_output: str) -
     with pytest.raises(MultimodalEncoderRequestError, match="must produce") as error:
         scheduler.forward_items(requests, selected)
 
+    assert str(error.value).endswith(f"got {actual}")
     assert error.value.request_ids == {2, 4}
     assert scheduler.encoder_cache.current_bytes == 0
     for request in requests:
