@@ -389,8 +389,8 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
     """
     rows: list[dict[str, Any]] = []
 
-    def walk(cls: type, prefix: str, stack: tuple, route: tuple[type, ...]) -> None:
-        if cls in stack:
+    def walk(cls: type, prefix: str, route: tuple[type, ...]) -> None:
+        if cls in route:
             return
         route = (*route, cls)
         for fname, finfo in cls.model_fields.items():
@@ -410,9 +410,9 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
                     }
                 )
             for sub_route in _nested_model_routes(ann):
-                walk(sub_route[-1], key, (*stack, cls), (*route, *sub_route[:-1]))
+                walk(sub_route[-1], key, (*route, *sub_route[:-1]))
 
-    walk(model_cls, "", (), ())
+    walk(model_cls, "", ())
 
     rows.sort(
         key=lambda r: (r["key"], tuple((step.__module__, step.__qualname__) for step in r["route"]))
