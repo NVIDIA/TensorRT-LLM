@@ -612,7 +612,8 @@ When removing servers, special attention is required in the current version. You
 
 **Q: Why does NIXL fail to use LIBFABRIC backend even when `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` is set?**
 
-A: The TensorRT-LLM container doesn't include the NIXL LIBFABRIC plugin by default. You need to either:
+A: The container builds the NIXL LIBFABRIC plugin against the bundled AWS EFA libfabric install by default, so this usually means something other than a missing plugin. Check:
 
-1. **Rebuild NIXL**: Install libfabric and hwloc first, then rebuild NIXL following the installation instructions above
-2. **Use a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGINS_DIR` to point to its directory
+1. **Not running on an EFA-enabled instance**: Confirm EFA devices are present and passed through to the container.
+2. **Custom libfabric version mismatch**: If you rebuilt NIXL against a different libfabric installation, confirm it meets the minimum required version (v1.21.0) and that the plugin was built against that same libfabric.
+3. **Using a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGINS_DIR` to point to its directory.
