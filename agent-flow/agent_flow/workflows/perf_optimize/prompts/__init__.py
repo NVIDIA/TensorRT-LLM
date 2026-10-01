@@ -12,6 +12,7 @@ from ._common import (
     SOL_ANALYZER_CONTEXT,
     SOL_OPTIMIZE_REPORTER_GUIDANCE,
     SOL_OPTIMIZER_CONTEXT,
+    TEST_CASE_CAMPAIGN,
     approach_restriction_note,
     kernel_coverage_analyzer_note,
 )
@@ -101,6 +102,7 @@ def build_perf_optimize_prompts(
     kernel_coverage: Mapping[str, Any] | None = None,
     sol_methodology: str = "full",
     include_disagg: bool = False,
+    include_test_case: bool = False,
 ) -> PromptBundle:
     """Return the workflow's prompt bundle, augmented per the task spec.
 
@@ -174,6 +176,14 @@ def build_perf_optimize_prompts(
     ``task.yaml``) makes every aggregate campaign pay for it and turns a
     deployment-time fact into a per-turn inference the agent can get
     wrong.
+
+    ``include_test_case`` (the task spec carries a ``test_case`` block)
+    composes the test-case section into the same roles for the same
+    reasons, and is mutually exclusive with ``include_disagg``: the two
+    describe different harnesses, so a campaign carrying both sections
+    would be told to measure the same workload two ways. The task schema
+    rejects that combination, and this builder leaves it to the schema
+    rather than re-deciding it per call.
     """
     bundle = DEFAULT_PROMPTS
     if sol_methodology != "full":
@@ -209,6 +219,15 @@ def build_perf_optimize_prompts(
             integrator=DISAGG_CAMPAIGN,
             qa=DISAGG_CAMPAIGN,
         )
+    if include_test_case:
+        bundle = bundle.with_extensions(
+            benchmarker=TEST_CASE_CAMPAIGN,
+            analyzer=TEST_CASE_CAMPAIGN,
+            optimizer=TEST_CASE_CAMPAIGN,
+            evaluator=TEST_CASE_CAMPAIGN,
+            integrator=TEST_CASE_CAMPAIGN,
+            qa=TEST_CASE_CAMPAIGN,
+        )
     if kernel_coverage is not None:
         bundle = bundle.with_extensions(
             analyzer=kernel_coverage_analyzer_note(
@@ -239,6 +258,7 @@ __all__ = [
     "OPTIMIZER_SYSTEM_PROMPT",
     "PROJECTOR_SYSTEM_PROMPT",
     "REMOTE_SLURM_EXECUTION",
+    "TEST_CASE_CAMPAIGN",
     "PromptBundle",
     "QA_SYSTEM_PROMPT",
     "REPORTER_SYSTEM_PROMPT",
