@@ -348,12 +348,17 @@ def test_handle_errors_tags_first_chunk_prefill_failures_as_reuse_poisoned():
     first_chunk = _failed_request(1, remaining=8, position=0)
     mid_context = _failed_request(2, remaining=4, position=4)
     generation = _failed_request(3, remaining=0, position=8)
-    executor.active_requests = [first_chunk, mid_context, generation]
+    # The disagg coordinator's error path feeds TransferRequest objects
+    # (no context_* attributes) through _handle_errors; tagging must not
+    # raise on them and must leave them untagged.
+    transfer_like = SimpleNamespace(py_request_id=4, py_client_id=104, state=None)
+    requests = [first_chunk, mid_context, generation, transfer_like]
+    executor.active_requests = list(requests)
 
     PyExecutor._handle_errors(
         executor,
         "forward failed",
-        requests=[first_chunk, mid_context, generation],
+        requests=requests,
         charge_budget=False,
     )
 
@@ -361,6 +366,7 @@ def test_handle_errors_tags_first_chunk_prefill_failures_as_reuse_poisoned():
     assert getattr(first_chunk, "py_kv_reuse_poisoned", False)
     assert not getattr(mid_context, "py_kv_reuse_poisoned", False)
     assert not getattr(generation, "py_kv_reuse_poisoned", False)
+    assert not getattr(transfer_like, "py_kv_reuse_poisoned", False)
 
 
 def _kv_cache_manager_shell():
@@ -371,23 +377,37 @@ def _kv_cache_manager_shell():
 
 
 def test_free_resources_releases_poisoned_request_without_reuse_store():
-    """remove_sequence(None) must take releaseBlocks' no-store branch.
+    """A poisoned release must advance the context cursor off position 0.
 
-    This bypasses the legacy position-0 fallback that would publish
-    unwritten blocks under the prompt's keys.
+    The remove_sequence binding only accepts (request_id, LlmRequest, bool),
+    so the no-store release is achieved by moving the cursor off 0 before
+    the call: usable-token accounting then yields zero tokens and the legacy
+    position-0 fallback -- which would publish unwritten blocks under the
+    prompt's keys -- no longer applies.
     """
     manager = _kv_cache_manager_shell()
-    request = SimpleNamespace(py_request_id=7, py_kv_reuse_poisoned=True)
+    positions_at_call = []
+    manager.impl.remove_sequence.side_effect = lambda _req_id, req, _pin: positions_at_call.append(
+        req.context_current_position
+    )
+    request = SimpleNamespace(
+        py_request_id=7, py_kv_reuse_poisoned=True, context_current_position=0
+    )
 
     KVCacheManager.free_resources(manager, request)
 
-    manager.impl.remove_sequence.assert_called_once_with(7, None, False)
+    # The binding's exact (request_id, LlmRequest, bool) signature is kept.
+    manager.impl.remove_sequence.assert_called_once_with(7, request, False)
+    assert positions_at_call == [1]
 
 
 def test_free_resources_keeps_reuse_store_for_untagged_requests():
     manager = _kv_cache_manager_shell()
-    request = SimpleNamespace(py_request_id=7)
+    request = SimpleNamespace(py_request_id=7, context_current_position=0)
 
     KVCacheManager.free_resources(manager, request)
 
     manager.impl.remove_sequence.assert_called_once_with(7, request, False)
+    # An untagged request keeps its cursor: a position-0 release with a real
+    # completed prefill is the legacy fallback's intended territory.
+    assert request.context_current_position == 0
