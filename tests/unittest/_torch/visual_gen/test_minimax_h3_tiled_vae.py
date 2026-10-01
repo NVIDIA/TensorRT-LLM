@@ -21,11 +21,7 @@ import pytest
 import torch
 from diffusers import AutoencoderKLMiniMaxH3
 
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.tiled_vae import (
-    MINIMAX_H3_VAE_DEFAULTS,
-    TiledAutoencoderKLMiniMaxH3,
-    validate_vae_tiling_config,
-)
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.tiled_vae import TiledAutoencoderKLMiniMaxH3
 
 pytestmark = pytest.mark.cpu_only
 
@@ -41,11 +37,10 @@ def _vae() -> TiledAutoencoderKLMiniMaxH3:
     torch.nn.Module.__init__(vae)
     vae.spatial_compression_ratio = 2
     vae.use_tiling = True
-    vae.tile_sample_min_height = vae.tile_sample_min_width = 256
-    vae.tile_sample_min_overlap_height = vae.tile_sample_min_overlap_width = 64
+    vae.tile_sample_min_height = vae.tile_sample_min_width = 8
+    vae.tile_sample_min_overlap_height = vae.tile_sample_min_overlap_width = 2
     vae.post_quant_conv = torch.nn.Conv3d(1, 1, 1)
     vae.decoder = _TileDecoder()
-    vae.configure_tiling({**MINIMAX_H3_VAE_DEFAULTS, "vae_tile_size": 8, "vae_tile_overlap": 2})
     return vae
 
 
@@ -104,41 +99,48 @@ def test_no_tile_group_and_disabled_tiling_do_not_use_collectives() -> None:
 
 
 @pytest.mark.parametrize(
-    "overrides",
-    [
-        {"vae_use_tiling": "false"},
-        {"vae_tile_size": 0},
-        {"vae_tile_size": True},
-        {"vae_tile_overlap": 0},
-        {"vae_tile_overlap": -1},
-        {"vae_tile_size": 256, "vae_tile_overlap": 256},
-        {"vae_tile_size": 32.5},
-    ],
+    "name,value",
+    [("tile_sample_min_height", 65), ("tile_sample_min_overlap_width", 3)],
 )
-def test_invalid_tiling_options(overrides: dict) -> None:
-    with pytest.raises(ValueError):
-        validate_vae_tiling_config({**MINIMAX_H3_VAE_DEFAULTS, **overrides})
-
-
-@pytest.mark.parametrize("name,value", [("vae_tile_size", 65), ("vae_tile_overlap", 3)])
-def test_tile_geometry_must_align_to_checkpoint(name: str, value: int) -> None:
-    with pytest.raises(ValueError, match="compression ratio"):
-        _vae().configure_tiling({**MINIMAX_H3_VAE_DEFAULTS, name: value})
-
-
-def test_unset_options_preserve_loaded_vae_defaults() -> None:
+def test_parallel_tile_geometry_must_align_to_checkpoint(name: str, value: int) -> None:
     vae = _vae()
-    vae.use_tiling = False
+    setattr(vae, name, value)
+    with pytest.raises(ValueError, match="compression ratio"):
+        vae.configure_parallel(group=object())
+
+
+@pytest.mark.parametrize("use_tiling", [True, False])
+def test_no_parallel_group_preserves_loaded_vae_defaults(use_tiling: bool) -> None:
+    vae = _vae()
+    vae.use_tiling = use_tiling
     vae.tile_sample_min_height = 16
     vae.tile_sample_min_width = 20
-    vae.configure_tiling(MINIMAX_H3_VAE_DEFAULTS)
-    assert not vae.use_tiling
+    vae.configure_parallel()
+    assert vae.use_tiling is use_tiling
     assert (vae.tile_sample_min_height, vae.tile_sample_min_width) == (16, 20)
     assert vae.tile_sample_min_overlap_height == 2
+    assert vae.tile_parallel_group is None
 
 
-def test_parallel_decode_requires_tiling() -> None:
-    with pytest.raises(ValueError, match="requires VAE spatial tiling"):
-        _vae().configure_tiling(
-            {**MINIMAX_H3_VAE_DEFAULTS, "vae_use_tiling": False}, group=object()
-        )
+@pytest.mark.parametrize("use_tiling", [True, False])
+def test_parallel_group_enables_tiling_without_changing_geometry(use_tiling: bool) -> None:
+    vae = _vae()
+    vae.use_tiling = use_tiling
+    vae.tile_sample_min_height = 16
+    vae.tile_sample_min_width = 20
+    vae.tile_sample_min_overlap_width = 4
+    group = object()
+    vae.configure_parallel(group=group)
+    assert vae.use_tiling
+    assert vae.tile_parallel_group is group
+    assert (vae.tile_sample_min_height, vae.tile_sample_min_width) == (16, 20)
+    assert (vae.tile_sample_min_overlap_height, vae.tile_sample_min_overlap_width) == (2, 4)
+
+
+@pytest.mark.parametrize("size,overlap", [(0, 2), (8, 0), (8, 8), (8, 10)])
+def test_parallel_group_rejects_invalid_loaded_geometry(size: int, overlap: int) -> None:
+    vae = _vae()
+    vae.tile_sample_min_height = size
+    vae.tile_sample_min_overlap_height = overlap
+    with pytest.raises(ValueError, match="overlap"):
+        vae.configure_parallel(group=object())

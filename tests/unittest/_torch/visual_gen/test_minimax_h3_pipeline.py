@@ -847,41 +847,6 @@ def test_keyframe_reference_role_must_be_a_keyframe_slot() -> None:
         _SyntheticMiniMaxH3Pipeline()._load_request_keyframes(req)
 
 
-@pytest.mark.parametrize("tiling", [True, False, None])
-@pytest.mark.parametrize("resolved", [True, False])
-def test_vae_tiling_options_reach_pipeline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tiling: bool | None, resolved: bool
-) -> None:
-    (tmp_path / "transformer").mkdir()
-    (tmp_path / "transformer" / "config.json").write_text('{"hidden_size": 32}')
-    (tmp_path / "modular_model_index.json").write_text(
-        json.dumps(
-            {
-                "_class_name": "MiniMaxH3ModularPipeline",
-                "transformer": ["diffusers", "MiniMaxH3Transformer3DModel"],
-            }
-        )
-    )
-    options = {
-        "vae_use_tiling": tiling,
-        "vae_tile_size": 128,
-        "vae_tile_overlap": 32,
-    }
-    args = VisualGenArgs(model=str(tmp_path), pipeline_config=options)
-    kwargs = (
-        {"pipeline_config": PipelineLoader(args)._resolve_pipeline_config(str(tmp_path))}
-        if resolved
-        else {}
-    )
-    config = DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args, **kwargs)
-    assert all(config.extra_attrs[key] == value for key, value in options.items())
-    monkeypatch.setattr(
-        h3_pipeline.BasePipeline, "__init__", lambda self, config: torch.nn.Module.__init__(self)
-    )
-    pipeline = MiniMaxH3Pipeline(config)
-    assert pipeline._vae_tiling_options == options
-
-
 def _ulysses_pipeline_config(world_size: int = 8) -> SimpleNamespace:
     return SimpleNamespace(
         mapping=SimpleNamespace(world_size=1, tp_size=1),
@@ -959,14 +924,6 @@ def test_h3_rejects_out_of_range_vae_groups(size: int) -> None:
         MiniMaxH3Pipeline(config)
 
 
-def test_h3_parallel_vae_requires_spatial_tiling() -> None:
-    config = _ulysses_pipeline_config(2)
-    config.parallel.parallel_vae_size = 2
-    config.extra_attrs = {"vae_use_tiling": False}
-    with pytest.raises(ValueError, match="requires VAE spatial tiling"):
-        MiniMaxH3Pipeline(config)
-
-
 @pytest.mark.parametrize("size", [2, 3, 4])
 @pytest.mark.parametrize("rank", range(4))
 def test_h3_uses_shared_vae_group(monkeypatch: pytest.MonkeyPatch, size: int, rank: int) -> None:
@@ -978,9 +935,8 @@ def test_h3_uses_shared_vae_group(monkeypatch: pytest.MonkeyPatch, size: int, ra
     pipeline.pipeline_config.visual_gen_mapping.vae_ranks = list(range(size))
     pipeline.pipeline_config.visual_gen_mapping.vae_group = group if rank < size else None
     monkeypatch.setattr(MiniMaxH3Pipeline, "rank", property(lambda self: rank))
-    pipeline._vae_tiling_options = {}
     calls = []
-    pipeline.vae = SimpleNamespace(configure_tiling=lambda options, group: calls.append(group))
+    pipeline.vae = SimpleNamespace(configure_parallel=lambda group: calls.append(group))
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: size)
     pipeline.setup_parallel_vae()
     assert calls == ([group] if rank < size else [])

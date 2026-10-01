@@ -448,7 +448,6 @@ def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size)
             torch_compile_config={"enable": True},
             cuda_graph_config={"enable": False},
             compilation_config={"skip_warmup": True},
-            pipeline_config={"vae_use_tiling": True, "vae_tile_size": 256, "vae_tile_overlap": 64},
         )
         engine = VisualGen(model=args.model, args=args)
         try:

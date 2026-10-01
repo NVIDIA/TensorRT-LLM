@@ -18,10 +18,7 @@ from tensorrt_llm._torch.visual_gen.config import (
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.tiled_vae import (
-    MINIMAX_H3_VAE_DEFAULTS,
-    TiledAutoencoderKLMiniMaxH3,
-)
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.tiled_vae import TiledAutoencoderKLMiniMaxH3
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.transformer_minimax_h3 import (
     MiniMaxH3Transformer3DModel,
 )
@@ -74,7 +71,6 @@ def _make_vae() -> TiledAutoencoderKLMiniMaxH3:
     vae.tile_sample_min_overlap_height = vae.tile_sample_min_overlap_width = 2
     vae.post_quant_conv = torch.nn.Conv3d(1, 1, 1)
     vae.decoder = _TileDecoder()
-    vae.configure_tiling(MINIMAX_H3_VAE_DEFAULTS)
     return vae
 
 
@@ -170,7 +166,6 @@ def _partial_vae_worker(rank: int, port: int) -> None:
                 visual_gen_mapping=vgm,
             )
             pipeline.vae = _make_vae().to(device).eval()
-            pipeline._vae_tiling_options = MINIMAX_H3_VAE_DEFAULTS
             pipeline.setup_parallel_vae()
             assert pipeline._parallel_vae_enabled == (size > 1)
             assert (pipeline.vae.tile_parallel_group is not None) == (size > 1 and rank < size)

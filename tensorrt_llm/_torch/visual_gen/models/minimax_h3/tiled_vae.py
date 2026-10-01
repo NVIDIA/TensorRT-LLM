@@ -23,27 +23,6 @@ import torch
 import torch.distributed as dist
 from diffusers import AutoencoderKLMiniMaxH3
 
-MINIMAX_H3_VAE_DEFAULTS = {
-    "vae_use_tiling": None,
-    "vae_tile_size": None,
-    "vae_tile_overlap": None,
-}
-
-
-def validate_vae_tiling_config(options: dict) -> None:
-    """Validate explicit overrides before loading checkpoint weights."""
-    if options["vae_use_tiling"] is not None and type(options["vae_use_tiling"]) is not bool:
-        raise ValueError("vae_use_tiling must be a boolean.")
-    for name in ("vae_tile_size", "vae_tile_overlap"):
-        if options[name] is not None and (type(options[name]) is not int or options[name] <= 0):
-            raise ValueError(f"{name} must be a positive integer.")
-    if (
-        options["vae_tile_overlap"] is not None
-        and options["vae_tile_size"] is not None
-        and options["vae_tile_overlap"] >= options["vae_tile_size"]
-    ):
-        raise ValueError("vae_tile_overlap must be smaller than vae_tile_size.")
-
 
 class TiledAutoencoderKLMiniMaxH3(AutoencoderKLMiniMaxH3):
     """Distribute spatial decode tiles over an explicitly supplied process group.
@@ -56,23 +35,11 @@ class TiledAutoencoderKLMiniMaxH3(AutoencoderKLMiniMaxH3):
 
     tile_parallel_group: dist.ProcessGroup | None = None
 
-    def configure_tiling(self, options: dict, group: dist.ProcessGroup | None = None) -> None:
-        """Apply validated pipeline options using checkpoint compression geometry."""
-        validate_vae_tiling_config(options)
-        use_tiling = options["vae_use_tiling"]
-        if use_tiling is not None:
-            self.use_tiling = use_tiling
-        for option, attributes in (
-            ("vae_tile_size", ("tile_sample_min_height", "tile_sample_min_width")),
-            (
-                "vae_tile_overlap",
-                ("tile_sample_min_overlap_height", "tile_sample_min_overlap_width"),
-            ),
-        ):
-            value = options[option]
-            if value is not None:
-                for attribute in attributes:
-                    setattr(self, attribute, value)
+    def configure_parallel(self, group: dist.ProcessGroup | None = None) -> None:
+        """Enable tile parallelism using the loaded VAE's spatial geometry."""
+        if group is None:
+            self.tile_parallel_group = None
+            return
         for size, overlap in (
             (self.tile_sample_min_height, self.tile_sample_min_overlap_height),
             (self.tile_sample_min_width, self.tile_sample_min_overlap_width),
@@ -81,8 +48,7 @@ class TiledAutoencoderKLMiniMaxH3(AutoencoderKLMiniMaxH3):
                 raise ValueError("VAE tile overlap must be positive and smaller than tile size.")
             if size % self.spatial_compression_ratio or overlap % self.spatial_compression_ratio:
                 raise ValueError("VAE tile geometry must align to the spatial compression ratio.")
-        if group is not None and not self.use_tiling:
-            raise ValueError("parallel_vae_size > 1 requires VAE spatial tiling.")
+        self.use_tiling = True
         self.tile_parallel_group = group
 
     def _decode_clip(self, z: torch.Tensor) -> torch.Tensor:
