@@ -73,7 +73,7 @@ def _handle(
         additional_generation_outputs=additional_generation_outputs,
     )
     result._done = True
-    result._handle_sequence([finish_reason], response, 0)
+    result._handle_sequence([finish_reason], response, response.output_token_ids, 0)
     return result._outputs[0]
 
 

@@ -369,6 +369,7 @@ class GenerationResultBase:
     def _handle_sequence(self,
                          finish_reasons,
                          response_tensors,
+                         output_token_ids,
                          sequence_index,
                          logprobs_result=None,
                          req_perf_metrics_dict: Optional[dict[str,
@@ -399,15 +400,15 @@ class GenerationResultBase:
             # Beam search enforces returning all generated tokens
             output.token_ids = [
                 *decoder_output_prefix,
-                *response_tensors.output_token_ids[src_idx],
+                *output_token_ids[src_idx],
             ]
         else:
             if decoder_output_prefix and not output.token_ids:
                 output.token_ids.extend(decoder_output_prefix)
-            output.token_ids.extend(response_tensors.output_token_ids[src_idx])
+            output.token_ids.extend(output_token_ids[src_idx])
 
-        if response_tensors.cum_log_probs is not None:
-            output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
+        if (cum_log_probs := response_tensors.cum_log_probs) is not None:
+            output.cumulative_logprob = cum_log_probs[src_idx]
 
         # prompt logprobs handling
         if logprobs_result and logprobs_result.prompt is not None:  # both backends
@@ -416,25 +417,25 @@ class GenerationResultBase:
         if logprobs_result and logprobs_result.generation is not None:  # TRT backend
             # update logprobs from ResponseWrapper (TRT top logprobs WAR)
             output.logprobs += logprobs_result.generation
-        elif response_tensors.log_probs is not None:  # PyTorch backend
+        elif (log_probs :=
+              response_tensors.log_probs) is not None:  # PyTorch backend
             # handle logprobs directly from response tensors given by sampler
             if decoder_output_prefix and self.sampling_params.use_beam_search:
                 output.logprobs = [
                     *self._get_decoder_output_prefix_logprobs(),
-                    *response_tensors.log_probs[src_idx],
+                    *log_probs[src_idx],
                 ]
             elif self._logprobs_reported_cumulatively:
-                assert output._last_logprobs_len <= len(
-                    response_tensors.log_probs[src_idx]
-                ), (f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
-                    f"{len(response_tensors.log_probs[src_idx])})")
-                output.logprobs += response_tensors.log_probs[src_idx][
-                    output._last_logprobs_len:]
+                assert output._last_logprobs_len <= len(log_probs[src_idx]), (
+                    f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
+                    f"{len(log_probs[src_idx])})")
+                output.logprobs += log_probs[src_idx][output.
+                                                      _last_logprobs_len:]
             else:
                 if decoder_output_prefix and not output.logprobs:
                     output.logprobs.extend(
                         self._get_decoder_output_prefix_logprobs())
-                output.logprobs += response_tensors.log_probs[src_idx]
+                output.logprobs += log_probs[src_idx]
 
             # overcome some WAR in the cpp executor
             if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
@@ -465,17 +466,20 @@ class GenerationResultBase:
                         f"logprobs length: {len(output.logprobs)} != "
                         f"output.length: {output.length}")
 
-        if response_tensors.generation_logits is not None:
-            output.generation_logits = response_tensors.generation_logits[
+        if (generation_logits :=
+                response_tensors.generation_logits) is not None:
+            output.generation_logits = generation_logits[
                 src_idx, :output.length]
 
-        if getattr(response_tensors, 'additional_context_outputs',
-                   None) is not None:
-            output.additional_context_outputs = response_tensors.additional_context_outputs
+        if (additional_context_outputs :=
+                getattr(response_tensors, 'additional_context_outputs',
+                        None)) is not None:
+            output.additional_context_outputs = additional_context_outputs
 
-        if getattr(response_tensors, 'additional_generation_outputs',
-                   None) is not None:
-            output.additional_generation_outputs = response_tensors.additional_generation_outputs
+        if (additional_generation_outputs :=
+                getattr(response_tensors, 'additional_generation_outputs',
+                        None)) is not None:
+            output.additional_generation_outputs = additional_generation_outputs
 
         # when sampling_params.n > 1 and is cancelled, make sure all the outputs
         # be marked as cancelled.
@@ -483,14 +487,16 @@ class GenerationResultBase:
                 src_idx] == tllm.FinishReason.CANCELLED:
             output.finish_reason = 'cancelled'
 
-        if response_tensors.request_perf_metrics is not None:
-            output.request_perf_metrics = response_tensors.request_perf_metrics
+        if (request_perf_metrics :=
+                response_tensors.request_perf_metrics) is not None:
+            output.request_perf_metrics = request_perf_metrics
             self._maybe_fill_spec_dec_perf_metrics(output.request_perf_metrics)
 
         # Request-level time breakdown (e.g. from PyTorch LlmResult); kept on result, not CompletionOutput.
-        if hasattr(response_tensors, 'time_breakdown_metrics'
-                   ) and response_tensors.time_breakdown_metrics is not None:
-            self.time_breakdown_metrics = response_tensors.time_breakdown_metrics
+        if (time_breakdown_metrics :=
+                getattr(response_tensors, 'time_breakdown_metrics',
+                        None)) is not None:
+            self.time_breakdown_metrics = time_breakdown_metrics
 
         # Check if this specific sequence is finished (not just if the entire request is done)
         # This is important for best_of > n sampling where sequences finish at different times
@@ -688,13 +694,16 @@ class GenerationResultBase:
 
             finish_reasons = response_result.finish_reasons
             # output_token_ids = (beams, tokens)
+            output_token_ids = response_result.output_token_ids
             if self.sampling_params.use_beam_search:
-                for beam_idx, _ in enumerate(response_result.output_token_ids):
+                for beam_idx, _ in enumerate(output_token_ids):
                     self._handle_sequence(finish_reasons, response_result,
-                                          beam_idx, logprobs_result,
+                                          output_token_ids, beam_idx,
+                                          logprobs_result,
                                           req_perf_metrics_dict)
             else:
                 self._handle_sequence(finish_reasons, response_result,
+                                      output_token_ids,
                                       response_result.sequence_index,
                                       logprobs_result, req_perf_metrics_dict)
 
@@ -722,12 +731,12 @@ class GenerationResultBase:
                     self._disaggregated_params.first_gen_logits = \
                         first_gen_logits
 
-            if response_result.context_logits is not None:
-                self._context_logits = response_result.context_logits
+            if (context_logits := response_result.context_logits) is not None:
+                self._context_logits = context_logits
 
-            if hasattr(response_result, "mm_embedding_handles"
-                       ) and response_result.mm_embedding_handles is not None:
-                mm_embedding_handles = response_result.mm_embedding_handles
+            if (mm_embedding_handles :=
+                    getattr(response_result, "mm_embedding_handles",
+                            None)) is not None:
                 if self._disaggregated_params is not None:
                     self._disaggregated_params.multimodal_embedding_handles = mm_embedding_handles
                     self._disaggregated_params.multimodal_hashes = self._multimodal_hashes

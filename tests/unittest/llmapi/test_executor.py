@@ -113,6 +113,79 @@ def test_GenerationResultBase():
     assert result._done
 
 
+@pytest.mark.parametrize("pytorch", [False, True])
+@pytest.mark.parametrize("beam_search", [False, True])
+def test_result_stream_sequence_alignment(pytorch, beam_search):
+    from tensorrt_llm._torch.pyexecutor.llm_request import (LlmResponse,
+                                                            LlmResult, PyResult)
+    from tensorrt_llm.executor.result import Logprob
+
+    result = GenerationResultBase(id=0,
+                                  sampling_params=SamplingParams(
+                                      max_tokens=2,
+                                      n=2,
+                                      best_of=2,
+                                      use_beam_search=beam_search,
+                                      top_k=10,
+                                      temperature=1.0,
+                                      logprobs=1))
+    for step in (1, 2):
+        for sequence in ([0] if beam_search else [0, 1]):
+            sequences = [0, 1] if beam_search else [sequence]
+            native = tllm.Result()
+            native.output_token_ids = [
+                [100 + seq * 10 + pos for pos in range(1, step + 1)]
+                if beam_search else [100 + seq * 10 + step] for seq in sequences
+            ]
+            probs = [[-0.25] * len(tokens)
+                     for tokens in native.output_token_ids]
+            native.log_probs = probs
+            native.cum_log_probs = [-0.25 * step] * len(sequences)
+            native.sequence_index = sequence
+            native.finish_reasons = [
+                tllm.FinishReason.LENGTH
+                if step == 2 else tllm.FinishReason.NOT_FINISHED
+            ] * len(sequences)
+            native.is_final = step == 2 and (beam_search or sequence == 1)
+            if pytorch:
+                py_result = PyResult(prompt_len=1,
+                                     max_new_tokens=2,
+                                     use_device_memory=False,
+                                     return_log_probs=True)
+                py_result.set_log_probs([[{
+                    token: Logprob(logprob=-0.25, rank=1)
+                } for token in tokens] for tokens in native.output_token_ids],
+                                        native.cum_log_probs)
+                wrapped = LlmResult(native,
+                                    py_result,
+                                    is_final=native.is_final,
+                                    time_breakdown_metrics={"step": step})
+                response = LlmResponse(request_id=0,
+                                       client_id=0,
+                                       result=wrapped)
+            else:
+                response = tllm.Response(request_id=0,
+                                         result=native,
+                                         client_id=0)
+            result._handle_response(response)
+            for seq in sequences:
+                output = result._outputs[seq]
+                assert output.token_ids == [
+                    100 + seq * 10 + pos for pos in range(1, step + 1)
+                ]
+                assert output.token_ids_diff == [100 + seq * 10 + step]
+                expected_logprobs = ([{
+                    token: Logprob(logprob=-0.25, rank=1)
+                } for token in output.token_ids] if pytorch else [-0.25] * step)
+                assert output.logprobs == expected_logprobs
+                assert output.logprobs_diff == expected_logprobs[-1:]
+                assert output.cumulative_logprob == -0.25 * step
+                assert output.finish_reason == ("length" if step == 2 else None)
+            if pytorch:
+                assert result.time_breakdown_metrics == {"step": step}
+    assert result._done
+
+
 def test_GenerationResult():
     request = GenerationRequest(prompt_token_ids=[12, 23, 34],
                                 sampling_params=SamplingParams(max_tokens=4))
