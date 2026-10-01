@@ -2511,6 +2511,30 @@ class TestChunkedContext:
         mgr.resize_context.assert_called_once_with(req, 256)
         draft_mgr.try_allocate_draft_context.assert_called_once_with(req, 256)
 
+    def test_remote_tail_source_larger_than_budget_is_chunked(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=200, ctx_chunk_config=(None, 64))
+        req = make_ctx_request(0, context_remaining_length=1000)
+        req.py_csa2_remote_tail_mode = "source"
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 192
+
+    def test_remote_tail_destination_requires_whole_tail_budget(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=200, ctx_chunk_config=(None, 64))
+        first = make_ctx_request(0, context_remaining_length=128)
+        first.py_csa2_remote_tail_mode = "destination"
+        pending = make_ctx_request(1, context_remaining_length=100)
+        pending.py_csa2_remote_tail_mode = "destination"
+
+        out = sched.schedule_request([first, pending], set())
+
+        assert ids(out.context_requests) == [0]
+        assert pending.context_chunk_size == 0
+
     def test_min_budget_check(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)
         sched = make_scheduler(mgr, max_num_tokens=50, ctx_chunk_config=(None, 64))
