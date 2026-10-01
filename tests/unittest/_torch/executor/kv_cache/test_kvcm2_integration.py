@@ -532,7 +532,11 @@ def test_zero_size_filter_rejects_empty_local_cache() -> None:
         manager._remove_zero_size_buffers(config)
 
 
-def test_event_window_sizes_filter_attention_without_backend_internals() -> None:
+@pytest.mark.parametrize("sliding_window_size", [None, 8])
+@pytest.mark.parametrize("attention_first", [False, True])
+def test_event_window_sizes_filter_attention_without_backend_internals(
+    sliding_window_size: int | None, attention_first: bool
+) -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager.max_seq_len = MAX_SEQ_LEN
     manager.kv_cache_manager_py_config = SimpleNamespace(
@@ -540,7 +544,7 @@ def test_event_window_sizes_filter_attention_without_backend_internals() -> None
             AttentionLayerConfig(
                 layer_id=LayerId(0),
                 buffers=[BufferConfig(role=Role.KEY, size=128)],
-                sliding_window_size=8,
+                sliding_window_size=sliding_window_size,
             ),
             SsmLayerConfig(
                 layer_id=LayerId(1),
@@ -550,10 +554,18 @@ def test_event_window_sizes_filter_attention_without_backend_internals() -> None
     )
     # Match the C++ binding surface: layer_grouping is public, while the
     # Python implementation's private _life_cycles registry is absent.
-    manager.impl = SimpleNamespace(layer_grouping=[[0], [1]])
+    manager.impl = SimpleNamespace(layer_grouping=[[0], [1]] if attention_first else [[1], [0]])
 
-    assert manager._get_event_window_sizes_by_layer_group(attention_only=True) == {0: 8}
-    assert manager._get_event_window_sizes_by_layer_group() == {0: 8, 1: MAX_SEQ_LEN}
+    attention_group_id = 0 if attention_first else 1
+    window_size = MAX_SEQ_LEN if sliding_window_size is None else sliding_window_size
+    # SSM must be excluded even when its window ties with full attention's window.
+    assert manager._get_event_window_sizes_by_layer_group(attention_only=True) == {
+        attention_group_id: window_size
+    }
+    assert manager._get_event_window_sizes_by_layer_group() == {
+        attention_group_id: window_size,
+        1 - attention_group_id: MAX_SEQ_LEN,
+    }
 
 
 def test_draft_token_relocation_uses_local_cache_layout(monkeypatch: pytest.MonkeyPatch) -> None:
