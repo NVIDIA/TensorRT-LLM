@@ -178,7 +178,43 @@ def test_fatal_callback_uses_captured_world_on_background_thread(
     kill.assert_not_called()
 
 
-def test_unproven_fatal_dispatches_kill_without_waiting_for_logging(
+@pytest.mark.parametrize("thread_error", [None, "start", "join"])
+def test_unproven_fatal_bounds_log_join_and_always_dispatches_kill(
+    monkeypatch: pytest.MonkeyPatch, thread_error: str | None
+) -> None:
+    """Try to finish the fatal record, but terminate even if thread setup fails."""
+    from tensorrt_llm._torch.disaggregation import transceiver
+
+    event = QuiescenceFatalEvent(12, "receive", "cancelled", 1.0, 2.0, 2.0)
+    record = Mock()
+    log_thread = Mock()
+    log_thread.join.side_effect = lambda **_: record(event)
+    factory = Mock(return_value=log_thread)
+    kill = Mock()
+    monkeypatch.setattr(transceiver, "_log_unproven_kv_transfer", record)
+    monkeypatch.setattr(transceiver.threading, "Thread", factory)
+    monkeypatch.setattr(hang_detector, "propagate_hard_kill", kill)
+    if thread_error is None:
+        kill.side_effect = lambda **_: record.assert_called_once_with(event)
+        _fail_unproven_kv_transfer(event)
+    else:
+        getattr(log_thread, thread_error).side_effect = RuntimeError("test thread failure")
+        with pytest.raises(RuntimeError, match="test thread failure"):
+            _fail_unproven_kv_transfer(event)
+        record.assert_not_called()
+
+    factory.assert_called_once_with(
+        target=record, args=(event,), name="kv-retirement-fatal-log", daemon=True
+    )
+    log_thread.start.assert_called_once_with()
+    if thread_error == "start":
+        log_thread.join.assert_not_called()
+    else:
+        log_thread.join.assert_called_once_with(timeout=0.5)
+    kill.assert_called_once_with(diagnostics=False, communicator=None)
+
+
+def test_unproven_fatal_dispatches_kill_without_waiting_forever_for_logging(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A blocked logging handler cannot block the watchdog's kill dispatch."""

@@ -79,10 +79,11 @@ if TYPE_CHECKING:
     from mpi4py import MPI
 
 _FP4_MLA_OWNERSHIP_BRIDGE_ENV = "TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE"
+_FATAL_LOG_JOIN_TIMEOUT_S = 0.5
 
 
 def _log_unproven_kv_transfer(event: QuiescenceFatalEvent) -> None:
-    """Emit fatal diagnostics without making termination wait for logging.
+    """Emit best-effort fatal diagnostics on a dedicated thread.
 
     Args:
         event: The sticky expiry event retained by the watchdog.
@@ -118,12 +119,16 @@ def _fail_unproven_kv_transfer(
         communicator: Validated executor world captured before the watchdog starts.
     """
     try:
-        threading.Thread(
+        log_thread = threading.Thread(
             target=_log_unproven_kv_transfer,
             args=(event,),
             name="kv-retirement-fatal-log",
             daemon=True,
-        ).start()
+        )
+        log_thread.start()
+        # Allow a fast diagnostic to finish without waiting indefinitely for
+        # a blocked handler. Admission and unresolved roots remain fenced.
+        log_thread.join(timeout=_FATAL_LOG_JOIN_TIMEOUT_S)
     finally:
         # Do not call PyExecutor._handle_errors(), request termination, or
         # transceiver.shutdown(): their normal cleanup may recycle KV pages.
