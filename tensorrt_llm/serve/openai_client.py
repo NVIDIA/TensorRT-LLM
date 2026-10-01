@@ -182,6 +182,7 @@ class OpenAIHttpClient(OpenAIClient):
         disagg_id_generator: Optional[Callable[[], Awaitable[int]]] = None,
         request_perf_metrics: bool = False,
         internal_disagg_auth_key: Optional[str] = None,
+        bounded_replay_on_generation: bool = False,
     ):
         self._router = router
         self._role = role
@@ -208,6 +209,7 @@ class OpenAIHttpClient(OpenAIClient):
         self._disagg_id_generator = disagg_id_generator
         self._request_perf_metrics = request_perf_metrics
         self._internal_disagg_auth_key = internal_disagg_auth_key
+        self._bounded_replay_on_generation = bounded_replay_on_generation
 
     def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
         headers = build_subagent_affinity_headers(
@@ -344,25 +346,36 @@ class OpenAIHttpClient(OpenAIClient):
     ) -> AsyncGenerator[Any, None]:
         is_stream = request.stream
         disagg_params = request.disaggregated_params
-        is_paired_handoff = disagg_params is not None and (
+        is_remote_tail_handoff = disagg_params is not None and (
             (
                 self._role == ServerRole.GENERATION
                 and disagg_params.request_type == "generation_only"
+                and disagg_params.remote_tail_start is not None
             )
             or (
-                self._role == ServerRole.CONTEXT
-                and disagg_params.request_type == "context_only"
+                self._bounded_replay_on_generation
                 and disagg_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+                and (
+                    (
+                        self._role == ServerRole.CONTEXT
+                        and disagg_params.request_type == "context_only"
+                    )
+                    or (
+                        self._role == ServerRole.GENERATION
+                        and disagg_params.request_type == "generation_only"
+                    )
+                )
             )
         )
-        # The other worker already owns this handoff ID. Retrying one side,
-        # especially with a new ID, cannot safely replay or cancel that transfer.
-        max_retries = 0 if is_paired_handoff else self._max_retries
+        # Remote-tail retries cannot safely replay or cancel the paired transfer.
+        # Generation-first dispatch precedes the context response carrying the
+        # tail boundary, so identify that handoff from the deployment config.
+        max_retries = 0 if is_remote_tail_handoff else self._max_retries
         # Loop range must cover the transient-TCP extended budget (up to 5)
         # so the conditional raise inside the except block can actually decide
         # to keep retrying.  Non-transient errors still raise on the first
         # attempt that reaches self._max_retries.
-        _TRANSIENT_TCP_BUDGET = 0 if self._no_retry or is_paired_handoff else 5
+        _TRANSIENT_TCP_BUDGET = 0 if self._no_retry or is_remote_tail_handoff else 5
         loop_max = max(max_retries, _TRANSIENT_TCP_BUDGET) + 1
         for attempt in range(loop_max):
             if attempt > 0:

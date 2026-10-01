@@ -365,6 +365,13 @@ and speculative decoding on the context worker are unsupported. Saved weight
 memory is available to KV cache or larger batches/token budgets, subject to the
 remaining runtime memory requirements.
 
+Remote-tail handoffs disable HTTP retries on the generation hop in context-first
+serving, and on both hops in generation-first serving. Retrying one side cannot
+safely replay or cancel the paired transfer. Context-first context requests and
+requests that bypass the handoff retain the configured retry policy. With
+remote-tail replay disabled, ordinary disaggregated requests retain their
+configured retry policy, including the transient TCP retry budget.
+
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
