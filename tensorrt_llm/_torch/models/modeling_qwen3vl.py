@@ -6,7 +6,7 @@ import dataclasses
 import math
 import re
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -229,6 +229,10 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
     separate timestamp tokens, so each frame is its own (1, h, w) block rather
     than a ``tokens_per_second``-scaled stretch.
     """
+
+    # The Qwen3-VL image processor can run several times slower with one PyTorch
+    # thread per CPU on large hosts than with 16.
+    frontend_torch_threads: ClassVar[Optional[int]] = 16
 
     def __init__(
         self,

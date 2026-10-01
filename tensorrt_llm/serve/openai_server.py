@@ -23,7 +23,7 @@ from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
-                    AsyncIterator, Dict, List, Optional, Tuple, Union)
+                    AsyncIterator, Callable, Dict, List, Optional, Tuple, Union)
 
 import msgspec
 import uvicorn
@@ -58,6 +58,7 @@ from tensorrt_llm.llmapi.llm import LLM, RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
+from tensorrt_llm.llmapi.utils import enable_worker_single_process_for_tp1
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
@@ -516,6 +517,56 @@ def _image_output_size(image) -> Optional[str]:
     return f"{width}x{height}"
 
 
+def _multimodal_processor_torch_initializer(
+    generator: Union[LLM, MultimodalEncoder, "VisualGen"],
+    input_processor: object,
+) -> Optional[Callable[[], None]]:
+    """Build an initializer that caps PyTorch threads of input-processor workers.
+
+    Multimodal input processors run small per-request PyTorch CPU ops on the
+    workers of the frontend input-processor pool. PyTorch sizes its intra-op
+    thread pool from the CPUs available to the process, which for some
+    processors is far wider than that work needs on large hosts. Processors
+    opt in through ``BaseMultimodalInputProcessor.frontend_torch_threads``.
+
+    ``torch.set_num_threads`` also becomes the default for threads that first
+    use intra-op parallelism later in this process and resizes PyTorch's
+    process-wide auxiliary thread pools, so the cap is skipped when the GPU
+    worker may run in the frontend process. It is also skipped when
+    ``OMP_NUM_THREADS`` is set, to respect an explicit user choice.
+
+    Args:
+        generator: The serving generator; its ``args`` tell whether the GPU
+            worker may run in this process.
+        input_processor: The input processor of ``generator``.
+
+    Returns:
+        An initializer for the input-processor ``ThreadPoolExecutor``, or
+        ``None`` to keep the current PyTorch thread count.
+    """
+    if not isinstance(input_processor, BaseMultimodalInputProcessor):
+        return None
+    max_threads = input_processor.frontend_torch_threads
+    if max_threads is None or "OMP_NUM_THREADS" in os.environ:
+        return None
+
+    # GenerationExecutor.create() may run the GPU worker in this process in
+    # either case.
+    args = getattr(generator, "args", None)
+    if (enable_worker_single_process_for_tp1()
+            or getattr(args, "gather_generation_logits", False)):
+        return None
+
+    import torch
+
+    current_threads = torch.get_num_threads()
+    if current_threads <= max_threads:
+        return None
+    logger.info(f"Limiting multimodal input processor PyTorch threads from "
+                f"{current_threads} to {max_threads}")
+    return functools.partial(torch.set_num_threads, max_threads)
+
+
 class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
@@ -591,6 +642,8 @@ class OpenAIServer(_VideoRoutesMixin):
         self._input_proc_executor = ThreadPoolExecutor(
             max_workers=input_processor_workers,
             thread_name_prefix="trtllm_inputproc",
+            initializer=_multimodal_processor_torch_initializer(
+                self.generator, ip),
         )
         self._media_load_executor = ThreadPoolExecutor(
             max_workers=media_load_workers,
