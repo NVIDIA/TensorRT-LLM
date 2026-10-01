@@ -1078,7 +1078,20 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         draft_manager = self._joint_draft_manager
         if draft_manager is None:
-            return self.kv_cache_manager.prepare_context(req) and self._admit_unpaired_draft(req)
+            if not self.kv_cache_manager.prepare_context(req):
+                return False
+            if self._admit_unpaired_draft(req):
+                return True
+            # Mirror the joint branch below: a non-first chunk reaches a
+            # refused admission with an ACTIVE target cache (prepare_context
+            # just resumed it), and leaving it active pins its pages while the
+            # request waits on the draft pool -- under pressure, the very
+            # requests whose completion would drain that pool can then no
+            # longer grow their own target KV. First chunks are rolled back
+            # (freed) by _try_schedule_context instead.
+            if not req.is_first_context_chunk:
+                self._suspend_request(req)
+            return False
 
         if not req.is_first_context_chunk:
             if self.kv_cache_manager.prepare_context(req) and draft_manager.prepare_context(req):

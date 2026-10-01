@@ -4171,6 +4171,20 @@ class KVCacheManagerV2(BaseResourceManager):
         # Loads end at full blocks and leave the final prompt token for logits.
         end = min(reservation.end, req.prompt_len - 1)
         end = end // self.tokens_per_block * self.tokens_per_block
+        # A connector-served prefix starves a hidden-state drafter exactly like
+        # local reuse does -- served tokens never pass a target forward -- and
+        # the cursor cannot rewind below py_connector_served_position once the
+        # load is accepted (_settle_context_cursor floors on it). Cap the
+        # reservation at the same recomputed-tail boundary as local reuse, so
+        # the tail stays local by construction; a full-re-prefill tail (-1)
+        # caps to zero and releases the reservation below.
+        end = _spec_recompute_target(
+            req,
+            end,
+            tail=self._spec_recompute_tail,
+            tokens_per_block=self.tokens_per_block,
+            is_draft=self.is_draft,
+        )
         if end <= local_end:
             self.kv_connector_manager.release_prefix_reservation(req)
             return

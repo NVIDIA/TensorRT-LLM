@@ -32,8 +32,15 @@ so that binding stays safe.
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import _spec_recompute_target
+import pytest
+
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheManagerV2,
+    _spec_recompute_target,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _req(prompt_len, is_dummy=False):
@@ -134,3 +141,87 @@ class TestV1RewindReusedContext:
         _rewind([req], tail=4)
         assert req.setter_calls == []
         assert req.context_chunk_size == 12
+
+
+class _ConnectorReq:
+    """The slice of LlmRequest that _prepare_connector_prefix_reservation touches."""
+
+    def __init__(self, prompt_len):
+        self.py_request_id = 1
+        self.prompt_len = prompt_len
+        self.is_dummy = False
+        self.is_first_context_chunk = True
+        self.py_connector_allocation_reported = False
+        self.py_connector_served_position = 0
+        self.context_current_position = 0
+        self.prepopulated_prompt_len = 0
+        self.context_chunk_size = prompt_len
+
+    @property
+    def context_remaining_length(self):
+        return self.prompt_len - self.context_current_position
+
+    def set_prepopulated_prompt_len(self, value, tokens_per_block):
+        self.prepopulated_prompt_len = value
+        # Mirrors the C++ setter: only a nonzero value moves the position.
+        if value:
+            self.context_current_position = value
+
+
+def _reserve(req, *, local_end, offered_end, tail, tokens_per_block=4):
+    connector = Mock()
+    connector.should_add_sequence.return_value = True
+    connector.reserve_prefix.return_value = SimpleNamespace(end=offered_end)
+    connector.trim_prefix_reservation.side_effect = lambda req, start, end: SimpleNamespace(end=end)
+    mgr = Mock()
+    mgr._connector_reservations_enabled.return_value = True
+    mgr._connector_may_serve.return_value = True
+    mgr.kv_connector_manager = connector
+    mgr.kv_cache_map = {req.py_request_id: SimpleNamespace(num_committed_tokens=local_end)}
+    mgr.tokens_per_block = tokens_per_block
+    mgr._spec_recompute_tail = tail
+    mgr.is_draft = False
+    KVCacheManagerV2._prepare_connector_prefix_reservation(mgr, req)
+    return connector
+
+
+class TestConnectorReservationRecomputeCap:
+    """A connector-served prefix starves the drafter exactly like local reuse:
+    served tokens never pass a target forward, and once the load is accepted
+    the cursor cannot rewind below ``py_connector_served_position``. The
+    reservation end is therefore capped at the same recomputed-tail boundary
+    as local reuse, so the tail stays local by construction."""
+
+    def test_a_reservation_is_capped_so_the_tail_stays_local(self):
+        req = _ConnectorReq(prompt_len=33)
+        connector = _reserve(req, local_end=8, offered_end=32, tail=6)
+        # floor_block(33 - 6) = 24: at least the last 6 prompt tokens run
+        # through the local target forward.
+        connector.trim_prefix_reservation.assert_called_once_with(req, 8, 24)
+        assert req.context_current_position == 24
+        assert req.context_chunk_size == 9
+
+    def test_a_reservation_already_leaving_the_tail_local_is_untouched(self):
+        req = _ConnectorReq(prompt_len=33)
+        connector = _reserve(req, local_end=8, offered_end=24, tail=6)
+        # 33 - 24 = 9 >= 6: the unserved span already recomputes the tail.
+        connector.trim_prefix_reservation.assert_called_once_with(req, 8, 24)
+
+    def test_a_full_re_prefill_tail_releases_the_reservation(self):
+        req = _ConnectorReq(prompt_len=33)
+        connector = _reserve(req, local_end=8, offered_end=32, tail=-1)
+        connector.release_prefix_reservation.assert_called_once_with(req)
+        connector.trim_prefix_reservation.assert_not_called()
+        assert req.context_current_position == 0
+
+    def test_a_cap_at_or_below_the_local_commit_releases_the_reservation(self):
+        req = _ConnectorReq(prompt_len=33)
+        # floor_block(33 - 20) = 12 <= local 16: nothing left worth serving.
+        connector = _reserve(req, local_end=16, offered_end=32, tail=20)
+        connector.release_prefix_reservation.assert_called_once_with(req)
+
+    def test_a_zero_tail_leaves_the_reservation_alone(self):
+        req = _ConnectorReq(prompt_len=33)
+        connector = _reserve(req, local_end=8, offered_end=32, tail=0)
+        connector.trim_prefix_reservation.assert_called_once_with(req, 8, 32)
+        assert req.context_current_position == 32

@@ -187,6 +187,11 @@ def make_kv_cache_manager(
     mgr.enable_joint_kv_cache_reuse = enable_joint_kv_cache_reuse
     mgr.enable_block_reuse = enable_block_reuse
     mgr.num_extra_kv_tokens = 0
+    # Real scalars, not auto-created Mocks: tests bind the real
+    # prepare_context/_prepare_connector_prefix_reservation onto this mock,
+    # and both feed _spec_recompute_tail/is_draft into cursor arithmetic.
+    mgr._spec_recompute_tail = 0
+    mgr.is_draft = False
     mgr.can_evict = can_evict
     mgr._has_cp_helix = False
     mgr.is_vswa = is_vswa
@@ -917,6 +922,54 @@ class TestUnpairedDraftAdmission:
         assert ids(out.context_requests) == []
         # Refused before the pool was grown for a chunk that will not run.
         mgr.resize_context.assert_not_called()
+
+    def test_a_refused_admission_mid_chunking_suspends_the_target_cache(self):
+        """A non-first chunk reaches the admission with an ACTIVE target cache
+        (prepare_context just resumed it). Returning SKIP with that cache
+        active would pin its pages while the request waits on the draft pool,
+        and under pressure the requests whose completion would drain that pool
+        can then no longer grow their own target KV. Mirror the joint branch:
+        suspend both pools and let the retry resume them."""
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        draft_mgr.admit_mirror.side_effect = lambda req: False
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            ctx_chunk_config=(None, 64),
+            draft_kv_cache_manager=draft_mgr,
+        )
+        req = make_ctx_request(0, context_remaining_length=100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == []
+        mgr.suspend_request.assert_called_once_with(req)
+        draft_mgr.suspend_request.assert_called_once_with(req)
+
+    def test_a_refused_admission_on_a_first_chunk_is_rolled_back_not_suspended(self):
+        """First chunks are freed by _try_schedule_context (suspension alone
+        cannot release prefix-reuse holds when the last cache tier is full),
+        so the pair-preparation must not also suspend them."""
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        draft_mgr.admit_mirror.side_effect = lambda req: False
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            ctx_chunk_config=(None, 64),
+            draft_kv_cache_manager=draft_mgr,
+        )
+        req = make_ctx_request(0, context_remaining_length=100)
+        # A real prepare_context creates the kv_cache entry; the mocked one
+        # does not, so seed it for the rollback's membership check.
+        mgr.kv_cache_map[req.py_request_id]
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == []
+        mgr.suspend_request.assert_not_called()
+        mgr.free_resources.assert_called_once_with(req)
 
     def test_a_joint_draft_pool_is_left_to_its_own_admission(self):
         """Pairing already resumes the draft cache inside its own calls; going

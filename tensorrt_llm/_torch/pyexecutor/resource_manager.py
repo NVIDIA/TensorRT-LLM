@@ -1184,7 +1184,11 @@ class KVCacheManager(BaseResourceManager):
                         self.kv_connector_manager.update_state_after_alloc(
                             req, block_ids)
 
-                if self._spec_recompute_tail:
+                # Target manager only: the rewind restores target-forward
+                # coverage for drafter hidden-state capture, and the V2
+                # counterpart (_spec_recompute_target) no-ops on draft pools
+                # for the same reason.
+                if self._spec_recompute_tail and not self.is_draft:
                     self._maybe_rewind_reused_context(batch_llm_requests)
 
             for req in scheduled_batch.generation_requests:
