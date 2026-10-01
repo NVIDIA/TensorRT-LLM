@@ -3213,3 +3213,109 @@ def test_first_token_response_carries_the_prefill_logits(monkeypatch, overlap):
         assert py_result.generation_logits is None
         py_result.append_generation_logits(first_logits + 10)  # the next decode step lands
         assert torch.equal(response.result.generation_logits, first_logits.transpose(0, 1))
+
+
+# ---------------------------------------------------------------------------
+# PyExecutor._sync_gen_only_benchmark_has_insufficient_kv
+# ---------------------------------------------------------------------------
+
+
+def _sync_insufficient_kv_executor(
+    *,
+    fill_phase_active,
+    req_queues_size=8,
+    is_warmup=False,
+    num_fetch_requests=8,
+    active_requests=(),
+):
+    """Build a bare PyExecutor exposing only what the fail-fast vote reads.
+
+    ``PyExecutor.__new__`` skips ``__init__``, so the attributes the
+    ``is_warmup`` setter writes/reads must exist before it is assigned.
+    """
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = Mock()
+    executor.draft_model_engine = None
+    executor.benchmark_req_queues_size = req_queues_size
+    executor.is_warmup = is_warmup
+    executor._benchmark_fill_phase_active = fill_phase_active
+    executor.num_fetch_requests = num_fetch_requests
+    executor.active_requests = list(active_requests)
+    executor.dist = Mock()
+    executor.dist.tp_size = 2
+    executor.dist.cp_size = 1
+    executor.dist.rank = 0
+    return executor
+
+
+def test_sync_insufficient_kv_rank_local_fill_phase_never_skips_collective():
+    """A rank whose local fill-phase flag already cleared must still join the
+    status allgather; a peer still filling would otherwise block on a
+    collective this rank never enters (issue #19435 regression)."""
+    executor = _sync_insufficient_kv_executor(fill_phase_active=False)
+    executor.dist.tp_allgather.side_effect = lambda v: [(False, True, True), (True, True, True)]
+
+    result = PyExecutor._sync_gen_only_benchmark_has_insufficient_kv(executor, [], False)
+
+    # This rank votes (fill_phase=False, all_fetched=True, terminal=False):
+    # the cleared local flag is carried in the vote, not used to skip it.
+    executor.dist.tp_allgather.assert_called_once_with((False, True, False))
+    # The decision comes from the gathered votes: a peer is still filling.
+    assert result is False
+
+
+def test_sync_insufficient_kv_terminal_vote_when_all_ranks_fill_active():
+    """Every rank still filling, every queue fetched, and a terminal no-fit
+    INIT request: the fail-fast must fire."""
+    executor = _sync_insufficient_kv_executor(
+        fill_phase_active=True, active_requests=[_make_adp_request(_STATE_DISAGG_GENERATION_INIT)]
+    )
+    executor.dist.tp_allgather.side_effect = lambda v: [(True, True, True), (True, True, True)]
+
+    result = PyExecutor._sync_gen_only_benchmark_has_insufficient_kv(executor, [], False)
+
+    executor.dist.tp_allgather.assert_called_once_with((True, True, True))
+    assert result is True
+
+
+def test_sync_insufficient_kv_uses_gathered_fill_phase_for_decision():
+    """The fill-phase short-circuit is taken from the gathered result: a peer
+    that already cleared its flag makes the vote return False, while this rank
+    still participates in the collective."""
+    executor = _sync_insufficient_kv_executor(fill_phase_active=True)
+    executor.dist.tp_allgather.side_effect = lambda v: [(False, True, True), (True, True, True)]
+
+    result = PyExecutor._sync_gen_only_benchmark_has_insufficient_kv(executor, [], False)
+
+    # Locally still filling and fully fetched, but no stuck INIT request here.
+    executor.dist.tp_allgather.assert_called_once_with((True, True, False))
+    assert result is False
+
+
+def test_sync_insufficient_kv_gathered_fetch_and_terminal_conditions():
+    """The decision ANDs the gathered fill-phase and fetch votes, and ORs the
+    terminal vote across ranks."""
+    stuck = [_make_adp_request(_STATE_DISAGG_GENERATION_INIT)]
+
+    # A rank has not fetched its full queue yet -> no fail-fast.
+    executor = _sync_insufficient_kv_executor(fill_phase_active=True, active_requests=stuck)
+    executor.dist.tp_allgather.side_effect = lambda v: [(True, False, True), (True, True, True)]
+    assert PyExecutor._sync_gen_only_benchmark_has_insufficient_kv(executor, [], False) is False
+    executor.dist.tp_allgather.assert_called_once_with((True, True, True))
+
+    # One rank votes non-terminal, the other terminal -> fail-fast still fires.
+    executor = _sync_insufficient_kv_executor(fill_phase_active=True, active_requests=stuck)
+    executor.dist.tp_allgather.side_effect = lambda v: [(True, True, False), (True, True, True)]
+    assert PyExecutor._sync_gen_only_benchmark_has_insufficient_kv(executor, [], False) is True
+    executor.dist.tp_allgather.assert_called_once_with((True, True, True))
+
+
+def test_sync_insufficient_kv_rank_uniform_short_circuits_skip_collective():
+    """Outside benchmark fill mode no collective is entered, so normal serving
+    keeps its zero-steady-state-overhead path."""
+    for kwargs in ({"req_queues_size": 0}, {"is_warmup": True}):
+        executor = _sync_insufficient_kv_executor(fill_phase_active=True, **kwargs)
+        executor.dist.tp_allgather.side_effect = lambda v: [(True, True, True), (True, True, True)]
+
+        assert PyExecutor._sync_gen_only_benchmark_has_insufficient_kv(executor, [], False) is False
+        executor.dist.tp_allgather.assert_not_called()

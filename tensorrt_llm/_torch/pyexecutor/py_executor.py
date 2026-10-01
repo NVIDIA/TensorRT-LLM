@@ -3754,9 +3754,9 @@ class PyExecutor:
         """Gather a status over the TP+CP scheduling group.
 
         Args:
-            local_status: Caller-defined ``(state, flag)`` pair from this rank.
-                The fill gate uses ``(ready, transfer_progress)`` and the
-                fail-fast path uses ``(all_fetched, terminal_no_fit)``.
+            local_status: Caller-defined status tuple from this rank. The
+                fill gate uses ``(ready, transfer_progress)`` and the fail-fast
+                path uses ``(fill_phase_active, all_fetched, terminal_no_fit)``.
 
         Returns:
             One status pair per TP+CP rank in the current pipeline-parallel
@@ -3783,8 +3783,10 @@ class PyExecutor:
         Model-parallel ranks can make different local scheduling decisions.
         Every rank must therefore vote before entering the collective error-
         handling path. One terminal rank prevents the global benchmark fill
-        gate from opening. The vote is fill-only to avoid adding a collective
-        to every decode iteration after the gate opens.
+        gate from opening. The fill-phase flag is part of the vote as well:
+        ranks can observe the gate opening (``_benchmark_fill_phase_active``
+        cleared) in different iterations, so reading it before the collective
+        would let model-parallel ranks diverge in collective order.
 
         Args:
             scheduler_fitting_disagg_gen_init_requests: Generation INIT
@@ -3796,14 +3798,18 @@ class PyExecutor:
                 progress can unblock a deferred request.
 
         Returns:
-            True when every TP+CP rank has fetched its full benchmark queue and
-            at least one rank has an INIT request that cannot fit KV capacity
-            and has no transfer progress that can unblock it; otherwise False.
+            True while every TP+CP rank is still in the benchmark fill phase,
+            every rank has fetched its full benchmark queue, and at least one
+            rank has an INIT request that cannot fit KV capacity and has no
+            transfer progress that can unblock it; otherwise False.
         """
-        if (self.benchmark_req_queues_size <= 0 or self.is_warmup
-                or not self._benchmark_fill_phase_active):
+        if (self.benchmark_req_queues_size <= 0 or self.is_warmup):
             return False
 
+        # This flag is cleared per rank when the gate opens, so it must be
+        # voted on like any other status: model-parallel ranks cannot diverge
+        # in collective order.
+        local_fill_phase_active = self._benchmark_fill_phase_active
         local_has_stuck = any(req.is_disagg_generation_init_state
                               for req in self.active_requests)
         local_all_fetched = (self.num_fetch_requests
@@ -3811,12 +3817,15 @@ class PyExecutor:
         local_terminal_no_fit = (local_has_stuck and
                                  not scheduler_fitting_disagg_gen_init_requests
                                  and not wait_for_disagg_gen_transfer_progress)
-        local_status = (local_all_fetched, local_terminal_no_fit)
+        local_status = (local_fill_phase_active, local_all_fetched,
+                        local_terminal_no_fit)
 
         all_rank_status = self._allgather_model_parallel_status(local_status)
-        all_ranks_fetched = all(status[0] for status in all_rank_status)
-        any_rank_terminal_no_fit = any(status[1] for status in all_rank_status)
-        return all_ranks_fetched and any_rank_terminal_no_fit
+        all_ranks_in_fill_phase = all(status[0] for status in all_rank_status)
+        all_ranks_fetched = all(status[1] for status in all_rank_status)
+        any_rank_terminal_no_fit = any(status[2] for status in all_rank_status)
+        return (all_ranks_in_fill_phase and all_ranks_fetched
+                and any_rank_terminal_no_fit)
 
     def _prepare_and_schedule_batch(self):
         self._release_unused_connector_reservations()
