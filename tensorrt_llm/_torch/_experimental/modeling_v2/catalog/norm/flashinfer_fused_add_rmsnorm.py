@@ -17,7 +17,9 @@ from .._op import Arch, Cell, OpWrapper
 
 
 class _FlashinferFusedAddRmsnorm(OpWrapper):
-    """`residual += x; x = rmsnorm(residual) * weight`, in place, returns None.
+    """`residual += x; x = rmsnorm(residual) * weight`, in place, returns
+    `(x, residual)` -- the same two tensors, mutated and handed back so a call
+    site can show what it touched without allocating.
 
     Both tensors are written. The residual output is the fp32 sum rounded once
     to its own dtype; the normalization reads that sum in fp32, not the rounded
@@ -61,8 +63,12 @@ class _FlashinferFusedAddRmsnorm(OpWrapper):
 
     def raw_call(
         self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
-    ) -> None:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Writes `x` and `residual` in place and returns both, in that order
+        -- the op destroys each argument's prior contents, so a caller that
+        wants them has to have kept its own copy beforehand."""
         torch.ops.trtllm.flashinfer_fused_add_rmsnorm(x, residual, weight, eps)
+        return x, residual
 
     def reference(
         self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float

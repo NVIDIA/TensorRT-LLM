@@ -12,7 +12,9 @@ from .._op import Arch, Cell, OpWrapper, assert_within_ulp
 
 
 class _FusedQkNormRope(OpWrapper):
-    """In place on `qkv`: RMS-norm the q and k heads, then rotate them. Returns None.
+    """In place on `qkv`: RMS-norm the q and k heads, then rotate them.
+    Returns `qkv` -- the same buffer, mutated and handed back so a call site
+    can show what it touched without allocating.
 
     The v heads are not touched. `qkv` is one `[num_tokens, (Hq + Hk + Hv) *
     head_dim]` buffer, which is the layout the fused projection already
@@ -87,7 +89,10 @@ class _FusedQkNormRope(OpWrapper):
         use_mrope: bool = False,
         mrope_section1: int = 0,
         mrope_section2: int = 0,
-    ) -> None:
+    ) -> torch.Tensor:
+        """Writes `qkv` in place and returns it -- the op destroys the q/k
+        heads' prior contents, so a caller that wants them has to have kept
+        its own copy beforehand."""
         torch.ops.trtllm.fused_qk_norm_rope(
             qkv,
             num_heads_q,
@@ -111,6 +116,7 @@ class _FusedQkNormRope(OpWrapper):
             mrope_section1,
             mrope_section2,
         )
+        return qkv
 
     def reference(
         self,
