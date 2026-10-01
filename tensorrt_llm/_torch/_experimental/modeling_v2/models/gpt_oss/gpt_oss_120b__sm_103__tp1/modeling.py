@@ -84,7 +84,9 @@ def _build_step_args(
     the engine prepared it. CUDA-graph classes: tensors are engine-owned
     persistent buffers refreshed in place (reference class); Python ints
     are per-capture constants (host-derived class). attention_window_size is
-    absent here on purpose: it varies per layer and is passed at the call site.
+    absent here on purpose: it is per-layer, not per-step, and is bound once
+    with `bind_layered` on the target's first forward instead -- see the
+    comment at that call site.
 
     `num_contexts` and `num_ctx_tokens` are passed rather than read off `md`
     because they are the two values a decode target knows by its routing --
@@ -245,8 +247,9 @@ class ModelingV2Core(DecoderModel):
         # load(), a separate module reached through `core.X` at a separate
         # time (load_weights, before `build_layer_views`), which is why they
         # stay instance attributes rather than becoming locals here. The two
-        # exceptions are `window` and `sliding`, still read every forward --
-        # see the comment at their read site for why they cannot move.
+        # exceptions are `window` and `sliding`, read once on a target's
+        # first forward to build its attention_window_size table -- see the
+        # comment at that `bind_layered` call for why it cannot run earlier.
         self.num_layers = cfg.num_hidden_layers
         self.hidden = cfg.hidden_size
         self.heads_q = cfg.num_attention_heads
@@ -467,6 +470,12 @@ class _GptOssTarget(Target):
         model computes.
         """
         super().__init__(core)
+        # One-shot: attention_window_size is bound on this target's first
+        # forward rather than here -- see the comment at the `bind_layered`
+        # call in `forward`. Mirrors `ModelingV2Core._contract_pending`:
+        # "pending" because the check this guards runs exactly once, not
+        # "enabled" state that toggles back and forth.
+        self._window_pending = True
         cfg = core.model_config.pretrained_config
         w = core.w
         device = w["final_norm"].device
@@ -516,14 +525,15 @@ class _GptOssTarget(Target):
             is_qk_norm=False,
         )
 
-        # attention_window_size is deliberately absent here -- see the
-        # comment at its read site in `forward` for why it cannot be a
-        # construction-time per-layer table. local_layer_idx is layered
-        # rather than passed at the call site even though it is exactly
-        # `layer`'s own value: it is a genuine op argument (the row
-        # thop_attention reads out of the pool mapping), not the binding
-        # mechanism's own index, and layering it here means the call site
-        # states `layer=i` once instead of the same `i` under two names.
+        # attention_window_size is deliberately absent here -- it is not
+        # knowable until a forward is underway (see the comment at its
+        # `bind_layered` call in `forward`), so this target's first forward
+        # binds it, not `__init__`. local_layer_idx is layered rather than
+        # passed at the call site even though it is exactly `layer`'s own
+        # value: it is a genuine op argument (the row thop_attention reads
+        # out of the pool mapping), not the binding mechanism's own index,
+        # and layering it here means the call site states `layer=i` once
+        # instead of the same `i` under two names.
         self._attn = type(thop_attention)()
         self._attn.bind_layered(attention_sinks=table("sinks"), local_layer_idx=layer_idx)
         self._attn.bind_const(
@@ -609,18 +619,29 @@ class _GptOssTarget(Target):
         advance_step_generation()
         self._attn.bind_const(**self.step_args(attn_metadata))
 
-        # attention_window_size cannot be a construction-time per-layer table
-        # like attention_sinks: its full-attention value is
-        # attn_metadata.max_seq_len, which reads the KV cache manager's
-        # *resolved* max_seq_len. That is not known until the cache is sized,
-        # well after `_GptOssTarget.__init__` runs at post-load, and it is not
-        # guaranteed to equal the engine's requested max_seq_len --
-        # resource_manager.py's window validation can clamp it down under
-        # memory pressure, and a value baked in at construction would then
-        # silently diverge from the one the engine actually runs with. So
-        # this stays a per-forward computation, read fresh off the metadata
-        # every step like it was before per-layer tables existed.
-        full_window = attn_metadata.max_seq_len
+        if self._window_pending:
+            # attention_window_size is per-layer but not per-step, so it is
+            # bound once with bind_layered rather than every forward like the
+            # state above, and not at construction like attention_sinks:
+            # its full-attention value is attn_metadata.max_seq_len, which
+            # reads the KV cache manager's *resolved* max_seq_len, not known
+            # until the cache is sized -- well after `_GptOssTarget.__init__`
+            # runs at post-load. By this first forward the cache already
+            # exists, so the value read here is final: no attention backend
+            # reassigns `max_seq_len` per step (see `AttentionMetadata` in
+            # interface.py), and the only writes to it happen in
+            # `KVCacheManager.__init__` and engine construction, both of
+            # which are long done once a forward reaches this target. Guarded
+            # by a flag rather than left in the per-layer loop below, so a
+            # served engine pays this read once per target's lifetime, not
+            # once a layer.
+            full_window = attn_metadata.max_seq_len
+            self._attn.bind_layered(
+                attention_window_size=tuple(
+                    core.window if sliding else full_window for sliding in core.sliding
+                )
+            )
+            self._window_pending = False
 
         pos = torch.reshape(position_ids, [-1])
 
@@ -639,12 +660,7 @@ class _GptOssTarget(Target):
         for i in range(core.num_layers):
             qkv = self._qkv(x, layer=i)
             qkv = self._qk_rope(qkv, position_ids=pos)
-            attn_out = self._attn(
-                q=qkv,
-                output=attn_out,
-                layer=i,
-                attention_window_size=core.window if core.sliding[i] else full_window,
-            )
+            attn_out = self._attn(q=qkv, output=attn_out, layer=i)
             o = self._o_proj(attn_out, layer=i)
             o, residual = self._norm2(o, residual, layer=i)
             # The router bias rides the GEMM epilogue: the MoE op silently
