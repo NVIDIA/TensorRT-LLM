@@ -62,6 +62,8 @@ BOLT_PROFILES_REQUIRED = (params.boltProfilesRequired ?: env.boltProfilesRequire
 // because overlayBoltBundle runs well below the scope globalVars is passed into.
 // Empty means unpinned, i.e. take whatever `latest` is.
 BOLT_PINNED_REF = ""
+// The branch that pin lives under. Set only together with the ref.
+BOLT_PINNED_BRANCH = ""
 // <<< BOLT profile-bundle overlay <<<
 
 ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
@@ -356,13 +358,12 @@ def overlayBoltBundle(pairs, arch, action) {
     // The overlay is a consumer like any other, so it takes the pipeline's pin
     // rather than resolving `latest` when it happens to run. Without this the
     // released image could carry a profile bundle that no other artifact in the
-    // run was built from, and boltProfilesRequired would not catch it: a bundle
-    // from any commit passes the manifest and profile-presence checks below.
-    // Empty means unpinned and pull-latest behaves exactly as before. The
-    // candidate walk is kept: the ref is a commit SHA, so the same ref under
-    // another branch's promote directory is the bundle built from that commit.
-    if (BOLT_PINNED_REF) {
-        echo "[BOLT] overlay pinned to bundle ${BOLT_PINNED_REF}"
+    // run was built from. Empty means unpinned and pull-latest behaves exactly
+    // as before; pinned, the pin supplies its own branch and the candidate walk
+    // collapses to it, because the ref names one object under one directory.
+    if (BOLT_PINNED_REF && BOLT_PINNED_BRANCH) {
+        candidates = [BOLT_PINNED_BRANCH]
+        echo "[BOLT] overlay pinned to bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
     }
     for (cand in candidates) {
         for (int attempt = 1; attempt <= 3 && !haveBundle; attempt++) {
@@ -672,6 +673,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
 def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
+    BOLT_PINNED_BRANCH = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
     def defaultBuildConfig = [
         target: "tritondevel",
         action: params.action,
