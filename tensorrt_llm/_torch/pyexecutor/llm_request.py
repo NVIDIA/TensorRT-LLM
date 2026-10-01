@@ -5,8 +5,8 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import (TYPE_CHECKING, Any, Dict, Hashable, Iterable, List,
-                    Optional, Union, cast)
+from typing import (TYPE_CHECKING, Any, Container, Dict, Hashable, Iterable,
+                    List, Optional, Union, cast)
 
 import torch
 
@@ -207,8 +207,12 @@ class MultimodalEncoderRequestState:
 
     def mark_cache_key_ready(self, cache_key: Hashable) -> None:
         """Mark every item using `cache_key` as ready."""
+        self.mark_cache_keys_ready((cache_key, ))
+
+    def mark_cache_keys_ready(self, cache_keys: Container[Hashable]) -> None:
+        """Mark every item using one of `cache_keys` as ready."""
         for item_idx, bound_cache_key in enumerate(self.item_cache_keys):
-            if bound_cache_key == cache_key and not self.item_ready[item_idx]:
+            if bound_cache_key is not None and bound_cache_key in cache_keys:
                 self.item_ready[item_idx] = True
 
     def pop_all_cache_keys(self) -> List[Hashable]:
