@@ -112,6 +112,11 @@ def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool
     below, the scheduler wrap and the executor encoder step must all agree. Both
     ``disable_mm_encoder`` and a ``DISABLED`` policy keep the capability but run only the
     base LLM scheduler.
+
+    Item scheduling does not yet support pipeline parallelism. Under PP, ``DEFAULT`` falls
+    back to inline encode with a warning; ``EAGER`` stays engaged so that
+    ``validate_mm_encoder_scheduling_compatibility`` rejects it. This keys on the policy
+    value, not ``model_fields_set``: applying model defaults marks every field as set.
     """
     mm_config = getattr(llm_args, "multimodal_config", None)
     policy = (
@@ -119,12 +124,25 @@ def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool
         if mm_config is not None
         else MultimodalEncoderSchedulingPolicy.DEFAULT
     )
-    return (
+    enabled = (
         not llm_args.disable_mm_encoder
         and isinstance(model, MultimodalModelMixin)
         and model.supports_mm_encoder_item_scheduling
         and policy != MultimodalEncoderSchedulingPolicy.DISABLED
     )
+    if (
+        enabled
+        and llm_args.pipeline_parallel_size > 1
+        and policy == MultimodalEncoderSchedulingPolicy.DEFAULT
+    ):
+        logger.warning_once(
+            "MM encoder item scheduling does not yet support pipeline parallelism; "
+            "falling back to inline MM encoding. Set "
+            "multimodal_config.encoder_scheduling_policy=DISABLED to select it explicitly.",
+            key="mm_encoder_item_scheduling_pp_fallback",
+        )
+        return False
+    return enabled
 
 
 def mm_encoder_cache_enabled(model: nn.Module) -> bool:
