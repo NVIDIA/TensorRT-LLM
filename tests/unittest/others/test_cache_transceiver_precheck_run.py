@@ -36,6 +36,7 @@ import json
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -1230,6 +1231,56 @@ class TestInternalApiContract:
 
         assert rp.resolve_model_prefs(str(model_dir), side, cache_cfg) is True
 
+    @pytest.mark.parametrize("role", ["ctx", "gen"])
+    @pytest.mark.parametrize(
+        "topology",
+        [
+            "con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3",
+            "con1456_ctx3_dep8_gen1_dep16_eplb0_dspark5",
+        ],
+    )
+    def test_deepseek_v4_declared_architecture_without_checkpoint(
+        self, api: object, tmp_path: Path, role: str, topology: str
+    ) -> None:
+        """Both failing configurations resolve V2/PYTHON without model weights."""
+        import yaml
+
+        config_path = (
+            Path(rp.__file__).parent.parent
+            / "disaggregated"
+            / (f"gb300_deepseek-v4-pro-dspark_agentx_{topology}_ccb-NIXL.yaml")
+        )
+        cfg = yaml.safe_load(config_path.read_text())
+        assert rp.pcfg.resolve_model_dir(cfg, llm_models_root=str(tmp_path)) is None
+        side = rp.pcfg.side_plan(rp.pcfg.resolve_plan(cfg), role)
+        cache_cfg = api.CacheTransceiverConfig(**side["cache_transceiver_config"])
+        assert rp.resolve_model_prefs(None, side, cache_cfg) is True
+        assert cache_cfg.transceiver_runtime == "PYTHON"
+
+    def test_resolved_contract_includes_pipelined_runtime_promotion(self, api: object) -> None:
+        """Record the final Python runtime when pipelining promotes an unset runtime."""
+        cfg = {
+            "hardware": {"gpus_per_node": 1, "num_ctx_servers": 1, "num_gen_servers": 1},
+            "worker_config": {
+                role: {
+                    "cache_transceiver_config": {
+                        "backend": "NIXL",
+                        "transceiver_runtime": None,
+                        "enable_pipelined_transfer": True,
+                    },
+                    "kv_cache_config": {"use_kv_cache_manager_v2": False},
+                }
+                for role in ("ctx", "gen")
+            },
+        }
+        runner = rp.PrecheckRunner.__new__(rp.PrecheckRunner)
+        runner.plan = rp.pcfg.resolve_plan(cfg)
+        runner.role, runner.is_leader = "ctx", False
+        resolved = runner._resolve_transfer_config(dict(rp.pcfg.FALLBACK_KV_SHAPE))
+        assert resolved.transceiver_runtime == "PYTHON"
+        assert runner.transfer_contract["ctx"]["runtime"] == "PYTHON"
+        assert runner.transfer_contract["gen"]["runtime"] == "PYTHON"
+
     def test_enum_members(self, api):
         for enum, members in (
             (api.DataType, ("FP8", "HALF", "BF16")),
@@ -1300,3 +1351,131 @@ class TestInternalApiContract:
         assert gen_req.py_request_id == 13
         py_gen = rp.make_request(False, rid=14, req_len=8, runtime="PYTHON", ctx_params=ctx_params)
         assert py_gen.py_disaggregated_params.request_type == "generation_only"
+
+
+@pytest.mark.parametrize(
+    "model_dir,declared,registered,expected",
+    [
+        (None, ["Declared"], True, True),
+        ("/checkpoint", ["Declared"], True, False),
+        (None, [], False, None),
+        (None, ["Unknown"], False, None),
+        ("/checkpoint", ["Declared"], False, None),
+    ],
+)
+def test_architecture_fallback_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    model_dir: str | None,
+    declared: list[str],
+    registered: bool,
+    expected: bool | None,
+) -> None:
+    """Checkpoint identity wins; unknown or missing identity still fails closed."""
+    checkpoint_cls = object() if model_dir and registered else None
+    declared_cls = object() if registered or model_dir else None
+    view = object() if model_dir else None
+    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _: (checkpoint_cls, view))
+    api = types.SimpleNamespace(
+        get_registered_model_class=lambda _: declared_cls,
+        TorchLlmArgs=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        resolve_kv_cache_manager_v2_auto=lambda args, cls, config: cls is declared_cls,
+    )
+    monkeypatch.setattr(rp, "load_internal_apis", lambda: api)
+    side = {
+        "architectures": declared,
+        "use_kv_cache_manager_v2": "auto",
+        "parallel": {"tp": 1, "pp": 1, "cp": 1},
+    }
+    cache_cfg = types.SimpleNamespace(transceiver_runtime="PYTHON")
+    if expected is None:
+        with pytest.raises(RuntimeError, match="refusing to assume V1"):
+            rp.resolve_model_prefs(model_dir, side, cache_cfg)
+    else:
+        assert rp.resolve_model_prefs(model_dir, side, cache_cfg) is expected
+
+
+@pytest.mark.parametrize("failure", ["resolution", "rank_contract", "api_import"])
+def test_setup_rejects_rank_divergence_before_construction(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """All ranks synchronize local errors before entering GPU constructors."""
+    runner = rp.PrecheckRunner.__new__(rp.PrecheckRunner)
+    runner.transfer_contract = {"ctx": {"use_v2": True}}
+    calls = []
+
+    def allgather(value: object) -> list:
+        """Emulate one remote rank disagreeing at the correct collective."""
+        calls.append(value)
+        if len(calls) == 1:
+            return [value, "missing architecture" if failure == "resolution" else ""]
+        return [value, {"ctx": {"use_v2": False}}]
+
+    runner.comm = types.SimpleNamespace(allgather=allgather)
+    if failure != "api_import":
+        runner._resolve_transfer_config = lambda shape: object()
+
+    def load_api() -> object:
+        """Fail the real preparation import when testing rank-local errors."""
+        if failure == "api_import":
+            raise ImportError("native binding unavailable")
+        return types.SimpleNamespace()
+
+    monkeypatch.setattr(rp, "load_internal_apis", load_api)
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "configuration resolution"
+            if failure != "rank_contract"
+            else "contract mismatch within instance"
+        ),
+    ):
+        runner.setup({}, 32)
+    assert len(calls) == (2 if failure == "rank_contract" else 1)
+
+
+@pytest.mark.parametrize("role", ["ctx", "gen"])
+def test_resolved_contract_preserves_role_asymmetry(
+    monkeypatch: pytest.MonkeyPatch, role: str
+) -> None:
+    """Both peers derive the same full contract despite role and path differences."""
+    import precheck_config as pcfg
+
+    cfg = {
+        "metadata": {"architectures": ["Example"]},
+        "hardware": {"gpus_per_node": 1, "num_ctx_servers": 1, "num_gen_servers": 1},
+        "worker_config": {
+            side: {
+                "cache_transceiver_config": {"backend": "DEFAULT", "transceiver_runtime": "PYTHON"},
+                "kv_cache_config": {
+                    "use_kv_cache_manager_v2": side == "gen",
+                    "dtype": "half" if side == "ctx" else "fp16",
+                },
+            }
+            for side in ("ctx", "gen")
+        },
+    }
+
+    def make_cache_config(**kwargs: object) -> object:
+        """Stand in for external pydantic config with its backend resolver surface."""
+        return types.SimpleNamespace(**kwargs, _resolve_default_backend=lambda: ("NIXL", None))
+
+    monkeypatch.setattr(
+        rp,
+        "load_internal_apis",
+        lambda: types.SimpleNamespace(
+            CacheTransceiverConfig=make_cache_config,
+            resolve_cache_transceiver_config=lambda cfg: None,
+            get_registered_model_class=lambda name: object(),
+        ),
+    )
+    runner = rp.PrecheckRunner.__new__(rp.PrecheckRunner)
+    runner.plan = pcfg.resolve_plan(cfg)
+    runner.role, runner.is_leader = role, False
+    shape = dict(pcfg.FALLBACK_KV_SHAPE, source="different local path")
+    resolved = runner._resolve_transfer_config(shape)
+    assert runner.use_v2 is (role == "gen")
+    assert resolved.transceiver_runtime == "PYTHON"
+    expected = {"runtime": "PYTHON", "backend": "NIXL", "kv_dtype": "fp16"}
+    assert runner.transfer_contract["ctx"] == dict(expected, use_v2=False)
+    assert runner.transfer_contract["gen"] == dict(expected, use_v2=True)
+    assert "source" not in runner.transfer_contract["kv_shape"]
