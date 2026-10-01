@@ -352,6 +352,11 @@ def _populate_dummy_mrope_config(req: LlmRequest, token_num: int,
 
 
 class KVCacheManager(BaseResourceManager):
+    # Declared on the class so it is present even when an instance is built
+    # without running __init__ (which overwrites it from the spec config);
+    # prepare_resources reads it on such test-built instances. Zero disables
+    # the spec recompute tail.
+    _spec_recompute_tail: int = 0
 
     def __init__(
         self,

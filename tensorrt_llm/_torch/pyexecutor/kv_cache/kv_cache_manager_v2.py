@@ -1196,6 +1196,11 @@ class KVCacheManagerV2(BaseResourceManager):
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
+    # Declared on the class for the same reason: prepare_context and the
+    # connector-reservation cap read it on instances tests build without
+    # running __init__ (which overwrites it from the spec config). Zero
+    # disables the spec recompute tail.
+    _spec_recompute_tail: int = 0
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
