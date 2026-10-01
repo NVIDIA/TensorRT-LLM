@@ -42,7 +42,13 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
+
 MINIMAX_H3_MODALITY_NUM = 3
+
+# Dispatch switch for the fused AdaLN kernels; benchmarks and tests flip it to
+# compare against the separate RMSNorm and modulation path.
+FUSE_ADALN = True
 
 
 @dataclass
@@ -392,6 +398,8 @@ class MiniMaxH3TransformerBlock(nn.Module):
             hidden_size=hidden_size,
             model_config=model_config,
         )
+        # Fused RMSNorm + gathered modulation (and the gated residual before norm2): internal gating, BF16 only.
+        self._fused_adaln = h3_adaln_supported(hidden_size, model_config.torch_dtype)
 
     def forward(
         self,
@@ -402,6 +410,10 @@ class MiniMaxH3TransformerBlock(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if FUSE_ADALN and self._fused_adaln and hidden_states.dtype == torch.bfloat16:
+            return self._forward_fused_adaln(
+                hidden_states, temb, adaln_indices, rotary_emb, key_padding_mask, timestep
+            )
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
 
         residual = hidden_states
@@ -425,6 +437,41 @@ class MiniMaxH3TransformerBlock(nn.Module):
             norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
         ).reshape_as(norm_hidden_states)
         return residual + gate_mlp.index_select(0, adaln_indices) * ff_output
+
+    def _forward_fused_adaln(
+        self,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        adaln_indices: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        key_padding_mask: Optional[torch.Tensor],
+        timestep: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        hidden_size = hidden_states.shape[-1]
+        # [n_t * 3, 6 * D]: one row per (timestep, modality); chunks shift/scale/gate (msa), shift/scale/gate (mlp).
+        mod = self.adaln_proj.linear(F.silu(temb).to(self.adaln_proj.linear.dtype)).view(
+            -1, 6 * hidden_size
+        )
+        norm_hidden_states = h3_norm_mod(
+            hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
+        )
+        attn_output = self.attn(norm_hidden_states, rotary_emb, key_padding_mask, timestep)
+        hidden_states, norm_hidden_states = h3_gate_res_norm_mod(
+            hidden_states,
+            attn_output,
+            self.norm2.weight,
+            mod,
+            adaln_indices,
+            self.norm2.variance_epsilon,
+            2,
+            4,
+            3,
+        )
+        ff_output = self.ff(
+            norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
+        ).reshape_as(norm_hidden_states)
+        gate_mlp = mod[:, 5 * hidden_size : 6 * hidden_size]
+        return hidden_states + gate_mlp.index_select(0, adaln_indices) * ff_output
 
 
 class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
