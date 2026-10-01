@@ -648,6 +648,10 @@ boundary translates public activation IDs to the internal enum values.
 When SwiGLU parameters are present, it supplies missing alpha/beta defaults
 as tensors so the legacy archive consumes the clamp limit.
 Public routing helpers remain available in either build.
+`torch.ops.trtllm.is_oss_cutlass_moe()` reports the build mode of the loaded
+native library. CUTLASS eligibility uses it to reject post-SiLU clamping and
+routed-expert LoRA during backend selection for internal builds, before
+inference reaches the native runner.
 
 Declare `limit_when_absent` only when the ABI has no encoding for "no clamp":
 `CuteDslFusedMoE` passes `float("inf")` because its epilogue always applies the

@@ -2620,6 +2620,15 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY(trtllm, m)
 {
+    m.def("is_oss_cutlass_moe() -> bool",
+        []()
+        {
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
+            return true;
+#else
+        return false;
+#endif
+        });
     m.class_<tensorrt_llm::torch_ext::FusedMoeRunner>("FusedMoeRunner")
         .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool, bool, bool, bool>())
         .def("run_gemm_profile", &tensorrt_llm::torch_ext::FusedMoeRunner::runGemmProfile)
