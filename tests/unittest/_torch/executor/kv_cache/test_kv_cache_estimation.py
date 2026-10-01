@@ -31,9 +31,9 @@ from tensorrt_llm._torch.pyexecutor._util import (
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
@@ -207,8 +207,9 @@ class _TextModel:
         )
 
 
-class _MultimodalModel(MultimodalModelMixin):
+class _MultimodalModel(MultimodalModelMixin, torch.nn.Module):
     def __init__(self, encoder_cache_max_bytes):
+        super().__init__()
         self.model_config = ModelConfig(
             multimodal_config=MultimodalConfig(encoder_cache_max_bytes=encoder_cache_max_bytes)
         )
@@ -222,9 +223,10 @@ class _EncoderCacheMultimodalModel(_MultimodalModel):
 class _ModelEngine:
     model: _TextModel | _MultimodalModel
     mm_encoder_output_budget_bytes: int | None = None
-    mm_encoder_cache: TensorLRUCache | None = None
+    _mm_item_scheduler: object | None = None
     mm_encoder_item_scheduling_enabled: bool = False
     bytes_per_mm_encoder_embedding: int = 8
+    mm_encoder_cache = PyTorchModelEngine.mm_encoder_cache
 
 
 def _make_reserve_creator(
@@ -243,7 +245,6 @@ def _make_reserve_creator(
     # Match ModelLoader: the model receives the effective, normalized config
     # from TorchLlmArgs rather than retaining the caller's input object.
     model.model_config.multimodal_config = llm_args.multimodal_config
-    cache_bytes = 0
     if isinstance(model, MultimodalModelMixin):
         cache_bytes = mm_encoder_output_budget_bytes or 0
         if model.encoder_cache_active:
@@ -251,11 +252,13 @@ def _make_reserve_creator(
                 cache_bytes,
                 model.model_config.multimodal_config.encoder_cache_max_bytes,
             )
+        model._initialize_multimodal_encoder_cache(cache_bytes)
+    item_scheduling = mm_encoder_output_budget_bytes is not None
     model_engine = _ModelEngine(
         model=model,
         mm_encoder_output_budget_bytes=mm_encoder_output_budget_bytes,
-        mm_encoder_cache=TensorLRUCache(cache_bytes) if cache_bytes else None,
-        mm_encoder_item_scheduling_enabled=mm_encoder_output_budget_bytes is not None,
+        _mm_item_scheduler=object() if item_scheduling else None,
+        mm_encoder_item_scheduling_enabled=item_scheduling,
     )
     return KvCacheCreator(
         model_engine=model_engine,
@@ -568,6 +571,9 @@ def test_reserve_adds_unprofiled_store_and_chunk_copies(
         mm_encoder_output_budget_bytes=cache_bytes,
         max_num_tokens=max_num_tokens,
     )
+    assert creator._get_multimodal_encoder_memory_reserve(profiled_bytes) == expected
+    # Whole-model torch.compile wraps the model after its cache is created.
+    creator._model_engine.model = torch.compile(creator._model_engine.model)
     assert creator._get_multimodal_encoder_memory_reserve(profiled_bytes) == expected
 
 

@@ -1093,11 +1093,13 @@ class PyTorchModelEngine(ModelEngine):
     @property
     def mm_encoder_cache(self) -> Optional[TensorLRUCache]:
         """Return the model-owned encoder-output cache used by this engine."""
-        if not isinstance(self.model, MultimodalModelMixin):
+        # Whole-model torch.compile wraps the model after its cache is created.
+        model = getattr(self.model, "_orig_mod", self.model)
+        if not isinstance(model, MultimodalModelMixin):
             return None
-        if self._mm_item_scheduler is None and not self.model.encoder_cache_active:
+        if self._mm_item_scheduler is None and not model.encoder_cache_active:
             return None
-        return self.model._multimodal_encoder_cache
+        return model._multimodal_encoder_cache
 
     def get_mm_encoder_item_cache_keys(
             self, request: LlmRequest) -> Optional[List[Hashable]]:
