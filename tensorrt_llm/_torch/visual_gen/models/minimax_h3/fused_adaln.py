@@ -18,14 +18,14 @@
     gate_res_norm_mod:  x1     = x + gate[idx] * a
                         m      = rmsnorm(x1) * (1 + scale[idx]) + shift[idx]        -> (x1, m)
 
+``idx`` must hold one row index per sequence position, each below ``mod.shape[0]`` (the model validates
+its layout once per request; the kernel does not bounds-check the gather).
 ``mod`` is the AdaLN projection output viewed as ``[n_t * 3, 6 * D]`` (one row per (timestep, modality) pair, the
 six chunks shift/scale/gate for attention and MLP in order); ``idx`` maps each packed token to its row. The tables
 are read in place (no per-token materialization). Rounding points follow the compiled reference: x1 is stored in
 bf16 and normalized from those bf16 values, the RMSNorm result is rounded to bf16 (the reference norm is an opaque
 custom op), the modulation is fp32 math with one final rounding.
 """
-
-from typing import Tuple
 
 import torch
 import triton
@@ -65,12 +65,14 @@ def _minimax_h3_adaln_kernel(
     scale_off,
     shift_off,
     eps,
+    SEQ,
     HAS_RES: tl.constexpr,
     CH: tl.constexpr,
 ):
     row = tl.program_id(0)
     r64 = row.to(tl.int64)
-    mrow = tl.load(idx_ptr + row).to(tl.int64)
+    # idx has one entry per sequence position; rows are [batch * sequence].
+    mrow = tl.load(idx_ptr + row % SEQ).to(tl.int64)
     mb = mod_ptr + mrow * mod_stride
     xr = x_ptr + r64 * x_stride
     x0 = _ld(xr, 0 * CH, D, CH)
@@ -131,6 +133,11 @@ def h3_adaln_supported(hidden_size: int, dtype: torch.dtype) -> bool:
 
 def _launch(x, a, w, mod, idx, eps, gate_col, scale_col, shift_col):
     D = x.shape[-1]
+    seq_len = x.shape[-2] if x.ndim >= 2 else x.shape[0]
+    if idx.numel() != seq_len:
+        raise ValueError(
+            f"adaln_indices must have one entry per sequence position: {idx.numel()} vs {seq_len}"
+        )
     x2 = x.reshape(-1, D)
     if x2.stride(-1) != 1:
         x2 = x2.contiguous()
@@ -161,6 +168,7 @@ def _launch(x, a, w, mod, idx, eps, gate_col, scale_col, shift_col):
         scale_col * D,
         shift_col * D,
         eps,
+        seq_len,
         HAS_RES=has_res,
         CH=_CH,
         num_warps=4,
@@ -208,7 +216,7 @@ def h3_gate_res_norm_mod(
     gate_col: int,
     scale_col: int,
     shift_col: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """x1 = x + mod[idx, gate] * a; m = rmsnorm(x1) * (1 + mod[idx, scale]) + mod[idx, shift]."""
     x1, m = _launch(x, a, w, mod, idx, eps, gate_col, scale_col, shift_col)
     return x1.view(x.shape), m.view(x.shape)

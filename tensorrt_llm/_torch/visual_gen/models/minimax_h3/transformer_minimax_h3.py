@@ -46,10 +46,6 @@ from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
 
 MINIMAX_H3_MODALITY_NUM = 3
 
-# Dispatch switch for the fused AdaLN kernels; benchmarks and tests flip it to
-# compare against the separate RMSNorm and modulation path.
-FUSE_ADALN = True
-
 
 @dataclass
 class MiniMaxH3TransformerOutput:
@@ -218,9 +214,17 @@ class MiniMaxH3AdaLayerNormModulation(nn.Module):
             reduce_output=False,
         )
 
-    def forward(self, temb: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def table(self, temb: torch.Tensor) -> torch.Tensor:
+        """Return the modulation table ``[n_t * 3, 6 * hidden_size]``.
+
+        One row per ``(timestep, modality)`` pair; the six column blocks are
+        shift, scale and gate for attention, then shift, scale and gate for the MLP.
+        """
         temb = self.linear(F.silu(temb).to(self.linear.dtype))
-        return temb.view(-1, 6 * self.hidden_size).chunk(6, dim=-1)
+        return temb.view(-1, 6 * self.hidden_size)
+
+    def forward(self, temb: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return self.table(temb).chunk(6, dim=-1)
 
 
 class MiniMaxH3AdaLayerNormOut(nn.Module):
@@ -398,7 +402,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             hidden_size=hidden_size,
             model_config=model_config,
         )
-        # Fused RMSNorm + gathered modulation (and the gated residual before norm2): internal gating, BF16 only.
+        # Fused RMSNorm + gathered modulation (and the gated residual before norm2).
         self._fused_adaln = h3_adaln_supported(hidden_size, model_config.torch_dtype)
 
     def forward(
@@ -410,7 +414,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if FUSE_ADALN and self._fused_adaln and hidden_states.dtype == torch.bfloat16:
+        if self._fused_adaln and hidden_states.dtype == torch.bfloat16:
             return self._forward_fused_adaln(
                 hidden_states, temb, adaln_indices, rotary_emb, key_padding_mask, timestep
             )
@@ -448,10 +452,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         timestep: Optional[torch.Tensor],
     ) -> torch.Tensor:
         hidden_size = hidden_states.shape[-1]
-        # [n_t * 3, 6 * D]: one row per (timestep, modality); chunks shift/scale/gate (msa), shift/scale/gate (mlp).
-        mod = self.adaln_proj.linear(F.silu(temb).to(self.adaln_proj.linear.dtype)).view(
-            -1, 6 * hidden_size
-        )
+        mod = self.adaln_proj.table(temb)
         norm_hidden_states = h3_norm_mod(
             hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
         )

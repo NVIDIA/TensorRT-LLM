@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tests for the MiniMax-H3 fused AdaLN kernels (RMSNorm + gathered modulation, gated residual)."""
 
 import pytest
@@ -28,10 +40,10 @@ def _rmsnorm_bf16(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Te
     )
 
 
-def _inputs(rows=1029, hidden=1536, n_mod=6, seed=3):
+def _inputs(rows=1029, hidden=1536, n_mod=6, seed=3, batch=1):
     torch.manual_seed(seed)
-    x = torch.randn((1, rows, hidden), device="cuda", dtype=torch.bfloat16)
-    a = torch.randn((1, rows, hidden), device="cuda", dtype=torch.bfloat16)
+    x = torch.randn((batch, rows, hidden), device="cuda", dtype=torch.bfloat16)
+    a = torch.randn((batch, rows, hidden), device="cuda", dtype=torch.bfloat16)
     w = (1 + 0.1 * torch.randn(hidden, device="cuda")).to(torch.bfloat16)
     mod = (0.5 * torch.randn((n_mod, 6 * hidden), device="cuda")).to(torch.bfloat16)
     idx = torch.randint(0, n_mod, (rows,), device="cuda")
@@ -39,8 +51,10 @@ def _inputs(rows=1029, hidden=1536, n_mod=6, seed=3):
 
 
 @requires_cuda
-def test_norm_mod_matches_reference_within_rounding():
-    x, _, w, mod, idx = _inputs()
+@pytest.mark.parametrize("hidden", [12, 1536, 5376, 6144])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_norm_mod_matches_reference_within_rounding(hidden, batch):
+    x, _, w, mod, idx = _inputs(hidden=hidden, batch=batch)
     hidden = x.shape[-1]
     scale, shift = mod[:, hidden : 2 * hidden], mod[:, :hidden]
     expected = (
@@ -54,8 +68,10 @@ def test_norm_mod_matches_reference_within_rounding():
 
 
 @requires_cuda
-def test_gate_res_norm_mod_matches_single_rounding_residual_and_norm():
-    x, a, w, mod, idx = _inputs()
+@pytest.mark.parametrize("hidden", [12, 1536, 5376, 6144])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_gate_res_norm_mod_matches_single_rounding_residual_and_norm(hidden, batch):
+    x, a, w, mod, idx = _inputs(hidden=hidden, batch=batch)
     hidden = x.shape[-1]
     gate = mod[:, 2 * hidden : 3 * hidden]
     scale = mod[:, 4 * hidden : 5 * hidden]
@@ -86,7 +102,8 @@ def test_block_dispatch_matches_separate_path_within_rounding(monkeypatch):
     """Model output with the fused AdaLN kernels is close to the separate norm + modulation path.
 
     The fused kernels modulate in FP32 with one rounding where the eager path rounds after each
-    BF16 op, so the outputs are not bit-identical; they agree to BF16 rounding noise.
+    BF16 op, so the outputs are not bit-identical; they agree to BF16 rounding noise. The bound
+    is a few BF16 ulps of the output scale on the one-layer tiny model used here.
     """
     inputs = _model_inputs("cuda")
     outputs = {}
@@ -98,8 +115,10 @@ def test_block_dispatch_matches_separate_path_within_rounding(monkeypatch):
         return op(*args, **kwargs)
 
     monkeypatch.setattr(h3, "h3_norm_mod", tracked)
+    supported = h3.h3_adaln_supported
     for fuse in (True, False):
-        monkeypatch.setattr(h3, "FUSE_ADALN", fuse)
+        # The block caches the support decision at construction, so patch the predicate.
+        monkeypatch.setattr(h3, "h3_adaln_supported", supported if fuse else (lambda *args: False))
         torch.manual_seed(0)
         model = (
             h3.MiniMaxH3Transformer3DModel(_make_model_config(num_layers=1, num_refiner_layers=1))
@@ -116,4 +135,4 @@ def test_block_dispatch_matches_separate_path_within_rounding(monkeypatch):
         fused_out = getattr(outputs[True], key).float()
         ref = getattr(outputs[False], key).float()
         assert fused_out.shape == ref.shape
-        assert (fused_out - ref).abs().max() <= ref.abs().max() * 2**-5
+        assert (fused_out - ref).abs().max() <= ref.abs().max() * 2**-6
