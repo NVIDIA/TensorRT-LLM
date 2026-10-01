@@ -22,20 +22,6 @@ requires the exact enum type `X`. The categorical domain lists tokens from
 `Literal`/`Enum` annotations or explicit `allowed_values`; it does not restrict
 `bool`, `int`, or `float` branches.
 
-Lists of configuration models are projected into arrays at each safe leaf
-path. For example, `extra_model_inputs.shape` can have policy
-`list[tuple[int|literal]]` and value `[["num_tokens"], ["batch_size", 20]]`.
-Only declared, safe fields are projected, not raw models or tensor contents.
-An empty list is `[]`; an unset parent config leaves the path absent.
-If any element lacks the leaf, excludes it, or fails its own model's policy,
-the whole projected field is omitted rather than changing element positions
-or inventing nulls. Nullable leaves can still contain explicit nulls.
-Tuple/set containers of models are not traversed; scalar tuple/set fields
-inside models remain supported. Sequences retain the 256-item cap at each level,
-and the full configuration retains its 16-KiB payload budget.
-Capture metadata flags sequence truncation and unsafe exclusions. Field policy
-version `4` distinguishes model-list capture from older clients.
-
 If the manifest check fails, run `python3 scripts/generate_llm_args_golden_manifest.py`, then commit
 `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval.
 
