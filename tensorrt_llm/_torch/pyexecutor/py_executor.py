@@ -4798,6 +4798,16 @@ class PyExecutor:
                             kv_cache_dtype_byte_size)
                         if self.enable_kv_cache_events:
                             self._add_kv_cache_events()
+                    else:
+                        # This rank survived a forward failure and skipped the
+                        # bookkeeping above, including the _handle_responses
+                        # response gather. Healthy attention-DP peers still
+                        # enter that gather, and collectives pair by call
+                        # order, so enter it here with an empty response list
+                        # to keep the group aligned; rank-symmetric companion
+                        # to the _enqueue_responses([]) else branch in the
+                        # overlap loop. No-op without attention DP.
+                        self._enqueue_responses([])
 
                 # Drain timeout buffer outside ``if can_queue`` so the synced
                 # collective fires every iter regardless of future restructuring.
@@ -8320,6 +8330,14 @@ class PyExecutor:
         for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
+            # A context request failing before its first chunk completed has
+            # written no KV. Tag it so the V1 KV-cache release skips the
+            # block-reuse store: the legacy releaseBlocks fallback would
+            # otherwise publish the unwritten blocks under the prompt's keys,
+            # corrupting later requests that share the prefix.
+            if (request.context_remaining_length > 0
+                    and request.context_current_position == 0):
+                request.py_kv_reuse_poisoned = True
             error_responses[req_id] = LlmResponse(
                 request_id=req_id,
                 error_msg=error_msg,

@@ -1618,7 +1618,14 @@ class KVCacheManager(BaseResourceManager):
             self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        result = self.impl.remove_sequence(request.py_request_id, request,
+        # A request tagged py_kv_reuse_poisoned failed before completing its
+        # first context chunk, so its blocks were never written. Pass None so
+        # releaseBlocks takes the no-store branch instead of its legacy
+        # position-0 fallback, which would publish the unwritten blocks for
+        # prefix reuse.
+        llm_request = (None if getattr(request, 'py_kv_reuse_poisoned', False)
+                       else request)
+        result = self.impl.remove_sequence(request.py_request_id, llm_request,
                                            pin_on_release)
         self._preprepared_dummy_request_ids.discard(request.py_request_id)
         return result
