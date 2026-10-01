@@ -556,7 +556,7 @@ def processScanResults(ref) {
                     }
                     skipArgs += " --skip-source-code"
                 }
-                if (!params.runContainerScanning) {
+                if (!params.runContainerLicenseScanning) {
                     skipArgs += " --skip-container"
                 }
                 def token = getPulseToken("4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i", "public.api:read")
