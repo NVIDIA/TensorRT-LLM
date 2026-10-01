@@ -794,9 +794,11 @@ class MultimodalModelMixin:
         """Optional hook after multimodal embeddings are gathered.
 
         Runs after cache lookup or encoder execution, before active-row model
-        hooks. Legacy inputs still contain full-request rows here; item
-        scheduling already supplies current-chunk rows. Row-dependent model
-        transforms should use `after_active_multimodal_embeddings` instead.
+        hooks. The row layout depends on the whole batch: if any param carries
+        item-scheduled current-chunk rows, the gather also cuts every other
+        param that has runtime data down to its current-chunk rows; otherwise
+        each param keeps its full-request rows. Row-dependent model transforms
+        should use `after_active_multimodal_embeddings` instead.
         """
         return input_ids, embeddings
 
