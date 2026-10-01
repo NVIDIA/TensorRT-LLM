@@ -121,3 +121,76 @@ def test_the_section_carries_the_rc_gate():
 
 def test_the_section_asks_for_the_metric_direction():
     assert "direction" in _flat(TEST_CASE_CAMPAIGN)
+
+
+# --------------------------------------------------------------------------- #
+# The layer-2 override
+# --------------------------------------------------------------------------- #
+
+SANITY_ID = "tests/integration/defs/perf/test_perf_sanity.py::test_e2e[aggr-cfg-entry]"
+
+
+def _workflow_for(task_path):
+    """A workflow shell wired only for ``_measurement_directive``."""
+    from agent_flow.workflows.perf_optimize import task_schema
+    from agent_flow.workflows.perf_optimize.workflow import PerfOptimizeWorkflow
+
+    wf = PerfOptimizeWorkflow.__new__(PerfOptimizeWorkflow)
+    wf._task_data = lambda: task_schema.load_and_validate_task_yaml(task_path)
+    return wf
+
+
+def _write_test_case_task(tmp_path):
+    import yaml
+
+    repo = tmp_path / "repo"
+    (repo / "tests/scripts/perf-sanity/aggregated").mkdir(parents=True)
+    (repo / "tests/scripts/perf-sanity/aggregated/cfg.yaml").write_text(
+        "metadata: {}\n", encoding="utf-8"
+    )
+    task = tmp_path / "task.yaml"
+    task.write_text(
+        yaml.safe_dump(
+            {
+                "checkpoint_path": str(repo),
+                "trtllm_repo_path": str(repo),
+                "test_case": {"name": SANITY_ID},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return task
+
+
+def test_directive_states_the_test_case_mode(tmp_path):
+    """The stage instruction also names trtllm-serve, and it arrives last.
+
+    Without the override the agent gets a contradiction: the system prompt
+    says "run the test case", the more specific stage instruction says
+    "launch trtllm-serve with --extra_llm_api_options and poll it".
+    """
+    directive = _workflow_for(_write_test_case_task(tmp_path))._measurement_directive()
+    assert "TEST CASE" in directive
+    assert SANITY_ID in directive
+    assert "replaces all of it" in directive
+    # It must name the guidance it overrides, or a reader cannot tell what to skip.
+    for superseded in ("trtllm-serve", "--extra_llm_api_options", "benchmark_serving.py"):
+        assert superseded in directive, superseded
+
+
+def test_directive_points_at_the_resolved_config(tmp_path):
+    directive = _workflow_for(_write_test_case_task(tmp_path))._measurement_directive()
+    assert "cfg.yaml" in directive
+
+
+def test_directive_is_empty_for_a_plain_campaign(tmp_path):
+    import yaml
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task = tmp_path / "task.yaml"
+    task.write_text(
+        yaml.safe_dump({"checkpoint_path": str(repo), "trtllm_repo_path": str(repo)}),
+        encoding="utf-8",
+    )
+    assert _workflow_for(task)._measurement_directive() == ""

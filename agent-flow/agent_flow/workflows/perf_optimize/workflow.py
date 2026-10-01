@@ -73,6 +73,8 @@ from .task_schema import (
     profile_ranks,
     sol_enabled,
 )
+from .task_schema import test_case_config_path as task_case_config_path
+from .task_schema import test_case_name as task_case_name
 
 
 def _progress_has_entries(path: Path) -> bool:
@@ -1277,7 +1279,7 @@ class PerfOptimizeWorkflow:
             clear_stale_benchmark_results(integration_dir)
             self._stamp_progress(state, round_no=round_no)
             self.integrator(
-                self._disagg_directive() + f"Workspace: {self.workspace}\n"
+                self._measurement_directive() + f"Workspace: {self.workspace}\n"
                 f"Round: {round_no}\n"
                 f"Integration worktree: {state.integration_worktree_path}\n"
                 f"Integration branch: {state.integration_branch}\n"
@@ -1537,31 +1539,48 @@ class PerfOptimizeWorkflow:
         """True iff ``path`` exists and holds non-whitespace content."""
         return path.is_file() and bool(path.read_text(encoding="utf-8").strip())
 
-    def _disagg_directive(self) -> str:
-        """The disagg override every stage prompt opens with, or ``""``.
+    def _measurement_directive(self) -> str:
+        """The measurement-mode override every stage prompt opens with.
+
+        ``""`` for the default single-server campaign.
 
         The role prompts are composed of two layers: a system prompt built
         from shared fragments, and the per-stage instruction this
-        orchestrator writes. ``DISAGG_CAMPAIGN`` supersedes the
-        single-server guidance in the *first* layer — but the second layer
-        also names ``trtllm-serve``, ``--extra_llm_api_options`` and a
-        readiness poll, and it arrives last and reads as the more specific
-        of the two. Without this the agent is handed a contradiction and
-        the disagg section can lose on specificity.
+        orchestrator writes. ``DISAGG_CAMPAIGN`` and
+        ``TEST_CASE_CAMPAIGN`` supersede the single-server guidance in the
+        *first* layer — but the second layer also names ``trtllm-serve``,
+        ``--extra_llm_api_options`` and a readiness poll, and it arrives
+        last and reads as the more specific of the two. Without this the
+        agent is handed a contradiction and the governing section can lose
+        on specificity.
 
         So the stage prompt states the mode up front and points at the
         section that governs it, rather than every stage's instruction
-        growing a disagg variant of its own.
+        growing a variant per mode. The two modes are mutually exclusive
+        (the task schema rejects a spec carrying both), so this returns at
+        most one override.
         """
-        if not has_disagg(self._task_data()):
-            return ""
-        config = disagg_config_path(self._task_data())
-        return (
-            f"⚠️ **This campaign is DISAGGREGATED** (harness config: `{config}`). "
-            f"Nothing below that mentions `trtllm-serve`, `--extra_llm_api_options` "
-            f"or polling a server applies — your system prompt's "
-            f"*Disaggregated serving* section replaces all of it.\n\n"
-        )
+        task_data = self._task_data()
+        name = task_case_name(task_data)
+        if name is not None:
+            config = task_case_config_path(task_data)
+            where = f", config: `{config}`" if config else ""
+            return (
+                f"⚠️ **This campaign measures a TEST CASE** (`{name}`{where}). "
+                f"Nothing below that mentions `trtllm-serve`, "
+                f"`--extra_llm_api_options`, `benchmark_serving.py` or polling a "
+                f"server applies — your system prompt's *Test-case workload* "
+                f"section replaces all of it.\n\n"
+            )
+        if has_disagg(task_data):
+            config = disagg_config_path(task_data)
+            return (
+                f"⚠️ **This campaign is DISAGGREGATED** (harness config: `{config}`). "
+                f"Nothing below that mentions `trtllm-serve`, `--extra_llm_api_options` "
+                f"or polling a server applies — your system prompt's "
+                f"*Disaggregated serving* section replaces all of it.\n\n"
+            )
+        return ""
 
     def _require_baseline_measurement(self) -> None:
         """Fail loudly when the baseline stage produced no measurement.
@@ -2133,7 +2152,7 @@ class PerfOptimizeWorkflow:
                 "the roadmap's `baseline.value`. "
             )
         self.benchmarker(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n\n"
+            self._measurement_directive() + f"Workspace: {self.workspace}\n\n"
             f"Read `{self.task_path}` for the spec — resolve `checkpoint_path`, "
             f"`trtllm_repo_path`, and the `benchmark` / `optimize` blocks.\n\n"
             f"Then **load the `perf-optimization-casebook` skill** (via the "
@@ -2255,7 +2274,7 @@ class PerfOptimizeWorkflow:
                 f"`{analysis_dir}` — do not re-derive it.\n\n"
             )
         self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._measurement_directive() + f"Workspace: {self.workspace}\n"
             f"Round: 1 (**reused analysis** — no profiling this round)\n"
             f"Analysis directory (already populated): {analysis_dir}\n\n"
             f"This campaign was launched with "
@@ -2417,7 +2436,7 @@ class PerfOptimizeWorkflow:
                 f"cannot be closed in this campaign.\n\n"
             )
         self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._measurement_directive() + f"Workspace: {self.workspace}\n"
             f"Round: {round_no}\n"
             f"Analysis directory (write your artifacts here): {analysis_dir}\n\n"
             f"Read `{self.task_path}` and `{self.baseline_results_path}` to "
@@ -2537,7 +2556,7 @@ class PerfOptimizeWorkflow:
                 f"campaign.\n\n"
             )
         self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._measurement_directive() + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} (**replan only** — no profiling this round)\n"
             f"Analysis directory (write your artifacts here): {analysis_dir}\n\n"
             f"Round {state.round_index} accepted **nothing**. "
@@ -2664,7 +2683,7 @@ class PerfOptimizeWorkflow:
                 f"your summary, not a claim to re-assert.\n\n"
             )
         (agent or self.optimizer)(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._measurement_directive() + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} — item {state.item_index + 1} of at most "
             f"{state.max_items_per_round} this round — attempt {attempt_no} "
             f"of {state.max_attempts_per_item}\n"
@@ -2862,7 +2881,7 @@ class PerfOptimizeWorkflow:
         else:
             attempt_note = ""
         (agent or self.evaluator)(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._measurement_directive() + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} — item {state.item_index + 1} of at most "
             f"{state.max_items_per_round} this round — attempt {attempt_no} "
             f"of {state.max_attempts_per_item}\n"
@@ -2973,7 +2992,7 @@ class PerfOptimizeWorkflow:
                 "`cumulative_improvement_pct` — from your own measurement"
             )
         self.qa(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._measurement_directive() + f"Workspace: {self.workspace}\n"
             f"Campaign: the optimization loop is over ({state.round_index} "
             f"round(s) ran); the system under test is the final accepted "
             f"state.\n"
