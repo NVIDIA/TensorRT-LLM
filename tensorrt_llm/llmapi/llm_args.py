@@ -291,8 +291,163 @@ class DecodeCudaGraphConfig(BaseCudaGraphConfig):
         return merged
 
 
+# Symbolic dim names allowed in EncodeExtraInputSpec.shape; a spec uses exactly
+# one. "num_tokens" resolves to the padded token bucket, "batch_size" to the
+# padded request count (per-request features that ignore sequence length).
+_ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS: Tuple[str,
+                                         ...] = ("num_tokens", "batch_size")
+
+# Encode-only inputs the encoder runner builds itself; callers cannot supply them
+# as model_kwargs.
+ENCODER_RUNNER_MANAGED_INPUTS: frozenset[str] = frozenset({
+    "input_ids",
+    "seq_lens",
+    "multi_item_part_lens",
+    "attn_metadata",
+    "return_context_logits",
+})
+# Names that may not be declared as extra model inputs. position_ids may be
+# passed through (the runner consumes it) but cannot name an extra input.
+ENCODER_RESERVED_INPUT_NAMES: frozenset[str] = (ENCODER_RUNNER_MANAGED_INPUTS
+                                                | {"position_ids"})
+
+
+class EncodeExtraInputSpec(StrictBaseModel):
+    """Declares an extra encoder-forward tensor kwarg for CUDA graph capture.
+
+    One spec is required for every tensor kwarg passed to
+    `LLM.encode(..., **model_kwargs)` (e.g. `token_type_ids` for BERT). The
+    runner backs each with a static buffer sized at the bucket maximum, and
+    warmup captures every bucket with a zero-filled stand-in so the graph sees
+    the full forward signature before the first real call.
+
+    Only tensors can be declared: a non-tensor kwarg cannot be captured and
+    instead forces that `encode()` call onto the eager path. Device is not part
+    of the spec: pass tensors where they already live. Each replay copies them
+    into the graph's buffer asynchronously, H2D for host tensors and D2D for
+    device tensors.
+    """
+
+    name: str = Field(
+        description="Kwarg name as it appears in the encoder forward() "
+        "signature (e.g. \"token_type_ids\").")
+
+    shape: Tuple[Union[Literal["num_tokens", "batch_size"], PositiveInt],
+                 ...] = Field(
+                     description="Tensor shape. Use exactly one symbolic dim "
+                     "from {\"num_tokens\", \"batch_size\"}: \"num_tokens\" "
+                     "scales with the packed token bucket (e.g. "
+                     "token_type_ids), \"batch_size\" scales with the request "
+                     "bucket (e.g. per-request features that are independent "
+                     "of sequence length). Remaining dims must be positive "
+                     "integer literals (e.g. hidden_size).")
+
+    dtype: str = Field(
+        description="Tensor dtype string accepted by tensorrt_llm "
+        "(e.g. \"int32\", \"float32\", \"bfloat16\"). See "
+        "`tensorrt_llm._utils._str_to_torch_dtype_dict` for the full list.")
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        if not value or not value.isidentifier():
+            raise ValueError(
+                f"EncodeExtraInputSpec.name must be a non-empty Python "
+                f"identifier, got {value!r}")
+        if value in ENCODER_RESERVED_INPUT_NAMES:
+            raise ValueError(
+                f"EncodeExtraInputSpec.name {value!r} is reserved by the "
+                f"encode-only path. Reserved names: "
+                f"{sorted(ENCODER_RESERVED_INPUT_NAMES)}")
+        return value
+
+    @field_validator("shape")
+    @classmethod
+    def _validate_shape(
+            cls, value: Tuple[Union[str, int],
+                              ...]) -> Tuple[Union[str, int], ...]:
+        if not value:
+            raise ValueError(
+                "EncodeExtraInputSpec.shape must contain at least one "
+                "dimension")
+        symbolic_count = sum(
+            1 for d in value
+            if isinstance(d, str) and d in _ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS)
+        if symbolic_count != 1:
+            raise ValueError(
+                f"EncodeExtraInputSpec.shape must contain exactly one "
+                f"symbolic dim from {_ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS} "
+                f"(a tensor may use \"num_tokens\" OR \"batch_size\", never "
+                f"both), got shape={value} with {symbolic_count} symbolic dims")
+        return value
+
+    @field_validator("dtype")
+    @classmethod
+    def _validate_dtype(cls, value: str) -> str:
+        if value not in _str_to_torch_dtype_dict:
+            raise ValueError(
+                f"EncodeExtraInputSpec.dtype {value!r} is not supported. "
+                f"Supported dtypes: {sorted(_str_to_torch_dtype_dict)}")
+        return value
+
+    def resolve_shape(self, num_tokens: int,
+                      batch_size: int) -> Tuple[int, ...]:
+        """Substitute the symbolic dim with the matching size, leaving literals alone.
+
+        Each spec uses exactly one symbolic dim (validated). The caller passes
+        both candidate sizes; only the one this spec actually uses is consumed.
+        """
+        resolved: List[int] = []
+        for d in self.shape:
+            if d == "num_tokens":
+                resolved.append(num_tokens)
+            elif d == "batch_size":
+                resolved.append(batch_size)
+            else:
+                resolved.append(int(d))
+        return tuple(resolved)
+
+    def symbolic_dim(self) -> Tuple[str, int]:
+        """Return ``(name, axis)`` of the spec's single symbolic dim.
+
+        The shape validator guarantees exactly one symbolic dim is present.
+        """
+        for axis, d in enumerate(self.shape):
+            if isinstance(d, str) and d in _ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS:
+                return d, axis
+        # Unreachable: validator enforces exactly-one occurrence.
+        raise ValueError(
+            f"EncodeExtraInputSpec.shape={self.shape} has no symbolic dim")
+
+    def torch_dtype(self) -> torch.dtype:
+        return _str_to_torch_dtype_dict[self.dtype]
+
+
 class EncodeCudaGraphConfig(BaseCudaGraphConfig):
-    """CUDA graph configuration for encode-only requests."""
+    """CUDA graph configuration for encode-only requests (``LLM.encode()``).
+
+    A graph is captured at startup for every feasible combination of
+    ``batch_sizes``, ``num_tokens`` and ``seq_lens``. A batch runs the graph
+    for its (batch size, total tokens, longest request) shape, rounded up when
+    ``enable_padding`` is set, and runs eagerly if no graph matches.
+
+    Example::
+
+        cuda_graph_config = EncodeCudaGraphConfig(
+            batch_sizes=[1, 2, 4, 8],
+            num_tokens=[128, 256, 512],
+            seq_lens=[64, 128],
+            enable_padding=True,
+            extra_model_inputs=[
+                EncodeExtraInputSpec(name="token_type_ids",
+                                     shape=("num_tokens",),
+                                     dtype="int32"),
+            ],
+        )
+        llm = LLM(model, encode_only=True, cuda_graph_config=cuda_graph_config)
+        # token_type_ids: one value per token, prompts packed in order.
+        outputs = llm.encode(prompts, token_type_ids=token_type_ids)
+    """
 
     mode: Literal["encode"] = Field(
         default="encode", description="CUDA graph configuration mode.")
@@ -332,6 +487,18 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         "`seq_lens` is generated from this value. Ignored by a fixed-shape "
         "feature encoder.")
 
+    extra_model_inputs: List[EncodeExtraInputSpec] = Field(
+        default_factory=list,
+        description=
+        "Tensor kwargs (beyond input_ids / position_ids) that LLM.encode() "
+        "passes to the encoder forward() under CUDA graphs. Each is backed "
+        "by a static buffer sized along its symbolic dim at the bucket "
+        "maximum (`num_tokens` → `max(num_tokens)`, `batch_size` → "
+        "`max(batch_sizes)`). With encoder CUDA graphs enabled, every tensor "
+        "kwarg passed to encode() must be declared here, and every declared "
+        "input must be passed on every call. Tensors may be on host or "
+        "device.")
+
     @model_validator(mode='after')
     def validate_encoder_cuda_graph_config(self) -> 'EncodeCudaGraphConfig':
         # Encoder fields — only generate defaults when the user opted in by
@@ -370,6 +537,15 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         elif self.max_seq_len > 0:
             self.seq_lens = self._generate_cuda_graph_seq_lens(
                 self.max_seq_len, self.enable_padding)
+
+        if self.extra_model_inputs:
+            seen_names: Set[str] = set()
+            for spec in self.extra_model_inputs:
+                if spec.name in seen_names:
+                    raise ValueError(
+                        f"EncodeCudaGraphConfig.extra_model_inputs contains "
+                        f"duplicate name {spec.name!r}")
+                seen_names.add(spec.name)
 
         return self
 
@@ -2053,8 +2229,8 @@ class DecodingBaseConfig(StrictBaseModel):
             "layer quantization, and a concrete backend applies only to the "
             "draft model or layers. Resolution may fall back based on model, "
             "quantization, and hardware support. Replacement-head MTP "
-            "checkpoints are unsupported because their independent "
-            "quantization metadata is not loaded. Nemotron-H embedded MTP "
+            "checkpoints must inherit the target model's MoE backend; leave "
+            "this option unset. Nemotron-H embedded MTP "
             "layers must inherit the target backend because their checkpoint "
             "mapper uses a shared backend-dependent layout. Decoding methods "
             "without a neural draft model ignore this option."))
@@ -2268,10 +2444,10 @@ class DecodingBaseConfig(StrictBaseModel):
                 or not self.uses_replacement_heads):
             return
         raise ValueError(
-            "speculative_config.moe_backend does not support replacement-head "
-            "MTP checkpoints because their independent quantization metadata "
-            "is not loaded. Leave moe_backend unset to inherit the target "
-            "backend, or use a full external draft-model checkpoint.")
+            "speculative_config.moe_backend cannot be set for replacement-head "
+            "MTP checkpoints. Replacement heads inherit the target model's "
+            "MoE backend. Leave moe_backend unset, or use a full external "
+            "draft-model checkpoint.")
 
     @property
     def uses_replacement_heads(self) -> bool:
@@ -4169,6 +4345,24 @@ class BlockReuseConfig(StrictBaseModel):
         "Only used when "
         "`policy` is 'per_conversation'.")
 
+    swa_endpoint_rewind_tokens: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description="Extra tokens before the final SWA window whose cache blocks "
+        "receive higher eviction priority, together with sink blocks. Zero "
+        "disables the entire endpoint-priority callback. Positive values require "
+        "KV cache manager v2, block reuse enabled, and policy='all_reusable'. "
+        "This preference does not guarantee residency or change attention windows "
+        "or prefix matching. Dummy and draft requests are excluded.")
+
+    @model_validator(mode="after")
+    def validate_swa_endpoint_policy(self) -> 'BlockReuseConfig':
+        if self.swa_endpoint_rewind_tokens > 0 and self.policy != "all_reusable":
+            raise ValueError(
+                "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                "block_reuse_config.policy='all_reusable'.")
+        return self
+
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
@@ -4513,6 +4707,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             update={
                 "periodic_snapshot_interval": self.mamba_state_cache_interval
             })
+        return self
+
+    @model_validator(mode='after')
+    def validate_swa_endpoint_rewind(self) -> 'KvCacheConfig':
+        if self.block_reuse_config.swa_endpoint_rewind_tokens > 0:
+            if not self.enable_block_reuse:
+                raise ValueError(
+                    "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                    "kv_cache_config.enable_block_reuse=True.")
+            if self.use_kv_cache_manager_v2 is False:
+                raise ValueError(
+                    "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                    "kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
     @model_validator(mode='after')

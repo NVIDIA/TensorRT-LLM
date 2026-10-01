@@ -51,6 +51,7 @@ from tensorrt_llm.commands._config_overrides import (ConfigOverride,
                                                      apply_config_overrides,
                                                      parse_config_overrides)
 from tensorrt_llm.commands._serve_stability import stability_option
+from tensorrt_llm.commands.mooncake import mooncake_donor, mooncake_master
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
@@ -842,6 +843,26 @@ def _resolve_embedding_architecture_override(
     logger.info(f"Embedding routing: overriding architecture "
                 f"{architectures[0]} -> {target}")
     return {"architectures": [target]}
+
+
+def _reject_embedding_extra_model_inputs(cuda_graph_config: Any) -> None:
+    """Reject encoder CUDA graph extra model inputs for the embeddings server.
+
+    /v1/embeddings has no field for extra model inputs, so the server calls
+    llm.encode() without them and every request would miss the declared inputs.
+    `cuda_graph_config` is the raw --config mapping or a parsed config object.
+    """
+    if isinstance(cuda_graph_config, dict):
+        specs = cuda_graph_config.get("extra_model_inputs")
+    else:
+        specs = getattr(cuda_graph_config, "extra_model_inputs", None)
+    if specs:
+        raise click.BadParameter(
+            "cuda_graph_config.extra_model_inputs is not supported by "
+            "trtllm-serve embeddings: /v1/embeddings has no field for extra "
+            "model inputs. Pass them through the Python llm.encode() API "
+            "instead.",
+            param_hint="config")
 
 
 def launch_embedding_server(
@@ -1968,6 +1989,7 @@ def serve_embedding(
             f"pipeline_parallel_size={effective_pp}, "
             f"context_parallel_size={effective_cp} from --config.",
             param_hint="config")
+    _reject_embedding_extra_model_inputs(llm_args.get("cuda_graph_config"))
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
@@ -2812,7 +2834,11 @@ main = DefaultGroup(
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
         "mm_embedding_serve": serve_encoder,
-        "embeddings": serve_embedding
+        "embeddings": serve_embedding,
+        # The parts of a Mooncake pool that cannot belong to a server, for
+        # deployments where a pool outlives or spans them.
+        "mooncake_master": mooncake_master,
+        "mooncake_donor": mooncake_donor,
     })
 
 if __name__ == "__main__":

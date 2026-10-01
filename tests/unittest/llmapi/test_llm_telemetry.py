@@ -83,15 +83,13 @@ class TestProcessLifecycleCounters:
         usage_lib._SESSION_LOCK = threading.Lock()
         usage_lib._REPORTER_STARTED = False
         usage_lib._REPORTER_ACTIVE = False
-        usage_lib._REPORTER_STOP = threading.Event()
-        usage_lib._PENDING_TERMINAL = None
+        usage_lib._HEARTBEAT_STOP = threading.Event()
         usage_lib._PROCESS_PID = os.getpid()
         yield
-        usage_lib._REPORTER_STOP.set()
+        usage_lib._HEARTBEAT_STOP.set()
         usage_lib._SESSION = None
         usage_lib._SESSION_DISABLED = False
         usage_lib._REPORTER_ACTIVE = False
-        usage_lib._PENDING_TERMINAL = None
 
     def test_two_live_objects_update_concurrency_counters(self, enable_telemetry):
         """Two successful constructors share one session and prove overlap."""
@@ -337,14 +335,13 @@ class TestRuntimeArchitecturePayloadFlow:
         monkeypatch.setattr(usage_lib, "_SESSION_LOCK", threading.Lock())
         monkeypatch.setattr(usage_lib, "_REPORTER_STARTED", False)
         monkeypatch.setattr(usage_lib, "_REPORTER_ACTIVE", False)
-        monkeypatch.setattr(usage_lib, "_PENDING_TERMINAL", None)
         monkeypatch.setattr(usage_lib, "_PROCESS_PID", os.getpid())
         monkeypatch.setattr(usage_lib, "_PROCESS_EXIT_HOOK_REGISTERED", True)
         assert usage_lib.apply_usage_session_config()
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=payloads.append),
-            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
         ):
             usage_lib._background_reporter(
                 report_args["llm_args"],
