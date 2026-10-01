@@ -192,14 +192,11 @@ class KvCacheConnectorWorker(ABC):
     def capacity_only(self) -> bool:
         """Whether this worker contributes resources but transfers no KV.
 
-        Several guards around the executor exist to protect the page addresses
-        a connector registers: the capacity scheduler is restricted, cache
-        tiers below GPU are refused, and per-layer hooks are installed. A
-        worker that registers nothing and moves nothing needs none of them, so
-        it overrides this and the executor leaves its engine alone.
-
-        Overriding does not make a connector optional. It still participates in
-        construction and shutdown; it simply has no KV of its own in flight.
+        Several executor guards exist to protect the page addresses a
+        connector registers: the capacity scheduler is restricted, cache tiers
+        below GPU are refused, and per-layer hooks are installed. A worker that
+        registers nothing needs none of them, so overriding this leaves its
+        engine alone. It still participates in construction and shutdown.
         """
         return False
 
@@ -459,7 +456,7 @@ class KvCacheConnectorScheduler(ABC):
         Rollback and failed admission take this path, where request_finished
         ends a request instead. Another request may own the released pages
         before this one is readmitted, so state the connector recorded in page
-        indices has to be dropped or rebuilt here. The default is a no-op.
+        indices has to be dropped or rebuilt here. Defaults to a no-op.
 
         Args:
             request: The request whose allocation was released.
@@ -740,9 +737,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         self.worker = worker
         self.scheduler = scheduler
-        #: Whether the attached connector moves KV at all. Read by the
-        #: executor to decide which of its connector-related restrictions
-        #: apply; see `KvCacheConnectorWorker.capacity_only`.
+        #: Whether the attached connector moves KV at all; see
+        #: `KvCacheConnectorWorker.capacity_only`.
         self.capacity_only = bool(worker.capacity_only)
 
         # Requests that haven't yet been passed into get_finished.
@@ -1180,11 +1176,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
     ):
         if self.capacity_only:
-            # A capacity-only connector registers no pages, so any scheduler
-            # output would describe no loads and no saves. Both KV cache
-            # managers call this once per iteration from `prepare_resources`,
+            # The output would describe no loads and no saves, and both KV
+            # cache managers build one per iteration from `prepare_resources`,
             # which on a generation server is inter-token latency.
-            # `handle_metadata` returns early when no output was built.
+            # `handle_metadata` returns early when none was built.
             return
         async_requests = AsyncRequests(
             {},

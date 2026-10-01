@@ -14,14 +14,13 @@
 # limitations under the License.
 """The part of a Mooncake pool that is not any engine's to own.
 
-A pool needs a master, and a master is infrastructure: one runs per deployment,
-outlives every engine's startup, and is what lets several servers share a pool.
-Running it here rather than inside a server keeps the pool's own settings
-stated once. This command publishes them as a manifest, and each server's
-`kv_connector_config.mooncake_store.pool` names it.
+A master runs per deployment rather than per engine, which is what lets several
+servers share a pool and keeps the pool's own settings stated once. It
+publishes them as a manifest that each server's
+`kv_connector_config.mooncake_store.pool` names.
 
-Capacity is not here. Every rank that joins the pool lends the memory its own
-config asks for, so there is no separate process to run for it.
+Capacity needs no command: every rank that joins the pool lends the memory its
+own config asks for.
 """
 
 import signal
@@ -37,8 +36,8 @@ from tensorrt_llm.commands import _telemetry as _command_telemetry
 from tensorrt_llm.logger import logger
 from tensorrt_llm.usage.config import UsageContext
 
-#: Both commands sit in the telemetry-aware `trtllm-serve` group, so they have
-#: to offer the same opt-out the group documents.
+#: Both commands sit in the telemetry-aware `trtllm-serve` group, so they offer
+#: the same opt-out the group documents.
 _telemetry_option = click.option(
     "--telemetry/--no-telemetry",
     default=True,
@@ -49,8 +48,9 @@ _telemetry_option = click.option(
 def _apply_cli_telemetry(telemetry: bool) -> None:
     """Honor --no-telemetry for a command that reads no config of its own.
 
-    The group already applies the flag it finds in argv, so this matters when
-    the command is reached through its callback rather than through the CLI.
+    The group already applies the flag it finds in argv, so this matters only
+    when the command is reached through its callback rather than through the
+    CLI.
     """
     if telemetry:
         return
@@ -65,12 +65,10 @@ def _apply_cli_telemetry(telemetry: bool) -> None:
 def _until_signalled() -> threading.Event:
     """An event that SIGINT and SIGTERM set.
 
-    This command holds a child process whose reaping, and a published manifest
-    whose retraction, are in a `finally`. Default SIGTERM handling would skip
-    both, leaving the master unreaped and an address that outlives it on disk
-    for the next run to dial. Setting an event lets the wait loop return and
-    those context managers unwind, so the signal reaches the telemetry
-    boundary only once the release is done; see `_report_signal_exit`.
+    The master's reaping and the manifest's retraction are in a `finally`,
+    which default SIGTERM handling would skip, leaving an address on disk for
+    the next run to dial. Setting an event instead lets the wait loop return
+    and those context managers unwind; see `_report_signal_exit`.
     """
     stopping = threading.Event()
     stopping.signal_number = None
@@ -88,8 +86,7 @@ def _report_signal_exit(stopping: threading.Event) -> None:
     """Exit as the signal that stopped the command, after it has released.
 
     `trtllm-serve` reports the exit as a signal rather than as a clean one only
-    if it sees `SignalExit`, and the resource is already gone by the time this
-    runs, so it is safe to leave here.
+    if it sees `SignalExit`.
     """
     if stopping.signal_number is None:
         return
@@ -228,7 +225,7 @@ def mooncake_master(
         binary=binary,
         timeout=timeout,
     ) as master:
-        logger.info(
+        logger.warning(
             f"mooncake-store: this master owns the pool until this command "
             f"stops; address {master.address}, log {master.log_path}, metrics "
             f"http://{master.address.rsplit(':', 1)[0]}:{metrics_port}/metrics"
@@ -237,8 +234,7 @@ def mooncake_master(
         announced = started
         while not stopping.is_set():
             if (code := master.process.poll()) is not None:
-                # The pool is gone once the master dies, and every client is
-                # about to start failing.
+                # The pool is gone once the master dies.
                 raise click.ClickException(
                     f"mooncake_master exited with code {code}. See {master.log_path}"
                 )
@@ -275,9 +271,8 @@ def mooncake_master(
 def mooncake_pool_report(run_dir: str, master_log: Optional[str], telemetry: bool):
     """Report the capacity a run's pool actually had, and where blocks landed.
 
-    Reads what the participants recorded rather than what they logged, so it
-    stays correct as provisioning changes. Safe to run after the job: the
-    records outlive the processes that wrote them.
+    Safe to run after the job, since the records outlive the processes that
+    wrote them.
     """
     _apply_cli_telemetry(telemetry)
 

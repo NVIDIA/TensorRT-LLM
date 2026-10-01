@@ -2329,9 +2329,9 @@ class DecodingBaseConfig(StrictBaseModel):
 class MooncakeStoreConfig(StrictBaseModel):
     """How this server joins a Mooncake store pool.
 
-    The pool itself is described by the master that owns it, in a manifest
-    `pool` names. What is left here is what belongs to this server alone: how
-    much memory each of its ranks lends, and what it then does with the pool.
+    The pool itself is described by the master that owns it, in the manifest
+    `pool` names. What is left here belongs to this server alone: how much
+    memory each of its ranks lends, and what it then does with the pool.
 
     Setting this makes `trtllm-serve` render the Mooncake client config and
     export `MOONCAKE_CONFIG_PATH` itself. An inherited `MOONCAKE_CONFIG_PATH`
@@ -2355,13 +2355,13 @@ class MooncakeStoreConfig(StrictBaseModel):
     segment_size: Union[int, str] = Field(
         "16GiB",
         description="Host memory each of this server's ranks contributes to "
-        "the pool. Pool capacity is the sum over every participating rank, so "
-        "it should be the same on every server; the run's summary reports the "
-        "distinct values seen. A node's demand is ranks_on_node x "
-        "segment_size, checked against available memory at startup. Write "
-        "binary sizes ('16GiB') or byte counts: 'GB' means a power of 1000 "
-        "here and a power of 1024 to vLLM, so it is refused in a file both "
-        "engines may read.")
+        "the pool. Capacity is the sum over every participating rank, so keep "
+        "it the same on every server; the run's summary reports the distinct "
+        "values seen. A node's demand is ranks_on_node x segment_size, "
+        "checked against available memory at startup. Write binary sizes "
+        "('16GiB') or byte counts: 'GB' means a power of 1000 here and a "
+        "power of 1024 to vLLM, so it is refused in a file both engines may "
+        "read.")
     transfer_batch_size: PositiveInt = Field(
         64, telemetry=False, description="Page keys per store call.")
     namespace: Optional[str] = Field(
@@ -2390,27 +2390,27 @@ class MooncakeStoreConfig(StrictBaseModel):
         description="Where this server keeps the Mooncake client config it "
         "renders and the record each of its ranks writes of the segment it "
         "mounted. Required when a launcher starts one task per rank, as "
-        "trtllm-llmapi-launch does, since those ranks cannot inherit the "
-        "path from the process that rendered it. Servers sharing a directory "
-        "render one client config between them, so give the context and "
-        "generation sides separate ones. Defaults to a temporary directory "
-        "removed at shutdown, which loses the records the pool report reads.")
+        "trtllm-llmapi-launch does, since those ranks cannot inherit the path "
+        "from the process that rendered it. Give each server its own: two "
+        "sharing a directory render one client config between them. Defaults "
+        "to a temporary directory removed at shutdown, which loses the "
+        "records the pool report reads.")
     master_timeout: float = Field(
         60.0,
         telemetry=False,
         description="Seconds to wait for the pool manifest to appear and the "
         "master to accept connections. Raise it when the wait spans container "
-        "start on another node. Too short fails the server at startup, which "
-        "is the intent: a master that is not there fails inside every rank "
-        "after the model has loaded, as a bare status code.")
+        "start on another node. Expiring fails the server at startup, which "
+        "is the intent: an unreachable master otherwise fails inside every "
+        "rank after the model has loaded, as a bare status code.")
 
     @field_validator("segment_size", mode="after")
     @classmethod
     def _check_segment_size(cls, value):
         """Reject a size here rather than in every rank after bringup.
 
-        The connector parses it, so a typo or a zero otherwise surfaces as a
-        per-rank failure with the model already loading.
+        The connector parses it, so a typo or a zero would otherwise surface
+        as a per-rank failure with the model already loading.
         """
         from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
             parse_size

@@ -16,8 +16,8 @@
 
 Runs without a Mooncake installation and without a GPU. The master process the
 command holds is a context manager that records its own release, and the signal
-under test is delivered from the poll that precedes the command's idle wait,
-which is the point at which everything it holds is held.
+under test arrives from the poll before the command's idle wait, the point at
+which everything it holds is held.
 """
 
 import contextlib
@@ -152,11 +152,9 @@ def signal_on_idle(command: CommandUnderTest, number: int, on_idle=None) -> None
     """Deliver `number` to this process the first time the command idles.
 
     The handler runs at the next bytecode boundary in the main thread, so the
-    command's own wait is what gives the interpreter one.
-
-    `on_idle` runs before the signal, which is the only point at which the
-    command's resources are all held. Anything released on the way out has to
-    be observed from there rather than after `run` returns.
+    command's own wait is what gives the interpreter one. `on_idle` runs just
+    before, which is the only point at which the command's resources are all
+    held, so anything released on the way out has to be observed from there.
     """
 
     def interrupt():

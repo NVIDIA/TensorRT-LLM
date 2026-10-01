@@ -14,15 +14,14 @@
 # limitations under the License.
 """Leader side of the Mooncake store KV cache connector.
 
-Runs only on rank 0. It decides what to load and what to save; the workers do
-the moving. Two pieces of bookkeeping make that possible, and both exist because
-`KVCacheManagerV2` reports `RequestData.block_hashes` empty:
+Runs only on rank 0, deciding what to load and what to save while the workers
+do the moving. That needs two pieces of per-request bookkeeping:
 
-* a hash chain per request, so a block has a content identity at all;
+* a hash chain, since `KVCacheManagerV2` reports `RequestData.block_hashes`
+  empty and a block has no content identity otherwise;
 * the page slot index per block ordinal, accumulated across iterations. The
-  manager reports only *newly allocated* indices each step, but a block is
-  allocated before it is full and is only savable once it is full, so the index
-  has to be remembered from the step that reported it.
+  manager reports only newly allocated indices each step, but a block is
+  allocated before it is full and is savable only once it is full.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -48,12 +47,12 @@ def _multimodal_item_digests(request: LlmRequest) -> Optional[Tuple[bytes, ...]]
     Returns:
         An empty tuple for a text-only request, one digest per item for a
         multimodal one, and None when the request carries media the digests do
-        not describe, which is the caller's signal to leave it alone. The
-        placeholder tokens of such a request say nothing about its content, so
-        there is no key that names its pages without naming someone else's.
+        not describe. The placeholder tokens of such a request say nothing
+        about its content, so no key names its pages without naming someone
+        else's; the caller leaves it alone.
     """
-    # The same three fields `KVCacheManagerV2` reads together to decide whether
-    # a request is multimodal at all, so local reuse and the store agree.
+    # The same three fields `KVCacheManagerV2` reads to decide whether a
+    # request is multimodal, so local reuse and the store agree.
     hashes = request.multimodal_hashes
     if hashes:
         # 8 int32 chunks per item, most significant byte first, matching
@@ -118,17 +117,13 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         self._requests: Dict[int, _RequestState] = {}
         self._worker: Optional[MooncakeStoreConnectorWorker] = None
 
-        logger.info(
+        logger.warning(
             f"mooncake-store leader ready (role={self._config.role.value}, "
             f"tokens_per_block={self._tokens_per_block})"
         )
 
     def wait_for_initialization(self):
-        """Bind to the process-local worker, which owns the store handle.
-
-        Called after the executor has built both halves and registered the KV
-        cache layout, which is what the worker needs before it can name a key.
-        """
+        """Bind to the process-local worker, which owns the store handle."""
         self._worker = resolve_local_worker()
 
     # ---- lookup ----
@@ -147,10 +142,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         """
         scope = _reuse_scope(request)
         if scope is None:
-            # No key names this request's pages without naming another's, so
-            # the store neither serves it nor receives from it. Leaving it
-            # without a `_RequestState` is what suppresses its saves too, since
-            # `build_connector_meta` skips requests it has no state for.
+            # Leaving it without a `_RequestState` suppresses its saves too,
+            # since `build_connector_meta` skips requests it has no state for.
             logger.warning_once(
                 "mooncake-store is bypassing requests whose multimodal content "
                 "carries no hashes: their prompt tokens do not identify the "
@@ -200,9 +193,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         """No-op: page indices are read from the scheduler output instead.
 
         The flat `block_ids` here are a single space, but a V2 page index is
-        scoped to a layer group. `RequestData.new_block_ids_by_layer_group` is
-        the form that stays correct for every model, so that is the only source
-        this connector uses.
+        scoped to a layer group, so this connector reads only
+        `RequestData.new_block_ids_by_layer_group`.
         """
 
     # ---- work lists ----
@@ -213,9 +205,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         for request_data in (*scheduler_output.new_requests, *scheduler_output.cached_requests):
             state = self._requests.get(request_data.request_id)
             if state is None:
-                # Only requests that went through get_num_new_matched_tokens have
-                # a hash chain. Generation-only requests never do, and the
-                # connector manager refuses them outright.
+                # Only requests that went through get_num_new_matched_tokens
+                # have a hash chain.
                 continue
 
             state.tokens.extend(request_data.new_tokens)
@@ -244,17 +235,16 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     def request_finished(self, request: LlmRequest, cache_block_ids: List[int]) -> bool:
         """Report whether pages must stay pinned for in-flight saves.
 
+        Whether a write has landed is known per rank and this runs only on the
+        leader, so the answer is "any save was emitted" rather than "a save is
+        in flight". A request whose writes already retired is reported done by
+        the next `get_finished`, costing one iteration; the exact answer would
+        cost a per-rank report back to the leader.
+
         Returns:
             True when this request handed any page to the background save
-            thread. Its pages are the source of those RDMA reads, so freeing
-            them now would let a later request overwrite bytes mid-transfer.
-
-        Whether those writes have since landed is known per rank, and this runs
-        only on the leader, so the answer is "any save was emitted" rather than
-        "a save is in flight". A request whose writes already retired is
-        reported done by the very next `get_finished`, so the conservative
-        answer costs one iteration; the exact one would need a per-rank report
-        back to the leader to save it.
+            thread, so freeing its pages now could let a later request
+            overwrite bytes mid-transfer.
         """
         state = self._requests.pop(request.request_id, None)
         return bool(state is not None and state.emitted_saves)
@@ -262,9 +252,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     def request_reset(self, request: LlmRequest) -> None:
         """Forget a request whose pages were released for it to run again.
 
-        `pages` and `saved_upto` describe the allocation that has just been
-        freed, and the tokens and hash chain are rebuilt by the lookup that
-        precedes the next attempt, so none of the state survives.
+        `pages` and `saved_upto` describe the allocation that was just freed,
+        and the lookup preceding the next attempt rebuilds the rest.
         """
         self._requests.pop(request.request_id, None)
 
@@ -282,9 +271,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         if state is None:
             state = _RequestState(BlockHashChain(self._tokens_per_block, scope=scope))
             self._requests[request.request_id] = state
-        # Hashing the prompt here rather than waiting for the first scheduler
-        # output is the whole point: the lookup happens before the request is
-        # scheduled, so the chain has to be ready before any metadata exists.
+        # The lookup runs before the request is scheduled, so the chain has to
+        # be ready before any scheduler output exists.
         state.chain.extend(tokens)
         return state
 
@@ -292,9 +280,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         """Append this step's newly allocated page indices, by block ordinal."""
         by_group = request_data.new_block_ids_by_layer_group
         if not by_group:
-            # Under a single layer group the manager also mirrors that group's
-            # indices into the flat `new_block_ids`, but it does not say which
-            # group they belong to, so there is nothing safe to record from it.
+            # The flat `new_block_ids` the manager also fills does not say
+            # which layer group its indices belong to, so it is unusable here.
             return
         for layer_group_id, indices in enumerate(by_group):
             state.pages.setdefault(layer_group_id, []).extend(int(index) for index in indices)
@@ -312,10 +299,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             block = state.load_first_block + offset
             if block >= limit:
                 # The runtime allocated fewer pages than it accepted tokens
-                # for, so the tail of the offer has nowhere to land. Loads are
-                # synchronous and become work only here, which is late enough
-                # to see the shortfall and drop that tail; the runtime
-                # recomputes it.
+                # for, so the tail of the offer has nowhere to land. Dropping
+                # it here leaves the runtime to recompute it.
                 break
             self._append_pages(state, transfers, block)
         return transfers
@@ -335,9 +320,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         for layer_group_id, indices in state.pages.items():
             page_index = indices[block]
             if page_index == BAD_PAGE_INDEX:
-                # The block has no page in this group, because a sliding window
-                # dropped it. A partial page is not a usable cache entry,
-                # so the whole block is skipped.
+                # A sliding window dropped the block in this group, and a
+                # partial block is not a usable cache entry.
                 return
             pages.append(PageTransfer(block_hash, layer_group_id, page_index))
         transfers.pages.extend(pages)

@@ -339,9 +339,7 @@ def _disable_native_kv_offload(kv_cache_config: KvCacheConfig) -> None:
     memory the ranks have already lent it. A native tier alongside it claims a
     second share of the same node's DRAM, which the connector's node budget
     check cannot account for because the KV cache manager provisions it later.
-
-    Applies to every role. A capacity role registers no page addresses, so it
-    escapes the restrictions that protect them, but not the memory it lent.
+    That applies to every role, capacity included.
 
     Both fields are pinned to 0 rather than left unset, since a host_cache_size
     of None asks KVCacheManagerV2 to size a host tier automatically. Call this
@@ -943,11 +941,10 @@ def _create_py_executor_impl(
         if uses_connector(kv_connector_config, "mooncake-store"):
             _disable_native_kv_offload(kv_cache_config)
 
-        # Both restrictions below exist because a connector registers page
-        # addresses and moves KV against them, which a capacity-only connector
-        # does not. Asked here so the worker itself can answer, and still
-        # before the KV cache manager is built, which partial reuse requires
-        # since the manager reads it to construct its block pools.
+        # Both restrictions below protect page addresses a connector registers
+        # and moves KV against, which a capacity-only connector does not.
+        # Asked here so the worker itself can answer, and still before the KV
+        # cache manager reads enable_partial_reuse to build its block pools.
         if not kv_connector_manager.capacity_only:
             # A policy that destroys and replays a live request leaves the
             # connector's per-request block delta measured against pages that

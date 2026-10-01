@@ -14,15 +14,13 @@
 # limitations under the License.
 """Configuration for the Mooncake store KV cache connector.
 
-Topology settings are read from the JSON file named by `MOONCAKE_CONFIG_PATH`,
-the same file and environment variable the vLLM Mooncake store connector uses,
-so one deployment can point both engines at the same pool.
+Read from the JSON file named by `MOONCAKE_CONFIG_PATH`, the same file and
+environment variable the vLLM Mooncake store connector uses, so one deployment
+can point both engines at the same pool.
 
-Settings that are the pool's rather than any engine's, such as which master
-owns it and how it is reached, come from the manifest that master publishes, so
-they cannot drift between participants. What stays per server is the traffic it
-drives and the memory it lends. See `master.provision_pool`, which merges the
-two into the file this reads back.
+Pool-wide settings come from the manifest its master publishes; what stays per
+server is the traffic it drives and the memory it lends. `master.provision_pool`
+merges the two into the file this reads back.
 """
 
 import json
@@ -44,37 +42,31 @@ __all__ = [
 ]
 
 #: Mooncake's own variable for the client config path, read by the vLLM
-#: connector too. A deployment that provisions the pool outside the engine
-#: names it this way, and `master.provision_pool` exports it for the ranks the
-#: LLM constructor spawns.
+#: connector too. `master.provision_pool` exports it for the ranks the LLM
+#: constructor spawns.
 CONFIG_PATH_ENV = "MOONCAKE_CONFIG_PATH"
 #: Name the rendered client config takes in the run directory.
 CLIENT_CONFIG_NAME = "mooncake.json"
-#: Records which server rendered the client config in a run directory. That
-#: config names the writing server's role and its node's RDMA devices, so a
-#: second server pointed at the same directory is a misconfiguration.
-#: See `master.claim_run_dir`.
+#: Records which server rendered the client config in a run directory; see
+#: `master.claim_run_dir`.
 RUN_DIR_OWNER_NAME = "owner.json"
 #: Subdirectory of the run directory where each rank records the segment it
-#: mounted. Telemetry reads it instead of scraping logs; see `ledger.py`.
+#: mounted; see `ledger.py`.
 SEGMENTS_DIR_NAME = "segments"
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200
-#: Per-process Mooncake transfer buffer. Not pool capacity, and not worth a
-#: knob: it bounds one client's scratch space, which no deployment has had
-#: reason to tune. Still written into the rendered config so a vLLM reader of
-#: the same file sees the same value rather than falling back to its own.
+#: Per-process Mooncake transfer buffer, not pool capacity. Written into the
+#: rendered config so a vLLM reader of the same file sees the same value.
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824
 DEFAULT_NAMESPACE = "trtllm"
-#: Mooncake's own peer-to-peer handshake, which keeps a separate metadata
-#: process out of the deployment. Nothing else is a sensible fallback: an empty
-#: connstring is not one of the forms `store.setup` accepts, so a config that
-#: leaves the field out means this rather than meaning no metadata service.
+#: Mooncake's peer-to-peer handshake, which keeps a separate metadata process
+#: out of the deployment. An empty connstring is not a form `store.setup`
+#: accepts, so this is the only sensible fallback.
 DEFAULT_METADATA_SERVER = "P2PHANDSHAKE"
 
 #: Suffixes this parser reads as powers of 1000. vLLM's Mooncake config parser
-#: reads the same spellings as powers of 1024, so a file both engines may open
-#: must not use them; `strict_units` rejects them for that reason.
+#: reads the same spellings as powers of 1024, so `strict_units` rejects them
+#: in a file both engines may open.
 _DECIMAL_UNITS = {
     "k": 1000,
     "kb": 1000,
@@ -111,10 +103,8 @@ _SIZE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)\s*$")
 class StoreRole(Enum):
     """Which directions of traffic this engine is allowed to drive.
 
-    Traffic is a separate concern from capacity: every role mounts the segment
-    its config asks for, and the role says only what the engine then does with
-    the pool. `CAPACITY` is the role that does nothing with it, which is how a
-    generation server lends its memory without reading or writing.
+    Traffic is separate from capacity: every role mounts the segment its config
+    asks for, and the role says only what the engine then does with the pool.
 
     A disaggregated deployment typically runs context servers as `both` and
     generation servers as `capacity`: generated tokens are rarely a reused
@@ -142,8 +132,8 @@ class StoreRole(Enum):
     def transfers(self) -> bool:
         """Whether this role moves KV at all.
 
-        False only for `CAPACITY`. The connector short-circuits every transfer
-        path on this, including KV registration.
+        False only for `CAPACITY`, which short-circuits every transfer path
+        including KV registration.
         """
         return self.loads or self.saves
 
@@ -155,9 +145,8 @@ def parse_size(value: Any, *, strict_units: bool = False) -> int:
         value: A byte count, or a magnitude with a unit suffix.
         strict_units: Reject `GB`/`MB`/`KB`/`TB` and their one-letter forms.
             Set this wherever the value comes from, or goes into, a file the
-            vLLM connector may also read: it scales those suffixes by 1024
-            rather than 1000, so `"80GB"` would name two different sizes.
-            Binary suffixes and plain byte counts mean the same thing to both.
+            vLLM connector may also read, since it scales those suffixes by
+            1024 rather than 1000.
 
     Returns:
         The size in bytes.
@@ -200,13 +189,10 @@ def pool_config(llm_args: Any) -> Optional[Any]:
 def provisioned_config_path(run_dir: Optional[str]) -> Optional[str]:
     """The client config a server rendered into `run_dir`, if there is one.
 
-    `provision_pool` writes one and exports `MOONCAKE_CONFIG_PATH`, which the
-    ranks the LLM constructor spawns inherit. Ranks an external launcher
-    started, one task per rank, were already running by then and never see it,
-    so they read the config back from the run directory instead.
-
-    Only possible when the config named that directory, since it otherwise
-    defaults to a per-process temporary one that no other rank could read.
+    Ranks an external launcher started were already running when
+    `provision_pool` exported `MOONCAKE_CONFIG_PATH`, so they read the config
+    back from the run directory instead. That needs the config to have named
+    the directory, since it otherwise defaults to a per-process temporary one.
     """
     if not run_dir:
         return None
@@ -231,18 +217,15 @@ class MooncakeStoreConnectorConfig:
     #: set different values; bump it after any change to page layout or
     #: contents.
     namespace: str = DEFAULT_NAMESPACE
-    #: Identity the keys are namespaced by. Two engines share cache only when
-    #: they agree on this, and two that disagree about what it names read each
-    #: other's pages, so it is required rather than defaulted. See
+    #: Checkpoint identity the keys are namespaced by; see
     #: :meth:`resolve_model_key`.
     model_key: Optional[str] = None
-    #: How many page keys go into one store call. Bounds the size of a single
-    #: RPC without bounding how much a request may transfer.
+    #: Page keys per store call. Bounds the size of a single RPC without
+    #: bounding how much a request may transfer.
     transfer_batch_size: int = 64
     #: Pass pages through a pinned host buffer instead of registering the KV
-    #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
-    #: RDMA, which registering device memory requires. The pinned allocation is
-    #: sized from the layout rather than configured; see `staging.py`.
+    #: pools with Mooncake. Costs a copy each way, but works without the
+    #: GPUDirect RDMA registering device memory requires. See `staging.py`.
     stage_through_host: bool = False
 
     def __post_init__(self) -> None:
@@ -263,11 +246,7 @@ class MooncakeStoreConnectorConfig:
 
     @staticmethod
     def from_file(path: str) -> "MooncakeStoreConnectorConfig":
-        """Read the topology from a vLLM-compatible Mooncake JSON config.
-
-        Sizes are parsed with `strict_units`, since this file is the one both
-        engines may open and the two parsers disagree about `GB`.
-        """
+        """Read the topology from a vLLM-compatible Mooncake JSON config."""
         with open(path) as handle:
             raw = json.load(handle)
         role = str(raw.get("role", StoreRole.BOTH.value)).strip().lower()
@@ -302,8 +281,7 @@ class MooncakeStoreConnectorConfig:
 
         An inherited `MOONCAKE_CONFIG_PATH` wins, since it names a pool the
         deployment provisioned itself. Otherwise the config is the one this
-        server rendered into `mooncake_store.run_dir`, which is the only route
-        open to a rank an external launcher started.
+        server rendered into `mooncake_store.run_dir`.
         """
         pool = pool_config(llm_args)
         run_dir = getattr(pool, "run_dir", None) if pool is not None else None
@@ -323,11 +301,10 @@ class MooncakeStoreConnectorConfig:
     def resolve_model_key(self, model: Any) -> str:
         """The model identity to namespace keys by.
 
-        Deliberately has no default. Deriving one from the model path would
-        make two checkpoints that happen to share a directory name, such as
-        `org-a/model` and `org-b/model` or two revisions mounted alike, agree
-        on a namespace while disagreeing on what the pages mean, and each would
-        read the other's KV as its own.
+        Deliberately has no default. Deriving one from the model path would let
+        two checkpoints that share a directory name, such as `org-a/model` and
+        `org-b/model`, agree on a namespace while disagreeing on what the pages
+        mean, and each would read the other's KV as its own.
         """
         if self.model_key:
             return self.model_key

@@ -14,26 +14,16 @@
 # limitations under the License.
 """KV cache connector backed by a Mooncake distributed store.
 
-Offloads KV pages to a shared CPU memory pool so a prefix computed by one engine
-can be replayed by another, which regular block reuse cannot do because it never
-leaves the instance that computed it.
-
-This is a different component from the Mooncake transfer engine that the C++
-cache transceiver uses for disaggregated prefill/decode handoff: that moves KV
-point to point between two known peers, while this one publishes pages into a
-pool addressed by content. The two compose, so a context server can write pages
-here and still hand off over NIXL.
-
-Transferring requires `KVCacheManagerV2`, the manager that can describe its
-pools to a connector through `register_kv_cache_layout`, and the Mooncake Python
-bindings, which `tensorrt-llm` pulls in as `mooncake-transfer-engine-cuda13`.
-A capacity-only rank describes no pools, so it needs only the bindings.
+Offloads KV pages to a shared CPU memory pool addressed by content, so a prefix
+computed by one engine can be replayed by another. Distinct from the Mooncake
+transfer engine the C++ cache transceiver uses, which moves KV point to point
+between two known peers; the two compose.
 
 A pool has one master, run as infrastructure rather than inside any engine::
 
     trtllm-serve mooncake_master --pool_file /shared/pool.json
 
-It publishes a manifest describing the pool, which each server then joins::
+Each server joins the pool the master's manifest describes::
 
     kv_connector_config:
       connector: mooncake-store
@@ -43,17 +33,15 @@ It publishes a manifest describing the pool, which each server then joins::
         segment_size: 160GiB
 
 Every rank that joins contributes `segment_size`, so capacity is the sum over
-participating ranks and grows with the deployment's parallelism. `role` governs
-only traffic, which is what lets a generation server lend its memory while
-leaving the pool alone; see `config.StoreRole`. What each rank contributed is
-recorded under the run directory for `ledger.format_pool_report` to total up.
+participating ranks. `role` governs traffic only; see `config.StoreRole`.
+`ledger.format_pool_report` totals up what each rank recorded.
 
-Pointing `MOONCAKE_CONFIG_PATH` at a Mooncake JSON config directly also works,
-and wins over `mooncake_store`, so an externally managed pool stays reachable.
-
-By default the KV pools themselves are registered with Mooncake, which requires
-GPUDirect RDMA. Where that is unavailable, `stage_through_host: true` routes
-pages through a pinned host buffer instead; see `staging.py`.
+Transferring requires `KVCacheManagerV2` and the Mooncake Python bindings,
+which `tensorrt-llm` pulls in as `mooncake-transfer-engine-cuda13`; a
+capacity-only rank needs only the bindings. An inherited `MOONCAKE_CONFIG_PATH`
+wins over `mooncake_store`, so an externally managed pool stays reachable.
+Registering the KV pools needs GPUDirect RDMA; where that is unavailable,
+`stage_through_host: true` routes pages through a pinned host buffer.
 """
 
 from .config import MooncakeStoreConnectorConfig, StoreRole, parse_size

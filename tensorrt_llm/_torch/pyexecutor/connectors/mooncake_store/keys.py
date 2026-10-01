@@ -14,19 +14,15 @@
 # limitations under the License.
 """Block identity and store key naming for the Mooncake store connector.
 
-`KVCacheManagerV2` exposes no block hashes to a connector, since `RequestData`
-reports them empty, so content identity is derived here instead. The chain is
-the standard one: a block's hash covers its own tokens *and* every token before
-it, so a key can only be reused by a request whose prefix is byte-identical.
+`KVCacheManagerV2` reports `RequestData.block_hashes` empty, so content identity
+is derived here. A block's hash covers its own tokens and every token before it,
+so a key can only be reused by a request whose prefix is byte-identical. The
+chain is seeded with a `ReuseScope` covering what the tokens do not record.
 
-Token ids alone do not say what a page holds, so the chain is seeded with a
-`ReuseScope` covering the rest: see its docstring.
-
-A key is `<namespace>/<block hash>`. The namespace pins down everything that
-would make the stored bytes mean something different: the model, the shard that
-produced them, the layer group inside that shard, the tokens each page holds and
-how many bytes a page is. Anything that changes those reads as a cache miss
-rather than as garbage.
+A key is `<namespace>/<block hash>`. The namespace pins down everything else
+that decides what the stored bytes mean: the model, the shard that produced
+them, the layer group inside that shard, the tokens each page holds and how many
+bytes a page is. A change to any of those reads as a miss rather than as garbage.
 """
 
 import hashlib
@@ -40,9 +36,8 @@ __all__ = [
     "HASH_DIGEST_BYTES",
 ]
 
-#: 128 bits. Collisions decide whether one request reads another's KV, so the
-#: digest is sized to make that negligible over any realistic cache lifetime,
-#: while staying half the width of a full blake2b digest in every key.
+#: 128 bits. A collision means one request reads another's KV, so the digest is
+#: sized to make that negligible over any realistic cache lifetime.
 HASH_DIGEST_BYTES = 16
 
 
@@ -62,16 +57,11 @@ def _framed(*parts: bytes) -> bytes:
 class ReuseScope:
     """What, besides the tokens, decides whose KV a block hash names.
 
-    Token ids are not a complete identity for the bytes a page holds. A LoRA
-    adapter rewrites every layer's weights, and a multimodal placeholder token
-    carries the same id whichever image stands behind it, so two requests
-    differing only in either one hash alike and would read each other's pages.
-    `KVCacheManagerV2` separates both cases at the root of its radix tree; the
-    store has to separate them too, and more carefully, since its pool is
-    shared across engines rather than private to the one that filled it.
-
-    Everything here is a property of the whole request, so it seeds the chain
-    rather than being mixed into each block.
+    A LoRA adapter rewrites every layer's weights, and a multimodal placeholder
+    token carries the same id whichever image stands behind it, so two requests
+    differing only in either one would otherwise hash alike and read each
+    other's pages. Everything here is a property of the whole request, so it
+    seeds the chain rather than being mixed into each block.
     """
 
     #: `LlmRequest.cache_salt`: the caller's own partition of the cache.
@@ -79,10 +69,8 @@ class ReuseScope:
     #: `LlmRequest.lora_task_id`.
     lora_task_id: Optional[int] = None
     #: Content digest per multimodal item, in prompt order. Seeding with the
-    #: whole set rather than per block means a request whose media differ
-    #: diverges from its first block, so sharing only a media prefix with
-    #: another request is a miss. That costs a reload; the alternative costs
-    #: correctness.
+    #: whole set means a request whose media differ diverges from its first
+    #: block, so sharing only a media prefix is a miss rather than a wrong page.
     multimodal_digests: Tuple[bytes, ...] = field(default_factory=tuple)
 
     def seed(self) -> bytes:
@@ -101,8 +89,8 @@ class ReuseScope:
 class BlockHashChain:
     """Rolling hashes of a request's full blocks, one entry per block ordinal.
 
-    Extended in place as a request's token list grows, so generation steps cost
-    one digest per newly completed block rather than a rehash of the prompt.
+    Extended in place as the token list grows, so a generation step costs one
+    digest per newly completed block rather than a rehash of the prompt.
     """
 
     def __init__(self, tokens_per_block: int, scope: Optional[ReuseScope] = None):
@@ -126,9 +114,9 @@ class BlockHashChain:
         """Grow the chain to cover every full block of `tokens`.
 
         Args:
-            tokens: The request's complete token list, prompt first. Must be an
-                extension of what was passed previously; a request's tokens only
-                ever grow, so a shorter list means the caller mixed up requests.
+            tokens: The request's complete token list, prompt first. Must
+                extend what was passed previously; a shorter list means the
+                caller mixed up requests.
 
         Returns:
             The full chain, indexed by block ordinal.
@@ -143,8 +131,7 @@ class BlockHashChain:
             start = ordinal * self._tokens_per_block
             block = tokens[start : start + self._tokens_per_block]
             parent = self._hashes[-1] if self._hashes else self._seed
-            # Fixed-width little-endian token ids: a delimiter-free encoding
-            # would let two different token sequences serialize identically.
+            # Fixed width, so no two different token sequences serialize alike.
             payload = b"".join(int(token).to_bytes(8, "little", signed=True) for token in block)
             self._hashes.append(_digest(parent, payload))
         return self._hashes
@@ -156,9 +143,9 @@ class KeyNamespace:
 
     namespace: str
     model_key: str
-    #: Global rank of the shard whose KV these bytes are, and the world size it
-    #: was produced under. Both are needed: rank 3 of 8 holds different heads
-    #: than rank 3 of 4.
+    #: Global rank of the shard whose KV these bytes are. Paired with the world
+    #: size it was produced under, since rank 3 of 8 holds different heads than
+    #: rank 3 of 4.
     rank: int
     world_size: int
     layer_group_id: int

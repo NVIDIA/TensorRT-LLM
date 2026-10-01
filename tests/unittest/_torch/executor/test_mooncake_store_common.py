@@ -343,9 +343,9 @@ def test_config_accepts_the_sizes_both_engines_agree_on(store_config, spelling, 
 def test_config_role_comes_from_the_json(store_config, role, loads, saves):
     """Each server's own config says what it does with the pool.
 
-    There is no environment override for it. The role is a field of
-    `mooncake_store`, and the rendered config carries what that field said, so
-    a second way to set it could only disagree with the first.
+    There is no environment override: the rendered config carries whatever
+    `mooncake_store.role` said, so a second way to set it could only disagree
+    with the first.
     """
     set_pool_setting(store_config, role=role)
     config = resolve_config()

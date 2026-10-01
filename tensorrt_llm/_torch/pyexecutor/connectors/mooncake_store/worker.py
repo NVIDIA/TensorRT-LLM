@@ -15,28 +15,22 @@
 """Worker side of the Mooncake store KV cache connector.
 
 One worker per rank owns a `MooncakeDistributedStore` handle and moves pages
-between that pool and its own GPU KV cache. It is also the only place that knows
-how a page is addressed and how a key is spelled, which is why the leader,
-colocated with rank 0's worker in the same process, asks it to run prefix
-lookups instead of rebuilding that knowledge.
+between that pool and its own GPU KV cache. It is also the only place that
+knows how a page is addressed and how a key is spelled, which is why the
+leader, colocated with rank 0's worker, asks it to run prefix lookups.
 
 Loads are synchronous: the runtime has already told the scheduler those tokens
-are computed, so the bytes must be in place before the forward pass reads them,
-and a failed load is a wrong answer rather than a slow one.
+are computed, so a failed load is a wrong answer rather than a slow one.
 
-Saves are asynchronous and gated on a CUDA event. The pages are only complete
-once the forward pass that wrote them has retired, and blocking the executor
-loop on an RDMA write is exactly the cost the store is supposed to avoid. The
-scheduler reports such a request as saving asynchronously, which keeps its pages
-pinned until `get_finished` says the writes landed.
+Saves are asynchronous and gated on a CUDA event, since the pages are complete
+only once the forward pass that wrote them has retired and blocking the
+executor loop on an RDMA write is the cost the store exists to avoid. The
+scheduler reports such a request as saving asynchronously, which keeps its
+pages pinned until `get_finished` says the writes landed.
 
-Mounting the segment and moving pages are separate things, and the `capacity`
-role does only the first: every rank contributes the memory its config names,
-while the role decides whether the rank then reads or writes the pool. A
-capacity-only worker opens its handle and stops there, with no layout, no
-buffer registration and no save thread. That is how a node lends host memory
-to the pool without its engine joining in, and without needing an HCA that can
-pin GPU pages.
+A capacity-only worker opens its handle and stops there, with no layout, no
+buffer registration and no save thread, so a node can lend host memory to the
+pool without an HCA that can pin GPU pages.
 """
 
 import threading
@@ -73,9 +67,8 @@ __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
 
 #: Set by the worker's constructor so the leader, which the executor builds in
 #: the same process on rank 0, can reach the store handle without a second
-#: connection or an out-of-band channel. See `py_executor_creator`, which
-#: constructs scheduler and worker concurrently for exactly this kind of
-#: mutual dependency.
+#: connection. `py_executor_creator` constructs the two concurrently, so the
+#: leader waits on `_LOCAL_WORKER_READY`.
 _LOCAL_WORKER: Optional["MooncakeStoreConnectorWorker"] = None
 _LOCAL_WORKER_READY = threading.Event()
 
@@ -84,11 +77,7 @@ def resolve_local_worker(timeout: float = 60.0) -> "MooncakeStoreConnectorWorker
     """The worker living in this process, once it has been constructed.
 
     Args:
-        timeout: Seconds to wait. Construction is concurrent with the leader's,
-            so a short wait is expected; exceeding it means the worker failed.
-
-    Returns:
-        The process-local worker.
+        timeout: Seconds to wait. Exceeding it means construction failed.
     """
     if not _LOCAL_WORKER_READY.wait(timeout):
         raise RuntimeError(
@@ -176,8 +165,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         validate_llm_args(llm_args)
         self._config = MooncakeStoreConnectorConfig.resolve(llm_args)
         # Where this rank records the segment it mounts. `None` when the
-        # deployment named no directory, which makes the run unreportable but
-        # not unworkable; see `ledger.record_segment`.
+        # deployment named no directory, which only makes the run
+        # unreportable; see `ledger.record_segment`.
         self._run_dir = getattr(pool_config(llm_args), "run_dir", None)
         self._rank = mpi_rank()
         self._world_size = mpi_world_size()
@@ -190,8 +179,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # shards of it are present, so a lookup has to ask about all of them.
         self._peer_namespaces: Dict[int, Tuple[KeyNamespace, ...]] = {}
 
-        # Checked before the segment is mounted: every rank on this node is
-        # about to ask for the same amount, and the kernel answers an
+        # Checked before the segment is mounted, since the kernel answers an
         # unaffordable total by killing the process rather than by failing the
         # allocation.
         validate_node_budget(self._config)
@@ -211,8 +199,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         )
         self._save_thread: Optional[threading.Thread] = None
         #: Set once the save thread has finished its device and stream setup,
-        #: whether or not that succeeded. Registration waits on it so a thread
-        #: that cannot start is a bringup failure.
+        #: whether or not that succeeded.
         self._save_started = threading.Event()
         self._save_lock = threading.Lock()
         # Host staging, when the pool cannot register device memory.
@@ -234,7 +221,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         _LOCAL_WORKER = self
         _LOCAL_WORKER_READY.set()
 
-        logger.info(
+        logger.warning(
             f"mooncake-store worker rank {self._rank}/{self._world_size} ready "
             f"(role={self._config.role.value}, model_key={self._model_key}, "
             f"master={self._config.master_server_address}, "
@@ -242,10 +229,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             f"on {self._segment_host})"
         )
         if self.capacity_only:
-            # Said plainly, because every other sign of a working connector is
-            # absent by design here, which otherwise looks like a broken
-            # deployment.
-            logger.info(
+            # Said plainly, since every other sign of a working connector is
+            # absent by design and otherwise looks like a broken deployment.
+            logger.warning(
                 f"mooncake-store worker rank {self._rank}: capacity-only. Its "
                 "memory is in the pool and its KV cache is not: no lookups, no "
                 "loads, no saves, and no KV registration, so this rank needs no "
@@ -256,27 +242,21 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
     @property
     def capacity_only(self) -> bool:
-        """Whether this rank lends memory to the pool and transfers nothing.
-
-        Read by the executor to skip the guards that protect a connector's
-        registered pages, since this role registers none.
-        """
+        """Whether this rank lends memory to the pool and transfers nothing."""
         return self._config.capacity_only
 
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
         """Reject the V1 single-pool registration, unless capacity-only.
 
         Raises:
-            NotImplementedError: Unless capacity-only. Identity here is a hash
-                chain the connector computes itself, keyed per layer group, and
-                the V1 manager supplies real block hashes over a single flat
-                block space instead. Running the V2 addressing against V1 block
-                ids would silently mislabel pages, so V1 is refused rather than
-                approximated.
+            NotImplementedError: Unless capacity-only. V1 supplies block hashes
+                over a single flat block space, while this connector keys pages
+                per layer group from a hash chain of its own, so running the V2
+                addressing against V1 block ids would mislabel pages.
         """
         if self.capacity_only:
             # Nothing is addressed, so which manager describes the cache does
-            # not matter and such a server may keep whichever suits it.
+            # not matter.
             return
         raise NotImplementedError(
             "The mooncake-store connector requires KVCacheManagerV2. Set "
@@ -289,11 +269,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             raise RuntimeError("KV cache layout already registered")
 
         if self.capacity_only:
-            # Registration exists to let the store reach this rank's pages, and
-            # nothing will ask it to, so the addressing, the buffer
-            # registration, the staging pool and the save thread are all
-            # skipped.
-            logger.info(
+            # Nothing will ask the store to reach this rank's pages, so the
+            # addressing, buffer registration, staging pool and save thread
+            # are all skipped.
+            logger.warning(
                 f"mooncake-store worker rank {self._rank}: capacity-only, so "
                 "the KV cache layout is not registered and no page of it is "
                 "reachable from the pool."
@@ -340,9 +319,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 daemon=True,
             )
             self._save_thread.start()
-            # Reporting ready before the thread is would turn a thread that
-            # cannot bind this rank's device into requests that stay pinned on
-            # saves nothing will consume. Fail bringup instead.
+            # A thread that cannot bind this rank's device has to fail bringup
+            # here, or its requests stay pinned on saves nothing will consume.
             self._save_started.wait()
             with self._save_lock:
                 startup_error, self._save_error = self._save_error, None
@@ -353,16 +331,15 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                     "could never write to the pool."
                 ) from startup_error
 
-        logger.info(
+        logger.warning(
             f"mooncake-store worker rank {self._rank} registered layout: {addressing.describe()}"
         )
 
     def _open_staging(self, addressing: PageAddressing) -> None:
         """Allocate and register the pinned slots pages will pass through.
 
-        Only the directions this role drives get a pool, since each one costs a
-        pinned allocation of its own. The GPU pools are left unregistered,
-        which is the point of the mode.
+        Only the directions this role drives get a pool, since each one costs
+        a pinned allocation of its own.
         """
         max_bytes_per_page = max(
             addressing.bytes_per_page(layer_group_id)
@@ -423,10 +400,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     def count_prefix_hit(self, block_hashes: Sequence[bytes]) -> int:
         """How many leading blocks of `block_hashes` are fully present.
 
-        A block counts only when every layer group and every rank has its page,
-        because a prefix is replayed as a whole. The scan stops at the first
-        incomplete block: the runtime consumes a prefix, so a later hit is not
-        usable on its own.
+        A block counts only when every layer group and every rank has its
+        page, since a prefix is replayed as a whole. The scan stops at the
+        first incomplete block, a later hit being unusable on its own.
 
         Args:
             block_hashes: Candidate hashes in block order.
@@ -505,8 +481,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             ]
             if failed or len(results) != len(batch_keys):
                 # The runtime already counted these tokens as computed, so a
-                # partial load leaves the forward pass reading uninitialized KV
-                # and silently producing wrong tokens. Fail loudly instead.
+                # partial load would leave the forward pass reading
+                # uninitialized KV and silently producing wrong tokens.
                 raise RuntimeError(
                     f"mooncake-store failed to load {len(failed) or len(batch_keys)} of "
                     f"{len(batch_keys)} pages; the affected KV slots were already "
@@ -525,9 +501,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
         """No-op: loads complete in `start_load_kv`.
 
-        Transfers are whole pages, so a page's bytes for every layer in a group
-        land in one store call rather than layer by layer. There is nothing left
-        outstanding by the time the first layer runs.
+        Transfers are whole pages, so every layer of a group lands in one
+        store call and nothing is outstanding when the first layer runs.
         """
 
     def save_kv_layer(self, layer_idx: int, stream: torch.cuda.Stream):
@@ -546,9 +521,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             return
         self._reraise_save_error()
 
-        # The pages are written by kernels still queued on this stream. The event
-        # is the handoff: the thread reads GPU memory only after the pass retires,
-        # and the executor loop is not blocked waiting for that.
+        # The pages are written by kernels still queued on this stream, so the
+        # event is the handoff: the thread reads GPU memory only after the
+        # pass retires, without the executor loop waiting for it.
         event = torch.cuda.Event()
         event.record(stream)
 
@@ -565,9 +540,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         Args:
             finished_gen_req_ids: Requests that will produce no further KV.
             started_loading_req_ids: Requests loading asynchronously. Always
-                empty here, since `get_num_new_matched_tokens` only ever
-                offers synchronous loads; echoed back so the runtime does not
-                wait on something that already happened.
+                empty here, since `get_num_new_matched_tokens` only offers
+                synchronous loads; echoed back so the runtime does not wait on
+                something that already happened.
 
         Returns:
             Requests that have finished saving, and requests that have finished
@@ -589,21 +564,20 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     def _drain_saves(self) -> None:
         try:
             # A new thread starts on device 0, so adopt the device captured on
-            # the executor thread. Otherwise a stream created below belongs to
+            # the executor thread. Otherwise the stream below belongs to
             # device 0 while the KV pointers belong to the rank's device, and
-            # the copy fails with cudaErrorInvalidValue on every rank except 0.
+            # the copy fails with cudaErrorInvalidValue on every rank but 0.
             if self._device_index is not None:
                 torch.cuda.set_device(self._device_index)
             if self._save_staging is not None and torch.cuda.is_available():
                 # Owned by this thread so the gather never queues behind the
-                # executor's work, and created after set_device so it lands on
-                # the rank's device.
+                # executor's work.
                 self._save_stream = torch.cuda.Stream()
         except Exception as exc:
-            # Same thread boundary as the transfer loop below, and the same
-            # handoff. A thread that died here would leave every later save
-            # outstanding against nothing, so the requests holding those pages
-            # would never retire and the worker would look merely slow.
+            # The same thread boundary and handoff as the transfer loop below.
+            # A thread that died here would leave every later save outstanding
+            # against nothing, so the requests holding those pages would never
+            # retire and the worker would look merely slow.
             logger.error(
                 f"mooncake-store save thread failed to start on rank {self._rank}: "
                 f"{type(exc).__name__}: {exc}"
@@ -656,8 +630,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         ):
             batch_keys, batch_addresses, batch_sizes = batch
             # Skip pages another rank or another instance already wrote. The
-            # scheduler cannot know this: it holds no store handle, and the
-            # answer changes between the time it builds metadata and now.
+            # scheduler holds no store handle, and the answer changes between
+            # the time it builds metadata and now.
             present = self._store.batch_is_exist(list(batch_keys))
             pending = [
                 index
@@ -683,8 +657,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             )
             failures = sum(1 for result in results if not isinstance(result, int) or result < 0)
             if failures:
-                # A dropped write only costs a future cache miss, so it is worth
-                # a warning rather than failing a request that already answered.
+                # A dropped write only costs a future cache miss, which is not
+                # worth failing a request that already answered.
                 logger.warning(
                     f"mooncake-store rank {self._rank} failed to save {failures} of "
                     f"{len(pending)} pages"

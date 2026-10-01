@@ -652,9 +652,9 @@ def _provision_kv_cache_pool(llm_args: dict,
     """Bring up the shared cache this server joins, for its lifetime.
 
     A connector backed by a cluster-wide pool needs that pool reachable before
-    any rank opens a handle, and the ranks are spawned by the LLM constructor,
-    so this wraps the construction. A deployment that provisions the pool
-    externally is detected and left alone.
+    any rank opens a handle, and the LLM constructor spawns the ranks, so this
+    wraps the construction. A deployment that provisions the pool externally is
+    detected and left alone.
 
     Only the process that owns the engine does this. An attached frontend
     re-execs this command line but shares the launcher's executor, so it would
@@ -669,9 +669,9 @@ def _provision_kv_cache_pool(llm_args: dict,
 
     connector_config = llm_args.get("kv_connector_config")
     if isinstance(connector_config, dict):
-        # A YAML config section arrives unvalidated, and the pool has to be
-        # described before the LLM constructor would coerce it. Hand the
-        # validated model on so it is not parsed twice.
+        # A YAML section arrives unvalidated, and the pool has to be described
+        # before the LLM constructor would coerce it. The validated model is
+        # handed on so it is not parsed twice.
         connector_config = KvCacheConnectorConfig(**connector_config)
         llm_args["kv_connector_config"] = connector_config
 
@@ -2841,9 +2841,8 @@ main = DefaultGroup(
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
         "mm_embedding_serve": serve_encoder,
         "embeddings": serve_embedding,
-        # The part of a Mooncake pool that cannot belong to a server, since it
-        # outlives and is shared by all of them, and the report of what they
-        # collectively contributed to it.
+        # The part of a Mooncake pool that outlives and is shared by every
+        # server, and the report of what they collectively contributed to it.
         "mooncake_master": mooncake_master,
         "mooncake_pool_report": mooncake_pool_report,
     })

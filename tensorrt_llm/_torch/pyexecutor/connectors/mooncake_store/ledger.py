@@ -15,15 +15,13 @@
 """What each rank put into the pool, recorded where telemetry can read it.
 
 Pool capacity is the sum of the segments its participants mounted, and no
-participant can see any other's. Reporting it therefore needs the facts written
-down as they happen: one small file per rank that mounted a segment, under a
-directory the deployment names. Recovering them from logs instead would tie the
-report to the wording of a log line.
+participant can see any other's, so each writes one small file under a
+directory the deployment names. Recovering the same figures from logs would tie
+the report to the wording of a log line.
 
-A record is a declaration, not a measurement: it says what this rank asked the
-master to accept. Where the blocks then landed is the master's to say, and
-`format_pool_report` joins the two, grouping the master's placement lines by
-segment host against the roles the records declare.
+A record is a declaration rather than a measurement: it says what this rank
+asked the master to accept. Where the blocks landed is the master's to say, and
+`format_pool_report` joins the two.
 """
 
 import json
@@ -57,8 +55,8 @@ class SegmentRecord:
 
     #: Host the segment is registered under, as the master knows it.
     host: str
-    #: Rank within its own server. Not unique across a job, since every server
-    #: is its own MPI world; the file name carries the process identity.
+    #: Rank within its own server, so not unique across a job. The file name
+    #: carries the process identity.
     rank: int
     segment_size: int
     role: str
@@ -86,12 +84,9 @@ def record_segment(
     """Write this rank's contribution, and return where it went.
 
     A no-op returning `None` when the deployment named no run directory, since
-    a per-process temporary one is nowhere anything else could read.
-
-    The file name is keyed by host and pid rather than by rank, because every
-    server numbers its ranks from zero. Failure to write is logged and
-    swallowed: losing a line of telemetry is not worth failing a healthy
-    server.
+    a per-process temporary one is nowhere anything else could read. The file
+    name is keyed by host and pid rather than by rank, because every server
+    numbers its ranks from zero. A failed write is logged and swallowed.
     """
     if not run_dir:
         return None
@@ -124,11 +119,9 @@ def record_segment(
 def _record_paths(run_dir: str) -> List[str]:
     """Every segment record anywhere beneath `run_dir`.
 
-    The whole tree rather than one directory in it, because each server needs a
-    run directory of its own: they render a client config apiece and would
-    overwrite each other's if they shared one. The pool's directory, the one
-    holding the manifest every participant named, is therefore their common
-    ancestor rather than their common directory.
+    The whole tree rather than one directory in it, since each server needs a
+    run directory of its own. The pool's directory is their common ancestor
+    rather than their common directory.
     """
     paths: List[str] = []
     for parent, directories, names in os.walk(run_dir):
@@ -165,8 +158,8 @@ def read_segments(run_dir: str) -> List[SegmentRecord]:
 def _roles_by_host(records: Sequence[SegmentRecord]) -> Dict[str, str]:
     """Which roles each host lent memory under.
 
-    This is the join key for the master's placement table. A host normally runs
-    one kind of server, so the value is normally a single role.
+    The join key for the master's placement table. A host normally runs one
+    kind of server, so the value is normally a single role.
     """
     roles: Dict[str, set] = {}
     for record in records:
@@ -211,10 +204,9 @@ def _capacity_lines(records: Sequence[SegmentRecord]) -> List[str]:
 def _placement_lines(master_log: str, records: Sequence[SegmentRecord]) -> List[str]:
     """Where blocks actually landed, by host, labelled with each host's role.
 
-    The master names a segment for every allocation, and a segment is one
-    client process's memory, so grouping by host shows how much of the pool's
-    contents live on a decode node rather than on the prefill node that
-    computed them. That is the question the report exists to answer.
+    A segment is one client process's memory, so grouping the master's
+    allocations by host shows how much of the pool's contents live on a decode
+    node rather than on the prefill node that computed them.
     """
     try:
         with open(master_log, errors="replace") as handle:
@@ -260,9 +252,6 @@ def _placement_lines(master_log: str, records: Sequence[SegmentRecord]) -> List[
 
 def format_pool_report(run_dir: str, master_log: Optional[str] = None) -> str:
     """A human-readable account of the pool a run stood up.
-
-    Reads the manifest and the segment records rather than any log. Joins the
-    master's own placement lines when its log is available.
 
     Args:
         run_dir: The pool's directory, holding `pool.json`. Segment records are

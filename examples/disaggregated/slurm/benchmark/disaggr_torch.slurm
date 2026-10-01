@@ -101,7 +101,7 @@ elif [ -d "${trtllm_repo}" ]; then
 
     if [ "${build_wheel}" = "true" ]; then
         echo "Building TensorRT-LLM wheel on one node..."
-        build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --use_ccache --clean"
+        build_command="python3 ./scripts/build_wheel.py --use_ccache --clean"
         if [ -n "${cuda_architectures:-}" ]; then
             build_command="${build_command} --cuda_architectures \"${cuda_architectures}\""
         fi
@@ -138,24 +138,9 @@ else
     echo "TensorRT-LLM environment variables saved to ${full_logdir}/env_vars.json"
 fi
 
-# The Mooncake store bindings, when a worker config asks for the connector.
-# Images built from this repo bake them in (docker/common/install_mooncake.sh),
-# so this only confirms they are there: a job that discovers the gap later
-# fails once per rank, deep in engine startup.
 mooncake_enabled=false
 if grep -qs "mooncake-store" "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"; then
     mooncake_enabled=true
-    # Both halves of the wheel are checked because they fail at different
-    # times: the connector needs mooncake.store in every context rank, and
-    # 'trtllm-serve mooncake_master' needs the binary on PATH.
-    if ! srun --container-name=${container_name} \
-        --container-mounts=${container_mount} --no-container-mount-home \
-        --mpi=pmix --overlap -N 1 -n 1 \
-        bash -c 'python3 -c "import mooncake.store" && command -v mooncake_master' \
-        &> ${full_logdir}/2_check_mooncake.log; then
-        cleanup_on_failure "A worker config requests the mooncake-store connector, but this image has neither the mooncake.store bindings nor the mooncake_master binary. Build the image from this repo so that docker/common/install_mooncake.sh runs. Check ${full_logdir}/2_check_mooncake.log for details"
-    fi
-    echo "Mooncake store bindings found in the image"
 fi
 
 # Get node lists and replace the placeholder with the actual node names
@@ -174,22 +159,21 @@ client_cmds_base_file=${full_logdir}/client_cmds_base.sh
 client_cmds_file=${full_logdir}/client_cmds.sh
 replace_placeholder "${client_cmds_base_file}" "${all_nodes_str}" "${client_cmds_file}"
 
-# The pool's master runs here, as its own job step. It belongs to no server:
-# one master serves every server in the job, it has to be answering before any
-# of them opens a store handle, and the settings every participant must agree
-# on are stated once, by it, in the manifest it publishes. Each worker config
-# names that manifest as mooncake_store.pool.
+# The pool's master runs as its own job step. One serves every server in the
+# job, it has to be answering before any of them opens a store handle, and the
+# manifest it publishes states the settings they must agree on. Each worker
+# config names that manifest as mooncake_store.pool.
 #
-# The one value a config written before submission cannot know is this job's
-# log directory, which the manifest is published into, so a __LOG_DIR__
-# placeholder in either worker config is filled in here.
+# A config written before submission cannot know this job's log directory,
+# which the manifest is published into, so a __LOG_DIR__ placeholder in either
+# worker config is filled in here.
 if [ "${mooncake_enabled}" = "true" ]; then
     sed -i "s|__LOG_DIR__|${full_logdir}|g" \
         "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"
 
     # Read from the worker configs so the master publishes where the workers
-    # look. A fixed path lets a config that names a different manifest wait out
-    # the timeout below on one that is never written.
+    # look. With a fixed path, a config naming a different manifest would wait
+    # out the timeout below on one that is never written.
     mooncake_pool_file=$(sed -n \
         's|^[[:space:]]*pool:[[:space:]]*file://\([^[:space:]]*\).*$|\1|p' \
         "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml" \
@@ -212,11 +196,10 @@ if [ "${mooncake_enabled}" = "true" ]; then
         &> ${full_logdir}/2_mooncake_master_step.log &
     mooncake_master_step_pid=$!
 
-    # Fail closed. Every part of this that can go wrong is silent in the
-    # benchmark numbers: a pool that never came up serves no lookup, so the
-    # run completes and merely reports no hits, which reads as a workload with
-    # no reuse rather than as a broken deployment. The alternative to failing
-    # here is discovering it while interpreting results.
+    # Fail closed: a pool that never came up serves no lookup, so the run
+    # completes reporting no hits, which reads as a workload with no reuse
+    # rather than as a broken deployment.
+    #
     # Generous, because the wait spans container start on another node. It
     # costs nothing when the manifest is already there, and the loop below
     # exits early if the master dies.
@@ -229,9 +212,7 @@ if [ "${mooncake_enabled}" = "true" ]; then
         fi
         sleep 1
     done
-    if [ ! -s "${mooncake_pool_file}" ]; then
-        cleanup_on_failure "No Mooncake pool manifest at ${mooncake_pool_file} after ${mooncake_master_wait}s, so no worker could have joined the pool. Check ${full_logdir}/2_mooncake_master_step.log and ${full_logdir}/mooncake_master.log"
-    fi
+    [ -s "${mooncake_pool_file}" ] || cleanup_on_failure "No Mooncake pool manifest at ${mooncake_pool_file} after ${mooncake_master_wait}s, so no worker could have joined the pool. Check ${full_logdir}/2_mooncake_master_step.log and ${full_logdir}/mooncake_master.log"
     echo "Mooncake pool manifest published:"
     cat "${mooncake_pool_file}"
 fi
@@ -258,24 +239,6 @@ cat ${start_server_cmds_file} | while read cmd; do
 done
 echo "Server is ready!"
 
-# A connector that failed to open its store handle does not stop the worker from
-# serving, it just never hits, so surface the startup lines here rather than
-# leaving them to be discovered after the benchmark. Both sides are scanned:
-# generation ranks join the pool too, as capacity, so their startup lines are
-# where a decode-side segment that never mounted shows up.
-if [ "${mooncake_enabled}" = "true" ]; then
-    echo "Mooncake store startup lines from the workers:"
-    if ! grep -h "mooncake-store" \
-            "${full_logdir}"/3_output_CTX_*.log \
-            "${full_logdir}"/3_output_GEN_*.log 2>/dev/null; then
-        echo "  WARNING: no mooncake-store lines found. The connector may not have" \
-             "loaded; check ${full_logdir}/3_output_CTX_*.log," \
-             "${full_logdir}/3_output_GEN_*.log and" \
-             "${full_logdir}/mooncake_master.log. The benchmark will still run," \
-             "but without the store."
-    fi
-fi
-
 # Start client commands
 echo "Starting client commands from ${client_cmds_file}..."
 while read -r cmd <&3; do
@@ -288,15 +251,13 @@ done 3< "${client_cmds_file}"
 
 # Collect what the pool actually was, and what the store did with it.
 #
-# The capacity half is read from the manifest and from the record each rank
-# wrote when it mounted its segment, rather than from log lines. Grepping logs
-# for it would tie the decode share reported here to the wording of one
-# provisioning path's message, and a share that is merely wrong looks like a
-# workload with no reuse.
+# The capacity half comes from the manifest and from each rank's segment
+# record rather than from log lines, which would tie the decode share reported
+# here to the wording of one provisioning path's message.
 #
-# The traffic half is log-derived, since per-event lines are all there is. They
-# live at DEBUG (module _torch), so the counts are only populated when a config
-# asks for that verbosity.
+# The traffic half is log-derived, per-event lines being all there is. They
+# live at DEBUG (module _torch), so the counts are populated only when a
+# config asks for that verbosity.
 if [ "${mooncake_enabled}" = "true" ]; then
     mooncake_summary="${full_logdir}/9_mooncake_summary.log"
     {
@@ -307,24 +268,23 @@ if [ "${mooncake_enabled}" = "true" ]; then
             trtllm-serve mooncake_pool_report --run_dir "${full_logdir}" \
             2>/dev/null || echo "(could not read the pool's records)"
         echo
+        # Both roles, since a decode-side segment that never mounted shows up
+        # only in the generation logs.
         echo "== startup =="
-        grep -h "mooncake-store.*\(ready\|registered layout\|capacity-only\)" \
+        grep -h "mooncake-store" \
             "${full_logdir}"/3_output_CTX_*.log \
-            "${full_logdir}"/3_output_GEN_*.log 2>/dev/null || echo "(none)"
+            "${full_logdir}"/3_output_GEN_*.log 2>/dev/null \
+            | head -n 40 || echo "(none; the connector may not have loaded)"
         echo
-        # Only the roles that transfer produce these, so they are counted over
-        # the context logs alone; a capacity rank contributing nothing here is
-        # the intended behaviour, not a missing signal.
+        # Only the roles that transfer produce these, so the context logs are
+        # the whole population. A capacity rank contributing nothing here is
+        # intended, not a missing signal.
         echo "== event counts (context workers) =="
         for pattern in "matched" "loaded" "failed to load" "failed to save" \
                        "lookup failed" "could not reserve connector prefix"; do
             count=$(grep -h "mooncake-store.*${pattern}" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null | wc -l || true)
             echo "${pattern}: ${count}"
         done
-        echo
-        echo "== pool bringup =="
-        grep -h "mooncake-store:" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null \
-            | head -n 30 || echo "(none)"
         echo
         # The master's own glog output, not anything TensorRT-LLM writes.
         echo "== master =="

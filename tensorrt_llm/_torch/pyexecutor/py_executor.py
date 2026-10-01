@@ -1192,10 +1192,10 @@ class PyExecutor:
                 # pinned to GPU. V2 migrates pages between cache tiers, and it
                 # provisions a host tier by default, so reject any non-GPU tier
                 # until the connector participates in migration. Read the
-                # resolved tier list rather than KvCacheConfig.host_cache_size:
-                # the default of None is falsy but still yields a host tier.
-                # A capacity-only connector registers nothing and serves no
-                # prefix, so neither rejection has anything to protect.
+                # resolved tier list rather than KvCacheConfig.host_cache_size,
+                # whose default of None is falsy but still yields a host tier.
+                # A capacity-only connector has nothing for either rejection
+                # to protect.
                 if not capacity_only:
                     self._reject_non_gpu_cache_tiers(self.kv_cache_manager)
                     self._reject_connector_prefix_without_block_reuse(
@@ -4053,9 +4053,9 @@ class PyExecutor:
     def _is_preemption_pending(self, request: LlmRequest) -> bool:
         """True while *request* is a preemption victim awaiting its connector.
 
-        Deferring a release is a V2-only path, and the attribute is read
-        through `getattr` because the response pass this guards also runs on
-        the minimal executors unit tests assemble.
+        Deferring a release is a V2-only path, read through `getattr` because
+        the response pass this guards also runs on the minimal executors unit
+        tests assemble.
         """
         if not getattr(self, "_is_kv_manager_v2", False):
             return False
@@ -4064,11 +4064,9 @@ class PyExecutor:
     def _resume_preempted_request(self, request: LlmRequest) -> bool:
         """Complete a preemption whose connector saves have now retired.
 
-        The scheduler preempts a request by handing it to the connector the
-        same way a finished request is handed over, so its pages stay put until
-        every rank reports the in-flight saves done. Both kinds come back
-        through `get_finished`, and only the KV cache manager knows which is
-        which.
+        A preempted request is handed to the connector the same way a finished
+        one is, so both come back through `get_finished` and only the KV cache
+        manager knows which is which.
 
         Returns True when *request* was preempted rather than finished, in
         which case its pages are now released and it is back in context state
@@ -4078,10 +4076,9 @@ class PyExecutor:
             return False
         if not self.kv_cache_manager.try_complete_preemption(request):
             return False
-        # The same teardown an immediate recompute pause does, since the
-        # request is in the same position by the time the saves retire.
-        # Pausing alone would clear py_seq_slot while SeqSlotManager still
-        # owned the slot, and the next schedule would trip its assertion.
+        # The same teardown an immediate recompute pause does. Pausing alone
+        # would clear py_seq_slot while SeqSlotManager still owned the slot,
+        # and the next schedule would trip its assertion.
         self._free_request_resources(request)
         self._pause_recompute_request(request)
         return True
@@ -8419,11 +8416,10 @@ class PyExecutor:
                 requests_to_terminate.append(request)
                 continue
 
-            # A victim parked mid-preemption sits in the state the finish path
-            # uses, which reads as finished here. Responding to it would hand
-            # the client a final response for a request that is about to
-            # re-prefill, and dropping it from active_requests would leave
-            # _resume_preempted_request nothing to put back.
+            # A victim parked mid-preemption reads as finished here.
+            # Responding would hand the client a final response for a request
+            # about to re-prefill, and dropping it from active_requests would
+            # leave _resume_preempted_request nothing to put back.
             if self._is_preemption_pending(request):
                 new_active_requests.append(request)
                 continue

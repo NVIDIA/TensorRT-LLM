@@ -54,13 +54,9 @@ rm -rf Mooncake
 
 echo "export LD_LIBRARY_PATH=${MOONCAKE_INSTALL_PATH}/lib:\$LD_LIBRARY_PATH" >> "${ENV}"
 
-# `make install` also emits a `mooncake` package that omits
-# libmooncake_store.so, so importing mooncake.store from it fails. It has to go
-# before the wheel is installed: CMake writes
-# store.cpython-312-x86_64-linux-gnu.so where the wheel writes store.so, and
-# importlib prefers the interpreter-tagged suffix, so the broken extension
-# would win even after pip reports success. The directory is the one
-# mooncake-integration/CMakeLists.txt chose, which this repeats.
+# `make install` also emits a `mooncake` Python package that omits
+# libmooncake_store.so and shadows the wheel's, so importing mooncake.store
+# fails unless it is removed.
 MOONCAKE_CMAKE_PACKAGE="$(python3 -c "import sys; print([s for s in sys.path if 'packages' in s][0])")/mooncake"
 echo "removing CMake-generated mooncake package: ${MOONCAKE_CMAKE_PACKAGE}"
 rm -rf "${MOONCAKE_CMAKE_PACKAGE}"

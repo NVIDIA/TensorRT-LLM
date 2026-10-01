@@ -356,12 +356,11 @@ class MinimalWorker(KvCacheConnectorWorker):
 
 
 def test_a_connector_is_assumed_to_move_kv():
-    """Several executor restrictions exist only because a connector normally
-    registers page addresses and transfers against them: the capacity
-    scheduler is pinned to GUARANTEED_NO_EVICT, cache tiers below GPU are
-    refused, and every decoder layer gets a pre/post hook. So the default has
-    to be the restrictive one, and a connector written before `capacity_only`
-    existed keeps every guard that was written for it.
+    """The default has to be the restrictive one.
+
+    A transferring connector pins the capacity scheduler to
+    GUARANTEED_NO_EVICT, refuses cache tiers below GPU, and hooks every
+    decoder layer. Guessing otherwise would drop all of that.
     """
     assert not MinimalWorker(MagicMock()).capacity_only
 

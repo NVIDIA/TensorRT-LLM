@@ -1,77 +1,26 @@
 # Extra LLM API options for trtllm-serve with the Mooncake store KV connector.
 #
-# Offloads KV pages to a Mooncake distributed store, a shared CPU memory pool
-# addressed by content, so a prefix computed by one engine can be replayed by
-# another. This is a different component from the Mooncake transfer engine used
-# by the C++ cache transceiver for disaggregated prefill/decode handoff; the two
-# compose rather than conflict.
-#
 # Prerequisites:
-#   - Mooncake Python bindings: pip install mooncake-transfer-engine
-#     (present in the release container; the C++ source build does not
-#     provide MooncakeDistributedStore)
-#   - A master owning the pool, started before this server:
+#   - mooncake installed: pip install mooncake-transfer-engine
+#   - A master owning the pool, started first:
 #       trtllm-serve mooncake_master --pool_file /shared/pool.json
-#     It publishes a manifest describing the pool, which `pool` below names.
-#     See https://kvcache-ai.github.io/Mooncake/
-#
-# Every rank that joins contributes `segment_size`, so pool capacity is the sum
-# over participating ranks. `role` governs only traffic, which is what lets a
-# generation server lend memory while leaving the pool alone:
-#
-#   role: both       reads and writes, which is what a context server wants
-#   role: capacity   neither, so it contributes memory and nothing else, and
-#                    registers no KV cache with Mooncake, so it needs no
-#                    GPUDirect RDMA. What a generation server wants, since it
-#                    receives prompt KV over the cache transceiver instead.
-#
-# Sizes must be binary ("160GiB") or a byte count. "GB" is refused: this
-# parser scales it by 1000 and vLLM's Mooncake parser by 1024, so it would name
-# two different segments in a file both engines may read.
-#
-# Every setting is in the block below. The one environment variable the
-# connector reads is MOONCAKE_CONFIG_PATH, which is Mooncake's own and points
-# at a client config directly; it wins over this block, so an externally
-# provisioned pool stays reachable.
+#   - PyTorch backend
 #
 # Example:
-#   trtllm-serve <hf_model> --backend pytorch --host 0.0.0.0 --port 8000 \
+#   trtllm-serve Qwen/Qwen2-1.5B-Instruct --backend pytorch --host 0.0.0.0 --port 8000 \
 #     --extra_llm_api_options /path/to/this/file
-#
-# Afterwards, what the pool actually held:
-#   trtllm-serve mooncake_pool_report --run_dir /shared/run
 
 kv_cache_config:
-  # The connector describes its pools through register_kv_cache_layout, which
-  # only KVCacheManagerV2 implements. Not needed for role: capacity.
   use_kv_cache_manager_v2: true
-  # Local reuse still runs first; the store serves whatever the device missed.
   enable_block_reuse: true
-  # host_cache_size and disk_cache_size are left unset: the connector forces
-  # both to 0 for every role, overriding any value with a warning. The pool is
-  # the offload tier, so a native one would claim a second share of the same
-  # node's DRAM. Put that memory into segment_size below.
 
 kv_connector_config:
   connector: mooncake-store
   mooncake_store:
     pool: file:///shared/pool.json
+    # both | producer | consumer | capacity ('capacity' only lends memory)
     role: both
-    # Per rank. Keep it identical on every server: capacity is meant to be
-    # uniform per rank, and each server can see only its own value. The node
-    # budget is checked at startup, since ranks_on_node x segment_size is what
-    # this actually claims from host memory.
+    # Per rank, and the same on every server joining the pool.
     segment_size: 32GiB
-    # What the pool's keys identify this checkpoint by, spelled the same way on
-    # every server on the pool. Two that disagree read each other's pages as
-    # their own, so there is no default. A model path is a poor choice:
-    # 'org-a/model' and 'org-b/model' share a directory name.
-    model_key: minimax-m3-fp4
-    # Where this server keeps the client config it renders and the record each
-    # of its ranks writes. Needed whenever a launcher starts one task per rank,
-    # since those ranks cannot inherit the path, and one directory per server:
-    # two sharing it render one client config between them.
-    run_dir: /shared/run/ctx0
-    # Seconds to wait for the master's manifest and for the master itself.
-    # Raise it when the wait spans container start on another node.
-    master_timeout: 300
+    # Identifies this checkpoint to the pool. Must match on every server.
+    model_key: qwen2-1.5b-instruct

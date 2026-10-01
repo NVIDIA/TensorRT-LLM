@@ -989,10 +989,10 @@ def test_a_save_thread_that_cannot_start_fails_registration(
 def test_staging_is_sized_from_the_layout_and_the_batch(store_config, fake_store):
     """The allocation follows from the geometry rather than from a field.
 
-    A slot has to hold the largest page any layer group produces, and there is
-    no point holding more slots than one store call has pages, so both numbers
-    are known once the layout is registered. A configured size could only be
-    too small, which costs throughput quietly by narrowing the batch.
+    A slot holds the largest page any layer group produces, and no more slots
+    are useful than one store call has pages, so both numbers follow from the
+    registered layout. A configured size could only be too small, which costs
+    throughput quietly by narrowing the batch.
     """
     layout = make_layout(regions_per_group=2)
     page_bytes = PageAddressing(layout).bytes_per_page(0)

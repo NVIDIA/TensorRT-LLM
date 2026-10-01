@@ -14,10 +14,9 @@
 # limitations under the License.
 """The per-iteration work list the scheduler hands the workers.
 
-Instances are broadcast from rank 0 to every worker, so these carry only plain
-data: a page's identity (its block hash) and where that page currently lives on
-this rank (a layer group and a page slot index). Deliberately no store keys:
-each worker prefixes its own rank namespace, so one broadcast serves all shards.
+Broadcast from rank 0, so these carry only plain data: a page's identity and
+where it lives on this rank. Deliberately no store keys, since each worker
+prefixes its own rank namespace and one broadcast serves all shards.
 """
 
 from dataclasses import dataclass, field
@@ -43,7 +42,7 @@ class RequestTransfers:
     """Pages belonging to one request, kept together for save bookkeeping.
 
     The worker owes `get_finished` an answer per request, so a save's owner has
-    to survive the trip from scheduler to worker.
+    to survive the trip from the scheduler.
     """
 
     request_id: int

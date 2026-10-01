@@ -264,10 +264,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         """Register the AsyncTransferManager the deadlock detector consults.
 
         A finished disaggregated context sender leaves active_requests once its
-        response is emitted, but the transfer manager still owns it and its
-        pinned KV pages until the send lands. Without this reference the
-        detector cannot see those pages and may report a false deadlock on a
-        context server whose pool is full of in-flight sends.
+        response is emitted, but the transfer manager still owns its pinned KV
+        pages until the send lands. Without this reference the detector cannot
+        see those pages and reports a false deadlock.
         """
         self._async_transfer_manager = mgr
 
@@ -469,9 +468,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             A success ends the phase 2 loop, reserving the pages for the
             request that paid a re-prefill for them. Letting a later context
-            request take them instead would leave `req` to preempt again on
-            the next pass, repeating without ever admitting it. The cost is
-            one iteration of admission.
+            request take them instead would leave `req` preempting again every
+            pass without ever being admitted.
             """
             protected = {r.py_request_id for r in scheduled_gen}
             protected.update(r.py_request_id for r in scheduled_ctx)
@@ -493,10 +491,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         contributed_blocks = self._collect_contributed_blocks(
             requests_list, pending_ctx, inflight_request_ids
         )
-        # A deferral behind an in-flight contributor leaves nothing on any of
-        # the scheduled lists, so the deadlock detector below would read the
-        # iteration as a stall even though the contributor is running. Deferring
-        # is itself the progress in that case.
+        # A deferral behind an in-flight contributor leaves the scheduled
+        # lists empty, which the deadlock detector would read as a stall even
+        # though the contributor is running. Deferring is the progress here.
         deferred_behind_contributor = False
 
         for req in pending_ctx:
@@ -917,7 +914,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         if chunk_size <= 0:
             # Out of token budget rather than out of pages, so releasing pages
-            # would not help; the next iteration gets a fresh budget. Not
+            # would not help and the next iteration gets a fresh budget. Not
             # suspended either, to avoid pathological suspend/resume cycles.
             return ScheduleAction.SKIP, 0, False
 
@@ -1428,13 +1425,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         `KVCacheManagerV2.preempt_request`. With a cache tier below GPU,
         suspension is cheaper and keeps the pages, so that path is left alone.
 
-        The victim leaves on `recompute_paused`, the same channel the generation
-        side uses, because a re-prefill needs more teardown than the KV cache:
-        the executor frees the request's remaining resources, its sequence slot
-        included, and `reset_for_recompute` rewrites the prompt and resyncs the
-        Python-side mirrors of it. Pausing the request here instead would leave
-        the slot owned by SeqSlotManager while `py_seq_slot` is None, which
-        asserts on the next schedule.
+        The victim leaves on `recompute_paused`, the same channel the
+        generation side uses, because a re-prefill needs more teardown than the
+        KV cache: the executor frees the sequence slot and
+        `reset_for_recompute` rewrites the prompt. Pausing the request here
+        instead would leave the slot owned by SeqSlotManager while
+        `py_seq_slot` is None, which asserts on the next schedule.
 
         Returns True when pages became available in this iteration.
         """
@@ -1457,13 +1453,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                 continue
 
             if not self.kv_cache_manager.preempt_request(victim):
-                # A connector is still reading these pages, so they are not
-                # free yet and the victim keeps its cache and its state. The
-                # executor finishes the release once the saves retire; see
-                # PyExecutor._resume_preempted_request. Stopping here leaves
-                # one victim draining at a time, so the next pass finds those
-                # pages instead of giving up a second request's cache for
-                # nothing.
+                # A connector is still reading these pages, so the victim
+                # keeps its cache and its state until the executor finishes
+                # the release; see PyExecutor._resume_preempted_request.
+                # Stopping here leaves one victim draining at a time, so the
+                # next pass finds those pages rather than giving up a second
+                # request's cache for nothing.
                 logger.debug(
                     f"[V2Scheduler] Preemption of request {victim.py_request_id} "
                     "deferred until its connector saves retire"
@@ -1484,8 +1479,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # Consecutive scheduling passes that reclaimed nothing before this counts
     # as a deadlock. A stalled pass costs ~2ms, so it trips within seconds,
-    # while transient one-iteration deferrals (multimodal chunk alignment,
-    # PEFT budget, IndexMapper slots) clear long before.
+    # while transient one-iteration deferrals such as multimodal chunk
+    # alignment, PEFT budget or IndexMapper slots clear long before.
     _DEADLOCK_STALL_ITERS = 1000
 
     # States in which an in-flight KV transfer still owns pages it is about to
@@ -1510,11 +1505,10 @@ class KVCacheV2Scheduler(RequestScheduler):
     ) -> None:
         """Fail loudly when no request can be scheduled or reclaimed.
 
-        Without this the executor spins at full speed while scheduling
-        nothing, which looks healthy to the hang detector and to `/health`
-        while the job burns its wall clock. Context candidates count alongside
-        generation ones because a disaggregated prefill server has no
-        generation requests at all.
+        Unchecked, the executor spins at full speed while scheduling nothing,
+        which looks healthy to the hang detector and to `/health`. Context
+        candidates count alongside generation ones because a disaggregated
+        prefill server has no generation requests at all.
         """
         if made_progress:
             if self._stalled_schedules:
@@ -1550,10 +1544,9 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # A connector load in flight releases its pages when it lands, so a
         # pass that reclaims nothing while one is outstanding is not a stall.
-        # A preemption waiting on the connector's saves to retire is the same
-        # case from the other direction: those pages are already given up and
-        # arrive once the saves land, but the victim keeps its state until
-        # then, so nothing above can see them.
+        # A preemption awaiting the connector's saves is the same case from
+        # the other direction: those pages are already given up, but the
+        # victim keeps its state until they land, so nothing above sees them.
         if (
             any(self._has_pending_connector_load(r) for r in active_requests)
             or self.kv_cache_manager.has_pending_preemption()
@@ -1562,14 +1555,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             return
 
         # Waiting on a transfer is not a deadlock: the pages come back when it
-        # lands. None of those states are schedulable, so a context server
-        # whose pool is full of pending sends shows no progress here at all. A
-        # send that never lands is the transfer layer's timeout to report.
+        # lands, and a send that never lands is the transfer layer's timeout
+        # to report. None of those states are schedulable, so a context server
+        # whose pool is full of pending sends shows no progress at all.
         #
         # The active_requests scan covers senders still on the list and the
-        # generation-side receiver. The transfer manager covers finished
-        # senders that have already left active_requests (see
-        # set_async_transfer_manager).
+        # generation-side receiver; the transfer manager covers finished
+        # senders that have already left it.
         transfer_holding = any(
             req.state_value in self._TRANSFER_HOLDING_STATE_VALUES for req in active_requests
         ) or (
@@ -1588,8 +1580,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         self._stalled_schedules += 1
         if self._stalled_schedules < self._DEADLOCK_STALL_ITERS:
-            # Warn as the stall builds so the raise is not a surprise. A quarter
-            # of the threshold keeps this to a handful of lines beforehand.
+            # Warn as the stall builds so the raise is not a surprise. A
+            # quarter of the threshold keeps that to a handful of lines.
             if self._stalled_schedules == 1:
                 logger.debug(
                     "[V2Scheduler] Scheduling stall started: "
@@ -1643,8 +1635,8 @@ class KVCacheV2Scheduler(RequestScheduler):
     ) -> str:
         """One-line breakdown of a stalled pass for the deadlock logs.
 
-        Re-derives the blocked candidates so the per-pass detector stays cheap:
-        this runs only on the rare logging branches.
+        Re-derives the blocked candidates so the per-pass detector stays
+        cheap, this running only on the rare logging branches.
         """
         gen = [
             r

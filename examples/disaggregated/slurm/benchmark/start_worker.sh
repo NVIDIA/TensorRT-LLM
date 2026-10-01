@@ -76,18 +76,14 @@ fi
 
 echo "config_file: ${config_file}"
 
-# The mooncake-store pool is named by the worker config, including
-# mooncake_store.run_dir, which has to point inside the job's log directory
-# because the ranks srun started never inherit the leader's environment and
-# read the rendered client config back from there.
-#
-# run_dir also has to differ per server: two sharing one render a single client
-# config between them, leaving a server transferring over another node's HCAs
-# or lending under another's role. The worker config is shared by every server
-# of a role and can only carry __LOG_DIR__, which is the whole job's, so the
-# per-server part is substituted here, where the role and the instance are
-# known. Each rank renders its own copy of the config, from the same value, so
-# that they do not race over one file. See the Mooncake section of README.md.
+# mooncake_store.run_dir has to point inside the job's log directory, since
+# the ranks srun started never inherit the leader's environment and read the
+# rendered client config back from there. It also has to differ per server:
+# two sharing one render a single client config between them. The worker
+# config is shared by every server of a role and can only carry __LOG_DIR__,
+# so the per-server part is substituted here, where the role and the instance
+# are known. Each rank renders its own copy, from the same value, so that they
+# do not race over one file. See the Mooncake section of README.md.
 if grep -q '__MOONCAKE_RUN_DIR__' "${config_file}"; then
     role_lower=$(echo "${role}" | tr '[:upper:]' '[:lower:]')
     mooncake_run_dir="${log_dir}/mooncake_${role_lower}_${instance_id}"
@@ -99,11 +95,9 @@ if grep -q '__MOONCAKE_RUN_DIR__' "${config_file}"; then
 fi
 
 # MiniMax-M3's MSA sparse attention JIT-compiles its FMHA kernels on first use,
-# from inside the attention forward pass. One TP rank runs ninja while the
-# others block on a file lock, so an uncached variant stalls the whole executor
-# loop for ~8s, or ~70s when an iteration needs several. The cache defaults to
-# ~/.cache, which is thrown away because the container is started with
-# --no-container-mount-home, so every job would pay the compiles again during
+# from inside the attention forward pass, stalling the executor loop for ~8s
+# per uncached variant. The cache defaults to ~/.cache, which the container
+# discards (--no-container-mount-home), so every job would recompile during
 # serving. Anchoring it next to this script puts it on the mounted filesystem
 # at a path identical across jobs, so only the first run compiles.
 if [ -z "${MINFER_FMHA_CACHE_DIR:-}" ]; then
@@ -112,10 +106,10 @@ if [ -z "${MINFER_FMHA_CACHE_DIR:-}" ]; then
     echo "MINFER_FMHA_CACHE_DIR: ${MINFER_FMHA_CACHE_DIR}"
 fi
 
-# Per-transfer KV timings (size, queue/transfer latency, throughput) as CSV next
-# to the worker logs. These separate slow prefill from a slow prefill-to-decode
-# handoff, which the aggregate benchmark numbers cannot. An explicit setting
-# wins, and KV_TRANSFER_PERF_LOG=false turns it off.
+# Per-transfer KV timings (size, queue/transfer latency, throughput) as CSV
+# next to the worker logs. They separate slow prefill from a slow
+# prefill-to-decode handoff, which the aggregate numbers cannot. An explicit
+# setting wins, and KV_TRANSFER_PERF_LOG=false turns it off.
 if [ "${KV_TRANSFER_PERF_LOG:-true}" = "true" ] \
     && [ -z "${TLLM_KV_TRANSFER_PERF_LOG_FILE:-}" ]; then
     export TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1

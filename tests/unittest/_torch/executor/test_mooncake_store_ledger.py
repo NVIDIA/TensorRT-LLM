@@ -14,10 +14,10 @@
 # limitations under the License.
 """Unit tests for reporting what a Mooncake pool was actually built from.
 
-The point of the ledger is that the report depends on records the ranks wrote
-rather than on log wording, so these tests are mostly about it staying right as
-things move around it. A report that is merely wrong is the failure to guard
-against: nothing about a mis-attributed byte looks like an error.
+The report reads the records the ranks wrote rather than log wording, so these
+tests are mostly about it staying right as things move around it. A report that
+is merely wrong is the failure to guard against: nothing about a mis-attributed
+byte looks like an error.
 """
 
 import json
@@ -129,8 +129,8 @@ def test_records_are_gathered_from_every_server_in_a_job(tmp_path):
 
     They have to: every server joining the pool renders a client config, and
     two sharing a directory would leave whichever started second in charge of
-    both. The records are therefore read from the tree beneath the pool's
-    directory rather than from one directory in it.
+    both. So the records are read from the whole tree beneath the pool's
+    directory, not from one directory in it.
     """
     write_segment(
         tmp_path,
