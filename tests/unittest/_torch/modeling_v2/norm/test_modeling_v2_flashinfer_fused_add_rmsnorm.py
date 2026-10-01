@@ -40,7 +40,8 @@ def test_certified_cells(cell) -> None:
     x, residual, weight, eps = _build(cell.spec, seed=abs(hash(cell.why)) % 2**31)
     ref_x, ref_residual = op.reference(x, residual, weight, eps)
     with validating(op):
-        assert op(x, residual, weight, eps) is None, "the op writes in place"
+        out_x, out_residual = op(x, residual, weight, eps)
+        assert out_x is x and out_residual is residual, "the op writes in place"
     op.compare(residual, ref_residual)
     op.compare(x, ref_x)
 

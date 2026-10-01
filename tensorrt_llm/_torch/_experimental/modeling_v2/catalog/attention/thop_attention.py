@@ -35,7 +35,9 @@ class _ThopAttention(OpWrapper):
     through it, by different paths: gpt-oss on the standard path with attention
     sinks and an alternating sliding window, deepseek on MLA's two phases.
 
-    Writes rows `[:num_tokens]` of `output` and returns None.
+    Writes rows `[:num_tokens]` of `output` and returns `output` -- the same
+    buffer, mutated and handed back so a call site can show what it touched
+    without allocating.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -236,7 +238,10 @@ class _ThopAttention(OpWrapper):
         kv_norm_weight: Optional[torch.Tensor] = None,
         kv_norm_eps: float = 1e-6,
         skip_correction_threshold: float = 0.0,
-    ) -> None:
+    ) -> torch.Tensor:
+        """Writes `output` in place and returns it -- the op destroys its
+        prior contents in rows `[:num_tokens]`, so a caller that wants them
+        has to have kept its own copy beforehand."""
         thop.attention(
             q=q,
             k=k,
@@ -354,6 +359,7 @@ class _ThopAttention(OpWrapper):
             kv_norm_eps=kv_norm_eps,
             skip_correction_threshold=skip_correction_threshold,
         )
+        return output
 
     def reference(
         self,
