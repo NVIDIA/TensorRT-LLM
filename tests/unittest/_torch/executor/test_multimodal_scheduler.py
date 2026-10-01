@@ -644,6 +644,10 @@ def test_terminate_request_releases_multimodal_cache_references_idempotently():
     cache.acquire(cache_key, 4, retain_after_release=False)
     cache.commit(cache_key, torch.ones(1))
     state.set_item_cache_key(0, cache_key, ready=True)
+    # Item 1 is still being encoded, so its entry is only reserved.
+    reserved_key = ("mm_transient", request.request_id, 1)
+    cache.acquire(reserved_key, 4, retain_after_release=False)
+    state.set_item_cache_key(1, reserved_key, ready=False)
     freed = []
 
     executor = object.__new__(PyExecutor)
@@ -659,13 +663,18 @@ def test_terminate_request_releases_multimodal_cache_references_idempotently():
     executor.result_wait_queues = {}
 
     executor._do_terminate_request(request)
-    executor._release_multimodal_resources(request)
 
     assert freed == [request]
     assert request.py_mm_encoder_state is None
     assert request.py_multimodal_data == {}
     assert executor._prefetched_request_ids == set()
     executor._disagg_coordinator.forget_request.assert_called_once_with(request.py_request_id)
+    stats = cache.stats()
+    assert (stats.item_count, stats.in_use_bytes, stats.reserved_bytes) == (0, 0, 0)
+
+    # A repeated termination finds no references left to release.
+    executor._do_terminate_request(request)
+    assert cache.stats() == stats
 
 
 def test_weight_invalidation_rejects_live_references():
