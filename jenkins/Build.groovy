@@ -825,6 +825,22 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         timeout: 300
     )
     def reuseArtifactPath = env.reuseArtifactPath
+    // copyCachedArtifacts walks the artifact map as it stands BEFORE the build
+    // runs, and bolted-<tarName> is added to that map by applyLatestBolt during
+    // the build. So a cache hit would copy canonical only, report success, and
+    // leave the test stages fetching a variant that was never published.
+    //
+    // Pre-declaring the variant in the map instead would break the builds where
+    // it is legitimately absent (x86_64 is outside the consume scope), so the
+    // reuse is dropped rather than taught about an artifact it cannot predict.
+    // reuse_build is a manual `/bot run` opt-in, never a default, and asking to
+    // skip the build on a run whose purpose is to produce these binaries is
+    // already contradictory.
+    if (reuseArtifactPath && BOLT_PUBLISH_VARIANT) {
+        echo "[bolt-consume] ignoring reuseArtifactPath: this run publishes " +
+             "bolted- variants, which a cached build has no way to supply"
+        reuseArtifactPath = null
+    }
 
     def k8s_cpu = "amd64"
     if (cpu_arch == AARCH64_TRIPLE) {
