@@ -68,8 +68,9 @@ def _batched_decode_clip(self: AutoencoderKLMiniMaxH3, z: torch.Tensor) -> torch
     """``AutoencoderKLMiniMaxH3._decode_clip`` with all equal-size spatial tiles in one decoder call.
 
     The ViT decoder treats batch entries independently (per-sample attention, per-token norms and projections), so
-    decoding the tiles of a clip as one batch is the same math as the reference loop over tiles; the tiles are split
-    back out and stitched/blended exactly as in the reference. Falls back to the per-tile loop when tile shapes differ.
+    decoding the tiles of a clip as one batch computes the same values as the reference loop over tiles, and the
+    measured configurations are bit-identical; the tiles are split back out and stitched exactly as in the
+    reference. Falls back to the per-tile loop should the tile splitter ever produce unequal tiles.
     """
     if not self.use_tiling:
         return self.decoder(self.post_quant_conv(z))
@@ -104,15 +105,23 @@ def _batched_decode_clip(self: AutoencoderKLMiniMaxH3, z: torch.Tensor) -> torch
 def _prepare_vae_decoder(vae: AutoencoderKLMiniMaxH3) -> None:
     """Lossless decode-path preparation for the fp16-autocast decode in ``MiniMaxH3Pipeline._decode_video``.
 
-    * Every ``nn.Linear`` of the ViT decoder keeps an fp16 copy of its weight and bias: autocast casts them to fp16 on
-      every call, so casting once is bit-identical (norm weights and the ``scale1``/``scale2`` gains stay fp32, as
-      autocast leaves them).
-    * Equal-size spatial tiles of a clip are decoded as one batch (``_batched_decode_clip``).
+    * Every ``nn.Linear`` of the ViT decoder is converted to fp16 in place: autocast casts weight and bias to fp16
+      on every call, so converting once gives the same bits under autocast (norm weights and the ``scale1``/``scale2``
+      gains stay fp32, as autocast leaves them). The decoder must therefore keep running under the fp16 autocast of
+      ``_decode_video``; a decode outside it would run fp16 instead of the reference fp32 math.
+    * Equal-size spatial tiles of a clip are decoded as one batch (``_batched_decode_clip``), only when the VAE still
+      uses the stock Diffusers ``_decode_clip``; a subclass that overrides tiling (for example parallel tiled
+      decoding) keeps its own method.
     """
     for module in vae.decoder.modules():
         if isinstance(module, torch.nn.Linear):
             module.to(torch.float16)
-    vae._decode_clip = types.MethodType(_batched_decode_clip, vae)
+    if type(vae)._decode_clip is AutoencoderKLMiniMaxH3._decode_clip:
+        vae._decode_clip = types.MethodType(_batched_decode_clip, vae)
+    else:
+        logger.info(
+            f"{type(vae).__name__} overrides _decode_clip; keeping its tiling and skipping batched tile decode."
+        )
 
 
 def _component_skipped(
@@ -353,7 +362,7 @@ class MiniMaxH3Pipeline(BasePipeline):
     def torch_compile(self) -> None:
         super().torch_compile()
         # The ViT VAE decoder is 36 identical blocks run once per clip; compile them like the transformer blocks.
-        if self.vae is not None and getattr(self.vae, "decoder", None) is not None:
+        if self.vae is not None:
             tc_config = self.pipeline_config.torch_compile
             blocks = self.vae.decoder.transformer_blocks
             logger.info(
