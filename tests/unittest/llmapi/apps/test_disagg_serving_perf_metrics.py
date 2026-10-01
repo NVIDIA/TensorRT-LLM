@@ -186,7 +186,11 @@ async def send_request(
         else:
             assert completion.id is not None
             message = completion.choices[0].text
-        assert message.startswith("2.")
+        # Qwen3-0.6B (migrated from TinyLlama) answers "2" without a
+        # trailing period and continues generating past the one-word
+        # instruction instead of stopping; only the numeric answer itself
+        # is a stable thing to assert on here.
+        assert message.startswith("2")
 
 
 def check_historgram(metrics_dict: dict, count: int, range: tuple[float, float]):
