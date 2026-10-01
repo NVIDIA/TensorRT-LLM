@@ -1028,8 +1028,8 @@ class _TelemetrySession:
             self.initial_reported = True
             return True
 
-    def try_start_delivery(self) -> bool:
-        """Reject queued delivery when process opt-out already won the race."""
+    def is_session_telemetry_enabled(self) -> bool:
+        """Return whether telemetry is enabled for this session."""
         with self.lock:
             return not self.disabled
 
@@ -1345,7 +1345,11 @@ def _capture_startup_context(
     """Snapshot LLM-only startup context at normal parsing/loading hooks; retain no raw objects."""
     try:
         session = _get_session()
-        if session is None or not is_usage_stats_enabled() or not session.try_start_delivery():
+        if (
+            session is None
+            or not is_usage_stats_enabled()
+            or not session.is_session_telemetry_enabled()
+        ):
             return
         fields = {}
         if requested is not None:
@@ -1421,7 +1425,7 @@ def _send_if_session_active(
 ) -> bool:
     """Start delivery only if process opt-out has not already won."""
     try:
-        if not session.try_start_delivery():
+        if not session.is_session_telemetry_enabled():
             return False
         _send_to_gxt(payload)
         return True
@@ -1451,7 +1455,7 @@ def _send_terminal(pending: _PendingTerminal) -> None:
     """Attach optional partial context without delaying exit beyond the shared deadline."""
     payload = pending.payload
     try:
-        if pending.startup_context is not None and pending.session.try_start_delivery():
+        if pending.startup_context is not None and pending.session.is_session_telemetry_enabled():
             fields = dict(pending.startup_context)
             meta = json.loads(fields.pop("llmApiConfigMetaJson", "{}"))
             source = meta.get("source", "requested_pre_initialization" if fields else "unavailable")
@@ -1598,7 +1602,7 @@ def report_exit(
         queued_to_reporter = False
         global _PENDING_TERMINAL
         with _REPORTER_LOCK:
-            if not session.try_start_delivery():
+            if not session.is_session_telemetry_enabled():
                 completion.set()
                 return True
             if _REPORTER_ACTIVE:
