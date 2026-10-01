@@ -141,19 +141,22 @@ def test_disabled_fallback_library_disables_gate(monkeypatch):
     assert metadata.use_paged_context_fmha
 
 
-def test_fp8_kv_dtype_exemption_admits_blocked_combination():
-    """The fused kernel is proven present for FP8 KV on SM 103 / head_dim 64:
-    the dtype exemption must admit the otherwise-blocked configuration."""
-    metadata = _make_metadata(
-        head_dim=64, sm_version=103, features=ALL_FEATURES, kv_dtype=DataType.FP8
-    )
+@pytest.mark.parametrize(
+    "kv_dtype", [DataType.FP8, DataType.BF16, DataType.HALF], ids=["fp8", "bf16", "half"]
+)
+def test_exempt_kv_dtypes_admit_blocked_combination(kv_dtype):
+    """A full build carries the fused kernel for FP8 and matched 16-bit KV
+    caches on SM 103 / head_dim 64 (the SM103 L0 suites run paged-context
+    attention with a BF16 KV cache): the dtype exemption must admit the
+    otherwise-blocked configuration once the kernel lookup confirms it."""
+    metadata = _make_metadata(head_dim=64, sm_version=103, features=ALL_FEATURES, kv_dtype=kv_dtype)
     assert metadata.use_paged_context_fmha
 
 
-@pytest.mark.parametrize("kv_dtype", [DataType.BF16, DataType.HALF], ids=["bf16", "half"])
+@pytest.mark.parametrize("kv_dtype", [DataType.FLOAT, DataType.INT8], ids=["float", "int8"])
 def test_unlisted_kv_dtypes_stay_refused(kv_dtype):
-    """The exemption is a per-dtype allowlist, not a bypass: 16-bit KV caches
-    (the incident configuration) must still be refused."""
+    """The exemption is a per-dtype allowlist, not a bypass: a KV dtype with
+    no proven-present kernel must still be refused."""
     with pytest.raises(RuntimeError, match="64"):
         _make_metadata(head_dim=64, sm_version=103, features=ALL_FEATURES, kv_dtype=kv_dtype)
 
@@ -277,8 +280,11 @@ def test_missing_lookup_binding_fails_closed():
 # Paged-KV context FMHA kernels are built for 32-token pages; a page size with
 # no kernel is a real absence, not a test artifact.
 _PAGED_CONTEXT_TOKENS_PER_BLOCK = 32
-# Divisible by 8 but not a supported BMM2-N width, so no kernel exists for it
-# on any architecture -- the forced miss for the live lookup.
+# A head width the SM100-family dispatcher has no context kernel for -- the
+# forced miss for the live lookup. Other architectures route to FMHA-v2
+# kernels with a different supported set (SM90 does carry head size 96), so
+# this absence holds only within the SM100 family, mirroring
+# test_context_fmha_kernel_presence.py.
 _UNSUPPORTED_HEAD_SIZE = 96
 
 _LIVE_LOOKUP_UNAVAILABLE = not torch.cuda.is_available() or not hasattr(
@@ -291,6 +297,8 @@ _LIVE_LOOKUP_SKIP_REASON = "needs a GPU and bindings built with fused_context_fm
 def test_native_lookup_reports_absent_for_an_unbuilt_head_size():
     """The live lookup must be able to say no: without that, the exemption
     check above can only ever pass."""
+    if not 100 <= get_sm_version() < 110:
+        pytest.skip("the unsupported head-size case targets the SM100-family dispatcher")
     assert not thop.fused_context_fmha_kernel_exists(
         head_size=_UNSUPPORTED_HEAD_SIZE,
         kv_cache_dtype=DataType.BF16,

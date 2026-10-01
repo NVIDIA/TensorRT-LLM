@@ -72,18 +72,22 @@ class FallbackFmha(Fmha):
         103: (64,),
     }
 
-    # Exemptions to the blocklist above: KV cache dtypes for which the fused
-    # context FMHA kernel is proven PRESENT for an otherwise-blocked
-    # (sm, head_dim). The incident behind the sm103/hd64 entry occurred with
-    # a 16-bit KV cache; with an FP8 KV cache the fused kernel loads and runs
-    # (no unfused-MHA fallback at boot or under sustained load, deterministic
-    # greedy replays, correct long-context recall through chunked prefill and
-    # block reuse). Unlisted dtypes stay refused (fail closed). Every entry is
-    # an assertion about the kernels this build contains, so it is checked
-    # against the native kernel lookup in ``validate_metadata`` rather than
-    # trusted.
+    # Exemptions to the blocklist above: KV cache dtypes whose fused context
+    # FMHA kernel a full build carries for an otherwise-blocked (sm,
+    # head_dim). FP8 KV on sm103/hd64 is proven by hand (no unfused-MHA
+    # fallback at boot or under sustained load, deterministic greedy replays,
+    # correct long-context recall through chunked prefill and block reuse);
+    # the 16-bit KV entries are proven by ``test_context_fmha_kernel_presence``
+    # (head-size-64 kernels present for matched 16-bit Q/KV across the SM100
+    # family) and exercised by the SM103 L0 suites that run paged-context
+    # attention with a BF16 KV cache. Every entry is an assertion about a
+    # kernel set the running build may not contain (a build whose
+    # ``--cuda_architectures`` omits the SM carries none of these), so
+    # ``validate_metadata`` confirms each against the native kernel lookup
+    # rather than trusting it: on a build without the kernel the combination
+    # stays refused. Unlisted dtypes stay refused (fail closed).
     CONTEXT_FMHA_PRESENT_KV_DTYPES: ClassVar[dict[tuple[int, int], tuple[DataType, ...]]] = {
-        (103, 64): (DataType.FP8,),
+        (103, 64): (DataType.FP8, DataType.BF16, DataType.HALF),
     }
 
     @classmethod
