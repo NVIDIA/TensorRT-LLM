@@ -170,6 +170,18 @@ class OpWrapper(ABC):
     forward; the runtime tensors arrive at the call. `__call__` merges the
     three and hands the whole set to `raw_call`.
 
+    A fourth kind of value is per-layer rather than per-step: a weight table or
+    a per-layer scalar that is fixed once the weights are real but differs by
+    `local_layer_idx`. `layered` names those at construction as `{argument:
+    per-layer sequence}`; a call states which row with `layer=i`, and that row
+    overrides whatever `__call__`'s other three stages supplied for the same
+    argument -- a target binding a weight table can still pass unrelated
+    per-call tensors through the same call. A value a target cannot resolve
+    until a step is underway (bound to runtime metadata rather than to the
+    weights) does not belong here even if it varies by layer; it stays a
+    plain per-call keyword argument instead, computed in the loop body -- see
+    gpt_oss's `attention_window_size` for why.
+
     `raw_call` is the certified surface, and it takes everything explicitly --
     it must not read any bound state off `self`. That is what keeps `CELLS`
     covering the entry's whole input space regardless of what a target chose to
@@ -188,15 +200,21 @@ class OpWrapper(ABC):
     CELLS: tuple[Cell, ...] = ()
     note: str = ""
 
-    def __init__(self, **bound: Any) -> None:
+    def __init__(self, *, layered: dict[str, Any] | None = None, **bound: Any) -> None:
         """Freeze what is known once the engine exists and the weights are real.
 
         Called from a target's post-load hook, never from its `__init__`: a
         fixture needs a device, and parameters are meta tensors until the
         engine materializes the registry.
+
+        `layered` is keyword-only and named apart from `bound` so a target
+        author sees the per-layer tables at a glance rather than finding them
+        buried in an otherwise flat kwargs dict; nothing about the split
+        matters to `__call__`'s merge order beyond that.
         """
         self._bound: dict[str, Any] = bound
         self._step: dict[str, Any] = {}
+        self._layered: dict[str, Any] = layered or {}
         self._step_generation = -1
 
     def bind_step(self, **step: Any) -> None:
@@ -209,14 +227,22 @@ class OpWrapper(ABC):
         self._step = step
         self._step_generation = _STEP_GENERATION
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Merge the three stages and make the call.
+    def __call__(self, *args: Any, layer: int | None = None, **kwargs: Any) -> Any:
+        """Merge the three stages, project the layer, and make the call.
 
         Later stages win: the call overrides the step, the step overrides
         construction. A decode target states `num_ctx_tokens=0` at construction
-        precisely so the narrower claim survives the step projection.
+        precisely so the narrower claim survives the step projection. The
+        layer projection applies last and only to the arguments `layered`
+        named, and only when a caller passes `layer=`. An unbound entry has
+        an empty `_layered`, so a call that never passes `layer=` runs the
+        same three-stage merge this always did -- which is what keeps every
+        existing call site byte-for-byte the same call it always was.
         """
-        return self.raw_call(*args, **{**self._bound, **self._step, **kwargs})
+        merged = {**self._bound, **self._step, **kwargs}
+        if layer is not None:
+            merged.update({name: table[layer] for name, table in self._layered.items()})
+        return self.raw_call(*args, **merged)
 
     @abstractmethod
     def raw_call(self, *args: Any, **kwargs: Any) -> Any:
