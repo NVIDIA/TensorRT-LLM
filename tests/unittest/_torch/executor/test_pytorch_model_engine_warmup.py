@@ -145,7 +145,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
     compiled = torch.nn.Identity()
     compile_model = Mock(return_value=compiled)
     monkeypatch.setattr(torch, "compile", compile_model)
-    monkeypatch.setattr(torch._dynamo.config, "cache_size_limit", 16)
+    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 8)
     # Stop after the complete compilation block, before runtime cache allocation.
     monkeypatch.setattr(
         model_engine_module,
@@ -165,12 +165,15 @@ def test_pcg_fx_fallback_policy_is_model_specific(
 
     expected_prefill_only = compile_enabled and piecewise and model_kind in ("m3", "m3_vl")
     assert engine._torch_compile_prefill_only is expected_prefill_only
+    # Dynamo config overrides are thread-local, so the limit must be bound to
+    # the compiled callable instead of being written to the global config.
+    assert torch._dynamo.config.recompile_limit == 8
     if not compile_enabled:
         compile_model.assert_not_called()
         assert model.model is eager
     else:
         compile_model.assert_called_once_with(
-            eager, backend=engine._torch_compile_backend, fullgraph=True
+            eager, backend=engine._torch_compile_backend, fullgraph=True, recompile_limit=16
         )
         assert backend_factory.call_args.args[0] is False  # Inductor stays disabled.
         if expected_prefill_only:
@@ -179,6 +182,31 @@ def test_pcg_fx_fallback_policy_is_model_specific(
             assert model.model.compiled_model is compiled
         else:
             assert model.model is compiled
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model_kind", ["qwen2_vl", "qwen3_vl"])
+def test_llm_compile_hook_binds_recompile_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    model_kind: str,
+) -> None:
+    """Multimodal LLM compile hooks pass the engine's recompile limit to torch.compile."""
+    from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLModelBase
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModelBase
+
+    model_cls = {"qwen2_vl": Qwen2VLModelBase, "qwen3_vl": Qwen3VLModelBase}[model_kind]
+    eager = torch.nn.Linear(4, 4)
+    compiled = torch.nn.Identity()
+    compile_model = Mock(return_value=compiled)
+    monkeypatch.setattr(torch, "compile", compile_model)
+    model = SimpleNamespace(llm=SimpleNamespace(model=eager))
+
+    model_cls.apply_llm_torch_compile(model, backend="backend", fullgraph=True, recompile_limit=16)
+
+    compile_model.assert_called_once_with(
+        eager, backend="backend", fullgraph=True, recompile_limit=16
+    )
+    assert model.llm.model is compiled
 
 
 @pytest.mark.cpu_only
