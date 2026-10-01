@@ -913,6 +913,10 @@ class KvCacheCreator:
         # also go through the V2-incompatible-feature gate below.
         if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
             sparse_attn_config = model_config.sparse_attention_config
+            quant_config = getattr(model_config, "quant_config", None)
+            fp4_mla = (sparse_attn_config is None and is_mla(config)
+                       and quant_config is not None
+                       and quant_config.quant_mode.has_fp4_kv_cache())
             incompat = kv_cache_manager_v2_incompatible_features(
                 self._max_beam_width)
             # Sparse attention: ModelEngine only forwards cache_indirection when
@@ -924,8 +928,8 @@ class KvCacheCreator:
             # The C++ V2 cache expands beams after receive completion, copying
             # the prompt's partial tail before the first generation step.
             if (self._max_beam_width is not None and self._max_beam_width > 1
-                    and
-                (is_hybrid_linear(config) or sparse_attn_config is not None)
+                    and (is_hybrid_linear(config)
+                         or sparse_attn_config is not None or fp4_mla)
                     and "max_beam_width > 1" not in incompat):
                 incompat.append("max_beam_width > 1")
             if incompat:
@@ -948,10 +952,7 @@ class KvCacheCreator:
                         f"Gemma4 hybrid attention requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
-                quant_config = getattr(model_config, "quant_config", None)
-                if (sparse_attn_config is None and is_mla(config)
-                        and quant_config is not None
-                        and quant_config.quant_mode.has_fp4_kv_cache()):
+                if fp4_mla:
                     raise NotImplementedError(
                         "FP4 MLA requires Fp4MlaKVCacheManagerV2, which is "
                         f"not yet supported with {incompat_str}. Disable these "

@@ -21,9 +21,9 @@ included and residency is capped at ``max_batch_size * pp_size`` however many
 seats exist. It stays off for V1 (the V1 capacity schedulers hardcode
 ``GENERATION_COMPLETE``) and for hybrid models (SSM state is sized from
 ``max_batch_size``). "V1" there is the manager the creator *selects*, not the
-``use_kv_cache_manager_v2`` request: a plain Python-backend model with
-``max_beam_width > 1`` is demoted to V1, so the gate reads
-``resolved_kv_cache_manager_is_v2``. It also stays off for the Qwen-VL models that
+``use_kv_cache_manager_v2`` request: the gate reads
+``resolved_kv_cache_manager_is_v2`` to follow the selected manager, including
+C++ V2 beam search. It also stays off for the Qwen-VL models that
 keep an MRoPE delta cache, which is sized ``max_num_tokens * pp_size + 1`` yet
 indexed by ``py_seq_slot``.
 
@@ -335,6 +335,39 @@ def test_resolved_v2_agrees_with_the_manager_the_creator_selects(max_beam_width,
 
     assert resolved is issubclass(selected, KVCacheManagerV2)
     assert selected is (KVCacheManagerV2 if resolved else KVCacheManager)
+
+
+@pytest.mark.parametrize("max_beam_width", [1, 2, 4])
+@pytest.mark.parametrize("mla", [False, True])
+@pytest.mark.parametrize("fp4_kv_cache", [False, True])
+def test_v2_fp4_mla_beam_compatibility(max_beam_width: int, mla: bool, fp4_kv_cache: bool) -> None:
+    """Reject unsupported beams before allocating a manager or preparing attention."""
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            architectures=["DeepseekV3ForCausalLM" if mla else "LlamaForCausalLM"],
+            kv_lora_rank=512 if mla else None,
+            qk_rope_head_dim=64 if mla else None,
+        ),
+        sparse_attention_config=None,
+        quant_config=SimpleNamespace(
+            quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: fp4_kv_cache)
+        ),
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._max_beam_width = max_beam_width
+
+    if mla and fp4_kv_cache and max_beam_width > 1:
+        with pytest.raises(NotImplementedError, match="FP4 MLA.*max_beam_width > 1"):
+            creator._validate_or_fallback_kv_cache_manager_v2(
+                KVCacheManagerV2, model_config, KvCacheConfig()
+            )
+    else:
+        assert (
+            creator._validate_or_fallback_kv_cache_manager_v2(
+                KVCacheManagerV2, model_config, KvCacheConfig()
+            )
+            is KVCacheManagerV2
+        )
 
 
 def test_resolved_v2_respects_an_explicit_v1_request():
