@@ -17,6 +17,7 @@
 
 #include "kvCacheManagerV2Utils.h"
 #include "tensorrt_llm/batch_manager/kvCacheManagerV2Utils.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/torchView.h"
@@ -227,7 +228,8 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
             TLLM_CHECK_WITH_INFO(indexScales.size(0) == input.size(0) && kvOffset.size(0) == input.size(0),
                 "index_scales and kv_offset must have one entry per pool");
 
-            if (copyIndex.numel() > 0)
+            // CUDA pointer queries are diagnostic checks, not per-step work in normal execution.
+            if (copyIndex.numel() > 0 && tensorrt_llm::DebugConfig::isCheckDebugEnabled())
             {
                 checkTensorReadableByGpu(input, output.device(), "input");
                 checkTensorReadableByGpu(copyIndex, output.device(), "copy_index");
