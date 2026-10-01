@@ -28,6 +28,7 @@ import pytest
 
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 
 pytestmark = pytest.mark.cpu_only
@@ -272,3 +273,121 @@ def test_executor_loop_pp_raises_explicit_fatal_on_last_rank(monkeypatch):
 
     executor._forward_step.assert_called_once()
     executor._sample_async.assert_not_called()
+
+
+def _response_gather_entries(executor):
+    """Response-gather entries a pass makes besides the synced flush.
+
+    Under attention DP both `_handle_responses` (via `_enqueue_responses`)
+    and a direct `_enqueue_responses` call perform exactly one tp_gather,
+    and collectives pair by call order across ranks.
+    """
+    return executor._handle_responses.call_count + executor._enqueue_responses.call_count
+
+
+def test_executor_loop_failed_forward_keeps_response_gather_parity(monkeypatch):
+    """A failed-forward pass must enter as many response gathers as a healthy one.
+
+    Under attention DP a rank-local forward failure leaves batch_outputs None
+    on one rank only; if that rank skips the `_handle_responses` gather while
+    healthy ranks enter it, the TP group desynchronizes and later pairs an
+    int payload against a response list (the fail-fast in _enqueue_responses).
+    """
+    healthy = _loop_executor(monkeypatch)
+    healthy._forward_step = Mock(return_value={"logits": Mock()})
+    PyExecutor._executor_loop(healthy)
+    healthy._forward_step.assert_called_once()
+
+    failed = _loop_executor(monkeypatch)  # its _forward_step returns None
+    PyExecutor._executor_loop(failed)
+    failed._forward_step.assert_called_once()
+    failed._sample_async.assert_not_called()
+
+    healthy_gathers = _response_gather_entries(healthy)
+    failed_gathers = _response_gather_entries(failed)
+    assert healthy_gathers == failed_gathers
+    assert failed_gathers > 0
+    # The synced flush is entered once per completed pass on both sides.
+    assert (
+        healthy._flush_pending_transfer_responses.call_count
+        == failed._flush_pending_transfer_responses.call_count
+    )
+
+
+# ---------------------------------------------------------------------------
+# First-chunk prefill failure must not publish unwritten V1 reuse blocks
+# ---------------------------------------------------------------------------
+
+
+def _error_executor():
+    """Executor shell exposing only what the non-ADP _handle_errors path touches."""
+    executor = object.__new__(PyExecutor)
+    executor._error_budget = Mock()
+    executor._fatal_error = None
+    executor.enable_attention_dp = False
+    executor.dist = Mock(world_size=1)
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor._enqueue_responses = Mock()
+    executor._terminate_request = Mock()
+    return executor
+
+
+def _failed_request(request_id, *, remaining, position):
+    return SimpleNamespace(
+        py_request_id=request_id,
+        py_client_id=100 + request_id,
+        context_remaining_length=remaining,
+        context_current_position=position,
+        state=None,
+    )
+
+
+def test_handle_errors_tags_first_chunk_prefill_failures_as_reuse_poisoned():
+    executor = _error_executor()
+    first_chunk = _failed_request(1, remaining=8, position=0)
+    mid_context = _failed_request(2, remaining=4, position=4)
+    generation = _failed_request(3, remaining=0, position=8)
+    executor.active_requests = [first_chunk, mid_context, generation]
+
+    PyExecutor._handle_errors(
+        executor,
+        "forward failed",
+        requests=[first_chunk, mid_context, generation],
+        charge_budget=False,
+    )
+
+    # Only the request that never completed a context chunk wrote no KV.
+    assert getattr(first_chunk, "py_kv_reuse_poisoned", False)
+    assert not getattr(mid_context, "py_kv_reuse_poisoned", False)
+    assert not getattr(generation, "py_kv_reuse_poisoned", False)
+
+
+def _kv_cache_manager_shell():
+    manager = object.__new__(KVCacheManager)
+    manager.impl = Mock()
+    manager._preprepared_dummy_request_ids = set()
+    return manager
+
+
+def test_free_resources_releases_poisoned_request_without_reuse_store():
+    """remove_sequence(None) must take releaseBlocks' no-store branch.
+
+    This bypasses the legacy position-0 fallback that would publish
+    unwritten blocks under the prompt's keys.
+    """
+    manager = _kv_cache_manager_shell()
+    request = SimpleNamespace(py_request_id=7, py_kv_reuse_poisoned=True)
+
+    KVCacheManager.free_resources(manager, request)
+
+    manager.impl.remove_sequence.assert_called_once_with(7, None, False)
+
+
+def test_free_resources_keeps_reuse_store_for_untagged_requests():
+    manager = _kv_cache_manager_shell()
+    request = SimpleNamespace(py_request_id=7)
+
+    KVCacheManager.free_resources(manager, request)
+
+    manager.impl.remove_sequence.assert_called_once_with(7, request, False)
