@@ -170,6 +170,22 @@ Publication uses only the latest request and its matching replies. A new request
 updates the same PR context on its requested head commit; an old request's late
 reply cannot replace the current result. Status history remains available.
 
+After publication, a tidy job maintains one sticky summary comment per PR
+(marked `semantic-review-sticky`): the latest state, derived from the same
+reviewState logic as the commit status, plus a per-request history table linking
+each request and reply. It then minimizes (classifier `OUTDATED`) request/reply
+pairs that have a recorded verdict or were superseded by a newer request; the
+active request stays visible while waiting. Minimized comments remain
+expandable and link-addressable, so status deep links keep working. The sticky
+comment never contains a live reviewer mention and is written only from
+validated fields (request IDs, revision SHAs, comment IDs, verdicts), never raw
+reply text. Both operations run only on reply events for PRs with a semantic
+review request, so between a new request and its reply the sticky summary
+still reflects the previous run; the commit status remains the verdict of
+record, and minimization is only a display change, not a result override. Minimization is
+best-effort: a failure logs a warning, never blocks the sticky summary or the
+status, and is retried on the next reply event.
+
 If a published reply is edited or deleted and no longer supplies a valid result,
 the current request returns to waiting without asking AI again. Publication
 retains the reply source so that it cannot fall back to an older PASS.
@@ -182,8 +198,8 @@ request's head. Completed Check Runs remain as historical records; they cannot
 be deleted or converted into commit statuses through the Checks API. New results
 are published only as commit statuses, and Check cancellation is not an AI result.
 
-Reply events publish without waiting for a scan. Request and publication jobs
-for the same PR share a concurrency queue. Each batch runs up to four workers;
+Reply events publish without waiting for a scan. Request, publication and tidy
+jobs for the same PR share a concurrency queue. Each batch runs up to four workers;
 the workers finish after their GitHub operations and do not wait for CodeRabbit.
 This is not a limit on concurrent AI analyses. Scheduled batches run one at a
 time; manual requests and publication do not share that batch lock.
@@ -233,6 +249,13 @@ own identity and quota; repository reads and commit status publication use
 publication jobs have `statuses: write` and retain `checks: write` only to cancel
 incomplete semantic Check Runs. The publisher recognizes `coderabbitai[bot]`
 (user ID `136622811`). Keep semantic statuses non-required.
+
+The tidy job keeps comment writes separate from the status/check writers: it
+has `issues: write` and `pull-requests: write` (comment upsert and
+minimization via `GITHUB_TOKEN`) with read-only status/check access, while the
+publish job never holds comment write permissions or the service PAT.
+Minimizing another user's comment requires repository write access, which the
+workflow's `GITHUB_TOKEN` grants per-scope.
 
 ## Validation
 
