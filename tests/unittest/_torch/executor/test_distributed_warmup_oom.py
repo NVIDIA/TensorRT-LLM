@@ -70,6 +70,9 @@ def _engine(
         tp_size=tp_size,
     )
     engine._reset_moe_alltoall_state = mock.Mock()
+    engine.is_spec_decode = False
+    engine.spec_config = None
+    engine.max_draft_len = 0
     return engine
 
 
@@ -400,7 +403,7 @@ def _general_warmup_engine(*, world_size: int, dwdp_size: int) -> PyTorchModelEn
 def test_general_warmup_oom_policy(world_size: int, dwdp_size: int, is_fatal: bool) -> None:
     engine = _general_warmup_engine(world_size=world_size, dwdp_size=dwdp_size)
     error = torch.OutOfMemoryError("asymmetric OOM")
-    engine.forward = mock.Mock(side_effect=error if is_fatal else [error, None])
+    engine._forward_warmup = mock.Mock(side_effect=error if is_fatal else [error, None])
 
     with _no_cuda_side_effects() as (empty_cache, _synchronize):
         if is_fatal:
@@ -413,9 +416,9 @@ def test_general_warmup_oom_policy(world_size: int, dwdp_size: int, is_fatal: bo
     if is_fatal:
         # The remaining shape is never attempted: this rank's peers are
         # already stuck in the failed forward's collectives.
-        engine.forward.assert_called_once()
+        engine._forward_warmup.assert_called_once()
     else:
-        assert engine.forward.call_count == 2
+        assert engine._forward_warmup.call_count == 2
         # A retry after an OOM between dispatch() and combine() has to start
         # from a clean MoE all-to-all state.
         engine._reset_moe_alltoall_state.assert_called_once_with()
@@ -470,7 +473,7 @@ def _run_mamba_warmup(engine: PyTorchModelEngine, resource_manager: object) -> N
 def test_mamba_preforward_error_policy_when_alone(error: Exception, recoverable: bool) -> None:
     engine, resource_manager = _mamba_engine()
     engine._create_warmup_request = mock.Mock(side_effect=error)
-    engine.forward = mock.Mock()
+    engine._forward_warmup = mock.Mock()
 
     with _no_cuda_side_effects():
         if recoverable:
@@ -479,7 +482,7 @@ def test_mamba_preforward_error_policy_when_alone(error: Exception, recoverable:
             with pytest.raises(RuntimeError, match="unexpected"):
                 _run_mamba_warmup(engine, resource_manager)
 
-    engine.forward.assert_not_called()
+    engine._forward_warmup.assert_not_called()
     # The failure predates dispatch(), so there is no half-finished MoE
     # all-to-all exchange to unwind.
     engine._reset_moe_alltoall_state.assert_not_called()
@@ -488,15 +491,15 @@ def test_mamba_preforward_error_policy_when_alone(error: Exception, recoverable:
 def test_mamba_midforward_runtime_error_recovers_when_alone() -> None:
     engine, resource_manager = _mamba_engine()
     engine._create_warmup_request = mock.Mock(return_value=object())
-    engine.forward = mock.Mock(side_effect=RuntimeError("mid-forward failure"))
+    engine._forward_warmup = mock.Mock(side_effect=RuntimeError("mid-forward failure"))
 
     with _no_cuda_side_effects():
         _run_mamba_warmup(engine, resource_manager)
 
     # Every shape is attempted, and each failed forward has to leave the MoE
     # all-to-all state clean for the shape that follows it.
-    assert engine.forward.call_count >= 1
-    assert engine._reset_moe_alltoall_state.call_count == engine.forward.call_count
+    assert engine._forward_warmup.call_count >= 1
+    assert engine._reset_moe_alltoall_state.call_count == engine._forward_warmup.call_count
 
 
 @pytest.mark.parametrize("phase", ["pre-forward", "mid-forward"])
@@ -505,10 +508,10 @@ def test_mamba_error_is_fatal_when_distributed(phase: str) -> None:
     error = RuntimeError(_KV_ALLOC_ERROR)
     if phase == "pre-forward":
         engine._create_warmup_request = mock.Mock(side_effect=error)
-        engine.forward = mock.Mock()
+        engine._forward_warmup = mock.Mock()
     else:
         engine._create_warmup_request = mock.Mock(return_value=object())
-        engine.forward = mock.Mock(side_effect=error)
+        engine._forward_warmup = mock.Mock(side_effect=error)
 
     with _no_cuda_side_effects():
         with pytest.raises(RuntimeError) as excinfo:
