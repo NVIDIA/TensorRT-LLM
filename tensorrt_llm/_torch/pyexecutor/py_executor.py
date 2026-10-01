@@ -8334,9 +8334,11 @@ class PyExecutor:
             # written no KV. Tag it so the V1 KV-cache release skips the
             # block-reuse store: the legacy releaseBlocks fallback would
             # otherwise publish the unwritten blocks under the prompt's keys,
-            # corrupting later requests that share the prefix.
-            if (request.context_remaining_length > 0
-                    and request.context_current_position == 0):
+            # corrupting later requests that share the prefix. getattr
+            # defaults keep non-LlmRequest objects (e.g. the disagg
+            # coordinator's TransferRequest) untagged.
+            if (getattr(request, "context_remaining_length", 0) > 0 and getattr(
+                    request, "context_current_position", None) == 0):
                 request.py_kv_reuse_poisoned = True
             error_responses[req_id] = LlmResponse(
                 request_id=req_id,

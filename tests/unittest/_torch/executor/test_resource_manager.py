@@ -1015,6 +1015,65 @@ class TestResourceManager(unittest.TestCase):
         simulate_prefill_completion_only_use_for_testing(req3)
         kv_cache_manager.free_resources(req3)
 
+    def test_free_resources_poisoned_request_skips_reuse_store(self):
+        """A py_kv_reuse_poisoned release must not publish reuse blocks.
+
+        A context request that failed before completing its first chunk has
+        written no KV, but releaseBlocks' legacy fallback stores blocks for
+        requests still at context position 0. The poisoned release must
+        store nothing, while an untagged position-0 release keeps the legacy
+        fallback behavior. Runs against the real remove_sequence binding,
+        pinning the call signature free_resources uses.
+        """
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                          enable_block_reuse=True,
+                                          max_tokens=256),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=64,
+            max_seq_len=1024,
+            max_batch_size=1,
+            mapping=Mapping(),
+        )
+        try:
+            tokens = [1, 2, 3, 4, 5]
+            initial_reused = kv_cache_manager.get_kv_cache_stats().reused_blocks
+
+            # Failed first-chunk prefill: still at context position 0.
+            req1 = self.create_llm_request(0, tokens)
+            kv_cache_manager.impl.add_sequence_batch(
+                [(req1.py_request_id, req1.prompt_len, 1)], [req1])
+            req1.py_kv_reuse_poisoned = True
+            kv_cache_manager.free_resources(req1)
+
+            req2 = self.create_llm_request(1, tokens)
+            kv_cache_manager.impl.add_sequence_batch(
+                [(req2.py_request_id, req2.prompt_len, 1)], [req2])
+            stats = kv_cache_manager.get_kv_cache_stats()
+            self.assertEqual(
+                stats.reused_blocks, initial_reused,
+                "A poisoned (failed first-chunk) release must not publish "
+                "its unwritten blocks for reuse")
+
+            # Control: an untagged position-0 release keeps the legacy
+            # fallback, which stores the prompt's blocks for reuse.
+            kv_cache_manager.free_resources(req2)
+            req3 = self.create_llm_request(2, tokens)
+            kv_cache_manager.impl.add_sequence_batch(
+                [(req3.py_request_id, req3.prompt_len, 1)], [req3])
+            stats = kv_cache_manager.get_kv_cache_stats()
+            self.assertGreater(
+                stats.reused_blocks, initial_reused,
+                "An untagged position-0 release must keep the legacy "
+                "fallback store")
+            kv_cache_manager.free_resources(req3)
+        finally:
+            kv_cache_manager.shutdown()
+
     def test_batch_cache_indices_honor_requested_blocks_for_beam0(self):
         """V1 returns and truncates only beam 0's cache indices."""
         kv_cache_manager = KVCacheManager(
