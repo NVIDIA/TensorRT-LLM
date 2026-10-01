@@ -1,17 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The three binding stages, and the one invariant that keeps certification intact.
+"""The two binding methods, and the one invariant that keeps certification intact.
 
-A catalog entry now takes its arguments at three different times: engine
-constants and op-owned fixtures at construction, per-forward state once a
-step, and runtime tensors at the call. `raw_call` is the surface underneath
-all of that -- it takes everything explicitly, which is what lets CELLS keep
-certifying the whole input space no matter what a target chose to bind.
-
-A per-layer weight table is also bound at construction, under `layered=`
-rather than the flat `bound=` kwargs, and is projected onto one row by a
-`layer=` keyword at the call -- still construction-time state, just indexed
-per call instead of read back by name.
+A catalog entry no longer cares *when* a value becomes known -- only whether it
+varies by layer. `bind_const` states a value that is the same for every layer;
+`bind_layered` states one value per layer, selected by a `layer=` keyword at
+the call. Both are callable from wherever a target finds the value knowable --
+construction, the first forward, every forward -- and `raw_call` is the
+surface underneath all of it: it takes everything explicitly, which is what
+lets CELLS keep certifying the whole input space no matter what a target chose
+to bind.
 """
 
 from __future__ import annotations
@@ -35,80 +33,87 @@ class _Spy(OpWrapper):
 def test_an_unbound_entry_is_a_passthrough():
     """Nothing bound: the call reaches raw_call unchanged.
 
-    This is what makes Task 1 behaviour-neutral -- every existing call site
-    still works because an entry constructed with no arguments forwards
-    verbatim.
+    This is what makes the reshape behaviour-neutral for an entry nobody
+    binds -- deepseek's module-level singletons never call `bind_const` or
+    `bind_layered`, so every one of their call sites still works.
     """
     assert _Spy()(a=1, b=2, c=3) == dict(a=1, b=2, c=3)
 
 
-def test_construction_supplies_what_the_caller_no_longer_passes():
-    op = _Spy(a=1)
+def test_bind_const_supplies_what_the_caller_no_longer_passes():
+    op = _Spy()
+    op.bind_const(a=1)
     assert op(b=2, c=3) == dict(a=1, b=2, c=3)
 
 
-def test_bind_step_supplies_the_per_forward_layer():
-    op = _Spy(a=1)
-    op.bind_step(b=2)
-    assert op(c=3) == dict(a=1, b=2, c=3)
+def test_bind_const_can_be_called_again_to_add_more():
+    """A target binds once at construction and again, for different keys,
+    on a later forward -- both bindings are live at the same time."""
+    op = _Spy()
+    op.bind_const(a="bound-at-construction")
+    op.bind_const(b="bound-on-forward")
+    assert op(c=3) == dict(a="bound-at-construction", b="bound-on-forward", c=3)
 
 
-def test_a_later_stage_wins_over_an_earlier_one():
-    """Call time beats step, step beats construction.
-
-    Not a convenience: a decode target states `num_ctx_tokens=0` at
-    construction while the step projection would report whatever the metadata
-    carried, and the narrower statement has to survive.
-    """
-    op = _Spy(a="bound", b="bound")
-    op.bind_step(b="step", c="step")
-    assert op(c="call") == dict(a="bound", b="step", c="call")
-
-
-def test_rebinding_a_step_replaces_the_previous_one():
-    """Stale step state is the failure mode this design introduces: a forward
-    that forgot to rebind would otherwise reuse the last one's block offsets.
-    Replacing rather than merging is what keeps a rebind total.
+def test_a_later_bind_const_updates_rather_than_replaces():
+    """This is the behaviour that makes the staleness check meaningful: a key
+    a forward forgets to rebind keeps whatever `bind_const` last gave it,
+    silently, rather than reverting to unset. Wrong output, no error -- the
+    generation check (below) is what catches it under `validating()`.
     """
     op = _Spy()
-    op.bind_step(a=1, b=1)
-    op.bind_step(a=2)
-    assert op() == dict(a=2, b=None, c=None)
+    op.bind_const(a=1, b=1)
+    op.bind_const(a=2)
+    assert op() == dict(a=2, b=1, c=None)
+
+
+def test_call_time_kwarg_overrides_bind_const():
+    op = _Spy()
+    op.bind_const(a="bound", b="bound")
+    assert op(c="call") == dict(a="bound", b="bound", c="call")
+    assert op(b="call") == dict(a="bound", b="call", c=None)
 
 
 def test_layer_selects_the_bound_row():
-    """A `layered` table built at construction, read by row at the call.
+    """A `bind_layered` table, read by row at the call.
 
     This is the mechanism gpt_oss's per-layer weight tables rest on: built
     once from the real weights, then indexed by `layer=i` every forward
     instead of being read out of a per-target tuple by the call site itself.
     """
-    op = _Spy(a="bound", layered=dict(b=("row0", "row1", "row2")))
+    op = _Spy()
+    op.bind_const(a="bound")
+    op.bind_layered(b=("row0", "row1", "row2"))
     assert op(c=3, layer=1) == dict(a="bound", b="row1", c=3)
 
 
-def test_layer_overrides_bound_and_step_for_the_same_argument():
-    """The layer projection is the last stage, and wins.
-
-    A target that both binds a default and layers an override for the same
-    argument name gets the layered row -- not the default, and not whatever a
-    stale step happened to carry for it.
-    """
-    op = _Spy(b="bound-default", layered=dict(b=("row0", "row1")))
-    op.bind_step(b="step-value")
+def test_layer_overrides_const_for_the_same_argument():
+    op = _Spy()
+    op.bind_const(b="const-default")
+    op.bind_layered(b=("row0", "row1"))
     assert op(layer=1) == dict(a=None, b="row1", c=None)
 
 
-def test_an_entry_with_no_layered_table_is_unaffected_by_the_absence_of_layer():
-    """An entry that never binds `layered=` is not even aware the mechanism
-    exists: with `_layered` empty, a call that passes no `layer=` runs the
-    exact same merge it would have before `layered` existed. This is what
-    keeps deepseek's 20-odd call sites -- none of which pass `layer=` -- and
-    their own tests working untouched.
+def test_call_time_kwarg_overrides_the_layer_row():
+    """Call-time kwargs win over everything, including a `layered` row for
+    the same argument -- a target binding a weight table can still pass an
+    unrelated, or even overriding, per-call value through the same call.
     """
-    op = _Spy(a=1)
-    op.bind_step(b=2)
-    assert op(c=3) == dict(a=1, b=2, c=3)
+    op = _Spy()
+    op.bind_layered(b=("row0", "row1"))
+    assert op(b="explicit", layer=1) == dict(a=None, b="explicit", c=None)
+
+
+def test_an_entry_with_no_layered_table_is_unaffected_by_the_absence_of_layer():
+    """An entry that never calls `bind_layered` is not even aware the
+    mechanism exists: with `_layered` empty, a call that passes no `layer=`
+    runs the exact same merge it would have before `layered` existed. This is
+    what keeps deepseek's 20-odd call sites -- none of which pass `layer=` --
+    and their own tests working untouched.
+    """
+    op = _Spy()
+    op.bind_const(a=1)
+    assert op(c=3) == dict(a=1, b=None, c=3)
 
 
 def test_an_entry_must_implement_raw_call():
@@ -120,11 +125,30 @@ def test_an_entry_must_implement_raw_call():
         Incomplete()
 
 
-def test_a_stale_step_binding_is_caught_under_validation():
+def test_a_key_bound_before_any_forward_is_never_flagged():
+    """Generation 0 -- a key `bind_const` or `bind_layered` sees before the
+    first `advance_step_generation()` call is a construction-time constant,
+    and the staleness check only ever flags generation >= 1. Any number of
+    forwards may pass without rebinding such a key.
+    """
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog import _op
+
+    __extra_import_path__ = [".."]  # noqa: F841 -- repo's file-scoped import hook
+    from _validating import validating
+
+    op = _Spy()
+    op.bind_const(a=1)  # before any forward: generation 0
+    _op.advance_step_generation()
+    _op.advance_step_generation()
+    with validating(op):
+        op()  # does not raise, even though two forwards passed unrebound
+
+
+def test_a_key_bound_mid_forward_and_not_rebound_is_flagged():
     """The failure mode this design introduces, and the only place it is seen.
 
     Outside validation nothing compares generations -- an entry running on last
-    forward's block offsets produces a wrong answer and no error. That is the
+    forward's value produces a wrong answer and no error. That is the
     accepted cost of keeping the hot path free; this test is the record that
     the check exists and fires.
     """
@@ -135,7 +159,7 @@ def test_a_stale_step_binding_is_caught_under_validation():
 
     op = _Spy()
     _op.advance_step_generation()
-    op.bind_step(a=1)
+    op.bind_const(a=1)  # bound during this forward: generation >= 1
     _op.advance_step_generation()  # a new forward that forgot to rebind
     with pytest.raises(AssertionError, match="previous step's metadata"):
         with validating(op):
