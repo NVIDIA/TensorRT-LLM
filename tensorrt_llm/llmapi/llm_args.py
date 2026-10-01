@@ -6360,6 +6360,9 @@ class TorchLlmArgs(BaseLlmArgs):
         is only enforced when the KV pool is sized by fraction (an explicit
         ``kv_cache_config.max_tokens`` cap can leave more headroom than the
         fraction implies) and when a CUDA device is visible.
+        With unified V2 draft KV, paged backends have no private arena;
+        VANILLA's dense staging is reserved before the managed pool is sized.
+        An unresolved "auto" manager defers buffer sizing to the runtime path.
         ``memory_budget_bytes`` overrides the derivation (tests).
         """
         from tensorrt_llm._torch.speculative.dflash import (
@@ -6402,10 +6405,16 @@ class TorchLlmArgs(BaseLlmArgs):
                 with open(draft_config_path) as f:
                     draft_config = json.load(f)
 
-        arena_before_pool = self._kv_cache_estimation_runs()
-        if spec_cfg.skip_ctx_buffer_budget_check:
-            # Opt out of the pooled-context buffer-fit check (the estimate is
-            # conservative); the token-budget check above still applies.
+        manager_setting = self.kv_cache_config.use_kv_cache_manager_v2
+        unified_draft_cache = manager_setting is True
+        arena_before_pool = (unified_draft_cache
+                             or self._kv_cache_estimation_runs())
+        if (spec_cfg.skip_ctx_buffer_budget_check or manager_setting == "auto"
+                or (unified_draft_cache
+                    and spec_cfg.attention_backend in ("TRTLLM", "FA4"))):
+            # Defer unresolved routing to runtime sizing. Managed pages belong
+            # to the KV pool budget; only VANILLA also needs dense staging.
+            # Keep token-budget and block-width checks for every route.
             memory_budget_bytes = None
         elif memory_budget_bytes is None:
             kv_fraction = self.kv_cache_config.free_gpu_memory_fraction
@@ -6592,22 +6601,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
 
             if isinstance(self.speculative_config, DFlashDecodingConfig):
-                if (self.cache_transceiver_config is not None
-                        and self.cache_transceiver_config.backend is not None):
-                    # The transceiver moves the target KV cache, but the
-                    # drafter's context is built from target hidden states
-                    # during prefill and is not transferred with it, so a
-                    # generation server drafts without the prompt. Drafts are
-                    # verified against the target, so this costs acceptance
-                    # rather than correctness: warn, do not reject.
-                    logger.warning(
-                        "DFlash acceptance is degraded under disaggregated "
-                        "serving: the cache transceiver moves the target KV "
-                        "cache, but the drafter's context is built during "
-                        "prefill and is not transferred, so a generation "
-                        "server drafts without the prompt context. Output is "
-                        "unaffected; expect a lower acceptance rate than the "
-                        "same configuration run aggregated.")
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
                 # A Hugging Face repo id is not readable yet: both calls below
                 # then run without the drafter's config.json (the budget check
