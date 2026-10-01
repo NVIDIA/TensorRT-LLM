@@ -10,6 +10,7 @@ import math
 import os
 import socket
 import tempfile
+import time
 from abc import ABC, abstractmethod
 from concurrent.futures import Executor
 from io import BytesIO
@@ -601,6 +602,40 @@ _VIDEO_TEMPFILE_DIR: Optional[str] = (  # nosec B108
     else None
 )
 
+# Sampled frames are reached by seeking when there are at least this many
+# frames per sample. A seek decodes from the keyframe before its target, so it
+# only beats decoding every frame in order when samples are far apart. This
+# conservative crossover made every seeking file faster on the Video-MME
+# short split.
+_VIDEO_SPARSE_SEEK_MIN_FRAME_RATIO = 250
+# Before seeking, this many frames after frames 0 and 1 are decoded in order
+# to estimate the per-frame cost of decoding in order.
+_VIDEO_SPARSE_SEEK_CALIBRATION_FRAMES = 32
+# Seeking stops, and decoding continues in order, once the time spent seeking
+# exceeds this multiple of the estimated time to decode the same frames in
+# order. This bounds streams whose keyframes are farther apart than the
+# samples, where every seek decodes a long run of frames again.
+_VIDEO_SPARSE_SEEK_TIME_BUDGET = 2.0
+# Seeking also stops before the seek targets add up to more than this multiple
+# of the frames up to the last sample. A seek decodes from the keyframe before
+# its target, at worst from frame 0, so unlike the time budget this bound holds
+# even if the opening frames misrepresent the decode cost. 5 still allows every
+# seek for 10 samples.
+_VIDEO_SPARSE_SEEK_MAX_FRAME_FACTOR = 5
+
+
+def _has_isobmff_signature(video: Union[str, bytes, bytearray, memoryview]) -> bool:
+    """Return whether `video` (a local path or raw bytes) starts with an ISO-BMFF `ftyp` box."""
+    if isinstance(video, (bytes, bytearray, memoryview)):
+        header = bytes(video[:8])
+    else:
+        try:
+            with open(_normalize_file_uri(video), "rb") as video_file:
+                header = video_file.read(8)
+        except OSError:
+            return False
+    return header[4:8] == b"ftyp"
+
 
 def _load_video_by_cv2(
     video: Union[str, bytes],
@@ -638,18 +673,20 @@ def _load_video_by_cv2(
     #   (b) `video` is mp4 bytes -> feed cv2 from an in-memory BytesIO via
     #       the caller-supplied stream-buffered backend. The buffer is held
     #       alive in `video_buf` because cv2 keeps a non-owning view into it.
-    video_buf: Optional[BytesIO] = None
-    if isinstance(video, (bytes, bytearray, memoryview)):
-        if cv2_backend is None:
-            raise ValueError(
-                "cv2_backend must be provided when `video` is bytes; "
-                "callers without a stream-buffered backend should spill "
-                "the bytes to a tempfile and pass the path instead."
-            )
-        video_buf = BytesIO(bytes(video))
-        vidcap = cv2.VideoCapture(video_buf, cv2_backend, [])
-    else:
-        vidcap = cv2.VideoCapture(video)
+    def open_video_capture() -> Tuple[Any, Optional[BytesIO]]:
+        if isinstance(video, (bytes, bytearray, memoryview)):
+            if cv2_backend is None:
+                raise ValueError(
+                    "cv2_backend must be provided when `video` is bytes; "
+                    "callers without a stream-buffered backend should spill "
+                    "the bytes to a tempfile and pass the path instead."
+                )
+            buffer = BytesIO(bytes(video))
+            return cv2.VideoCapture(buffer, cv2_backend, []), buffer
+        return cv2.VideoCapture(video), None
+
+    # Keep the buffer alive because VideoCapture holds a non-owning view.
+    vidcap, video_buf = open_video_capture()
 
     try:
         if not vidcap.isOpened():
@@ -691,36 +728,114 @@ def _load_video_by_cv2(
         # Log at most once per decode to avoid spamming when a whole stream is
         # affected (e.g. every frame retrieves with a drifted shape).
         skip_warned = False
-        frame_idx = 0
-        while frame_idx <= max_idx and vidcap.grab():
-            if frame_idx in target_set:
-                # Reuse a single BGR buffer across retrieves; cv2 replaces its
-                # contents in place when the argument is shape-compatible.
-                ok, bgr_scratch = vidcap.retrieve(bgr_scratch)
-                if ok:
-                    fh, fw = bgr_scratch.shape[:2]
-                    if stacked_rgb is None:
-                        H, W = fh, fw
-                        stacked_rgb = np.empty((num_frames_to_sample, H, W, 3), dtype=np.uint8)
-                    if (fh, fw) == (H, W):
-                        cv2.cvtColor(
-                            bgr_scratch,
-                            cv2.COLOR_BGR2RGB,
-                            dst=stacked_rgb[len(valid_indices)],
-                        )
-                        valid_indices.append(frame_idx)
+        # Index of the frame that the next `grab()` decodes.
+        next_frame = 0
+        stream_ended = False
+
+        def store_rgb_frame(frame_idx: int, bgr_frame: np.ndarray) -> None:
+            nonlocal H, W, skip_warned, stacked_rgb
+            fh, fw = bgr_frame.shape[:2]
+            if stacked_rgb is None:
+                H, W = fh, fw
+                stacked_rgb = np.empty((num_frames_to_sample, H, W, 3), dtype=np.uint8)
+            if (fh, fw) == (H, W):
+                cv2.cvtColor(
+                    bgr_frame,
+                    cv2.COLOR_BGR2RGB,
+                    dst=stacked_rgb[len(valid_indices)],
+                )
+                valid_indices.append(frame_idx)
+            elif not skip_warned:
+                logger.warning(
+                    f"Skipping frame {frame_idx} and subsequent size-drifted frames: "
+                    f"shape={(fh, fw)} differs from first decoded shape=({H}, {W})."
+                )
+                skip_warned = True
+
+        def decode_in_order(last_frame: int) -> None:
+            nonlocal bgr_scratch, next_frame, skip_warned, stream_ended
+            while not stream_ended and next_frame <= last_frame:
+                if not vidcap.grab():
+                    stream_ended = True
+                    break
+                if next_frame in target_set:
+                    # Reuse a single BGR buffer across retrieves; cv2 replaces
+                    # its contents when the argument is shape-compatible.
+                    ok, bgr_scratch = vidcap.retrieve(bgr_scratch)
+                    if ok:
+                        store_rgb_frame(next_frame, bgr_scratch)
                     elif not skip_warned:
                         logger.warning(
-                            f"Skipping frame {frame_idx} and subsequent size-drifted frames: "
-                            f"shape={(fh, fw)} differs from first decoded shape=({H}, {W})."
+                            f"Skipping frame {next_frame} and subsequent retrieve failures: "
+                            "retrieve returned ok=False."
                         )
                         skip_warned = True
-                elif not skip_warned:
-                    logger.warning(
-                        f"Skipping frame {frame_idx} and subsequent retrieve failures: retrieve returned ok=False."
-                    )
-                    skip_warned = True
-            frame_idx += 1
+                next_frame += 1
+
+        # Seek to sampled frames that are far apart instead of decoding every
+        # frame up to the last one. Only ISO-BMFF (MP4/MOV) input decoded by
+        # FFmpeg qualifies: for MPEG-TS/PS, OpenCV can return a different frame
+        # than the position it reports.
+        use_sparse_seek = (
+            max_idx + 1 >= _VIDEO_SPARSE_SEEK_MIN_FRAME_RATIO * len(indices)
+            and vidcap.getBackendName() == "FFMPEG"
+            and _has_isobmff_signature(video)
+        )
+        if use_sparse_seek:
+            # Decode the opening frames in order: a seek to frame 0 can land on a
+            # later keyframe, frames 0 and 1 check the frame rate, and the
+            # following frames estimate the cost of decoding in order.
+            decode_in_order(0)
+            first_frame_msec = vidcap.get(cv2.CAP_PROP_POS_MSEC)
+            decode_in_order(1)
+            interval_msec = vidcap.get(cv2.CAP_PROP_POS_MSEC) - first_frame_msec
+            start = time.perf_counter()
+            decode_in_order(1 + _VIDEO_SPARSE_SEEK_CALIBRATION_FRAMES)
+            frame_sec = (time.perf_counter() - start) / _VIDEO_SPARSE_SEEK_CALIBRATION_FRAMES
+            period_msec = 1000.0 / original_fps
+            # OpenCV resolves seek targets through timestamps and the average
+            # frame rate, which matches decode order only at a constant frame
+            # rate. Seek only if the first frame interval predicts the last
+            # sampled frame's timestamp within half a frame. Drift that cancels
+            # out by the last sample (e.g. a stall followed by a burst) is not
+            # detected, and such streams can return different frames.
+            use_sparse_seek = (
+                not stream_ended and abs(interval_msec - period_msec) * max_idx <= 0.5 * period_msec
+            )
+        if use_sparse_seek:
+            seek_sec = 0.0
+            seek_frames = 0
+            for frame_idx in indices:
+                if frame_idx < next_frame:
+                    continue
+                # Stop seeking once it costs more than decoding in order would,
+                # and decode the remaining samples in order.
+                if (
+                    seek_sec > _VIDEO_SPARSE_SEEK_TIME_BUDGET * frame_sec * next_frame
+                    or seek_frames + frame_idx > _VIDEO_SPARSE_SEEK_MAX_FRAME_FACTOR * (max_idx + 1)
+                ):
+                    break
+                start = time.perf_counter()
+                ok = vidcap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx) and vidcap.grab()
+                if ok:
+                    ok, bgr_scratch = vidcap.retrieve(bgr_scratch)
+                if not ok or abs(vidcap.get(cv2.CAP_PROP_POS_FRAMES) - (frame_idx + 1)) > 0.5:
+                    # The decoder position is unknown, so start over in order.
+                    vidcap.release()
+                    vidcap, video_buf = open_video_capture()
+                    if not vidcap.isOpened():
+                        raise ValueError("Video could not be reopened after sparse seek failed.")
+                    stacked_rgb = None
+                    H = W = None
+                    valid_indices.clear()
+                    skip_warned = False
+                    next_frame = 0
+                    break
+                seek_sec += time.perf_counter() - start
+                seek_frames += frame_idx
+                store_rgb_frame(frame_idx, bgr_scratch)
+                next_frame = frame_idx + 1
+        decode_in_order(max_idx)
         vidcap.release()
 
         if stacked_rgb is None or not valid_indices:
