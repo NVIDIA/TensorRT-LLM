@@ -127,7 +127,7 @@ _STEP_GENERATION = 0
 
 
 def advance_step_generation() -> None:
-    """Called once per forward, before any `bind_step`."""
+    """Called once per forward, before any `bind_const` or `bind_layered`."""
     global _STEP_GENERATION
     _STEP_GENERATION += 1
 
@@ -164,23 +164,33 @@ class Cell:
 class OpWrapper(ABC):
     """Base for a catalog entry.
 
-    An entry takes its arguments at three different times. Engine-construction
-    constants and the fixtures the op needs for its own signature are supplied
-    when the instance is built; the per-step batch state is rebound once a
-    forward; the runtime tensors arrive at the call. `__call__` merges the
-    three and hands the whole set to `raw_call`.
+    An entry does not care *when* a value becomes known -- that was the old
+    design's axis (construction vs. per-step), and it was the caller's
+    business, not the interface's. What the entry actually needs to know is
+    whether a value varies by layer. Two binding methods state exactly that:
 
-    A fourth kind of value is per-layer rather than per-step: a weight table or
-    a per-layer scalar that is fixed once the weights are real but differs by
-    `local_layer_idx`. `layered` names those at construction as `{argument:
-    per-layer sequence}`; a call states which row with `layer=i`, and that row
-    overrides whatever `__call__`'s other three stages supplied for the same
-    argument -- a target binding a weight table can still pass unrelated
-    per-call tensors through the same call. A value a target cannot resolve
-    until a step is underway (bound to runtime metadata rather than to the
-    weights) does not belong here even if it varies by layer; it stays a
-    plain per-call keyword argument instead, computed in the loop body -- see
-    gpt_oss's `attention_window_size` for why.
+        bind_const(**values)     a value, the same for every layer
+        bind_layered(**tables)   one value per layer, selected by `layer=`
+
+    Both are callable from anywhere a target chooses -- construction, the
+    first forward, every forward -- and the caller decides which. Both may be
+    called more than once; a later call updates only the keys it names and
+    leaves every other binding alone. `__call__` merges `_const`, then the
+    row `_layered` holds for `layer=` (so a layered value wins over a flat
+    const for the same argument), then the call's own kwargs last of all, and
+    hands the result to `raw_call`.
+
+    This is what gives gpt_oss's `attention_window_size` a home: per-layer,
+    but not knowable at construction (it derives from `attn_metadata`'s
+    resolved `max_seq_len`, which the KV cache manager does not produce until
+    after weights load) and not per-step either -- it never changes again
+    once known. It is bound with `bind_layered` once, on the first forward.
+
+    The cost of collapsing the time axis: a reader at a call site can no
+    longer tell a volatile per-forward binding from a permanent one by the
+    method name alone -- both read `bind_const`. Make that obvious in
+    context instead, e.g. a comment naming what gets rebound each step --
+    see gpt_oss's attention binding for the pattern.
 
     `raw_call` is the certified surface, and it takes everything explicitly --
     it must not read any bound state off `self`. That is what keeps `CELLS`
@@ -188,9 +198,8 @@ class OpWrapper(ABC):
     bind, and it is why `reference` and `is_valid` mirror `raw_call` rather
     than `__call__`. A gate in the claims suite enforces it.
 
-    Instances are no longer stateless: binding is state, and an op that
-    manufactures its own fixture holds a device tensor. They are still
-    immutable after `bind_step`, and each target owns its own instances --
+    Instances are stateful: binding is state, and an op that manufactures its
+    own fixture holds a device tensor. Each target owns its own instances --
     there is no module-level singleton to contend over, which is what makes
     per-target binding safe. Two models genuinely disagree about values like
     `num_heads`; a shared instance could only hold one of them.
@@ -200,48 +209,71 @@ class OpWrapper(ABC):
     CELLS: tuple[Cell, ...] = ()
     note: str = ""
 
-    def __init__(self, *, layered: dict[str, Any] | None = None, **bound: Any) -> None:
-        """Freeze what is known once the engine exists and the weights are real.
+    def __init__(self) -> None:
+        """Set up empty binding state.
 
-        Called from a target's post-load hook, never from its `__init__`: a
-        fixture needs a device, and parameters are meta tensors until the
-        engine materializes the registry.
-
-        `layered` is keyword-only and named apart from `bound` so a target
-        author sees the per-layer tables at a glance rather than finding them
-        buried in an otherwise flat kwargs dict; nothing about the split
-        matters to `__call__`'s merge order beyond that.
+        No binding arguments: a target binds explicitly, from wherever a
+        value becomes knowable, with `bind_const` or `bind_layered` -- there
+        is no longer a stage reserved for construction.
         """
-        self._bound: dict[str, Any] = bound
-        self._step: dict[str, Any] = {}
-        self._layered: dict[str, Any] = layered or {}
-        self._step_generation = -1
+        self._const: dict[str, Any] = {}
+        self._layered: dict[str, Any] = {}
+        # Per key: the step generation in effect when that key was last
+        # bound. Read only by the validation harness -- see `bind_const`.
+        self._generation: dict[str, int] = {}
 
-    def bind_step(self, **step: Any) -> None:
-        """Rebind the per-forward batch state. Replaces, never merges.
+    def bind_const(self, **values: Any) -> None:
+        """Bind values that are the same for every layer.
 
-        Total replacement is deliberate. A forward that rebinds only some of
-        the projection would otherwise run on a mixture of this step's and the
-        last step's metadata -- wrong output, no error.
+        Updates rather than replaces: a later call adds or overwrites only
+        the keys it names, leaving every other binding -- including ones
+        made at construction -- in place. A target rebinding its per-step
+        projections once a forward is not required to also restate its
+        construction-time constants on every call.
+
+        Also stamps each bound key with the step generation in effect right
+        now. A key bound before the first `advance_step_generation()` call
+        -- a construction-time constant -- carries generation 0 forever,
+        because nothing ever rebinds it. A key bound while a forward is
+        underway carries that forward's generation, and gets left behind the
+        moment the next forward advances the counter without rebinding it.
+        That drift is exactly the bug `_validating.validating` watches for:
+        the base class cannot tell a construction-time constant from a
+        volatile per-forward value by name anymore, but it can tell whether
+        a given key's last bind has fallen behind the current forward.
         """
-        self._step = step
-        self._step_generation = _STEP_GENERATION
+        self._const.update(values)
+        for key in values:
+            self._generation[key] = _STEP_GENERATION
+
+    def bind_layered(self, **tables: Any) -> None:
+        """Bind one value per layer, selected by `layer=` at the call.
+
+        Same update-not-replace and generation bookkeeping as `bind_const`,
+        for the same reason: a `layered` table is not inherently a
+        construction-time thing -- gpt_oss's `attention_window_size` is
+        bound once, on the first forward rather than at construction, and a
+        future entry could just as well rebind a layered table every step.
+        """
+        self._layered.update(tables)
+        for key in tables:
+            self._generation[key] = _STEP_GENERATION
 
     def __call__(self, *args: Any, layer: int | None = None, **kwargs: Any) -> Any:
-        """Merge the three stages, project the layer, and make the call.
+        """Merge const, the layer row, and the call's own kwargs, in that order.
 
-        Later stages win: the call overrides the step, the step overrides
-        construction. A decode target states `num_ctx_tokens=0` at construction
-        precisely so the narrower claim survives the step projection. The
-        layer projection applies last and only to the arguments `layered`
-        named, and only when a caller passes `layer=`. An unbound entry has
-        an empty `_layered`, so a call that never passes `layer=` runs the
-        same three-stage merge this always did -- which is what keeps every
-        existing call site byte-for-byte the same call it always was.
+        Later stages win: the layer row overrides a flat const for the same
+        argument, and a call-time kwarg overrides both -- a target can still
+        pass a per-call override through the same call a `layered` table is
+        bound on. An unbound entry has empty `_const` and `_layered`, so a
+        call that never passes `layer=` is a plain passthrough -- which is
+        what keeps deepseek's call sites byte-for-byte the same call they
+        always were.
         """
-        merged = {**self._bound, **self._step, **kwargs}
+        merged = dict(self._const)
         if layer is not None:
             merged.update({name: table[layer] for name, table in self._layered.items()})
+        merged.update(kwargs)
         return self.raw_call(*args, **merged)
 
     @abstractmethod
