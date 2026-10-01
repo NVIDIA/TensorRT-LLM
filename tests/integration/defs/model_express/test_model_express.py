@@ -52,7 +52,7 @@ _MX_CASES = (
         MxE2ECase(
             model_env="TRTLLM_MX_LLAMA_MODEL",
             default_model_subdir="Qwen3/Qwen3-0.6B",
-            repository_cache_prefix="models--trtllm-mx-e2e--llama-tp1",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-0.6b-tp1",
             tp_size=1,
         ),
         id="qwen3-0.6b-bf16-tp1",
@@ -62,7 +62,7 @@ _MX_CASES = (
         MxE2ECase(
             model_env="TRTLLM_MX_LLAMA_MODEL",
             default_model_subdir="Qwen3/Qwen3-0.6B",
-            repository_cache_prefix="models--trtllm-mx-e2e--llama-tp2",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-0.6b-tp2",
             tp_size=2,
         ),
         id="qwen3-0.6b-bf16-tp2",
