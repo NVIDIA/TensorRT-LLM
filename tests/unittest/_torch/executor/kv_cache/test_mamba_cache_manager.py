@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for Python, Cpp, and V2 Mamba cache managers."""
 
+import math
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -300,12 +301,16 @@ def _kimi_model_config() -> SimpleNamespace:
         quant_config=None,
         sparse_attention_config=None,
         get_num_mamba_layers=lambda: 2,
+        # get_kv_cache_manager_cls reads the mapping and spec config (helix check).
+        mapping=None,
+        spec_config=None,
     )
 
 
 def _capture_kimi_v2_manager_ctor(
     monkeypatch: pytest.MonkeyPatch,
     spec_config=None,
+    model_engine=None,
 ) -> tuple[tuple, dict]:
     """Route a Kimi config through _create_kv_cache_manager with an explicit
     V2 manager and capture the constructor arguments."""
@@ -324,7 +329,7 @@ def _capture_kimi_v2_manager_ctor(
     assert get_kv_cache_manager_cls(model_config, kv_cache_config) is MambaHybridCacheManagerV2
 
     _create_kv_cache_manager(
-        model_engine=None,
+        model_engine=model_engine,
         kv_cache_manager_cls=RecordingV2Manager,
         mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
         kv_cache_config=kv_cache_config,
@@ -380,6 +385,33 @@ def test_kimi_explicit_v2_manager_enables_kda_replay(
 
     assert kwargs["kda_replay_num_spec"] == spec_config.tokens_per_gen_step - 1
     assert kwargs["conv_state_layout"] == "q_k_v"
+    assert "kda_token_states" not in kwargs
+
+
+@pytest.mark.parametrize("backbone_asks", [True, False])
+def test_kimi_explicit_v2_manager_kda_token_states_follow_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+    backbone_asks: bool,
+) -> None:
+    """The factory asks the V2 manager for per-token KDA verify states only when
+    the model's backbone sets ``kda_token_states``."""
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
+        lambda: True,
+    )
+    backbone = SimpleNamespace(kda_token_states=True) if backbone_asks else SimpleNamespace()
+    model_engine = SimpleNamespace(
+        model=SimpleNamespace(model=backbone),
+        _max_cuda_graph_batch_size=4,
+        is_multimodal=True,
+    )
+
+    _, kwargs = _capture_kimi_v2_manager_ctor(
+        monkeypatch, MTPDecodingConfig(max_draft_len=3), model_engine
+    )
+
+    assert kwargs["kda_replay_num_spec"] == 3
+    assert kwargs.get("kda_token_states", False) is backbone_asks
 
 
 def test_kimi_explicit_v2_manager_uses_qkv_convolution_layout(
@@ -2353,6 +2385,7 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_n_groups=1,
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
+    kda_token_states=False,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
@@ -2407,6 +2440,7 @@ def _build_v2_hybrid_with_mamba_layer(
         dtype=dtype,
         conv_state_layout=conv_state_layout,
         kda_replay_num_spec=kda_replay_num_spec,
+        kda_token_states=kda_token_states,
     )
 
 
@@ -3629,6 +3663,43 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
         )
         assert layer_cache.intermediate_ssm is None
         assert layer_cache.intermediate_conv_window is None
+        assert layer_cache.kda_state_tok is None
+        assert not mgr.keeps_kda_token_states
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("kda_replay_num_spec", [2, None])
+def test_v2_kda_token_states_allocated_with_the_replay_caches(kda_replay_num_spec):
+    """With the replay caches, ``kda_token_states`` adds the fp32 state after every
+    draft of each slot, per layer; without them it allocates nothing."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=4,
+        num_mamba_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        conv_state_layout="q_k_v",
+        mamba_d_conv=5,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
+        mamba_ssm_cache_dtype=torch.float32,
+        kda_replay_num_spec=kda_replay_num_spec,
+        kda_token_states=True,
+    )
+    try:
+        if kda_replay_num_spec is None:
+            assert getattr(mgr, "kda_state_tok", None) is None
+            assert not mgr.keeps_kda_token_states
+            return
+        assert mgr.keeps_kda_token_states
+        for layer_idx in range(2):
+            layer_cache = mgr.mamba_layer_cache(layer_idx)
+            cache_size = layer_cache.temporal.shape[0]
+            states = layer_cache.kda_state_tok
+            assert states.shape == (cache_size, 2, *layer_cache.temporal.shape[1:])
+            assert states.dtype is torch.float32
+            assert states.data_ptr() == mgr.kda_state_tok[layer_idx].data_ptr()
+            assert not states.any()
     finally:
         mgr.shutdown()
 
@@ -3783,6 +3854,60 @@ def test_v2_kda_replay_relocates_live_slot_history():
             torch.testing.assert_close(replay_buffer[:, 2], source_one)
     finally:
         mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_kda_token_states_relocate_with_their_slot():
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        conv_state_layout="q_k_v",
+        mamba_n_groups=4,
+        mamba_ssm_cache_dtype=torch.float32,
+        kda_replay_num_spec=2,
+        kda_token_states=True,
+    )
+    try:
+        states = mgr.kda_state_tok
+        assert states is not None
+        states.zero_()
+        states[:, 0].fill_(1.0)
+        states[:, 1].fill_(2.0)
+        source_zero, source_one = states[:, 0].clone(), states[:, 1].clone()
+
+        mgr._relocate_kda_replay_slots([0, 1], [1, 2])
+
+        torch.testing.assert_close(states[:, 1], source_zero, rtol=0, atol=0)
+        torch.testing.assert_close(states[:, 2], source_one, rtol=0, atol=0)
+    finally:
+        mgr.shutdown()
+    # Released with the other replay buffers.
+    assert mgr.kda_state_tok is None
+
+
+@skip_no_cuda
+def test_v2_kda_token_states_count_in_the_per_slot_budget():
+    """The capacity math sees the per-token states: a slot costs one more fp32 SSM state per draft and layer."""
+    kwargs = dict(
+        num_mamba_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        conv_state_layout="q_k_v",
+        mamba_d_conv=5,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
+        mamba_ssm_cache_dtype=torch.float32,
+        kda_replay_num_spec=2,
+    )
+    plain = _build_v2_hybrid_with_mamba_layer(**kwargs)
+    try:
+        plain_bytes = plain._mamba_state_bytes_per_slot()
+    finally:
+        plain.shutdown()
+    with_states = _build_v2_hybrid_with_mamba_layer(kda_token_states=True, **kwargs)
+    try:
+        per_token = 2 * 2 * math.prod(with_states.ssm_state_shape) * 4
+        assert with_states._mamba_state_bytes_per_slot() == plain_bytes + per_token
+    finally:
+        with_states.shutdown()
 
 
 @skip_no_cuda
