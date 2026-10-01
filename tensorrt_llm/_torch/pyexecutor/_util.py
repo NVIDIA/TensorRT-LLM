@@ -1324,8 +1324,13 @@ class KvCacheCreator:
         encoder_cache = self._model_engine.mm_encoder_cache
         if encoder_cache is None:
             return 0
-        reserve = max(0, encoder_cache.max_bytes - profiled_output_bytes)
+        reserve = encoder_cache.max_bytes
         if self._model_engine.mm_encoder_item_scheduling_enabled:
+            # Item outputs live only in the store, so the retained profiling
+            # output already occupies part of it. Inline encoding keeps its
+            # batch output beside the store's copies; the retained output
+            # stands in for that batch, so the whole store stays unprofiled.
+            reserve = max(0, reserve - profiled_output_bytes)
             # The text-only dummy does not assemble cached MM rows for LLM
             # prefill. Per-request joins and their batch-wide join can coexist.
             # Both contain only current-chunk rows, bounded by the LLM token
@@ -1558,7 +1563,7 @@ class KvCacheCreator:
 
         if py_executor is not None and not self._skip_est:
             # Run the MM encoder at its independent token budget, then keep the
-            # equivalent cache-owned embeddings resident while the text-only
+            # equivalent runtime-owned embeddings resident while the text-only
             # LLM dummy fills max_num_tokens.
             encoder_profile_output = self._encode_dummy_inputs()
             if encoder_profile_output is not None:
