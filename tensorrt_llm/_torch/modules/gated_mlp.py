@@ -14,6 +14,8 @@ from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor
+from .gate_up_swiglu_quack import (gate_up_swiglu_quack_available,
+                                   gate_up_swiglu_quack_bf16)
 from .linear import (Linear, TensorParallelMode, WeightMode,
                      WeightsLoadingConfig, is_static_nvfp4_input_eligible)
 from .swiglu import swiglu
@@ -243,6 +245,30 @@ class GatedMLP(nn.Module):
             return False
         return is_static_nvfp4_input_eligible(self.down_proj)
 
+    def _can_fuse_gate_up_swiglu_bf16(self) -> bool:
+        """Check whether the BF16 gate/up GEMM can apply SwiGLU in its epilogue.
+
+        The QuACK SM100 GEMM replaces the ``[M, 2I]`` BF16 intermediate and the
+        separate SwiGLU kernel with one GEMM whose epilogue computes
+        ``silu(gate) * up`` on the FP32 accumulators. Plain SwiGLU only (no
+        limit, alpha or beta), unquantized BF16 weights without bias, and no
+        tensor parallelism: with TP the local ``[gate; up]`` shard layout is the
+        same, but the path is kept to the measured configuration until it is
+        validated with TP collectives.
+        """
+        if not (self.activation == F.silu and self._is_plain_swiglu()):
+            return False
+        if self.swiglu_limit is not None and self.swiglu_limit != float("inf"):
+            return False
+        proj = self.gate_up_proj
+        weight = getattr(proj, "weight", None)
+        if (getattr(proj, "has_any_quant", True)
+                or getattr(proj, "tp_size", 1) != 1
+                or getattr(proj, "bias", None) is not None or weight is None
+                or weight.dtype != torch.bfloat16):
+            return False
+        return gate_up_swiglu_quack_available()
+
     def _can_fuse_swiglu_fp8_quant(self) -> bool:
         """Check whether down projection can consume fused SwiGLU FP8 output."""
         # silu_and_mul_fp8_quantize_1x128_packed_ue8m0 takes the limit but has
@@ -354,6 +380,12 @@ class GatedMLP(nn.Module):
             h2 = self._fused_gate_up_swiglu(x, fp4_out=fp4_out)
         elif self._can_fuse_gate_up_swiglu():
             h2 = self._fused_gate_up_swiglu(x)
+        elif self._can_fuse_gate_up_swiglu_bf16() and isinstance(
+                x, torch.Tensor) and x.dtype == torch.bfloat16:
+            if x.dim() > 2:
+                fused_output_shape = x.shape[:-1]
+                x = x.reshape(-1, x.shape[-1])
+            h2 = gate_up_swiglu_quack_bf16(x, self.gate_up_proj.weight)
         else:
             h1 = self.gate_up_proj(x)
             if self._can_fuse_swiglu_fp8_quant():
