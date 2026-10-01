@@ -14,10 +14,13 @@
 # limitations under the License.
 """CI-routed CPU coverage for Ulysses attention with replicated K/V."""
 
+from functools import partial
+
 import pytest
 
 from .test_ulysses_attention import (
     _logic_ulysses_replicated_kv_equal_lengths,
+    _logic_ulysses_replicated_kv_impl,
     _logic_ulysses_replicated_kv_unequal_lengths,
     run_test_in_distributed,
 )
@@ -39,5 +42,24 @@ def test_ulysses_replicated_kv_equal_lengths():
     run_test_in_distributed(
         world_size=2,
         test_fn=_logic_ulysses_replicated_kv_equal_lengths,
+        use_cuda=False,
+    )
+
+
+@pytest.mark.parametrize("backend", ["eager", "inductor"])
+@pytest.mark.parametrize("unequal_lengths", [False, True])
+def test_ulysses_replicated_kv_fullgraph(backend: str, unequal_lengths: bool) -> None:
+    """L2: fullgraph Ulysses output matches unpadded SDPA (transparent).
+
+    Unequal-length calls also match feature-off attention on a second request,
+    without compiling another graph when only the text lengths change.
+    """
+    run_test_in_distributed(
+        world_size=2,
+        test_fn=partial(
+            _logic_ulysses_replicated_kv_impl,
+            unequal_lengths=unequal_lengths,
+            compile_backend=backend,
+        ),
         use_cuda=False,
     )

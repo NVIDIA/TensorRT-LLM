@@ -436,7 +436,9 @@ def _logic_ulysses_with_key_padding_mask_parity(rank, world_size):
         )
 
 
-def _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths):
+def _logic_ulysses_replicated_kv_impl(
+    rank, world_size, unequal_lengths, compile_backend: str | None = None
+):
     """Match unpadded SDPA with text-first K/V under Ulysses (transparent)."""
     batch = 2
     generated_len = 5
@@ -466,11 +468,13 @@ def _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths):
             super().__init__(**kwargs)
             self.kv_seq_lens = []
             self.kv_inputs = []
+            self.timesteps = []
 
         def forward(self, q, k, v, *, key_padding_mask=None, **kwargs):
             assert key_padding_mask is None
             self.kv_seq_lens.append(k.shape[2])
             self.kv_inputs.append((k, v))
+            self.timesteps.append(kwargs.get("timestep"))
             return super().forward(q, k, v, key_padding_mask=key_padding_mask, **kwargs)
 
     inner = _RecordingVanillaAttention(
@@ -478,17 +482,29 @@ def _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths):
         head_dim=head_dim,
     )
     attention = UlyssesAttention(inner_backend=inner, process_group=None)
-    output = attention(
+    if compile_backend is not None:
+        from torch._dynamo.testing import CompileCounterWithBackend
+
+        compile_counter = CompileCounterWithBackend(compile_backend)
+        run_attention = torch.compile(attention, backend=compile_counter, fullgraph=True)
+    else:
+        run_attention = attention
+    context_lengths_host = (
+        torch.tensor(context_lengths, dtype=torch.int32) if unequal_lengths else None
+    )
+    call_kwargs = dict(
+        attention_mask=PredefinedAttentionMask.FULL,
+        timestep=torch.tensor([0.25, 0.75]),
+        replicated_k=context_k,
+        replicated_v=context_v,
+        replicated_k_lengths=context_lengths_host,
+        global_generated_seq_len=generated_len,
+    )
+    output = run_attention(
         q_shard,
         k_shard,
         v_shard,
-        attention_mask=PredefinedAttentionMask.FULL,
-        replicated_k=context_k,
-        replicated_v=context_v,
-        replicated_k_lengths=(
-            torch.tensor(context_lengths, dtype=torch.int32) if unequal_lengths else None
-        ),
-        global_generated_seq_len=generated_len,
+        **call_kwargs,
     )
     expected_kv_seq_lens = (
         [generated_len + length for length in context_lengths]
@@ -496,6 +512,9 @@ def _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths):
         else [generated_len + context_len]
     )
     assert inner.kv_seq_lens == expected_kv_seq_lens
+    for call_idx, actual_timestep in enumerate(inner.timesteps):
+        batch_slice = slice(call_idx, call_idx + 1) if unequal_lengths else slice(None)
+        torch.testing.assert_close(actual_timestep, call_kwargs["timestep"][batch_slice])
 
     head_start = rank * (num_heads // world_size)
     head_end = head_start + num_heads // world_size
@@ -542,6 +561,42 @@ def _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths):
             atol=1e-4,
             msg=f"Rank {rank}: replicated K/V padding changed Ulysses attention output",
         )
+
+    if compile_backend is not None:
+        assert compile_counter.frame_count == 1, "fullgraph must compile exactly one graph"
+        has_replicated_kv_op = any(
+            "visual_gen_replicated_kv_attention" in str(node.target)
+            for node in compile_counter.graphs[0].graph.nodes
+        )
+        assert has_replicated_kv_op == unequal_lengths, "only unequal lengths need the opaque op"
+        if unequal_lengths:
+            # Same shapes, different lengths: empty prefix, then a uniform batch.
+            for lengths in ([context_len, 0], [2, 2]):
+                call_kwargs["replicated_k_lengths"] = torch.tensor(lengths, dtype=torch.int32)
+                inner.kv_seq_lens.clear()
+                next_output = run_attention(q_shard, k_shard, v_shard, **call_kwargs)
+                expected_calls = lengths if lengths[0] != lengths[1] else lengths[:1]
+                assert inner.kv_seq_lens == [generated_len + length for length in expected_calls]
+                eager_output = attention(q_shard, k_shard, v_shard, **call_kwargs)
+                torch.testing.assert_close(next_output, eager_output, rtol=1e-4, atol=1e-4)
+                cosine = F.cosine_similarity(next_output.flatten(), eager_output.flatten(), dim=0)
+                reference_norm = eager_output.norm()
+                assert reference_norm > 0, "random-input attention reference must have nonzero norm"
+                relative_l2 = (next_output - eager_output).norm() / reference_norm
+                max_error = (next_output - eager_output).abs().max()
+                evidence = (
+                    f"Rank {rank}: fullgraph Ulysses {compile_backend}, "
+                    f"dtype={next_output.dtype}, shape={tuple(next_output.shape)}, "
+                    f"lengths={lengths}, relative L2={relative_l2}, cosine={cosine}, "
+                    f"max error={max_error}"
+                )
+                print(evidence)
+                assert cosine >= 0.9999, evidence
+                assert relative_l2 <= 1e-2, evidence
+                assert max_error <= 1e-3, evidence
+                assert compile_counter.frame_count == 1, (
+                    "text lengths must not specialize the graph"
+                )
 
 
 def _logic_ulysses_replicated_kv_unequal_lengths(rank, world_size):

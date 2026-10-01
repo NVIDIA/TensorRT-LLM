@@ -20,7 +20,9 @@ backend — compose around a real backend (VANILLA/TRTLLM/FA4/CUTEDSL).
 
 """
 
+from itertools import count
 from typing import TYPE_CHECKING, Callable, ClassVar, Dict, Optional
+from weakref import WeakValueDictionary
 
 import torch
 import torch.distributed as dist
@@ -245,6 +247,80 @@ def _run_attention_with_replicated_kv(
     return output
 
 
+_replicated_kv_backend_ids = count()
+_replicated_kv_backends: WeakValueDictionary[int, AttentionBackend] = WeakValueDictionary()
+
+
+@torch.library.custom_op(
+    "trtllm::visual_gen_replicated_kv_attention",
+    mutates_args=(),
+    schema=(
+        "(Tensor q, Tensor k, Tensor v, Tensor replicated_k, Tensor replicated_v, "
+        "Tensor replicated_k_lengths, int valid_generated_seq_len, int backend_id, "
+        "bool is_hnd, str[] tensor_kwarg_names, Tensor[] tensor_kwarg_values, "
+        "Dict(str, Any) scalar_kwargs) -> Tensor"
+    ),
+)
+def _compiled_attention_with_replicated_kv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    replicated_k: torch.Tensor,
+    replicated_v: torch.Tensor,
+    replicated_k_lengths: torch.Tensor,
+    valid_generated_seq_len: int,
+    backend_id: int,
+    is_hnd: bool,
+    tensor_kwarg_names: list[str],
+    tensor_kwarg_values: list[torch.Tensor],
+    scalar_kwargs: dict[str, object],
+) -> torch.Tensor:
+    """Keep exact-prefix attention opaque without introducing a graph break.
+
+    The owning Ulysses wrapper keeps the selected backend alive. Weak references
+    avoid retaining unloaded models, and monotonic IDs cannot alias a new backend.
+    Tensor kwargs are explicit operator inputs so functionalization sees them.
+    """
+    kwargs = dict(scalar_kwargs)
+    kwargs.update(zip(tensor_kwarg_names, tensor_kwarg_values))
+    output = _run_attention_with_replicated_kv(
+        _replicated_kv_backends[backend_id],
+        q,
+        k,
+        v,
+        replicated_k,
+        replicated_v,
+        replicated_k_lengths,
+        valid_generated_seq_len,
+        kwargs,
+    )
+    # Hoist the existing _output_a2a normalization into the operator so its
+    # output strides do not depend on whether runtime text lengths are equal.
+    if is_hnd:
+        output = output.transpose(1, 2)
+    elif output.ndim == 3:
+        output = output.view(q.shape)
+    return output.contiguous()
+
+
+@_compiled_attention_with_replicated_kv.register_fake
+def _compiled_attention_with_replicated_kv_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    replicated_k: torch.Tensor,
+    replicated_v: torch.Tensor,
+    replicated_k_lengths: torch.Tensor,
+    valid_generated_seq_len: int,
+    backend_id: int,
+    is_hnd: bool,
+    tensor_kwarg_names: list[str],
+    tensor_kwarg_values: list[torch.Tensor],
+    scalar_kwargs: dict[str, object],
+) -> torch.Tensor:
+    return q.new_empty(q.shape)
+
+
 def post_permute_5d_to_4d(out_5d, P):
     """5D [P, B, Sp, H/P, D] → 4D [B, P*Sp, H/P, D] (block-by-rank gather).
     .contiguous() copies slot data out (layout-normalize for SDPA, decoupling
@@ -301,6 +377,8 @@ class UlyssesAttention(AttentionBackend):
         self.inner_backend = inner_backend
         self.process_group = process_group
         self._preferred_layout = AttentionTensorLayout.NHD
+        self._replicated_kv_backend_id = next(_replicated_kv_backend_ids)
+        _replicated_kv_backends[self._replicated_kv_backend_id] = inner_backend
 
         self.head_dim = inner_backend.head_dim
         self.sharded_num_heads = inner_backend.num_heads
@@ -470,6 +548,32 @@ class UlyssesAttention(AttentionBackend):
                     dim=1,
                 )
                 kv_seq_len_full = k.shape[1]
+            elif torch.compiler.is_compiling():
+                tensor_kwargs = {
+                    key: value for key, value in kwargs.items() if torch.is_tensor(value)
+                }
+                scalar_kwargs = {
+                    key: value.value if isinstance(value, PredefinedAttentionMask) else value
+                    for key, value in kwargs.items()
+                    if not torch.is_tensor(value)
+                }
+                output = _compiled_attention_with_replicated_kv(
+                    q,
+                    k,
+                    v,
+                    replicated_k,
+                    replicated_v,
+                    replicated_k_lengths,
+                    global_generated_seq_len,
+                    self._replicated_kv_backend_id,
+                    self.inner_backend.preferred_layout == AttentionTensorLayout.HND,
+                    list(tensor_kwargs),
+                    list(tensor_kwargs.values()),
+                    scalar_kwargs,
+                )
+                return all_to_all_4d(
+                    output, scatter_dim=1, gather_dim=2, process_group=self.process_group
+                )
             else:
                 output = _run_attention_with_replicated_kv(
                     self.inner_backend,
