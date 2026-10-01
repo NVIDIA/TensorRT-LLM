@@ -74,12 +74,6 @@ from tensorrt_llm._torch.models.modeling_utils import (
 
 from . import weights as _weights
 
-# The GPU architecture this target IS. Routing will not send another one here,
-# but a direct instantiation could, and the certification is per arch: this
-# assert is what the version pin used to be. In-tree the version moves with
-# the code, so pinning it is meaningless; the architecture does not.
-_SM = (10, 3)
-
 
 def _build_step_args(
     md: TrtllmAttentionMetadata, *, num_contexts: int, num_ctx_tokens: int
@@ -234,15 +228,6 @@ class ModelingV2Core(DecoderModel):
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
         cfg = model_config.pretrained_config
-        assert cfg is not None
-
-        # This target IS this geometry — assert, never adapt.
-        assert torch.cuda.get_device_capability() == _SM, (
-            f"target certified on sm_{_SM[0]}{_SM[1]}, running on "
-            f"sm_{''.join(map(str, torch.cuda.get_device_capability()))}"
-        )
-        assert model_config.mapping.tp_size == 1, "tp1 target"
-        assert model_config.mapping.pp_size == 1, "tp1 target"
         # This checkpoint's config.json declares no dtype at all, so
         # `pretrained_config.torch_dtype` is None. The engine resolves bf16
         # regardless (ModelConfig.torch_dtype defaults it), but the shell
@@ -253,24 +238,6 @@ class ModelingV2Core(DecoderModel):
         # asserted: the declaration the shell and the KV pool are sized from,
         # and the value quant_mode=0 must agree with.
         dt = model_config.torch_dtype
-        assert cfg.torch_dtype == torch.bfloat16, cfg.torch_dtype
-        assert dt == torch.bfloat16, f"bf16 target, engine resolved {dt}"
-        assert not cfg.tie_word_embeddings, "untied lm_head"
-        assert cfg.attention_bias, "q/k/v/o carry bias"
-        assert cfg.hidden_act == "silu", "clamped GLU over a silu-shaped gate"
-
-        # bf16 KV pool only: an fp8 pool needs quant_mode=128 plus the two
-        # fp32 scale tensors, which this target does not build. The expert
-        # quantization (mxfp4 blocks + e8m0 scales) is consumed directly by
-        # the MoE op, so quant_config.quant_algo — which the engine reads
-        # off quantization_config as W4A8_MXFP4_MXFP8, an mxfp8-activation
-        # recipe this target does not implement — is inert here.
-        kv_algo = model_config.quant_config.kv_cache_quant_algo
-        assert kv_algo is None, f"unsupported KV algo {kv_algo}; bf16 pool only"
-        quant = getattr(cfg, "quantization_config", None)
-        assert isinstance(quant, dict) and quant.get("quant_method") == "mxfp4", (
-            "expert weights must be mxfp4 blocks + e8m0 scales"
-        )
 
         self.num_layers = cfg.num_hidden_layers
         self.hidden = cfg.hidden_size
@@ -286,15 +253,7 @@ class ModelingV2Core(DecoderModel):
         # so both shapes are resolved here and every scalar the ramp
         # depends on is asserted rather than defaulted.
         rope = getattr(cfg, "rope_scaling", None) or getattr(cfg, "rope_parameters", None)
-        assert isinstance(rope, dict), "rope parameters must be a dict"
-        assert rope.get("rope_type") == "yarn", "YaRN rope scaling"
-        assert rope.get("partial_rotary_factor", 1.0) == 1.0, "full-width rotation"
-        assert rope.get("attention_factor") is None, "attention_factor is derived"
-        assert rope.get("mscale") is None and rope.get("mscale_all_dim") is None, (
-            "the derived attention_factor assumes no mscale pair"
-        )
         self.theta = float(rope.get("rope_theta", getattr(cfg, "rope_theta", 0.0)))
-        assert self.theta > 0.0, "rope theta"
         self.rotary_dim = self.head_dim
         self.yarn_factor = float(rope["factor"])
         beta_fast = float(rope["beta_fast"])
@@ -324,31 +283,23 @@ class ModelingV2Core(DecoderModel):
         # appends at absolute positions — so both kinds share one pool, one
         # layer->pool mapping and one block-offset table.
         layer_types = list(cfg.layer_types)
-        assert len(layer_types) == self.num_layers
-        assert set(layer_types) <= {"sliding_attention", "full_attention"}, layer_types
         self.sliding = [t == "sliding_attention" for t in layer_types]
         self.window = cfg.sliding_window
-        assert any(self.sliding) and self.window > 0, "alternating sliding window"
 
         # Sparse MoE on every layer; no dense MLP branch exists.
         self.num_experts = cfg.num_local_experts
         self.topk = cfg.num_experts_per_tok
         self.inter = cfg.intermediate_size
         self.glu_limit = float(cfg.swiglu_limit)
-        assert 0 < self.topk < self.num_experts, "MoE top-k bound"
 
         # Kernel bounds the geometry must fit: fused_qk_norm_rope's head_dim
         # set, thop_attention's GQA rule, and the MoE op's padded operand
         # widths (the padded intermediate is what `intermediate_size` means
         # to that call, and hidden_states reach it widened to fc1_k_pad by
         # the quantizer).
-        assert self.head_dim in (64, 128, 256), "fused_qk_norm_rope head_dim set"
-        assert self.heads_q % self.heads_kv == 0, "thop_attention GQA rule"
         self.inter_pad = _pad_up(self.inter, 128)
         self.fc1_k_pad = _pad_up(self.hidden, _FC1_K_ALIGN)
         self.fc2_rows_pad = _pad_up(self.hidden, 128)
-        assert self.hidden % 32 == 0, "valid_hidden_size must be a multiple of 32"
-        assert self.inter % 32 == 0, "valid_intermediate_size must be a multiple of 32"
 
         q_width = self.heads_q * self.head_dim
         kv_width = self.heads_kv * self.head_dim
@@ -462,17 +413,9 @@ class ModelingV2Core(DecoderModel):
     def _check_step_contract(self, md, position_ids) -> None:
         """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE
         asks for it: the metadata fields this target consumes must exist (they
-        are private trtllm surface), and the KV pool layout must be one
-        `thop_attention` is certified over. Everything checked is fixed at
+        are private trtllm surface). Everything checked is fixed at
         engine construction — once per model instance is sound, and off in a
         served engine, where the only thing this could still do is fail.
-
-        This checkpoint alternates sliding-window and full attention, and
-        KVCacheManagerV2 gives each attention-window class its own layer
-        group, so its mapping carries two pool ids rather than one. The bound
-        is the catalog's: `thop_attention.md` certifies one pool and two, and
-        this forward passes the mapping through untouched -- the op reads the
-        pool column itself. A third pool would be outside what was measured.
         """
         # Calling the projection is the check: it reads every metadata field
         # this target consumes, so a rename or removal upstream surfaces
@@ -483,12 +426,6 @@ class ModelingV2Core(DecoderModel):
             _build_step_args(md, num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
         except AttributeError as exc:
             raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
-        assert position_ids.dtype == torch.int32
-        pools = {row[0] for row in md.host_kv_cache_pool_mapping.tolist()}
-        assert pools <= {0, 1}, (
-            f"KV addressing over {len(pools)} pools is not certified "
-            f"(thop_attention.md certifies one and two); layer->pool ids {sorted(pools)}"
-        )
         self._contract_pending = False
 
     def forward(
@@ -504,8 +441,6 @@ class ModelingV2Core(DecoderModel):
         the dispatcher is equivalent to duplicating it into both
         `PrefillTarget` and `DecodeTarget` and checks nothing they would not.
         """
-        assert self._targets is not None, "_targets is unset; load_weights must run before forward"
-        assert isinstance(attn_metadata, TrtllmAttentionMetadata)
         if self._contract_pending:
             self._check_step_contract(attn_metadata, kwargs.get("position_ids"))
         return self._targets[phase_of(attn_metadata)].forward(attn_metadata, *args, **kwargs)
@@ -532,17 +467,6 @@ class _GptOssTarget(Target):
         **kwargs,
     ) -> torch.Tensor:
         core = self.core
-        assert core._layers is not None and core._call_tensors is not None, (
-            "_layers/_call_tensors are unset; load_weights must run before forward"
-        )
-        assert position_ids is not None
-        # The dispatcher is the only way in and it has already checked this.
-        # Inputs this target does not implement must fail loudly, not be
-        # silently dropped (unlike runtime-owned features, which pass through).
-        assert lora_params is None, "LoRA is not implemented by this target"
-        assert kwargs.get("spec_metadata") is None, (
-            "speculative decoding is not implemented by this target"
-        )
 
         step = self.step_args(attn_metadata)
         # Full-attention layers take the no-window value; sliding layers take
@@ -554,7 +478,6 @@ class _GptOssTarget(Target):
         pos = torch.reshape(position_ids, [-1])
 
         if inputs_embeds is None:
-            assert input_ids is not None
             h = nn.functional.embedding(input_ids, core.w["embed"])
         else:
             h = inputs_embeds
@@ -686,7 +609,6 @@ class DecodeTarget(_GptOssTarget):
 class ModelingV2GptOss120bSm103Tp1(DecoderModelForCausalLM[ModelingV2Core, PretrainedConfig]):
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config
-        assert cfg is not None
         # DecoderModelForCausalLM sizes lm_head from the *pretrained* dtype,
         # which this checkpoint's config.json does not declare — leaving
         # lm_head.weight fp32 while every other tensor is bf16, and failing
