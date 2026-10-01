@@ -1127,6 +1127,12 @@ class MultimodalModelMixin:
         Zero leaves the cache disabled.
         """
         if self._multimodal_encoder_cache is not None:
+            if max_bytes != self._multimodal_encoder_cache.max_bytes:
+                raise ValueError(
+                    f"{_MM_ENCODER_CACHE_LOG_NAME}: already initialized with "
+                    f"max_bytes={self._multimodal_encoder_cache.max_bytes}; "
+                    f"cannot reinitialize with max_bytes={max_bytes}"
+                )
             return self._multimodal_encoder_cache
 
         if max_bytes == 0:

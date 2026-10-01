@@ -325,6 +325,19 @@ def test_explicit_cache_capacity_can_exceed_persistent_reuse_capacity():
     assert model._multimodal_encoder_cache is cache
 
 
+def test_cache_reinitialization_requires_same_capacity():
+    model = DummyMultimodalModel(make_embedding(hidden_size=4), torch.tensor([7]))
+    model.model_config = ModelConfig(
+        multimodal_config=MultimodalConfig(encoder_cache_max_bytes=4096)
+    )
+    cache = model._initialize_multimodal_encoder_cache(1024)
+
+    assert model._initialize_multimodal_encoder_cache(1024) is cache
+    with pytest.raises(ValueError, match="cannot reinitialize"):
+        model._initialize_multimodal_encoder_cache(2048)
+    assert model._multimodal_encoder_cache is cache
+
+
 def test_encoder_cache_creation_logs_embedding_row_capacity():
     with patch("tensorrt_llm._torch.models.modeling_multimodal_mixin.logger.info") as info:
         CountingEncoderMultimodalModel(

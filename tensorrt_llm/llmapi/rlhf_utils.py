@@ -200,6 +200,9 @@ class WorkerExtension:
                     moe_load_balancer.finalize_model()
                     logger.info("moe_load_balancer finalize model done")
                 self.engine.reset_prefix_cache()
+                # Finalization can post-process weights; drop outputs encoded
+                # since the last bucket reload.
+                self.engine.invalidate_multimodal_encoder_cache()
                 delattr(self.engine.model_engine.model, "first_pre_reload_weights")
 
                 torch.cuda.synchronize()
