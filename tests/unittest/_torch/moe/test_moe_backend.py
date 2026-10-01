@@ -2231,6 +2231,7 @@ def generate_int8_woq_non_aligned_test_params() -> List:
                 1 if gated else None,
                 0 if gated else None,
                 float("inf") if gated else None,
+                False,
             )
             params.append(create_test_param(param_values, test_id))
             generated_activations.add(activation_type)
