@@ -1226,9 +1226,12 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
             moe_output_for_ref=moe_output_for_ref,
         )
     except Exception:
-        _destroy_cached_worker_comm()
         traceback.print_exc()
         raise
+    finally:
+        # A CFT workspace holds a process-global binding only destroy() frees,
+        # and the cache does not survive to the next pool task.
+        _destroy_cached_worker_comm()
 
 
 def _nccl_ep_replay_slots(
