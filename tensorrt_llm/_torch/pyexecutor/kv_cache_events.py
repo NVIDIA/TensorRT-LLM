@@ -534,6 +534,9 @@ class _StreamingEventSource:
                         parent_block_hash=event.parent_block_hash,
                         token_ids=list(event.token_ids),
                         block_size=self._block_size,
+                        # V2 events omit explicit LoRA identity (buffered events do too).
+                        # Related: https://github.com/NVIDIA/TensorRT-LLM/issues/18156
+                        # That issue covers request-side hashing, not this payload gap.
                         lora_id=None,
                         medium="GPU",
                         lora_name=None,
