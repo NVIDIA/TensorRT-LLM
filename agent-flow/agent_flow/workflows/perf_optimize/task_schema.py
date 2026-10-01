@@ -146,7 +146,8 @@ VALID_METRICS: frozenset[str] = frozenset(
 # The perf-optimize half of the key census the base schema documents. Same
 # contract: this is what a lint may call real, not what the validator rejects.
 KNOWN_OPTIMIZE_KEYS: frozenset[str] = frozenset(
-    set(OPTIMIZE_DEFAULTS) | {"target_improvement_pct", "focus_concurrencies", "max_regression_pct"}
+    set(OPTIMIZE_DEFAULTS)
+    | {"target_improvement_pct", "focus_concurrencies", "max_regression_pct", "direction"}
 )
 KNOWN_ACCURACY_KEYS: frozenset[str] = frozenset({"command", "baseline_score", "max_drop_pct"})
 KNOWN_KERNEL_COVERAGE_KEYS: frozenset[str] = frozenset({"min_share_pct", "coverage_target_pct"})
@@ -154,6 +155,11 @@ KNOWN_KERNEL_COVERAGE_KEYS: frozenset[str] = frozenset({"min_share_pct", "covera
 #: Top-level block naming the workload by test-case id instead of by an
 #: ``extra_llm_api_options`` YAML. ``name`` is the pytest node id;
 #: ``resolved`` is written back by the validator and is not user input.
+#: Whether ``optimize.target_metric`` is better when higher or lower.
+#: Optional: the baseline stage records its own determination on the
+#: roadmap, and this is the explicit override for when it does not run.
+METRIC_DIRECTIONS: tuple[str, ...] = ("higher", "lower")
+
 TEST_CASE_FIELD = "test_case"
 TEST_CASE_NAME_KEY = "name"
 TEST_CASE_RESOLVED_KEY = "resolved"
@@ -191,6 +197,14 @@ def _mapping_block(data: Mapping[str, Any], key: str, errors: list[str]) -> dict
 
 
 def _validate_optimize_block(optimize: Mapping[str, Any], errors: list[str]) -> None:
+    if optimize.get("direction") is not None:
+        value = optimize["direction"]
+        if value not in METRIC_DIRECTIONS:
+            allowed = ", ".join(repr(choice) for choice in METRIC_DIRECTIONS)
+            errors.append(
+                f"'optimize.direction' must be one of {allowed} — whether "
+                f"'optimize.target_metric' is better when higher or lower — got {value!r}"
+            )
     for field in (
         "max_rounds",
         "max_attempts_per_item",
@@ -679,6 +693,7 @@ __all__ = [
     "KNOWN_KERNEL_COVERAGE_KEYS",
     "KNOWN_OPTIMIZE_KEYS",
     "KNOWN_TEST_CASE_KEYS",
+    "METRIC_DIRECTIONS",
     "ITEM_EXECUTIONS",
     "OPTIMIZE_DEFAULTS",
     "REMOTE_RUN_ROOT_FIELD",

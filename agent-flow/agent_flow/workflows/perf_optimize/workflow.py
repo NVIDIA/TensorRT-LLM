@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime
@@ -63,6 +64,7 @@ from .state import (
 )
 from .task_schema import (
     OPTIMIZE_DEFAULTS,
+    VALID_METRICS,
     concurrency_points,
     dump_task_yaml,
     focus_concurrencies,
@@ -121,6 +123,8 @@ def _make_agent(
         )
     )
 
+
+METRIC_DIRECTIONS = ("higher", "lower")
 
 _ROLES = (
     "benchmarker",
@@ -1369,11 +1373,15 @@ class PerfOptimizeWorkflow:
                         "integrator curve verdict does not cover the configured concurrency points"
                     )
                 metric = str(self._optimize_block()["target_metric"])
+                direction = self._metric_direction(roadmap)
                 regression_budget = self._regression_budget()
                 allowed_regression = noise_floor if regression_budget is None else regression_budget
                 for point in sorted(expected_points):
                     gain = self._normalized_gain_pct(
-                        reference_by_point[point], measured_by_point[point], metric
+                        reference_by_point[point],
+                        measured_by_point[point],
+                        metric,
+                        direction,
                     )
                     if gain is None or gain < -allowed_regression:
                         raise RuntimeError(
@@ -1896,17 +1904,71 @@ class PerfOptimizeWorkflow:
         return any(item.get("status") == "accepted" for item in roadmap.get("items", []))
 
     @staticmethod
-    def _normalized_gain_pct(reference: float, measured: float, metric: str) -> float | None:
+    def _normalized_gain_pct(
+        reference: float, measured: float, metric: str, direction: str | None = None
+    ) -> float | None:
         """Signed % gain of ``measured`` vs ``reference``, positive = better.
 
-        Mirrors the prompts' measurement protocol: throughput metrics
-        improve upward, ``*_ms`` latency metrics improve downward.
+        ``direction`` is ``"higher"`` or ``"lower"`` and decides the sign.
+        When it is ``None`` the metric name decides, which mirrors the
+        prompts' measurement protocol and is only sound for a metric this
+        workflow already knows: throughput improves upward, ``*_ms``
+        latency improves downward. :meth:`_metric_direction` resolves it
+        and is what refuses to guess for anything else.
         """
         if reference == 0:
             return None
-        if metric.endswith("_ms"):
+        if direction is None:
+            direction = "lower" if metric.endswith("_ms") else "higher"
+        if direction == "lower":
             return (reference - measured) / reference * 100.0
         return (measured - reference) / reference * 100.0
+
+    def _metric_direction(self, roadmap: Mapping[str, Any] | None = None) -> str:
+        """Whether the target metric is better when higher or lower.
+
+        Resolved in three tiers, most specific first:
+
+        1. ``direction`` on the roadmap's ``baseline`` block — the
+           benchmarker's own determination, carried in by the analyzer.
+           This is the normal path: the benchmarker is the first stage to
+           read the metric out of a result, so it classifies it there, and
+           nothing earlier needs the answer because a gain needs two
+           numbers and the baseline is only the first.
+        2. ``optimize.direction`` in ``task.yaml`` — an explicit override,
+           and the only available source when the benchmarker does not run.
+        3. The metric name, for the metrics in
+           :data:`task_schema.VALID_METRICS`.
+
+        Raises when none of the three applies. A metric from outside the
+        known set whose name does not end in ``_ms`` would otherwise be
+        read as better-when-higher, so a latency-like metric such as
+        ``prev_device_step_time`` would score a slowdown as a gain — and
+        every later comparison, the target gate and the final report would
+        agree with it.
+        """
+        if isinstance(roadmap, Mapping):
+            baseline = roadmap.get("baseline")
+            if isinstance(baseline, Mapping):
+                recorded = baseline.get("direction")
+                if recorded in METRIC_DIRECTIONS:
+                    return str(recorded)
+        configured = self._optimize_block().get("direction")
+        if configured in METRIC_DIRECTIONS:
+            return str(configured)
+        metric = str(self._optimize_block()["target_metric"])
+        if metric.endswith("_ms"):
+            return "lower"
+        if metric in VALID_METRICS:
+            return "higher"
+        raise RuntimeError(
+            f"cannot tell whether '{metric}' is better when higher or lower: it is "
+            f"not one of the metrics this workflow knows ({', '.join(sorted(VALID_METRICS))}) "
+            f"and its name does not end in '_ms'. Set 'optimize.direction' to "
+            f"'higher' or 'lower' in task.yaml, or have the baseline stage record "
+            f"'direction' on the roadmap's baseline block. Guessing would risk "
+            f"scoring a regression as an improvement."
+        )
 
     def _target_met(self) -> tuple[bool, float | None]:
         """Whether ``optimize.target_improvement_pct`` is met, plus the gain.
@@ -1935,6 +1997,7 @@ class PerfOptimizeWorkflow:
             return (False, None)
         metric = str(roadmap.get("target_metric") or optimize["target_metric"])
 
+        direction = self._metric_direction(roadmap)
         gains: list[float] = []
         base_curve = baseline.get("curve")
         best_curve = best.get("curve")
@@ -1949,14 +2012,16 @@ class PerfOptimizeWorkflow:
                 reference = reference_by_point.get(point["concurrency"])
                 if reference is None:
                     continue
-                gain = self._normalized_gain_pct(reference, float(point["value"]), metric)
+                gain = self._normalized_gain_pct(
+                    reference, float(point["value"]), metric, direction
+                )
                 if gain is not None:
                     gains.append(gain)
         if gains:
             cumulative = sum(gains) / len(gains)
         else:
             cumulative = self._normalized_gain_pct(
-                float(baseline["value"]), float(best["value"]), metric
+                float(baseline["value"]), float(best["value"]), metric, direction
             )
         if cumulative is None:
             return (False, None)
