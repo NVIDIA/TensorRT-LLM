@@ -106,6 +106,7 @@ class StubRequest:
         self.total_input_len_cp = len(self._tokens)
         self.context_current_position = 0
         self.multimodal_hashes = None
+        self.multimodal_uuids = None
         self.multimodal_positions = None
         self.multimodal_lengths = None
         self.multimodal_item_run_cu_offsets = None
@@ -234,20 +235,30 @@ class TestTokenParity:
         mgr.impl.probe_first_new_block_key.assert_called_once()
         mgr.impl.probe_reuse.assert_not_called()
 
-    def test_multimodal_tokens_match_prepare_context(self) -> None:
+    @pytest.mark.parametrize("uuid", [None, "probe-item"])
+    def test_multimodal_tokens_match_prepare_context(self, uuid: str | None) -> None:
+        """Probe and preparation preserve both digest identity and optional UUIDs."""
         mgr = make_stub_manager()
         req = make_request(range(20))
         req.multimodal_hashes = [[17] * 8]
+        if uuid is not None:
+            req.multimodal_uuids = [uuid]
         req.multimodal_positions = [3]
         req.multimodal_lengths = [2]
         probed, _ = probed_tokens_and_scope(mgr, req)
         prepared, _ = prepared_tokens_and_scope(mgr, req)
         assert probed == prepared
-        assert isinstance(probed[3], bytes) and len(probed[3]) == 32
+        if uuid is None:
+            assert isinstance(probed[3], bytes) and len(probed[3]) == 32
+        else:
+            assert probed[3].digest == prepared[3].digest == (17).to_bytes(4, "big") * 8
+            assert probed[3].uuid == prepared[3].uuid == uuid
         req.multimodal_hashes[0][0] = 19
         changed, _ = probed_tokens_and_scope(mgr, req)
         assert changed[3] != probed[3]
         assert changed[:3] + changed[4:] == probed[:3] + probed[4:]
+        if uuid is not None:
+            assert changed[3].uuid == uuid
 
     def test_augmentation_call_matches_prepare_context(self):
         """Multimodal requests key on content digests, so the probe has to use
