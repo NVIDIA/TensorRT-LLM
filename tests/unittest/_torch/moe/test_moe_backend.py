@@ -464,6 +464,7 @@ def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(
     plan = scheduler._build_comm_plan(
         all_rank_num_tokens=None,
         output_dtype=torch.bfloat16,
+        do_finalize=True,
         use_deep_ep_direct_metadata=use_direct_metadata,
     )
 
