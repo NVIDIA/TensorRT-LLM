@@ -192,6 +192,46 @@ def _subagent_label_from_task_input(tool_input: dict[str, Any]) -> str:
     return "subagent"
 
 
+class TransientTurnError(RuntimeError):
+    """A turn that failed without producing anything, and may well not next time.
+
+    The distinction this draws is between a turn that was ATTEMPTED and lost,
+    and one that ran and produced something wrong. Only the first is worth
+    sending again: the second replays the same inputs and fails the same way,
+    and retrying it buries the real error under repeated attempts.
+
+    "Produced nothing" is read off the message rather than guessed from the
+    error string, because the string is frequently the bare word "unknown".
+    The signature is `model='<synthetic>'` with every usage counter zero -- the
+    CLI synthesising a failure because the response never arrived. Observed with
+    `error` as both `server_error` and `unknown`, which is why the check is on
+    the shape and not on a list of names.
+    """
+
+
+def _produced_nothing(message: AssistantMessage) -> bool:
+    """Whether this failed turn yielded no tokens at all.
+
+    `<synthetic>` is the CLI's own marker for a message it manufactured rather
+    than received. Paired with zero usage it means the request was lost in
+    flight: no tokens billed, no tools run FROM THIS MESSAGE, nothing to undo.
+    """
+    if str(getattr(message, "model", "")) != "<synthetic>":
+        return False
+    usage = getattr(message, "usage", None)
+    if usage is None:
+        return True
+    counters = (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    )
+    if isinstance(usage, dict):
+        return not any(usage.get(name) for name in counters)
+    return not any(getattr(usage, name, 0) for name in counters)
+
+
 def _assistant_error_detail(message: AssistantMessage) -> str:
     """Render whatever context the SDK attached to a failed assistant turn.
 
@@ -249,10 +289,11 @@ class ClaudeCodeClient(BackendClient):
                     yield _rate_limit_warning_from_event(sdk_message)
                 elif isinstance(sdk_message, AssistantMessage):
                     if sdk_message.error is not None:
-                        raise RuntimeError(
-                            f"Claude Code turn failed: {sdk_message.error}"
-                            f"{_assistant_error_detail(sdk_message)}"
-                        )
+                        detail = _assistant_error_detail(sdk_message)
+                        text = f"Claude Code turn failed: {sdk_message.error}{detail}"
+                        if _produced_nothing(sdk_message):
+                            raise TransientTurnError(text)
+                        raise RuntimeError(text)
                     parent_id = sdk_message.parent_tool_use_id
                     label = self._resolve_label(parent_id)
                     for block in sdk_message.content:

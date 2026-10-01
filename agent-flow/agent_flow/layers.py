@@ -8,6 +8,7 @@ import anyio
 
 from .backends import create_backend
 from .backends.base import Backend, BackendClient, ResultEvent
+from .backends.claude_code import TransientTurnError
 from .config import AgentLayerConfig, HumanRequest, HumanRequestOption
 from .console import (
     print_agent_completed,
@@ -113,6 +114,54 @@ def _read_human_reply(request: HumanRequest) -> str:
             if opt.label.strip().lower() == lowered:
                 return opt.label
     return raw
+
+
+# How many extra times a turn that produced NOTHING is sent again, and how long
+# to wait first. Three tries over ~45s: long enough to outlast the blips that
+# were killing campaigns, short enough that a genuine outage still fails the run
+# in about a minute rather than holding a Slurm allocation while it retries.
+TRANSIENT_TURN_RETRIES = 2
+TRANSIENT_TURN_BACKOFF_S = (15.0, 30.0)
+
+
+async def _resent_while_transient(client, message, observe):
+    """``client.send_message`` with a bounded resend when nothing came back.
+
+    A campaign is hours of GPU time and dies on the first failed turn; measured
+    on one reproduction, `server_error` ended 2 of 4 runs of a stage that a
+    third run of the SAME input completed. That is the definition of worth
+    retrying, and nothing in this stack did.
+
+    Only :class:`TransientTurnError` -- raised solely when the failed message
+    carries `<synthetic>` and zero usage, i.e. the request was lost before the
+    model produced anything. A turn that ran and returned something invalid is
+    NOT retried: it would replay identical inputs and fail identically, and the
+    repetition would bury the real error.
+
+    Resent to the SAME client, deliberately. The session history already holds
+    whatever tools this turn ran, so the model continues from there rather than
+    redoing them -- which is also why a fresh client would be the more
+    dangerous choice, not the safer one.
+
+    Events already yielded from the failed attempt have reached the caller and
+    cannot be recalled. That is acceptable here and only here: the retry happens
+    when the message produced no tokens, so there is nothing to double-count.
+    """
+    last: TransientTurnError | None = None
+    for attempt in range(TRANSIENT_TURN_RETRIES + 1):
+        try:
+            async for event in client.send_message(message):
+                yield event
+            return
+        except TransientTurnError as exc:
+            last = exc
+            if attempt == TRANSIENT_TURN_RETRIES:
+                break
+            delay = TRANSIENT_TURN_BACKOFF_S[min(attempt, len(TRANSIENT_TURN_BACKOFF_S) - 1)]
+            observe("transient_retry", exc)
+            await anyio.sleep(delay)
+    assert last is not None
+    raise last
 
 
 class AgentLayer(Module):
@@ -416,7 +465,7 @@ class AgentLayer(Module):
         message = request.content
         for attempt in range(2):
             turn_usage: UsageInfo | None = None
-            async for event in client.send_message(message):
+            async for event in _resent_while_transient(client, message, observe):
                 if isinstance(event, ResultEvent):
                     if event.is_error:
                         raise RuntimeError(
