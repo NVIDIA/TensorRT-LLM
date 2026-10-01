@@ -63,6 +63,10 @@ from .packing import (
 )
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
 
+# Upper bound on spatial tiles decoded in one ViT decoder call (28 tiles at 768x1344 fit on one
+# B200; the bound keeps activation memory proportional to this many tiles, not the frame size).
+VAE_DECODE_MAX_TILES_PER_BATCH = 16
+
 
 def _batched_decode_clip(self: AutoencoderKLMiniMaxH3, z: torch.Tensor) -> torch.Tensor:
     """``AutoencoderKLMiniMaxH3._decode_clip`` with all equal-size spatial tiles in one decoder call.
@@ -94,8 +98,15 @@ def _batched_decode_clip(self: AutoencoderKLMiniMaxH3, z: torch.Tensor) -> torch
     ]
     num_cols = len(x_indices)
     if len({tuple(tile.shape) for tile in tiles}) == 1:
+        # Decode up to VAE_DECODE_MAX_TILES_PER_BATCH tiles per call: batching removes per-tile
+        # launch overhead, the cap keeps decoder intermediates bounded as tiling intends.
         batch = z.shape[0]
-        decoded = self.decoder(self.post_quant_conv(torch.cat(tiles, dim=0))).split(batch, dim=0)
+        decoded = []
+        for start in range(0, len(tiles), VAE_DECODE_MAX_TILES_PER_BATCH):
+            chunk = tiles[start : start + VAE_DECODE_MAX_TILES_PER_BATCH]
+            decoded.extend(
+                self.decoder(self.post_quant_conv(torch.cat(chunk, dim=0))).split(batch, dim=0)
+            )
     else:
         decoded = [self.decoder(self.post_quant_conv(tile)) for tile in tiles]
     rows = [list(decoded[r * num_cols : (r + 1) * num_cols]) for r in range(len(y_indices))]

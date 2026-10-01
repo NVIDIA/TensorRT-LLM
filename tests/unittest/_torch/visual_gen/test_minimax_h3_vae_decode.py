@@ -10,6 +10,7 @@ AutoencoderKLMiniMaxH3 = pytest.importorskip(
     "diffusers.models.autoencoders.autoencoder_kl_minimax_h3"
 ).AutoencoderKLMiniMaxH3
 
+import tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 as pm  # noqa: E402
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (  # noqa: E402
     _batched_decode_clip,
     _prepare_vae_decoder,
@@ -122,3 +123,30 @@ def test_prepare_skips_batched_decode_for_subclasses_with_their_own_tiling():
         for m in vae.decoder.modules()
         if isinstance(m, torch.nn.Linear)
     )
+
+
+@requires_cuda
+def test_batched_decode_respects_the_tile_batch_cap(monkeypatch):
+    vae = _tiny_vae()
+    vae.enable_tiling(
+        tile_sample_min_height=64,
+        tile_sample_min_width=64,
+        tile_sample_min_overlap_height=16,
+        tile_sample_min_overlap_width=16,
+    )
+    z = _latent(vae, frames=2, tiles=2)  # 3 x 3 tiles
+    calls = []
+    forward = vae.decoder.forward
+
+    def counting_forward(x):
+        calls.append(x.shape[0])
+        return forward(x)
+
+    monkeypatch.setattr(vae.decoder, "forward", counting_forward)
+    monkeypatch.setattr(pm, "VAE_DECODE_MAX_TILES_PER_BATCH", 4)
+    with torch.inference_mode(), torch.autocast("cuda", torch.float16):
+        expected = vae._decode_clip(z)
+        calls.clear()
+        actual = _batched_decode_clip(vae, z)
+    assert calls == [4, 4, 1]
+    assert torch.equal(actual, expected)
