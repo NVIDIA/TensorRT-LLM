@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import sys
+from enum import IntEnum
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -396,6 +397,8 @@ def test_nccl_ep_downgrades_unsupported_low_precision_combine(
     """Strategy selection may request combine quantization for BF16 workloads."""
     monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
 
+    monkeypatch.setattr(nccl_ep_utils, "get_nccl_ep_context", Mock())
+
     strategy = NcclEP(
         mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
         num_slots=32,
@@ -678,7 +681,9 @@ def test_nccl_ep_context_init_rejects_cuda_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
 ):
     strategy = object.__new__(NcclEP)
-    strategy._ctx = None
+    strategy._ctx = object.__new__(nccl_ep_utils.NcclEpContext)
+    strategy._ctx.comm = Mock()
+    strategy._ctx.initialized = False
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     with pytest.raises(RuntimeError, match="context must be initialized before CUDA graph capture"):
@@ -704,3 +709,279 @@ def test_nccl_ep_handle_init_rejects_cuda_graph_capture(
         RuntimeError, match="dispatch handle must be initialized before CUDA graph capture"
     ):
         strategy._setup_handle(ctx, object(), 0)
+
+
+@pytest.fixture
+def nccl_preflight_runtime(monkeypatch: pytest.MonkeyPatch):
+    """Native communicator doubles; constructing a group is forbidden during preflight."""
+    import tensorrt_llm._utils as utils
+
+    class Layout(IntEnum):
+        RANK_MAJOR = 1
+
+    class NCCLError(Exception):
+        pass
+
+    monkeypatch.setitem(sys.modules, "nccl.bindings.nccl", SimpleNamespace(NCCLError=NCCLError))
+    gin_types = SimpleNamespace(NONE=0, GDAKI=1, PROXY=2)
+    comm = Mock(n_lsa_teams=2, gin_type=gin_types.GDAKI)
+    core = SimpleNamespace(
+        NcclGinType=gin_types,
+        get_unique_id=Mock(return_value="unique-id"),
+        Communicator=SimpleNamespace(init=Mock(return_value=comm)),
+    )
+    group_create = Mock(side_effect=AssertionError("EP group created before warmup"))
+    ep = SimpleNamespace(Layout=Layout, Group=SimpleNamespace(create=group_create))
+    monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(core=core, ep=ep))
+    monkeypatch.setitem(sys.modules, "nccl.core", core)
+    monkeypatch.setitem(sys.modules, "nccl.ep", ep)
+    mpi = Mock()
+    mpi.Get_rank.return_value = 0
+    mpi.Get_size.return_value = 2
+    mpi.allgather.side_effect = lambda error: [error, None]
+    monkeypatch.setattr(utils, "mpi_comm", Mock(return_value=Mock(Split=Mock(return_value=mpi))))
+    monkeypatch.setattr(nccl_ep_utils, "_ep_group_cache", {})
+    monkeypatch.setattr(nccl_ep_utils, "_ep_group_refcounts", {})
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    loader = Mock()
+    monkeypatch.setattr(nccl_ep_utils.ctypes, "CDLL", loader)
+    monkeypatch.setenv("NCCL_NET_PLUGIN", "spcx")
+    monkeypatch.delenv("NCCL_GIN_PLUGIN", raising=False)
+    monkeypatch.delenv("NCCL_GIN_GPUNETIO_PATH", raising=False)
+    return SimpleNamespace(
+        comm=comm,
+        core=core,
+        mpi=mpi,
+        loader=loader,
+        group_create=group_create,
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0, pp_rank=0),
+    )
+
+
+@pytest.mark.parametrize(
+    "single_domain,gin_type,plugin",
+    [
+        (True, 1, "spcx"),
+        (False, 2, "spcx"),
+        (False, 1, ""),
+    ],
+)
+def test_nccl_ep_preflight_does_not_require_external_gpunetio(
+    nccl_preflight_runtime,
+    monkeypatch: pytest.MonkeyPatch,
+    single_domain: bool,
+    gin_type: int,
+    plugin: str,
+) -> None:
+    runtime = nccl_preflight_runtime
+    runtime.comm.n_lsa_teams = 1 if single_domain else 2
+    runtime.comm.gin_type = gin_type
+    runtime.loader.side_effect = OSError("GPUNetIO is absent")
+    monkeypatch.setenv("NCCL_NET_PLUGIN", plugin)
+
+    nccl_ep_utils._check_gin_dependencies(runtime.comm, runtime.mpi)
+
+    runtime.loader.assert_not_called()
+    runtime.mpi.allgather.assert_called_once_with(None)
+
+
+@pytest.mark.parametrize("path", [None, "/plugin/libdoca_gpunetio_host.so"])
+def test_nccl_ep_preflight_loads_gpunetio(
+    nccl_preflight_runtime,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str | None,
+) -> None:
+    runtime = nccl_preflight_runtime
+    if path is not None:
+        monkeypatch.setenv("NCCL_GIN_GPUNETIO_PATH", path)
+
+    nccl_ep_utils._check_gin_dependencies(runtime.comm, runtime.mpi)
+
+    runtime.loader.assert_called_once_with(path or "libdoca_gpunetio_host.so")
+    runtime.mpi.allgather.assert_called_once_with(None)
+
+
+@pytest.mark.parametrize("remote_failure", [False, True])
+def test_nccl_ep_preflight_failure_cleans_up_on_every_rank(
+    nccl_preflight_runtime,
+    remote_failure: bool,
+) -> None:
+    runtime = nccl_preflight_runtime
+    if remote_failure:
+        runtime.mpi.allgather.side_effect = lambda _: [None, "cannot load GPUNetIO"]
+    else:
+        runtime.loader.side_effect = OSError("cannot load GPUNetIO")
+
+    with pytest.raises(RuntimeError, match="EP rank [01].*GPUNetIO"):
+        nccl_ep_utils.get_nccl_ep_context(
+            runtime.mapping,
+            32,
+            128,
+            4096,
+            8,
+            defer_initialization=True,
+        )
+
+    runtime.comm.finalize.assert_called_once()
+    runtime.comm.destroy.assert_called_once()
+    runtime.mpi.Free.assert_called_once()
+    runtime.group_create.assert_not_called()
+    assert not nccl_ep_utils._ep_group_cache
+    assert not nccl_ep_utils._ep_group_refcounts
+
+
+def test_nccl_ep_preflight_rejects_missing_gin(nccl_preflight_runtime) -> None:
+    runtime = nccl_preflight_runtime
+    runtime.comm.gin_type = runtime.core.NcclGinType.NONE
+
+    with pytest.raises(RuntimeError, match="full connectivity"):
+        nccl_ep_utils._check_gin_dependencies(runtime.comm, runtime.mpi)
+
+    runtime.loader.assert_not_called()
+
+
+@pytest.mark.parametrize("quantization", ["bf16", "fp8", "nvfp4"])
+def test_nccl_ep_preflight_shares_context_and_defers_buffers(
+    nccl_preflight_runtime,
+    monkeypatch: pytest.MonkeyPatch,
+    quantization: str,
+) -> None:
+    runtime = nccl_preflight_runtime
+    quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(
+            has_fp8_qdq=lambda: quantization == "fp8",
+            has_nvfp4=lambda: quantization == "nvfp4",
+        )
+    )
+    allocation = Mock(side_effect=AssertionError("tensor allocation during model construction"))
+    monkeypatch.setattr(torch, "empty", allocation)
+    first = NcclEP(runtime.mapping, 32, 4096, quant_config=quant_config)
+    second = NcclEP(runtime.mapping, 32, 4096, quant_config=quant_config)
+
+    assert first._ctx is second._ctx
+    assert first._ctx.external_fp8 == (quantization == "fp8")
+    assert first._ctx.external_nvfp4 == (quantization == "nvfp4")
+    runtime.core.Communicator.init.assert_called_once()
+    runtime.mpi.allgather.assert_called_once()
+    runtime.group_create.assert_not_called()
+    allocation.assert_not_called()
+
+    # Dropping one layer must not release the shared communicator.
+    first.destroy()
+    runtime.comm.destroy.assert_not_called()
+    second.destroy()
+    second.destroy()
+    runtime.comm.finalize.assert_called_once()
+    runtime.comm.destroy.assert_called_once()
+    runtime.mpi.Free.assert_called_once()
+    assert not nccl_ep_utils._ep_group_cache
+
+
+def test_nccl_ep_warmup_reuses_preflight_communicator(
+    nccl_preflight_runtime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = nccl_preflight_runtime
+    initialize_group = Mock()
+    monkeypatch.setattr(nccl_ep_utils.NcclEpContext, "_initialize_group", initialize_group)
+    strategy = NcclEP(runtime.mapping, 32, 4096)
+
+    context = strategy._get_context()
+    assert strategy._get_context() is context
+    assert context.comm is runtime.comm
+    assert context.initialized
+    initialize_group.assert_called_once()
+    runtime.core.Communicator.init.assert_called_once()
+    strategy.destroy()
+
+
+def test_nccl_ep_group_init_failure_releases_preflight_resources(
+    nccl_preflight_runtime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = nccl_preflight_runtime
+    monkeypatch.setattr(
+        nccl_ep_utils.NcclEpContext,
+        "_initialize_group",
+        Mock(side_effect=RuntimeError("group creation failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="group creation failed"):
+        nccl_ep_utils.get_nccl_ep_context(runtime.mapping, 32, 128, 4096, 8)
+
+    runtime.comm.destroy.assert_called_once()
+    runtime.mpi.Free.assert_called_once()
+    assert not nccl_ep_utils._ep_group_cache
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_nccl_ep_missing_gpunetio_falls_back_only_for_auto_selection(
+    nccl_preflight_runtime,
+    monkeypatch: pytest.MonkeyPatch,
+    forced: bool,
+) -> None:
+    runtime = nccl_preflight_runtime
+    runtime.loader.side_effect = OSError("cannot load GPUNetIO")
+    _mock_nccl_ep_v02(monkeypatch)
+    monkeypatch.setattr(communication_factory, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+    model_config = _make_model_config()
+    model_config.mapping.pp_rank = 0
+    kwargs = dict(
+        num_experts=32, num_slots=32, top_k=8, expert_size_per_partition=16, hidden_size=4096
+    )
+
+    if forced:
+        with pytest.raises(RuntimeError, match="NCCL_GIN_GPUNETIO_PATH"):
+            communication_factory.CommunicationFactory._create_forced_method(
+                "NCCL_EP",
+                model_config,
+                payload_in_workspace=False,
+                alltoall_result_do_sum=True,
+                use_flashinfer=False,
+                **kwargs,
+            )
+    else:
+        strategy = communication_factory.CommunicationFactory.create_strategy(
+            model_config, **kwargs
+        )
+        assert isinstance(strategy, AllGatherReduceScatter)
+    runtime.group_create.assert_not_called()
+    runtime.comm.destroy.assert_called_once()
+
+
+@pytest.mark.parametrize("native_error", [False, True])
+def test_nccl_ep_topology_query_failure_is_collective(
+    nccl_preflight_runtime,
+    native_error: bool,
+) -> None:
+    runtime = nccl_preflight_runtime
+    from nccl.bindings.nccl import NCCLError
+
+    error = (
+        NCCLError("incompatible NCCL runtime") if native_error else AttributeError("missing API")
+    )
+
+    class FailedQuery:
+        @property
+        def n_lsa_teams(self) -> int:
+            raise error
+
+    comm = FailedQuery()
+    with pytest.raises(RuntimeError, match="cannot query NCCL communicator topology"):
+        nccl_ep_utils._check_gin_dependencies(comm, runtime.mpi)
+    runtime.mpi.allgather.assert_called_once()
+    runtime.loader.assert_not_called()
+
+
+def test_nccl_ep_communicator_init_failure_releases_mpi(nccl_preflight_runtime) -> None:
+    runtime = nccl_preflight_runtime
+    runtime.core.Communicator.init.side_effect = RuntimeError("communicator init failed")
+    with pytest.raises(RuntimeError, match="communicator init failed"):
+        nccl_ep_utils.get_nccl_ep_context(runtime.mapping, 32, 128, 4096, 8)
+    runtime.mpi.Free.assert_called_once()
+    assert not nccl_ep_utils._ep_group_cache

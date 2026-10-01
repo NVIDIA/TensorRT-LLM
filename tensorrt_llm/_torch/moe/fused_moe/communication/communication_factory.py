@@ -277,7 +277,7 @@ class CommunicationFactory:
                 logger.info("Selected communication strategy: NcclEP")
                 return strategy
             except RuntimeError as e:
-                logger.debug(f"NcclEP not available: {e}")
+                logger.info(f"NcclEP not available: {e}")
         else:
             logger.debug(f"NcclEP not available: {nccl_ep_unavailable_reason}")
 
