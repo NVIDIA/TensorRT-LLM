@@ -579,7 +579,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             remote_mode = getattr(req, "py_csa2_remote_tail_mode", None)
             if exclusive_remote_mode is not None and remote_mode != exclusive_remote_mode:
                 continue
-            if remote_mode is not None and not budget.can_fit_tokens(req.context_remaining_length):
+            # Destination replay is atomic; source prefix processing may be chunked.
+            if remote_mode == "destination" and not budget.can_fit_tokens(
+                req.context_remaining_length
+            ):
                 continue
             if scheduled_ctx and remote_mode != scheduled_remote_mode:
                 continue
