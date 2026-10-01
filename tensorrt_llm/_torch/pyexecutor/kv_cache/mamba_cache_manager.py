@@ -33,7 +33,10 @@ if TYPE_CHECKING:
 from tensorrt_llm._torch.disaggregation.resource.page import (MapperKind,
                                                               RoleLayout)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
-    _RESERVED_REQUEST_IDS, BlockReusePolicy, KVCacheManagerV2, Role)
+    _RESERVED_REQUEST_IDS, BlockReusePolicy, KVCacheManagerV2, Role,
+    _estimate_draft_cache_size_components)
+from tensorrt_llm._torch.pyexecutor.kv_cache.standalone_draft_cache import \
+    StandaloneDraftLayout
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
     KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -2141,6 +2144,7 @@ def _estimate_mamba_hybrid_cache_cost(
     cap_partial_attention_snapshots: bool,
     is_draft: bool = False,
     use_separate_draft_kv_cache: bool = False,
+    draft_layout: Optional[StandaloneDraftLayout] = None,
     **kwargs,
 ) -> Tuple[int, int]:
     spec_config = kwargs.get("spec_config")
@@ -2203,6 +2207,20 @@ def _estimate_mamba_hybrid_cache_cost(
         if (has_unaligned_periodic_snapshot
                 and not cap_partial_attention_snapshots):
             regular_slope += math.ceil(attention_block_bytes / interval)
+    if draft_layout is not None:
+        # Hybrid target attention is full attention. Reserve capture/noise
+        # capacity only in its attention pools and the distinct draft pools;
+        # recurrent state retains the fixed/snapshot accounting above.
+        # Hybrid profiling bounds draft storage by full-history attention.
+        _, draft_slope, draft_fixed = _estimate_draft_cache_size_components(
+            replace(draft_layout, window_size=None),
+            tokens_per_block,
+            generation_capacity_headroom=1,
+            helix_cp_size=mapping.cp_size if mapping.has_cp_helix() else 1,
+        )
+        draft_fixed += draft_layout.extra_tokens * attention_slope
+        attention_slope += draft_slope
+        intercept += max_batch_size * draft_fixed
     return attention_slope + regular_slope, intercept
 
 
@@ -3786,7 +3804,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         )
 
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
-        return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
+        layer_id = self.pp_layers[local_layer_idx]
+        return layer_id < len(
+            self._mamba_layer_mask) and self._mamba_layer_mask[layer_id]
 
     def _get_pool_roles(self,
                         pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
@@ -3912,6 +3932,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                  self.tokens_per_block
                                  if snapshot_slots > 0 else 0)
         return attention_quota + state_quota + extra_attention_quota
+
+    def _get_draft_quota_from_max_tokens(self, max_tokens: float) -> int:
+        draft_quota = super()._get_draft_quota_from_max_tokens(max_tokens)
+        snapshot_slots = self._num_ssm_snapshots_for_capacity(
+            max_tokens, self.kv_cache_config)
+        if snapshot_slots > 0:
+            # The snapshot plan's partial-page reserve also covers draft KV.
+            draft_quota += (self._max_resident_sequences() *
+                            self.draft_layout.bytes_per_token *
+                            self.tokens_per_block)
+        return draft_quota
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         if self._get_quota_from_max_tokens(0) > quota:
@@ -4200,8 +4231,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     self._ssm_page_index_scale)
             else:
                 attention_pages.append(
-                    self.impl.get_page_index_upper_bound(layer_id, Role.KEY) //
-                    self.kv_factor)
+                    self._get_attention_pool_num_blocks(local_layer_idx))
         if attention_pages:
             return max(attention_pages)
         return max(ssm_pages) if ssm_pages else 0

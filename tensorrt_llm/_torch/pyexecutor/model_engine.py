@@ -55,6 +55,7 @@ from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
                                                 _build_request_multimodal_input)
+from ..models.modeling_speculative import SpecDecOneEngineForCausalLM
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..moe.expert_statistic import ExpertStatistic
@@ -1059,6 +1060,15 @@ class PyTorchModelEngine(ModelEngine):
         """Register how a batch maps to its sampling tier, for the graph key."""
         self.cuda_graph_runner.register_sample_type_resolver(resolver)
         self._stage_in_graph_sampling = stage
+
+    def get_speculative_model(self) -> Optional[SpecDecOneEngineForCausalLM]:
+        """Return the one-engine speculative model, including inside a VLM."""
+        if not self.is_spec_decode:
+            return None
+        model = self.model
+        if isinstance(model, MultimodalModelMixin):
+            model = model.language_model
+        return model if isinstance(model, SpecDecOneEngineForCausalLM) else None
 
     def get_kv_cache_dtype_byte_size(self) -> float:
         """
@@ -6160,6 +6170,13 @@ class PyTorchModelEngine(ModelEngine):
                 can_run_graph,
                 execution_promoted_context_ids,
                 use_lora_graph=use_lora_graph)
+            speculative_model = self.get_speculative_model()
+            spec_worker = (speculative_model.spec_worker
+                           if speculative_model is not None else None)
+            if spec_worker is not None:
+                spec_worker.prepare_managed_draft_cache(
+                    speculative_model.draft_model, spec_metadata, attn_metadata,
+                    resource_manager)
             if execution_promoted_context_ids:
                 self.iter_states[
                     'num_ctx_requests'] = scheduled_requests.num_context_requests
@@ -6242,6 +6259,16 @@ class PyTorchModelEngine(ModelEngine):
                         finally:
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
+
+            if (spec_worker is not None and not self.is_warmup
+                    and not self.cuda_graph_runner.is_warmup_only):
+                draft_history_update = spec_worker.snapshot_managed_draft_history(
+                )
+                if draft_history_update is not None:
+                    # Graph output dictionaries persist across replays. Each
+                    # overlapped iteration must retain its own host readback.
+                    outputs = dict(outputs)
+                    outputs['draft_history_update'] = draft_history_update
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()

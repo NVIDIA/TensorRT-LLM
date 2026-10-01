@@ -624,13 +624,21 @@ def block_bytes_per_group(page_table: KVCachePageTable) -> list[int | None]:
     remains aligned with receive-request layer-group indices.
     """
     from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
+    from tensorrt_llm._torch.disaggregation.resource.utils import (
+        get_physical_pool,
+        get_pool_view_num_layers,
+    )
 
     assert page_table is not None
     out: list[int | None] = []
     for lg_idx, lg in enumerate(page_table.layer_groups):
         if lg.kind != CacheKind.PAGED:
             out.append(None)
+            continue
+        if lg.cp_as_tp:
+            out.append(
+                sum(get_pool_view_num_layers(pv) * pv.bytes_per_layer for pv in lg.pool_views)
+            )
             continue
         pool_indices = {pool_view.pool_idx for pool_view in lg.pool_views}
         out.append(

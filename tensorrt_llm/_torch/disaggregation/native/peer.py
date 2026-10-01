@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -26,7 +26,12 @@ from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import Atte
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind, PoolView
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    AttentionLayerGroup,
+    CacheKind,
+    MapperKind,
+    PoolView,
+)
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_layer_byte_ranges,
     get_layer_to_layer_group,
@@ -392,6 +397,10 @@ class PeerRegistrar:
 
         # Polymorphic dispatch: attention vs mamba policy
         policy = self._get_policy(self_lg.kind)
+        mapper_peer_ri = peer_ri
+        if self_lg.kind == CacheKind.PAGED and self_lg.cp_as_tp:
+            policy = AttentionPolicy(self._group_rank_info(self._ri, self_lg))
+            mapper_peer_ri = self._group_rank_info(peer_ri, peer_lg)
 
         # For mamba, compute ptr-array layer offsets for partial PP overlap.
         # extract_slot returns ptrs for ALL local_layer_ids in sorted order;
@@ -414,7 +423,7 @@ class PeerRegistrar:
             )
 
         mapper = policy.build_mapper(
-            peer_ri=peer_ri,
+            peer_ri=mapper_peer_ri,
             mapper_kind=self_pv.mapper_kind,
             self_layer_offsets=self_layer_offsets,
             peer_layer_offsets=peer_layer_offsets,
@@ -577,10 +586,42 @@ class PeerRegistrar:
         """
         layer_group = self._self_ext_cache.page_table.layer_groups[layer_group_id]
         pool_view = layer_group.pool_views[pool_idx]
+        if layer_group.kind == CacheKind.PAGED and layer_group.cp_as_tp:
+            peer_lg_id, _ = self.get_pool_mapping(peer_rank_info)[(layer_group_id, pool_idx)]
+            peer_lg = peer_rank_info.page_table.layer_groups[peer_lg_id]
+            if not MambaPolicy.is_paired(self._ri, peer_rank_info):
+                return False
+            policy = AttentionPolicy(self._group_rank_info(self._ri, layer_group))
+            peer = self._group_rank_info(peer_rank_info, peer_lg)
+            duplicate, peer_duplicate = policy.duplicate_head_factors(peer)
+            overlap = replace(
+                peer_overlap,
+                duplicate_head_factor=duplicate,
+                peer_duplicate_head_factor=peer_duplicate,
+            )
+            return policy.should_send(overlap, peer, mapper_kind=pool_view.mapper_kind)
         # Delegate to the policy's should_send. None means fan-in election.
         policy = self._get_policy(layer_group.kind)
         result = policy.should_send(peer_overlap, peer_rank_info, mapper_kind=pool_view.mapper_kind)
         return self._owns_tp_fan_in(peer_rank_info) if result is None else result
+
+    @staticmethod
+    def _group_rank_info(rank_info: RankInfo, layer_group: AttentionLayerGroup) -> RankInfo:
+        tp_size, tp_rank = MambaPolicy._mamba_tp(rank_info)
+        return replace(
+            rank_info,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            cp_size=1,
+            cp_rank=0,
+            dp_size=1,
+            attention=replace(
+                rank_info.attention,
+                kv_heads_per_rank=layer_group.kv_head_num_per_rank,
+                is_mla=False,
+                enable_attention_dp=False,
+            ),
+        )
 
     def should_send_aux(self, peer_rank_info: RankInfo) -> bool:
         # to ensure the transfer aux is not duplicated

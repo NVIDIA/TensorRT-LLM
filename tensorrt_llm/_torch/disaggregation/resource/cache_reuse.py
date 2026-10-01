@@ -19,9 +19,10 @@ from typing import List, Sequence, Union
 
 import numpy as np
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 
 from .page import AttentionLayerGroup
 from .utils import get_global_layer_ids
@@ -211,6 +212,9 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         # cache_level==GPU), so the slot_ids yielded here are already the right
         # offsets for primary-pool pointer arithmetic. No translation is needed,
         # unlike V1 (see _CacheReuseAdapterV1.get_block_ids).
+        if lg.cp_as_tp:
+            ordinals = self.get_block_ordinals(req, group_idx, lg)
+            return ordinals[ordinals >= 0]
         return np.fromiter(
             self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
                 group_idx, valid_only=True
@@ -222,12 +226,20 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         # valid_only=False yields one entry per block ordinal, with -1
         # (BAD_PAGE_INDEX) for out-of-window (SWA-evicted) and unbound blocks.
         # Position is the index; no length arithmetic needed.
-        return np.fromiter(
+        ordinals = np.fromiter(
             self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
                 group_idx, valid_only=False
             ),
             dtype=np.int64,
         )
+        if lg.cp_as_tp:
+            converter = self._mgr.impl.get_page_index_converter(
+                lg.local_layers[0].local_layer_id, Role.KEY
+            )
+            return np.asarray(
+                converter(ordinals.tolist(), index_mode=PageIndexMode.SHARED), dtype=np.int64
+            )
+        return ordinals
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         self._mgr.try_commit_blocks(req)
