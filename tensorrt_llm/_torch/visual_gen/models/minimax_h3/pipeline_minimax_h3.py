@@ -18,6 +18,7 @@
 """TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA checkpoints."""
 
 import time
+import types
 from io import BytesIO
 from typing import Any, Optional
 
@@ -61,6 +62,57 @@ from .packing import (
     video_latent_num_frames,
 )
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+
+
+def _batched_decode_clip(self: AutoencoderKLMiniMaxH3, z: torch.Tensor) -> torch.Tensor:
+    """``AutoencoderKLMiniMaxH3._decode_clip`` with all equal-size spatial tiles in one decoder call.
+
+    The ViT decoder treats batch entries independently (per-sample attention, per-token norms and projections), so
+    decoding the tiles of a clip as one batch is the same math as the reference loop over tiles; the tiles are split
+    back out and stitched/blended exactly as in the reference. Falls back to the per-tile loop when tile shapes differ.
+    """
+    if not self.use_tiling:
+        return self.decoder(self.post_quant_conv(z))
+    ratio = self.spatial_compression_ratio
+    height = z.shape[-2] * ratio
+    width = z.shape[-1] * ratio
+    y_indices, y_lengths, y_overlaps = self._split_tiles(
+        height, self.tile_sample_min_height, self.tile_sample_min_overlap_height
+    )
+    x_indices, x_lengths, x_overlaps = self._split_tiles(
+        width, self.tile_sample_min_width, self.tile_sample_min_overlap_width
+    )
+    tiles = [
+        z[
+            ...,
+            i_pos // ratio : i_pos // ratio + i_len // ratio,
+            j_pos // ratio : j_pos // ratio + j_len // ratio,
+        ]
+        for i_pos, i_len in zip(y_indices, y_lengths)
+        for j_pos, j_len in zip(x_indices, x_lengths)
+    ]
+    num_cols = len(x_indices)
+    if len({tuple(tile.shape) for tile in tiles}) == 1:
+        batch = z.shape[0]
+        decoded = self.decoder(self.post_quant_conv(torch.cat(tiles, dim=0))).split(batch, dim=0)
+    else:
+        decoded = [self.decoder(self.post_quant_conv(tile)) for tile in tiles]
+    rows = [list(decoded[r * num_cols : (r + 1) * num_cols]) for r in range(len(y_indices))]
+    return self._stitch_tiles(rows, y_overlaps, x_overlaps)
+
+
+def _prepare_vae_decoder(vae: AutoencoderKLMiniMaxH3) -> None:
+    """Lossless decode-path preparation for the fp16-autocast decode in ``MiniMaxH3Pipeline._decode_video``.
+
+    * Every ``nn.Linear`` of the ViT decoder keeps an fp16 copy of its weight and bias: autocast casts them to fp16 on
+      every call, so casting once is bit-identical (norm weights and the ``scale1``/``scale2`` gains stay fp32, as
+      autocast leaves them).
+    * Equal-size spatial tiles of a clip are decoded as one batch (``_batched_decode_clip``).
+    """
+    for module in vae.decoder.modules():
+        if isinstance(module, torch.nn.Linear):
+            module.to(torch.float16)
+    vae._decode_clip = types.MethodType(_batched_decode_clip, vae)
 
 
 def _component_skipped(
@@ -295,6 +347,24 @@ class MiniMaxH3Pipeline(BasePipeline):
             self.scheduler.set_shift(self.VIDEO_SCHEDULER_SHIFT)
         if self.audio_scheduler is not None:
             self.audio_scheduler.set_shift(self.AUDIO_SCHEDULER_SHIFT)
+        if self.vae is not None and self.device.type == "cuda":
+            _prepare_vae_decoder(self.vae)
+
+    def torch_compile(self) -> None:
+        super().torch_compile()
+        # The ViT VAE decoder is 36 identical blocks run once per clip; compile them like the transformer blocks.
+        if self.vae is not None and getattr(self.vae, "decoder", None) is not None:
+            tc_config = self.pipeline_config.torch_compile
+            blocks = self.vae.decoder.transformer_blocks
+            logger.info(
+                f"torch.compile: vae.decoder.transformer_blocks ({len(blocks)} blocks, mode=default)"
+            )
+            self.vae.decoder.transformer_blocks = torch.nn.ModuleList(
+                torch.compile(
+                    block, mode="default", dynamic=None, fullgraph=tc_config.enable_fullgraph
+                )
+                for block in blocks
+            )
 
     def _load_request_keyframes(
         self,
