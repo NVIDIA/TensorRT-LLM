@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
     validate_mm_encoder_scheduling_compatibility,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import (
+    LlmRequest,
     MultimodalEncoderRequestError,
     initialize_multimodal_encoder_request,
     is_multimodal_encoder_ready,
@@ -359,6 +360,29 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(
     assert "multimodal_embedding_is_chunk" not in request.py_multimodal_data
     assert "multimodal_embedding" not in request.py_multimodal_data
     assert mm_item_scheduler.encoder_cache.current_bytes == 40
+
+
+def test_admission_requires_item_rows_to_fill_prompt_embedding_slots() -> None:
+    def make_request(embed_mask_cumsum: list[int]) -> LlmRequest:
+        return make_llm_request(
+            1,
+            multimodal_data={
+                "image": {"pixel_values": torch.empty(5, 1)},
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+                    item_refs=[("image", 0), ("image", 1)],
+                    encoder_token_lengths=[2, 3],
+                    output_embedding_lengths=[2, 3],
+                ),
+                "multimodal_embedding_lengths": [2, 3],
+                "multimodal_embed_mask_cumsum": torch.tensor(embed_mask_cumsum),
+            },
+        )
+
+    # Two image-A slots, a text-only gap, then three image-B slots.
+    initialize_multimodal_encoder_request(make_request([0, 1, 2, 2, 2, 3, 4, 5]), max_num_tokens=8)
+    for embed_mask_cumsum in ([0, 1, 2, 2, 2, 3, 4], [0, 1, 2, 2, 2, 3, 4, 5, 6]):
+        with pytest.raises(ValueError, match="declare 5 embedding rows"):
+            initialize_multimodal_encoder_request(make_request(embed_mask_cumsum), max_num_tokens=8)
 
 
 def test_cache_hit_only_request_omits_raw_inputs_from_llm_payload() -> None:
