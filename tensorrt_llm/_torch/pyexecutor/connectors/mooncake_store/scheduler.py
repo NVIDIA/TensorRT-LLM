@@ -196,25 +196,6 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         )
         return hit_blocks * self._tokens_per_block, False
 
-    def cancel_load(self, request: LlmRequest, start: int, end: int):
-        """Drop offered blocks whose tokens the runtime will not consume.
-
-        Loads here are synchronous and nothing has been transferred yet, so this
-        is exact: the offer is truncated before `build_connector_meta` turns it
-        into work.
-        """
-        state = self._requests.get(request.request_id)
-        if state is None or state.load_blocks == 0:
-            return
-        kept = 0
-        for offset in range(state.load_blocks):
-            block = state.load_first_block + offset
-            block_start = block * self._tokens_per_block
-            if block_start + self._tokens_per_block > start and block_start < end:
-                break
-            kept += 1
-        state.load_blocks = kept
-
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
         """No-op: page indices are read from the scheduler output instead.
 
@@ -330,9 +311,11 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         for offset in range(state.load_blocks):
             block = state.load_first_block + offset
             if block >= limit:
-                # The runtime allocated fewer pages than it accepted tokens for.
-                # It reports the shortfall through cancel_load; until then the
-                # unaddressable tail is simply not loaded.
+                # The runtime allocated fewer pages than it accepted tokens
+                # for, so the tail of the offer has nowhere to land. Loads are
+                # synchronous and become work only here, which is late enough
+                # to see the shortfall and drop that tail; the runtime
+                # recomputes it.
                 break
             self._append_pages(state, transfers, block)
         return transfers

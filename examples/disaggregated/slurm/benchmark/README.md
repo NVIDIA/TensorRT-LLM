@@ -133,15 +133,20 @@ worker_config:
         master_timeout: 900
 ```
 
-`__LOG_DIR__` is substituted with the job's log directory, which is not known when the config is written. `pool` stays the same across both roles and every server: one master publishes one manifest there, and joining it is what puts them all on the same pool.
+Write the `__LOG_DIR__` and `__MOONCAKE_RUN_DIR__` placeholders literally; the job substitutes them at launch. Set the rest as follows.
 
-`__MOONCAKE_RUN_DIR__` is substituted per server, by `start_worker.sh`, with `<log dir>/mooncake_<role>_<instance>`. It cannot be written as a `__LOG_DIR__` path because that is one directory for the whole job, while each server needs its own: two servers sharing a run directory render one client config between them, and the last writer wins for both. With more than one context or generation server, a shared path fails at startup with a message naming the other server's claim.
+| Key | What to set | If you get it wrong |
+| --- | --- | --- |
+| `pool` | `file://__LOG_DIR__/pool.json`, identical on every server. | Servers naming different manifests join different pools and share nothing. |
+| `role` | `both` on context, `capacity` on generation. | See [Roles and sizing](#roles-and-sizing). |
+| `segment_size` | The same per-rank figure on both sides. | See [Roles and sizing](#roles-and-sizing). |
+| `model_key` | Any stable name for this checkpoint, identical on every server. Required. | Servers that disagree share nothing; two *different* checkpoints sharing one name read each other's KV. |
+| `run_dir` | `__MOONCAKE_RUN_DIR__`. Context and generation need **separate** directories. | Servers sharing a directory render one client config between them. With more than one server per side the job fails at startup, naming the other server's claim. |
+| `master_timeout` | Seconds to wait for the master; 900 covers container start on another node. | Too short and the server fails at startup — which is the point, since a pool that never came up otherwise shows up only as missing cache hits. |
 
-`model_key` is required and has to read the same on every server, since it is what the pool's keys identify this checkpoint by.
+`__LOG_DIR__` becomes the job's log directory, which is not known when the config is written. `__MOONCAKE_RUN_DIR__` becomes `<log dir>/mooncake_<role>_<instance>`, substituted per server by `start_worker.sh` — which is why it cannot be spelled out as a `__LOG_DIR__` path, that being one directory for the whole job where each server needs its own. Both stay inside the log directory because the ranks `srun` starts do not inherit the leader's environment and read the rendered client config back from disk.
 
-`run_dir` is where each server keeps the client config it renders and the record each of its ranks writes. It has to be inside the job's log directory, because the ranks `srun` starts never inherit the leader's environment and read that client config back from there. Give the two sides **separate** directories: servers sharing one render a single client config between them, and these two differ in `role`. The run's report gathers the records from the whole tree, so the pool still totals up.
-
-`master_timeout` is generous because the wait spans container start on another node. Too short fails the server at startup, which is the intent: a pool that never came up shows up only as an absence of cache hits.
+##### Roles and sizing
 
 Neither side sets `host_cache_size` or `disk_cache_size`, because the connector forces both to 0 for every role, `capacity` included. The pool is the deployment's offload tier, and a native one would claim a second share of the same node's DRAM, which on the generation side is the DRAM it just lent the pool. Size `segment_size` against the whole node's memory on that basis.
 
@@ -150,6 +155,8 @@ Both sides contribute the same amount per rank, so pool capacity is `total ranks
 The roles differ only in traffic. `capacity` drives none: those ranks mount their segment and never look up, load or save, and they register no KV cache with Mooncake, so they need no GPUDirect RDMA and keep their scheduler policy and block reuse unchanged.
 
 Keep `segment_size` identical in both sections. Each server sees only its own value, so a mismatch is otherwise invisible; the run's report names the distinct sizes it finds. Note also that `segment_size` is claimed **per rank**, so a node's demand is `ranks_on_node x segment_size` — 4 x 160 GiB on a 4-GPU TP4 node. The connector checks this against available host memory and refuses at startup rather than letting the OOM killer arrive during weight loading.
+
+##### Checking the pool afterwards
 
 After the run, `${full_logdir}/9_mooncake_summary.log` reports the capacity the pool actually had and where blocks landed, read from the records each rank wrote rather than from log messages. The same report is available directly:
 

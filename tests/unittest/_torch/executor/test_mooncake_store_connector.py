@@ -1174,20 +1174,6 @@ def test_scheduler_skips_blocks_without_a_page_in_every_group(store_config):
     ]
 
 
-def test_scheduler_cancel_load_truncates_the_offer(store_config):
-    scheduler = make_scheduler(store_config, hit_blocks=3)
-    tokens = list(range(6 * TOKENS_PER_BLOCK))
-    request = make_request(1, tokens)
-    scheduler.get_num_new_matched_tokens(request, 0)
-
-    # The runtime will not consume anything from block 1 onwards.
-    scheduler.cancel_load(request, TOKENS_PER_BLOCK, 6 * TOKENS_PER_BLOCK)
-    metadata = scheduler.build_connector_meta(
-        SchedulerOutput(new_requests=[request_data(1, tokens, list(range(10, 16)))])
-    )
-    assert [page.page_index for page in metadata.loads[0].pages] == [10]
-
-
 def test_scheduler_request_finished_pins_pages_only_when_saving(store_config):
     scheduler = make_scheduler(store_config, hit_blocks=0)
     tokens = list(range(2 * TOKENS_PER_BLOCK))
