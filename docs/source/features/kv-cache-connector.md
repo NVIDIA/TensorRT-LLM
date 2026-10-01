@@ -523,7 +523,9 @@ The store is addressed by whole blocks. The connector is handed the device match
 
 #### How it keys pages
 
-`KVCacheManagerV2` reports `RequestData.block_hashes` empty, so the connector derives block identity itself: a blake2b chain where each block's hash covers its own tokens *and* every token before it, seeded by the request's `cache_salt`. A key is `<prefix>/<model>/w<world size>r<rank>/lg<layer group>/t<tokens per block>b<bytes per page>/<block hash>`. The namespace pins down everything that would make the stored bytes mean something different, so a mismatched shard count, layer group or page geometry reads as a cache miss rather than as garbage.
+`KVCacheManagerV2` reports `RequestData.block_hashes` empty, so the connector derives block identity itself: a blake2b chain where each block's hash covers its own tokens *and* every token before it. A key is `<prefix>/<model>/w<world size>r<rank>/lg<layer group>/t<tokens per block>b<bytes per page>/<block hash>`. The namespace pins down everything that would make the stored bytes mean something different, so a mismatched shard count, layer group or page geometry reads as a cache miss rather than as garbage.
+
+The chain is seeded with what the tokens themselves do not record: the request's `cache_salt`, its `lora_task_id`, and the content digest of each of its multimodal items. Without the last two, requests whose prompts differ only in the adapter applied or in the images behind identical placeholder tokens would hash alike and read each other's pages. The seed covers a request's media as a set rather than per block, so two requests sharing only a prefix of their media get a miss rather than a hit — a reload, not a wrong page. A multimodal request whose items carry no hashes is skipped entirely: the store neither serves it nor receives from it, with one warning saying so.
 
 The value for one key is the concatenation of that layer group's regions for one page slot, handed to Mooncake's multi-buffer batch APIs as a list of `(address, size)` pairs.
 

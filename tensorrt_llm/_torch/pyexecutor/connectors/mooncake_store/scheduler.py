@@ -34,12 +34,49 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from ..kv_cache_connector import KvCacheConnectorScheduler, RequestData, SchedulerOutput
 from .config import MooncakeStoreConnectorConfig
-from .keys import BlockHashChain
+from .keys import BlockHashChain, ReuseScope
 from .metadata import MooncakeStoreMetadata, PageTransfer, RequestTransfers
 from .validation import validate_llm_args
 from .worker import MooncakeStoreConnectorWorker, resolve_local_worker
 
 __all__ = ["MooncakeStoreConnectorScheduler"]
+
+
+def _multimodal_item_digests(request: LlmRequest) -> Optional[Tuple[bytes, ...]]:
+    """Content digest per multimodal item of *request*, in prompt order.
+
+    Returns:
+        An empty tuple for a text-only request, one digest per item for a
+        multimodal one, and None when the request carries media the digests do
+        not describe, which is the caller's signal to leave it alone. The
+        placeholder tokens of such a request say nothing about its content, so
+        there is no key that names its pages without naming someone else's.
+    """
+    # The same three fields `KVCacheManagerV2` reads together to decide whether
+    # a request is multimodal at all, so local reuse and the store agree.
+    hashes = request.multimodal_hashes
+    if hashes:
+        # 8 int32 chunks per item, most significant byte first, matching
+        # `_hash_to_digest` in kv_cache_manager_v2 and C++ `getNthByte`.
+        return tuple(
+            b"".join(int(chunk).to_bytes(4, "big", signed=True) for chunk in item_hash)
+            for item_hash in hashes
+        )
+    if request.multimodal_positions or request.multimodal_lengths:
+        return None
+    return ()
+
+
+def _reuse_scope(request: LlmRequest) -> Optional[ReuseScope]:
+    """The scope *request*'s block hashes belong in, or None to skip it."""
+    digests = _multimodal_item_digests(request)
+    if digests is None:
+        return None
+    return ReuseScope(
+        cache_salt=request.cache_salt,
+        lora_task_id=request.lora_task_id,
+        multimodal_digests=digests,
+    )
 
 
 class _RequestState:
@@ -108,8 +145,23 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         Returns:
             Tokens the store can supply, and `False` for a synchronous load.
         """
+        scope = _reuse_scope(request)
+        if scope is None:
+            # No key names this request's pages without naming another's, so
+            # the store neither serves it nor receives from it. Leaving it
+            # without a `_RequestState` is what suppresses its saves too, since
+            # `build_connector_meta` skips requests it has no state for.
+            logger.warning_once(
+                "mooncake-store is bypassing requests whose multimodal content "
+                "carries no hashes: their prompt tokens do not identify the "
+                "media behind them, so a stored page could be served to a "
+                "different request.",
+                key="mooncake-store-unhashed-multimodal",
+            )
+            return 0, False
+
         tokens = request.get_tokens(0)
-        state = self._state_for(request, tokens)
+        state = self._state_for(request, tokens, scope)
         state.load_first_block = 0
         state.load_blocks = 0
 
@@ -215,6 +267,13 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             True when this request handed any page to the background save
             thread. Its pages are the source of those RDMA reads, so freeing
             them now would let a later request overwrite bytes mid-transfer.
+
+        Whether those writes have since landed is known per rank, and this runs
+        only on the leader, so the answer is "any save was emitted" rather than
+        "a save is in flight". A request whose writes already retired is
+        reported done by the very next `get_finished`, so the conservative
+        answer costs one iteration; the exact one would need a per-rank report
+        back to the leader to save it.
         """
         state = self._requests.pop(request.request_id, None)
         return bool(state is not None and state.emitted_saves)
@@ -235,12 +294,12 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             self._worker = resolve_local_worker()
         return self._worker
 
-    def _state_for(self, request: LlmRequest, tokens: List[int]) -> _RequestState:
+    def _state_for(
+        self, request: LlmRequest, tokens: List[int], scope: ReuseScope
+    ) -> _RequestState:
         state = self._requests.get(request.request_id)
         if state is None:
-            state = _RequestState(
-                BlockHashChain(self._tokens_per_block, cache_salt=request.cache_salt)
-            )
+            state = _RequestState(BlockHashChain(self._tokens_per_block, scope=scope))
             self._requests[request.request_id] = state
         # Hashing the prompt here rather than waiting for the first scheduler
         # output is the whole point: the lookup happens before the request is

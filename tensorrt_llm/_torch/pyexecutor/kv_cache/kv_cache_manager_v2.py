@@ -3807,6 +3807,17 @@ class KVCacheManagerV2(BaseResourceManager):
         """True while a deferred preemption is still waiting on a connector."""
         return bool(self._pending_preemption)
 
+    def is_preemption_pending(self, req: LlmRequest) -> bool:
+        """True while *req* is parked mid-preemption waiting on a connector.
+
+        `preempt_request` parks the victim in the state the finish path uses,
+        which `LlmRequest.isFinished` reports as finished. That is what keeps
+        it out of the schedulable range, but a caller that reads the state as
+        "done generating" -- the response path above all -- has to ask here
+        instead, since this request is going to run again.
+        """
+        return req.py_request_id in self._pending_preemption
+
     def preempt_request(self, req: LlmRequest) -> bool:
         """Give up *req*'s KV cache so its pages can be reclaimed.
 

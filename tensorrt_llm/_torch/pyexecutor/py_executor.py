@@ -4050,6 +4050,17 @@ class PyExecutor:
             ]
         self._terminate_request(request)
 
+    def _is_preemption_pending(self, request: LlmRequest) -> bool:
+        """True while *request* is a preemption victim awaiting its connector.
+
+        Deferring a release is a V2-only path, and the attribute is read
+        through `getattr` because the response pass this guards also runs on
+        the minimal executors unit tests assemble.
+        """
+        if not getattr(self, "_is_kv_manager_v2", False):
+            return False
+        return self.kv_cache_manager.is_preemption_pending(request)
+
     def _resume_preempted_request(self, request: LlmRequest) -> bool:
         """Complete a preemption whose connector saves have now retired.
 
@@ -8406,6 +8417,15 @@ class PyExecutor:
             # no responses for dummy request, and finish it
             if request.is_attention_dp_dummy:
                 requests_to_terminate.append(request)
+                continue
+
+            # A victim parked mid-preemption sits in the state the finish path
+            # uses, which reads as finished here. Responding to it would hand
+            # the client a final response for a request that is about to
+            # re-prefill, and dropping it from active_requests would leave
+            # _resume_preempted_request nothing to put back.
+            if self._is_preemption_pending(request):
+                new_active_requests.append(request)
                 continue
 
             # Check if a generation request needs cleanup due to KV cache transfer timeout.

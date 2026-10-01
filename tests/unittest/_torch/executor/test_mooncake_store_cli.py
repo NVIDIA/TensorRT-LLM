@@ -33,6 +33,8 @@ from tensorrt_llm.commands import _telemetry
 from tensorrt_llm.commands import mooncake as mooncake_commands
 from tensorrt_llm.usage.config import UsageContext
 
+pytestmark = pytest.mark.cpu_only
+
 HANDLED_SIGNALS = [signal.SIGINT, signal.SIGTERM]
 
 

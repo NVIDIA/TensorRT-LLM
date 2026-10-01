@@ -72,6 +72,8 @@ from tensorrt_llm._torch.pyexecutor.py_executor_creator import _disable_native_k
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
+pytestmark = pytest.mark.cpu_only
+
 TOKENS_PER_BLOCK = 4
 
 
@@ -234,12 +236,40 @@ def make_worker(
         worker.shutdown()
 
 
-def make_request(request_id, tokens, cache_salt=None):
+def make_request(
+    request_id,
+    tokens,
+    cache_salt=None,
+    lora_task_id=None,
+    multimodal_hashes=None,
+    multimodal_positions=None,
+    multimodal_lengths=None,
+):
+    """A stand-in for the fields the leader reads off an `LlmRequest`.
+
+    The multimodal three travel together on a real request, so a caller that
+    names any of them gets plausible values for the others.
+    """
+    if multimodal_positions is None and (
+        multimodal_hashes is not None or multimodal_lengths is not None
+    ):
+        multimodal_positions = [0]
+    if multimodal_lengths is None and multimodal_positions is not None:
+        multimodal_lengths = [1] * len(multimodal_positions)
     return SimpleNamespace(
         request_id=request_id,
         cache_salt=cache_salt,
+        lora_task_id=lora_task_id,
+        multimodal_hashes=multimodal_hashes,
+        multimodal_positions=multimodal_positions,
+        multimodal_lengths=multimodal_lengths,
         get_tokens=lambda _beam=0, _tokens=tuple(tokens): list(_tokens),
     )
+
+
+#: One item's content hash in the form the bindings report: 8 int32 chunks.
+IMAGE_A_HASH = [1, 2, 3, 4, 5, 6, 7, 8]
+IMAGE_B_HASH = [1, 2, 3, 4, 5, 6, 7, 9]
 
 
 # ---- addressing ----
@@ -1206,3 +1236,64 @@ def test_scheduler_isolates_requests_by_cache_salt(store_config):
     scheduler.get_num_new_matched_tokens(make_request(1, tokens, cache_salt="a"), 0)
     scheduler.get_num_new_matched_tokens(make_request(2, tokens, cache_salt="b"), 0)
     assert scheduler._worker.queries[0] != scheduler._worker.queries[1]
+
+
+def test_scheduler_isolates_requests_by_lora_adapter(store_config):
+    """Same prompt, different adapter, different keys.
+
+    Sharing them would serve one adapter's KV to the other, which is a wrong
+    answer rather than a slow one.
+    """
+    scheduler = make_scheduler(store_config, hit_blocks=1)
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0)
+    scheduler.get_num_new_matched_tokens(make_request(2, tokens, lora_task_id=0), 0)
+    scheduler.get_num_new_matched_tokens(make_request(3, tokens, lora_task_id=1), 0)
+
+    queries = scheduler._worker.queries
+    assert len({tuple(query) for query in queries}) == 3
+
+
+def test_scheduler_isolates_requests_by_multimodal_content(store_config):
+    """Two images behind the same placeholder tokens are two prefixes."""
+    scheduler = make_scheduler(store_config, hit_blocks=1)
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    scheduler.get_num_new_matched_tokens(
+        make_request(1, tokens, multimodal_hashes=[IMAGE_A_HASH]), 0
+    )
+    scheduler.get_num_new_matched_tokens(
+        make_request(2, tokens, multimodal_hashes=[IMAGE_B_HASH]), 0
+    )
+    scheduler.get_num_new_matched_tokens(make_request(3, tokens), 0)
+
+    queries = scheduler._worker.queries
+    assert len({tuple(query) for query in queries}) == 3
+
+    # The same image again is the same prefix, which is the point of keying on
+    # the content rather than refusing the request.
+    scheduler.get_num_new_matched_tokens(
+        make_request(4, tokens, multimodal_hashes=[IMAGE_A_HASH]), 0
+    )
+    assert queries[3] == queries[0]
+
+
+def test_scheduler_bypasses_multimodal_requests_it_cannot_identify(store_config):
+    """Media without hashes gets neither a lookup nor a save.
+
+    The prompt's placeholder tokens say nothing about the content behind them,
+    so there is no key that names this request's pages and no one else's.
+    """
+    scheduler = make_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens, multimodal_positions=[4], multimodal_lengths=[4])
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert scheduler._worker.queries == []
+
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, [7, 8, 9])])
+    )
+    assert metadata.loads == []
+    assert metadata.saves == []
+    # Nothing was handed to a save thread, so nothing pins its pages either.
+    assert scheduler.request_finished(request, [7, 8, 9]) is False

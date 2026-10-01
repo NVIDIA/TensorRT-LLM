@@ -47,6 +47,8 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, MooncakeStoreConfig
 
+pytestmark = pytest.mark.cpu_only
+
 
 def free_port() -> int:
     with socket.socket() as probe:

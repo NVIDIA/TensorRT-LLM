@@ -35,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
     BlockHashChain,
     KeyNamespace,
+    ReuseScope,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
     MooncakeStoreMetadata,
@@ -48,6 +49,8 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.staging import (
     stage_batch_for_put,
     unstage_batch_after_get,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 TOKENS_PER_BLOCK = 4
 
@@ -159,10 +162,77 @@ def test_hash_chain_extends_incrementally():
 def test_hash_chain_separates_cache_salts():
     tokens = list(range(TOKENS_PER_BLOCK))
     unsalted = BlockHashChain(TOKENS_PER_BLOCK).extend(tokens)
-    salted = BlockHashChain(TOKENS_PER_BLOCK, cache_salt="tenant-a").extend(tokens)
-    other = BlockHashChain(TOKENS_PER_BLOCK, cache_salt="tenant-b").extend(tokens)
+    salted = BlockHashChain(TOKENS_PER_BLOCK, scope=ReuseScope(cache_salt="tenant-a")).extend(
+        tokens
+    )
+    other = BlockHashChain(TOKENS_PER_BLOCK, scope=ReuseScope(cache_salt="tenant-b")).extend(tokens)
     assert unsalted[0] != salted[0] != other[0]
     assert salted[0] != other[0]
+
+
+def test_hash_chain_separates_lora_adapters():
+    """Identical text under two adapters must not name one key.
+
+    The adapter rewrites every layer's weights, so the pages differ while the
+    token ids do not.
+    """
+    tokens = list(range(2 * TOKENS_PER_BLOCK))
+    base = list(BlockHashChain(TOKENS_PER_BLOCK).extend(tokens))
+    first = list(BlockHashChain(TOKENS_PER_BLOCK, scope=ReuseScope(lora_task_id=0)).extend(tokens))
+    second = list(BlockHashChain(TOKENS_PER_BLOCK, scope=ReuseScope(lora_task_id=1)).extend(tokens))
+
+    # Task id 0 is a real adapter, so it has to differ from no adapter at all.
+    assert base[0] != first[0]
+    assert first != second
+    assert all(a != b for a, b in zip(first, second))
+
+
+def test_hash_chain_separates_multimodal_content():
+    """Placeholder tokens are the same ids whichever media stands behind them."""
+    tokens = list(range(2 * TOKENS_PER_BLOCK))
+    text_only = list(BlockHashChain(TOKENS_PER_BLOCK).extend(tokens))
+    one_image = list(
+        BlockHashChain(TOKENS_PER_BLOCK, scope=ReuseScope(multimodal_digests=(b"image-a",))).extend(
+            tokens
+        )
+    )
+    other_image = list(
+        BlockHashChain(TOKENS_PER_BLOCK, scope=ReuseScope(multimodal_digests=(b"image-b",))).extend(
+            tokens
+        )
+    )
+    two_images = list(
+        BlockHashChain(
+            TOKENS_PER_BLOCK, scope=ReuseScope(multimodal_digests=(b"image-a", b"image-b"))
+        ).extend(tokens)
+    )
+
+    assert len({text_only[0], one_image[0], other_image[0], two_images[0]}) == 4
+    assert all(a != b for a, b in zip(one_image, other_image))
+
+    # Same media, same keys: this is what lets a repeated multimodal prompt hit.
+    assert one_image == list(
+        BlockHashChain(TOKENS_PER_BLOCK, scope=ReuseScope(multimodal_digests=(b"image-a",))).extend(
+            tokens
+        )
+    )
+
+
+def test_reuse_scope_fields_cannot_be_confused_for_one_another():
+    """A scope's seed reads its fields apart, however their bytes line up.
+
+    The parts are length-prefixed for this reason: concatenating them raw would
+    let a salt spell out an adapter id, or one media digest spell out two.
+    """
+    seeds = {
+        ReuseScope(cache_salt="a").seed(),
+        ReuseScope(multimodal_digests=(b"a",)).seed(),
+        ReuseScope(multimodal_digests=(b"ab",)).seed(),
+        ReuseScope(multimodal_digests=(b"a", b"b")).seed(),
+        ReuseScope(cache_salt="a", multimodal_digests=(b"b",)).seed(),
+        ReuseScope(cache_salt="ab").seed(),
+    }
+    assert len(seeds) == 6
 
 
 def test_hash_chain_rejects_shrinking_token_list():

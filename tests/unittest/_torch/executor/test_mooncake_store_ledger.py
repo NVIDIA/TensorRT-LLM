@@ -23,12 +23,16 @@ against: nothing about a mis-attributed byte looks like an error.
 import json
 import os
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ledger import (
     format_pool_report,
     read_segments,
     record_segment,
     segments_dir,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 GIB = 1 << 30
 
