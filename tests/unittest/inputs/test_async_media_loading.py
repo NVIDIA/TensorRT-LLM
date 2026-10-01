@@ -114,6 +114,7 @@ class TestAsyncLoadAudio:
             wav_path = _make_audio_file(f.name)
         audio_array, sample_rate = await async_load_audio(wav_path)
         assert isinstance(audio_array, np.ndarray)
+        assert audio_array.dtype == np.float32
         assert sample_rate == 16000  # matches the sr=16000 used in _make_audio_file
 
     @pytest.mark.asyncio
@@ -138,6 +139,31 @@ class TestAsyncLoadAudio:
         assert worker_thread_ids[0] != event_loop_thread_id, (
             "soundfile.read ran on the event loop thread — event loop is being blocked"
         )
+
+
+@pytest.mark.parametrize("subtype", ["PCM_16", "FLOAT"])
+def test_audio_loading_returns_float32(subtype, tmp_path):
+    samples = np.linspace(-1, 1, 32, dtype=np.float32)
+    buffer = BytesIO()
+    soundfile.write(buffer, samples, 16_000, format="WAV", subtype=subtype)
+    encoded = buffer.getvalue()
+    path = tmp_path / "input.wav"
+    path.write_bytes(encoded)
+    loader = media_io_module.AudioMediaIO()
+
+    from_bytes, bytes_rate = loader.load_bytes(encoded)
+    from_base64, base64_rate = loader.load_base64("audio/wav", base64.b64encode(encoded).decode())
+    from_file, file_rate = loader.load_file(str(path))
+    from_legacy, legacy_rate = utils_module.load_audio(str(path))
+    # The previous default float64 decode must match exactly once converted to float32.
+    previous, previous_rate = soundfile.read(BytesIO(encoded))
+
+    assert from_bytes.dtype == np.float32
+    np.testing.assert_array_equal(from_bytes, previous.astype(np.float32), strict=True)
+    np.testing.assert_array_equal(from_base64, from_bytes, strict=True)
+    np.testing.assert_array_equal(from_file, from_bytes, strict=True)
+    np.testing.assert_array_equal(from_legacy, from_bytes, strict=True)
+    assert bytes_rate == base64_rate == file_rate == legacy_rate == previous_rate == 16_000
 
 
 # ──────────────────────────────────────────────────────────────
