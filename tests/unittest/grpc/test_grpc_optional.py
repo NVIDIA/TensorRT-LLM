@@ -24,14 +24,62 @@ checks recovery guidance for an incomplete installation.
 import asyncio
 import builtins
 import importlib
+import os
+import subprocess
 import sys
 import types
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from click.testing import CliRunner
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("implementation", ["python", "upb"])
+def test_native_protobuf_requirement_in_fresh_process(implementation: str) -> None:
+    """Check the loaded implementation, even after the environment changes."""
+    helper = Path(__file__).resolve().parents[3] / "tensorrt_llm/grpc/_protobuf.py"
+    script = (
+        "import os, runpy, sys\n"
+        "from google.protobuf.internal import api_implementation\n"
+        "assert api_implementation.Type() == sys.argv[2]\n"
+        "os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'upb'\n"
+        "runpy.run_path(sys.argv[1])['_require_native_protobuf']()\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(helper), implementation],
+        env={**os.environ, "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": implementation},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    if implementation == "upb":
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        assert "requires native protobuf (upb)" in result.stderr
+        assert "before starting Python" in result.stderr
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("protocol", ["smg", "openengine"])
+def test_python_protobuf_rejected_before_model_startup(monkeypatch, protocol: str) -> None:
+    from google.protobuf.internal import api_implementation
+
+    if protocol == "smg":
+        pytest.importorskip("smg_grpc_proto")
+    server_module = importlib.import_module(f"tensorrt_llm.grpc.{protocol}.server")
+    llm_factory = MagicMock()
+    monkeypatch.setattr(server_module, "PyTorchLLM", llm_factory)
+    monkeypatch.setattr(api_implementation, "Type", lambda: "python")
+    launch = server_module.launch_smg_server if protocol == "smg" else server_module.launch_server
+    with pytest.raises(RuntimeError, match="requires native protobuf"):
+        launch("127.0.0.1", 50051, {"backend": "pytorch", "model": "test-model"})
+    llm_factory.assert_not_called()
 
 
 def test_smg_bindings_missing_gives_actionable_error(monkeypatch):

@@ -10,6 +10,17 @@ TensorRT LLM uses a [multi-stage Dockerfile](https://github.com/NVIDIA/TensorRT-
 | **`wheel`** | Intermediate build stage. Extends `devel`, copies the source tree, and compiles the TensorRT LLM wheel. Not published as a standalone image. | -- |
 | **`release`** | Runtime image. Extends `devel`, installs the pre-built wheel from the `wheel` stage, including the OpenEngine gRPC runtime. Ready to use with no further compilation. | [`release`](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release) |
 
+## Protobuf runtime for gRPC
+
+The SMG and OpenEngine gRPC servers require protobuf's native `upb` implementation.
+The `devel` and `release` images set `PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb`.
+For older or custom images, set this variable before starting Python, for example
+with `docker run -e PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb ...`.
+The installed protobuf wheel must include the native extension. A gRPC server
+using another implementation stops before model initialization; it does not fall
+back to Python protobuf. Changing the variable after protobuf has been imported
+does not change the active implementation.
+
 ## Pre-built Images on NGC
 
 The `devel` and `release` images are published to NGC and can be pulled directly:

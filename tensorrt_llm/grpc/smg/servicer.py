@@ -28,6 +28,7 @@ from typing import List, Union
 import grpc
 
 from tensorrt_llm.executor.result import Logprob, TokenLogprobs
+from tensorrt_llm.grpc._protobuf import _require_native_protobuf
 from tensorrt_llm.inputs.media_io import _load_and_convert_image
 from tensorrt_llm.logger import logger
 
@@ -59,6 +60,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             request_manager: The GrpcRequestManager instance
             model_path: Path to the model (for metadata)
         """
+        _require_native_protobuf()
         self.request_manager = request_manager
         self.model_path = model_path
         self._start_time = time.time()
@@ -421,7 +423,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             index = completion.index
             # Use cumulative token_ids and compute delta ourselves
             # because token_ids_diff doesn't clear between iterations for n>1
-            all_tokens = list(completion.token_ids) if completion.token_ids else []
+            all_tokens = completion.token_ids or []
             sent_count = sent_token_counts.get(index, 0)
             delta_tokens = all_tokens[sent_count:]
 
