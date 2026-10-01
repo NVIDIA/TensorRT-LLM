@@ -1243,7 +1243,11 @@ def test_fused_qk_norm_rope_dispatch_matches_separate_path(monkeypatch) -> None:
     for fuse in (True, False):
         monkeypatch.setattr(h3, "FUSE_QK_NORM_ROPE", fuse)
         torch.manual_seed(0)
-        config = _make_model_config(num_layers=1, num_refiner_layers=1, attention_head_dim=128)
+        # The kernel needs head_dim 128 and a rotary width that is a multiple of 32
+        # (rope_freq_dim 16 gives the checkpoint's 96), not _TINY_CONFIG's 8 and 6.
+        config = _make_model_config(
+            num_layers=1, num_refiner_layers=1, attention_head_dim=128, rope_freq_dim=16
+        )
         model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
         _initialize_weights(model, scale=0.1)
         model.requires_grad_(False)

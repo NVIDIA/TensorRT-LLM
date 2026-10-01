@@ -114,80 +114,106 @@ def _reference_qk_norm_rope(
     return _reference_rotary_emb(normalized, cos, sin)
 
 
+def _packed_inputs(batch, seq, heads, rotary_dim, table_dtype, seed=7):
+    torch.manual_seed(seed)
+    qkv = torch.randn((batch, seq, 3 * heads * 128), device="cuda", dtype=torch.bfloat16)
+    weight_q = (1 + 0.1 * torch.randn(128, device="cuda")).to(torch.bfloat16)
+    weight_k = (1 + 0.1 * torch.randn(128, device="cuda")).to(torch.bfloat16)
+    angles = torch.randn((seq, rotary_dim * 2), device="cuda", dtype=table_dtype)
+    cos, sin = angles.cos()[:, ::2], angles.sin()[:, ::2]
+    return qkv, weight_q, weight_k, cos, sin
+
+
+def _reference_packed(qkv, weight_q, weight_k, cos, sin, heads, eps):
+    hd = heads * 128
+    q = qkv[..., :hd].view(*qkv.shape[:2], heads, 128)
+    k = qkv[..., hd : 2 * hd].view(*qkv.shape[:2], heads, 128)
+    return (
+        _reference_qk_norm_rope(q, weight_q, cos, sin, eps).flatten(2),
+        _reference_qk_norm_rope(k, weight_k, cos, sin, eps).flatten(2),
+    )
+
+
 @requires_cuda
 @pytest.mark.parametrize(
-    "shape,rotary_dim", [((1, 257, 4, 128), 96), ((2, 13, 3, 128), 128), ((1, 0, 2, 128), 96)]
+    "batch,seq,heads,rotary_dim", [(1, 257, 8, 96), (2, 13, 16, 128), (1, 5, 8, 32), (1, 0, 8, 96)]
 )
-@pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("table_dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("torch_reduction_order", [True, False])
-def test_fused_qk_norm_rope_matches_eager_bf16(
-    shape, rotary_dim, strided, table_dtype, torch_reduction_order
-):
-    torch.manual_seed(7)
-    storage_shape = (*shape[:-1], shape[-1] * (2 if strided else 1))
-    hidden_states = torch.randn(storage_shape, device="cuda", dtype=torch.bfloat16)
-    if strided:
-        hidden_states = hidden_states[..., ::2]
-    weight = (1 + 0.1 * torch.randn(shape[-1], device="cuda")).to(torch.bfloat16)
-    angles = torch.randn((shape[1], rotary_dim * 2), device="cuda", dtype=table_dtype)
-    cos, sin = angles.cos()[:, ::2], angles.sin()[:, ::2]
-    expected = _reference_qk_norm_rope(hidden_states, weight, cos, sin, 1e-5)
-    actual = apply_minimax_h3_qk_norm_rope_bf16(
-        hidden_states, weight, cos, sin, 1e-5, torch_reduction_order=torch_reduction_order
+def test_fused_qk_norm_rope_matches_eager_bf16_exactly(batch, seq, heads, rotary_dim, table_dtype):
+    qkv, weight_q, weight_k, cos, sin = _packed_inputs(batch, seq, heads, rotary_dim, table_dtype)
+    expected_q, expected_k = _reference_packed(qkv, weight_q, weight_k, cos, sin, heads, 1e-5)
+    q, k = apply_minimax_h3_qk_norm_rope_bf16(qkv, weight_q, weight_k, cos, sin, 1e-5, heads, 128)
+    assert q.is_contiguous() and k.is_contiguous()
+    assert torch.equal(q, expected_q)
+    assert torch.equal(k, expected_k)
+    # V columns are never touched.
+    assert torch.equal(qkv[..., 2 * heads * 128 :], qkv[..., 2 * heads * 128 :].clone())
+
+
+@requires_cuda
+def test_fused_qk_norm_rope_single_rounding_is_close_not_exact():
+    qkv, weight_q, weight_k, cos, sin = _packed_inputs(1, 1029, 8, 96, torch.float32)
+    expected_q, expected_k = _reference_packed(qkv, weight_q, weight_k, cos, sin, 8, 1e-5)
+    q, k = apply_minimax_h3_qk_norm_rope_bf16(
+        qkv, weight_q, weight_k, cos, sin, 1e-5, 8, 128, exact_rounding=False
     )
-    assert actual.is_contiguous()
-    assert actual.shape == expected.shape
-    if torch_reduction_order:
-        # Torch's CUDA reduction order is reproduced, so the result is bit-exact.
-        assert torch.equal(actual, expected)
-    else:
-        # A different FP32 summation order may move the variance by one ulp,
-        # which flips a BF16 rounding for a small fraction of elements.
-        assert torch.allclose(actual.float(), expected.float(), rtol=1e-2, atol=1e-2)
+    # FP32 math with one final rounding: the eager path rounds four times, so the two differ in
+    # many elements by rounding noise, but the error stays at the BF16 scale of the activations.
+    for actual, expected in ((q, expected_q), (k, expected_k)):
+        diff = (actual.float() - expected.float()).abs()
+        assert diff.max() <= expected.float().abs().max() * 2**-6
+        assert diff.norm() / expected.float().norm() < 1e-2
+    assert not torch.equal(q, expected_q)
 
 
 @requires_cuda
 def test_fused_qk_norm_rope_compile_matches_eager_bf16_exactly():
-    hidden_states = torch.randn((1, 17, 2, 128), device="cuda", dtype=torch.bfloat16)
-    weight = torch.rand(128, device="cuda").to(torch.bfloat16) + 0.5
-    angles = torch.randn((17, 96), device="cuda")
-    cos, sin = angles.cos(), angles.sin()
-    expected = _reference_qk_norm_rope(hidden_states, weight, cos, sin, 1e-5)
+    qkv, weight_q, weight_k, cos, sin = _packed_inputs(1, 17, 8, 96, torch.float32)
+    expected_q, expected_k = _reference_packed(qkv, weight_q, weight_k, cos, sin, 8, 1e-5)
     compiled = torch.compile(apply_minimax_h3_qk_norm_rope_bf16, fullgraph=True)
-    assert torch.equal(compiled(hidden_states, weight, cos, sin, 1e-5), expected)
+    q, k = compiled(qkv, weight_q, weight_k, cos, sin, 1e-5, 8, 128)
+    assert torch.equal(q, expected_q) and torch.equal(k, expected_k)
 
 
 @requires_cuda
 @pytest.mark.parametrize(
     "invalid",
-    ["rank", "dtype", "weight_shape", "weight_dtype", "shape", "odd", "wide", "head_dim", "grad"],
+    [
+        "rank",
+        "dtype",
+        "weight_shape",
+        "weight_dtype",
+        "shape",
+        "rot_multiple",
+        "wide",
+        "head_dim",
+        "columns",
+        "grad",
+    ],
 )
 def test_fused_qk_norm_rope_rejects_invalid_inputs(invalid):
-    hidden_states = torch.randn((1, 7, 2, 128), device="cuda", dtype=torch.bfloat16)
-    weight = torch.ones(128, device="cuda", dtype=torch.bfloat16)
-    cos = torch.ones((7, 96), device="cuda")
-    sin = torch.zeros_like(cos)
+    qkv, weight_q, weight_k, cos, sin = _packed_inputs(1, 7, 8, 96, torch.float32)
+    heads, head_dim = 8, 128
     if invalid == "rank":
-        hidden_states = hidden_states[0]
+        qkv = qkv[0]
     elif invalid == "dtype":
-        hidden_states = hidden_states.float()
+        qkv = qkv.float()
     elif invalid == "weight_shape":
-        weight = weight[:64]
+        weight_q = weight_q[:64]
     elif invalid == "weight_dtype":
-        weight = weight.float()
+        weight_k = weight_k.float()
     elif invalid == "shape":
         sin = sin[:1]
-    elif invalid == "odd":
-        cos, sin = cos[:, :95], sin[:, :95]
+    elif invalid == "rot_multiple":
+        cos, sin = cos[:, :80], sin[:, :80]
     elif invalid == "wide":
-        cos = torch.ones((7, 130), device="cuda")
+        cos = torch.ones((7, 160), device="cuda")
         sin = torch.zeros_like(cos)
     elif invalid == "head_dim":
-        hidden_states = torch.randn((1, 7, 2, 64), device="cuda", dtype=torch.bfloat16)
-        weight = torch.ones(64, device="cuda", dtype=torch.bfloat16)
-        cos, sin = cos[:, :48], sin[:, :48]
+        head_dim = 64
+    elif invalid == "columns":
+        qkv = qkv[..., : heads * 128]
     elif invalid == "grad":
-        hidden_states.requires_grad_(True)
+        qkv.requires_grad_(True)
     with pytest.raises(ValueError):
-        apply_minimax_h3_qk_norm_rope_bf16(hidden_states, weight, cos, sin, 1e-5)
+        apply_minimax_h3_qk_norm_rope_bf16(qkv, weight_q, weight_k, cos, sin, 1e-5, heads, head_dim)

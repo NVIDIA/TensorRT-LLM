@@ -60,6 +60,9 @@ class MiniMaxH3TransformerOutput:
 # Dispatch switch for the fused per-head QK-norm + RoPE kernel; benchmarks and
 # tests flip it to compare against the separate norm and RoPE path.
 FUSE_QK_NORM_ROPE = True
+# Rounding contract of the fused kernel: True reproduces the eager module bit for
+# bit; False computes in FP32 with one final rounding (not eager-identical).
+FUSE_QK_NORM_ROPE_EXACT = True
 
 
 @dataclass
@@ -173,17 +176,19 @@ class MiniMaxH3Attention(Attention):
 
     def _can_fuse_qk_norm_rope(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
+        hidden_states: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
     ) -> bool:
         """Return whether the fused per-head RMSNorm + RoPE kernel applies.
 
-        The kernel reproduces the eager ``RMSNormTPAware`` numerics only for
-        CUDA BF16 inputs, an un-sharded plain RMSNorm with a BF16 weight, and
-        head dimension 128. Everything else keeps the separate eager path.
+        The kernel reads Q and K from the packed QKV projection, so it needs the
+        fused-QKV layout with equal Q and K head counts, CUDA BF16 activations, an
+        un-sharded plain RMSNorm with BF16 weights, head dimension 128 and a rotary
+        width that is a multiple of 32. Everything else keeps the separate eager path.
         """
-        if not FUSE_QK_NORM_ROPE or not self.qk_norm:
+        if not FUSE_QK_NORM_ROPE or not self.qk_norm or self.qkv_mode != QKVMode.FUSE_QKV:
+            return False
+        if self.local_num_attention_heads != self.local_num_key_value_heads or self.head_dim != 128:
             return False
         cos, sin = rotary_emb
         for norm in (self.norm_q, self.norm_k):
@@ -192,26 +197,27 @@ class MiniMaxH3Attention(Attention):
                 or getattr(norm, "use_gemma", False)
                 or norm.weight.dtype != torch.bfloat16
                 or norm.weight.shape != (self.head_dim,)
+                or norm.variance_epsilon != self.norm_q.variance_epsilon
             ):
                 return False
-        for tensor in (query, key):
-            if (
-                not tensor.is_cuda
-                or tensor.dtype != torch.bfloat16
-                or tensor.ndim != 4
-                or tensor.shape[-1] != 128
-                or cos.shape != (tensor.shape[1], cos.shape[-1])
-            ):
-                return False
-        if sin.shape != cos.shape or cos.device != query.device or sin.device != query.device:
-            return False
-        if cos.dtype not in (torch.float32, torch.bfloat16) or sin.dtype not in (
-            torch.float32,
-            torch.bfloat16,
+        if (
+            not hidden_states.is_cuda
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.ndim != 3
+            or cos.ndim != 2
+            or cos.shape[0] != hidden_states.shape[1]
+            or cos.shape[1] % 32
+            or cos.shape[1] > self.head_dim
+            or sin.shape != cos.shape
+            or cos.device != hidden_states.device
+            or sin.device != hidden_states.device
+            or cos.dtype not in (torch.float32, torch.bfloat16)
+            or sin.dtype not in (torch.float32, torch.bfloat16)
         ):
             return False
         if torch.is_grad_enabled() and any(
-            t.requires_grad for t in (query, key, cos, sin, self.norm_q.weight, self.norm_k.weight)
+            t.requires_grad
+            for t in (hidden_states, cos, sin, self.norm_q.weight, self.norm_k.weight)
         ):
             return False
         return True
@@ -224,27 +230,37 @@ class MiniMaxH3Attention(Attention):
         timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, sequence_length = hidden_states.shape[:2]
-        query, key, value = self.get_qkv(hidden_states)
-        query = query.view(
-            batch_size, sequence_length, self.local_num_attention_heads, self.head_dim
-        )
-        key = key.view(batch_size, sequence_length, self.local_num_key_value_heads, self.head_dim)
-        if rotary_emb is not None and self._can_fuse_qk_norm_rope(query, key, rotary_emb):
+        if rotary_emb is not None and self._can_fuse_qk_norm_rope(hidden_states, rotary_emb):
+            # One launch normalizes and rotates Q and K straight from the packed
+            # projection output; V stays a view of the same buffer.
+            qkv = self.qkv_proj(hidden_states)
+            value = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)[2]
             cos, sin = rotary_emb
-            query = apply_minimax_h3_qk_norm_rope_bf16(
-                query, self.norm_q.weight, cos, sin, self.norm_q.variance_epsilon
-            )
-            key = apply_minimax_h3_qk_norm_rope_bf16(
-                key, self.norm_k.weight, cos, sin, self.norm_k.variance_epsilon
+            query, key = apply_minimax_h3_qk_norm_rope_bf16(
+                qkv,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cos,
+                sin,
+                self.norm_q.variance_epsilon,
+                self.local_num_attention_heads,
+                self.head_dim,
+                exact_rounding=FUSE_QK_NORM_ROPE_EXACT,
             )
         else:
+            query, key, value = self.get_qkv(hidden_states)
+            query = query.view(
+                batch_size, sequence_length, self.local_num_attention_heads, self.head_dim
+            )
+            key = key.view(
+                batch_size, sequence_length, self.local_num_key_value_heads, self.head_dim
+            )
             query, key = self.apply_qk_norm(query, key)
             if rotary_emb is not None:
                 query = apply_minimax_h3_rotary_emb(query, *rotary_emb)
                 key = apply_minimax_h3_rotary_emb(key, *rotary_emb)
-
-        query = query.flatten(2)
-        key = key.flatten(2)
+            query = query.flatten(2)
+            key = key.flatten(2)
         hidden_states = self._attn_impl(
             query,
             key,
