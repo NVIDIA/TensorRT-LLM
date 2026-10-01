@@ -39,7 +39,7 @@ from tensorrt_llm.inputs.registry import (
     BaseMultimodalDummyInputsBuilder,
     MultimodalEncoderItemMetadata,
 )
-from tensorrt_llm.llmapi.llm_args import MultimodalEncoderSchedulingPolicy
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderSchedulingPolicy
 
 # The item-scheduling surface is pure logic: no kernels, no device transfers.
 pytestmark = pytest.mark.cpu_only
@@ -131,13 +131,22 @@ def test_side_stream_compatibility_is_checked_only_for_item_scheduled_models() -
         validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=True)
 
 
-def test_pipeline_parallel_compatibility_is_checked_only_for_item_scheduled_models() -> None:
+@pytest.mark.parametrize(
+    ("mm_config_kwargs", "falls_back"),
+    [
+        ({}, True),
+        ({"encoder_scheduling_policy": "DEFAULT"}, True),
+        ({"encoder_scheduling_policy": "EAGER"}, False),
+    ],
+    ids=["unset", "explicit-default", "explicit-eager"],
+)
+def test_pipeline_parallel_compatibility_is_checked_only_for_item_scheduled_models(
+    mm_config_kwargs: dict, falls_back: bool
+) -> None:
     args = SimpleNamespace(
-        multimodal_config=SimpleNamespace(
-            encoder_scheduling_policy=MultimodalEncoderSchedulingPolicy.DEFAULT,
-            encoder_side_stream_max_ahead=0,
-        ),
+        multimodal_config=MultimodalConfig(**mm_config_kwargs),
         pipeline_parallel_size=2,
+        disable_mm_encoder=False,
         enable_attention_dp=False,
         cache_transceiver_config=None,
     )
@@ -146,6 +155,24 @@ def test_pipeline_parallel_compatibility_is_checked_only_for_item_scheduled_mode
 
     with pytest.raises(ValueError, match="pipeline parallelism"):
         validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=True)
+
+    class _Model(MultimodalModelMixin):
+        supports_mm_encoder_item_scheduling = True
+
+    create_kwargs = dict(
+        llm_args=args, model=_Model(), input_processor=None, encoder_max_num_tokens=None
+    )
+    if falls_back:
+        # DEFAULT runs inline encode even when set (model defaults mark every field
+        # set); only EAGER fails startup.
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.engine.multimodal.logger.warning_once"
+        ) as warning_once:
+            assert MultimodalItemScheduler.maybe_create(**create_kwargs) is None
+        warning_once.assert_called_once()
+    else:
+        with pytest.raises(ValueError, match="pipeline parallelism"):
+            MultimodalItemScheduler.maybe_create(**create_kwargs)
 
 
 def test_item_encoder_classifies_request_state_contract_errors() -> None:
