@@ -89,6 +89,8 @@ def test_retirement_rejects_unqualified_executor_world(
 
     mapping = Mapping(world_size=2, rank=1, tp_size=2)
     assert transceiver._retirement_executor_comm(mapping) is retirement_mpi_world
+    warning = Mock()
+    monkeypatch.setattr(transceiver.logger, "warning", warning)
     if invalid_world == "single_device":
         monkeypatch.setattr(transceiver, "ENABLE_MULTI_DEVICE", False)
     elif invalid_world == "disabled":
@@ -109,6 +111,30 @@ def test_retirement_rejects_unqualified_executor_world(
         retirement_mpi_world.Get_rank.return_value = 0
     with pytest.raises(ValueError, match="MPI_THREAD_MULTIPLE.*rank/size matching Mapping"):
         transceiver._retirement_executor_comm(mapping)
+    warning.assert_not_called()
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_retirement_warns_executor_root_about_job_wide_abort(
+    monkeypatch: pytest.MonkeyPatch, retirement_mpi_world: Mock, rank: int
+) -> None:
+    """Qualification identifies participating ranks, not a separately isolated MPI job."""
+    from tensorrt_llm._torch.disaggregation import transceiver
+
+    warning = Mock()
+    monkeypatch.setattr(transceiver.logger, "warning", warning)
+    retirement_mpi_world.Get_rank.return_value = rank
+    communicator = transceiver._retirement_executor_comm(
+        Mapping(world_size=2, rank=rank, tp_size=2)
+    )
+    assert communicator is retirement_mpi_world
+    if rank == 0:
+        warning.assert_called_once()
+        message = warning.call_args.args[0]
+        assert "MPI job" in message
+        assert "independent" in message
+    else:
+        warning.assert_not_called()
 
 
 def test_fatal_callback_uses_captured_world_on_background_thread(
@@ -266,6 +292,67 @@ def test_peer_loss_fails_closed_only_for_unsettled_exposure(exposure: str) -> No
     unaffected.stop()
 
 
+def test_failed_sender_write_retains_roots_until_fatal_deadline() -> None:
+    """A persistent backend error closes sender admission, not physical ownership."""
+    now = [10.0]
+    contain = Mock()
+    watchdog = RetirementWatchdog(contain, clock=lambda: now[0])
+    owner = watchdog.create_owner(12, "send", 1.0)
+    task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=12))
+    task.bind_logical_outcomes(transfer_mod._LogicalOutcomes(owner))
+    assert task.begin_physical_operation(7)
+    request = object()
+    status = Mock(wait=Mock(return_value=False), is_completed=Mock(return_value=False))
+    status.last_status_str.return_value = "ERROR"
+    sender = object.__new__(transfer_mod.Sender)
+    sender._shutdown = True  # No worker threads or transport were created by this fixture.
+    sender._sessions_lock = threading.Lock()
+    sender._enforce_physical_ownership = True
+    sender._ownership_poisoned = None
+    sender._ownership_poison_lock = watchdog.lock
+    sender._agent = Mock(submit_transfer_requests=Mock(return_value=status))
+
+    assert sender._submit_transfer(task, 7, request) == (False, "ERROR")
+    operation = task._physical_operations[7]
+    assert operation.state is transfer_mod._PhysicalOperationState.IN_DOUBT
+    assert operation.request is request
+    assert operation.status is status
+    assert not task.resources_drained
+
+    # Sender poisoning rejects a different request even before grace expires.
+    later = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=13))
+    assert later.begin_physical_operation(8)
+    with pytest.raises(transfer_mod._TransferNotSubmittedError, match="before backend submission"):
+        sender._submit_transfer(later, 8, object())
+    sender._agent.submit_transfer_requests.assert_called_once_with(request)
+    assert later._physical_operations[8].state is transfer_mod._PhysicalOperationState.NOT_SUBMITTED
+    assert later.resources_drained
+
+    now[0] = 10.5
+    assert not task.poll_in_doubt_physical_operation(7)
+    watchdog.progress()
+    contain.assert_not_called()
+    assert not owner.can_retire()
+
+    # Repeated ERROR observations cannot settle the write or reset its deadline.
+    now[0] = 11.0
+    assert not task.poll_in_doubt_physical_operation(7)
+    watchdog.progress()
+    watchdog.progress()
+    contain.assert_called_once_with(watchdog.fatal)
+    assert watchdog.fatal is not None
+    assert watchdog.fatal.request_id == 12
+    assert watchdog.fatal.direction == "send"
+    assert watchdog.fatal.reason == "backend quiescence unproven"
+    assert watchdog.fatal.started_at == 10.0
+    assert watchdog.fatal.deadline == 11.0
+    assert operation.state is transfer_mod._PhysicalOperationState.IN_DOUBT
+    assert operation.request is request
+    assert operation.status is status
+    assert not task.resources_drained
+    assert not owner.close()
+
+
 @pytest.mark.parametrize("kill_raises", [False, True])
 def test_failed_termination_cannot_reopen_admission_or_retire_roots(
     monkeypatch: pytest.MonkeyPatch, kill_raises: bool
@@ -400,7 +487,7 @@ def _shutdown_transceiver() -> tuple[KvCacheTransceiverV2, transfer_mod.RxSessio
     receiver._bounce = Mock()
     receiver._dealers = {}
     receiver._messenger = Mock()
-    receiver.send_cancel_to_senders = Mock()
+    receiver.send_cancel_to_senders = Mock(return_value=None)
     aux = Mock()
     aux.alloc_slot.return_value = SimpleNamespace(id=3)
     session = transfer_mod.RxSession(
@@ -533,8 +620,10 @@ def test_existing_proxy_closes_endpoint_after_retirement_worker_death() -> None:
 
 _MPI_RETIREMENT_SCRIPT = """
 import os
+import sys
 import threading
 from mpi4py import MPI
+from tensorrt_llm import _utils
 from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
 from tensorrt_llm._torch.disaggregation.transceiver import (
     _fail_unproven_kv_transfer, _retirement_executor_comm
@@ -542,41 +631,68 @@ from tensorrt_llm._torch.disaggregation.transceiver import (
 from tensorrt_llm.executor.worker_process_monitor import capture_worker_process_identity
 from tensorrt_llm.mapping import Mapping
 
-comm = MPI.COMM_WORLD
+world = MPI.COMM_WORLD
+split_executors = sys.argv[1:] == ["split-executors"]
+comm = world.Split(world.Get_rank() // 2) if split_executors else world
+_utils.thread_local_comm.value = comm
 retirement_comm = _retirement_executor_comm(
     Mapping(world_size=comm.Get_size(), rank=comm.Get_rank(), tp_size=comm.Get_size())
 )
-comm.Barrier()
-identity = capture_worker_process_identity(comm.Get_rank())
+assert retirement_comm == comm
+world.Barrier()
+identity = capture_worker_process_identity(world.Get_rank())
 print(f"RETIREMENT_RANK_READY:{identity.rank}:{identity.pid}:{identity.start_time}", flush=True)
-comm.Barrier()
-if comm.Get_rank() == 0:
-    def fail(event):
-        assert event.expired_at >= event.deadline
-        print("UNPROVEN_FATAL_OBSERVED", flush=True)
-        _fail_unproven_kv_transfer(event, retirement_comm)
-    watchdog = RetirementWatchdog(fail)
-    owner = watchdog.create_owner(12, "receive", 0.1)
-    assert owner.expose(object())
-    owner.request_drain("test never-settles transfer")
+def fail(event):
+    assert event.expired_at >= event.deadline
+    print("UNPROVEN_FATAL_OBSERVED", flush=True)
+    _fail_unproven_kv_transfer(event, retirement_comm)
+watchdog = RetirementWatchdog(fail)
+if split_executors and world.Get_rank() >= 2:
+    # This executor has no operation or deadline capable of causing its own abort.
+    assert watchdog.fatal is None
     watchdog.start()
-    threading.Event().wait()  # Model/backend progress is intentionally unavailable.
-else:
-    comm.Barrier()  # The peer cannot observe a fatal event through normal collectives.
-print("RETIREMENT_RANK_SURVIVED", flush=True)
+    print(f"RETIREMENT_OTHER_EXECUTOR_READY:{world.Get_rank()}", flush=True)
+world.Barrier()
+try:
+    if world.Get_rank() == 0:
+        owner = watchdog.create_owner(12, "receive", 0.1)
+        assert owner.expose(object())
+        owner.request_drain("test never-settles transfer")
+        watchdog.start()
+        threading.Event().wait()  # Model/backend progress is intentionally unavailable.
+    else:
+        comm.Barrier()  # No normal collective can notify the affected executor's peer.
+        threading.Event().wait()  # The other executor cannot complete ordinary cleanup.
+    print("RETIREMENT_RANK_SURVIVED", flush=True)
+finally:
+    print(f"RETIREMENT_ORDINARY_CLEANUP:{world.Get_rank()}", flush=True)
 """
 
 
-def _run_mpi_world(script: str) -> subprocess.CompletedProcess[str]:
-    """Run an isolated two-rank job, killing its process group on test timeout.
+def _run_mpi_world(
+    script: str, *, world_size: int = 2, script_args: tuple[str, ...] = ()
+) -> subprocess.CompletedProcess[str]:
+    """Run an owned MPI job, killing its process group on test timeout.
 
     Args:
         script: Python code executed by each rank in the owned test world.
+        world_size: Number of child ranks in this launcher job.
+        script_args: Optional arguments passed to each rank's script.
 
     Returns:
         Completed launcher status and captured output.
     """
-    command = ["mpirun", "--allow-run-as-root", "-n", "2", sys.executable, "-c", script]
+    command = [
+        "mpirun",
+        "--allow-run-as-root",
+        "--oversubscribe",
+        "-n",
+        str(world_size),
+        sys.executable,
+        "-c",
+        script,
+        *script_args,
+    ]
     with subprocess.Popen(
         command,
         env={**_standalone_process_env(), "TLLM_DISABLE_MPI": "0"},
@@ -592,7 +708,7 @@ def _run_mpi_world(script: str) -> subprocess.CompletedProcess[str]:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            process.communicate()
+            process.communicate(timeout=30)
             raise
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
@@ -635,3 +751,36 @@ def test_real_mpi_retirement_kills_blocked_world_before_fresh_world_starts() -> 
     )
     assert replacement.returncode == 0, replacement.stderr[-4000:]
     assert replacement.stdout.count("FRESH_WORLD_READY") == 2
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("mpirun") is None,
+    reason="requires Linux process identities and mpirun",
+)
+@pytest.mark.timeout(900)
+def test_openmpi_subcommunicator_abort_also_terminates_other_executor_in_job() -> None:
+    """Qualify Open MPI's shared-job blast radius, not a GPU or RDMA fence."""
+    from mpi4py import MPI
+
+    if MPI.get_vendor()[0] != "Open MPI":
+        pytest.skip("job-wide subcommunicator abort behavior is qualified only for Open MPI")
+    failed = _run_mpi_world(_MPI_RETIREMENT_SCRIPT, world_size=4, script_args=("split-executors",))
+    output = failed.stdout + failed.stderr
+    assert failed.returncode != 0, output[-4000:]
+    assert output.count("UNPROVEN_FATAL_OBSERVED") == 1, output[-4000:]
+    assert "RETIREMENT_OTHER_EXECUTOR_READY:2" in output, output[-4000:]
+    assert "RETIREMENT_OTHER_EXECUTOR_READY:3" in output, output[-4000:]
+    assert "RETIREMENT_RANK_SURVIVED" not in output, output[-4000:]
+    assert "RETIREMENT_ORDINARY_CLEANUP" not in output, output[-4000:]
+    identities = [
+        line.split(":")[1:]
+        for line in output.splitlines()
+        if line.startswith("RETIREMENT_RANK_READY:")
+    ]
+    assert {int(rank) for rank, _pid, _start in identities} == {0, 1, 2, 3}, output[-4000:]
+    assert len(identities) == 4, output[-4000:]
+    for _rank, pid, start_time in identities:
+        state = _read_process_state(int(pid))
+        assert state is None or state[0] == "Z" or state[1] != int(start_time), (
+            f"Shared-job worker {pid} remains live after launcher exit: {state}"
+        )

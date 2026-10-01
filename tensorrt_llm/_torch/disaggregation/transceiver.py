@@ -46,7 +46,11 @@ from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.publish import PeerPublish
 from tensorrt_llm._torch.disaggregation.native.retirement import QuiescenceFatalEvent
-from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
+from tensorrt_llm._torch.disaggregation.native.transfer import (
+    RxSession,
+    TransferWorker,
+    TransferWorkerConfig,
+)
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
@@ -85,7 +89,8 @@ def _log_unproven_kv_transfer(event: QuiescenceFatalEvent) -> None:
     """
     try:
         logger.critical(
-            "UNPROVEN_FATAL: hard-stopping the executor world; retaining KV "
+            "UNPROVEN_FATAL: hard-stopping through MPI/launcher; termination may include "
+            "other executors in the same job. Retaining KV "
             f"and transport roots until process teardown. request_id={event.request_id}, "
             f"direction={event.direction}, reason={event.reason}, "
             f"deadline={event.deadline}, expired_at={event.expired_at}"
@@ -102,6 +107,9 @@ def _fail_unproven_kv_transfer(
     Called by the independent retirement watchdog after fatal expiry is sticky
     and transfer admission is closed. The existing MPI/launcher crash path
     makes the endpoint unhealthy; request failure is not memory-release proof.
+    The communicator identifies the executor, not an isolated failure domain:
+    Open MPI aborts the entire job, including other executors in split worlds.
+    Launcher-driven termination can likewise extend beyond this executor.
     A supervisor may replace the world only after qualified platform teardown,
     not merely after this function requests termination.
 
@@ -124,6 +132,9 @@ def _fail_unproven_kv_transfer(
 
 def _retirement_executor_comm(mapping: Mapping) -> "MPI.Comm":
     """Capture the MPI executor world that the deadline watchdog may abort.
+
+    Rank/size validation does not isolate termination. Shared MPI launches can
+    lose every executor when one executor reaches fatal expiry.
 
     Args:
         mapping: The executor's expected worker rank and world size.
@@ -153,6 +164,13 @@ def _retirement_executor_comm(mapping: Mapping) -> "MPI.Comm":
         or communicator.Get_rank() != mapping.rank
     ):
         raise ValueError(message)
+    if mapping.rank == 0:
+        logger.warning(
+            "KV retirement fail-stop may terminate the entire MPI job, including other "
+            "CTX/GEN executors sharing the launch. A split communicator does not isolate "
+            "MPI_Abort. Use separate launcher jobs when independent availability is required, "
+            "and qualify their termination boundaries."
+        )
     return communicator
 
 
@@ -302,7 +320,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"rank={rank}/{mapping.world_size}, backend=NIXL, runtime=PYTHON, "
                 "request_schedule_required=GENERATION_FIRST, attention_dp=True, pp=1, cp=1, "
                 "retry=False, async=True, layerwise=False, bounce_mb=0, "
-                "unproven_retirement=whole_executor_fail_stop, "
+                "unproven_retirement=fail_stop, termination_scope=mpi_job_or_launcher, "
                 f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}"
             )
         logger.info(
@@ -824,6 +842,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 completed.append(rid)
             elif session.has_failed():
                 if self._ownership_blocks_retirement(session):
+                    if isinstance(session, RxSession):
+                        session.notify_cancel()
                     continue
                 failed.append(rid)
         return completed, failed
@@ -1040,7 +1060,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
             # A remote cancellation can win before the local TxSession is
             # created. Sender.setup_session() records that terminal state and
-            # reports safe pre-submission failures to every known receiver;
+            # acknowledges the fenced session to every known receiver;
             # leave retirement to the normal status path without attempting
             # to publish KV or auxiliary memory afterward.
             if session.has_failed():

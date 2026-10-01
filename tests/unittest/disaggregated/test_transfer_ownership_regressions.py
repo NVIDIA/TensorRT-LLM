@@ -388,7 +388,7 @@ def test_pre_cancelled_rx_session_never_publishes_destination(
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
     receiver.dispatch_task = Mock()
-    receiver.send_cancel_to_senders = Mock()
+    receiver.send_cancel_to_senders = Mock(return_value=None)
 
     monkeypatch.setattr(
         transfer_mod.tensorrt_llm.bindings,
@@ -416,7 +416,7 @@ def test_remote_cancel_resolves_strong_owned_session() -> None:
     receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
-    receiver.send_cancel_to_senders = Mock()
+    receiver.send_cancel_to_senders = Mock(return_value=None)
     session = _make_rx_session(receiver, rid)
 
     assert receiver._sessions[rid] is session
@@ -1341,12 +1341,14 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender = object.__new__(transfer_mod.Sender)
     sender._enforce_physical_ownership = True
     sender._sessions_lock, sender._sessions = threading.Lock(), {}
+    sender._pre_cancelled_rids = {}
     sender._shutdown = sender._shutdown_requested = False
     sender._ownership_poisoned, sender._ownership_poison_lock = None, threading.Lock()
     sender._loaded_remote_agents_lock, sender._loaded_remote_agents = threading.Lock(), set()
     sender._instance_rank = 0
     sender._num_threads = 1
     sender._pending_settlements = [{}]
+    sender._pending_session_quiescence = {}
     sender._send_task_queues = [queue.Queue()]
     return sender
 
@@ -1377,30 +1379,27 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
     session = SimpleNamespace(
         disagg_request_id=rid,
         _need_aux=True,
+        lock=threading.Lock(),
+        has_failed=Mock(return_value=True),
+        resources_drained=Mock(return_value=True),
         cancel_local=Mock(return_value=True),
         _claim_unsubmitted_aux_failure=Mock(return_value=True),
     )
+    dealer = Mock()
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
 
     sender.setup_session(session)
 
     assert sender._sessions == {rid: session}
-    assert sender._pre_cancelled_rids == {}
-    session.cancel_local.assert_called_once_with(by_peer=True)
-    session._claim_unsubmitted_aux_failure.assert_called_once_with(info)
-    make_result.assert_called_once_with(5, rid, 0, True, AgentResult.FAILED)
-    assert sender._send_task_queues[0].get_nowait() == (
-        "receiver",
-        [MessageType.KV_AGENT_RESULT, b"failed"],
-    )
-    assert sender._send_task_queues[0].get_nowait() == (
-        "receiver",
-        [
-            MessageType.AUX_AGENT_RESULT,
-            b"5",
-            b"97",
-            AgentResult.FAILED.value.encode("ascii"),
-        ],
-    )
+    assert sender._pre_cancelled_rids == {rid: True}
+    session.cancel_local.assert_called_once_with(by_peer=True, report_unsubmitted_aux=False)
+    session._claim_unsubmitted_aux_failure.assert_not_called()
+    make_result.assert_not_called()
+    marker = sender._send_task_queues[0].get_nowait()
+    assert marker == transfer_mod._SessionQuiescence(rid, 2, "receiver")
+    assert sender._send_session_quiesced(marker)
+    dealer.send.assert_called_once_with([MessageType.SESSION_QUIESCED, b"5", b"97"])
+    assert not sender._pending_session_quiescence
     assert sender._send_task_queues[0].empty()
 
 
