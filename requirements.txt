@@ -36,7 +36,8 @@ torchvision
 nvidia-nccl-cu13==2.30.7
 # NCCL-EP uses nccl4py's nccl.ep package. The nccl-extensions wheel is built
 # from pinned source by CMake so it links against the container's NCCL.
-nccl4py>=0.4,<=0.5
+# Communicator topology queries must use bindings compatible with NCCL 2.30.7.
+nccl4py==0.4.1
 nvidia-cuda-nvrtc
 transformers==5.5.4
 prometheus_client

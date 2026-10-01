@@ -102,12 +102,22 @@ class NcclEP(Communication):
         )
         self.max_recv_tokens = self.ep_size * self.max_tokens_per_rank
 
-        # Singleton NCCL EP context: owns the EP group, RDMA buffers, and
-        # persistent OUTPUT Tensor descriptors. Allocate it lazily on first
-        # dispatch because full-model construction runs under MetaInitMode,
-        # which redirects torch.empty to the meta device even when a CUDA
-        # device is passed explicitly.
-        self._ctx = None
+        # Query topology before the factory commits to this strategy. The group
+        # and torch receive buffers stay lazy because model construction runs
+        # under MetaInitMode, which redirects even explicit CUDA allocations.
+        from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import get_nccl_ep_context
+
+        self._ctx = get_nccl_ep_context(
+            self.mapping,
+            self.num_experts,
+            self.max_tokens_per_rank,
+            self.hidden_size,
+            self.max_top_k,
+            self.uses_internal_fp8_dispatch,
+            external_fp8=self.use_external_fp8,
+            external_nvfp4=self.use_external_nvfp4,
+            defer_initialization=True,
+        )
 
         # Persistent dispatch handle. Created on first dispatch via
         # group.create_handle; reused thereafter via handle.update so
@@ -146,26 +156,8 @@ class NcclEP(Communication):
 
     def _get_context(self):
         if self._ctx is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "NcclEP context must be initialized before CUDA graph capture. "
-                    "Run an eager warmup forward before enabling or capturing CUDA graphs."
-                )
-            from nccl.ep import Layout
-
-            from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import get_nccl_ep_context
-
-            self._ctx = get_nccl_ep_context(
-                self.mapping,
-                self.num_experts,
-                self.max_tokens_per_rank,
-                self.hidden_size,
-                self.max_top_k,
-                self.uses_internal_fp8_dispatch,
-                Layout.RANK_MAJOR,
-                external_fp8=self.use_external_fp8,
-                external_nvfp4=self.use_external_nvfp4,
-            )
+            raise RuntimeError("Cannot use a destroyed NCCL-EP strategy")
+        self._ctx.initialize()
         return self._ctx
 
     def _setup_handle(self, ctx, topk_nd, stream):
