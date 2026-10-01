@@ -538,14 +538,15 @@ class MultimodalItemScheduler:
 
         for output, (_, cache_key, _) in zip(outputs, output_targets, strict=True):
             encoder_cache.commit(cache_key, output)
-            for live_request in requests:
-                live_state = live_request.py_mm_encoder_state
-                if live_state is not None:
-                    live_state.mark_cache_key_ready(cache_key)
 
+        # Every scheduled key is now committed. One pass over the requests
+        # also marks the items of requests that only share a committed entry.
         for request in requests:
             state = request.py_mm_encoder_state
-            if state is not None and state.progress is MultimodalEncoderProgress.READY:
+            if state is None:
+                continue
+            state.mark_cache_keys_ready(scheduled_cache_keys)
+            if state.progress is MultimodalEncoderProgress.READY:
                 strip_mm_encoder_inputs(request.py_multimodal_data)
 
     def build_multimodal_data_for_llm(

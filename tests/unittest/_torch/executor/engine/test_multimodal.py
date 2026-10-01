@@ -263,6 +263,7 @@ def test_item_encoder_validates_all_outputs_before_commit(invalid_output: str) -
     scheduler.forward_items(requests, selected)
     assert scheduler.encoder_cache.current_bytes == 24
     assert all(is_multimodal_encoder_ready(request) for request in requests)
+    assert all("image" not in request.py_multimodal_data for request in requests)
 
 
 @pytest.mark.parametrize("window", [None, (0, 3), (2, 7), (6, 8), (3, 5)])
