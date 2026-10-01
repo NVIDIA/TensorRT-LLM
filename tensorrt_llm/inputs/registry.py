@@ -218,6 +218,12 @@ class BaseMultimodalInputProcessor(ABC):
     # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
 
+    # Upper bound on PyTorch intra-op threads for the serving frontend's
+    # input-processor workers. None keeps PyTorch's default. Set it only when
+    # measurements show the processor's small per-request CPU ops are slower
+    # with the default thread count.
+    frontend_torch_threads: ClassVar[Optional[int]] = None
+
     def get_mm_encoder_item_metadata(
         self,
         prompt_token_ids: List[int],
