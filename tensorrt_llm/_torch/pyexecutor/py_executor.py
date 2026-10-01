@@ -1426,7 +1426,8 @@ class PyExecutor:
             return
 
         blockers = []
-        for resource in self._mnnvl_checkpoint_resources(list(ExecutorMemoryType)):
+        for resource in self._mnnvl_checkpoint_resources(
+                list(ExecutorMemoryType)):
             reason = resource.checkpoint_blocked_reason()
             if reason is not None:
                 blockers.append(reason)
@@ -1434,9 +1435,9 @@ class PyExecutor:
         if blockers:
             raise ValueError(
                 "sleep_config was requested, but the engine holds a resource that "
-                "cannot be checkpointed: " + "; ".join(sorted(set(blockers))) + ". "
-                "Remove sleep_config to keep the current configuration."
-            )
+                "cannot be checkpointed: " + "; ".join(sorted(set(blockers))) +
+                ". "
+                "Remove sleep_config to keep the current configuration.")
 
     def start_worker(self):
         with self.worker_lock:
