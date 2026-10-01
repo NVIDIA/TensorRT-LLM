@@ -38,6 +38,7 @@ struct StreamingBlockStoredData
     std::vector<EventTokenId> tokenIds;
     //! One entry per blockHash. Empty block entries represent text-only blocks.
     std::vector<std::vector<MmKey>> mmKeys;
+    std::optional<LoraTaskIdType> loraId;
 };
 
 //! Semantic data for one wire-level BlockRemoved event.
@@ -81,6 +82,12 @@ public:
         Digest const& blockKey, CacheLevel oldLevel, CacheLevel newLevel, LifeCycleId lifeCycle) override;
 
 private:
+    struct StoredBlock
+    {
+        int64_t blockHash;
+        std::optional<LoraTaskIdType> loraId;
+    };
+
     void addStoredBlockUnlocked(Block const& block);
     void addRemovedBlockUnlocked(Digest const& blockKey);
     void addRemovedHashUnlocked(int64_t blockHash);
@@ -92,7 +99,7 @@ private:
     std::optional<int> mMmTokenIdOffset;
     std::optional<LifeCycleId> mTargetLifeCycle;
     int mPendingEntries = 0;
-    std::unordered_map<Digest, int64_t> mStoredBlocks;
+    std::unordered_map<Digest, StoredBlock> mStoredBlocks;
     std::vector<StreamingEventData> mPendingEvents;
     StreamingEventStats mStats;
     mutable std::mutex mMutex;

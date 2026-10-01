@@ -22,9 +22,13 @@ import time
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, cast
 
+import msgspec
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_events import StreamingKVCacheEventManager
+from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
+    KVEventBatch,
+    StreamingKVCacheEventManager,
+)
 from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 from tensorrt_llm.runtime.kv_cache_hash import (
@@ -263,7 +267,8 @@ def test_event_manager_queue_and_stored_coalescing():
     ]
 
 
-def test_native_streaming_sink_to_python_wire_structs(real_block_factory):
+@pytest.mark.parametrize("lora_id", [None, 0, 7, 2**64 - 1])
+def test_native_streaming_sink_to_python_wire_structs(real_block_factory, lora_id):
     manager = StreamingKVCacheEventManager(
         KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
         data_parallel_rank=0,
@@ -279,7 +284,7 @@ def test_native_streaming_sink_to_python_wire_structs(real_block_factory):
         manager._publisher.publish = lambda batch: published.append(batch) or True
         make_block = real_block_factory(event_sink, num_life_cycles=2, tokens_per_block=2)
 
-        first = make_block(_token_ids(1, 3), [2, 2])
+        first = make_block(_token_ids(1, 3), [2, 2], reuse_scope=ReuseScope(lora_id=lora_id))
         partial = make_block(_token_ids(5, 7), [1, 2], parent=first)
         second = make_block(_token_ids(3, 5), [2, 2], parent=first)
 
@@ -303,6 +308,17 @@ def test_native_streaming_sink_to_python_wire_structs(real_block_factory):
         assert stored[0].block_hashes == [first_hash, second_hash]
         assert stored[0].parent_block_hash is None
         assert stored[0].token_ids == [1, 2, 3, 4]
+        assert stored[0].lora_id == lora_id
+        assert stored[0].lora_name is None
+        wire_batch = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]), type=KVEventBatch)
+        assert wire_batch.events[0].lora_id == lora_id
+
+        # Descendants retain the scope after their parent's event has been drained.
+        third = make_block(_token_ids(7, 9), [2, 2], parent=second)
+        _add_streaming_stored_block(event_sink, third)
+        manager.flush_iteration_events()
+        assert published[-1].events[0].parent_block_hash == second_hash
+        assert published[-1].events[0].lora_id == lora_id
 
         _add_streaming_removed_life_cycle(event_sink, second, 1)
         _add_streaming_removed_block(event_sink, first)
@@ -311,15 +327,47 @@ def test_native_streaming_sink_to_python_wire_structs(real_block_factory):
         assert manager.non_target_life_cycles_ignored == 2
         manager.flush_iteration_events()
 
-        assert len(published) == 2
-        removed = published[1].events
+        assert len(published) == 3
+        removed = published[2].events
         assert len(removed) == 1
         assert removed[0].block_hashes == [first_hash, second_hash]
-        assert manager.stored_blocks == 2
+        assert manager.stored_blocks == 3
         assert manager.removed_blocks == 2
         assert manager.partial_blocks_suppressed == 1
         assert manager.non_target_life_cycles_ignored == 2
         assert manager.dropped_events == 0
+        _add_streaming_stored_block(event_sink, first)
+        manager.flush_iteration_events()
+        assert published[-1].events[0].block_hashes == [first_hash]
+        assert published[-1].events[0].lora_id == lora_id
+    finally:
+        manager.shutdown()
+
+
+def test_native_streaming_sink_separates_lora_scopes(real_block_factory):
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+    )
+    manager.start()
+    try:
+        manager.set_layer_group_window_sizes({0: 128})
+        published = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+        make_block = real_block_factory(manager.event_sink, tokens_per_block=2)
+        for lora_id in (None, 0, 7, 8):
+            first = make_block(_token_ids(1, 3), [2], reuse_scope=ReuseScope(lora_id=lora_id))
+            second = make_block(_token_ids(3, 5), [2], parent=first)
+            _add_streaming_stored_block(manager.event_sink, first)
+            _add_streaming_stored_block(manager.event_sink, second)
+        manager.flush_iteration_events()
+        stored = published[0].events
+        assert [event.lora_id for event in stored] == [None, 0, 7, 8]
+        assert all(event.token_ids == [1, 2, 3, 4] for event in stored)
+        assert all(len(event.block_hashes) == 2 for event in stored)
+        assert len({block_hash for event in stored for block_hash in event.block_hashes}) == 8
     finally:
         manager.shutdown()
 

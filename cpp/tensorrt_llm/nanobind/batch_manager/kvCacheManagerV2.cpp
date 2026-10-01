@@ -1072,6 +1072,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("block_hashes", &kv::StreamingBlockStoredData::blockHashes)
         .def_ro("parent_block_hash", &kv::StreamingBlockStoredData::parentBlockHash)
         .def_ro("token_ids", &kv::StreamingBlockStoredData::tokenIds)
+        .def_ro("lora_id", &kv::StreamingBlockStoredData::loraId)
         .def_prop_ro("mm_keys", [](kv::StreamingBlockStoredData const& self) { return castStreamingMmKeys(self); });
 
     nb::class_<kv::StreamingBlockRemovedData>(m, "StreamingBlockRemovedData")

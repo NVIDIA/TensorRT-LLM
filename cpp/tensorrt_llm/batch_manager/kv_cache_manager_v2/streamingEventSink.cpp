@@ -144,6 +144,7 @@ void StreamingEventSink::addStoredBlockUnlocked(Block const& block)
 
     int64_t const blockHash = wireHash(block.key);
     std::optional<int64_t> parentHash;
+    std::optional<LoraTaskIdType> loraId;
     if (block.prev->type() == NodeBase::Type::kBLOCK)
     {
         auto const& parent = *static_cast<Block const*>(block.prev);
@@ -153,7 +154,13 @@ void StreamingEventSink::addStoredBlockUnlocked(Block const& block)
             recordDroppedEventUnlocked("parent block has not been published");
             return;
         }
-        parentHash = storedParent->second;
+        parentHash = storedParent->second.blockHash;
+        // Inherit scope metadata from the published parent without walking the ancestor chain.
+        loraId = storedParent->second.loraId;
+    }
+    else
+    {
+        loraId = static_cast<RootBlock const*>(block.prev)->reuseScope.loraId;
     }
 
     auto decoded = decodeEventBlock(block, mMmTokenIdOffset);
@@ -162,12 +169,12 @@ void StreamingEventSink::addStoredBlockUnlocked(Block const& block)
         return;
     }
 
-    mStoredBlocks.emplace(block.key, blockHash);
+    mStoredBlocks.emplace(block.key, StoredBlock{blockHash, loraId});
     if (!mPendingEvents.empty())
     {
         auto* stored = std::get_if<StreamingBlockStoredData>(&mPendingEvents.back());
         if (stored != nullptr && !stored->blockHashes.empty() && parentHash.has_value()
-            && stored->blockHashes.back() == *parentHash)
+            && stored->blockHashes.back() == *parentHash && stored->loraId == loraId)
         {
             stored->blockHashes.push_back(blockHash);
             stored->tokenIds.insert(stored->tokenIds.end(), std::make_move_iterator(decoded.tokenIds.begin()),
@@ -180,7 +187,7 @@ void StreamingEventSink::addStoredBlockUnlocked(Block const& block)
     std::vector<std::vector<MmKey>> mmKeys;
     mmKeys.push_back(std::move(decoded.mmKeys));
     mPendingEvents.emplace_back(
-        StreamingBlockStoredData{{blockHash}, parentHash, std::move(decoded.tokenIds), std::move(mmKeys)});
+        StreamingBlockStoredData{{blockHash}, parentHash, std::move(decoded.tokenIds), std::move(mmKeys), loraId});
     ++mStats.storedBlocks;
 }
 
@@ -191,7 +198,7 @@ void StreamingEventSink::addRemovedBlockUnlocked(Digest const& blockKey)
     {
         return;
     }
-    int64_t const blockHash = stored->second;
+    int64_t const blockHash = stored->second.blockHash;
     mStoredBlocks.erase(stored);
     addRemovedHashUnlocked(blockHash);
 }
