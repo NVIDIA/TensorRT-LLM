@@ -525,6 +525,27 @@ class TestStrictBufferCheck:
         with pytest.raises(RuntimeError, match="other_buf"):
             runner.replay(key, inputs)
 
+    def test_replay_skips_graph_temporary(self, monkeypatch):
+        """A rebound graph temporary is ignored; other rebinds are still flagged."""
+        runner, key, attn_metadata, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
+        attn_metadata.graph_temporary_attrs = frozenset({"tmp_buf"})
+        attn_metadata.tmp_buf = torch.full((1,), 10, device="cuda", dtype=torch.int32)
+
+        def forward_fn(fn_inputs):
+            return fn_inputs["input_ids"].clone() + fn_inputs["attn_metadata"].tmp_buf
+
+        runner.capture(key, forward_fn, inputs)
+
+        # Keep the captured tensor alive so the graph doesn't read freed memory.
+        captured_tmp_buf = attn_metadata.tmp_buf
+        attn_metadata.tmp_buf = torch.full((1,), 99, device="cuda", dtype=torch.int32)
+        assert runner.replay(key, inputs).item() == 10
+
+        attn_metadata.some_buf = torch.full((1,), 99, device="cuda", dtype=torch.int32)
+        with pytest.raises(RuntimeError, match="some_buf"):
+            runner.replay(key, inputs)
+        del captured_tmp_buf
+
     def _make_draft_replay_runner_and_inputs(self, monkeypatch, value):
         runner, key, _, inputs = self._make_runner_and_inputs(monkeypatch, value)
         attn_metadata = _DraftReplayMetadataStub(value)

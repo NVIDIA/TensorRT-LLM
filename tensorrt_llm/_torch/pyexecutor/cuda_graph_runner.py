@@ -873,12 +873,14 @@ class CUDAGraphRunner:
 
         These are the addresses the captured graph's kernels may have baked
         in; any of them changing before a later replay means the graph would
-        read stale (or freed) memory.
+        read stale (or freed) memory. obj.graph_temporary_attrs are skipped.
         """
+        graph_temporary_attrs = getattr(obj, "graph_temporary_attrs", ())
         return {
             name: value.data_ptr()
             for name, value in vars(obj).items()
             if isinstance(value, torch.Tensor) and value.is_cuda
+            and name not in graph_temporary_attrs
         }
 
     @staticmethod

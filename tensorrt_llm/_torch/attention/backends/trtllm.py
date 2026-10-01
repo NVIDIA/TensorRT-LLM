@@ -18,7 +18,8 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, List,
+                    Optional, Tuple)
 
 import torch
 
@@ -229,14 +230,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_block_ids_per_seq: Optional[torch.Tensor] = None
     draft_block_ids_per_seq: Optional[torch.Tensor] = None
     draft_kv_block_ids_per_seq: Optional[torch.Tensor] = None
-    # Attributes currently rebound to draft KV cache buffers by
-    # prepare_attn_metadata_for_draft_replay, mapped to the target value they
-    # held before the swap; empty outside that window. The CUDA graph strict
-    # buffer check validates the saved target value instead of the live one.
+    # Attributes swapped to draft KV buffers during draft replay, mapped to their
+    # target values; the strict buffer check validates those instead.
     draft_replay_swapped_attrs: Dict[str, Any] = field(default_factory=dict,
                                                        init=False,
                                                        repr=False,
                                                        compare=False)
+    # Tensors produced and consumed inside the captured graph; the strict
+    # buffer check skips them.
+    graph_temporary_attrs: ClassVar[FrozenSet[str]] = frozenset()
 
     # Batch-shared FP4 state; other attention paths allocate none of it.
     fp4_mla_state: Optional[Fp4MlaState] = field(init=False,

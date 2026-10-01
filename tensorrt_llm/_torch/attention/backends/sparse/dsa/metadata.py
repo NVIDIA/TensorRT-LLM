@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, ClassVar, FrozenSet, List, Optional
 
 import torch
 
@@ -124,6 +124,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Number of compressed KV tokens for context requests
     num_ctx_kv_tokens: int = 0
     gen_indexer_kv_lens_cuda_runtime: Optional[torch.Tensor] = None
+    # Rebound by on_update_kv_lens(); the decode graph recomputes it.
+    graph_temporary_attrs: ClassVar[FrozenSet[str]] = frozenset(
+        {"gen_indexer_kv_lens_cuda_runtime"}
+    )
     # Temporal-GVR prior state: allocated only when the two-level dispatch
     # selects the temporal engine (the self-sampling engine keeps no
     # cross-step state).
