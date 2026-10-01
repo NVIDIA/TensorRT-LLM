@@ -539,6 +539,37 @@ test('the sticky summary follows a revoked verdict instead of an older PASS', as
   assert.doesNotMatch(sticky().body, /No semantic conflict found/);
 });
 
+test('history rows follow the newest reply, and all bound replies are minimized', async () => {
+  const a = request();
+  const {state, sticky, repair, tidy} = harness(a);
+  state.comments.push(reply(20, a));
+  await repair();
+  state.comments.push(reply(30, a, 'FAIL'));
+  await repair();
+  state.comments.push(record(40, request(2, {target: 'd'.repeat(40)})));
+  await tidy();
+  assert.match(sticky().body, /\| FAIL \| \[reply\]\([^)]*#issuecomment-30\)/);
+  assert.doesNotMatch(sticky().body, /\| PASS \|/);
+  assert.deepEqual(state.minimized.sort(), ['IC_10', 'IC_20', 'IC_30']);
+});
+
+test('history rows do not resurrect a verdict revoked before supersession', async () => {
+  const a = request();
+  const {state, sticky, repair, tidy} = harness(a);
+  state.comments.push(reply(20, a));
+  await repair();
+  const revoked = reply(30, a, 'FAIL');
+  state.comments.push(revoked);
+  await repair();
+  state.comments.splice(state.comments.indexOf(revoked), 1);
+  await repair();
+  state.comments.push(record(40, request(2, {target: 'd'.repeat(40)})));
+  await tidy();
+  assert.match(sticky().body, /\| NO RESULT \|/);
+  assert.doesNotMatch(sticky().body, /\| PASS \|/);
+  assert.deepEqual(state.minimized.sort(), ['IC_10', 'IC_20']);
+});
+
 test('a revoked verdict restores the minimized active request to visible', async () => {
   const r = request();
   const {state, sticky, tidy} = harness(r);
