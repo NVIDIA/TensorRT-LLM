@@ -888,7 +888,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         setattr(self, name, draft_value)
 
     def restore_draft_swaps(self) -> None:
-        """Rebind every recorded attribute to its original and clear the record."""
+        """Rebind every recorded attribute to its original and clear the record.
+
+        Swaps do not nest: this restores all swaps made since the last restore.
+        """
         for name, original in self.draft_replay_swapped_attrs.items():
             setattr(self, name, original)
         self.draft_replay_swapped_attrs = {}

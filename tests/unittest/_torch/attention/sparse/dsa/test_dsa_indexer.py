@@ -4592,7 +4592,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
             saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
 
         assert saved is not None
-        assert saved["target_kv_cache_manager"] is original_kv_mgr
+        assert meta.draft_replay_swapped_attrs["kv_cache_manager"] is original_kv_mgr
         assert meta.kv_cache_manager is mgr
         assert "saved_backend_state" not in saved
         meta.prepare_for_draft_forward.assert_called_once_with()

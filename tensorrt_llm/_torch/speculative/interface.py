@@ -199,23 +199,15 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     if draft_block_offsets is None:
         return None
 
-    saved = {
-        'target_kv_cache_manager':
-        attn_metadata.kv_cache_manager,
-        'target_kv_cache_block_offsets':
-        attn_metadata.kv_cache_block_offsets,
-        'target_host_kv_cache_block_offsets':
-        attn_metadata.host_kv_cache_block_offsets,
-    }
+    # Marks that a swap happened and carries the backend's state for its
+    # restore hook; swap_for_draft records the originals on attn_metadata.
+    saved = {}
     if attn_metadata.enable_flash_mla:
         if (attn_metadata.draft_block_ids_per_seq is None
                 or attn_metadata.draft_kv_block_ids_per_seq is None):
             raise RuntimeError(
                 "FlashMLA separate draft KV cache requires dedicated draft block-ID buffers"
             )
-        saved['target_block_ids_per_seq'] = attn_metadata.block_ids_per_seq
-        saved[
-            'target_kv_block_ids_per_seq'] = attn_metadata.kv_block_ids_per_seq
         attn_metadata.swap_for_draft('block_ids_per_seq',
                                      attn_metadata.draft_block_ids_per_seq)
         attn_metadata.swap_for_draft('kv_block_ids_per_seq',
