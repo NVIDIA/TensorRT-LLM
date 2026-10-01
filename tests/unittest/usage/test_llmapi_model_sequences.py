@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Manifest-to-payload coverage for sequences of configuration models."""
+"""Manifest-to-payload coverage for lists of configuration models."""
 
 import json
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 from pydantic import PositiveInt
@@ -87,15 +87,6 @@ def test_nested_model_lists_and_nullable_leaves_preserve_positions() -> None:
     assert capture.manifest_rows(_Groups)[0]["capture_policy"] == "list[list[int|none]]"
 
 
-def test_nested_containers_before_model_are_retained() -> None:
-    class _Matrix(StrictBaseModel):
-        items: list[tuple[_Leaf, ...]]
-
-    args = _Matrix(items=[(_Leaf(value=1), _Leaf(value=2)), ()])
-    assert _collect(args)[0] == {"items.value": [[1, 2], []]}
-    assert capture.manifest_rows(_Matrix)[0]["capture_policy"] == "list[tuple[int|none]]"
-
-
 def test_optional_model_inside_list_does_not_fabricate_null_leaf() -> None:
     class _OptionalItems(StrictBaseModel):
         items: list[_Leaf | None]
@@ -105,21 +96,28 @@ def test_optional_model_inside_list_does_not_fabricate_null_leaf() -> None:
     assert metadata["unsafe_excluded"] is True
 
 
-@pytest.mark.parametrize("container", [list, tuple, set])
-def test_model_sequence_container_types(container: type) -> None:
+@pytest.mark.parametrize("container", ["tuple", "mixed_tuple", "set", "list_of_tuples"])
+def test_unsupported_model_containers_do_not_enroll_or_capture(container: str) -> None:
     class _FrozenLeaf(StrictBaseModel):
         model_config = {"frozen": True}
         value: int
 
-    annotation = tuple[_FrozenLeaf, ...] if container is tuple else container[_FrozenLeaf]
+    first, second = _FrozenLeaf(value=1), _FrozenLeaf(value=987654)
+    annotation, items = {
+        "tuple": (tuple[_FrozenLeaf, ...], (first, second)),
+        "mixed_tuple": (tuple[_FrozenLeaf, Any], (first, second)),
+        "set": (set[_FrozenLeaf], {first, second}),
+        "list_of_tuples": (list[tuple[_FrozenLeaf, ...]], [(first, second)]),
+    }[container]
 
     class _Sequence(StrictBaseModel):
         items: annotation
+        enabled: bool = True
 
-    args = _Sequence(items=container([_FrozenLeaf(value=2), _FrozenLeaf(value=1)]))
-    expected = [1, 2] if container is set else [2, 1]
-    assert _collect(args)[0] == {"items.value": expected}
-    assert capture.manifest_rows(_Sequence)[0]["capture_policy"] == f"{container.__name__}[int]"
+    config, metadata = _collect(_Sequence(items=items))
+    assert config == {"enabled": True}
+    assert metadata["capture_succeeded"] is True
+    assert [row["path"] for row in capture.manifest_rows(_Sequence)] == ["enabled"]
 
 
 class _ModeA(StrictBaseModel):

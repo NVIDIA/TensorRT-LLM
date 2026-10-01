@@ -345,7 +345,7 @@ def _policy_kind(policy: _CapturePolicy) -> str:
 
 
 def _nested_model_routes(annotation: Any) -> list[tuple[type, ...]]:
-    """Reachable models with their enclosing sequence types, never dict keys/values."""
+    """Reachable models through unions/lists, excluding tuple, set and dict containers."""
     out: list[tuple[type, ...]] = []
 
     def rec(ann: Any, containers: tuple[type, ...]) -> None:
@@ -359,7 +359,7 @@ def _nested_model_routes(annotation: Any) -> list[tuple[type, ...]]:
         if _is_union(ann):
             for arg in get_args(ann):
                 rec(arg, containers)
-        elif origin in {list, tuple, set}:
+        elif origin is list:
             for arg in get_args(ann):
                 rec(arg, (*containers, origin))
 
@@ -371,7 +371,7 @@ def _projected_policy(variant: _PolicyVariant) -> _CapturePolicy:
     """Describe the wire value, including containers enclosing the leaf owner."""
     policy = variant.policy
     for step in reversed(variant.route):
-        if step in {list, tuple, set}:
+        if step is list:
             policy = _CapturePolicy("sequence", runtime_type=step, branches=(policy,))
     return policy
 
@@ -428,14 +428,6 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
                 f"across model arms: {grouped[key]['kind']} vs {r['kind']}"
             )
         variants: list[_PolicyVariant] = grouped[key]["variants"]
-        matching = [variant for variant in variants if variant.route == r["route"]]
-        if matching:
-            if any(_policy_key(variant.policy) != _policy_key(r["policy"]) for variant in matching):
-                raise ValueError(
-                    f"telemetry manifest: key '{key}' has conflicting policies "
-                    f"for model route {r['route']}"
-                )
-            continue
         variants.append(_PolicyVariant(route=r["route"], policy=r["policy"]))
 
     entries = []
@@ -579,48 +571,45 @@ def _schema_digest(model_cls: type[BaseModel]) -> str:
 def _capture_path(
     instance: BaseModel, entry: _ManifestEntry, state: _CaptureState
 ) -> tuple[bool, bool, Any]:
-    """Return (present, safe, value) for a manifest path, projecting model sequences.
+    """Return (present, safe, value) for a manifest path, projecting model lists.
 
-    Every model and container must match a compiled route. Sequence projections
+    Every model and container must match a compiled route. List projections
     preserve positions: an absent, excluded or unsafe element omits the whole
-    field instead of shortening it or fabricating nulls. Empty sequences are
+    field instead of shortening it or fabricating nulls. Empty lists are
     captured as [], and nullable *leaf* values still follow their own policy.
     """
+    segments = entry.path.split(".")
 
     def visit(
-        value: Any, segments: list[str], variants: tuple[_PolicyVariant, ...]
+        value: Any,
+        variants: tuple[_PolicyVariant, ...],
+        route_index: int,
+        segment_index: int,
     ) -> tuple[bool, bool, Any]:
-        matching = tuple(variant for variant in variants if variant.route[0] is type(value))
+        matching = tuple(
+            variant for variant in variants if variant.route[route_index] is type(value)
+        )
         if not matching:
             return False, False, None
-        if type(value) in {list, tuple, set}:
-            remaining = tuple(
-                _PolicyVariant(route=variant.route[1:], policy=variant.policy)
-                for variant in matching
-            )
+        if type(value) is list:
             projected = []
             for item in value:
-                present, safe, captured = visit(item, segments, remaining)
+                present, safe, captured = visit(item, matching, route_index + 1, segment_index)
                 if not present or not safe:
                     return True, False, None
                 projected.append(captured)
-            if type(value) is set:
-                projected.sort(key=_canonical_json)
             if len(projected) > MAX_SEQ_ITEMS:
                 projected = projected[:MAX_SEQ_ITEMS]
                 state.sequence_truncated = True
             return True, True, projected
 
-        field_value = getattr(value, segments[0], None)
-        if len(segments) == 1:
+        field_value = getattr(value, segments[segment_index], None)
+        if segment_index == len(segments) - 1:
             safe, captured = _sanitize_policy(field_value, matching[0].policy, state)
             return True, safe, captured
-        remaining = tuple(
-            _PolicyVariant(route=variant.route[1:], policy=variant.policy) for variant in matching
-        )
-        return visit(field_value, segments[1:], remaining)
+        return visit(field_value, matching, route_index + 1, segment_index + 1)
 
-    return visit(instance, entry.path.split("."), entry.variants)
+    return visit(instance, entry.variants, 0, 0)
 
 
 def _truncate_to_budget(values: dict[str, Any]) -> tuple[dict[str, Any], str]:
