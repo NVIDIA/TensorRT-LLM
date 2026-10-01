@@ -652,6 +652,8 @@ Public routing helpers remain available in either build.
 native library. CUTLASS eligibility uses it to reject post-SiLU clamping and
 routed-expert LoRA during backend selection for internal builds, before
 inference reaches the native runner.
+The same eligibility gate rejects SiTu and Relu2 activations and the MXFP8
+and W4A8-MXFP4-MXFP8 quantization formats in that build mode.
 
 Declare `limit_when_absent` only when the ABI has no encoding for "no clamp":
 `CuteDslFusedMoE` passes `float("inf")` because its epilogue always applies the
