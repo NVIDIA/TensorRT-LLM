@@ -10,7 +10,6 @@ from typing import Any
 import grpc
 
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
-from tensorrt_llm.grpc._protobuf import _require_native_protobuf
 from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.logger import logger
 
@@ -32,7 +31,6 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
     """Translate OpenEngine generation streams to TensorRT-LLM requests."""
 
     def __init__(self, llm: LLM, model: str, kv_transfer_backend: str = "") -> None:
-        _require_native_protobuf()
         self._llm = llm
         self._model = model
         # Informational label placed in the KvSessionRef of PrefillReady events so

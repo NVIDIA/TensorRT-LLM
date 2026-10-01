@@ -29,7 +29,6 @@ import subprocess
 import sys
 import types
 from collections.abc import Sequence
-from pathlib import Path
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
@@ -39,47 +38,70 @@ from click.testing import CliRunner
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("implementation", ["python", "upb"])
-def test_native_protobuf_requirement_in_fresh_process(implementation: str) -> None:
+def test_protobuf_warning_in_fresh_process(implementation: str) -> None:
     """Check the loaded implementation, even after the environment changes."""
-    helper = Path(__file__).resolve().parents[3] / "tensorrt_llm/grpc/_protobuf.py"
     script = (
-        "import os, runpy, sys\n"
+        "import os, sys\n"
+        "from unittest.mock import patch\n"
         "from google.protobuf.internal import api_implementation\n"
-        "assert api_implementation.Type() == sys.argv[2]\n"
-        "os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'upb'\n"
-        "runpy.run_path(sys.argv[1])['_require_native_protobuf']()\n"
+        "from tensorrt_llm.grpc import _protobuf\n"
+        "assert api_implementation.Type() == sys.argv[1]\n"
+        "os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = "
+        "'upb' if sys.argv[1] == 'python' else 'python'\n"
+        "with patch.object(_protobuf.logger, 'warning') as warning:\n"
+        "    _protobuf._warn_if_python_protobuf()\n"
+        "    if sys.argv[1] == 'python':\n"
+        "        warning.assert_called_once()\n"
+        "        assert 'before starting Python' in warning.call_args.args[0]\n"
+        "    else:\n"
+        "        warning.assert_not_called()\n"
+        "assert api_implementation.Type() == sys.argv[1]\n"
     )
     result = subprocess.run(
-        [sys.executable, "-c", script, str(helper), implementation],
+        [sys.executable, "-c", script, implementation],
         env={**os.environ, "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": implementation},
         capture_output=True,
         text=True,
         check=False,
-        timeout=30,
+        timeout=60,
     )
-    if implementation == "upb":
-        assert result.returncode == 0, result.stderr
-    else:
-        assert result.returncode != 0
-        assert "requires native protobuf (upb)" in result.stderr
-        assert "before starting Python" in result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.cpu_only
+def test_cpp_protobuf_does_not_warn(monkeypatch) -> None:
+    from tensorrt_llm.grpc import _protobuf
+
+    warning = MagicMock()
+    monkeypatch.setattr(_protobuf.api_implementation, "Type", lambda: "cpp")
+    monkeypatch.setattr(_protobuf.logger, "warning", warning)
+    _protobuf._warn_if_python_protobuf()
+    warning.assert_not_called()
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("protocol", ["smg", "openengine"])
-def test_python_protobuf_rejected_before_model_startup(monkeypatch, protocol: str) -> None:
+def test_python_protobuf_warns_before_model_startup(monkeypatch, protocol: str) -> None:
     from google.protobuf.internal import api_implementation
 
     if protocol == "smg":
         pytest.importorskip("smg_grpc_proto")
     server_module = importlib.import_module(f"tensorrt_llm.grpc.{protocol}.server")
-    llm_factory = MagicMock()
+    warning = MagicMock()
+
+    def initialize_model(**kwargs):
+        warning.assert_called_once()
+        raise RuntimeError("model startup reached")
+
+    llm_factory = MagicMock(side_effect=initialize_model)
     monkeypatch.setattr(server_module, "PyTorchLLM", llm_factory)
+    monkeypatch.setattr(server_module.logger, "warning", warning)
+    monkeypatch.setattr(server_module.uvloop, "run", asyncio.run)
     monkeypatch.setattr(api_implementation, "Type", lambda: "python")
     launch = server_module.launch_smg_server if protocol == "smg" else server_module.launch_server
-    with pytest.raises(RuntimeError, match="requires native protobuf"):
+    with pytest.raises(RuntimeError, match="model startup reached"):
         launch("127.0.0.1", 50051, {"backend": "pytorch", "model": "test-model"})
-    llm_factory.assert_not_called()
+    llm_factory.assert_called_once_with(backend="pytorch", model="test-model")
 
 
 def test_smg_bindings_missing_gives_actionable_error(monkeypatch):
@@ -163,8 +185,14 @@ def test_smg_server_startup_failure_cleans_up(monkeypatch, failure_point):
         grpc_server.add_insecure_port.return_value = 8000
         grpc_server.start.side_effect = RuntimeError("start failed")
 
-    monkeypatch.setitem(sys.modules, "grpc_reflection", None)
-    monkeypatch.delitem(sys.modules, "grpc_reflection.v1alpha", raising=False)
+    real_import = builtins.__import__
+
+    def import_without_reflection(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "grpc_reflection.v1alpha":
+            raise ModuleNotFoundError("No module named 'grpc_reflection'", name="grpc_reflection")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_reflection)
     monkeypatch.setattr(server_module.uvloop, "run", asyncio.run)
     monkeypatch.setattr(server_module, "PyTorchLLM", MagicMock(return_value=llm))
     monkeypatch.setattr(server_module, "GrpcRequestManager", MagicMock())

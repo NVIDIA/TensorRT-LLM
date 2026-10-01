@@ -28,7 +28,6 @@ from typing import List, Union
 import grpc
 
 from tensorrt_llm.executor.result import Logprob, TokenLogprobs
-from tensorrt_llm.grpc._protobuf import _require_native_protobuf
 from tensorrt_llm.inputs.media_io import _load_and_convert_image
 from tensorrt_llm.logger import logger
 
@@ -60,7 +59,6 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             request_manager: The GrpcRequestManager instance
             model_path: Path to the model (for metadata)
         """
-        _require_native_protobuf()
         self.request_manager = request_manager
         self.model_path = model_path
         self._start_time = time.time()
@@ -438,7 +436,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 token_ids=delta_tokens,
                 sequence_index=completion.index,
                 prompt_tokens=len(prompt_token_ids),
-                completion_tokens=len(completion.token_ids) if completion.token_ids else 0,
+                completion_tokens=len(all_tokens),
                 cached_tokens=cached_tokens,
             )
 
@@ -498,7 +496,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
 
         # Process all outputs (for n>1 support)
         for completion in gen_result.outputs:
-            output_tokens = list(completion.token_ids) if completion.token_ids else []
+            output_tokens = completion.token_ids or []
 
             complete = trtllm_service_pb2.GenerateComplete(
                 output_token_ids=output_tokens,

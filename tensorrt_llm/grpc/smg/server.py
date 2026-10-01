@@ -24,7 +24,7 @@ import grpc
 import uvloop
 
 from tensorrt_llm import LLM as PyTorchLLM
-from tensorrt_llm.grpc._protobuf import _require_native_protobuf
+from tensorrt_llm.grpc._protobuf import _warn_if_python_protobuf
 from tensorrt_llm.logger import logger
 
 from .bindings import trtllm_service_pb2, trtllm_service_pb2_grpc
@@ -49,7 +49,7 @@ def launch_smg_server(
         served_model_name: Model name returned by discovery RPCs. Defaults to
             the model path.
     """
-    _require_native_protobuf()
+    _warn_if_python_protobuf()
     try:
         from grpc_reflection.v1alpha import reflection
     except ModuleNotFoundError as e:

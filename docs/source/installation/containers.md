@@ -12,14 +12,14 @@ TensorRT LLM uses a [multi-stage Dockerfile](https://github.com/NVIDIA/TensorRT-
 
 ## Protobuf runtime for gRPC
 
-The SMG and OpenEngine gRPC servers require protobuf's native `upb` implementation.
+Native protobuf (`upb`) is recommended for SMG and OpenEngine gRPC throughput.
 The `devel` and `release` images set `PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb`.
 For older or custom images, set this variable before starting Python, for example
 with `docker run -e PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb ...`.
-The installed protobuf wheel must include the native extension. A gRPC server
-using another implementation stops before model initialization; it does not fall
-back to Python protobuf. Changing the variable after protobuf has been imported
-does not change the active implementation.
+The installed protobuf wheel must include the native extension to use `upb`.
+Both gRPC launchers warn when Python protobuf is active and continue startup.
+Native `cpp` is also accepted without a warning. Changing the variable after
+protobuf has been imported does not change the active implementation.
 
 ## Pre-built Images on NGC
 

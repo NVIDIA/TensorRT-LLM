@@ -85,6 +85,10 @@ def test_streaming_deltas_preserve_sequences_logprobs_and_final_tokens() -> None
     assert [list(response.complete.output_token_ids) for response in final] == [[10, 11], [20, 21]]
     assert [response.complete.sequence_index for response in final] == [0, 1]
     assert all(response.complete.finish_reason == "length" for response in final)
+    final_bytes = [response.SerializeToString() for response in final]
+    first.token_ids.append(12)
+    second.token_ids.clear()
+    assert [response.SerializeToString() for response in final] == final_bytes
 
 
 @pytest.mark.cpu_only

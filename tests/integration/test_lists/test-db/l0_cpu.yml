@@ -134,6 +134,12 @@ l0_cpu:
   - unittest/grpc/openengine/test_control.py
   - unittest/grpc/openengine/test_openengine.py
   - unittest/grpc/openengine/test_servicer.py
+  - unittest/grpc/smg/test_smg.py::test_streaming_deltas_preserve_sequences_logprobs_and_final_tokens
+  - unittest/grpc/smg/test_smg.py::test_streaming_empty_token_history
+  - unittest/grpc/test_grpc_optional.py::test_protobuf_warning_in_fresh_process
+  - unittest/grpc/test_grpc_optional.py::test_cpp_protobuf_does_not_warn
+  - unittest/grpc/test_grpc_optional.py::test_python_protobuf_warns_before_model_startup
+  - unittest/grpc/test_grpc_optional.py::test_smg_server_startup_failure_cleans_up
   - unittest/inputs
   - unittest/kv_cache_manager_v2_tests
   - unittest/llmapi/apps/test_anthropic_adapter.py
