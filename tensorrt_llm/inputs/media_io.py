@@ -1193,7 +1193,34 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> VideoData:
-        return self.load_bytes(Path(_normalize_file_uri(url)).read_bytes())
+        path = Path(_normalize_file_uri(url))
+        # The hash and the frames come from separate reads of the file, so a
+        # file that changes in between is rejected rather than having its
+        # frames cached under the hash of other content.
+        before = path.stat()
+        raw_bytes_hasher = blake3()
+        # Read in bounded chunks: blake3's update_mmap would raise SIGBUS if
+        # the file were truncated while it is being hashed.
+        with open(path, "rb") as video_file:
+            while chunk := video_file.read(1 << 20):
+                raw_bytes_hasher.update(chunk)
+        video_data = _load_video_by_cv2(
+            str(path),
+            self._num_frames,
+            self._fps,
+            self._format,
+            self._device,
+            extract_audio=self._extract_audio,
+            raw_bytes_hash=raw_bytes_hasher.hexdigest(),
+        )
+        after = path.stat()
+        if (before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise ValueError(f"Video file {url!r} changed while it was being loaded.")
+        return video_data
 
 
 MEDIA_IO_REGISTRY: Mapping[MediaModality, Type[BaseMediaIO]] = MappingProxyType(

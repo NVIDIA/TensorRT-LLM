@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+from blake3 import blake3
 from PIL import Image
 from transformers.video_utils import make_batched_videos
 
@@ -17,7 +19,7 @@ pytest.importorskip("cv2")
 import cv2  # noqa: E402
 
 import tensorrt_llm.inputs.media_io as media_io_module  # noqa: E402
-from tensorrt_llm.inputs.media_io import _load_video_by_cv2  # noqa: E402
+from tensorrt_llm.inputs.media_io import VideoMediaIO, _load_video_by_cv2  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -69,6 +71,37 @@ def test_np_format_hits_hf_video_processor_fast_path(sample_video_path: str) -> 
 
     assert len(batched) == 1
     assert np.shares_memory(video.frames, batched[0])
+
+
+def test_load_file_does_not_buffer_entire_video(
+    sample_video_path: str, tmp_path: Path, monkeypatch
+) -> None:
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(Path(sample_video_path).read_bytes())
+    expected_hash = blake3(video_path.read_bytes()).hexdigest()
+
+    def fail_read_bytes(self):
+        raise AssertionError(f"unexpected full-file read: {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    media_io = VideoMediaIO(num_frames=10, fps=-1, format="np")
+    video = media_io.load_file(str(video_path))
+
+    assert video.raw_bytes_hash == expected_hash
+    assert len(video.frames) == 10
+
+    # A file modified between hashing and decoding is rejected.
+    original_load = media_io_module._load_video_by_cv2
+
+    def load_then_modify(*args, **kwargs):
+        result = original_load(*args, **kwargs)
+        stat = video_path.stat()
+        os.utime(video_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        return result
+
+    monkeypatch.setattr(media_io_module, "_load_video_by_cv2", load_then_modify)
+    with pytest.raises(ValueError, match="changed while it was being loaded"):
+        media_io.load_file(str(video_path))
 
 
 @pytest.mark.parametrize(
