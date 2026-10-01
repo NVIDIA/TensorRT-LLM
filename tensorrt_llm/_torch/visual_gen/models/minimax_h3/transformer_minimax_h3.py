@@ -57,12 +57,9 @@ class MiniMaxH3TransformerOutput:
     audio_sample: torch.Tensor
 
 
-# Dispatch switch for the fused per-head QK-norm + RoPE kernel; benchmarks and
-# tests flip it to compare against the separate norm and RoPE path.
+# Dispatch switch for the fused per-head QK-norm + RoPE kernel (tests compare
+# against the separate norm and RoPE path by turning it off).
 FUSE_QK_NORM_ROPE = True
-# Rounding contract of the fused kernel: True reproduces the eager module bit for
-# bit; False computes in FP32 with one final rounding (not eager-identical).
-FUSE_QK_NORM_ROPE_EXACT = True
 
 
 @dataclass
@@ -231,8 +228,8 @@ class MiniMaxH3Attention(Attention):
     ) -> torch.Tensor:
         batch_size, sequence_length = hidden_states.shape[:2]
         if rotary_emb is not None and self._can_fuse_qk_norm_rope(hidden_states, rotary_emb):
-            # One launch normalizes and rotates Q and K straight from the packed
-            # projection output; V stays a view of the same buffer.
+            # One launch normalizes and rotates Q and K from the packed projection
+            # output; V stays a view of the same buffer.
             qkv = self.qkv_proj(hidden_states)
             value = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)[2]
             cos, sin = rotary_emb
@@ -245,7 +242,6 @@ class MiniMaxH3Attention(Attention):
                 self.norm_q.variance_epsilon,
                 self.local_num_attention_heads,
                 self.head_dim,
-                exact_rounding=FUSE_QK_NORM_ROPE_EXACT,
             )
         else:
             query, key, value = self.get_qkv(hidden_states)

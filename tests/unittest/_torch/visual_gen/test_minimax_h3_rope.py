@@ -151,6 +151,27 @@ def test_fused_qk_norm_rope_matches_eager_bf16_exactly(batch, seq, heads, rotary
 
 
 @requires_cuda
+@pytest.mark.parametrize("tokens_per_program,heads_per_program", [(4, 2), (8, 1), (2, 4)])
+def test_fused_qk_norm_rope_tail_tokens_are_masked(tokens_per_program, heads_per_program):
+    """Launch shapes that do not divide the token count exercise the tail-token mask."""
+    qkv, weight_q, weight_k, cos, sin = _packed_inputs(1, 13, 8, 96, torch.float32)
+    expected_q, expected_k = _reference_packed(qkv, weight_q, weight_k, cos, sin, 8, 1e-5)
+    q, k = apply_minimax_h3_qk_norm_rope_bf16(
+        qkv,
+        weight_q,
+        weight_k,
+        cos,
+        sin,
+        1e-5,
+        8,
+        128,
+        tokens_per_program=tokens_per_program,
+        heads_per_program=heads_per_program,
+    )
+    assert torch.equal(q, expected_q) and torch.equal(k, expected_k)
+
+
+@requires_cuda
 def test_fused_qk_norm_rope_single_rounding_is_close_not_exact():
     qkv, weight_q, weight_k, cos, sin = _packed_inputs(1, 1029, 8, 96, torch.float32)
     expected_q, expected_k = _reference_packed(qkv, weight_q, weight_k, cos, sin, 8, 1e-5)
@@ -189,6 +210,8 @@ def test_fused_qk_norm_rope_compile_matches_eager_bf16_exactly():
         "head_dim",
         "columns",
         "grad",
+        "launch",
+        "strided",
     ],
 )
 def test_fused_qk_norm_rope_rejects_invalid_inputs(invalid):
@@ -215,5 +238,10 @@ def test_fused_qk_norm_rope_rejects_invalid_inputs(invalid):
         qkv = qkv[..., : heads * 128]
     elif invalid == "grad":
         qkv.requires_grad_(True)
+    kwargs = {"tokens_per_program": 3} if invalid == "launch" else {}
+    if invalid == "strided":
+        qkv = qkv.expand(2, -1, -1)
     with pytest.raises(ValueError):
-        apply_minimax_h3_qk_norm_rope_bf16(qkv, weight_q, weight_k, cos, sin, 1e-5, heads, head_dim)
+        apply_minimax_h3_qk_norm_rope_bf16(
+            qkv, weight_q, weight_k, cos, sin, 1e-5, heads, head_dim, **kwargs
+        )

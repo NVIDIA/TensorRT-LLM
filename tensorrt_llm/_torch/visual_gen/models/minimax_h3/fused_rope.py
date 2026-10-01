@@ -170,6 +170,8 @@ def _minimax_h3_qk_norm_rope_kernel(
     EXACT_ROUNDING reproduces the eager module bit for bit: torch's FP32 summation order for the
     variance of a 128-wide row (32 lanes x 4 sequential squares, then a shuffle-down tree), x * rsqrt
     rounded to BF16, weight multiply rounded to BF16, BF16 tables, each RoPE product rounded to BF16.
+    The summation order is torch's CUDA reduction for a contiguous 128-element FP32 inner dim,
+    verified bitwise on torch 2.14; a torch change there flips the equality tests, not the quality.
     Otherwise everything is computed in FP32 with a single rounding at the store.
     """
     pid_t = tl.program_id(0)
@@ -272,12 +274,7 @@ def _minimax_h3_qk_norm_rope_op(
     heads_per_program: int,
     num_warps: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Opaque custom op around the Triton launch.
-
-    Registering the launch as a custom op keeps torch.compile from functionalizing
-    the kernel's output stores into extra clones and lets Inductor schedule it as
-    one opaque node between the QKV projection and attention.
-    """
+    """Opaque custom op around the Triton launch (one node under torch.compile)."""
     hd = num_heads * head_dim
     batch, seq = qkv.shape[:2]
     tokens = batch * seq
@@ -377,8 +374,8 @@ def apply_minimax_h3_qk_norm_rope_bf16(
     if head_dim != 128:
         raise ValueError("H3 fused QK-norm RoPE is implemented for head dimension 128 only")
     hd = num_heads * head_dim
-    if qkv.shape[-1] < 2 * hd or qkv.stride(-1) != 1:
-        raise ValueError("qkv must hold Q and K columns contiguously along the last dimension")
+    if qkv.shape[-1] < 2 * hd:
+        raise ValueError("qkv must hold Q and K columns in its first 2 * heads * dim columns")
     for weight in (weight_q, weight_k):
         if (
             weight.shape != (head_dim,)
@@ -406,6 +403,11 @@ def apply_minimax_h3_qk_norm_rope_bf16(
         heads_per_program = next(h for h in (8, 4, 2, 1) if num_heads % h == 0)
     if heads_per_program & (heads_per_program - 1) or num_heads % heads_per_program:
         raise ValueError("heads_per_program must be a power of two dividing num_heads")
+    rows = tokens_per_program * heads_per_program
+    if tokens_per_program < 1 or rows & (rows - 1):
+        raise ValueError("tokens_per_program * heads_per_program must be a power of two")
+    if not qkv.is_contiguous():
+        raise ValueError("qkv must be contiguous")
     return torch.ops.trtllm.minimax_h3_qk_norm_rope(
         qkv,
         weight_q,
