@@ -99,6 +99,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_executor_lifecycle.py
   - unittest/_torch/visual_gen/test_flux_infer.py
+  - unittest/_torch/visual_gen/test_cosmos3_guardrails.py
   - unittest/evaluate/visual_gen/test_generation_evaluation_pipeline.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
   - unittest/_torch/visual_gen/test_minimax_h3_pipeline.py
@@ -144,6 +145,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_anthropic_routes.py
   - unittest/llmapi/apps/test_chat_template_kwargs_guard.py
   - unittest/llmapi/apps/test_chat_utils.py
+  - unittest/llmapi/apps/test_context_length_error.py
   - unittest/llmapi/apps/test_harmony_channel_validation.py
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
@@ -164,6 +166,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_web_search_shared.py
   - unittest/llmapi/test_bench_async.py
+  - unittest/llmapi/test_config_overrides.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
   - unittest/llmapi/test_executor.py
   - unittest/llmapi/test_gc_utils.py
