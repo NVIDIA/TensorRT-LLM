@@ -88,6 +88,9 @@ from agent_flow.workflows.perf_optimize.disagg import (
 )
 from agent_flow.workflows.perf_optimize.roadmap_schema import APPROACHES
 from agent_flow.workflows.perf_optimize.roles import ROLES
+from agent_flow.workflows.perf_optimize.testcase import PerfSanityCase, TestCaseError
+from agent_flow.workflows.perf_optimize.testcase import parse as parse_test_case
+from agent_flow.workflows.perf_optimize.testcase import resolve_config as resolve_test_case_config
 
 # Defaults merged under the user's values. ``target_improvement_pct`` is
 # deliberately absent: when the user does not set it, there is no
@@ -148,6 +151,14 @@ KNOWN_OPTIMIZE_KEYS: frozenset[str] = frozenset(
 )
 KNOWN_ACCURACY_KEYS: frozenset[str] = frozenset({"command", "baseline_score", "max_drop_pct"})
 KNOWN_KERNEL_COVERAGE_KEYS: frozenset[str] = frozenset({"min_share_pct", "coverage_target_pct"})
+
+#: Top-level block naming the workload by test-case id instead of by an
+#: ``extra_llm_api_options`` YAML. ``name`` is the pytest node id;
+#: ``resolved`` is written back by the validator and is not user input.
+TEST_CASE_FIELD = "test_case"
+TEST_CASE_NAME_KEY = "name"
+TEST_CASE_RESOLVED_KEY = "resolved"
+KNOWN_TEST_CASE_KEYS: frozenset[str] = frozenset({TEST_CASE_NAME_KEY})
 
 # Defaults merged under ``profile.kernel_coverage`` when the block is
 # present (its presence is the opt-in; absent ⇒ the bounded top-kernel
@@ -410,6 +421,97 @@ def _validate_disagg_block(data: dict[str, Any], errors: list[str]) -> dict[str,
         return None
 
 
+def _validate_test_case_block(
+    data: dict[str, Any], path: str | Path, errors: list[str]
+) -> dict[str, Any] | None:
+    """Validate the ``test_case`` block and resolve what its id names.
+
+    Returns the resolved facts to write back under
+    ``test_case.resolved``, or ``None`` when the block is absent or
+    invalid. Both the id grammar and the config lookup are checked here,
+    at the CLI boundary, for the same reason the disagg harness config is
+    loaded here: an id that cannot be read, or whose config is not in the
+    checkout under test, has to abort the run before any agent is
+    constructed rather than an hour into a GPU allocation. It matters
+    more for a test case than for a tuning YAML, because an unresolved
+    perf-sanity case is sized downstream at a single GPU and would
+    otherwise run a multi-node case on one device and publish the result.
+    """
+    if not has_test_case(data):
+        return None
+    block = data.get(TEST_CASE_FIELD)
+    if not isinstance(block, Mapping):
+        errors.append(
+            f"'{TEST_CASE_FIELD}' must be a mapping carrying "
+            f"'{TEST_CASE_NAME_KEY}: <pytest node id>', got {type(block).__name__}"
+        )
+        return None
+    name = block.get(TEST_CASE_NAME_KEY)
+    if not isinstance(name, str) or not name.strip():
+        errors.append(
+            f"'{TEST_CASE_FIELD}.{TEST_CASE_NAME_KEY}' is required and must be a "
+            f"non-empty string: the pytest node id of the case to optimize, e.g. "
+            f"'tests/integration/defs/perf/test_perf_sanity.py::test_e2e[...]'"
+        )
+        return None
+
+    # Exclusive with the other two ways of naming a workload. Each would
+    # otherwise describe the same run alongside the test case, and nothing
+    # downstream would raise: the prompts would simply quote conditions the
+    # run never used.
+    if data.get(EXTRA_LLM_API_OPTIONS_FIELD) is not None:
+        errors.append(
+            f"'{EXTRA_LLM_API_OPTIONS_FIELD}' cannot be combined with "
+            f"'{TEST_CASE_FIELD}': the test case generates its own server "
+            f"configuration, so a tuning YAML would never be read"
+        )
+        return None
+    if has_disagg(data):
+        errors.append(
+            f"'{DISAGG_FIELD}' cannot be combined with '{TEST_CASE_FIELD}': the "
+            f"disagg block drives examples/disaggregated/slurm/benchmark, while a "
+            f"test case is driven by its own harness — composing both would put two "
+            f"measurement systems in one campaign"
+        )
+        return None
+
+    try:
+        case = parse_test_case(name)
+    except TestCaseError as exc:
+        errors.append(f"'{TEST_CASE_FIELD}.{TEST_CASE_NAME_KEY}': {exc}")
+        return None
+
+    resolved: dict[str, Any] = {"family": case.family}
+    if isinstance(case, PerfSanityCase):
+        resolved.update(
+            runtime=case.runtime,
+            benchmark_mode=case.benchmark_mode,
+            select_pattern=case.select_pattern,
+        )
+        repo = data.get("trtllm_repo_path")
+        if isinstance(repo, str) and repo.strip():
+            try:
+                resolved["config"] = str(resolve_test_case_config(case, repo))
+            except TestCaseError as exc:
+                errors.append(f"'{TEST_CASE_FIELD}.{TEST_CASE_NAME_KEY}': {exc}")
+                return None
+
+    # The id fixes the measurement conditions, so a benchmark key set
+    # beside it is a second authority over the same thing. Rejecting is
+    # deliberate: filling-if-unset would leave a resolved spec that agrees
+    # with the task and disagrees with the run.
+    user_keys = sorted(user_set_benchmark_keys(path))
+    if user_keys:
+        listed = ", ".join(f"'benchmark.{key}'" for key in user_keys)
+        errors.append(
+            f"{listed} cannot be set alongside '{TEST_CASE_FIELD}': the test case id "
+            f"fixes the measurement conditions, so a benchmark block would describe "
+            f"a different run than the one named"
+        )
+        return None
+    return resolved
+
+
 def load_and_validate_task_yaml(
     path: str | Path, *, max_rounds_override: int | None = None
 ) -> dict[str, Any]:
@@ -425,7 +527,16 @@ def load_and_validate_task_yaml(
     data = _base_load_and_validate(path, agent_roles=ROLES)
 
     errors: list[str] = []
-    # Disagg first: the harness config is the source of truth for the
+    # Test case first: it is exclusive with both other ways of naming a
+    # workload, so settling it decides whether the disagg backfill below
+    # has anything to do.
+    resolved_test_case = _validate_test_case_block(data, path, errors)
+    if resolved_test_case is not None:
+        data[TEST_CASE_FIELD] = {
+            **data[TEST_CASE_FIELD],
+            TEST_CASE_RESOLVED_KEY: resolved_test_case,
+        }
+    # Disagg next: the harness config is the source of truth for the
     # measurement conditions, so the backfill has to land before the
     # blocks that are validated against them (focus_concurrencies against
     # the concurrency points, accuracy against its own presence).
@@ -476,6 +587,37 @@ def load_and_validate_task_yaml(
         data["accuracy"] = {**ACCURACY_DEFAULTS, **accuracy}
 
     return data
+
+
+def has_test_case(data: Mapping[str, Any]) -> bool:
+    """Whether the task names its workload by test-case id."""
+    return data.get(TEST_CASE_FIELD) is not None
+
+
+def test_case_name(data: Mapping[str, Any]) -> str | None:
+    """The validated test-case id, or ``None`` when the task has no block."""
+    block = data.get(TEST_CASE_FIELD)
+    if not isinstance(block, Mapping):
+        return None
+    name = block.get(TEST_CASE_NAME_KEY)
+    return name if isinstance(name, str) and name.strip() else None
+
+
+def test_case_config_path(data: Mapping[str, Any]) -> str | None:
+    """Path the id resolved to, for the family that reads a config file.
+
+    ``None`` both for a task with no test case and for a ``test_perf`` id,
+    which generates its configuration from the id itself rather than
+    reading a file.
+    """
+    block = data.get(TEST_CASE_FIELD)
+    if not isinstance(block, Mapping):
+        return None
+    resolved = block.get(TEST_CASE_RESOLVED_KEY)
+    if not isinstance(resolved, Mapping):
+        return None
+    config = resolved.get("config")
+    return config if isinstance(config, str) else None
 
 
 def has_accuracy_check(data: Mapping[str, Any]) -> bool:
@@ -537,15 +679,22 @@ __all__ = [
     "KNOWN_ACCURACY_KEYS",
     "KNOWN_KERNEL_COVERAGE_KEYS",
     "KNOWN_OPTIMIZE_KEYS",
+    "KNOWN_TEST_CASE_KEYS",
     "ITEM_EXECUTIONS",
     "OPTIMIZE_DEFAULTS",
     "REMOTE_RUN_ROOT_FIELD",
+    "TEST_CASE_FIELD",
+    "TEST_CASE_NAME_KEY",
+    "TEST_CASE_RESOLVED_KEY",
     "VALID_METRICS",
     "TaskSchemaError",
     "concurrency_points",
     "dump_task_yaml",
     "focus_concurrencies",
     "has_accuracy_check",
+    "has_test_case",
+    "test_case_config_path",
+    "test_case_name",
     "cluster_ssh",
     "has_slurm_environment",
     "is_curve_mode",
