@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.moe.fused_moe.moe_op_backend import FlashinferOpBackend
 
@@ -97,7 +98,10 @@ def test_fp4_input_scales_are_token_major(tokens, routed, flattened, flag, monke
     assert observed[0].data_ptr() == scales.data_ptr()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+# The real provider is exercised here: FlashInfer's FP4 quantization has no
+# backend for pre-Blackwell architectures, so CUDA availability alone is not
+# enough to run it.
+@skip_pre_blackwell
 @pytest.mark.parametrize("enable_pdl", [None, False, True])
 def test_opt_in_real_fp4_provider_and_graph(enable_pdl, monkeypatch):
     monkeypatch.setenv("TRTLLM_FLASHINFER_FP4_CONTRACT_FIX", "1")
