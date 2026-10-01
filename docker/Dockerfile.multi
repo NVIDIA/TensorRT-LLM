@@ -47,6 +47,9 @@ SHELL ["/bin/bash", "-c"]
 
 FROM base AS devel
 
+# Spectrum-X loads its bundled GPUNetIO library separately from the NCCL plugin.
+ENV NCCL_GIN_GPUNETIO_PATH=/opt/hpcx/nccl_spectrum-x_plugin/lib/libdoca_gpunetio_host.so
+
 #
 # NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
