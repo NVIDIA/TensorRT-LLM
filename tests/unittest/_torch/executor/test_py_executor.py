@@ -57,6 +57,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     SerializableSchedulerOutput,
 )
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
+from tensorrt_llm.llmapi import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
@@ -150,7 +151,7 @@ def _make_remote_tail_executor_and_request(
     )
     request = types.SimpleNamespace(
         prompt_len=prompt_len,
-        py_disaggregated_params=types.SimpleNamespace(remote_tail_start=None),
+        py_disaggregated_params=types.SimpleNamespace(remote_tail_start=None, schedule_style=None),
         py_llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
         py_beam_width=1,
         py_return_context_logits=False,
@@ -186,6 +187,21 @@ def test_remote_tail_destination_accepts_matching_boundary(
 
     PyExecutor._configure_csa2_remote_tail(executor, request)
 
+    assert request.py_csa2_remote_tail_mode == "destination"
+    assert request.py_csa2_remote_tail_start == expected_start
+
+
+@pytest.mark.parametrize("prompt_len, expected_start", [(64, 0), (128, 0), (256, 128)])
+def test_remote_tail_generation_first_derives_destination_boundary(
+    prompt_len: int, expected_start: int
+) -> None:
+    executor, request = _make_remote_tail_executor_and_request(prompt_len, context_only=False)
+    request.py_llm_request_type = LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+    request.py_disaggregated_params.schedule_style = DisaggScheduleStyle.GENERATION_FIRST
+
+    PyExecutor._configure_csa2_remote_tail(executor, request)
+
+    assert request.py_disaggregated_params.remote_tail_start == expected_start
     assert request.py_csa2_remote_tail_mode == "destination"
     assert request.py_csa2_remote_tail_start == expected_start
 
