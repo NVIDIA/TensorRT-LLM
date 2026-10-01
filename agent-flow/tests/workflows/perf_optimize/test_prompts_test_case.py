@@ -146,7 +146,13 @@ def _write_test_case_task(tmp_path):
     repo = tmp_path / "repo"
     (repo / "tests/scripts/perf-sanity/aggregated").mkdir(parents=True)
     (repo / "tests/scripts/perf-sanity/aggregated/cfg.yaml").write_text(
-        "metadata: {}\n", encoding="utf-8"
+        yaml.safe_dump(
+            {
+                "hardware": {"gpus_per_node": 8},
+                "server_configs": [{"name": "entry", "tensor_parallel_size": 8}],
+            }
+        ),
+        encoding="utf-8",
     )
     task = tmp_path / "task.yaml"
     task.write_text(
@@ -181,6 +187,14 @@ def test_directive_states_the_test_case_mode(tmp_path):
 def test_directive_points_at_the_resolved_config(tmp_path):
     directive = _workflow_for(_write_test_case_task(tmp_path))._measurement_directive()
     assert "cfg.yaml" in directive
+
+
+def test_directive_states_the_allocation_explicitly(tmp_path):
+    """A runner told only the id has nothing to derive from and uses one GPU."""
+    directive = _workflow_for(_write_test_case_task(tmp_path))._measurement_directive()
+    assert "8 GPU(s)" in directive
+    assert "1 node(s)" in directive
+    assert "derives nothing from the test id" in directive
 
 
 def test_directive_is_empty_for_a_plain_campaign(tmp_path):

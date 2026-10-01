@@ -59,6 +59,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
+import yaml
+
 from agent_flow.workflows.perf_analyze.task_schema import (
     EXTRA_LLM_API_OPTIONS_FIELD,
     REMOTE_RUN_ROOT_FIELD,
@@ -88,6 +90,7 @@ from agent_flow.workflows.perf_optimize.disagg import (
 )
 from agent_flow.workflows.perf_optimize.roadmap_schema import APPROACHES
 from agent_flow.workflows.perf_optimize.testcase import PerfSanityCase, TestCaseError
+from agent_flow.workflows.perf_optimize.testcase import allocation as test_case_allocation
 from agent_flow.workflows.perf_optimize.testcase import parse as parse_test_case
 from agent_flow.workflows.perf_optimize.testcase import resolve_config as resolve_test_case_config
 
@@ -434,6 +437,26 @@ def _validate_disagg_block(data: dict[str, Any], errors: list[str]) -> dict[str,
         return None
 
 
+def _sized(case: Any, config: Any, errors: list[str]) -> dict[str, Any]:
+    """The case's GPU allocation, as resolved fields, or ``{}`` on error.
+
+    Computed here so the number a runner is given comes from the config in
+    the checkout under test rather than from a default. The in-repo case
+    executor derives nothing from a test id and falls back to one GPU, which
+    would submit a multi-node case as a single-device job.
+    """
+    try:
+        sizing = test_case_allocation(case, config)
+    except TestCaseError as exc:
+        errors.append(f"'{TEST_CASE_FIELD}.{TEST_CASE_NAME_KEY}': {exc}")
+        return {}
+    return {
+        "devices": sizing.devices,
+        "devices_per_node": sizing.devices_per_node,
+        "nodes": sizing.nodes,
+    }
+
+
 def _validate_test_case_block(
     data: dict[str, Any], path: str | Path, errors: list[str]
 ) -> dict[str, Any] | None:
@@ -504,10 +527,26 @@ def _validate_test_case_block(
         repo = data.get("trtllm_repo_path")
         if isinstance(repo, str) and repo.strip():
             try:
-                resolved["config"] = str(resolve_test_case_config(case, repo))
+                config_path = resolve_test_case_config(case, repo)
+                resolved["config"] = str(config_path)
+                with config_path.open(encoding="utf-8") as handle:
+                    parsed = yaml.safe_load(handle)
             except TestCaseError as exc:
                 errors.append(f"'{TEST_CASE_FIELD}.{TEST_CASE_NAME_KEY}': {exc}")
                 return None
+            except (OSError, yaml.YAMLError) as exc:
+                errors.append(
+                    f"'{TEST_CASE_FIELD}.{TEST_CASE_NAME_KEY}': cannot read the config "
+                    f"it selects ({config_path}): {exc}"
+                )
+                return None
+            resolved.update(_sized(case, parsed, errors))
+            if errors:
+                return None
+    else:
+        resolved.update(_sized(case, None, errors))
+        if errors:
+            return None
 
     # The id fixes the measurement conditions, so a benchmark key set
     # beside it is a second authority over the same thing. Rejecting is
@@ -616,6 +655,24 @@ def test_case_name(data: Mapping[str, Any]) -> str | None:
     return name if isinstance(name, str) and name.strip() else None
 
 
+def test_case_allocation_spec(data: Mapping[str, Any]) -> dict[str, Any] | None:
+    """GPU counts the id resolved to: ``devices``, ``devices_per_node``, ``nodes``.
+
+    ``None`` when the task names no test case. These are what a runner
+    must be given explicitly rather than left to derive.
+    """
+    block = data.get(TEST_CASE_FIELD)
+    if not isinstance(block, Mapping):
+        return None
+    resolved = block.get(TEST_CASE_RESOLVED_KEY)
+    if not isinstance(resolved, Mapping):
+        return None
+    keys = ("devices", "devices_per_node", "nodes")
+    if not all(isinstance(resolved.get(key), int) for key in keys):
+        return None
+    return {key: int(resolved[key]) for key in keys}
+
+
 def test_case_config_path(data: Mapping[str, Any]) -> str | None:
     """Path the id resolved to, for the family that reads a config file.
 
@@ -707,6 +764,7 @@ __all__ = [
     "focus_concurrencies",
     "has_accuracy_check",
     "has_test_case",
+    "test_case_allocation_spec",
     "test_case_config_path",
     "test_case_name",
     "cluster_ssh",

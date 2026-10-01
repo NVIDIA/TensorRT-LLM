@@ -274,6 +274,110 @@ def test_pinned_labels_omit_a_knob_the_id_does_not_spell_out():
     assert "maxbs" not in testcase.pinned_labels(case)
 
 
+# --------------------------------------------------------------------------- #
+# Allocation sizing
+# --------------------------------------------------------------------------- #
+
+
+def _agg(entries, gpus_per_node=8):
+    return {"hardware": {"gpus_per_node": gpus_per_node}, "server_configs": entries}
+
+
+def test_single_node_perf_case_sizing_from_the_id():
+    case = _perf("model-bench-maxbs:64-gpus:8")
+    assert testcase.allocation(case) == testcase.Allocation(8, 8, 1)
+
+
+def test_perf_case_sizing_falls_back_to_tp_times_pp():
+    """``gpus:`` is omitted when it equals tp, so tp x pp must agree."""
+    assert testcase.allocation(_perf("model-bench-tp:4-pp:2")).devices == 8
+    # Neither spelled out means the knobs are at their defaults.
+    assert testcase.allocation(_perf("model-bench")).devices == 1
+
+
+def test_aggregated_sizing_uses_the_selected_entry():
+    config = _agg(
+        [
+            {"name": "small", "tensor_parallel_size": 2},
+            {"name": "big", "tensor_parallel_size": 8},
+        ]
+    )
+    case = _sanity("aggr-cfg-small")
+    assert testcase.allocation(case, config) == testcase.Allocation(2, 2, 1)
+
+
+def test_aggregated_sizing_spans_nodes_when_tp_exceeds_a_node():
+    config = _agg([{"name": "e", "tensor_parallel_size": 16}], gpus_per_node=8)
+    assert testcase.allocation(_sanity("aggr-cfg-e"), config) == testcase.Allocation(16, 8, 2)
+
+
+def test_parallelism_multiplies_across_dimensions():
+    config = _agg(
+        [
+            {
+                "name": "e",
+                "tensor_parallel_size": 4,
+                "pipeline_parallel_size": 2,
+                "context_parallel_size": 1,
+                # Expert parallelism partitions the same GPUs tensor
+                # parallelism already covers, so it must not multiply in.
+                "moe_expert_parallel_size": 4,
+            }
+        ]
+    )
+    assert testcase.allocation(_sanity("aggr-cfg-e"), config).devices == 8
+
+
+def test_no_selection_allocates_the_widest_entry():
+    """The id means "run every entry", and they need not agree."""
+    config = _agg(
+        [
+            {"name": "a", "tensor_parallel_size": 2},
+            {"name": "b", "tensor_parallel_size": 8},
+        ]
+    )
+    assert testcase.allocation(_sanity("aggr-cfg"), config).devices == 8
+
+
+def test_a_missing_entry_name_raises():
+    config = _agg([{"name": "a", "tensor_parallel_size": 2}])
+    with pytest.raises(testcase.TestCaseError, match="no 'server_configs' entry named"):
+        testcase.allocation(_sanity("aggr-cfg-absent"), config)
+
+
+def test_disagg_sizing_sums_over_roles():
+    """Every role is allocated at once, so roles add rather than max."""
+    config = {
+        "hardware": {"gpus_per_node": 8, "num_ctx_servers": 2, "num_gen_servers": 1},
+        "worker_config": {
+            "ctx": {"tensor_parallel_size": 4, "pipeline_parallel_size": 1},
+            "gen": {"tensor_parallel_size": 8, "pipeline_parallel_size": 1},
+        },
+    }
+    # 2 ctx x 4 + 1 gen x 8 = 16 GPUs over two 8-GPU nodes.
+    assert testcase.allocation(_sanity("disagg-e2e-cfg"), config) == testcase.Allocation(16, 8, 2)
+
+
+def test_sizing_a_perf_sanity_case_without_its_config_raises():
+    with pytest.raises(testcase.TestCaseError, match="needs its perf-sanity config"):
+        testcase.allocation(_sanity("aggr-cfg-e"))
+
+
+@pytest.mark.parametrize(
+    "config,match",
+    [
+        ({"server_configs": []}, "no 'hardware' block"),
+        ({"hardware": {}, "server_configs": [{"name": "e"}]}, "gpus_per_node"),
+        ({"hardware": {"gpus_per_node": 8}}, "no 'server_configs' entries"),
+        ({"hardware": {"gpus_per_node": 8}, "worker_config": {}}, "neither a 'ctx' nor a 'gen'"),
+    ],
+)
+def test_an_unsizeable_config_raises_rather_than_defaulting(config, match):
+    """Never fall back to one GPU: that submits and reports a meaningless run."""
+    with pytest.raises(testcase.TestCaseError, match=match):
+        testcase.allocation(_sanity("aggr-cfg-e"), config)
+
+
 def test_pinned_labels_for_perf_sanity_cover_stem_and_selection():
     case = _sanity("aggr-cfg-entry")
     assert testcase.pinned_labels(case) == frozenset({"config_stem", "select_pattern"})

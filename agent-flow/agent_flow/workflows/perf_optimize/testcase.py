@@ -44,8 +44,11 @@ to update rather than as a run against the wrong config.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
+from typing import Any
 
 # The function this module mirrors. Named rather than imported: it lives in
 # the repo under test, it is only importable with pytest present, and
@@ -298,6 +301,121 @@ def resolve_config(case: TestCase, repo_dir: str | Path) -> Path:
     return path
 
 
+@dataclass(frozen=True)
+class Allocation:
+    """GPUs a case needs, in the shape a Slurm submission asks for."""
+
+    devices: int
+    devices_per_node: int
+    nodes: int
+
+
+def _server_entry(config: Mapping[str, Any], select_pattern: str | None) -> Mapping[str, Any]:
+    """The ``server_configs`` entry a plain aggregated id selects.
+
+    With no selection the id means "every entry", and they need not agree
+    on parallelism — the widest one is what has to be allocated.
+    """
+    entries = config.get("server_configs")
+    if not isinstance(entries, list) or not entries:
+        raise TestCaseError("perf-sanity config carries no 'server_configs' entries")
+    candidates = [entry for entry in entries if isinstance(entry, Mapping)]
+    if select_pattern is not None:
+        candidates = [entry for entry in candidates if entry.get("name") == select_pattern]
+        if not candidates:
+            raise TestCaseError(
+                f"no 'server_configs' entry named {select_pattern!r} in the config this id selects"
+            )
+    return max(candidates, key=_world_size)
+
+
+def _world_size(entry: Mapping[str, Any]) -> int:
+    """``tp x pp x cp`` for one server role.
+
+    Expert parallelism is deliberately absent: it partitions the same GPUs
+    a tensor-parallel group already covers rather than adding any.
+    """
+    size = 1
+    for key in ("tensor_parallel_size", "pipeline_parallel_size", "context_parallel_size"):
+        value = entry.get(key, 1)
+        if isinstance(value, int) and value > 0:
+            size *= value
+    return size
+
+
+def allocation(case: TestCase, config: Mapping[str, Any] | None = None) -> Allocation:
+    """GPUs ``case`` needs, for the caller to pass to its runner verbatim.
+
+    ``config`` is the parsed perf-sanity YAML, and is required for that
+    family and ignored for the other. Worth passing explicitly rather than
+    letting a runner work it out: the in-repo case executor performs no
+    derivation from a test id and falls back to a **single GPU**, which
+    submits a multi-node case as a one-device job that runs, reports, and
+    means nothing.
+    """
+    if isinstance(case, PerfCase):
+        # test_perf is single-node -- it carries no Slurm plumbing at all --
+        # so per-node is the total. The id reconciles num_gpus against
+        # tp x pp in both directions and asserts they agree, so either
+        # spelling gives the same answer and a missing ``gpus:`` label just
+        # means the knobs are at their defaults.
+        devices = _int_knob(case, "gpus") or (
+            (_int_knob(case, "tp") or 1) * (_int_knob(case, "pp") or 1)
+        )
+        return Allocation(devices=devices, devices_per_node=devices, nodes=1)
+
+    if config is None:
+        raise TestCaseError(
+            f"sizing {case.name!r} needs its perf-sanity config; resolve it with "
+            f"resolve_config() and pass the parsed mapping"
+        )
+    hardware = config.get("hardware")
+    if not isinstance(hardware, Mapping):
+        raise TestCaseError("perf-sanity config carries no 'hardware' block")
+    per_node = hardware.get("gpus_per_node")
+    if not isinstance(per_node, int) or per_node <= 0:
+        raise TestCaseError(
+            f"'hardware.gpus_per_node' must be a positive integer, got {per_node!r}"
+        )
+
+    worker_config = config.get("worker_config")
+    if isinstance(worker_config, Mapping):
+        # Disagg shape: every role is allocated at once, so the total is the
+        # sum over roles rather than any single role's world size.
+        devices = 0
+        for role, count_key in (("ctx", "num_ctx_servers"), ("gen", "num_gen_servers")):
+            entry = worker_config.get(role)
+            if not isinstance(entry, Mapping):
+                continue
+            count = hardware.get(count_key, 1)
+            count = count if isinstance(count, int) and count > 0 else 1
+            devices += count * _world_size(entry)
+        if devices == 0:
+            raise TestCaseError(
+                "disagg perf-sanity config carries neither a 'ctx' nor a 'gen' worker_config role"
+            )
+    else:
+        devices = _world_size(_server_entry(config, case.select_pattern))
+
+    return Allocation(
+        devices=devices,
+        devices_per_node=min(per_node, devices),
+        nodes=max(1, ceil(devices / per_node)),
+    )
+
+
+def _int_knob(case: PerfCase, key: str) -> int | None:
+    """A positive integer ``key:value`` label, or ``None``."""
+    raw = case.knobs.get(key)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def pinned_labels(case: TestCase) -> frozenset[str]:
     """Knob names the id itself fixes, which a fix should leave alone.
 
@@ -329,6 +447,7 @@ def pinned_labels(case: TestCase) -> frozenset[str]:
 
 __all__ = [
     "AGG_CONFIG_SUBDIR",
+    "Allocation",
     "AGGREGATED_DISAGG_YAML_MODES",
     "DISAGG_BENCHMARK_MODES",
     "DISAGG_CONFIG_MODES",
@@ -343,6 +462,7 @@ __all__ = [
     "PerfSanityCase",
     "TestCase",
     "TestCaseError",
+    "allocation",
     "parse",
     "pinned_labels",
     "resolve_config",

@@ -75,6 +75,7 @@ from .task_schema import (
     profile_ranks,
     sol_enabled,
 )
+from .task_schema import test_case_allocation_spec as task_case_allocation_spec
 from .task_schema import test_case_config_path as task_case_config_path
 from .task_schema import test_case_name as task_case_name
 
@@ -1573,12 +1574,25 @@ class PerfOptimizeWorkflow:
         if name is not None:
             config = task_case_config_path(task_data)
             where = f", config: `{config}`" if config else ""
+            sizing = task_case_allocation_spec(task_data)
+            # Stated explicitly because a runner told only the test id has
+            # nothing to derive from and falls back to a single GPU, which
+            # turns a multi-node case into a one-device job that still
+            # reports numbers.
+            needs = (
+                f"Allocate **{sizing['devices']} GPU(s)** over "
+                f"**{sizing['nodes']} node(s)** at {sizing['devices_per_node']} per "
+                f"node, and pass those counts to the runner explicitly — it derives "
+                f"nothing from the test id.\n\n"
+                if sizing
+                else ""
+            )
             return (
                 f"⚠️ **This campaign measures a TEST CASE** (`{name}`{where}). "
                 f"Nothing below that mentions `trtllm-serve`, "
                 f"`--extra_llm_api_options`, `benchmark_serving.py` or polling a "
                 f"server applies — your system prompt's *Test-case workload* "
-                f"section replaces all of it.\n\n"
+                f"section replaces all of it.\n\n{needs}"
             )
         if has_disagg(task_data):
             config = disagg_config_path(task_data)
