@@ -28,7 +28,12 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.logger import logger
 
-from ..nccl_ep_utils import nccl_ep_supports_version
+from ..moe_comm_timeout_guard import get_moe_comm_timeout_budgets
+from ..nccl_ep_utils import (
+    is_nccl_ep_installed,
+    nccl_ep_supports_group_timeout,
+    nccl_ep_supports_version,
+)
 from ..wide_ep_ft import get_wide_ep_ft_options
 from .allgather_reducescatter import AllGatherReduceScatter
 from .base import Communication
@@ -125,7 +130,14 @@ class CommunicationFactory:
         Note:
             Most parameters are extracted from model_config. Only MoE-specific parameters
             (num_experts, num_slots, top_k, expert_size_per_partition) need to be provided separately.
+
+        Raises:
+            ValueError: If the MoE communication timeout environment variables are invalid.
         """
+        # Backend constructors apply these budgets, and auto-selection below treats a constructor
+        # error as "backend unavailable", so an invalid variable must fail here instead.
+        get_moe_comm_timeout_budgets()
+
         # Extract parameters from model_config
         mapping = model_config.mapping
         if mapping.has_cp_helix():
@@ -499,4 +511,9 @@ class CommunicationFactory:
                     f"{required_smem} bytes of dynamic shared memory, but the current device "
                     f"supports only {max_dynamic_smem} bytes."
                 )
+        if is_nccl_ep_installed() and not nccl_ep_supports_group_timeout():
+            return (
+                "NcclEP requires nccl.ep.Group.set_timeout_ns; rebuild so nccl-extensions "
+                "carries 3rdparty/patches/nccl_ep_group_timeout.patch."
+            )
         return None

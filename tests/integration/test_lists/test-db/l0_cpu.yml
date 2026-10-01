@@ -47,6 +47,9 @@ l0_cpu:
   - unittest/_torch/disaggregation
   - unittest/_torch/peft
   - unittest/_torch/memory
+  # unittest/_torch/misc runs on GPU lists with -m "not cpu_only", so this entry runs
+  # its CPU-only file.
+  - unittest/_torch/misc/test_moe_a2a_warmup_timeout.py
   - unittest/_torch/modeling
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms

@@ -7241,6 +7241,11 @@ def _import_deep_gemm():
             f"tensorrt_llm.deep_gemm missing mega_moe symbols {missing}; "
             f"upgrade the TRT-LLM bundled DeepGEMM to a release that "
             f"includes fp8_fp4_mega_moe.")
+    if not hasattr(_dg, "set_barrier_timeout_seconds"):
+        raise _MegaMoEUnavailable(
+            "tensorrt_llm.deep_gemm lacks set_barrier_timeout_seconds; rebuild "
+            "so the bundled DeepGEMM carries "
+            "3rdparty/patches/deepgemm_configurable_barrier_timeout.patch.")
 
     mega_moe_params = inspect.signature(_dg.fp8_fp4_mega_moe).parameters
     missing_situ_params = [

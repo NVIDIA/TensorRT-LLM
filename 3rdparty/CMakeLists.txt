@@ -143,20 +143,57 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
     list(APPEND FETCH_ARGS SOURCE_SUBDIR "${DEP_SOURCE_SUBDIR}")
   endif()
 
-  if(DEP_PATCH_FILE AND NOT DEP_PATCH_FILE STREQUAL "")
-    set(_patch_file "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
-    # Try applying the patch; --forward skips patches already applied and -r -
+  # patch_file is one path or a list of paths, relative to this directory and
+  # applied in order.
+  set(_patch_files "")
+  string(
+    JSON
+    _patch_file_type
+    ERROR_VARIABLE
+    _err
+    TYPE
+    "${DEP_OBJECT}"
+    "patch_file")
+  if(_patch_file_type STREQUAL "ARRAY")
+    string(JSON _patch_count LENGTH "${DEP_OBJECT}" "patch_file")
+    if(_patch_count GREATER 0)
+      math(EXPR _patch_last "${_patch_count} - 1")
+      foreach(_patch_idx RANGE ${_patch_last})
+        string(JSON _patch GET "${DEP_OBJECT}" "patch_file" ${_patch_idx})
+        list(APPEND _patch_files "${_patch}")
+      endforeach()
+    endif()
+  elseif(DEP_PATCH_FILE AND NOT DEP_PATCH_FILE STREQUAL "")
+    list(APPEND _patch_files "${DEP_PATCH_FILE}")
+  endif()
+
+  if(_patch_files)
+    # Try applying each patch; --forward skips patches already applied and -r -
     # discards rejects. The forward exit status alone cannot distinguish an
-    # already-patched tree from a failure. Require a reverse dry-run to succeed.
-    # --force keeps this check in reverse mode instead of automatically
-    # switching direction for an unapplied patch.
+    # already-patched tree from a failure. Require a reverse dry-run of each
+    # patch to succeed, which also requires the patches of one dependency to
+    # touch disjoint hunks. --force keeps this check in reverse mode instead of
+    # automatically switching direction for an unapplied patch. The script must
+    # not contain semicolons: CMake would split it into separate arguments.
+    set(_patch_script "")
+    foreach(_patch IN LISTS _patch_files)
+      set(_patch_path "${CMAKE_CURRENT_SOURCE_DIR}/${_patch}")
+      if(NOT _patch_script STREQUAL "")
+        string(APPEND _patch_script " && ")
+      endif()
+      string(
+        APPEND
+        _patch_script
+        "(patch -p1 --forward --batch -r - -i '${_patch_path}' >/dev/null 2>&1 || true) && patch -p1 --reverse --force --dry-run -i '${_patch_path}' >/dev/null 2>&1"
+      )
+    endforeach()
     list(
       APPEND
       FETCH_ARGS
       PATCH_COMMAND
       bash
       -c
-      "patch -p1 --forward --batch -r - -i '${_patch_file}' >/dev/null 2>&1; patch -p1 --reverse --force --dry-run -i '${_patch_file}' >/dev/null 2>&1 || (echo 'Patch state for ${DEP_NAME} is inconsistent. Remove ${CMAKE_BINARY_DIR}/_deps/${DEP_NAME}-src and reconfigure.' >&2; false)"
+      "${_patch_script} || (echo 'Patch state for ${DEP_NAME} is inconsistent. Remove ${CMAKE_BINARY_DIR}/_deps/${DEP_NAME}-src and reconfigure.' >&2 && false)"
     )
   endif()
 

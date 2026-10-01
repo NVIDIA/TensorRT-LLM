@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import socket
+from types import ModuleType
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -53,6 +54,7 @@ from ..impl_contract import (
 from ..impl_environment import MoEDep
 from ..impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
 from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
+from ..moe_comm_timeout_guard import register_moe_comm_timeout_proxy
 from ..quantization import W4A8MXFP4MXFP8MegaMoEDeepGemmMethod, _import_deep_gemm
 from ..routing import BaseMoeRoutingMethod
 
@@ -79,6 +81,34 @@ __all__ = ["DeepgemmCudaW4a8Mxfp4Mxfp8Impl", "MegaMoEDeepGemm"]
 # into a false stale -- freeing a buffer another layer already holds.
 # ``release_symm_buffer_cache`` bounds the lifetime.
 _MEGA_MOE_SYMM_BUFFER_CACHE: Dict[tuple, Tuple[object, object]] = {}
+
+
+class _DeepGemmTimeoutProxy:
+    """Applies MoE communication timeouts to DeepGEMM's in-kernel barriers.
+
+    The timeout lives in DeepGEMM's process-wide device runtime and each ``fp8_fp4_mega_moe``
+    launch passes it to the kernel as an argument, so one proxy serves every layer.
+    """
+
+    name = "DeepGEMM MegaMoE"
+
+    def __init__(self, dg: ModuleType) -> None:
+        self._dg = dg
+
+    def set_timeout_seconds(self, seconds: int | None) -> None:
+        # DeepGEMM restores its JIT-time default for 0.
+        self._dg.set_barrier_timeout_seconds(0 if seconds is None else seconds)
+
+
+# Kept alive here because the timeout guard holds its proxies weakly.
+_TIMEOUT_PROXY: Optional[_DeepGemmTimeoutProxy] = None
+
+
+def _register_timeout_proxy(dg: ModuleType) -> None:
+    global _TIMEOUT_PROXY
+    if _TIMEOUT_PROXY is None:
+        _TIMEOUT_PROXY = _DeepGemmTimeoutProxy(dg)
+    register_moe_comm_timeout_proxy(_TIMEOUT_PROXY)
 
 
 def _free_symm_buffer(buffered: object) -> int:
@@ -501,6 +531,7 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         # paying that on every forward (``run_moe`` path) shows up in host-side
         # CPU overhead even though the underlying ``import`` is cached by Python.
         self._dg = _import_deep_gemm()
+        _register_timeout_proxy(self._dg)
 
         # NVLink SymmBuffer activation workspace. Allocation is a
         # model-build-period collective (``symm_mem.rendezvous`` over the
