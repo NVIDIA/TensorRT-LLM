@@ -301,26 +301,22 @@ kv_cache_config = KvCacheConfig(
 )
 ```
 
-**Constraints.** A native event sink captures compact semantic event data and Python converts
-it to the wire structs at the once-per-iteration flush boundary; no Python callback runs from
-the native cache hot path. Pipeline parallelism and context parallelism are rejected. Events
-are not published for draft models or during KV-cache-size estimation. When streaming is
-enabled the buffered pull API returns an empty list rather than raising.
+**Limitations.** Pipeline and context parallelism are unsupported. Buffered polling returns
+no events while streaming is enabled. Draft models and KV-cache-size estimation do not publish
+events. Use buffered mode for cache-tier, priority, and other lifecycle updates.
 
-The streaming contract starts from the external router's requirement—whether a full, reusable
-attention block is resident—rather than mirroring every internal cache-manager transition. It
-therefore selects one attention lifecycle (the maximum-window lifecycle), publishes only full
-blocks, and emits only `BlockStored` and `BlockRemoved`. Native semantic event data is converted
-to the common wire structs at the publisher boundary. This centralizes event conversion while
-keeping lifecycle IDs, cache tiers, priorities, and other cache-manager details inside TensorRT
-LLM. Use the buffered path when a consumer needs those richer internal lifecycle events.
+Streaming exposes only the full-block residency information external routers need, using the
+attention lifecycle with the largest window. Conversion to `BlockStored`/`BlockRemoved` is
+centralized at the once-per-iteration publisher boundary, keeping internal lifecycle details
+contained and avoiding Python callbacks from native cache operations.
 
-For V2 multimodal prefixes, streaming uses the same digest-first representation as the
-buffered path. A digest token is emitted as a hexadecimal string in `token_ids`, and
-`mm_keys` is aligned one-for-one with `block_hashes`; each nested list contains that block's
-multimodal segments using the `hash` and `start_offset` semantics described above. Consumers
-must accept `token_ids` values of type `int | str` and normalize them before applying their
-ordinary token hashing logic.
+**Multimodal payloads.** `token_ids` can contain integers and hexadecimal digest strings;
+integer-only consumers are incompatible. Each `mm_keys[i]` describes the multimodal segments
+in `block_hashes[i]`, using the `hash` and `start_offset` fields defined above. This payload
+support does not establish end-to-end multimodal-aware routing compatibility. The final
+identity and normalization contract will be revisited separately after
+[Dynamo #15095](https://github.com/ai-dynamo/dynamo/pull/15095) and
+[TensorRT-LLM #19529](https://github.com/NVIDIA/TensorRT-LLM/pull/19529) merge.
 
 **Endpoint convention.** Every attention-DP rank binds `base_port + rank` using its
 **global** rank, so `N` ranks occupy `[base_port, base_port + N - 1]` cluster-wide and

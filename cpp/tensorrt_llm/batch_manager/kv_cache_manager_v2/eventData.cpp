@@ -28,13 +28,13 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 std::string digestToHex(Digest const& digest)
 {
     constexpr char kHex[] = "0123456789abcdef";
-    std::string result;
-    result.resize(digest.size() * 2);
-    for (size_t i = 0; i < digest.size(); ++i)
+    std::string result(digest.size() * 2, '\0');
+    auto out = result.begin();
+    for (auto byte : digest)
     {
-        auto const value = std::to_integer<uint8_t>(digest[i]);
-        result[2 * i] = kHex[value >> 4U];
-        result[2 * i + 1] = kHex[value & 0x0FU];
+        auto const value = std::to_integer<unsigned>(byte);
+        *out++ = kHex[value >> 4U];
+        *out++ = kHex[value & 0x0FU];
     }
     return result;
 }

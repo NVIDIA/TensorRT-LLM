@@ -433,6 +433,51 @@ def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factor
         manager.shutdown()
 
 
+@pytest.mark.parametrize("overflow", [False, True])
+def test_native_streaming_removals_are_never_dropped_by_the_entry_cap(real_block_factory, overflow):
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+        max_entries=2,
+    )
+    manager.start()
+    try:
+        manager.set_layer_group_window_sizes({0: 128})
+        published = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+        event_sink = manager.event_sink
+        make_block = real_block_factory(event_sink, tokens_per_block=2)
+        first = make_block(_token_ids(1, 3), [2])
+        second = make_block(_token_ids(3, 5), [2], parent=first)
+        _add_streaming_stored_block(event_sink, first)
+        _add_streaming_stored_block(event_sink, second)
+        if overflow:
+            third = make_block(_token_ids(5, 7), [2], parent=second)
+            _add_streaming_stored_block(event_sink, third)
+
+        # Both removal entry points must bypass the saturated store cap.
+        _add_streaming_removed_block(event_sink, first)
+        _add_streaming_removed_life_cycle(event_sink, second, 0)
+        manager.flush_iteration_events()
+
+        assert manager.stored_blocks == 2
+        assert manager.removed_blocks == 2
+        assert manager.dropped_events == int(overflow)
+        assert len(published) == 1
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]))
+        assert [event["type"] for event in decoded[1]] == ["BlockStored", "BlockRemoved"]
+        expected_hashes = [
+            int.from_bytes(_block_key(block)[:8], byteorder="big", signed=True)
+            for block in (first, second)
+        ]
+        assert decoded[1][0]["block_hashes"] == expected_hashes
+        assert decoded[1][1]["block_hashes"] == expected_hashes
+    finally:
+        manager.shutdown()
+
+
 def test_native_streaming_sink_drops_descendants_of_unpublished_parent(real_block_factory):
     manager = StreamingKVCacheEventManager(
         KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
