@@ -103,7 +103,7 @@ l0_b200:
   #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
   #               rebind mpi4py's serializer at import time, which applies process-wide on
   #               every stage that collects them, including where the tests themselves skip.
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (90)
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/compilation
   - unittest/_torch/debugger
