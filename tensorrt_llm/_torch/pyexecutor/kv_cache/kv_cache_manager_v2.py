@@ -3347,9 +3347,11 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
 
         if not kv_cache.is_active:
-            if not kv_cache.resume(self._stream.cuda_stream):
+            if not kv_cache.resume(self._stream.cuda_stream, is_decoding=True):
                 return False
             self._restore_page_index_bufs(req.py_request_id, kv_cache)
+        elif not kv_cache.enter_decode():
+            return False
 
         request_id = req.py_request_id
         draft_slots = self._generation_draft_slots(req)

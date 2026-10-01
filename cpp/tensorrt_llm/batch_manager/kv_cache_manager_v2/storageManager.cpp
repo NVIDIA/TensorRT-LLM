@@ -1269,10 +1269,10 @@ void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<Sh
 {
     struct OffloadBatch
     {
-        std::vector<SharedPtr<Page>> pages;
-        std::vector<SharedPtr<UniqPageLock>> locks;
-        std::vector<Slot> slots;
-        std::vector<PageIndexPair> indices;
+        std::vector<SharedPtr<Page>> srcPages;
+        std::vector<SharedPtr<UniqPageLock>> srcPageLocks;
+        std::vector<Slot> dstSlots;
+        std::vector<PageIndexPair> srcDstPageIndices;
     };
 
     std::map<LayerGroupId, OffloadBatch> batches;
@@ -1300,12 +1300,12 @@ void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<Sh
             continue;
         }
         auto& batch = batches[getMigrationBatchingLayerGroupId(kSparseHistoryLevel, kHotLevel, page->lifeCycle)];
-        batch.pages.push_back(page);
+        batch.srcPages.push_back(page);
         for (auto const& owner : lock->owners())
         {
             ownerStreams.insert(owner.kvCache->cudaStream());
         }
-        batch.locks.push_back(std::move(lock));
+        batch.srcPageLocks.push_back(std::move(lock));
     }
     if (batches.empty())
     {
@@ -1315,7 +1315,8 @@ void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<Sh
     TypedVec<PoolGroupIndex, SlotCount> requirements(numPoolGroups(kSparseHistoryLevel), 0);
     for (auto const& [layerGroup, batch] : batches)
     {
-        requirements[getPoolGroupIndex(kSparseHistoryLevel, layerGroup)] += slotCountValueFromSize(batch.pages.size());
+        requirements[getPoolGroupIndex(kSparseHistoryLevel, layerGroup)]
+            += slotCountValueFromSize(batch.srcPages.size());
     }
     prepareFreeSlots(kSparseHistoryLevel, requirements, migrationRecorder, dropRecorder);
     auto releaseDestinations = FuncGuard(
@@ -1323,7 +1324,7 @@ void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<Sh
         {
             for (auto& [layerGroup, batch] : batches)
             {
-                for (auto& slot : batch.slots)
+                for (auto& slot : batch.dstSlots)
                 {
                     if (slot.hasValidSlot())
                     {
@@ -1335,12 +1336,12 @@ void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<Sh
     for (auto& [layerGroup, batch] : batches)
     {
         auto& pool = poolGroup(kSparseHistoryLevel, getPoolGroupIndex(kSparseHistoryLevel, layerGroup));
-        batch.slots = pool.allocateMultiple(slotCountValueFromSize(batch.pages.size()));
-        batch.indices.reserve(batch.pages.size());
-        for (size_t i = 0; i < batch.pages.size(); ++i)
+        batch.dstSlots = pool.allocateMultiple(slotCountValueFromSize(batch.srcPages.size()));
+        batch.srcDstPageIndices.reserve(batch.srcPages.size());
+        for (size_t i = 0; i < batch.srcPages.size(); ++i)
         {
-            batch.indices.push_back({.dst = slotIdToPageIndexValue(batch.slots[i].slotId()),
-                .src = slotIdToPageIndexValue(batch.pages[i]->slotId())});
+            batch.srcDstPageIndices.push_back({.dst = slotIdToPageIndexValue(batch.dstSlots[i].slotId()),
+                .src = slotIdToPageIndexValue(batch.srcPages[i]->slotId())});
         }
     }
 
@@ -1355,11 +1356,11 @@ void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<Sh
     }
     for (auto const& [layerGroup, batch] : batches)
     {
-        for (size_t i = 0; i < batch.pages.size(); ++i)
+        for (size_t i = 0; i < batch.srcPages.size(); ++i)
         {
-            batch.pages[i]->readyEvent.waitInStream(cudaStream);
-            batch.slots[i].readyEvent.waitInStream(cudaStream);
-            for (auto const& event : batch.locks[i]->finishEvents)
+            batch.srcPages[i]->readyEvent.waitInStream(cudaStream);
+            batch.dstSlots[i].readyEvent.waitInStream(cudaStream);
+            for (auto const& event : batch.srcPageLocks[i]->finishEvents)
             {
                 event.waitInStream(cudaStream);
             }
@@ -1374,17 +1375,17 @@ void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<Sh
             completion = CachedCudaEvent(cudaStream);
             for (auto& [layerGroup, batch] : batches)
             {
-                for (size_t i = 0; i < batch.pages.size(); ++i)
+                for (size_t i = 0; i < batch.srcPages.size(); ++i)
                 {
-                    batch.slots[i].readyEvent = completion;
-                    batch.locks[i]->recordOffloadEvent(completion);
+                    batch.dstSlots[i].readyEvent = completion;
+                    batch.srcPageLocks[i]->recordOffloadEvent(completion);
                 }
             }
         });
     for (auto const& [layerGroup, batch] : batches)
     {
-        submitMigrationBatch(
-            kSparseHistoryLevel, kHotLevel, layerGroup, batch.indices.data(), batch.indices.size(), stream);
+        submitMigrationBatch(kSparseHistoryLevel, kHotLevel, layerGroup, batch.srcDstPageIndices.data(),
+            batch.srcDstPageIndices.size(), stream);
     }
     fenceCopies.run();
 
@@ -1397,22 +1398,22 @@ void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<Sh
     {
         if (migrationRecorder)
         {
-            migrationRecorder(batch.pages, batch.slots, kHotLevel, kSparseHistoryLevel);
+            migrationRecorder(batch.srcPages, batch.dstSlots, kHotLevel, kSparseHistoryLevel);
         }
     }
     for (auto& [layerGroup, batch] : batches)
     {
-        for (size_t i = 0; i < batch.pages.size(); ++i)
+        for (size_t i = 0; i < batch.srcPages.size(); ++i)
         {
-            Slot source = batch.locks[i]->moveToSparseHistory(std::move(batch.slots[i]));
-            releaseSlot(batch.pages[i]->lifeCycle, kHotLevel, std::move(source));
+            Slot source = batch.srcPageLocks[i]->moveToSparseHistory(std::move(batch.dstSlots[i]));
+            releaseSlot(batch.srcPages[i]->lifeCycle, kHotLevel, std::move(source));
         }
     }
     if (mEventSink)
     {
         for (auto const& [layerGroup, batch] : batches)
         {
-            for (auto const& page : batch.pages)
+            for (auto const& page : batch.srcPages)
             {
                 if (page->isCommitted())
                 {

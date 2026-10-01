@@ -188,8 +188,19 @@ public:
 
     // Resume: check utilization and lock active pages at their required storage levels.
     // Optionally sets a new CUDA stream; if nullopt, uses the existing one.
+    // isDecoding defaults to the current phase. A cache starts in prefill and cannot return to it
+    // after decode admission. Set true when admitting a suspended request directly to decode.
     // Returns false if utilization too high or out of memory.
-    bool resume(std::optional<CUstream> stream = std::nullopt);
+    bool resume(std::optional<CUstream> stream = std::nullopt, std::optional<bool> isDecoding = std::nullopt);
+
+    // Enter decode only after prefill has submitted its final KV accesses. Reconciles all complete
+    // sparse history, including on retries with an unchanged watermark. Returns false on host OOM.
+    bool enterDecode();
+
+    bool isDecoding() const noexcept
+    {
+        return mIsDecoding;
+    }
 
     // Suspend: detach from CUDA stream, unlock pages → PageHolder.
     void suspend();
@@ -349,7 +360,7 @@ public:
     // Plan dropping SWA blocks needed only by the next conversation turn.
     //
     // The plan covers committed pages in each SWA life cycle's current attention
-    // window. Full-attention and attention-sink blocks are excluded because
+    // window. Sparse history, full-attention, and attention-sink blocks are excluded because
     // later turns may still need them. An SSM life cycle contributes its final block. Must be
     // called after stopCommitting(). Returns nullptr without creating a plan if
     // any required SWA page is unavailable. Mirrors Python's
@@ -483,9 +494,16 @@ private:
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
     void activate();
 
-    // Keep cold sparse history (and immutable reuse sources) in host memory.
-    // Writable pages require GPU storage; GPU history stays there until explicitly offloaded.
+    // Release active locks and scratch slots without recording a scheduler suspension.
+    void _deactivate();
+
+    // Prefill and writable pages require GPU storage. Decode keeps cold sparse history on host.
     CacheLevel _lockLevel(Page const& page, BlockOrdinal ordinal) const;
+
+    // Offload GPU pages in the supplied complete-history range, validating every live owner's phase.
+    // The candidate watermark is visible only under the exclusive API lock until offload succeeds.
+    void _offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int historyLength);
+    void _publishHistoryLength(int historyLength);
 
     // Internal helpers.
     // Turn the per-block cache levels observed while holding the matched pages into logical token
@@ -545,7 +563,6 @@ private:
     std::vector<ActivePage> _activePages() const;
     SharedPtr<Page> _page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycleId lcId) const;
 
-    bool _shortcutSetCapacity(int capacity);
     bool _shortcutSetHistoryLength(int historyLength);
     bool _shouldRecordManagerStats() const;
     bool _shouldRecordRequestStats() const;
@@ -642,6 +659,7 @@ private:
     BeamIndex mBeamWidth;
     int mCapacity;
     int mHistoryLength;
+    bool mIsDecoding = false;
     std::optional<int> mExpectedPromptLength;
     bool mGenerationAllocReady = false;
 
@@ -673,6 +691,7 @@ private:
     // SSM pages: [beamIdx][lcId] — always initialized (empty entries = monostate).
     BeamBlockPages mSsmBlocks;
     bool mNeverResumed = true;
+    bool mHasResumed = false; // Successful admission, independent of completed deferred copies.
 
     PendingStats mPendingStats;
 

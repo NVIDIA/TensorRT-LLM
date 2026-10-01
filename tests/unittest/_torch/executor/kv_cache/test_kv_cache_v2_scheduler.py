@@ -22,11 +22,42 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BlockReusePolicy
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("admitted", [False, True])
+def test_generation_admits_decode_before_capacity_growth(active: bool, admitted: bool) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    cache = Mock(is_active=active, capacity=8)
+    cache.enter_decode.return_value = admitted
+    cache.resume.return_value = admitted
+    cache.resize.return_value = True
+    manager.kv_cache_map = {1: cache}
+    manager._stream = Mock(cuda_stream=123)
+    manager._restore_page_index_bufs = Mock()
+    manager._generation_draft_slots = Mock(return_value=0)
+    manager._allocated_draft_lens = {}
+    manager._has_cp_helix = False
+    manager._fill_fresh_kv_pages = Mock()
+    manager._log_window_crossing = Mock()
+    req = Mock(py_request_id=1)
+
+    assert manager.try_allocate_generation(req) == admitted
+    admission = call.enter_decode() if active else call.resume(123, is_decoding=True)
+    assert cache.mock_calls == [admission] + ([call.resize(9)] if admitted else [])
+    if not active and admitted:
+        manager._restore_page_index_bufs.assert_called_once_with(1, cache)
+    else:
+        manager._restore_page_index_bufs.assert_not_called()
+    assert manager._allocated_draft_lens == ({1: 0} if admitted else {})
 
 
 # ---------------------------------------------------------------------------

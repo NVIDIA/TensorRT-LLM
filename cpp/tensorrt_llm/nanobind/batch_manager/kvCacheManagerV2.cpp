@@ -1705,15 +1705,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::KvCache>(m, "_KVCache")
         .def(
             "resume",
-            [](kv::KvCache& self, nb::object stream)
+            [](kv::KvCache& self, nb::object stream, std::optional<bool> isDecoding)
             {
                 std::optional<CUstream> optStream;
                 if (!stream.is_none())
                     optStream = reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
                 nb::gil_scoped_release rel;
-                return self.resume(optStream);
+                return self.resume(optStream, isDecoding);
             },
-            nb::arg("cuda_stream") = nb::none())
+            nb::arg("cuda_stream") = nb::none(), nb::arg("is_decoding") = nb::none())
+        .def("enter_decode", &kv::KvCache::enterDecode, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("is_decoding", &kv::KvCache::isDecoding)
         .def("suspend", &kv::KvCache::suspend, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
