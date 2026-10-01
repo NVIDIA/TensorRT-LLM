@@ -38,7 +38,6 @@ def _register_fake():
         route_capacity: int,
         ctas: int,
         threads: int,
-        algorithm: int,
         enable_pdl: bool,
         spin_cycles: int,
         plan_abi_version: int,

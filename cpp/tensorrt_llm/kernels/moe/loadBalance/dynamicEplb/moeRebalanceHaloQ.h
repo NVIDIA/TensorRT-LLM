@@ -50,7 +50,6 @@ struct MoeRebalanceHaloQParams
     int routeCapacity;
     int ctas;
     int threads;
-    int algorithm;
     bool enablePdl;
     std::uint64_t spinCycles;
     int planAbiVersion;

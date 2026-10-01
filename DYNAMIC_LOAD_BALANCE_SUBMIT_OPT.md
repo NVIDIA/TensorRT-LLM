@@ -5,8 +5,7 @@
 
 The MegaMoE path uses HALO-Q route planning by default and in-switch TMA
 weight copies with one CPU submitter, an ordinary MAIN stream, and a
-higher-priority COPY stream. The same scheduler path can select GAR-N through
-legacy mode.
+higher-priority COPY stream.
 
 ## Configuration
 
@@ -25,13 +24,11 @@ per-rank `TLLM_AUTOTUNER_CACHE_PATH` for each configuration.
 Rebuild TensorRT-LLM's native operators: the FP4/FP8 quantizers add SM-budget overloads,
 so deploying these Python sources onto an older wheel is insufficient.
 
-The GAR-N/HALO-Q scheduler and in-switch TMA use TensorRT-LLM's standard
+The HALO-Q scheduler and in-switch TMA use TensorRT-LLM's standard
 native-operator path: CUDA launchers live under
 `cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb`, the Torch bindings live
 under `cpp/tensorrt_llm/thop/moe/loadBalance`, and both are linked into
-`libth_common.so`. The scheduler uses one `trtllm::moe_rebalance_halo_q` op:
-`CudaSchedulerConfig.algorithm="legacy"` selects GAR-N, while
-`CudaSchedulerConfig.algorithm="halo_q"` selects HALO-Q and remains the default.
+`libth_common.so`. The scheduler uses one `trtllm::moe_rebalance_halo_q` op.
 Python calls `torch.ops.trtllm` directly; the production
 path does not compile these kernels at runtime. The scheduler op has a fake
 registration for `torch.compile`. TMA keeps its stateful create/bind/submit/
@@ -70,8 +67,8 @@ therefore be validated with explicit tolerances rather than asserted bitwise.
 
 ## Execution and lifetime
 
-1. MAIN produces route IDs. COPY waits for that input event, then the selected
-   scheduler (HALO-Q by default) receives the original contiguous CUDA int32
+1. MAIN produces route IDs. COPY waits for that input event, then HALO-Q
+   receives the original contiguous CUDA int32
    `[tokens, topk]` tensor via `submit(ids,
    stream_handle)`. There is no route bitwise-OR, tail fill, or staging kernel.
    `record_stream` protects allocator reuse; the producer must not overwrite IDs.
