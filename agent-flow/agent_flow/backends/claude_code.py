@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
@@ -455,9 +456,26 @@ def _sdk_tools(tools: list) -> list[SdkMcpTool]:
 # working directory and the argv prompt becomes a short pointer telling the
 # model to read it first. The pointer is deliberately plain: no SDK feature
 # is involved.
-SYSTEM_PROMPT_FILE_THRESHOLD = int(
-    os.environ.get("AGENT_FLOW_SYSTEM_PROMPT_FILE_THRESHOLD", str(64 * 1024))
-)
+_DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD = 64 * 1024
+
+
+def _system_prompt_file_threshold() -> int:
+    raw = os.environ.get("AGENT_FLOW_SYSTEM_PROMPT_FILE_THRESHOLD")
+    if raw is None:
+        return _DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"[agent-flow] ignoring invalid AGENT_FLOW_SYSTEM_PROMPT_FILE_THRESHOLD={raw!r}; "
+            f"falling back to {_DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return _DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD
+
+
+SYSTEM_PROMPT_FILE_THRESHOLD = _system_prompt_file_threshold()
 
 
 def spill_system_prompt(system_prompt: str, cwd: Path, threshold: int | None = None) -> str:
@@ -476,9 +494,17 @@ def spill_system_prompt(system_prompt: str, cwd: Path, threshold: int | None = N
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"system-prompt-{digest}.md"
     if not target.exists():
-        tmp = target.with_suffix(".md.tmp")
-        tmp.write_bytes(data)
-        os.replace(tmp, target)
+        # Use a unique temp file per writer so concurrent sessions spilling
+        # the same prompt can't truncate or unlink each other's in-progress
+        # file before os.replace runs.
+        fd, tmp_name = tempfile.mkstemp(dir=target_dir, prefix=target.name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp_name, target)
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
     kb = (len(data) + 1023) // 1024
     return (
         "Your full system instructions could not be passed inline and were written to "
