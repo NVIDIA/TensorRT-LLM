@@ -889,20 +889,11 @@ class TestDisaggIdRegenOnRetry:
             ),
         )
 
-        if role == ServerRole.GENERATION:
-            with pytest.raises(aiohttp.ClientError, match="transient"):
-                await client.send_request(request)
-            assert request.disaggregated_params.disagg_request_id == 42
-            client._router.renew_request.assert_not_awaited()
-            if regenerate_id:
-                client._disagg_id_generator.assert_not_awaited()
-            expected_ids = [42]
-        else:
-            await client.send_request(request)
-            expected_ids = [42, 1000 if regenerate_id else 42]
+        await client.send_request(request)
+        expected_ids = [42, 1000 if regenerate_id else 42]
 
         # Serialized attempts retain their own IDs when a context retry
-        # regenerates the request ID; a paired generation handoff is not retried.
+        # regenerates the request ID.
         assert session.post.call_count == len(expected_ids)
         bodies = [
             msgspec.msgpack.decode(call.kwargs["data"]) for call in session.post.call_args_list
@@ -922,11 +913,10 @@ class TestDisaggIdRegenOnRetry:
             if role == ServerRole.GENERATION:
                 validate_internal_disagg_request("secret", wire_request, attempt_headers)
         if role == ServerRole.GENERATION:
-            altered_request = wire_requests[0].model_copy(deep=True)
-            altered_request.disaggregated_params.disagg_request_id = 1000
-            with pytest.raises(ValueError, match="Invalid internal subagent"):
-                validate_subagent_affinity("secret", altered_request, role, headers[0])
-        elif regenerate_id:
+            assert (
+                headers[0][INTERNAL_DISAGG_AUTH_HEADER] == headers[1][INTERNAL_DISAGG_AUTH_HEADER]
+            )
+        if regenerate_id:
             assert (
                 headers[0][SUBAGENT_AFFINITY_AUTH_HEADER]
                 != headers[1][SUBAGENT_AFFINITY_AUTH_HEADER]
@@ -1439,21 +1429,29 @@ class TestRequestCleanup:
         client._metrics_collector.completed_requests.inc.assert_called_once_with()
 
 
-class TestPairedHandoffRetry:
+class TestRemoteTailHandoffRetry:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize(
-        "role,request_type,schedule_style",
+        "role,request_type,schedule_style,remote_tail_start,bounded_replay",
         [
-            (ServerRole.GENERATION, "generation_only", None),
-            (ServerRole.CONTEXT, "context_only", DisaggScheduleStyle.GENERATION_FIRST),
-            (ServerRole.CONTEXT, "context_only", 1),
+            (ServerRole.GENERATION, "generation_only", None, 0, False),
+            (ServerRole.GENERATION, "generation_only", DisaggScheduleStyle.CONTEXT_FIRST, 8, False),
+            (
+                ServerRole.GENERATION,
+                "generation_only",
+                DisaggScheduleStyle.GENERATION_FIRST,
+                None,
+                True,
+            ),
+            (ServerRole.CONTEXT, "context_only", DisaggScheduleStyle.GENERATION_FIRST, None, True),
+            (ServerRole.CONTEXT, "context_only", 1, None, True),
         ],
     )
     @pytest.mark.parametrize(
         "error_type", [aiohttp.ClientOSError, aiohttp.ServerDisconnectedError, ConnectionResetError]
     )
-    async def test_paired_handoff_does_not_retry_or_change_id(
+    async def test_remote_tail_handoff_does_not_retry_or_change_id(
         self,
         openai_client,
         mock_session,
@@ -1462,9 +1460,12 @@ class TestPairedHandoffRetry:
         role,
         request_type,
         schedule_style,
+        remote_tail_start,
+        bounded_replay,
         error_type,
     ):
         openai_client._role = role
+        openai_client._bounded_replay_on_generation = bounded_replay
         openai_client._metrics_collector = MagicMock()
         openai_client._disagg_id_generator = AsyncMock(return_value=999)
         mock_session.post.side_effect = error_type("connection failed")
@@ -1476,6 +1477,7 @@ class TestPairedHandoffRetry:
                 request_type=request_type,
                 disagg_request_id=123,
                 schedule_style=schedule_style,
+                remote_tail_start=remote_tail_start,
             ),
         )
         hooks = MagicMock(spec=ResponseHooks)
@@ -1496,19 +1498,41 @@ class TestPairedHandoffRetry:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("disagg", [False, True])
-    @pytest.mark.parametrize("schedule_style", [None, DisaggScheduleStyle.CONTEXT_FIRST])
-    async def test_unpaired_request_retains_retry(
-        self, openai_client, completion_request, mock_session, mock_router, disagg, schedule_style
+    @pytest.mark.parametrize(
+        "role,request_type,schedule_style,bounded_replay",
+        [
+            (ServerRole.GENERATION, None, None, True),
+            (ServerRole.GENERATION, "generation_only", None, False),
+            (ServerRole.GENERATION, "generation_only", DisaggScheduleStyle.CONTEXT_FIRST, False),
+            (ServerRole.GENERATION, "generation_only", DisaggScheduleStyle.GENERATION_FIRST, False),
+            (ServerRole.CONTEXT, "context_only", DisaggScheduleStyle.GENERATION_FIRST, False),
+            (ServerRole.CONTEXT, "context_only", DisaggScheduleStyle.CONTEXT_FIRST, True),
+        ],
+    )
+    @pytest.mark.parametrize("error_type", [aiohttp.ClientError, aiohttp.ServerDisconnectedError])
+    async def test_other_requests_retain_retry(
+        self,
+        openai_client,
+        completion_request,
+        mock_session,
+        mock_router,
+        role,
+        request_type,
+        schedule_style,
+        bounded_replay,
+        error_type,
     ):
-        openai_client._role = ServerRole.CONTEXT if disagg else ServerRole.GENERATION
+        openai_client._role = role
+        openai_client._bounded_replay_on_generation = bounded_replay
         openai_client._retry_interval_sec = 0
+        # Transient TCP failures retain their budget even without normal retries.
+        openai_client._max_retries = 0 if error_type is aiohttp.ServerDisconnectedError else 2
         openai_client._disagg_id_generator = AsyncMock(return_value=999)
         completion_request.disaggregated_params = (
             DisaggregatedParams(
-                request_type="context_only", disagg_request_id=123, schedule_style=schedule_style
+                request_type=request_type, disagg_request_id=123, schedule_style=schedule_style
             )
-            if disagg
+            if request_type is not None
             else None
         )
         response_body = TestOpenAIHttpClient().dummy_response()
@@ -1518,14 +1542,14 @@ class TestPairedHandoffRetry:
         http_response.json.return_value = response_body.model_dump()
         http_response.__aenter__.return_value = http_response
         http_response.__aexit__.return_value = False
-        mock_session.post.side_effect = [aiohttp.ServerDisconnectedError(), http_response]
+        mock_session.post.side_effect = [error_type("connection failed"), http_response]
         hooks = MagicMock(spec=ResponseHooks)
 
         response = await openai_client.send_request(completion_request, hooks=hooks, req_id=42)
 
         assert response == response_body
         assert mock_session.post.call_count == 2
-        if disagg:
+        if request_type is not None:
             assert completion_request.disaggregated_params.disagg_request_id == 999
             openai_client._disagg_id_generator.assert_awaited_once_with()
             hooks.on_disagg_request_id.assert_called_once_with(999)
