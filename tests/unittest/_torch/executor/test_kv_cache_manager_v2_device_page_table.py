@@ -23,7 +23,11 @@ same bytes as an ordinary H2D copy, and invokes the same expansion kernel from
 device-resident data instead.
 """
 
+import os
+import subprocess
+import sys
 from itertools import product
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -391,12 +395,35 @@ def test_native_materializer_accepts_each_gpu_readable_source_independently(cuda
 
 @requires_cuda
 @pytest.mark.parametrize("pageable_source", ("input", "copy_index", "index_scales", "kv_offset"))
-def test_native_materializer_validates_pageable_cpu_sources_before_launch(pageable_source):
+def test_native_materializer_validates_pageable_cpu_sources_before_launch(
+    pageable_source: str,
+) -> None:
+    """Enable debug validation before the subprocess first reads its cached setting."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runpy, sys; "
+            "runpy.run_path(sys.argv[1])['_check_pageable_cpu_source'](sys.argv[2])",
+            str(Path(__file__).resolve()),
+            pageable_source,
+        ],
+        env={**os.environ, "TLLM_DEBUG_MODE": "1"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _check_pageable_cpu_source(pageable_source: str) -> None:
     """Pageable memory may be readable on coherent systems; otherwise fail before launch."""
     from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
         copy_batch_block_offsets_to_device,
     )
 
+    assert torch.cuda.is_available(), "The debug-validation subprocess must exercise CUDA"
     host_table = _make_host_table()
     copy_idx = torch.tensor([3, 0, 1], dtype=torch.int32)
     index_scales = torch.tensor([2, 3], dtype=torch.int32)
@@ -427,6 +454,8 @@ def test_native_materializer_validates_pageable_cpu_sources_before_launch(pageab
     except RuntimeError as error:
         assert pageable_source in str(error)
         assert "not readable by output device" in str(error)
+        # A rejected source must not leave a failing kernel queued on the stream.
+        torch.cuda.synchronize()
     else:
         torch.cuda.synchronize()
         assert torch.equal(
@@ -804,7 +833,7 @@ def test_forced_device_page_table_matches_the_native_kernel(monkeypatch):
 @requires_native_page_table_kernel
 @pytest.mark.parametrize("heterogeneous", [False, True], ids=["swa", "heterogeneous_no_swa"])
 def test_forced_device_page_table_matches_non_cc_per_layer(monkeypatch, heterogeneous):
-    """Compare both reasons for per-layer conversion across CC transports."""
+    """Per-layer conversion retains its full-table H2D path under either policy."""
     request_ids = [1, 2]
     num_seqs = len(request_ids)
 
@@ -866,7 +895,10 @@ def test_forced_device_page_table_matches_non_cc_per_layer(monkeypatch, heteroge
             torch.cuda.synchronize()
             if setting == "1":
                 assert manager._page_table_materializer._device_base_page_rows is None
-                assert torch.all(manager._device_kv_cache_block_offsets_input[:, num_seqs:] == 0)
+            torch.testing.assert_close(
+                manager._device_kv_cache_block_offsets_input.cpu(),
+                manager.host_kv_cache_block_offsets,
+            )
             return output.cpu()
         finally:
             manager.shutdown()
