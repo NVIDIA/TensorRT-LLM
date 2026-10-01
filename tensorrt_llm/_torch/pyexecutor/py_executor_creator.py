@@ -216,9 +216,10 @@ def _flashinfer_one_engine_spec_supported(attn_backend: str,
 ALLOW_UNCORRECTED_OVERLAP_SPEC_ENV_VAR = "TRTLLM_ALLOW_UNCORRECTED_OVERLAP_SPEC"
 
 
-def _overlap_spec_kv_lengths_uncorrected(
-        attn_backend: str, spec_config,
-        disable_overlap_scheduler: bool) -> bool:
+def _overlap_spec_kv_lengths_uncorrected(attn_backend: str,
+                                         spec_config,
+                                         disable_overlap_scheduler: bool,
+                                         sparse_attention_config=None) -> bool:
     """Whether overlap decode would run this speculation on stale KV lengths.
 
     With the overlap scheduler on, generation rows are prepared before
@@ -237,9 +238,28 @@ def _overlap_spec_kv_lengths_uncorrected(
         return False
     if not spec_config.spec_dec_mode.use_one_engine():
         return False
-    # Resolved exactly as the runtime resolves it, including the fallback to
-    # TRTLLM when the requested backend is unavailable.
-    metadata_cls = get_attention_backend(attn_backend).Metadata
+    # Resolved exactly as the runtime resolves it: with lowered sparse params
+    # when sparse attention is configured (a sparse config replaces the dense
+    # backend in its slot with a sparse backend whose metadata owns its own
+    # KV-length handling), and with the fallback to TRTLLM when the requested
+    # backend is unavailable.
+    if sparse_attention_config is not None:
+        try:
+            sparse_params = sparse_attention_config.to_sparse_params()
+            metadata_cls = get_attention_backend(
+                attn_backend, sparse_params=sparse_params).Metadata
+        except Exception:
+            # Some sparse configs only lower once checkpoint-derived fields
+            # are available (the engine lowers with pretrained_config, which
+            # does not exist yet at this point), and some sparse backends
+            # probe hardware during resolution. When the effective backend
+            # cannot be resolved here, do not refuse: no sparse metadata
+            # class relies on the opt-in correction hook this guard is
+            # about, and a real resolution error still fails engine
+            # construction in its established place.
+            return False
+    else:
+        metadata_cls = get_attention_backend(attn_backend).Metadata
     if not hasattr(metadata_cls, 'apply_spec_decode_kv_lens_offsets'):
         # This backend does not use the opt-in hook, so it cannot no-op.
         return False
@@ -249,9 +269,10 @@ def _overlap_spec_kv_lengths_uncorrected(
                                                spec_config, metadata_cls)
 
 
-def _enforce_overlap_spec_kv_correction(
-        attn_backend: str, spec_config,
-        disable_overlap_scheduler: bool) -> None:
+def _enforce_overlap_spec_kv_correction(attn_backend: str,
+                                        spec_config,
+                                        disable_overlap_scheduler: bool,
+                                        sparse_attention_config=None) -> None:
     """Refuse a speculation whose KV lengths overlap decode would not correct.
 
     The failure this prevents is silent: the engine boots, drafts and accepts
@@ -259,7 +280,8 @@ def _enforce_overlap_spec_kv_correction(
     only place it can still be reported.
     """
     if not _overlap_spec_kv_lengths_uncorrected(attn_backend, spec_config,
-                                                disable_overlap_scheduler):
+                                                disable_overlap_scheduler,
+                                                sparse_attention_config):
         return
     message = (
         f"Speculation mode {spec_config.spec_dec_mode.name} on the "
@@ -538,8 +560,11 @@ def _create_py_executor_impl(
             "mode needs a separate draft KV cache manager, which FLASHINFER "
             "does not support. Use TRTLLM target attention.")
 
-    _enforce_overlap_spec_kv_correction(llm_args.attn_backend, spec_config,
-                                        llm_args.disable_overlap_scheduler)
+    _enforce_overlap_spec_kv_correction(
+        llm_args.attn_backend,
+        spec_config,
+        llm_args.disable_overlap_scheduler,
+        sparse_attention_config=llm_args.sparse_attention_config)
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True

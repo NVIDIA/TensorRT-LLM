@@ -21,6 +21,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
 )
 from tensorrt_llm.llmapi import (
     DFlashDecodingConfig,
+    MiniMaxM3SparseAttentionConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
     SADecodingConfig,
@@ -61,7 +62,11 @@ def _use_stub_backend(monkeypatch, metadata_cls):
     class _Backend:
         Metadata = metadata_cls
 
-    monkeypatch.setattr(py_executor_creator, "get_attention_backend", lambda backend_name: _Backend)
+    monkeypatch.setattr(
+        py_executor_creator,
+        "get_attention_backend",
+        lambda backend_name, sparse_params=None: _Backend,
+    )
 
 
 def _sa_config():
@@ -166,6 +171,69 @@ def test_external_drafters_are_not_gated(monkeypatch):
 def test_no_speculation_is_not_gated(monkeypatch):
     _use_stub_backend(monkeypatch, _OptInCorrectionMetadata)
     assert not _overlap_spec_kv_lengths_uncorrected("FLASHINFER", None, False)
+
+
+def test_sparse_attention_judges_the_effective_backend(monkeypatch):
+    """A sparse config replaces the dense backend in its slot at runtime.
+
+    The guard has to resolve with the lowered sparse params like the engine
+    does, otherwise it judges dense metadata that will never run and refuses
+    combinations the sparse backend corrects on its own.
+    """
+    received = []
+
+    class _DenseBackend:
+        Metadata = _OptInCorrectionMetadata
+
+    class _SparseBackend:
+        Metadata = _UnconditionalCorrectionMetadata
+
+    def _resolve(backend_name, sparse_params=None):
+        received.append(sparse_params)
+        return _DenseBackend if sparse_params is None else _SparseBackend
+
+    monkeypatch.setattr(py_executor_creator, "get_attention_backend", _resolve)
+    sparse_config = MiniMaxM3SparseAttentionConfig(implementation="triton")
+    config = _sa_config()
+    assert not _overlap_spec_kv_lengths_uncorrected(
+        "FLASHINFER", config, False, sparse_attention_config=sparse_config
+    )
+    _enforce_overlap_spec_kv_correction(
+        "FLASHINFER", config, False, sparse_attention_config=sparse_config
+    )
+    assert received and all(params is not None for params in received)
+
+
+def test_unlowerable_sparse_config_is_not_refused(monkeypatch):
+    """Lowering can need checkpoint fields that do not exist at this point.
+
+    The engine lowers with pretrained_config later; when that makes the
+    effective backend unresolvable here, the guard must stand down rather
+    than refuse (or crash) on metadata it cannot identify.
+    """
+    _use_stub_backend(monkeypatch, _OptInCorrectionMetadata)
+
+    class _NeedsCheckpoint:
+        def to_sparse_params(self, **kwargs):
+            raise ValueError("resolved from a checkpoint config")
+
+    assert not _overlap_spec_kv_lengths_uncorrected(
+        "FLASHINFER", _sa_config(), False, sparse_attention_config=_NeedsCheckpoint()
+    )
+
+
+@pytest.mark.skipif(not IS_FLASHINFER_AVAILABLE, reason="requires the FlashInfer backend")
+def test_minimax_m3_sparse_attention_with_overlap_is_admitted():
+    """Real-coupling pin for the sparse resolution path.
+
+    MiniMax-M3 under the FLASHINFER slot selects a TrtllmAttention-based
+    sparse metadata that the engine corrects through ``kv_lens_cuda``, so
+    overlap plus one-engine speculation must be admitted.
+    """
+    sparse_config = MiniMaxM3SparseAttentionConfig(implementation="triton")
+    assert not _overlap_spec_kv_lengths_uncorrected(
+        "FLASHINFER", _sa_config(), False, sparse_attention_config=sparse_config
+    )
 
 
 @pytest.mark.skipif(not IS_FLASHINFER_AVAILABLE, reason="requires the FlashInfer backend")
