@@ -281,7 +281,6 @@ unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_kimi_without
 unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_qwen3_gdn_replay_uses_v2_preference SKIP (https://nvbugs/6818710)
 unittest/_torch/executor/test_pytorch_model_engine.py::PyTorchModelEngineTestCase::test_prepare_tp_inputs_with_helix_parallelism SKIP (https://nvbugs/6818710)
 unittest/_torch/modeling/test_modeling_nemotron_h_multimodal.py::test_nemotron_nano_v2_vl_image_batch_equivalence SKIP (https://nvbugs/6758946)
-unittest/_torch/modeling/test_modeling_nemotron_h_multimodal.py::test_nemotron_nano_v2_vl_video_batch_equivalence SKIP (https://nvbugs/6625695)
 unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm SKIP (https://nvbugs/6853741)
 unittest/_torch/modeling_v2/comm/test_modeling_v2_allgather_op_matrix.py::test_allgather_op_matrix SKIP (https://nvbugs/6843474)
 unittest/_torch/modeling_v2/comm/test_modeling_v2_reducescatter_op_matrix.py::test_reducescatter_op_matrix SKIP (https://nvbugs/6843474)
