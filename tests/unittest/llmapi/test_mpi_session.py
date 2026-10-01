@@ -5,13 +5,17 @@ import os
 import subprocess  # nosec B404
 import sys
 import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Literal
 
 import pytest
+import zmq
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
                                              MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
@@ -128,6 +132,74 @@ def run_client(server_addr, values_to_process, hmac_key: bytes):
 
     except Exception as e:
         return f"Error in client: {str(e)}"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("response",
+                         [[1, 1], RuntimeError("remote task failed")],
+                         ids=["results", "error"])
+def test_remote_mpi_submit_sync_response_after_empty_poll(
+        monkeypatch: pytest.MonkeyPatch,
+        response: list[int] | RuntimeError) -> None:
+    """A response following an empty poll must wake the waiting client."""
+    first_empty_poll = threading.Event()
+    release_server = threading.Event()
+    address: Future[tuple[str, bytes]] = Future()
+    empty_poll_at: list[float] = []
+    monkeypatch.setattr(RemoteMpiCommSessionClient, "_global_instance", None)
+
+    def send_response() -> None:
+        # Each socket is created, used, and closed on its owning thread.
+        server = ZeroMqQueue(is_server=True)
+        server.socket.setsockopt(zmq.SNDTIMEO, 2000)
+        server.socket.setsockopt(zmq.LINGER, 0)
+        try:
+            address.set_result(server.address)
+            request = server.get(timeout=10)
+            assert request.sync
+            assert request.args == (-1, )
+            assert first_empty_poll.wait(10)
+            server.put(response)
+            assert release_server.wait(10)
+        finally:
+            server.close()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        peer = executor.submit(send_response)
+        client = None
+        try:
+            endpoint, key = address.result(timeout=10)
+            client = RemoteMpiCommSessionClient(endpoint, hmac_key=key)
+            client.queue.socket.setsockopt(zmq.SNDTIMEO, 2000)
+            client.queue.socket.setsockopt(zmq.LINGER, 0)
+            poll = client.poll
+
+            def observe_poll() -> object:
+                if empty_poll_at and time.monotonic() - empty_poll_at[0] > 10:
+                    raise TimeoutError("Client did not receive the response")
+                result = poll()
+                if not result and not first_empty_poll.is_set():
+                    empty_poll_at.append(time.monotonic())
+                    first_empty_poll.set()
+                return result
+
+            # Observe the real socket poll; do not alter its timeout or result.
+            monkeypatch.setattr(client, "poll", observe_poll)
+            actual = client.submit_sync(abs, -1)
+            elapsed = time.monotonic() - empty_poll_at[0]
+        finally:
+            release_server.set()
+            if client is not None:
+                client.queue.close()
+            peer.result(timeout=10)
+
+    assert first_empty_poll.is_set()
+    assert elapsed < 2, f"Client waited {elapsed:.3f}s after an empty poll"
+    if isinstance(response, RuntimeError):
+        assert isinstance(actual, RuntimeError)
+        assert actual.args == response.args
+    else:
+        assert actual == response
 
 
 @pytest.mark.cpu_only

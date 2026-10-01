@@ -799,15 +799,13 @@ class RemoteMpiCommSessionClient(MpiSession):
         self.queue.put(RemoteTask(task, args, kwargs, sync=sync))
         return []
 
-    SYNC_IDLE_INTERVAL = 8
-
     def submit_sync(self, task, *args, **kwargs) -> List[T]:
         """Submit a task to the remote MPI pool and wait for task completion."""
         self.submit(task, *args, sync=True, **kwargs)
 
+        # poll() blocks on the response socket and wakes when a result arrives.
         while not ((res := self.poll()) or self._is_shutdown):
             logger_debug(f"Waiting for task completion... {res}\n", "grey")
-            time.sleep(self.SYNC_IDLE_INTERVAL)
 
         logger_debug(
             f"rank{global_mpi_rank()} RemoteMpiCommSessionClient.send_sync received results: {res}\n",
