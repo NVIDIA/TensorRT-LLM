@@ -12,6 +12,7 @@ attention_config:
 
 parallel_config:
   ulysses_size: 8
+  # Decode independent spatial tiles using the loaded VAE geometry.
   parallel_vae_size: 8
 
 compilation_config:
@@ -20,7 +21,3 @@ compilation_config:
     - [544, 960]
   num_frames:
     - 124
-
-# Reuse the Ulysses GPUs to decode independent spatial VAE tiles.
-pipeline_config:
-  vae_use_tiling: true

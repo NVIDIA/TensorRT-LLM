@@ -67,11 +67,7 @@ from .packing import (
     video_latent_num_frames,
 )
 from .ref2va import load_references, prepare_references, validate_reference_order
-from .tiled_vae import (
-    MINIMAX_H3_VAE_DEFAULTS,
-    TiledAutoencoderKLMiniMaxH3,
-    validate_vae_tiling_config,
-)
+from .tiled_vae import TiledAutoencoderKLMiniMaxH3
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
 
 
@@ -121,7 +117,7 @@ def _check_denoise_step(velocity: torch.Tensor, name: str, step: int) -> None:
 @register_pipeline(
     "MiniMaxH3ModularPipeline",
     hf_ids=["MiniMaxAI/MiniMax-H3"],
-    defaults={"workflow": "fl2va", **MINIMAX_H3_VAE_DEFAULTS},
+    defaults={"workflow": "fl2va"},
     download_patterns=[
         "modular_model_index.json",
         "LICENSE",
@@ -208,18 +204,11 @@ class MiniMaxH3Pipeline(BasePipeline):
                 "CUDA graphs are not yet supported for MiniMax-H3's packed layout inputs."
             )
         self.workflow = pipeline_config.extra_attrs.get("workflow", "fl2va")
-        self._vae_tiling_options = {
-            key: pipeline_config.extra_attrs.get(key, value)
-            for key, value in MINIMAX_H3_VAE_DEFAULTS.items()
-        }
-        validate_vae_tiling_config(self._vae_tiling_options)
         vae_size = pipeline_config.parallel.parallel_vae_size
         if not 1 <= vae_size <= world_size:
             raise ValueError(
                 "MiniMax-H3 parallel_vae_size must be between 1 and ulysses_size=world_size."
             )
-        if vae_size > 1 and self._vae_tiling_options["vae_use_tiling"] is False:
-            raise ValueError("parallel_vae_size > 1 requires VAE spatial tiling.")
         self.audio_vae = None
         self.audio_scheduler = None
         self.processor = None
@@ -240,7 +229,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             raise RuntimeError("MiniMax-H3 parallel VAE requires a VAE group.")
         if torch.distributed.get_world_size(vgm.vae_group) != size:
             raise RuntimeError("MiniMax-H3 VAE group size does not match parallel_vae_size.")
-        self.vae.configure_tiling(self._vae_tiling_options, group=vgm.vae_group)
+        self.vae.configure_parallel(group=vgm.vae_group)
         logger.info(f"MiniMax-H3 spatial VAE tile decode ranks={size}")
 
     @property
@@ -372,7 +361,6 @@ class MiniMaxH3Pipeline(BasePipeline):
                 torch_dtype=torch.float32,
             ).to(device)
             self.vae.eval()
-            self.vae.configure_tiling(self._vae_tiling_options)
         if not _component_skipped(skip_components, PipelineComponent.AUDIO_VAE):
             self.audio_vae = AutoencoderKLMiniMaxH3Audio.from_pretrained(
                 checkpoint_dir,

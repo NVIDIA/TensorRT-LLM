@@ -70,39 +70,3 @@ The Python API uses existing `MediaRef` slots with role `reference`,
 The BF16 Ref2VA example uses eager execution and TRTLLM normalization and SwiGLU kernels.
 Ref2VA references condition content rather than anchoring the first/last frame;
 the default output canvas is 768×1344 regardless of reference dimensions.
-
-
-### MiniMax-H3 tiled VAE
-
-MiniMax-H3 inherits spatial tiling settings from the loaded Diffusers VAE
-unless explicitly overridden (Diffusers 0.40 defaults: enabled, 256-pixel
-tiles, 64-pixel overlap). Its video decoder
-can distribute independent tiles across the shared VAE process group; the
-eight-GPU BF16 configuration enables this. Tile geometry, overlap blending,
-and temporal chunking match the sequential tiled decoder. Small canvases
-with fewer tiles than ranks use sequential decoding on each rank.
-
-Use `VisualGen.pipeline_config("MiniMaxAI/MiniMax-H3")` to discover the knobs.
-They can be set through `VisualGenArgs.pipeline_config` or the YAML
-`pipeline_config` mapping:
-
-```yaml
-parallel_config:
-  ulysses_size: 8
-  parallel_vae_size: 8
-pipeline_config:
-  vae_use_tiling: true
-  vae_tile_size: 256
-  vae_tile_overlap: 64
-```
-
-Tile size and overlap are positive pixel counts aligned to the checkpoint's
-spatial compression ratio, with overlap smaller than tile size. Setting
-`parallel_config.parallel_vae_size: 1` retains sequential tiling. For H3,
-parallel VAE size can be any integer from 1 through the Ulysses world size;
-it does not need to divide that size. Only the first `parallel_vae_size`
-ranks decode, and rank 0 returns the generated video and audio. Setting
-`vae_use_tiling: false` disables spatial tiling for encode and decode, which changes the
-checkpoint's reference output and can increase memory and latency. Audio
-VAE processing is unaffected. Tile parallelism requires all VAE-group ranks to decode
-the same video latents and uses the supported pure Ulysses configuration.
