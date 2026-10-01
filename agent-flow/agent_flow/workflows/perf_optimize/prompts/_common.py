@@ -628,6 +628,79 @@ profiling:
 
 
 # --------------------------------------------------------------------------- #
+# Test-case campaign (every server-launching role)
+# --------------------------------------------------------------------------- #
+
+TEST_CASE_CAMPAIGN = """\
+## Test-case workload (supersedes the server-lifecycle, tuning, and benchmark guidance above)
+
+**This campaign measures a named test case.** The orchestrator composes
+this section only for such a campaign, so it applies unconditionally.
+Nothing above that mentions `trtllm-serve`, `--extra_llm_api_options`,
+`benchmark_serving.py` or polling a server applies: you do not launch or
+tear down a server, and there is no tuning YAML. The workload is one
+pytest invocation of the id in `task.yaml`'s `test_case.name`, and the
+harness owns the server lifecycle, the client, and the metrics it prints.
+
+### The id is the identity of the measurement
+
+The id is what CI, the regression report and the stored result series are
+all keyed on. **Never change it, and never run a different one** — a
+number measured at a different operating point does not answer the
+question this campaign was opened on.
+
+Everything the id spells out is therefore fixed. What remains editable
+depends on the family:
+
+**`test_perf_sanity.py::test_e2e[...]`** — the id selects a config YAML
+under `tests/scripts/perf-sanity/` and, for the plain aggregated shape,
+one `server_configs` entry of it. Editable: that entry's tuning fields —
+`max_batch_size`, `max_num_tokens`, `moe_config`, `attn_backend`,
+`cuda_graph_config`, `kv_cache_config`.
+
+**`test_perf.py::test_perf[...]`** — the id *is* the configuration: every
+`key:value` label in it is a pinned knob. Editable:
+`tests/integration/defs/perf/pytorch_model_config.py`, whose tables supply
+everything the id does not spell out.
+
+Two consequences worth stating plainly:
+
+- **A config edit is a `code` item, not a `config` item.** Both families
+  read their configuration from the checkout under test, so the edit is a
+  source change in your worktree like any other, and it is picked up with
+  no further action. There is no tuning file to write; one named in any
+  guidance above is not read by this harness.
+- **Do not edit a field the id encodes.** For `test_perf` the id *is* the
+  serialized config, so changing `maxbs:512` means running a different
+  test case — one that need not even exist in
+  `tests/integration/test_lists/`, in which case CI never runs the test
+  the fix claims to repair. For perf-sanity the harness parses only the
+  config stem and the entry selection, so a token like `con128` inside the
+  stem is not read at all: editing the matching YAML field changes nothing
+  mechanically and still leaves the id describing a run it no longer
+  performs. If you conclude such an edit is genuinely the fix, say so
+  explicitly in the item rationale rather than making it quietly.
+
+### Reading the result
+
+Read the metric named by `optimize.target_metric` from the harness's own
+output, and **state which direction counts as better** next to the first
+number you report.
+
+### Gates that keep a green run honest
+
+- **Never gate on the exit code.** A pruned or empty test selection runs
+  nothing and still exits `0` with every other check passing. Require the
+  benchmark log to exist and to report `Successful requests` > 0 before
+  you treat a run as a measurement.
+- A run whose id, commit or cluster differs from the campaign's is not
+  this campaign's data, whatever directory it is sitting in. Check those
+  before reusing an existing log, and check its timestamp — a stale
+  artifact from an earlier run reads exactly like a fresh one.
+"""
+
+
+# --------------------------------------------------------------------------- #
 # Actionable casebook variant (optimizer)
 # --------------------------------------------------------------------------- #
 
