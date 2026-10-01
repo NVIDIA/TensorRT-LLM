@@ -487,11 +487,15 @@ class MultimodalItemScheduler:
                 encoder_items.append((multimodal_param, item_idx))
                 output_targets.append((item_idx, cache_key, state.embedding_lengths[item_idx]))
 
+        # A batch-level error cannot be traced to one output, so fail only the
+        # scheduled producers. Requests that only share a scheduled entry keep
+        # their references, and the next scheduling pass picks a new producer.
+        producer_request_ids = scheduled_items.keys()
         try:
             encoder_inputs = self.model.prepare_multimodal_encoder_inputs(encoder_items)
         except MultimodalEncoderContractError as error:
             raise MultimodalEncoderRequestError(
-                str(error), request_ids=requests_using_cache_keys(scheduled_cache_keys)
+                str(error), request_ids=producer_request_ids
             ) from error
         for encoder_input, _, _ in encoder_inputs:
             encoder_input.to_device(
@@ -505,12 +509,12 @@ class MultimodalItemScheduler:
             outputs = self.model.forward_multimodal_encoder_items(encoder_inputs)
         except MultimodalEncoderContractError as error:
             raise MultimodalEncoderRequestError(
-                str(error), request_ids=requests_using_cache_keys(scheduled_cache_keys)
+                str(error), request_ids=producer_request_ids
             ) from error
         if len(outputs) != len(output_targets):
             raise MultimodalEncoderRequestError(
                 "MM item encoder must return one output per item",
-                request_ids=requests_using_cache_keys(scheduled_cache_keys),
+                request_ids=producer_request_ids,
             )
 
         try:
