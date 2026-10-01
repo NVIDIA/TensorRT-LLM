@@ -14,7 +14,8 @@ import threading
 
 import pytest
 
-from tensorrt_llm.llmapi import llmman
+from tensorrt_llm.llmapi import llm_utils, llmman
+from tensorrt_llm.llmapi.llm_args import _ModelWrapper
 
 
 def _ndjson(*objs):
@@ -195,3 +196,38 @@ def test_rejects_an_empty_reference(ref):
 def test_endpoint_parsing(monkeypatch, host, want):
     monkeypatch.setenv(llmman.HOST_ENV, host)
     assert llmman.endpoint() == want
+
+
+@pytest.mark.parametrize(
+    "model,want",
+    [
+        ("oci://ghcr.io/org/model:tag", True),
+        ("OCI://ghcr.io/org/model:tag", True),
+        ("meta-llama/Llama-3.1-8B-Instruct", False),
+        ("ghcr.io/org/model:tag", False),
+    ],
+)
+def test_wrapper_claims_only_oci_refs(model, want):
+    wrapper = _ModelWrapper(model)
+    assert wrapper.is_oci_model is want
+    # An OCI ref must not fall through to the HF download path.
+    assert wrapper.is_hub_model is not want
+
+
+def test_wrapper_does_not_treat_a_local_dir_as_oci(tmp_path):
+    wrapper = _ModelWrapper(tmp_path)
+    assert wrapper.is_local_model
+    assert not wrapper.is_oci_model
+    assert not wrapper.is_hub_model
+
+
+@pytest.mark.parametrize("rank,want_pull", [(0, True), (1, False)])
+def test_node_resolve_oci_model_pulls_only_on_local_rank_0(monkeypatch, tmp_path, rank, want_pull):
+    pulled = []
+    monkeypatch.setattr(llm_utils, "local_mpi_rank", lambda: rank)
+    monkeypatch.setattr(llmman, "resolve_model", lambda m: pulled.append(m) or str(tmp_path))
+
+    got = llm_utils.CachedModelLoader._node_resolve_oci_model("oci://ghcr.io/org/model:tag")
+
+    assert got == (tmp_path if want_pull else None)
+    assert pulled == (["oci://ghcr.io/org/model:tag"] if want_pull else [])
