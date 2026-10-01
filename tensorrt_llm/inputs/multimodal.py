@@ -823,6 +823,23 @@ class MultimodalParams:
 @dataclass
 class MultimodalServerConfig():
     media_io_kwargs: Optional[dict] = None
+    max_cpu_bytes: Optional[int] = None
+    max_cpu_bytes_per_request: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.max_cpu_bytes is not None and self.max_cpu_bytes <= 0:
+            raise ValueError("max_cpu_bytes must be positive")
+        if (self.max_cpu_bytes_per_request is not None
+                and self.max_cpu_bytes_per_request <= 0):
+            raise ValueError("max_cpu_bytes_per_request must be positive")
+        if (self.max_cpu_bytes is not None
+                and self.max_cpu_bytes_per_request is None):
+            self.max_cpu_bytes_per_request = self.max_cpu_bytes
+        if (self.max_cpu_bytes is not None
+                and self.max_cpu_bytes_per_request is not None
+                and self.max_cpu_bytes_per_request > self.max_cpu_bytes):
+            raise ValueError(
+                "max_cpu_bytes_per_request cannot exceed max_cpu_bytes")
 
 
 def _update_hash(hasher, item: object) -> None:

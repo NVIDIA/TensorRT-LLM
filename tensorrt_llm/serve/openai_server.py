@@ -49,6 +49,7 @@ from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import (ConversationMessage,
+                                       MultimodalDataTooLargeError,
                                        async_apply_chat_template)
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
@@ -574,6 +575,17 @@ class OpenAIServer(_VideoRoutesMixin):
                     merged.setdefault(modality, {}).update(kw)
                 cfg.media_io_kwargs = merged
                 self.multimodal_server_config = cfg
+        self._mm_cpu_request_slots: Optional[asyncio.BoundedSemaphore] = None
+        if (self.multimodal_server_config is not None
+                and self.multimodal_server_config.max_cpu_bytes is not None):
+            request_bytes = self.multimodal_server_config.max_cpu_bytes_per_request
+            assert request_bytes is not None
+            num_slots = self.multimodal_server_config.max_cpu_bytes // request_bytes
+            self._mm_cpu_request_slots = asyncio.BoundedSemaphore(num_slots)
+            logger.info(
+                f"Multimodal CPU limit: at most {num_slots} request(s) with "
+                "media are decoded and preprocessed at a time in this "
+                f"frontend process, each capped at {request_bytes} bytes")
         self.allow_request_chat_template = allow_request_chat_template
         self._internal_disagg_auth_key = internal_disagg_auth_key
         self._enable_rl_control_endpoints = enable_rl_control_endpoints
@@ -1101,6 +1113,14 @@ class OpenAIServer(_VideoRoutesMixin):
                                        code=status_code.value)
         return JSONResponse(content=error_response.model_dump(),
                             status_code=error_response.code)
+
+    async def _acquire_mm_cpu_slot(self) -> bool:
+        """Reserve one request's worst-case MM CPU working set, if limited."""
+        config = self.multimodal_server_config
+        if config is None or config.max_cpu_bytes is None:
+            return False
+        await self._mm_cpu_request_slots.acquire()
+        return True
 
     def _create_invalid_response_id_error(self, response_id: str) -> Response:
         return self.create_error_response(
@@ -1842,6 +1862,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 logger.error(traceback.format_exc())
                 raise
 
+        mm_cpu_slot_acquired = False
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
@@ -2098,6 +2119,14 @@ class OpenAIServer(_VideoRoutesMixin):
                     resolve_media=resolve_media,
                 )
 
+            # Media loads have not started yet; reserve CPU before they do.
+            # mm_item_order also lists items whose placeholder is empty (e.g.
+            # Whisper audio); embedding items appear only in the counts.
+            has_multimodal_data = resolve_media and (bool(mm_item_order) or
+                                                     any(mm_placeholder_counts))
+            if has_multimodal_data:
+                mm_cpu_slot_acquired = await self._acquire_mm_cpu_slot()
+
             # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
             if request.prompt_token_ids is None and request.prompt_token_ids_b64:
                 import numpy as np
@@ -2223,6 +2252,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 priority=request.priority
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
+            if mm_cpu_slot_acquired:
+                self._mm_cpu_request_slots.release()
+                mm_cpu_slot_acquired = False
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
@@ -2254,11 +2286,19 @@ class OpenAIServer(_VideoRoutesMixin):
             # If internal executor error is raised, shutdown the server
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
+        except MultimodalDataTooLargeError as e:
+            return self.create_error_response(
+                str(e),
+                err_type="RequestTooLargeError",
+                status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
         except ValueError as e:
             return self.create_error_response(str(e))
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+        finally:
+            if mm_cpu_slot_acquired:
+                self._mm_cpu_request_slots.release()
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:

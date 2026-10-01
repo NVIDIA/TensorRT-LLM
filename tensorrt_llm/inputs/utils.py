@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 import numpy as np
 import soundfile
 import torch
-from PIL import Image
+from PIL import Image, ImageMode
 from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.utils import logging
@@ -45,6 +45,58 @@ from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 logger = logging.get_logger(__name__)
+
+
+class MultimodalDataTooLargeError(ValueError):
+    """A request's materialized multimodal inputs exceed its CPU limit."""
+
+
+def _cpu_storage_bytes(
+        value: Any,
+        seen_storages: Optional[set[tuple[str, int, int]]] = None) -> int:
+    """Count unique CPU tensor, array, and image storage reachable from value."""
+    if seen_storages is None:
+        seen_storages = set()
+
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cpu":
+            return 0
+        storage = value.untyped_storage()
+        key = ("cpu", storage.data_ptr(), storage.nbytes())
+        if key in seen_storages:
+            return 0
+        seen_storages.add(key)
+        return storage.nbytes()
+
+    if isinstance(value, np.ndarray):
+        owner = value
+        while isinstance(owner.base, np.ndarray):
+            owner = owner.base
+        data_ptr = owner.__array_interface__["data"][0]
+        key = ("cpu", data_ptr, owner.nbytes)
+        if key in seen_storages:
+            return 0
+        seen_storages.add(key)
+        return owner.nbytes
+
+    if isinstance(value, Image.Image):
+        mode = ImageMode.getmode(value.mode)
+        size_bytes = (value.width * value.height * len(mode.bands) *
+                      np.dtype(mode.typestr).itemsize)
+        key = ("pil", id(value), size_bytes)
+        if key in seen_storages:
+            return 0
+        seen_storages.add(key)
+        return size_bytes
+
+    if isinstance(value, BaseModalityData):
+        return _cpu_storage_bytes(vars(value), seen_storages)
+    if isinstance(value, dict):
+        return sum(
+            _cpu_storage_bytes(item, seen_storages) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_cpu_storage_bytes(item, seen_storages) for item in value)
+    return 0
 
 
 def load_base64_image(parsed_url: str) -> Image.Image:
@@ -426,7 +478,12 @@ class MultimodalDataTracker:
                 out[modality].append(result)
             return dict(out)
 
-        # _data and _embeddings also gathered concurrently
+        max_bytes = self._multimodal_server_config.max_cpu_bytes_per_request
+        if max_bytes is not None:
+            return await self._retrieve_with_byte_limit(max_bytes)
+
+        # _data and _embeddings also gathered concurrently. Preserve this
+        # zero-overhead path when frontend byte admission is not configured.
         data_result, embed_result = await asyncio.gather(
             _retrieve(self._data), _retrieve(self._embeddings))
         return data_result, embed_result
@@ -451,6 +508,52 @@ class MultimodalDataTracker:
                         item.close()
             pending.clear()
         return None, None
+
+    async def _retrieve_with_byte_limit(
+        self, max_bytes: int
+    ) -> tuple[Optional[Dict[str, List[Any]]], Optional[Dict[str, List[Any]]]]:
+        """Collect completed items until their unique CPU storage hits the limit."""
+        pairs = [(False, modality, item)
+                 for modality, items in self._data.items() for item in items]
+        pairs.extend((True, modality, item)
+                     for modality, items in self._embeddings.items()
+                     for item in items)
+        if not pairs:
+            return None, None
+
+        async def _indexed_result(index: int,
+                                  item: Coroutine) -> tuple[int, Any]:
+            return index, await item
+
+        tasks = [
+            asyncio.create_task(_indexed_result(index, item))
+            for index, (_, _, item) in enumerate(pairs)
+        ]
+        results: list[Any] = [None] * len(tasks)
+        seen_storages: set[tuple[str, int, int]] = set()
+        resident_bytes = 0
+        try:
+            for completed in asyncio.as_completed(tasks):
+                index, result = await completed
+                resident_bytes += _cpu_storage_bytes(result, seen_storages)
+                if resident_bytes > max_bytes:
+                    raise MultimodalDataTooLargeError(
+                        "Multimodal inputs require at least "
+                        f"{resident_bytes} CPU bytes, exceeding the per-request "
+                        f"limit of {max_bytes} bytes")
+                results[index] = result
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        data_result: dict[str, list] = defaultdict(list)
+        embed_result: dict[str, list] = defaultdict(list)
+        for (is_embedding, modality, _), result in zip(pairs, results):
+            (embed_result
+             if is_embedding else data_result)[modality].append(result)
+        return (dict(data_result) or None, dict(embed_result) or None)
 
     def retrieve_all_sync(
         self
