@@ -174,18 +174,56 @@ client_cmds_base_file=${full_logdir}/client_cmds_base.sh
 client_cmds_file=${full_logdir}/client_cmds.sh
 replace_placeholder "${client_cmds_base_file}" "${all_nodes_str}" "${client_cmds_file}"
 
-# The pool is described in the worker configs and provisioned by trtllm-serve
-# during its own bringup: the context server starts the master, renders the
-# client config and publishes the master's address, and the generation servers
-# read that address to lend the pool their memory. Nothing here starts, waits
-# for or configures any of it.
+# The pool's master runs here, as its own job step. It belongs to no server:
+# one master serves every server in the job, it has to be answering before any
+# of them opens a store handle, and the settings every participant must agree
+# on are stated once, by it, in the manifest it publishes. Each worker config
+# names that manifest as mooncake_store.pool.
 #
-# The one value a config written before submission cannot know is this job's log
-# directory, which the master's address is published into, so a __LOG_DIR__
+# The one value a config written before submission cannot know is this job's
+# log directory, which the manifest is published into, so a __LOG_DIR__
 # placeholder in either worker config is filled in here.
 if [ "${mooncake_enabled}" = "true" ]; then
     sed -i "s|__LOG_DIR__|${full_logdir}|g" \
         "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"
+
+    mooncake_pool_file="${full_logdir}/pool.json"
+    # A manifest left by an earlier attempt would be read as this run's and
+    # send every worker to a master that is gone.
+    rm -f "${mooncake_pool_file}"
+
+    echo "Starting the Mooncake master..."
+    srun --container-name=${container_name} \
+        --container-mounts=${container_mount} --no-container-mount-home \
+        --mpi=pmix --overlap -N 1 -n 1 \
+        trtllm-serve mooncake_master \
+            --pool_file "${mooncake_pool_file}" \
+            --run_dir "${full_logdir}" \
+        &> ${full_logdir}/2_mooncake_master_step.log &
+    mooncake_master_step_pid=$!
+
+    # Fail closed. Every part of this that can go wrong is silent in the
+    # benchmark numbers: a pool that never came up serves no lookup, so the
+    # run completes and merely reports no hits, which reads as a workload with
+    # no reuse rather than as a broken deployment. The alternative to failing
+    # here is discovering it while interpreting results.
+    # Generous, because the wait spans container start on another node. It
+    # costs nothing when the manifest is already there, and the loop below
+    # exits early if the master dies.
+    mooncake_master_wait=900
+    echo "Waiting up to ${mooncake_master_wait}s for the pool manifest at ${mooncake_pool_file}..."
+    for _ in $(seq 1 ${mooncake_master_wait}); do
+        [ -s "${mooncake_pool_file}" ] && break
+        if ! kill -0 ${mooncake_master_step_pid} 2>/dev/null; then
+            cleanup_on_failure "The Mooncake master exited before publishing ${mooncake_pool_file}. Check ${full_logdir}/2_mooncake_master_step.log and ${full_logdir}/mooncake_master.log"
+        fi
+        sleep 1
+    done
+    if [ ! -s "${mooncake_pool_file}" ]; then
+        cleanup_on_failure "No Mooncake pool manifest at ${mooncake_pool_file} after ${mooncake_master_wait}s, so no worker could have joined the pool. Check ${full_logdir}/2_mooncake_master_step.log and ${full_logdir}/mooncake_master.log"
+    fi
+    echo "Mooncake pool manifest published:"
+    cat "${mooncake_pool_file}"
 fi
 
 # Per-worker hostfile / gpu_map files for srun --distribution=arbitrary.
@@ -212,13 +250,17 @@ echo "Server is ready!"
 
 # A connector that failed to open its store handle does not stop the worker from
 # serving, it just never hits, so surface the startup lines here rather than
-# leaving them to be discovered after the benchmark. The registration line
-# carries the bytes/page figure the pool sizing depends on.
+# leaving them to be discovered after the benchmark. Both sides are scanned:
+# generation ranks join the pool too, as capacity, so their startup lines are
+# where a decode-side segment that never mounted shows up.
 if [ "${mooncake_enabled}" = "true" ]; then
-    echo "Mooncake store startup lines from the context workers:"
-    if ! grep -h "mooncake-store" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null; then
+    echo "Mooncake store startup lines from the workers:"
+    if ! grep -h "mooncake-store" \
+            "${full_logdir}"/3_output_CTX_*.log \
+            "${full_logdir}"/3_output_GEN_*.log 2>/dev/null; then
         echo "  WARNING: no mooncake-store lines found. The connector may not have" \
-             "loaded; check ${full_logdir}/3_output_CTX_*.log and" \
+             "loaded; check ${full_logdir}/3_output_CTX_*.log," \
+             "${full_logdir}/3_output_GEN_*.log and" \
              "${full_logdir}/mooncake_master.log. The benchmark will still run," \
              "but without the store."
     fi
@@ -234,67 +276,43 @@ while read -r cmd <&3; do
     fi
 done 3< "${client_cmds_file}"
 
-# Collect the store's traffic into one file. The per-event lines live at DEBUG
-# in the worker logs (module _torch), so this is only populated when a config
-# asks for that verbosity. The counts are what show the store did work rather
-# than merely started.
+# Collect what the pool actually was, and what the store did with it.
+#
+# The capacity half is read from the manifest and from the record each rank
+# wrote when it mounted its segment, rather than from log lines. Grepping logs
+# for it would tie the decode share reported here to the wording of one
+# provisioning path's message, and a share that is merely wrong looks like a
+# workload with no reuse.
+#
+# The traffic half is log-derived, since per-event lines are all there is. They
+# live at DEBUG (module _torch), so the counts are only populated when a config
+# asks for that verbosity.
 if [ "${mooncake_enabled}" = "true" ]; then
     mooncake_summary="${full_logdir}/9_mooncake_summary.log"
     {
-        # The address file is retracted when the master stops, so fall back to
-        # the context server's log, which still names the master the run used.
-        echo "master: $(tr -d '[:space:]' < "${full_logdir}/master.addr" 2>/dev/null \
-            || grep -hoE "master at [0-9.]+:[0-9]+" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null \
-               | head -n 1 | awk '{print $3}' || echo unknown)"
+        echo "== pool =="
+        srun --container-name=${container_name} \
+            --container-mounts=${container_mount} --no-container-mount-home \
+            --overlap -N 1 -n 1 \
+            trtllm-serve mooncake_pool_report --run_dir "${full_logdir}" \
+            2>/dev/null || echo "(could not read the pool's records)"
         echo
         echo "== startup =="
-        grep -h "mooncake-store.*\(ready\|registered layout\)" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null || echo "(none)"
+        grep -h "mooncake-store.*\(ready\|registered layout\|capacity-only\)" \
+            "${full_logdir}"/3_output_CTX_*.log \
+            "${full_logdir}"/3_output_GEN_*.log 2>/dev/null || echo "(none)"
         echo
-        echo "== event counts =="
+        # Only the roles that transfer produce these, so they are counted over
+        # the context logs alone; a capacity rank contributing nothing here is
+        # the intended behaviour, not a missing signal.
+        echo "== event counts (context workers) =="
         for pattern in "matched" "loaded" "failed to load" "failed to save" \
                        "lookup failed" "could not reserve connector prefix"; do
             count=$(grep -h "mooncake-store.*${pattern}" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null | wc -l || true)
             echo "${pattern}: ${count}"
         done
         echo
-        # Where the blocks physically went. The master names a segment for
-        # every allocation and a segment is one client process's donated
-        # memory, so grouping by segment host shows how much of the pool lives
-        # on a decode node rather than on the prefill node that computed it.
-        # Without a donor this section shows only the prefill node.
-        echo "== block placement by segment host =="
-        echo "(lending hosts: $(grep -hoE "GiB of [0-9.]+ is now part of the pool" \
-            "${full_logdir}"/3_output_GEN_*.log 2>/dev/null \
-            | awk '{print $3}' | sort -u | paste -sd, - || echo none))"
-        grep -o "allocation_succeeded size=[0-9]* segment=[0-9.]*:[0-9]*" \
-            "${full_logdir}/mooncake_master.log" 2>/dev/null \
-            | awk '{
-                    sub(/size=/, "", $2); sub(/segment=/, "", $3);
-                    split($3, parts, ":"); host = parts[1]; port = parts[2];
-                    allocs[host]++; bytes[host] += $2;
-                    if (!((host, port) in seen)) {
-                        seen[host, port] = 1;
-                        segs[host] = segs[host] " " port;
-                    }
-                    total_allocs++; total_bytes += $2;
-                }
-                END {
-                    if (total_allocs == 0) { print "(no allocations)"; exit }
-                    for (h in allocs) {
-                        printf "%-16s pages=%-7d %8.2f GiB  %5.1f%% of pool contents  segments:%s\n",
-                            h, allocs[h], bytes[h] / 1073741824,
-                            100 * bytes[h] / total_bytes, segs[h];
-                    }
-                    printf "%-16s pages=%-7d %8.2f GiB\n", "TOTAL", total_allocs, total_bytes / 1073741824;
-                }' || echo "(could not parse master log)"
-        echo
-        # Lending memory happens inside the generation servers, so their own
-        # logs are where a segment that never mounted shows up.
-        echo "== lent segments =="
-        grep -h "mooncake-store: .*\(lending memory\|part of the pool\|withdrew\)" \
-            "${full_logdir}"/3_output_GEN_*.log 2>/dev/null || echo "(none)"
-        echo
-        echo "== pool bringup (context server) =="
+        echo "== pool bringup =="
         grep -h "mooncake-store:" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null \
             | head -n 30 || echo "(none)"
         echo

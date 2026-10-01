@@ -332,6 +332,44 @@ def create_encoder_executor(
     )
 
 
+def _disable_native_kv_offload(kv_cache_config: KvCacheConfig) -> None:
+    """Turn off this engine's own host and disk cache tiers for Mooncake.
+
+    The pool is the deployment's offload tier, and its pages live in host
+    memory the ranks have already lent it. A native tier alongside it claims a
+    second share of the same node's DRAM, which the connector's node budget
+    check cannot account for because the KV cache manager provisions it later.
+
+    Applies to every role. A capacity role registers no page addresses, so it
+    escapes the restrictions that protect them, but not the memory it lent.
+
+    Both fields are pinned to 0 rather than left unset, since a host_cache_size
+    of None asks KVCacheManagerV2 to size a host tier automatically. Call this
+    before the KV cache manager is built, which reads both to decide its tiers.
+    """
+    explicit = {
+        name: value
+        for name, value in (("host_cache_size",
+                             kv_cache_config.host_cache_size),
+                            ("disk_cache_size",
+                             kv_cache_config.disk_cache_size)) if value
+    }
+    if explicit:
+        requested = ", ".join(f"{name}={value}"
+                              for name, value in explicit.items())
+        logger.warning(
+            f"Ignoring kv_cache_config {requested}: the mooncake-store "
+            "connector is this deployment's offload tier. Put the memory into "
+            "mooncake_store.segment_size instead, where every server on the "
+            "node can reuse what any of them stored.")
+    else:
+        logger.info(
+            "Native KV cache offloading is off: the mooncake-store connector "
+            "provides the offload tier.")
+    kv_cache_config.host_cache_size = 0
+    kv_cache_config.disk_cache_size = 0
+
+
 def log_memory_usage(stage: str):
     GB = 1 << 30
     torch.cuda.empty_cache()
@@ -395,19 +433,6 @@ def _create_py_executor_impl(
     if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
         # Disable KV cache reuse for deterministic mode
         kv_cache_config.enable_block_reuse = False
-        kv_cache_config.enable_partial_reuse = False
-
-    # Must happen before the KV cache manager is built, since the manager reads
-    # enable_partial_reuse to construct its block pools.
-    if (kv_cache_config.enable_partial_reuse
-            and uses_connector(kv_connector_config, "mooncake-store")):
-        logger.warning(
-            "Disabling partial reuse: it is not usable with the mooncake-store "
-            "connector. The store is addressed by whole blocks, so a partial "
-            "device match leaves the matched length off a block boundary and "
-            "the connector declines the lookup rather than resume a block from "
-            "the middle. Partial reuse therefore trades part of one block for "
-            "every stored block of the remaining prefix.")
         kv_cache_config.enable_partial_reuse = False
 
     # The tokenizer is stripped from MPI kwargs in proxy.py to avoid pickle
@@ -846,24 +871,12 @@ def _create_py_executor_impl(
             f"Initializing kv connector with config: {kv_connector_config}")
 
         # `use_kv_cache_manager_v2` is tri-state and under "auto" the manager is
-        # not chosen until model loading, so the three manager-dependent
-        # rejections below fire here only when the config names the manager
-        # outright, sparing an explicit config a model load it cannot use.
-        # `_maybe_init_kv_connector_manager` repeats all three against the
-        # manager that was actually built.
+        # not chosen until model loading, so the manager-dependent rejections
+        # below fire here only when the config names the manager outright,
+        # sparing an explicit config a model load it cannot use.
+        # `_maybe_init_kv_connector_manager` repeats them against the manager
+        # that was actually built.
         v2_selection = kv_cache_config.use_kv_cache_manager_v2
-
-        # A policy that destroys and replays a live request leaves the
-        # connector's per-request block delta measured against pages that were
-        # freed with it. Only KVCacheManagerV2 drops that delta on replay.
-        if (scheduler_config.capacity_scheduler_policy
-                != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-                and v2_selection is False):
-            raise NotImplementedError(
-                "KV connector in this configuration is only supported with the "
-                "GUARANTEED_NO_EVICT capacity scheduler policy. Set "
-                "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
-            )
 
         # Rejected draft tokens shrink a request's page list, and the freed slot
         # goes to whichever request allocates next. The connector is only told
@@ -926,6 +939,44 @@ def _create_py_executor_impl(
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")
             raise e
+
+        if uses_connector(kv_connector_config, "mooncake-store"):
+            _disable_native_kv_offload(kv_cache_config)
+
+        # Both restrictions below exist because a connector registers page
+        # addresses and moves KV against them, which a capacity-only connector
+        # does not. Asked here so the worker itself can answer, and still
+        # before the KV cache manager is built, which partial reuse requires
+        # since the manager reads it to construct its block pools.
+        if not kv_connector_manager.capacity_only:
+            # A policy that destroys and replays a live request leaves the
+            # connector's per-request block delta measured against pages that
+            # were freed with it. Only KVCacheManagerV2 drops that delta on
+            # replay.
+            if (scheduler_config.capacity_scheduler_policy
+                    != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+                    and v2_selection is False):
+                raise NotImplementedError(
+                    "KV connector in this configuration is only supported with the "
+                    "GUARANTEED_NO_EVICT capacity scheduler policy. Set "
+                    "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
+                )
+
+            if (kv_cache_config.enable_partial_reuse
+                    and uses_connector(kv_connector_config, "mooncake-store")):
+                logger.warning(
+                    "Disabling partial reuse: it is not usable with the mooncake-store "
+                    "connector. The store is addressed by whole blocks, so a partial "
+                    "device match leaves the matched length off a block boundary and "
+                    "the connector declines the lookup rather than resume a block from "
+                    "the middle. Partial reuse therefore trades part of one block for "
+                    "every stored block of the remaining prefix.")
+                kv_cache_config.enable_partial_reuse = False
+        else:
+            logger.info(
+                "KV connector is capacity-only: it registers no KV cache pages "
+                "and transfers nothing, so this engine keeps its capacity "
+                "scheduler policy and its block reuse settings unchanged.")
     else:
         kv_connector_manager = None
 

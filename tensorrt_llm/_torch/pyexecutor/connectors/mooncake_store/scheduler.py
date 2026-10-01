@@ -76,7 +76,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         super().__init__(llm_args)
 
         validate_llm_args(llm_args)
-        self._config = MooncakeStoreConnectorConfig.from_env()
+        self._config = MooncakeStoreConnectorConfig.resolve(llm_args)
         self._tokens_per_block = int(llm_args.kv_cache_config.tokens_per_block)
         self._requests: Dict[int, _RequestState] = {}
         self._worker: Optional[MooncakeStoreConnectorWorker] = None

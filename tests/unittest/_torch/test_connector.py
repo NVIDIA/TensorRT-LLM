@@ -333,6 +333,85 @@ def test_scheduler_output_keeps_deltas_while_the_allocation_lives():
     assert again.cached_requests[0].new_block_ids == []
 
 
+class MinimalWorker(KvCacheConnectorWorker):
+    """A worker with nothing filled in beyond the abstract methods."""
+
+    def register_kv_caches(self, kv_cache_tensor):
+        pass
+
+    def start_load_kv(self, stream):
+        pass
+
+    def wait_for_layer_load(self, layer_idx, stream):
+        pass
+
+    def save_kv_layer(self, layer_idx, stream):
+        pass
+
+    def wait_for_save(self, stream):
+        pass
+
+    def get_finished(self, finished_gen_req_ids, started_loading_req_ids):
+        return [], []
+
+
+def test_a_connector_is_assumed_to_move_kv():
+    """Several executor restrictions exist only because a connector normally
+    registers page addresses and transfers against them: the capacity
+    scheduler is pinned to GUARANTEED_NO_EVICT, cache tiers below GPU are
+    refused, and every decoder layer gets a pre/post hook. So the default has
+    to be the restrictive one, and a connector written before `capacity_only`
+    existed keeps every guard that was written for it.
+    """
+    assert not MinimalWorker(MagicMock()).capacity_only
+
+
+def test_the_manager_reports_whether_its_worker_moves_kv():
+    """The executor asks the manager, since that is the only handle it holds."""
+
+    class CapacityWorker(MinimalWorker):
+        capacity_only = True
+
+    assert not KvCacheConnectorManager(MinimalWorker(MagicMock()),
+                                       scheduler=MagicMock()).capacity_only
+    assert KvCacheConnectorManager(CapacityWorker(MagicMock()),
+                                   scheduler=MagicMock()).capacity_only
+
+
+def test_a_capacity_only_manager_builds_no_scheduler_output():
+    """A capacity-only manager skips the per-iteration scheduler output, and a
+    transferring one still builds it."""
+
+    class CapacityWorker(MinimalWorker):
+        capacity_only = True
+
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [
+        MagicMock(is_dummy_request=False,
+                  request_id=7,
+                  state=LlmRequestState.GENERATION_IN_PROGRESS)
+    ]
+
+    # Attention DP keeps this to one process: `_run_on_leader` runs locally
+    # with it, and broadcasts the TP leader's result without it.
+    capacity = KvCacheConnectorManager(CapacityWorker(MagicMock()),
+                                       scheduler=MagicMock(),
+                                       enable_attention_dp=True)
+    capacity.build_scheduler_output(scheduled_batch, MagicMock())
+    # With no output built, handle_metadata binds nothing to the worker.
+    capacity.handle_metadata()
+    capacity.scheduler.build_connector_meta.assert_not_called()
+    assert capacity.worker.get_connector_meta() is None
+
+    # The transferring role needs the output and must be unaffected.
+    transferring = KvCacheConnectorManager(MinimalWorker(MagicMock()),
+                                           scheduler=MagicMock(),
+                                           enable_attention_dp=True)
+    transferring.build_scheduler_output(scheduled_batch, MagicMock())
+    transferring.handle_metadata()
+    transferring.scheduler.build_connector_meta.assert_called_once()
+
+
 def test_scheduler_output_num_scheduled_tokens_with_mtp():
     """Test that num_scheduled_tokens is correctly set for MTP (multi-token prediction)."""
     NUM_DRAFT_TOKENS = 3

@@ -188,6 +188,21 @@ class KvCacheConnectorWorker(ABC):
             {"register_kv_caches": "register_kv_cache_layout"},
         )
 
+    @property
+    def capacity_only(self) -> bool:
+        """Whether this worker contributes resources but transfers no KV.
+
+        Several guards around the executor exist to protect the page addresses
+        a connector registers: the capacity scheduler is restricted, cache
+        tiers below GPU are refused, and per-layer hooks are installed. A
+        worker that registers nothing and moves nothing needs none of them, so
+        it overrides this and the executor leaves its engine alone.
+
+        Overriding does not make a connector optional. It still participates in
+        construction and shutdown; it simply has no KV of its own in flight.
+        """
+        return False
+
     def bind_connector_meta(self, metadata: object):
         self._metadata = metadata
 
@@ -712,6 +727,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         self.worker = worker
         self.scheduler = scheduler
+        #: Whether the attached connector moves KV at all. Read by the
+        #: executor to decide which of its connector-related restrictions
+        #: apply; see `KvCacheConnectorWorker.capacity_only`.
+        self.capacity_only = bool(worker.capacity_only)
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -1144,6 +1163,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def build_scheduler_output(
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
     ):
+        if self.capacity_only:
+            # A capacity-only connector registers no pages, so any scheduler
+            # output would describe no loads and no saves. Both KV cache
+            # managers call this once per iteration from `prepare_resources`,
+            # which on a generation server is inter-token latency.
+            # `handle_metadata` returns early when no output was built.
+            return
         async_requests = AsyncRequests(
             {},
             {

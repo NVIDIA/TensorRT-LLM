@@ -24,61 +24,71 @@ point to point between two known peers, while this one publishes pages into a
 pool addressed by content. The two compose, so a context server can write pages
 here and still hand off over NIXL.
 
-Requires `KVCacheManagerV2`, the manager that can describe its pools to a
-connector through `register_kv_cache_layout`, and the Mooncake Python bindings,
-which `tensorrt-llm` pulls in as `mooncake-transfer-engine-cuda13`.
+Transferring requires `KVCacheManagerV2`, the manager that can describe its
+pools to a connector through `register_kv_cache_layout`, and the Mooncake Python
+bindings, which `tensorrt-llm` pulls in as `mooncake-transfer-engine-cuda13`.
+A capacity-only rank describes no pools, so it needs only the bindings.
 
-Enable it with::
+A pool has one master, run as infrastructure rather than inside any engine::
 
-    kv_connector_config = KvCacheConnectorConfig(connector="mooncake-store")
+    trtllm-serve mooncake_master --pool_file /shared/pool.json
 
-with `MOONCAKE_CONFIG_PATH` pointing at a Mooncake JSON config. Describing the
-pool in `KvCacheConnectorConfig.mooncake_store` instead lets `trtllm-serve`
-provision it during bringup, so no external script has to; see `master.py`.
+It publishes a manifest describing the pool, which each server then joins::
 
-Capacity comes only from processes that open a store handle, which in a
-disaggregated deployment is the context servers alone. `donor.py` lends a
-node's memory to the pool without giving it a connector. `trtllm-serve
-mooncake_master` and `mooncake_donor` expose both.
+    kv_connector_config:
+      connector: mooncake-store
+      mooncake_store:
+        pool: file:///shared/pool.json
+        role: both          # or: capacity, on a server that only lends memory
+        segment_size: 160GiB
+
+Every rank that joins contributes `segment_size`, so capacity is the sum over
+participating ranks and grows with the deployment's parallelism. `role` governs
+only traffic, which is what lets a generation server lend its memory while
+leaving the pool alone; see `config.StoreRole`. What each rank contributed is
+recorded under the run directory for `ledger.format_pool_report` to total up.
+
+Pointing `MOONCAKE_CONFIG_PATH` at a Mooncake JSON config directly also works,
+and wins over `mooncake_store`, so an externally managed pool stays reachable.
 
 By default the KV pools themselves are registered with Mooncake, which requires
-GPUDirect RDMA. Where that is unavailable, `"stage_through_host": true` in the
-JSON config, or `TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST=1`, routes pages
-through a pinned host buffer instead; see `staging.py`.
+GPUDirect RDMA. Where that is unavailable, `stage_through_host: true` routes
+pages through a pinned host buffer instead; see `staging.py`.
 """
 
 from .config import MooncakeStoreConnectorConfig, StoreRole, parse_size
-from .donor import DEFAULT_DONOR_LOCAL_BUFFER_SIZE, donate_segment, maybe_donate_segment
+from .ledger import SegmentRecord, format_pool_report, read_segments, record_segment
 from .master import (
-    PoolSpec,
+    POOL_MANIFEST_NAME,
+    PoolManifest,
     local_address,
-    master_timeout,
     maybe_provision_pool,
     provision_pool,
-    resolve_master_address,
+    resolve_device_name,
+    resolve_pool,
     running_master,
     wait_for_master,
-    write_client_config,
 )
 from .scheduler import MooncakeStoreConnectorScheduler
 from .worker import MooncakeStoreConnectorWorker
 
 __all__ = [
-    "DEFAULT_DONOR_LOCAL_BUFFER_SIZE",
+    "POOL_MANIFEST_NAME",
     "MooncakeStoreConnectorConfig",
     "MooncakeStoreConnectorScheduler",
     "MooncakeStoreConnectorWorker",
-    "PoolSpec",
+    "PoolManifest",
+    "SegmentRecord",
     "StoreRole",
-    "donate_segment",
+    "format_pool_report",
     "local_address",
-    "master_timeout",
-    "maybe_donate_segment",
     "maybe_provision_pool",
     "parse_size",
     "provision_pool",
-    "resolve_master_address",
+    "read_segments",
+    "record_segment",
+    "resolve_device_name",
+    "resolve_pool",
     "running_master",
     "wait_for_master",
-    "write_client_config",
 ]

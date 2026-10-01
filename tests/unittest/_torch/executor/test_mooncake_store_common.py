@@ -23,6 +23,7 @@ in-process fake that records what it was handed.
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -99,10 +100,6 @@ def store_config(tmp_path, monkeypatch):
         )
     )
     monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(path))
-    monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_ROLE", raising=False)
-    monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_PREFIX", raising=False)
-    monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_MODEL_KEY", raising=False)
-    monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST", raising=False)
     return path
 
 
@@ -177,7 +174,7 @@ def test_hash_chain_rejects_shrinking_token_list():
 
 def test_key_namespace_separates_every_dimension():
     base = dict(
-        cache_prefix="trtllm",
+        namespace="trtllm",
         model_key="m",
         rank=0,
         world_size=2,
@@ -188,7 +185,7 @@ def test_key_namespace_separates_every_dimension():
     block_hash = b"\x01" * 16
     reference = KeyNamespace(**base).key(block_hash)
     for field, value in [
-        ("cache_prefix", "other"),
+        ("namespace", "other"),
         ("model_key", "n"),
         ("rank", 1),
         ("world_size", 4),
@@ -202,9 +199,31 @@ def test_key_namespace_separates_every_dimension():
 # ---- config ----
 
 
+def make_llm_args(*, run_dir=None) -> SimpleNamespace:
+    """Only the parts of the worker config that config resolution reads."""
+    return SimpleNamespace(
+        kv_connector_config=SimpleNamespace(
+            connector="mooncake-store",
+            mooncake_store=SimpleNamespace(run_dir=run_dir),
+        )
+    )
+
+
+def resolve_config(run_dir=None) -> MooncakeStoreConnectorConfig:
+    """The client config a rank resolves, given what its worker config said."""
+    return MooncakeStoreConnectorConfig.resolve(make_llm_args(run_dir=run_dir))
+
+
+def set_pool_setting(store_config, **settings):
+    """Rewrite the rendered client config, as a differently configured server would."""
+    raw = json.loads(store_config.read_text())
+    raw.update(settings)
+    store_config.write_text(json.dumps(raw))
+
+
 def test_config_reads_sizes_and_staging_from_the_json(store_config):
     """Sizes arrive as unit strings, and staging is off until the JSON asks."""
-    config = MooncakeStoreConnectorConfig.from_env()
+    config = resolve_config()
     assert config.global_segment_size == 1024**3
     assert config.local_buffer_size == 256 * 1024**2
     assert config.role is StoreRole.BOTH
@@ -213,47 +232,111 @@ def test_config_reads_sizes_and_staging_from_the_json(store_config):
 
     raw = json.loads(store_config.read_text())
     raw["stage_through_host"] = True
-    raw["staging_buffer_bytes"] = "256MiB"
     store_config.write_text(json.dumps(raw))
 
-    config = MooncakeStoreConnectorConfig.from_env()
+    config = resolve_config()
     assert config.stage_through_host is True
-    assert config.staging_buffer_bytes == 256 * 1024**2
 
 
-def test_config_role_comes_from_environment(store_config, monkeypatch):
-    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_ROLE", "producer")
-    config = MooncakeStoreConnectorConfig.from_env()
-    assert config.role is StoreRole.PRODUCER
-    assert config.role.saves and not config.role.loads
+@pytest.mark.parametrize("spelling", ["80GB", "4g", "2TB", "512mb"])
+def test_config_refuses_sizes_vllm_would_read_differently(store_config, spelling):
+    """This file is the one both engines open, and they disagree about 'GB'."""
+    raw = json.loads(store_config.read_text())
+    raw["global_segment_size"] = spelling
+    store_config.write_text(json.dumps(raw))
 
-    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_ROLE", "consumer")
-    config = MooncakeStoreConnectorConfig.from_env()
-    assert config.role.loads and not config.role.saves
-
-    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_ROLE", "nonsense")
-    with pytest.raises(ValueError, match="TRTLLM_MOONCAKE_STORE_ROLE"):
-        MooncakeStoreConnectorConfig.from_env()
+    with pytest.raises(ValueError, match="power of 1000"):
+        resolve_config()
 
 
-def test_config_requires_the_env_var(monkeypatch):
+@pytest.mark.parametrize(
+    "spelling, expected",
+    [("160GiB", 160 * 1024**3), ("512MiB", 512 * 1024**2), (1024, 1024)],
+)
+def test_config_accepts_the_sizes_both_engines_agree_on(store_config, spelling, expected):
+    raw = json.loads(store_config.read_text())
+    raw["global_segment_size"] = spelling
+    store_config.write_text(json.dumps(raw))
+
+    assert resolve_config().global_segment_size == expected
+
+
+@pytest.mark.parametrize(
+    "role, loads, saves",
+    [
+        ("both", True, True),
+        ("producer", False, True),
+        ("consumer", True, False),
+        ("capacity", False, False),
+    ],
+)
+def test_config_role_comes_from_the_json(store_config, role, loads, saves):
+    """Each server's own config says what it does with the pool.
+
+    There is no environment override for it. The role is a field of
+    `mooncake_store`, and the rendered config carries what that field said, so
+    a second way to set it could only disagree with the first.
+    """
+    set_pool_setting(store_config, role=role)
+    config = resolve_config()
+
+    assert config.role is StoreRole(role)
+    assert (config.role.loads, config.role.saves) == (loads, saves)
+    assert config.capacity_only is (not loads and not saves)
+
+
+def test_config_rejects_a_role_it_does_not_have(store_config):
+    raw = json.loads(store_config.read_text())
+    raw["role"] = "donor"
+    store_config.write_text(json.dumps(raw))
+
+    with pytest.raises(ValueError, match="not one of"):
+        resolve_config()
+
+
+# ---- roles ----
+#
+# A role names the traffic an engine drives, not the memory it lends, so every
+# call site is guarded on `loads` and `saves` alone.
+
+
+@pytest.mark.parametrize(
+    "role, loads, saves",
+    [
+        (StoreRole.BOTH, True, True),
+        (StoreRole.PRODUCER, False, True),
+        (StoreRole.CONSUMER, True, False),
+        (StoreRole.CAPACITY, False, False),
+    ],
+)
+def test_each_role_drives_the_traffic_it_names(role, loads, saves):
+    assert role.loads is loads
+    assert role.saves is saves
+    assert role.transfers is (loads or saves)
+
+
+def test_exactly_one_role_transfers_nothing():
+    """Without it, contributing memory would mean also using the pool."""
+    silent = [role for role in StoreRole if not role.transfers]
+    assert silent == [StoreRole.CAPACITY]
+
+
+def test_config_needs_a_pool_described_somewhere(monkeypatch):
     monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
-    monkeypatch.delenv("TRTLLM_MOONCAKE_RUN_DIR", raising=False)
     with pytest.raises(ValueError, match="MOONCAKE_CONFIG_PATH"):
-        MooncakeStoreConnectorConfig.from_env()
+        resolve_config()
 
 
 def test_config_falls_back_to_the_run_directory(tmp_path, monkeypatch):
     # A rank an external launcher started was already running when its leader
     # provisioned the pool, so it never inherited the exported path and reads
-    # the rendered config out of the shared run directory instead.
+    # the rendered config out of the run directory its own config names.
     monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
-    monkeypatch.setenv("TRTLLM_MOONCAKE_RUN_DIR", str(tmp_path))
     (tmp_path / "mooncake.json").write_text(
         json.dumps({"master_server_address": "10.0.0.1:50051", "global_segment_size": "8GiB"})
     )
 
-    config = MooncakeStoreConnectorConfig.from_env()
+    config = resolve_config(run_dir=str(tmp_path))
 
     assert config.master_server_address == "10.0.0.1:50051"
     assert config.global_segment_size == 8 * 1024**3
@@ -263,9 +346,8 @@ def test_config_run_directory_without_a_rendered_config_still_asks(tmp_path, mon
     # An empty run directory means no leader provisioned anything, which is a
     # missing pool rather than a default one.
     monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
-    monkeypatch.setenv("TRTLLM_MOONCAKE_RUN_DIR", str(tmp_path))
     with pytest.raises(ValueError, match="MOONCAKE_CONFIG_PATH"):
-        MooncakeStoreConnectorConfig.from_env()
+        resolve_config(run_dir=str(tmp_path))
 
 
 def test_config_env_var_wins_over_the_run_directory(tmp_path, monkeypatch):
@@ -277,9 +359,8 @@ def test_config_env_var_wins_over_the_run_directory(tmp_path, monkeypatch):
         json.dumps({"master_server_address": "provisioned:50051"})
     )
     monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(named))
-    monkeypatch.setenv("TRTLLM_MOONCAKE_RUN_DIR", str(tmp_path))
 
-    assert MooncakeStoreConnectorConfig.from_env().master_server_address == "external:50051"
+    assert resolve_config(run_dir=str(tmp_path)).master_server_address == "external:50051"
 
 
 @pytest.mark.parametrize("named", [{}, {"metadata_server": ""}], ids=["omitted", "empty"])
@@ -290,7 +371,7 @@ def test_config_metadata_server_falls_back_to_the_handshake(tmp_path, monkeypatc
     path = tmp_path / "metadata.json"
     path.write_text(json.dumps({"master_server_address": "127.0.0.1:50051", **named}))
     monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(path))
-    assert MooncakeStoreConnectorConfig.from_env().metadata_server == "P2PHANDSHAKE"
+    assert resolve_config().metadata_server == "P2PHANDSHAKE"
 
 
 def test_config_requires_an_explicit_model_key(store_config, tmp_path, monkeypatch):
@@ -299,37 +380,9 @@ def test_config_requires_an_explicit_model_key(store_config, tmp_path, monkeypat
     path = tmp_path / "no_model_key.json"
     path.write_text(json.dumps({"master_server_address": "127.0.0.1:50051"}))
     monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(path))
-    config = MooncakeStoreConnectorConfig.from_env()
+    config = resolve_config()
     with pytest.raises(ValueError, match="needs a model key"):
         config.resolve_model_key("/models/MiniMax-M3/")
-
-
-@pytest.mark.parametrize(
-    "value,expected", [("1", True), ("true", True), ("on", True), ("0", False), ("off", False)]
-)
-def test_config_staging_env_override(store_config, monkeypatch, value, expected):
-    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST", value)
-    assert MooncakeStoreConnectorConfig.from_env().stage_through_host is expected
-
-
-def test_config_namespace_env_overrides(store_config, monkeypatch):
-    # Both feed KeyNamespace, which decides whether two engines share cache.
-    # Getting either wrong silently loses every hit, or lets one engine read
-    # another's pages.
-    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_PREFIX", "tenant-a")
-    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_MODEL_KEY", "llama-3.1-8b@rev7")
-
-    config = MooncakeStoreConnectorConfig.from_env()
-
-    assert config.cache_prefix == "tenant-a"
-    # Overrides the JSON's model_key rather than only supplying a missing one.
-    assert config.resolve_model_key("/models/test-model") == "llama-3.1-8b@rev7"
-
-
-def test_config_rejects_a_non_boolean_staging_env(store_config, monkeypatch):
-    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST", "sometimes")
-    with pytest.raises(ValueError, match="not a boolean"):
-        MooncakeStoreConnectorConfig.from_env()
 
 
 # The connector itself, the registry preset that selects it, and the startup

@@ -108,7 +108,7 @@ class BlockHashChain:
 class KeyNamespace:
     """The part of a store key that is fixed for one shard and layer group."""
 
-    cache_prefix: str
+    namespace: str
     model_key: str
     #: Global rank of the shard whose KV these bytes are, and the world size it
     #: was produced under. Both are needed: rank 3 of 8 holds different heads
@@ -123,7 +123,7 @@ class KeyNamespace:
     def prefix(self) -> str:
         """The literal string every key in this namespace starts with."""
         return (
-            f"{self.cache_prefix}/{self.model_key}"
+            f"{self.namespace}/{self.model_key}"
             f"/w{self.world_size}r{self.rank}"
             f"/lg{self.layer_group_id}"
             f"/t{self.tokens_per_block}b{self.bytes_per_page}"

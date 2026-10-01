@@ -29,6 +29,14 @@ once the forward pass that wrote them has retired, and blocking the executor
 loop on an RDMA write is exactly the cost the store is supposed to avoid. The
 scheduler reports such a request as saving asynchronously, which keeps its pages
 pinned until `get_finished` says the writes landed.
+
+Mounting the segment and moving pages are separate things, and the `capacity`
+role does only the first: every rank contributes the memory its config names,
+while the role decides whether the rank then reads or writes the pool. A
+capacity-only worker opens its handle and stops there, with no layout, no
+buffer registration and no save thread. That is how a node lends host memory
+to the pool without its engine joining in, and without needing an HCA that can
+pin GPU pages.
 """
 
 import threading
@@ -46,10 +54,12 @@ from tensorrt_llm.logger import logger
 from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
-from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig
+from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, pool_config
 from .keys import KeyNamespace
+from .ledger import record_segment
 from .metadata import MooncakeStoreMetadata, RequestTransfers
 from .staging import (
+    MAX_STAGING_BUFFER_BYTES,
     HostStagingPool,
     describe_batch_for_get,
     plan_slot_geometry,
@@ -57,7 +67,7 @@ from .staging import (
     unstage_batch_after_get,
 )
 from .staging import sync_stream as _sync_stream
-from .validation import validate_layout, validate_llm_args
+from .validation import validate_layout, validate_llm_args, validate_node_budget
 
 __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
 
@@ -91,7 +101,11 @@ def resolve_local_worker(timeout: float = 60.0) -> "MooncakeStoreConnectorWorker
 
 
 def _open_store(config: MooncakeStoreConnectorConfig):
-    """Connect to the Mooncake master and return a live store handle."""
+    """Connect to the Mooncake master and return a live store handle.
+
+    Returns:
+        The store handle, and the host the segment is registered under.
+    """
     try:
         from mooncake.store import MooncakeDistributedStore
     except ImportError as exc:
@@ -121,10 +135,14 @@ def _open_store(config: MooncakeStoreConnectorConfig):
         raise RuntimeError(
             f"MooncakeDistributedStore.setup failed with status {status} "
             f"(master={config.master_server_address!r}, "
-            f"metadata={config.metadata_server!r}, protocol={config.protocol!r}). "
-            f"Check the config named by {CONFIG_PATH_ENV}."
+            f"metadata={config.metadata_server!r}, protocol={config.protocol!r}, "
+            f"global_segment_size={config.global_segment_size}). The master "
+            "must already be accepting connections; the protocol and device "
+            "must be usable from this host; and this node must have the "
+            "segment's worth of memory to spare once every rank on it has "
+            f"claimed one. Check the config named by {CONFIG_PATH_ENV}."
         )
-    return store
+    return store, hostname
 
 
 def _default_hostname() -> str:
@@ -156,7 +174,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         super().__init__(llm_args)
 
         validate_llm_args(llm_args)
-        self._config = MooncakeStoreConnectorConfig.from_env()
+        self._config = MooncakeStoreConnectorConfig.resolve(llm_args)
+        # Where this rank records the segment it mounts. `None` when the
+        # deployment named no directory, which makes the run unreportable but
+        # not unworkable; see `ledger.record_segment`.
+        self._run_dir = getattr(pool_config(llm_args), "run_dir", None)
         self._rank = mpi_rank()
         self._world_size = mpi_world_size()
         self._model_key = self._config.resolve_model_key(llm_args.model)
@@ -168,7 +190,21 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # shards of it are present, so a lookup has to ask about all of them.
         self._peer_namespaces: Dict[int, Tuple[KeyNamespace, ...]] = {}
 
-        self._store = _open_store(self._config)
+        # Checked before the segment is mounted: every rank on this node is
+        # about to ask for the same amount, and the kernel answers an
+        # unaffordable total by killing the process rather than by failing the
+        # allocation.
+        validate_node_budget(self._config)
+
+        self._store, self._segment_host = _open_store(self._config)
+        record_segment(
+            self._run_dir,
+            host=self._segment_host,
+            rank=self._rank,
+            segment_size=self._config.global_segment_size,
+            role=self._config.role.value,
+            model_key=self._model_key,
+        )
 
         self._save_queue: "Queue[Optional[Tuple[torch.cuda.Event, List[RequestTransfers]]]]" = (
             Queue()
@@ -201,22 +237,47 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         logger.info(
             f"mooncake-store worker rank {self._rank}/{self._world_size} ready "
             f"(role={self._config.role.value}, model_key={self._model_key}, "
-            f"master={self._config.master_server_address})"
+            f"master={self._config.master_server_address}, "
+            f"segment={self._config.global_segment_size / (1 << 30):.1f} GiB "
+            f"on {self._segment_host})"
         )
+        if self.capacity_only:
+            # Said plainly, because every other sign of a working connector is
+            # absent by design here, which otherwise looks like a broken
+            # deployment.
+            logger.info(
+                f"mooncake-store worker rank {self._rank}: capacity-only. Its "
+                "memory is in the pool and its KV cache is not: no lookups, no "
+                "loads, no saves, and no KV registration, so this rank needs no "
+                "GPUDirect RDMA."
+            )
 
     # ---- registration ----
 
+    @property
+    def capacity_only(self) -> bool:
+        """Whether this rank lends memory to the pool and transfers nothing.
+
+        Read by the executor to skip the guards that protect a connector's
+        registered pages, since this role registers none.
+        """
+        return self._config.capacity_only
+
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
-        """Reject the V1 single-pool registration.
+        """Reject the V1 single-pool registration, unless capacity-only.
 
         Raises:
-            NotImplementedError: Always. Identity here is a hash chain the
-                connector computes itself, keyed per layer group, and the V1
-                manager supplies real block hashes over a single flat block
-                space instead. Running the V2 addressing against V1 block ids
-                would silently mislabel pages, so V1 is refused rather than
+            NotImplementedError: Unless capacity-only. Identity here is a hash
+                chain the connector computes itself, keyed per layer group, and
+                the V1 manager supplies real block hashes over a single flat
+                block space instead. Running the V2 addressing against V1 block
+                ids would silently mislabel pages, so V1 is refused rather than
                 approximated.
         """
+        if self.capacity_only:
+            # Nothing is addressed, so which manager describes the cache does
+            # not matter and such a server may keep whichever suits it.
+            return
         raise NotImplementedError(
             "The mooncake-store connector requires KVCacheManagerV2. Set "
             "kv_cache_config.use_kv_cache_manager_v2=True."
@@ -226,6 +287,18 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         """Register the KV pools with Mooncake and start the save thread."""
         if self._addressing is not None:
             raise RuntimeError("KV cache layout already registered")
+
+        if self.capacity_only:
+            # Registration exists to let the store reach this rank's pages, and
+            # nothing will ask it to, so the addressing, the buffer
+            # registration, the staging pool and the save thread are all
+            # skipped.
+            logger.info(
+                f"mooncake-store worker rank {self._rank}: capacity-only, so "
+                "the KV cache layout is not registered and no page of it is "
+                "reachable from the pool."
+            )
+            return
 
         validate_layout(layout)
         addressing = PageAddressing(layout)
@@ -298,7 +371,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         slot_bytes, num_slots = plan_slot_geometry(
             max_bytes_per_page,
             self._config.transfer_batch_size,
-            self._config.staging_buffer_bytes,
+            MAX_STAGING_BUFFER_BYTES,
         )
         if self._config.role.loads:
             self._load_staging = HostStagingPool(
@@ -319,14 +392,14 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             logger.warning(
                 f"mooncake-store rank {self._rank} reduced its transfer batch from "
                 f"{self._config.transfer_batch_size} to {self._batch_size} pages: "
-                f"staging {max_bytes_per_page} B pages within "
-                f"{self._config.staging_buffer_bytes} B does not fit more. Raise "
-                f"staging_buffer_bytes to restore the configured batch size."
+                f"staging {max_bytes_per_page} B pages within the "
+                f"{MAX_STAGING_BUFFER_BYTES} B pinned-memory ceiling does not fit "
+                f"more. Lower transfer_batch_size to make the reduction explicit."
             )
 
     def _namespace(self, rank: int, layer_group_id: int, bytes_per_page: int) -> KeyNamespace:
         return KeyNamespace(
-            cache_prefix=self._config.cache_prefix,
+            namespace=self._config.namespace,
             model_key=self._model_key,
             rank=rank,
             world_size=self._world_size,

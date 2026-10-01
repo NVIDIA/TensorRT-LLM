@@ -18,9 +18,11 @@ Topology settings are read from the JSON file named by `MOONCAKE_CONFIG_PATH`,
 the same file and environment variable the vLLM Mooncake store connector uses,
 so one deployment can point both engines at the same pool.
 
-`KvCacheConnectorConfig` carries no free-form dictionary, so the two settings
-that are TensorRT-LLM's rather than Mooncake's, the read/write role and the key
-prefix, are also taken from the environment.
+Settings that are the pool's rather than any engine's, such as which master
+owns it and how it is reached, come from the manifest that master publishes, so
+they cannot drift between participants. What stays per server is the traffic it
+drives and the memory it lends. See `master.provision_pool`, which merges the
+two into the file this reads back.
 """
 
 import json
@@ -34,40 +36,46 @@ __all__ = [
     "CLIENT_CONFIG_NAME",
     "CONFIG_PATH_ENV",
     "MooncakeStoreConnectorConfig",
-    "ROLE_ENV",
-    "RUN_DIR_ENV",
-    "STAGE_THROUGH_HOST_ENV",
+    "SEGMENTS_DIR_NAME",
     "StoreRole",
+    "parse_size",
+    "pool_config",
     "provisioned_config_path",
 ]
 
+#: Mooncake's own variable for the client config path, read by the vLLM
+#: connector too. A deployment that provisions the pool outside the engine
+#: names it this way, and `master.provision_pool` exports it for the ranks the
+#: LLM constructor spawns.
 CONFIG_PATH_ENV = "MOONCAKE_CONFIG_PATH"
-#: Where a server keeps the client config it renders and the master's log. Set
-#: it to keep them after shutdown; otherwise they live in a temporary directory.
-RUN_DIR_ENV = "TRTLLM_MOONCAKE_RUN_DIR"
 #: Name the rendered client config takes in the run directory.
 CLIENT_CONFIG_NAME = "mooncake.json"
-ROLE_ENV = "TRTLLM_MOONCAKE_STORE_ROLE"
-CACHE_PREFIX_ENV = "TRTLLM_MOONCAKE_STORE_PREFIX"
-MODEL_KEY_ENV = "TRTLLM_MOONCAKE_STORE_MODEL_KEY"
-STAGE_THROUGH_HOST_ENV = "TRTLLM_MOONCAKE_STORE_STAGE_THROUGH_HOST"
+#: Records which server rendered the client config in a run directory. That
+#: config names the writing server's role and its node's RDMA devices, so a
+#: second server pointed at the same directory is a misconfiguration.
+#: See `master.claim_run_dir`.
+RUN_DIR_OWNER_NAME = "owner.json"
+#: Subdirectory of the run directory where each rank records the segment it
+#: mounted. Telemetry reads it instead of scraping logs; see `ledger.py`.
+SEGMENTS_DIR_NAME = "segments"
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200
+#: Per-process Mooncake transfer buffer. Not pool capacity, and not worth a
+#: knob: it bounds one client's scratch space, which no deployment has had
+#: reason to tune. Still written into the rendered config so a vLLM reader of
+#: the same file sees the same value rather than falling back to its own.
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824
-DEFAULT_CACHE_PREFIX = "trtllm"
-DEFAULT_STAGING_BUFFER_SIZE = 536870912
+DEFAULT_NAMESPACE = "trtllm"
 #: Mooncake's own peer-to-peer handshake, which keeps a separate metadata
 #: process out of the deployment. Nothing else is a sensible fallback: an empty
 #: connstring is not one of the forms `store.setup` accepts, so a config that
 #: leaves the field out means this rather than meaning no metadata service.
 DEFAULT_METADATA_SERVER = "P2PHANDSHAKE"
 
-_TRUE = {"1", "true", "yes", "on"}
-_FALSE = {"0", "false", "no", "off"}
-
-_SIZE_UNITS = {
-    "": 1,
-    "b": 1,
+#: Suffixes this parser reads as powers of 1000. vLLM's Mooncake config parser
+#: reads the same spellings as powers of 1024, so a file both engines may open
+#: must not use them; `strict_units` rejects them for that reason.
+_DECIMAL_UNITS = {
     "k": 1000,
     "kb": 1000,
     "m": 1000**2,
@@ -76,10 +84,26 @@ _SIZE_UNITS = {
     "gb": 1000**3,
     "t": 1000**4,
     "tb": 1000**4,
+}
+_BINARY_UNITS = {
+    "": 1,
+    "b": 1,
     "kib": 1024,
     "mib": 1024**2,
     "gib": 1024**3,
     "tib": 1024**4,
+}
+_SIZE_UNITS = {**_BINARY_UNITS, **_DECIMAL_UNITS}
+#: The binary spelling to recommend for each rejected decimal one.
+_BINARY_SPELLING = {
+    "k": "KiB",
+    "kb": "KiB",
+    "m": "MiB",
+    "mb": "MiB",
+    "g": "GiB",
+    "gb": "GiB",
+    "t": "TiB",
+    "tb": "TiB",
 }
 _SIZE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)\s*$")
 
@@ -87,28 +111,57 @@ _SIZE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)\s*$")
 class StoreRole(Enum):
     """Which directions of traffic this engine is allowed to drive.
 
+    Traffic is a separate concern from capacity: every role mounts the segment
+    its config asks for, and the role says only what the engine then does with
+    the pool. `CAPACITY` is the role that does nothing with it, which is how a
+    generation server lends its memory without reading or writing.
+
     A disaggregated deployment typically runs context servers as `both` and
-    leaves generation servers unconfigured: generated tokens are rarely a reused
-    prefix, so writing them costs bandwidth for no hit rate.
+    generation servers as `capacity`: generated tokens are rarely a reused
+    prefix, and prompt KV reaches decode over the cache transceiver rather than
+    through the pool, so decode-side traffic would cost bandwidth for no hits.
     """
 
     PRODUCER = "producer"
     CONSUMER = "consumer"
     BOTH = "both"
+    #: Mounts a segment and transfers nothing.
+    CAPACITY = "capacity"
 
     @property
     def loads(self) -> bool:
         """Whether this role reads previously stored KV back onto the GPU."""
-        return self is not StoreRole.PRODUCER
+        return self in (StoreRole.CONSUMER, StoreRole.BOTH)
 
     @property
     def saves(self) -> bool:
         """Whether this role writes newly computed KV into the store."""
-        return self is not StoreRole.CONSUMER
+        return self in (StoreRole.PRODUCER, StoreRole.BOTH)
+
+    @property
+    def transfers(self) -> bool:
+        """Whether this role moves KV at all.
+
+        False only for `CAPACITY`. The connector short-circuits every transfer
+        path on this, including KV registration.
+        """
+        return self.loads or self.saves
 
 
-def parse_size(value: Any) -> int:
-    """Accept either a byte count or a suffixed string such as `"4GiB"`."""
+def parse_size(value: Any, *, strict_units: bool = False) -> int:
+    """Accept either a byte count or a suffixed string such as `"4GiB"`.
+
+    Args:
+        value: A byte count, or a magnitude with a unit suffix.
+        strict_units: Reject `GB`/`MB`/`KB`/`TB` and their one-letter forms.
+            Set this wherever the value comes from, or goes into, a file the
+            vLLM connector may also read: it scales those suffixes by 1024
+            rather than 1000, so `"80GB"` would name two different sizes.
+            Binary suffixes and plain byte counts mean the same thing to both.
+
+    Returns:
+        The size in bytes.
+    """
     if isinstance(value, bool):
         raise ValueError(f"expected a size, got {value!r}")
     if isinstance(value, int):
@@ -119,24 +172,42 @@ def parse_size(value: Any) -> int:
     if match is None:
         raise ValueError(f"cannot parse size {value!r}")
     magnitude, unit = match.groups()
-    scale = _SIZE_UNITS.get(unit.lower())
+    normalized = unit.lower()
+    if strict_units and normalized in _DECIMAL_UNITS:
+        raise ValueError(
+            f"size {value!r} uses the ambiguous unit {unit!r}, which this "
+            f"parser reads as a power of 1000 and vLLM's Mooncake parser reads "
+            f"as a power of 1024. Write "
+            f"{magnitude}{_BINARY_SPELLING[normalized]} for the binary size, "
+            f"or a plain byte count; both mean the same thing to either engine."
+        )
+    scale = _SIZE_UNITS.get(normalized)
     if scale is None:
         raise ValueError(f"unknown size unit {unit!r} in {value!r}")
     return int(float(magnitude) * scale)
 
 
-def provisioned_config_path() -> Optional[str]:
-    """The client config a server on this node rendered, if there is one.
+def pool_config(llm_args: Any) -> Optional[Any]:
+    """The `mooncake_store` block of `llm_args`, if the deployment set one.
+
+    Every rank parses the same worker config, so this is how a rank reaches
+    settings the process that rendered the client config could not pass it.
+    """
+    connector = getattr(llm_args, "kv_connector_config", None)
+    return getattr(connector, "mooncake_store", None) if connector is not None else None
+
+
+def provisioned_config_path(run_dir: Optional[str]) -> Optional[str]:
+    """The client config a server rendered into `run_dir`, if there is one.
 
     `provision_pool` writes one and exports `MOONCAKE_CONFIG_PATH`, which the
     ranks the LLM constructor spawns inherit. Ranks an external launcher
     started, one task per rank, were already running by then and never see it,
     so they read the config back from the run directory instead.
 
-    Only possible when the deployment named that directory, since it otherwise
+    Only possible when the config named that directory, since it otherwise
     defaults to a per-process temporary one that no other rank could read.
     """
-    run_dir = os.getenv(RUN_DIR_ENV)
     if not run_dir:
         return None
     path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
@@ -156,7 +227,10 @@ class MooncakeStoreConnectorConfig:
     local_hostname: Optional[str] = None
     tenant_id: Optional[str] = None
     role: StoreRole = StoreRole.BOTH
-    cache_prefix: str = DEFAULT_CACHE_PREFIX
+    #: Key namespace for the pool. Two deployments that should not share cache
+    #: set different values; bump it after any change to page layout or
+    #: contents.
+    namespace: str = DEFAULT_NAMESPACE
     #: Identity the keys are namespaced by. Two engines share cache only when
     #: they agree on this, and two that disagree about what it names read each
     #: other's pages, so it is required rather than defaulted. See
@@ -167,12 +241,9 @@ class MooncakeStoreConnectorConfig:
     transfer_batch_size: int = 64
     #: Pass pages through a pinned host buffer instead of registering the KV
     #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
-    #: RDMA, which registering device memory requires.
+    #: RDMA, which registering device memory requires. The pinned allocation is
+    #: sized from the layout rather than configured; see `staging.py`.
     stage_through_host: bool = False
-    #: Ceiling on the pinned allocation per direction when staging. Slots are
-    #: sized from the layout's largest page, so this caps how many pages may be
-    #: in flight rather than how large one may be.
-    staging_buffer_bytes: int = DEFAULT_STAGING_BUFFER_SIZE
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
@@ -184,82 +255,70 @@ class MooncakeStoreConnectorConfig:
             raise ValueError("global_segment_size must be >= 0")
         if self.transfer_batch_size <= 0:
             raise ValueError("transfer_batch_size must be > 0")
-        if self.stage_through_host and self.staging_buffer_bytes <= 0:
-            raise ValueError("staging_buffer_bytes must be > 0 when staging is on")
+
+    @property
+    def capacity_only(self) -> bool:
+        """Whether this rank lends memory without transferring any KV."""
+        return not self.role.transfers
 
     @staticmethod
     def from_file(path: str) -> "MooncakeStoreConnectorConfig":
-        """Read the topology from a vLLM-compatible Mooncake JSON config."""
+        """Read the topology from a vLLM-compatible Mooncake JSON config.
+
+        Sizes are parsed with `strict_units`, since this file is the one both
+        engines may open and the two parsers disagree about `GB`.
+        """
         with open(path) as handle:
             raw = json.load(handle)
+        role = str(raw.get("role", StoreRole.BOTH.value)).strip().lower()
+        try:
+            parsed_role = StoreRole(role)
+        except ValueError as exc:
+            known = ", ".join(member.value for member in StoreRole)
+            raise ValueError(f"role={role!r} in {path} is not one of: {known}") from exc
         return MooncakeStoreConnectorConfig(
             master_server_address=raw.get("master_server_address", ""),
             metadata_server=raw.get("metadata_server") or DEFAULT_METADATA_SERVER,
             protocol=raw.get("protocol", "rdma"),
             device_name=raw.get("device_name", ""),
             global_segment_size=parse_size(
-                raw.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
+                raw.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE), strict_units=True
             ),
-            local_buffer_size=parse_size(raw.get("local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE)),
+            local_buffer_size=parse_size(
+                raw.get("local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE), strict_units=True
+            ),
             local_hostname=raw.get("local_hostname") or None,
             tenant_id=raw.get("tenant_id") or None,
-            role=StoreRole(str(raw.get("role", StoreRole.BOTH.value)).strip().lower()),
-            cache_prefix=str(raw.get("cache_prefix", DEFAULT_CACHE_PREFIX)),
+            role=parsed_role,
+            namespace=str(raw.get("namespace", DEFAULT_NAMESPACE)),
             model_key=raw.get("model_key") or None,
             transfer_batch_size=int(raw.get("transfer_batch_size", 64)),
             stage_through_host=bool(raw.get("stage_through_host", False)),
-            staging_buffer_bytes=parse_size(
-                raw.get("staging_buffer_bytes", DEFAULT_STAGING_BUFFER_SIZE)
-            ),
         )
 
     @staticmethod
-    def from_env() -> "MooncakeStoreConnectorConfig":
-        """Load the JSON config, then apply the TensorRT-LLM env overrides."""
-        path = os.getenv(CONFIG_PATH_ENV) or provisioned_config_path()
+    def resolve(llm_args: Any) -> "MooncakeStoreConnectorConfig":
+        """The client config this rank should open, read from wherever it is.
+
+        An inherited `MOONCAKE_CONFIG_PATH` wins, since it names a pool the
+        deployment provisioned itself. Otherwise the config is the one this
+        server rendered into `mooncake_store.run_dir`, which is the only route
+        open to a rank an external launcher started.
+        """
+        pool = pool_config(llm_args)
+        run_dir = getattr(pool, "run_dir", None) if pool is not None else None
+        path = os.getenv(CONFIG_PATH_ENV) or provisioned_config_path(run_dir)
         if not path:
             raise ValueError(
                 f"The mooncake-store connector needs {CONFIG_PATH_ENV} set to a "
                 "Mooncake JSON config (metadata_server, master_server_address, "
                 "protocol, device_name, global_segment_size, local_buffer_size), "
                 "or kv_connector_config.mooncake_store set so the server renders "
-                f"one, into ${RUN_DIR_ENV} if this rank was started by the "
-                "launcher rather than spawned by the server."
+                "one. Set mooncake_store.run_dir as well if this rank was "
+                "started by the launcher rather than spawned by the server, "
+                "since it cannot inherit the path."
             )
-        config = MooncakeStoreConnectorConfig.from_file(path)
-        return config.with_env_overrides()
-
-    def with_env_overrides(self) -> "MooncakeStoreConnectorConfig":
-        """Apply `TRTLLM_MOONCAKE_STORE_*` on top of the file's settings."""
-        import dataclasses
-
-        updates: dict[str, Any] = {}
-        role = os.getenv(ROLE_ENV)
-        if role:
-            try:
-                updates["role"] = StoreRole(role.strip().lower())
-            except ValueError as exc:
-                known = ", ".join(member.value for member in StoreRole)
-                raise ValueError(f"{ROLE_ENV}={role!r} is not one of: {known}") from exc
-        prefix = os.getenv(CACHE_PREFIX_ENV)
-        if prefix:
-            updates["cache_prefix"] = prefix
-        model_key = os.getenv(MODEL_KEY_ENV)
-        if model_key:
-            updates["model_key"] = model_key
-        staging = os.getenv(STAGE_THROUGH_HOST_ENV)
-        if staging:
-            normalized = staging.strip().lower()
-            if normalized in _TRUE:
-                updates["stage_through_host"] = True
-            elif normalized in _FALSE:
-                updates["stage_through_host"] = False
-            else:
-                known = ", ".join(sorted(_TRUE | _FALSE))
-                raise ValueError(
-                    f"{STAGE_THROUGH_HOST_ENV}={staging!r} is not a boolean; use one of: {known}"
-                )
-        return dataclasses.replace(self, **updates) if updates else self
+        return MooncakeStoreConnectorConfig.from_file(path)
 
     def resolve_model_key(self, model: Any) -> str:
         """The model identity to namespace keys by.
@@ -275,8 +334,7 @@ class MooncakeStoreConnectorConfig:
         raise ValueError(
             f"The mooncake-store connector needs a model key to namespace its "
             f"pool keys by, and there is no safe default: set the model_key "
-            f"field of the Mooncake JSON config, or ${MODEL_KEY_ENV}. Give it "
-            f"a value that separates this checkpoint from any other an engine "
-            f"sharing the pool might load, rather than one derived from "
-            f"{model!r}."
+            f"field of the Mooncake JSON config. Give it a value that "
+            f"separates this checkpoint from any other an engine sharing the "
+            f"pool might load, rather than one derived from {model!r}."
         )

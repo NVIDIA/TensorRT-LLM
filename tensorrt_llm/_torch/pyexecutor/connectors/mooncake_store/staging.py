@@ -48,7 +48,14 @@ except ImportError:
 from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.logger import logger
 
-__all__ = ["HostStagingPool", "plan_slot_geometry", "sync_stream"]
+__all__ = ["MAX_STAGING_BUFFER_BYTES", "HostStagingPool", "plan_slot_geometry", "sync_stream"]
+
+#: Ceiling on the pinned allocation per direction. The natural size is one slot
+#: per page of a transfer batch, which is what `plan_slot_geometry` asks for;
+#: this only bounds what a large page times a large batch could demand, since
+#: the memory is pinned for the process's lifetime and comes out of the same
+#: host DRAM the pool segment is charged against.
+MAX_STAGING_BUFFER_BYTES = 1 << 30
 
 #: Stated explicitly rather than inferred from the pointers, which would be
 #: wrong for a host pointer outside the unified address space.
@@ -82,13 +89,19 @@ def sync_stream(stream: int) -> None:
 def plan_slot_geometry(
     max_bytes_per_page: int,
     transfer_batch_size: int,
-    budget_bytes: int,
+    budget_bytes: int = MAX_STAGING_BUFFER_BYTES,
 ) -> Tuple[int, int]:
     """Choose how many pages may be staged at once, and how wide a slot is.
 
-    A slot has to hold the largest page any layer group produces, so the page size
-    is a floor on the allocation: a budget below one page is raised to one rather
-    than refused, since the alternative is not starting.
+    The geometry follows from the layout rather than from configuration: a slot
+    has to hold the largest page any layer group produces, and there is no
+    point holding more slots than a transfer batch has pages. So the natural
+    allocation is `transfer_batch_size` slots of `max_bytes_per_page`, and
+    `budget_bytes` only caps what a large page times a large batch could
+    demand.
+
+    The page size is a floor on the allocation: a budget below one page is
+    raised to one rather than refused, since the alternative is not starting.
 
     Args:
         max_bytes_per_page: Largest page payload across layer groups.

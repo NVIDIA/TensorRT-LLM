@@ -12,22 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The two pieces of a Mooncake pool that are not any one engine's to run.
+"""The part of a Mooncake pool that is not any engine's to own.
 
-`mooncake_master` owns a pool for as long as the command runs, and with
-`--config` also writes the client config its workers read into `--run_dir`.
-Pointing every server at that directory with `$TRTLLM_MOONCAKE_RUN_DIR`, or at
-the file with `$MOONCAKE_CONFIG_PATH`, is how a pool is described today.
+A pool needs a master, and a master is infrastructure: one runs per deployment,
+outlives every engine's startup, and is what lets several servers share a pool.
+Running it here rather than inside a server keeps the pool's own settings
+stated once. This command publishes them as a manifest, and each server's
+`kv_connector_config.mooncake_store.pool` names it.
 
-`mooncake_donor` lends a node's host memory to a pool it does not otherwise
-use, which is how capacity comes from nodes whose engines have no connector.
+Capacity is not here. Every rank that joins the pool lends the memory its own
+config asks for, so there is no separate process to run for it.
 """
 
-import contextlib
-import json
-import os
 import signal
 import tempfile
+import threading
 import time
 from typing import Optional
 
@@ -37,10 +36,6 @@ import tensorrt_llm.usage as usage
 from tensorrt_llm.commands import _telemetry as _command_telemetry
 from tensorrt_llm.logger import logger
 from tensorrt_llm.usage.config import UsageContext
-
-#: How long a donor with heartbeats turned off sleeps between wakeups. Only
-#: the signal that ends the command interrupts it, so the value is arbitrary.
-_IDLE_POLL_SECONDS = 60.0
 
 #: Both commands sit in the telemetry-aware `trtllm-serve` group, so they have
 #: to offer the same opt-out the group documents.
@@ -67,62 +62,41 @@ def _apply_cli_telemetry(telemetry: bool) -> None:
     )
 
 
-@contextlib.contextmanager
-def _signal_handoff():
-    """Turn SIGINT and SIGTERM into the exit the telemetry boundary expects.
+def _until_signalled() -> threading.Event:
+    """An event that SIGINT and SIGTERM set.
 
-    Both commands hold a resource, a child process or a mounted segment, whose
-    release is in a `finally`. Default SIGTERM handling would skip it, leaving
-    the master unreaped or the pool advertising memory that has gone.
-
-    `raise_signal_exit` unwinds those context managers and carries the signal
-    number out to `trtllm-serve`, which is what reports the exit as a signal
-    rather than as a clean one.
-
-    Wrap this around the resource so the log below follows the release.
+    This command holds a child process whose reaping, and a published manifest
+    whose retraction, are in a `finally`. Default SIGTERM handling would skip
+    both, leaving the master unreaped and an address that outlives it on disk
+    for the next run to dial. Setting an event lets the wait loop return and
+    those context managers unwind, so the signal reaches the telemetry
+    boundary only once the release is done; see `_report_signal_exit`.
     """
+    stopping = threading.Event()
+    stopping.signal_number = None
+
+    def stop(signum, _frame):
+        stopping.signal_number = signum
+        stopping.set()
+
     for received in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(received, _command_telemetry.raise_signal_exit)
-    try:
-        yield
-    except _command_telemetry.SignalExit as stopping:
-        # Logged here rather than in the handler, which must not take the
-        # logging lock.
-        logger.info(f"mooncake-store: signal {stopping.signal_number} received, shut down")
-        raise
+        signal.signal(received, stop)
+    return stopping
 
 
-@contextlib.contextmanager
-def _announce_ready(ready_file: Optional[str], host: str, segment_size: int):
-    """Hold a readiness file for exactly as long as the segment is mounted.
+def _report_signal_exit(stopping: threading.Event) -> None:
+    """Exit as the signal that stopped the command, after it has released.
 
-    Launchers gate prefill on this file existing, so it has to go when the
-    capacity does. Left behind, it would clear that gate for a pool the donor
-    no longer contributes to, and prefill would start writing into a pool
-    short of the memory the launcher waited for.
+    `trtllm-serve` reports the exit as a signal rather than as a clean one only
+    if it sees `SignalExit`, and the resource is already gone by the time this
+    runs, so it is safe to leave here.
     """
-    if ready_file is None:
-        yield
+    if stopping.signal_number is None:
         return
-
-    with open(ready_file, "w") as handle:
-        handle.write(f"{host} {segment_size}\n")
-    logger.info(
-        f"mooncake-store: announced this segment in {ready_file}, so a "
-        "launcher waiting on the pool's capacity can proceed"
-    )
-    try:
-        yield
-    finally:
-        # A launcher that consumes the file by removing it has already had the
-        # signal, so its absence here is a success and not worth failing the
-        # shutdown over.
-        with contextlib.suppress(OSError):
-            os.unlink(ready_file)
-        logger.info(
-            f"mooncake-store: withdrew the announcement in {ready_file}; a "
-            "launcher waiting on this pool's capacity will wait again"
-        )
+    # Logged here rather than in the handler, which must not take the logging
+    # lock.
+    logger.info(f"mooncake-store: signal {stopping.signal_number} received, shut down")
+    raise _command_telemetry.SignalExit(stopping.signal_number)
 
 
 @click.command("mooncake_master")
@@ -149,30 +123,61 @@ def _announce_ready(ready_file: Optional[str], host: str, segment_size: int):
     help="Fraction of the pool freed per eviction pass.",
 )
 @click.option(
-    "--address_file",
+    "--pool_file",
     type=str,
     default=None,
-    help="File to publish 'host:port' to once the master answers. "
-    "Workers name it as master_server_address: file://<path>, which "
-    "is how they reach a master whose host the scheduler chose. "
-    "Removed on exit so a stale address is never dialed.",
+    help="File to publish the pool manifest to once the master "
+    "answers. Servers name it as mooncake_store.pool: "
+    "file://<path>, which is how they reach a master whose host "
+    "the scheduler chose. Removed on exit so a stale address is "
+    "never dialed. One is written to --run_dir regardless.",
+)
+@click.option(
+    "--protocol",
+    type=str,
+    default="rdma",
+    show_default=True,
+    help="Transport every participant will use: 'rdma' or 'tcp'. "
+    "Recorded in the manifest so the servers need not restate it. "
+    "TCP is for bring-up only; it invalidates performance conclusions.",
+)
+@click.option(
+    "--metadata_server",
+    type=str,
+    default="P2PHANDSHAKE",
+    show_default=True,
+    help="Mooncake metadata service, recorded in the manifest. "
+    "P2PHANDSHAKE keeps a separate metadata process out of the deployment.",
+)
+@click.option(
+    "--namespace",
+    type=str,
+    default="trtllm",
+    show_default=True,
+    help="Default key namespace for this pool, recorded in the manifest. A server may override it.",
 )
 @click.option(
     "--run_dir",
     type=str,
     default=None,
-    help="Where to keep the master's log. Defaults to "
-    "$TRTLLM_MOONCAKE_RUN_DIR, else a temporary directory.",
+    help="Where to keep the master's log and a copy of the "
+    "manifest. Defaults to a temporary directory.",
 )
 @click.option(
-    "--config",
+    "--binary",
     type=str,
-    default=None,
-    help="Mooncake JSON config describing the pool. When given, a copy "
-    "naming this master is written to --run_dir as the client config "
-    "every worker reads, so no external script has to render one. "
-    "Workers find it by setting $TRTLLM_MOONCAKE_RUN_DIR to that "
-    "directory, or $MOONCAKE_CONFIG_PATH to the file.",
+    default="mooncake_master",
+    show_default=True,
+    help="The master executable to run, looked up on PATH. It "
+    "ships with the Mooncake runtime that "
+    "docker/common/install_mooncake.sh installs.",
+)
+@click.option(
+    "--timeout",
+    type=float,
+    default=60.0,
+    show_default=True,
+    help="Seconds to wait for the master to accept connections before giving up on it.",
 )
 @click.option(
     "--heartbeat_seconds",
@@ -186,47 +191,43 @@ def mooncake_master(
     rpc_port: int,
     metrics_port: int,
     eviction_ratio: float,
-    address_file: Optional[str],
+    pool_file: Optional[str],
+    protocol: str,
+    metadata_server: str,
+    namespace: str,
     run_dir: Optional[str],
-    config: Optional[str],
+    binary: str,
+    timeout: float,
     heartbeat_seconds: int,
     telemetry: bool,
 ):
-    """Run a mooncake_master for as long as this command runs."""
+    """Own a Mooncake pool for as long as this command runs.
+
+    Start this before the servers that join the pool. They wait for the
+    manifest, so the order within a job is not delicate, but nothing can hold
+    capacity or serve a lookup until this is up.
+    """
     _apply_cli_telemetry(telemetry)
 
     # Imported lazily so other subcommands and --help do not pay for the
     # connector package.
-    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import (
-        PoolSpec,
-        running_master,
-        write_client_config,
-    )
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import running_master
 
-    raw = {}
-    if config:
-        with open(config) as handle:
-            raw = json.load(handle)
-        # This command is the master, so whichever one the config names is not
-        # the one being described here.
-        raw.pop("master_server_address", None)
+    run_dir = run_dir or tempfile.mkdtemp(prefix="trtllm-mooncake-master-")
 
-    pool = PoolSpec.from_json(
-        raw,
-        launch_master=True,
-        master_port=rpc_port,
-        master_metrics_port=metrics_port,
-        master_eviction_ratio=eviction_ratio,
-    )
-    run_dir = (
-        run_dir
-        or os.getenv("TRTLLM_MOONCAKE_RUN_DIR")
-        or tempfile.mkdtemp(prefix="trtllm-mooncake-master-")
-    )
-
-    with _signal_handoff(), running_master(pool, run_dir, address_file=address_file) as master:
-        if config:
-            write_client_config(pool, master.address, run_dir)
+    stopping = _until_signalled()
+    with running_master(
+        run_dir,
+        pool_file=pool_file,
+        rpc_port=rpc_port,
+        metrics_port=metrics_port,
+        eviction_ratio=eviction_ratio,
+        metadata_server=metadata_server,
+        protocol=protocol,
+        namespace=namespace,
+        binary=binary,
+        timeout=timeout,
+    ) as master:
         logger.info(
             f"mooncake-store: this master owns the pool until this command "
             f"stops; address {master.address}, log {master.log_path}, metrics "
@@ -234,16 +235,17 @@ def mooncake_master(
         )
         started = time.monotonic()
         announced = started
-        while True:
+        while not stopping.is_set():
             if (code := master.process.poll()) is not None:
                 # The pool is gone once the master dies, and every client is
                 # about to start failing.
                 raise click.ClickException(
                     f"mooncake_master exited with code {code}. See {master.log_path}"
                 )
-            time.sleep(1.0)
+            stopping.wait(1.0)
             now = time.monotonic()
-            # Distinguishes a dead master from a dead fabric.
+            # Distinguishes a dead master from a dead fabric once clients
+            # start failing.
             if heartbeat_seconds > 0 and now - announced >= heartbeat_seconds:
                 announced = now
                 logger.info(
@@ -251,170 +253,34 @@ def mooncake_master(
                     f"{(now - started) / 60:.0f}m"
                 )
 
+    _report_signal_exit(stopping)
 
-@click.command("mooncake_donor")
+
+@click.command("mooncake_pool_report")
 @click.option(
-    "--master_server_address",
+    "--run_dir",
+    type=str,
+    required=True,
+    help="Directory holding the pool manifest and the segments/ "
+    "records each participating rank wrote.",
+)
+@click.option(
+    "--master_log",
     type=str,
     default=None,
-    help="Master to join, as host:port or file://<path> naming a "
-    "file that holds one. Defaults to the master_server_address in "
-    "--config.",
-)
-@click.option(
-    "--segment_size",
-    type=str,
-    default="32GiB",
-    show_default=True,
-    help="Host memory to contribute from this node. Deliberately "
-    "separate from a config's global_segment_size, which is sized "
-    "for an engine worker rather than a node lending what it can "
-    "spare.",
-)
-@click.option(
-    "--config",
-    type=str,
-    default=None,
-    help="Mooncake JSON config describing the pool, for the "
-    "settings not given here. Defaults to $MOONCAKE_CONFIG_PATH.",
-)
-@click.option(
-    "--protocol",
-    type=str,
-    default=None,
-    help="Transport, 'rdma' or 'tcp'. Defaults to --config's, else rdma.",
-)
-@click.option(
-    "--device_name",
-    type=str,
-    default=None,
-    help="RDMA device, from ibv_devinfo. Defaults to --config's.",
-)
-@click.option(
-    "--metadata_server",
-    type=str,
-    default=None,
-    help="Mooncake metadata service. Defaults to --config's, else P2PHANDSHAKE.",
-)
-@click.option(
-    "--local_buffer_size",
-    type=str,
-    default=None,
-    help="Mooncake transfer buffer for this process. Deliberately "
-    "separate from a config's local_buffer_size, which is sized for "
-    "an engine worker: a donor never transfers, and only needs one "
-    "because setup rejects a zero-sized buffer. Defaults to 64MiB.",
-)
-@click.option(
-    "--ready_file",
-    type=str,
-    default=None,
-    help="File to create once the segment is mounted, for launchers "
-    "that must not let prefill start writing before the pool has "
-    "this capacity.",
-)
-@click.option(
-    "--heartbeat_seconds",
-    type=int,
-    default=300,
-    show_default=True,
-    help="Interval between liveness lines. 0 disables them.",
+    help="The master's log, for the block-placement table. "
+    "Defaults to mooncake_master.log in --run_dir.",
 )
 @_telemetry_option
-def mooncake_donor(
-    master_server_address: Optional[str],
-    segment_size: str,
-    config: Optional[str],
-    protocol: Optional[str],
-    device_name: Optional[str],
-    metadata_server: Optional[str],
-    local_buffer_size: Optional[str],
-    ready_file: Optional[str],
-    heartbeat_seconds: int,
-    telemetry: bool,
-):
-    """Lend this node's host memory to a Mooncake pool, for as long as it runs.
+def mooncake_pool_report(run_dir: str, master_log: Optional[str], telemetry: bool):
+    """Report the capacity a run's pool actually had, and where blocks landed.
 
-    Running this on the generation nodes puts their memory into the pool while
-    leaving those engines connector-free.
+    Reads what the participants recorded rather than what they logged, so it
+    stays correct as provisioning changes. Safe to run after the job: the
+    records outlive the processes that wrote them.
     """
     _apply_cli_telemetry(telemetry)
 
-    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import (
-        DEFAULT_DONOR_LOCAL_BUFFER_SIZE,
-        donate_segment,
-        master_timeout,
-        parse_size,
-        resolve_master_address,
-        wait_for_master,
-    )
-    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
-        CONFIG_PATH_ENV,
-        DEFAULT_METADATA_SERVER,
-    )
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import format_pool_report
 
-    raw = {}
-    config = config or os.getenv(CONFIG_PATH_ENV)
-    if config:
-        with open(config) as handle:
-            raw = json.load(handle)
-
-    master = master_server_address or raw.get("master_server_address", "")
-    if not master:
-        raise click.UsageError(
-            "No master to join. Pass --master_server_address, or a --config "
-            f"naming one (or set {CONFIG_PATH_ENV})."
-        )
-
-    def size_option(name: str, value: str) -> int:
-        """Parse a size option, reporting a bad one as a usage error."""
-        try:
-            return parse_size(value)
-        except ValueError as exc:
-            raise click.UsageError(f"{name}: {exc}") from exc
-
-    donating = size_option("--segment_size", segment_size)
-    # None means the option was left off. An empty string was passed, so it goes
-    # to parse_size and is rejected rather than silently taking the default.
-    buffer_size = (
-        DEFAULT_DONOR_LOCAL_BUFFER_SIZE
-        if local_buffer_size is None
-        else size_option("--local_buffer_size", local_buffer_size)
-    )
-    resolved = resolve_master_address(master, master_timeout())
-    wait_for_master(resolved)
-
-    # Left empty, Mooncake discovers this node's own devices, which is what a
-    # pool whose nodes do not have the same HCAs needs.
-    transport = protocol or raw.get("protocol") or "rdma"
-    transfer_device = device_name or raw.get("device_name", "") or ""
-
-    with (
-        _signal_handoff(),
-        donate_segment(
-            resolved,
-            donating,
-            protocol=transport,
-            device_name=transfer_device,
-            metadata_server=(
-                metadata_server or raw.get("metadata_server") or DEFAULT_METADATA_SERVER
-            ),
-            local_buffer_size=buffer_size,
-        ) as host,
-        # After `as host`, so the announcement names the segment that mounted
-        # and is withdrawn before the segment is.
-        _announce_ready(ready_file, host, donating),
-    ):
-        # Idle by design: a put or get here would make this node a traffic
-        # client, which is what donation exists to avoid.
-        started = time.monotonic()
-        while True:
-            if heartbeat_seconds <= 0:
-                time.sleep(_IDLE_POLL_SECONDS)
-                continue
-            time.sleep(heartbeat_seconds)
-            logger.info(
-                f"mooncake-store: {host} still lending "
-                f"{donating / 1024**3:.1f}GiB to the pool at {master} "
-                f"after {(time.monotonic() - started) / 60:.0f}m"
-            )
+    click.echo(format_pool_report(run_dir, master_log))

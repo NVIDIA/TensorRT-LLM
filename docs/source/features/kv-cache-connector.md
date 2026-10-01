@@ -365,101 +365,126 @@ This is a **different component** from the Mooncake transfer engine that the C++
 
 #### Requirements
 
-* `KVCacheManagerV2` (`kv_cache_config.use_kv_cache_manager_v2: true`), since that is the manager that can describe its pools through `register_kv_cache_layout`.
+* `KVCacheManagerV2` (`kv_cache_config.use_kv_cache_manager_v2: true`), since that is the manager that can describe its pools through `register_kv_cache_layout`. Not needed for `role: capacity`, which describes no pools.
 * The Mooncake Python bindings, which `tensorrt-llm` pulls in as `mooncake-transfer-engine-cuda13`, so reinstall that package if this environment dropped it. The source build of the C++ transfer engine does not provide them.
-* A reachable Mooncake master (and metadata server, unless using `P2PHANDSHAKE`). See the [Mooncake documentation](https://kvcache-ai.github.io/Mooncake/). `trtllm-serve` can start one for a single engine; see below.
-* GPU-only KV cache tiers, which the connector arranges for itself: leave `kv_cache_config.host_cache_size` and `disk_cache_size` unset. Setting either above zero fails at bring-up, since a page evicted to another tier has its GPU slot reassigned, which would invalidate the addresses registered with the store. See [KV cache tiers](#kv-cache-tiers-are-gpu-only-under-a-connector).
+* A reachable Mooncake master (and metadata server, unless using `P2PHANDSHAKE`), run as `trtllm-serve mooncake_master`. See the [Mooncake documentation](https://kvcache-ai.github.io/Mooncake/).
+
+The connector also forces `kv_cache_config.host_cache_size` and `disk_cache_size` to 0, overriding any configured value with a warning. A page evicted to another tier has its GPU slot reassigned, which would invalidate the addresses registered with the store, and the pool is already the deployment's offload tier. Give that memory to `segment_size` instead, where every server on the node can reuse what any of them stored.
+
+#### The master is infrastructure
+
+One master owns a pool, and it is not part of any engine. Run it before the servers that join:
+
+```bash
+trtllm-serve mooncake_master --pool_file /shared/pool.json
+```
+
+It publishes a **manifest** at that path describing the pool it owns, and removes it on exit so a stale address is never dialed:
+
+```json
+{
+  "master_server_address": "10.0.0.1:50051",
+  "metadata_server": "P2PHANDSHAKE",
+  "protocol": "rdma",
+  "namespace": "trtllm",
+  "eviction_ratio": 0.05,
+  "metrics_port": 9004
+}
+```
+
+The manifest exists because the settings in it have to be identical for every participant, and restating them in each worker config is how they come to differ. Naming a file rather than an address also closes a gap that a scheduler opens: the master's host is unknown when the configs are written, so the configs name the path instead, and a server reading it waits for it. The master and the servers can therefore be started in any order.
 
 #### Configuration
 
-Describe the pool in `kv_connector_config.mooncake_store` and `trtllm-serve` provisions it during bringup: it resolves the master, renders the client config, and exports `MOONCAKE_CONFIG_PATH` before the ranks that open store handles are spawned.
+Each server names the pool and says what it contributes and what it does:
 
 ```yaml
 kv_connector_config:
   connector: mooncake-store
   mooncake_store:
-    master_server_address: 10.0.0.1:50051   # a master with its own lifetime
-    protocol: rdma
-    device_name: mlx5_0
-    global_segment_size: 32GiB
-    local_buffer_size: 1GiB
+    pool: file:///shared/pool.json
+    role: both            # both | producer | consumer | capacity
+    segment_size: 160GiB  # per rank
 ```
 
-Replacing `master_server_address` with `launch_master: true` makes the server start a `mooncake_master` itself and use it, so a single-instance deployment needs nothing prepared outside `trtllm-serve`. **That master lives and dies with the server**, which makes it wrong for anything else: several engines that should share one pool would each get their own, and a pool meant to survive a restart cannot be owned by the thing restarting.
+`trtllm-serve` then reads the manifest, adds this server's settings and this node's detected RDMA devices, renders the Mooncake client config, and exports `MOONCAKE_CONFIG_PATH` before the ranks that open store handles are spawned.
 
-A master started this way still publishes its address, to `master.addr` in the run directory and to `master_address_file` if one is named. That is how other processes, the donors below above all, find a pool this server owns, and how a finished run's logs say which master it used:
+Only `pool` is required. `pool` also accepts a bare `host:port` for joining a master run without this CLI, in which case the pool-wide settings take their defaults and keeping them consistent is the deployment's problem.
 
-```yaml
-mooncake_store:
-  launch_master: true
-  master_address_file: /shared/master.addr
-```
+Sizes are written as binary units (`160GiB`) or byte counts. `GB` and friends are **refused** in anything both engines may read: this parser scales them by 1000 and vLLM's Mooncake parser by 1024, so `80GB` would name two different segments. The rendered client config always holds resolved integers for the same reason.
 
-The two cases above, several engines or surviving a restart, run the master as its own command instead:
+`master_timeout` (default 60s) is how long a server waits for the manifest to appear and the master to accept connections. Without that wait, a master that is not there yet fails inside every rank after the model has loaded. `run_dir` keeps the generated client config and the segment records, which are otherwise in a temporary directory removed at shutdown. The master command takes `--timeout` for the same wait and `--binary` to name the executable.
 
-```bash
-trtllm-serve mooncake_master --rpc_port 50051 --address_file /shared/master.addr
-```
-
-The pool then lasts as long as that command, independently of any engine. `--address_file` receives `host:port` once the master accepts connections, and `master_server_address` accepts `file://<path>` as well as a literal address:
-
-```yaml
-kv_connector_config:
-  connector: mooncake-store
-  mooncake_store:
-    master_server_address: file:///shared/master.addr
-```
-
-This is what makes a master reachable without anyone writing its address down. Under a scheduler its host is not known when the configs are written; publishing it to a file the configs already name closes that gap, and a server reading the file waits for it, so the master and the engines can be started in any order. The file is removed when the master stops, so a stale address is never dialed.
-
-`TRTLLM_MOONCAKE_MASTER_BINARY` overrides the binary a launched master runs, and `TRTLLM_MOONCAKE_MASTER_TIMEOUT` (default 60s) sets how long startup waits for any master to accept connections or publish its address. Without that wait, a master that is not there yet fails inside every rank after the model has loaded. Set `TRTLLM_MOONCAKE_RUN_DIR` to keep the generated client config and the master's log, which are otherwise in a temporary directory removed at shutdown.
+There is no environment override for any of this. `MOONCAKE_CONFIG_PATH` is the one variable the connector reads, and it belongs to Mooncake rather than to TensorRT-LLM.
 
 #### Servers whose ranks the launcher starts
 
 Provisioning happens in the server process and reaches the ranks that open store handles by exporting `MOONCAKE_CONFIG_PATH` for them to inherit. That holds when the LLM constructor spawns them. It does not when the launcher starts one task per rank, as `trtllm-llmapi-launch` under a scheduler does, because those ranks were already running.
 
-Naming a shared run directory covers that case: the rendered config is read back from `$TRTLLM_MOONCAKE_RUN_DIR/mooncake.json` by any rank that inherited no path, so every rank of a multi-GPU server joins the pool its own leader provisioned. The directory has to be one they all see, which under a scheduler means the job's own, and it is where the master's log and published address already go:
+Setting `run_dir` covers that case: the rendered config is read back from `<run_dir>/mooncake.json` by any rank that inherited no path, so every rank of a multi-GPU server joins the pool its own leader provisioned. It has to be a directory all of that server's ranks see, which under a scheduler means a shared filesystem, and **one per server rather than one per job**, since two servers sharing it render one client config between them:
 
-```bash
-export TRTLLM_MOONCAKE_RUN_DIR=/shared/run/$SLURM_JOB_ID
-srun trtllm-llmapi-launch trtllm-serve "$model" --config ctx.yaml
+```yaml
+mooncake_store:
+  pool: file:///shared/run/pool.json
+  run_dir: /shared/run/ctx0
 ```
 
-Without it, a rank that inherited nothing fails during bringup naming `MOONCAKE_CONFIG_PATH`, rather than serving without a store.
+Because it comes from the worker config rather than the environment, every rank of the server reads the same value without the launch script having to export anything. Without it, a rank that inherited nothing fails during bringup naming `MOONCAKE_CONFIG_PATH`, rather than serving without a store.
 
 #### Reading bringup in the log
 
-Everything the pool is assembled from is logged under the `mooncake-store:` prefix before the model loads, because a pool that came up wrong is otherwise visible only as a low hit rate hours later. In order: the run directory, the master's command line and pid, the address it published and where, the rendered client config in full, and the capacity each rank will contribute. A server lending memory logs the master it resolved, the segment in both GiB and bytes, and the transport, so that a size string parsed wrong is caught before the pool starts evicting far too eagerly.
+Everything the pool is assembled from is logged under the `mooncake-store:` prefix before the model loads, because a pool that came up wrong is otherwise visible only as a low hit rate hours later. In order: the run directory, the manifest that was read, the rendered client config in full, the segment each rank will contribute in both GiB and bytes, and the total that implies for this node. A capacity-only rank says so explicitly, because every other sign of a working connector is absent by design there and their absence otherwise reads as a broken deployment.
 
-Both waits report progress every five seconds, since waiting for a master in another job is normal and indistinguishable from a hang if it is silent. A master that dies during startup has the tail of its own log quoted in the failure, which is where the reason, a port in use or a bad flag, actually is.
+Both waits report progress every five seconds, since waiting for a master in another job step is normal and indistinguishable from a hang if it is silent. A master that dies during startup has the tail of its own log quoted in the failure, which is where the reason, a port in use or a bad flag, actually is.
 
-#### Pool capacity
+#### Pool capacity, and the `capacity` role
 
-Capacity comes only from processes that open a store handle, and `global_segment_size` is what each contributes, so the pool is that value times the number of such processes. In a disaggregated deployment the connector belongs on the context servers only, which makes every byte of the pool prefill-node memory: prefill's DRAM caching prefill's GPUs, largely duplicating what `kv_cache_config.host_cache_size` already does.
+Capacity comes from processes that open a store handle, and every rank that joins contributes `segment_size`. Pool capacity is therefore the sum over participating ranks, and grows with the deployment's parallelism by design.
 
-To give the pool memory from nodes whose engines run no connector, ask those servers to lend it:
+In a disaggregated deployment you want the generation side in that sum. Its nodes hold most of the deployment's host DRAM, and a pool built only from context ranks is prefill's DRAM caching prefill's GPUs, which is close to what a native host tier would have done for those ranks alone. But a generation engine has no use for the pool's contents: it receives prompt KV over the cache transceiver, so its lookups would nearly all miss.
+
+`role: capacity` is that combination — contribute memory, drive no traffic:
 
 ```yaml
-# generation server: no connector, memory only
-mooncake_donation:
-  master_server_address: file:///shared/master.addr
-  segment_size: 320GiB
-  protocol: rdma
-  device_name: mlx5_1
+# generation server
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    pool: file:///shared/pool.json
+    role: capacity
+    segment_size: 160GiB   # the same per-rank figure as the context servers
 ```
 
-`trtllm-serve` then holds that segment for as long as the server runs, so a generation node holds pages prefill wrote while its own engine stays connector-free and keeps its cache transceiver for the prefill-to-decode handoff. The server is ready only once the segment is mounted, which makes its readiness the signal that the pool has this capacity.
+Such a rank opens its handle, mounts its segment, and stops. It runs no prefix lookup, issues no load or save, starts no background save thread, and **registers no KV cache with Mooncake** — which also means it needs no GPUDirect RDMA, so a host whose HCA cannot pin GPU pages can still lend memory.
 
-Lending memory is deliberately outside `kv_connector_config`, and not a `TRTLLM_MOONCAKE_STORE_ROLE` either. Both of those attach a connector, and a connector reads or writes: `producer`, `consumer` and `both` all describe traffic, and none of them means "contribute memory only". Expressing capacity there would therefore start this server using the store. Capacity and traffic are separate, and configured separately.
+Because it moves no KV, the restrictions that exist to protect registered page addresses do not apply to it. Such a server keeps its capacity scheduler policy, its partial block reuse and its per-layer forward hooks exactly as configured, which is what lets the generation side stay on `MAX_UTILIZATION` while lending the pool memory.
 
-Size is charged **per server process, not per rank**, unlike `global_segment_size`. Two servers on one node lend twice this. The memory is charged to the process and competes with everything else on the node, `kv_cache_config.host_cache_size` above all, so size the two together.
+Its native cache tiers are the exception, and are turned off as they are for every other role. Not because of page addresses, which a capacity rank does not register, but because a local tier would compete for the DRAM that rank lent the pool. With no tier to spill to, the V2 scheduler reclaims pages by preemption rather than suspension.
 
-A node that runs no server at all can still lend, as its own command:
+Contribution is per rank, which is the right interface: capacity then tracks the hardware in the deployment. Host DRAM, however, is a per-node limit, and the ranks sharing a node each claim the segment independently. A tensor-parallel-4 generation server on a 4-GPU node claims `4 x segment_size`; under attention DP with 8 owners it claims eight times. The connector checks this at startup and refuses a segment the node cannot afford, because the failure otherwise is not an allocation error but the OOM killer arriving minutes later, while weights are still loading, naming no cause.
+
+Keep `segment_size` the same on every server. Pool capacity is meant to be uniform per rank, but each server only ever sees its own value, so a mismatch is invisible from every vantage point — except the run's report, which names the distinct sizes it finds.
+
+#### What the pool actually was
+
+Every rank records the segment it mounted under `<run_dir>/segments/`, and the run's capacity is read back from those records rather than from log lines. The report is given the pool's own directory — the one holding the manifest every participant named — and gathers the records from the tree beneath it, so a job whose servers each have a run directory of their own still totals up:
 
 ```bash
-trtllm-serve mooncake_donor --master_server_address file:///shared/master.addr \
-    --segment_size 160GiB --protocol rdma --device_name mlx5_0
+trtllm-serve mooncake_pool_report --run_dir /shared/run/$SLURM_JOB_ID
 ```
+
+```text
+master        : 10.66.5.9:50051
+ranks         : 24 across 7 host(s)
+capacity      : 3840.0 GiB
+  role both     :   4 rank(s),    640.0 GiB   16.7%
+  role capacity :  20 rank(s),   3200.0 GiB   83.3%
+per rank      : 160.0 GiB, uniform
+```
+
+Reading declared facts rather than log messages is deliberate. Recovering the same figures by grepping worker logs ties the report to the wording of one provisioning mechanism, and when the mechanism changes the report does not fail — it silently attributes the bytes to the wrong side. With the master's log available the report also joins its `allocation_succeeded` lines against these records, which is what answers the question the pool exists for: did prefill's writes reach memory on the other side of the deployment, or only its own nodes?
+
+#### Pointing at a pool directly
 
 Topology can equally come from a JSON file named by `MOONCAKE_CONFIG_PATH`, using the same schema as the vLLM Mooncake store connector so one deployment can point both engines at the same pool:
 
@@ -469,28 +494,20 @@ Topology can equally come from a JSON file named by `MOONCAKE_CONFIG_PATH`, usin
   "master_server_address": "127.0.0.1:50051",
   "protocol": "rdma",
   "device_name": "mlx5_0",
-  "global_segment_size": "32GiB",
-  "local_buffer_size": "1GiB"
+  "global_segment_size": 34359738368,
+  "role": "both"
 }
 ```
 
-Only `master_server_address` is required. `metadata_server` may be left out, in which case it is `P2PHANDSHAKE`, Mooncake's peer-to-peer handshake, which is also what `mooncake_store` and `mooncake_donation` default to; the example above names a metadata service instead.
+Only `master_server_address` is required. `metadata_server` may be left out, in which case it is `P2PHANDSHAKE`, Mooncake's peer-to-peer handshake, which is what the manifest defaults to as well; the example above names a metadata service instead.
 
-An inherited `MOONCAKE_CONFIG_PATH` wins over `mooncake_store` and is logged as doing so, so an orchestrator that already provisions the pool, as the SLURM benchmark harness does, keeps working unchanged.
+An inherited `MOONCAKE_CONFIG_PATH` wins over `mooncake_store` and is logged as doing so, so an orchestrator that already provisions the pool keeps working unchanged.
 
-Three further settings are TensorRT-LLM's rather than Mooncake's, and stay in the environment because they are per process rather than per pool:
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `TRTLLM_MOONCAKE_STORE_ROLE` | `both` | `producer` writes only, `consumer` reads only, `both` does both. |
-| `TRTLLM_MOONCAKE_STORE_PREFIX` | `trtllm` | Leading component of every key, for isolating deployments that share a pool. |
-| `TRTLLM_MOONCAKE_STORE_MODEL_KEY` | model directory basename | Identity keys are namespaced by. Two engines share cache only when they agree on it, so the default is the basename rather than the full path, since the same checkpoint is routinely mounted elsewhere on another host, which is exactly what sharing is for. |
-
-In a disaggregated deployment, run context servers as `both` and leave generation servers unconfigured. Generated tokens are rarely a reused prefix, so writing them costs bandwidth for no hit rate.
+`role` and `stage_through_host` are read from that file too, so a hand-written config controls them the same way `mooncake_store` does.
 
 #### Partial block reuse is forced off
 
-`kv_cache_config.enable_partial_reuse` is set to `false` when this connector is configured, with a warning, whether or not it was requested explicitly. It defaults to `true`, so most deployments will see that warning.
+`kv_cache_config.enable_partial_reuse` is set to `false` when this connector is configured for traffic, with a warning, whether or not it was requested explicitly. It defaults to `true`, so most deployments will see that warning. A `role: capacity` server consults the store for nothing and keeps partial reuse.
 
 The store is addressed by whole blocks. The connector is handed the device match as `num_computed_tokens` and offers only blocks beyond it, but it can resume only from a block boundary, so when the device match ends mid-block it declines the lookup and the store is not consulted at all. Partial reuse is precisely what puts the match off a boundary, so it trades part of one block of device reuse for every stored block of the remaining prefix. Measured on MiniMax-M3, leaving it enabled declined 97.2% of lookups and left actual prompt cache read at 35% against a 96% ceiling; forcing it off raised that to 94% and roughly doubled throughput.
 
@@ -516,9 +533,10 @@ These are rejected at startup, before any request is admitted:
 | Sliding-window attention / VSWA | A page's validity depends on where the window sits, which is a property of the request that read it rather than of the tokens it holds. |
 | MiniMax-M3 with `sparse_disable_index_value: false` | The index-V cache is a plain tensor outside the paged pools, so a replayed prefix would pair stored index-K with stale index-V. Disaggregated serving applies the same restriction. |
 | Pipeline parallelism | Untested rather than unsound. Use tensor parallelism. |
-| `KVCacheManagerV1` | Identity here is a per-layer-group hash chain; V1 supplies real block hashes over a single flat block space. |
+| `KVCacheManagerV1` | Identity here is a per-layer-group hash chain; V1 supplies real block hashes over a single flat block space. Allowed under `role: capacity`, which addresses no pages. |
+| `segment_size` a node cannot afford | `ranks_on_node x segment_size` against available host memory. Rejecting it here turns an OOM kill during weight loading into a startup error. |
 
-Beam search, attention data parallelism, non-GPU cache tiers and Mamba caches are rejected for all connectors by the executor.
+Beam search, attention data parallelism and Mamba caches are rejected for all connectors by the executor, as are non-GPU cache tiers for any connector that registers pages.
 
 #### Example
 
