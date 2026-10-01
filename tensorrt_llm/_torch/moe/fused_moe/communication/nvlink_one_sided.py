@@ -689,7 +689,21 @@ class NVLinkOneSided(Communication):
         self.ep_group_health = ep_group_health
         # Keep the kernel specialization stable for this communicator's lifetime.
         self._rank_mask_enabled = ep_group_health is not None
-        if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
+        if can_use_cft_counted_writes:
+            # CFT signals completion through counted-write counters and never
+            # publishes the completion flags the host watchdog polls, so a watch
+            # would report every healthy peer as missing. The CFT kernels bound
+            # their own waits, so hangs are still detected; fault tolerance under
+            # CFT needs a recovery path of its own.
+            if alltoall_watchdog_timeout_s is not None or self.ep_group_health is not None:
+                tllm_logger.warning_once(
+                    "MoE All-to-All watchdog disabled: CFT counted writes do not publish "
+                    "completion flags. Set TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 to "
+                    "select fence-based dispatch and re-enable the watchdog.",
+                    key="moe_a2a_watchdog_disabled_for_cft",
+                )
+            alltoall_watchdog_timeout_s = None
+        elif alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         flag_val_offset_index = self.FLAG_VAL_OFFSET_INDEX
         dispatch_flags_offset_index = self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX
