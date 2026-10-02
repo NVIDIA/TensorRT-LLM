@@ -428,6 +428,8 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
                 f"across model arms: {grouped[key]['kind']} vs {r['kind']}"
             )
         variants: list[_PolicyVariant] = grouped[key]["variants"]
+        if any(variant.route == r["route"] for variant in variants):
+            raise ValueError(f"telemetry manifest: key '{key}' has a duplicate model route")
         variants.append(_PolicyVariant(route=r["route"], policy=r["policy"]))
 
     entries = []

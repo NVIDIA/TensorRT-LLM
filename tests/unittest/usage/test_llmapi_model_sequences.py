@@ -74,6 +74,14 @@ class _Group(StrictBaseModel):
     members: list[_Leaf]
 
 
+def test_duplicate_model_route_fails_manifest_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    nested_model_routes = capture._nested_model_routes
+    monkeypatch.setattr(capture, "_nested_model_routes", lambda ann: nested_model_routes(ann) * 2)
+
+    with pytest.raises(ValueError, match="key 'members.value' has a duplicate model route"):
+        capture.build_capture_manifest(_Group)
+
+
 def test_nested_model_lists_and_nullable_leaves_preserve_positions() -> None:
     class _Groups(StrictBaseModel):
         groups: list[_Group]
