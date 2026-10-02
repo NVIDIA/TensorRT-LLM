@@ -4093,32 +4093,87 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
  # SPDX-License-Identifier: MIT
  
  """Per-variant lazy JIT compilation for FMHA varlen kernels.
-@@ -22,10 +23,14 @@
+@@ -6,11 +7,12 @@
+ Each FMHA variant (dtype x tile x sparse x page x split_kv x pack_factor) is compiled
+ independently on first use and cached to ~/.cache/minfer/fmha_sm100/.
+ 
+-To recompile after kernel changes: scripts/clear_fmha_cache.sh
++Source changes select a new cache automatically; prewarm using the same sources.
+ """
+ 
+ import itertools
+ import fcntl
++import hashlib
+ import logging
+ import os
+ import shutil
+@@ -22,11 +24,18 @@
  
  logger = logging.getLogger(__name__)
  
-+# Invalidate binaries that interpreted selectors as contiguous. Both per-variant
-+# and all_variants.so caches must use the updated binding and kernel together.
-+_CACHE_VERSION = "selector_strides_unitcol_ct_v4"
++# Kernel sources and CUTLASS headers are shipped inside the package directory
++# so that JIT compilation works from both editable and wheel installs.
++_PACKAGE_DIR = Path(__file__).resolve().parent
++_FMHA_VARLEN_DIR = _PACKAGE_DIR / "csrc"
++_CUTLASS_DIR = _PACKAGE_DIR / "cutlass"
++_CUTLASS_INCLUDE = _CUTLASS_DIR / "include"
++_CUTLASS_UTIL_INCLUDE = _CUTLASS_DIR / "tools" / "util" / "include"
++
 +
  def _compute_cache_base():
      explicit = os.environ.get("MINFER_FMHA_CACHE_DIR")
-     if explicit:
+-    if explicit:
 -        return Path(explicit)
-+        return Path(explicit) / _CACHE_VERSION
-     base = Path(os.path.expanduser("~/.cache/minfer/fmha_sm100"))
+-    base = Path(os.path.expanduser("~/.cache/minfer/fmha_sm100"))
++    base = Path(explicit) if explicit else Path(os.path.expanduser("~/.cache/minfer/fmha_sm100"))
      # Different build configs get separate cache dirs to avoid conflicts
      suffix = ""
-@@ -37,7 +42,7 @@
+     if os.environ.get("GPU_TRACE") is not None:
+@@ -35,9 +44,27 @@
+         suffix += "_sm_timing"
+     if os.environ.get("FMHA_GMEM_CHECK") is not None:
          suffix += "_gmem_check"
-     if suffix:
+-    if suffix:
++    if suffix and not explicit:
          base = base.parent / (base.name + suffix)
 -    return base
-+    return base / _CACHE_VERSION
++
++    # Hash templates, bindings and headers together; jit.py also covers changes
++    # to dispatch and compiler flags. Use relative names so installs share keys.
++    digest = hashlib.sha256()
++    sources = sorted(path for path in _FMHA_VARLEN_DIR.rglob("*") if path.is_file())
++    sources.append(_PACKAGE_DIR / "jit.py")
++    for path in sources:
++        content = path.read_bytes()
++        digest.update(path.relative_to(_PACKAGE_DIR).as_posix().encode() + b"\0")
++        digest.update(len(content).to_bytes(8, "little"))
++        digest.update(content)
++    # An explicit cache root must also isolate instrumented and normal binaries.
++    digest.update(suffix.encode())
++    cache_base = base / ("sources_sha256_" + digest.hexdigest())
++    logger.info(
++        "Using FMHA cache %s (source/build fingerprint; changed sources or "
++        "diagnostic modes require recompilation)", cache_base,
++    )
++    return cache_base
  
  
  CACHE_BASE = _compute_cache_base()
-@@ -199,6 +204,9 @@
+@@ -55,13 +82,6 @@
+     os.close(fd)
+ 
+ 
+-# Kernel sources and CUTLASS headers are shipped inside the package directory
+-# so that JIT compilation works from both editable and wheel installs.
+-_PACKAGE_DIR = Path(__file__).resolve().parent
+-_FMHA_VARLEN_DIR = _PACKAGE_DIR / "csrc"
+-_CUTLASS_DIR = _PACKAGE_DIR / "cutlass"
+-_CUTLASS_INCLUDE = _CUTLASS_DIR / "include"
+-_CUTLASS_UTIL_INCLUDE = _CUTLASS_DIR / "tools" / "util" / "include"
+ 
+ _PACK_FACTORS = [1,2,4,6,8,16]
+ # _PACK_FACTORS = [1, 6]
+@@ -199,6 +219,9 @@
          "--expt-relaxed-constexpr", "--expt-extended-lambda",
          "-gencode=arch=compute_100a,code=sm_100a",
          "-gencode=arch=compute_103a,code=sm_103a",
@@ -4502,7 +4557,12 @@ diff --git a/python/fmha_sm100/csrc/fmha_sm100_inst.jinja b/python/fmha_sm100/cs
 diff --git a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh b/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
 --- a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
 +++ b/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
-@@ -57,7 +57,8 @@
+@@ -1,3 +1,4 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ /*
+  * Copyright (c) 2023 by FlashInfer team.
+  *
+@@ -57,7 +58,8 @@
            bool SingleSoftmaxWarpGroup = false,
            int KVPageSize = -1,
            cutlass::fmha::collective::SparseAttnMode kSparseAttnMode =
@@ -4512,7 +4572,7 @@ diff --git a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh b/python/fmha
  struct FwdRunner {
    using Element = DTypeIn;
    using ElementAccumulatorQK = float;
-@@ -89,7 +90,8 @@
+@@ -89,7 +91,8 @@
  
    using Mainloop = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
        Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeQK, TileShapePV, StrideQ,
@@ -4522,7 +4582,7 @@ diff --git a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh b/python/fmha
    using Epilogue = cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
        ElementOut, ElementAccumulatorPV, typename Mainloop::TileShapePV, NumQStages, IsSplitKV, bNeedOutput, kPackFactor>;
    using Operation =
-@@ -126,6 +128,9 @@
+@@ -126,6 +129,9 @@
                           int max_k_tiles = 0,
                           int* kv_block_indexes = nullptr,
                           int kv_block_num = 0,
@@ -4532,53 +4592,137 @@ diff --git a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh b/python/fmha
                           int pack_factor = 1,
                           int q_stride_n_original = 0,
                           int q_stride_h_original = 0,
-@@ -224,8 +229,9 @@
+@@ -223,11 +229,28 @@
+       if constexpr (IsSplitKV) {
          arguments = {
            {problem_shape,
-            {{q, layout_Q, k, layout_K, v, layout_V, kv_indices, kv_page_indptr, kv_block_indexes, kv_block_num,
+-           {{q, layout_Q, k, layout_K, v, layout_V, kv_indices, kv_page_indptr, kv_block_indexes, kv_block_num,
 -#ifdef FMHA_GMEM_BOUNDS_CHECK
 -             pack_gqa.gmem_bounds.kv_page_indptr_size, pack_gqa.gmem_bounds.kv_indices_size, pack_gqa.gmem_bounds.kv_block_indexes_numel,
-+             kv_block_stride_n, kv_block_stride_h, kv_block_stride_b,
+-#endif
+-             pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
++           {{.ptr_Q = q,
++             .layout_Q = layout_Q,
++             .ptr_K = k,
++             .layout_K = layout_K,
++             .ptr_V = v,
++             .layout_V = layout_V,
++             .kv_indices = kv_indices,
++             .kv_page_indptr = kv_page_indptr,
++             .kv_block_indexes = kv_block_indexes,
++             .kv_block_num = kv_block_num,
++             .kv_block_stride_n = kv_block_stride_n,
++             .kv_block_stride_h = kv_block_stride_h,
++             .kv_block_stride_b = kv_block_stride_b,
 +#ifdef FMHA_GMEM_BOUNDS_CHECK
-+             pack_gqa.gmem_bounds.kv_page_indptr_size, pack_gqa.gmem_bounds.kv_indices_size, pack_gqa.gmem_bounds.kv_block_indexes_span,
- #endif
-              pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
-             sm_scale, q_scale, k_scale, v_scale, o_scale},
-@@ -245,8 +251,9 @@
-         arguments = {
-           problem_shape,
-           {{q, layout_Q, k, layout_K, v, layout_V, kv_indices, kv_page_indptr, kv_block_indexes, kv_block_num,
--#ifdef FMHA_GMEM_BOUNDS_CHECK
--            pack_gqa.gmem_bounds.kv_page_indptr_size, pack_gqa.gmem_bounds.kv_indices_size, pack_gqa.gmem_bounds.kv_block_indexes_numel,
-+             kv_block_stride_n, kv_block_stride_h, kv_block_stride_b,
-+#ifdef FMHA_GMEM_BOUNDS_CHECK
-+            pack_gqa.gmem_bounds.kv_page_indptr_size, pack_gqa.gmem_bounds.kv_indices_size, pack_gqa.gmem_bounds.kv_block_indexes_span,
- #endif
-             pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
-            sm_scale, q_scale, k_scale, v_scale, o_scale},
-@@ -344,6 +351,10 @@
-         arguments = {
-           {problem_shape,
-            {{q, layout_Q, k, layout_K, v, layout_V, nullptr, nullptr, nullptr, 0,
-+             0, 0, 1,
-+#ifdef FMHA_GMEM_BOUNDS_CHECK
-+             0, 0, 0,
++             .kv_page_indptr_size = pack_gqa.gmem_bounds.kv_page_indptr_size,
++             .kv_indices_size = pack_gqa.gmem_bounds.kv_indices_size,
++             .kv_block_indexes_span = pack_gqa.gmem_bounds.kv_block_indexes_span,
 +#endif
-              pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
++             .pack_factor = pack_factor,
++             .q_stride_n_original = q_stride_n_original,
++             .q_stride_h_original = q_stride_h_original,
++             .h_r_original = h_r_original},
              sm_scale, q_scale, k_scale, v_scale, o_scale},
             epi_args,
-@@ -362,6 +373,10 @@
+            sched_args,
+@@ -244,11 +267,28 @@
+       } else {
          arguments = {
            problem_shape,
-           {{q, layout_Q, k, layout_K, v, layout_V, nullptr, nullptr, nullptr, 0,
-+            0, 0, 1,
+-          {{q, layout_Q, k, layout_K, v, layout_V, kv_indices, kv_page_indptr, kv_block_indexes, kv_block_num,
+-#ifdef FMHA_GMEM_BOUNDS_CHECK
+-            pack_gqa.gmem_bounds.kv_page_indptr_size, pack_gqa.gmem_bounds.kv_indices_size, pack_gqa.gmem_bounds.kv_block_indexes_numel,
+-#endif
+-            pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
++          {{.ptr_Q = q,
++             .layout_Q = layout_Q,
++             .ptr_K = k,
++             .layout_K = layout_K,
++             .ptr_V = v,
++             .layout_V = layout_V,
++             .kv_indices = kv_indices,
++             .kv_page_indptr = kv_page_indptr,
++             .kv_block_indexes = kv_block_indexes,
++             .kv_block_num = kv_block_num,
++             .kv_block_stride_n = kv_block_stride_n,
++             .kv_block_stride_h = kv_block_stride_h,
++             .kv_block_stride_b = kv_block_stride_b,
 +#ifdef FMHA_GMEM_BOUNDS_CHECK
-+            0, 0, 0,
++             .kv_page_indptr_size = pack_gqa.gmem_bounds.kv_page_indptr_size,
++             .kv_indices_size = pack_gqa.gmem_bounds.kv_indices_size,
++             .kv_block_indexes_span = pack_gqa.gmem_bounds.kv_block_indexes_span,
 +#endif
-             pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
++             .pack_factor = pack_factor,
++             .q_stride_n_original = q_stride_n_original,
++             .q_stride_h_original = q_stride_h_original,
++             .h_r_original = h_r_original},
             sm_scale, q_scale, k_scale, v_scale, o_scale},
            epi_args,
-@@ -412,7 +427,8 @@
+           sched_args,
+@@ -343,8 +383,28 @@
+       if constexpr (IsSplitKV) {
+         arguments = {
+           {problem_shape,
+-           {{q, layout_Q, k, layout_K, v, layout_V, nullptr, nullptr, nullptr, 0,
+-             pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
++           {{.ptr_Q = q,
++             .layout_Q = layout_Q,
++             .ptr_K = k,
++             .layout_K = layout_K,
++             .ptr_V = v,
++             .layout_V = layout_V,
++             .kv_indices = nullptr,
++             .kv_page_indptr = nullptr,
++             .kv_block_indexes = nullptr,
++             .kv_block_num = 0,
++             .kv_block_stride_n = 0,
++             .kv_block_stride_h = 0,
++             .kv_block_stride_b = 1,
++#ifdef FMHA_GMEM_BOUNDS_CHECK
++             .kv_page_indptr_size = 0,
++             .kv_indices_size = 0,
++             .kv_block_indexes_span = 0,
++#endif
++             .pack_factor = pack_factor,
++             .q_stride_n_original = q_stride_n_original,
++             .q_stride_h_original = q_stride_h_original,
++             .h_r_original = h_r_original},
+             sm_scale, q_scale, k_scale, v_scale, o_scale},
+            epi_args,
+            sched_args,
+@@ -361,8 +421,28 @@
+       } else {
+         arguments = {
+           problem_shape,
+-          {{q, layout_Q, k, layout_K, v, layout_V, nullptr, nullptr, nullptr, 0,
+-            pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
++          {{.ptr_Q = q,
++             .layout_Q = layout_Q,
++             .ptr_K = k,
++             .layout_K = layout_K,
++             .ptr_V = v,
++             .layout_V = layout_V,
++             .kv_indices = nullptr,
++             .kv_page_indptr = nullptr,
++             .kv_block_indexes = nullptr,
++             .kv_block_num = 0,
++             .kv_block_stride_n = 0,
++             .kv_block_stride_h = 0,
++             .kv_block_stride_b = 1,
++#ifdef FMHA_GMEM_BOUNDS_CHECK
++             .kv_page_indptr_size = 0,
++             .kv_indices_size = 0,
++             .kv_block_indexes_span = 0,
++#endif
++             .pack_factor = pack_factor,
++             .q_stride_n_original = q_stride_n_original,
++             .q_stride_h_original = q_stride_h_original,
++             .h_r_original = h_r_original},
+            sm_scale, q_scale, k_scale, v_scale, o_scale},
+           epi_args,
+           sched_args,
+@@ -412,7 +492,8 @@
            bool SingleSoftmaxWarpGroup = false,
            int KVPageSize = -1,
            cutlass::fmha::collective::SparseAttnMode kSparseAttnMode =
@@ -4588,7 +4732,7 @@ diff --git a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh b/python/fmha
  cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn* v,
                           IdType* qo_segment_lens, IdType* kv_segment_lens,
                           IdType* qo_segment_offsets, IdType* kv_segment_offsets,
-@@ -436,6 +452,9 @@
+@@ -436,6 +517,9 @@
                           int max_k_tiles = 0,
                           int* kv_block_indexes = nullptr,
                           int kv_block_num = 0,
@@ -4598,7 +4742,7 @@ diff --git a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh b/python/fmha
                           int pack_factor = 1,
                           int q_stride_n_original = 0,
                           int q_stride_h_original = 0,
-@@ -443,7 +462,8 @@
+@@ -443,7 +527,8 @@
                           PackGQAUnpackParams pack_gqa = {},
                           int num_ctas = 0) {
    return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask,
@@ -4608,7 +4752,7 @@ diff --git a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh b/python/fmha
        workspace_buffer, q, k, v, qo_segment_lens, kv_segment_lens,
        qo_segment_offsets, kv_segment_offsets, packed_work_range,
        packed_work_info, o, mask_mode_code, sm_scale,
-@@ -455,6 +475,7 @@
+@@ -455,6 +540,7 @@
        kv_indices, kv_page_indptr, total_page_num,
        maybe_max_score, max_k_tiles,
        kv_block_indexes, kv_block_num,
