@@ -27,6 +27,9 @@ l0_dgx_h100:
   - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-tp2-bart-large-cnn]
   - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs[tp2]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp32-kv-v1-graphs-off-greedy-tp2]
+  # Per-rank store namespaces and the save thread's device binding only break
+  # above one rank. The single-GPU cases are in l0_a10.yml.
+  - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks
   # ------------- Disaggregated serving tests ---------------
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False-True]
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[True-True]
