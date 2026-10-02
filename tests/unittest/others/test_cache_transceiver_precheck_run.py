@@ -217,16 +217,104 @@ def _read_status(tmp_path, name):
 
 
 def test_recorder_pass(tmp_path):
-    rec = rp.StatusRecorder(str(tmp_path), "gen", 0, is_leader=True)
+    metadata = {"model_dir_resolved": True, "synthetic_kv_shape": False}
+    rec = rp.StatusRecorder(str(tmp_path), "gen", 0, is_leader=True, metadata=metadata)
+    metadata["model_dir_resolved"] = False
     rec.record("ctx_0", 1024, "PASS")
     text, doc = _read_status(tmp_path, "gen_0")
     assert text.startswith("RUNNING")  # not final yet: a SIGKILL must not read as PASS
     assert doc["overall"] == "RUNNING"
+    assert doc["model_dir_resolved"] is True
+    assert doc["synthetic_kv_shape"] is False
     rec.finalize(extra={"transceiver_runtime": "CPP"})
     text, doc = _read_status(tmp_path, "gen_0")
     assert text.startswith("PASS gen_0")
     assert doc["overall"] == "PASS"
     assert doc["transceiver_runtime"] == "CPP"
+    assert doc["model_dir_resolved"] is True
+    assert doc["synthetic_kv_shape"] is False
+
+
+@pytest.mark.parametrize(
+    "checkpoint,case_status,model_dir_resolved,synthetic_kv_shape",
+    [
+        ("unresolved", "INIT_ERROR", False, True),
+        ("gqa", "PASS", True, False),
+        ("sparse", "TIMEOUT", True, True),
+        ("malformed", "TRANSFER_ERROR", True, True),
+    ],
+)
+def test_runner_persists_checkpoint_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+    case_status: str,
+    model_dir_resolved: bool,
+    synthetic_kv_shape: bool,
+) -> None:
+    """Carry actual checkpoint resolution through successful and failed status writes."""
+    models_root = tmp_path / "models"
+    model_dir = models_root / "model"
+    if checkpoint != "unresolved":
+        model_dir.mkdir(parents=True)
+        hf_config = {
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+        }
+        if checkpoint == "sparse":
+            hf_config["index_head_dim"] = 128
+        config_text = "{" if checkpoint == "malformed" else json.dumps(hf_config)
+        (model_dir / "config.json").write_text(config_text)
+    monkeypatch.setenv("LLM_MODELS_ROOT", str(models_root))
+    config_path = tmp_path / "precheck.yaml"
+    config_path.write_text(
+        json.dumps(
+            {
+                "metadata": {"model_dir_name": "model"},
+                "hardware": {"gpus_per_node": 1, "num_ctx_servers": 1, "num_gen_servers": 1},
+                "worker_config": {
+                    role: {
+                        "tensor_parallel_size": 1,
+                        "cache_transceiver_config": {"backend": "NIXL"},
+                    }
+                    for role in ("ctx", "gen")
+                },
+            }
+        )
+    )
+    args = rp.parse_args(
+        [
+            "--role",
+            "gen",
+            "--server-idx",
+            "0",
+            "--config",
+            str(config_path),
+            "--work-dir",
+            str(tmp_path),
+        ]
+    )
+    plan, side = rp.load_plan(args)
+    monkeypatch.setitem(sys.modules, "mpi4py", types.SimpleNamespace(MPI=None))
+    runner = rp.PrecheckRunner(args, plan, side, types.SimpleNamespace(Get_rank=lambda: 0))
+    runner.recorder.record("ctx_0", 64, case_status, "example outcome")
+    _, doc = _read_status(tmp_path, "gen_0")
+    assert doc["overall"] == ("RUNNING" if case_status == "PASS" else "FAIL")
+    assert doc["model_dir_resolved"] is model_dir_resolved
+    assert doc["synthetic_kv_shape"] is synthetic_kv_shape
+    runner.recorder.finalize(
+        extra={"transceiver_runtime": "PYTHON", "kv_cache_manager": "V2", "per_gpu_bw_gbps": 2.5}
+    )
+    _, doc = _read_status(tmp_path, "gen_0")
+    assert doc["overall"] == ("PASS" if case_status == "PASS" else "FAIL")
+    assert doc["cases"][0]["status"] == case_status
+    assert doc["model_dir_resolved"] is model_dir_resolved
+    assert doc["synthetic_kv_shape"] is synthetic_kv_shape
+    assert doc["transceiver_runtime"] == "PYTHON"
+    assert doc["kv_cache_manager"] == "V2"
+    assert doc["per_gpu_bw_gbps"] == 2.5
 
 
 def test_recorder_failure_summary_first_line_only(tmp_path):
@@ -1224,6 +1312,7 @@ class TestInternalApiContract:
             json.dumps({"architectures": ["DeepseekV4ForCausalLM"]})
         )
         side = {
+            "architecture": "LlamaForCausalLM",
             "use_kv_cache_manager_v2": "auto",
             "parallel": {"tp": 1, "pp": 1, "cp": 1},
         }
@@ -1253,6 +1342,7 @@ class TestInternalApiContract:
         cfg = yaml.safe_load(config_path.read_text())
         assert rp.pcfg.resolve_model_dir(cfg, llm_models_root=str(tmp_path)) is None
         side = rp.pcfg.side_plan(rp.pcfg.resolve_plan(cfg), role)
+        assert side["architecture"] == "DeepseekV4ForCausalLM"
         cache_cfg = api.CacheTransceiverConfig(**side["cache_transceiver_config"])
         assert rp.resolve_model_prefs(None, side, cache_cfg) is True
         assert cache_cfg.transceiver_runtime == "PYTHON"
@@ -1356,17 +1446,17 @@ class TestInternalApiContract:
 @pytest.mark.parametrize(
     "model_dir,declared,registered,expected",
     [
-        (None, ["Declared"], True, True),
-        ("/checkpoint", ["Declared"], True, False),
-        (None, [], False, None),
-        (None, ["Unknown"], False, None),
-        ("/checkpoint", ["Declared"], False, None),
+        (None, "Declared", True, True),
+        ("/checkpoint", "Declared", True, False),
+        (None, None, False, None),
+        (None, "Unknown", False, None),
+        ("/checkpoint", "Declared", False, None),
     ],
 )
 def test_architecture_fallback_precedence(
     monkeypatch: pytest.MonkeyPatch,
     model_dir: str | None,
-    declared: list[str],
+    declared: str | None,
     registered: bool,
     expected: bool | None,
 ) -> None:
@@ -1374,15 +1464,29 @@ def test_architecture_fallback_precedence(
     checkpoint_cls = object() if model_dir and registered else None
     declared_cls = object() if registered or model_dir else None
     view = object() if model_dir else None
+    registry_calls = []
+    resolver_calls = []
+
+    def get_registered_model_class(name: str) -> object | None:
+        """Record the full scalar used to select the exact declared class."""
+        registry_calls.append(name)
+        assert name == declared
+        return declared_cls
+
+    def resolve_v2(args: object, cls: object, config: object) -> bool:
+        """Capture the identity and checkpoint view passed to serving's resolver."""
+        resolver_calls.append((cls, config))
+        return cls is declared_cls
+
     monkeypatch.setattr(rp, "_lookup_model_cls", lambda _: (checkpoint_cls, view))
     api = types.SimpleNamespace(
-        get_registered_model_class=lambda _: declared_cls,
+        get_registered_model_class=get_registered_model_class,
         TorchLlmArgs=lambda **kwargs: types.SimpleNamespace(**kwargs),
-        resolve_kv_cache_manager_v2_auto=lambda args, cls, config: cls is declared_cls,
+        resolve_kv_cache_manager_v2_auto=resolve_v2,
     )
     monkeypatch.setattr(rp, "load_internal_apis", lambda: api)
     side = {
-        "architectures": declared,
+        "architecture": declared,
         "use_kv_cache_manager_v2": "auto",
         "parallel": {"tp": 1, "pp": 1, "cp": 1},
     }
@@ -1390,8 +1494,11 @@ def test_architecture_fallback_precedence(
     if expected is None:
         with pytest.raises(RuntimeError, match="refusing to assume V1"):
             rp.resolve_model_prefs(model_dir, side, cache_cfg)
+        assert not resolver_calls
     else:
         assert rp.resolve_model_prefs(model_dir, side, cache_cfg) is expected
+        assert resolver_calls == [(checkpoint_cls if model_dir else declared_cls, view)]
+    assert registry_calls == ([declared] if model_dir is None and declared else [])
 
 
 @pytest.mark.parametrize("failure", ["resolution", "rank_contract", "api_import"])
@@ -1441,7 +1548,7 @@ def test_resolved_contract_preserves_role_asymmetry(
     import precheck_config as pcfg
 
     cfg = {
-        "metadata": {"architectures": ["Example"]},
+        "metadata": {"architecture": "Example"},
         "hardware": {"gpus_per_node": 1, "num_ctx_servers": 1, "num_gen_servers": 1},
         "worker_config": {
             side: {

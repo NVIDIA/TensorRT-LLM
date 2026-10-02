@@ -1445,33 +1445,55 @@ def test_python_transceiver_bandwidth_csv(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "value,expected",
+    "metadata,expected",
     [
-        ([], []),
-        (" DeepseekV4ForCausalLM ", ["DeepseekV4ForCausalLM"]),
-        (["DeepseekV4ForCausalLM"], ["DeepseekV4ForCausalLM"]),
+        ({}, None),
+        ({"architecture": "DeepseekV4ForCausalLM"}, "DeepseekV4ForCausalLM"),
+        ({"architecture": " DeepseekV4ForCausalLM "}, "DeepseekV4ForCausalLM"),
     ],
 )
-def test_declared_architectures(value: object, expected: list[str]) -> None:
-    """Normalize metadata and retain it in the shared and per-role plans."""
-    cfg = _disagg_yaml(metadata={"architectures": value})
+def test_declared_architecture(metadata: dict, expected: str | None) -> None:
+    """Retain one optional, normalized architecture in both roles and the fingerprint."""
+    cfg = _disagg_yaml(metadata=metadata)
+    assert pcfg.declared_architecture(cfg) == expected
     plan = pcfg.resolve_plan(cfg)
-    assert plan["architectures"] == expected
-    assert pcfg.side_plan(plan, "ctx")["architectures"] == expected
-    assert json.loads(plan["fingerprint"])["architectures"] == expected
+    assert plan["architecture"] == expected
+    for role in ("ctx", "gen"):
+        assert pcfg.side_plan(plan, role)["architecture"] == expected
+    assert json.loads(plan["fingerprint"])["architecture"] == expected
+    if expected is not None:
+        normalized = pcfg.resolve_plan(_disagg_yaml(metadata={"architecture": expected}))
+        assert normalized["fingerprint"] == plan["fingerprint"]
 
 
-@pytest.mark.parametrize("value", [None, 42, {}, [""], [" "], [None], [42]])
-def test_invalid_declared_architectures(value: object) -> None:
-    """Malformed hints fail early rather than selecting an unintended class."""
-    with pytest.raises(ValueError, match="metadata.architectures"):
-        pcfg.resolve_plan(_disagg_yaml(metadata={"architectures": value}))
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        " \t\n",
+        42,
+        {},
+        True,
+        [],
+        [""],
+        [" "],
+        [None],
+        [42],
+        ["DeepseekV4ForCausalLM"],
+        ["Unknown", "DeepseekV4ForCausalLM"],
+    ],
+)
+def test_invalid_declared_architecture(value: object) -> None:
+    """Reject malformed scalars and every list, including a valid later entry."""
+    with pytest.raises(ValueError, match=r"metadata\.architecture"):
+        pcfg.resolve_plan(_disagg_yaml(metadata={"architecture": value}))
 
 
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("architectures", ["DeepseekV4ForCausalLM"]),
+        ("architecture", "DeepseekV4ForCausalLM"),
         ("ctx_use_kv_cache_manager_v2", True),
         ("gen_kv_dtype", "bf16"),
     ],
