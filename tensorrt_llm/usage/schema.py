@@ -327,7 +327,7 @@ class TrtllmExitReport(_LlmCounterSnapshot):
 
 
 # ---------------------------------------------------------------------------
-# GXT Event Wrapper (single event in the events array)
+# GXT Event Wrapper (one entry in a potentially multi-event envelope)
 # ---------------------------------------------------------------------------
 
 
