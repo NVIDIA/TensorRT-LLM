@@ -97,7 +97,7 @@ def _quantize_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return x_q, descale.float().reshape(1, 1, 1, 1)
 
 
-def _quantize_mxfp8_qk(x_bhsd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def _quantize_mxfp8_qk_native(x_bhsd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a Q or K tensor to MXFP8, blocking along the head dimension.
 
     cuDNN wants ``descale_q``/``descale_k`` as ``[B, H, S_padded, D_scale]`` with
@@ -134,7 +134,7 @@ def _quantize_mxfp8_qk(x_bhsd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
     return x_q, x_sf_1d.view(b, h, s_pad, d_scale)
 
 
-def _quantize_mxfp8_v(x_bhsd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def _quantize_mxfp8_v_native(x_bhsd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a V tensor to MXFP8, blocking along the *sequence* dimension.
 
     The second attention GEMM contracts over S, so V's scale factors block along S
@@ -164,6 +164,22 @@ def _quantize_mxfp8_v(x_bhsd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
     # [B, H, D_padded, S_scale] -> [B, H, S_scale, D_padded] (stride[2] == 1).
     x_sf = x_sf_1d.view(b, h, d_pad, s_scale).permute(0, 1, 3, 2)
     return x_q, x_sf
+
+
+def _quantize_mxfp8_qk(x_bhsd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    from .mxfp8_pack import metadata_eligible, pack_qk
+
+    if metadata_eligible(x_bhsd):
+        return pack_qk(x_bhsd)
+    return _quantize_mxfp8_qk_native(x_bhsd)
+
+
+def _quantize_mxfp8_v(x_bhsd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    from .mxfp8_pack import metadata_eligible, pack_v
+
+    if metadata_eligible(x_bhsd):
+        return pack_v(x_bhsd)
+    return _quantize_mxfp8_v_native(x_bhsd)
 
 
 # ============================================================================
