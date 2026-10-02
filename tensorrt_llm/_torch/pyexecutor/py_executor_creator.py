@@ -938,18 +938,11 @@ def _create_py_executor_impl(
             logger.error(f"Error instantiating connector: {e}")
             raise e
 
-        if uses_connector(kv_connector_config, "mooncake-store"):
+        uses_mooncake = uses_connector(kv_connector_config, "mooncake-store")
+        if uses_mooncake:
             _disable_native_kv_offload(kv_cache_config)
 
-        # Both restrictions below protect page addresses a connector registers
-        # and moves KV against, which a capacity-only connector does not.
-        # Asked here so the worker itself can answer, and still before the KV
-        # cache manager reads enable_partial_reuse to build its block pools.
         if not kv_connector_manager.capacity_only:
-            # A policy that destroys and replays a live request leaves the
-            # connector's per-request block delta measured against pages that
-            # were freed with it. Only KVCacheManagerV2 drops that delta on
-            # replay.
             if (scheduler_config.capacity_scheduler_policy
                     != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
                     and v2_selection is False):
@@ -959,21 +952,14 @@ def _create_py_executor_impl(
                     "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
                 )
 
-            if (kv_cache_config.enable_partial_reuse
-                    and uses_connector(kv_connector_config, "mooncake-store")):
+            # The KV cache manager is built after this and reads the result.
+            if uses_mooncake and kv_cache_config.enable_partial_reuse:
                 logger.warning(
-                    "Disabling partial reuse: it is not usable with the mooncake-store "
-                    "connector. The store is addressed by whole blocks, so a partial "
-                    "device match leaves the matched length off a block boundary and "
-                    "the connector declines the lookup rather than resume a block from "
-                    "the middle. Partial reuse therefore trades part of one block for "
-                    "every stored block of the remaining prefix.")
+                    "Disabling partial reuse: the mooncake-store connector addresses "
+                    "whole blocks, so a partial match leaves the matched length off a "
+                    "block boundary and the connector declines the lookup, trading part "
+                    "of one block for every stored block of the remaining prefix.")
                 kv_cache_config.enable_partial_reuse = False
-        else:
-            logger.info(
-                "KV connector is capacity-only: it registers no KV cache pages "
-                "and transfers nothing, so this engine keeps its capacity "
-                "scheduler policy and its block reuse settings unchanged.")
     else:
         kv_connector_manager = None
 
