@@ -18,6 +18,16 @@ TensorRT LLM
 ---
 <div align="left">
 
+> **Telemetry is enabled by default for LLM and VisualGen workloads.**
+> TensorRT-LLM sends system/GPU information, selected configuration, and
+> session-level usage, performance, and error summaries to NVIDIA to understand
+> usage and improve reliability and performance. Prompts, input media,
+> generated outputs, and model weights are not collected.
+>
+> **To opt out before running**, set `TRTLLM_NO_USAGE_STATS=1` in the environment
+> where you launch TensorRT-LLM. See [collected data](#telemetry-data-collection)
+> and [step-by-step opt-out instructions](#opting-out-of-telemetry-data-collection).
+
 ## Tech Blogs
 
 <!-- Use github markdown link to link for the latest blog since the doc build has not happened yet. When the doc build is updated, it should be updated to the webpage link. -->
@@ -307,13 +317,14 @@ Deprecation is used to inform developers that some APIs and tools are no longer 
 
 ## Telemetry Data Collection
 
-TensorRT-LLM collects anonymous telemetry data by default. This data is used
+TensorRT-LLM collects usage telemetry by default for LLM and VisualGen workloads. This data is used
 in aggregate to understand usage patterns and prioritize engineering efforts.
-**This data cannot be traced back to any individual user.** No prompts,
-outputs, model weights, model paths, tokenizer paths, user-identifying
-information, raw free-form configuration strings, or persistent identifiers are
-collected. Any deployment identifiers are ephemeral, randomly generated per
-deployment, and not linked to users. The data we collect includes:
+The client does not include prompts, input media, generated outputs, model
+weights, model or tokenizer paths, raw free-form configuration strings, or
+persistent user, device, account, or installation identifiers in telemetry
+payloads. Session identifiers are randomly generated for each process session;
+deployment identifiers correlate processes within a deployment. The data we
+collect includes:
 
 - Ingress point (e.g., LLM API, CLI, serve command)
 - Deployment duration (via periodic heartbeats)
@@ -328,6 +339,8 @@ deployment, and not linked to users. The data we collect includes:
 - Disaggregated serving metadata (role and deployment ID)
 - Process-local LLM lifecycle counts (initialization attempts, successful and active instances, peak concurrency, and initialization failures)
 - VisualGen pipeline identity, capability, parallelism, feature settings, and process-local lifecycle counts
+- VisualGen aggregate request counts by endpoint/modality, bucketed request shapes, approved extra-parameter key usage, and peak queued/active requests
+- VisualGen pipeline load/warmup durations, approximate generation/phase latency summaries, and categorized error/timeout counts, without request content or exception text
 - Bounded terminal status for instrumented processes (known exit code or signal, termination category, lifecycle phase, component, and reporting source)
 - Selected LLM and VisualGen configuration values: parallelism, dtype, caching, attention, CUDA graph, and compile settings
 - Capture diagnostics for that payload: a schema checksum (for provenance), the count of captured fields, and whether any free-form value was skipped
@@ -336,7 +349,19 @@ Telemetry is automatically disabled in CI and test environments.
 
 ### Opting Out of Telemetry Data Collection
 
-To disable telemetry data collection, use any of the following methods:
+To disable telemetry before launching a workload:
+
+1. In the shell where you will launch TensorRT-LLM, run:
+
+   ```bash
+   export TRTLLM_NO_USAGE_STATS=1
+   ```
+
+2. Launch your Python program or TensorRT-LLM CLI from that same shell.
+   For containers or managed jobs, set the variable in the container/job
+   environment too (for example, `docker run -e TRTLLM_NO_USAGE_STATS=1 ...`).
+
+Alternatively, use any of the following methods:
 
 - **Environment variable**: Set `TRTLLM_NO_USAGE_STATS=1`, `DO_NOT_TRACK=1`, or `TELEMETRY_DISABLED=true`
 - **File-based**: Create the file `~/.config/trtllm/do_not_track`
