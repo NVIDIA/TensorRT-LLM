@@ -72,7 +72,7 @@ from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.drafter import Drafter
-from ..speculative.spec_sampler_base import SampleStateTensorsSpec
+from ..speculative.spec_sampler_base import SampleStateTensorsSpec, SpecSampler
 from ..speculative.speculation_gate import SpeculationGate
 from ..speculative.utils import update_draft_len
 from .adp_iter_stats import ADPIterStatsBuffer
@@ -5426,7 +5426,16 @@ class PyExecutor:
 
                 if can_queue:
                     guided_decoder_failed_requests = None
-                    with self.perf_manager.record_perf_events(
+                    # The one-model speculative sampler only moves the forward's
+                    # outputs into its stores, and the next forward reads those
+                    # on the execution stream. Sampling on that stream too keeps
+                    # the chain between two forwards on one stream (None: the
+                    # current stream).
+                    sample_stream = (self.execution_stream if isinstance(
+                        self.sampler, SpecSampler) else None)
+                    with torch.cuda.stream(
+                            sample_stream
+                    ), self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
                         with self._step_scope(scheduled_batch, phase="sample"):
                             if self.guided_decoder is not None:

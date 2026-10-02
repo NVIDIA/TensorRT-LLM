@@ -509,8 +509,6 @@ class SpecMetadata:
     host_position_ids: Optional[torch.Tensor] = None
     # The gather ids for logits.
     gather_ids: Optional[torch.Tensor] = None
-    # The number of accepted draft tokens for each request.
-    num_accepted_draft_tokens: Optional[torch.Tensor] = None
     # The number of tokens for speculative model/layer
     num_tokens: int = 0
     # The number of tokens for speculative model/layer of different rank
@@ -863,6 +861,11 @@ class SpecMetadata:
                                                  pin_memory=prefer_pinned()),
                                     non_blocking=True)
 
+        # An all-greedy batch runs the argmax graph, which reads none of these
+        # buffers. The offset windows above still advance, so skipping the
+        # copies changes no later batch's streams.
+        if self.is_all_greedy_sample:
+            return
         _upload(self.request_seeds, request_seeds)
         _upload(self.request_offsets, request_offsets)
         _upload(self.seeds, flat_seeds)
