@@ -411,9 +411,14 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(bf16_t c
                                     float2 f[2] = {__bfloat1622float2(v2[0]), __bfloat1622float2(v2[1])};
                                     if constexpr (FULL_N12)
                                     {
-                                        if (n == AN - 1 && lane == 0)
+                                        if (n == AN - 1)
                                         {
-                                            cute::arrive_barrier(plan.bar_consumed[chunk_slot]);
+                                            // Every lane's reads of the chunk's slots before lane 0 releases them.
+                                            __syncwarp();
+                                            if (lane == 0)
+                                            {
+                                                cute::arrive_barrier(plan.bar_consumed[chunk_slot]);
+                                            }
                                         }
                                     }
                                     tmem_st_32dp32bNx<4>(
@@ -492,6 +497,8 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(bf16_t c
                 }
                 if constexpr (!FULL_N12)
                 {
+                    // Every lane's reads of the chunk's slots before lane 0 releases them to the producer.
+                    __syncwarp();
                     if (lane == 0)
                     {
                         cute::arrive_barrier(plan.bar_consumed[chunk_slot]);
@@ -551,6 +558,10 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(bf16_t c
                 {
                     cross_warp_tail(lane);
                 }
+                // ws_stats is one buffer reused every chunk. The barrier above orders this chunk's writes before the
+                // reads; this one orders the reads before the next chunk's writes, so a warp that has finished
+                // reading cannot overwrite its row while a slower warp still reads it.
+                cutlass::arch::NamedBarrier::sync(CONSUMER_THREADS, 0);
                 float logit_n[N_CHUNK];
 #pragma unroll
                 for (int n = 0; n < N_CHUNK; n++)

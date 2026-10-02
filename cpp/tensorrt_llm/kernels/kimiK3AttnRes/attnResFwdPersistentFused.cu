@@ -650,6 +650,8 @@ __global__ void __launch_bounds__(BLK, 1)
                     default: __builtin_unreachable();
                     }
                 }
+                // Every lane's reads of the chunk's slots before lane 0 releases them to the producer.
+                __syncwarp();
                 if (lane == 0)
                 {
                     mbarrier_arrive(plan.bar_consumed[chunk_slot]);
