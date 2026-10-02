@@ -47,6 +47,17 @@ if(${BUILD_PYT})
     LABELS
     "unit;common;host")
   add_tllm_gtest(
+    profilerTest
+    OWNER
+    common
+    SOURCES
+    profilerTest.cpp
+    ../../../tensorrt_llm/common/profiler.cpp
+    LINK_LIBRARIES
+    ${TORCH_LIBRARIES}
+    LABELS
+    "unit;common;host")
+  add_tllm_gtest(
     thUtilsTest
     OWNER
     runtime
