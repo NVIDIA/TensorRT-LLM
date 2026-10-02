@@ -258,11 +258,35 @@ def test_int4_rejects_non_byte_aligned_tp_shards() -> None:
         mapper.preprocess_weights(weights)
 
 
-def test_int4_rejects_mixed_storage_dtypes() -> None:
+@pytest.mark.parametrize("projection", ["z", "a"])
+@pytest.mark.parametrize("other_dtype", [torch.int8, torch.bfloat16])
+def test_int4_rejects_mixed_storage_dtypes(projection: str, other_dtype: torch.dtype) -> None:
     mapper, weights, _, _ = _make_int4_weights()
-    name = f"{_ATTN_PREFIX}.in_proj_z.weight"
-    weights[name] = weights[name].view(torch.int8)
-    with pytest.raises(AssertionError, match="same storage dtype"):
+    name = f"{_ATTN_PREFIX}.in_proj_{projection}.weight"
+    weights[name] = weights[name].to(other_dtype)
+    message = "same storage dtype" if other_dtype == torch.int8 else "packed INT4 and unpacked"
+    with pytest.raises(ValueError, match=message):
+        mapper.preprocess_weights(weights)
+
+
+@pytest.mark.parametrize("projection", ["q", "v", "ba"])
+def test_int4_rejects_odd_logical_dimensions(projection: str) -> None:
+    mapper, weights, _, _ = _make_int4_weights()
+    config = mapper.config.pretrained_config
+    config.linear_num_key_heads = 1
+    if projection == "ba":
+        config.linear_num_value_heads = 47
+        weights = {
+            key: value
+            for key, value in weights.items()
+            if ".in_proj_b." in key or ".in_proj_a." in key
+        }
+    elif projection == "q":
+        config.linear_key_head_dim = 3
+    else:
+        config.linear_num_value_heads = 1
+        config.linear_value_head_dim = 3
+    with pytest.raises(ValueError, match="projection dimensions must be even"):
         mapper.preprocess_weights(weights)
 
 

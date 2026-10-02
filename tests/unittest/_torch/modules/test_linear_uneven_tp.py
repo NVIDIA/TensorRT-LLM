@@ -1157,9 +1157,13 @@ class TestW4A16AWQMLP(_AWQMLPMixin):
 
     quant_algo = QuantAlgo.W4A16_AWQ
 
-    @pytest.mark.parametrize("has_scale", [False, True])
+    @pytest.mark.parametrize(
+        "has_scale,reload_without_scale", [(False, False), (True, False), (True, True)]
+    )
     @pytest.mark.parametrize("tp_mode", [TensorParallelMode.COLUMN, TensorParallelMode.ROW])
-    def test_optional_pre_quant_scale(self, has_scale: bool, tp_mode: TensorParallelMode) -> None:
+    def test_optional_pre_quant_scale(
+        self, has_scale: bool, reload_without_scale: bool, tp_mode: TensorParallelMode
+    ) -> None:
         dim, tp_size = 256, 2
         dtype = torch.float16
         weights = build_weights(dim, dim, self.quant_algo, bias=False)
@@ -1194,6 +1198,13 @@ class TestW4A16AWQMLP(_AWQMLPMixin):
                 torch.testing.assert_close(linear.pre_quant_scale, expected_scale)
             else:
                 assert linear.pre_quant_scale is None
+            if reload_without_scale:
+                unscaled_weights = [
+                    {key: value for key, value in weights[0].items() if key != "pre_quant_scale"}
+                ]
+                linear.load_weights(unscaled_weights)
+                linear.post_load_weights()
+                assert linear.pre_quant_scale is None
             shard_input = x.chunk(tp_size, dim=-1)[rank] if tp_mode == TensorParallelMode.ROW else x
             outputs.append(linear(shard_input.contiguous()))
 
@@ -1202,7 +1213,7 @@ class TestW4A16AWQMLP(_AWQMLPMixin):
         )
         # The synthetic checkpoint maps input i to output i + 1 with unit weight.
         reference_weight = torch.diag(torch.ones(dim - 1, dtype=dtype, device="cuda"), diagonal=-1)
-        scaled_input = x * pre_quant_scale if has_scale else x
+        scaled_input = x * pre_quant_scale if has_scale and not reload_without_scale else x
         expected = torch.nn.functional.linear(scaled_input, reference_weight)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 

@@ -540,15 +540,18 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                     and suffix == "weight"
                     and any(tensors[key].dtype in (torch.uint8, torch.int8) for key in qkvz_keys)
                 ):
-                    assert all(
+                    if not all(
                         tensors[key].dtype in (torch.uint8, torch.int8) for key in qkvz_keys
-                    ), f"Cannot fuse packed INT4 and unpacked weights for {prefix}"
-                    assert len({tensors[key].dtype for key in qkvz_keys}) == 1, (
-                        f"Packed INT4 projections must have the same storage dtype for {prefix}"
-                    )
-                    assert row_q % 2 == 0 and row_v % 2 == 0, (
-                        f"INT4 projection dimensions must be even for {prefix}"
-                    )
+                    ):
+                        raise ValueError(
+                            f"Cannot fuse packed INT4 and unpacked weights for {prefix}"
+                        )
+                    if len({tensors[key].dtype for key in qkvz_keys}) != 1:
+                        raise ValueError(
+                            f"Packed INT4 projections must have the same storage dtype for {prefix}"
+                        )
+                    if row_q % 2 != 0 or row_v % 2 != 0:
+                        raise ValueError(f"INT4 projection dimensions must be even for {prefix}")
                     row_q //= 2
                     row_v //= 2
                 if "qkv" in tensors:
@@ -595,15 +598,20 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                     if dense_layout and any(
                         tensors[key].dtype in (torch.uint8, torch.int8) for key in ba_keys
                     ):
-                        assert all(
+                        if not all(
                             tensors[key].dtype in (torch.uint8, torch.int8) for key in ba_keys
-                        ), f"Cannot fuse packed INT4 and unpacked weights for {prefix}"
-                        assert len({tensors[key].dtype for key in ba_keys}) == 1, (
-                            f"Packed INT4 projections must have the same storage dtype for {prefix}"
-                        )
-                        assert row_ba % 2 == 0, (
-                            f"INT4 projection dimensions must be even for {prefix}"
-                        )
+                        ):
+                            raise ValueError(
+                                f"Cannot fuse packed INT4 and unpacked weights for {prefix}"
+                            )
+                        if len({tensors[key].dtype for key in ba_keys}) != 1:
+                            raise ValueError(
+                                f"Packed INT4 projections must have the same storage dtype for {prefix}"
+                            )
+                        if row_ba % 2 != 0:
+                            raise ValueError(
+                                f"INT4 projection dimensions must be even for {prefix}"
+                            )
                         row_ba //= 2
                     assert tensors["b"].shape[0] == row_ba
                     assert tensors["a"].shape[0] == row_ba

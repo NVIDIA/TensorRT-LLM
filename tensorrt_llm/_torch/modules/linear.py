@@ -2974,6 +2974,8 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
                 requires_grad=False).to(device=device)
 
             copy_weight(module.pre_quant_scale, pre_quant_scale)
+        else:
+            module.pre_quant_scale = None
 
         weight_scale = self.load_weight_scales(module, weights)[0]
 
