@@ -19,7 +19,18 @@ import sys
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
-from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -84,7 +95,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     gen_multimodal_cache_key_tokens,
     typed_range,
 )
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BACKEND as KV_CACHE_MANAGER_V2_BACKEND
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfMemoryError as KVCacheOutOfMemoryError
@@ -256,6 +266,30 @@ class BlockReusePolicy(StrEnum):
     ALL_REUSABLE = "all_reusable"
     PER_REQUEST = "per_request"
     PER_CONVERSATION = "per_conversation"
+
+
+def _swa_endpoint_priority(
+    prompt_length: int, tokens_per_block: int, rewind_tokens: int
+) -> Callable[[int, object], int]:
+    """Assign page priorities around a fixed reusable prompt endpoint.
+
+    ``prompt_length`` excludes the final prompt token that is recomputed.
+    The callback applies to newly created pages; reused pages keep their priority.
+    Intermediate pages remain reusable until evicted.
+    """
+
+    def priority(ordinal: int, life_cycle: object) -> int:
+        if not isinstance(life_cycle, AttnLifeCycle) or life_cycle.window_size is None:
+            return 35
+        first_protected_token = max(0, prompt_length - rewind_tokens - life_cycle.window_size)
+        block_start = ordinal * tokens_per_block
+        if ordinal < life_cycle.num_sink_blocks or (
+            block_start < prompt_length and block_start + tokens_per_block > first_protected_token
+        ):
+            return 70
+        return 0
+
+    return priority
 
 
 def _request_conversation_id(request: LlmRequest) -> Optional[str]:
@@ -1180,6 +1214,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         block_reuse_config = kv_cache_config.block_reuse_config
         self.block_reuse_policy = BlockReusePolicy(block_reuse_config.policy)
+        self._swa_endpoint_rewind = block_reuse_config.swa_endpoint_rewind_tokens
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {idx: offset for offset, idx in enumerate(self.pp_layers)}
         self.max_beam_width = max_beam_width
@@ -1285,16 +1320,9 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_events_config is not None and kv_events_config.enable_kv_cache_events
         )
         if streaming_events_enabled:
-            if self.event_buffer_max_size > 0:
-                logger.warning(
-                    "Both kv_cache_config.event_buffer_max_size and streaming "
-                    "kv_events_config are enabled; streaming publishing takes "
-                    "precedence and the buffered get_kv_cache_events() poll path "
-                    "will return no events."
-                )
             assert kv_events_config is not None
-            # Rejects unsupported parallelism, a non-Python V2 backend and colliding
-            # publish/replay port ranges, all before any socket is bound.
+            # Rejects unsupported parallelism and streaming itself, before any socket is
+            # bound and before any claim is made about which event path is in use.
             validate_streaming_support(
                 kv_events_config,
                 pp_size=mapping.pp_size,
@@ -1302,8 +1330,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Ranks bind by global rank; only those sharing a host can collide.
                 ranks_per_host=min(mapping.dp_size, mapping.gpus_per_node),
                 data_parallel_size=mapping.dp_size,
-                backend=KV_CACHE_MANAGER_V2_BACKEND,
             )
+            if self.event_buffer_max_size > 0:
+                logger.warning(
+                    "Both kv_cache_config.event_buffer_max_size and streaming "
+                    "kv_events_config are enabled; streaming publishing takes "
+                    "precedence and the buffered get_kv_cache_events() poll path "
+                    "will return no events."
+                )
             if mapping.enable_attention_dp or mpi_rank() == 0:
                 # Constructing it is side-effect free; start() below binds the socket
                 # and starts the publisher thread once every other check has passed.
@@ -3777,6 +3811,45 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
         return self._resume_and_restore(req.py_request_id, kv_cache)
 
+    # ---- preemption ----
+    #
+    # Suspension only unpins pages; the eviction controller then migrates them
+    # one cache level down. With GPU as the last level a suspended page stays
+    # `HELD`, which `CacheLevelManager.is_evictable` refuses to evict, so
+    # suspension frees nothing and the scheduler has no way out of a full pool.
+    #
+    # Preemption is the fallback for that case. It gives the pages up instead
+    # of parking them, which costs a re-prefill but always works.
+
+    @property
+    def has_cache_tier_below_gpu(self) -> bool:
+        """True when a suspended page has somewhere to be evicted to."""
+        return len(self.impl.cache_tier_list) > 1
+
+    def preempt_request(self, req: LlmRequest) -> bool:
+        """Give up *req*'s KV cache so its pages can be reclaimed.
+
+        Unlike :meth:`suspend_request` this does not keep the pages. Closing
+        the request's `_KVCache` returns its committed blocks to the radix tree
+        as reusable prefix and leaves their pages `DROPPABLE`, which is
+        evictable at every level, unlike `HELD`. The data is not thrown away:
+        it stays resident and locally matchable until something else needs the
+        space.
+
+        The request is reset to context state by the caller and re-prefills
+        whatever it can no longer match.
+
+        Returns whether the pages were released. Callers must check: pages
+        still being read out of, such as by a connector save in flight, are
+        not released until that completes.
+        """
+        self._release_preempted(req)
+        return True
+
+    def _release_preempted(self, req: LlmRequest) -> None:
+        self.free_resources(req)
+        req.py_num_connector_matched_tokens = 0
+
     # ---- prepare_resources ----
 
     def _life_cycle_by_layer_group(self) -> List[AttnLifeCycle]:
@@ -5760,12 +5833,25 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         salt_int = self._derive_reuse_salt(cache_salt)
         enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
+        priority_kwargs = {}
+        if (
+            self._swa_endpoint_rewind > 0
+            and self.enable_block_reuse
+            and self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
+            and not is_dummy
+            and not self.is_draft
+            and expected_prompt_length is not None
+        ):
+            priority_kwargs["custom_priority_callback"] = _swa_endpoint_priority(
+                expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind
+            )
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=salt_int),
             input_tokens,
             id=request_id,
             enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
+            **priority_kwargs,
         )
         self.kv_cache_map[request_id] = kv_cache
         if enable_request_stats and not self.enable_stats:
