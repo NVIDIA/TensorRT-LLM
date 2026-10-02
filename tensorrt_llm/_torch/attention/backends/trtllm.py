@@ -900,11 +900,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Prepare backend state shared by draft-forward execution paths."""
-        return None
+        # Recurrent-state metadata can own cache-layout-dependent tables too,
+        # such as the GLM k-pool slot tables. Let it select its draft view.
+        hook = getattr(getattr(self, "mamba_metadata", None),
+                       "prepare_for_draft_forward", None)
+        return hook(self) if hook is not None else None
 
     def restore_after_draft_forward(self, saved_state: dict | None) -> None:
         """Restore backend state modified for draft-forward execution."""
-        return None
+        hook = getattr(getattr(self, "mamba_metadata", None),
+                       "restore_after_draft_forward", None)
+        if hook is not None:
+            hook(self, saved_state)
 
     def token_major_gen_view(self) -> Optional["TokenMajorGenView"]:
         """The token-major generation presentation, or None.

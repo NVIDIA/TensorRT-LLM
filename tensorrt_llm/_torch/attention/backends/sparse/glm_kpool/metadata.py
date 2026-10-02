@@ -29,6 +29,11 @@ class Glm5NextMamba2Metadata(KimiK3MambaMetadata):
         super().__init__(max_batch_size, chunk_size, max_num_tokens)
         self.glm_block_tables: torch.Tensor | None = None
         self._glm_block_tables_cpu: torch.Tensor | None = None
+        # Slot tables of a separate draft cache manager. A draft forward rebinds
+        # glm_block_tables to this buffer, so the target and draft segments of a
+        # captured graph read distinct addresses.
+        self._glm_draft_block_tables: torch.Tensor | None = None
+        self._glm_draft_block_tables_cpu: torch.Tensor | None = None
         self.glm_cached_lens_host: list[int] = []
         self.glm_ctx_cu_seqlens: list[int] = [0]
 
@@ -88,3 +93,47 @@ class Glm5NextMamba2Metadata(KimiK3MambaMetadata):
             if page_ids:
                 staging[row, : len(page_ids)].copy_(torch.as_tensor(page_ids, dtype=torch.long))
         self.glm_block_tables[:batch].copy_(staging[:batch], non_blocking=True)
+
+    def prepare_for_draft_forward(self, attn_metadata) -> dict | None:
+        """Select the draft cache manager's slot tables for a draft forward.
+
+        The caller has already swapped attn_metadata.kv_cache_manager to the
+        separate draft manager, so the sparse backend reads the draft pools. The
+        slot ids must come from that manager too: the target and draft managers
+        allocate independently and the draft pool can be smaller, so a target
+        slot id can be past its end.
+        """
+        manager = attn_metadata.kv_cache_manager
+        if self.glm_block_tables is None or not isinstance(manager, Glm5NextCacheManager):
+            return None
+        target_tables = self.glm_block_tables
+        if self._glm_draft_block_tables is None:
+            self._glm_draft_block_tables = torch.zeros_like(target_tables)
+            self._glm_draft_block_tables_cpu = torch.zeros(
+                target_tables.shape, dtype=torch.long, pin_memory=prefer_pinned()
+            )
+        self.glm_block_tables = self._glm_draft_block_tables
+        saved_state = {"glm_block_tables": target_tables}
+        # Recording a capture executes no kernels. Eager forwards and the
+        # pre-replay call from the model engine refresh the tables.
+        request_ids = attn_metadata.request_ids
+        capturing = target_tables.is_cuda and torch.cuda.is_current_stream_capturing()
+        if capturing or request_ids is None:
+            return saved_state
+        batch = attn_metadata.seq_lens.shape[0]
+        pages = manager.get_batch_slot_tables(list(request_ids)[:batch])
+        staging = self._glm_draft_block_tables_cpu
+        staging[:batch].zero_()
+        width = staging.shape[1]
+        for row, page_ids in enumerate(pages):
+            if page_ids:
+                count = min(len(page_ids), width)
+                staging[row, :count].copy_(torch.as_tensor(page_ids[:count], dtype=torch.long))
+        self._glm_draft_block_tables[:batch].copy_(staging[:batch], non_blocking=True)
+        return saved_state
+
+    def restore_after_draft_forward(self, attn_metadata, saved_state: dict | None) -> None:
+        """Rebind the target manager's slot tables after a draft forward."""
+        del attn_metadata
+        if saved_state is not None and "glm_block_tables" in saved_state:
+            self.glm_block_tables = saved_state["glm_block_tables"]
