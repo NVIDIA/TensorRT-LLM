@@ -29,6 +29,7 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
+from ..pyexecutor.config_utils import get_layer_attention_window
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
@@ -679,6 +680,7 @@ class Eagle3DecoderLayer(DecoderLayer):
         is_first_layer: bool = True,
         use_mla: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        local_layer_idx: int = 0,
     ) -> None:
         super().__init__()
         config = model_config.pretrained_config
@@ -700,6 +702,29 @@ class Eagle3DecoderLayer(DecoderLayer):
         else:
             self.self_attn = Eagle3Attention(model_config, layer_idx,
                                              self._next_layer_regular)
+
+        # Resolve the per-layer sliding window with the same helper that sizes
+        # the draft KV cache (``_derive_draft_max_attention_window``), indexed
+        # by the draft-local layer index rather than the target-offset global
+        # ``layer_idx``. The window is forwarded to attention as
+        # ``attention_window_size`` only when its forward accepts it -- MLA
+        # does not, and no MLA model currently uses SWA.
+        sliding_window = get_layer_attention_window(config, local_layer_idx)
+        self.self_attn.sliding_window = sliding_window
+        self._attn_kwargs = {}
+        if sliding_window is not None:
+            forward_params = inspect.signature(
+                self.self_attn.forward).parameters
+            if "attention_window_size" in forward_params:
+                self._attn_kwargs["attention_window_size"] = sliding_window
+            else:
+                logger.warning(
+                    "sliding_window=%s is configured on %s but its forward "
+                    "method does not accept attention_window_size; ignoring "
+                    "sliding window for this attention module.",
+                    sliding_window,
+                    type(self.self_attn).__name__,
+                )
 
         if config.model_type == "llama4_text":
             inter_size = config.intermediate_size_mlp
@@ -754,6 +779,7 @@ class Eagle3DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            **self._attn_kwargs,
         )
 
         hidden_states, residual = self.post_attention_layernorm(
@@ -846,6 +872,7 @@ class Eagle3DraftModel(DecoderModel):
                     is_first_layer=(i == 0),
                     use_mla=use_mla,
                     aux_stream=self.aux_stream,
+                    local_layer_idx=i,
                 ) for i in range(self.num_layers)
             ])
         else:
@@ -854,6 +881,7 @@ class Eagle3DraftModel(DecoderModel):
                 start_layer_idx,
                 use_mla=use_mla,
                 aux_stream=self.aux_stream,
+                local_layer_idx=0,
             )
 
         self.norm = RMSNorm(
