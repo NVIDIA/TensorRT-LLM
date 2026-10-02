@@ -99,7 +99,8 @@ def _fc1_perm(rows: int, device) -> torch.Tensor:
 
 def _prep_fc1_weight(blocks: torch.Tensor, core) -> torch.Tensor:
     """[E, 2I, H/32, 16] uint8 blocks -> kernel FC1 operand."""
-    b = blocks.reshape(core.num_experts, 2 * core.inter, core.hidden // 2)
+    cfg = core.model_config.pretrained_config
+    b = blocks.reshape(cfg.num_local_experts, 2 * cfg.intermediate_size, cfg.hidden_size // 2)
     up, gate = _split_gate_up(b)
     cols = core.fc1_k_pad // 2
     w = torch.cat(
@@ -135,8 +136,9 @@ def _prep_fc1_bias(bias: torch.Tensor, core) -> torch.Tensor:
 
 def _prep_fc2_weight(blocks: torch.Tensor, core) -> torch.Tensor:
     """[E, H, I/32, 16] uint8 blocks -> kernel FC2 operand (no interleave)."""
+    cfg = core.model_config.pretrained_config
     w = _pad_rows_cols(
-        blocks.reshape(core.num_experts, core.hidden, core.inter // 2),
+        blocks.reshape(cfg.num_local_experts, cfg.hidden_size, cfg.intermediate_size // 2),
         core.fc2_rows_pad,
         core.inter_pad // 2,
     )
@@ -163,10 +165,11 @@ def _to_fp32(t: torch.Tensor, core) -> torch.Tensor:
 def _manifest(core) -> dict:
     """target param key -> list of (ckpt key, index into the param | None,
     source transform | None)."""
-    q_width = core.heads_q * core.head_dim
-    kv_width = core.heads_kv * core.head_dim
+    cfg = core.model_config.pretrained_config
+    q_width = cfg.num_attention_heads * cfg.head_dim
+    kv_width = cfg.num_key_value_heads * cfg.head_dim
     rows: dict = {}
-    for i in range(core.num_layers):
+    for i in range(cfg.num_hidden_layers):
         p = f"model.layers.{i}"
         rows[f"l{i}_norm1"] = [(f"{p}.input_layernorm.weight", None, None)]
         rows[f"l{i}_qkv"] = [
