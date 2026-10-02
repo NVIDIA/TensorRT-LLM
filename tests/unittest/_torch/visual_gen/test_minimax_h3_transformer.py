@@ -812,7 +812,7 @@ def test_transformer_block_is_fullgraph_compile_safe(
 
 @pytest.mark.parametrize(
     ("backend", "supported"),
-    [("VANILLA", True), ("FA4", False), ("TRTLLM", False), ("CUTEDSL", False)],
+    [("VANILLA", True), ("FA4", True), ("TRTLLM", False), ("CUTEDSL", False)],
 )
 def test_key_padding_mask_support_tracks_attention_backend(backend: str, supported: bool) -> None:
     config = _make_model_config()
@@ -1306,3 +1306,18 @@ def test_refiner_rejects_padding_without_mask_support() -> None:
     refiner.sharder = SimpleNamespace(size=2)
     with pytest.raises(NotImplementedError, match="key_padding_mask"):
         refiner(torch.zeros(1, 3, 4))
+
+
+@requires_cuda
+def test_fa4_rejects_interior_padding() -> None:
+    if not _sm_at_least(10):
+        pytest.skip("FA4 requires SM100 or newer")
+    assert FA4_AVAILABLE
+    config = _make_model_config(num_layers=1, num_refiner_layers=1, attention_head_dim=128)
+    config.attention = AttentionConfig(backend="FA4")
+    model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
+    _initialize_weights(model)
+    inputs = _model_inputs("cuda")
+    inputs["token_tags"] = torch.tensor([1, -1, 2, 0], device="cuda")
+    with torch.inference_mode(), pytest.raises(NotImplementedError, match="trailing"):
+        model(**inputs)

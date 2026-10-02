@@ -27,12 +27,12 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 
-def _make_model_config() -> DiffusionModelConfig:
+def _make_model_config(backend: str = "VANILLA") -> DiffusionModelConfig:
     return DiffusionModelConfig(
         pretrained_config=SimpleNamespace(
             num_attention_heads=2,
-            attention_head_dim=16,
-            hidden_size=32,
+            attention_head_dim=128 if backend == "FA4" else 16,
+            hidden_size=256 if backend == "FA4" else 32,
             num_layers=2,
             num_refiner_layers=1,
             ffn_dim=32,
@@ -51,7 +51,7 @@ def _make_model_config() -> DiffusionModelConfig:
         ),
         quant_config=QuantConfig(),
         mapping=Mapping(),
-        attention=AttentionConfig(backend="VANILLA"),
+        attention=AttentionConfig(backend=backend),
         attention_metadata_state=create_attention_metadata_state(),
     )
 
@@ -74,7 +74,7 @@ def _make_vae() -> TiledAutoencoderKLMiniMaxH3:
     return vae
 
 
-def _worker(rank: int, port: int) -> None:
+def _worker(rank: int, port: int, backend: str) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "nccl",
@@ -86,7 +86,7 @@ def _worker(rank: int, port: int) -> None:
     try:
         device = torch.device("cuda", rank)
         torch.manual_seed(42)
-        config = _make_model_config()
+        config = _make_model_config(backend)
         reference = MiniMaxH3Transformer3DModel(config).to(device).eval()
         with torch.no_grad():
             for name, parameter in reference.named_parameters():
@@ -94,7 +94,7 @@ def _worker(rank: int, port: int) -> None:
                     parameter.fill_(1)
                 else:
                     parameter.normal_(0, 0.02)
-        config = _make_model_config()
+        config = _make_model_config(backend)
         vgm = VisualGenMapping(world_size=2, rank=rank, ulysses_size=2, parallel_vae_size=2)
         config.visual_gen_mapping = vgm
         config.mapping = vgm.to_llm_mapping()
@@ -138,11 +138,14 @@ def _worker(rank: int, port: int) -> None:
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA GPUs")
-def test_h3_ulysses_and_parallel_vae(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("backend", ["VANILLA", "FA4"])
+def test_h3_ulysses_and_parallel_vae(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
     from ._visual_gen_dist_utils import spawn_with_retry
 
+    if backend == "FA4" and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("FA4 requires SM100 or newer")
     monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
-    spawn_with_retry(lambda port: mp.spawn(_worker, args=(port,), nprocs=2, join=True))
+    spawn_with_retry(lambda port: mp.spawn(_worker, args=(port, backend), nprocs=2, join=True))
 
 
 def _partial_vae_worker(rank: int, port: int) -> None:

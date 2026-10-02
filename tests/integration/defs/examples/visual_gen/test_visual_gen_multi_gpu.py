@@ -426,8 +426,10 @@ def test_wan22_t2v_lpips_against_golden_tp(
     )
 
 
-@pytest.mark.parametrize("ulysses_size,vae_size", [(2, 2), (4, 3)])
-def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size):
+@pytest.mark.parametrize(
+    "ulysses_size,vae_size,backend", [(2, 2, "VANILLA"), (4, 3, "VANILLA"), (2, 2, "FA4")]
+)
+def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size, backend):
     """Compare real Ulysses + tiled VAE collectives with a fresh one-GPU baseline."""
     from defs.examples.visual_gen.test_minimax_h3_e2e import (
         _mean_lpips_distance,
@@ -444,7 +446,7 @@ def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size)
         args = VisualGenArgs(
             model=_minimax_h3_checkpoint_path(),
             parallel_config={"ulysses_size": size, "parallel_vae_size": decode_size},
-            attention_config={"backend": "VANILLA"},
+            attention_config={"backend": backend},
             torch_compile_config={"enable": True},
             cuda_graph_config={"enable": False},
             compilation_config={"skip_warmup": True},
