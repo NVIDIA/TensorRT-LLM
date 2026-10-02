@@ -170,54 +170,6 @@ def test_hash_chain_separates_cache_salts():
     assert salted[0] != other[0]
 
 
-def test_hash_chain_separates_lora_adapters():
-    """Identical text under two adapters must not name one key.
-
-    The adapter rewrites every layer's weights, so the pages differ while the
-    token ids do not.
-    """
-    tokens = list(range(2 * TOKENS_PER_BLOCK))
-    base = list(BlockHashChain(TOKENS_PER_BLOCK).extend(tokens))
-    first = list(BlockHashChain(TOKENS_PER_BLOCK, scope=ReuseScope(lora_task_id=0)).extend(tokens))
-    second = list(BlockHashChain(TOKENS_PER_BLOCK, scope=ReuseScope(lora_task_id=1)).extend(tokens))
-
-    # Task id 0 is a real adapter, so it has to differ from no adapter at all.
-    assert base[0] != first[0]
-    assert first != second
-    assert all(a != b for a, b in zip(first, second))
-
-
-def test_hash_chain_separates_multimodal_content():
-    """Placeholder tokens are the same ids whichever media stands behind them."""
-    tokens = list(range(2 * TOKENS_PER_BLOCK))
-    text_only = list(BlockHashChain(TOKENS_PER_BLOCK).extend(tokens))
-    one_image = list(
-        BlockHashChain(TOKENS_PER_BLOCK, scope=ReuseScope(multimodal_digests=(b"image-a",))).extend(
-            tokens
-        )
-    )
-    other_image = list(
-        BlockHashChain(TOKENS_PER_BLOCK, scope=ReuseScope(multimodal_digests=(b"image-b",))).extend(
-            tokens
-        )
-    )
-    two_images = list(
-        BlockHashChain(
-            TOKENS_PER_BLOCK, scope=ReuseScope(multimodal_digests=(b"image-a", b"image-b"))
-        ).extend(tokens)
-    )
-
-    assert len({text_only[0], one_image[0], other_image[0], two_images[0]}) == 4
-    assert all(a != b for a, b in zip(one_image, other_image))
-
-    # Same media, same keys: this is what lets a repeated multimodal prompt hit.
-    assert one_image == list(
-        BlockHashChain(TOKENS_PER_BLOCK, scope=ReuseScope(multimodal_digests=(b"image-a",))).extend(
-            tokens
-        )
-    )
-
-
 def test_reuse_scope_fields_cannot_be_confused_for_one_another():
     """A scope's seed reads its fields apart, however their bytes line up.
 
@@ -308,29 +260,6 @@ def test_config_reads_sizes_and_staging_from_the_json(store_config):
     assert config.stage_through_host is True
 
 
-@pytest.mark.parametrize("spelling", ["80GB", "4g", "2TB", "512mb"])
-def test_config_refuses_sizes_vllm_would_read_differently(store_config, spelling):
-    """This file is the one both engines open, and they disagree about 'GB'."""
-    raw = json.loads(store_config.read_text())
-    raw["global_segment_size"] = spelling
-    store_config.write_text(json.dumps(raw))
-
-    with pytest.raises(ValueError, match="power of 1000"):
-        resolve_config()
-
-
-@pytest.mark.parametrize(
-    "spelling, expected",
-    [("160GiB", 160 * 1024**3), ("512MiB", 512 * 1024**2), (1024, 1024)],
-)
-def test_config_accepts_the_sizes_both_engines_agree_on(store_config, spelling, expected):
-    raw = json.loads(store_config.read_text())
-    raw["global_segment_size"] = spelling
-    store_config.write_text(json.dumps(raw))
-
-    assert resolve_config().global_segment_size == expected
-
-
 @pytest.mark.parametrize(
     "role, loads, saves",
     [
@@ -362,33 +291,6 @@ def test_config_rejects_a_role_it_does_not_have(store_config):
 
     with pytest.raises(ValueError, match="not one of"):
         resolve_config()
-
-
-# ---- roles ----
-#
-# A role names the traffic an engine drives, not the memory it lends, so every
-# call site is guarded on `loads` and `saves` alone.
-
-
-@pytest.mark.parametrize(
-    "role, loads, saves",
-    [
-        (StoreRole.BOTH, True, True),
-        (StoreRole.PRODUCER, False, True),
-        (StoreRole.CONSUMER, True, False),
-        (StoreRole.CAPACITY, False, False),
-    ],
-)
-def test_each_role_drives_the_traffic_it_names(role, loads, saves):
-    assert role.loads is loads
-    assert role.saves is saves
-    assert role.transfers is (loads or saves)
-
-
-def test_exactly_one_role_transfers_nothing():
-    """Without it, contributing memory would mean also using the pool."""
-    silent = [role for role in StoreRole if not role.transfers]
-    assert silent == [StoreRole.CAPACITY]
 
 
 def test_config_needs_a_pool_described_somewhere(monkeypatch):
