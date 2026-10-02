@@ -33,7 +33,9 @@ KERNEL_FUSED_MOE = "fused_moe"
 
 # Every leaf publishes these two, so they are declared family-wide rather
 # than per leaf.
-TRTLLM_GEN_CAPABILITIES = MoEStaticCapability(supports_expert_bias=True, supports_eplb=True)
+TRTLLM_GEN_CAPABILITIES = MoEStaticCapability(
+    supports_graph_padding_trim=True, supports_expert_bias=True, supports_eplb=True
+)
 
 TRTLLM_GEN_INPUT_REQUIREMENT = MoEInputRequirement(
     # The kernels read bf16 scales, and DeepEP dispatch must mark unfilled rows

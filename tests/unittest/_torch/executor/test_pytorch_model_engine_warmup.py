@@ -40,7 +40,7 @@ from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.speculative.utils import update_draft_len
-from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
+from tensorrt_llm._torch.utils import is_torch_compiling, model_extra_attrs, torch_compiling
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
@@ -290,6 +290,7 @@ def test_prefill_compile_scopes_whole_model_forward(
     engine = SimpleNamespace(
         _model_caller=ModelCaller(model, prefill_compile_only=prefill_only),
         _eager_workspace_reclaimer=None,
+        _moe_graph_padding=None,
         is_warmup=False,
     )
     monkeypatch.setattr(model_call_module, "get_model_extra_attrs", lambda: {})
@@ -306,6 +307,36 @@ def test_prefill_compile_scopes_whole_model_forward(
         assert is_torch_compiling()
     expected = eligible if prefill_only else True
     assert observed == [expected] * (1 if raises else 2)
+
+
+@pytest.mark.cpu_only
+def test_model_forward_publishes_and_clears_moe_padding() -> None:
+    padding = torch.tensor([False, True])
+    observed = []
+    metadata = Mock()
+
+    def forward(*, attn_metadata: object) -> None:
+        assert attn_metadata is metadata
+        observed.append(model_call_module.get_model_extra_attrs()["moe_graph_padding"])
+
+    model = SimpleNamespace(
+        model_config=SimpleNamespace(extra_attrs={"moe_graph_padding": padding}),
+        forward=forward,
+    )
+    caller = ModelCaller(model)
+    engine = SimpleNamespace(
+        _model_caller=caller,
+        _eager_workspace_reclaimer=None,
+        _moe_graph_padding=padding,
+        is_warmup=False,
+    )
+    with model_extra_attrs({}):
+        PyTorchModelEngine.model_forward(engine, attn_metadata=metadata)
+        engine._moe_graph_padding = None
+        PyTorchModelEngine.model_forward(engine, attn_metadata=metadata)
+        caller(attn_metadata=metadata)
+    assert observed[0] is padding
+    assert observed[1:] == [None, None]
 
 
 @pytest.mark.cpu_only
@@ -348,6 +379,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _torch_compile_prefill_only=prefill_only,
         _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
+        _moe_graph_padding=None,
         _warmup_timer=_WarmupTimer(rank=0),
         is_warmup=True,
         cuda_graph_runner=SimpleNamespace(enabled=True),

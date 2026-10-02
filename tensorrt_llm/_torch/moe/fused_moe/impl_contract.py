@@ -39,6 +39,7 @@ class MoEStaticCapability:
 
     # Legacy gate: ``moe.backend.__class__ == CutlassFusedMoE`` in MoEScheduler.
     supports_moe_lora: bool = False
+    supports_graph_padding_trim: bool = False
     # Legacy gate: CuteDslFusedMoE isinstance check in ConfigurableMoE DWDP.
     supports_dwdp: bool = False
     # Legacy gate: ``assert moe_cls in supported_load_balancer_backends`` in

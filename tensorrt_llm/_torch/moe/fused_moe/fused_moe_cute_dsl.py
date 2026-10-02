@@ -683,6 +683,7 @@ class CuteDslFusedMoE(MoEImplBase):
     """
 
     capabilities = MoEStaticCapability(
+        supports_graph_padding_trim=True,
         supports_dwdp=True,
         supports_eplb=True,
         supports_apply_router_weight_on_input=True,

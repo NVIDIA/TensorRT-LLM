@@ -381,3 +381,16 @@ Notes:
           n |= n >> 32
           return n + 1
       ```
+
+### BCG MoE padding
+
+Decoder breakable prefill graphs exclude bucket-padding routes from MoE dispatch and
+expert compute when using NVLinkOneSided with TRTLLM-Gen, CUTLASS, DeepGEMM, or
+CuteDSL backends that declare trim support. Other combinations retain padding;
+router and shared-expert computation is unchanged. PCG does not use this mask.
+Set `TLLM_MOE_TRIM_GRAPH_PADDING=0` before starting the process to disable
+trimming for comparison; this does not disable BCG itself.
+
+Kimi K3 BCG requires the indexed state pool, optimized full-rank KDA decode,
+and finalized decode projection weights. Unsupported configurations fail during
+initialization, before graph capture.

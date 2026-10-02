@@ -774,7 +774,9 @@ class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
                            "fp8_block_scales"),
         scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
         capabilities=MoEStaticCapability(
-            supports_eplb=True, supports_apply_router_weight_on_input=True),
+            supports_graph_padding_trim=True,
+            supports_eplb=True,
+            supports_apply_router_weight_on_input=True),
         input_requirement=MoEInputRequirement(
             routing_scales_dtype=torch.float32,
             requires_run_moe_workspace=True,
