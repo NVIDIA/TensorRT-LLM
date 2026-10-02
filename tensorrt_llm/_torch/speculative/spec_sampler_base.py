@@ -148,10 +148,6 @@ class SampleStateSpec(SampleState):
     # instead would see the NEXT step's buffer, which update_requests itself
     # installs.
     draft_lens: Optional[list[int]] = None
-    # Per-request verify windows for this sampler step, keyed by request id.
-    # The overlap scheduler can stamp the next step on the live request before
-    # this state is consumed, so rewind accounting must use this snapshot.
-    verify_lens_snapshot: Optional[dict[int, int]] = None
 
 
 class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
@@ -327,57 +323,6 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 
-    @staticmethod
-    def _verified_len(
-        request: LlmRequest,
-        runtime_draft_len: int,
-        verify_lens_snapshot: Optional[dict[int, int]],
-        token_window: Optional[int] = None,
-    ) -> int:
-        """Return the number of draft positions verified for one request."""
-        if token_window is not None and token_window > 0:
-            return int(token_window) - 1
-        verify_len = (
-            verify_lens_snapshot.get(request.py_request_id)
-            if verify_lens_snapshot is not None
-            else None
-        )
-        return runtime_draft_len if verify_len is None else int(verify_len)
-
-    @staticmethod
-    def _snapshot_verify_lens(
-        requests: list[LlmRequest],
-    ) -> Optional[dict[int, int]]:
-        """Capture overlap-sensitive ragged windows for one sampler step."""
-        snapshot = {
-            request.py_request_id: int(verify_len)
-            for request in requests
-            if (verify_len := getattr(request, "py_verify_len", None)) is not None
-        }
-        return snapshot or None
-
-    @classmethod
-    def _snapshot_policy_windows_for_step(
-        cls,
-        requests: list[LlmRequest],
-        *,
-        native_uniform: bool,
-        host_snapshot_required: bool,
-        device_verify_lens_available: bool,
-    ) -> Optional[dict[int, int]]:
-        """Select one authoritative verification-window source for this step."""
-        if type(native_uniform) is not bool or type(host_snapshot_required) is not bool:
-            raise ValueError("verification-window markers must be boolean")
-        if native_uniform and (host_snapshot_required or device_verify_lens_available):
-            raise ValueError("native-uniform verification cannot also publish ragged windows")
-        if host_snapshot_required and device_verify_lens_available:
-            raise ValueError("device windows and host-window snapshots are mutually exclusive")
-        if native_uniform:
-            return {}
-        if device_verify_lens_available:
-            return None
-        return cls._snapshot_verify_lens(requests)
-
     def update_requests(
         self,
         state: SampleStateSpec,
@@ -403,6 +348,23 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 
+        if token_windows is not None:
+            for request_index, request in enumerate(state.requests):
+                if request.state == LlmRequestState.GENERATION_COMPLETE:
+                    continue
+                token_window = token_windows[request_index]
+                num_new_tokens = new_tokens_lens_list[request.py_seq_slot]
+                max_new_tokens = min(token_window, self.max_accepted_path_len)
+                if state.draft_lens is not None:
+                    max_new_tokens = min(max_new_tokens, state.draft_lens[request_index] + 1)
+                if not 1 <= token_window <= runtime_draft_len + 1 or not (
+                    1 <= num_new_tokens <= max_new_tokens
+                ):
+                    raise ValueError(
+                        "executed verify_lens must be positive and new_tokens_lens must fit "
+                        "the executed window, original proposals, and token storage"
+                    )
+
         for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
@@ -427,14 +389,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             # length must not be used as the denominator (0 for the request's
             # prefill step, where nothing was verified).
             verified_len = (
-                runtime_draft_len
-                if token_windows is None and state.verify_lens_snapshot is None
-                else self._verified_len(
-                    req,
-                    runtime_draft_len,
-                    state.verify_lens_snapshot,
-                    token_windows[req_idx] if token_windows is not None else None,
-                )
+                token_windows[req_idx] - 1 if token_windows is not None else runtime_draft_len
             )
             drafted_len = state.draft_lens[req_idx] if state.draft_lens is not None else 0
             req.py_num_draft_tokens_verified = min(drafted_len, verified_len)
@@ -458,9 +413,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 - new_tokens_lens: [batch] number of accepted tokens
                 - next_draft_tokens: [batch, max_draft_len] draft tokens for next iter
                 - next_new_tokens: [batch, max_draft_len + 1] input for next iter
-                - verify_lens: optional [batch] device-selected token windows
+                - verify_lens: optional int32 [output rows] executed token windows
+                - verify_lens_in_output_order: required True with verify_lens
                 - native_uniform_verify: optional boolean declaring uniform windows
-                - host_policy_windows_snapshot: optional boolean declaring host windows
+                - host_policy_windows_snapshot: legacy True is rejected
             num_context_logits_prefix_sum: Prefix sum of context logits (unused)
 
         Returns:
@@ -498,23 +454,40 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         runtime_draft_len = o_next_draft_tokens.shape[1]
 
         o_verify_lens = outputs.get("verify_lens")
-        if o_verify_lens is not None:
+        native_uniform = outputs.get("native_uniform_verify", False)
+        host_snapshot = outputs.get("host_policy_windows_snapshot", False)
+        output_order = outputs.get("verify_lens_in_output_order", False)
+        if any(
+            type(marker) is not bool for marker in (native_uniform, host_snapshot, output_order)
+        ):
+            raise ValueError("verification-window markers must be boolean")
+        if host_snapshot:
+            raise ValueError("legacy ragged producers must publish executed output-row verify_lens")
+        if native_uniform and (o_verify_lens is not None or output_order):
+            raise ValueError("native-uniform verification cannot also publish ragged windows")
+        if output_order != (o_verify_lens is not None):
+            raise ValueError("verify_lens requires an explicit output-row layout declaration")
+        if o_verify_lens is None:
+            if not native_uniform and any(
+                getattr(r, "py_verify_len", None) is not None for r in sampling_requests
+            ):
+                raise ValueError("ragged producers must publish executed output-row verify_lens")
+        else:
+            output_rows = outputs["new_tokens_lens"].shape[0]
             if (
                 not isinstance(o_verify_lens, torch.Tensor)
                 or o_verify_lens.dim() != 1
-                or o_verify_lens.dtype not in (torch.int32, torch.int64)
-                or o_verify_lens.shape[0] < num_skip + num_sampling_requests
-            ):
-                raise ValueError(
-                    "verify_lens must contain one integer token window per sampled request"
+                or o_verify_lens.dtype != torch.int32
+                or o_verify_lens.device != outputs["new_tokens_lens"].device
+                or o_verify_lens.shape[0] != output_rows
+                or output_rows < num_skip + num_sampling_requests
+                or any(
+                    outputs[name].shape[0] != output_rows
+                    for name in ("new_tokens", "next_draft_tokens", "next_new_tokens")
                 )
+            ):
+                raise ValueError("verify_lens must contain one int32 token window per output row")
             o_verify_lens = o_verify_lens[num_skip : num_skip + num_sampling_requests]
-        verify_lens_snapshot = self._snapshot_policy_windows_for_step(
-            sampling_requests,
-            native_uniform=outputs.get("native_uniform_verify", False),
-            host_snapshot_required=outputs.get("host_policy_windows_snapshot", False),
-            device_verify_lens_available=o_verify_lens is not None,
-        )
 
         # Pad or truncate to match fixed-size store buffers for index_copy_.
         # The worker output width tracks runtime_draft_len, which dynamic draft
@@ -573,5 +546,4 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             sampler_event=sampler_event,
             runtime_draft_len=runtime_draft_len,
             draft_lens=draft_lens,
-            verify_lens_snapshot=verify_lens_snapshot,
         )
