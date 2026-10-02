@@ -558,15 +558,12 @@ class PyExecutor:
         self.print_log = self.llm_args.print_iter_log
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
         self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
-        # Only every Nth executor iteration builds a full IterationStats
-        # record; see _init_iter_stats_if_sampled.
-        self.iter_perf_stats_interval = getattr(self.llm_args,
-                                                'iter_perf_stats_interval', 1)
-        # Per-iteration counters from iterations skipped by
-        # iter_perf_stats_interval. They are folded into the next emitted
-        # record so that sums over records stay exact.
-        self._skipped_num_new_active_requests = 0
-        self._skipped_num_completed_requests = 0
+        self.iter_perf_stats_interval = self.llm_args.iter_perf_stats_interval
+        # Request counts not yet reported by an IterationStats record. They
+        # accumulate across iterations skipped by iter_perf_stats_interval and
+        # drain into the next emitted record, so sums over records stay exact.
+        self._pending_num_new_active_requests = 0
+        self._pending_num_completed_requests = 0
         self.stream_interval = self.llm_args.stream_interval
         self.perf_manager = PerfMetricsManager(
             enabled=getattr(self.llm_args, 'return_perf_metrics', False))
@@ -2084,17 +2081,26 @@ class PyExecutor:
         The decision only depends on ``iter_counter``, which advances in
         lockstep on all ranks, so Attention-DP ranks sample the same
         iterations and their stats payloads stay aligned.
+
+        New requests only join the pending count here; the record takes it
+        over once its batch is queued (_take_pending_new_active_requests).
         """
         if not self.enable_iter_perf_stats:
             return None
+        self._pending_num_new_active_requests += num_new_active_requests
         if self.iter_counter % self.iter_perf_stats_interval != 0:
-            self._skipped_num_new_active_requests += num_new_active_requests
             return None
-        num_new_active_requests += self._skipped_num_new_active_requests
-        self._skipped_num_new_active_requests = 0
         return self._get_init_iter_stats(
-            num_new_active_requests,
-            self._get_new_active_requests_queue_latency())
+            0, self._get_new_active_requests_queue_latency())
+
+    def _take_pending_new_active_requests(
+            self,
+            iter_stats: Optional[IterationStats]) -> Optional[IterationStats]:
+        """Move the pending new-request count into a queued batch's record."""
+        if iter_stats is not None:
+            iter_stats.num_new_active_requests = self._pending_num_new_active_requests
+            self._pending_num_new_active_requests = 0
+        return iter_stats
 
     def _should_flush_skipped_iter_stats(
             self, active_requests: List[LlmRequest]) -> bool:
@@ -2107,8 +2113,8 @@ class PyExecutor:
         keeps the default behavior unchanged.
         """
         return (self.iter_perf_stats_interval > 1 and not active_requests
-                and (self._skipped_num_completed_requests > 0
-                     or self._skipped_num_new_active_requests > 0))
+                and (self._pending_num_completed_requests > 0
+                     or self._pending_num_new_active_requests > 0))
 
     @staticmethod
     def _is_stats_dummy_request(req) -> bool:
@@ -2656,10 +2662,10 @@ class PyExecutor:
         # IterationStats record); the per-record schedulerMode field tells
         # consumers which interpretation applies.
         iter_latency_ms = (iter_end_time - batch_state.iter_start_time) * 1e3
+        self._pending_num_completed_requests += len(finished_requests)
         if batch_state.iter_stats is None:
-            # Batch skipped by iter_perf_stats_interval: carry its completed
-            # requests over to the next emitted record.
-            self._skipped_num_completed_requests += len(finished_requests)
+            # Batch skipped by iter_perf_stats_interval: its completed
+            # requests stay pending for the next emitted record.
             if not self._should_flush_skipped_iter_stats(active_requests):
                 if batch_state.gpu_forward_events_from_perf_pool:
                     self.perf_manager.release_forward_timing_events(
@@ -2669,18 +2675,13 @@ class PyExecutor:
             # This batch drained the executor. No sampled iteration may follow
             # until new requests arrive, so emit a record now instead of
             # holding the carried-over counters back while idle.
-            num_new_active_requests = self._skipped_num_new_active_requests
-            self._skipped_num_new_active_requests = 0
-            batch_state.iter_stats = self._get_init_iter_stats(
-                num_new_active_requests,
-                self._get_new_active_requests_queue_latency())
+            batch_state.iter_stats = self._take_pending_new_active_requests(
+                self._get_init_iter_stats(
+                    0, self._get_new_active_requests_queue_latency()))
             if batch_state.iter_id is not None:
                 batch_state.iter_stats.iter = batch_state.iter_id
-            num_completed_requests = self._skipped_num_completed_requests
-        else:
-            num_completed_requests = (len(finished_requests) +
-                                      self._skipped_num_completed_requests)
-        self._skipped_num_completed_requests = 0
+        num_completed_requests = self._pending_num_completed_requests
+        self._pending_num_completed_requests = 0
 
         # Snapshot per-loop profiler timings plus the batch-matched GPU
         # forward time. The FPM GPU value is read from CUDA events without
@@ -3070,7 +3071,8 @@ class PyExecutor:
                         scheduled_requests=scheduled_batch,
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,
-                        iter_stats=iter_stats,
+                        iter_stats=self._take_pending_new_active_requests(
+                            iter_stats),
                         iter_id=self.iter_counter,
                         scheduled_batch_stats=scheduled_batch_stats,
                         gpu_forward_start_event=gpu_forward_start,
@@ -4671,6 +4673,8 @@ class PyExecutor:
                 self._flush_pending_transfer_responses()
 
                 if self.enable_iter_perf_stats and sample_state is not None:
+                    iter_stats = self._take_pending_new_active_requests(
+                        iter_stats)
                     self._process_iter_stats(
                         finished_requests, self.active_requests,
                         BatchState(scheduled_requests=scheduled_batch,
@@ -5569,7 +5573,8 @@ class PyExecutor:
                         scheduled_requests=scheduled_batch,
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,
-                        iter_stats=iter_stats,
+                        iter_stats=self._take_pending_new_active_requests(
+                            iter_stats),
                         iter_id=self.iter_counter,
                         scheduled_batch_stats=scheduled_batch_stats,
                         gpu_forward_start_event=gpu_forward_start,

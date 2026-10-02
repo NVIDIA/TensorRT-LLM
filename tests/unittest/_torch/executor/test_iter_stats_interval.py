@@ -12,7 +12,7 @@ unbound against a minimal fake ``self`` and check that:
   are folded into the next emitted record, so sums over records stay exact;
 * an unsampled batch that drains the executor still emits one record, so the
   carried-over counters are not held back while the executor is idle;
-* an interval of 1 keeps the previous behavior;
+* an interval of 1 still builds a record on every iteration;
 * KV-cache iteration deltas are keyed on the record's construction iteration,
   so they still line up with sampled records under the overlap scheduler.
 """
@@ -39,14 +39,13 @@ def _build_fake_self(interval: int, *, enabled: bool = True):
     fake.iter_perf_stats_interval = interval
     fake.iter_counter = 0
     fake.active_requests = []
-    fake._skipped_num_new_active_requests = 0
-    fake._skipped_num_completed_requests = 0
+    fake._pending_num_new_active_requests = 0
+    fake._pending_num_completed_requests = 0
     fake._latest_host_step_time_ms = None
     fake._latest_prev_device_step_time_ms = None
     # _get_init_iter_stats: no spec-decode resource manager / spec config.
     fake.resource_manager.resource_managers.get.return_value = None
     fake.model_engine.spec_config = None
-    fake.drafter = None
     fake._get_new_active_requests_queue_latency.return_value = 0.0
     fake.perf_manager.try_compute_gpu_elapsed_time_ms.return_value = None
 
@@ -54,6 +53,7 @@ def _build_fake_self(interval: int, *, enabled: bool = True):
     for name in (
         "_get_init_iter_stats",
         "_init_iter_stats_if_sampled",
+        "_take_pending_new_active_requests",
         "_should_flush_skipped_iter_stats",
     ):
         method = getattr(PyExecutor, name)
@@ -64,8 +64,9 @@ def _build_fake_self(interval: int, *, enabled: bool = True):
 
 
 def _run_iteration(fake, iter_counter: int, num_new: int):
+    """Build the iteration's record and queue its batch."""
     fake.iter_counter = iter_counter
-    return fake._init_iter_stats_if_sampled(num_new)
+    return fake._take_pending_new_active_requests(fake._init_iter_stats_if_sampled(num_new))
 
 
 def _process(fake, iter_stats, *, iter_id, finished=(), active=(), from_pool=False):
@@ -96,7 +97,7 @@ def _emitted(fake):
 def test_disabled_stats_never_sample_or_accumulate():
     fake = _build_fake_self(interval=1, enabled=False)
     assert _run_iteration(fake, 0, num_new=3) is None
-    assert fake._skipped_num_new_active_requests == 0
+    assert fake._pending_num_new_active_requests == 0
 
 
 def test_interval_one_samples_every_iteration():
@@ -106,7 +107,7 @@ def test_interval_one_samples_every_iteration():
         assert stats is not None
         assert stats.iter == it
         assert stats.num_new_active_requests == num_new
-    assert fake._skipped_num_new_active_requests == 0
+    assert fake._pending_num_new_active_requests == 0
 
 
 def test_interval_samples_every_nth_iteration_and_folds_new_requests():
@@ -122,7 +123,11 @@ def test_interval_samples_every_nth_iteration_and_folds_new_requests():
     # Each record covers its own iteration plus the skipped ones before it.
     assert sampled == {0: 1, 4: 2 + 3 + 4 + 5, 8: 6 + 7 + 8 + 9}
     assert sum(sampled.values()) == sum(new_per_iter)
-    assert fake._skipped_num_new_active_requests == 0
+    assert fake._pending_num_new_active_requests == 0
+    # A sampled record dropped with an unqueued batch leaves its count pending.
+    fake.iter_counter = 12
+    assert fake._init_iter_stats_if_sampled(10) is not None
+    assert _run_iteration(fake, 16, num_new=1).num_new_active_requests == 10 + 1
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +153,7 @@ def test_skipped_batches_fold_completed_requests_into_next_record():
     assert [stats.iter for stats, _ in emitted] == [0, 3]
     assert [completed for _, completed in emitted] == [1, 2 + 0 + 4]
     # Iterations 4 and 5 are still pending for the next record.
-    assert fake._skipped_num_completed_requests == 1 + 3
+    assert fake._pending_num_completed_requests == 1 + 3
     assert fake._append_iter_stats.call_count == 2
 
 
@@ -183,8 +188,8 @@ def test_draining_skipped_batch_emits_record_with_carried_counters():
     assert drain_completed == 1 + 1 + 1
     assert drain_stats.num_new_active_requests == 1
     assert drain_stats.num_active_requests == 0
-    assert fake._skipped_num_completed_requests == 0
-    assert fake._skipped_num_new_active_requests == 0
+    assert fake._pending_num_completed_requests == 0
+    assert fake._pending_num_new_active_requests == 0
 
 
 def test_draining_skipped_batch_without_pending_counters_emits_nothing():
