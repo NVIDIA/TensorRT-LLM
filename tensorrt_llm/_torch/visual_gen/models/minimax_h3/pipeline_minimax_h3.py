@@ -149,16 +149,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         vgm = pipeline_config.visual_gen_mapping
         world_size = vgm.world_size if vgm is not None else pipeline_config.mapping.world_size
         if world_size != 1:
-            is_pure_ulysses = (
-                vgm is not None
-                and pipeline_config.mapping.tp_size == 1
-                and vgm.cfg_size == 1
-                and vgm.ulysses_size == world_size
-                and vgm.cp_size == 1
-                and vgm.ring_size == 1
-                and vgm.attn2d_row_size == 1
-                and vgm.attn2d_col_size == 1
-            )
+            is_pure_ulysses = vgm is not None and vgm.ulysses_size == world_size
             if not is_pure_ulysses:
                 raise NotImplementedError(
                     "MiniMax-H3 multi-GPU support is currently limited to pure "
