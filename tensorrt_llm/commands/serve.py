@@ -1548,6 +1548,7 @@ def serve(
         llm_args = _apply_config_overrides(llm_args, parsed_config_overrides)
 
         _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
+        # Preserve requested settings for failures before entering the LLM constructor.
         try:
             from tensorrt_llm.usage.usage_lib import _capture_startup_context
             _capture_startup_context(requested=llm_args)
