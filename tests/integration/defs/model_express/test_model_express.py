@@ -51,11 +51,11 @@ _MX_CASES = (
     pytest.param(
         MxE2ECase(
             model_env="TRTLLM_MX_LLAMA_MODEL",
-            default_model_subdir="Qwen3/Qwen3-0.6B",
-            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-0.6b-tp1",
+            default_model_subdir="llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+            repository_cache_prefix="models--trtllm-mx-e2e--llama-tp1",
             tp_size=1,
         ),
-        id="qwen3-0.6b-bf16-tp1",
+        id="llama-bf16-tp1",
         marks=pytest.mark.skip_less_device(2),
     ),
     pytest.param(
