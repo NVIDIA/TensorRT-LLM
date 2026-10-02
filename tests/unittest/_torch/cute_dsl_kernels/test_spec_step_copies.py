@@ -562,6 +562,7 @@ def measure_graph(tokens, replays=6):
             st.torch_stage(b)
 
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for st in steps:  # the kernels compile on their first call, outside capture
             run_kernels(st, clone_bufs(st.bufs), stage)
@@ -798,6 +799,7 @@ def time_graph(body, calls, replays=15):
     """Per-call us of a CUDA graph of ``calls`` back-to-back ``body(i)``: median (min, max) over ``replays`` replays.
     ``body(-1)`` runs first, outside capture."""
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         body(-1)
         torch.cuda.synchronize()
