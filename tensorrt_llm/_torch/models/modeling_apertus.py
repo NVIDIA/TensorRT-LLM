@@ -247,12 +247,24 @@ def _alias_language_model_quant_names(model_config: ModelConfig) -> None:
     """Quantization metadata of Apertus 1.5 checkpoints names decoder modules
     ``model.language_model.*``, as in the checkpoint; here they are ``model.*``.
     Add the runtime names alongside the checkpoint names."""
+    # Copy before changing: the configs may be shared with the caller.
+    updates = {}
     quant_config = model_config.quant_config
     if quant_config is not None and quant_config.exclude_modules:
         aliases = [_strip_language_model(m) for m in quant_config.exclude_modules]
-        quant_config.exclude_modules = list(
-            dict.fromkeys([*quant_config.exclude_modules, *aliases])
+        updates["quant_config"] = quant_config.model_copy(
+            update={
+                "exclude_modules": list(dict.fromkeys([*quant_config.exclude_modules, *aliases]))
+            }
         )
     if model_config.quant_config_dict:
-        for name, layer_config in list(model_config.quant_config_dict.items()):
-            model_config.quant_config_dict.setdefault(_strip_language_model(name), layer_config)
+        quant_config_dict = dict(model_config.quant_config_dict)
+        for name, layer_config in model_config.quant_config_dict.items():
+            quant_config_dict.setdefault(_strip_language_model(name), layer_config)
+        updates["quant_config_dict"] = quant_config_dict
+    if updates:
+        frozen = model_config._frozen
+        model_config._frozen = False
+        for key, value in updates.items():
+            setattr(model_config, key, value)
+        model_config._frozen = frozen

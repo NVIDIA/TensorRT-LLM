@@ -526,6 +526,8 @@ class TestApertus1p5(unittest.TestCase):
         self.assertFalse(quantized(model.model.layers[0].mlp.down_proj))
         self.assertTrue(quantized(model.model.layers[0].mlp.up_proj))
         self.assertTrue(quantized(model.model.layers[1].mlp.down_proj))
+        # The caller's QuantConfig is not modified.
+        self.assertEqual(quant_config.exclude_modules, [excluded, "lm_head"])
 
     def setUp(self):
         if not torch.cuda.is_available():
