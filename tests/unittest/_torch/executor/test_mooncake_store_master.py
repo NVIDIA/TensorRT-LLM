@@ -42,6 +42,8 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
     resolve_master_address,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def free_port() -> int:
     with socket.socket() as probe:
