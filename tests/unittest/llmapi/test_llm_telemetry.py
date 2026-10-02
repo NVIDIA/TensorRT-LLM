@@ -19,6 +19,7 @@ hook fires, and that telemetry_disabled flows through correctly.
 """
 
 import builtins
+import json
 import os
 import threading
 from pathlib import Path
@@ -148,7 +149,7 @@ class TestProcessLifecycleCounters:
         assert snapshot["llmInitializationFailures"] == 1
         assert snapshot["llmInstancesCreated"] == 0
 
-    def test_validated_dict_config_tracks_success_only(self, enable_telemetry):
+    def test_validated_dict_config_tracks_success(self, enable_telemetry):
         """A raw dict starts tracking only after it becomes a validated config."""
 
         def initialize(instance, *args, **kwargs):
@@ -168,6 +169,56 @@ class TestProcessLifecycleCounters:
         assert snapshot["llmInstancesCreated"] == 1
         with patch.object(BaseLLM, "_shutdown_resources"):
             llm.shutdown()
+
+    @pytest.mark.cpu_only
+    @pytest.mark.parametrize(
+        "telemetry_config", [{}, {"usage_context": "cli_bench"}, {"disabled": True}]
+    )
+    def test_validated_dict_config_tracks_build_failure(self, enable_telemetry, telemetry_config):
+        """Real argument validation enables tracking before model construction fails."""
+        from tensorrt_llm.commands._telemetry import run_with_terminal_reporting
+
+        error = RuntimeError("expected model build failure")
+        payloads = []
+        with (
+            patch.object(BaseLLM, "_build_model", side_effect=error) as build,
+            patch.object(usage_lib, "_send_to_gxt", side_effect=payloads.append),
+            patch.object(usage_lib, "_is_reporting_rank", return_value=True),
+            patch.object(usage_lib, "bounded_gpu_fields", return_value={}),
+            pytest.raises(RuntimeError) as raised,
+        ):
+            run_with_terminal_reporting(
+                lambda: LLM_torch(
+                    model="unused",
+                    skip_tokenizer_init=True,
+                    gpus_per_node=1,
+                    telemetry_config=telemetry_config,
+                )
+            )
+
+        assert raised.value is error
+        build.assert_called_once_with()
+        assert usage_lib._REPORTER_STARTED is False
+        if telemetry_config.get("disabled"):
+            assert payloads == []
+            assert usage_lib._SESSION is None
+            return
+
+        assert len(payloads) == 1
+        initial, terminal = payloads[0]["events"]
+        assert initial["name"] == "trtllm_initial_report"
+        assert terminal["name"] == "trtllm_exit_report"
+        for event in (initial, terminal):
+            params = event["parameters"]
+            assert params["llmInitializationAttempts"] == 1
+            assert params["llmInitializationFailures"] == 1
+            assert params["llmInstancesCreated"] == 0
+            assert params["ingressPoint"] == telemetry_config.get("usage_context", "llm_class")
+        meta = json.loads(initial["parameters"]["llmApiConfigMetaJson"])
+        assert meta["report_context"] == "pre_initialization_exit"
+        assert meta["source"] == "validated_pre_initialization"
+        assert terminal["parameters"]["terminationKind"] == "exception"
+        assert terminal["parameters"]["lifecyclePhase"] == "model_initialization"
 
     def test_invalid_config_does_not_disable_later_session(self, enable_telemetry):
         """A rejected config object cannot poison later valid telemetry."""
