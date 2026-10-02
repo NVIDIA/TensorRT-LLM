@@ -1581,51 +1581,64 @@ class DeepseekV4MoE(nn.Module):
 
         self.mapping = model_config.mapping
 
-        # FIXME: incompatible with mixed quantization mode (including excluding modules from quantization)
-        block_size = 1
-        if model_config.quant_config and model_config.quant_config.group_size is not None:
-            block_size = model_config.quant_config.group_size
+        gate_up_quant_config, down_quant_config = self._get_shared_expert_projection_quant_configs(
+            model_config, layer_idx
+        )
+        shared_model_config = model_config
+        if (
+            gate_up_quant_config == down_quant_config
+            and gate_up_quant_config is not model_config.quant_config
+        ):
+            shared_model_config = copy.copy(model_config)
+            shared_model_config.quant_config = gate_up_quant_config
 
+        quantized_block_sizes = [
+            quant_config.group_size
+            for quant_config in (gate_up_quant_config, down_quant_config)
+            if (
+                quant_config is not None
+                and quant_config.quant_algo is not None
+                and quant_config.group_size is not None
+            )
+        ]
+        block_size = max(quantized_block_sizes, default=1)
         shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
             shared_expert_intermediate_size, block_size
         )
 
-        # Warmup bypasses rebalance, so configure this before autotuning.
-        # Serving must use the same budget and tuning-cache identity.
-        shared_fc12_reserved_sms = 0
         rebalance_backend = getattr(self.experts, "backend", self.experts)
+        descriptor = getattr(rebalance_backend, "descriptor", None)
+        use_fused_fc12 = (
+            descriptor is not None
+            and descriptor.impl_id == "trtllm.cutedsl.mega_moe.nvfp4"
+            and get_sm_version() == 107
+            and self._shared_fc12_quantization_supported(gate_up_quant_config, down_quant_config)
+            and not model_config.use_cuda_graph
+        )
+
+        shared_mlp_cls = GatedMLP
+        if use_fused_fc12:
+            from ..modules.megamoe_shared_mlp import MegaMoESharedMLP
+
+            shared_mlp_cls = MegaMoESharedMLP
+
+        # Only fused FC12 accepts an SM budget; other shared MLP backends stay unrestricted.
+        shared_reserved_sms = 0
         if (
             getattr(rebalance_backend, "_rebalance_slots_active", 0) > 0
             and get_sm_version() == 107
             and not model_config.use_cuda_graph
             and os.environ.get("TRTLLM_MOE_REBALANCE_PLAN_GAP", "1") == "1"
         ):
-            from ..moe.fused_moe.mega_moe.rebalance_slot_scheduler_v2 import TMA_COPY_SM_COUNT
-
-            shared_fc12_reserved_sms = TMA_COPY_SM_COUNT
-
-        shared_mlp_cls = GatedMLP
-        shared_mlp_kwargs = {}
-        descriptor = getattr(rebalance_backend, "descriptor", None)
-        if (
-            descriptor is not None
-            and descriptor.impl_id == "trtllm.cutedsl.mega_moe.nvfp4"
-            and get_sm_version() == 107
-            and model_config.get_quant_config().quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-            and not model_config.use_cuda_graph
-        ):
-            from ..modules.megamoe_shared_mlp import MegaMoESharedMLP
-
-            # Use the same complete shared FC12 path for OFF and ON.
-            shared_mlp_cls = MegaMoESharedMLP
-            shared_mlp_kwargs["fc12_reserved_sms"] = shared_fc12_reserved_sms
+            shared_reserved_sms = int(getattr(rebalance_backend, "_rebalance_reserved_sms", 0))
+        shared_mlp_kwargs = {"fc12_reserved_sms": shared_reserved_sms} if use_fused_fc12 else {}
 
         self.shared_experts = shared_mlp_cls(
             hidden_size=hidden_size,
             intermediate_size=shared_expert_intermediate_size,
             bias=False,
             dtype=dtype,
-            config=model_config,
+            config=shared_model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
             use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
@@ -1694,6 +1707,61 @@ class DeepseekV4MoE(nn.Module):
             return model_config.quant_config
         return model_config.quant_config_dict.get(
             f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config
+        )
+
+    @staticmethod
+    def _get_shared_expert_projection_quant_configs(
+        model_config, layer_idx: int
+    ) -> tuple[Optional[QuantConfig], Optional[QuantConfig]]:
+        base_name = f"model.layers.{layer_idx}.mlp.shared_experts"
+        quant_config_dict = getattr(model_config, "quant_config_dict", None) or {}
+        global_quant_config = model_config.quant_config
+
+        def resolve_projection(*projection_names: str) -> Optional[QuantConfig]:
+            quant_config = quant_config_dict.get(base_name, global_quant_config)
+            overrides = [
+                candidate
+                for name, candidate in quant_config_dict.items()
+                if any(
+                    name == projection_name or name.startswith(projection_name + ".")
+                    for projection_name in projection_names
+                )
+            ]
+            if overrides:
+                quant_config = overrides[0]
+                if any(candidate != quant_config for candidate in overrides[1:]):
+                    return None
+
+            # modules_to_not_convert is applied after layerwise overrides, so
+            # the global exclusion list must win here as well.
+            if global_quant_config is not None and any(
+                global_quant_config.is_module_excluded_from_quantization(name)
+                for name in projection_names
+            ):
+                return QuantConfig(
+                    quant_algo=None,
+                    kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo,
+                )
+            return quant_config
+
+        gate_up_quant_config = resolve_projection(
+            f"{base_name}.gate_up_proj",
+            f"{base_name}.gate_proj",
+            f"{base_name}.up_proj",
+        )
+        down_quant_config = resolve_projection(f"{base_name}.down_proj")
+        return gate_up_quant_config, down_quant_config
+
+    @staticmethod
+    def _shared_fc12_quantization_supported(
+        gate_up_quant_config: Optional[QuantConfig],
+        down_quant_config: Optional[QuantConfig],
+    ) -> bool:
+        return (
+            gate_up_quant_config is not None
+            and gate_up_quant_config == down_quant_config
+            and gate_up_quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            and gate_up_quant_config.group_size == 128
         )
 
     def compute_routed_output(

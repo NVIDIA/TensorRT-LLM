@@ -45,6 +45,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
+    DeepseekV4MoE,
     DeepseekV4MTP,
     DeepseekV4WeightLoader,
     _copy_deepseek_v4_fused_a_weight_scale,
@@ -609,6 +610,83 @@ def test_deepseek_v4_nvfp4_mixed_precision_config():
         normalized_config.quant_config_dict["model.layers.0.mlp.experts"].quant_algo
         == QuantAlgo.NVFP4
     )
+
+
+@pytest.mark.parametrize(
+    ("quant_config_dict", "exclude_modules", "expected"),
+    [
+        (None, None, True),
+        (
+            {"model.layers.4.mlp.shared_experts.gate_up_proj": QuantConfig(quant_algo=None)},
+            None,
+            False,
+        ),
+        (
+            {"model.layers.4.mlp.shared_experts.down_proj": QuantConfig(quant_algo=None)},
+            None,
+            False,
+        ),
+        (None, ["*shared_experts.gate_up_proj"], False),
+        (None, ["*shared_experts.down_proj"], False),
+        (
+            {
+                "model.layers.4.mlp.shared_experts.gate_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128
+                ),
+                "model.layers.4.mlp.shared_experts.up_proj": QuantConfig(quant_algo=None),
+            },
+            None,
+            False,
+        ),
+        (
+            {
+                "model.layers.4.mlp.shared_experts.gate_up_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=64
+                ),
+                "model.layers.4.mlp.shared_experts.down_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=64
+                ),
+            },
+            None,
+            False,
+        ),
+    ],
+)
+def test_deepseek_v4_shared_fc12_uses_final_projection_quantization(
+    quant_config_dict, exclude_modules, expected
+):
+    model_config = ModelConfig(
+        pretrained_config=DeepseekV4Config(),
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+            group_size=128,
+            exclude_modules=exclude_modules,
+        ),
+        quant_config_dict=quant_config_dict,
+    )
+
+    gate_up_quant, down_quant = DeepseekV4MoE._get_shared_expert_projection_quant_configs(
+        model_config, layer_idx=4
+    )
+
+    assert DeepseekV4MoE._shared_fc12_quantization_supported(gate_up_quant, down_quant) is expected
+
+
+def test_dynamic_eplb_auxiliary_sm_budget_tracks_largest_serial_kernel(
+    monkeypatch,
+):
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe.rebalance_slot_scheduler_v2 import (
+        rebalance_auxiliary_sm_count,
+    )
+
+    monkeypatch.delenv("TRTLLM_MOE_REBALANCE_CTAS_V2", raising=False)
+    assert rebalance_auxiliary_sm_count() == 8
+
+    monkeypatch.setenv("TRTLLM_MOE_REBALANCE_CTAS_V2", "3")
+    assert rebalance_auxiliary_sm_count() == 8
+
+    monkeypatch.setenv("TRTLLM_MOE_REBALANCE_CTAS_V2", "12")
+    assert rebalance_auxiliary_sm_count() == 12
 
 
 def test_deepseek_v4_routed_moe_quant_config_from_mxfp4_header(tmp_path, monkeypatch):
