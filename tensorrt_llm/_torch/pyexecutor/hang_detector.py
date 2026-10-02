@@ -20,10 +20,13 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, print_all_stacks
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    from mpi4py import MPI
 
 # 137 == 128 + SIGKILL(9): the exit code a shell reports for a SIGKILL'd process.
 _HARD_KILL_EXIT_CODE = 137
@@ -61,7 +64,12 @@ def _best_effort_log_debug(message: str) -> None:
         pass
 
 
-def propagate_hard_kill(exit_code: int = _HARD_KILL_EXIT_CODE) -> None:
+def propagate_hard_kill(
+    exit_code: int = _HARD_KILL_EXIT_CODE,
+    *,
+    diagnostics: bool = True,
+    communicator: Optional["MPI.Comm"] = None,
+) -> None:
     """Hard-kill this rank and propagate the kill to peer ranks.
 
     Cross-rank propagation is the load-bearing part: a peer blocked in an NCCL
@@ -73,27 +81,43 @@ def propagate_hard_kill(exit_code: int = _HARD_KILL_EXIT_CODE) -> None:
     - Fallback: self-``SIGKILL``. The launcher (``mpirun`` propagates by default;
       ``srun`` needs ``--kill-on-bad-exit``) then tears down peers.
 
-    All flushing and logging is best-effort: a closed/broken stdout, stderr, or
-    logger must never prevent reaching ``MPI_Abort`` or ``os.kill``.
+    Diagnostic exceptions are ignored. Deadline-driven callers also disable
+    diagnostics so a blocked stream or logging lock cannot delay termination.
+
+    Args:
+        exit_code: Error code supplied to MPI when aborting the worker world.
+        diagnostics: Whether to flush streams and log before termination. Disable
+            for deadline-driven containment, which cannot wait for logging locks
+            or a blocked stream. Existing crash handling keeps its diagnostics.
+        communicator: An executor world captured by a caller before starting a
+            background thread. Defaults to the calling thread's MPI communicator.
     """
-    _best_effort_flush_streams()
+    if diagnostics:
+        _best_effort_flush_streams()
     try:
         if ENABLE_MULTI_DEVICE and not mpi_disabled():
             from mpi4py import MPI
 
-            if MPI.Is_initialized() and MPI.Query_thread() == MPI.THREAD_MULTIPLE:
-                _best_effort_log_error(
-                    "HangDetector: propagating hard-kill to all ranks via MPI_Abort."
-                )
-                mpi_comm().Abort(exit_code)
+            if (
+                MPI.Is_initialized()
+                and not MPI.Is_finalized()
+                and MPI.Query_thread() == MPI.THREAD_MULTIPLE
+            ):
+                if diagnostics:
+                    _best_effort_log_error(
+                        "HangDetector: propagating hard-kill to all ranks via MPI_Abort."
+                    )
+                (mpi_comm() if communicator is None else communicator).Abort(exit_code)
                 return  # not reached; Abort does not return
     except Exception as e:  # noqa: BLE001 - last-resort path must not raise
+        if diagnostics:
+            _best_effort_log_error(
+                f"HangDetector: MPI_Abort propagation failed ({e}); falling back to self-SIGKILL."
+            )
+    if diagnostics:
         _best_effort_log_error(
-            f"HangDetector: MPI_Abort propagation failed ({e}); falling back to self-SIGKILL."
+            "HangDetector: self-SIGKILL; relying on the launcher to propagate to peer ranks."
         )
-    _best_effort_log_error(
-        "HangDetector: self-SIGKILL; relying on the launcher to propagate to peer ranks."
-    )
     os.kill(os.getpid(), signal.SIGKILL)
 
 

@@ -81,3 +81,9 @@ The private Python namespace does not change the protobuf descriptor names: gene
 ## Maintenance boundary
 
 The OpenEngine contributor community owns this adapter, its tests, protocol version updates, and integration bugs. TensorRT-LLM internal APIs do not provide compatibility guarantees to protocol adapters. Adapter updates must follow core runtime changes and must not block normal TensorRT-LLM development or releases.
+
+### Token-only output and conversation affinity
+
+For token-only clients, send boolean `extra["detokenize"] = false`. Omitted detokenize retains normal text output. Forward the same stable `extra["conversation_id"]` on prefill and decode requests and across conversation turns.
+
+Conversation-affinity placement requires `attention_dp_config.kv_cache_routing_conversation_affinity: true` when using attention DP; it is disabled by default. Per-conversation cache retention requires block reuse to be enabled and `kv_cache_config.block_reuse_config.policy: per_conversation` with KV cache manager v2; the default policy is `all_reusable`. Forwarding a conversation ID does not enable either setting. These extensions do not require KV-event discovery, publication, or routing-load snapshots.

@@ -222,6 +222,15 @@
       "path": "cuda_graph_config.enable_padding"
     },
     {
+      "allowed_values": [
+        "num_tokens",
+        "batch_size"
+      ],
+      "capture_policy": "tuple[int|literal]",
+      "kind": "categorical",
+      "path": "cuda_graph_config.extra_model_inputs.shape"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "cuda_graph_config.max_batch_size"
@@ -410,6 +419,15 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "encoder_cuda_graph_config.enable_padding"
+    },
+    {
+      "allowed_values": [
+        "num_tokens",
+        "batch_size"
+      ],
+      "capture_policy": "tuple[int|literal]",
+      "kind": "categorical",
+      "path": "encoder_cuda_graph_config.extra_model_inputs.shape"
     },
     {
       "capture_policy": "int",
