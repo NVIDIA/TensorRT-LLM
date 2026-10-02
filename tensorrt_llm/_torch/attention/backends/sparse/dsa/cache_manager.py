@@ -664,7 +664,7 @@ class DSACacheManagerV2(KVCacheManagerV2):
             )
         cache_bytes = super().get_layer_bytes_per_token(local_layer_idx, data_role)
         if (
-            self.layer_properties[local_layer_idx].dtype == DataType.NVFP4
+            self.dtype_per_layer[local_layer_idx] == DataType.NVFP4
             and self.mla_kv_cache_residual_dim > 0
         ):
             if data_role == Role.KEY:

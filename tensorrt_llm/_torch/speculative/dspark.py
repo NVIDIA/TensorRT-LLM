@@ -550,8 +550,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 manager.draft_window_size != self._win
                 or len(manager.draft_layer_ids) != self._kv_windows.shape[1]
                 or any(
-                    manager.layer_properties[manager.layer_offsets[layer_id]].kv_factor != 1
-                    or manager.layer_properties[manager.layer_offsets[layer_id]].head_dim
+                    manager.kv_factor_per_layer[manager.layer_offsets[layer_id]] != 1
+                    or manager.head_dim_per_layer[manager.layer_offsets[layer_id]]
                     != self._kv_windows.shape[-1]
                     for layer_id in manager.draft_layer_ids
                 )

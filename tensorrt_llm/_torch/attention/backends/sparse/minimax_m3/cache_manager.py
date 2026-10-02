@@ -439,7 +439,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
         """Report the hybrid sparse-NVFP4 / dense-FP8 storage footprint."""
-        if self.layer_properties[local_layer_idx].dtype != DataType.NVFP4:
+        if self.dtype_per_layer[local_layer_idx] != DataType.NVFP4:
             return super().get_layer_bytes_per_token(local_layer_idx, data_role)
         global_layer_idx = int(self.pp_layers[int(local_layer_idx)])
         if global_layer_idx in self.sparse_layer_ids:

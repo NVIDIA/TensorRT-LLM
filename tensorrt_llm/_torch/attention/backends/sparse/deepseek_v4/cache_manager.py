@@ -28,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     _estimate_draft_cache_size_components,
     _fill_kv_pages,
+    _get_draft_layer_sizes,
     _get_generation_kv_capacity,
 )
 from tensorrt_llm._utils import (
@@ -962,10 +963,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         )
         context_size_per_token = non_sliding_attn_size_per_token + context_swa_size_per_token
         generation_size_per_token = non_sliding_attn_size_per_token + generation_swa_size_per_token
-        if self.draft_cache_layers:
+        if self._draft_layer_sizes:
             draft_context, draft_generation, draft_per_request = (
                 _estimate_draft_cache_size_components(
-                    self.draft_cache_layers,
+                    self._draft_layer_sizes,
                     self.tokens_per_block,
                     scratch_tokens=self._standalone_draft_reserve,
                     window_size=self.draft_window_size,
@@ -1176,10 +1177,12 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         )
 
     def _append_standalone_draft_layers(
-        self, config: KVCacheManagerConfigPy
+        self, config: KVCacheManagerConfigPy, **kwargs
     ) -> KVCacheManagerConfigPy:
         # Preserve target virtual-layer indices when registering draft layers.
-        return super()._append_standalone_draft_layers(config, register_model_layers=False)
+        return super()._append_standalone_draft_layers(
+            config, register_model_layers=False, **kwargs
+        )
 
     def _init_indexer_dtype(self, sparse_attn_config: DeepSeekV4SparseAttentionConfig) -> None:
         # Indexer compressor cache layout. Two modes are supported:
@@ -1387,8 +1390,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         local_layer_idx: int,
         data_role: DataRole,
     ) -> int:
-        layer = self.layer_properties.get(local_layer_idx)
-        if layer is not None and layer.cp_as_tp:
+        if local_layer_idx in self.cp_as_tp_layer_ids:
             return super().get_layer_bytes_per_token(local_layer_idx, data_role)
         # The generic layers in the base config are replaced by
         # _build_cache_config, so their buffer sizes are only placeholders.
@@ -1664,9 +1666,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             use_fp8_ds_mla=use_fp8_ds_mla,
         )
         max_batch_size = int(kwargs.get("max_batch_size") or 0)
-        draft_cache_layers = kwargs.get("draft_cache_layers", ())
+        draft_layer_sizes = _get_draft_layer_sizes(**kwargs)
         draft_scratch_tokens = kwargs.get("draft_scratch_tokens", 0)
-        if draft_cache_layers:
+        if draft_layer_sizes:
             _, headroom = _get_generation_kv_capacity(kwargs.get("spec_config"), is_draft=False)
             target_context_swa_bytes, _ = _estimate_swa_cache_size(
                 head_dim,
@@ -1681,7 +1683,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 use_fp8_ds_mla=use_fp8_ds_mla,
             )
             _, draft_generation, draft_per_request = _estimate_draft_cache_size_components(
-                draft_cache_layers,
+                draft_layer_sizes,
                 kwargs["tokens_per_block"],
                 scratch_tokens=draft_scratch_tokens,
                 window_size=kwargs.get("draft_window_size"),

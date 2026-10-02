@@ -32,10 +32,9 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.disaggregation.resource.page import (MapperKind,
                                                               RoleLayout)
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layer import KVCacheLayer
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS, BlockReusePolicy, KVCacheManagerV2, Role,
-    _estimate_draft_cache_size_components)
+    _estimate_draft_cache_size_components, _get_draft_layer_sizes)
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
     KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -2143,7 +2142,6 @@ def _estimate_mamba_hybrid_cache_cost(
     cap_partial_attention_snapshots: bool,
     is_draft: bool = False,
     use_separate_draft_kv_cache: bool = False,
-    draft_cache_layers: tuple[KVCacheLayer, ...] = (),
     draft_scratch_tokens: int = 0,
     **kwargs,
 ) -> Tuple[int, int]:
@@ -2207,13 +2205,14 @@ def _estimate_mamba_hybrid_cache_cost(
         if (has_unaligned_periodic_snapshot
                 and not cap_partial_attention_snapshots):
             regular_slope += math.ceil(attention_block_bytes / interval)
-    if draft_cache_layers:
+    draft_layer_sizes = _get_draft_layer_sizes(**kwargs)
+    if draft_layer_sizes:
         # Hybrid target attention is full attention. Reserve capture/noise
         # capacity only in its attention pools and the distinct draft pools;
         # recurrent state retains the fixed/snapshot accounting above.
         # Hybrid profiling bounds draft storage by full-history attention.
         _, draft_slope, draft_fixed = _estimate_draft_cache_size_components(
-            draft_cache_layers,
+            draft_layer_sizes,
             tokens_per_block,
             generation_capacity_headroom=1,
             scratch_tokens=draft_scratch_tokens,
@@ -3941,8 +3940,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if snapshot_slots > 0:
             # The snapshot plan's partial-page reserve also covers draft KV.
             draft_quota += (self._max_resident_sequences() *
-                            sum(layer.bytes_per_token
-                                for layer in self.draft_cache_layers) *
+                            sum(self._draft_layer_sizes) *
                             self.tokens_per_block)
         return draft_quota
 

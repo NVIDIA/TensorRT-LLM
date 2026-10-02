@@ -25,6 +25,7 @@ from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  is_sm_100f, prefer_pinned,
                                  str_dtype_to_binding, torch_dtype_to_binding,
                                  torch_dtype_to_str)
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
@@ -64,7 +65,6 @@ from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
-from .kv_cache.cache_layer import KVCacheLayer
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            CppMambaHybridCacheManager,
@@ -1896,15 +1896,12 @@ class KvCacheCreator:
         """Pass draft storage properties separately from its history requirements."""
         draft = self._model_engine.model.draft_model
         if self._is_embedded_dspark():
-            layer = KVCacheLayer(
-                num_kv_heads=1,
-                head_dim=int(draft._attn_params["head_dim"]),
-                dtype=torch_dtype_to_binding(torch.bfloat16),
-                kv_factor=1,
-                cp_as_tp=True,
-            )
             return dict(
-                draft_cache_layers=(layer, ) * draft.num_stages,
+                draft_num_layers=draft.num_stages,
+                draft_num_kv_heads=1,
+                draft_head_dim=int(draft._attn_params["head_dim"]),
+                draft_dtype=torch_dtype_to_binding(torch.bfloat16),
+                draft_kv_factor=1,
                 draft_scratch_tokens=0,
                 draft_attention_backend="DSv4",
                 draft_window_size=int(draft._attn_params["window_size"]),
@@ -1927,16 +1924,13 @@ class KvCacheCreator:
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
                 "Standalone draft KV supports FP16 and BF16 storage")
-        layer = KVCacheLayer(
-            num_kv_heads=(num_kv_heads + attention_tp_size - 1) //
-            attention_tp_size,
-            head_dim=head_dim,
-            dtype=torch_dtype_to_binding(dtype),
-            total_num_kv_heads=num_kv_heads,
-            cp_as_tp=True,
-        )
         return dict(
-            draft_cache_layers=(layer, ) * config.num_hidden_layers,
+            draft_num_layers=config.num_hidden_layers,
+            draft_num_kv_heads=(num_kv_heads + attention_tp_size - 1) //
+            attention_tp_size,
+            draft_head_dim=head_dim,
+            draft_dtype=torch_dtype_to_binding(dtype),
+            draft_total_num_kv_heads=num_kv_heads,
             draft_scratch_tokens=self._get_draft_scratch_tokens(),
             draft_attention_backend=attention_backend,
             draft_max_position_embeddings=(getattr(
@@ -2908,7 +2902,12 @@ def _create_kv_cache_manager(
         disable_overlap_scheduler: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None,
-        draft_cache_layers: Sequence[KVCacheLayer] = (),
+        draft_num_layers: int = 0,
+        draft_num_kv_heads: int = 0,
+        draft_head_dim: int = 0,
+        draft_dtype: DataType = DataType.BF16,
+        draft_kv_factor: int = 2,
+        draft_total_num_kv_heads: Optional[int] = None,
         draft_scratch_tokens: int = 0,
         draft_window_size: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
@@ -2919,8 +2918,8 @@ def _create_kv_cache_manager(
     Returns:
         A KVCacheManager instance for the given model engine or model config
     """
-    if draft_cache_layers and not issubclass(kv_cache_manager_cls,
-                                             KVCacheManagerV2):
+    if draft_num_layers and not issubclass(kv_cache_manager_cls,
+                                           KVCacheManagerV2):
         raise ValueError("Unified draft cache layers require KVCacheManagerV2.")
     if cold_page_codec_provider is not None and not issubclass(
             kv_cache_manager_cls, KVCacheManagerV2):
@@ -3090,7 +3089,12 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         manager_extra_kwargs.update(
-            draft_cache_layers=draft_cache_layers,
+            draft_num_layers=draft_num_layers,
+            draft_num_kv_heads=draft_num_kv_heads,
+            draft_head_dim=draft_head_dim,
+            draft_dtype=draft_dtype,
+            draft_kv_factor=draft_kv_factor,
+            draft_total_num_kv_heads=draft_total_num_kv_heads,
             draft_scratch_tokens=draft_scratch_tokens,
             draft_window_size=draft_window_size,
             draft_attention_backend=draft_attention_backend,

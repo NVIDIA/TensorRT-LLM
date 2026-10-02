@@ -753,8 +753,8 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 )
             cache_kind = CacheKind.STATE if is_recurrent else CacheKind.PAGED
 
-            layer = manager.layer_properties.get(int(all_internal_layer_ids[0]))
-            if layer is not None and layer.cp_as_tp:
+            layer_id = int(all_internal_layer_ids[0])
+            if layer_id in manager.cp_as_tp_layer_ids:
                 draft_pool_group, pool_views = _build_draft_pool_views(manager, variant, pg_desc)
                 draft_pool_group_idx = len(pool_groups)
                 pool_groups.append(draft_pool_group)
@@ -762,10 +762,10 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                     pool_group_idx=draft_pool_group_idx,
                     local_layers=local_layers,
                     pool_views=pool_views,
-                    kv_head_num_per_rank=layer.num_kv_heads,
+                    kv_head_num_per_rank=manager.num_kv_heads_per_layer[layer_id],
                     sliding_window_size=_window_size_for_layer(all_internal_layer_ids[0]),
                     cp_as_tp=True,
-                    total_kv_head_num=layer.total_num_kv_heads,
+                    total_kv_head_num=manager._draft_total_num_kv_heads,
                 )
                 continue
 
