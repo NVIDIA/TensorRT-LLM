@@ -47,7 +47,6 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
-from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 _NUM_POOLS = 2
 _CAPACITY = 5
@@ -671,7 +670,7 @@ def _build_manager(
     *, enable_swa_scratch_reuse: bool = False, heterogeneous: bool = False
 ) -> KVCacheManagerV2:
     """A small manager; ``_DEVICE_PAGE_TABLE_ENV`` is read during construction."""
-    init_cuda_once()
+    torch.cuda.init()
     return KVCacheManagerV2(
         KvCacheConfig(
             enable_block_reuse=False,
