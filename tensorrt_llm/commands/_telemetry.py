@@ -250,6 +250,18 @@ def run_with_terminal_reporting(
         return result
 
 
+class TelemetryCommand(click.Command):
+    """Command metadata for partial startup reporting before argument parsing.
+
+    Args:
+        telemetry_llm_startup: Whether the command intends to start an LLM.
+    """
+
+    def __init__(self, *args: Any, telemetry_llm_startup: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.telemetry_llm_startup = telemetry_llm_startup
+
+
 class TelemetryGroup(click.Group):
     """Click group that reports one authoritative terminal process outcome."""
 
@@ -272,10 +284,8 @@ class TelemetryGroup(click.Group):
     def resolve_command(self, ctx: click.Context, args: list[str]) -> tuple:
         """Resolve which Click CLI subcommand was used to start TRT-LLM."""
         result = super().resolve_command(ctx, args)
-        if self._telemetry_usage_context == UsageContext.CLI_BENCH and result[0] in (
-            "throughput",
-            "latency",
-        ):
+        command = result[1]
+        if isinstance(command, TelemetryCommand) and command.telemetry_llm_startup:
             try:
                 from tensorrt_llm.usage.usage_lib import _mark_llm_startup
 

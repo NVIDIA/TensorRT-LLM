@@ -88,10 +88,15 @@ def captured_exit_payloads(monkeypatch, enable_telemetry):
     "command", ["throughput", "latency", "prepare-dataset", "visual-gen", "invalid"]
 )
 def test_bench_startup_context_command_scope(captured_exit_payloads, command):
+    from tensorrt_llm.bench.benchmark.low_latency import latency_command
+    from tensorrt_llm.bench.benchmark.throughput import throughput_command
+
     cli = _telemetry.TelemetryGroup(
         name="bench", telemetry_usage_context=UsageContext.CLI_BENCH, telemetry_component="llm"
     )
-    for name in ("throughput", "latency", "prepare-dataset", "visual-gen"):
+    cli.add_command(throughput_command)
+    cli.add_command(latency_command)
+    for name in ("prepare-dataset", "visual-gen"):
         cli.add_command(click.Command(name))
     with patch.object(usage_lib, "bounded_gpu_fields", return_value={}) as collect:
         with pytest.raises(SystemExit) as exc:
@@ -102,6 +107,36 @@ def test_bench_startup_context_command_scope(captured_exit_payloads, command):
         expected.insert(0, "trtllm_initial_report")
     assert [event["name"] for event in captured_exit_payloads[0]["events"]] == expected
     assert collect.called is (command in ("throughput", "latency"))
+
+
+@pytest.mark.parametrize("name", ["throughput", "renamed-benchmark"])
+@pytest.mark.parametrize("startup", [False, True])
+@pytest.mark.parametrize("option", ["--invalid-option", "--help", "--no-telemetry"])
+def test_startup_command_metadata(captured_exit_payloads, name, startup, option):
+    cli = _telemetry.TelemetryGroup(
+        name="bench", telemetry_usage_context=UsageContext.CLI_BENCH, telemetry_component="llm"
+    )
+
+    @cli.command(name=name, cls=_telemetry.TelemetryCommand, telemetry_llm_startup=startup)
+    @click.option("--telemetry/--no-telemetry", default=True)
+    def command(telemetry):
+        pytest.fail("The command callback must not run before argument validation")
+
+    args = [name, option]
+    if option == "--no-telemetry":
+        args.append("--invalid-option")
+    with patch.object(usage_lib, "bounded_gpu_fields", return_value={}) as collect:
+        with pytest.raises(SystemExit) as exc:
+            cli.main(args=args)
+    assert exc.value.code == (0 if option == "--help" else 2)
+    events = [event["name"] for payload in captured_exit_payloads for event in payload["events"]]
+    expected = []
+    if option == "--invalid-option":
+        expected = ["trtllm_exit_report"]
+        if startup:
+            expected.insert(0, "trtllm_initial_report")
+    assert events == expected
+    assert collect.called is (startup and option == "--invalid-option")
 
 
 @pytest.fixture
