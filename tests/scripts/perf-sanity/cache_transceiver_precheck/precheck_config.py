@@ -339,26 +339,25 @@ def gate_library_content(draft_launch_sh, llm_src):
     )
 
 
-def declared_architectures(cfg: Mapping[str, Any]) -> list[str]:
-    """Read architecture hints for prechecks without a local checkpoint.
+def declared_architecture(cfg: Mapping[str, Any]) -> str | None:
+    """Read one architecture hint for prechecks without a local checkpoint.
 
     Args:
         cfg: Parsed disaggregated benchmark YAML.
 
     Returns:
-        Architecture names in declared priority order, or an empty list.
+        The stripped architecture name, or None when the hint is omitted.
 
     Raises:
-        ValueError: If the declaration is not a string or list of nonempty strings.
+        ValueError: If a supplied declaration is not a nonempty string.
     """
-    value = (cfg.get("metadata") or {}).get("architectures", [])
-    if isinstance(value, str):
-        value = [value]
-    if not isinstance(value, list) or any(
-        not isinstance(name, str) or not name.strip() for name in value
-    ):
-        raise ValueError("metadata.architectures must be a string or list of nonempty strings")
-    return [name.strip() for name in value]
+    metadata = cfg.get("metadata") or {}
+    if "architecture" not in metadata:
+        return None
+    value = metadata["architecture"]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("metadata.architecture must be a nonempty string")
+    return value.strip()
 
 
 def normalized_kv_dtype(dtype: str) -> str:
@@ -473,7 +472,7 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         ),
         "rendezvous_timeout_s": rendezvous_timeout_s,
         "verify_data": bool(knobs["verify_data"]),
-        "architectures": declared_architectures(cfg),
+        "architecture": declared_architecture(cfg),
     }
     for role, side, xcvr in (("ctx", ctx_side, ctx_xcvr), ("gen", gen_side, gen_xcvr)):
         kv_cfg = side.get("kv_cache_config") or {}
@@ -492,7 +491,7 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
 def plan_fingerprint(plan):
     """Stable string both sides must agree on before transferring."""
     keys = (
-        "architectures",
+        "architecture",
         "ctx_use_kv_cache_manager_v2",
         "gen_use_kv_cache_manager_v2",
         "ctx_kv_dtype",
@@ -519,7 +518,7 @@ def side_plan(plan, role):
     """Per-role view: this role's parallelism + transceiver/kv config."""
     return {
         "role": role,
-        "architectures": plan["architectures"],
+        "architecture": plan["architecture"],
         "parallel": plan[role],
         "cache_transceiver_config": plan[f"{role}_cache_transceiver_config"],
         "kv_dtype": plan[f"{role}_kv_dtype"],

@@ -256,7 +256,7 @@ def _read_status(work_dir, name):
     return text, doc
 
 
-def _assert_all_passed(work_dir, launched):
+def _assert_all_passed(work_dir, launched, *, model_dir_resolved=True, synthetic_kv_shape=False):
     failures = []
     for name, proc, log_path in launched:
         if proc.returncode != 0:
@@ -271,6 +271,8 @@ def _assert_all_passed(work_dir, launched):
         assert doc["overall"] == "PASS"
         assert doc["transceiver_runtime"] == "PYTHON"
         assert doc["kv_cache_manager"] == "V2"
+        assert doc["model_dir_resolved"] is model_dir_resolved
+        assert doc["synthetic_kv_shape"] is synthetic_kv_shape
         # The Python transceiver records bandwidth on the ctx (sender) leader
         # via PerfLogManager CSVs in TRTLLM_KVCACHE_TIME_OUTPUT_PATH. Asserting
         # it here ties the whole chain (perf_logger naming -> CSV -> parser)
@@ -352,6 +354,8 @@ def test_precheck_fails_fast_on_fingerprint_mismatch(tmp_path):
         text, doc = _read_status(work_dir, name)
         assert text.startswith(f"FAIL {name}"), f"{name} status: {text}"
         assert doc["overall"] == "FAIL"
+        assert doc["model_dir_resolved"] is True
+        assert doc["synthetic_kv_shape"] is False
     # The gen driver saw the ctx abort its handshake: the reason must name it.
     text, _ = _read_status(work_dir, "gen_0")
     assert "fingerprint" in text or "abort" in text.lower()
@@ -362,14 +366,14 @@ def test_precheck_declared_architecture_without_checkpoint(tmp_path: Path) -> No
     """Missing weights still allow actual V2/Python transfers after auto resolution."""
     pytest.importorskip("mpi4py")
     cfg = _disagg_yaml(1, 1, 1, 1)
-    cfg["metadata"] = {"model_dir_name": "unstaged", "architectures": ["DeepseekV4ForCausalLM"]}
+    cfg["metadata"] = {"model_dir_name": "unstaged", "architecture": "DeepseekV4ForCausalLM"}
     for side in cfg["worker_config"].values():
         side["kv_cache_config"].pop("use_kv_cache_manager_v2")
         side["cache_transceiver_config"]["transceiver_runtime"] = "auto"
     config_path, models_root = _write_inputs(tmp_path, cfg)
     work_dir, launched = _launch_instances(tmp_path, _jobs(cfg, config_path), models_root)
     _wait_all(launched)
-    _assert_all_passed(work_dir, launched)
+    _assert_all_passed(work_dir, launched, model_dir_resolved=False, synthetic_kv_shape=True)
 
 
 @pytest.mark.timeout(300)
@@ -389,4 +393,6 @@ def test_precheck_rejects_inconsistent_checkpoint_visibility(tmp_path: Path) -> 
         text, doc = _read_status(work_dir, name)
         assert "resolved transfer contract mismatch" in text
         assert doc["overall"] == "FAIL"
+        assert doc["model_dir_resolved"] is (name == "ctx_0")
+        assert doc["synthetic_kv_shape"] is (name == "gen_0")
         assert not any(case["status"] == "PASS" for case in doc["cases"])

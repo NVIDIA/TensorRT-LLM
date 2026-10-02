@@ -392,15 +392,15 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
 
     api = load_internal_apis()
     model_cls, hf_view = _lookup_model_cls(model_dir)
-    declared = side.get("architectures", [])
+    declared = side.get("architecture")
     if model_dir is None and declared:
-        model_cls = api.get_registered_model_class(declared[0])
+        model_cls = api.get_registered_model_class(declared)
     setting = side["use_kv_cache_manager_v2"]
     if setting == "auto" and model_cls is None:
         raise RuntimeError(
             "use_kv_cache_manager_v2 is 'auto', but the precheck could not resolve "
             f"a registered model class from model_dir={model_dir!r} or "
-            f"metadata.architectures={declared!r}; refusing to assume V1. "
+            f"metadata.architecture={declared!r}; refusing to assume V1. "
             "Check LLM_MODELS_ROOT/checkpoint staging or declare the model architecture."
         )
 
@@ -455,7 +455,6 @@ def build_kv_cache_manager(kv_shape, plan, side, mapping, max_req_len, use_v2):
     dtype = dtype_map[pcfg.normalized_kv_dtype(dtype_str)]
     if dtype_str not in dtype_map:
         print(f"[precheck] kv dtype {dtype_str!r} not mapped, using BF16", flush=True)
-        dtype = api.DataType.BF16
 
     spec_config = None
     if side["num_nextn_predict_layers"] > 0:
@@ -767,11 +766,12 @@ class StatusRecorder:
     cases + the in-flight failure on disk.
     """
 
-    def __init__(self, work_dir, role, server_idx, is_leader):
+    def __init__(self, work_dir, role, server_idx, is_leader, metadata=None):
         self.role = role
         self.server_idx = server_idx
         self.is_leader = is_leader
         self.cases = []
+        self.metadata = dict(metadata or {})
         status_dir = os.path.join(work_dir, "status")
         if is_leader:
             os.makedirs(status_dir, exist_ok=True)
@@ -807,6 +807,7 @@ class StatusRecorder:
             "overall": overall,
             "cases": self.cases,
             "env": self.env,
+            **self.metadata,
         }
         if extra:
             doc.update(extra)
@@ -929,7 +930,22 @@ class PrecheckRunner:
         self.rank = comm.Get_rank()
         self.is_leader = self.rank == 0
         self.work_dir = args.work_dir
-        self.recorder = StatusRecorder(self.work_dir, self.role, self.server_idx, self.is_leader)
+        model_dir_resolved = plan.get("_model_dir") is not None
+        kv_shape = plan.get("_kv_shape", {})
+        self.recorder = StatusRecorder(
+            self.work_dir,
+            self.role,
+            self.server_idx,
+            self.is_leader,
+            metadata={
+                "model_dir_resolved": model_dir_resolved,
+                "synthetic_kv_shape": (
+                    not model_dir_resolved
+                    or bool(kv_shape.get("simplified"))
+                    or kv_shape.get("source") == "fallback"
+                ),
+            },
+        )
         self.zmq_ctx = None
         self.kvm = None
         self.xcvr = None
@@ -999,7 +1015,7 @@ class PrecheckRunner:
             print(
                 f"[precheck {self.role}_{self.server_idx}] synthetic KV pool; "
                 f"model_dir={self.plan.get('_model_dir')!r}, "
-                f"architectures={self.plan['architectures']!r}. "
+                f"architecture={self.plan['architecture']!r}. "
                 "This checks cache transport; serving still requires a staged checkpoint.",
                 flush=True,
             )
