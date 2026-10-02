@@ -334,6 +334,96 @@ def mnnvl_checkpoint_worker_env(_: int):
     }
 
 
+def mnnvl_growth_graph_forward(tensor_parallel_size: int,
+                               tensor_parallel_rank: int) -> bool:
+    """A graph captured on the MNNVL workspace replays correctly after an eager call grew the workspace, and growth
+    during capture is refused."""
+    env_names = ("TLLM_TEST_MNNVL", "TRTLLM_FORCE_MNNVL_AR")
+    previous_env = {
+        name: (name in os.environ, os.environ.get(name))
+        for name in env_names
+    }
+    tensor_parallel_rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(tensor_parallel_rank)
+    os.environ["TLLM_TEST_MNNVL"] = "1"
+    os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
+    mapping = None
+    try:
+        MPI.COMM_WORLD.barrier()
+        mapping = Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        )
+        MNNVLAllReduce.allreduce_mnnvl_workspaces.pop(mapping, None)
+        MNNVLAllReduce.allreduce_mnnvl_retired_workspaces.pop(mapping, None)
+        gc.collect()
+        MPI.COMM_WORLD.barrier()
+        expected = tensor_parallel_size * (tensor_parallel_size + 1) // 2
+        with torch.inference_mode():
+            allreduce = AllReduce(
+                mapping=mapping,
+                strategy=AllReduceStrategy.MNNVL,
+                dtype=torch.bfloat16,
+            )
+            input_ = torch.full((1, 7168),
+                                tensor_parallel_rank + 1,
+                                dtype=torch.bfloat16,
+                                device="cuda")
+            allreduce(input_)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = allreduce(input_)
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(output,
+                                       torch.full_like(output, expected))
+
+            before = MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping]
+            # Two-shot footprint 2 * 4096 * 7168 * 2 B: well past the initial 16 MiB per Lamport buffer.
+            big = torch.ones((4096, 7168), dtype=torch.bfloat16, device="cuda")
+            torch.testing.assert_close(
+                allreduce(big),
+                torch.full_like(big, tensor_parallel_size))
+            after = MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping]
+            assert after["buffer_size_bytes"] > before["buffer_size_bytes"]
+            assert MNNVLAllReduce.allreduce_mnnvl_retired_workspaces[
+                mapping] == [before]
+            assert before["handle"].is_mapped()
+            del big
+
+            for step in range(3):
+                input_.fill_(tensor_parallel_rank + 2 + step)
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    output,
+                    torch.full_like(output,
+                                    expected + tensor_parallel_size *
+                                    (1 + step)))
+
+            huge = torch.ones((8192, 7168),
+                              dtype=torch.bfloat16,
+                              device="cuda")
+            with pytest.raises(RuntimeError,
+                               match="during CUDA graph capture"):
+                with torch.cuda.graph(torch.cuda.CUDAGraph()):
+                    allreduce(huge)
+        return True
+    finally:
+        if mapping is not None:
+            MNNVLAllReduce.allreduce_mnnvl_workspaces.pop(mapping, None)
+            MNNVLAllReduce.allreduce_mnnvl_retired_workspaces.pop(
+                mapping, None)
+        gc.collect()
+        for name, (was_present, value) in previous_env.items():
+            if was_present:
+                os.environ[name] = value
+            else:
+                os.environ.pop(name, None)
+
+
 def mnnvl_checkpoint_rejects_wrong_membership(world_size: int,
                                               world_rank: int) -> bool:
     env_names = ("TLLM_TEST_MNNVL", "TRTLLM_FORCE_MNNVL_AR")
@@ -701,6 +791,23 @@ def test_mnnvl_checkpoint_rejects_wrong_group_membership(
         mnnvl_checkpoint_rejects_wrong_membership,
         [world_size] * world_size,
         range(world_size),
+    )
+    assert all(results)
+
+
+@pytest.mark.skipif(
+    platform.machine().lower() != "aarch64" or torch.cuda.device_count() < 2
+    or not MnnvlMemory.supports_mnnvl(),
+    reason="requires at least two GB200 GPUs with fabric-backed MNNVL",
+)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_mnnvl_workspace_growth_keeps_captured_graphs(
+        mpi_pool_executor) -> None:
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        mnnvl_growth_graph_forward,
+        [tensor_parallel_size] * tensor_parallel_size,
+        range(tensor_parallel_size),
     )
     assert all(results)
 

@@ -287,6 +287,10 @@ def _get_or_scale_allreduce_mnnvl_workspace(
 
     if mapping not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[
             mapping]["buffer_size_bytes"] < (buffer_size_bytes or 0):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "MNNVL all-reduce workspace creation or growth during CUDA graph capture: run each shape once "
+                "outside capture first")
         # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
         init_buffer_size_bytes = max(1024 * 8192 * elem_size, buffer_size_bytes
                                      or 0)
@@ -363,6 +367,11 @@ def _get_or_scale_allreduce_mnnvl_workspace(
         _initialize_allreduce_mnnvl_protocol(candidate_workspace)
         # Hand ownership of the communicator to the workspace.
         pending_comms.pop(mapping, None)
+        previous_workspace = allreduce_mnnvl_workspaces.get(mapping)
+        if previous_workspace is not None:
+            # CUDA graphs captured before this growth keep launching on the previous buffers and flags.
+            MNNVLAllReduce.allreduce_mnnvl_retired_workspaces.setdefault(
+                mapping, []).append(previous_workspace)
         allreduce_mnnvl_workspaces[mapping] = candidate_workspace
     return allreduce_mnnvl_workspaces[mapping]
 
@@ -753,6 +762,11 @@ class MNNVLAllReduce(nn.Module):
     """
     allreduce_mnnvl_workspaces: typing.ClassVar[dict[Mapping,
                                                      _MnnvlWorkspace]] = {}
+
+    # Workspaces a larger one replaced. CUDA graphs captured before the growth still launch on their buffers and
+    # flags, so they stay alive with the process. The checkpoint hooks cover only the current workspace.
+    allreduce_mnnvl_retired_workspaces: typing.ClassVar[dict[
+        Mapping, list[_MnnvlWorkspace]]] = {}
 
     # Communicators split for a mapping whose workspace construction has not
     # succeeded yet. Ownership moves to the workspace once it is published, so
