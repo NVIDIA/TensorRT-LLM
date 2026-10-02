@@ -60,6 +60,128 @@ def test_generation_admits_decode_before_capacity_growth(active: bool, admitted:
     assert manager._allocated_draft_lens == ({1: 0} if admitted else {})
 
 
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_sparse_metadata_publishes_after_preparation(is_draft: bool) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    order = Mock()
+    manager._disagg_receive_ready = {}
+    manager.is_draft = is_draft
+    manager._stream = Mock(cuda_stream=123)
+    manager.sparse_metadata_batch = Mock()
+    manager.kv_connector_manager = Mock()
+    manager._prepare_draft_resources = order.prepare_draft
+    manager._run_kv_connector_hooks = order.connector
+    order.attach_mock(manager.sparse_metadata_batch.record_read, "record_read")
+    order.attach_mock(manager.sparse_metadata_batch.publish, "publish")
+    scheduled = Mock(context_requests=[])
+    manager.prepare_resources(scheduled)
+    prepare = call.prepare_draft(scheduled) if is_draft else call.connector(scheduled)
+    assert order.mock_calls == [prepare, call.record_read(123), call.publish(123)]
+
+
+def test_sparse_metadata_republishes_after_connector_acceptance() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    order = Mock()
+    manager.is_draft = False
+    manager._stream = Mock(cuda_stream=123)
+    manager.sparse_metadata_batch = Mock()
+    manager.kv_connector_manager = Mock()
+    manager._connector_reservations_enabled = Mock(return_value=True)
+    manager._accept_connector_prefix_reservations = order.accept
+    order.attach_mock(manager.kv_connector_manager.build_scheduler_output, "report")
+    order.attach_mock(manager.sparse_metadata_batch.record_read, "record_read")
+    order.attach_mock(manager.sparse_metadata_batch.publish, "publish")
+    scheduled = Mock()
+    manager.report_batch_to_connector(scheduled)
+    assert order.mock_calls == [
+        call.accept(scheduled),
+        call.report(scheduled, manager),
+        call.record_read(123),
+        call.publish(123),
+    ]
+
+
+def test_sparse_host_indices_cannot_reach_dense_attention_offsets() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._stream = Mock(cuda_stream=123)
+    manager.sparse_metadata_batch = Mock()
+    manager.tokens_per_block = 4
+    manager.kv_cache_map = {7: Mock(is_decoding=True, history_length=4)}
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2."
+        "copy_batch_block_offsets_to_device"
+    ) as dense_copy:
+        with pytest.raises(RuntimeError, match="Offloaded sparse history"):
+            manager.copy_batch_block_offsets(Mock(), [7], 1, 0, 1)
+        dense_copy.assert_not_called()
+    manager.sparse_metadata_batch.publish.assert_called_once_with(123)
+
+
+def test_sparse_publication_failure_stops_metadata_preparation() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._stream = Mock(cuda_stream=123)
+    manager.sparse_metadata_batch = Mock()
+    manager.sparse_metadata_batch.publish.side_effect = RuntimeError("upload failed")
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2."
+        "copy_batch_block_offsets_to_device"
+    ) as dense_copy:
+        with pytest.raises(RuntimeError, match="upload failed"):
+            manager.copy_batch_block_offsets(Mock(), [7], 1, 0, 1)
+        dense_copy.assert_not_called()
+
+
+def test_dense_metadata_preparation_uses_existing_offsets() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._stream = Mock(cuda_stream=123)
+    manager._use_per_layer_page_tables = False
+    manager.index_mapper = Mock()
+    manager.index_mapper.get_copy_index.return_value = Mock(shape=(1,))
+    manager.host_kv_cache_block_offsets = Mock()
+    manager.index_scales = Mock()
+    manager.kv_offset = Mock()
+    destination = Mock()
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2."
+        "copy_batch_block_offsets_to_device"
+    ) as dense_copy:
+        manager.copy_batch_block_offsets(destination, [7], 1, 0, 1)
+        dense_copy.assert_called_once_with(
+            manager.host_kv_cache_block_offsets,
+            destination,
+            manager.index_mapper.get_copy_index.return_value,
+            manager.index_scales,
+            manager.kv_offset,
+            123,
+        )
+
+
+def test_sparse_index_slot_release_detaches_batch_before_reuse() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = False
+    manager._stream = Mock(cuda_stream=123)
+    manager.max_beam_width = 1
+    manager.num_pools = 1
+    manager._early_freed_index_requests = set()
+    cache = Mock()
+    manager.kv_cache_map = {7: cache}
+    manager.sparse_metadata_batch = Mock()
+    manager.index_mapper = Mock()
+    order = Mock()
+    order.attach_mock(manager.sparse_metadata_batch.record_read, "record_read")
+    order.attach_mock(manager.sparse_metadata_batch.remove, "remove")
+    order.attach_mock(cache.set_base_page_index_buf, "detach_buffer")
+    order.attach_mock(manager.index_mapper.remove_sequence, "release_slot")
+    manager.release_index_slot(7)
+    assert order.mock_calls == [
+        call.record_read(123),
+        call.remove(cache),
+        call.detach_buffer(0, 0, None),
+        call.release_slot(7),
+    ]
+    assert manager._early_freed_index_requests == {7}
+
+
 # ---------------------------------------------------------------------------
 # State value constants
 # ---------------------------------------------------------------------------

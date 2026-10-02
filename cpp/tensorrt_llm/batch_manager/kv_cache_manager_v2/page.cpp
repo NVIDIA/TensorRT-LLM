@@ -387,6 +387,9 @@ void UniqPageLock::recordOffloadEvent(CachedCudaEvent const& event)
     page()->readyEvent = event;
     finishEvents.clear();
     finishEvents.push_back(event);
+    // A rejected copy can change readiness without changing the source slot.
+    for (auto const& owner : mOwners)
+        owner.kvCache->onPageStorageChanged();
 }
 
 Slot UniqPageLock::moveToSparseHistory(Slot&& hostSlot)

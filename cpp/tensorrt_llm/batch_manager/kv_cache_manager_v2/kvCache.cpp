@@ -16,6 +16,7 @@
  */
 
 #include "kv_cache_manager_v2/kvCache.h"
+#include "kv_cache_manager_v2/batch.h"
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
@@ -726,6 +727,7 @@ void KvCache::_deactivate()
         _freeScratchSlots();
     }
     mStatus = Status::SUSPENDED;
+    onPageStorageChanged();
 }
 
 void KvCache::close()
@@ -764,7 +766,13 @@ void KvCache::close()
         auto scope = recordEventScope();
         _clearBlocks();
     }
+    if (mPageStorageBatch != nullptr)
+    {
+        mPageStorageBatch->remove(*this);
+    }
     mStatus = Status::CLOSED;
+    mPageStorageRow.reset();
+    onPageStorageChanged();
     mManager->unregisterKvCache(this);
 }
 
@@ -2628,7 +2636,14 @@ bool KvCache::_checkSanity() const
                 }
                 else
                 {
-                    TLLM_CHECK_DEBUG(std::holds_alternative<SharedPageLock>(bp));
+                    if (mStatus == Status::ACTIVE)
+                    {
+                        TLLM_CHECK_DEBUG(std::holds_alternative<SharedPageLock>(bp));
+                    }
+                    else
+                    {
+                        TLLM_CHECK_DEBUG(std::holds_alternative<SharedPtr<PageHolder>>(bp));
+                    }
                     auto page = blockPageGetPage(bp);
                     TLLM_CHECK_DEBUG(dynamicPointerCast<UncommittedPage>(page) != nullptr);
                 }
@@ -2642,6 +2657,120 @@ bool KvCache::_checkSanity() const
 // ---------------------------------------------------------------------------
 // Page index tables
 // ---------------------------------------------------------------------------
+
+void PageStorageSnapshot::waitReady(CudaStream stream) const
+{
+    for (auto const& event : mReadyEvents)
+        event.waitInStream(stream);
+}
+
+void KvCache::onPageStorageChanged() noexcept
+{
+    ++mPageStorageVersion;
+    mPageStorageDirty = true;
+    if (mPageStorageBatch != nullptr)
+    {
+        mPageStorageBatch->markDirty(*mPageStorageRow);
+    }
+}
+
+uint64_t KvCache::pageStorageVersion() const
+{
+    auto const apiLock = mManager->lockShared();
+    return mPageStorageVersion;
+}
+
+bool KvCache::pageStorageDirty() const
+{
+    auto const apiLock = mManager->lockShared();
+    return mPageStorageDirty;
+}
+
+bool KvCache::acknowledgePageStorage(uint64_t version)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    if (version != mPageStorageVersion)
+        return false;
+    mPageStorageDirty = false;
+    return true;
+}
+
+void KvCache::bindPageStorageRow(std::optional<int> row)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    if (mPageStorageBatch != nullptr)
+    {
+        throw LogicError("Use Batch membership APIs to change a batched request's row");
+    }
+    if (row && (*row < 0 || mStatus == Status::CLOSED))
+        throw LogicError("Page storage rows must be nonnegative and bound to a live request");
+    mPageStorageRow = row;
+    onPageStorageChanged();
+}
+
+std::optional<int> KvCache::pageStorageRow() const
+{
+    auto const apiLock = mManager->lockShared();
+    return mPageStorageRow;
+}
+
+PageStorageSnapshot KvCache::getPageStorageSnapshot(LayerGroupId lgId, BeamIndex beamIdx) const
+{
+    auto const apiLock = mManager->lockShared();
+    auto const& buf = mBasePageIndices.at(beamIdx).at(lgId);
+    PageStorageSnapshot snapshot;
+    snapshot.mVersion = mPageStorageVersion;
+    snapshot.mRow = mPageStorageRow;
+    auto const numBlocks = mBlocks.stdSize();
+    if (numBlocks != 0)
+    {
+        std::visit([&](auto const& indices)
+            { snapshot.mBasePageIndices.assign(indices.data(), indices.data() + numBlocks); },
+            buf);
+    }
+    snapshot.mCacheLevels.resize(numBlocks);
+    if (!isActive())
+    {
+        // Held pages may be evicted or relocated; only active locks expose usable slot indices.
+        std::fill(snapshot.mBasePageIndices.begin(), snapshot.mBasePageIndices.end(), kBadPageIndex.value());
+        return snapshot;
+    }
+
+    auto const* attn = std::get_if<AttnLifeCycle>(&mManager->lifeCycles()[lgId]);
+    if (mIsDecoding && attn && attn->isSparse)
+        snapshot.mEligibleHistoryBlocks = mHistoryLength / mTokensPerBlock;
+    snapshot.mReadyEvents.reserve(numBlocks);
+    for (BlockOrdinal ord{0}; ord < mBlocks.size(); ++ord)
+    {
+        int const index = snapshot.mBasePageIndices[toSizeT(ord)];
+        auto const& page = blockPageGetPage(mBlocks[ord].pages.at(beamIdx).at(lgId));
+        if (ord.value() < snapshot.mEligibleHistoryBlocks)
+        {
+            TLLM_CHECK_WITH_INFO(page && index != kBadPageIndex.value() && page->cacheLevel == kSparseHistoryLevel
+                    && page->hasValidSlot() && index == slotIdToPageIndexValue(page->slotId()),
+                "Eligible sparse history must have a locked host mapping");
+        }
+        if (index == kBadPageIndex.value())
+            continue;
+        // Dense SWA scratch indices refer to GPU slots without a Page object.
+        snapshot.mCacheLevels[toSizeT(ord)] = page ? page->cacheLevel : kHotLevel;
+        if (page)
+            snapshot.mReadyEvents.push_back(page->readyEvent);
+    }
+    return snapshot;
+}
+
+void KvCache::recordPageStorageRead(CudaStream stream)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    if (!isActive())
+        throw LogicError("Page storage reads must finish submission before the request is deactivated");
+    CachedCudaEvent completion(stream);
+    completion.waitInStream(reinterpret_cast<CudaStream>(cudaStream()));
+}
 
 void KvCache::_checkPageIndexBufferCapacity(BlockOrdinal newNumBlocks) const
 {
@@ -2662,6 +2791,8 @@ void KvCache::_checkPageIndexBufferCapacity(BlockOrdinal newNumBlocks) const
 
 void KvCache::_resizePageIndexBuffers(BlockOrdinal newNumBlocks)
 {
+    // External buffers keep their full allocation; the number of published entries still changes.
+    onPageStorageChanged();
     for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
     {
         for (LifeCycleId lcId{0}; lcId < mBasePageIndices[bi].size(); ++lcId)
@@ -2700,7 +2831,7 @@ int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc,
     if (ord == kBadBlockOrdinal)
         return kBadPageIndex.value(); // SSM pages use BAD_BLOCK_ORDINAL
     auto& buf = mBasePageIndices[bi][lc];
-    return std::visit(
+    int const old = std::visit(
         [&](auto& b) -> int
         {
             using T = std::decay_t<decltype(b)>;
@@ -2720,6 +2851,9 @@ int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc,
             }
         },
         buf);
+    if (old != value)
+        onPageStorageChanged();
+    return old;
 }
 
 Span<int const> KvCache::getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx) const
@@ -2764,6 +2898,7 @@ std::vector<int> KvCache::getAggregatedPageIndices(LayerGroupId lgId, BeamIndex 
 
 void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t* buf, int len)
 {
+    auto const apiLock = mManager->lockExclusive();
     auto& slot = mBasePageIndices[beamIdx][lgId];
     BlockOrdinal const numBlocks = mBlocks.size();
 
@@ -2776,6 +2911,7 @@ void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t*
             auto const n = std::min(toSizeT(numBlocks), static_cast<size_t>(ext->len));
             std::vector<int> vec(ext->ptr, ext->ptr + n);
             slot = std::move(vec);
+            onPageStorageChanged();
         }
         // If already a vector, nothing to do.
         return;
@@ -2804,6 +2940,7 @@ void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t*
     std::copy(oldData, oldData + copyLen, buf);
     std::fill(buf + copyLen, buf + len, kBadPageIndex.value());
     slot = Span<int>{buf, len};
+    onPageStorageChanged();
 }
 
 int KvCache::getSsmBlockBaseIndex(LayerGroupId lgId, BeamIndex beamIdx) const

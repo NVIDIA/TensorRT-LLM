@@ -38,6 +38,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 // Forward declarations.
+class Batch;
 class KvCacheIntrospection;
 class KvCacheManager;
 class StorageManager;
@@ -152,6 +153,55 @@ private:
     std::optional<std::vector<WeakPtr<CommittedPage>>> mPageRefs;
 };
 
+// Independent host metadata for one request's layer group and beam. Events retain copy readiness,
+// not storage ownership: use the indices only while the request is active and its version matches.
+class PageStorageSnapshot
+{
+public:
+    uint64_t version() const noexcept
+    {
+        return mVersion;
+    }
+
+    std::optional<int> row() const noexcept
+    {
+        return mRow;
+    }
+
+    std::vector<int> const& basePageIndices() const noexcept
+    {
+        return mBasePageIndices;
+    }
+
+    // A missing level accompanies BAD_PAGE_INDEX. Valid indices address slots in the indicated level.
+    std::vector<std::optional<CacheLevel>> const& cacheLevels() const noexcept
+    {
+        return mCacheLevels;
+    }
+
+    int eligibleHistoryBlocks() const noexcept
+    {
+        return mEligibleHistoryBlocks;
+    }
+
+    std::vector<CachedCudaEvent> const& readyEvents() const noexcept
+    {
+        return mReadyEvents;
+    }
+
+    // Queue copy-completion dependencies without blocking the CPU or publishing device metadata.
+    void waitReady(CudaStream stream) const;
+
+private:
+    friend class KvCache;
+    uint64_t mVersion = 0;
+    std::optional<int> mRow;
+    std::vector<int> mBasePageIndices;
+    std::vector<std::optional<CacheLevel>> mCacheLevels;
+    int mEligibleHistoryBlocks = 0;
+    std::vector<CachedCudaEvent> mReadyEvents;
+};
+
 // ---------------------------------------------------------------------------
 // KvCache — manages the per-sequence KV cache state.
 // Mirrors Python's _KVCache.
@@ -230,12 +280,27 @@ public:
     //! Caller must ensure every owner has finished the execution phase that requires these pages on GPU.
     void offloadSparsePages(std::vector<SharedPtr<Page>> const& pages);
 
-    //! Changes when offload relocates an owned page, even if its numeric slot index stays the same.
-    //! Internal invalidation hook for page metadata; read under the manager's API lock.
-    uint64_t pageStorageVersion() const noexcept
-    {
-        return mPageStorageVersion;
-    }
+    // CPU-side invalidation for page indices, levels, readiness, eligibility and row/buffer bindings.
+    // Several changes leave one pending refresh. Acknowledging an older version never clears it.
+    uint64_t pageStorageVersion() const;
+    bool pageStorageDirty() const;
+    // Acknowledge only after refreshing every group/beam from snapshots of this same version.
+    bool acknowledgePageStorage(uint64_t version);
+
+    // Associate a consumer's stable row with this request; nullopt detaches it. Every bind
+    // requires a refresh, including reuse of the same row number by a new consumer. Close detaches it.
+    // Batch members must use Batch::add/remove instead of rebinding directly.
+    void bindPageStorageRow(std::optional<int> row);
+    std::optional<int> pageStorageRow() const;
+
+    // Copies raw indices (no expansion or BAD-to-zero conversion) and readiness under the API lock.
+    // Eligibility is zero for prefill, inactive requests and non-sparse layer groups.
+    PageStorageSnapshot getPageStorageSnapshot(LayerGroupId lgId, BeamIndex beamIdx = kDefaultBeamIndex) const;
+
+    // Call after submitting reads on another stream, before mutating/suspending/closing this cache.
+    // Joins those reads into the request stream so its normal unlock/commit fences protect storage.
+    // Snapshot acquisition, read submission and this call belong to the request's owning thread.
+    void recordPageStorageRead(CudaStream stream);
 
     // ---- Committing tokens -------------------------------------------------
 
@@ -475,6 +540,7 @@ public:
 
     // ---- Internal callbacks (called by SharedPageLock) ----------------------
 
+    // Caller holds the manager's exclusive API lock, including when updating another owner's table.
     int updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc, int value);
 
     std::optional<RequestIdType> id; // opaque identifier (mirrors Python's id field)
@@ -482,13 +548,11 @@ public:
 private:
     friend class KvCacheIntrospection;
     friend class UniqPageLock;
+    friend class Batch;
     friend std::vector<SharedPageLock> batchedLockPages(
         KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
 
-    void onPageStorageChanged() noexcept
-    {
-        ++mPageStorageVersion;
-    }
+    void onPageStorageChanged() noexcept;
 
     // Activate: lock active pages at their required levels. mCudaStream must already be set.
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
@@ -669,7 +733,10 @@ private:
     using LifeCyclePageIndexBuffers = TypedVec<LifeCycleId, PageIndexBuf>;
     using BeamPageIndexBuffers = TypedVec<BeamIndex, LifeCyclePageIndexBuffers>;
     BeamPageIndexBuffers mBasePageIndices;
+    Batch* mPageStorageBatch = nullptr; // Non-owning; both destructors detach membership.
     uint64_t mPageStorageVersion = 0;
+    bool mPageStorageDirty = true;
+    std::optional<int> mPageStorageRow;
 
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
 
