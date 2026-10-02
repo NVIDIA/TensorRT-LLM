@@ -68,20 +68,32 @@ _TIMEOUT_S = 4 * _PHASE_TIMEOUT_S
 _WORKER_TIMEOUT_S = 120.0
 
 
-def _wait(predicate: Callable[[], bool], description: str, timeout: float = 30.0) -> None:
+def _wait(
+    predicate: Callable[[], bool],
+    description: str,
+    timeout: float = 30.0,
+    *,
+    deadline: float | None = None,
+) -> None:
     """Wait for a bounded test precondition, never treating timeout as success.
 
     Args:
         predicate: Observation that must become true.
         description: Diagnostic identifying the missing precondition.
         timeout: Maximum wall-clock wait in seconds.
+        deadline: Shared monotonic deadline, overriding the relative timeout.
 
     Raises:
         AssertionError: The precondition did not become true in time.
     """
-    deadline = time.monotonic() + timeout
-    while not predicate():
+    if deadline is None:
+        deadline = time.monotonic() + timeout
+    while True:
+        ready = predicate()
+        # Evaluating the predicate can consume the remaining deadline budget.
         assert time.monotonic() < deadline, f"Timed out: {description}"
+        if ready:
+            return
         time.sleep(0.01)
 
 
@@ -97,6 +109,31 @@ def _record(directory: Path, name: str, **fields: object) -> None:
     temporary = target.with_suffix(f".{os.getpid()}.tmp")
     temporary.write_text(json.dumps({"pid": os.getpid(), "time": time.monotonic(), **fields}))
     temporary.replace(target)
+
+
+def _report_startup_failure(jobs: dict[str, subprocess.Popen], directory: Path) -> None:
+    """Include bounded worker diagnostics in captured CI output before cleanup.
+
+    Args:
+        jobs: Owned MPI launchers whose startup did not complete.
+        directory: Per-rank markers and CTX/GEN logs for this test.
+    """
+    for role, job in jobs.items():
+        expected = [
+            *(f"{role}.{rank}.{phase}" for rank in range(2) for phase in ("spawned", "ready")),
+            f"{role}.allocated",
+            f"{role}.1.blocked",
+        ]
+        missing = [name for name in expected if not (directory / f"{name}.json").exists()]
+        print(f"Startup failure: {role} launcher_exit={job.poll()}, missing={missing}")
+        try:
+            with (directory / f"{role}.log").open("rb") as log:
+                log.seek(0, os.SEEK_END)
+                log.seek(max(0, log.tell() - 8192))
+                tail = log.read(8192).decode(errors="replace")
+        except OSError as error:
+            tail = f"Log unavailable: {error}"
+        print(f"{role} log tail (at most 8192 bytes):\n{tail}")
 
 
 def _stop_owned_jobs(jobs: dict[str, subprocess.Popen], directory: Path) -> None:
@@ -151,6 +188,62 @@ def _stop_owned_jobs(jobs: dict[str, subprocess.Popen], directory: Path) -> None
         except psutil.NoSuchProcess:
             pass
     assert not survivors, f"owned MPI ranks survived cleanup: {survivors}"
+
+
+def _wait_for_rank_exit(directory: Path, role: str, timeout: float = 15.0) -> None:
+    """Observe both original ranks exiting, without sending cleanup signals.
+
+    A zombie has exited but has not been reaped. Neither that state nor PID reuse
+    means the original rank is still executing; neither proves GPU/RDMA fencing.
+
+    Args:
+        directory: Existing per-rank PID/create-time records and output directory.
+        role: Endpoint world whose production containment must stop both ranks.
+        timeout: Maximum passive observation time, independent of transfer grace.
+
+    Raises:
+        AssertionError: Any original rank remains live or cannot be observed.
+    """
+    import psutil
+
+    identities = [
+        json.loads((directory / f"{role}.{rank}.spawned.json").read_text()) for rank in range(2)
+    ]
+    started = time.monotonic()
+    history = []
+    previous = None
+    while True:
+        observations = []
+        for rank, identity in enumerate(identities):
+            observation = {"rank": rank, "pid": identity["pid"], "created": identity["created"]}
+            try:
+                process = psutil.Process(identity["pid"])
+                observed_created = process.create_time()
+                observation["observed_created"] = observed_created
+                if observed_created != identity["created"]:
+                    state = "reused"
+                else:
+                    status = process.status()
+                    observation["status"] = status
+                    state = "zombie" if status == psutil.STATUS_ZOMBIE else "live"
+            except psutil.NoSuchProcess:
+                state = "absent"
+            except psutil.AccessDenied:
+                state = "unobservable"
+            observation["state"] = state
+            observations.append(observation)
+        elapsed = time.monotonic() - started
+        if observations != previous:
+            history.append({"elapsed": elapsed, "ranks": observations})
+            previous = observations
+        exited = all(item["state"] in ("absent", "zombie", "reused") for item in observations)
+        if exited or elapsed >= timeout:
+            _record(
+                directory, f"{role}.exit_check", passed=exited, elapsed=elapsed, history=history
+            )
+            assert exited, f"Original {role} ranks did not exit before cleanup: {observations}"
+            return
+        time.sleep(0.01)
 
 
 class _MaskedCompletion:
@@ -408,7 +501,11 @@ def _worker(args: argparse.Namespace) -> None:
     )
     if role == "ctx" and rank == 0:
         _record(directory, "endpoint", endpoint=transceiver._context_info_endpoint)
-    _wait(lambda: (directory / "endpoint.json").exists(), "CTX endpoint")
+    _wait(
+        lambda: (directory / "endpoint.json").exists(),
+        "CTX endpoint",
+        deadline=args.startup_deadline,
+    )
     endpoint = json.loads((directory / "endpoint.json").read_text())["endpoint"]
     world.Barrier()
     if rank == 1:
@@ -463,7 +560,11 @@ def _worker(args: argparse.Namespace) -> None:
         pool=full_pool,
         filler_blocks=initial_pool["free"],
     )
-    _wait(lambda: (directory / "start.json").exists(), "both endpoint worlds initialized")
+    _wait(
+        lambda: (directory / "start.json").exists(),
+        "both endpoint worlds initialized",
+        deadline=args.startup_deadline,
+    )
 
     submissions: list[object] = []
     masked: list[_MaskedCompletion] = []
@@ -885,6 +986,9 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
     )
     unique_id = uuid.uuid4().int & ((1 << 62) - 1)
     jobs = {}
+    # All ranks are local, so their monotonic clocks share this startup budget.
+    startup_deadline = time.monotonic() + _WORKER_TIMEOUT_S
+    startup_complete = False
     with ExitStack() as stack:
         try:
             for role, offset in (("ctx", 0), ("gen", 2)):
@@ -909,6 +1013,8 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
                         str(tmp_path),
                         "--unique-id",
                         str(unique_id),
+                        "--startup-deadline",
+                        str(startup_deadline),
                     ],
                     env=environment,
                     stdout=log,
@@ -922,7 +1028,7 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
                     for rank in range(2)
                 ),
                 "four native MPI ranks",
-                _WORKER_TIMEOUT_S,
+                deadline=startup_deadline,
             )
             _wait(
                 lambda: all(
@@ -931,8 +1037,10 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
                     for role in jobs
                 ),
                 "real V2 allocations and both idle peers entering MPI_Barrier",
+                deadline=startup_deadline,
             )
             _record(tmp_path, "start")
+            startup_complete = True
             if case not in ("baseline", "cancel_before_publication"):
                 _wait(
                     lambda: all((tmp_path / f"{role}.prepared.json").exists() for role in jobs),
@@ -980,12 +1088,7 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
                     "independent peer survives",
                 )
                 assert jobs[survivor].poll() is None
-                for rank in range(2):
-                    pid = json.loads((tmp_path / f"{fatal_role}.{rank}.ready.json").read_text())[
-                        "pid"
-                    ]
-                    with pytest.raises(ProcessLookupError):
-                        os.kill(pid, 0)
+                _wait_for_rank_exit(tmp_path, fatal_role)
             else:
                 for role, job in jobs.items():
                     job.wait(timeout=60)
@@ -994,7 +1097,11 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
                         (tmp_path / f"{role}.{rank}.clean.json").exists() for rank in range(2)
                     )
         finally:
-            _stop_owned_jobs(jobs, tmp_path)
+            try:
+                if not startup_complete:
+                    _report_startup_failure(jobs, tmp_path)
+            finally:
+                _stop_owned_jobs(jobs, tmp_path)
 
 
 if __name__ == "__main__":
@@ -1005,4 +1112,5 @@ if __name__ == "__main__":
     parser.add_argument("--gpu-offset", type=int, required=True)
     parser.add_argument("--directory", required=True)
     parser.add_argument("--unique-id", type=int, required=True)
+    parser.add_argument("--startup-deadline", type=float, required=True)
     _worker(parser.parse_args())
