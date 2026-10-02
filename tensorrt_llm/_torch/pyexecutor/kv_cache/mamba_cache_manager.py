@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.disaggregation.resource.page import (MapperKind,
                                                               RoleLayout)
+from tensorrt_llm._torch.modules.mamba.mamba2_tp import Mamba2TpShard
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS, BlockReusePolicy, KVCacheManagerV2, Role)
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
@@ -493,6 +494,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         use_replay_state_update: bool = False,
         mamba_ssm_stochastic_rounding: bool = False,
         kda_replay_num_spec: Optional[int] = None,
+        is_disagg: bool = False,
     ) -> None:
 
         self.mamba_ssm_cache_dtype = ssm_cache_dtype
@@ -529,21 +531,26 @@ class PythonMambaCacheManager(BaseResourceManager):
         # get tp size
         tp_size = mamba_effective_tp_size(mapping)
 
-        # derive mamba parameters for conv and ssm states
-        d_inner = head_dim * num_heads
-        conv_dim = d_inner + 2 * n_groups * d_state
-        nheads = num_heads
-
-        # check that can be partitioned
-        assert nheads % tp_size == 0, "nheads must be divisible by tp_size"
-        assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
-
-        # partition conv_dim and nheads
-        d_inner_local = d_inner // tp_size
-        ng_ds_local = n_groups * d_state // tp_size
-        conv_dim = conv_dim // tp_size
-        nheads = nheads // tp_size
-        d_inner = d_inner // tp_size
+        # Per-rank conv / ssm state dims. Groups replicate across ranks when
+        # tp_size > n_groups (see mamba2_tp.py); the shard validates tp_size.
+        shard = Mamba2TpShard(tp_size=tp_size,
+                              nheads=num_heads,
+                              n_groups=n_groups,
+                              head_dim=head_dim,
+                              d_state=d_state)
+        # `disaggregation/resource/kv_extractor.py` publishes the conv sections
+        # below for the TP-mismatch split/concat, which assumes every section
+        # is sharded across ranks. Once B/C groups replicate, the two grouped
+        # sections are per-rank replicas, not shards, so the transfer would
+        # silently reassemble a wrong conv state.
+        if is_disagg and shard.replicated:
+            raise ValueError(
+                "Disaggregated Mamba transfer does not support replicated "
+                f"groups (tp_size={tp_size} > n_groups={n_groups})")
+        d_inner_local = shard.tp_d_inner
+        ng_ds_local = shard.tp_grouped_state_dim
+        conv_dim = shard.tp_conv_dim
+        nheads = shard.tp_nheads
 
         # Per-section dims for conv_state.
         # Qwen3-Next: [Q | K | V] = [ng*ds, ng*ds, d_inner]
@@ -671,9 +678,9 @@ class PythonMambaCacheManager(BaseResourceManager):
                 ]
                 spec_path_label = "kda-replay"
             elif self._use_replay_state_update:
-                assert n_groups % tp_size == 0, \
-                    "replay state update requires n_groups divisible by tp_size"
-                n_groups_per_rank = n_groups // tp_size
+                # Replicated layouts hold exactly one group per rank, which the
+                # replay caches handle like any other single-group rank.
+                n_groups_per_rank = shard.tp_ngroups
                 self.replay_history_size = max(MIN_REPLAY_HISTORY_SIZE, T)
 
                 # Compact replay cache.
@@ -1222,6 +1229,7 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
         use_replay_state_update: bool = False,
         mamba_ssm_stochastic_rounding: bool = False,
         kda_replay_num_spec: Optional[int] = None,
+        is_disagg: bool = False,
     ) -> None:
         max_num_sequences = max_batch_size * mapping.pp_size
 
@@ -1243,6 +1251,7 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
             use_replay_state_update=use_replay_state_update,
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
             kda_replay_num_spec=kda_replay_num_spec,
+            is_disagg=is_disagg,
         )
 
     def get_max_resource_count(self) -> int:
@@ -1672,6 +1681,10 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         use_replay_state_update: bool = False,
         mamba_ssm_stochastic_rounding: bool = False,
         kda_replay_num_spec: Optional[int] = None,
+        # Forwarded to the Mamba side only: the Python state pool rejects
+        # replicated B/C groups under disaggregated serving (see
+        # PythonMambaCacheManager.__init__).
+        is_disagg: bool = False,
         # Per-pool configurations forwarded to the C++ KVCacheManager ctor.
         # Lets a single manager host pools with mixed shapes (e.g. Gemma4
         # hybrid attention). See KVCacheManager.__init__.
@@ -1715,6 +1728,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             use_replay_state_update=use_replay_state_update,
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
             kda_replay_num_spec=kda_replay_num_spec,
+            is_disagg=is_disagg,
         )
 
         # initialize kv cache manager
@@ -2251,6 +2265,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         model_type: str = "nemotron_hybrid",
         **kwargs,
     ) -> None:
+        # Consumed here only (the layout guard below); popped so it is not
+        # forwarded into KVCacheManager.__init__, which has no use for it.
+        is_disagg = kwargs.pop("is_disagg", False)
         # 3 kinds of layers:
         # 1) Mamba layers (mamba_layer_mask is True)
         # 2) Full attention layers (full_attention_layer_mask is True)
@@ -2344,24 +2361,26 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
         tp_size = mamba_effective_tp_size(mapping)
-        d_inner = mamba_head_dim * mamba_num_heads
-        conv_dim = d_inner + 2 * mamba_n_groups * mamba_d_state
-        nheads = mamba_num_heads
-        assert nheads % tp_size == 0, "mamba_num_heads must be divisible by tp_size"
-        assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
-        if use_replay_state_update:
-            assert mamba_n_groups % tp_size == 0, \
-                "replay state update requires mamba_n_groups divisible by tp_size"
-        self._n_groups_per_rank = mamba_n_groups // tp_size
-        conv_dim = conv_dim // tp_size
-        nheads = nheads // tp_size
-        self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
-        self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
+        shard = Mamba2TpShard(tp_size=tp_size,
+                              nheads=mamba_num_heads,
+                              n_groups=mamba_n_groups,
+                              head_dim=mamba_head_dim,
+                              d_state=mamba_d_state)
+        # The C++ TP-mismatch split/concat rebuilds the conv sections from the
+        # GLOBAL dims published below (linear_attention_metadata.rnn_*) by
+        # dividing them by tp_size, which is not the per-rank layout once B/C
+        # groups are replicated.
+        if is_disagg and shard.replicated:
+            raise ValueError(
+                "Disaggregated Mamba transfer does not support replicated "
+                f"groups (tp_size={tp_size} > n_groups={mamba_n_groups})")
+        self._n_groups_per_rank = shard.tp_ngroups
+        self.conv_state_shape = [shard.tp_conv_dim, mamba_d_conv - 1]
+        self.ssm_state_shape = [shard.tp_nheads, mamba_head_dim, mamba_d_state]
         self.conv_state_dtype = mamba_cache_dtype
 
         # Store GLOBAL (pre-TP-division) mamba params for disagg RnnModelConfig.
-        # d_inner is computed at the top of __init__ before TP division.
-        d_inner_global = d_inner  # = mamba_head_dim * mamba_num_heads (GLOBAL)
+        d_inner_global = shard.d_inner  # = mamba_head_dim * mamba_num_heads
         conv_dim_global = d_inner_global + 2 * mamba_n_groups * mamba_d_state
         self._rnn_d_state = mamba_d_state
         self._rnn_d_conv = mamba_d_conv
@@ -3134,25 +3153,24 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         if self.local_num_mamba_layers > 0:
             tp_size = mamba_effective_tp_size(mapping)
-            d_inner = mamba_head_dim * mamba_num_heads
-            grouped_state_dim = mamba_n_groups * mamba_d_state
-            conv_dim = d_inner + 2 * grouped_state_dim
-            nheads = mamba_num_heads
-            assert nheads % tp_size == 0, "mamba_num_heads must be divisible by tp_size"
-            assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
-            if kwargs.get("is_disagg",
-                          False) and grouped_state_dim % tp_size != 0:
+            shard = Mamba2TpShard(tp_size=tp_size,
+                                  nheads=mamba_num_heads,
+                                  n_groups=mamba_n_groups,
+                                  head_dim=mamba_head_dim,
+                                  d_state=mamba_d_state)
+            # Replication is the only layout whose conv sections a
+            # disaggregated transfer cannot express: for every non-replicated
+            # tp_size the shard validator admits, n_groups is divisible by
+            # tp_size, hence so is each grouped section.
+            if kwargs.get("is_disagg", False) and shard.replicated:
                 raise ValueError(
-                    "Disaggregated Mamba transfer requires each convolution "
-                    "state section to be divisible by tp_size")
-            if use_replay_state_update:
-                assert mamba_n_groups % tp_size == 0, \
-                    "replay state update requires mamba_n_groups divisible by tp_size"
-            self._n_groups_per_rank = mamba_n_groups // tp_size
-            d_inner_local = d_inner // tp_size
-            grouped_state_dim_local = grouped_state_dim // tp_size
-            conv_dim = conv_dim // tp_size
-            nheads = nheads // tp_size
+                    "Disaggregated Mamba transfer does not support replicated "
+                    f"groups (tp_size={tp_size} > n_groups={mamba_n_groups})")
+            self._n_groups_per_rank = shard.tp_ngroups
+            d_inner_local = shard.tp_d_inner
+            grouped_state_dim_local = shard.tp_grouped_state_dim
+            conv_dim = shard.tp_conv_dim
+            nheads = shard.tp_nheads
             self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
             self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
             # TP-mismatch disaggregated transfers must split the flat
