@@ -17,7 +17,7 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from .._op import Arch, Cell, OpWrapper
 
 
-class _FlashinferRmsnorm(OpWrapper):
+class FlashinferRmsnorm(OpWrapper):
     """`x / sqrt(mean(x^2, -1) + eps) * weight`, one op call, new tensor out.
 
     Fusion boundary: normalization and weight scaling only. No residual add
@@ -95,4 +95,4 @@ class _FlashinferRmsnorm(OpWrapper):
         )
 
 
-flashinfer_rmsnorm = _FlashinferRmsnorm()
+flashinfer_rmsnorm = FlashinferRmsnorm()

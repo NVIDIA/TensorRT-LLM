@@ -31,7 +31,7 @@ _SUMMABLE_DTYPES = frozenset(
 )
 
 
-class _Reducescatter(OpWrapper):
+class Reducescatter(OpWrapper):
     """Sum `input` across every rank in `group`, then keep this rank's slice.
 
     Every rank passes a tensor of the same full shape; the elementwise sum is
@@ -175,4 +175,4 @@ class _Reducescatter(OpWrapper):
             )
 
 
-reducescatter = _Reducescatter()
+reducescatter = Reducescatter()

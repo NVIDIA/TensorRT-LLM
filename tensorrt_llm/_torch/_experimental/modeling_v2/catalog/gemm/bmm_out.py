@@ -11,7 +11,7 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from .._op import Arch, Cell, OpWrapper, assert_within_ulp, true_fp32_matmul
 
 
-class _BmmOut(OpWrapper):
+class BmmOut(OpWrapper):
     """`out[i] = a[i] @ b[i]` for every batch index, in place, returns None.
 
     The point of the op over `torch.bmm` is the caller-owned `out`: both
@@ -98,4 +98,4 @@ class _BmmOut(OpWrapper):
         assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=2.0)
 
 
-bmm_out = _BmmOut()
+bmm_out = BmmOut()

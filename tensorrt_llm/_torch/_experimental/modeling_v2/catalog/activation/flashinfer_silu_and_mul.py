@@ -12,7 +12,7 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from .._op import Arch, Cell, OpWrapper
 
 
-class _FlashinferSiluAndMul(OpWrapper):
+class FlashinferSiluAndMul(OpWrapper):
     """`silu(x[..., :d]) * x[..., d:]` with `d = x.shape[-1] // 2`, new tensor out.
 
     The gate and up projections arrive concatenated along the last dim, which
@@ -74,4 +74,4 @@ class _FlashinferSiluAndMul(OpWrapper):
         )
 
 
-flashinfer_silu_and_mul = _FlashinferSiluAndMul()
+flashinfer_silu_and_mul = FlashinferSiluAndMul()

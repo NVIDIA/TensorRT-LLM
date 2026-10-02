@@ -33,7 +33,7 @@ def _pad_up(value: int, multiple: int) -> int:
     return (value + multiple - 1) // multiple * multiple
 
 
-class _Fp4Quantize(OpWrapper):
+class Fp4Quantize(OpWrapper):
     """Quantize to FP4: `(packed e2m1 data [..., K/2] uint8, scale bytes, 1-D)`.
 
     One scale per `sf_vec_size` contiguous elements of the last dim. NVFP4 --
@@ -207,4 +207,4 @@ class _Fp4Quantize(OpWrapper):
         return out
 
 
-fp4_quantize = _Fp4Quantize()
+fp4_quantize = Fp4Quantize()

@@ -23,6 +23,15 @@ _ROUTING_BIAS_IGNORED = (0, 1, 4, 6)
 ROUTING_METHOD_RENORMALIZE = 1
 ACT_TYPE_SWIGLU = 0
 
+#: The clamped gated activation's fixed constants: `(up + beta) * gate *
+#: sigmoid(alpha * gate)` after `gate.clamp(max=limit)`, `up.clamp(+-limit)`.
+#: gpt-oss carries these two in its HF reference rather than its checkpoint --
+#: every expert on every layer uses the same alpha and beta -- which is why
+#: `bind_glu` below builds them from a count rather than taking them as
+#: arguments: there is nothing a caller could supply that varies.
+GLU_ALPHA = 1.702
+GLU_BETA = 1.0
+
 #: MX block size: one e8m0 scale per 32 elements along K.
 SF_VEC_SIZE = 32
 
@@ -116,7 +125,7 @@ def dequantize_mxfp4(codes: torch.Tensor, exponents: torch.Tensor) -> torch.Tens
     return table[codes.long()] * scale
 
 
-class _Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
+class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
     """One MXFP4-weight MoE layer over MXFP8 (e4m3 + UE8M0) activations, with
     gpt-oss's clamped gated activation.
 
@@ -191,6 +200,26 @@ class _Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
     checks it, and the entry's test builds the layout twice -- once in torch,
     once through the trtllm preprocessing ops -- and compares them first.
     """
+
+    def bind_glu(self, num_experts: int, clamp_limit: float, device: torch.device) -> None:
+        """Bind gpt-oss's clamped-GLU epilogue vectors, via `bind_const`.
+
+        `gemm1_alpha` and `gemm1_beta` are this op's own fixture: a fixed pair
+        the checkpoint never carries, so the op manufactures the per-expert
+        vectors itself from `GLU_ALPHA`/`GLU_BETA` rather than taking them as
+        tensors a caller built. `clamp_limit` does come from the checkpoint --
+        gpt-oss's `swiglu_limit` -- but is still a scalar here: every local
+        expert shares the one value, and broadcasting it into the per-expert
+        `gemm1_clamp_limit` vector `raw_call` wants is this op's business, not
+        a caller's.
+        """
+        self.bind_const(
+            gemm1_alpha=torch.full((num_experts,), GLU_ALPHA, dtype=torch.float32, device=device),
+            gemm1_beta=torch.full((num_experts,), GLU_BETA, dtype=torch.float32, device=device),
+            gemm1_clamp_limit=torch.full(
+                (num_experts,), float(clamp_limit), dtype=torch.float32, device=device
+            ),
+        )
 
     def raw_call(
         self,
@@ -431,4 +460,4 @@ class _Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
             )
 
 
-mxe4m3_mxe2m1_block_scale_moe_runner = _Mxe4m3Mxe2m1BlockScaleMoeRunner()
+mxe4m3_mxe2m1_block_scale_moe_runner = Mxe4m3Mxe2m1BlockScaleMoeRunner()
