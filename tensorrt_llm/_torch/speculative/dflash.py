@@ -796,12 +796,12 @@ class DFlashWorker(SpecWorkerBase):
     ) -> Optional[BaseResourceManager]:
         if resource_manager is not None:
             manager = resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
-            if getattr(manager, "draft_layout", None) is not None:
+            if bool(getattr(manager, "draft_layer_ids", ())):
                 return manager
         return super().get_draft_kv_cache_manager(resource_manager)
 
     def _has_unified_draft_cache(self) -> bool:
-        return getattr(self._ctx_kv_manager, "draft_layout", None) is not None
+        return bool(getattr(self._ctx_kv_manager, "draft_layer_ids", ()))
 
     def _prepare_managed_history(self, request_ids: list[int]) -> list[int]:
         """Restore newly resident histories without rewinding overlapping iterations."""
@@ -874,7 +874,7 @@ class DFlashWorker(SpecWorkerBase):
     ) -> None:
         """Refresh managed inputs before eager execution, capture, or graph replay."""
         manager = self.get_draft_kv_cache_manager(resource_manager)
-        if getattr(manager, "draft_layout", None) is None:
+        if not getattr(manager, "draft_layer_ids", ()):
             return
         self._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata, manager)
         spec_metadata._dflash_worker = self
@@ -989,7 +989,7 @@ class DFlashWorker(SpecWorkerBase):
             # what DSpark is, so this drafter does get a manager under DP. The
             # reachable cases are the two-model paths, which never build one.
             return None
-        unified = getattr(draft_kv_cache_manager, "draft_layout", None) is not None
+        unified = bool(getattr(draft_kv_cache_manager, "draft_layer_ids", ()))
         get_buffers = (
             draft_kv_cache_manager.get_draft_buffers
             if unified
@@ -1126,7 +1126,7 @@ class DFlashWorker(SpecWorkerBase):
         # Only TrtllmAttentionMetadata builds draft_kv_cache_block_offsets.
         # Without it the table stays all-zero and every request would read and
         # write pool block 0 -- silently, at acceptance 1.0.
-        unified = getattr(draft_kv_cache_manager, "draft_layout", None) is not None
+        unified = bool(getattr(draft_kv_cache_manager, "draft_layer_ids", ()))
         if (
             not unified
             and draft_kv_cache_manager is not None
@@ -1744,7 +1744,7 @@ class DFlashWorker(SpecWorkerBase):
             )
 
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
-        if getattr(draft_kv_cache_manager, "draft_layout", None) is not None:
+        if bool(getattr(draft_kv_cache_manager, "draft_layer_ids", ())):
             if not self._ctx_buf_inited or self._ctx_kv_manager is not draft_kv_cache_manager:
                 raise RuntimeError("Unified DSpark draft inputs must be prepared before forward")
         else:

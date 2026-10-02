@@ -23,7 +23,8 @@ import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  is_sm_100f, prefer_pinned,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+                                 str_dtype_to_binding, torch_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
@@ -63,13 +64,13 @@ from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
+from .kv_cache.cache_layer import KVCacheLayer
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            CppMambaHybridCacheManager,
                                            MambaHybridCacheManagerV2,
                                            MixedMambaHybridCacheManager,
                                            use_py_mamba_cache_manager)
-from .kv_cache.standalone_draft_cache import StandaloneDraftLayout
 from .llm_request import ExecutorResponse, LlmRequestState
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -1022,7 +1023,7 @@ class KvCacheCreator:
             self._should_create_separate_draft_kv_cache())
         draft_kwargs = {}
         if self._uses_unified_standalone_draft_cache():
-            draft_kwargs["draft_layout"] = self._get_standalone_draft_layout()
+            draft_kwargs = self._get_unified_draft_cache_kwargs()
         total = self._per_manager_cache_cost(
             self._kv_cache_manager_cls,
             model_config,
@@ -1344,8 +1345,7 @@ class KvCacheCreator:
             num_extra_tokens_per_seq += spec_cfg.tokens_per_gen_step - 1
             num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
             if self._uses_unified_standalone_draft_cache():
-                draft_layout = self._get_standalone_draft_layout()
-                num_extra_tokens_per_seq += draft_layout.extra_tokens
+                num_extra_tokens_per_seq += self._get_draft_scratch_tokens()
 
         if self._dummy_reqs is None:
             self._dummy_reqs = self._create_dummy_context_requests(
@@ -1778,16 +1778,14 @@ class KvCacheCreator:
         kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
             model_engine, kv_cache_config)
 
-        # Keep the target layer layout separate from standalone draft layouts.
-        # Legacy modes construct a separate manager; unified standalone DSpark
-        # passes an explicit draft layout to the target's owner instead.
-        # We still pass spec_config so that num_extra_kv_tokens is calculated.
+        # The target and draft layers have independent storage properties.
+        # spec_config also determines the target's extra-token capacity.
         spec_dec_layer_mask = None
-        standalone_draft_layout = (self._get_standalone_draft_layout() if
-                                   self._uses_unified_standalone_draft_cache()
-                                   else None)
+        draft_cache_kwargs = (self._get_unified_draft_cache_kwargs()
+                              if self._uses_unified_standalone_draft_cache()
+                              else {})
         if (self._should_create_separate_draft_kv_cache()
-                or standalone_draft_layout is not None):
+                or draft_cache_kwargs):
             num_target_layers = model_engine.model.model_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_target_layers
 
@@ -1816,7 +1814,7 @@ class KvCacheCreator:
             self._llm_args.kv_cache_config.kv_events_config,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
-            standalone_draft_layout=standalone_draft_layout,
+            **draft_cache_kwargs,
         )
 
         if not self._skip_est:
@@ -1890,19 +1888,26 @@ class KvCacheCreator:
         return (self._mapping.repurpose_helix_cp_to_tp()
                 if self._mapping.has_cp_helix() else self._mapping)
 
-    def _get_standalone_draft_layout(self) -> StandaloneDraftLayout:
-        """Describe distinct draft layers without borrowing target shapes."""
+    def _get_draft_scratch_tokens(self) -> int:
+        return 0 if self._is_embedded_dspark(
+        ) else self._speculative_config.max_draft_len + 1
+
+    def _get_unified_draft_cache_kwargs(self) -> dict:
+        """Pass draft storage properties separately from its history requirements."""
         draft = self._model_engine.model.draft_model
         if self._is_embedded_dspark():
-            return StandaloneDraftLayout(
-                num_layers=draft.num_stages,
+            layer = KVCacheLayer(
                 num_kv_heads=1,
                 head_dim=int(draft._attn_params["head_dim"]),
-                dtype=torch.bfloat16,
-                extra_tokens=0,
-                attention_backend="DSv4",
+                dtype=torch_dtype_to_binding(torch.bfloat16),
                 kv_factor=1,
-                window_size=int(draft._attn_params["window_size"]),
+                cp_as_tp=True,
+            )
+            return dict(
+                draft_cache_layers=(layer, ) * draft.num_stages,
+                draft_scratch_tokens=0,
+                draft_attention_backend="DSv4",
+                draft_window_size=int(draft._attn_params["window_size"]),
             )
         config = self._draft_config.pretrained_config
         num_heads = config.num_attention_heads
@@ -1917,19 +1922,26 @@ class KvCacheCreator:
         if attention_backend == "AUTO":
             attention_backend = draft.dflash_attention_backend
         draft_model_config = getattr(draft, "config", None)
-        return StandaloneDraftLayout(
-            num_layers=config.num_hidden_layers,
+        dtype = draft.fc.weight.dtype if hasattr(draft,
+                                                 "fc") else torch.bfloat16
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "Standalone draft KV supports FP16 and BF16 storage")
+        layer = KVCacheLayer(
             num_kv_heads=(num_kv_heads + attention_tp_size - 1) //
             attention_tp_size,
             head_dim=head_dim,
-            dtype=(draft.fc.weight.dtype
-                   if hasattr(draft, "fc") else torch.bfloat16),
-            extra_tokens=self._speculative_config.max_draft_len + 1,
-            attention_backend=attention_backend,
+            dtype=torch_dtype_to_binding(dtype),
             total_num_kv_heads=num_kv_heads,
-            max_position_embeddings=(getattr(draft_model_config,
-                                             "max_position_embeddings", None)
-                                     if draft_model_config else None),
+            cp_as_tp=True,
+        )
+        return dict(
+            draft_cache_layers=(layer, ) * config.num_hidden_layers,
+            draft_scratch_tokens=self._get_draft_scratch_tokens(),
+            draft_attention_backend=attention_backend,
+            draft_max_position_embeddings=(getattr(
+                draft_model_config, "max_position_embeddings", None)
+                                           if draft_model_config else None),
         )
 
     def _should_create_separate_draft_kv_cache(self) -> bool:
@@ -2896,16 +2908,20 @@ def _create_kv_cache_manager(
         disable_overlap_scheduler: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None,
-        standalone_draft_layout: Optional[StandaloneDraftLayout] = None,
+        draft_cache_layers: Sequence[KVCacheLayer] = (),
+        draft_scratch_tokens: int = 0,
+        draft_window_size: Optional[int] = None,
+        draft_attention_backend: Optional[str] = None,
+        draft_max_position_embeddings: Optional[int] = None,
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
     """
-    if standalone_draft_layout is not None and not issubclass(
-            kv_cache_manager_cls, KVCacheManagerV2):
-        raise ValueError("Standalone draft layouts require KVCacheManagerV2.")
+    if draft_cache_layers and not issubclass(kv_cache_manager_cls,
+                                             KVCacheManagerV2):
+        raise ValueError("Unified draft cache layers require KVCacheManagerV2.")
     if cold_page_codec_provider is not None and not issubclass(
             kv_cache_manager_cls, KVCacheManagerV2):
         raise ValueError(
@@ -3073,9 +3089,13 @@ def _create_kv_cache_manager(
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
-        if standalone_draft_layout is not None:
-            manager_extra_kwargs[
-                "standalone_draft_layout"] = standalone_draft_layout
+        manager_extra_kwargs.update(
+            draft_cache_layers=draft_cache_layers,
+            draft_scratch_tokens=draft_scratch_tokens,
+            draft_window_size=draft_window_size,
+            draft_attention_backend=draft_attention_backend,
+            draft_max_position_embeddings=draft_max_position_embeddings,
+        )
         manager_extra_kwargs[
             "disable_overlap_scheduler"] = disable_overlap_scheduler
         # Vocab size also enables multimodal event decoding and its per-block

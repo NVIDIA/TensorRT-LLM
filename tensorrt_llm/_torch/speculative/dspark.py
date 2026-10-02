@@ -540,21 +540,26 @@ class DSv4DSparkWorker(SpecWorkerBase):
             if resource_manager is not None
             else None
         )
-        layout = getattr(manager, "draft_layout", None)
-        if layout is None:
+        if not getattr(manager, "draft_layer_ids", ()):
             manager = None
         if manager is self._draft_kv_manager:
             return
         buffers = ()
         if manager is not None:
             if (
-                layout.window_size != self._win
-                or layout.kv_factor != 1
-                or layout.num_layers != self._kv_windows.shape[1]
-                or layout.head_dim != self._kv_windows.shape[-1]
+                manager.draft_window_size != self._win
+                or len(manager.draft_layer_ids) != self._kv_windows.shape[1]
+                or any(
+                    manager.layer_properties[manager.layer_offsets[layer_id]].kv_factor != 1
+                    or manager.layer_properties[manager.layer_offsets[layer_id]].head_dim
+                    != self._kv_windows.shape[-1]
+                    for layer_id in manager.draft_layer_ids
+                )
             ):
                 raise ValueError("Embedded DSpark draft cache does not match its rolling window")
-            buffers = tuple(manager.get_draft_buffers(stage) for stage in range(layout.num_layers))
+            buffers = tuple(
+                manager.get_draft_buffers(stage) for stage in range(len(manager.draft_layer_ids))
+            )
         self._draft_kv_manager = manager
         self._draft_kv_buffers = buffers
         self._managed_residency.clear()
@@ -936,7 +941,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 manager = resource_manager.get_resource_manager(
                     ResourceManagerType.KV_CACHE_MANAGER
                 )
-                if getattr(manager, "draft_layout", None) is not None:
+                if bool(getattr(manager, "draft_layer_ids", ())):
                     raise RuntimeError(
                         "Unified DSpark KV cache must be prepared before worker forward"
                     )

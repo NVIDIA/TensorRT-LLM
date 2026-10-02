@@ -32,11 +32,10 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.disaggregation.resource.page import (MapperKind,
                                                               RoleLayout)
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layer import KVCacheLayer
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS, BlockReusePolicy, KVCacheManagerV2, Role,
     _estimate_draft_cache_size_components)
-from tensorrt_llm._torch.pyexecutor.kv_cache.standalone_draft_cache import \
-    StandaloneDraftLayout
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
     KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -2144,7 +2143,8 @@ def _estimate_mamba_hybrid_cache_cost(
     cap_partial_attention_snapshots: bool,
     is_draft: bool = False,
     use_separate_draft_kv_cache: bool = False,
-    draft_layout: Optional[StandaloneDraftLayout] = None,
+    draft_cache_layers: tuple[KVCacheLayer, ...] = (),
+    draft_scratch_tokens: int = 0,
     **kwargs,
 ) -> Tuple[int, int]:
     spec_config = kwargs.get("spec_config")
@@ -2207,18 +2207,19 @@ def _estimate_mamba_hybrid_cache_cost(
         if (has_unaligned_periodic_snapshot
                 and not cap_partial_attention_snapshots):
             regular_slope += math.ceil(attention_block_bytes / interval)
-    if draft_layout is not None:
+    if draft_cache_layers:
         # Hybrid target attention is full attention. Reserve capture/noise
         # capacity only in its attention pools and the distinct draft pools;
         # recurrent state retains the fixed/snapshot accounting above.
         # Hybrid profiling bounds draft storage by full-history attention.
         _, draft_slope, draft_fixed = _estimate_draft_cache_size_components(
-            replace(draft_layout, window_size=None),
+            draft_cache_layers,
             tokens_per_block,
             generation_capacity_headroom=1,
+            scratch_tokens=draft_scratch_tokens,
             helix_cp_size=mapping.cp_size if mapping.has_cp_helix() else 1,
         )
-        draft_fixed += draft_layout.extra_tokens * attention_slope
+        draft_fixed += draft_scratch_tokens * attention_slope
         attention_slope += draft_slope
         intercept += max_batch_size * draft_fixed
     return attention_slope + regular_slope, intercept
@@ -3940,7 +3941,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if snapshot_slots > 0:
             # The snapshot plan's partial-page reserve also covers draft KV.
             draft_quota += (self._max_resident_sequences() *
-                            self.draft_layout.bytes_per_token *
+                            sum(layer.bytes_per_token
+                                for layer in self.draft_cache_layers) *
                             self.tokens_per_block)
         return draft_quota
 

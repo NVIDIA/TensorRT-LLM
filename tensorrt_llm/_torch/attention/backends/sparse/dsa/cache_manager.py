@@ -663,7 +663,10 @@ class DSACacheManagerV2(KVCacheManagerV2):
                 self.index_head_dim, self.quant_block_size, self.use_fp4
             )
         cache_bytes = super().get_layer_bytes_per_token(local_layer_idx, data_role)
-        if self.dtype == DataType.NVFP4 and self.mla_kv_cache_residual_dim > 0:
+        if (
+            self.layer_properties[local_layer_idx].dtype == DataType.NVFP4
+            and self.mla_kv_cache_residual_dim > 0
+        ):
             if data_role == Role.KEY:
                 cache_bytes += self.mla_kv_cache_residual_dim // 2
             elif data_role == Role.KEY_BLOCK_SCALE:
@@ -673,6 +676,7 @@ class DSACacheManagerV2(KVCacheManagerV2):
                 cache_bytes += self.mla_kv_cache_residual_dim // 16
         if (
             data_role == Role.ALL
+            and self.pp_layers[local_layer_idx] < len(self._indexer_k_cache_layer_mask)
             and self._indexer_k_cache_layer_mask[self.pp_layers[local_layer_idx]]
         ):
             cache_bytes += self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)

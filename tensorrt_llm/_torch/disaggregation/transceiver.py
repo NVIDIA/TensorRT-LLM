@@ -436,7 +436,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 ordinals = adapter.get_block_ordinals(req, idx, lg)
                 if (
                     isinstance(self._kv_cache_manager, KVCacheManagerV2)
-                    and self._kv_cache_manager.draft_layout is not None
+                    and self._kv_cache_manager.draft_layer_ids
                     and lg.sliding_window_size is not None
                     and (
                         is_gen_only
@@ -518,7 +518,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _need_aux_transfer(self, req: LlmRequest) -> bool:
         params = req.py_disaggregated_params
-        return getattr(self._kv_cache_manager, "draft_layout", None) is not None or (
+        return bool(getattr(self._kv_cache_manager, "draft_layer_ids", ())) or (
             params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         )
 
@@ -531,7 +531,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # Full-attention drafters can skip an oversized context store; rolling
         # drafters retain their complete live suffix. Neither includes scratch.
         window_size = history["layout"]["window_size"]
-        max_positions = self._kv_cache_manager.draft_layout.max_position_embeddings
+        max_positions = self._kv_cache_manager.draft_max_position_embeddings
         prompt_len = self._global_prompt_len(req)
         expected_length = prompt_len
         if window_size is not None:
@@ -549,7 +549,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _pack_draft_history(self, req: LlmRequest) -> None:
         manager = getattr(self, "_kv_cache_manager", None)
-        if getattr(manager, "draft_layout", None) is None:
+        if not getattr(manager, "draft_layer_ids", ()):
             return
         history = self._kv_cache_manager.export_draft_history(req.py_request_id)
         self._validate_draft_history_range(req, history)
@@ -558,7 +558,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _restore_draft_history(self, req: LlmRequest) -> None:
         history = getattr(req, "py_draft_transfer_history", None)
         manager = getattr(self, "_kv_cache_manager", None)
-        has_draft = getattr(manager, "draft_layout", None) is not None
+        has_draft = bool(getattr(manager, "draft_layer_ids", ()))
         if history is None:
             if has_draft:
                 raise ValueError(
@@ -1280,8 +1280,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             0 if need_progress else wait_num,
             block_all,
         )
-        has_draft_history = (
-            getattr(getattr(self, "_kv_cache_manager", None), "draft_layout", None) is not None
+        has_draft_history = bool(
+            getattr(getattr(self, "_kv_cache_manager", None), "draft_layer_ids", ())
         )
 
         completed, failed, cancelled = [], [], []

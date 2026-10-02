@@ -4036,7 +4036,7 @@ def _create_nixl_agent(
 def _make_aux_buffer(
     kvm: KVCacheManager, max_slots: int, max_draft_len: Optional[int] = None
 ) -> Optional[AuxBuffer]:
-    draft_history = getattr(kvm, "draft_layout", None) is not None
+    draft_history = bool(getattr(kvm, "draft_layer_ids", ()))
     if max_slots <= 0:
         if draft_history:
             raise ValueError("Standalone draft transfer requires auxiliary buffer slots")
