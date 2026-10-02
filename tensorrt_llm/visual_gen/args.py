@@ -351,10 +351,10 @@ class ParallelConfig(StrictBaseModel):
         ge=1,
         status="prototype",
         description=(
-            "Text encoder residency size. MiniMax-H3 loads its Qwen3-VL "
-            "text encoder on the first text_encoder_tp_size ranks and "
-            "broadcasts prompt embeddings to the remaining ranks. This "
-            "does not shard text-encoder weights."
+            "Text encoder tensor-parallel group size. MiniMax-H3 shards "
+            "its Qwen3-VL text encoder across ranks "
+            "[0, text_encoder_tp_size), then rank 0 broadcasts prompt "
+            "embeddings to the remaining ranks."
         ),
     )
 

@@ -34,9 +34,10 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import MpiTopology
 
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
@@ -110,6 +111,25 @@ def _check_denoise_step(velocity: torch.Tensor, name: str, step: int) -> None:
         )
 
 
+class _MiniMaxH3TextEncoderMapping(MpiTopology):
+    """Mapping for the MiniMax-H3 text-encoder-only TP subgroup."""
+
+    def __new__(cls, *args, **kwargs):
+        del args, kwargs
+        return object.__new__(cls)
+
+    def __init__(self, *args, tp_group_pg=None, **kwargs) -> None:
+        self._tp_group_pg = tp_group_pg
+        self._use_torch_distributed_allreduce = True
+        super().__init__(*args, **kwargs)
+
+    @property
+    def tp_group_pg(self):
+        if self._tp_group_pg is None:
+            raise RuntimeError("MiniMax-H3 text encoder TP process group is not initialized.")
+        return self._tp_group_pg
+
+
 @register_pipeline(
     "MiniMaxH3ModularPipeline",
     hf_ids=["MiniMaxAI/MiniMax-H3"],
@@ -164,12 +184,20 @@ class MiniMaxH3Pipeline(BasePipeline):
                 f"text_encoder_tp_size ({self.text_encoder_tp_size}) exceeds "
                 f"world_size ({world_size})."
             )
-        if self.text_encoder_tp_size > 1 and self.text_encoder_tp_size != world_size:
-            raise NotImplementedError(
-                "MiniMax-H3 text_encoder_tp_size > 1 currently must match "
-                "world_size so the Qwen text encoder can be tensor-sharded "
-                "across all ranks."
-            )
+        self._text_encoder_tp_group = None
+        if self._uses_tensor_parallel_text_encoder and dist.is_initialized():
+            text_encoder_tp_ranks = list(range(self.text_encoder_tp_size))
+            rank = int(getattr(pipeline_config.mapping, "rank", 0))
+            if self.text_encoder_tp_size == world_size:
+                group = dist.group.WORLD
+            else:
+                group = dist.new_group(
+                    ranks=text_encoder_tp_ranks,
+                    use_local_synchronization=False,
+                )
+            if rank in text_encoder_tp_ranks:
+                self._text_encoder_tp_group = group
+
         if (
             pipeline_config.attention.backend == "TRTLLM"
             and torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
@@ -265,17 +293,32 @@ class MiniMaxH3Pipeline(BasePipeline):
         checkpoint_dir: str,
         device: torch.device,
     ) -> MiniMaxH3TensorParallelTextEncoder:
-        text_encoder_mapping = Mapping(
-            world_size=self.world_size,
+        if not self._loads_text_encoder_on_this_rank:
+            raise RuntimeError(
+                "MiniMax-H3 tensor-parallel text encoder is loaded only on "
+                f"ranks < {self.text_encoder_tp_size}; rank {self.rank} "
+                "must receive broadcast prompt embeddings."
+            )
+        if self.text_encoder_tp_size < self.world_size and not mpi_disabled():
+            raise RuntimeError(
+                "MiniMax-H3 subset text_encoder_tp_size requires TLLM_DISABLE_MPI=1 "
+                "so Qwen text encoder TP uses a torch process group instead of MPI collectives."
+            )
+        text_encoder_mapping = _MiniMaxH3TextEncoderMapping(
+            world_size=self.text_encoder_tp_size,
             rank=self.rank,
             tp_size=self.text_encoder_tp_size,
-            gpus_per_node=self.world_size,
+            gpus_per_node=self.text_encoder_tp_size,
+            tp_group_pg=self._text_encoder_tp_group,
         )
         text_encoder = MiniMaxH3TensorParallelTextEncoder.from_pretrained_config(
             checkpoint_dir, text_encoder_mapping, device
         )
+        # Safetensors prefetch synchronizes on the default process group. Disable
+        # it when only a subset of ranks loads the text encoder.
+        prefetch = self.text_encoder_tp_size == self.world_size
         weights = WeightLoader(components=PipelineComponent.TEXT_ENCODER).load_weights(
-            checkpoint_dir, text_encoder_mapping
+            checkpoint_dir, text_encoder_mapping, prefetch=prefetch
         )
         text_encoder.load_weights(weights)
         return text_encoder.eval()
@@ -301,15 +344,18 @@ class MiniMaxH3Pipeline(BasePipeline):
                 subfolder=PipelineComponent.PROCESSOR,
             )
         if not _component_skipped(skip_components, PipelineComponent.TEXT_ENCODER):
-            if self._uses_tensor_parallel_text_encoder:
-                self.text_encoder = self._load_tensor_parallel_text_encoder(checkpoint_dir, device)
-            elif self._loads_text_encoder_on_this_rank:
-                self.text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
-                    checkpoint_dir,
-                    subfolder=PipelineComponent.TEXT_ENCODER,
-                    torch_dtype=torch.bfloat16,
-                ).to(device)
-                self.text_encoder.eval()
+            if self._loads_text_encoder_on_this_rank:
+                if self._uses_tensor_parallel_text_encoder:
+                    self.text_encoder = self._load_tensor_parallel_text_encoder(
+                        checkpoint_dir, device
+                    )
+                else:
+                    self.text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+                        checkpoint_dir,
+                        subfolder=PipelineComponent.TEXT_ENCODER,
+                        torch_dtype=torch.bfloat16,
+                    ).to(device)
+                    self.text_encoder.eval()
             else:
                 self.text_encoder = None
                 logger.info(
@@ -499,14 +545,12 @@ class MiniMaxH3Pipeline(BasePipeline):
         prompt: str,
         keyframes: list[Image.Image],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._uses_tensor_parallel_text_encoder:
-            return self._encode_prompt_local(prompt, keyframes)
         if self.world_size == 1:
             return self._encode_prompt_local(prompt, keyframes)
 
         prompt_embeds: torch.Tensor | None = None
         text_token_tags: torch.Tensor | None = None
-        if self.rank == 0:
+        if self._loads_text_encoder_on_this_rank:
             prompt_embeds, text_token_tags = self._encode_prompt_local(prompt, keyframes)
 
         prompt_embeds = self._broadcast_tensor_from_rank0(prompt_embeds, dtype=self.dtype)
@@ -519,7 +563,7 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     @property
     def _loads_text_encoder_on_this_rank(self) -> bool:
-        return self._uses_tensor_parallel_text_encoder or self.rank < self.text_encoder_tp_size
+        return self.rank < self.text_encoder_tp_size
 
     def _broadcast_tensor_from_rank0(
         self,
