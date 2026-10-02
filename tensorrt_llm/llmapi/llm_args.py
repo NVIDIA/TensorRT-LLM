@@ -2053,8 +2053,8 @@ class DecodingBaseConfig(StrictBaseModel):
             "layer quantization, and a concrete backend applies only to the "
             "draft model or layers. Resolution may fall back based on model, "
             "quantization, and hardware support. Replacement-head MTP "
-            "checkpoints are unsupported because their independent "
-            "quantization metadata is not loaded. Nemotron-H embedded MTP "
+            "checkpoints must inherit the target model's MoE backend; leave "
+            "this option unset. Nemotron-H embedded MTP "
             "layers must inherit the target backend because their checkpoint "
             "mapper uses a shared backend-dependent layout. Decoding methods "
             "without a neural draft model ignore this option."))
@@ -2268,10 +2268,10 @@ class DecodingBaseConfig(StrictBaseModel):
                 or not self.uses_replacement_heads):
             return
         raise ValueError(
-            "speculative_config.moe_backend does not support replacement-head "
-            "MTP checkpoints because their independent quantization metadata "
-            "is not loaded. Leave moe_backend unset to inherit the target "
-            "backend, or use a full external draft-model checkpoint.")
+            "speculative_config.moe_backend cannot be set for replacement-head "
+            "MTP checkpoints. Replacement heads inherit the target model's "
+            "MoE backend. Leave moe_backend unset, or use a full external "
+            "draft-model checkpoint.")
 
     @property
     def uses_replacement_heads(self) -> bool:
@@ -4169,6 +4169,24 @@ class BlockReuseConfig(StrictBaseModel):
         "Only used when "
         "`policy` is 'per_conversation'.")
 
+    swa_endpoint_rewind_tokens: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description="Extra tokens before the final SWA window whose cache blocks "
+        "receive higher eviction priority, together with sink blocks. Zero "
+        "disables the entire endpoint-priority callback. Positive values require "
+        "KV cache manager v2, block reuse enabled, and policy='all_reusable'. "
+        "This preference does not guarantee residency or change attention windows "
+        "or prefix matching. Dummy and draft requests are excluded.")
+
+    @model_validator(mode="after")
+    def validate_swa_endpoint_policy(self) -> 'BlockReuseConfig':
+        if self.swa_endpoint_rewind_tokens > 0 and self.policy != "all_reusable":
+            raise ValueError(
+                "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                "block_reuse_config.policy='all_reusable'.")
+        return self
+
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
@@ -4513,6 +4531,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             update={
                 "periodic_snapshot_interval": self.mamba_state_cache_interval
             })
+        return self
+
+    @model_validator(mode='after')
+    def validate_swa_endpoint_rewind(self) -> 'KvCacheConfig':
+        if self.block_reuse_config.swa_endpoint_rewind_tokens > 0:
+            if not self.enable_block_reuse:
+                raise ValueError(
+                    "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                    "kv_cache_config.enable_block_reuse=True.")
+            if self.use_kv_cache_manager_v2 is False:
+                raise ValueError(
+                    "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                    "kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
     @model_validator(mode='after')

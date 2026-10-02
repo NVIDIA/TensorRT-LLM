@@ -310,6 +310,7 @@ def _model(
     nn.Module.__init__(model)
     model._fp8_weight_read_moe_mlp = False
     model.model_config = config
+    model.spec_config = config.spec_config
     model._repurposed_tp_mapping = config.mapping if cp_size > 1 else None
     model.model = nn.Module()
     model.model.layers = nn.ModuleList([layer])

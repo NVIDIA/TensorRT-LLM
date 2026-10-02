@@ -745,6 +745,11 @@ class PyExecutor:
             self.resource_manager,
             should_store_blocks=self.enable_disagg_partial_reuse_store)
 
+        # Wire the transfer manager into the V2 scheduler's deadlock detector.
+        if hasattr(self.scheduler, "set_async_transfer_manager"):
+            self.scheduler.set_async_transfer_manager(
+                self.async_transfer_manager)
+
         # Router is built after async_transfer_manager so KVCacheAwareADPRouter
         # can receive the transfer-manager reference at construction time.
         self.adp_router: ADPRouter = ADPRouter.create(
@@ -7283,6 +7288,12 @@ class PyExecutor:
                 self.resource_manager.resource_managers[
                     resource_mgr_type].prepare_resources(
                         disagg_gen_init_to_prepare)
+
+        # These requests skip the context branch of _prepare_tp_inputs (their
+        # context phase ran on another worker); latch cached_tokens from the
+        # prefix this worker just matched in its own cache.
+        for req in requests:
+            req.cached_tokens = req.prepopulated_prompt_len
 
         # Reporting this mini-batch to the KV connector used to happen
         # inside KVCacheManager.prepare_resources; it now runs after the
