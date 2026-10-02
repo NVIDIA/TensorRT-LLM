@@ -286,9 +286,7 @@ def test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks(mooncake_pool):
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(
-    single_process_worker, mooncake_pool
-):
+def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(mooncake_pool):
     """Chunked prefill against a cache too small to hold every request.
 
     This is the preemption path the connector complicates: a victim's pages may
@@ -300,17 +298,33 @@ def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(
     The reference run differs only in cache size and the connector, so the
     chunking is the same on both sides.
 
+    Unlike its neighbours this one leaves the worker in its own process. The
+    iteration statistics it asserts on reach the caller over RPC, and an
+    in-process worker has no RPC server to answer, so they come back empty.
+
     The bound on context tokens is what makes this more than a liveness check.
-    Chunks partition a prompt, so without preemption the engine prefills each
-    prompt token once, and every recompute after a preemption adds another pass
-    over the same tokens. A scheduler that preempted and recomputed in a loop
-    would still finish, but not within this budget.
+    Chunks partition a prompt, so each prompt token is prefilled once when
+    nothing is preempted, and a victim that recomputes adds another pass over
+    the same tokens. Saves are write-through, so a resumed victim should find
+    its prefix in the pool and load it instead, which is what keeps the count
+    near one pass and is the behaviour this bound confirms.
     """
     # Distinct prefixes, so the requests compete for cache rather than sharing
-    # pages. Long enough that several do not fit at once.
-    prompts = [f"{index}. {PROMPT} " * 6 for index in range(4)]
-    sampling_params = SamplingParams(max_tokens=16, ignore_eos=True)
-    chunking = dict(enable_chunked_prefill=True, max_num_tokens=256)
+    # pages. A page is only reclaimed when a generating request cannot get one,
+    # so the pressure has to come from decode growth rather than prompt length:
+    # these six fit at admission and outgrow the cache while generating.
+    prompts = [f"{index}. {PROMPT} " * 2 for index in range(6)]
+    sampling_params = SamplingParams(max_tokens=256, ignore_eos=True)
+    # `max_seq_len` bounds the warmup allocation, which would otherwise size
+    # itself against this model's 40k position limit and dwarf the cache below.
+    # `max_batch_size` has to exceed the number of prompts, or the scheduler
+    # limits concurrency before the cache does and nothing is ever preempted.
+    engine = dict(
+        enable_chunked_prefill=True,
+        max_num_tokens=256,
+        max_batch_size=8,
+        max_seq_len=1024,
+    )
 
     reference = LLM(
         **llm_kwargs(
@@ -319,7 +333,7 @@ def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(
             kv_cache_config=KvCacheConfig(
                 free_gpu_memory_fraction=0.3, use_kv_cache_manager_v2=True
             ),
-            **chunking,
+            **engine,
         )
     )
     try:
@@ -331,10 +345,14 @@ def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(
         **llm_kwargs(
             mooncake_pool,
             enable_iter_perf_stats=True,
-            # Tight enough that the scheduler has to preempt; the prompts above
-            # total well past this.
-            kv_cache_config=KvCacheConfig(max_tokens=2048, use_kv_cache_manager_v2=True),
-            **chunking,
+            # Keep every iteration rather than the most recent 1000, so the
+            # sums below cover the whole run.
+            iter_stats_max_iterations=-1,
+            # Bounds a V2 cache, which max_tokens does not; 256MiB is roughly 2300 tokens.
+            kv_cache_config=KvCacheConfig(
+                max_gpu_total_bytes=256 << 20, use_kv_cache_manager_v2=True
+            ),
+            **engine,
         )
     )
     try:
@@ -342,6 +360,10 @@ def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(
         stats = llm.get_stats(timeout=30)
     finally:
         llm.shutdown()
+
+    # Every sum below is over this list, so an empty one would make them all
+    # read zero and report that as a scheduler result.
+    assert stats, "The engine returned no iteration statistics to assert on."
 
     # The assertions below are about the scheduler, so a connector that did
     # nothing at all would satisfy them. Its worker mounting a segment is the
@@ -361,8 +383,9 @@ def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(
     inflight = [entry.get("inflightBatchingStats", {}) for entry in stats]
     paused = sum(entry.get("numPausedRequests", 0) for entry in inflight)
     assert paused > 0, (
-        "No request was ever paused, so the cache was not small enough to reach "
-        "the preemption path and this test exercised nothing."
+        f"No request was ever paused across {len(stats)} iterations, so the "
+        "cache was not small enough to reach the preemption path and this test "
+        "exercised nothing."
     )
 
     prompt_tokens = sum(len(output.prompt_token_ids) for output in reference_outputs)
