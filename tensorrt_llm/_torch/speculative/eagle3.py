@@ -21,6 +21,7 @@ from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
+from .draft_argmax import DraftArgmaxExchange, draft_argmax_exchange_enabled
 from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
                         SpecWorkerBase)
 from .mtp import _select_mtp_position_ids
@@ -461,6 +462,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         # Mode flag: True = MTP Eagle one-model, False = Eagle3 one-model.
         self.is_mtp_eagle = spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+
+        # MTP-Eagle heads under plain TP are vocab-sharded: register the
+        # group's argmax-pair exchange (draft_argmax.py) here so its workspace
+        # exists before any CUDA-graph capture.
+        if (draft_argmax_exchange_enabled() and self.is_mtp_eagle
+                and mapping is not None and mapping.tp_size > 1
+                and not mapping.enable_attention_dp
+                and model_config is not None):
+            self._draft_argmax_by_mapping[mapping] = DraftArgmaxExchange(
+                mapping, model_config.allreduce_strategy)
 
         # SA enhancer (common to both modes)
         self.sa_enhancer: Optional[SADraftEnhancer] = None

@@ -206,6 +206,7 @@ def test_checkpoint_restore_resets_inference_protocol_state(monkeypatch) -> None
     allreduce = object.__new__(MNNVLAllReduce)
     torch.nn.Module.__init__(allreduce)
     allreduce.mapping = mapping
+    allreduce.workspace_key = mapping
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_workspaces", {mapping: workspace})
 
@@ -251,6 +252,7 @@ def test_checkpoint_restore_protocol_failure_is_terminal(monkeypatch) -> None:
     allreduce = object.__new__(MNNVLAllReduce)
     torch.nn.Module.__init__(allreduce)
     allreduce.mapping = mapping
+    allreduce.workspace_key = mapping
     monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_workspaces", {mapping: workspace})
     monkeypatch.setattr(
         ops_module,
@@ -284,6 +286,7 @@ def test_checkpoint_restore_communicator_duplication_failure_is_terminal(monkeyp
     allreduce = object.__new__(MNNVLAllReduce)
     torch.nn.Module.__init__(allreduce)
     allreduce.mapping = mapping
+    allreduce.workspace_key = mapping
     monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_workspaces", {mapping: workspace})
 
     allreduce.checkpoint_prepare()
