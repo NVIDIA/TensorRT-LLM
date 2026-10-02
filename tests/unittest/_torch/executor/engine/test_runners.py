@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 from typing import Any
@@ -29,9 +30,12 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import (
     NoKVCacheRunnerConfig,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
+from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
@@ -752,3 +756,63 @@ def test_model_caller_borrows_live_compile_streams_and_events():
 def test_model_caller_requires_streams_with_compile_backend():
     with pytest.raises(ValueError, match="requires its auxiliary stream container"):
         ModelCaller(SimpleNamespace(), compile_backend=SimpleNamespace(events=Backend.Events()))
+
+
+def test_mm_encoder_handoff_preserves_per_item_metadata_in_sparse_batch() -> None:
+    requests = [
+        SimpleNamespace(
+            py_multimodal_data={"image": object(), "multimodal_embedding_lengths": [1]},
+            multimodal_lengths=[1],
+        ),
+        SimpleNamespace(py_multimodal_data=None),
+        SimpleNamespace(
+            py_multimodal_data={"video": object(), "multimodal_embedding_lengths": [3, 2]},
+            multimodal_lengths=[7, 6],
+        ),
+    ]
+    for request in requests:
+        request.py_result = PyResult(prompt_len=1, max_new_tokens=1)
+        request.set_finished_reason = Mock()
+    params = [
+        SimpleNamespace(multimodal_data=request.py_multimodal_data)
+        for request in requests
+        if request.py_multimodal_data is not None
+    ]
+    scheduled_requests = SimpleNamespace(
+        context_requests=requests, generation_requests=[], num_context_requests=len(requests)
+    )
+    embeddings = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+
+    def encode(batch_params: list[SimpleNamespace]) -> list[torch.Tensor]:
+        batch_params[1].multimodal_data["multimodal_embedding_metadata"] = [
+            {"retained_token_counts": [2, 1]},
+            {"retained_token_counts": [2, 0]},
+        ]
+        return [embeddings]
+
+    runner = _make_runner(MultimodalEncoderRunner, SimpleNamespace(forward=encode))
+    result = runner._forward_step(
+        {"multimodal_params": params},
+        scheduled_requests,
+    )
+    sampler = EarlyStopWithMMResult()
+    state = sampler.sample_async(scheduled_requests, result, [])
+    sampler.update_requests(state)
+
+    assert requests[1].py_result.mm_embedding_handles is None
+    image_handles = json.loads(json.dumps(requests[0].py_result.mm_embedding_handles))
+    assert len(image_handles) == 1
+    assert "metadata" not in image_handles[0]
+    torch.testing.assert_close(
+        SharedTensorContainer.from_dict(image_handles[0]).get_local_view(), embeddings[:1]
+    )
+    video_handles = json.loads(json.dumps(requests[2].py_result.mm_embedding_handles))
+    assert [handle["metadata"]["retained_token_counts"] for handle in video_handles] == [
+        [2, 1],
+        [2, 0],
+    ]
+    restored = [
+        SharedTensorContainer.from_dict(handle).get_local_view() for handle in video_handles
+    ]
+    assert [len(embedding) for embedding in restored] == [3, 2]
+    torch.testing.assert_close(torch.cat(restored), embeddings[1:])
