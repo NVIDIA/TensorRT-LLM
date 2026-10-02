@@ -1179,6 +1179,8 @@ class Indexer(nn.Module):
         """
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
+        # A full rebuild clears the stale marker.
+        metadata.indexer_schedule_stale = False
         gen_seq_lens = metadata.get_indexer_kv_lens(
             metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations]
         )
@@ -1680,6 +1682,15 @@ class Indexer(nn.Module):
                 metadata.shared_topk_indices[:num_generations, :]
             )
         elif has_decode and not metadata.skip_indexer_for_gen_reqs:
+            # SimpleNamespace doubles in test_indexer_gvr_prior reach this path without the field.
+            if getattr(metadata, "indexer_schedule_stale", False):
+                raise RuntimeError(
+                    "DSA indexer: the MQA-logits schedule is stale (its rebuild was skipped) "
+                    "but this pass computes TopK "
+                    f"(in_mtp_draft_loop={metadata.in_mtp_draft_loop}, "
+                    f"indexer_skip_topk={metadata.indexer_skip_topk}, "
+                    f"mtp_index_share={self.mtp_index_share})"
+                )
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts : num_contexts + num_generations]
             if not metadata.is_ragged_verify:

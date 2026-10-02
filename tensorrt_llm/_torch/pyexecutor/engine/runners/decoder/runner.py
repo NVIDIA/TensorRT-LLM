@@ -15,7 +15,10 @@ from typing import Any
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionMetadata,
+    kv_lens_hook_is_idempotent,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.compilation.backend import Backend
@@ -2712,8 +2715,21 @@ class DecoderRunner(ScheduledModelRunner):
         Make some changes to the device inputs and avoid blocking the async data transfer
         """
         attn_meta = inputs.get("attn_metadata")
+        # Overlap scheduling corrects kv_lens_cuda below from the runtime
+        # accepted-token counts and calls on_update_kv_lens() again after it.
+        has_kv_lens_correction = (
+            enable_spec_decode
+            and not self._config.disable_overlap_scheduler
+            and attn_meta is not None
+            and attn_meta.kv_cache_manager is not None
+            and hasattr(attn_meta, "kv_lens_cuda")
+        )
         # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
-        if attn_meta is not None:
+        # An idempotent hook that the correction repeats right after, with
+        # nothing reading its results in between, is called once.
+        if attn_meta is not None and not (
+            has_kv_lens_correction and kv_lens_hook_is_idempotent(attn_meta)
+        ):
             attn_meta.on_update_kv_lens()
 
         if enable_spec_decode and not self._config.disable_overlap_scheduler:
@@ -2739,7 +2755,7 @@ class DecoderRunner(ScheduledModelRunner):
                         :previous_batch_tokens
                     ]
 
-                if hasattr(inputs["attn_metadata"], "kv_lens_cuda"):
+                if has_kv_lens_correction:
                     if (
                         num_ctx_requests >= num_chunked_ctx_requests
                         and num_chunked_ctx_requests > 0
