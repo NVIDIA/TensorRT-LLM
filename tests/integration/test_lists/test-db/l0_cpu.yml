@@ -88,6 +88,7 @@ l0_cpu:
   - unittest/_torch/test_utils.py
   - unittest/_torch/thop/parallel_hw_agnostic
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
+  - unittest/_torch/visual_gen/multi_gpu/test_ulysses_replicated_kv.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_mapping.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_multinode.py
   - unittest/_torch/visual_gen/sparse_attention/skip_softmax/test_skip_softmax.py
@@ -144,6 +145,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_anthropic_routes.py
   - unittest/llmapi/apps/test_chat_template_kwargs_guard.py
   - unittest/llmapi/apps/test_chat_utils.py
+  - unittest/llmapi/apps/test_context_length_error.py
   - unittest/llmapi/apps/test_harmony_channel_validation.py
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
@@ -164,6 +166,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_web_search_shared.py
   - unittest/llmapi/test_bench_async.py
+  - unittest/llmapi/test_config_overrides.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
   - unittest/llmapi/test_executor.py
   - unittest/llmapi/test_gc_utils.py
