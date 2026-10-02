@@ -7289,6 +7289,12 @@ class PyExecutor:
                     resource_mgr_type].prepare_resources(
                         disagg_gen_init_to_prepare)
 
+        # These requests skip the context branch of _prepare_tp_inputs (their
+        # context phase ran on another worker); latch cached_tokens from the
+        # prefix this worker just matched in its own cache.
+        for req in requests:
+            req.cached_tokens = req.prepopulated_prompt_len
+
         # Reporting this mini-batch to the KV connector used to happen
         # inside KVCacheManager.prepare_resources; it now runs after the
         # token-budget trim, which this path does not go through. Kept here
