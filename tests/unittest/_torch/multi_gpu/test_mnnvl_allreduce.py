@@ -29,7 +29,8 @@ import tensorrt_llm
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams)
-from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+from tensorrt_llm._torch.distributed.ops import (
+    MNNVLAllReduce, get_or_scale_allreduce_mnnvl_workspace)
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
@@ -804,6 +805,20 @@ def test_mnnvl_workspace_growth_keeps_captured_graphs(
         range(tensor_parallel_size),
     )
     assert all(results)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_mnnvl_workspace_creation_refuses_graph_capture() -> None:
+    """Creating or growing the MNNVL workspace allocates collectively, so under
+    CUDA-graph capture it raises before entering the allocation. One process,
+    a group of one: the guard runs before any MNNVL call."""
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    MNNVLAllReduce.allreduce_mnnvl_workspaces.pop(mapping, None)
+    graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+    with torch.cuda.graph(graph, stream=stream):
+        with pytest.raises(RuntimeError, match="during CUDA graph capture"):
+            get_or_scale_allreduce_mnnvl_workspace(mapping, torch.bfloat16)
+    assert mapping not in MNNVLAllReduce.allreduce_mnnvl_workspaces
 
 
 def _make_quant_scale(reference_norm: torch.Tensor,
