@@ -3747,6 +3747,78 @@ def test_v2_kda_replay_validates_configuration(
         )
 
 
+@pytest.mark.parametrize(
+    ("kda_token_states", "enable_block_reuse", "at_floor"),
+    [(True, False, True), (False, False, False), (True, True, False)],
+)
+def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
+    kda_token_states, enable_block_reuse, at_floor
+):
+    """The per-token KDA states take memory per SSM slot outside the cache quota. Without block reuse the SSM pool
+    keeps only its live floor and attention gets the rest of the quota; otherwise (replay caches only, or block reuse)
+    the typical step's ratio sizes it."""
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._generation_kv_capacity_headroom = 1
+    mgr._has_cp_helix = False
+    mgr.kv_cache_type = CacheTypeCpp.SELF
+    mgr.head_dim_per_layer = [64, 64]
+    mgr.pp_layers = [0, 1]
+    mgr._mamba_layer_mask = [True, False]
+    # One 2 MiB grain per state slot, so the pool's slot count follows its grains (a Kimi K3 slot holds 27 MB).
+    mgr.ssm_bytes = 2 << 20
+    mgr.conv_bytes = 64 << 10
+    mgr.max_attention_window_vec = [128, 128]
+    mgr.max_batch_size = 2
+    mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+    mgr.max_seq_len = 128
+    mgr.max_num_tokens = 128
+    mgr.tokens_per_block = 32
+    mgr.num_local_layers = 2
+    mgr.local_num_mamba_layers = 1
+    mgr._num_reserved_dummy_slots = 1
+    mgr.dtype = DataType.HALF
+    mgr.enable_swa_scratch_reuse = False
+    mgr.enable_stats = False
+    mgr.num_extra_kv_tokens = 0
+    mgr.get_layer_bytes_per_token = lambda **kwargs: 8
+    # Layer 1's 256-byte pages of 32 tokens (_base_attention_layer_configs; layer 0 becomes the SSM layer).
+    mgr._attention_cache_bytes_per_token = lambda: 8
+    mgr._use_kda_replay_update = True
+    mgr._kda_token_states = kda_token_states
+    # The per-token states count in each slot's state bytes (_mamba_state_bytes_per_slot): num_spec fp32 states of
+    # the SSM state shape, 2 MiB each here.
+    mgr._kda_replay_num_spec = 2
+    mgr.ssm_state_shape = [8, 256, 256]
+    mgr.kv_cache_config = KvCacheConfig(
+        avg_seq_len=64,
+        enable_block_reuse=enable_block_reuse,
+        enable_partial_reuse=False,
+    )
+    base_config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=128 << 20)],
+        layers=_base_attention_layer_configs(2),
+    )
+    runtime_manager = RuntimeKVCacheManager(mgr._build_cache_config(base_config))
+    try:
+        slots = {}
+        for stats in runtime_manager.get_storage_statistics():
+            sizes = stats.slot_sizes if hasattr(stats, "slot_sizes") else stats.slot_size
+            role = "ssm" if mgr.ssm_bytes in [int(s) for s in sizes] else "attention"
+            slots[role] = int(stats.total)
+    finally:
+        runtime_manager.shutdown()
+
+    floor = mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots
+    if at_floor:
+        # The floor's min-slots constraint is scaled by 1 / max_util_for_resume (0.97).
+        assert floor <= slots["ssm"] <= floor + 1
+        # Every other 2 MiB grain goes to attention's 256-byte pages.
+        assert slots["attention"] >= ((128 << 20) // (2 << 20) - (floor + 2)) * ((2 << 20) // 256)
+    else:
+        assert slots["ssm"] > 10 * floor
+
+
 def test_mamba_cache_manager_delegates_kda_replay_capability() -> None:
     mgr = object.__new__(MambaCacheManager)
     mgr._impl = SimpleNamespace(use_kda_replay_update=True)

@@ -3985,6 +3985,32 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             state_quota + attention_block_quota,
         )
 
+    def _ssm_pool_at_live_floor(self, kv_cache_config: KvCacheConfig) -> bool:
+        """Whether the SSM pool group keeps only its min-slots floor (one slot
+        per resident sequence plus the reserved dummies) instead of its share
+        of the typical step's ratio.
+
+        With per-token KDA states, ``kda_state_tok`` takes num_spec states per
+        SSM slot outside the cache quota (``_allocate_pool_replay_buffers``),
+        addressed by the request's SSM slot. Without block reuse no SSM slot
+        holds anything but a live request or a reserved dummy, so slots past
+        the floor are never used and would only add that memory.
+        """
+        return (getattr(self, "_kda_token_states", False)
+                and self.local_num_mamba_layers > 0
+                and not kv_cache_config.enable_block_reuse
+                and self._attention_cache_bytes_per_token() > 0)
+
+    def _quota_filling_request_capacity(self, gpu_quota: int) -> int:
+        """A typical request capacity whose resident requests' attention pages
+        alone take ``gpu_quota``. The typical step's ratio then gives the SSM
+        pool group fewer slots than its floor, so the min-slots constraint
+        sets its size and attention gets the rest of the quota."""
+        bytes_per_token = (self._max_resident_sequences() *
+                           self._attention_cache_bytes_per_token())
+        # KVCacheDesc.capacity is a 32-bit int.
+        return min(-(-gpu_quota // bytes_per_token), 1 << 30)
+
     def _build_cache_config(
             self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         kv_cache_config = self.kv_cache_config
@@ -4030,6 +4056,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if config.initial_pool_ratio is None:
             typical_capacity = self._get_typical_request_capacity(
                 kv_cache_config)
+            if self._ssm_pool_at_live_floor(kv_cache_config):
+                typical_capacity = max(
+                    typical_capacity,
+                    self._quota_filling_request_capacity(gpu_quota))
             request_descs = self._typical_request_descs(typical_capacity,
                                                         kv_cache_config)
             typical_step = BatchDesc(request_descs *
