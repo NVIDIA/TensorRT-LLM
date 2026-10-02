@@ -62,3 +62,39 @@ cancelled outcome, request exit, and a timeout cannot authorize `Lease.release`.
 Keep leases and registration roots until physical access and local copies have
 ended; only then deregister memory and release the `PartsHold` on the manager's
 owner thread. `release` asserts that access ended; it does not stop a transfer.
+
+## Staging lifetime binding
+
+`resource.shared_lifetime.SharedStagingAdapter` binds an existing manager and its
+staging lender to one registered provider. Construction validates the profile and
+takes a `PartsHold`; the caller retains the adapter before calling `register`.
+Pool registration happens once for this physical allocation, independently of
+request lifetime. All adapter, lender and lease calls run on the manager thread.
+
+Submit only a ready lease: a read lease's `poll` must have completed its device-to-
+host copy before publication. Each operation takes a fresh `RetirementDeadline`
+from the same watchdog as the adapter's separate registration-teardown owner.
+The watchdog must run independently with the executor's containment callback.
+This first binding supports one operation per deadline; multi-piece sessions,
+retry and paired-path convergence require their later integration work.
+
+The adapter roots the lease before submission. `SubmissionRejected` proves that
+nothing escaped; an unexpected submission exception retains the loan because
+there is no handle with which to establish access-end. Logical outcomes are
+latched independently from background `quiesce` calls. A false or exceptional
+quiescence result starts drain and needs explicit evidence retry; it never
+authorizes reuse. Blocking backend waits do not run on the manager or watchdog
+thread.
+
+After positive backend quiescence, a write operation marks only the served whole
+rows. Pass `cuda_copy_completion` the exact manager execution stream: its event
+is recorded immediately after `mark_arrived` and its query remains valid after
+request exit. Only backend access-end, local-copy completion and successful
+lifecycle arbitration together permit lease release. Neither this event nor a
+backend outcome replaces `StagingLender.readiness` for engine scheduling.
+
+`close` stops admission and progresses retained operations without waiting on
+backend threads. Once they drain, it closes registrations and then releases the
+parts hold. Failed registration closure retains the same handle for retry;
+unproven access, copy errors or fatal expiry retain roots for containment.
+The adapter does not activate a scheduler, route selection or native transport.
