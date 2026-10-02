@@ -1404,14 +1404,14 @@ standard-no-fastapi-cloud-cli = ["email-validator (>=2.0.0)", "fastapi-cli[stand
 
 [[package]]
 name = "filelock"
-version = "4.0.7"
+version = "4.0.9"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-4.0.7-py3-none-any.whl", hash = "sha256:a93c4d93269b339a6af4848342c7e940d0f9928ad95eff64764699e5f1bf8a6a"},
-    {file = "filelock-4.0.7.tar.gz", hash = "sha256:da5915714a70b55d167fdc7e251ad91302b0a36816fb574dfafae8f4f2c9bb21"},
+    {file = "filelock-4.0.9-py3-none-any.whl", hash = "sha256:9287fd61b99a806e5202be29a83034c0808a1b9830e820537c2f5773981f7eeb"},
+    {file = "filelock-4.0.9.tar.gz", hash = "sha256:635e7d67fa92654eed444e75e9ca18426d34e77ad9c469bf4373f75a932f7b22"},
 ]
 
 [[package]]
@@ -2698,6 +2698,29 @@ soundfile = ["soundfile (>=0.12.1)"]
 soxr = ["soxr (>=0.5.0)"]
 
 [[package]]
+name = "mooncake-transfer-engine-cuda13"
+version = "0.3.13"
+description = "A KVCache-centric Disaggregated Architecture for large-scale LLM inference and training. (CUDA 13 version)"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:fd0b41cca5550f244ecf2e1a92979262d2aefc4acf34bd5ddb1d8e7f698c6d55"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:fb56dbcb174f1b573c7fce216e5be8c368557b9064bed6d5c67fc8c3b51e7f5c"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:47289507b5d1ab495270b63ef42530cf78ba4b2628fbd99d3443d4737a8a987f"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:f65e034c3257203e4173c0c5838b034546e4f52bb1717629a726a27f0bc0efc0"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:b8bbe5d9a5e30996f956ca5f7d1193e63abcc67bcba66d2886cf945705f34d6c"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:d98837392fdba3ec0eab65cdb6727af0849367b5935265b610412a415343a4fe"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:6ac9673102be62b5cbc061eaad030219dc1c28cfb7c91080f6aaca194cae67c2"},
+    {file = "mooncake_transfer_engine_cuda13-0.3.13-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:7ff638b4d782f64d7eebe7c3c34f2b4f3471be9eb1962970e6ae0a80b70ec65c"},
+]
+
+[package.dependencies]
+aiohttp = "*"
+msgpack = "*"
+requests = "*"
+
+[[package]]
 name = "mpi4py"
 version = "4.1.2"
 description = "Python bindings for MPI"
@@ -3893,14 +3916,14 @@ PyYAML = ">=5.1.0"
 
 [[package]]
 name = "openai"
-version = "3.22.1"
+version = "3.23.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "openai-3.22.1-py3-none-any.whl", hash = "sha256:43ff3de5457a8beb4afa177d4e0ba6841cfadd5219ebc62297fde6c8a9d401a6"},
-    {file = "openai-3.22.1.tar.gz", hash = "sha256:2575f961e4c1df8761f8eeb4d78e967de3f9b9f91b22f7120d60e393e970094d"},
+    {file = "openai-3.23.0-py3-none-any.whl", hash = "sha256:7fbec2e50a05ac0fa858629505688e5998fd82245058390ac1b6d98960174bd5"},
+    {file = "openai-3.23.0.tar.gz", hash = "sha256:47381c61622d4dbdc3c8492dad18628fd940b8fbd9cb1f89ed46cf0bb6795bb8"},
 ]
 
 [package.dependencies]
@@ -5093,14 +5116,14 @@ six = ">=1.5"
 
 [[package]]
 name = "python-dotenv"
-version = "1.2.3"
+version = "1.2.4"
 description = "Read key-value pairs from a .env file and set them as environment variables"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "python_dotenv-1.2.3-py3-none-any.whl", hash = "sha256:904552145e8bfed22162c09dab1c2b9b54fefa7b23ba780f4f26ca0316b0f0d9"},
-    {file = "python_dotenv-1.2.3.tar.gz", hash = "sha256:a20a594dabeaa385725aa239d5244871c143ecb356add8a20fcf23773a6c3a35"},
+    {file = "python_dotenv-1.2.4-py3-none-any.whl", hash = "sha256:42269a8a5b3fd54ffa6f3d84b18abed50064717576b4ecf03dc4a55d8aa04fdc"},
+    {file = "python_dotenv-1.2.4.tar.gz", hash = "sha256:f0d53e69935a851c0dcc78f3ab7aaccd8cabef0b92382b576b824212902873c0"},
 ]
 
 [package.extras]
@@ -7212,4 +7235,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "f3cb4d8d845bbcc5fbb6fe7b4f2886797dc746730bcf45518a1a0165c0ca2105"
+content-hash = "85c95a3509ad23debfe4285989ea9fe25b3dddaa42bb28b9e2287aa3ca310aef"
