@@ -887,7 +887,7 @@ class RemoteMpiCommSessionServer():
 
     @staticmethod
     def task_wrapper(client_sys_path: Tuple[str, ...], task: Callable[..., T],
-                     *args, **kwargs) -> T:
+                     /, *args, **kwargs) -> T:
         # Adopt the client's sys.path before the task runs, so objects it later
         # unpickles -- per-request payloads such as a caller-defined logits
         # processor -- can resolve their classes on this rank. Appending keeps
