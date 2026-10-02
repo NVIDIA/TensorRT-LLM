@@ -749,6 +749,12 @@ def _run_warmup_tracked(
     tracker = _Tracker()
     # Engines left by earlier tests are cyclic; finalize them before tracking.
     gc.collect()
+    # Observe this module's explicit cleanup without counting unrelated
+    # destructors triggered by gc.collect() or lazy imports.
+    tracked_cuda = SimpleNamespace(**vars(torch.cuda))
+    tracked_cuda.empty_cache = tracker("empty_cache")
+    tracked_torch = SimpleNamespace(**vars(torch))
+    tracked_torch.cuda = tracked_cuda
     helix_ctx = (
         patch.object(model_engine.mapping, "has_cp_helix", return_value=True)
         if force_helix_cp
@@ -782,7 +788,7 @@ def _run_warmup_tracked(
             "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.warmup_sampling_module",
             side_effect=tracker("sampling_warmup"),
         ),
-        patch("torch.cuda.empty_cache", side_effect=tracker("empty_cache")),
+        patch.object(decoder_runner_module, "torch", tracked_torch),
         patch(
             "tensorrt_llm._torch.custom_ops.torch_custom_ops.MoERunner.clear_all_workspaces",
             side_effect=tracker("moe_clear"),
@@ -975,7 +981,8 @@ class TestWarmupCleanup(unittest.TestCase):
             is_warmup_only=False,
         )
         runner._metrics = {}
-        resource_manager = object()
+        runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        resource_manager = ResourceManager({})
         events = []
 
         @contextlib.contextmanager

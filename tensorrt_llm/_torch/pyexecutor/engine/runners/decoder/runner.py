@@ -2279,12 +2279,15 @@ class DecoderRunner(ScheduledModelRunner):
             yield batch
         finally:
             if batch is not None and kv_cache_manager is not None:
+                release_request_state = getattr(self.model, "release_request_state", None)
                 for req in batch.all_requests():
                     kv_cache_manager.free_resources(req)
                     if draft_kv_cache_manager is not None:
                         draft_kv_cache_manager.free_resources(req)
                     if spec_resource_manager is not None:
                         spec_resource_manager.free_resources(req)
+                    if release_request_state is not None:
+                        release_request_state(req.py_request_id)
 
     @staticmethod
     def _apply_chunk_alignment(

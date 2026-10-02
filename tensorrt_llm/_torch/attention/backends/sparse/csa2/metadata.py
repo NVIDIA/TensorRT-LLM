@@ -117,6 +117,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
     shared_plan: CSA2SharedKVPlan | None = None
     _csa2_defer_decode_outputs: bool = False
     _csa2_deferred_decode_outputs: bool = False
+    _csa2_graph_reserved: bool = False
 
     # Request metadata is held directly on this object. Main/index physical
     # tables and write slots are owner-keyed; SWA and visibility are layer-keyed.
@@ -463,24 +464,21 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             owner,
         )
         workspace = None
-        if context_lengths:
-            # Eager whole-phase buffers retain only the latest shape per family
-            # and owner: owners with different shared-bank sizes alternate
-            # within one forward and must not evict each other. GEN and
-            # captured-context storage is never evicted or resized here.
-            for previous in tuple(self._csa2_query_tiles):
-                if (
-                    previous != key
-                    and previous[4]
-                    and previous[:2] == key[:2]
-                    and previous[3] == key[3]
-                    and previous[5] == key[5]
-                    and previous[8] == key[8]
-                ):
-                    # These eager tiles run sequentially on the model stream.
-                    # Keep the native scratch high-water mark when replacing
-                    # geometry, without retaining the old staging pools.
-                    workspace = self._csa2_query_tiles.pop(previous).workspace
+        # Retain only the latest eager shape per phase, family and owner.
+        # Graph warmup reserves storage permanently: shallow metadata clones
+        # share this cache, and an eager use can clear a tile's is_cuda_graph.
+        for previous, tile in tuple(self._csa2_query_tiles.items()):
+            if (
+                previous != key
+                and not tile._csa2_graph_reserved
+                and previous[:2] == key[:2]
+                and previous[3:6] == key[3:6]
+                and previous[8] == key[8]
+            ):
+                # Eager tiles run sequentially on the model stream. Keep their
+                # native scratch high-water mark without retaining old pools;
+                # graph-owned workspaces must never be borrowed or resized.
+                workspace = self._csa2_query_tiles.pop(previous).workspace
         with torch.cuda.device(q.device):
             capturing = torch.cuda.is_current_stream_capturing()
             metadata = self._csa2_query_tiles.get(key)
@@ -496,6 +494,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                     metadata.workspace = metadata.cuda_graph_workspace = workspace
                 self._csa2_query_tiles[key] = metadata
             metadata.shared_plan = shared_plan
+            metadata._csa2_graph_reserved |= self.is_cuda_graph or capturing
             metadata.is_cuda_graph = capturing
             if capturing:
                 self._csa2_replay_capture_signature = getattr(self, "csa2_replay_signature", None)
@@ -572,10 +571,18 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         """
         groups = source.__dict__.setdefault("_csa2_stage_groups", {})
         key = (group, self.prepared_lens.shape[0], self.num_sparse_topk)
+        capturing = torch.cuda.is_current_stream_capturing()
+        frame = (id(source), id(source.kv_cache_manager), getattr(source, "_csa2_stage_epoch", 0))
         entry = groups.get(key)
         if entry is None:
-            if torch.cuda.is_current_stream_capturing():
+            if capturing:
                 raise RuntimeError("Warm up CSA2 staging groups before graph capture")
+            # A new geometry or phase offset retires obsolete eager scratch.
+            # Keep this forward's groups for layers that reuse their selections,
+            # plus every graph reservation shared by shallow metadata clones.
+            for previous, scratch in tuple(groups.items()):
+                if not scratch["graph_reserved"] and scratch["serial"][:3] != frame:
+                    del groups[previous]
             capacity, device = self.prepared_lens.shape[0], self.prepared_lens.device
             entry = groups[key] = {
                 "tags": torch.empty(
@@ -588,13 +595,10 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                     device=device,
                 ),
                 "serial": None,
+                "graph_reserved": False,
             }
-        serial = (
-            id(source.kv_cache_manager),
-            getattr(source, "_csa2_stage_epoch", 0),
-            count,
-            torch.cuda.is_current_stream_capturing(),
-        )
+        entry["graph_reserved"] |= self.is_cuda_graph or source.is_cuda_graph or capturing
+        serial = (*frame, count, capturing)
         compact = group is None or entry["serial"] != serial
         entry["serial"] = serial
         return entry, compact
