@@ -93,7 +93,7 @@ def dequantize_nvfp4(codes: torch.Tensor, block_scales: torch.Tensor) -> torch.T
     return table[codes.long()] * block_scales.float().repeat_interleave(SF_VEC_SIZE, dim=1)
 
 
-class _Fp4BlockScaleMoeRunner(OpWrapper):
+class Fp4BlockScaleMoeRunner(OpWrapper):
     """One NVFP4-weight MoE layer over NVFP4 (e2m1 + e4m3 block-scale)
     activations, entered pre-routed.
 
@@ -396,4 +396,4 @@ class _Fp4BlockScaleMoeRunner(OpWrapper):
         )
 
 
-fp4_block_scale_moe_runner = _Fp4BlockScaleMoeRunner()
+fp4_block_scale_moe_runner = Fp4BlockScaleMoeRunner()

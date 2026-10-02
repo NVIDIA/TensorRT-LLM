@@ -25,7 +25,7 @@ E4M3_ULP_RTOL = 2.0**-3
 E4M3_MAX_INEXACT_FRACTION = 1e-3
 
 
-class _MlaRopeAppendPagedKvAssignQ(OpWrapper):
+class MlaRopeAppendPagedKvAssignQ(OpWrapper):
     """RoPE each new context token's `q_pe` (in `q`) and `k_pe` (in
     `latent_cache`) in place at its absolute position, then append the token's
     latent row `[compressed_kv | rope(k_pe)]` to the paged MLA KV cache.
@@ -215,4 +215,4 @@ class _MlaRopeAppendPagedKvAssignQ(OpWrapper):
         )
 
 
-mla_rope_append_paged_kv_assign_q = _MlaRopeAppendPagedKvAssignQ()
+mla_rope_append_paged_kv_assign_q = MlaRopeAppendPagedKvAssignQ()

@@ -16,7 +16,7 @@ from .._op import Arch, Cell, OpWrapper
 QM_FP8_KV_CACHE = 128
 
 
-class _LoadPagedKvCacheForMla(OpWrapper):
+class LoadPagedKvCacheForMla(OpWrapper):
     """Copy positions `[0, L_s)` of every context sequence out of the paged MLA
     latent cache into two new contiguous tensors, `(compressed_kv, k_pe)`.
 
@@ -163,4 +163,4 @@ class _LoadPagedKvCacheForMla(OpWrapper):
         torch.testing.assert_close(out, ref, rtol=0.0, atol=0.0)
 
 
-load_paged_kv_cache_for_mla = _LoadPagedKvCacheForMla()
+load_paged_kv_cache_for_mla = LoadPagedKvCacheForMla()

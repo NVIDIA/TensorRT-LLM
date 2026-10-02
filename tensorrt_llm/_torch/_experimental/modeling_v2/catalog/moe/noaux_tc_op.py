@@ -11,7 +11,7 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from .._op import Arch, Cell, OpWrapper
 
 
-class _NoauxTcOp(OpWrapper):
+class NoauxTcOp(OpWrapper):
     """Route each token to `topk` experts by biased sigmoid score.
 
     Selection uses `sigmoid(router_logits) + bias`; the combine weights are
@@ -131,4 +131,4 @@ class _NoauxTcOp(OpWrapper):
         )
 
 
-noaux_tc_op = _NoauxTcOp()
+noaux_tc_op = NoauxTcOp()

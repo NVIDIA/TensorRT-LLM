@@ -27,7 +27,7 @@ STANDARD, MLA_CONTEXT, MLA_GENERATION = 0, 1, 2
 QM_FP8_KV_CACHE = 128
 
 
-class _ThopAttention(OpWrapper):
+class ThopAttention(OpWrapper):
     """Append this step's K/V to the paged cache, then attend over it.
 
     The most load-bearing entry in the catalog and the only one wrapping a
@@ -566,4 +566,4 @@ class _ThopAttention(OpWrapper):
             )
 
 
-thop_attention = _ThopAttention()
+thop_attention = ThopAttention()
