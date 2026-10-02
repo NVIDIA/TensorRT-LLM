@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import os
-import re
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Literal
@@ -86,13 +85,9 @@ def _get_layer_moe_param(config, layer_idx: int, param_name: str):
 def _remap_hf_quant_module_name(name: str, num_hidden_layers: int) -> str:
     """Map an HF-checkpoint module name or glob onto the TRT-LLM module tree.
     """
-    name = re.sub(r"(model\.layers\.)?backbone", "model", name)
-    mtp_root = f"model.layers.{num_hidden_layers}"
-    if name in ("mtp", "mtp*", "mtp.*"):
-        return mtp_root
-    if name.startswith("mtp."):
-        return mtp_root + name[len("mtp"):]
-    return name
+    from .checkpoints.hf.nemotron_h_weight_mapper import NemotronHHfWeightMapper
+
+    return NemotronHHfWeightMapper.map_mtp_module_name(name, num_hidden_layers)
 
 
 class MLPLayer(MLP):
@@ -272,9 +267,10 @@ class NemotronHMOE(nn.Module):
         # Look up the per-expert quant config from quant_config_dict and use it for create_moe.
         override_quant_config = None
         if model_config.quant_config_dict is not None:
-            experts_prefix = f"{module_prefix}.mixer.experts."
+            experts_prefix = f"{module_prefix}.mixer.experts"
             for key, cfg in model_config.quant_config_dict.items():
-                if key.startswith(experts_prefix):
+                if key == experts_prefix or key.startswith(experts_prefix +
+                                                           "."):
                     override_quant_config = cfg
                     break
 
@@ -968,11 +964,6 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                 "Set speculative_config.speculative_model to a separate MTP "
                 "head replacement checkpoint, or use a target checkpoint that "
                 "embeds MTP.")
-            if ckpt_nextn == 0 and has_mtp_head_replacement:
-                # Neither checkpoint declares a head count: fall back to a
-                # single shared head, matching MTPForCausalLM's MTP-Eagle
-                # default.
-                ckpt_nextn = model_nextn = 1
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
                 pass
             else:
@@ -1316,6 +1307,7 @@ class NemotronHMTP(nn.Module):
             sublayer_model_config = replace(model_config,
                                             quant_config=sublayer_quant_config,
                                             spec_config=None)
+            sublayer_model_config.extra_attrs = model_config.extra_attrs
 
             self.layers[str(step_rel_idx)] = NemotronHMTPDecoderLayer(
                 model_config=sublayer_model_config,

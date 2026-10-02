@@ -86,6 +86,7 @@ DISAGG_CONFIG_MODES = DISAGG_BENCHMARK_MODES + AGGREGATED_DISAGG_YAML_MODES
 GEN_ONLY_MODES = ("gen_only", GEN_ONLY_NO_CONTEXT_MODE)
 
 GEN_ONLY_NO_CONTEXT_RUNTIME = "gen_only_no_context_server"
+GEN_ONLY_NO_CONTEXT_ENV = "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"
 
 DISAGG_CONFIG_RUNTIMES = ("multi_node_disagg_server", GEN_ONLY_NO_CONTEXT_RUNTIME)
 
@@ -657,8 +658,87 @@ def _scan_gen_worker_device_step_time(
     return per_file_rows
 
 
+# The expected steady-state bucket must hold at least this fraction of the
+# modal bucket's rows to be trusted. A config-derived value that the run never
+# settled at (e.g. a scheduler cap the formula does not model) otherwise lands
+# on a handful of transient iterations; below the floor the mode is used.
+_EXPECTED_NGEN_MIN_MODE_FRACTION = 0.5
+
+
+def expected_gen_only_ngen(
+    gen_config: Optional["ServerConfig"],
+    concurrency: int,
+    num_gen_servers: int,
+) -> Optional[int]:
+    """Steady-state num_generation_tokens a gen_only-mode gen worker settles at.
+
+    In the gen_only modes every request is queued on the gen workers before
+    decoding starts, so once the iteration log is stable each rank holds a fixed
+    share of the concurrency, capped by the batch and token budgets, and emits
+    1 + max_draft_len tokens per request:
+
+        per_rank = min(ceil(concurrency / (num_gen_servers * dp)),
+                       max_batch_size,
+                       max_num_tokens // (1 + max_draft_len))
+        ngen     = per_rank * (1 + max_draft_len)
+
+    dp is the attention-DP size (== tp) when enable_attention_dp is on, else 1
+    (every TP rank then sees the whole batch). num_gen_servers is always 1 for
+    gen_only_no_context and hardware.num_gen_servers for gen_only.
+
+    The inputs are read from the configuration the worker actually receives
+    (the perf YAML merged over any extra_llm_api_config_path file), not from
+    ServerConfig's reporting defaults. Returns None -- so the caller falls back
+    to the modal bucket -- when that configuration cannot be loaded, does not
+    set max_batch_size or max_num_tokens, or otherwise cannot determine a value.
+    """
+    if gen_config is None or concurrency <= 0 or num_gen_servers <= 0:
+        return None
+    try:
+        llm_args = gen_config.merged_llm_api_config_data()
+    except (OSError, yaml.YAMLError) as e:
+        print_warning(f"Cannot load the gen worker config for the expected ngen: {e}")
+        return None
+    max_batch_size = llm_args.get("max_batch_size")
+    max_num_tokens = llm_args.get("max_num_tokens")
+    if max_batch_size is None or max_num_tokens is None:
+        return None
+    spec_config = llm_args.get("speculative_config") or {}
+    max_draft_len = spec_config.get("max_draft_len", spec_config.get("num_nextn_predict_layers", 0))
+    tokens_per_request = 1 + max(int(max_draft_len or 0), 0)
+    dp = int(llm_args.get("tensor_parallel_size", 1)) if llm_args.get("enable_attention_dp") else 1
+    per_rank = min(
+        math.ceil(concurrency / (num_gen_servers * max(dp, 1))),
+        int(max_batch_size),
+        int(max_num_tokens) // tokens_per_request,
+    )
+    if per_rank <= 0:
+        return None
+    return per_rank * tokens_per_request
+
+
+def _select_ngen_bucket(
+    by_ngen: Dict[int, List[float]],
+    expected_ngen: Optional[int],
+) -> List[float]:
+    """Pick the steady-state bucket: the expected ngen if trusted, else the mode."""
+    mode_ngen, mode_values = max(by_ngen.items(), key=lambda kv: (len(kv[1]), kv[0]))
+    if expected_ngen is None or expected_ngen == mode_ngen:
+        return mode_values
+    expected_values = by_ngen.get(expected_ngen, [])
+    if len(expected_values) >= _EXPECTED_NGEN_MIN_MODE_FRACTION * len(mode_values):
+        return expected_values
+    print_warning(
+        f"Expected steady-state num_generation_tokens={expected_ngen} has "
+        f"{len(expected_values)} iterations vs {len(mode_values)} at the mode "
+        f"({mode_ngen}); falling back to the modal bucket."
+    )
+    return mode_values
+
+
 def _stats_at_mode_ngen(
     per_file_rows: List[List[_IterRow]],
+    expected_ngen: Optional[int] = None,
 ) -> Optional[_DeviceStepTimeStats]:
     """Aggregate per-file rows into one set of distribution statistics.
 
@@ -673,6 +753,14 @@ def _stats_at_mode_ngen(
     When a file produced usable rows but no parseable num_generation_tokens on
     any of them, fall back to that file's whole sample so a present metric is
     never lost (nvbugs 6487036 / 6487040).
+
+    When expected_ngen is given (the gen_only modes, see
+    expected_gen_only_ngen) that bucket is described instead of the mode,
+    provided it holds at least _EXPECTED_NGEN_MIN_MODE_FRACTION of the modal
+    bucket's rows. The mode alone is not stable: a workload can have two
+    near-tied buckets with very different step times -- the full-batch plateau
+    and a smaller tail -- and the mode then flips between them run to run
+    (nvbug 6843918: 440 vs 441 iterations, 98 ms vs 32 ms).
 
     Then average each statistic across workers, unweighted -- one vote per
     worker, matching how the mean has always been combined. Averaging a median
@@ -689,7 +777,7 @@ def _stats_at_mode_ngen(
             if row.ngen is not None:
                 by_ngen.setdefault(row.ngen, []).append(row.device_step_time)
         if by_ngen:
-            _mode_ngen, values = max(by_ngen.items(), key=lambda kv: (len(kv[1]), kv[0]))
+            values = _select_ngen_bucket(by_ngen, expected_ngen)
         else:
             # No parseable ngen anywhere in this worker; use every row.
             values = [row.device_step_time for row in rows]
@@ -715,13 +803,15 @@ def parse_gen_worker_device_step_time(
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
     end_offsets: Optional[List[int]] = None,
+    expected_ngen: Optional[int] = None,
 ) -> Optional[_DeviceStepTimeStats]:
     """Per-iter prev_device_step_time statistics (ms) across all gen workers.
 
     For each gen_server_{i}.log, take the iter >= 5 rows that are not the
     successor of an empty (num_scheduled_requests == 0) iteration, bucket them
-    by num_generation_tokens, pick the bucket with the most rows (the mode;
-    ties break to the largest ngen), and describe that bucket with mean,
+    by num_generation_tokens, pick the expected steady-state bucket when
+    expected_ngen is given and trusted, else the bucket with the most rows (the
+    mode; ties break to the largest ngen), and describe that bucket with mean,
     median, stdev, P75 and P99. Then average each statistic across the
     num_gen_servers workers. A worker whose num_generation_tokens never parses
     falls back to its whole sample rather than being dropped to None. Returns
@@ -753,7 +843,7 @@ def parse_gen_worker_device_step_time(
     per_file_rows = _scan_gen_worker_device_step_time(
         output_dir, num_gen_servers, start_offsets, end_offsets
     )
-    return _stats_at_mode_ngen(per_file_rows)
+    return _stats_at_mode_ngen(per_file_rows, expected_ngen)
 
 
 def append_gen_worker_device_step_time(
@@ -769,6 +859,7 @@ def append_gen_worker_device_step_time(
             num_gen_servers,
             start_offsets=record["start_offsets"],
             end_offsets=record.get("end_offsets"),
+            expected_ngen=record.get("expected_ngen"),
         )
         if stats is None:
             continue
@@ -1792,11 +1883,9 @@ class ServerConfig:
         }
         return db_data
 
-    def generate_extra_llm_api_config(self) -> str:
-        """Generate extra-llm-api-config.yml content."""
+    def merged_llm_api_config_data(self) -> dict:
+        """LLM API fields the worker receives: the perf YAML over the external config."""
         config_data = dict(self.extra_llm_api_config_data)
-
-        # Merge an external config if specified
         if self.extra_llm_api_config_path:
             config_path = self.extra_llm_api_config_path
             if not os.path.isabs(config_path):
@@ -1804,8 +1893,12 @@ class ServerConfig:
             with open(config_path, "r") as f:
                 external_config = yaml.safe_load(f) or {}
             # Fields in extra_llm_api_config_data (from perf YAML) take precedence
-            merged = {**external_config, **config_data}
-            config_data = merged
+            config_data = {**external_config, **config_data}
+        return config_data
+
+    def generate_extra_llm_api_config(self) -> str:
+        """Generate extra-llm-api-config.yml content."""
+        config_data = self.merged_llm_api_config_data()
 
         # Handle speculative_model path conversion
         if (
@@ -3139,6 +3232,19 @@ class DisaggTestCmds(NamedTuple):
                                     "benchmark_file_path": benchmark_file_path,
                                     "start_offsets": gen_log_start_offsets,
                                     "end_offsets": None,
+                                    # Only the gen_only modes reach a steady
+                                    # state the config determines; e2e keeps
+                                    # the modal bucket.
+                                    "expected_ngen": (
+                                        expected_gen_only_ngen(
+                                            configs_for_idx[1],
+                                            client_config.concurrency,
+                                            self.num_gen_servers,
+                                        )
+                                        if benchmark_mode_for_idx in GEN_ONLY_MODES
+                                        and client_config is not None
+                                        else None
+                                    ),
                                 }
                             )
                         if collect_time_breakdown:
@@ -3322,6 +3428,9 @@ class AggrGenOnlyNoContextCmds(NamedTuple):
             gen_env = copy.deepcopy(os.environ)
             if gen_cfg is not None:
                 gen_env.update(gen_cfg.to_env())
+            # With zero context servers, both the gen worker and the proxy must run
+            # in benchmark gen-only mode, whichever launcher started this test.
+            gen_env[GEN_ONLY_NO_CONTEXT_ENV] = "1"
             with open(gen_log_path, "a") as gen_ctx:
                 gen_proc = subprocess.Popen(
                     gen_cmd_with_port,
@@ -3343,6 +3452,7 @@ class AggrGenOnlyNoContextCmds(NamedTuple):
                 proxy_env = copy.deepcopy(os.environ)
                 if disagg_cfg is not None:
                     proxy_env.update(to_env_dict(disagg_cfg.server_env_var))
+                proxy_env[GEN_ONLY_NO_CONTEXT_ENV] = "1"
                 with open(proxy_log_path, "w") as proxy_ctx:
                     proxy_proc = subprocess.Popen(
                         proxy_cmd,
@@ -3417,6 +3527,12 @@ class AggrGenOnlyNoContextCmds(NamedTuple):
                                 "benchmark_file_path": benchmark_file_path,
                                 "start_offsets": gen_log_start_offsets,
                                 "end_offsets": None,
+                                # One gen worker, by construction of this mode.
+                                "expected_ngen": (
+                                    expected_gen_only_ngen(gen_cfg, client_config.concurrency, 1)
+                                    if client_config is not None
+                                    else None
+                                ),
                             }
                         )
                         if collect_time_breakdown:
