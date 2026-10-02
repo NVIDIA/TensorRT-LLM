@@ -920,12 +920,12 @@ def build_row_mapping(
     num_gens = batch_size - num_contexts
     batch_slots = slot_ids[:batch_size].to(device=device, dtype=torch.int64)
 
-    if getattr(spec_metadata, "is_ragged_verify", False):
-        from tensorrt_llm._torch.speculative.dspark_ragged import row_ids_from_lens
+    if spec_metadata.is_ragged_verify:
+        from tensorrt_llm._torch.speculative.ragged_helpers import row_ids_from_lens
 
-        verify_lens = getattr(spec_metadata, "verify_lens", None)
-        qo_indptr = getattr(spec_metadata, "qo_indptr", None)
-        total_verify_tokens = getattr(spec_metadata, "total_verify_tokens", None)
+        verify_lens = spec_metadata.verify_lens
+        qo_indptr = spec_metadata.qo_indptr
+        total_verify_tokens = spec_metadata.total_verify_tokens
         if (
             verify_lens is None
             or qo_indptr is None
