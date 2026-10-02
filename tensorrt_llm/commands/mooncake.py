@@ -23,9 +23,9 @@ Capacity needs no command: every rank that joins the pool lends the memory its
 own config asks for.
 """
 
+import contextlib
 import signal
 import tempfile
-import threading
 import time
 from typing import Optional
 
@@ -62,38 +62,32 @@ def _apply_cli_telemetry(telemetry: bool) -> None:
     )
 
 
-def _until_signalled() -> threading.Event:
-    """An event that SIGINT and SIGTERM set.
+@contextlib.contextmanager
+def _signal_handoff():
+    """Turn SIGINT and SIGTERM into the exit the telemetry boundary expects.
 
     The master's reaping and the manifest's retraction are in a `finally`,
     which default SIGTERM handling would skip, leaving an address on disk for
-    the next run to dial. Setting an event instead lets the wait loop return
-    and those context managers unwind; see `_report_signal_exit`.
+    the next run to dial.
+
+    `raise_signal_exit` unwinds those context managers and carries the signal
+    number out to `trtllm-serve`, which is what reports the exit as a signal
+    rather than as a clean one. It raises rather than recording, since a
+    handler shares its thread with whatever it interrupted and so must take no
+    lock: setting a `threading.Event` here deadlocks against the wait that the
+    signal interrupted.
+
+    Wrap this around the resource so the log below follows the release.
     """
-    stopping = threading.Event()
-    stopping.signal_number = None
-
-    def stop(signum, _frame):
-        stopping.signal_number = signum
-        stopping.set()
-
     for received in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(received, stop)
-    return stopping
-
-
-def _report_signal_exit(stopping: threading.Event) -> None:
-    """Exit as the signal that stopped the command, after it has released.
-
-    `trtllm-serve` reports the exit as a signal rather than as a clean one only
-    if it sees `SignalExit`.
-    """
-    if stopping.signal_number is None:
-        return
-    # Logged here rather than in the handler, which must not take the logging
-    # lock.
-    logger.info(f"mooncake-store: signal {stopping.signal_number} received, shut down")
-    raise _command_telemetry.SignalExit(stopping.signal_number)
+        signal.signal(received, _command_telemetry.raise_signal_exit)
+    try:
+        yield
+    except _command_telemetry.SignalExit as stopping:
+        # Logged here rather than in the handler, which must not take the
+        # logging lock.
+        logger.info(f"mooncake-store: signal {stopping.signal_number} received, shut down")
+        raise
 
 
 @click.command("mooncake_master")
@@ -212,19 +206,21 @@ def mooncake_master(
 
     run_dir = run_dir or tempfile.mkdtemp(prefix="trtllm-mooncake-master-")
 
-    stopping = _until_signalled()
-    with running_master(
-        run_dir,
-        pool_file=pool_file,
-        rpc_port=rpc_port,
-        metrics_port=metrics_port,
-        eviction_ratio=eviction_ratio,
-        metadata_server=metadata_server,
-        protocol=protocol,
-        namespace=namespace,
-        binary=binary,
-        timeout=timeout,
-    ) as master:
+    with (
+        _signal_handoff(),
+        running_master(
+            run_dir,
+            pool_file=pool_file,
+            rpc_port=rpc_port,
+            metrics_port=metrics_port,
+            eviction_ratio=eviction_ratio,
+            metadata_server=metadata_server,
+            protocol=protocol,
+            namespace=namespace,
+            binary=binary,
+            timeout=timeout,
+        ) as master,
+    ):
         logger.warning(
             f"mooncake-store: this master owns the pool until this command "
             f"stops; address {master.address}, log {master.log_path}, metrics "
@@ -232,14 +228,16 @@ def mooncake_master(
         )
         started = time.monotonic()
         announced = started
-        while not stopping.is_set():
+        while True:
             if (code := master.process.poll()) is not None:
                 # The pool is gone once the master dies, and every client is
                 # about to start failing.
                 raise click.ClickException(
                     f"mooncake_master exited with code {code}. See {master.log_path}"
                 )
-            stopping.wait(1.0)
+            # The handler raises, so a signal ends this wait rather than
+            # resuming it.
+            time.sleep(1.0)
             now = time.monotonic()
             # Distinguishes a dead master from a dead fabric.
             if heartbeat_seconds > 0 and now - announced >= heartbeat_seconds:
@@ -248,8 +246,6 @@ def mooncake_master(
                     f"mooncake-store: master at {master.address} alive after "
                     f"{(now - started) / 60:.0f}m"
                 )
-
-    _report_signal_exit(stopping)
 
 
 @click.command("mooncake_pool_report")

@@ -49,6 +49,7 @@ from .config import (
     DEFAULT_METADATA_SERVER,
     DEFAULT_NAMESPACE,
     RUN_DIR_OWNER_NAME,
+    MooncakeStoreConnectorConfig,
     StoreRole,
     parse_size,
 )
@@ -742,6 +743,54 @@ def claim_run_dir(run_dir: str, role: str) -> None:
     )
 
 
+def _adopt_inherited_settings(pool: Any, path: str) -> None:
+    """Restate `pool` as the client config at `path` leaves it.
+
+    An inherited `MOONCAKE_CONFIG_PATH` decides what every rank opens its store
+    handle with, so what `mooncake_store` asked for is not what this server
+    does. Anything reading the block afterwards would otherwise describe a
+    server lending 16 GiB as `both` while its ranks lend 32 as `capacity`; the
+    usage report the LLM constructor sends captures `role` and `segment_size`
+    from here.
+
+    Read through the workers' own reader, so a value is restated as they will
+    resolve it, defaults for absent keys included. Reporting only: an
+    unreadable config is left to the workers, which fail on it with the path
+    and the parse error in hand. `pool`, `run_dir` and `master_timeout` are not
+    restated, naming how to reach the pool and where this run's files go rather
+    than how the server joins it.
+    """
+    try:
+        effective = MooncakeStoreConnectorConfig.from_file(path)
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            f"mooncake-store: {path} could not be read ({exc}), so "
+            "kv_connector_config.mooncake_store still describes what this "
+            "server asked for rather than what its ranks will use."
+        )
+        return
+
+    restated = {}
+    for setting, value in (
+        ("role", effective.role.value),
+        ("segment_size", effective.global_segment_size),
+        ("namespace", effective.namespace),
+        ("model_key", effective.model_key),
+        ("transfer_batch_size", effective.transfer_batch_size),
+        ("stage_through_host", effective.stage_through_host),
+    ):
+        if value is None or not hasattr(pool, setting) or value == getattr(pool, setting):
+            continue
+        setattr(pool, setting, value)
+        restated[setting] = value
+    if restated:
+        logger.warning(
+            f"mooncake-store: {path} states "
+            f"{', '.join(f'{k}={v!r}' for k, v in restated.items())}, which is "
+            "what this server joins the pool as."
+        )
+
+
 @contextlib.contextmanager
 def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optional[str]]:
     """Join the pool `pool` names and point this process's ranks at it.
@@ -762,6 +811,7 @@ def provision_pool(pool: Any, run_dir: Optional[str] = None) -> Iterator[Optiona
             "kv_connector_config.mooncake_store is ignored and the pool it "
             "names is used as is."
         )
+        _adopt_inherited_settings(pool, inherited)
         yield None
         return
 
