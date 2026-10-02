@@ -22,6 +22,7 @@
 #include <ATen/Functions.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/EmptyTensor.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -34,8 +35,9 @@ namespace torch_ext
 at::Tensor xielu(at::Tensor const& input, double a_p, double a_n, double beta, double eps)
 {
     CHECK_TH_CUDA(input);
+    c10::cuda::CUDAGuard const deviceGuard(input.device());
     at::Tensor const in = input.contiguous();
-    at::Tensor output = at::empty_like(in);
+    at::Tensor output = at::empty(in.sizes(), in.options());
     kernels::XieluParams const params{
         static_cast<float>(a_p), static_cast<float>(a_n), static_cast<float>(beta), static_cast<float>(eps)};
     auto stream = at::cuda::getCurrentCUDAStream(in.get_device());

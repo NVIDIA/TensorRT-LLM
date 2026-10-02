@@ -42,7 +42,12 @@ def _op(x: torch.Tensor, a_p: float, a_n: float, beta: float, eps: float) -> tor
 
 
 def _assert_identical(actual: torch.Tensor, expected: torch.Tensor) -> None:
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0, equal_nan=True)
+    """Same bit patterns (so +0.0 != -0.0); NaN only needs to be NaN in both."""
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype
+    nan = torch.isnan(expected)
+    assert torch.equal(torch.isnan(actual), nan)
+    bits = torch.int16 if actual.element_size() == 2 else torch.int32
+    torch.testing.assert_close(actual.view(bits)[~nan], expected.view(bits)[~nan], atol=0, rtol=0)
 
 
 def _special_values(dtype: torch.dtype) -> torch.Tensor:
@@ -122,6 +127,29 @@ def test_non_contiguous_input(dtype):
     x = (torch.randn(64, 256, device="cuda") * 4).to(dtype).t()
     out = _op(x, **COEFFS)
     assert out.shape == x.shape
+    _assert_identical(out, xielu_reference(x, **COEFFS))
+
+
+def test_output_layout_matches_fake():
+    """Singleton dims let a non-standard stride count as contiguous."""
+    x = (torch.randn(1, 40, device="cuda") * 4).to(torch.bfloat16).as_strided((2, 1), (1, 20))
+    assert x.is_contiguous()
+    out = _op(x, **COEFFS)
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode(allow_non_fake_inputs=True) as mode:
+        fake_out = _op(mode.from_tensor(x), **COEFFS)
+    assert out.stride() == fake_out.stride() == (1, 1)
+    _assert_identical(out, xielu_reference(x, **COEFFS))
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires 2 GPUs")
+def test_input_on_non_current_device():
+    x = (torch.randn(4096, device="cuda:1") * 4).to(torch.bfloat16)
+    with torch.cuda.device(0), torch.cuda.stream(torch.cuda.Stream(device=1)):
+        out = _op(x, **COEFFS)
+    torch.cuda.synchronize(1)
+    assert out.device == x.device
     _assert_identical(out, xielu_reference(x, **COEFFS))
 
 

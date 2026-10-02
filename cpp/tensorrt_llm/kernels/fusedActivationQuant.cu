@@ -110,7 +110,7 @@ void invokeXielu(T const* input, T* output, int64_t numel, XieluParams params, c
     bool const vectorized = reinterpret_cast<uintptr_t>(input) % sizeof(uint4) == 0
         && reinterpret_cast<uintptr_t>(output) % sizeof(uint4) == 0;
     int64_t const work = vectorized ? (numel + kVecSize - 1) / kVecSize : numel;
-    static int const maxBlocks = tensorrt_llm::common::getMultiProcessorCount() * 32;
+    int const maxBlocks = tensorrt_llm::common::getMultiProcessorCount() * 32;
     int const numBlocks
         = static_cast<int>(std::min<int64_t>((work + kThreadsPerBlock - 1) / kThreadsPerBlock, maxBlocks));
     xieluKernel<T><<<numBlocks, kThreadsPerBlock, 0, stream>>>(input, output, numel, params, vectorized);
