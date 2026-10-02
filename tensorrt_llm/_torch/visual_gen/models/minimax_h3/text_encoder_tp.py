@@ -16,6 +16,7 @@ from transformers import AutoConfig
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3ForTextEmbedding
+from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
 from .packing import MINIMAX_H3_TEXT_ENCODER_LAYER
@@ -69,6 +70,10 @@ class MiniMaxH3TensorParallelTextEncoder(torch.nn.Module):
             pretrained_config=config,
             mapping=mapping,
             attn_backend="VANILLA",
+            # MiniMax-H3 can load its Qwen text encoder on a subset of ranks.
+            # NCCL keeps all-reduce scoped to that TP group and avoids the
+            # custom workspace setup that synchronizes the full world.
+            allreduce_strategy=AllReduceStrategy.NCCL,
             max_num_tokens=max_num_tokens or getattr(config, "max_position_embeddings", 8192),
         )
         model_config._frozen = True
@@ -109,9 +114,9 @@ class MiniMaxH3TensorParallelTextEncoder(torch.nn.Module):
         if key.startswith("model.visual."):
             return None
         if key.startswith(self._LANGUAGE_MODEL_PREFIX):
-            key = f"model.{key[len(self._LANGUAGE_MODEL_PREFIX):]}"
+            key = f"model.{key[len(self._LANGUAGE_MODEL_PREFIX) :]}"
         elif key.startswith(self._BARE_LANGUAGE_MODEL_PREFIX):
-            key = f"model.{key[len(self._BARE_LANGUAGE_MODEL_PREFIX):]}"
+            key = f"model.{key[len(self._BARE_LANGUAGE_MODEL_PREFIX) :]}"
 
         if key.startswith(("lm_head.", "model.lm_head.")):
             return None
