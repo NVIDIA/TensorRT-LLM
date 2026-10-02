@@ -520,6 +520,16 @@ class TestParallelConfigValidation:
         with pytest.raises(ValidationError):
             ParallelConfig(parallel_vae_size=0)
 
+    def test_text_encoder_tp_size_does_not_change_worker_count(self):
+        pc = ParallelConfig(ulysses_size=2, text_encoder_tp_size=2)
+        assert pc.n_workers == 2
+        pc.validate_world_size(2)
+
+    def test_text_encoder_tp_size_validate_world_size_fails(self):
+        pc = ParallelConfig(text_encoder_tp_size=2)
+        with pytest.raises(ValueError, match="text_encoder_tp_size"):
+            pc.validate_world_size(1)
+
     def test_attn2d_and_ulysses_seq_parallel_size(self):
         pc = ParallelConfig(
             attn2d_size=(2, 2),

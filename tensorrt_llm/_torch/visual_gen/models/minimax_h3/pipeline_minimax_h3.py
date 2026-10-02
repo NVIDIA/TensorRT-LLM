@@ -23,17 +23,20 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from diffusers import AutoencoderKLMiniMaxH3, AutoencoderKLMiniMaxH3Audio, MiniMaxH3Scheduler
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image, ImageOps
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
+from tensorrt_llm._torch.visual_gen.checkpoints.weight_loader import WeightLoader
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
@@ -60,6 +63,7 @@ from .packing import (
     unpatchify_video_tokens,
     video_latent_num_frames,
 )
+from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
 
 
@@ -145,8 +149,27 @@ class MiniMaxH3Pipeline(BasePipeline):
         return torch.Generator().manual_seed(seed)
 
     def __init__(self, pipeline_config: DiffusionPipelineConfig) -> None:
-        if pipeline_config.mapping.world_size != 1:
-            raise NotImplementedError("MiniMax-H3 initial support is single-GPU only.")
+        if pipeline_config.mapping.tp_size != 1:
+            raise NotImplementedError(
+                "MiniMax-H3 DiT tensor parallelism is not supported yet. Set "
+                "parallel_config.tp_size=1. text_encoder_tp_size may still be "
+                "used to tensor-shard the MiniMax-H3 Qwen text encoder."
+            )
+        self.text_encoder_tp_size = int(
+            getattr(getattr(pipeline_config, "parallel", None), "text_encoder_tp_size", 1)
+        )
+        world_size = pipeline_config.mapping.world_size
+        if self.text_encoder_tp_size > world_size:
+            raise ValueError(
+                f"text_encoder_tp_size ({self.text_encoder_tp_size}) exceeds "
+                f"world_size ({world_size})."
+            )
+        if self.text_encoder_tp_size > 1 and self.text_encoder_tp_size != world_size:
+            raise NotImplementedError(
+                "MiniMax-H3 text_encoder_tp_size > 1 currently must match "
+                "world_size so the Qwen text encoder can be tensor-sharded "
+                "across all ranks."
+            )
         if (
             pipeline_config.attention.backend == "TRTLLM"
             and torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
@@ -237,6 +260,26 @@ class MiniMaxH3Pipeline(BasePipeline):
         self.transformer.load_weights(transformer_weights)
         self.transformer.eval()
 
+    def _load_tensor_parallel_text_encoder(
+        self,
+        checkpoint_dir: str,
+        device: torch.device,
+    ) -> MiniMaxH3TensorParallelTextEncoder:
+        text_encoder_mapping = Mapping(
+            world_size=self.world_size,
+            rank=self.rank,
+            tp_size=self.text_encoder_tp_size,
+            gpus_per_node=self.world_size,
+        )
+        text_encoder = MiniMaxH3TensorParallelTextEncoder.from_pretrained_config(
+            checkpoint_dir, text_encoder_mapping, device
+        )
+        weights = WeightLoader(components=PipelineComponent.TEXT_ENCODER).load_weights(
+            checkpoint_dir, text_encoder_mapping
+        )
+        text_encoder.load_weights(weights)
+        return text_encoder.eval()
+
     def load_standard_components(
         self,
         checkpoint_dir: str,
@@ -258,12 +301,23 @@ class MiniMaxH3Pipeline(BasePipeline):
                 subfolder=PipelineComponent.PROCESSOR,
             )
         if not _component_skipped(skip_components, PipelineComponent.TEXT_ENCODER):
-            self.text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
-                checkpoint_dir,
-                subfolder=PipelineComponent.TEXT_ENCODER,
-                torch_dtype=torch.bfloat16,
-            ).to(device)
-            self.text_encoder.eval()
+            if self._uses_tensor_parallel_text_encoder:
+                self.text_encoder = self._load_tensor_parallel_text_encoder(checkpoint_dir, device)
+            elif self._loads_text_encoder_on_this_rank:
+                self.text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+                    checkpoint_dir,
+                    subfolder=PipelineComponent.TEXT_ENCODER,
+                    torch_dtype=torch.bfloat16,
+                ).to(device)
+                self.text_encoder.eval()
+            else:
+                self.text_encoder = None
+                logger.info(
+                    "MiniMax-H3 text encoder is loaded only on ranks < %d; "
+                    "rank %d will receive broadcast prompt embeddings.",
+                    self.text_encoder_tp_size,
+                    self.rank,
+                )
         if not _component_skipped(skip_components, PipelineComponent.VAE):
             self.vae = AutoencoderKLMiniMaxH3.from_pretrained(
                 checkpoint_dir,
@@ -445,13 +499,74 @@ class MiniMaxH3Pipeline(BasePipeline):
         prompt: str,
         keyframes: list[Image.Image],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_layers = self.text_encoder.config.text_config.num_hidden_layers
-        if num_layers <= MINIMAX_H3_TEXT_ENCODER_LAYER:
-            raise ValueError(
-                "MiniMax-H3 requires the unnormalized hidden state after Qwen3-VL "
-                f"layer {MINIMAX_H3_TEXT_ENCODER_LAYER}, but the encoder has "
-                f"{num_layers} layers."
+        if self._uses_tensor_parallel_text_encoder:
+            return self._encode_prompt_local(prompt, keyframes)
+        if self.world_size == 1:
+            return self._encode_prompt_local(prompt, keyframes)
+
+        prompt_embeds: torch.Tensor | None = None
+        text_token_tags: torch.Tensor | None = None
+        if self.rank == 0:
+            prompt_embeds, text_token_tags = self._encode_prompt_local(prompt, keyframes)
+
+        prompt_embeds = self._broadcast_tensor_from_rank0(prompt_embeds, dtype=self.dtype)
+        text_token_tags = self._broadcast_tensor_from_rank0(text_token_tags, dtype=torch.long)
+        return prompt_embeds, text_token_tags.cpu()
+
+    @property
+    def _uses_tensor_parallel_text_encoder(self) -> bool:
+        return self.text_encoder_tp_size > 1
+
+    @property
+    def _loads_text_encoder_on_this_rank(self) -> bool:
+        return self._uses_tensor_parallel_text_encoder or self.rank < self.text_encoder_tp_size
+
+    def _broadcast_tensor_from_rank0(
+        self,
+        tensor: torch.Tensor | None,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if not dist.is_initialized():
+            if tensor is None:
+                raise ValueError("rank 0 tensor is required when distributed is not initialized.")
+            return tensor.to(device=self.device, dtype=dtype)
+
+        shape = torch.zeros(8, dtype=torch.long, device=self.device)
+        if self.rank == 0:
+            if tensor is None:
+                raise ValueError("rank 0 tensor is required for MiniMax-H3 broadcast.")
+            tensor = tensor.to(device=self.device, dtype=dtype).contiguous()
+            shape[0] = tensor.ndim
+            shape[1 : tensor.ndim + 1] = torch.tensor(tensor.shape, device=self.device)
+        dist.broadcast(shape, src=0)
+        ndim = int(shape[0].item())
+        tensor_shape = tuple(int(value) for value in shape[1 : ndim + 1].tolist())
+        if self.rank != 0:
+            tensor = torch.empty(tensor_shape, dtype=dtype, device=self.device)
+        dist.broadcast(tensor, src=0)
+        return tensor
+
+    def _encode_prompt_local(
+        self,
+        prompt: str,
+        keyframes: list[Image.Image],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.text_encoder is None:
+            raise RuntimeError("MiniMax-H3 text encoder is not loaded on this rank.")
+        if self._uses_tensor_parallel_text_encoder and keyframes:
+            raise NotImplementedError(
+                "MiniMax-H3 tensor-parallel text encoder currently supports "
+                "text-only prompts; set text_encoder_tp_size=1 for keyframe requests."
             )
+        if not self._uses_tensor_parallel_text_encoder:
+            num_layers = self.text_encoder.config.text_config.num_hidden_layers
+            if num_layers <= MINIMAX_H3_TEXT_ENCODER_LAYER:
+                raise ValueError(
+                    "MiniMax-H3 requires the unnormalized hidden state after Qwen3-VL "
+                    f"layer {MINIMAX_H3_TEXT_ENCODER_LAYER}, but the encoder has "
+                    f"{num_layers} layers."
+                )
 
         pixel_values = None
         image_grid_thw = None
@@ -486,26 +601,32 @@ class MiniMaxH3Pipeline(BasePipeline):
         token_ids.extend(prompt_ids)
         token_tags.extend([MINIMAX_H3_TEXT_TAG] * len(prompt_ids))
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
-        mm_token_type_ids = torch.tensor(
-            self.processor.create_mm_token_type_ids([token_ids]),
-            dtype=torch.long,
-            device=self.device,
-        )
-        outputs = self.text_encoder.model(
-            input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids),
-            mm_token_type_ids=mm_token_type_ids,
-            pixel_values=None
-            if pixel_values is None
-            else pixel_values.to(self.device, self.text_encoder.dtype),
-            image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(self.device),
-            use_cache=False,
-            output_hidden_states=True,
-        )
-        prompt_embeds = outputs.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER].to(
-            device=self.device,
-            dtype=self.dtype,
-        )
+        if self._uses_tensor_parallel_text_encoder:
+            prompt_embeds = self.text_encoder.encode(input_ids).to(
+                device=self.device,
+                dtype=self.dtype,
+            )
+        else:
+            mm_token_type_ids = torch.tensor(
+                self.processor.create_mm_token_type_ids([token_ids]),
+                dtype=torch.long,
+                device=self.device,
+            )
+            outputs = self.text_encoder.model(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                mm_token_type_ids=mm_token_type_ids,
+                pixel_values=None
+                if pixel_values is None
+                else pixel_values.to(self.device, self.text_encoder.dtype),
+                image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(self.device),
+                use_cache=False,
+                output_hidden_states=True,
+            )
+            prompt_embeds = outputs.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER].to(
+                device=self.device,
+                dtype=self.dtype,
+            )
         return prompt_embeds, torch.tensor(token_tags, dtype=torch.long)
 
     def _encode_keyframes(
