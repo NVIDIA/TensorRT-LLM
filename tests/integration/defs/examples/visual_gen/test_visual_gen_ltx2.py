@@ -385,6 +385,7 @@ def test_ltx2_cuda_graph_lpips_matches_eager(_visual_gen_deps, tmp_path):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_ltx2_cuda_graph_trtllm_backend(request, _visual_gen_deps, tmp_path, monkeypatch):
+    conftest.skip_fp4_pre_blackwell(True)
     reference_path = tmp_path / "ltx2_trtllm_backend_generated.mp4"
     generated_path = tmp_path / "ltx2_cuda_graph_trtllm_backend_generated.mp4"
     # Compare the same NVFP4, attention, and compilation configuration.
