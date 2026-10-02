@@ -639,15 +639,24 @@ class PyResult:
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
 
-    def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
-                             mm_embedding_lengths: List[int]):
+    def append_mm_embeddings(
+        self,
+        mm_embeddings: torch.Tensor,
+        mm_embedding_lengths: List[int],
+        mm_embedding_metadata: list[dict[str, list[int]]]
+        | None = None) -> None:
         """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:
             mm_embeddings: Concatenated multimodal embeddings tensor of shape
                 [total_tokens, hidden_dim].
             mm_embedding_lengths: Per-item encoder-output embedding lengths.
+            mm_embedding_metadata: Optional per-item layout data for prefill.
         """
+        if mm_embedding_metadata is not None and len(
+                mm_embedding_metadata) != len(mm_embedding_lengths):
+            raise ValueError(
+                "Embedding metadata must have one entry per multimodal item")
         split_embeddings = torch.split(mm_embeddings,
                                        mm_embedding_lengths,
                                        dim=0)
@@ -656,6 +665,11 @@ class PyResult:
             SharedTensorContainer.from_tensor(emb).dump_to_dict()
             for emb in split_embeddings
         ]
+        if mm_embedding_metadata is not None:
+            for handle, metadata in zip(self._mm_embeddings,
+                                        mm_embedding_metadata,
+                                        strict=True):
+                handle["metadata"] = metadata
         self.diff.mm_embeddings = self._mm_embeddings
 
     def set_mrope_position(

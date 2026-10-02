@@ -3155,6 +3155,12 @@ def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def RUN_MODE = "run_mode"
+// Whether this pipeline asked for BOLT-optimized binaries. Resolved once by
+// L0_MergeRequest.groovy::resolveBoltConsume and propagated here in globalVars,
+// so the release wheel below follows the same switch as the build tarball
+// instead of inventing a second answer to "is BOLT on".
+@Field
+def BOLT_CONSUME_BUILD = "bolt_consume_build"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -3162,6 +3168,7 @@ def globalVars = [
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): null,
+    (BOLT_CONSUME_BUILD): false,
 ]
 
 class GlobalState {
@@ -5092,20 +5099,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
             }
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
-            // Gateway adapters (SMG, OpenEngine) are opt-in extras excluded
-            // from requirements.txt, each declaring its pins in a dedicated
-            // requirements-<gateway>.txt so it is tested under the dependency
-            // set its real opt-in users receive. Both are installed on every
-            // stage: their pins co-resolve, so no stage-name guard is needed to
-            // keep them apart, and no stage silently loses a gateway's coverage
-            // to an `importorskip` at collection.
-            //
-            // OpenEngine's bindings resolve only from a custom index
-            // (--extra-index-url https://buf.build/gen/python), but that flag is
-            // scoped to this one pip invocation and does not affect how any
-            // other package resolves.
+            // SMG's generated package remains an opt-in dependency. OpenEngine's
+            // private bindings and grpcio dependency are part of the base package.
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
                 // TODO(dlfw-26.08): reinstate causal-conv1d and mamba-ssm once
@@ -5693,6 +5689,77 @@ def checkKitmakerWheelDryRun(pipeline, kitmakerDryRunMetadata)
 }
 
 
+// Apply the branch's latest promoted BOLT profile bundle to a freshly built
+// wheel, in place. Mirrors Build.groovy's premerge applyLatestBolt (same
+// llvm-bolt staging, same apply_latest.sh, same exit-code contract), but for a
+// standalone .whl rather than a packed tarball.
+//
+// Every failure is fatal, including a missing bundle. The caller only reaches
+// here when the pipeline asked for BOLT, and this wheel is what the release job
+// publishes, so "BOLT is on" has to mean the wheel IS optimized -- degrading to
+// an un-BOLTed wheel with a log line is how an unoptimized artifact reaches PyPI
+// unnoticed. That is stricter than Build.groovy's applyLatestBolt, which treats
+// a missing bundle as a skip; it has to, because the same switch covers x86_64,
+// where nothing is promoted yet. This path is aarch64-only and the switch is
+// main-only, so there is always a bundle to find.
+def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch)
+{
+    def llvmArch = (cpu_arch == AARCH64_TRIPLE) ? "ARM64" : "X64"
+    // apply_latest.sh resolves exactly one branch, so try the build's own branch
+    // and fall back to main. Profiles are function-name-keyed and applied with
+    // -infer-stale-profile, so a nearby branch's bundle is valid -- the same
+    // candidate-branch fallback BuildDockerImage.groovy's overlay uses.
+    def branches = [env.gitlabTargetBranch, env.branch_name, "main"]
+        .collect { it?.toString()?.trim() }
+        .findAll { it }
+        .unique()
+
+    stage("BOLT release wheel") {
+        sh """
+            set -e
+            export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
+            if ! command -v llvm-bolt >/dev/null 2>&1; then
+                . tensorrt_llm/scripts/bolt/internal/llvm_bolt_version.sh
+                echo "[bolt-wheel] staging llvm-bolt \${LLVM_BOLT_VERSION}"
+                tb=LLVM-\${LLVM_BOLT_VERSION}-Linux-${llvmArch}.tar.xz
+                mkdir -p .bolt-llvm
+                curl -fSL --retry 10 --retry-all-errors --retry-delay 15 --connect-timeout 60 \
+                     -o /tmp/\$tb "https://github.com/llvm/llvm-project/releases/download/llvmorg-\${LLVM_BOLT_VERSION}/\$tb"
+                tar -xJf /tmp/\$tb -C .bolt-llvm --strip-components=1
+                rm -f /tmp/\$tb
+            fi
+        """
+        // Exit codes (apply_latest.sh): 3 = no promoted bundle for branch/triple,
+        // 2 = apply error, 0 = applied. Only 3 is worth trying the next branch for;
+        // an apply error means the bundle IS there and did not take, which retrying
+        // against a different branch would only paper over.
+        def rc = 3
+        def appliedFrom = null
+        for (b in branches) {
+            rc = sh(returnStatus: true, script: """
+                export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
+                bash tensorrt_llm/scripts/bolt/internal/apply_latest.sh \
+                     ${b} ${cpu_arch} ${wheel} ${wheel}.bolted
+            """)
+            if (rc != 3) {
+                appliedFrom = b
+                break
+            }
+            echo "[bolt-wheel] no promoted bundle for ${b}/${cpu_arch}; trying next candidate branch"
+        }
+        if (rc == 3) {
+            error("[bolt-wheel] no promoted BOLT bundle for any of ${branches.join(', ')} (${cpu_arch}); " +
+                  "refusing to upload an unoptimized release wheel (promote a bundle via BoltProfileGen, " +
+                  "or turn BOLT consume off for this run)")
+        }
+        if (rc != 0) {
+            error("[bolt-wheel] apply_latest.sh failed (rc=${rc}) for ${appliedFrom}/${cpu_arch}")
+        }
+        sh "mv -f ${wheel}.bolted ${wheel}"
+        echo "[bolt-wheel] ${wheel} is now BOLTed (profiles from ${appliedFrom}/${cpu_arch})"
+    }
+}
+
 def runLLMBuild(
     pipeline,
     cpu_arch,
@@ -5701,7 +5768,8 @@ def runLLMBuild(
     version_override="",
     cpver="cp312",
     plat_name="",
-    is_dlfw=false)
+    is_dlfw=false,
+    boltConsume=false)
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -5746,6 +5814,27 @@ def runLLMBuild(
     }
 
     def wheelName = sh(returnStdout: true, script: 'cd tensorrt_llm/build && ls -1 *.whl').trim()
+
+    // ENABLE_BOLT_COMPATIBLE=ON above only makes the binaries BOLT-able; it does
+    // not optimize them. The tarball gets the actual optimization elsewhere
+    // (Build.groovy premerge, BoltProfileGen postmerge), but this wheel is built
+    // and uploaded on its own, so without this step the released SBSA wheel ships
+    // unoptimized. Must run BEFORE the upload below, and before the local
+    // pip install / DLFW repack, so every consumer sees the same bytes.
+    //
+    // Gated on the pipeline's BOLT switch, not on the run mode: the wheel the
+    // release job publishes is the same artifact whether the run is nightly,
+    // weekly or GA, so the trigger has to be "is BOLT on", not "is this a
+    // nightly". aarch64 only -- x86_64 has no promoted bundle.
+    //
+    // Scoped to the wheel published at the root of <arch>/, which is the one the
+    // release job picks up. An imageTest/ build is a throwaway wheel compiled
+    // inside an already-released image to prove that image can still build from
+    // source; optimizing it would prove nothing and only add a failure mode.
+    if (boltConsume && cpu_arch == AARCH64_TRIPLE && !wheel_path) {
+        applyLatestBoltToWheel(pipeline, "tensorrt_llm/build/${wheelName}", cpu_arch)
+    }
+
     def rootWheelUploadPath = "${cpu_arch}/${wheel_path}"
     // DLFW publishes the built public-version wheel under its subdirectory. Other
     // builds continue to publish the built wheel at the original path.
@@ -6916,10 +7005,14 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                 pyver = "3.10"
             }
 
+            // Same switch the build helpers use for the tarball, so the released
+            // wheel and the released tarball are never optimized differently.
+            def boltConsume = globalVars[BOLT_CONSUME_BUILD]?.toString() == "true"
+
             buildRunner("[${toStageName(values[1], key)}] Build") {
                 wheelPath = runLLMBuild(
                     pipeline, cpu_arch, values[3], "", versionOverride, cpver,
-                    values[7], isDlfw)
+                    values[7], isDlfw, boltConsume)
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.
