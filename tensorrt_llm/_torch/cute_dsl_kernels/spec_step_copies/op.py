@@ -94,7 +94,8 @@ class SlotScatter:
     """The speculative sampler's store update as one kernel.
 
     ``store[..., slots[r]] = outputs[row_begin + r]`` for every row ``r``, each row padded with zeros or cut to its
-    store's width.
+    store's width. A row's ``new_tokens`` at or past its ``new_tokens_lens`` are stored as zeros: the forward writes
+    only column 0 of a context row, and readers of the store stop at that length.
     """
 
     _kernel: ClassVar[Any] = None

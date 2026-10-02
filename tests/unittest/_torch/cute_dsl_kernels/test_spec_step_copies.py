@@ -18,8 +18,11 @@ engine's for max batch 8 and max draft length 7 (sampler stores [8, slots, 1], [
 8 or 16 slots; draft-token buffer 56, KV-length offsets 8, per-token buffers max_num_tokens).
 
 * ``SlotScatter.scatter`` vs SpecSampler's torch store update (each output padded with zeros or cut to its store's
-  width, then four ``index_copy_`` by slot): outputs narrower than (dynamic draft length), as wide as and wider than the
-  stores, and mixed per field; row_begin 0 and > 0; shuffled distinct slot tables.
+  width, the new tokens at or past a row's accepted length zeroed, then four ``index_copy_`` by slot): outputs
+  narrower than (dynamic draft length), as wide as and wider than the stores, and mixed per field; row_begin 0 and
+  > 0; shuffled distinct slot tables; accepted lengths from 0 to past the output width. A mixed context / generation
+  batch laid out as the one-model worker writes it (a context row's tokens past column 0 never written) stores zeros
+  there.
 * ``StepInputStage.gather`` committed on its own vs PyTorchModelEngine._prepare_tp_inputs's torch overlap gathers (the
   stores by slot into the input ids and draft tokens, the lengths by the per-token index list into the position
   offsets, ``new_tokens_lens - T`` by slot into the KV-length offsets): the engine's offsets (the requests without a
@@ -135,6 +138,8 @@ def torch_scatter(
         return t[:, :width]
 
     o_new_tokens = fit(o_new_tokens, store_new_tokens.shape[0])
+    columns = torch.arange(o_new_tokens.shape[1], device=o_new_tokens.device)
+    o_new_tokens = torch.where(columns < o_new_tokens_lens[:, None], o_new_tokens, 0)
     o_next_draft_tokens = fit(o_next_draft_tokens, store_next_draft_tokens.shape[1])
     o_next_new_tokens = fit(o_next_new_tokens, store_next_new_tokens.shape[0])
     store_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
@@ -309,6 +314,8 @@ class Step:
         for t in b.values():
             if t.is_cuda:
                 t.copy_(rand_i32(t.shape, g))
+        # Accepted lengths from none to past the new-token width, so every row cuts its new tokens somewhere.
+        b["out_lens"].copy_(rand_i32(b["out_lens"].shape, g, 0, self.widths[0] + 2))
         slots = shuffled_distinct(rows, num_slots, g)
         table = rand_i32((num_slots,), g, 0, num_slots)
         table[:rows] = torch.tensor(slots, dtype=torch.int32)
@@ -636,6 +643,59 @@ def test_stage(rows, tokens):
 def test_graph_replay(tokens):
     bad = [r for r in measure_graph(tokens) if not r["ok"]]
     assert not bad, bad
+
+
+POISON = 0x5EEDF00D  # what the never-written columns hold in the poisoned case
+
+
+@pytest.mark.parametrize("poison", [True, False], ids=["poisoned", "never_written"])
+def test_scatter_zeros_past_accepted_length(poison):
+    """A mixed batch as the one-model worker's acceptance leaves its outputs (``new_tokens`` is ``torch.empty``
+    [N, K + 1]; a context row writes its first token only and accepts 1, a generation row writes every column): the
+    store holds each row's accepted tokens, then zeros, never a never-written column. ``poisoned``: those columns hold
+    POISON. ``never_written``: they keep the allocation's contents, so compute-sanitizer initcheck reports any read of
+    them. Row 0 is a context row whose chunk is not its last (row_begin 1 skips it)."""
+    op = _op()
+    g = torch.Generator().manual_seed(49)
+    skipped, num_contexts, accepted = 1, 3, [1, 3, MAX_DRAFT + 1, 5]
+    n = skipped + num_contexts + len(accepted)
+    rows, row_begin, num_slots = n - skipped, skipped, 2 * MAX_BATCH
+    width = MAX_DRAFT + 1
+    contexts = skipped + num_contexts
+    tokens = rand_i32((n, width), g, 0, 1 << 20)
+    lens = torch.tensor([1] * contexts + accepted, dtype=torch.int32)
+    new_tokens = torch.empty((n, width), dtype=torch.int32, device="cuda")
+    if poison:
+        new_tokens.fill_(POISON)
+    new_tokens[:contexts, 0] = tokens[:contexts, 0].cuda()
+    new_tokens[contexts:] = tokens[contexts:].cuda()
+    outputs = {
+        "new_tokens": new_tokens,
+        "new_tokens_lens": lens.cuda(),
+        "next_new_tokens": rand_i32((n, width), g).cuda(),
+        "next_draft_tokens": rand_i32((n, MAX_DRAFT), g).cuda(),
+    }
+    slots = shuffled_distinct(rows, num_slots, g)
+    slot_table = torch.tensor(slots + [0] * (num_slots - rows), dtype=torch.int32, device="cuda")
+    stores = [
+        torch.full(shape, -1, dtype=torch.int32, device="cuda")
+        for shape in (
+            (STORE_WIDTH, num_slots, 1),
+            (STORE_WIDTH, num_slots, 1),
+            (num_slots,),
+            (num_slots, MAX_DRAFT),
+        )
+    ]
+    assert op.SlotScatter().scatter(outputs, row_begin, rows, slot_table, *stores)
+    store_new, store_lens = stores[0][:, :, 0].T.cpu(), stores[2].cpu()
+    want = torch.full((num_slots, STORE_WIDTH), -1, dtype=torch.int32)
+    for r, s in enumerate(slots):
+        src = row_begin + r
+        want[s] = 0
+        want[s, : lens[src]] = tokens[src, : lens[src]]
+        assert store_lens[s] == lens[src], (r, s)
+    assert not (store_new == POISON).any(), "a never-written column reached the store"
+    assert torch.equal(store_new, want), (store_new, want)
 
 
 def test_contract():

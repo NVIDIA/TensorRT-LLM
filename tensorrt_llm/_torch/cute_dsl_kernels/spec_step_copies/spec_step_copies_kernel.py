@@ -15,7 +15,8 @@
 """The one-model speculative decoding step's eager copy passes, one kernel each.
 
 * ``scatter_kernel``: the sampler moves the forward's per-row outputs into its slot-indexed stores (``index_copy_``
-  of new tokens, next new tokens, accepted lengths and next draft tokens, each padded or cut to its store width).
+  of new tokens, next new tokens, accepted lengths and next draft tokens, each padded or cut to its store width;
+  a row's new tokens past its accepted length are written as zeros).
 * ``stage_kernel``: one launch writes a decode step's per-step inputs: the overlap scheduler's gathers from those
   stores for the rows whose request ran in the previous step (``index_select`` into input ids and draft tokens by
   slot, into the position offsets by the per-token index list, and into the KV-length offsets by slot, minus the
@@ -76,11 +77,14 @@ def scatter_kernel(
         col = t - row * columns
         src_row = row_begin + row
         slot = _i32_at(slots, row)[0]
+        accepted = _i32_at(out_lens, src_row)[0]
         zero = cutlass.Int32(0)
         if col < new_width:
+            # Only the row's accepted tokens are read: past them a context row's forward output is never written.
             value = zero
             if col < out_new_width:
-                value = _i32_at(out_new_tokens, src_row * out_new_width + col)[0]
+                if col < accepted:
+                    value = _i32_at(out_new_tokens, src_row * out_new_width + col)[0]
             _i32_at(store_new_tokens, col * num_slots + slot)[0] = value
         if col < next_width:
             value = zero
@@ -93,7 +97,7 @@ def scatter_kernel(
                 value = _i32_at(out_next_draft, src_row * out_draft_width + col)[0]
             _i32_at(store_next_draft, slot * draft_width + col)[0] = value
         if col == zero:
-            _i32_at(store_lens, slot)[0] = _i32_at(out_lens, src_row)[0]
+            _i32_at(store_lens, slot)[0] = accepted
 
 
 @cute.jit
