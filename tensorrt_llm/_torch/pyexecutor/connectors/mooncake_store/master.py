@@ -223,7 +223,7 @@ def _wait_for_manifest(path: str, timeout: float) -> Dict[str, Any]:
         now = time.monotonic()
         if now - announced >= 5.0:
             announced = now
-            # Waiting on a master in another job step is normal, so narrate it
+            # Waiting on a master in another job is normal here, so say so
             # rather than letting the wait look like a hang.
             logger.warning(
                 f"mooncake-store: no pool manifest at {path} yet "

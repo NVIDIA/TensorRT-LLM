@@ -3790,8 +3790,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # Suspension only unpins pages; the eviction controller then migrates them
     # one cache level down. With GPU as the last level a suspended page stays
     # `HELD`, which `CacheLevelManager.is_evictable` refuses to evict, so
-    # suspension frees nothing. Preemption is the fallback: it gives the pages
-    # up rather than parking them, costing a re-prefill but always working.
+    # suspension frees nothing and the scheduler has no way out of a full pool.
+    #
+    # Preemption is the fallback for that case. It gives the pages up instead
+    # of parking them, which costs a re-prefill but always works.
 
     @property
     def has_cache_tier_below_gpu(self) -> bool:

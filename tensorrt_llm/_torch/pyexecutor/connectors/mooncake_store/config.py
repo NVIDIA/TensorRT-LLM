@@ -220,12 +220,12 @@ class MooncakeStoreConnectorConfig:
     #: Checkpoint identity the keys are namespaced by; see
     #: :meth:`resolve_model_key`.
     model_key: Optional[str] = None
-    #: Page keys per store call. Bounds the size of a single RPC without
-    #: bounding how much a request may transfer.
+    #: How many page keys go into one store call. Bounds the size of a single
+    #: RPC without bounding how much a request may transfer.
     transfer_batch_size: int = 64
     #: Pass pages through a pinned host buffer instead of registering the KV
-    #: pools with Mooncake. Costs a copy each way, but works without the
-    #: GPUDirect RDMA registering device memory requires. See `staging.py`.
+    #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
+    #: RDMA, which registering device memory requires.
     stage_through_host: bool = False
 
     def __post_init__(self) -> None:

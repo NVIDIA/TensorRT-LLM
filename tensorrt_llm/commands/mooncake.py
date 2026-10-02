@@ -234,14 +234,14 @@ def mooncake_master(
         announced = started
         while not stopping.is_set():
             if (code := master.process.poll()) is not None:
-                # The pool is gone once the master dies.
+                # The pool is gone once the master dies, and every client is
+                # about to start failing.
                 raise click.ClickException(
                     f"mooncake_master exited with code {code}. See {master.log_path}"
                 )
             stopping.wait(1.0)
             now = time.monotonic()
-            # Distinguishes a dead master from a dead fabric once clients
-            # start failing.
+            # Distinguishes a dead master from a dead fabric.
             if heartbeat_seconds > 0 and now - announced >= heartbeat_seconds:
                 announced = now
                 logger.info(

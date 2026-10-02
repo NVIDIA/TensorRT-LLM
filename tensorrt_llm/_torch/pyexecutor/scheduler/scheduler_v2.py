@@ -491,9 +491,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         contributed_blocks = self._collect_contributed_blocks(
             requests_list, pending_ctx, inflight_request_ids
         )
-        # A deferral behind an in-flight contributor leaves the scheduled
-        # lists empty, which the deadlock detector would read as a stall even
-        # though the contributor is running. Deferring is the progress here.
+        # A deferral behind an in-flight contributor leaves nothing on any of
+        # the scheduled lists, so the deadlock detector below would read the
+        # iteration as a stall even though the contributor is running. Deferring
+        # is itself the progress in that case.
         deferred_behind_contributor = False
 
         for req in pending_ctx:
@@ -914,7 +915,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         if chunk_size <= 0:
             # Out of token budget rather than out of pages, so releasing pages
-            # would not help and the next iteration gets a fresh budget. Not
+            # would not help; the next iteration gets a fresh budget. Not
             # suspended either, to avoid pathological suspend/resume cycles.
             return ScheduleAction.SKIP, 0, False
 
@@ -1479,8 +1480,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # Consecutive scheduling passes that reclaimed nothing before this counts
     # as a deadlock. A stalled pass costs ~2ms, so it trips within seconds,
-    # while transient one-iteration deferrals such as multimodal chunk
-    # alignment, PEFT budget or IndexMapper slots clear long before.
+    # while transient one-iteration deferrals (multimodal chunk alignment,
+    # PEFT budget, IndexMapper slots) clear long before.
     _DEADLOCK_STALL_ITERS = 1000
 
     # States in which an in-flight KV transfer still owns pages it is about to
@@ -1555,13 +1556,14 @@ class KVCacheV2Scheduler(RequestScheduler):
             return
 
         # Waiting on a transfer is not a deadlock: the pages come back when it
-        # lands, and a send that never lands is the transfer layer's timeout
-        # to report. None of those states are schedulable, so a context server
-        # whose pool is full of pending sends shows no progress at all.
+        # lands. None of those states are schedulable, so a context server
+        # whose pool is full of pending sends shows no progress here at all. A
+        # send that never lands is the transfer layer's timeout to report.
         #
         # The active_requests scan covers senders still on the list and the
-        # generation-side receiver; the transfer manager covers finished
-        # senders that have already left it.
+        # generation-side receiver. The transfer manager covers finished
+        # senders that have already left active_requests (see
+        # set_async_transfer_manager).
         transfer_holding = any(
             req.state_value in self._TRANSFER_HOLDING_STATE_VALUES for req in active_requests
         ) or (
@@ -1580,8 +1582,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         self._stalled_schedules += 1
         if self._stalled_schedules < self._DEADLOCK_STALL_ITERS:
-            # Warn as the stall builds so the raise is not a surprise. A
-            # quarter of the threshold keeps that to a handful of lines.
+            # Warn as the stall builds so the raise is not a surprise. A quarter
+            # of the threshold keeps this to a handful of lines beforehand.
             if self._stalled_schedules == 1:
                 logger.debug(
                     "[V2Scheduler] Scheduling stall started: "

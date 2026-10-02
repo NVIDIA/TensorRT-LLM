@@ -36,8 +36,9 @@ __all__ = [
     "HASH_DIGEST_BYTES",
 ]
 
-#: 128 bits. A collision means one request reads another's KV, so the digest is
-#: sized to make that negligible over any realistic cache lifetime.
+#: 128 bits. Collisions decide whether one request reads another's KV, so the
+#: digest is sized to make that negligible over any realistic cache lifetime,
+#: while staying half the width of a full blake2b digest in every key.
 HASH_DIGEST_BYTES = 16
 
 
@@ -131,7 +132,8 @@ class BlockHashChain:
             start = ordinal * self._tokens_per_block
             block = tokens[start : start + self._tokens_per_block]
             parent = self._hashes[-1] if self._hashes else self._seed
-            # Fixed width, so no two different token sequences serialize alike.
+            # Fixed-width little-endian token ids: a delimiter-free encoding
+            # would let two different token sequences serialize identically.
             payload = b"".join(int(token).to_bytes(8, "little", signed=True) for token in block)
             self._hashes.append(_digest(parent, payload))
         return self._hashes
@@ -143,9 +145,9 @@ class KeyNamespace:
 
     namespace: str
     model_key: str
-    #: Global rank of the shard whose KV these bytes are. Paired with the world
-    #: size it was produced under, since rank 3 of 8 holds different heads than
-    #: rank 3 of 4.
+    #: Global rank of the shard whose KV these bytes are, and the world size it
+    #: was produced under. Both are needed: rank 3 of 8 holds different heads
+    #: than rank 3 of 4.
     rank: int
     world_size: int
     layer_group_id: int

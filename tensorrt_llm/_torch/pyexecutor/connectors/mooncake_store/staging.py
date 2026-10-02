@@ -62,7 +62,7 @@ def _memcpy_async(dst: int, src: int, size: int, kind, stream: int) -> None:
     if status == cudart.cudaError_t.cudaSuccess:
         return
     # Raised here rather than through CUASSERT so the operands appear in the
-    # message, since a bare cudaErrorInvalidValue names no cause.
+    # message; a bare cudaErrorInvalidValue names no cause.
     device = torch.cuda.current_device() if torch.cuda.is_available() else None
     raise RuntimeError(
         f"cudaMemcpyAsync failed with {status} staging a KV page: "
@@ -130,8 +130,8 @@ class HostStagingPool:
         self._store = store
         self._label = label
 
-        # Page-locking is required rather than a copy-speed preference: this
-        # memory is handed to the store to register.
+        # Page-locking is a correctness requirement here rather than a
+        # copy-speed preference: this memory is handed to the store to register.
         pin = torch.cuda.is_available()
         self._buffer = torch.empty(
             self._slot_bytes * self._num_slots, dtype=torch.uint8, pin_memory=pin
