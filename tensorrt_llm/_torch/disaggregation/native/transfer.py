@@ -22,6 +22,7 @@ import struct
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum
@@ -917,6 +918,11 @@ class Sender(SenderBase):
     # RecvReqInfo that never gets consumed.  Entries older than this
     # are evicted during periodic sweeps.
     _STALE_REQ_INFO_TTL_S = 120.0
+    # How long a retired send session's id is remembered so a late or duplicate
+    # REQUEST_DATA naming it is answered FAILED instead of parked (see
+    # _respond_with_kv), and the most ids kept.
+    _RETIRED_RID_TTL_S = 120.0
+    _RETIRED_RID_MAX = 8192
 
     def __init__(
         self,
@@ -947,6 +953,8 @@ class Sender(SenderBase):
         # cancelled immutable ID until Sender teardown, not merely metadata TTL.
         self._pre_cancelled_rids: dict[int, bool] = {}
         self._pending_session_quiescence: dict[tuple[int, int], _SessionQuiescence] = {}
+        # unique_rid -> when its TxSession was cleared. Guarded by _sessions_lock.
+        self._retired_rids: "OrderedDict[int, float]" = OrderedDict()
         self._shutdown = False
         self._shutdown_requested = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
@@ -2064,12 +2072,24 @@ class Sender(SenderBase):
                 self._enforce_physical_ownership and info.unique_rid in self._pre_cancelled_rids
             )
             if session is None and not fenced:
-                self._save_peer_req_info(info)
-                return
+                # Gen-first (and its ADP broadcast) asks before the context session exists, so an
+                # unknown id is parked for the session to come. An id whose session already came
+                # and went is different: its KV was delivered to (or released with) the first
+                # requester, so this one is a duplicate or late attempt that nothing will ever
+                # answer. Parking it would make the receiver wait out kv_transfer_timeout_ms.
+                if not self._was_recently_retired_locked(info.unique_rid):
+                    self._save_peer_req_info(info)
+                    return
         if fenced:
             self._queue_session_quiescence(info.unique_rid, info.instance_name, info.instance_rank)
             return
-        assert session is not None
+        if session is None:
+            logger.warning(
+                f"_respond_with_kv: rid={info.unique_rid} names a send session that already "
+                "ended; failing the requester instead of parking it"
+            )
+            self._send_failed_result_to_receiver(info)
+            return
         with session.lock:
             with self._sessions_lock:
                 if self._get_session(info.unique_rid) is not session or session._closed:
@@ -2246,7 +2266,38 @@ class Sender(SenderBase):
         with self._sessions_lock:
             if unique_rid in self._sessions:
                 del self._sessions[unique_rid]
+                self._record_retired_rid_locked(unique_rid)
         self._remove_req_info(unique_rid)
+
+    def _retired_rids_locked(self) -> "OrderedDict[int, float]":
+        # Lazily created so Sender objects built without __init__ (tests) work too.
+        retired = self.__dict__.get("_retired_rids")
+        if retired is None:
+            retired = self._retired_rids = OrderedDict()
+        return retired
+
+    def _record_retired_rid_locked(self, unique_rid: int) -> None:
+        """Remember a cleared session's id for _RETIRED_RID_TTL_S (bounded)."""
+        now = time.monotonic()
+        retired = self._retired_rids_locked()
+        retired[unique_rid] = now
+        retired.move_to_end(unique_rid)
+        while retired:
+            oldest_rid, retired_at = next(iter(retired.items()))
+            if len(retired) > self._RETIRED_RID_MAX or now - retired_at > self._RETIRED_RID_TTL_S:
+                del retired[oldest_rid]
+            else:
+                break
+
+    def _was_recently_retired_locked(self, unique_rid: int) -> bool:
+        retired = self._retired_rids_locked()
+        retired_at = retired.get(unique_rid)
+        if retired_at is None:
+            return False
+        if time.monotonic() - retired_at > self._RETIRED_RID_TTL_S:
+            del retired[unique_rid]
+            return False
+        return True
 
     def send_cancel_to_receivers(self, unique_rid: int) -> None:
         """Notify all receivers involved in this session to cancel."""
