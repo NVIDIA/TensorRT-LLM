@@ -711,6 +711,8 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
             fullSum = 0.F;
             // Need to reduce over the entire cluster
             int const blockRank = cluster.block_rank();
+            // Every CTA of the cluster must have started before another CTA writes its shared memory.
+            cluster.sync();
             if (threadIdx.x < numBlocks)
             {
                 cluster.map_shared_rank(&sharedVal[0], threadIdx.x)[blockRank] = blockSum;
@@ -1140,6 +1142,8 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
             fullSum = 0.F;
             // Need to reduce over the entire cluster
             int const blockRank = cluster.block_rank();
+            // Every CTA of the cluster must have started before another CTA writes its shared memory.
+            cluster.sync();
             if (threadIdx.x < numBlocks)
             {
                 cluster.map_shared_rank(&sharedVal[0], threadIdx.x)[blockRank] = blockSum;
