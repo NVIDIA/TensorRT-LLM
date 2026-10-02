@@ -166,11 +166,11 @@ class MiniMaxH3Pipeline(BasePipeline):
                     "ring_size=1, attn2d_size=(1, 1), and "
                     "ulysses_size=world_size."
                 )
-            if pipeline_config.attention.backend != "VANILLA":
+            if pipeline_config.attention.backend not in ("VANILLA", "FA4"):
                 raise NotImplementedError(
-                    "MiniMax-H3 Ulysses is currently validated with VANILLA "
-                    "attention only. Other attention backends need packed-row "
-                    "padding mask validation."
+                    "MiniMax-H3 Ulysses requires VANILLA or FA4 attention. "
+                    "Other attention backends do not support the required "
+                    "packed-row padding mask."
                 )
         if (
             pipeline_config.attention.backend == "TRTLLM"

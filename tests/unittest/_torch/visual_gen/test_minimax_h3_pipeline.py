@@ -1181,7 +1181,7 @@ def test_pipeline_rejects_unsupported_ulysses_topology(field: str, value: int) -
         MiniMaxH3Pipeline(config)
 
 
-@pytest.mark.parametrize("backend", ["TRTLLM", "FA4", "CUTEDSL"])
+@pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL"])
 def test_pipeline_rejects_unvalidated_ulysses_attention(backend: str) -> None:
     config = _ulysses_pipeline_config()
     config.attention.backend = backend
@@ -1285,3 +1285,12 @@ def test_h3_forward_decodes_only_on_vae_ranks(
     assert calls == (["video", "audio"] if rank < size else [])
     assert (output.video is not None) == (rank < size)
     assert (output.audio is not None) == (rank < size)
+
+
+def test_pipeline_accepts_fa4_ulysses(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        h3_pipeline.BasePipeline, "__init__", lambda self, config: torch.nn.Module.__init__(self)
+    )
+    config = _ulysses_pipeline_config(2)
+    config.attention.backend = "FA4"
+    MiniMaxH3Pipeline(config)

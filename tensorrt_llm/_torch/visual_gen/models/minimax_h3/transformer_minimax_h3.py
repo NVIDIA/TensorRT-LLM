@@ -347,7 +347,10 @@ class MiniMaxH3TokenRefiner(nn.Module):
         model_config: DiffusionModelConfig,
     ) -> None:
         super().__init__()
-        self._supports_key_padding_mask = model_config.attention.backend.upper() == "VANILLA"
+        self._supports_key_padding_mask = model_config.attention.backend.upper() in (
+            "VANILLA",
+            "FA4",
+        )
         self.sharder = SequenceSharder.from_vgm(
             model_config.visual_gen_mapping,
             num_attention_heads=num_attention_heads,
@@ -381,7 +384,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
         if pad:
             if not self._supports_key_padding_mask:
                 raise NotImplementedError(
-                    "Padded token-refiner sequences require key_padding_mask support; use VANILLA."
+                    "Padded token-refiner sequences require key_padding_mask support; use VANILLA or FA4."
                 )
             valid = hidden_states.new_ones((hidden_states.shape[0], seq_len), dtype=torch.bool)
             key_padding_mask = _pad_tensor_dim(valid, 1, pad, False)
@@ -500,7 +503,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             )
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
         # Only VANILLA supports arbitrary padding between packed modalities.
-        self._supports_key_padding_mask = self._attn_backend == "VANILLA"
+        self._supports_key_padding_mask = self._attn_backend in ("VANILLA", "FA4")
         quant_algo = model_config.quant_config.quant_algo
         # TODO: Support calibrated checkpoints in load_weights before enabling static quantization.
         if quant_algo is not None and not (
@@ -823,7 +826,15 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     "Padded packed sequences (negative token_tags) need an attention "
                     "backend that honours key_padding_mask; the "
                     f"{self._attn_backend} backend cannot express it. Use "
-                    "VANILLA."
+                    "VANILLA or FA4."
+                )
+            # FA4 expresses padding through seqused_k, which requires valid
+            # tokens to form a prefix. Ulysses appends padding in this layout.
+            if self._attn_backend == "FA4" and bool(
+                ((token_tags_for_mask[:-1] < 0) & (token_tags_for_mask[1:] >= 0)).any()
+            ):
+                raise NotImplementedError(
+                    "FA4 requires trailing packed-row padding; use VANILLA for interior padding."
                 )
             key_padding_mask = (
                 (token_tags_for_mask >= 0).unsqueeze(0).expand(packed_hidden_states.shape[0], -1)
