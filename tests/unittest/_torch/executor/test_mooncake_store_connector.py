@@ -26,6 +26,7 @@ plain integers, which is all the addressing arithmetic needs.
 
 import contextlib
 import json
+import threading
 import time
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -554,6 +555,54 @@ def test_a_save_thread_that_cannot_start_fails_registration(
     with pytest.raises(RuntimeError, match="save thread"):
         with make_worker(fake_store, layout=make_layout()):
             pytest.fail("registration should not have completed")
+
+
+def test_shutdown_leaves_the_store_open_under_a_save_still_reading(
+    store_config, fake_store, monkeypatch
+):
+    """A timed join is not evidence that the thread stopped.
+
+    The save thread reads the KV pools, and it reads them through the store
+    handle and the staging slots this releases. Closing the handle or dropping
+    those buffers mid-`batch_put` takes the memory out from under a transfer
+    in flight, so a thread that outlived the wait keeps them.
+    """
+    monkeypatch.setattr(worker_module, "SAVE_DRAIN_TIMEOUT", 0.1)
+    reading = threading.Event()
+    release = threading.Event()
+    store_put = fake_store.batch_put_from_multi_buffers
+
+    def blocking_put(*args, **kwargs):
+        reading.set()
+        assert release.wait(30.0), "the test never released the save thread"
+        return store_put(*args, **kwargs)
+
+    fake_store.batch_put_from_multi_buffers = blocking_put
+
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        # Queued directly: what matters is a thread inside the store call, not
+        # how the pass that produced the pages reached it.
+        worker._save_queue.put(
+            (
+                SimpleNamespace(synchronize=lambda: None),
+                [RequestTransfers(1, [PageTransfer(b"\x05" * 16, 0, 0)])],
+            )
+        )
+        assert reading.wait(30.0), "the save thread never reached the store"
+
+        worker.shutdown()
+
+        assert not fake_store.closed
+        assert worker._store is fake_store
+        # Kept rather than dropped, so a later call retries the join.
+        assert worker._save_thread is not None
+
+        release.set()
+        worker.shutdown()
+
+        assert fake_store.closed
+        assert worker._store is None
+        assert worker._save_thread is None
 
 
 def test_staging_narrows_the_batch_to_the_budget(store_config, fake_store, staged_copies):

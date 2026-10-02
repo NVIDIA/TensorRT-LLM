@@ -72,6 +72,11 @@ __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
 _LOCAL_WORKER: Optional["MooncakeStoreConnectorWorker"] = None
 _LOCAL_WORKER_READY = threading.Event()
 
+#: Seconds `shutdown` gives the save thread to drain its queue and return.
+#: Sized for a backlog of pages over a congested fabric rather than a healthy
+#: one, since what follows the wait is only safe once the thread has stopped.
+SAVE_DRAIN_TIMEOUT = 30.0
+
 
 def resolve_local_worker(timeout: float = 60.0) -> "MooncakeStoreConnectorWorker":
     """The worker living in this process, once it has been constructed.
@@ -701,11 +706,27 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             raise RuntimeError("mooncake-store background save failed") from error
 
     def shutdown(self) -> None:
-        """Stop the save thread and release the store handle. Idempotent."""
-        thread, self._save_thread = self._save_thread, None
+        """Stop the save thread, then release what it was reading. Idempotent."""
+        thread = self._save_thread
         if thread is not None:
             self._save_queue.put(None)
-            thread.join(timeout=30.0)
+            thread.join(timeout=SAVE_DRAIN_TIMEOUT)
+            if thread.is_alive():
+                # The thread reads the KV pools and the staging slots, and it
+                # reads them through the store handle. Closing that handle or
+                # dropping those buffers while a transfer is in flight takes
+                # the memory out from under it, so they are left registered
+                # instead: the process is going down either way, and a leak
+                # outlives a read of freed memory. The thread is a daemon, so
+                # it does not hold the process open; a later call retries.
+                logger.error(
+                    f"mooncake-store rank {self._rank}: the save thread did not stop "
+                    f"within {SAVE_DRAIN_TIMEOUT:g}s, so the store handle and its "
+                    "staging buffers are left in place rather than freed under a "
+                    "transfer still reading them."
+                )
+                return
+            self._save_thread = None
         store, self._store = self._store, None
         if store is not None:
             try:

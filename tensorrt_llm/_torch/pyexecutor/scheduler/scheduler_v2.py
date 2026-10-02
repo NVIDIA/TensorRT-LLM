@@ -1453,26 +1453,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             if not self.kv_cache_manager.is_request_active(victim.py_request_id):
                 continue
 
-            if not self.kv_cache_manager.preempt_request(victim):
-                # A connector is still reading these pages, so the victim
-                # keeps its cache and its state until the executor finishes
-                # the release; see PyExecutor._resume_preempted_request.
-                # Stopping here leaves one victim draining at a time, so the
-                # next pass finds those pages rather than giving up a second
-                # request's cache for nothing.
-                logger.debug(
-                    f"[V2Scheduler] Preemption of request {victim.py_request_id} "
-                    "deferred until its connector saves retire"
-                )
+            if not self._preempt_or_defer(victim, recompute_paused):
                 return False
             logger.debug(
                 f"[V2Scheduler] Preempting request {victim.py_request_id} "
                 f"(state={victim.state.name})"
             )
-            self._clear_request_runtime_state(victim)
-            if self.draft_kv_cache_manager is not None:
-                self.draft_kv_cache_manager.free_resources(victim)
-            recompute_paused.append(victim)
             preempted_ids.add(victim.py_request_id)
             return True
 
@@ -1708,9 +1694,39 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         return self._is_started_request(req)
 
-    def _recompute_pause_request(self, req: LlmRequest) -> None:
+    def _preempt_or_defer(self, req: LlmRequest, recompute_paused: RequestList) -> bool:
+        """Give up *req*'s pages for another request, if they are free to give.
+
+        Every destructive release goes through here, because a page a
+        connector save is still reading cannot be freed: a later request would
+        allocate it and overwrite the bytes mid-transfer, and the store would
+        publish one request's KV under another's hash.
+        `KVCacheManagerV2.preempt_request` answers that question and parks the
+        victim until the executor completes the release; see
+        `PyExecutor._resume_preempted_request`.
+
+        On success *req* lands on `recompute_paused`, which is the channel a
+        re-prefill needs: the executor frees the sequence slot and
+        `reset_for_recompute` rewrites the prompt.
+
+        Returns whether the pages are available in this iteration. A caller
+        that gets False stops looking rather than taking a second victim, so
+        one victim drains at a time and the next pass finds its pages instead
+        of a second request having given up its cache for nothing. A deferred
+        victim must be left off every scheduler output list: parked, it keeps
+        its pages, and `pause` would overwrite the state that holds it there.
+        """
+        if not self.kv_cache_manager.preempt_request(req):
+            logger.debug(
+                f"[V2Scheduler] Preemption of request {req.py_request_id} "
+                "deferred until its connector saves retire"
+            )
+            return False
         self._clear_request_runtime_state(req)
-        self._free_kv_caches(req)
+        if self.draft_kv_cache_manager is not None:
+            self.draft_kv_cache_manager.free_resources(req)
+        recompute_paused.append(req)
+        return True
 
     def _try_evict_for_gen(
         self, req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
@@ -1816,8 +1832,11 @@ class KVCacheV2Scheduler(RequestScheduler):
                 f"[V2Scheduler] Recompute-pausing request {victim.py_request_id} "
                 f"to free pages for request {req.py_request_id}"
             )
-            self._recompute_pause_request(victim)
-            recompute_paused.append(victim)
+            if not self._preempt_or_defer(victim, recompute_paused):
+                # Off `evicted` above and onto no list here: the victim is
+                # parked holding its pages, and the `pause` an evicted request
+                # gets would overwrite the state that keeps it there.
+                return req_it_end, False
             recompute_pause_state.victim_indices.add(victim_idx)
             recompute_pause_state.frontier = min(recompute_pause_state.frontier, victim_idx)
 
