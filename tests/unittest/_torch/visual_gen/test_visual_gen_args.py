@@ -95,13 +95,14 @@ class TestAttentionConfigQuantValidation:
             )
 
     def test_quant_config_rejected_when_unsupported(self):
-        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
-            AttentionConfig(
-                backend="TRTLLM",
-                quant_attention_config=QuantAttentionConfig(
-                    qk_dtype="int8", q_block_size=1, k_block_size=127, v_block_size=1
-                ),
-            )
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(
+                        qk_dtype="int8", q_block_size=1, k_block_size=127, v_block_size=1
+                    ),
+                )
 
     @pytest.mark.parametrize(
         ("backend", "quant_config"),
@@ -122,14 +123,15 @@ class TestAttentionConfigQuantValidation:
         ],
     )
     def test_vsa_and_quantization_are_mutually_exclusive(self, backend, quant_config):
-        with pytest.raises(
-            ValidationError, match="VSA and quant_attention_config are mutually exclusive"
-        ):
-            AttentionConfig(
-                backend=backend,
-                quant_attention_config=quant_config,
-                sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
-            )
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(
+                ValidationError, match="VSA and quant_attention_config are mutually exclusive"
+            ):
+                AttentionConfig(
+                    backend=backend,
+                    quant_attention_config=quant_config,
+                    sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+                )
 
     def test_skip_softmax_and_sage_quantization_can_be_combined(self):
         # int8 Q/K SAGE has a compiled cubin only on SM100; pin the SM so this
@@ -275,11 +277,12 @@ class TestAttentionConfigQuantValidation:
             )
 
     def test_blockscaled_qk_dtype_rejected_on_trtllm(self):
-        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
-            AttentionConfig(
-                backend="TRTLLM",
-                quant_attention_config=QuantAttentionConfig(qk_dtype="nvfp4"),
-            )
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(qk_dtype="nvfp4"),
+                )
 
     def test_supported_quant_config_cudnn_fp8(self):
         attention = AttentionConfig(
