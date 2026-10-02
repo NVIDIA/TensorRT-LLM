@@ -21,6 +21,9 @@ are created in ``communication/nccl_ep.py``. ``use_internal_fp8_dispatch`` gates
 the persistent FP8 scales receive buffer.
 """
 
+import ctypes
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -35,6 +38,8 @@ from .moe_comm_timeout_guard import (
 )
 
 if TYPE_CHECKING:
+    from mpi4py import MPI
+    from nccl.core import Communicator
     from nccl.ep import Group
 
 _MIN_NCCL_EP_INT32_TOPK_VERSION = "0.2"
@@ -121,6 +126,47 @@ _ep_group_cache: dict = {}
 _ep_group_refcounts: dict = {}
 
 
+def _check_gin_dependencies(comm: "Communicator", ep_mpi_comm: "MPI.Comm") -> None:
+    """Agree on GIN dependency availability before any rank creates an EP group."""
+    from nccl.bindings.nccl import NCCLError
+    from nccl.core import NcclGinType
+
+    local_error = None
+    try:
+        if comm.n_lsa_teams > 1:
+            if comm.gin_type == NcclGinType.NONE:
+                local_error = "multiple LSA teams require GIN with full connectivity"
+            elif comm.gin_type == NcclGinType.GDAKI:
+                # Built-in GDAKI embeds GPUNetIO. Only the configured Spectrum-X
+                # plugin requires a separately loadable host library.
+                plugins = (
+                    os.environ.get("NCCL_GIN_PLUGIN", ""),
+                    os.environ.get("NCCL_NET_PLUGIN", ""),
+                )
+                uses_spcx = any(
+                    Path(plugin).name in ("spcx", "libnccl-net-spcx.so", "libnccl-gin-spcx.so")
+                    for candidates in plugins
+                    for plugin in candidates.split(",")
+                )
+                if uses_spcx:
+                    library = os.environ.get("NCCL_GIN_GPUNETIO_PATH", "libdoca_gpunetio_host.so")
+                    try:
+                        ctypes.CDLL(library)
+                    except OSError as error:
+                        local_error = (
+                            f"Spectrum-X GDAKI cannot load GPUNetIO ({library!r}): {error}. "
+                            "Set NCCL_GIN_GPUNETIO_PATH to a loadable GPUNetIO host library"
+                        )
+    except (AttributeError, RuntimeError, NCCLError) as error:
+        local_error = f"cannot query NCCL communicator topology: {error}"
+
+    # A local loader failure must not leave peers entering collective Group.create.
+    errors = ep_mpi_comm.allgather(local_error)
+    for rank, error in enumerate(errors):
+        if error is not None:
+            raise RuntimeError(f"NCCL-EP GIN preflight failed on EP rank {rank}: {error}")
+
+
 class NcclEpContext:
     """Long-lived NCCL EP group + receive buffers, shared across NcclEP instances.
 
@@ -144,19 +190,7 @@ class NcclEpContext:
         external_fp8: bool = False,
         external_nvfp4: bool = False,
     ):
-        import nccl.core as nccl_core
-        from nccl.ep import (
-            Algorithm,
-            DispatchConfig,
-            DispatchOutputs,
-            Group,
-            GroupConfig,
-            Layout,
-            LayoutInfo,
-            Tensor,
-        )
-
-        from tensorrt_llm._utils import mpi_comm
+        from nccl.ep import Layout
 
         self.mapping = mapping
         self.ep_size = mapping.moe_ep_size
@@ -171,6 +205,89 @@ class NcclEpContext:
         self.external_nvfp4 = external_nvfp4
         self.layout = Layout.RANK_MAJOR if layout is None else Layout(layout)
         self.max_recv_tokens = self.ep_size * max_tokens_per_rank
+
+        self.comm = None
+        self._ep_mpi_comm = None
+        self.ep_group = None
+        self._timeout_proxy = None
+        self.initialized = False
+        ready = False
+        try:
+            self._initialize_communicator()
+            _check_gin_dependencies(self.comm, self._ep_mpi_comm)
+            ready = True
+        finally:
+            # Release partially constructed native resources on any failure.
+            if not ready:
+                self.destroy()
+
+    def _initialize_communicator(self) -> None:
+        try:
+            import nccl.core as nccl_core
+            from nccl.bindings.nccl import NCCLError
+        except ImportError as error:
+            raise RuntimeError(f"NCCL-EP communicator imports failed: {error}") from error
+
+        from tensorrt_llm._utils import mpi_comm
+
+        mapping = self.mapping
+        # MPI sub-communicator scoped to the EP group. Mirrors the
+        # DeepEPLowLatency pattern (see deep_ep_utils.py:104): split
+        # MPI_COMM_WORLD by pp_rank so each pipeline stage gets its own EP
+        # comm, keyed by moe_ep_rank. Avoids the wheel's
+        # nccl.ep.get_nccl_comm_from_group() helper which requires
+        # torch.distributed.init_process_group() -- the test infrastructure
+        # (mpi_pool_executor) and microbenchmarks use MPI4PY only.
+        self._ep_mpi_comm = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)
+        ep_world_rank = self._ep_mpi_comm.Get_rank()
+        ep_world_size = self._ep_mpi_comm.Get_size()
+        unique_id = nccl_core.get_unique_id() if ep_world_rank == 0 else None
+        unique_id = self._ep_mpi_comm.bcast(unique_id, root=0)
+        try:
+            self.comm = nccl_core.Communicator.init(
+                nranks=ep_world_size,
+                rank=ep_world_rank,
+                unique_id=unique_id,
+            )
+        except NCCLError as error:
+            raise RuntimeError(f"NCCL-EP communicator initialization failed: {error}") from error
+
+    def initialize(self) -> None:
+        """Create the EP group and receive tensors once, outside MetaInitMode."""
+        if self.initialized:
+            return
+        if self.comm is None:
+            raise RuntimeError("Cannot initialize a destroyed NCCL-EP context")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "NcclEP context must be initialized before CUDA graph capture. "
+                "Run an eager warmup forward before enabling or capturing CUDA graphs."
+            )
+        try:
+            self._initialize_group()
+            self.initialized = True
+        finally:
+            if not self.initialized:
+                self.destroy()
+
+    def _initialize_group(self) -> None:
+        from nccl.ep import (
+            Algorithm,
+            DispatchConfig,
+            DispatchOutputs,
+            Group,
+            GroupConfig,
+            LayoutInfo,
+            Tensor,
+        )
+
+        num_experts = self.num_experts
+        max_tokens_per_rank = self.max_tokens_per_rank
+        hidden_size = self.hidden_size
+        max_top_k = self.max_top_k
+        use_internal_fp8_dispatch = self.uses_internal_fp8_dispatch
+        external_fp8 = self.external_fp8
+        external_nvfp4 = self.external_nvfp4
 
         # topk_idx dtype passed to the EP runtime. NCCL-EP < 0.2 asserts
         # int64 in ncclEpUpdateHandle; 0.2+ supports TRT-LLM's native int32
@@ -215,24 +332,6 @@ class NcclEpContext:
         self.zerocopy_enabled = not (
             use_internal_fp8_dispatch or external_fp8 or external_nvfp4
         ) and "zero_copy" in getattr(GroupConfig, "__dataclass_fields__", {})
-
-        # MPI sub-communicator scoped to the EP group. Mirrors the
-        # DeepEPLowLatency pattern (see deep_ep_utils.py:104): split
-        # MPI_COMM_WORLD by pp_rank so each pipeline stage gets its own EP
-        # comm, keyed by moe_ep_rank. Avoids the wheel's
-        # nccl.ep.get_nccl_comm_from_group() helper which requires
-        # torch.distributed.init_process_group() -- the test infrastructure
-        # (mpi_pool_executor) and microbenchmarks use MPI4PY only.
-        self._ep_mpi_comm = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)
-        ep_world_rank = self._ep_mpi_comm.Get_rank()
-        ep_world_size = self._ep_mpi_comm.Get_size()
-        unique_id = nccl_core.get_unique_id() if ep_world_rank == 0 else None
-        unique_id = self._ep_mpi_comm.bcast(unique_id, root=0)
-        self.comm = nccl_core.Communicator.init(
-            nranks=ep_world_size,
-            rank=ep_world_rank,
-            unique_id=unique_id,
-        )
 
         dispatch_token_bytes = (
             hidden_size * 2
@@ -394,6 +493,7 @@ class NcclEpContext:
         first (uses the comm), then ``finalize`` + ``destroy`` on the comm
         (the recommended nccl4py pattern), then ``Free`` on the MPI comm.
         """
+        self.initialized = False
         if self.ep_group is not None:
             unregister_moe_comm_timeout_proxy(self._timeout_proxy)
             try:
@@ -447,8 +547,14 @@ def get_nccl_ep_context(
     layout: Optional[int] = None,
     external_fp8: bool = False,
     external_nvfp4: bool = False,
+    *,
+    defer_initialization: bool = False,
 ) -> NcclEpContext:
-    """Get or create a singleton :class:`NcclEpContext` for the given configuration."""
+    """Acquire a shared context, optionally deferring EP group and tensor allocation.
+
+    The NCCL communicator and collective GIN dependency preflight always run
+    before returning, including when ``defer_initialization`` is true.
+    """
     from nccl.ep import Layout
 
     if layout is None:
@@ -477,8 +583,17 @@ def get_nccl_ep_context(
             external_fp8,
             external_nvfp4,
         )
+    ctx = _ep_group_cache[key]
     _ep_group_refcounts[key] = _ep_group_refcounts.get(key, 0) + 1
-    return _ep_group_cache[key]
+    acquired = False
+    try:
+        if not defer_initialization:
+            ctx.initialize()
+        acquired = True
+        return ctx
+    finally:
+        if not acquired:
+            release_nccl_ep_context(ctx)
 
 
 def release_nccl_ep_context(ctx: Optional[NcclEpContext]) -> None:
