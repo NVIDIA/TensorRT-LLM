@@ -19,6 +19,7 @@ import logging
 import os
 import threading
 import time
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -85,6 +86,14 @@ def _visual_gen_args():
             enable=False, enable_fullgraph=False, enable_autotune=True
         ),
     )
+
+
+@pytest.fixture(params=["llm", "visual_gen"])
+def background_reporter(request):
+    """Exercise shared delivery behavior through both runtime entry points."""
+    if request.param == "visual_gen":
+        return partial(usage_lib._visual_gen_background_reporter, _visual_gen_args(), {}, "")
+    return partial(usage_lib._background_reporter, None, None, "")
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +748,20 @@ class TestRankGuard:
 class TestReporterShutdown:
     """Verify _REPORTER_STOP event exits the heartbeat loop."""
 
+    def test_heartbeats_respect_session_limit(self, reporter_session, background_reporter):
+        """Both runtimes retain the target branch's heartbeat limit."""
+        sent = []
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
+            patch.object(usage_lib, "_MAX_HEARTBEATS", 3),
+            patch.object(usage_lib._REPORTER_STOP, "wait", return_value=False) as wait,
+        ):
+            background_reporter()
+
+        assert len(sent) == 4
+        assert [payload["events"][0]["parameters"]["seq"] for payload in sent[1:]] == [0, 1, 2]
+        assert wait.call_count == 3
+
     def test_reporter_stop_event_exits_heartbeat_loop(self, reporter_session):
         """Setting _REPORTER_STOP causes the heartbeat loop to exit."""
         send_count = {"n": 0}
@@ -797,7 +820,9 @@ class TestReporterShutdown:
 class TestHeartbeatFailSilent:
     """Verify transient heartbeat failure doesn't kill the loop."""
 
-    def test_heartbeat_continues_after_transient_failure(self, reporter_session):
+    def test_heartbeat_continues_after_transient_failure(
+        self, reporter_session, background_reporter
+    ):
         """OSError on one heartbeat doesn't prevent subsequent heartbeats."""
         calls = []
 
@@ -815,7 +840,7 @@ class TestHeartbeatFailSilent:
             patch.object(usage_lib, "_REPORTER_STOP", stop),
             patch.object(usage_lib, "_get_heartbeat_interval", return_value=0),
         ):
-            usage_lib._background_reporter(None, None, "")
+            background_reporter()
 
         timer.join(timeout=1)
 
@@ -826,17 +851,19 @@ class TestHeartbeatFailSilent:
 
 
 class TestBackgroundReporterOptOut:
-    def test_late_opt_out_prevents_initial_event(self, enable_telemetry):
+    def test_late_opt_out_prevents_initial_event(self, enable_telemetry, background_reporter):
         """A reporter waking after session deactivation sends nothing."""
         assert usage_lib.apply_usage_session_config()
         usage_lib._deactivate_usage_session()
 
         with patch.object(usage_lib, "_send_to_gxt") as send:
-            usage_lib._background_reporter(None, None, "")
+            background_reporter()
 
         send.assert_not_called()
 
-    def test_opt_out_after_initial_claim_cancels_delivery(self, monkeypatch, enable_telemetry):
+    def test_opt_out_after_initial_claim_cancels_delivery(
+        self, monkeypatch, enable_telemetry, background_reporter
+    ):
         """Opt-out between claiming and sending the initial event wins."""
         assert usage_lib.apply_usage_session_config()
         session = usage_lib._SESSION
@@ -852,10 +879,7 @@ class TestBackgroundReporterOptOut:
 
         monkeypatch.setattr(session, "claim_initial", claim_then_pause)
         with patch.object(usage_lib, "_send_to_gxt") as send:
-            reporter = threading.Thread(
-                target=usage_lib._background_reporter,
-                args=(None, None, ""),
-            )
+            reporter = threading.Thread(target=background_reporter)
             reporter.start()
             assert claimed.wait(timeout=5)
             usage_lib._deactivate_usage_session()
@@ -865,7 +889,7 @@ class TestBackgroundReporterOptOut:
         assert not reporter.is_alive()
         send.assert_not_called()
 
-    def test_opt_out_before_heartbeat_cancels_delivery(self, enable_telemetry):
+    def test_opt_out_before_heartbeat_cancels_delivery(self, enable_telemetry, background_reporter):
         """A heartbeat prepared before late opt-out is not delivered afterward."""
         assert usage_lib.apply_usage_session_config()
 
@@ -889,9 +913,10 @@ class TestBackgroundReporterOptOut:
             patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
             patch.object(usage_lib, "_REPORTER_STOP", _OptOutBeforeHeartbeat()),
         ):
-            usage_lib._background_reporter(None, None, "")
+            background_reporter()
 
-        assert [payload["events"][0]["name"] for payload in sent] == ["trtllm_initial_report"]
+        assert len(sent) == 1
+        assert sent[0]["events"][0]["name"].endswith("_initial_report")
 
 
 # ---------------------------------------------------------------------------

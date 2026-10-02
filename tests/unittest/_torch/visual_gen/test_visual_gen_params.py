@@ -968,6 +968,23 @@ class TestPipelineMetadataBridging:
         assert private_pipeline["resolved_pipeline_class"] == "other"
         assert private_pipeline["modality"] == "unknown"
 
+        from tensorrt_llm.usage.usage_lib import _visual_gen_initial_fields
+        from tensorrt_llm.visual_gen import VisualGenArgs
+
+        failed = executor._visual_gen_telemetry_metadata(object(), SimpleNamespace(model="private"))
+        assert failed == {}
+        fields = _visual_gen_initial_fields(VisualGenArgs(model="private"), failed)
+        assert (
+            fields["modelId"]
+            == fields["pipelineClassName"]
+            == fields["resolvedPipelineClass"]
+            == "other"
+        )
+        assert fields["modality"] == "unknown"
+        assert fields["quantizationAlgo"] == ""
+        assert fields["dynamicWeightQuant"] is False
+        assert fields["quantizedComponentsJson"] == "[]"
+
 
 # =============================================================================
 # Request validation — validate_visual_gen_params

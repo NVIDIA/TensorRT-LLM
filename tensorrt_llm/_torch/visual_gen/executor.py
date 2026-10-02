@@ -96,15 +96,6 @@ def _quant_algo_name(quant_config: Any) -> str:
 
 def _visual_gen_telemetry_metadata(pipeline: Any, args: VisualGenArgs) -> Dict[str, Any]:
     """Build bounded READY metadata from the successfully loaded pipeline."""
-    defaults: Dict[str, Any] = {
-        "model_id": "other",
-        "pipeline_class_name": "other",
-        "resolved_pipeline_class": "other",
-        "modality": "unknown",
-        "quantization_algo": "",
-        "dynamic_weight_quant": False,
-        "quantized_components": [],
-    }
     try:
         pipeline_class_name = getattr(pipeline, "_telemetry_pipeline_class_name", "other")
         entry = PIPELINE_REGISTRY.get(pipeline_class_name)
@@ -112,15 +103,11 @@ def _visual_gen_telemetry_metadata(pipeline: Any, args: VisualGenArgs) -> Dict[s
             pipeline_class_name = "other"
             entry = None
 
-        resolved_entry = next(
-            (
-                candidate
-                for candidate in PIPELINE_REGISTRY.values()
-                if candidate.telemetry_safe and type(pipeline) is candidate.pipeline_cls
-            ),
-            None,
+        resolved_is_public = any(
+            candidate.telemetry_safe and type(pipeline) is candidate.pipeline_cls
+            for candidate in PIPELINE_REGISTRY.values()
         )
-        resolved_pipeline_class = type(pipeline).__name__ if resolved_entry is not None else "other"
+        resolved_pipeline_class = type(pipeline).__name__ if resolved_is_public else "other"
 
         model_id = "other"
         if any(
@@ -149,7 +136,7 @@ def _visual_gen_telemetry_metadata(pipeline: Any, args: VisualGenArgs) -> Dict[s
         else:
             quantization_algo = ""
 
-        defaults.update(
+        return dict(
             model_id=model_id,
             pipeline_class_name=pipeline_class_name,
             resolved_pipeline_class=resolved_pipeline_class,
@@ -177,8 +164,7 @@ def _visual_gen_telemetry_metadata(pipeline: Any, args: VisualGenArgs) -> Dict[s
         )
     except Exception:
         # Telemetry metadata is optional and must never disrupt worker startup.
-        pass
-    return defaults
+        return {}
 
 
 def _reap_worker_process(process: mp.Process) -> bool:

@@ -736,6 +736,36 @@ def _visual_gen_initial_fields(
     }
 
 
+def _run_reporter_loop(
+    session: "_TelemetrySession",
+    initial_event: schema.TrtllmInitialReport | schema.TrtllmVisualGenInitialReport,
+    make_heartbeat: Callable[[int], schema.TrtllmHeartbeat | schema.TrtllmVisualGenHeartbeat],
+) -> None:
+    """Send an initial report and bounded heartbeats until stopped."""
+    payload = schema.build_gxt_payload(
+        event=initial_event,
+        session_id=session.session_id,
+        trtllm_version=session.trtllm_version,
+    )
+    if not session.claim_initial():
+        return
+    _send_if_session_active(session, payload)
+
+    heartbeat_interval = _get_heartbeat_interval()
+    for seq in range(_MAX_HEARTBEATS):
+        if _REPORTER_STOP.wait(timeout=heartbeat_interval):
+            return
+        try:
+            payload = schema.build_gxt_payload(
+                event=make_heartbeat(seq),
+                session_id=session.session_id,
+                trtllm_version=session.trtllm_version,
+            )
+            _send_if_session_active(session, payload)
+        except (urllib.error.URLError, OSError, ValueError, TypeError):
+            pass  # fail-silent on individual heartbeat
+
+
 def _background_reporter(
     llm_args: Any,
     pretrained_config: Any,
@@ -752,7 +782,6 @@ def _background_reporter(
         # waking the reporter. Never replace it with an uncorrelated event.
         if session is None:
             return
-        session_id = session.session_id
         trtllm_version = session.trtllm_version
         # --- Collect initial data ---
         system_info = _collect_system_info()
@@ -818,36 +847,14 @@ def _background_reporter(
             **_session_event_fields(event_snapshot),
         )
 
-        # --- Send initial report ---
-        payload = schema.build_gxt_payload(
-            event=initial_event,
-            session_id=session_id,
-            trtllm_version=trtllm_version,
+        _run_reporter_loop(
+            session,
+            initial_event,
+            lambda seq: schema.TrtllmHeartbeat(
+                seq=seq,
+                **_session_event_fields(_event_snapshot(usage_context)),
+            ),
         )
-        if not session.claim_initial():
-            return
-        _send_if_session_active(session, payload)
-
-        # --- Heartbeat loop ---
-        heartbeat_interval = _get_heartbeat_interval()
-        for seq in range(_MAX_HEARTBEATS):
-            if _REPORTER_STOP.wait(timeout=heartbeat_interval):
-                return  # stop requested
-
-            try:
-                event_snapshot = _event_snapshot(usage_context)
-                heartbeat_event = schema.TrtllmHeartbeat(
-                    seq=seq,
-                    **_session_event_fields(event_snapshot),
-                )
-                heartbeat_payload = schema.build_gxt_payload(
-                    event=heartbeat_event,
-                    session_id=session_id,
-                    trtllm_version=trtllm_version,
-                )
-                _send_if_session_active(session, heartbeat_payload)
-            except (urllib.error.URLError, OSError, ValueError, TypeError):
-                pass  # fail-silent on individual heartbeat
 
     except Exception:
         pass  # fail-silent: entire background reporter
@@ -865,7 +872,6 @@ def _visual_gen_background_reporter(
         session = _get_session()
         if session is None:
             return
-        session_id = session.session_id
         trtllm_version = session.trtllm_version
         system_info = _collect_system_info()
         gpu_info = _collect_gpu_info()
@@ -886,35 +892,16 @@ def _visual_gen_background_reporter(
             **static_fields,
             **_visual_gen_session_event_fields(event_snapshot),
         )
-        payload = schema.build_gxt_payload(
-            event=initial_event,
-            session_id=session_id,
-            trtllm_version=trtllm_version,
+        _run_reporter_loop(
+            session,
+            initial_event,
+            lambda seq: schema.TrtllmVisualGenHeartbeat(
+                seq=seq,
+                nWorkers=static_fields["nWorkers"],
+                gpuCount=_bounded_uint(gpu_info.get("gpu_count")),
+                **_visual_gen_session_event_fields(_event_snapshot(usage_context)),
+            ),
         )
-        if not session.claim_initial():
-            return
-        _send_if_session_active(session, payload)
-
-        heartbeat_interval = _get_heartbeat_interval()
-        for seq in range(_MAX_HEARTBEATS):
-            if _REPORTER_STOP.wait(timeout=heartbeat_interval):
-                return
-            try:
-                event_snapshot = _event_snapshot(usage_context)
-                heartbeat_event = schema.TrtllmVisualGenHeartbeat(
-                    seq=seq,
-                    nWorkers=static_fields["nWorkers"],
-                    gpuCount=_bounded_uint(gpu_info.get("gpu_count")),
-                    **_visual_gen_session_event_fields(event_snapshot),
-                )
-                heartbeat_payload = schema.build_gxt_payload(
-                    event=heartbeat_event,
-                    session_id=session_id,
-                    trtllm_version=trtllm_version,
-                )
-                _send_if_session_active(session, heartbeat_payload)
-            except (urllib.error.URLError, OSError, ValueError, TypeError):
-                pass
     except Exception:
         pass
     finally:
@@ -1331,21 +1318,19 @@ def _session_event_fields(snapshot: dict[str, Any]) -> dict[str, Any]:
 def _visual_gen_session_event_fields(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Select ingress and VisualGen counters for VisualGen events."""
     return {
-        **{
-            key: snapshot[key]
-            for key in (
-                "visualGenMetricsJson",
-                "peakNumQueuedRequests",
-                "peakNumActiveRequests",
-                "sessionDurationSec",
-                "failedComponent",
-            )
-        },
-        "ingressPoint": snapshot["ingressPoint"],
-        "visualGenInitializationAttempts": snapshot["visualGenInitializationAttempts"],
-        "visualGenInstancesCreated": snapshot["visualGenInstancesCreated"],
-        "activeVisualGenInstances": snapshot["activeVisualGenInstances"],
-        "visualGenInitializationFailures": snapshot["visualGenInitializationFailures"],
+        key: snapshot[key]
+        for key in (
+            "visualGenMetricsJson",
+            "peakNumQueuedRequests",
+            "peakNumActiveRequests",
+            "sessionDurationSec",
+            "failedComponent",
+            "ingressPoint",
+            "visualGenInitializationAttempts",
+            "visualGenInstancesCreated",
+            "activeVisualGenInstances",
+            "visualGenInitializationFailures",
+        )
     }
 
 
