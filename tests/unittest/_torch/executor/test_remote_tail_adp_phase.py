@@ -73,17 +73,20 @@ def _make_generation_request(request_id: int) -> LlmRequest:
 def test_deferred_generation_waits_for_next_phase_vote(phase: RemoteTailPhase) -> None:
     manager = make_kv_cache_manager()
     scheduler = make_scheduler(manager)
+    scheduler._DEADLOCK_STALL_ITERS = 2
     generation = _make_generation_request(1)
     generation.py_batch_idx = 7
     # CONTEXT/NONE defer existing decode work; DECODE defers a late arrival.
     frozen_generation_ids = frozenset() if phase is RemoteTailPhase.DECODE else frozenset({1})
     scheduler.set_remote_tail_phase(phase, frozenset(), frozen_generation_ids)
 
-    deferred = scheduler.schedule_request([generation], set())
+    for _ in range(scheduler._DEADLOCK_STALL_ITERS + 2):
+        deferred = scheduler.schedule_request([generation], set())
 
-    assert not deferred.context_requests
-    assert not deferred.generation_requests
-    assert generation.py_batch_idx is None
+        assert not deferred.context_requests
+        assert not deferred.generation_requests
+        assert generation.py_batch_idx is None
+        assert scheduler._stalled_schedules == 0
     manager.try_allocate_generation.assert_not_called()
     manager.suspend_request.assert_not_called()
 
@@ -117,8 +120,10 @@ def test_deadlock_guard_preserves_inflight_and_complete_exclusions(
     assert not result.generation_requests
     if progress == "inflight_peer":
         manager.try_allocate_generation.assert_called_once_with(generation)
+        assert scheduler._stalled_schedules == 1
     else:
         manager.try_allocate_generation.assert_not_called()
+        assert scheduler._stalled_schedules == 0
     manager.suspend_request.assert_not_called()
 
 
@@ -126,6 +131,7 @@ def test_deadlock_guard_preserves_inflight_and_complete_exclusions(
 def test_eligible_generation_kv_exhaustion_still_raises(phase: RemoteTailPhase | None) -> None:
     manager = make_kv_cache_manager(try_allocate_generation_fn=lambda request: False)
     scheduler = make_scheduler(manager, enable_recompute_pause=False)
+    scheduler._DEADLOCK_STALL_ITERS = 2
     generation = _make_generation_request(1)
     # Already suspended: allocation cannot succeed, and self-eviction cannot
     # release any more pages. No in-flight work can free capacity either.
@@ -136,10 +142,21 @@ def test_eligible_generation_kv_exhaustion_still_raises(phase: RemoteTailPhase |
         # The late arrival must neither mask the deadlock nor inflate its count.
         active.append(_make_generation_request(2))
 
-    with pytest.raises(RuntimeError, match=r"V2 scheduler deadlock: 1 generation request\(s\)"):
+    first = scheduler.schedule_request(active, set())
+    assert not first.context_requests
+    assert not first.generation_requests
+    assert scheduler._stalled_schedules == 1
+    manager.try_allocate_generation.assert_called_once_with(generation)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"V2 scheduler deadlock: 1 generation and 0 context request\(s\)",
+    ):
         scheduler.schedule_request(active, set())
 
-    manager.try_allocate_generation.assert_called_once_with(generation)
+    assert scheduler._stalled_schedules == 2
+    assert manager.try_allocate_generation.call_count == 2
+    manager.try_allocate_generation.assert_called_with(generation)
     manager.suspend_request.assert_not_called()
 
 
