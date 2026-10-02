@@ -465,8 +465,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     # sender's grid); the sender lists all points and
                     # Sender._mamba_slot_pairs suffix-aligns. The Mixed and V2
                     # managers keep the single current-state slot.
-                    pts, snapshot_slots = self._kv_cache_manager.get_prompt_recurrent_snapshot_slots(
-                        req
+                    pts, snapshot_slots = (
+                        self._kv_cache_manager.get_prompt_recurrent_snapshot_slots(req)
                     )
                     if is_gen_only and adapter.enable_block_reuse:
                         cached = adapter._global_cached_token_count(req)
@@ -1030,6 +1030,26 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 cast(Any, session).set_exception(f"transfer admission failed: {error}")
             raise
 
+    def _reject_duplicate_receive(self, req: LlmRequest, rid: int, where: str) -> None:
+        """A receive is already registered under this request's KV handshake id.
+
+        Re-submitting the same request is idempotent. A different request
+        carrying the same id (a generation leg retried while its first attempt
+        is still being served) can never complete: the context side holds the
+        KV under that id for the receive already in flight. Left in
+        DISAGG_GENERATION_INIT it would be re-admitted every iteration without
+        a transfer to time out, so it goes to the transfer-error path instead.
+        """
+        if self._recv_reqs.get(rid) is req:
+            logger.warning(f"{where}: rid={rid} already has a recv session, skipping")
+            return
+        logger.warning(
+            f"{where}: rid={rid} already has a recv session for another request; failing "
+            "this duplicate generation request (its KV handshake belongs to the receive in "
+            "flight)"
+        )
+        req.state = LlmRequestState.DISAGG_TRANS_ERROR
+
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest) -> None:
         if not self._validate_bridge_req(req, synchronous=True):
@@ -1037,9 +1057,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         rid = get_unique_rid(req)
         self._ever_had_recv_session = True
         if rid in self._recv_sessions:
-            logger.warning(
-                f"request_and_receive_sync: rid={rid} already has a recv session, skipping"
-            )
+            self._reject_duplicate_receive(req, rid, "request_and_receive_sync")
             return
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         session = None
@@ -1117,9 +1135,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
         rid = get_unique_rid(req)
         if rid in self._recv_sessions:
-            logger.warning(
-                f"request_and_receive_async: rid={rid} already has a recv session, skipping"
-            )
+            self._reject_duplicate_receive(req, rid, "request_and_receive_async")
             return
         extent = self._create_cache_extent(req)
         req.py_kv_cache_xfer_bytes = self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
