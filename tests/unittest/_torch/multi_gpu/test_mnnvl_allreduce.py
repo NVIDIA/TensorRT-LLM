@@ -384,8 +384,7 @@ def mnnvl_growth_graph_forward(tensor_parallel_size: int,
             # Two-shot footprint 2 * 4096 * 7168 * 2 B: well past the initial 16 MiB per Lamport buffer.
             big = torch.ones((4096, 7168), dtype=torch.bfloat16, device="cuda")
             torch.testing.assert_close(
-                allreduce(big),
-                torch.full_like(big, tensor_parallel_size))
+                allreduce(big), torch.full_like(big, tensor_parallel_size))
             after = MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping]
             assert after["buffer_size_bytes"] > before["buffer_size_bytes"]
             assert MNNVLAllReduce.allreduce_mnnvl_retired_workspaces[
@@ -399,23 +398,18 @@ def mnnvl_growth_graph_forward(tensor_parallel_size: int,
                 torch.cuda.synchronize()
                 torch.testing.assert_close(
                     output,
-                    torch.full_like(output,
-                                    expected + tensor_parallel_size *
-                                    (1 + step)))
+                    torch.full_like(
+                        output, expected + tensor_parallel_size * (1 + step)))
 
-            huge = torch.ones((8192, 7168),
-                              dtype=torch.bfloat16,
-                              device="cuda")
-            with pytest.raises(RuntimeError,
-                               match="during CUDA graph capture"):
+            huge = torch.ones((8192, 7168), dtype=torch.bfloat16, device="cuda")
+            with pytest.raises(RuntimeError, match="during CUDA graph capture"):
                 with torch.cuda.graph(torch.cuda.CUDAGraph()):
                     allreduce(huge)
         return True
     finally:
         if mapping is not None:
             MNNVLAllReduce.allreduce_mnnvl_workspaces.pop(mapping, None)
-            MNNVLAllReduce.allreduce_mnnvl_retired_workspaces.pop(
-                mapping, None)
+            MNNVLAllReduce.allreduce_mnnvl_retired_workspaces.pop(mapping, None)
         gc.collect()
         for name, (was_present, value) in previous_env.items():
             if was_present:
