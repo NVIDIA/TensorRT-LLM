@@ -13,8 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility imports for the shared lifecycle deadline controller."""
-
-from ..lifecycle.retirement import QuiescenceFatalEvent, RetirementDeadline, RetirementWatchdog
-
-__all__ = ["QuiescenceFatalEvent", "RetirementDeadline", "RetirementWatchdog"]
+"""Internal lifecycle enforcement; no public resource or transfer API."""
