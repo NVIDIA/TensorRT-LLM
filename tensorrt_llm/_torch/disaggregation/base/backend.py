@@ -76,8 +76,16 @@ class CacheKind(IntEnum):
 class Chunk:
     """One piece of a transfer. A monolithic transfer is the sole piece.
 
+    ``block_ids_per_layer_groups[g]`` of a PAGED group is positional: entry ``i`` is the local pool
+    slot holding block ordinal ``i`` (tokens ``[i * tpb, (i + 1) * tpb)``), or ``-1`` when this side
+    has nothing to offer/accept there -- SWA-evicted, not yet allocated, already cached on the
+    receiver, or outside this piece's range. Paged groups carry ``ceil(prompt_len / tpb)`` entries
+    and beam 0 only; a STATE group carries a single slot. The sender pairs ordinals that are
+    ``>= 0`` on both sides, so neither side needs to know the other's eviction or reuse state.
+
     ``token_range`` is the span this piece moves, not a claim that every layer group covers it: a
-    recurrent-state group carries one slot rather than a span, and a windowed group's list is short.
+    recurrent-state group carries one slot rather than a span, and a windowed group's table is
+    mostly holes.
     """
 
     block_ids_per_layer_groups: List[np.ndarray]
@@ -108,8 +116,8 @@ class Chunk:
 class CacheExtent:
     """One ask: which content, and where this rank's blocks for it are.
 
-    One ``name`` covers the request, while ``local``'s blocks are per layer group and a windowed
-    group's list is shorter.
+    One ``name`` covers the request, while ``local``'s blocks are per layer group, positional with
+    ``-1`` holes (see ``Chunk``).
 
     Handing one to ``fetch`` or ``publish`` lends it out: a backend may keep it and read it on
     another thread. Neither it, its ``Chunk``, nor the arrays inside may be changed while it is
@@ -189,8 +197,9 @@ class Cancelled:
 Outcome = Union[Delivered, Failed, Cancelled]
 """How one delivery ended. ``None`` rather than a member means it has not ended yet.
 
-Latch which member it is, not the object: ``reports_pending`` turns from true to false over time, so
-a stored outcome carries a stale one.
+The logical member and its cause are committed at the task/session transition;
+polling only observes that decision. ``reports_pending`` can still change, so a
+stored outcome carries stale report progress, not a different logical result.
 
 ``reports_pending`` asks one question and only one: is a report this transfer was owed still to
 arrive. Receiving waits on the writers' reports, sending on word about its own writes.
@@ -218,6 +227,7 @@ class Attempt(Protocol):
 
         A failure is reported as soon as it is known, which may be before every report is in --
         that second question is carried by the outcome itself.
+        The logical result is stable and does not depend on when the first poll occurs.
         """
         ...
 

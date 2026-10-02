@@ -26,10 +26,7 @@ namespace fmha
 
 struct Smem_tile_o_dummy
 {
-    enum
-    {
-        BYTES_PER_TILE = 0
-    };
+    static constexpr int BYTES_PER_TILE = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -44,15 +41,12 @@ struct Smem_tile_o_gmma_32bit_8bit : public Smem_tile_o_base_8bit_mma<Traits, Ct
     using Mma_tile = typename Base::Mma_tile;
     using Accumulator = typename Base::Accumulator;
 
-    enum
-    {
-        BYTES_PER_ROW = Base::BYTES_PER_ROW,
-        BYTES_PER_ROW_WITH_PACKING = Base::BYTES_PER_ROW_WITH_PACKING,
-        LOOPS = Base::LOOPS,
-        LDS_PER_LOOP = Base::LDS_PER_LOOP,
-        ROWS_PER_LDS = Base::ROWS_PER_LDS,
-        HAS_INCOMPLETE_LDS = Base::HAS_INCOMPLETE_LDS,
-    };
+    static constexpr int BYTES_PER_ROW = Base::BYTES_PER_ROW;
+    static constexpr int BYTES_PER_ROW_WITH_PACKING = Base::BYTES_PER_ROW_WITH_PACKING;
+    static constexpr int LOOPS = Base::LOOPS;
+    static constexpr int LDS_PER_LOOP = Base::LDS_PER_LOOP;
+    static constexpr int ROWS_PER_LDS = Base::ROWS_PER_LDS;
+    static constexpr int HAS_INCOMPLETE_LDS = Base::HAS_INCOMPLETE_LDS;
 
     // Ctor.
     inline __device__ Smem_tile_o_gmma_32bit_8bit(void* smem, int tidx)
@@ -64,19 +58,13 @@ struct Smem_tile_o_gmma_32bit_8bit : public Smem_tile_o_base_8bit_mma<Traits, Ct
     inline __device__ void store(Accumulator const (&acc)[1][1], int mi)
     {
 
-        enum
-        {
-            M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA
-        };
+        static constexpr int M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA;
 
         static_assert(M_PER_MMA == 64);
         static_assert(Base::WARPS_4x1x2);
 
         // The number of MMAs that are stored per loop iteration.
-        enum
-        {
-            MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS
-        };
+        static constexpr int MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS;
 
         static_assert(MMAS_M_PER_LOOP == 1);
         static_assert(Mma_tile::MMAS_N == 1);
@@ -150,12 +138,9 @@ struct Smem_tile_o<Hopper_hgmma_fp16_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_A_RF, G
 
     using Accumulator = typename Base::Accumulator;
 
-    enum
-    {
-        LOOPS = Base::LOOPS,
-        ROW_PACKING = Base::ROW_PACKING,
-        BYTES_PER_ROW = Base::BYTES_PER_ROW,
-    };
+    static constexpr int LOOPS = Base::LOOPS;
+    static constexpr int ROW_PACKING = Base::ROW_PACKING;
+    static constexpr int BYTES_PER_ROW = Base::BYTES_PER_ROW;
 
     // Ctor.
     inline __device__ Smem_tile_o(void* smem, int tidx)
@@ -167,20 +152,14 @@ struct Smem_tile_o<Hopper_hgmma_fp16_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_A_RF, G
     inline __device__ void store(Accumulator const (&acc)[1][1], int mi)
     {
 
-        enum
-        {
-            M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA
-        };
+        static constexpr int M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA;
 
 #pragma unroll
         for (int ni = 0; ni < Mma_tile::CORES_N; ++ni)
         {
 
             // The number of MMAs that are stored per loop iteration.
-            enum
-            {
-                MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS
-            };
+            static constexpr int MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS;
 
             static_assert(MMAS_M_PER_LOOP == 1);
             // inplace multiples seem to be 1, 3, 1, 7, 1, 3, 1,
@@ -223,12 +202,9 @@ struct Smem_tile_o<Hopper_hgmma_fp32_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_A_RF, G
 
     using Accumulator = typename Base::Accumulator;
 
-    enum
-    {
-        LOOPS = Base::LOOPS,
-        ROW_PACKING = Base::ROW_PACKING,
-        BYTES_PER_ROW = Base::BYTES_PER_ROW,
-    };
+    static constexpr int LOOPS = Base::LOOPS;
+    static constexpr int ROW_PACKING = Base::ROW_PACKING;
+    static constexpr int BYTES_PER_ROW = Base::BYTES_PER_ROW;
 
     // Ctor.
     inline __device__ Smem_tile_o(void* smem, int tidx)
@@ -240,20 +216,14 @@ struct Smem_tile_o<Hopper_hgmma_fp32_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_A_RF, G
     inline __device__ void store(Accumulator const (&acc)[1][1], int mi)
     {
 
-        enum
-        {
-            M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA
-        };
+        static constexpr int M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA;
 
 #pragma unroll
         for (int ni = 0; ni < Mma_tile::CORES_N; ++ni)
         {
 
             // The number of MMAs that are stored per loop iteration.
-            enum
-            {
-                MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS
-            };
+            static constexpr int MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS;
 
             static_assert(MMAS_M_PER_LOOP == 1);
             // inplace multiples seem to be 1, 3, 1, 7, 1, 3, 1,
@@ -302,12 +272,9 @@ struct Smem_tile_o<Hopper_hgmma_bf16_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_A_RF, G
 
     using Accumulator = typename Base::Accumulator;
 
-    enum
-    {
-        LOOPS = Base::LOOPS,
-        ROW_PACKING = Base::ROW_PACKING,
-        BYTES_PER_ROW = Base::BYTES_PER_ROW,
-    };
+    static constexpr int LOOPS = Base::LOOPS;
+    static constexpr int ROW_PACKING = Base::ROW_PACKING;
+    static constexpr int BYTES_PER_ROW = Base::BYTES_PER_ROW;
 
     // Ctor.
     inline __device__ Smem_tile_o(void* smem, int tidx)
@@ -319,10 +286,7 @@ struct Smem_tile_o<Hopper_hgmma_bf16_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_A_RF, G
     inline __device__ void store(Accumulator const (&acc)[1][1], int mi)
     {
 
-        enum
-        {
-            M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA
-        };
+        static constexpr int M_PER_MMA = Mma_tile::M_PER_MMA_PER_CTA;
 
         static_assert(Mma_tile::CORES_M == 2);
 
@@ -331,10 +295,7 @@ struct Smem_tile_o<Hopper_hgmma_bf16_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_A_RF, G
         {
 
             // The number of MMAs that are stored per loop iteration.
-            enum
-            {
-                MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS
-            };
+            static constexpr int MMAS_M_PER_LOOP = Mma_tile::MMAS_M / LOOPS;
 
             static_assert(MMAS_M_PER_LOOP == 1);
             // inplace multiples seem to be 1, 3, 1, 7, 1, 3, 1,

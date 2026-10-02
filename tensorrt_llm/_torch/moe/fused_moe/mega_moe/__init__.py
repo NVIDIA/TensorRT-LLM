@@ -20,10 +20,10 @@ Two backends share the ``MoESchedulerKind.FUSED_COMM`` contract:
   fused kernel for W4A8_MXFP4_MXFP8 weights, aliased as ``MegaMoEDeepGemm``.
   ``W4A8MXFP4MXFP8MegaMoEDeepGemmMethod`` owns the DG-native weight tensors,
   scale conversion, and DeepGEMM weight transform.
-* :class:`MegaMoECuteDsl` — architecture-dispatched CuteDSL fused dispatch +
-  FC1 + activation + FC2 + combine kernels for NVFP4 weights. The kernel and
-  helper sources are ported into
-  ``tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe``;
+* :class:`TrtllmCutedslMegaMoeNvfp4Impl` — architecture-dispatched CuteDSL
+  fused dispatch + FC1 + activation + FC2 + combine kernels for NVFP4 weights,
+  aliased as ``MegaMoECuteDsl``. The kernel and helper sources are exported
+  into ``tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe``;
   ``NVFP4MegaMoECuteDslMethod`` owns the NVFP4 weight tensors, MegaMoE-format
   derived buffers, and per-expert scale tensors consumed by the kernel ABI.
 """
@@ -33,6 +33,7 @@ from .mega_moe_cute_dsl import (
     MegaMoECuteDsl,
     MegaMoeCuteDslUnavailable,
     MegaMoECuteDslWeightView,
+    TrtllmCutedslMegaMoeNvfp4Impl,
     is_megamoe_cute_dsl_runtime_available,
 )
 from .mega_moe_deepgemm import DeepgemmCudaW4a8Mxfp4Mxfp8Impl, MegaMoEDeepGemm
@@ -44,6 +45,7 @@ __all__ = [
     "MegaMoeCuteDslUnavailable",
     "MegaMoEDeepGemm",
     "NVFP4MegaMoECuteDslMethod",
+    "TrtllmCutedslMegaMoeNvfp4Impl",
     "W4A8MXFP4MXFP8MegaMoEDeepGemmMethod",
     "is_megamoe_cute_dsl_runtime_available",
 ]

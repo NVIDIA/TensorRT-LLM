@@ -11,11 +11,11 @@ from typing import Any
 import click
 import grpc
 import uvloop
-from openengine.v1 import openengine_pb2_grpc
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.logger import logger
 
+from .bindings import openengine_pb2_grpc
 from .control import OpenEngineControlServicer
 from .servicer import OpenEngineInferenceServicer
 
@@ -154,12 +154,6 @@ def launch_server(
         backend = llm_args.get("backend")
         model = served_model_name or llm_args.get("model", "")
         llm_args.pop("build_config", None)
-        if backend == "_autodeploy":
-            raise click.BadParameter(
-                "OpenEngine generation does not support the AutoDeploy backend because "
-                "AutoDeploy requests cannot currently be cancelled.",
-                param_hint="backend",
-            )
         if backend != "pytorch":
             raise click.BadParameter(
                 f"{backend} is not a known backend, check help for available options.",

@@ -18,7 +18,6 @@ from ..distributed import Distributed
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..moe.expert_statistic import ExpertStatistic
-from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
@@ -37,6 +36,11 @@ CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 # as a one-token context chunk to write its cross-KV cache, so enc-dec
 # dummies need one prompt token plus one generated token.
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
+
+
+def get_mrope_dummy_seq_slot(max_num_tokens: int, pp_size: int) -> int:
+    """Cache slot index reserved for MRoPE dummy/no-delta requests."""
+    return max_num_tokens * pp_size
 
 
 class KeyType(NamedTuple):
@@ -122,7 +126,6 @@ class CUDAGraphRunnerConfig:
     use_mrope: bool
     original_max_draft_len: int
     original_max_total_draft_tokens: int
-    is_draft_model: bool
     enable_attention_dp: bool
     is_encoder_decoder: bool
     batch_size: int
@@ -374,52 +377,37 @@ class CUDAGraphRunner:
                        else self._resolve_sample_type(
                            batch, promoted_context_request_ids))
 
-        if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
-                spec_resource_manager, Eagle3ResourceManager):
-            # If 'is_first_draft' is True, even with tree decoding, the length of draft_len will only be 'max_draft_len', not 'max_total_draft_token'.
-            # Because we will pad the input to 'max_draft_len' length for the first draft layer.
-            draft_len = self.config.original_max_draft_len if spec_resource_manager.is_first_draft else 0
-            key = KeyType(batch_size=batch_size,
-                          draft_len=draft_len,
-                          is_first_draft=spec_resource_manager.is_first_draft,
-                          short_seq_len_mode=short_seq_len_mode,
-                          is_all_greedy_sample=is_all_greedy_sample,
-                          sample_type=sample_type,
-                          peft_cache_data_type=peft_cache_data_type,
-                          use_lora_graph=use_lora_graph)
-        else:
-            # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
-            # so we need to get the draft length from the batch instead of using enable_spec_decode.
-            draft_len_list = []
-            for request in batch.generation_requests:
-                draft_len_list.append(len(request.py_draft_tokens))
-            draft_len = max(draft_len_list)
-            assert len(
-                set(draft_len_list)) == 1, "All draft lengths must be the same"
-            context_requests = batch.context_requests
-            num_contexts = len(context_requests)
-            context_query_len = 0
-            if num_contexts:
-                context_query_len = int(context_requests[0].context_chunk_size)
-                if any(
-                        int(request.context_chunk_size) != context_query_len
-                        for request in context_requests[1:]):
-                    return None
-            num_encoder_tokens = sum(
-                int(request.encoder_output_len) for request in context_requests
-                if not request.py_skip_cross_kv_projection)
-            key = KeyType(batch_size=batch_size,
-                          draft_len=draft_len,
-                          is_first_draft=False,
-                          short_seq_len_mode=short_seq_len_mode,
-                          is_all_greedy_sample=is_all_greedy_sample,
-                          sample_type=sample_type,
-                          num_contexts=num_contexts,
-                          context_query_len=context_query_len,
-                          num_encoder_tokens=num_encoder_tokens,
-                          peft_cache_data_type=peft_cache_data_type,
-                          use_lora_graph=use_lora_graph)
-        return key
+        # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
+        # so we need to get the draft length from the batch instead of using enable_spec_decode.
+        draft_len_list = []
+        for request in batch.generation_requests:
+            draft_len_list.append(len(request.py_draft_tokens))
+        draft_len = max(draft_len_list)
+        assert len(
+            set(draft_len_list)) == 1, "All draft lengths must be the same"
+        context_requests = batch.context_requests
+        num_contexts = len(context_requests)
+        context_query_len = 0
+        if num_contexts:
+            context_query_len = int(context_requests[0].context_chunk_size)
+            if any(
+                    int(request.context_chunk_size) != context_query_len
+                    for request in context_requests[1:]):
+                return None
+        num_encoder_tokens = sum(
+            int(request.encoder_output_len) for request in context_requests
+            if not request.py_skip_cross_kv_projection)
+        return KeyType(batch_size=batch_size,
+                       draft_len=draft_len,
+                       is_first_draft=False,
+                       short_seq_len_mode=short_seq_len_mode,
+                       is_all_greedy_sample=is_all_greedy_sample,
+                       sample_type=sample_type,
+                       num_contexts=num_contexts,
+                       context_query_len=context_query_len,
+                       num_encoder_tokens=num_encoder_tokens,
+                       peft_cache_data_type=peft_cache_data_type,
+                       use_lora_graph=use_lora_graph)
 
     def set_capture_sample_type(self,
                                 sample_type: Optional[SampleType]) -> None:
@@ -812,7 +800,8 @@ class CUDAGraphRunner:
                     "replay() got no mrope_delta_read_seq_slots for a "
                     "use_mrope graph; filling the static buffer with the "
                     "dummy seq slot instead of copying real values.")
-                mrope_dummy_seq_slot = self.config.max_num_tokens * self.config.mapping.pp_size
+                mrope_dummy_seq_slot = get_mrope_dummy_seq_slot(
+                    self.config.max_num_tokens, self.config.mapping.pp_size)
                 static_tensors['mrope_delta_read_seq_slots'][:num_slots].fill_(
                     mrope_dummy_seq_slot)
         else:

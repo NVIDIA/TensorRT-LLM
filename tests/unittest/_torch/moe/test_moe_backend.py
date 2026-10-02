@@ -14,6 +14,7 @@
 # limitations under the License.
 """MoE backend unit tests."""
 
+import dataclasses
 import importlib
 import itertools
 import logging
@@ -70,6 +71,7 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
     TRTLLMGenFusedMoE,
@@ -93,8 +95,14 @@ from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
     override_moe_environment,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
-from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from tensorrt_llm._torch.moe.fused_moe.marlin import MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl
+from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
+    MegaMoECuteDsl,
+    MegaMoEDeepGemm,
+    TrtllmCutedslMegaMoeNvfp4Impl,
+)
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
+    _reject_unsupported_activation,
     build_moe_deployment,
     impl_class_for,
     resolve_moe_impl,
@@ -777,6 +785,31 @@ def test_marlin_moe_repack_is_transform_stage():
     assert NVFP4MarlinFusedMoEMethod.post_load_weights is FusedMoEMethodBase.post_load_weights
 
 
+@pytest.mark.parametrize("act_scale", [None, torch.ones(1, 8)], ids=["absent", "present"])
+def test_marlin_refuses_a_pre_quant_activation_scale(act_scale):
+    """An AWQ-style checkpoint must be refused, not served with the scale dropped.
+
+    ``canonical_quant`` folds NVFP4_AWQ / NVFP4_ARC into ``nvfp4`` before the
+    ``MoEProblem`` is built, so no eligibility gate can see the distinction --
+    the guard has to sit where the evidence appears, which is after
+    ``load_quant_scales`` has materialized ``fc31_act_scale``.
+
+    ``__new__`` without ``__init__``: the check reads one attribute off the
+    module and a real constructor would need a GPU.
+    """
+    method = NVFP4MarlinFusedMoEMethod.__new__(NVFP4MarlinFusedMoEMethod)
+    module = SimpleNamespace(fc31_act_scale=act_scale)
+
+    if act_scale is None:
+        # Nothing to refuse; it falls through to the real repack, which needs
+        # loaded weights. Reaching past the guard is the assertion here.
+        with pytest.raises(AttributeError):
+            method.transform_weights(module)
+    else:
+        with pytest.raises(ValueError, match="pre-quant activation scale"):
+            method.transform_weights(module)
+
+
 def _marlin_model_config(quant_algo=QuantAlgo.NVFP4):
     cfg = ModelConfig()
     cfg.moe_backend = "MARLIN"
@@ -789,10 +822,19 @@ def _marlin_environment(sm: int = 90) -> MoEEnvironment:
     return MoEEnvironment(sm=sm)
 
 
-def test_marlin_is_selected_for_nvfp4():
+@pytest.mark.parametrize(
+    "quant_algo, expected_leaf",
+    [
+        pytest.param(QuantAlgo.NVFP4, MarlinCudaNvfp4Impl, id="nvfp4"),
+        pytest.param(QuantAlgo.W4A16_NVFP4, MarlinCudaW4a16Nvfp4Impl, id="w4a16_nvfp4"),
+    ],
+)
+def test_marlin_selects_the_leaf_that_publishes_the_format(quant_algo, expected_leaf):
+    """``moe_backend: MARLIN`` names the family; the quant picks which leaf."""
     with override_moe_environment(_marlin_environment()):
-        report = resolve_moe_impl(_marlin_model_config())
-    assert impl_class_for(report) is MarlinFusedMoE
+        report = resolve_moe_impl(_marlin_model_config(quant_algo))
+    assert impl_class_for(report) is expected_leaf
+    assert issubclass(impl_class_for(report), MarlinFusedMoE)
     assert report.selected_by == "pinned"
     assert not report.degraded
 
@@ -1204,6 +1246,42 @@ def test_megamoe_cache_derived_state_survives_the_read_only_reader_walk():
     wrapper.cache_derived_state.assert_not_called()
 
 
+def test_megamoe_cutedsl_cache_derived_state_survives_the_read_only_reader_walk():
+    """The CuteDSL leaf's override has to be the one the walk reaches.
+
+    Same wrapper geometry as the DeepGEMM sibling above, but this override
+    guards a different thing: the base hook dereferences ``self.quant_method``
+    unguarded, and a weights-removed reader never reaches
+    ``post_load_weights``, so losing the override here leaves the derived
+    MegaMoE-format state silently never recomputed.
+    """
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    # ``__new__`` rather than the constructor: the real ``__init__`` would want
+    # a process group and the cuMem symmetric-memory rendezvous.
+    backend = TrtllmCutedslMegaMoeNvfp4Impl.__new__(TrtllmCutedslMegaMoeNvfp4Impl)
+    torch.nn.Module.__init__(backend)
+    backend.quant_method = None
+    quant_method = SimpleNamespace(cache_derived_state=MagicMock())
+    backend.create_weights = MagicMock(
+        side_effect=lambda: setattr(backend, "quant_method", quant_method)
+    )
+
+    wrapper = torch.nn.Module()
+    wrapper._weights_removed = True
+    wrapper.cache_derived_state = MagicMock()
+    wrapper.backend = backend
+
+    model = torch.nn.Module()
+    model.moe = wrapper
+
+    ModelLoader._walk_cache_state(model)
+
+    backend.create_weights.assert_called_once_with()
+    quant_method.cache_derived_state.assert_called_once_with(backend)
+    wrapper.cache_derived_state.assert_not_called()
+
+
 def test_megamoe_bakes_situ_softcaps_as_uniform_scalars():
     # MegaMoE declares UNIFORM_SCALAR for alpha/beta because the kernels bake
     # them at codegen time, so a per-expert tensor is reduced here.
@@ -1229,6 +1307,41 @@ def test_megamoe_plain_swiglu_carries_no_constants():
 
     assert (params.alpha, params.beta) == (None, None)
     assert params.clamp is None
+    assert params.clamp_after_silu is False
+
+
+def test_cutlass_materializes_post_silu_clamp_mode():
+    params = materialize_activation_params(
+        SwigluActivation(clamp=5.0, clamp_after_silu=True),
+        CutlassFusedMoE.activation_support,
+        num_local_experts=2,
+        device="cpu",
+        owner="CutlassFusedMoE",
+    )
+
+    assert torch.equal(params.clamp, torch.full((2,), 5.0))
+    assert params.clamp_after_silu is True
+
+
+def test_deepgemm_rejects_post_silu_clamp_materialization():
+    with pytest.raises(ValueError, match="does not implement post-SiLU clamping"):
+        materialize_activation_params(
+            SwigluActivation(clamp=5.0, clamp_after_silu=True),
+            DeepGemmFusedMoE.activation_support,
+            num_local_experts=2,
+            owner="DeepGemmFusedMoE",
+        )
+
+
+def test_post_silu_clamp_mode_requires_limit():
+    with pytest.raises(ValueError, match="requires a clamp value"):
+        SwigluActivation(clamp_after_silu=True)
+
+
+def test_fused_moe_appends_post_silu_mode_to_positional_schema():
+    registered_schema = torch.ops.trtllm.fused_moe.default._schema
+
+    assert registered_schema.arguments[-1].name == "swiglu_clamp_after_silu"
 
 
 def test_create_moe_forwards_situ_activation_as_one_carrier(monkeypatch):
@@ -1821,6 +1934,7 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.MEGAMOE_CUTEDSL,
     MoeBackendType.CUTE_DSL_B12X,
     MoeBackendType.MARLIN,
+    MoeBackendType.CUTEDSL_FC12,
 ]
 
 # Data types to test
@@ -1848,6 +1962,7 @@ CI_MOE_MODEL_CONFIGS = [
 LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
     MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
     MoeModelConfig(256, 6, 4096, 2048),  # DeepSeek-V4-Flash
+    MoeModelConfig(384, 6, 7168, 3072),  # DeepSeek-V4-Pro
     MoeModelConfig(8, 2, 4096, 14336),  # Mixtral-8x7B
     MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
     MoeModelConfig(8, 2, 6144, 32768),  # Grok-1
@@ -3170,6 +3285,30 @@ def test_nvfp4_fc1_row_alignment_gate(
     else:
         # Other gates may still turn the layer down; this one must not.
         assert verdict.reject_reason is not MoERejectReason.SHAPE_UNALIGNED
+
+
+@pytest.mark.parametrize(
+    "backend_cls",
+    [CutlassFusedMoE, CuteDslFusedMoE],
+    ids=["cutlass", "cutedsl"],
+)
+def test_situ_survives_resolution_not_just_construction(backend_cls):
+    """A SiTU layer must be admitted by the *resolver*, not only build.
+
+    Every other SiTU test constructs a backend directly and so never consults
+    ``activation_support``. Resolution does, and it reads the **class**
+    attribute, because it judges candidates before any instance exists. A
+    backend that declared its alpha/beta shape per instance instead passed
+    every unit test and then resolved away to CUTLASS on real hardware with
+    "kernels take no activation alpha, which this layer's SiTu supplies" --
+    silently, because Kimi K3 permits degradation for this backend.
+    """
+    problem = dataclasses.replace(
+        _nvfp4_problem(2048, "SiTu"),
+        activation_constants=frozenset({"alpha", "beta"}),
+    )
+    rejection = _reject_unsupported_activation(backend_cls, problem)
+    assert rejection is None, f"{backend_cls.__name__} refuses SiTU at resolution: {rejection}"
 
 
 def test_unresolvable_layer_error_carries_rejection_details():

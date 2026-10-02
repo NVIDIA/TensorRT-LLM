@@ -111,6 +111,37 @@ continue to run.
 For the native V2 cold-storage representation and codec extension contract, see
 [KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
 
+### SWA Endpoint Retention
+
+To prefer cached sliding-window attention (SWA) blocks near a prompt's endpoint
+under cache pressure, opt in with the prototype
+`kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens` option:
+
+```yaml
+kv_cache_config:
+  enable_block_reuse: true
+  use_kv_cache_manager_v2: true
+  block_reuse_config:
+    policy: all_reusable
+    swa_endpoint_rewind_tokens: 1024
+```
+
+For newly created pages, positive values assign priority `70` to sink blocks
+and SWA blocks overlapping the final `window_size + swa_endpoint_rewind_tokens`
+tokens of the reusable prompt prefix, excluding the final prompt token that is
+recomputed. Other SWA pages receive priority `0`; full-attention and other
+life cycles retain the default priority `35`. Blocks remain reusable until
+evicted. Within each eviction pool, lower priorities are evicted first, with
+LRU ordering among pages of equal priority.
+
+The endpoint is fixed for each request. Existing reused pages retain their
+assigned priorities: advancing the conversation does not automatically promote
+or demote them, and decoding does not advance the callback's endpoint.
+This preference does not guarantee residency or change attention windows or
+prefix matching. It excludes dummy and draft requests. The default, `0`, disables
+the entire endpoint-priority callback, including its preference for the final window.
+This option requires V2, block reuse, and the `all_reusable` policy.
+
 ### Mamba Snapshot Boundaries
 
 Hybrid Mamba models must retain the recurrent Mamba state together with the
@@ -172,7 +203,7 @@ This isolation is enforced entirely by the block-key hash: the salt is mixed int
 
 When working with multimodal models (e.g., vision-language models), the KV cache system needs to identify which cached blocks correspond to which multimodal inputs (images, videos, etc.). By default, the system uses content-based hashing to generate unique identifiers for each multimodal input. However, this approach has limitations for cache management across sessions, as the same content must be re-processed to generate the same hash.
 
-To enable deterministic cache management, you can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. When provided, these UUIDs are returned in KV cache events instead of computed content hashes, while the cache key itself is computed from **both** the UUID and content together for correctness.
+You can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. Both cache managers compute the item digest from **both** the UUID and content together for correctness. V1 returns the original UUID in the KV cache event's `mm_keys[].hash` field when one is supplied. V2 returns the item digest as a hexadecimal string, including for items with UUIDs.
 
 **Usage Example:**
 
@@ -191,14 +222,16 @@ prompt = TextPrompt(
 
 - **Cache Correctness**: When a UUID is provided, the cache key is computed from both the UUID and content together using `BLAKE3(UUID || Content)`. This ensures different content always produces different cache entries, even with the same UUID.
 - **User Isolation**: Same content with different UUIDs produces different cache entries, enabling per-user or per-session cache isolation.
-- **Stable Event Identifiers**: The original UUID string is preserved and returned in KV cache events via `get_kv_cache_events()`, enabling deterministic external cache management.
+- **Stable Event Identifiers**: `get_kv_cache_events()` returns the original UUID for V1, or the item digest for V2. V2 consumers can use the same digest that appears in its cache-key token sequence.
 - **Partial UUID Support**: You can provide UUIDs for some items and use `None` for others to fall back to content-only hashing.
 - **Cross-Modality Support**: Different modalities (images, videos) can each have their own UUIDs.
 
 **UUID Format:**
 
 - Can be any string (e.g., "image-123", "user-session-img-a", database keys)
-- Original UUID strings are preserved and returned in KV cache events
+- Original UUID strings are preserved in request metadata and returned in V1 KV cache events
+
+V2 derives `mm_keys` directly from the cached token sequence. Each entry identifies a continuous multimodal segment within that block: `hash` is the item's digest, and `start_offset` is the segment's first token offset within the item. An item spanning multiple blocks retains the same digest with increasing offsets. Text may separate segments of the same item. Items are processed in prompt order; one item cannot resume after another item has started. The item digest is distinct from `block_hash`, which also depends on the preceding token sequence.
 
 
 ### Enable Offloading to Host Memory
@@ -276,7 +309,14 @@ Events are buffered per rank, gathered onto rank 0 under attention data parallel
 pulled per iteration through `LLM.get_kv_cache_events()` / `LLM.get_kv_cache_events_async()`,
 or over the `/kv_cache_events` endpoint of `trtllm-serve`.
 
-#### Streaming path (prototype)
+#### Streaming path (unsupported)
+
+```{note}
+The streaming path has no implementation: `kv_cache_config.kv_events_config` is rejected
+at startup. Use the buffered path via `kv_cache_config.event_buffer_max_size` instead. The
+wire format and endpoint convention below describe the contract a future native event sink
+must satisfy.
+```
 
 Configured with ```kv_cache_config.kv_events_config```. Each rank encodes its own events and
 publishes them directly over a ZeroMQ `PUB` socket from a background thread, so there is no
@@ -295,12 +335,10 @@ kv_cache_config = KvCacheConfig(
 )
 ```
 
-**Constraints.** The streaming path requires KV cache manager V2 running on its Python
-backend (`TLLM_KV_CACHE_MANAGER_V2_BACKEND=python`); the default `cpp` backend cannot
-consume the Python event sink and raises an error naming this variable. Pipeline
-parallelism and context parallelism are rejected. Events are not published for draft
-models or during KV-cache-size estimation. When streaming is enabled the buffered pull API
-returns an empty list rather than raising.
+**Constraints.** Enabling the streaming path raises at startup. A Python event sink cannot
+serve it, because the KV cache manager V2 radix tree calls its sink natively rather than
+through Python; re-enabling it needs a native sink. Pipeline parallelism and context
+parallelism are rejected independently.
 
 **Endpoint convention.** Every attention-DP rank binds `base_port + rank` using its
 **global** rank, so `N` ranks occupy `[base_port, base_port + N - 1]` cluster-wide and

@@ -121,6 +121,9 @@ class MoEProblem:
     activation_constants: frozenset[str] = frozenset()
     #: ``RoutingMethodType`` member name; None means the call site did not say.
     routing: Optional[str] = None
+    #: True when a clamped SwiGLU must clamp its activated gate rather than
+    #: preserving the historical raw-gate clamp order.
+    clamp_after_silu: bool = False
 
     @property
     def routing_method_type(self) -> Optional["RoutingMethodType"]:
@@ -372,6 +375,23 @@ class MoEEligibility:
         return cls(eligible=False, reject_reason=reason, detail=detail)
 
 
+def identity_quant_of(cls: type) -> str:
+    """The single format ``cls`` publishes, spelled as the identities spell it."""
+    return cls.descriptor.identity.quant
+
+
+def check_quant_matches_identity(cls: type, p: "MoEProblem") -> Optional[MoEEligibility]:
+    """Reject any format other than the one in this leaf's own identity."""
+    expected = identity_quant_of(cls)
+    actual = p.identity_quant
+    if actual != expected:
+        return MoEEligibility.no(
+            MoERejectReason.QUANT_UNSUPPORTED,
+            f"{cls.__name__} implements quant={expected}, got {actual}",
+        )
+    return None
+
+
 def nvfp4_fc1_row_alignment_rejection(
     p: "MoEProblem", d: "MoEDeployment"
 ) -> Optional[MoEEligibility]:
@@ -486,6 +506,7 @@ class MoEResolutionReport:
                 "bias": self.problem.bias,
                 "activation": self.problem.activation,
                 "activation_constants": sorted(self.problem.activation_constants),
+                "clamp_after_silu": self.problem.clamp_after_silu,
                 "routing": self.problem.routing,
             },
             "deployment": {

@@ -7,10 +7,10 @@ from collections.abc import Mapping
 from typing import Any
 
 import grpc
-from openengine.v1 import generation_pb2
 
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
+from .bindings import generation_pb2
 from .capabilities import supported_guides
 from .errors import UnsupportedFeatureError
 

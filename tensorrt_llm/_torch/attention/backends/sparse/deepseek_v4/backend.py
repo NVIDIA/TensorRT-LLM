@@ -34,7 +34,7 @@ from tensorrt_llm.quantization import QuantMode
 
 from ..dsa.backend import _get_nvfp4_mla_kv_cache_amax
 from .cache_manager import get_token_bytes
-from .compressor import NVFP4_COMPRESS_RESIDUAL_DIM, Compressor
+from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
 from .kernels import deepseek_v4_local_to_global_indices
 from .metadata import DeepseekV4TrtllmAttentionMetadata
@@ -280,6 +280,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             local_layer_idx, DeepseekV4AttentionType.SWA.value
         ]
 
+        active_request_count = None
         if self.compress_ratio > 1:
             compressed_buffer_ptr = metadata.compressed_buffer_ptrs[layer_idx]
             compress_pool_base_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
@@ -292,6 +293,28 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 topk_indices = sparse_backend_args.topk_indices
                 assert topk_indices is not None, "topk_indices is required when compress_ratio=4"
                 compressed_local_indices = topk_indices
+                # Metadata setup and prepare() validate the dtype and batch layout.
+                # Fresh prefill already uses the resident write table.
+                if (
+                    self.sparse_attention_config.enable_kv_cache_offload
+                    and attention_input_type == AttentionInputType.generation_only
+                ):
+                    state = metadata.sparse_offload_state
+                    assert state is not None, "Sparse offload metadata must be initialized"
+                    # module.forward_sparse_attn has joined both producer
+                    # streams. Keep fetch before the conversion kernel's
+                    # FMHA scheduler prologue on this consuming stream.
+                    block_table_compressed = kv_cache_manager.fetch_sparse_read_table(
+                        state,
+                        layer_idx,
+                        topk_indices,
+                        req_id,
+                        metadata.compressed_kv_lens_cuda[self.compress_ratio],
+                        block_table_compressed,
+                    )
+                    # Metadata counts include CUDA graph dummy rows. The active
+                    # count is refreshed in place before replay to mask them.
+                    active_request_count = state.active_request_count
             else:
                 compressed_local_indices = metadata.compressed_local_indices_cuda[start_idx:end_idx]
         else:
@@ -344,7 +367,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             tokens_per_block=kv_cache_manager.tokens_per_block,
             token_stride=token_stride,
             compressed_token_stride=(
-                (self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // 2
+                (self.head_dim + kv_cache_manager.nvfp4_residual_dim) // 2
                 if self._uses_nvfp4_compress
                 else token_stride
             ),
@@ -356,6 +379,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
             **sched_kwargs,
             split_extra=self.use_fp8_ds_mla,
+            active_request_count=active_request_count,
+            mask_invalid_pages=active_request_count is not None,
         )
 
         if self.use_fp8_ds_mla:
@@ -367,7 +392,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             compressed_indices = global_indices[:, -num_compressed_indices:].contiguous()
             data_pool, scale_pool = kv_cache_manager.get_compress_pool_buffers(self.compress_ratio)
             num_pool_tokens = data_pool.numel() // (
-                (self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // 2
+                (self.head_dim + kv_cache_manager.nvfp4_residual_dim) // 2
             )
             # The previous layer has already enqueued its attention on this stream.
             # Release its Python reference before allocating the next scratch so
@@ -385,7 +410,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                     compressed_indices,
                     scratch,
                     self._nvfp4_compress_scale_quant_orig,
-                    NVFP4_COMPRESS_RESIDUAL_DIM,
+                    kv_cache_manager.nvfp4_residual_dim,
                     num_pool_tokens,
                 )
             else:
@@ -427,7 +452,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         compressed_indices,
                         scratch,
                         self._nvfp4_compress_scale_quant_orig,
-                        NVFP4_COMPRESS_RESIDUAL_DIM,
+                        kv_cache_manager.nvfp4_residual_dim,
                         max_compressed_kv_tokens,
                         num_pool_tokens,
                     )

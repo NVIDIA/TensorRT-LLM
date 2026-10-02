@@ -89,6 +89,8 @@ l0_dgx_b300:
       stage: pre_merge
       backend: pytorch
   tests:
+  # Helix zero-local-KV coverage needs two Blackwell GPUs and must run before merge.
+  - unittest/_torch/attention/multi_gpu/test_helix_zero_kv.py TIMEOUT (30)
   # ------------- MoE components tests (multi-GPU) ---------------
   # ------------- MoE: multi-GPU module tests (DEP parallel, per backend per quant) ---------------
   # CUTLASS backend: FP8, NVFP4, W4A8_MXFP4_MXFP8, W8A16

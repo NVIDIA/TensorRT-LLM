@@ -800,10 +800,13 @@ size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int3
 
     auto const batch_size = static_cast<size_t>(max_num_seq);
     auto const kv_seq_length = (isCrossAttention() ? cross_kv_length : input_seq_length);
-    // The unfused-MHA buffers below must upper-bound the enqueueContext carve, which sizes them by
-    // batch_size * input_seq_length (not num_tokens): with padding removal the actual token count can be
-    // smaller than batch_size * max(context q length), so sizing by max_num_tokens underestimates.
-    size_t const attention_mask_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_length * kv_seq_length;
+    // Unfused context attention operates on padded [batch, sequence] tensors,
+    // even when the input QKV is packed. Size those buffers from the padded
+    // token counts exactly as enqueueContext does; max_num_tokens remains the
+    // packed count used by the fused paths below.
+    size_t const padded_num_tokens = batch_size * static_cast<size_t>(input_seq_length);
+    size_t const padded_kv_tokens = batch_size * static_cast<size_t>(kv_seq_length);
+    size_t const attention_mask_size = mEnableContextFMHA ? 0 : size * padded_num_tokens * kv_seq_length;
     size_t const cu_seqlens_size = sizeof(int) * (batch_size + 1);
     size_t const rotary_inv_freq_size = sizeof(float) * batch_size * mRotaryEmbeddingDim / 2;
 
@@ -823,7 +826,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int3
     size_t const v_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * kv_seq_length * local_hidden_units_kv;
     size_t const qk_buf_size
         = mEnableContextFMHA ? 0 : size * batch_size * mNumHeads * input_seq_length * kv_seq_length;
-    size_t const qkv_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_length * local_hidden_units_qo;
+    size_t const qkv_buf_2_size = mEnableContextFMHA ? 0 : size * padded_num_tokens * local_hidden_units_qo;
     size_t const qk_buf_float_size
         = mEnableContextFMHA ? 0 : sizeof(float) * batch_size * mNumHeads * input_seq_length * kv_seq_length;
     int dim_q_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
@@ -899,8 +902,8 @@ size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int3
         ? sizeof(float) * tc::divUp(local_hidden_units_kv, std::max(1, mSageAttnNumEltsPerBlkV))
         : 0;
 
-    size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * batch_size * input_seq_length;
-    size_t const encoder_padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * batch_size * cross_kv_length;
+    size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * padded_num_tokens;
+    size_t const encoder_padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * padded_kv_tokens;
     // Each token holds (batch_idx, token_idx_in_seq) int2.
     size_t const tokens_info_size = sizeof(int2) * max_num_tokens;
     size_t const fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
@@ -1886,6 +1889,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.is_last_chunk
             = !mAttentionChunkSize.has_value() || (params.input_seq_length == params.max_past_kv_length);
 
+        if (!(mIsMLAEnabled && params.mla_param != nullptr && params.mla_param->q_rope_applied))
         {
             std::string const beforeRopeStr = "ctx attention before RoPE at layer " + std::to_string(mLayerIdx);
             TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(params.num_tokens,
@@ -1991,6 +1995,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             invokeQKVPreprocessing(preprocessingParams, stream);
         }
         sync_check_cuda_error(stream);
+        if (!(mIsMLAEnabled && params.mla_param != nullptr && params.mla_param->q_rope_applied))
         {
             std::string const afterRopeStr = "ctx attention after RoPE at layer " + std::to_string(mLayerIdx);
             TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(params.num_tokens,
@@ -3127,6 +3132,7 @@ int AttentionOp::initialize() noexcept
         fmhaParams.hasAlibi = isALiBi();
         fmhaParams.scaleAlibi = isAliBiWithScale();
         fmhaParams.useSparseMLA = useSparseMLA();
+        fmhaParams.useSpcompress = mUsesSpcompress;
         fmhaParams.useTllmGenSparseAttention = useTllmGenSparseAttention();
         fmhaParams.fusesDsv4InvRopeFp8Quant = mFusesDsv4InvRopeFp8Quant;
 
