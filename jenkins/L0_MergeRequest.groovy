@@ -2008,7 +2008,7 @@ def resolveBoltProfileRef(String branch, String triple = "aarch64-linux-gnu")
         echo "BOLT profile pin: nothing promoted for ${branch}/${triple}; running unpinned."
         return ""
     }
-    echo "BOLT profile pin: ${branch}/${triple} -> ${ref}. Every consumer in this pipeline uses this bundle."
+    echo "BOLT profile pin: ${branch}/${triple} -> ${ref}. Every consumer in this run uses this bundle."
     return ref
 }
 
