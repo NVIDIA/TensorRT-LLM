@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.disaggregation.native.transfer import RxSession, TxSession
     from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import BindingsNixlTransferStatus
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
@@ -62,7 +63,8 @@ _CASES = (
     "source_fatal",
     "destination_fatal",
 )
-_TIMEOUT_S = 5.0
+_PHASE_TIMEOUT_S = 30.0
+_TIMEOUT_S = 4 * _PHASE_TIMEOUT_S
 _WORKER_TIMEOUT_S = 120.0
 
 
@@ -178,7 +180,11 @@ class _MaskedCompletion:
         assert self.status.is_completed() is True
         self.observed_done.set()
         _record(self.directory, "native_done_masked", evidence="software_completion_mask")
-        _wait(lambda: (self.directory / "report_ambiguous.json").exists(), "inject wait result", 90)
+        _wait(
+            lambda: (self.directory / "report_ambiguous.json").exists(),
+            "inject wait result",
+            _TIMEOUT_S + 2 * _PHASE_TIMEOUT_S,
+        )
         return False
 
     def is_completed(self) -> bool:
@@ -196,6 +202,28 @@ class _MaskedCompletion:
             Diagnostic describing completion evidence masking.
         """
         return "test-only mask of already observed native DONE"
+
+
+def _pool_state(manager: KVCacheManagerV2) -> dict[str, int]:
+    """Read the real, locked slot accounting for this fixture's one GPU pool.
+
+    Args:
+        manager: Native-backed V2 manager, including its granularity-rounded capacity.
+
+    Returns:
+        Physical slot counts, not the nominal max_tokens budget.
+    """
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
+
+    statistics = manager.impl.get_storage_statistics(GPU_LEVEL)
+    assert len(statistics) == 1
+    pool = statistics[0]
+    return {
+        "total": pool.total,
+        "free": pool.free,
+        "available": pool.available,
+        "evictable": pool.evictable,
+    }
 
 
 def _new_request(role: str, request_id: int, unique_id: int, endpoint: str) -> LlmRequest:
@@ -316,7 +344,13 @@ def _worker(args: argparse.Namespace) -> None:
     torch.cuda.set_device(args.gpu_offset + rank)
     mapping = Mapping(world_size=2, rank=rank, tp_size=2, pp_size=1, enable_attention_dp=True)
     manager = KVCacheManagerV2(
-        KvCacheConfig(max_tokens=128, dtype="nvfp4", enable_block_reuse=False, host_cache_size=0),
+        KvCacheConfig(
+            max_tokens=128,
+            dtype="nvfp4",
+            enable_block_reuse=False,
+            host_cache_size=0,
+            max_util_for_resume=1.0,
+        ),
         CacheTypeCpp.SELFKONLY,
         num_layers=1,
         num_kv_heads=1,
@@ -332,7 +366,7 @@ def _worker(args: argparse.Namespace) -> None:
     fatal_role = "ctx" if case == "source_fatal" else "gen"
     fatal_case = case.endswith("fatal")
     # Asymmetric finite deadlines are fault isolation, not matching-config qualification.
-    timeout = _TIMEOUT_S if not fatal_case or role == fatal_role else 90.0
+    timeout = _TIMEOUT_S if not fatal_case or role == fatal_role else 3 * _TIMEOUT_S
     transceiver = KvCacheTransceiverV2(
         mapping,
         MPIDist(mapping),
@@ -398,6 +432,18 @@ def _worker(args: argparse.Namespace) -> None:
     for region in regions:
         region.fill_(123 if role == "ctx" else 17)
     torch.cuda.synchronize()
+    # Native quota is rounded to GPU granularity, not one physical block. Pin its
+    # spare slots before either request clock starts, so only the tested block can
+    # become reusable later. A native cache avoids the wrapper's two-request index limit.
+    initial_pool = _pool_state(manager)
+    assert initial_pool["evictable"] == 0 and initial_pool["total"] - initial_pool["free"] == 1
+    filler = manager.impl.create_kv_cache()
+    filler.stop_committing()
+    assert filler.resume(manager._stream.cuda_stream)
+    assert filler.resize(initial_pool["free"] * manager.tokens_per_block)
+    full_pool = _pool_state(manager)
+    assert full_pool["total"] == initial_pool["total"]
+    assert full_pool["free"] == full_pool["available"] == full_pool["evictable"] == 0
     # No model, scheduler loop, response transport, or async-send manager is initialized.
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = transceiver
@@ -410,7 +456,13 @@ def _worker(args: argparse.Namespace) -> None:
     executor.gather_all_responses = False
     executor.result_wait_queues = {request.py_request_id: None}
     assert executor.disagg is not None
-    _record(directory, f"{role}.allocated", addresses=addresses)
+    _record(
+        directory,
+        f"{role}.allocated",
+        addresses=addresses,
+        pool=full_pool,
+        filler_blocks=initial_pool["free"],
+    )
     _wait(lambda: (directory / "start.json").exists(), "both endpoint worlds initialized")
 
     submissions: list[object] = []
@@ -501,6 +553,7 @@ def _worker(args: argparse.Namespace) -> None:
     )
     world.Barrier()
     transceiver.shutdown()
+    filler.close()
     manager.shutdown()
     _record(directory, f"{role}.0.clean")
 
@@ -581,6 +634,8 @@ def _exercise_live_session(
         assert session.status == SessionStatus.ERROR
         assert worker._retirement_watchdog.fatal is event
         assert event.direction == ("send" if role == "ctx" else "receive")
+        assert event.reason != "transfer timeout", event
+        assert event.deadline == event.started_at + _TIMEOUT_S
         assert _TIMEOUT_S <= event.expired_at - event.started_at <= _TIMEOUT_S + 2.0
         with pytest.raises(RuntimeError, match="admission is closed"):
             worker.create_tx_session(_new_request("ctx", 5, rid + 2, ""))
@@ -602,22 +657,52 @@ def _exercise_live_session(
         if role == "ctx":
             assert len(submissions) == (1 if case == "cancel_late_kv" else 2)
             assert masked[0].observed_done.is_set()
+        retained()
+        assert all(bool(torch.all(region == 123)) for region in regions)
+        probe = _new_request(role, 3, rid + 1, "")
+        assert manager.prepare_context_cache(probe) is not None
+        assert not manager.kv_cache_map[3].resize(128, 127), "live pages reused under pressure"
+        retained()
+        manager.free_resources(probe)
+        assert _pool_state(manager)["available"] == 0
+        retirement = session._retirement
+        assert retirement._request_deadline is not None
+        assert retirement._drain_started is None, retirement._reason
+        _record(
+            directory,
+            f"{role}.prepared",
+            request_deadline=retirement._request_deadline,
+            timeout=retirement.timeout_s,
+        )
+        _wait(
+            lambda: (directory / "transition.json").exists(), "both endpoints ready for transition"
+        )
         if case.startswith("cancel_"):
+            assert retirement._request_deadline - time.monotonic() > _PHASE_TIMEOUT_S
+            # The other endpoint may already have sent cancellation after the gate.
+            # Local cancellation must preserve that first drain, not restart grace.
+            previous_drain = retirement._drain_started
             assert not executor._try_cancel_request(request)
-            assert session.status == SessionStatus.CANCELLED
+            assert session.status == SessionStatus.CANCELLED, (session.status, retirement._reason)
+            if previous_drain is not None:
+                assert retirement._drain_started == previous_drain
         elif case == "timeout_late_aux":
             # Do not poll the session before the independent request clock commits timeout.
             _wait(
                 lambda: session._retirement._drain_started is not None,
                 "independent request timeout",
+                _TIMEOUT_S + _PHASE_TIMEOUT_S,
             )
             assert session.status == SessionStatus.ERROR
+            assert retirement._reason == "transfer timeout"
+            assert retirement._drain_started == retirement._request_deadline
             _record(directory, f"{role}.timed_out")
             _wait(
                 lambda: all(
                     (directory / f"{peer}.timed_out.json").exists() for peer in ("ctx", "gen")
                 ),
                 "both logical timeouts precede cancellation notification",
+                2 * _PHASE_TIMEOUT_S,
             )
         retained()
         drain_started = session._retirement._drain_started
@@ -628,19 +713,13 @@ def _exercise_live_session(
             status = poll(0)
             assert not any(status)
             retained()
-        assert all(bool(torch.all(region == 123)) for region in regions)
-        probe = _new_request(role, 3, rid + 1, "")
-        # Native resume can refuse high utilization before resize requests new pages.
-        if manager.prepare_context_cache(probe) is not None:
-            assert not manager.kv_cache_map[3].resize(128, 127), "live pages reused under pressure"
-        retained()
-        manager.free_resources(probe)
         _record(
             directory,
             f"{role}.retained",
             logical=session.status.name,
             addresses=addresses,
             native_submissions=len(submissions),
+            pool=_pool_state(manager),
         )
         _wait(
             lambda: (directory / "report_ambiguous.json").exists(),
@@ -660,6 +739,9 @@ def _exercise_live_session(
             )
             _wait(lambda: 0 in owner._in_doubt_writers, "actual IN_DOUBT report reaches receiver")
         retained()
+        if case.endswith("fatal"):
+            assert retirement._drain_started is not None
+            assert retirement._reason != "transfer timeout", retirement._reason
         _record(directory, f"{role}.in_doubt", logical=session.status.name)
 
         if case.endswith("fatal"):
@@ -668,10 +750,15 @@ def _exercise_live_session(
                 _wait(
                     lambda: (directory / f"{fatal_role}.fatal.json").exists(),
                     "opposite endpoint fatal",
+                    _TIMEOUT_S + _PHASE_TIMEOUT_S,
                 )
                 retained()
                 _record(directory, f"{role}.survived", resources_retained=True)
-            _wait(lambda: False, "supervisor terminates surviving owned job", 90)
+            _wait(
+                lambda: False,
+                "supervisor terminates surviving owned job",
+                _TIMEOUT_S + 2 * _PHASE_TIMEOUT_S,
+            )
             return
 
         _wait(
@@ -691,7 +778,30 @@ def _exercise_live_session(
         return rid not in sessions
 
     _wait(retired, "native completion and session retirement")
-    assert session.resources_drained() and session.status == terminal_before
+    actual_status = session.status
+    drained = session.resources_drained()
+    _record(
+        directory,
+        f"{role}.retired",
+        expected=terminal_before.name,
+        actual=actual_status.name,
+        drained=drained,
+        drain_reason=session._retirement._reason,
+        poll_results=[
+            {
+                "completed": result[0],
+                "failed": result[1],
+                "cancelled_count": len(result[2]) if len(result) == 3 else 0,
+            }
+            for result in results
+        ],
+    )
+    assert drained, "retired session still owns physical accesses"
+    assert actual_status == terminal_before, (
+        actual_status,
+        terminal_before,
+        session._retirement._reason,
+    )
     assert (
         worker._aux_buffer.free_slot.call_count == 1
         and slot not in worker._aux_buffer._occupied_slots
@@ -711,9 +821,12 @@ def _exercise_live_session(
     executor._do_terminate_request(request)
     assert request.py_request_id not in executor._prefetched_request_ids
     assert request.py_request_id not in executor.result_wait_queues
+    retired_pool = _pool_state(manager)
+    assert retired_pool["free"] == retired_pool["available"] == 1, retired_pool
     replacement = _new_request(role, 4, rid + 3, "")
     assert manager.prepare_context_cache(replacement) is not None
     assert manager.kv_cache_map[4].resize(128, 127)
+    assert _pool_state(manager)["available"] == 0
     replacement_regions = _regions(transceiver, replacement)
     assert set(addresses) == {(region.data_ptr(), region.numel()) for region in replacement_regions}
     for region in replacement_regions:
@@ -744,7 +857,7 @@ def _exercise_live_session(
     _record(directory, f"{role}.reused_after_done", stable_outcome=session.status.name, sentinel=77)
 
 
-@pytest.mark.timeout(180, method="signal")
+@pytest.mark.timeout(600, method="signal")
 @pytest.mark.parametrize("case", _CASES)
 def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
     """Qualify real GPU/NIXL software lifecycle with four GPUs and separate MPI jobs.
@@ -822,8 +935,28 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
             _record(tmp_path, "start")
             if case not in ("baseline", "cancel_before_publication"):
                 _wait(
+                    lambda: all((tmp_path / f"{role}.prepared.json").exists() for role in jobs),
+                    "native DONE and measured allocator pressure on both endpoints",
+                )
+                clocks = [
+                    json.loads((tmp_path / f"{role}.prepared.json").read_text()) for role in jobs
+                ]
+                # Preserve enough grace for both independent timeouts plus bounded rendezvous.
+                assert (
+                    min(clock["request_deadline"] for clock in clocks) - time.monotonic()
+                    > 2 * _PHASE_TIMEOUT_S
+                ), clocks
+                if case == "timeout_late_aux":
+                    assert max(
+                        clock["request_deadline"] for clock in clocks
+                    ) + 2 * _PHASE_TIMEOUT_S < min(
+                        clock["request_deadline"] + clock["timeout"] for clock in clocks
+                    ), clocks
+                _record(tmp_path, "transition")
+                _wait(
                     lambda: all((tmp_path / f"{role}.retained.json").exists() for role in jobs),
                     "both sides retain real resources",
+                    _TIMEOUT_S + 2 * _PHASE_TIMEOUT_S,
                 )
                 _record(tmp_path, "report_ambiguous")
                 _wait(
@@ -838,7 +971,7 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
                 _wait(
                     lambda: (tmp_path / f"{fatal_role}.fatal.json").exists(),
                     "asserted fatal decision",
-                    3 * _TIMEOUT_S,
+                    _TIMEOUT_S + _PHASE_TIMEOUT_S,
                 )
                 jobs[fatal_role].wait(timeout=15)
                 assert jobs[fatal_role].returncode != 0

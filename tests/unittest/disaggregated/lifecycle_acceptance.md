@@ -167,6 +167,13 @@ A minimally initialized
 the production coordinator and resource manager; no scheduler/serving loop or
 asynchronous-send manager is initialized.
 
+Before publication, a real native filler cache pins the allocator's measured
+spare slots; the nominal token quota is not assumed to equal physical capacity.
+The protected slot must stay unavailable until retirement and then be reused
+with unchanged sentinels after duplicate reports. Readiness gates establish
+native DONE and allocation pressure before cancellation or timeout; the real
+120-second request/grace clocks are never reset by the fixture.
+
 The fault control masks completion evidence **after the real backend reports
 DONE**. This deterministically tests the software's behavior while completion is
 unproven to the owner: retain resources, preserve the logical outcome, retire
