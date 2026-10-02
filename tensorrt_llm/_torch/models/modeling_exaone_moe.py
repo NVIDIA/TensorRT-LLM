@@ -698,7 +698,10 @@ class ExaoneMoeModel(DecoderModel):
         return hidden_states
 
 
+# K-EXAONE checkpoints declare `ExaoneMoEForCausalLM`; K-EXAONE-2 declares
+# `ExaoneMoeForCausalLM`. Both share this implementation.
 @register_auto_model("ExaoneMoeForCausalLM")
+@register_auto_model("ExaoneMoEForCausalLM")
 class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoeConfig]):
     def __init__(
         self,
