@@ -103,6 +103,8 @@ def test_engram_history_uploads_refresh_recycled_rows(provider, device, masked):
             assert not provider._pending_history_seeds
             assert set(request_ids).issubset(provider._history_row_of)
             assert len(set(provider._history_row_of.values())) == len(provider._history_row_of)
+            for request_id in request_ids:
+                provider.release_request_state(request_id)
     if stream is not None:
         stream.synchronize()
     for actual, expected in observed:

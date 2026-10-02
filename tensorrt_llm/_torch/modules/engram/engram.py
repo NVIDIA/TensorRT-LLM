@@ -456,8 +456,7 @@ class EngramHashProvider:
         """Stage a new request's raw-token lookback before its first GEN forward.
 
         Only the final ``max_ngram_size - 1`` prompt tokens are needed. Delay
-        device writes until the complete forward batch has reserved its rows;
-        reserving just the new requests could evict an existing batch member.
+        device writes until the complete forward batch has reserved its rows.
         False ``token_mask`` entries mark image boundaries.
         """
         if start_position < 0 or len(token_ids) >= self.config.max_ngram_size:
@@ -531,15 +530,19 @@ class EngramHashProvider:
         min_columns: int,
         device: torch.device,
     ) -> List[int]:
-        """Reserve active request rows, recycling inactive history when needed.
+        """Reserve rows without discarding requests absent from this forward.
 
-        Resumed contexts restore their lookback before hashing; unwritten cells
-        remain ``_DEAD`` so recycled tokens cannot enter another request's hash.
+        Deferred requests retain their history until ``release_request_state``.
+        Recycled rows start with ``_DEAD`` cells so a completed request's tokens
+        cannot enter another request's hash.
         """
         rows = self._history.shape[0] if self._history is not None else 0
         columns = self._history.shape[1] if self._history is not None else 0
+        num_required_rows = len(self._history_row_of) + len(
+            set(request_ids).difference(self._history_row_of)
+        )
         needed_rows = max(rows, 1)
-        while needed_rows < len(request_ids):
+        while needed_rows < num_required_rows:
             needed_rows *= 2
         needed_columns = max(columns, 1)
         while needed_columns < min_columns:
@@ -562,23 +565,10 @@ class EngramHashProvider:
                 row for row in range(needed_rows) if row not in set(self._history_row_of.values())
             ]
 
-        live = set(request_ids)
         assigned: List[int] = []
         for request_id in request_ids:
             row = self._history_row_of.get(request_id)
             if row is None:
-                if not self._history_free_rows:
-                    # Evict any row held by a request outside this batch. One is
-                    # guaranteed to exist: the buffer has at least as many rows
-                    # as the batch has requests.
-                    stale = [rid for rid in self._history_row_of if rid not in live]
-                    assert stale, (
-                        "engram history has no free row and every row belongs to a "
-                        f"request in this batch (rows={self._history.shape[0]}, "
-                        f"batch={len(request_ids)})"
-                    )
-                    for rid in stale:
-                        self._history_free_rows.append(self._history_row_of.pop(rid))
                 row = self._history_free_rows.pop()
                 # A recycled row still holds the previous request's tokens, which
                 # would otherwise be hashed into this one's first n-grams.
@@ -600,7 +590,7 @@ class EngramHashProvider:
 
         Each entry is ``request_id: (first_query_position, preceding_raw_ids)``.
         These tokens populate history only and never add attention/query rows.
-        Reserving all active request IDs prevents evicting a generation peer.
+        Generation peers retain their owned rows across context-only forwards.
         Optional per-request text masks preserve image boundaries.
         """
         if not context_prefixes:

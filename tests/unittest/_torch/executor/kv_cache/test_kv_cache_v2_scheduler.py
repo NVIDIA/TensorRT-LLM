@@ -467,7 +467,9 @@ class TestEncoderReplayBudget:
             ctx_chunk_config=(None, 128),
             enable_prefix_aware_scheduling=prefix_aware,
         )
-        action, cost, _ = sched._try_schedule_context_chunked(req, BudgetTracker(budget, 1))
+        action, cost, _ = sched._try_schedule_context_chunked(
+            req, BudgetTracker(budget, 1), preempt_for_pages=lambda _req: False
+        )
         assert action is ScheduleAction.SCHEDULED
         expected_chunk = min(suffix, budget - replay_rows)
         assert req.context_chunk_size == expected_chunk
@@ -498,7 +500,9 @@ class TestEncoderReplayBudget:
             ctx_chunk_config=(None, 128),
             enable_prefix_aware_scheduling=prefix_aware,
         )
-        action, cost, _ = sched._try_schedule_context_chunked(req, BudgetTracker(budget, 1))
+        action, cost, _ = sched._try_schedule_context_chunked(
+            req, BudgetTracker(budget, 1), preempt_for_pages=lambda _req: False
+        )
         assert req.context_current_position == 4000
         assert not req.py_ced_replay.consumed
         assert action is ScheduleAction.SCHEDULED
@@ -512,14 +516,18 @@ class TestEncoderReplayBudget:
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=budget, ctx_chunk_config=(None, 128))
         with pytest.raises(ValueError, match="Encoder replay cannot make progress"):
-            sched._try_schedule_context_chunked(req, BudgetTracker(budget, 1))
+            sched._try_schedule_context_chunked(
+                req, BudgetTracker(budget, 1), preempt_for_pages=lambda _req: False
+            )
         mgr.resize_context.assert_not_called()
 
     def test_busy_batch_defers_replay_until_budget_is_available(self):
         req = make_replay_request()
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 128))
-        action, cost, _ = sched._try_schedule_context_chunked(req, BudgetTracker(128, 1))
+        action, cost, _ = sched._try_schedule_context_chunked(
+            req, BudgetTracker(128, 1), preempt_for_pages=lambda _req: False
+        )
         assert action is ScheduleAction.SKIP
         assert cost == 0
         mgr.resize_context.assert_not_called()
@@ -534,13 +542,17 @@ class TestEncoderReplayBudget:
             mgr, max_num_tokens=129, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 128)
         )
         if snapshot_offset == 1:
-            action, cost, _ = sched._try_schedule_context_chunked(req, BudgetTracker(129, 1))
+            action, cost, _ = sched._try_schedule_context_chunked(
+                req, BudgetTracker(129, 1), preempt_for_pages=lambda _req: False
+            )
             assert action is ScheduleAction.SCHEDULED
             assert cost == 129
             assert req.context_chunk_size == 1
         else:
             with pytest.raises(ValueError, match="Encoder replay cannot make progress"):
-                sched._try_schedule_context_chunked(req, BudgetTracker(129, 1))
+                sched._try_schedule_context_chunked(
+                    req, BudgetTracker(129, 1), preempt_for_pages=lambda _req: False
+                )
             mgr.resize_context.assert_not_called()
 
     def test_consumed_replay_does_not_charge_later_chunk(self):
@@ -550,7 +562,9 @@ class TestEncoderReplayBudget:
         req.py_ced_replay = EncoderReplay(7, 123, 4000, 3872, consumed=True)
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 128))
-        action, cost, _ = sched._try_schedule_context_chunked(req, BudgetTracker(1024, 1))
+        action, cost, _ = sched._try_schedule_context_chunked(
+            req, BudgetTracker(1024, 1), preempt_for_pages=lambda _req: False
+        )
         assert action is ScheduleAction.SCHEDULED
         assert cost == 1000
         assert req.context_chunk_size == 1000
@@ -559,7 +573,9 @@ class TestEncoderReplayBudget:
         req = make_replay_request(1)
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=128)
-        action, _, _ = sched._try_schedule_context_full(req, BudgetTracker(128, 1))
+        action, _, _ = sched._try_schedule_context_full(
+            req, BudgetTracker(128, 1), preempt_for_pages=lambda _req: False
+        )
         assert action is ScheduleAction.STOP
         mgr.resize_context.assert_not_called()
 
