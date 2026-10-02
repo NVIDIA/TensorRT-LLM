@@ -35,48 +35,20 @@ Each server joins the pool the master's manifest describes::
 Every rank that joins contributes `segment_size`, so capacity is the sum over
 participating ranks. `role` governs traffic only; see `config.StoreRole`.
 `ledger.format_pool_report` totals up what each rank recorded.
-
-Transferring requires `KVCacheManagerV2` and the Mooncake Python bindings,
-which `tensorrt-llm` pulls in as `mooncake-transfer-engine-cuda13`; a
-capacity-only rank needs only the bindings. An inherited `MOONCAKE_CONFIG_PATH`
-wins over `mooncake_store`, so an externally managed pool stays reachable.
-Registering the KV pools needs GPUDirect RDMA; where that is unavailable,
-`stage_through_host: true` routes pages through a pinned host buffer.
 """
 
-from .config import MooncakeStoreConnectorConfig, StoreRole, parse_size
-from .ledger import SegmentRecord, format_pool_report, read_segments, record_segment
-from .master import (
-    POOL_MANIFEST_NAME,
-    PoolManifest,
-    local_address,
-    maybe_provision_pool,
-    provision_pool,
-    resolve_device_name,
-    resolve_pool,
-    running_master,
-    wait_for_master,
-)
+from .ledger import format_pool_report
+from .master import maybe_provision_pool, running_master
 from .scheduler import MooncakeStoreConnectorScheduler
 from .worker import MooncakeStoreConnectorWorker
 
+# What reaches this package from outside it: the two classes `registry.py`
+# resolves by name, and the three entry points `trtllm-serve` calls. Everything
+# else is imported from the submodule that defines it.
 __all__ = [
-    "POOL_MANIFEST_NAME",
-    "MooncakeStoreConnectorConfig",
     "MooncakeStoreConnectorScheduler",
     "MooncakeStoreConnectorWorker",
-    "PoolManifest",
-    "SegmentRecord",
-    "StoreRole",
     "format_pool_report",
-    "local_address",
     "maybe_provision_pool",
-    "parse_size",
-    "provision_pool",
-    "read_segments",
-    "record_segment",
-    "resolve_device_name",
-    "resolve_pool",
     "running_master",
-    "wait_for_master",
 ]
