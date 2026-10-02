@@ -32,6 +32,10 @@ from pydantic import ValidationError
 
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
+from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         is_context_length_exceeded_message)
+from tensorrt_llm.inputs.chat_template_guard import \
+    UnusedChatTemplateKwargsError
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
@@ -57,7 +61,7 @@ from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
-    ConversationParams, UCompletionRequest, UCompletionResponse,
+    ConversationParams, ErrorResponse, UCompletionRequest, UCompletionResponse,
     ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
@@ -254,7 +258,8 @@ class OpenAIDisaggServer:
                 self._config, self._create_client,
                 metadata_config=self._metadata_server_cfg,
                 server_preparation_func=self._sync_server_clock,
-                server_start_timeout_secs=self._server_start_timeout_secs)
+                server_start_timeout_secs=self._server_start_timeout_secs,
+                request_timeout_secs=self._req_timeout_secs)
         self._ctx_router = self._coordinator.ctx_router
         self._gen_router = self._coordinator.gen_router
 
@@ -436,7 +441,9 @@ class OpenAIDisaggServer:
                         media_type="text/event-stream")
                 return JSONResponse(content=response_or_generator.model_dump())
             except Exception as e:
-                self._handle_exception(e)
+                # Usually raises; returns a Response for worker errors that
+                # carry a machine-readable code (context_length_exceeded).
+                return self._handle_exception(e)
         return wrapper
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
@@ -528,13 +535,34 @@ class OpenAIDisaggServer:
             # caller, so it goes through the same unwrapping the Anthropic
             # route uses. This branch is shared with /v1/completions and
             # /v1/chat/completions, so those get the same treatment.
-            raise HTTPException(
-                status_code=status,
-                detail=_upstream_error_message(exception)) from exception
+            message = _upstream_error_message(exception)
+            if is_context_length_exceeded_message(message):
+                # The worker tagged this rejection with the machine-readable
+                # code "context_length_exceeded" (openai_server.py,
+                # create_error_response). HTTPException would flatten it to
+                # {"detail": message}, dropping the code, so re-emit the
+                # worker's error envelope. Detection is by message text, the
+                # same way the worker itself detects it: only the string is
+                # guaranteed to survive the hops.
+                return JSONResponse(status_code=status,
+                                    content=ErrorResponse(
+                                        message=message,
+                                        type="BadRequestError",
+                                        code=CONTEXT_LENGTH_EXCEEDED_CODE,
+                                    ).model_dump())
+            raise HTTPException(status_code=status,
+                                detail=message) from exception
         elif isinstance(exception, HTTPException):
             self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())
             raise exception
+        elif isinstance(exception, UnusedChatTemplateKwargsError):
+            # Raised while this server tokenizes a chat request for routing.
+            # It is a client mistake (a chat_template_kwargs key the template
+            # never reads), not a server fault, so it must not fall through to
+            # the generic 500 below.
+            self._perf_metrics_collector.http_exceptions.inc()
+            raise HTTPException(status_code=400, detail=str(exception)) from exception
         else:
             self._perf_metrics_collector.internal_errors.inc()
             logger.error("Internal server error: ", traceback.format_exc())

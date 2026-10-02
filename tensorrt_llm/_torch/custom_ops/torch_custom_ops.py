@@ -280,6 +280,7 @@ def fused_moe(
     gated_slot_lora_ranks: Optional[torch.Tensor] = None,
     gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
     token_to_slot: Optional[torch.Tensor] = None,
+    swiglu_clamp_after_silu: bool = False,
 ) -> List[torch.Tensor]:
     tuner = AutoTuner.get()
     # Only the non-alltoall case is considered for profiling in the warmup phase.
@@ -380,6 +381,7 @@ def fused_moe(
             fc2_slot_lora_ranks, fc2_slot_lora_weight_ptrs,
             gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot
         ]
+    run_moe_args.append(swiglu_clamp_after_silu)
     try:
         output = run_moe(*run_moe_args)
     except RuntimeError as e:
@@ -453,7 +455,8 @@ def _(input: torch.Tensor,
       fc2_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
       gated_slot_lora_ranks: Optional[torch.Tensor] = None,
       gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
-      token_to_slot: Optional[torch.Tensor] = None):
+      token_to_slot: Optional[torch.Tensor] = None,
+      swiglu_clamp_after_silu: bool = False):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:
         # Note: The weight shape for INT8 weight only quantization is different, i.e.,
@@ -2083,7 +2086,7 @@ _USE_FUSED_FP8_QUANT_PACK = os.environ.get("TRTLLM_FUSED_FP8_QUANT_PACK",
 def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
     """Dispatch FP8 1x128 quantization to CUDA or Triton kernel.
 
-    On SM100 with ``TRTLLM_FUSED_FP8_QUANT_PACK=1``, the fused
+    On SM100/SM103/SM107 with ``TRTLLM_FUSED_FP8_QUANT_PACK=1``, the fused
     ``fp8_quantize_1x128_packed_ue8m0`` op already emits the legacy packed-UE8M0
     (int32) layout deep_gemm expects, so the follow-on
     ``get_mn_major_tma_aligned_packed_ue8m0_tensor`` call is skipped.

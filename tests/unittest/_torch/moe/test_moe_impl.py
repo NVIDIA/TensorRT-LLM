@@ -30,6 +30,7 @@ import torch
 from _torch.moe.moe_test_utils import MoeBackendType
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.moe.fused_moe.activation import SwigluActivation
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
     TrtllmCutedslFusedFc12Nvfp4Impl,
@@ -124,6 +125,45 @@ def test_pinned_deepgemm_identity_resolves_to_the_leaf():
     assert report.selected_by == "pinned"
     assert report.requested == _DEEPGEMM_IMPL_ID
     assert not report.degraded
+
+
+def test_pinned_deepgemm_rejects_post_silu_clamping():
+    activation = SwigluActivation(clamp=5.0, clamp_after_silu=True)
+    with override_moe_environment(_deepgemm_environment()):
+        report = resolve_moe_impl(
+            _deepgemm_model_config(),
+            activation=activation,
+            impl_id=_DEEPGEMM_IMPL_ID,
+        )
+
+    assert report.winner is None
+    assert report.rejected[-1].reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+    assert "post-SiLU clamping" in report.rejected[-1].detail
+
+
+@pytest.mark.parametrize("sm, eligible", [(90, True), (120, False)])
+def test_cutlass_post_silu_clamp_rejects_triton_fallback(sm, eligible):
+    problem = MoEProblem(
+        quant=canonical_quant(QuantAlgo.FP8_BLOCK_SCALES),
+        dtype_act=torch.bfloat16,
+        activation_constants=frozenset({"clamp"}),
+        clamp_after_silu=True,
+    )
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        use_dp=False,
+        num_slots=8,
+        env=MoEEnvironment(sm=sm),
+        parallel_size=1,
+    )
+
+    verdict = CutlassFusedMoE.can_implement(problem, deployment)
+
+    assert verdict.eligible is eligible
+    if not eligible:
+        assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+        assert "Triton fallback" in verdict.detail
 
 
 def test_pinned_identity_fails_hard_where_the_backend_literal_degrades():
@@ -769,6 +809,20 @@ def test_trtllm_gen_leaves_without_a_bias_runner_decline_during_selection(impl_i
 
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+
+
+@pytest.mark.parametrize("sm, eligible", [(100, True), (103, True), (107, False)])
+def test_w4a8_nvfp4_fp8_leaf_is_pinned_to_its_arch_specific_cubins(sm, eligible):
+    """Its E2m1 x E4m3 drop is sm_100a/sm_103a only, so the family gate is too wide."""
+    impl = TrtllmTrtllmGenW4a8Nvfp4Fp8Impl
+    verdict = impl.can_implement(
+        MoEProblem(quant=impl.descriptor.identity.quant.upper(), dtype_act=torch.bfloat16),
+        _single_rank_deployment(_trtllm_gen_environment(sm=sm)),
+    )
+
+    assert verdict.eligible == eligible
+    if not eligible:
+        assert verdict.reject_reason is MoERejectReason.SM_UNSUPPORTED
 
 
 # The leaves whose runner reads no activation constant: their cubins have no

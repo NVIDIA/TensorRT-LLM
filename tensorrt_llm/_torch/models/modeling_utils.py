@@ -8,8 +8,8 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import (Any, Callable, Dict, Generic, Iterator, List, Literal,
-                    Optional, Tuple, Type, TypeVar, Union)
+from typing import (Any, Callable, ClassVar, Dict, Generic, Iterator, List,
+                    Literal, Optional, Tuple, Type, TypeVar, Union)
 
 import torch
 from torch import nn
@@ -366,6 +366,105 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 remove_weights(layer)
 
 
+def apply_layerwise_quant_config(
+        model_config: ModelConfig,
+        named_modules: Iterator[tuple[str, nn.Module]]) -> None:
+    quant_config_dict = model_config.quant_config_dict
+    if quant_config_dict is not None:
+        for name, module in named_modules:
+            if isinstance(module, (MoE, VanillaMoE)):
+                for n, q in quant_config_dict.items():
+                    # all linear layers inside FusedMoE share the same quant config
+                    if name in n:
+                        module.quant_config = q
+                        break
+            elif isinstance(module, Linear):
+                weight_mode = module.weights_loading_config.weight_mode
+                prefix_name = '.'.join(name.split('.')[:-1])
+                if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
+                    for n, q in quant_config_dict.items():
+                        # gate_proj and up_proj share the same quant config
+                        if prefix_name + '.gate_proj' in n or prefix_name + '.gate_up_proj' in n:
+                            module.quant_config = q
+                            break
+                elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
+                    for n, q in quant_config_dict.items():
+                        # q_proj, k_proj and v_proj share the same quant config
+                        if prefix_name + '.q_proj' in n:
+                            module.quant_config = q
+                            break
+                else:
+                    for n, q in quant_config_dict.items():
+                        if name == n:
+                            module.quant_config = q
+                            break
+            elif isinstance(module, Attention):
+                for n, q in quant_config_dict.items():
+                    # reuse q_proj quant config as the attention quant config
+                    if name + '.q_proj' in n:
+                        module.quant_config = q
+                        break
+            elif hasattr(module, 'kv_a_proj_with_mqa'):
+                # DeepseekV3Attention
+                for n, q in quant_config_dict.items():
+                    # reuse q_proj quant config as the attention quant config
+                    if name + '.kv_a_proj_with_mqa' in n:
+                        module.quant_config = q
+                        break
+
+
+def apply_quant_config_exclude_modules(
+        model_config: ModelConfig,
+        named_modules: Iterator[tuple[str, nn.Module]]) -> None:
+    """
+    Skip quant for modules in QuantConfig.exclude_modules.
+    kv_cache_quant_algo takes precedence over exclude_modules.
+    kv_cache_quant_algo, if not None, is set for non-Attention
+    modules too, which is the same practice as when there's no
+    exclude_modules.
+    """
+    quant_config = model_config.quant_config
+    kv_cache_quant_algo = None
+    if quant_config:
+        kv_cache_quant_algo = quant_config.kv_cache_quant_algo
+    new_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
+
+    if quant_config is not None:
+        if quant_config.exclude_modules is not None:
+            for name, module in named_modules:
+                candidates = [name]
+                if isinstance(module, Linear):
+                    weight_mode = module.weights_loading_config.weight_mode
+                    if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
+                        # sometimes gate and up proj are not packed in the checkpoint,
+                        # but they still share the same exclusion rule
+                        candidates += [
+                            name.replace('gate_up_proj', 'gate_proj'),
+                            name.replace('gate_up_proj', 'up_proj')
+                        ]
+                    elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
+                        # sometimes q_proj, k_proj and v_proj are not packed in the checkpoint,
+                        # but they still share the same exclusion rule
+                        candidates += [
+                            name.replace('qkv_proj', 'q_proj'),
+                            name.replace('qkv_proj', 'k_proj'),
+                            name.replace('qkv_proj', 'v_proj')
+                        ]
+                is_excluded = any(
+                    quant_config.is_module_excluded_from_quantization(n)
+                    for n in candidates)
+                if is_excluded and getattr(module, "quant_config",
+                                           None) is not None:
+                    module.quant_config = new_config
+                    # Reset _weights_created so create_weights() in
+                    # __post_init__ will re-create this module's weights
+                    # with the updated (non-quantized) config. Some
+                    # Wrappers such as ConfigurableMoE delegate this state
+                    # update to their child backend.
+                    if hasattr(module, '_weights_created'):
+                        module._weights_created = False
+
+
 class PostInitCaller(type):
 
     def __call__(cls, *args, **kwargs):
@@ -388,16 +487,22 @@ class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
 
+    # Keep FX optimizations for decode and prefill above the PCG capture ceiling.
+    use_fx_for_pcg_fallback: ClassVar[bool] = True
+
     @staticmethod
-    def _checkpoint_has_lm_head_scale(config: ModelConfig[TConfig]) -> bool:
+    def _checkpoint_has_lm_head_scale(
+            config: ModelConfig[TConfig],
+            checkpoint_dir: str | None = None) -> bool:
         """Whether the checkpoint stores a quantized lm_head (a weight scale).
 
         Used to decide lm_head quantization for homogeneous checkpoints, which
         carry no explicit per-layer quant entry. Reads only the safetensors
         header for ``lm_head.weight_scale`` (no weight load).
         """
-        checkpoint_dir = getattr(config.pretrained_config, "_name_or_path",
-                                 None)
+        if checkpoint_dir is None:
+            checkpoint_dir = getattr(config.pretrained_config, "_name_or_path",
+                                     None)
         if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
             return False
         return ModelConfig._get_safetensors_header_for_tensor(
@@ -544,98 +649,16 @@ class DecoderModelForCausalLM(nn.Module,
 
         self.model.__pp_init__()
 
+    def _quantization_named_modules(self) -> Iterator[tuple[str, nn.Module]]:
+        return self.named_modules()
+
     def apply_layerwise_quant_config(self):
-        quant_config_dict = self.model_config.quant_config_dict
-        if quant_config_dict is not None:
-            for name, module in self.named_modules():
-                if isinstance(module, (MoE, VanillaMoE)):
-                    for n, q in quant_config_dict.items():
-                        # all linear layers inside FusedMoE share the same quant config
-                        if name in n:
-                            module.quant_config = q
-                            break
-                elif isinstance(module, Linear):
-                    weight_mode = module.weights_loading_config.weight_mode
-                    prefix_name = '.'.join(name.split('.')[:-1])
-                    if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
-                        for n, q in quant_config_dict.items():
-                            # gate_proj and up_proj share the same quant config
-                            if prefix_name + '.gate_proj' in n or prefix_name + '.gate_up_proj' in n:
-                                module.quant_config = q
-                                break
-                    elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
-                        for n, q in quant_config_dict.items():
-                            # q_proj, k_proj and v_proj share the same quant config
-                            if prefix_name + '.q_proj' in n:
-                                module.quant_config = q
-                                break
-                    else:
-                        for n, q in quant_config_dict.items():
-                            if name == n:
-                                module.quant_config = q
-                                break
-                elif isinstance(module, Attention):
-                    for n, q in quant_config_dict.items():
-                        # reuse q_proj quant config as the attention quant config
-                        if name + '.q_proj' in n:
-                            module.quant_config = q
-                            break
-                elif hasattr(module, 'kv_a_proj_with_mqa'):
-                    # DeepseekV3Attention
-                    for n, q in quant_config_dict.items():
-                        # reuse q_proj quant config as the attention quant config
-                        if name + '.kv_a_proj_with_mqa' in n:
-                            module.quant_config = q
-                            break
+        apply_layerwise_quant_config(self.model_config,
+                                     self._quantization_named_modules())
 
     def apply_quant_config_exclude_modules(self):
-        """
-        Skip quant for modules in QuantConfig.exclude_modules.
-        kv_cache_quant_algo takes precedence over exclude_modules.
-        kv_cache_quant_algo, if not None, is set for non-Attention
-        modules too, which is the same practice as when there's no
-        exclude_modules.
-        """
-        quant_config = self.model_config.quant_config
-        kv_cache_quant_algo = None
-        if quant_config:
-            kv_cache_quant_algo = quant_config.kv_cache_quant_algo
-        new_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
-
-        if quant_config is not None:
-            if quant_config.exclude_modules is not None:
-                for name, module in self.named_modules():
-                    candidates = [name]
-                    if isinstance(module, Linear):
-                        weight_mode = module.weights_loading_config.weight_mode
-                        if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
-                            # sometimes gate and up proj are not packed in the checkpoint,
-                            # but they still share the same exclusion rule
-                            candidates += [
-                                name.replace('gate_up_proj', 'gate_proj'),
-                                name.replace('gate_up_proj', 'up_proj')
-                            ]
-                        elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
-                            # sometimes q_proj, k_proj and v_proj are not packed in the checkpoint,
-                            # but they still share the same exclusion rule
-                            candidates += [
-                                name.replace('qkv_proj', 'q_proj'),
-                                name.replace('qkv_proj', 'k_proj'),
-                                name.replace('qkv_proj', 'v_proj')
-                            ]
-                    is_excluded = any(
-                        quant_config.is_module_excluded_from_quantization(n)
-                        for n in candidates)
-                    if is_excluded and getattr(module, "quant_config",
-                                               None) is not None:
-                        module.quant_config = new_config
-                        # Reset _weights_created so create_weights() in
-                        # __post_init__ will re-create this module's weights
-                        # with the updated (non-quantized) config. Some
-                        # Wrappers such as ConfigurableMoE delegate this state
-                        # update to their child backend.
-                        if hasattr(module, '_weights_created'):
-                            module._weights_created = False
+        apply_quant_config_exclude_modules(self.model_config,
+                                           self._quantization_named_modules())
 
     def __post_init__(self):
         self.apply_layerwise_quant_config()

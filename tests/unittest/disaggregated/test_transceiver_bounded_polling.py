@@ -36,6 +36,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TransferWorker,
     TransferWorkerConfig,
     TxSession,
+    _LogicalOutcomes,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm.bindings import LlmRequestState
@@ -171,6 +172,7 @@ def _make_tx_session(
     deadline_monotonic_s: Optional[float] = None,
 ) -> TxSession:
     session = object.__new__(TxSession)
+    session._logical_outcomes = _LogicalOutcomes()
     session._timeout_s = timeout_s
     session._overall_timeout_s = None
     session._deadline_monotonic_s = deadline_monotonic_s
@@ -415,7 +417,7 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver._recv_reqs = {}
     transceiver._gen_consensus = Mock(return_value=[])
     transceiver._build_to_process = Mock(return_value=[])
-    transceiver._gen_consensus_outcome = Mock(return_value=([], [], []))
+    transceiver._gen_consensus_outcome = Mock(return_value=([], [], [], set()))
     transceiver._close_failed_sessions = Mock()
 
     status = transceiver.check_gen_transfer_status(at_least_request_num=0)
@@ -426,6 +428,8 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     assert failed == []
     assert cancelled == []
     transceiver._gen_consensus.assert_called_once_with([])
+    # to_process, cancelled, failed, completed, locally_verified
+    transceiver._gen_consensus_outcome.assert_called_once_with([], [], [], [], [])
 
 
 def test_consensus_outcome_uses_single_batched_allgather() -> None:
@@ -959,6 +963,7 @@ def test_transfer_worker_passes_overall_timeout_to_tx_session(monkeypatch) -> No
         timeout_s=0.25,
         prompt_len=128,
         overall_timeout_s=60.0,
+        retirement_watchdog=None,
     )
 
 
