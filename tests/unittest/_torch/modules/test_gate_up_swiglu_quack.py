@@ -10,10 +10,23 @@ from tensorrt_llm._torch.modules import gate_up_swiglu_quack as fused
 from tensorrt_llm._torch.modules import gated_mlp as gated_mlp_module
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.swiglu import swiglu
+from tensorrt_llm._utils import get_sm_version
+
+
+def _kernel_available_or_fail() -> bool:
+    """Skip on unsupported hardware; fail on SM100/SM103 if QuACK (a pinned dependency) is missing."""
+    if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
+        return False
+    if not fused.gate_up_swiglu_quack_available():
+        pytest.fail(
+            "SM100-family GPU but QuACK gemm_act is unavailable; the pinned quack-kernels dependency is broken"
+        )
+    return True
+
 
 requires_kernel = pytest.mark.skipif(
-    not (torch.cuda.is_available() and fused.gate_up_swiglu_quack_available()),
-    reason="needs an SM100-family GPU with QuACK installed",
+    not (torch.cuda.is_available() and get_sm_version() in (100, 103)),
+    reason="needs an SM100/SM103 GPU",
 )
 
 
@@ -32,6 +45,7 @@ def _oracle(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     "tokens,hidden,intermediate", [(1, 256, 512), (257, 512, 1024), (4096, 5376, 14336)]
 )
 def test_fused_epilogue_matches_unfused_path(tokens, hidden, intermediate):
+    _kernel_available_or_fail()
     torch.manual_seed(0)
     x = torch.randn((tokens, hidden), device="cuda", dtype=torch.bfloat16)
     weight = (
@@ -52,6 +66,7 @@ def test_fused_epilogue_matches_unfused_path(tokens, hidden, intermediate):
 
 @requires_kernel
 def test_fused_epilogue_rejects_invalid_inputs():
+    _kernel_available_or_fail()
     x = torch.randn((4, 64), device="cuda", dtype=torch.bfloat16)
     weight = torch.randn((128, 64), device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError):
@@ -64,6 +79,7 @@ def test_fused_epilogue_rejects_invalid_inputs():
 
 @requires_kernel
 def test_gated_mlp_dispatches_bf16_epilogue(monkeypatch):
+    _kernel_available_or_fail()
     torch.manual_seed(1)
     mlp = GatedMLP(
         hidden_size=256,
@@ -119,6 +135,11 @@ def test_gated_mlp_bf16_epilogue_is_opt_in_and_excludes_bias_quant_and_tp(monkey
         use_quack_swiglu_epilogue=True,
     )
     assert mlp._can_fuse_gate_up_swiglu_bf16()
+    monkeypatch.setattr(type(mlp.gate_up_proj), "has_any_quant", True)
+    assert not mlp._can_fuse_gate_up_swiglu_bf16()  # quantized projection
+    monkeypatch.undo()
+    monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_available", lambda: True)
+    assert mlp._can_fuse_gate_up_swiglu_bf16()
     monkeypatch.setattr(mlp.gate_up_proj, "tp_size", 2)
     assert not mlp._can_fuse_gate_up_swiglu_bf16()  # tensor parallel
     monkeypatch.setattr(mlp.gate_up_proj, "tp_size", 1)
@@ -142,3 +163,46 @@ def test_gated_mlp_bf16_epilogue_is_opt_in_and_excludes_bias_quant_and_tp(monkey
     )
     monkeypatch.setattr(mlp.gate_up_proj, "use_cute_dsl_bf16_gemm", True, raising=False)
     assert not mlp._can_fuse_gate_up_swiglu_bf16()  # another GEMM provider was selected
+
+
+@requires_kernel
+def test_gated_mlp_bf16_epilogue_replays_under_cuda_graph(monkeypatch):
+    """The fused op must capture and replay in a CUDA graph (shared-module consumers may use graphs)."""
+    _kernel_available_or_fail()
+    torch.manual_seed(2)
+    mlp = GatedMLP(
+        hidden_size=256,
+        intermediate_size=512,
+        bias=False,
+        dtype=torch.bfloat16,
+        use_quack_swiglu_epilogue=True,
+    ).cuda()
+    for p in mlp.parameters():
+        p.data.normal_(std=0.05)
+    calls = []
+    op = gated_mlp_module.gate_up_swiglu_quack_bf16
+
+    def tracked(*args, **kwargs):
+        calls.append(True)
+        return op(*args, **kwargs)
+
+    monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_bf16", tracked)
+    static_x = torch.randn((64, 256), device="cuda", dtype=torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.inference_mode(), torch.cuda.stream(stream):
+        for _ in range(3):  # warmup: JIT compile and allocator state
+            mlp(static_x)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.inference_mode(), torch.cuda.graph(graph):
+        static_out = mlp(static_x)
+    assert calls, "fused op was not used"
+    inputs = [torch.randn((64, 256), device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    with torch.inference_mode():
+        for x in inputs:
+            static_x.copy_(x)
+            graph.replay()
+            torch.cuda.synchronize()
+            eager = mlp(x)
+            assert torch.equal(static_out, eager)
