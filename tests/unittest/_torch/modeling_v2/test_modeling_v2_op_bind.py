@@ -4,8 +4,8 @@
 
 A catalog entry no longer cares *when* a value becomes known -- only whether it
 varies by layer. `bind_const` states a value that is the same for every layer;
-`bind_layered` states one value per layer, selected by a `layer=` keyword at
-the call. Both are callable from wherever a target finds the value knowable --
+`bind_layered` binds one layer's values at a time, read back by a `layer=`
+keyword at the call. Both are callable from wherever a target finds the value knowable --
 construction, the first forward, every forward -- and `raw_call` is the
 surface underneath all of it: it takes everything explicitly, which is what
 lets CELLS keep certifying the whole input space no matter what a target chose
@@ -75,33 +75,49 @@ def test_call_time_kwarg_overrides_bind_const():
 
 
 def test_layer_selects_the_bound_row():
-    """A `bind_layered` table, read by row at the call.
+    """One `bind_layered` call per layer, read back by `layer=` at the call.
 
-    This is the mechanism gpt_oss's per-layer weight tables rest on: built
-    once from the real weights, then indexed by `layer=i` every forward
-    instead of being read out of a per-target tuple by the call site itself.
+    This is the mechanism gpt_oss's per-layer weight tables rest on: bound
+    once per layer from the real weights, then indexed by `layer=i` every
+    forward instead of being read out of a per-target tuple by the call site
+    itself.
     """
     op = _Spy()
     op.bind_const(a="bound")
-    op.bind_layered(b=("row0", "row1", "row2"))
+    op.bind_layered(0, b="row0")
+    op.bind_layered(1, b="row1")
+    op.bind_layered(2, b="row2")
     assert op(c=3, layer=1) == dict(a="bound", b="row1", c=3)
 
 
 def test_layer_overrides_const_for_the_same_argument():
     op = _Spy()
     op.bind_const(b="const-default")
-    op.bind_layered(b=("row0", "row1"))
+    op.bind_layered(0, b="row0")
+    op.bind_layered(1, b="row1")
     assert op(layer=1) == dict(a=None, b="row1", c=None)
 
 
 def test_call_time_kwarg_overrides_the_layer_row():
-    """Call-time kwargs win over everything, including a `layered` row for
+    """Call-time kwargs win over everything, including a layered value for
     the same argument -- a target binding a weight table can still pass an
     unrelated, or even overriding, per-call value through the same call.
     """
     op = _Spy()
-    op.bind_layered(b=("row0", "row1"))
+    op.bind_layered(0, b="row0")
+    op.bind_layered(1, b="row1")
     assert op(b="explicit", layer=1) == dict(a=None, b="explicit", c=None)
+
+
+def test_bind_layered_can_bind_a_subset_of_layers():
+    """A model whose layers are not uniform -- dense layers beside MoE
+    layers, as deepseek's will be -- binds only the layers that have the
+    operand; a call for an unbound layer simply never happens, rather than
+    the caller having to pad the gap with a placeholder.
+    """
+    op = _Spy()
+    op.bind_layered(3, b="moe-row")
+    assert op(layer=3) == dict(a=None, b="moe-row", c=None)
 
 
 def test_an_entry_with_no_layered_table_is_unaffected_by_the_absence_of_layer():
