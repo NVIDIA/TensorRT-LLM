@@ -40,6 +40,9 @@ class PostprocArgs:
     num_prompt_tokens_offset: int = 0
     tokenizer: Optional[TransformersTokenizer] = None
     ctx_usage: Optional[Any] = None
+    image_tokens: Optional[int] = None
+    video_tokens: Optional[int] = None
+    audio_tokens: Optional[int] = None
 
 
 @dataclass(kw_only=True)
