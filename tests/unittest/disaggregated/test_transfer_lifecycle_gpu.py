@@ -153,6 +153,62 @@ def _stop_owned_jobs(jobs: dict[str, subprocess.Popen], directory: Path) -> None
     assert not survivors, f"owned MPI ranks survived cleanup: {survivors}"
 
 
+def _wait_for_rank_exit(directory: Path, role: str, timeout: float = 15.0) -> None:
+    """Observe both original ranks exiting, without sending cleanup signals.
+
+    A zombie has exited but has not been reaped. Neither that state nor PID reuse
+    means the original rank is still executing; neither proves GPU/RDMA fencing.
+
+    Args:
+        directory: Existing per-rank PID/create-time records and output directory.
+        role: Endpoint world whose production containment must stop both ranks.
+        timeout: Maximum passive observation time, independent of transfer grace.
+
+    Raises:
+        AssertionError: Any original rank remains live or cannot be observed.
+    """
+    import psutil
+
+    identities = [
+        json.loads((directory / f"{role}.{rank}.spawned.json").read_text()) for rank in range(2)
+    ]
+    started = time.monotonic()
+    history = []
+    previous = None
+    while True:
+        observations = []
+        for rank, identity in enumerate(identities):
+            observation = {"rank": rank, "pid": identity["pid"], "created": identity["created"]}
+            try:
+                process = psutil.Process(identity["pid"])
+                observed_created = process.create_time()
+                observation["observed_created"] = observed_created
+                if observed_created != identity["created"]:
+                    state = "reused"
+                else:
+                    status = process.status()
+                    observation["status"] = status
+                    state = "zombie" if status == psutil.STATUS_ZOMBIE else "live"
+            except psutil.NoSuchProcess:
+                state = "absent"
+            except psutil.AccessDenied:
+                state = "unobservable"
+            observation["state"] = state
+            observations.append(observation)
+        elapsed = time.monotonic() - started
+        if observations != previous:
+            history.append({"elapsed": elapsed, "ranks": observations})
+            previous = observations
+        exited = all(item["state"] in ("absent", "zombie", "reused") for item in observations)
+        if exited or elapsed >= timeout:
+            _record(
+                directory, f"{role}.exit_check", passed=exited, elapsed=elapsed, history=history
+            )
+            assert exited, f"Original {role} ranks did not exit before cleanup: {observations}"
+            return
+        time.sleep(0.01)
+
+
 class _MaskedCompletion:
     """Retain a real native status while masking its already-observed DONE."""
 
@@ -980,12 +1036,7 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
                     "independent peer survives",
                 )
                 assert jobs[survivor].poll() is None
-                for rank in range(2):
-                    pid = json.loads((tmp_path / f"{fatal_role}.{rank}.ready.json").read_text())[
-                        "pid"
-                    ]
-                    with pytest.raises(ProcessLookupError):
-                        os.kill(pid, 0)
+                _wait_for_rank_exit(tmp_path, fatal_role)
             else:
                 for role, job in jobs.items():
                     job.wait(timeout=60)

@@ -3,10 +3,9 @@
 
 # KV transfer lifecycle acceptance
 
-This test-only qualification suite is stacked on
-[PR #19674](https://github.com/NVIDIA/TensorRT-LLM/pull/19674), at
-`0efe12dab04d44841ebd39e28d9f767c06828006`. It complements the implementation's
-focused regressions. It adds real GPU/NIXL transfer coverage without changing
+This test-only qualification suite builds on the lifecycle implementation merged in
+[PR #19674](https://github.com/NVIDIA/TensorRT-LLM/pull/19674). It complements the
+implementation's focused regressions and adds real GPU/NIXL coverage without changing
 production behavior; it does not establish a GPU/RDMA fencing guarantee.
 Coverage is grouped into three milestones:
 
@@ -121,7 +120,7 @@ has passed. Track those results separately for each exact revision/configuration
 | B-OUTCOME | Stable event-time logical outcomes | Outcome: `test_receive_outcome_does_not_depend_on_polling_before_late_completion`, `test_receive_cancel_keeps_its_outcome_when_a_writer_later_fails`, `test_sender_cancel_survives_late_kv_and_aux_exceptions` | Same semantics through native executor/backend paths |
 | B-LATE-DONE | Exact retained-handle settlement, idempotence, no revival/reopening | Merged [PR #19378](https://github.com/NVIDIA/TensorRT-LLM/pull/19378); Late settlement: `test_late_settlement_requires_positive_retained_status`, `test_concurrent_late_done_retires_once_without_changing_failure`, `test_late_done_does_not_retire_active_sibling` | Qualify retained-handle completion and actual source/destination reuse with the real backend |
 | B-DEADLINE | Non-resettable quiescence clock, independent progress, sticky fatal expiry | Merged [PR #19673](https://github.com/NVIDIA/TensorRT-LLM/pull/19673); Deadline: `test_first_drain_trigger_cannot_be_extended`, `test_blocked_backend_cannot_delay_fatal_deadline`, `test_receiver_deadline_retains_kv_aux_and_registration` | Real outstanding GPU/NIXL access through deadline expiry; coordinator request timeout alone does not test the drain clock |
-| B-CONTAINMENT | Rank-aligned fail-close and qualified fencing/replacement | Stack parent [PR #19674](https://github.com/NVIDIA/TensorRT-LLM/pull/19674); Containment: `test_real_mpi_retirement_kills_blocked_world_before_fresh_world_starts`; Session ACK: `test_session_ack_cannot_bypass_existing_unsettled_access`, `test_missing_candidate_still_expires_and_late_ack_cannot_reverse_fatal` | GPU/RDMA access revocation, surviving-peer behavior, qualified fencing before reuse, and replacement recovery; MPI process death is not this proof |
+| B-CONTAINMENT | Rank-aligned fail-close and qualified fencing/replacement | Merged foundation [PR #19674](https://github.com/NVIDIA/TensorRT-LLM/pull/19674); Containment: `test_real_mpi_retirement_kills_blocked_world_before_fresh_world_starts`; Session ACK: `test_session_ack_cannot_bypass_existing_unsettled_access`, `test_missing_candidate_still_expires_and_late_ack_cannot_reverse_fatal` | GPU/RDMA access revocation, surviving-peer behavior, qualified fencing before reuse, and replacement recovery; MPI process death is not this proof |
 | C-IDENTITY | Attempt/incarnation isolation | Pending; no acceptance test here | Old evidence cannot settle new attempt memory, including retries/restarts |
 | C-COVERAGE | Qualify additional configurations individually | Pending; no acceptance test here | Repeat full contract for each named profile; bounce/layerwise probes alone do not qualify those modes |
 | C-CANCELLATION | Replay-safe coordinated in-flight cancellation | Pending; no acceptance test here | Exact participant-cancellation scenario, partial completion, B's bounded containment, and C-IDENTITY where replay/retry applies |
@@ -181,6 +180,10 @@ idempotently when the exact handle becomes visible as DONE, or fail closed when
 the grace period expires. It does not simulate a still-active DMA, nor qualify
 abort/release semantics. A fatal test must establish its fault preconditions and
 retention assertions before process death; an arbitrary MPI failure is not a pass.
+The fatal-world exit check observes both recorded PID/create-time identities
+before cleanup, with a bounded wait and state diagnostics. Absent, exited/zombie,
+or reused identities mean the original process no longer executes; a live or
+unobservable rank fails. This process observation is not GPU/RDMA fencing proof.
 
 The seven cases cover normal delivery, cancellation before publication,
 cancellation with KV or AUX completing late, timeout with AUX completing late,
