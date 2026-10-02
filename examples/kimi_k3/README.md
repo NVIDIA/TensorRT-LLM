@@ -202,7 +202,7 @@ sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
 ```
 
 Block reuse stays off by default because suffix-automaton speculative
-decoding requires the default cache manager, which cannot reuse blocks.
+decoding is incompatible with KV-cache block reuse.
 
 ## Suffix-automaton speculative decoding
 
@@ -240,8 +240,8 @@ limitations" below.
   TRTLLM-14904.
 - FP8 KV cache (`kv_cache_config.dtype: fp8`) is not yet supported.
 - Suffix-automaton speculative decoding (see the dedicated section above)
-  carries configuration restrictions. SA requires the default KV-cache
-  manager, so it is incompatible with KV-cache block reuse. The evaluated
+  carries configuration restrictions. SA is incompatible with KV-cache
+  block reuse. The evaluated
   aggregated configuration (`eval_extra_llm_options_sa.yaml`) runs with the
   overlap scheduler off, chunked prefill off, and `max_batch_size` 8 with a
   matching CUDA-graph `max_batch_size`. Under disaggregated serving, SA runs
