@@ -19,10 +19,11 @@ TensorRT LLM
 <div align="left">
 
 > **Telemetry is enabled by default for LLM and VisualGen workloads.**
-> TensorRT-LLM sends system/GPU information, selected configuration, and
-> session-level usage, performance, and error summaries to NVIDIA to understand
-> usage and improve reliability and performance. Prompts, input media,
-> generated outputs, and model weights are not collected.
+> TensorRT-LLM sends sanitized system/GPU information, selected configuration,
+> and session-level usage, performance, and error summaries to NVIDIA to improve
+> reliability and performance. The client excludes prompts, input media,
+> generated outputs, model weights, and persistent user, device, or account
+> identifiers from its telemetry payloads.
 >
 > **To opt out before running**, set `TRTLLM_NO_USAGE_STATS=1` in the environment
 > where you launch TensorRT-LLM. See [collected data](#telemetry-data-collection)
