@@ -15,6 +15,7 @@ from torch import nn
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
 from tensorrt_llm._torch.memory_buffer_utils import with_shared_pool
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
@@ -342,34 +343,40 @@ class EncoderDecoderRunner(EncoderMixin):
         if encoder is None:
             raise AttributeError("Encoder-decoder models must expose `encoder` or `model.encoder`.")
 
-        input_features = inputs.get("input_features")
-        if input_features is not None:
-            return encoder(
-                input_features=input_features,
-                attn_metadata=inputs["encoder_attn_metadata"],
+        # The independent encoder bypasses model_forward, including its embedding prelude.
+        with nccl_window_tensor_scope(inputs) as scope:
+            input_features = inputs.get("input_features")
+            if input_features is not None:
+                return scope.escape(
+                    encoder(
+                        input_features=input_features,
+                        attn_metadata=inputs["encoder_attn_metadata"],
+                    )
+                )
+
+            top_level_model = get_top_level_model(self._model)
+            embedding = getattr(top_level_model, "shared_embedding", None) or getattr(
+                top_level_model, "embed_tokens", None
             )
+            input_ids = inputs["encoder_input_ids"]
+            if embedding is None:
+                hidden_states = input_ids
+            else:
+                hidden_states = embedding(input_ids)
+                embedding_scale = getattr(top_level_model, "embed_scale", None)
+                if embedding_scale is not None:
+                    hidden_states = hidden_states * embedding_scale
 
-        top_level_model = get_top_level_model(self._model)
-        embedding = getattr(top_level_model, "shared_embedding", None) or getattr(
-            top_level_model, "embed_tokens", None
-        )
-        input_ids = inputs["encoder_input_ids"]
-        if embedding is None:
-            hidden_states = input_ids
-        else:
-            hidden_states = embedding(input_ids)
-            embedding_scale = getattr(top_level_model, "embed_scale", None)
-            if embedding_scale is not None:
-                hidden_states = hidden_states * embedding_scale
-
-        position_ids = inputs.get("encoder_position_ids")
-        if position_ids is not None and position_ids.dim() == 2:
-            position_ids = position_ids.squeeze(0)
-        return encoder(
-            hidden_states=hidden_states,
-            attn_metadata=inputs["encoder_attn_metadata"],
-            position_ids=position_ids,
-        )
+            position_ids = inputs.get("encoder_position_ids")
+            if position_ids is not None and position_ids.dim() == 2:
+                position_ids = position_ids.squeeze(0)
+            return scope.escape(
+                encoder(
+                    hidden_states=hidden_states,
+                    attn_metadata=inputs["encoder_attn_metadata"],
+                    position_ids=position_ids,
+                )
+            )
 
     def _forward_graph_inputs(self, inputs: dict[str, Any]) -> torch.Tensor:
         return self._forward_encoder_stack(

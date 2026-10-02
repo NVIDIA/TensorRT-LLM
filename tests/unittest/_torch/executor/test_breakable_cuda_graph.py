@@ -10,6 +10,7 @@ import pytest
 import torch
 from torch import nn
 
+import tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.breakable_cuda_graph as bcg
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
@@ -24,6 +25,40 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import (
 from tensorrt_llm._torch.utils import make_weak_ref
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+
+
+@pytest.mark.parametrize("failure_point", ["begin", "end"])
+def test_capture_failure_unwinds_owner_context(monkeypatch, failure_point):
+    events = []
+
+    class OwnerContext:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, exc_type, _exc_value, _traceback):
+            events.append(("exit", exc_type))
+
+    monkeypatch.setattr(bcg, "nccl_window_graph_owner", lambda _pool: OwnerContext())
+    capture = BreakableCUDAGraphCapture(BreakableCUDAGraph(), stream=torch.cuda.Stream())
+
+    def fail():
+        raise RuntimeError(f"capture {failure_point} failed")
+
+    if failure_point == "begin":
+        monkeypatch.setattr(capture, "_begin_new_segment", fail)
+    else:
+        monkeypatch.setattr(capture, "_begin_new_segment", lambda: None)
+        monkeypatch.setattr(capture, "_end_current_segment", fail)
+
+    with pytest.raises(RuntimeError, match=f"capture {failure_point} failed"):
+        with capture:
+            assert events == ["enter"]
+
+    assert events == ["enter", ("exit", RuntimeError)]
+    assert capture._exit_stack is None
+    assert bcg._current_capture.get() is None
+    assert bcg._current_stream.get() is None
+    assert bcg._forked_streams.get() is None
 
 
 def _capture(body):
@@ -303,6 +338,30 @@ def test_runner_first_bucket_segments_share_one_memory_pool():
     assert graph.num_segments == 3
     assert runner._memory_pool is not None
     assert all(segment.pool() == runner._memory_pool for segment in graph._segments)
+
+
+def test_runner_clear_releases_memory_pool_after_graph_reset(monkeypatch):
+    runner = BreakableCUDAGraphRunner(_Body().cuda())
+    pool = (12345, 67890)
+    events = []
+
+    class Graph:
+        @staticmethod
+        def reset():
+            events.append("reset")
+
+    runner._graphs[4] = Graph()
+    runner._memory_pool = pool
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner."
+        "release_nccl_window_graph_owner",
+        lambda released_pool: events.append(("release", released_pool)),
+    )
+
+    runner.clear()
+
+    assert events == ["reset", ("release", pool)]
+    assert runner._memory_pool is None
 
 
 def test_runner_graph_miss_nested_execute_and_exception_recovery():

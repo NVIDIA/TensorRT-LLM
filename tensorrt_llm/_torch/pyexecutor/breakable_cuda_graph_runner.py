@@ -8,6 +8,8 @@ from typing import Any, Callable, Iterator, Optional
 import torch
 from torch import nn
 
+from ..nccl_window_graph import abandon_nccl_window_graph_owner, release_nccl_window_graph_owner
+from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..utils import make_weak_ref
 from .breakable_cuda_graph import (
     BreakableCUDAGraph,
@@ -54,7 +56,12 @@ class BreakableCUDAGraphRunner:
     def has_graph(self, num_tokens: int) -> bool:
         return num_tokens in self._graphs
 
-    def warmup(self, engine_forward: Callable[[], Any], steps: int = _WARMUP_STEPS) -> None:
+    def warmup(
+        self,
+        engine_forward: Callable[[], Any],
+        scope_inputs: Any = None,
+        steps: int = _WARMUP_STEPS,
+    ) -> None:
         """Run the complete eager engine forward under the warmup state.
         model_engine.forward will use state to determine what forward to do."""
         if self._state != BreakableCUDAGraphRunnerState.IDLE:
@@ -62,11 +69,14 @@ class BreakableCUDAGraphRunner:
         self._state = BreakableCUDAGraphRunnerState.WARMUP
         try:
             for _ in range(steps):
-                engine_forward()
+                with discard_nccl_window_tensor_outputs(scope_inputs):
+                    engine_forward()
         finally:
             self._state = BreakableCUDAGraphRunnerState.IDLE
 
-    def capture(self, num_tokens: int, engine_forward: Callable[[], Any]) -> None:
+    def capture(
+        self, num_tokens: int, engine_forward: Callable[[], Any], scope_inputs: Any = None
+    ) -> None:
         """Warm up eagerly, then capture one prefill token bucket."""
         if self._state != BreakableCUDAGraphRunnerState.IDLE:
             raise RuntimeError(f"Cannot capture BCG while runner is {self._state.value}")
@@ -79,7 +89,7 @@ class BreakableCUDAGraphRunner:
         created_memory_pool = False
         try:
             with torch.cuda.stream(self._capture_stream):
-                self.warmup(engine_forward)
+                self.warmup(engine_forward, scope_inputs)
 
                 # Every segment in the first BCG bucket must receive the same
                 # explicit pool handle. Passing None lets each CUDAGraph create
@@ -107,6 +117,8 @@ class BreakableCUDAGraphRunner:
             if graph is not None:
                 graph.reset()
             if created_memory_pool and not self._graphs:
+                # Capture failure can be rank-local; do not return this pool to reuse.
+                abandon_nccl_window_graph_owner(self._memory_pool)
                 self._memory_pool = None
                 self._shared_output = None
             raise
@@ -202,11 +214,13 @@ class BreakableCUDAGraphRunner:
             self.layer_model.forward = original_forward
             self._state = BreakableCUDAGraphRunnerState.IDLE
 
-    def clear(self) -> None:
+    def clear(self, *, release_nccl_window_owners: bool = True) -> None:
         if self._state != BreakableCUDAGraphRunnerState.IDLE:
             raise RuntimeError(f"Cannot clear BCG while runner is {self._state.value}")
         for graph in self._graphs.values():
             graph.reset()
+        if release_nccl_window_owners and self._memory_pool is not None:
+            release_nccl_window_graph_owner(self._memory_pool)
         self._graphs.clear()
         self._outputs.clear()
         self._shared_output = None

@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderPreparedInputs
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
@@ -174,3 +175,67 @@ def test_encoder_decoder_forward_returns_hidden_states_with_prepared_lengths() -
         runtime_draft_len=0,
     )
     runner._execute_prepared.assert_called_once_with(prepared)
+
+
+@pytest.mark.parametrize("feature_mode", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_encoder_lifetime_scope_covers_embedding_and_preserves_output(
+    monkeypatch: pytest.MonkeyPatch, feature_mode: bool, fail: bool
+) -> None:
+    events = []
+    active = False
+
+    def begin(inputs):
+        nonlocal active
+        assert not active
+        active = True
+        events.append("begin")
+        return 0
+
+    def end(inputs, outputs, failed, entry_depth):
+        nonlocal active
+        assert active
+        assert failed is fail
+        assert entry_depth == 0
+        assert len(outputs) == (0 if fail else 1)
+        if not fail:
+            assert outputs[0] is output
+        active = False
+        events.append("end")
+
+    def embedding(input_ids):
+        assert active
+        events.append("embedding")
+        return input_ids.to(torch.float32).unsqueeze(1)
+
+    def encoder(**kwargs):
+        assert active
+        events.append("encoder")
+        if fail:
+            raise RuntimeError("encoder failed")
+        return output
+
+    monkeypatch.setattr(torch.ops.trtllm.begin_nccl_window_tensor_scope, "tracked", begin)
+    monkeypatch.setattr(torch.ops.trtllm.end_nccl_window_tensor_scope, "tracked", end)
+    runner = object.__new__(EncoderDecoderRunner)
+    runner._model = SimpleNamespace(
+        encoder=encoder,
+        model=SimpleNamespace(shared_embedding=embedding, embed_scale=2.0),
+    )
+    with FakeTensorMode():
+        output = torch.empty(3, 2, device="cuda")
+        inputs = {"encoder_attn_metadata": object()}
+        if feature_mode:
+            inputs["input_features"] = torch.empty(3, 4, device="cuda")
+        else:
+            inputs["encoder_input_ids"] = torch.tensor([1, 2, 3], device="cuda")
+        if fail:
+            with pytest.raises(RuntimeError, match="encoder failed"):
+                runner._forward_encoder_stack(inputs)
+        else:
+            assert runner._forward_encoder_stack(inputs) is output
+
+    assert not active
+    assert events == (
+        ["begin", "encoder", "end"] if feature_mode else ["begin", "embedding", "encoder", "end"]
+    )

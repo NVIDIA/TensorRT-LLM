@@ -113,7 +113,7 @@ class ModelRunner(Protocol):
         """Pass the scheduled batch to ``prepare_inputs`` and execute its result."""
         ...
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, release_nccl_window_owners: bool = True) -> None:
         """Release everything the runner owns; the engine drops it afterwards."""
         ...
 
@@ -150,6 +150,6 @@ class PackedModelRunner(Protocol):
         """Pass the packed batch to ``prepare_inputs`` and execute its result."""
         ...
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, release_nccl_window_owners: bool = True) -> None:
         """Release everything the runner owns; the engine drops it afterwards."""
         ...
