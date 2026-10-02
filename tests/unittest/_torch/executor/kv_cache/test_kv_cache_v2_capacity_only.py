@@ -9,7 +9,10 @@ import pytest
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 
 DataType = tensorrt_llm.bindings.DataType
@@ -23,6 +26,8 @@ def _manager(
     kv_reserve_draft_tokens: int = 0,
 ) -> KVCacheManagerV2:
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    manager.enable_block_reuse = False
+    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
     manager.is_draft = is_draft
     manager._has_cp_helix = False
     manager.kv_compression_manages_history = kv_compression_manages_history
@@ -103,6 +108,69 @@ def test_default_generation_resize_updates_capacity_and_history() -> None:
     manager.update_resources(SimpleNamespace(generation_requests=[request]))
 
     cache.resize.assert_called_once_with(253, 200)
+
+
+@pytest.mark.parametrize("complete", [False, True], ids=["in_progress", "finished"])
+def test_generation_commits_stable_tokens_after_relocation_and_resize(
+    monkeypatch: pytest.MonkeyPatch,
+    complete: bool,
+) -> None:
+    calls = []
+    manager = _manager(is_draft=False)
+    manager.enable_block_reuse = True
+    manager.kv_connector_manager = None
+    monkeypatch.setattr(kv_cache_v2_module, "_cpp_introspection", None)
+    request = _request(1, rewind=2, accepted_draft_tokens=2, complete=complete)
+    request.py_num_accepted_draft_tokens_indices = [0, 3]
+    request.py_rewind_draft_token_separate_adjustment = 0
+    request.is_dummy_request = False
+    request.is_context_only_request = False
+    request.multimodal_hashes = None
+    request.multimodal_positions = None
+    request.multimodal_lengths = None
+    request.get_tokens_view = lambda beam_id: list(range(201))
+    batch = SimpleNamespace(generation_requests=[request])
+    attn_metadata = object()
+    cache = _cache()
+    cache.num_committed_tokens = 197
+    cache.history_length = 197
+
+    def resize(capacity: int | None, history_length: int) -> bool:
+        calls.append(("resize", (capacity, history_length)))
+        cache.history_length = history_length
+        return True
+
+    def commit(tokens: list[int], is_end: bool = False) -> None:
+        assert cache.history_length == 200
+        calls.append(("commit", list(tokens), is_end))
+        cache.num_committed_tokens += len(tokens)
+
+    cache.resize.side_effect = resize
+    cache.commit.side_effect = commit
+    manager.kv_cache_map[request.py_request_id] = cache
+
+    relocate = MagicMock(
+        side_effect=lambda *args, **kwargs: calls.append(
+            ("relocate", kwargs["include_finished_requests"])
+        )
+    )
+    monkeypatch.setattr(kv_cache_v2_module, "_update_kv_cache_draft_token_location", relocate)
+
+    manager.update_resources(batch, attn_metadata, 2.0)
+
+    relocate.assert_called_once_with(
+        manager,
+        batch,
+        attn_metadata,
+        2.0,
+        include_finished_requests=True,
+    )
+    assert calls == [
+        ("relocate", True),
+        ("resize", (None if complete else 254, 200)),
+        ("commit", [197, 198, 199], complete),
+    ]
+    assert cache.num_committed_tokens == 200
 
 
 def test_capacity_only_is_scoped_to_target_manager() -> None:
