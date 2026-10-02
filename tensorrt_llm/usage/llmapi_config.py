@@ -579,6 +579,7 @@ def _capture_path(
     captured as [], and nullable *leaf* values still follow their own policy.
     """
     segments = entry.path.split(".")
+    field_state = _CaptureState()
 
     def visit(
         value: Any,
@@ -600,16 +601,19 @@ def _capture_path(
                 projected.append(captured)
             if len(projected) > MAX_SEQ_ITEMS:
                 projected = projected[:MAX_SEQ_ITEMS]
-                state.sequence_truncated = True
+                field_state.sequence_truncated = True
             return True, True, projected
 
         field_value = getattr(value, segments[segment_index], None)
         if segment_index == len(segments) - 1:
-            safe, captured = _sanitize_policy(field_value, matching[0].policy, state)
+            safe, captured = _sanitize_policy(field_value, matching[0].policy, field_state)
             return True, safe, captured
         return visit(field_value, matching, route_index + 1, segment_index + 1)
 
-    return visit(instance, entry.variants, 0, 0)
+    present, safe, captured = visit(instance, entry.variants, 0, 0)
+    if safe:
+        state.sequence_truncated |= field_state.sequence_truncated
+    return present, safe, captured
 
 
 def _truncate_to_budget(values: dict[str, Any]) -> tuple[dict[str, Any], str]:
