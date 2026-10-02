@@ -324,10 +324,21 @@ class OpenAIHttpClient(OpenAIClient):
         _TRANSIENT_TCP_BUDGET = 0 if self._no_retry else 5
         loop_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET) + 1
         for attempt in range(loop_max):
-            # Regenerate disagg_request_id on retry to avoid ID collision on workers
+            # A context retry re-runs prefill, so it takes a fresh
+            # disagg_request_id: the worker may still hold the first attempt
+            # under the old one. A generation retry must keep its id. The
+            # context worker registered this request's KV send session under
+            # it when prefill finished; with a regenerated id the generation
+            # request asks for KV nobody holds and the context session waits
+            # for a requester that never comes, both until
+            # kv_transfer_timeout_ms.
             if attempt > 0 and self._disagg_id_generator is not None:
                 dp = getattr(request, "disaggregated_params", None)
-                if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
+                if (
+                    dp is not None
+                    and getattr(dp, "disagg_request_id", None) is not None
+                    and getattr(dp, "request_type", None) == "context_only"
+                ):
                     dp.disagg_request_id = await self._disagg_id_generator()
                     if hooks:
                         hooks.on_disagg_request_id(dp.disagg_request_id)
