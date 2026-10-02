@@ -2412,19 +2412,24 @@ class PyExecutor:
         if scheduled_batch_stats.num_ctx_kv_tokens is not None:
             num_ctx_kv_tokens = int(scheduled_batch_stats.num_ctx_kv_tokens)
         else:
+            ctx_chunk_tokens = 0
             for req in scheduled_batch.context_requests:
                 if self._is_stats_dummy_request(req):
                     continue
                 last_chunk = getattr(req, "py_last_context_chunk", None)
                 if last_chunk is not None and last_chunk[0] is not None:
-                    start, _end = last_chunk
+                    start, stop = last_chunk
                     num_ctx_kv_tokens += start
+                    ctx_chunk_tokens += stop - start
                 else:
                     try:
                         num_ctx_kv_tokens += \
                             req.context_current_position
                     except RuntimeError:
                         pass
+            if scheduled_batch_stats.num_ctx_tokens is None:
+                # Drain record of an unsampled batch (see _process_iter_stats).
+                stats.inflight_batching_stats.num_ctx_tokens = ctx_chunk_tokens
 
         # Total KV context length (prompt + tokens generated so far)
         # summed across scheduled generation requests.
