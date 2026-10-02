@@ -18,6 +18,8 @@ The completion gate first observes genuine NIXL DONE, then withholds that eviden
 from the production sender. These are backend/ownership and software-containment
 tests, NOT outstanding-DMA, platform-fence, replacement, or initialized-executor tests.
 The cancellation/cleanup seam uses real PyExecutor methods on a model-free shell.
+Generic V2 NVFP4 key/scale storage isolates lifecycle coverage from the unfinished
+dense FP4 MLA manager/serving integration and its extra high-precision-tail roles.
 No transport environment is changed, and no replacement starts after fail-stop.
 """
 
@@ -243,29 +245,35 @@ def _regions(transceiver: KvCacheTransceiverV2, request: LlmRequest) -> list[tor
         request: Allocated request whose complete transfer extent is inspected.
 
     Returns:
-        One-dimensional uint8 GPU views of declared FP4-MLA role bytes, excluding padding.
+        One-dimensional uint8 GPU views of key and block-scale bytes, excluding padding.
     """
     import torch
 
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
     from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 
     chunk = transceiver._create_chunk(request)
     extractor = transceiver._transfer_worker._peer_registrar.self_extractor
     result = []
     seen = set()
+    roles = set()
     for group, blocks in enumerate(chunk.block_ids_per_layer_groups):
         for pool in range(len(extractor.page_table.layer_groups[group].pool_views)):
             memory = extractor.extract(blocks, group, pool).memory
             view = extractor.page_table.layer_groups[group].pool_views[pool]
+            assert len(memory.ptrs) > 0 and len(view.buffer_entries) > 0
+            roles.update(view.pool_role)
             for pointer in memory.ptrs:
                 for entry in view.buffer_entries:
                     key = (int(pointer) + int(entry["offset"]), int(entry["size"]))
+                    assert key[0] > 0 and key[1] > 0, "allocated role extent must be nonempty"
                     if key not in seen:
                         seen.add(key)
                         result.append(
                             convert_to_torch_tensor(TensorWrapper(key[0], torch.uint8, [key[1]]))
                         )
-    assert len(result) >= 4, "FP4 MLA key, block scale, V scale and HP roles must be allocated"
+    assert roles == {str(Role.KEY), str(Role.KEY_BLOCK_SCALE)}
+    assert len(result) == 2, "one allocated block must expose both key and block-scale storage"
     return result
 
 
@@ -287,11 +295,11 @@ def _worker(args: argparse.Namespace) -> None:
     from mpi4py import MPI
 
     from tensorrt_llm import Mapping
-    from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
     from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
     from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import BindingsNixlTransferAgent
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
     from tensorrt_llm._torch.distributed.communicator import MPIDist
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
     from tensorrt_llm._torch.pyexecutor.resource_manager import (
         CacheTypeCpp,
@@ -307,7 +315,7 @@ def _worker(args: argparse.Namespace) -> None:
     rank, role, directory, case = world.rank, args.role, Path(args.directory), args.case
     torch.cuda.set_device(args.gpu_offset + rank)
     mapping = Mapping(world_size=2, rank=rank, tp_size=2, pp_size=1, enable_attention_dp=True)
-    manager = Fp4MlaKVCacheManagerV2(
+    manager = KVCacheManagerV2(
         KvCacheConfig(max_tokens=128, dtype="nvfp4", enable_block_reuse=False, host_cache_size=0),
         CacheTypeCpp.SELFKONLY,
         num_layers=1,
@@ -736,7 +744,7 @@ def _exercise_live_session(
     _record(directory, f"{role}.reused_after_done", stable_outcome=session.status.name, sentinel=77)
 
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(180, method="signal")
 @pytest.mark.parametrize("case", _CASES)
 def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
     """Qualify real GPU/NIXL software lifecycle with four GPUs and separate MPI jobs.
@@ -761,7 +769,6 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
         TRTLLM_USE_PY_NIXL_KVCACHE="0",
         TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP="0",
         TRTLLM_DISAGG_LAYERWISE="0",
-        TRTLLM_FP4_MLA_ATTENTION_BACKEND="triton",
     )
     unique_id = uuid.uuid4().int & ((1 << 62) - 1)
     jobs = {}

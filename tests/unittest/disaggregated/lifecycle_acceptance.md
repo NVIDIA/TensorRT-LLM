@@ -157,8 +157,12 @@ diagnostic evidence, not native CI qualification.
 [test_transfer_lifecycle_gpu.py](test_transfer_lifecycle_gpu.py) exercises the
 bridge with real GPU allocations, the C++ NIXL agent, and separate MPI CTX/GEN
 worlds. Each world has an active attention-DP rank and an idle peer. The tests
-use the FP4-MLA Manager V2 layout and real KV/AUX transfers, without loading a
-model or introducing production fault-injection hooks. A minimally initialized
+use generic `KVCacheManagerV2` NVFP4/`SELFKONLY` allocations with explicit key and
+block-scale coverage and real KV/AUX transfers, without loading a model or
+introducing production fault-injection hooks. This deliberately excludes the
+unfinished dense FP4 MLA manager/serving integration: its high-precision tail,
+V-scale/packed-V roles, and replicated-role mapping are not qualified here.
+A minimally initialized
 `PyExecutor` exercises its real cancellation gate and termination methods through
 the production coordinator and resource manager; no scheduler/serving loop or
 asynchronous-send manager is initialized.
