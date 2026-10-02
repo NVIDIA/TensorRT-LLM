@@ -14,14 +14,10 @@ from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor
-from .gate_up_swiglu_quack import gate_up_swiglu_quack_available, gate_up_swiglu_quack_bf16
-from .linear import (
-    Linear,
-    TensorParallelMode,
-    WeightMode,
-    WeightsLoadingConfig,
-    is_static_nvfp4_input_eligible,
-)
+from .gate_up_swiglu_quack import (gate_up_swiglu_quack_available,
+                                   gate_up_swiglu_quack_bf16)
+from .linear import (Linear, TensorParallelMode, WeightMode,
+                     WeightsLoadingConfig, is_static_nvfp4_input_eligible)
 from .swiglu import swiglu
 
 
