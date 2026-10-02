@@ -5576,6 +5576,15 @@ class TorchCompileConfig(StrictBaseModel):
         default=True,
         description="Enable full graph compilation in torch.compile.")
 
+    compile_only_piecewise_graphs: bool = Field(
+        default=False,
+        description="Compile only forwards eligible for piecewise prefill "
+        "CUDA graphs, while generation-only forwards, prefill graph misses, "
+        "and auxiliary kernel warmup forwards remain eager. Enabling this "
+        "will speed up startup, but might lead to degraded performance or "
+        "inconsistent output in specific configurations.",
+        status="prototype")
+
     enable_inductor: bool = Field(
         default=False, description="Enable inductor backend in torch.compile.")
 
@@ -6325,6 +6334,13 @@ class TorchLlmArgs(BaseLlmArgs):
                     "prefill_capture_num_tokens")
             if not buckets_are_explicit and legacy_buckets is not None:
                 self.prefill_capture_num_tokens = list(legacy_buckets)
+
+        if (compile_config is not None
+                and compile_config.compile_only_piecewise_graphs):
+            if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.PIECEWISE:
+                raise ValueError(
+                    "torch_compile_config.compile_only_piecewise_graphs requires "
+                    "prefill_cuda_graph_backend='piecewise'")
 
         if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
             if self.prefill_capture_num_tokens is None:
