@@ -144,6 +144,173 @@ def test_fp8_rowwise_full() -> None:
     assert out[f"{_ATTN_PREFIX}.in_proj_ba.weight_scale"].shape == (_PACKED_BA_ROWS, 1)
 
 
+def _pack_int4_rows(weight: torch.Tensor) -> torch.Tensor:
+    return ((weight[0::2] & 15) | ((weight[1::2] & 15) << 4)).to(torch.uint8)
+
+
+def _unpack_int4_rows(weight: torch.Tensor) -> torch.Tensor:
+    packed = weight.view(torch.uint8)
+    values = torch.stack((packed & 15, packed >> 4), dim=1).flatten(0, 1).to(torch.int8)
+    return torch.where(values >= 8, values - 16, values)
+
+
+def _make_int4_weights(
+    split_qkv: bool = False, quantize_ba: bool = True, head_dim: int = 4
+) -> tuple[Qwen3_5MoeHfWeightMapper, dict, dict, dict]:
+    mapper = _make_mapper(QuantAlgo.W4A16_AWQ)
+    config = mapper.config.pretrained_config
+    config.linear_num_key_heads = 16
+    config.linear_num_value_heads = 48
+    config.linear_key_head_dim = head_dim
+    config.linear_value_head_dim = head_dim
+    generator = torch.Generator().manual_seed(6562942)
+    logical_weights, scales, weights = {}, {}, {}
+    for name, rows in (
+        ("q", 16 * head_dim),
+        ("k", 16 * head_dim),
+        ("v", 48 * head_dim),
+        ("z", 48 * head_dim),
+        ("b", 48),
+        ("a", 48),
+    ):
+        logical_weights[name] = torch.randint(
+            -8, 8, (rows, 256), generator=generator, dtype=torch.int8
+        )
+        scales[name] = torch.rand(rows, 2, generator=generator) + 0.1
+        if name in ("b", "a") and not quantize_ba:
+            logical_weights[name] = logical_weights[name].to(torch.bfloat16)
+            weights[f"{_ATTN_PREFIX}.in_proj_{name}.weight"] = logical_weights[name]
+        else:
+            weights[f"{_ATTN_PREFIX}.in_proj_{name}.weight"] = _pack_int4_rows(
+                logical_weights[name]
+            )
+            weights[f"{_ATTN_PREFIX}.in_proj_{name}.weight_scale"] = scales[name]
+    if not split_qkv:
+        for suffix in ("weight", "weight_scale"):
+            weights[f"{_ATTN_PREFIX}.in_proj_qkv.{suffix}"] = torch.cat(
+                [weights.pop(f"{_ATTN_PREFIX}.in_proj_{name}.{suffix}") for name in ("q", "k", "v")]
+            )
+    return mapper, weights, logical_weights, scales
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("split_qkv", [False, True])
+@pytest.mark.parametrize("quantize_ba", [False, True])
+@pytest.mark.parametrize("storage_dtype", [torch.uint8, torch.int8])
+def test_int4_projections_preserve_values_and_scales(
+    tp_size: int, split_qkv: bool, quantize_ba: bool, storage_dtype: torch.dtype
+) -> None:
+    mapper, weights, logical_weights, scales = _make_int4_weights(split_qkv, quantize_ba)
+    weights = {
+        name: value.view(storage_dtype) if value.dtype == torch.uint8 else value
+        for name, value in weights.items()
+    }
+    mapper.config.mapping.tp_size = tp_size
+    out = mapper.preprocess_weights(weights)
+    activation = torch.randn(3, 256, generator=torch.Generator().manual_seed(17))
+
+    for projection, components in (("qkvz", ("q", "k", "v", "z")), ("ba", ("b", "a"))):
+        quantized = projection == "qkvz" or quantize_ba
+        packed_weight = out[f"{_ATTN_PREFIX}.in_proj_{projection}.weight"]
+        if quantized:
+            assert packed_weight.dtype == storage_dtype
+            assert packed_weight.shape[0] * 2 == sum(
+                logical_weights[name].shape[0] for name in components
+            )
+            fused_weight = _unpack_int4_rows(packed_weight)
+            fused_scale = out[f"{_ATTN_PREFIX}.in_proj_{projection}.weight_scale"]
+            fused_dequantized = fused_weight.float() * fused_scale.repeat_interleave(128, dim=1)
+        else:
+            assert packed_weight.dtype == torch.bfloat16
+            fused_weight = packed_weight
+            fused_dequantized = fused_weight.float()
+
+        # Each rank's fused projection must compute the same outputs as the
+        # individual checkpoint projections, with every scale attached to its row.
+        for rank, shard in enumerate(fused_dequantized.chunk(tp_size, dim=0)):
+            references = []
+            row_offset = rank * (fused_weight.shape[0] // tp_size)
+            for name in components:
+                original = logical_weights[name].chunk(tp_size, dim=0)[rank]
+                torch.testing.assert_close(
+                    fused_weight[row_offset : row_offset + original.shape[0]], original
+                )
+                row_offset += original.shape[0]
+                dequantized = logical_weights[name].float()
+                if quantized:
+                    dequantized = dequantized * scales[name].repeat_interleave(128, dim=1)
+                references.append((activation @ dequantized.T).chunk(tp_size, dim=1)[rank])
+            torch.testing.assert_close(activation @ shard.T, torch.cat(references, dim=1))
+
+
+def test_int4_qwen35_27b_qkv_rows() -> None:
+    mapper, weights, _, _ = _make_int4_weights(head_dim=128)
+    assert weights[f"{_ATTN_PREFIX}.in_proj_qkv.weight"].shape[0] == 5120
+    out = mapper.preprocess_weights(weights)
+    assert out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight"].shape == (8192, 256)
+    assert out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight_scale"].shape == (16384, 2)
+
+
+def test_int4_rejects_non_byte_aligned_tp_shards() -> None:
+    mapper, weights, _, _ = _make_int4_weights()
+    mapper.config.mapping.tp_size = 16
+    with pytest.raises(ValueError, match="projection rows 24 are not divisible by tp_size=16"):
+        mapper.preprocess_weights(weights)
+
+
+def test_int4_rejects_mixed_storage_dtypes() -> None:
+    mapper, weights, _, _ = _make_int4_weights()
+    name = f"{_ATTN_PREFIX}.in_proj_z.weight"
+    weights[name] = weights[name].view(torch.int8)
+    with pytest.raises(AssertionError, match="same storage dtype"):
+        mapper.preprocess_weights(weights)
+
+
+def test_int4_excluded_qkvz_keeps_bf16_layout() -> None:
+    mapper, weights, logical_weights, _ = _make_int4_weights(split_qkv=True)
+    mapper.config.mapping.tp_size = 2
+    for name in ("q", "k", "v", "z"):
+        weights[f"{_ATTN_PREFIX}.in_proj_{name}.weight"] = logical_weights[name].to(torch.bfloat16)
+        del weights[f"{_ATTN_PREFIX}.in_proj_{name}.weight_scale"]
+    out = mapper.preprocess_weights(weights)
+    fused = out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight"]
+    assert fused.dtype == torch.bfloat16
+    assert f"{_ATTN_PREFIX}.in_proj_qkvz.weight_scale" not in out
+    for rank, shard in enumerate(fused.chunk(2)):
+        torch.testing.assert_close(
+            shard,
+            torch.cat([logical_weights[name].chunk(2)[rank] for name in ("q", "k", "v", "z")]).to(
+                torch.bfloat16
+            ),
+        )
+
+
+def test_int4_attention_dp_uses_unsplit_projections() -> None:
+    mapper, weights, _, _ = _make_int4_weights()
+    reference = mapper.preprocess_weights(weights)
+    mapper.config.mapping.tp_size = 16
+    mapper.config.mapping.enable_attention_dp = True
+    out = mapper.preprocess_weights(weights)
+    for name in reference:
+        torch.testing.assert_close(out[name], reference[name])
+
+
+def test_int4_partial_loading_and_mtp_names() -> None:
+    mapper, weights, _, _ = _make_int4_weights()
+    weights = {
+        name.replace("model.layers.0", "mtp.layers.0"): value for name, value in weights.items()
+    }
+    reference = mapper.preprocess_weights(weights)
+    assert "model.layers.1.linear_attn.in_proj_qkvz.weight" in reference
+    out = {}
+    for name, value in weights.items():
+        out.update(mapper.preprocess_weights({name: value}, allow_partial_loading=True))
+    mapper.finalize_update_weights()
+    assert out.keys() == reference.keys()
+    for name in reference:
+        torch.testing.assert_close(out[name], reference[name])
+
+
 def test_modelopt_fp8_per_tensor_linear_attention() -> None:
     # ModelOpt stores QKV and Z as separate per-tensor FP8 projections with independent scales.
     checkpoint_prefix = "model.language_model.layers.0.linear_attn"
