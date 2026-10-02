@@ -49,7 +49,8 @@ from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs, get_metrics_dict)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    bucket_responses_by_frontend, frontend_lane_index,
+                    bucket_responses_by_frontend,
+                    context_length_exceeded_message, frontend_lane_index,
                     is_llm_response)
 
 if TYPE_CHECKING:
@@ -451,11 +452,15 @@ class BaseWorker(GenerationExecutor):
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
             default_max_tokens = max_seq_len - splited_prompt_len
             if default_max_tokens <= 0:
-                # Raise error on `default_max_tokens` not enough, since max_tokens should be less than `default_max_tokens``
+                # Reject (never truncate): the prompt leaves no room for even
+                # one generated token. The message reports request-level
+                # totals, not per-CP-rank arithmetic: splited_prompt_len >=
+                # max_seq_len implies len(prompt_token_ids) >= max_seq_len *
+                # cp_size.
                 raise ValueError(
-                    f"`default_max_tokens` ({default_max_tokens}) must be greater than 0, "
-                    f"`default_max_tokens` ({default_max_tokens}) = max_seq_len ({max_seq_len})"
-                    f" - `splited_prompt_len` ({splited_prompt_len})")
+                    context_length_exceeded_message(
+                        max_context_length=max_seq_len * cp_size,
+                        num_prompt_tokens=len(prompt_token_ids)))
 
             # default_max_tokens is the biggest available value
             if max_tokens is None:
@@ -1047,6 +1052,19 @@ class BaseWorker(GenerationExecutor):
             return {}
 
         startup_metrics = {}
+        executor_metrics = dict(getattr(self.engine, "metrics", {}))
+        for model_engine_stage in (
+                "initial_model_engine",
+                "final_model_engine",
+                "initial_draft_model_engine",
+                "final_draft_model_engine",
+        ):
+            model_engine_metrics = executor_metrics.pop(model_engine_stage,
+                                                        None)
+            if model_engine_metrics is not None:
+                startup_metrics[model_engine_stage] = dict(model_engine_metrics)
+        startup_metrics["py_executor"] = executor_metrics
+
         model_engine = getattr(self.engine, "model_engine", None)
         model_loader = getattr(model_engine, "model_loader", None)
         if model_loader is not None:

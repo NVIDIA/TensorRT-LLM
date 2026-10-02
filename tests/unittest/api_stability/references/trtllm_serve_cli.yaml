@@ -73,6 +73,15 @@ commands:
         is_flag: false
         flags:
         - "--chat_template"
+      config_overrides:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: true
+        is_flag: false
+        flags:
+        - "--set"
       context_parallel_size:
         type: int
         default: 1
