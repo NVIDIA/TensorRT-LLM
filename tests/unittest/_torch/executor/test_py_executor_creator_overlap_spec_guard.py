@@ -229,8 +229,24 @@ def test_minimax_m3_sparse_attention_with_overlap_is_admitted():
     MiniMax-M3 under the FLASHINFER slot selects a TrtllmAttention-based
     sparse metadata that the engine corrects through ``kv_lens_cuda``, so
     overlap plus one-engine speculation must be admitted.
+
+    Resolution runs in the open here, not only inside the guard: the guard
+    answers False both for "resolved to self-correcting metadata" and for
+    "could not resolve at all" (its deliberate stand-down path), so on its
+    own it cannot pin which of the two happened. A lowering or resolution
+    failure must fail this test, not pass as admission.
     """
     sparse_config = MiniMaxM3SparseAttentionConfig(implementation="triton")
+    sparse_params = sparse_config.to_sparse_params()
+    metadata_cls = py_executor_creator.get_attention_backend(
+        "FLASHINFER", sparse_params=sparse_params
+    ).Metadata
+    # The sparse params must actually change the resolution away from the
+    # dense FlashInfer metadata the guard would otherwise refuse ...
+    assert metadata_cls is not py_executor_creator.get_attention_backend("FLASHINFER").Metadata
+    # ... to metadata that never uses the opt-in hook whose silent no-op the
+    # guard is about, which is exactly the predicate the guard applies.
+    assert not hasattr(metadata_cls, "apply_spec_decode_kv_lens_offsets")
     assert not _overlap_spec_kv_lengths_uncorrected(
         "FLASHINFER", _sa_config(), False, sparse_attention_config=sparse_config
     )
