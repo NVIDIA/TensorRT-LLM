@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License. You may obtain a copy of
+# the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations under
+# the License.
+
 add_custom_target(deep_gemm)
 
 if(WIN32)
@@ -97,8 +111,31 @@ file(COPY ${DEEP_GEMM_SOURCE_DIR}/third-party/cutlass/include/cutlass
 find_library(TORCH_PYTHON_LIB torch_python REQUIRED
              HINTS ${TORCH_INSTALL_PREFIX}/lib)
 
+# Use the standard formatter when available. Older C++20 standard libraries
+# build host-only copies against header-only fmt, without modifying the fetched
+# sources or changing the CUDA kernels included in the wheel.
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles(
+  "#include <format>
+   int main() { return std::format(\"{}\", 42) != \"42\"; }"
+  DEEP_GEMM_HAVE_STD_FORMAT)
+set(DEEP_GEMM_CSRC_DIR ${DEEP_GEMM_SOURCE_DIR}/csrc)
+set(DEEP_JIT_INCLUDE_DIR ${DEEP_GEMM_SOURCE_DIR}/third-party/deep_jit/include)
+if(NOT DEEP_GEMM_HAVE_STD_FORMAT)
+  message(
+    STATUS "std::format unavailable; DeepGEMM host code uses header-only fmt")
+  FetchContent_MakeAvailable(fmt)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/formatCompatibility.cmake)
+  set(DEEP_GEMM_COMPAT_DIR ${CMAKE_CURRENT_BINARY_DIR}/format_compat)
+  trtllm_copy_with_fmt(${DEEP_GEMM_CSRC_DIR} ${DEEP_GEMM_COMPAT_DIR}/csrc)
+  trtllm_copy_with_fmt(${DEEP_JIT_INCLUDE_DIR}
+                       ${DEEP_GEMM_COMPAT_DIR}/deep_jit/include)
+  set(DEEP_GEMM_CSRC_DIR ${DEEP_GEMM_COMPAT_DIR}/csrc)
+  set(DEEP_JIT_INCLUDE_DIR ${DEEP_GEMM_COMPAT_DIR}/deep_jit/include)
+endif()
+
 # Build deep_gemm_cpp_tllm extension (matching deep_gemm's setup.py)
-set(DEEP_GEMM_SOURCES ${DEEP_GEMM_SOURCE_DIR}/csrc/python_api.cpp)
+set(DEEP_GEMM_SOURCES ${DEEP_GEMM_CSRC_DIR}/python_api.cpp)
 
 pybind11_add_module(deep_gemm_cpp_tllm ${DEEP_GEMM_SOURCES})
 set_target_properties(
@@ -117,14 +154,18 @@ target_compile_options(deep_gemm_cpp_tllm PRIVATE ${TORCH_CXX_FLAGS} -O3 -fPIC
 # Extension name definition
 target_compile_definitions(deep_gemm_cpp_tllm
                            PRIVATE TORCH_EXTENSION_NAME=deep_gemm_cpp_tllm)
+if(NOT DEEP_GEMM_HAVE_STD_FORMAT)
+  target_compile_definitions(deep_gemm_cpp_tllm PRIVATE FMT_HEADER_ONLY=1)
+  target_include_directories(
+    deep_gemm_cpp_tllm PRIVATE ${fmt_SOURCE_DIR}/include
+                               ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
 
 # Include directories matching deep_gemm setup.py
 target_include_directories(
   deep_gemm_cpp_tllm
-  PRIVATE ${CUDA_INCLUDE_DIRS}
-          ${CUDA_TOOLKIT_ROOT_DIR}/include/cccl
-          ${DEEP_GEMM_SOURCE_DIR}/deep_gemm/include
-          ${DEEP_GEMM_SOURCE_DIR}/third-party/deep_jit/include
+  PRIVATE ${CUDA_INCLUDE_DIRS} ${CUDA_TOOLKIT_ROOT_DIR}/include/cccl
+          ${DEEP_GEMM_SOURCE_DIR}/deep_gemm/include ${DEEP_JIT_INCLUDE_DIR}
           ${DEEP_GEMM_SOURCE_DIR}/third-party/cutlass/include)
 
 # DeepJIT resolves libdwfl through dlopen at runtime but includes the elfutils
