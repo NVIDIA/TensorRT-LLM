@@ -401,7 +401,11 @@ def apply_minimax_h3_qk_norm_rope_bf16(
     if heads_per_program is None:
         # Largest power of two up to 8 that divides the head count (8 measured best on B200).
         heads_per_program = next(h for h in (8, 4, 2, 1) if num_heads % h == 0)
-    if heads_per_program & (heads_per_program - 1) or num_heads % heads_per_program:
+    if (
+        heads_per_program < 1
+        or heads_per_program & (heads_per_program - 1)
+        or num_heads % heads_per_program
+    ):
         raise ValueError("heads_per_program must be a power of two dividing num_heads")
     rows = tokens_per_program * heads_per_program
     if tokens_per_program < 1 or rows & (rows - 1):

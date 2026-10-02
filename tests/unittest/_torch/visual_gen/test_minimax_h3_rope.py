@@ -148,12 +148,13 @@ def _reference_packed(qkv, weight_q, weight_k, cos, sin, heads, eps):
 def test_fused_qk_norm_rope_matches_eager_bf16_exactly(batch, seq, heads, rotary_dim, table_dtype):
     qkv, weight_q, weight_k, cos, sin = _packed_inputs(batch, seq, heads, rotary_dim, table_dtype)
     expected_q, expected_k = _reference_packed(qkv, weight_q, weight_k, cos, sin, heads, 1e-5)
+    v_before = qkv[..., 2 * heads * 128 :].clone()
     q, k = apply_minimax_h3_qk_norm_rope_bf16(qkv, weight_q, weight_k, cos, sin, 1e-5, heads, 128)
     assert q.is_contiguous() and k.is_contiguous()
     assert torch.equal(q, expected_q)
     assert torch.equal(k, expected_k)
-    # V columns are never touched.
-    assert torch.equal(qkv[..., 2 * heads * 128 :], qkv[..., 2 * heads * 128 :].clone())
+    # V columns are never touched: compare against the snapshot taken before the call.
+    assert torch.equal(qkv[..., 2 * heads * 128 :], v_before)
 
 
 @requires_cuda
@@ -218,6 +219,7 @@ def test_fused_qk_norm_rope_compile_matches_eager_bf16_exactly():
         "grad",
         "launch",
         "strided",
+        "zero_heads",
     ],
 )
 def test_fused_qk_norm_rope_rejects_invalid_inputs(invalid):
@@ -245,6 +247,8 @@ def test_fused_qk_norm_rope_rejects_invalid_inputs(invalid):
     elif invalid == "grad":
         qkv.requires_grad_(True)
     kwargs = {"tokens_per_program": 3} if invalid == "launch" else {}
+    if invalid == "zero_heads":
+        kwargs = {"heads_per_program": 0}
     if invalid == "strided":
         qkv = qkv.expand(2, -1, -1)
     with pytest.raises(ValueError):
