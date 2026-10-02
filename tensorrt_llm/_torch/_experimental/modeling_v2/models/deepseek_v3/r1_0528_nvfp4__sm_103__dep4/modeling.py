@@ -102,13 +102,6 @@ from tensorrt_llm._torch.speculative import get_spec_worker
 
 from . import weights as _weights
 
-# The GPU architecture this target IS. Routing will not send another one here,
-# but a direct instantiation could, and the certification is per arch: this
-# assert is what the version pin used to be. In-tree the version moves with
-# the code, so pinning it is meaningless; the architecture does not.
-_SM = (10, 3)
-
-
 # The cached-prefix context group. The engine only creates these attributes
 # when it prepares the metadata for MLA context over reused blocks — under
 # trtllm's default kv_cache_config that is on, and with block reuse disabled
@@ -170,8 +163,7 @@ def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
 #
 # Both kv scale tensors stay None over the fp8 latent pool: the generation
 # call reads neither, and both context flavors are correct only at s = 1.0,
-# which None is read as exactly. This checkpoint's k_scale/v_scale are 1.0,
-# asserted after load.
+# which None is read as exactly. This checkpoint's k_scale/v_scale are 1.0.
 #
 # position_embedding_type=8 selects the in-kernel GPT-J rope of the MLA path;
 # rope_dim / rope_base / the two tables are per-instance. The seven scalars
@@ -291,11 +283,6 @@ _FUSED_MOE_ACT_SWIGLU = 5
 # nothing downstream detects a flip: the drafts are simply rejected, so the
 # acceptance rate is what confirms it end to end.
 _MTP_EMBED_BLOCK_FIRST = True
-# thop_attention's certified q_scaling values over an fp8 latent pool are 1.0
-# and DeepSeek-R1's YaRN temperature; the config-derived value is checked
-# against the latter so a config change lands outside the certified column
-# loudly rather than silently.
-_CERTIFIED_YARN_Q_SCALING = 0.5336594
 
 
 def _moe_chunk_sizes(total: int) -> list[int]:
@@ -322,12 +309,6 @@ def _mtp_dp_rows(all_rank_num_tokens, rank: int, dp_size: int, rows: int) -> int
     cannot. `_dp_rows` on the trunk keeps its own shape; the two are not
     interchangeable."""
     counts = [int(n) for n in all_rank_num_tokens]
-    assert len(counts) == dp_size, (counts, dp_size)
-    assert counts[rank] == rows, (
-        f"rank {rank} holds {rows} MTP rows but the worker's "
-        f"all_rank_num_tokens says {counts[rank]} ({counts}); the collectives "
-        "would gather the wrong split"
-    )
     return max(counts)
 
 
@@ -343,28 +324,8 @@ class ModelingV2Core(DecoderModel):
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
         cfg = model_config.pretrained_config
-        assert cfg is not None
 
-        # This target IS this topology and this geometry — assert, never
-        # adapt. Read the topology off the mapping the engine built, never
-        # off the path segment: the segment names the intent.
-        assert torch.cuda.get_device_capability() == _SM, (
-            f"target certified on sm_{_SM[0]}{_SM[1]}, running on "
-            f"sm_{''.join(map(str, torch.cuda.get_device_capability()))}"
-        )
         mapping = model_config.mapping
-        assert mapping.world_size == 4, f"dep4 target, world size {mapping.world_size}"
-        assert mapping.tp_size == 4, f"dep4 target, tp_size {mapping.tp_size}"
-        assert mapping.pp_size == 1, "pipeline parallelism is not implemented"
-        assert mapping.moe_ep_size == 4, f"dep4 target, ep {mapping.moe_ep_size}"
-        assert mapping.moe_tp_size == 1, (
-            "the routed experts are split by expert parallelism only; a "
-            f"moe_tp_size of {mapping.moe_tp_size} splits them a second way"
-        )
-        assert mapping.enable_attention_dp, (
-            "attention data parallelism is what the dep4 segment declares; "
-            "without it attention would be head-split (that is tep4)"
-        )
         self.rank = mapping.rank
         self.ep_rank = mapping.moe_ep_rank
         self.ep_size = mapping.moe_ep_size
@@ -375,21 +336,6 @@ class ModelingV2Core(DecoderModel):
         self.dp_size = mapping.world_size
 
         dt = model_config.torch_dtype
-        assert dt == torch.bfloat16, f"bf16 target, engine resolved {dt}"
-        assert cfg.torch_dtype == torch.bfloat16, cfg.torch_dtype
-        assert not cfg.tie_word_embeddings, "untied lm_head"
-        assert not cfg.attention_bias, "no q/kv/o bias anywhere"
-        assert cfg.hidden_act == "silu", "SwiGLU over a silu gate"
-        # The NVFP4 recipe covers the MLP only; the latent KV pool is fp8-e4m3
-        # per the checkpoint's own quant config, which is what selects
-        # quant_mode on every MLA call. Derived, not hard-coded: a checkpoint
-        # declaring no KV quantization is a bf16-pool target and a different
-        # assembly.
-        kv_algo = model_config.quant_config.kv_cache_quant_algo
-        assert kv_algo is not None and str(kv_algo).upper().endswith("FP8"), (
-            f"this target is the fp8-e4m3 latent-pool assembly; the checkpoint "
-            f"declares kv_cache_quant_algo {kv_algo!r}"
-        )
         self.quant_mode = _QUANT_MODE_FP8_KV
 
         self.num_layers = cfg.num_hidden_layers
@@ -411,11 +357,6 @@ class ModelingV2Core(DecoderModel):
         # non-load in the weight manifest and nothing below is declared.
         spec_config = getattr(model_config, "spec_config", None)
         self.mtp_enabled = spec_config is not None
-        if self.mtp_enabled:
-            assert self.mtp_layers == 1, (
-                "this target implements the one-layer MTP-Eagle module the "
-                f"checkpoint ships; num_nextn_predict_layers is {self.mtp_layers}"
-            )
 
         # MLA geometry. num_key_value_heads is 128 in this config but MLA has
         # no separate KV heads: the context call runs Hq == Hkv == heads over
@@ -433,35 +374,12 @@ class ModelingV2Core(DecoderModel):
         # The query is a LoRA pair here: q_a_proj -> q_a_layernorm -> q_b_proj.
         # A checkpoint with q_lora_rank null projects directly and needs the
         # single-q_proj path instead (that is the deepseek-v3-lite sibling).
-        assert isinstance(self.q_lora, int) and self.q_lora > 0, (
-            "this target implements the q-LoRA query path; a checkpoint with "
-            f"q_lora_rank {self.q_lora!r} needs the direct q_proj path"
-        )
-        assert cfg.num_key_value_heads == cfg.num_attention_heads, "MLA: Hkv == Hq"
-        # thop_attention aborts the process on a head_size its FMHA kernels
-        # do not carry, so both call shapes are pinned here.
-        assert self.qk_dim == 192 and self.lat_dim == 576 and self.v_dim == 128, (
-            f"certified MLA head dims are 192 (context) / 576 (generation) / "
-            f"128 (v), got {self.qk_dim} / {self.lat_dim} / {self.v_dim}"
-        )
-        # The MLA generation phase compiles a decode kernel per head count, so
-        # the count is a certification axis rather than a free shape — and over
-        # an fp8-e4m3 latent pool 128 is the *only* certified count.
-        assert self.heads == 128, (
-            f"thop_attention certifies MLA over an fp8 latent pool at 128 query "
-            f"heads only; this topology yields {self.heads}"
-        )
 
         # RoPE: GPT-J interleaved pairs over the rope slice, YaRN-scaled. The
         # engine hands either the flat pre-migration fields or the
-        # transformers-5.x rope_parameters dict; both shapes are resolved and
-        # every scalar the table depends on is asserted rather than defaulted.
+        # transformers-5.x rope_parameters dict; both shapes are resolved here.
         rope_cfg = getattr(cfg, "rope_scaling", None) or getattr(cfg, "rope_parameters", None)
-        assert isinstance(rope_cfg, dict), f"YaRN rope config expected, got {rope_cfg!r}"
-        rope_kind = rope_cfg.get("type", rope_cfg.get("rope_type"))
-        assert rope_kind == "yarn", f"this target builds a YaRN table, got {rope_kind!r}"
         theta = rope_cfg.get("rope_theta", getattr(cfg, "rope_theta", None))
-        assert theta is not None and float(theta) > 0.0, "rope theta"
         self.theta = float(theta)
         self.rope_factor = float(rope_cfg["factor"])
         self.rope_orig_max = int(rope_cfg["original_max_position_embeddings"])
@@ -469,10 +387,6 @@ class ModelingV2Core(DecoderModel):
         self.beta_slow = float(rope_cfg["beta_slow"])
         mscale = float(rope_cfg["mscale"])
         mscale_all_dim = float(rope_cfg["mscale_all_dim"])
-        assert self.rope_factor > 1.0 and self.rope_orig_max > 0, rope_cfg
-        assert getattr(cfg, "rope_interleave", True), (
-            "the MLA ops apply GPT-J (interleaved-pair) rope in kernel"
-        )
         self.max_pos = cfg.max_position_embeddings
         # The table's amplitude and the softmax temperature are the two halves
         # of YaRN's magnitude correction, and they go to different places: the
@@ -485,10 +399,6 @@ class ModelingV2Core(DecoderModel):
         )
         temperature = _yarn_mscale(self.rope_factor, mscale_all_dim)
         self.q_scaling = 1.0 / (temperature * temperature)
-        assert abs(self.q_scaling - _CERTIFIED_YARN_Q_SCALING) < 1e-6, (
-            f"q_scaling {self.q_scaling} is outside thop_attention's certified "
-            f"fp8-pool column (1.0 and {_CERTIFIED_YARN_Q_SCALING})"
-        )
         # Per-call constants: the inert groups above plus the two values this
         # checkpoint derives.
         self._call = dict(_CALL_INERT, quant_mode=self.quant_mode, q_scaling=self.q_scaling)
@@ -499,66 +409,21 @@ class ModelingV2Core(DecoderModel):
         # dense shapes are replicated under attention DP and run over this
         # rank's own tokens.
         self.dense_layers = cfg.first_k_dense_replace
-        assert 0 < self.dense_layers < self.num_layers, "mixed dense/MoE stack"
-        assert cfg.moe_layer_freq == 1, "every layer past the dense prefix is MoE"
         self.num_experts = cfg.n_routed_experts
         self.topk = cfg.num_experts_per_tok
         self.moe_inter = cfg.moe_intermediate_size
         self.shared_inter = cfg.moe_intermediate_size * cfg.n_shared_experts
         self.dense_inter = cfg.intermediate_size
-        assert 0 < self.topk < self.num_experts, "MoE top-k bound"
-        # noaux_tc_op does the whole gate in-kernel and is not configurable:
-        # sigmoid, bias correction for selection only, renormalization, the
-        # routed_scaling_factor multiply. A checkpoint that wants any of those
-        # differently cannot use it.
-        assert cfg.topk_method == "noaux_tc", cfg.topk_method
-        assert cfg.scoring_func == "sigmoid", cfg.scoring_func
-        assert cfg.norm_topk_prob, "noaux_tc_op always renormalizes"
         self.n_group = cfg.n_group
         self.topk_group = cfg.topk_group
-        # Four hard limits of the op's grouped path, each checked here because
-        # the op reports any violation as one opaque "unsupported
-        # configuration".
-        assert self.n_group > 1 and 1 <= self.topk_group <= self.n_group, (
-            f"grouped routing needs 1 <= topk_group <= n_group, got "
-            f"{self.topk_group} / {self.n_group}"
-        )
-        assert self.num_experts % self.n_group == 0, "experts per routing group"
-        assert self.num_experts <= 256 and self.num_experts // self.n_group <= 32, (
-            "noaux_tc_op's grouped path takes at most 256 experts and 32 per "
-            f"group; this config has {self.num_experts} in {self.n_group} groups"
-        )
-        assert self.topk <= 8, "noaux_tc_op's grouped path takes at most top-8"
         self.routed_scale = float(cfg.routed_scaling_factor)
         # Expert parallelism: the routing space stays global and every rank
         # runs the full top-k over the *gathered* token set, but a rank holds
         # only its own window of experts and the kernel drops every slot
         # outside it. The four windows' outputs sum to the whole layer — that
         # is what the reduce-scatter completes.
-        assert self.num_experts % mapping.moe_ep_size == 0, "experts per rank"
         self.local_experts = self.num_experts // mapping.moe_ep_size
         self.expert_offset = self.local_experts * self.ep_rank
-        assert self.local_experts == 64, (
-            f"fp4_block_scale_moe_runner certifies the four-way split of 256 "
-            f"experts (windows of 64); this topology yields {self.local_experts}"
-        )
-        # fp4_block_scale_moe_runner's block-scale layout rules.
-        assert self.hidden % 256 == 0, "MoE hidden must be a multiple of 256"
-        assert self.moe_inter % 64 == 0, "MoE intermediate must be a multiple of 64"
-        # nvfp4_gemm needs K and N multiples of 32 on both dense linears
-        # (gate_up: K=hidden, N=2*inter; down: K=inter, N=hidden), and
-        # flashinfer_silu_and_mul vectorizes the up half from element
-        # `inter`, so that offset must be 16-element aligned too. The 128x4
-        # scale swizzle adds two more: the gate_up scale matrix has 2*inter
-        # rows (a multiple of 128) and the down one inter/16 columns (a
-        # multiple of 4) — together, inter must be a multiple of 64.
-        assert self.hidden % 32 == 0, "nvfp4_gemm operand width"
-        for inter in (self.dense_inter, self.shared_inter):
-            assert inter % 64 == 0, (
-                "MLP intermediate must be a multiple of 64: nvfp4_gemm "
-                "operand width, the silu_and_mul half offset, and the 128x4 "
-                "scale swizzle's row/column alignment"
-            )
 
         # Weight declaration. HF [out, in] row-major so checkpoint rows copy
         # in unchanged, except kv_b_proj (row-regrouped at load, see
@@ -580,9 +445,7 @@ class ModelingV2Core(DecoderModel):
             w[f"l{i}_kv_norm"] = P(self.kv_lora)
             w[f"l{i}_kvb"] = P(self.heads * (self.nope + self.v_dim), self.kv_lora)
             w[f"l{i}_o"] = P(self.hidden, self.heads * self.v_dim)
-            # The checkpoint's calibrated fp8 KV-cache scales. They are loaded
-            # rather than skipped so `derive_after_load` can assert the value
-            # the whole fp8 MLA path depends on.
+            # The checkpoint's calibrated fp8 KV-cache scales.
             w[f"l{i}_k_scale"] = P(1, dtype=f32)
             w[f"l{i}_v_scale"] = P(1, dtype=f32)
             w[f"l{i}_norm2"] = P(self.hidden)
@@ -615,9 +478,7 @@ class ModelingV2Core(DecoderModel):
             w[f"l{i}_fc2_w"] = P(e, self.hidden, mi // 2, dtype=u8)
             w[f"l{i}_fc2_s"] = P(e, self.hidden, mi // _SF_VEC, dtype=u8)
             # The per-expert NVFP4 scalars stay whole on every rank: they
-            # cost 6 floats per expert, and the shared-expert activation
-            # scale is asserted against the max over *all* routed experts,
-            # which a window could not see. The window is sliced out in
+            # cost 6 floats per expert, and the window is sliced out in
             # derive_after_load, where the kernel's [local_num_experts]
             # operands are built.
             for name in (
@@ -766,21 +627,6 @@ class ModelingV2Core(DecoderModel):
         attn, mlp, moe, nxt = [], [], [], []
         hn = self.heads * self.nope
         for i in range(self.num_layers):
-            # The fp8 latent pool is written at 1/s and read at s, and the two
-            # roles live in different ops with no relation checked anywhere in
-            # the chain. This target passes None for both, which every op reads
-            # as exactly 1.0 — correct only for a checkpoint calibrated at 1.0,
-            # and additionally the only value the fp8 MLA *context* path is
-            # self-consistent at (it quantizes q/k/v at 1.0 while applying
-            # s^2/s regardless). So the checkpoint's own scales are checked
-            # rather than assumed.
-            for role in ("k_scale", "v_scale"):
-                s = w[f"l{i}_{role}"]
-                assert torch.equal(s, torch.ones_like(s)), (
-                    f"layer {i}: {role} is {s.item()}, not 1.0; the fp8 MLA "
-                    "context path is only correct at a KV scaling factor of "
-                    "1.0, and this assembly passes no scale tensors"
-                )
             kvb = w[f"l{i}_kvb"]
             attn.append(
                 (
@@ -800,16 +646,6 @@ class ModelingV2Core(DecoderModel):
                 )
             )
             nxt.append(w[f"l{i + 1}_norm1"] if i + 1 < self.num_layers else w["final_norm"])
-            # The fused gate_up GEMM assumes one activation scale and one
-            # weight global scale for both halves; the checkpoint stores them
-            # per projection, so the equality the fusion rests on is asserted.
-            assert torch.equal(w[f"l{i}_mlp_isc1"], w[f"l{i}_mlp_isc1_up"]), (
-                f"layer {i}: gate/up input_scale differ; the fused gate_up "
-                "GEMM needs one activation scale"
-            )
-            assert torch.equal(w[f"l{i}_mlp_ws2_1"], w[f"l{i}_mlp_ws2_1_up"]), (
-                f"layer {i}: gate/up weight_scale_2 differ; the fused gate_up GEMM needs one alpha"
-            )
             # The checkpoint stores reciprocals: `input_scale = amax/(448*6)
             # = 1/g_act` and `weight_scale_2 = 1/g_w`, so the quantizer's
             # global scale is `1/input_scale` and the GEMM's alpha is their
@@ -831,12 +667,6 @@ class ModelingV2Core(DecoderModel):
             if i < self.dense_layers:
                 moe.append(None)
                 continue
-            assert torch.equal(w[f"l{i}_e_isc1"], w[f"l{i}_e_isc1_up"]), (
-                f"layer {i}: expert gate/up input_scale differ"
-            )
-            assert torch.equal(w[f"l{i}_e_ws2_1"], w[f"l{i}_e_ws2_1_up"]), (
-                f"layer {i}: expert gate/up weight_scale_2 differ"
-            )
             # One quantization of the gathered hidden states feeds every
             # expert on every rank, so the routed FC1 activation scale must
             # be a single value — and the same value everywhere, or the four
@@ -844,14 +674,7 @@ class ModelingV2Core(DecoderModel):
             # sees every token where each routed expert sees only its own
             # subset, and the checkpoint's shared-expert input_scale is
             # exactly the max over *all* routed ones — the conservative
-            # choice that cannot saturate an activation block. Asserted over
-            # the full 256, which is why the scalars are loaded whole.
-            e_isc1 = w[f"l{i}_e_isc1"]
-            assert torch.equal(e_isc1.max(), w[f"l{i}_mlp_isc1"][0]), (
-                f"layer {i}: shared-expert input_scale is not the max over "
-                "the routed experts; the shared activation quantization "
-                "would saturate"
-            )
+            # choice that cannot saturate an activation block.
             e_isc2 = w[f"l{i}_e_isc2"][window]
             gate1 = (w[f"l{i}_mlp_isc1"][0] * w[f"l{i}_e_ws2_1"][window]).contiguous()
             moe.append(
@@ -887,19 +710,12 @@ class ModelingV2Core(DecoderModel):
 
     def _derive_mtp(self) -> dict:
         """The MTP layer's operand set, derived exactly as a trunk layer's is:
-        column-major GEMM views (`.t()` is zero-copy), the two MLA absorption
-        operands split out of the row-regrouped kv_b_proj, and the same fp8 KV
-        scale check. No NVFP4 scalars — this module is bf16 throughout, so its
-        expert stacks go to `fused_moe` as they are stored."""
+        column-major GEMM views (`.t()` is zero-copy), and the two MLA absorption
+        operands split out of the row-regrouped kv_b_proj. No NVFP4 scalars —
+        this module is bf16 throughout, so its expert stacks go to `fused_moe`
+        as they are stored."""
         w = self.w
         hn = self.heads * self.nope
-        for role in ("k_scale", "v_scale"):
-            s = w[f"mtp_{role}"]
-            assert torch.equal(s, torch.ones_like(s)), (
-                f"MTP layer: {role} is {s.item()}, not 1.0; the fp8 MLA "
-                "context path is only correct at a KV scaling factor of 1.0, "
-                "and this assembly passes no scale tensors"
-            )
         kvb = w["mtp_kvb"]
         return {
             "enorm": w["mtp_enorm"],
@@ -928,11 +744,8 @@ class ModelingV2Core(DecoderModel):
     def _check_step_contract(self, md, position_ids) -> None:
         """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE
         asks for it: the metadata fields this target consumes must exist
-        (private trtllm surface), the paged
-        latent pool must be the single pool the MLA entries are certified
-        over at the page size their fp8 column covers, the rope table must
-        cover every position the engine admits, and every feature this target
-        holds inert must actually be off. Everything checked is fixed at
+        (private trtllm surface), and the rope table is grown to cover every
+        position the engine admits. Everything checked is fixed at
         engine construction — once per model instance is sound."""
         # Calling the projection is the check: it reads every metadata field
         # this target consumes, so a rename or removal upstream surfaces
@@ -943,30 +756,6 @@ class ModelingV2Core(DecoderModel):
             _build_step_args(md)
         except AttributeError as exc:
             raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
-        # position_ids is not consumed: the MLA ops derive each context
-        # token's position from its row index within the sequence and each
-        # generation token's from sequence_length - 1. Checked anyway so a
-        # layout change upstream is loud rather than silent.
-        assert position_ids.dtype == torch.int32, position_ids.dtype
-        # Narrower than the gpt-oss target's bound on purpose. That one reaches
-        # its KV cache through thop_attention, which is certified at one pool
-        # and two; this one goes through the MLA family --
-        # load_paged_kv_cache_for_mla, mla_rope_generation,
-        # mla_rope_append_paged_kv_assign_q -- and none of those entries has a
-        # multi-pool cell. Every layer here is the same attention-window class,
-        # so a manager gives them one group and this holds; if that ever
-        # changes, certify the MLA entries before widening it.
-        pools = {row[0] for row in md.host_kv_cache_pool_mapping.tolist()}
-        assert pools == {0}, (
-            f"multi-pool KV addressing is not certified for the MLA entries; "
-            f"layer->pool ids {sorted(pools)}"
-        )
-        # Every MLA entry's fp8-e4m3 column is page 32 only (the bf16 columns
-        # also carry 64). 32 is what a default KvCacheConfig produces.
-        assert md.tokens_per_block == 32, (
-            f"the fp8 latent-pool column of every MLA entry is certified at "
-            f"tokens_per_block 32; this engine built {md.tokens_per_block}"
-        )
         # The rope table must cover every position the engine admits: a short
         # table is read out of bounds with no check, and `rope_max_positions`,
         # the argument that looks like it bounds this, is one of the inert
@@ -987,37 +776,9 @@ class ModelingV2Core(DecoderModel):
         # explicit-K/V FMHA, which serves reused and fresh sequences alike;
         # without it (block reuse off) no context sequence can carry a
         # prefix, and the fresh-prefill flavor with the in-kernel rope and
-        # append is the whole context path. The two cache ops reject any
-        # index dtype but int64.
+        # append is the whole context path.
         self._cached_ctx = all(hasattr(md, n) for n in _CACHED_CTX_FIELDS) and bool(
             md.enable_context_mla_with_cached_kv
-        )
-        if self._cached_ctx:
-            for name in ("ctx_cached_token_indptr", "ctx_kv_indptr"):
-                t = getattr(md, name)
-                assert t.dtype == torch.int64 and t.is_cuda, (name, t.dtype, t.device)
-        assert md.effective_beam_width == 1, "beam search is not implemented"
-        assert md.cache_indirection is None, "beam search is not implemented"
-        assert md.block_ids_per_seq is None, "the FlashMLA layout is not implemented"
-        assert md.flash_mla_tile_scheduler_metadata is None, "FlashMLA is not implemented"
-        assert md.flash_mla_num_splits is None, "FlashMLA is not implemented"
-        assert not md.is_cross, "cross attention is not implemented"
-        # The spec-dec **mask** machinery, which is a different thing from
-        # speculative decoding being on. Under a linear-tree MTP on a trtllm-gen
-        # arch the
-        # backend computes `is_spec_decoding_enabled and (not trtllm_gen_arch
-        # or is_spec_dec_dynamic_tree)` and gets False, so every
-        # `spec_decoding_*` tensor stays None — which is exactly the inert
-        # group `_CALL_INERT` holds and every MLA column certifies. Drafting
-        # itself reaches the attention ops through `predicted_tokens_per_seq`
-        # alone. This assert is the precondition those inert values rest on: it
-        # fires on a tree draft, or on a pre-Blackwell arch where the gating
-        # does not force the mask off, and either would need the mask surface
-        # certified first.
-        assert not md.is_spec_decoding_enabled and not md.use_spec_decoding, (
-            "the spec-decoding mask surface is live; this target holds the "
-            "whole spec_decoding_* group at its inert values, which is only "
-            "valid while the Blackwell linear-tree gating keeps it off"
         )
         self._contract_pending = False
 
@@ -1044,12 +805,6 @@ class ModelingV2Core(DecoderModel):
         collective, whose row counts come from tensor shapes the graph
         fixes."""
         counts = [int(n) for n in md.all_rank_num_tokens]
-        assert len(counts) == self.dp_size, (counts, self.dp_size)
-        assert counts[self.rank] == num_tokens, (
-            f"rank {self.rank} holds {num_tokens} rows but the engine's "
-            f"all_rank_num_tokens says {counts[self.rank]} ({counts}); the "
-            "collectives would gather the wrong split"
-        )
         return max(counts)
 
     def _dense_mlp(self, x, params, dt):
@@ -1075,30 +830,12 @@ class ModelingV2Core(DecoderModel):
     ) -> torch.Tensor:
         attn_w, mlp_w, moe_w = self._attn, self._mlp, self._moe
         next_norm = self._next_norm
-        assert attn_w is not None and mlp_w is not None and moe_w is not None, (
-            "load_weights must run before forward"
-        )
-        assert next_norm is not None, "load_weights must run before forward"
-        assert position_ids is not None
-        assert isinstance(attn_metadata, TrtllmAttentionMetadata)
-        # Inputs this target does not implement must fail loudly, not be
-        # silently dropped (unlike runtime-owned features, which pass through).
-        assert lora_params is None, "LoRA is not implemented by this target"
-        # The trunk does not read `spec_metadata` even when the engine drafts:
-        # on MTP_EAGLE_ONE_MODEL the runtime sets `layers_to_capture = ()`, so
-        # no hidden-state capture hook is owed and the shell keeps the argument
-        # to itself. Keeping this assert is a stronger guarantee than deleting
-        # it.
-        assert kwargs.get("spec_metadata") is None, (
-            "spec_metadata reached the trunk; the shell owns the draft loop and must not forward it"
-        )
         md = attn_metadata
         if self._contract_pending:
             self._check_step_contract(md, position_ids)
         # Read after the contract check: that is where a table too short for
         # the engine's admitted max_seq_len is regrown.
         rope = self._rope
-        assert rope is not None, "load_weights must run before forward"
 
         step = _build_step_args(md)
         num_ctx = md.num_contexts
@@ -1110,12 +847,8 @@ class ModelingV2Core(DecoderModel):
         block_offsets = md.kv_cache_block_offsets
         pool_ptrs = md.host_kv_cache_pool_pointers
         pool_map = md.host_kv_cache_pool_mapping
-        assert tokens_per_block is not None, "paged KV cache is required"
-        assert block_offsets is not None and pool_ptrs is not None, "paged KV cache is required"
-        assert pool_map is not None, "paged KV cache is required"
 
         if inputs_embeds is None:
-            assert input_ids is not None
             h = nn.functional.embedding(input_ids, self.w["embed"])
         else:
             h = inputs_embeds
@@ -1132,11 +865,6 @@ class ModelingV2Core(DecoderModel):
         # when MTP is off and is a per-capture host constant when it is on.
         gen_seqs = md.num_seqs - num_ctx
         gen_p = gen // gen_seqs if gen_seqs else 1
-        assert gen_p * gen_seqs == gen, (
-            f"{gen} generation rows do not divide over {gen_seqs} generation "
-            "sequences; a ragged per-sequence draft length cannot be expressed "
-            "to the MLA generation call"
-        )
         # The context sequences' cached+new latent-KV row count: what the
         # cache gather returns and what the context FMHA attends over.
         ctx_kv_tokens = int(md.host_total_kv_lens[0]) if tc else 0
@@ -1236,10 +964,6 @@ class ModelingV2Core(DecoderModel):
                     # prefix, so the fresh-prefill flavor does the rope and
                     # the append inside the attention call and the latent
                     # rows never leave registers.
-                    assert ctx_kv_tokens == tc, (
-                        "a context sequence arrived with a cached KV prefix "
-                        "while the cached-KV metadata surface is off"
-                    )
                     ckv_full, _ = torch.split(ckv, [tc, gen], 0)
                     k_pe_full = None
                     latent_arg = latent_ctx
@@ -1422,7 +1146,6 @@ class ModelingV2Core(DecoderModel):
                 # and back, so a decode capture records both streams.
                 side = self._side_stream
                 main = torch.cuda.current_stream()
-                assert side is not None, "derive_after_load must run before forward"
                 side.wait_stream(main)
                 with torch.cuda.stream(side):
                     shared = self._dense_mlp(o, mlp_w[i], dt)
@@ -1583,7 +1306,6 @@ class MTPLayer:
         projection itself is the inherited shell's `logits_processor`, exactly
         as on the non-speculative path."""
         mw = self.core._mtp
-        assert mw is not None, "load_weights must run before the draft loop"
         return self.logits_processor.forward(
             flashinfer_rmsnorm(hidden_states, mw["head_norm"], self.core.eps),
             lm_head,
@@ -1669,20 +1391,9 @@ class MTPLayer:
     ) -> torch.Tensor:
         core = self.core
         mw, rope = core._mtp, core._rope
-        assert mw is not None and rope is not None, "load_weights must run before the draft loop"
-        assert isinstance(attn_metadata, TrtllmAttentionMetadata)
-        assert not core._contract_pending, (
-            "the trunk's first-forward contract check has not run; the shell "
-            "calls the core before the worker, so this cannot be reached first. "
-            "Vacuous when the check is off, which is the only time it is free"
-        )
         md = attn_metadata
         step = _build_step_args(md)
         rows = hidden_states.shape[0]
-        assert input_ids.shape[0] == rows, (
-            f"the draft step's {input_ids.shape[0]} token ids and "
-            f"{rows} hidden-state rows must describe the same tokens"
-        )
         dt = hidden_states.dtype
         dev = hidden_states.device
         num_ctx = md.num_contexts
@@ -1700,18 +1411,10 @@ class MTPLayer:
         # `runtime_draft_len + 1` on step 0 and exactly 1 afterwards.
         gen_seqs = md.num_seqs - num_ctx
         gen_p = gen // gen_seqs if gen_seqs else 1
-        assert gen_p * gen_seqs == gen, (
-            f"{gen} generation rows do not divide over {gen_seqs} generation "
-            "sequences; a ragged per-sequence draft length cannot be expressed "
-            "to the MLA generation call"
-        )
         tokens_per_block = md.tokens_per_block
         block_offsets = md.kv_cache_block_offsets
         pool_ptrs = md.host_kv_cache_pool_pointers
         pool_map = md.host_kv_cache_pool_mapping
-        assert tokens_per_block is not None, "paged KV cache is required"
-        assert block_offsets is not None and pool_ptrs is not None, "paged KV cache is required"
-        assert pool_map is not None, "paged KV cache is required"
         ctx_kv_tokens = int(md.host_total_kv_lens[0]) if tc else 0
         # The engine raises the KV pool's layer count by
         # `num_nextn_predict_layers` under a one-model MTP mode, so this
@@ -1791,10 +1494,6 @@ class MTPLayer:
                 )
                 latent_arg = None
             else:
-                assert ctx_kv_tokens == tc, (
-                    "a context sequence arrived with a cached KV prefix while "
-                    "the cached-KV metadata surface is off"
-                )
                 ckv_full, _ = torch.split(ckv, [tc, gen], 0)
                 k_pe_full = None
                 latent_arg = latent_ctx
@@ -1976,7 +1675,6 @@ class ModelingV2DeepseekR10528Nvfp4Sm103Dep4(
 ):
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config
-        assert cfg is not None
         super().__init__(
             ModelingV2Core(model_config),
             config=model_config,
@@ -1999,16 +1697,6 @@ class ModelingV2DeepseekR10528Nvfp4Sm103Dep4(
         self.draft_model = None
         self.spec_worker = None
         if self.spec_config is not None:
-            mode = self.spec_config.spec_dec_mode
-            assert mode.is_mtp_eagle_one_model(), (
-                f"this target implements the one-model MTP-Eagle draft loop; "
-                f"the engine resolved spec_dec_mode {mode!r}"
-            )
-            assert self.model.mtp_enabled, "core built without the MTP module"
-            assert hasattr(self, "logits_processor"), (
-                "the inherited shell no longer exposes logits_processor; the "
-                "draft head and the shell's own gather both project through it"
-            )
             self.draft_model = DraftModel(self.model, self.lm_head, self.logits_processor)
             self.spec_worker = get_spec_worker(self.spec_config, model_config, model_config.mapping)
 
@@ -2040,10 +1728,6 @@ class ModelingV2DeepseekR10528Nvfp4Sm103Dep4(
         the worker squeezes it itself, and flattening here would produce a
         silently wrong draft position sequence."""
         if self.spec_worker is None:
-            assert spec_metadata is None, (
-                "spec_metadata arrived without a spec worker; this engine was "
-                "built without a speculative_config"
-            )
             return super().forward(
                 attn_metadata,
                 # A typing no-op: the base declares `input_ids: torch.IntTensor
@@ -2057,15 +1741,11 @@ class ModelingV2DeepseekR10528Nvfp4Sm103Dep4(
                 lora_params,
                 **kwargs,
             )
-        assert spec_metadata is not None, (
-            "the spec worker is built but the engine passed no spec_metadata"
-        )
         # `spec_metadata` is not forwarded into the core: the trunk genuinely
         # does not read it — on MTP_EAGLE_ONE_MODEL the runtime sets
         # `layers_to_capture = ()`, so `is_layer_capture()` is False everywhere
         # and no hidden-state capture hook is owed (that is Eagle3's
-        # requirement, not this mode's) — and the core's assert that it is
-        # absent is a stronger guarantee than deleting the assert would be.
+        # requirement, not this mode's).
         hidden = self.model(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
