@@ -57,7 +57,8 @@ public:
     //! Detach all members. Exported arrays retain their allocation until the last owner dies.
     void close();
 
-    //! Upload final dirty rows and counts; return the row slots uploaded.
+    //! Retry deferred sparse offloads, then upload final dirty rows and counts; return uploaded rows.
+    //! Offload failures propagate and retain pending work for retry.
     //! Staging buffers are retained until their asynchronous copies complete.
     std::vector<int> publish(CudaStream stream);
     //! Wait for publication and KV readiness. Reject unpublished changes.
