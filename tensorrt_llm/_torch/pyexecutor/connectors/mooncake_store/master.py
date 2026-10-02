@@ -748,21 +748,19 @@ def _adopt_inherited_settings(pool: Any, path: str) -> None:
 
     An inherited `MOONCAKE_CONFIG_PATH` decides what every rank opens its store
     handle with, so what `mooncake_store` asked for is not what this server
-    does. Anything reading the block afterwards would otherwise describe a
-    server lending 16 GiB as `both` while its ranks lend 32 as `capacity`; the
-    usage report the LLM constructor sends captures `role` and `segment_size`
-    from here.
+    does. The usage report the LLM constructor sends reads `role` and
+    `segment_size` from here, and would otherwise describe a server lending
+    16 GiB as `both` while its ranks lend 32 as `capacity`.
 
-    Read through the workers' own reader, so a value is restated as they will
-    resolve it, defaults for absent keys included. Reporting only: an
-    unreadable config is left to the workers, which fail on it with the path
-    and the parse error in hand. `pool`, `run_dir` and `master_timeout` are not
-    restated, naming how to reach the pool and where this run's files go rather
-    than how the server joins it.
+    Reading through the workers' own reader resolves each value as they will,
+    defaults for absent keys included. `pool`, `run_dir` and `master_timeout`
+    name how to reach the pool and where this run's files go rather than how
+    the server joins it, so they stay as they are.
     """
     try:
         effective = MooncakeStoreConnectorConfig.from_file(path)
     except (OSError, ValueError) as exc:
+        # Reporting only, so the workers are left to fail on the parse instead.
         logger.warning(
             f"mooncake-store: {path} could not be read ({exc}), so "
             "kv_connector_config.mooncake_store still describes what this "

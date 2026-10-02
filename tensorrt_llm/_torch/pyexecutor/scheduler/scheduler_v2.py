@@ -1697,24 +1697,19 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _preempt_or_defer(self, req: LlmRequest, recompute_paused: RequestList) -> bool:
         """Give up *req*'s pages for another request, if they are free to give.
 
-        Every destructive release goes through here, because a page a
-        connector save is still reading cannot be freed: a later request would
-        allocate it and overwrite the bytes mid-transfer, and the store would
-        publish one request's KV under another's hash.
-        `KVCacheManagerV2.preempt_request` answers that question and parks the
-        victim until the executor completes the release; see
-        `PyExecutor._resume_preempted_request`.
+        Every destructive release goes through here, because a page a connector
+        save is still reading cannot be freed: a later request would allocate it
+        and overwrite the bytes mid-transfer, and the store would publish one
+        request's KV under another's hash. `KVCacheManagerV2.preempt_request`
+        answers that question and parks the victim until the executor completes
+        the release; see `PyExecutor._resume_preempted_request`.
 
-        On success *req* lands on `recompute_paused`, which is the channel a
-        re-prefill needs: the executor frees the sequence slot and
-        `reset_for_recompute` rewrites the prompt.
-
-        Returns whether the pages are available in this iteration. A caller
-        that gets False stops looking rather than taking a second victim, so
-        one victim drains at a time and the next pass finds its pages instead
-        of a second request having given up its cache for nothing. A deferred
-        victim must be left off every scheduler output list: parked, it keeps
-        its pages, and `pause` would overwrite the state that holds it there.
+        On success *req* lands on `recompute_paused`, the channel a re-prefill
+        needs: the executor frees the sequence slot and `reset_for_recompute`
+        rewrites the prompt. False means the pages are unavailable this
+        iteration, and the caller stops looking rather than taking a second
+        victim, so one drains at a time and the next pass finds those pages
+        instead of a second request having given up its cache for nothing.
         """
         if not self.kv_cache_manager.preempt_request(req):
             logger.debug(
@@ -1833,9 +1828,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                 f"to free pages for request {req.py_request_id}"
             )
             if not self._preempt_or_defer(victim, recompute_paused):
-                # Off `evicted` above and onto no list here: the victim is
-                # parked holding its pages, and the `pause` an evicted request
-                # gets would overwrite the state that keeps it there.
+                # Off `evicted` above and onto no list here: a parked victim
+                # keeps its pages, and the `pause` an evicted request gets
+                # would overwrite the state that holds it there.
                 return req_it_end, False
             recompute_pause_state.victim_indices.add(victim_idx)
             recompute_pause_state.frontier = min(recompute_pause_state.frontier, victim_idx)

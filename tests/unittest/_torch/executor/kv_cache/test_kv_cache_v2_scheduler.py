@@ -224,12 +224,9 @@ def make_kv_cache_manager(
     mgr.has_cache_tier_below_gpu = has_cache_tier_below_gpu
 
     def preempt_request(req):
-        """What the real one does with no connector: release the pages now.
+        """Release the pages now, as the real one does with no connector.
 
-        Releasing through `free_resources` is load-bearing rather than
-        cosmetic: it is the only reason a scheduler that preempts frees
-        anything, so a mock that merely answered True would let a test assert
-        a release that never happened.
+        Going through `free_resources` is what makes the release observable.
         """
         mgr.free_resources(req)
         return True
@@ -243,9 +240,8 @@ def make_kv_cache_manager(
 def defer_preemption(mgr, *request_ids):
     """Make *mgr* hold back the preemption of each id, as a connector save does.
 
-    Mirrors `KVCacheManagerV2.preempt_request` when a save is still reading
-    the victim's pages: nothing is released, the request is parked, and
-    `has_pending_preemption` stays true until the executor completes it.
+    Nothing is released, and `has_pending_preemption` stays true until the
+    returned set is cleared, which stands in for the executor completing it.
     """
     deferred = set(request_ids)
 
@@ -1608,10 +1604,9 @@ class TestPreemptionDefersToConnectorSaves:
 
     A freed page is allocated by the next request and overwritten, and a save
     reading it mid-transfer publishes those bytes under the victim's hash, so
-    an unrelated request's KV is served as a prefix hit. Both allocation
-    paths, context and generation, therefore release through
-    `KVCacheManagerV2.preempt_request`, which parks the victim instead of
-    releasing it until the save retires.
+    an unrelated request's KV is served as a prefix hit. Both allocation paths
+    therefore release through `KVCacheManagerV2.preempt_request`, which parks
+    the victim until the save retires.
     """
 
     @staticmethod
@@ -1634,8 +1629,7 @@ class TestPreemptionDefersToConnectorSaves:
 
         mgr.preempt_request.assert_called_once_with(victim)
         mgr.free_resources.assert_not_called()
-        # Parked, so it belongs to no output list: the executor must neither
-        # pause it nor reset it for recompute while it still holds its pages.
+        # Parked, so it belongs to no output list.
         assert out.recompute_paused_requests == []
         assert victim not in out.paused_requests
         assert out.generation_requests == []
@@ -1660,9 +1654,8 @@ class TestPreemptionDefersToConnectorSaves:
         """`pause` would overwrite the state that parks it.
 
         A victim suspended earlier in the pass sits on `evicted`, which the
-        executor pauses. A parked request has to keep the state
-        `preempt_request` left it in until the release completes, so the
-        deferral takes it off that list and puts it on no other.
+        executor pauses. A parked request keeps the state `preempt_request`
+        left it in until the release completes, so it goes on no list at all.
         """
         from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import _RecomputePauseState
 

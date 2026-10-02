@@ -562,10 +562,9 @@ def test_shutdown_leaves_the_store_open_under_a_save_still_reading(
 ):
     """A timed join is not evidence that the thread stopped.
 
-    The save thread reads the KV pools, and it reads them through the store
-    handle and the staging slots this releases. Closing the handle or dropping
-    those buffers mid-`batch_put` takes the memory out from under a transfer
-    in flight, so a thread that outlived the wait keeps them.
+    The save thread reads the KV pools through the store handle and the staging
+    slots, so closing the handle or dropping those buffers mid-transfer takes
+    the memory out from under it.
     """
     monkeypatch.setattr(worker_module, "SAVE_DRAIN_TIMEOUT", 0.1)
     reading = threading.Event()

@@ -66,26 +66,23 @@ def _apply_cli_telemetry(telemetry: bool) -> None:
 def _signal_handoff():
     """Turn SIGINT and SIGTERM into the exit the telemetry boundary expects.
 
-    The master's reaping and the manifest's retraction are in a `finally`,
-    which default SIGTERM handling would skip, leaving an address on disk for
-    the next run to dial.
+    The master's reaping and the manifest's retraction sit in a `finally` that
+    default SIGTERM handling would skip, leaving an address on disk for the
+    next run to dial. `raise_signal_exit` unwinds those context managers and
+    carries the signal number out to `trtllm-serve`, which reports the exit as
+    a signal rather than as a clean one.
 
-    `raise_signal_exit` unwinds those context managers and carries the signal
-    number out to `trtllm-serve`, which is what reports the exit as a signal
-    rather than as a clean one. It raises rather than recording, since a
-    handler shares its thread with whatever it interrupted and so must take no
-    lock: setting a `threading.Event` here deadlocks against the wait that the
-    signal interrupted.
-
-    Wrap this around the resource so the log below follows the release.
+    It raises rather than recording because a handler shares its thread with
+    whatever it interrupted and so can take no lock: setting a
+    `threading.Event` or logging here deadlocks against the wait the signal
+    interrupted. Wrap this around the resource so the log below follows the
+    release.
     """
     for received in (signal.SIGINT, signal.SIGTERM):
         signal.signal(received, _command_telemetry.raise_signal_exit)
     try:
         yield
     except _command_telemetry.SignalExit as stopping:
-        # Logged here rather than in the handler, which must not take the
-        # logging lock.
         logger.info(f"mooncake-store: signal {stopping.signal_number} received, shut down")
         raise
 
@@ -235,8 +232,7 @@ def mooncake_master(
                 raise click.ClickException(
                     f"mooncake_master exited with code {code}. See {master.log_path}"
                 )
-            # The handler raises, so a signal ends this wait rather than
-            # resuming it.
+            # The handler raises, so a signal ends this wait rather than resuming it.
             time.sleep(1.0)
             now = time.monotonic()
             # Distinguishes a dead master from a dead fabric.

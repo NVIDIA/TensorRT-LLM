@@ -178,9 +178,9 @@ def test_a_signal_is_reported_once_and_still_releases_what_was_held(
 ):
     """The signal reaches the boundary, and the resource is still given up.
 
-    A command that returned normally instead would be reported as a clean
-    exit before any model was loaded. One that deadlocked in its handler, as
-    setting a `threading.Event` from there can, would report nothing at all.
+    A command that returned normally instead would be reported as a clean exit
+    before any model was loaded, and one whose handler took a lock would
+    deadlock against the wait it interrupted and report nothing at all.
     """
     signal_on_idle(master, number)
 

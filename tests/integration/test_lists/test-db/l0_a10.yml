@@ -41,10 +41,6 @@ l0_a10:
   - unittest/_torch/executor/kv_cache/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/executor/test_kv_cache_layout.py
   - unittest/_torch/executor/test_kv_connector_v2_prefix_real_manager.py
-  # The Mooncake store suite is fully cpu_only and is covered by l0_cpu.yml,
-  # which lists unittest/_torch/executor as a directory. It needs no GPU: the
-  # store handle is a fake, the KV layout is synthesized from plain integers,
-  # and the one test that wants a device patches torch.cuda.
   - unittest/_torch/executor/test_error_classification.py
   - unittest/_torch/executor/test_resource_manager.py
   - unittest/_torch/executor/test_seq_slot_sizing.py
@@ -245,8 +241,6 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_vswa_out_of_window_blocks_reach_the_connector
   - llmapi/test_llm_api_connector.py::test_connector_transfers_only_in_window_blocks_to_the_sliding_group[gemma3_interleaved]
   - llmapi/test_llm_api_connector.py::test_connector_transfers_only_in_window_blocks_to_the_sliding_group[qwen3_forced_windows]
-  # The mooncake-store connector against a live pool, started by the test.
-  # The TP 2 case is in l0_dgx_h100.yml.
   - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_cross_engine_prefix_reuse
   - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_chunked_prefill_survives_a_small_cache
   # third-party policy checks CPU-only

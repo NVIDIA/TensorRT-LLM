@@ -712,13 +712,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             self._save_queue.put(None)
             thread.join(timeout=SAVE_DRAIN_TIMEOUT)
             if thread.is_alive():
-                # The thread reads the KV pools and the staging slots, and it
-                # reads them through the store handle. Closing that handle or
-                # dropping those buffers while a transfer is in flight takes
-                # the memory out from under it, so they are left registered
-                # instead: the process is going down either way, and a leak
-                # outlives a read of freed memory. The thread is a daemon, so
-                # it does not hold the process open; a later call retries.
+                # The thread reads the KV pools through the store handle and
+                # the staging slots below, so releasing either takes the memory
+                # out from under a transfer in flight. Leaking both is the safer
+                # end: the process is going down anyway, the thread is a daemon
+                # and does not hold it open, and a later call retries the join.
                 logger.error(
                     f"mooncake-store rank {self._rank}: the save thread did not stop "
                     f"within {SAVE_DRAIN_TIMEOUT:g}s, so the store handle and its "
