@@ -51,6 +51,11 @@ These partial reports are marked with
 `llmApiConfigMetaJson.report_context == "pre_initialization_exit"` and do not
 indicate successful initialization.
 
+For dashboards, the top-level event parameter `llmInstancesCreated >= 1`
+confirms successful LLM initialization; partial reports have `llmInstancesCreated == 0`.
+Do not count initial reports alone as successful deployments. Treat a missing
+counter in older records as unknown, not zero.
+
 #### System fields
 
 | Field | Type | Description | Example |
