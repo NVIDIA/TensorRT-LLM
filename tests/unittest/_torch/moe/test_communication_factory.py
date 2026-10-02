@@ -34,6 +34,8 @@ from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter imp
     AllGatherReduceScatter,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def _make_model_config(
@@ -556,6 +558,99 @@ def test_auto_selection_skips_nccl_ep_when_preconditions_fail(
     )
 
     assert isinstance(strategy, AllGatherReduceScatter)
+
+
+_NCCL_EP_QUANT_ALGOS = [
+    None,
+    QuantAlgo.W4A16_MXFP4,
+    QuantAlgo.W4A8_MXFP4_FP8,
+    QuantAlgo.W4A8_MXFP4_MXFP8,
+    QuantAlgo.FP8,
+    QuantAlgo.FP8_BLOCK_SCALES,
+    QuantAlgo.NVFP4,
+]
+
+
+@pytest.mark.parametrize("quant_algo", _NCCL_EP_QUANT_ALGOS)
+@pytest.mark.parametrize("low_precision_combine", [False, True])
+def test_nccl_ep_quantized_transport_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_algo: QuantAlgo | None,
+    low_precision_combine: bool,
+) -> None:
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: True)
+    strategy = NcclEP(
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
+        num_slots=128,
+        hidden_size=3072,
+        top_k=4,
+        quant_config=QuantConfig(quant_algo=quant_algo),
+        use_low_precision_combine=low_precision_combine,
+    )
+    assert strategy.use_external_fp8 == (quant_algo == QuantAlgo.FP8)
+    assert strategy.use_external_nvfp4 == (quant_algo == QuantAlgo.NVFP4)
+    assert not strategy.uses_internal_dispatch_quantization()
+    assert strategy.supports_post_quant_dispatch() == (
+        quant_algo in (QuantAlgo.FP8, QuantAlgo.NVFP4)
+    )
+    assert strategy.use_low_precision_combine == (
+        low_precision_combine and quant_algo == QuantAlgo.NVFP4
+    )
+
+
+@pytest.mark.parametrize("force_nccl_ep", [False, True], ids=["auto", "forced"])
+@pytest.mark.parametrize("quant_algo", _NCCL_EP_QUANT_ALGOS)
+@pytest.mark.parametrize("low_precision_combine", [False, True])
+@pytest.mark.parametrize(
+    ("hidden_size", "supported"),
+    [(2880, False), (3328, False), (3072, True)],
+    ids=["gpt_oss", "dispatch_aligned_only", "dispatch_and_combine_aligned"],
+)
+def test_nccl_ep_hidden_size_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    force_nccl_ep: bool,
+    quant_algo: QuantAlgo | None,
+    hidden_size: int,
+    supported: bool,
+    low_precision_combine: bool,
+) -> None:
+    _mock_nccl_ep_v02(monkeypatch)
+    model_config = _make_model_config()
+    model_config.quant_config = QuantConfig(quant_algo=quant_algo)
+    model_config.use_low_precision_moe_combine = low_precision_combine
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+    monkeypatch.delenv("TRTLLM_FORCE_COMM_METHOD", raising=False)
+    if force_nccl_ep:
+        monkeypatch.setenv("TRTLLM_FORCE_COMM_METHOD", "NCCL_EP")
+    constructor = Mock(side_effect=_FakeNcclEP)
+    monkeypatch.setattr(communication_factory, "NcclEP", constructor)
+
+    def create_strategy() -> _FakeNcclEP | AllGatherReduceScatter:
+        return communication_factory.CommunicationFactory.create_strategy(
+            model_config,
+            num_experts=128,
+            num_slots=128,
+            top_k=4,
+            expert_size_per_partition=64,
+            hidden_size=hidden_size,
+        )
+
+    if force_nccl_ep and not supported:
+        with pytest.raises(
+            ValueError, match=f"hidden_size divisible by 512, got hidden_size={hidden_size}"
+        ):
+            create_strategy()
+    else:
+        strategy = create_strategy()
+        assert isinstance(strategy, _FakeNcclEP if supported else AllGatherReduceScatter)
+
+    if supported:
+        constructor.assert_called_once()
+    else:
+        constructor.assert_not_called()
 
 
 def test_auto_selection_falls_back_when_nccl_probe_runtime_fails(
