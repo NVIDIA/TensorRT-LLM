@@ -57,6 +57,12 @@
       "source_subdir": "dont-add-this-project-with-add-subdirectory"
     },
     {
+      "name": "fmt",
+      "git_repository": "https://github.com/fmtlib/fmt",
+      "git_tag": "553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28",
+      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+    },
+    {
       "name": "googlebenchmark",
       "git_repository": "https://github.com/google/benchmark",
       "git_tag": "v1.8.3",
