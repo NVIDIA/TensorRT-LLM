@@ -164,6 +164,7 @@ add_th_common_family(
 
 add_library(
   th_common SHARED
+  ../common/profiler.cpp
   $<TARGET_OBJECTS:th_common_attention>
   $<TARGET_OBJECTS:th_common_gemm_quant>
   $<TARGET_OBJECTS:th_common_moe>
