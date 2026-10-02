@@ -185,19 +185,31 @@ def test_scalar_and_sequence_model_union_preserves_each_wire_shape() -> None:
     assert _collect(_Either(item=[_Leaf(value=3)]))[0] == {"item.value": [3]}
 
 
-def test_model_sequence_caps_outer_and_leaf_sequences(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("field", ["cuda_graph_config", "encoder_cuda_graph_config"])
+def test_model_sequence_caps_outer_and_leaf_sequences(
+    monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
     monkeypatch.setattr(capture, "MAX_SEQ_ITEMS", 2)
     specs = [_InputSpec(shape=("num_tokens", 10, 20)) for _ in range(3)]
-    args = _Args(cuda_graph_config=_GraphConfig(extra_model_inputs=specs))
+    args = _Args(**{field: _GraphConfig(extra_model_inputs=specs)})
     config, metadata = _collect(args)
-    assert config == {"cuda_graph_config.extra_model_inputs.shape": [["num_tokens", 10]] * 2}
+    assert config == {f"{field}.extra_model_inputs.shape": [["num_tokens", 10]] * 2}
     assert metadata["sequence_truncated"] is True
     assert metadata["unsafe_excluded"] is False
 
     # Unsafe values beyond the retained prefix must still exclude the field.
-    args.cuda_graph_config.extra_model_inputs[-1].shape = ("private",)
+    getattr(args, field).extra_model_inputs[-1].shape = ("private",)
     config, metadata = _collect(args)
     assert config == {}
+    assert metadata["unsafe_excluded"] is True
+    assert metadata["sequence_truncated"] is False
+
+    # A rejected field must not clear truncation recorded by another field.
+    other = "encoder_cuda_graph_config" if field == "cuda_graph_config" else "cuda_graph_config"
+    setattr(args, other, _GraphConfig(extra_model_inputs=specs[:1]))
+    config, metadata = _collect(args)
+    assert config == {f"{other}.extra_model_inputs.shape": [["num_tokens", 10]]}
+    assert metadata["sequence_truncated"] is True
     assert metadata["unsafe_excluded"] is True
 
 
