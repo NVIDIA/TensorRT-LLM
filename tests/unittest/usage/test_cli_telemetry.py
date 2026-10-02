@@ -109,7 +109,7 @@ def _captured_terminal_parameters(payloads):
     """Return the parameters from one fully serialized terminal event."""
     assert len(payloads) == 1
     payload = payloads[0]
-    assert payload["eventSchemaVer"] == "0.7"
+    assert payload["eventSchemaVer"] == "0.8"
     assert len(payload["events"]) == 1
     event = payload["events"][0]
     assert event["name"] == "trtllm_exit_report"
@@ -170,6 +170,59 @@ class TestTelemetryGroup:
             )
 
         apply_config.assert_not_called()
+
+    def test_visual_gen_bench_yaml_opt_out_precedes_prompt_validation(
+        self,
+        tmp_path,
+        captured_exit_payloads,
+    ):
+        """A valid YAML opt-out is honored before benchmark argument errors."""
+        from click.testing import CliRunner
+
+        from tensorrt_llm.commands.bench import main as bench_main
+
+        config_path = tmp_path / "visual_gen.yaml"
+        config_path.write_text(
+            "telemetry_config:\n  disabled: true\n",
+            encoding="utf-8",
+        )
+
+        result = CliRunner().invoke(
+            bench_main,
+            [
+                "--model",
+                "test-model",
+                "visual-gen",
+                "--visual_gen_args",
+                str(config_path),
+            ],
+        )
+
+        assert result.exit_code == 2
+        assert "Either --prompt or --prompt_file must be specified." in result.output
+        assert captured_exit_payloads == []
+
+    def test_visual_gen_bench_attributes_invalid_yaml_to_visual_gen(
+        self,
+        tmp_path,
+        captured_exit_payloads,
+    ):
+        from click.testing import CliRunner
+
+        from tensorrt_llm.commands.bench import main as bench_main
+
+        config_path = tmp_path / "visual_gen.yaml"
+        config_path.write_text("invalid: [", encoding="utf-8")
+
+        result = CliRunner().invoke(
+            bench_main,
+            ["--model", "test-model", "visual-gen", "--visual_gen_args", str(config_path)],
+        )
+
+        assert result.exit_code != 0
+        parameters = _captured_terminal_parameters(captured_exit_payloads)
+        assert parameters["component"] == "visual_gen"
+        assert parameters["ingressPoint"] == "cli_bench"
 
     @pytest.mark.parametrize(
         ("yaml_config", "telemetry", "expected_disabled"),

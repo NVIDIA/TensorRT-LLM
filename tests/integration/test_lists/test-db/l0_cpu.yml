@@ -188,3 +188,5 @@ l0_cpu:
   - unittest/utils/test_confidential_compute.py
   - unittest/utils/test_llm_data.py
   - unittest/visual_gen/test_output.py
+  - unittest/visual_gen/test_telemetry.py
+  - unittest/usage/test_visual_gen_metrics.py

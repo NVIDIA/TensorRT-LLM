@@ -19,6 +19,7 @@ import logging
 import os
 import threading
 import time
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -57,6 +58,42 @@ pytestmark = pytest.mark.cpu_only
 def reporter_session(enable_telemetry):
     """Create the session required by the background reporter."""
     assert usage_lib.apply_usage_session_config()
+
+
+def _visual_gen_args():
+    """Return the small validated-config surface consumed by the reporter."""
+    parallel = SimpleNamespace(
+        cfg_size=1,
+        ulysses_size=1,
+        async_ulysses=False,
+        ring_size=1,
+        attn2d_size=(1, 1),
+        tp_size=1,
+        parallel_vae_size=1,
+        parallel_vae_split_dim="width",
+    )
+    attention = SimpleNamespace(
+        backend="VANILLA",
+        sparse_attention_config=None,
+        quant_attention_config=None,
+    )
+    return SimpleNamespace(
+        parallel_config=parallel,
+        attention_config=attention,
+        cache_config=None,
+        cuda_graph_config=SimpleNamespace(enable=False),
+        torch_compile_config=SimpleNamespace(
+            enable=False, enable_fullgraph=False, enable_autotune=True
+        ),
+    )
+
+
+@pytest.fixture(params=["llm", "visual_gen"])
+def background_reporter(request):
+    """Exercise shared delivery behavior through both runtime entry points."""
+    if request.param == "visual_gen":
+        return partial(usage_lib._visual_gen_background_reporter, _visual_gen_args(), {}, "")
+    return partial(usage_lib._background_reporter, None, None, "")
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +198,95 @@ class TestReportUsage:
         """_get_trtllm_version returns a string."""
         result = usage_lib._get_trtllm_version()
         assert isinstance(result, str)
+
+    def test_report_visual_gen_usage_spawns_visual_gen_reporter(
+        self, monkeypatch, enable_telemetry
+    ):
+        """VisualGen starts its dedicated initial/heartbeat reporter."""
+        usage_lib._NOTIFICATION_SHOWN.set()
+        mock_thread = MagicMock()
+
+        with patch.object(usage_lib.threading, "Thread", return_value=mock_thread) as thread_cls:
+            usage_lib.report_visual_gen_usage(_visual_gen_args())
+
+        assert thread_cls.call_args.kwargs["target"] is usage_lib._visual_gen_background_reporter
+        assert thread_cls.call_args.kwargs["name"] == "trtllm-visual-gen-usage-stats"
+        assert thread_cls.call_args.kwargs["daemon"] is True
+        mock_thread.start.assert_called_once()
+
+    def test_visual_gen_reporter_sends_initial_and_heartbeat(self, monkeypatch):
+        """VisualGen reports bounded runtime metadata and current lifecycle counters."""
+
+        class _OneHeartbeat:
+            def __init__(self):
+                self.wait_count = 0
+
+            def wait(self, timeout):
+                del timeout
+                self.wait_count += 1
+                return self.wait_count > 1
+
+        monkeypatch.setenv("TRTLLM_USAGE_FORCE_ENABLED", "1")
+        assert usage_lib.record_visual_gen_initialization_attempt()
+        assert usage_lib.record_visual_gen_initialized()
+        sent = []
+        visual_gen_args = _visual_gen_args()
+        visual_gen_args.parallel_config.cfg_size = 2
+        visual_gen_args.parallel_config.tp_size = 2
+        visual_gen_args.cache_config = SimpleNamespace(cache_backend="teacache")
+        metadata = {
+            "model_id": "nvidia/test-model",
+            "pipeline_class_name": "TestPipeline",
+            "resolved_pipeline_class": "ResolvedPipeline",
+            "modality": "image",
+            "launch_mode": "local_spawn",
+            "node_count": 2,
+            "n_workers": 3,
+            "quantization_algo": "NVFP4",
+            "dynamic_weight_quant": True,
+            "quantized_components": ["transformer"],
+        }
+
+        with (
+            patch.object(usage_lib, "_collect_system_info", return_value={}),
+            patch.object(usage_lib, "_collect_gpu_info", return_value={"gpu_count": 4}),
+            patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
+            patch.object(usage_lib, "_REPORTER_STOP", _OneHeartbeat()),
+        ):
+            usage_lib._visual_gen_background_reporter(visual_gen_args, metadata, "visual_gen_class")
+
+        assert [payload["events"][0]["name"] for payload in sent] == [
+            "trtllm_visual_gen_initial_report",
+            "trtllm_visual_gen_heartbeat",
+        ]
+        initial = sent[0]["events"][0]["parameters"]
+        expected_initial = {
+            "modelId": "nvidia/test-model",
+            "pipelineClassName": "TestPipeline",
+            "resolvedPipelineClass": "ResolvedPipeline",
+            "modality": "image",
+            "launchMode": "local_spawn",
+            "nodeCount": 2,
+            "nWorkers": 3,
+            "quantizationAlgo": "NVFP4",
+            "dynamicWeightQuant": True,
+            "quantizedComponentsJson": '["transformer"]',
+            "cfgSize": 2,
+            "tensorParallelSize": 2,
+            "cacheBackend": "teacache",
+        }
+        assert {key: initial[key] for key in expected_initial} == expected_initial
+
+        heartbeat = sent[1]["events"][0]["parameters"]
+        assert heartbeat["seq"] == 0
+        assert heartbeat["runtimeKind"] == "visual_gen"
+        assert heartbeat["ingressPoint"] == "visual_gen_class"
+        assert heartbeat["nWorkers"] == 3
+        assert heartbeat["gpuCount"] == 4
+        assert heartbeat["visualGenInitializationAttempts"] == 1
+        assert heartbeat["visualGenInstancesCreated"] == 1
+        assert heartbeat["activeVisualGenInstances"] == 1
+        assert heartbeat["visualGenInitializationFailures"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +748,20 @@ class TestRankGuard:
 class TestReporterShutdown:
     """Verify _REPORTER_STOP event exits the heartbeat loop."""
 
+    def test_heartbeats_respect_session_limit(self, reporter_session, background_reporter):
+        """Both runtimes retain the target branch's heartbeat limit."""
+        sent = []
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
+            patch.object(usage_lib, "_MAX_HEARTBEATS", 3),
+            patch.object(usage_lib._REPORTER_STOP, "wait", return_value=False) as wait,
+        ):
+            background_reporter()
+
+        assert len(sent) == 4
+        assert [payload["events"][0]["parameters"]["seq"] for payload in sent[1:]] == [0, 1, 2]
+        assert wait.call_count == 3
+
     def test_reporter_stop_event_exits_heartbeat_loop(self, reporter_session):
         """Setting _REPORTER_STOP causes the heartbeat loop to exit."""
         send_count = {"n": 0}
@@ -680,7 +820,9 @@ class TestReporterShutdown:
 class TestHeartbeatFailSilent:
     """Verify transient heartbeat failure doesn't kill the loop."""
 
-    def test_heartbeat_continues_after_transient_failure(self, reporter_session):
+    def test_heartbeat_continues_after_transient_failure(
+        self, reporter_session, background_reporter
+    ):
         """OSError on one heartbeat doesn't prevent subsequent heartbeats."""
         calls = []
 
@@ -698,7 +840,7 @@ class TestHeartbeatFailSilent:
             patch.object(usage_lib, "_REPORTER_STOP", stop),
             patch.object(usage_lib, "_get_heartbeat_interval", return_value=0),
         ):
-            usage_lib._background_reporter(None, None, "")
+            background_reporter()
 
         timer.join(timeout=1)
 
@@ -709,17 +851,19 @@ class TestHeartbeatFailSilent:
 
 
 class TestBackgroundReporterOptOut:
-    def test_late_opt_out_prevents_initial_event(self, enable_telemetry):
+    def test_late_opt_out_prevents_initial_event(self, enable_telemetry, background_reporter):
         """A reporter waking after session deactivation sends nothing."""
         assert usage_lib.apply_usage_session_config()
         usage_lib._deactivate_usage_session()
 
         with patch.object(usage_lib, "_send_to_gxt") as send:
-            usage_lib._background_reporter(None, None, "")
+            background_reporter()
 
         send.assert_not_called()
 
-    def test_opt_out_after_initial_claim_cancels_delivery(self, monkeypatch, enable_telemetry):
+    def test_opt_out_after_initial_claim_cancels_delivery(
+        self, monkeypatch, enable_telemetry, background_reporter
+    ):
         """Opt-out between claiming and sending the initial event wins."""
         assert usage_lib.apply_usage_session_config()
         session = usage_lib._SESSION
@@ -735,10 +879,7 @@ class TestBackgroundReporterOptOut:
 
         monkeypatch.setattr(session, "claim_initial", claim_then_pause)
         with patch.object(usage_lib, "_send_to_gxt") as send:
-            reporter = threading.Thread(
-                target=usage_lib._background_reporter,
-                args=(None, None, ""),
-            )
+            reporter = threading.Thread(target=background_reporter)
             reporter.start()
             assert claimed.wait(timeout=5)
             usage_lib._deactivate_usage_session()
@@ -748,7 +889,7 @@ class TestBackgroundReporterOptOut:
         assert not reporter.is_alive()
         send.assert_not_called()
 
-    def test_opt_out_before_heartbeat_cancels_delivery(self, enable_telemetry):
+    def test_opt_out_before_heartbeat_cancels_delivery(self, enable_telemetry, background_reporter):
         """A heartbeat prepared before late opt-out is not delivered afterward."""
         assert usage_lib.apply_usage_session_config()
 
@@ -772,9 +913,10 @@ class TestBackgroundReporterOptOut:
             patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
             patch.object(usage_lib, "_REPORTER_STOP", _OptOutBeforeHeartbeat()),
         ):
-            usage_lib._background_reporter(None, None, "")
+            background_reporter()
 
-        assert [payload["events"][0]["name"] for payload in sent] == ["trtllm_initial_report"]
+        assert len(sent) == 1
+        assert sent[0]["events"][0]["name"].endswith("_initial_report")
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +1049,44 @@ class TestProcessTelemetrySession:
         assert snapshot["llmInitializationFailures"] == 1
         assert snapshot["llmInstancesCreated"] == 0
         assert snapshot["activeLlmInstances"] == 0
+
+    def test_visual_gen_lifecycle_updates_separate_counters(self, enable_telemetry):
+        """VisualGen lifecycle state is independent from LLM lifecycle state."""
+        assert usage_lib.record_visual_gen_initialization_attempt()
+        assert usage_lib.record_visual_gen_initialized()
+
+        snapshot = usage_lib._SESSION.snapshot()
+        assert snapshot["runtimeKind"] == "visual_gen"
+        assert snapshot["visualGenInitializationAttempts"] == 1
+        assert snapshot["visualGenInstancesCreated"] == 1
+        assert snapshot["activeVisualGenInstances"] == 1
+        assert snapshot["llmInitializationAttempts"] == 0
+
+        usage_lib.record_visual_gen_shutdown()
+        assert usage_lib._SESSION.snapshot()["activeVisualGenInstances"] == 0
+
+    def test_mixed_session_exit_contains_both_runtime_counters(self, enable_telemetry):
+        """A shared process exit snapshot identifies mixed LLM/VisualGen use."""
+        assert usage_lib.record_llm_initialization_attempt()
+        assert usage_lib.record_llm_initialized()
+        assert usage_lib.record_visual_gen_initialization_attempt()
+        assert usage_lib.record_visual_gen_initialized()
+        sent = []
+
+        with patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append):
+            assert usage_lib.report_exit(
+                usage_lib.TerminalOutcome(
+                    termination_kind="clean",
+                    component="server",
+                    exit_code_known=True,
+                    exit_code=0,
+                )
+            )
+
+        parameters = sent[0]["events"][0]["parameters"]
+        assert parameters["runtimeKind"] == "mixed"
+        assert parameters["llmInstancesCreated"] == 1
+        assert parameters["visualGenInstancesCreated"] == 1
 
     def test_monotonic_counters_saturate_at_uint32(self, enable_telemetry):
         """Cumulative counters never exceed the SMS PositiveInt bound."""
