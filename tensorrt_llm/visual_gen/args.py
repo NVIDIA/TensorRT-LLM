@@ -412,6 +412,17 @@ class ParallelConfig(StrictBaseModel):
     def token_sharded_tp(self) -> bool:
         """True iff ``tp_layout`` is ``'token_sharded'`` (test this, not the field's truthiness)."""
         return self.tp_layout == "token_sharded"
+    text_encoder_tp_size: int = Field(
+        1,
+        ge=1,
+        status="prototype",
+        description=(
+            "Text encoder residency size. MiniMax-H3 loads its Qwen3-VL "
+            "text encoder on the first text_encoder_tp_size ranks and "
+            "broadcasts prompt embeddings to the remaining ranks. This "
+            "does not shard text-encoder weights."
+        ),
+    )
 
     @property
     def seq_parallel_size(self) -> int:
@@ -478,6 +489,11 @@ class ParallelConfig(StrictBaseModel):
         if self.total_parallel_size > world_size:
             raise ValueError(
                 f"total_parallel_size ({self.total_parallel_size}) "
+                f"exceeds world_size ({world_size})"
+            )
+        if self.text_encoder_tp_size > world_size:
+            raise ValueError(
+                f"text_encoder_tp_size ({self.text_encoder_tp_size}) "
                 f"exceeds world_size ({world_size})"
             )
 
