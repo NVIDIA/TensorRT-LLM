@@ -360,6 +360,14 @@ def initialize_dummy_weights(
         elif torch.is_floating_point(param):
             param.uniform_(low, high, generator=generator)
 
+    # Non-persistent buffers are intentionally absent from state_dict(). Let
+    # modules that need such buffers during dummy execution initialize them
+    # explicitly after the regular state has been populated.
+    for module in model.modules():
+        initialize_dummy_state = getattr(module, "initialize_dummy_state", None)
+        if initialize_dummy_state is not None:
+            initialize_dummy_state(low=low, high=high, seed=seed)
+
 
 def get_rank_model_storage(model):
     total_bytes = 0
@@ -1544,9 +1552,8 @@ class ModelLoader:
             checkpoint_loader: BaseCheckpointLoader) -> None:
         """Load draft/MTP weights from ``speculative_model`` into the one-engine model.
 
-        Eagle3 / external drafters use a draft-specific mapper and ``draft_config``.
-        One-model MTP with separate heads reuses the target architecture mapper
-        because MTP modules are already attached under the target model.
+        Each draft config initializes its own architecture mapper so replacement
+        MTP weights use the draft's quantization and MoE backend.
         """
         draft_load_kwargs = {}
         if checkpoint_loader.checkpoint_format == "MX":
@@ -1570,7 +1577,7 @@ class ModelLoader:
             draft_weight_mapper.init_model_and_config(model.draft_model,
                                                       model.draft_config)
         else:
-            # MTP one-model + separate MTP checkpoint: no draft HF architecture.
+            # Drafters without a separate config reuse the target mapper.
             draft_weight_mapper = self.weight_mapper
 
         with timing_metric(
@@ -2069,7 +2076,7 @@ class ModelLoader:
                 draft_weight_mapper.init_model_and_config(
                     model.draft_model, model.draft_config)
             else:
-                # MTP one-model + separate MTP checkpoint: no draft HF architecture.
+                # Drafters without a separate config reuse the target mapper.
                 draft_weight_mapper = self.weight_mapper
             _inspect_shadow_weight_load_plan(
                 checkpoint_loader,

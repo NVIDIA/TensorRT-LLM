@@ -675,7 +675,6 @@ tests/unittest/llmapi/apps/_test_openai_reasoning.py
 tests/unittest/llmapi/apps/_test_openai_responses.py
 tests/unittest/llmapi/apps/_test_openai_tool_call.py
 tests/unittest/llmapi/apps/_test_trtllm_serve_benchmark.py
-tests/unittest/llmapi/apps/_test_trtllm_serve_duplicated_args.py
 tests/unittest/llmapi/apps/_test_trtllm_serve_example.py
 tests/unittest/llmapi/apps/_test_trtllm_serve_lora.py
 tests/unittest/llmapi/apps/_test_trtllm_serve_multimodal_benchmark.py
