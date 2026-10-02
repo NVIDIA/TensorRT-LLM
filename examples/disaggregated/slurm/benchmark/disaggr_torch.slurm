@@ -17,6 +17,7 @@ while [[ $# -gt 0 ]]; do
         --build-wheel) build_wheel="$2"; shift 2 ;;
         --cuda-architectures) cuda_architectures="$2"; shift 2 ;;
         --trtllm-wheel-path) trtllm_wheel_path="$2"; shift 2 ;;
+        --mooncake-pool-file) mooncake_pool_file="$2"; shift 2 ;;
         *)
             echo "Unknown argument: $1"
             exit 1
@@ -39,6 +40,7 @@ echo "  container_image: ${container_image}"
 echo "  build_wheel: ${build_wheel}"
 echo "  cuda_architectures: ${cuda_architectures}"
 echo "  trtllm_wheel_path: ${trtllm_wheel_path}"
+echo "  mooncake_pool_file: ${mooncake_pool_file}"
 
 # Set TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode
 if [ "${benchmark_mode}" = "gen_only_no_context" ]; then
@@ -138,11 +140,6 @@ else
     echo "TensorRT-LLM environment variables saved to ${full_logdir}/env_vars.json"
 fi
 
-mooncake_enabled=false
-if grep -qs "mooncake-store" "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"; then
-    mooncake_enabled=true
-fi
-
 # Get node lists and replace the placeholder with the actual node names
 echo "SLURM_NODELIST: ${SLURM_NODELIST}"
 all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
@@ -159,60 +156,29 @@ client_cmds_base_file=${full_logdir}/client_cmds_base.sh
 client_cmds_file=${full_logdir}/client_cmds.sh
 replace_placeholder "${client_cmds_base_file}" "${all_nodes_str}" "${client_cmds_file}"
 
-# The pool's master runs as its own job step. One serves every server in the
-# job, it has to be answering before any of them opens a store handle, and the
-# manifest it publishes states the settings they must agree on. Each worker
-# config names that manifest as mooncake_store.pool.
-#
-# A config written before submission cannot know this job's log directory,
-# which the manifest is published into, so a __LOG_DIR__ placeholder in either
-# worker config is filled in here.
-if [ "${mooncake_enabled}" = "true" ]; then
-    sed -i "s|__LOG_DIR__|${full_logdir}|g" \
-        "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"
-
-    # Read from the worker configs so the master publishes where the workers
-    # look. With a fixed path, a config naming a different manifest would wait
-    # out the timeout below on one that is never written.
-    mooncake_pool_file=$(sed -n \
-        's|^[[:space:]]*pool:[[:space:]]*file://\([^[:space:]]*\).*$|\1|p' \
-        "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml" \
-        | sort -u)
-    if [ "$(printf '%s' "${mooncake_pool_file}" | grep -c '^')" -ne 1 ]; then
-        cleanup_on_failure "The worker configs must name one shared manifest as mooncake_store.pool for the single master this job starts, but they name: $(echo ${mooncake_pool_file} | tr '\n' ' '). A host:port pool is for joining a master run outside this script, which this path does not support"
-    fi
-    echo "Mooncake manifest: ${mooncake_pool_file}"
-    # A manifest left by an earlier attempt would be read as this run's and
-    # send every worker to a master that is gone.
+# One Mooncake master per job, up before any server opens a store handle.
+if [ -n "${mooncake_pool_file}" ]; then
+    # A stale manifest would send every worker to a master that is gone.
     rm -f "${mooncake_pool_file}"
 
     echo "Starting the Mooncake master..."
     srun --container-name=${container_name} \
         --container-mounts=${container_mount} --no-container-mount-home \
-        --mpi=pmix --overlap -N 1 -n 1 \
-        trtllm-serve mooncake_master \
-            --pool_file "${mooncake_pool_file}" \
-            --run_dir "${full_logdir}" \
-        &> ${full_logdir}/2_mooncake_master_step.log &
-    mooncake_master_step_pid=$!
+        --overlap -N 1 -n 1 \
+        trtllm-serve mooncake_master --run_dir "${full_logdir}" \
+        &> ${full_logdir}/2_mooncake_master.log &
+    mooncake_master_pid=$!
 
-    # Fail closed: a pool that never came up serves no lookup, so the run
-    # completes reporting no hits, which reads as a workload with no reuse
-    # rather than as a broken deployment.
-    #
-    # Generous, because the wait spans container start on another node. It
-    # costs nothing when the manifest is already there, and the loop below
-    # exits early if the master dies.
-    mooncake_master_wait=900
-    echo "Waiting up to ${mooncake_master_wait}s for the pool manifest at ${mooncake_pool_file}..."
-    for _ in $(seq 1 ${mooncake_master_wait}); do
+    # A pool that never came up reads as a workload with no reuse, so fail closed.
+    echo "Waiting for the pool manifest at ${mooncake_pool_file}..."
+    for _ in $(seq 1 900); do
         [ -s "${mooncake_pool_file}" ] && break
-        if ! kill -0 ${mooncake_master_step_pid} 2>/dev/null; then
-            cleanup_on_failure "The Mooncake master exited before publishing ${mooncake_pool_file}. Check ${full_logdir}/2_mooncake_master_step.log and ${full_logdir}/mooncake_master.log"
-        fi
+        kill -0 ${mooncake_master_pid} 2>/dev/null \
+            || cleanup_on_failure "The Mooncake master exited before publishing ${mooncake_pool_file}. Check ${full_logdir}/2_mooncake_master.log and ${full_logdir}/mooncake_master.log"
         sleep 1
     done
-    [ -s "${mooncake_pool_file}" ] || cleanup_on_failure "No Mooncake pool manifest at ${mooncake_pool_file} after ${mooncake_master_wait}s, so no worker could have joined the pool. Check ${full_logdir}/2_mooncake_master_step.log and ${full_logdir}/mooncake_master.log"
+    [ -s "${mooncake_pool_file}" ] \
+        || cleanup_on_failure "No Mooncake pool manifest at ${mooncake_pool_file}, so no worker could join the pool. Check ${full_logdir}/2_mooncake_master.log and ${full_logdir}/mooncake_master.log"
     echo "Mooncake pool manifest published:"
     cat "${mooncake_pool_file}"
 fi
@@ -249,49 +215,17 @@ while read -r cmd <&3; do
     fi
 done 3< "${client_cmds_file}"
 
-# Collect what the pool actually was, and what the store did with it.
-#
-# The capacity half comes from the manifest and from each rank's segment
-# record rather than from log lines, which would tie the decode share reported
-# here to the wording of one provisioning path's message.
-#
-# The traffic half is log-derived, per-event lines being all there is. They
-# live at DEBUG (module _torch), so the counts are populated only when a
-# config asks for that verbosity.
-if [ "${mooncake_enabled}" = "true" ]; then
-    mooncake_summary="${full_logdir}/9_mooncake_summary.log"
-    {
-        echo "== pool =="
-        srun --container-name=${container_name} \
-            --container-mounts=${container_mount} --no-container-mount-home \
-            --overlap -N 1 -n 1 \
-            trtllm-serve mooncake_pool_report --run_dir "${full_logdir}" \
-            2>/dev/null || echo "(could not read the pool's records)"
-        echo
-        # Both roles, since a decode-side segment that never mounted shows up
-        # only in the generation logs.
-        echo "== startup =="
-        grep -h "mooncake-store" \
-            "${full_logdir}"/3_output_CTX_*.log \
-            "${full_logdir}"/3_output_GEN_*.log 2>/dev/null \
-            | head -n 40 || echo "(none; the connector may not have loaded)"
-        echo
-        # Only the roles that transfer produce these, so the context logs are
-        # the whole population. A capacity rank contributing nothing here is
-        # intended, not a missing signal.
-        echo "== event counts (context workers) =="
-        for pattern in "matched" "loaded" "failed to load" "failed to save" \
-                       "lookup failed" "could not reserve connector prefix"; do
-            count=$(grep -h "mooncake-store.*${pattern}" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null | wc -l || true)
-            echo "${pattern}: ${count}"
-        done
-        echo
-        # The master's own glog output, not anything TensorRT-LLM writes.
-        echo "== master =="
-        tail -n 50 "${full_logdir}/mooncake_master.log" 2>/dev/null || echo "(no master log)"
-    } > "${mooncake_summary}" 2>&1
-    echo "Mooncake store summary written to ${mooncake_summary}"
-    cat "${mooncake_summary}"
+# Signalled before the scancel below so it withdraws the manifest it published.
+if [ -n "${mooncake_pool_file}" ]; then
+    echo "Stopping the Mooncake master..."
+    kill ${mooncake_master_pid} 2>/dev/null || true
+    for _ in $(seq 1 30); do
+        kill -0 ${mooncake_master_pid} 2>/dev/null || break
+        sleep 1
+    done
+    kill -0 ${mooncake_master_pid} 2>/dev/null \
+        && echo "The Mooncake master did not stop on its own; scancel will take it." \
+        || echo "Mooncake master stopped."
 fi
 
 echo "Job completed successfully, total runtime: $SECONDS seconds"

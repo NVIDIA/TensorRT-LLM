@@ -76,47 +76,6 @@ fi
 
 echo "config_file: ${config_file}"
 
-# mooncake_store.run_dir has to point inside the job's log directory, since
-# the ranks srun started never inherit the leader's environment and read the
-# rendered client config back from there. It also has to differ per server:
-# two sharing one render a single client config between them. The worker
-# config is shared by every server of a role and can only carry __LOG_DIR__,
-# so the per-server part is substituted here, where the role and the instance
-# are known. Each rank renders its own copy, from the same value, so that they
-# do not race over one file. See the Mooncake section of README.md.
-if grep -q '__MOONCAKE_RUN_DIR__' "${config_file}"; then
-    role_lower=$(echo "${role}" | tr '[:upper:]' '[:lower:]')
-    mooncake_run_dir="${log_dir}/mooncake_${role_lower}_${instance_id}"
-    rendered_config="${log_dir}/config_${role}_${instance_id}_rank${SLURM_PROCID}.yaml"
-    sed "s|__MOONCAKE_RUN_DIR__|${mooncake_run_dir}|g" \
-        "${config_file}" > "${rendered_config}"
-    config_file="${rendered_config}"
-    echo "mooncake_store.run_dir: ${mooncake_run_dir} (config ${config_file})"
-fi
-
-# MiniMax-M3's MSA sparse attention JIT-compiles its FMHA kernels on first use,
-# from inside the attention forward pass, stalling the executor loop for ~8s
-# per uncached variant. The cache defaults to ~/.cache, which the container
-# discards (--no-container-mount-home), so every job would recompile during
-# serving. Anchoring it next to this script puts it on the mounted filesystem
-# at a path identical across jobs, so only the first run compiles.
-if [ -z "${MINFER_FMHA_CACHE_DIR:-}" ]; then
-    export MINFER_FMHA_CACHE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.cache/minfer/fmha_sm100"
-    mkdir -p "${MINFER_FMHA_CACHE_DIR}"
-    echo "MINFER_FMHA_CACHE_DIR: ${MINFER_FMHA_CACHE_DIR}"
-fi
-
-# Per-transfer KV timings (size, queue/transfer latency, throughput) as CSV
-# next to the worker logs. They separate slow prefill from a slow
-# prefill-to-decode handoff, which the aggregate numbers cannot. An explicit
-# setting wins, and KV_TRANSFER_PERF_LOG=false turns it off.
-if [ "${KV_TRANSFER_PERF_LOG:-true}" = "true" ] \
-    && [ -z "${TLLM_KV_TRANSFER_PERF_LOG_FILE:-}" ]; then
-    export TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1
-    export TLLM_KV_TRANSFER_PERF_LOG_FILE="${log_dir}/kv_transfer_perf"
-    echo "TLLM_KV_TRANSFER_PERF_LOG_FILE: ${TLLM_KV_TRANSFER_PERF_LOG_FILE}"
-fi
-
 nsys_prefix=""
 if [ "${enable_nsys}" != "true" ]; then
     echo "nsys is not enabled, start normal flow"
