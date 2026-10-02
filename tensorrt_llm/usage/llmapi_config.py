@@ -579,16 +579,28 @@ def _capture_path(
     preserve positions: an absent, excluded or unsafe element omits the whole
     field instead of shortening it or fabricating nulls. Empty lists are
     captured as [], and nullable *leaf* values still follow their own policy.
+    Missing optional models skip the field without counting as unsafe values.
     """
     segments = entry.path.split(".")
     field_state = _CaptureState()
+
+    def list_item_annotations(annotation: Any) -> tuple[Any, ...]:
+        annotation = _unwrap_annotated(annotation)
+        if _is_union(annotation):
+            return tuple(
+                item for branch in get_args(annotation) for item in list_item_annotations(branch)
+            )
+        return get_args(annotation) if get_origin(annotation) is list else ()
 
     def visit(
         value: Any,
         variants: tuple[_PolicyVariant, ...],
         route_index: int,
         segment_index: int,
+        annotations: tuple[Any, ...],
     ) -> tuple[bool, bool, Any]:
+        if value is None and any(_annotation_allows_none(ann) for ann in annotations):
+            return False, True, None
         matching = tuple(
             variant for variant in variants if variant.route[route_index] is type(value)
         )
@@ -596,11 +608,20 @@ def _capture_path(
             return False, False, None
         if type(value) is list:
             projected = []
+            complete = True
+            item_annotations = tuple(
+                item for ann in annotations for item in list_item_annotations(ann)
+            )
             for item in value:
-                present, safe, captured = visit(item, matching, route_index + 1, segment_index)
-                if not present or not safe:
+                present, safe, captured = visit(
+                    item, matching, route_index + 1, segment_index, item_annotations
+                )
+                if not safe:
                     return True, False, None
+                complete &= present
                 projected.append(captured)
+            if not complete:
+                return False, True, None
             if len(projected) > MAX_SEQ_ITEMS:
                 projected = projected[:MAX_SEQ_ITEMS]
                 field_state.sequence_truncated = True
@@ -610,10 +631,11 @@ def _capture_path(
         if segment_index == len(segments) - 1:
             safe, captured = _sanitize_policy(field_value, matching[0].policy, field_state)
             return True, safe, captured
-        return visit(field_value, matching, route_index + 1, segment_index + 1)
+        annotation = type(value).model_fields[segments[segment_index]].annotation
+        return visit(field_value, matching, route_index + 1, segment_index + 1, (annotation,))
 
-    present, safe, captured = visit(instance, entry.variants, 0, 0)
-    if safe:
+    present, safe, captured = visit(instance, entry.variants, 0, 0, (type(instance),))
+    if present and safe:
         state.sequence_truncated |= field_state.sequence_truncated
     return present, safe, captured
 

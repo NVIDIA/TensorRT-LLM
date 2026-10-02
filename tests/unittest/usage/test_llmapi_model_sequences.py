@@ -91,13 +91,42 @@ def test_nested_model_lists_and_nullable_leaves_preserve_positions() -> None:
     assert capture.manifest_rows(_Groups)[0]["capture_policy"] == "list[list[int|none]]"
 
 
-def test_optional_model_inside_list_does_not_fabricate_null_leaf() -> None:
-    class _OptionalItems(StrictBaseModel):
-        items: list[_Leaf | None]
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("invalid", [False, True])
+def test_optional_model_inside_list_does_not_fabricate_null_leaf(
+    nested: bool, invalid: bool
+) -> None:
+    annotation = list[list[_Leaf | None]] if nested else list[_Leaf | None]
 
-    config, metadata = _collect(_OptionalItems(items=[_Leaf(value=1), None]))
+    class _OptionalItems(StrictBaseModel):
+        items: annotation
+
+    items = [None, _Leaf(value=1)]
+    args = _OptionalItems(items=[items] if nested else items)
+    if invalid:
+        # A valid missing model must not hide a later unsafe value.
+        items = args.items[0] if nested else args.items
+        items[-1].value = "private"
+    config, metadata = _collect(args)
     assert config == {}
-    assert metadata["unsafe_excluded"] is True
+    assert metadata["capture_succeeded"] is True
+    assert metadata["unsafe_excluded"] is invalid
+    assert metadata["excluded_field_count"] == int(invalid)
+
+
+def test_missing_optional_model_does_not_mark_projection_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _OptionalItems(StrictBaseModel):
+        items: list[_InputSpec | None]
+
+    monkeypatch.setattr(capture, "MAX_SEQ_ITEMS", 1)
+    args = _OptionalItems(items=[_InputSpec(shape=("num_tokens", 20)), None])
+    config, metadata = _collect(args)
+    assert config == {}
+    assert metadata["sequence_truncated"] is False
+    assert metadata["unsafe_excluded"] is False
+    assert metadata["excluded_field_count"] == 0
 
 
 @pytest.mark.parametrize("container", ["tuple", "mixed_tuple", "set", "list_of_tuples"])

@@ -32,7 +32,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-308 captured fields.
+310 captured fields.
 
 | Captured key | Capture policy | Kind | Categorical domain |
 |--------------|----------------|------|--------------------|
@@ -133,6 +133,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.avg_seq_len` | `int\|none` | `value` |  |
 | `kv_cache_config.block_reuse_config.max_num_turns` | `int` | `value` |  |
 | `kv_cache_config.block_reuse_config.policy` | `literal` | `categorical` | `all_reusable`, `per_request`, `per_conversation` |
+| `kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens` | `int` | `value` |  |
 | `kv_cache_config.copy_on_partial_reuse` | `bool` | `value` |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `float\|none` | `value` |  |
 | `kv_cache_config.disk_cache_size` | `int\|none` | `value` |  |
@@ -250,6 +251,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.algorithm` | `literal` | `categorical` | `dsa`, `deepseek_v4`, `minimax_m3`, `qsa`, `rocket`, `skip_softmax` |
 | `sparse_attention_config.compress_ratios` | `list[int]` | `value` |  |
 | `sparse_attention_config.enable_heuristic_topk` | `bool` | `value` |  |
+| `sparse_attention_config.enable_kv_cache_offload` | `bool` | `value` |  |
 | `sparse_attention_config.fuse_qkv_index_projection` | `bool` | `value` |  |
 | `sparse_attention_config.implementation` | `literal` | `categorical` | `triton`, `msa` |
 | `sparse_attention_config.index_head_dim` | `int\|none` | `value` |  |
