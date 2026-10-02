@@ -1157,6 +1157,55 @@ class TestW4A16AWQMLP(_AWQMLPMixin):
 
     quant_algo = QuantAlgo.W4A16_AWQ
 
+    @pytest.mark.parametrize("has_scale", [False, True])
+    @pytest.mark.parametrize("tp_mode", [TensorParallelMode.COLUMN, TensorParallelMode.ROW])
+    def test_optional_pre_quant_scale(self, has_scale: bool, tp_mode: TensorParallelMode) -> None:
+        dim, tp_size = 256, 2
+        dtype = torch.float16
+        weights = build_weights(dim, dim, self.quant_algo, bias=False)
+        pre_quant_scale = torch.linspace(0.5, 1.5, dim, dtype=dtype, device="cuda")
+        if has_scale:
+            weights[0]["pre_quant_scale"] = pre_quant_scale
+        else:
+            weights[0].pop("pre_quant_scale")
+
+        x = torch.randn(3, dim, dtype=dtype, device="cuda")
+        outputs = []
+        for rank in range(tp_size):
+            linear = Linear(
+                dim,
+                dim,
+                bias=False,
+                dtype=dtype,
+                mapping=FakeMapping(tp_size, rank),
+                quant_config=QuantConfig(
+                    quant_algo=self.quant_algo, group_size=128, has_zero_point=False
+                ),
+                tensor_parallel_mode=tp_mode,
+                reduce_output=False,
+            )
+            linear.load_weights(weights)
+            linear.post_load_weights()
+            linear.cuda()
+            if has_scale:
+                expected_scale = pre_quant_scale
+                if tp_mode == TensorParallelMode.ROW:
+                    expected_scale = pre_quant_scale.chunk(tp_size)[rank]
+                torch.testing.assert_close(linear.pre_quant_scale, expected_scale)
+            else:
+                assert linear.pre_quant_scale is None
+            shard_input = x.chunk(tp_size, dim=-1)[rank] if tp_mode == TensorParallelMode.ROW else x
+            outputs.append(linear(shard_input.contiguous()))
+
+        result = (
+            torch.cat(outputs, dim=-1) if tp_mode == TensorParallelMode.COLUMN else sum(outputs)
+        )
+        # The synthetic checkpoint maps input i to output i + 1 with unit weight.
+        reference_weight = torch.diag(torch.ones(dim - 1, dtype=dtype, device="cuda"), diagonal=-1)
+        scaled_input = x * pre_quant_scale if has_scale else x
+        expected = torch.nn.functional.linear(scaled_input, reference_weight)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
 
 @pytest.mark.skipif(
     not (get_sm_version() in (89, 90) or is_sm_100f()),
