@@ -214,6 +214,28 @@ class CutlassFusedMoE(MoEImplBase):
         sm_version = d.env.sm
         quant_algo = p.quant_algo
 
+        if not torch.ops.trtllm.is_oss_cutlass_moe():
+            if p.activation_type in (ActivationType.SiTu, ActivationType.Relu2):
+                return _reject(
+                    MoERejectReason.ACTIVATION_UNSUPPORTED,
+                    f"CutlassFusedMoE {p.activation} requires a build with "
+                    "USING_OSS_CUTLASS_MOE_GEMM=ON")
+            if quant_algo in (QuantAlgo.MXFP8, QuantAlgo.W4A8_MXFP4_MXFP8):
+                return _reject(
+                    MoERejectReason.QUANT_UNSUPPORTED,
+                    f"CutlassFusedMoE {quant_algo.name} requires a build with "
+                    "USING_OSS_CUTLASS_MOE_GEMM=ON")
+            if p.clamp_after_silu:
+                return _reject(
+                    MoERejectReason.ACTIVATION_UNSUPPORTED,
+                    "CutlassFusedMoE post-SiLU clamping requires a build with "
+                    "USING_OSS_CUTLASS_MOE_GEMM=ON")
+            if d.moe_lora_enabled:
+                return _reject(
+                    MoERejectReason.LORA_UNSUPPORTED,
+                    "CutlassFusedMoE routed-expert LoRA requires a build with "
+                    "USING_OSS_CUTLASS_MOE_GEMM=ON")
+
         # Check minimum SM version for Cutlass backend
         if sm_version < 80:
             return _reject(

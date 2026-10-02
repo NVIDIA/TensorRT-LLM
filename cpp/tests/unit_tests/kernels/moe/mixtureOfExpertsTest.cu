@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
+#include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
 #include <algorithm>
@@ -25,12 +26,11 @@
 
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
 #include "tensorrt_llm/kernels/moe/cutlass/include/moe_kernels.h"
-#include <tensorrt_llm/kernels/quantization.h>
 #else
 #include "moe_kernels.h"
-#include "quantization.h"
 #endif
 #include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_gemm_kernels.h"
 
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -42,7 +42,10 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
 using namespace CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
-using CUTLASS_MOE_GEMM_NAMESPACE::TmaWarpSpecializedGroupedGemmInput;
+using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
+#if !defined(USING_OSS_CUTLASS_MOE_GEMM)
+using MoeGemmId = GemmProfilerBackend::GemmToProfile;
+#endif
 using CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::CutlassMoeFCRunner;
 using CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
 using CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::ActivationParams;
@@ -343,19 +346,12 @@ protected:
     using ElementSF = TmaWarpSpecializedGroupedGemmInput::ElementSF;
     constexpr static int FP4VecSize = MX_QUANT_WEIGHT ? TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize
                                                       : TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
-#ifdef USING_OSS_CUTLASS_MOE_GEMM
     constexpr static int MinNDimAlignmentFP4 = MX_QUANT_WEIGHT
         ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX
         : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4;
     constexpr static int MinKDimAlignmentFP4 = MX_QUANT_WEIGHT
         ? TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX
         : TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4;
-#else
-    constexpr static int MinNDimAlignmentFP4 = MX_QUANT_WEIGHT
-        ? TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentMXFPX
-        : TmaWarpSpecializedGroupedGemmInput::MiNumRowsAlignmentNVFP4;
-    constexpr static int MinKDimAlignmentFP4 = FP4VecSize * 4; // Hardcode the correct value
-#endif
     ElementSF* mFP4ScalingFactorsW1 = nullptr;
     ElementSF* mFP4ScalingFactorsW2 = nullptr;
 
@@ -800,15 +796,9 @@ protected:
         int64_t padded_in_dim = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(in_shape, MinKDimAlignmentFP4);
         check_cuda_error(cudaMemsetAsync(scaling_factors, 0x00,
             num_experts * padded_out_dim * padded_in_dim / FP4VecSize * sizeof(ElementSF), mStream->get()));
-#ifdef USING_OSS_CUTLASS_MOE_GEMM
         invokeFP4Quantization<WeightRawType, FP4VecSize>(num_experts, out_shape, in_shape, raw_weights, global_scales,
             reinterpret_cast<int64_t*>(quant_weights), reinterpret_cast<int32_t*>(scaling_factors), MX_QUANT_WEIGHT,
             tensorrt_llm::QuantizationSFLayout::SWIZZLED, mMultiProcessorCount, mStream->get());
-#else
-        invokeBatchedFP4Quantization<WeightRawType, FP4VecSize>(num_experts, out_shape, in_shape, raw_weights,
-            global_scales, reinterpret_cast<int64_t*>(quant_weights), reinterpret_cast<int32_t*>(scaling_factors),
-            MX_QUANT_WEIGHT, mMultiProcessorCount, mStream->get());
-#endif
 
         // auto sf_data = getDataFromDevice<ElementSF>(scaling_factors, num_experts * padded_out_dim * padded_in_dim /
         // FP4VecSize); auto unquant_data = getDataFromDevice<WeightRawType>(raw_weights, num_experts * out_shape *
@@ -1237,7 +1227,11 @@ protected:
 
     auto getFilteredConfigs(int sm, MoeGemmId gemm_id)
     {
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
         auto tactics = mMoERunner.getTactics(gemm_id);
+#else
+        auto tactics = mMoERunner.getTactics();
+#endif
         if (sm == 89 || sm >= 120)
         {
             // Filter some unsupported configs for L40S
@@ -1404,8 +1398,12 @@ protected:
             }
             else if constexpr (MXFP8_MXFP4)
             {
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
                 quant_params = QuantParams::MXFP8MXFP4(mFP4ScalingFactorsW1, static_cast<float const*>(scale1_ptr),
                     mFP4ScalingFactorsW2, static_cast<float const*>(scale3_ptr));
+#else
+                GTEST_SKIP() << "MXFP8 x MXFP4 requires the open-source CUTLASS MoE kernels";
+#endif
             }
         }
 
@@ -1435,11 +1433,11 @@ protected:
             mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, enable_alltoall,
             mUseLora, lora_params, useFp8BlockScales, minLatencyMode, min_latency_params, stream);
 #else
-        mMoERunner.runMoe(mInputTensor, nullptr, true, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
-            ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit, mSwigluClampAfterSilu), weight2_ptr,
-            bias2_ptr, quant_params, mTotalTokens, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size,
-            mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params,
-            useFp8BlockScales, minLatencyMode, min_latency_params, stream);
+        mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
+            ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit), weight2_ptr, bias2_ptr, quant_params,
+            mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace,
+            mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params, useFp8BlockScales,
+            minLatencyMode, min_latency_params, stream);
 #endif
 
         check_cuda_error(cudaStreamSynchronize(stream));
@@ -1731,8 +1729,10 @@ protected:
         // 1 expert per rank
         ParallelismTest(k, 1, num_experts, hidden_size, num_experts, num_tokens);
 
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
         // 2 expert per rank, enable alltoall optimised finalize
         ParallelismTest(k, 1, num_experts / 2, hidden_size, num_experts, num_tokens, true);
+#endif
     }
 
     // Tensor parallel tests default to inter_size_fraction = 1.0f so that all ranks have interesting values (i.e. a
@@ -1798,7 +1798,9 @@ using Types = ::testing::Types<
 
 #ifdef ENABLE_BF16
 #ifdef ENABLE_FP8
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
     WeightParams<SafeFP8, cutlass::uint4b_t, __nv_bfloat16, void, __nv_bfloat16>,
+#endif
 #endif
 #endif
     WeightParams<half>, WeightParams<float>
@@ -1988,6 +1990,9 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluBias)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluPostSiluClamp)
 {
+#if !defined(USING_OSS_CUTLASS_MOE_GEMM)
+    GTEST_SKIP() << "Post-SiLU SwiGLU clamping requires the open-source CUTLASS MoE kernels";
+#endif
     if (this->W4A8_AWQ)
     {
         GTEST_SKIP() << "W4A8 does not support gated activations";
@@ -2142,6 +2147,12 @@ template <class TypeParam_>
 void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
     int k, int tp_size, int ep_size, int64_t hidden_size, int64_t num_experts, int64_t num_tokens, bool enable_alltoall)
 {
+#if !defined(USING_OSS_CUTLASS_MOE_GEMM)
+    if (mUnpaddedHiddenSize > 0 && mUnpaddedHiddenSize != hidden_size)
+    {
+        GTEST_SKIP() << "Unpadded MoE output requires the open-source CUTLASS MoE kernels";
+    }
+#endif
     if (NVFP4 || (MXFP8_MXFP4 && isGatedActivation(mActType)))
     {
         // TODO Remove this when bias + FPX is supported
