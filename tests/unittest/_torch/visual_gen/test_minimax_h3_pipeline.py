@@ -1172,8 +1172,11 @@ def test_pipeline_rejects_unsupported_ulysses_topology(field: str, value: int) -
         config.mapping.world_size = 8
     elif field == "tp_size":
         config.mapping.tp_size = value
+        config.visual_gen_mapping.world_size *= value
     else:
         setattr(config.visual_gen_mapping, field, value)
+        if field != "ulysses_size":
+            config.visual_gen_mapping.world_size *= value
     with pytest.raises(NotImplementedError, match="pure Ulysses"):
         MiniMaxH3Pipeline(config)
 
