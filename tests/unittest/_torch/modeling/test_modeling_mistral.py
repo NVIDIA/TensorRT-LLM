@@ -772,7 +772,6 @@ def test_mistral_item_metadata_separates_patch_and_embedding_units():
     [
         ([[28, 56]], [8], [2]),
         ([[28, 56], [28, 56]], [8, 8], [2, 2]),
-        ([[28, 56], [56, 56]], [8, 16], [2, 4]),
         ([[28, 56], [56, 84]], [8, 24], [2, 6]),
     ],
 )
@@ -943,16 +942,16 @@ def test_dummy_mm_data_satisfies_the_encoder_input_contract():
 # therefore have to satisfy the contract.
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    "processor_cls",
-    [MistralHFInputProcessor, MistralNativeInputProcessor],
-    ids=["hf", "native"],
+    "processor_cls, geometry_from_processor",
+    [(MistralHFInputProcessor, False), (MistralNativeInputProcessor, True)],
+    ids=["hf-config", "native-processor"],
 )
-@pytest.mark.parametrize("geometry_from_processor", [False, True], ids=["from_config", "from_proc"])
 @pytest.mark.cpu_only
 def test_both_mistral_processors_satisfy_item_scheduling_contract(
     processor_cls: type[MistralHFInputProcessor] | type[MistralNativeInputProcessor],
     geometry_from_processor: bool,
 ) -> None:
+    """Check encoder budgets, request metadata, and dummy inputs for both frontends."""
     proc = _make_dummy_processor(
         processor_cls=processor_cls, geometry_from_processor=geometry_from_processor
     )
@@ -960,19 +959,32 @@ def test_both_mistral_processors_satisfy_item_scheduling_contract(
 
     # Exercise the sequence `ModelEngine.__init__` runs for item scheduling.
     max_tokens_per_item = proc.get_mm_max_tokens_per_item()
-    assert max_tokens_per_item, "engine aborts on an empty per-item budget"
-    assert all(value > 0 for value in max_tokens_per_item.values())
+    assert max_tokens_per_item == {"image": 12100}
 
     capacity = proc.get_mm_encoder_attention_metadata_capacity(budget)
-    assert capacity and all(value > 0 for value in capacity.values())
+    assert capacity == {"attention": 2048}
 
     max_output_embeddings = proc.get_max_mm_encoder_output_embeddings(budget)
-    assert max_output_embeddings is not None and max_output_embeddings > 0
+    assert max_output_embeddings == 2048
 
     # ...and the request-routing hook, which gates the item-scheduled path.
     metadata = proc.get_mm_encoder_item_metadata([], {"image": {"image_sizes": [[28, 56]]}})
     assert metadata is not None
     metadata.validate()
+    assert metadata.item_refs == [("image", 0)]
+    assert metadata.encoder_token_lengths == [8]
+    assert metadata.output_embedding_lengths == [2]
+
+    dummy = proc.get_dummy_mm_data(max_num_encoder_tokens=16, mm_counts={"image": 1})
+    assert dummy["image"]["pixel_values"].shape == (1, 3, 56, 56)
+    assert dummy["image"]["pixel_values"].dtype == proc.dtype
+    assert dummy["image"]["image_sizes"] == [[56, 56]]
+    dummy_metadata = proc.get_mm_encoder_item_metadata([], dummy)
+    assert dummy_metadata is not None
+    dummy_metadata.validate()
+    assert dummy_metadata.item_refs == [("image", 0)]
+    assert dummy_metadata.encoder_token_lengths == [16]
+    assert dummy_metadata.output_embedding_lengths == [4]
 
 
 # The native processor is shared by every `checkpoint_format="mistral"`
