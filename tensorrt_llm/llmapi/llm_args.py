@@ -5870,9 +5870,11 @@ class TorchLlmArgs(BaseLlmArgs):
         "enable_iter_req_stats). A value of 1 builds a record every iteration. "
         "With N > 1, numCompletedRequests and numNewActiveRequests in each "
         "record also include the iterations skipped since the previous record, "
-        "so their sums over all records stay exact, and one extra record is "
-        "emitted when the last active request finishes. All other fields "
-        "describe only the sampled iteration.",
+        "so their sums over all records stay exact, and without attention DP "
+        "one extra record is emitted when the last active request finishes. "
+        "All other fields describe only the sampled iteration. With "
+        "enable_iter_req_stats, requests that finish in a skipped iteration "
+        "get no requestStats entry.",
         status="prototype")
 
     print_iter_log: bool = Field(default=False,

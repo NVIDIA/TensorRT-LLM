@@ -10,8 +10,9 @@ unbound against a minimal fake ``self`` and check that:
   decision only depends on ``iter_counter`` (so all ranks agree);
 * ``numNewActiveRequests`` / ``numCompletedRequests`` from skipped iterations
   are folded into the next emitted record, so sums over records stay exact;
-* an unsampled batch that drains the executor still emits one record, so the
-  carried-over counters are not held back while the executor is idle;
+* without attention DP, an unsampled batch that drains the executor still
+  emits one record, so the carried-over counters are not held back while the
+  executor is idle;
 * an interval of 1 still builds a record on every iteration;
 * KV-cache iteration deltas are keyed on the record's construction iteration,
   so they still line up with sampled records under the overlap scheduler.
@@ -196,6 +197,15 @@ def test_draining_skipped_batch_without_pending_counters_emits_nothing():
     fake = _build_fake_self(interval=4)
     _process(fake, None, iter_id=5, finished=[], active=[])
     fake._update_iter_stats.assert_not_called()
+
+
+def test_attention_dp_never_flushes_unsampled_batch():
+    """Under attention DP the drain decision is rank-local, so it is skipped."""
+    fake = _build_fake_self(interval=4)
+    fake.enable_attention_dp = True
+    _process(fake, None, iter_id=3, finished=[MagicMock()], active=[])
+    fake._update_iter_stats.assert_not_called()
+    assert fake._pending_num_completed_requests == 1
 
 
 def test_interval_one_never_flushes_unsampled_batch():

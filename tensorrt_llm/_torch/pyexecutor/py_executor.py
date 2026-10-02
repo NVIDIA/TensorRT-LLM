@@ -979,7 +979,7 @@ class PyExecutor:
         self._kv_iter_stats_interval = getattr(
             getattr(self.llm_args, 'kv_cache_config', None),
             'iteration_stats_interval', 1)
-        if (self.enable_iter_perf_stats and self.iter_perf_stats_interval > 1
+        if (self.enable_iter_perf_stats and self._kv_iter_stats_interval > 1
                 and self._kv_iter_stats_interval % self.iter_perf_stats_interval
                 != 0):
             # KV iteration deltas are only fetched for sampled records, so the
@@ -2110,9 +2110,11 @@ class PyExecutor:
         skipped iterations are pending. The executor goes idle after such a
         batch, so waiting for the next sampled iteration could hold those
         counters back indefinitely. Always False with an interval of 1, which
-        keeps the default behavior unchanged.
+        keeps the default behavior unchanged. Also False under attention DP,
+        where a rank-local drain record would misalign the ADP stats payloads.
         """
-        return (self.iter_perf_stats_interval > 1 and not active_requests
+        return (self.iter_perf_stats_interval > 1
+                and not self.enable_attention_dp and not active_requests
                 and (self._pending_num_completed_requests > 0
                      or self._pending_num_new_active_requests > 0))
 
