@@ -187,16 +187,29 @@ def _prune_on_gc(cache, key, *keyobjs):
         weakref.finalize(o, cache.pop, key, None)
 
 
+def _release_scratch_wrappers(entry):
+    """Drop the cached cute wrappers of scratch tensors that leave an LRU cache.
+
+    A wrapper from ``_ct_cached`` pins its tensor's storage, so the finalizer
+    registered by ``_prune_on_gc`` never runs for it. Evicted scratch must
+    release its wrappers here, or every evicted shape stays allocated forever.
+    """
+    ids = {id(t) for t in entry if isinstance(t, torch.Tensor)}
+    for key in [k for k in _input_wrap_cache if k[0] in ids]:
+        _input_wrap_cache.pop(key, None)
+
+
 def _ct_cached(t, etype):
     """`_ct(t, etype)` with id(t)-based cache. Returns the same cute wrapper
     for repeated calls with the same tensor object, avoiding per-call
     `from_dlpack` overhead (~5-10us each).
 
-    ONLY use for tensors with process-long lifetime (module params, the
-    module-level scratch from ``_get_buffers``): the cached wrapper pins the
-    tensor's storage, so the weakref pruning never fires for the keyed
+    ONLY use for tensors with process-long lifetime (module params) and for
+    the module-level scratch from ``_get_buffers``: the cached wrapper pins
+    the tensor's storage, so the weakref pruning never fires for the keyed
     object and a per-call activation would be pinned forever (~100MB/call
     leak in the executor runtime). Per-call tensors must use plain ``_ct``.
+    ``_get_buffers`` releases the wrappers of the scratch it evicts.
     """
     key = (id(t), etype)
     w = _input_wrap_cache.get(key)
@@ -471,7 +484,7 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
         )
 
         while len(_buf_cache) >= _BUF_CACHE_MAX_ENTRIES:
-            _buf_cache.pop(next(iter(_buf_cache)))
+            _release_scratch_wrappers(_buf_cache.pop(next(iter(_buf_cache))))
         _buf_cache[key] = (
             k_scaled,
             kg,
