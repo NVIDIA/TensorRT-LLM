@@ -40,7 +40,8 @@ from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
 from ..runtime import ModelConfig
-from ..sampling_params import BatchedLogitsProcessor, SamplingParams
+from ..sampling_params import (BatchedLogitsProcessor, EmbeddingBias,
+                               SamplingParams)
 from .executor import GenerationExecutor, IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
@@ -338,6 +339,24 @@ class BaseWorker(GenerationExecutor):
             model_config=self._runtime_model_config,
             uids=[str(prompt_adapter_request.adapter_id)])
 
+    @staticmethod
+    def _embedding_bias_sparse_to_dense(embedding_bias: EmbeddingBias, *,
+                                        vocab_size: int) -> torch.Tensor:
+        return torch.zeros(
+            vocab_size,
+            dtype=torch.float32,
+        ).scatter_(
+            dim=0,
+            index=torch.tensor(
+                [idx for (idx, val) in embedding_bias],
+                dtype=torch.int32,
+            ),
+            src=torch.tensor(
+                [val for (idx, val) in embedding_bias],
+                dtype=torch.float32,
+            ),
+        )
+
     def _enqueue_request(self,
                          request: GenerationRequest,
                          result_wait_queue=None) -> int:
@@ -490,7 +509,13 @@ class BaseWorker(GenerationExecutor):
                 bad_words=request.sampling_params._get_bad_words(),
                 stop_words=[] if request.sampling_params.ignore_eos else
                 request.sampling_params._get_stop_words(),
-                embedding_bias=request.sampling_params.embedding_bias,
+                embedding_bias=(
+                    None if request.sampling_params._embedding_bias_sparse
+                    is None or self._is_pytorch_backend else
+                    self._embedding_bias_sparse_to_dense(
+                        request.sampling_params._embedding_bias_sparse,
+                        vocab_size=self._runtime_model_config.vocab_size,
+                    )),
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
                 multimodal_input=multimodal_input,
@@ -512,6 +537,7 @@ class BaseWorker(GenerationExecutor):
                 request.sampling_params.logprobs_simple_format)
             executor_request.py_return_routed_experts = (
                 request.sampling_params.return_routed_experts)
+            executor_request.py_embedding_bias = request.sampling_params._embedding_bias_sparse
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if self._is_pytorch_backend and request.disaggregated_params is not None:
