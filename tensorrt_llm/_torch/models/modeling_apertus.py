@@ -129,7 +129,7 @@ class ApertusDecoderLayer(DecoderLayer):
         )
 
         hidden_states, residual = self.feedforward_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, lora_params=kwargs.get("lora_params"))
 
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
@@ -141,6 +141,8 @@ class ApertusModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[ApertusConfig]):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
+        if config.hidden_act != "xielu":
+            raise ValueError(f"Apertus supports hidden_act='xielu' only, got {config.hidden_act!r}")
 
         self.embed_tokens = Embedding(
             getattr(config, "input_vocab_size", config.vocab_size),
@@ -231,3 +233,26 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
         r"^model\.language_model\.(.*)\.mlp\.act_fn\.(.*)$": r"model.\1.mlp.activation.\2",
         r"^model\.language_model\.(.*)$": r"model.\1",
     }
+
+    def __init__(self, model_config: ModelConfig[ApertusConfig]):
+        _alias_language_model_quant_names(model_config)
+        super().__init__(model_config)
+
+
+def _strip_language_model(name: str) -> str:
+    return name.replace("language_model\\.", "", 1).replace("language_model.", "", 1)
+
+
+def _alias_language_model_quant_names(model_config: ModelConfig) -> None:
+    """Quantization metadata of Apertus 1.5 checkpoints names decoder modules
+    ``model.language_model.*``, as in the checkpoint; here they are ``model.*``.
+    Add the runtime names alongside the checkpoint names."""
+    quant_config = model_config.quant_config
+    if quant_config is not None and quant_config.exclude_modules:
+        aliases = [_strip_language_model(m) for m in quant_config.exclude_modules]
+        quant_config.exclude_modules = list(
+            dict.fromkeys([*quant_config.exclude_modules, *aliases])
+        )
+    if model_config.quant_config_dict:
+        for name, layer_config in list(model_config.quant_config_dict.items()):
+            model_config.quant_config_dict.setdefault(_strip_language_model(name), layer_config)
