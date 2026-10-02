@@ -300,7 +300,6 @@ class CuDNNAttention(AttentionBackend):
     def check_hardware_compatibility(
         cls, device: torch.device, quant_dtype: str | None = None
     ) -> None:
-        # SM 107 (Rubin): cuDNN runs its native sm107 FP8 flash-attention kernel.
         if get_sm_version() not in (100, 103, 107) and quant_dtype is not None:
             raise RuntimeError(
                 "cuDNN quantized attention requires an NVIDIA Blackwell- or Rubin-class GPU "
@@ -712,8 +711,8 @@ class CuDNNAttention(AttentionBackend):
 
         self._execute_graph(bundle, tensor_map, device)
 
-        # Stats is packed [B, H, S, 1]; other backends expose LSE as [B, S, H].
-        lse = None if stats is None else stats.squeeze(-1).transpose(1, 2).contiguous()
+        # Stats is packed [B, H, S, 1]; LSE consumers (Ring/Attention2D) expect [B, H, S].
+        lse = None if stats is None else stats.squeeze(-1)
         return output, lse
 
     def forward(
@@ -756,7 +755,7 @@ class CuDNNAttention(AttentionBackend):
 
         Returns:
             output: ``[B, S_q, H, D_v]``
-            lse: ``[B, S_q, H]`` float32
+            lse: ``[B, H, S_q]`` float32
         """
         output, lse = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=True
