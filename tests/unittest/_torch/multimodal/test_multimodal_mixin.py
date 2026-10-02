@@ -14,6 +14,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -105,6 +106,7 @@ class CountingEncoderMultimodalModel(DummyMultimodalModel):
             multimodal_config=MultimodalConfig(encoder_cache_max_bytes=encoder_cache_max_bytes)
         )
         self.encode_calls = 0
+        self._initialize_multimodal_encoder_cache(encoder_cache_max_bytes)
 
     def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs) -> torch.Tensor:
         self.encode_calls += 1
@@ -294,15 +296,42 @@ def test_encoder_cache_requires_model_opt_in():
     assert not model.encoder_cache_active
 
 
-def test_encoder_cache_creation_logs_embedding_row_capacity():
+def test_explicit_cache_initialization_creates_cache_without_persistent_reuse():
+    model = DummyMultimodalModel(make_embedding(hidden_size=4), torch.tensor([7]))
+    model.model_config = ModelConfig(
+        multimodal_config=MultimodalConfig(encoder_cache_max_bytes=4096)
+    )
+
+    cache = model._initialize_multimodal_encoder_cache(1024)
+
+    assert cache is not None
+    assert cache.max_bytes == 1024
+    assert model._multimodal_encoder_cache is cache
+
+
+def test_explicit_cache_capacity_can_exceed_persistent_reuse_capacity():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
         torch.tensor([7]),
-        encoder_cache_max_bytes=4096,
+    )
+    model.model_config = ModelConfig(
+        multimodal_config=MultimodalConfig(encoder_cache_max_bytes=1024)
     )
 
+    cache = model._initialize_multimodal_encoder_cache(2048)
+
+    assert cache is not None
+    assert cache.max_bytes == 2048
+    assert model._multimodal_encoder_cache is cache
+
+
+def test_encoder_cache_creation_logs_embedding_row_capacity():
     with patch("tensorrt_llm._torch.models.modeling_multimodal_mixin.logger.info") as info:
-        model._get_multimodal_encoder_cache()
+        CountingEncoderMultimodalModel(
+            make_embedding(hidden_size=4),
+            torch.tensor([7]),
+            encoder_cache_max_bytes=4096,
+        )
 
     messages = [" ".join(map(str, call.args)) for call in info.call_args_list]
     assert any(
@@ -319,7 +348,7 @@ def test_encoder_cache_creation_logs_byte_capacity_without_embedding_metadata():
     )
 
     with patch("tensorrt_llm._torch.models.modeling_multimodal_mixin.logger.info") as info:
-        model._get_multimodal_encoder_cache()
+        model._initialize_multimodal_encoder_cache(4096)
 
     messages = [" ".join(map(str, call.args)) for call in info.call_args_list]
     assert any(
@@ -383,6 +412,115 @@ def test_encoder_cache_repeated_chunk_does_not_rewrite_entries():
     torch.testing.assert_close(second_embeddings, first_embeddings)
     put.assert_not_called()
     assert cache.stats().replacements == 0
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("peer_layout", ["tensor", "pieces", "raw"])
+def test_chunk_embeddings_mix_with_full_request_embeddings(peer_layout):
+    model = CountingEncoderMultimodalModel(
+        make_embedding(hidden_size=4), torch.tensor([7]), encoder_cache_max_bytes=4096
+    )
+    full_output = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    chunk = make_cached_multimodal_param(full_output[2:4])
+    chunk.multimodal_data["multimodal_embedding_is_chunk"] = True
+    chunk.multimodal_runtime = MultimodalRuntimeData(
+        embed_mask_cumsum=torch.tensor([0, 1, 2, 2, 3, 4, 5]),
+        past_seen_token_num=4,
+        chunk_end_pos=6,
+    )
+    peer_output = full_output + 100
+    peer = make_keyed_multimodal_param(
+        embedding_lengths=[5],
+        local_embedding=peer_output if peer_layout != "raw" else None,
+    )
+    if peer_layout == "pieces":
+        peer.multimodal_data["multimodal_embedding"] = list(peer_output.split([2, 3]))
+    peer.multimodal_runtime = MultimodalRuntimeData(
+        embed_mask_cumsum=torch.arange(1, 6), past_seen_token_num=1, chunk_end_pos=3
+    )
+
+    input_ids = torch.tensor([7, 7, 0, 7, 7])
+    with patch("torch.cat", wraps=torch.cat) as join:
+        prepared = model.prepare_multimodal_inputs(
+            input_ids=input_ids,
+            positions=None,
+            multimodal_params=[chunk, peer],
+            num_context_requests=2,
+            text_token_indices=torch.tensor([2]),
+            mm_token_indices=torch.tensor([0, 1, 3, 4]),
+        )
+
+    expected_peer = torch.ones(2, 4) if peer_layout == "raw" else peer_output[1:3]
+    torch.testing.assert_close(prepared.inputs_embeds[:2], full_output[2:4])
+    torch.testing.assert_close(prepared.inputs_embeds[3:], expected_peer)
+    torch.testing.assert_close(prepared.inputs_embeds[2:3], model.embedding(input_ids[2:3]))
+    # Neither a legacy list of pieces nor the batch join may copy full future
+    # chunks. The chunk payload's nonzero cached prefix is not applied twice.
+    assert all(sum(tensor.shape[0] for tensor in call.args[0]) <= 4 for call in join.call_args_list)
+    assert model.encode_calls == int(peer_layout == "raw")
+    attached_peer = peer.multimodal_data["multimodal_embedding"]
+    peer_rows = (
+        sum(tensor.shape[0] for tensor in attached_peer)
+        if isinstance(attached_peer, list)
+        else attached_peer.shape[0]
+    )
+    assert peer_rows == 5  # Retained for subsequent chunks, not replaced by a slice.
+    if peer_layout == "raw":
+        assert model._multimodal_encoder_cache.current_bytes == 5 * 4 * 4
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("text_only_chunk", [False, True])
+def test_chunk_embeddings_preserve_qwen3_deepstack_layout(text_only_chunk):
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModelBase
+
+    # Exercise the real shared prepare flow and Qwen3 split/scatter hooks,
+    # without constructing a vision encoder or loading model weights.
+    model = Qwen3VLModelBase.__new__(Qwen3VLModelBase)
+    torch.nn.Module.__init__(model)
+    model.llm = SimpleNamespace(model=SimpleNamespace(embed_tokens=make_embedding(hidden_size=4)))
+    model.mm_encoder = torch.nn.Identity()
+    model._mm_token_ids = torch.tensor([7])
+    model.use_deepstack = True
+    model.deepstack_num_level = 2
+    model.deepstack_input_embeds = torch.empty(2, 5, 4)
+    full_output = torch.arange(60, dtype=torch.float32).reshape(5, 12)
+    runtime = MultimodalRuntimeData(
+        embed_mask_cumsum=torch.tensor([1, 2, 3, 3, 4, 5]),
+        past_seen_token_num=3 if text_only_chunk else 1,
+        chunk_end_pos=4 if text_only_chunk else 3,
+    )
+    start = runtime.num_cached_mm_tokens
+    end = start + runtime.num_mm_tokens_in_chunk
+    chunk = make_cached_multimodal_param(full_output[start:end])
+    chunk.multimodal_data["multimodal_embedding_is_chunk"] = True
+    peer = make_cached_multimodal_param(full_output + 100)
+    chunk.multimodal_runtime = peer.multimodal_runtime = runtime
+    input_ids = torch.tensor([0, 1] if text_only_chunk else [7, 0, 7, 7, 7])
+    mm_indices = torch.tensor([] if text_only_chunk else [0, 2, 3, 4], dtype=torch.long)
+    text_indices = torch.tensor([0, 1] if text_only_chunk else [1])
+
+    prepared = model.prepare_multimodal_inputs(
+        input_ids=input_ids,
+        positions=None,
+        multimodal_params=[chunk, peer],
+        num_context_requests=2,
+        text_token_indices=text_indices,
+        mm_token_indices=mm_indices,
+    )
+
+    if text_only_chunk:
+        assert prepared.input_ids is input_ids
+        assert prepared.inputs_embeds is None
+        assert not prepared.extra_embeds
+    else:
+        expected = torch.cat([full_output[start:end], (full_output + 100)[start:end]])
+        primary, *extra = expected.split(4, dim=1)
+        torch.testing.assert_close(prepared.inputs_embeds[mm_indices], primary)
+        assert len(prepared.extra_embeds) == 2
+        for actual, expected_level in zip(prepared.extra_embeds, extra, strict=True):
+            torch.testing.assert_close(actual[mm_indices], expected_level)
+            assert torch.count_nonzero(actual[text_indices]) == 0
 
 
 def test_encoder_cache_mixed_attached_and_uncached_requests():

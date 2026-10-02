@@ -19,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     MultimodalEncoderRequestState,
     initialize_multimodal_encoder_request,
 )
+from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
 from tensorrt_llm.inputs.registry import (
@@ -33,6 +34,8 @@ def bare_mm_item_scheduler(
 ) -> MultimodalItemScheduler:
     """A scheduler with no budget resolution -- the engine only builds one when item
     scheduling is engaged, so these tests skip `create()` and exercise the item path."""
+    if model._multimodal_encoder_cache is None:
+        model._multimodal_encoder_cache = TensorLRUCache(1 << 20)
     return MultimodalItemScheduler(model=model, input_processor=input_processor)
 
 
@@ -54,11 +57,9 @@ def record_output(
     hidden: int = 1,
     fill: float = 0.0,
 ) -> None:
-    """Write one item the way the encoder step does, sized from its declaration."""
-    state.record(
-        item_idx,
-        torch.full((state.embedding_lengths[item_idx], hidden), fill),
-    )
+    """Mark one item ready without materializing an output tensor."""
+    del hidden, fill
+    state.item_ready[item_idx] = True
 
 
 def make_mm_request(request_id: int, costs: list[int], *, ready: Sequence[int] = ()) -> LlmRequest:

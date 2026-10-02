@@ -178,6 +178,13 @@ class WorkerExtension:
                     weights[param_name] = tensor
 
                 logger.info(f"weights key size: {len(weights.keys())}")
+                # Encoder outputs are weight-derived. The control action is
+                # draining by default, so any live reference or reservation
+                # here is a lifecycle error rather than state that may be
+                # force-dropped. Invalidate before every partial reload; a
+                # multi-call update session must not expose outputs from an
+                # earlier weight bucket through the persistent cache.
+                self.engine.invalidate_multimodal_encoder_cache()
                 self.engine.model_engine.model_loader.reload(
                     self.engine.model_engine.model, weights, allow_partial_loading=True
                 )
