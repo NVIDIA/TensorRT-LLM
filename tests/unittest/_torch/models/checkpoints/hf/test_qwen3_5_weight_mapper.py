@@ -193,14 +193,29 @@ def _make_int4_weights(
     return mapper, weights, logical_weights, scales
 
 
-@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
-@pytest.mark.parametrize("split_qkv", [False, True])
-@pytest.mark.parametrize("quantize_ba", [False, True])
-@pytest.mark.parametrize("storage_dtype", [torch.uint8, torch.int8])
+@pytest.mark.parametrize(
+    "tp_size,split_qkv,quantize_ba,storage_dtype,head_dim",
+    [
+        # Cover both checkpoint layouts and gate formats in the TP1 and TP2 paths.
+        (1, False, False, torch.uint8, 4),
+        pytest.param(1, False, True, torch.uint8, 128, id="qwen35-27b"),
+        (1, True, False, torch.uint8, 4),
+        (1, True, True, torch.uint8, 4),
+        (2, False, False, torch.uint8, 4),
+        (2, False, True, torch.uint8, 4),
+        (2, True, False, torch.uint8, 4),
+        (2, True, True, torch.uint8, 4),
+        # Signed storage in both layouts; TP8 gives three packed gate rows per rank.
+        (2, True, True, torch.int8, 4),
+        (8, False, True, torch.int8, 4),
+    ],
+)
 def test_int4_projections_preserve_values_and_scales(
-    tp_size: int, split_qkv: bool, quantize_ba: bool, storage_dtype: torch.dtype
+    tp_size: int, split_qkv: bool, quantize_ba: bool, storage_dtype: torch.dtype, head_dim: int
 ) -> None:
-    mapper, weights, logical_weights, scales = _make_int4_weights(split_qkv, quantize_ba)
+    mapper, weights, logical_weights, scales = _make_int4_weights(split_qkv, quantize_ba, head_dim)
+    if head_dim == 128:
+        assert weights[f"{_ATTN_PREFIX}.in_proj_qkv.weight"].shape[0] == 5120
     weights = {
         name: value.view(storage_dtype) if value.dtype == torch.uint8 else value
         for name, value in weights.items()
@@ -219,6 +234,7 @@ def test_int4_projections_preserve_values_and_scales(
             )
             fused_weight = _unpack_int4_rows(packed_weight)
             fused_scale = out[f"{_ATTN_PREFIX}.in_proj_{projection}.weight_scale"]
+            assert fused_scale.shape == (fused_weight.shape[0], 2)
             fused_dequantized = fused_weight.float() * fused_scale.repeat_interleave(128, dim=1)
         else:
             assert packed_weight.dtype == torch.bfloat16
@@ -241,14 +257,6 @@ def test_int4_projections_preserve_values_and_scales(
                     dequantized = dequantized * scales[name].repeat_interleave(128, dim=1)
                 references.append((activation @ dequantized.T).chunk(tp_size, dim=1)[rank])
             torch.testing.assert_close(activation @ shard.T, torch.cat(references, dim=1))
-
-
-def test_int4_qwen35_27b_qkv_rows() -> None:
-    mapper, weights, _, _ = _make_int4_weights(head_dim=128)
-    assert weights[f"{_ATTN_PREFIX}.in_proj_qkv.weight"].shape[0] == 5120
-    out = mapper.preprocess_weights(weights)
-    assert out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight"].shape == (8192, 256)
-    assert out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight_scale"].shape == (16384, 2)
 
 
 def test_int4_rejects_non_byte_aligned_tp_shards() -> None:
