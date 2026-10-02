@@ -22,7 +22,7 @@ from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
 from tensorrt_llm.executor.ipc import ZeroMqQueue
-from tensorrt_llm.llmapi.utils import configure_cpu_affinity
+from tensorrt_llm.llmapi.utils import acquire_cpu_affinity, release_cpu_affinity
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 
@@ -776,6 +776,7 @@ def run_diffusion_worker(
             logger.error(f"VisualGen worker could not supervise its coordinator: {e}")
             raise
 
+    cpu_affinity_lease = None
     try:
         # Set log level before any other work so loading logs are visible
         logger.set_level(log_level)
@@ -801,7 +802,7 @@ def run_diffusion_worker(
         if torch.cuda.is_available():
             torch.cuda.set_device(device_id)
             try:
-                configure_cpu_affinity(device_id)
+                cpu_affinity_lease = acquire_cpu_affinity(device_id)
             except Exception as e:
                 logger.warning(
                     f"[rank {rank}] NUMA-aware CPU affinity setup failed: {e}. "
@@ -835,6 +836,8 @@ def run_diffusion_worker(
         logger.error(f"Worker failed: {e}")
         traceback.print_exc()
         raise
+    finally:
+        release_cpu_affinity(cpu_affinity_lease)
 
 
 class DiffusionRemoteClient:

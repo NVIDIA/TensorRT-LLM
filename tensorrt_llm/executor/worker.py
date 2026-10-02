@@ -118,6 +118,13 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         else:
             self.doing_shutdown = True
 
+        try:
+            self._shutdown()
+        finally:
+            self._release_cpu_affinity()
+
+    def _shutdown(self):
+
         logger_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
 
         if self.engine is not None:
