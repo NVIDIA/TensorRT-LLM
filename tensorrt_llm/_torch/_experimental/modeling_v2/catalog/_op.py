@@ -169,22 +169,25 @@ class OpWrapper(ABC):
     business, not the interface's. What the entry actually needs to know is
     whether a value varies by layer. Two binding methods state exactly that:
 
-        bind_const(**values)     a value, the same for every layer
-        bind_layered(**tables)   one value per layer, selected by `layer=`
+        bind_const(**values)            a value, the same for every layer
+        bind_layered(layer_id, **values)  one layer's values, read back by `layer=`
 
     Both are callable from anywhere a target chooses -- construction, the
     first forward, every forward -- and the caller decides which. Both may be
     called more than once; a later call updates only the keys it names and
-    leaves every other binding alone. `__call__` merges `_const`, then the
-    row `_layered` holds for `layer=` (so a layered value wins over a flat
-    const for the same argument), then the call's own kwargs last of all, and
-    hands the result to `raw_call`.
+    leaves every other binding alone. `bind_layered` takes one layer at a
+    time rather than a whole table so that a caller whose layers are not
+    uniform -- some dense, some not -- can bind only the layers that have a
+    given operand, instead of padding the gaps itself. `__call__` merges
+    `_const`, then the row `_layered` holds for `layer=` (so a layered value
+    wins over a flat const for the same argument), then the call's own
+    kwargs last of all, and hands the result to `raw_call`.
 
     This is what gives gpt_oss's `attention_window_size` a home: per-layer,
     but not knowable at construction (it derives from `attn_metadata`'s
     resolved `max_seq_len`, which the KV cache manager does not produce until
-    after weights load) and not per-step either -- it never changes again
-    once known. It is bound with `bind_layered` once, on the first forward.
+    after weights load). It is rebound with `bind_layered` every forward
+    rather than once at construction.
 
     The cost of collapsing the time axis: a reader at a call site can no
     longer tell a volatile per-forward binding from a permanent one by the
@@ -217,7 +220,9 @@ class OpWrapper(ABC):
         is no longer a stage reserved for construction.
         """
         self._const: dict[str, Any] = {}
-        self._layered: dict[str, Any] = {}
+        #: name -> {layer_id: value}, filled one layer at a time by
+        #: `bind_layered`.
+        self._layered: dict[str, dict[int, Any]] = {}
         # Per key: the step generation in effect when that key was last
         # bound. Read only by the validation harness -- see `bind_const`.
         self._generation: dict[str, int] = {}
@@ -246,25 +251,33 @@ class OpWrapper(ABC):
         for key in values:
             self._generation[key] = _STEP_GENERATION
 
-    def bind_layered(self, **tables: Any) -> None:
-        """Bind one value per layer, selected by `layer=` at the call.
+    def bind_layered(self, layer_id: int, **values: Any) -> None:
+        """Bind one layer's values, read back by `layer=` at the call.
+
+        One layer per call rather than a whole table: a caller binds
+        exactly the layers that have a given operand, which is what a model
+        whose layers are not uniform -- some dense, some not -- needs, and a
+        whole-table signature could not express without the caller padding
+        the gaps itself. The call site is unchanged either way -- still
+        `op(..., layer=i)`.
 
         Same update-not-replace and generation bookkeeping as `bind_const`,
-        for the same reason: a `layered` table is not inherently a
+        for the same reason: a layered value is not inherently a
         construction-time thing -- gpt_oss's `attention_window_size` is
-        bound once, on the first forward rather than at construction, and a
-        future entry could just as well rebind a layered table every step.
+        rebound this way on every forward rather than once at construction,
+        and does so one layer at a time just like a construction-time table
+        would.
         """
-        self._layered.update(tables)
-        for key in tables:
-            self._generation[key] = _STEP_GENERATION
+        for name, value in values.items():
+            self._layered.setdefault(name, {})[layer_id] = value
+            self._generation[name] = _STEP_GENERATION
 
     def __call__(self, *args: Any, layer: int | None = None, **kwargs: Any) -> Any:
         """Merge const, the layer row, and the call's own kwargs, in that order.
 
         Later stages win: the layer row overrides a flat const for the same
         argument, and a call-time kwarg overrides both -- a target can still
-        pass a per-call override through the same call a `layered` table is
+        pass a per-call override through the same call a layered value is
         bound on. An unbound entry has empty `_const` and `_layered`, so a
         call that never passes `layer=` is a plain passthrough -- which is
         what keeps deepseek's call sites byte-for-byte the same call they
@@ -272,7 +285,7 @@ class OpWrapper(ABC):
         """
         merged = dict(self._const)
         if layer is not None:
-            merged.update({name: table[layer] for name, table in self._layered.items()})
+            merged.update({name: rows[layer] for name, rows in self._layered.items()})
         merged.update(kwargs)
         return self.raw_call(*args, **merged)
 

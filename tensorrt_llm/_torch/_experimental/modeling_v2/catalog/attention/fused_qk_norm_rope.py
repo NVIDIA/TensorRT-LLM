@@ -11,7 +11,7 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from .._op import Arch, Cell, OpWrapper, assert_within_ulp
 
 
-class _FusedQkNormRope(OpWrapper):
+class FusedQkNormRope(OpWrapper):
     """In place on `qkv`: RMS-norm the q and k heads, then rotate them.
     Returns `qkv` -- the same buffer, mutated and handed back so a call site
     can show what it touched without allocating.
@@ -261,4 +261,4 @@ class _FusedQkNormRope(OpWrapper):
         )
 
 
-fused_qk_norm_rope = _FusedQkNormRope()
+fused_qk_norm_rope = FusedQkNormRope()

@@ -24,7 +24,7 @@ from .._op import Arch, Cell, OpWrapper
 _R1 = dict(hidden=7168, inter=2048, experts_local=64, ep_size=4, topk=8)
 
 
-class _FusedMoe(OpWrapper):
+class FusedMoe(OpWrapper):
     """One MoE layer over pre-routed tokens; returns a fresh `[T, hidden]`.
 
     Fusion boundary: permutation, both GEMMs, the gated activation between
@@ -310,4 +310,4 @@ class _FusedMoe(OpWrapper):
         assert rel_rms <= 4 * ulp, f"relative RMS {rel_rms:.3e} > {4 * ulp:.3e}"
 
 
-fused_moe = _FusedMoe()
+fused_moe = FusedMoe()

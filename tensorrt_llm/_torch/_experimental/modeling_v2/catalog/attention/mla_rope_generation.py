@@ -31,7 +31,7 @@ _R1_MSCALE = 0.1 * math.log(40.0) + 1.0
 Q_SCALING_R1 = 1.0 / (_R1_MSCALE * _R1_MSCALE)
 
 
-class _MlaRopeGeneration(OpWrapper):
+class MlaRopeGeneration(OpWrapper):
     """One decode step's MLA preprocessing, over the batch's generation
     sequences only.
 
@@ -443,4 +443,4 @@ class _MlaRopeGeneration(OpWrapper):
             )
 
 
-mla_rope_generation = _MlaRopeGeneration()
+mla_rope_generation = MlaRopeGeneration()

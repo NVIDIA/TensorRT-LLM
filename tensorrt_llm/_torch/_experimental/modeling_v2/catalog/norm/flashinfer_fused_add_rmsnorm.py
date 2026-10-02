@@ -16,7 +16,7 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from .._op import Arch, Cell, OpWrapper
 
 
-class _FlashinferFusedAddRmsnorm(OpWrapper):
+class FlashinferFusedAddRmsnorm(OpWrapper):
     """`residual += x; x = rmsnorm(residual) * weight`, in place, returns
     `(x, residual)` -- the same two tensors, mutated and handed back so a call
     site can show what it touched without allocating.
@@ -103,4 +103,4 @@ class _FlashinferFusedAddRmsnorm(OpWrapper):
         )
 
 
-flashinfer_fused_add_rmsnorm = _FlashinferFusedAddRmsnorm()
+flashinfer_fused_add_rmsnorm = FlashinferFusedAddRmsnorm()

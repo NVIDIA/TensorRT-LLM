@@ -43,7 +43,7 @@ def _swizzle_index(rows: int, cols: int, device) -> torch.Tensor:
     )
 
 
-class _Nvfp4Gemm(OpWrapper):
+class Nvfp4Gemm(OpWrapper):
     """`alpha * (act @ weight.T) (+ bias)` over block-scaled NVFP4 operands.
 
     Both operands are packed e2m1, two values to a byte, with one e4m3 scale per
@@ -219,4 +219,4 @@ class _Nvfp4Gemm(OpWrapper):
             )
 
 
-nvfp4_gemm = _Nvfp4Gemm()
+nvfp4_gemm = Nvfp4Gemm()

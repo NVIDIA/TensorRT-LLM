@@ -18,7 +18,7 @@ def _pad_up(value: int, multiple: int) -> int:
     return (value + multiple - 1) // multiple * multiple
 
 
-class _Mxfp8Quantize(OpWrapper):
+class Mxfp8Quantize(OpWrapper):
     """Quantize to MXFP8: `(e4m3 data [..., pad_up(K, alignment)], uint8 scales)`.
 
     One scale per 32 contiguous elements of the last dim. The scale is the
@@ -159,4 +159,4 @@ class _Mxfp8Quantize(OpWrapper):
         assert input.is_contiguous(), "input must be contiguous; the kernel reads it flat"
 
 
-mxfp8_quantize = _Mxfp8Quantize()
+mxfp8_quantize = Mxfp8Quantize()

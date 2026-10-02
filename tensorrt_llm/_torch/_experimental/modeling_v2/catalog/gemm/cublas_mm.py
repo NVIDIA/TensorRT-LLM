@@ -11,7 +11,7 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from .._op import ULP, Arch, Cell, OpWrapper, assert_within_ulp, true_fp32_matmul
 
 
-class _CublasMm(OpWrapper):
+class CublasMm(OpWrapper):
     """`mat_a @ mat_b (+ bias)`, fp32-accumulated, one cublas_mm call.
 
     `mat_b` is read column-major, which is what a stored weight's `.t()` already
@@ -127,4 +127,4 @@ class _CublasMm(OpWrapper):
         assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=2.0, ulp=ULP[torch.bfloat16])
 
 
-cublas_mm = _CublasMm()
+cublas_mm = CublasMm()

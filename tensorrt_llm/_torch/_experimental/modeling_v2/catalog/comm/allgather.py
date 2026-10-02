@@ -13,7 +13,7 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from .._op import Arch, Cell, OpWrapper
 
 
-class _Allgather(OpWrapper):
+class Allgather(OpWrapper):
     """Gather `input` from every rank in `group`, concatenated along dim 0.
 
     `sizes` gives each rank's `input.shape[0]` in ascending rank order, or is
@@ -118,4 +118,4 @@ class _Allgather(OpWrapper):
         )
 
 
-allgather = _Allgather()
+allgather = Allgather()
