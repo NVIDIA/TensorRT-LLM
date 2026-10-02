@@ -31,6 +31,20 @@ __all__ = ["RebalanceSlotSchedulerGroupV2", "build_rebalance_slot_scheduler_grou
 # Shared-expert persistent grids use the same capacity hint as the copy grid.
 TMA_COPY_SM_COUNT = 8
 
+
+def configured_halo_q_sm_count() -> int:
+    value = os.environ.get("TRTLLM_MOE_REBALANCE_CTAS_V2", "").strip()
+    count = int(value) if value else TMA_COPY_SM_COUNT
+    if count <= 0:
+        raise ValueError("HALO-Q SM count must be positive")
+    return count
+
+
+def rebalance_auxiliary_sm_count() -> int:
+    # HALO-Q and TMA copy share one stream and cannot run concurrently.
+    return max(configured_halo_q_sm_count(), TMA_COPY_SM_COUNT)
+
+
 _COPY_STREAM: Optional[torch.cuda.Stream] = None
 
 
@@ -161,7 +175,6 @@ class RebalanceSlotSchedulerGroupV2:
 
         # Use the EP rank, not the CUDA ordinal. HALO-Q shares the configured
         # copy-stream launch budget with TMA.
-        ctas_env = os.environ.get("TRTLLM_MOE_REBALANCE_CTAS_V2", "").strip()
         cfg = CudaSchedulerConfig(
             ep_size=ep_size,
             logical_expert_count=logical_expert_count,
@@ -169,11 +182,9 @@ class RebalanceSlotSchedulerGroupV2:
             max_tokens_per_rank=self.max_tokens_per_rank,
             topk=self.topk,
             local_rank=ep_rank,
-            ctas=(int(ctas_env) if ctas_env else TMA_COPY_SM_COUNT),
+            ctas=configured_halo_q_sm_count(),
         )
         cfg.validate()
-        if cfg.ctas > TMA_COPY_SM_COUNT:
-            raise ValueError("HALO-Q CTAs exceed the shared-expert SM reservation")
         self.cfg = cfg
         self.scheduler = CudaPhysicalSlotScheduler(cfg, device=f"cuda:{self.device}")
 

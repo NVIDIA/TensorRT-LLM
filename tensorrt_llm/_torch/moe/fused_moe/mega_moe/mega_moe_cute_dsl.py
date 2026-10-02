@@ -693,15 +693,18 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             else 0
         )
         self._quantize_reserved_sms = 0
+        self._rebalance_reserved_sms = 0
         if self._rebalance_slots_active > 0:
-            from .rebalance_slot_scheduler_v2 import TMA_COPY_SM_COUNT
+            from .rebalance_slot_scheduler_v2 import rebalance_auxiliary_sm_count
 
-            self._quantize_reserved_sms = TMA_COPY_SM_COUNT
-            if not hasattr(torch.ops.trtllm.fp4_quantize, "sm_budget"):
-                raise RuntimeError(
-                    "ON MegaMoE quantization requires the native "
-                    "trtllm::fp4_quantize.sm_budget overload; rebuild the "
-                    "TensorRT-LLM native operators."
+            self._rebalance_reserved_sms = rebalance_auxiliary_sm_count()
+            if hasattr(torch.ops.trtllm.fp4_quantize, "sm_budget"):
+                self._quantize_reserved_sms = self._rebalance_reserved_sms
+            else:
+                logger.warning_once(
+                    "fp4_quantize.sm_budget is unavailable; DynamicEPLB "
+                    "quantization will use the selected backend without SM control",
+                    key="dynamic_eplb_quantize_without_sm_budget",
                 )
         self._rebalance_warmup = False
         self._rebalance_plan_ran = False
