@@ -1269,12 +1269,10 @@ class TestMambaEffectiveTpSize:
 
 class TestGraphCaptureConcurrencyWarning:
     """Every real build warns when admitted decode concurrency outruns the
-    range covered by captured CUDA graphs (decode above it runs eager).
+    range covered by captured CUDA graphs.
 
-    Coverage semantics: with enable_padding a batch rounds up to the nearest
-    captured size, so the whole capture range is covered; without padding
-    only the dense {1..n} prefix is (a ragged batch must match a captured
-    size exactly).
+    Coverage: with padding, up to the largest capture; without, only the
+    dense {1..n} prefix (a ragged batch must match a capture exactly).
     """
 
     # The default no-padding capture set for max_batch_size=256:
@@ -1373,10 +1371,6 @@ class TestGraphCaptureConcurrencyWarning:
         c._model_engine = Mock()
 
         assert self._warnings(mocker, c) == []
-
-    # The check must run for every real build: a plain non-draft config can
-    # outrun graph coverage just as easily as a speculative one, so gating it
-    # on the draft budget split would silence exactly the common case.
 
     def _build(self, mocker, tmp_path, *, draft: bool, estimating: bool):
         c = TestBuildManagersBudgetGates._make_build_creator(

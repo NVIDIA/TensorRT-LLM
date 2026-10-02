@@ -2154,14 +2154,11 @@ class KvCacheCreator:
     _CUDA_GRAPH_CAPTURE_WARN_FACTOR = 1.5
 
     def _warn_if_admitted_concurrency_outruns_graph_capture(self) -> None:
-        """Warn when the engine admits decode batches far above the range
-        covered by captured CUDA graphs.
+        """Warn when admitted decode concurrency far outruns CUDA-graph coverage.
 
-        Decode batches above the covered range run in eager mode, whose
-        per-iteration latency is far higher than a graph replay, so the added
-        concurrency can cost throughput instead of buying it. Eager decode is
-        still valid at low load, so this warns and names the knobs rather than
-        refusing.
+        Decode above the covered range runs eager, which can cost more
+        throughput than the extra concurrency buys; still valid at low load,
+        hence a warning that names the knobs rather than a refusal.
         """
         capture_sizes = getattr(self._model_engine, "_cuda_graph_batch_sizes",
                                 None)
