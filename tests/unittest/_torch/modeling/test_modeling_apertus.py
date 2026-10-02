@@ -19,6 +19,7 @@ import tempfile
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +44,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 # A 2-layer Apertus. RoPE uses llama3 scaling with a short original context
 # so that the scaling changes most rotary frequencies and a model that ignored
@@ -212,6 +214,32 @@ class TestApertus(unittest.TestCase):
             model.load_weights(hf_model.state_dict())
             model.post_load_weights()
         return config, hf_model, model
+
+    def test_rejects_other_activations(self):
+        config = ApertusConfig.from_dict({**deepcopy(APERTUS_TINY_CONFIG), "hidden_act": "silu"})
+        with torch.device("cuda"), self.assertRaisesRegex(ValueError, "hidden_act"):
+            ApertusForCausalLM(ModelConfig(pretrained_config=config))
+
+    def test_lora_params_reach_mlp(self):
+        config = ApertusConfig.from_dict(deepcopy(APERTUS_TINY_CONFIG))
+        with torch.device("cuda"), default_dtype(config.torch_dtype):
+            model = ApertusForCausalLM(ModelConfig(pretrained_config=config))
+        layer = model.model.layers[0]
+        hidden = torch.randn(3, config.hidden_size, device="cuda", dtype=config.torch_dtype)
+        lora_params = {"sentinel": True}
+        with (
+            mock.patch.object(layer.self_attn, "forward", return_value=hidden) as attn,
+            mock.patch.object(layer.mlp, "forward", return_value=hidden) as mlp,
+        ):
+            layer(
+                position_ids=None,
+                hidden_states=hidden,
+                attn_metadata=None,
+                residual=None,
+                lora_params=lora_params,
+            )
+        self.assertIs(attn.call_args.kwargs["lora_params"], lora_params)
+        self.assertIs(mlp.call_args.kwargs["lora_params"], lora_params)
 
     def test_weights_loaded(self):
         _, hf_model, model = self._build_models("TRTLLM")
@@ -470,6 +498,35 @@ class TestApertus1p5Config(unittest.TestCase):
 
 
 class TestApertus1p5(unittest.TestCase):
+    @parameterized.expand(
+        [
+            ("plain", "model.language_model.layers.0.mlp.down_proj"),
+            ("regex", r"re:model\.language_model\.layers\.0\.mlp\.down_proj"),
+        ]
+    )
+    def test_quant_exclusions_use_checkpoint_names(self, _, excluded):
+        """1.5 quantization metadata names modules as the checkpoint does."""
+        config_dict = deepcopy(APERTUS_TINY_CONFIG)
+        config_dict["vocab_size"] = self.INPUT_VOCAB_SIZE
+        config = ApertusConfig.from_dict(
+            {**config_dict, "output_vocab_size": self.OUTPUT_VOCAB_SIZE}
+        )
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8, exclude_modules=[excluded, "lm_head"])
+        with torch.device("cuda"), default_dtype(config.torch_dtype):
+            model = Apertus1p5ForConditionalGeneration(
+                ModelConfig(pretrained_config=config, quant_config=quant_config)
+            )
+
+        def quantized(linear):
+            return (
+                linear.quant_config is not None
+                and linear.quant_config.layer_quant_mode.has_any_quant()
+            )
+
+        self.assertFalse(quantized(model.model.layers[0].mlp.down_proj))
+        self.assertTrue(quantized(model.model.layers[0].mlp.up_proj))
+        self.assertTrue(quantized(model.model.layers[1].mlp.down_proj))
+
     def setUp(self):
         if not torch.cuda.is_available():
             self.skipTest("needs CUDA")
@@ -600,19 +657,16 @@ class _RealCheckpointGreedyTest:
 
     @staticmethod
     def _use_fp32_xielu(hf_model):
-        """Evaluate HF's xIELU formula in fp32 and round once, as TRT-LLM does.
+        """Run HF's own xIELU formula in fp32 and round once, as TRT-LLM does.
 
-        HF's own path rounds to bf16 after every operation, which by itself
-        flips near-tied greedy choices.
+        HF's path in bf16 rounds after every operation, which by itself flips
+        near-tied greedy choices. HF's implementation is used (not the one
+        under test) so the reference stays independent.
         """
         for layer in hf_model.model.layers:
-            act = layer.mlp.act_fn
+            act = layer.mlp.act_fn.float()
             act.forward = functools.partial(
-                xielu_reference,
-                a_p=F.softplus(act.alpha_p.float()).item(),
-                a_n=act.beta.float().item() + F.softplus(act.alpha_n.float()).item(),
-                beta=act.beta.float().item(),
-                eps=act.eps.float().item(),
+                lambda x, act: act._xielu_python(x.float()).to(x.dtype), act=act
             )
 
     def _trtllm_greedy(self, prompt_ids):
