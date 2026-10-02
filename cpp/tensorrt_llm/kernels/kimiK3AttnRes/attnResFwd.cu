@@ -413,6 +413,9 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(bf16_t c
                                     {
                                         if (n == AN - 1)
                                         {
+                                            // The producer refills the slots through the async proxy (TMA): a
+                                            // cross-proxy fence orders this lane's generic-proxy reads before it.
+                                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                                             // Every lane's reads of the chunk's slots before lane 0 releases them.
                                             __syncwarp();
                                             if (lane == 0)
@@ -497,6 +500,9 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(bf16_t c
                 }
                 if constexpr (!FULL_N12)
                 {
+                    // The producer refills the slots through the async proxy (TMA): a cross-proxy fence orders this
+                    // lane's generic-proxy reads before it.
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     // Every lane's reads of the chunk's slots before lane 0 releases them to the producer.
                     __syncwarp();
                     if (lane == 0)
@@ -983,6 +989,9 @@ __global__ void __launch_bounds__(BLK, 1)
                 }
                 cutlass::arch::NamedBarrier::sync(CONSUMER_THREADS, 1);
             }
+            // The producer refills the tile through the async proxy (TMA): a cross-proxy fence orders this thread's
+            // generic-proxy reads before it.
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             cute::arrive_barrier(plan.bar_consumed[slot]);
         }
     }

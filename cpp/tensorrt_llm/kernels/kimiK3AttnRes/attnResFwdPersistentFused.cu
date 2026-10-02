@@ -650,6 +650,9 @@ __global__ void __launch_bounds__(BLK, 1)
                     default: __builtin_unreachable();
                     }
                 }
+                // The producer refills the slots through the async proxy (TMA): a cross-proxy fence orders this lane's
+                // generic-proxy reads before it.
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 // Every lane's reads of the chunk's slots before lane 0 releases them to the producer.
                 __syncwarp();
                 if (lane == 0)
