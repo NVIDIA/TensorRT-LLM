@@ -17,7 +17,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.speculative.dspark_ragged import (
+from tensorrt_llm._torch.speculative.ragged_helpers import (
     RaggedVerifyLayout,
     build_qo_indptr,
     build_row_maps_device,

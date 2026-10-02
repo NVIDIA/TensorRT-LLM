@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import get_request_tokens_per_gen_step
-from tensorrt_llm._torch.speculative.dspark_ragged import ragged_gather_index_lists
+from tensorrt_llm._torch.speculative.ragged_helpers import ragged_gather_index_lists
 
 pytestmark = pytest.mark.cpu_only
 

@@ -543,7 +543,7 @@ class SpecMetadata:
     #                               [qo_indptr[r], qo_indptr[r + 1])
     #
     # Both stay None on every other path. Built by
-    # ``_torch/speculative/dspark_ragged.RaggedVerifyLayout``.
+    # ``_torch/speculative/ragged_helpers.RaggedVerifyLayout``.
     verify_lens: Optional[torch.Tensor] = None
     qo_indptr: Optional[torch.Tensor] = None
     # Host-side ``sum(verify_lens)`` (reading it off the tensor would sync).
@@ -1592,7 +1592,7 @@ def _padded_gen_draft_tokens(spec_metadata: SpecMetadata, num_gens: int,
     rectangular, so scatter back out; positions past a request's window are
     padding and get masked by ``count_accepted_ragged``.
     """
-    from .dspark_ragged import build_qo_indptr, scatter_ragged_to_padded
+    from .ragged_helpers import build_qo_indptr, scatter_ragged_to_padded
 
     # verify_lens counts tokens (bonus position + drafts); the draft buffer
     # only holds the drafts.
@@ -2004,8 +2004,8 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # Generation requests: verify draft tokens against target tokens
         if spec_metadata is not None and spec_metadata.is_ragged_verify:
-            from .dspark_ragged import (count_accepted_ragged,
-                                        scatter_ragged_to_padded)
+            from .ragged_helpers import (count_accepted_ragged,
+                                         scatter_ragged_to_padded)
             verify_lens = spec_metadata.verify_lens
             total = spec_metadata.total_verify_tokens
             qo_indptr = spec_metadata.qo_indptr
@@ -2604,8 +2604,8 @@ class SpecWorkerBase(nn.Module, ABC):
                 spec_metadata.top_ps[gen_start:gen_end],
                 spec_metadata.min_ps[gen_start:gen_end])
             if is_ragged:
-                from .dspark_ragged import (fill_padded_rows_onehot,
-                                            scatter_ragged_to_padded)
+                from .ragged_helpers import (fill_padded_rows_onehot,
+                                             scatter_ragged_to_padded)
                 target_probs = scatter_ragged_to_padded(
                     target_probs_flat,
                     verify_lens=spec_metadata.verify_lens,
