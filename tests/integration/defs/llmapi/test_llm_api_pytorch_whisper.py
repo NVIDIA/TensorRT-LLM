@@ -29,6 +29,7 @@ import pytest
 import soundfile
 
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
@@ -255,10 +256,10 @@ def test_whisper_pytorch_block_reuse_requested(monkeypatch: pytest.MonkeyPatch) 
 
     Whisper requests carry encoder features, not encoder token ids, so the
     executor disables reuse for both KV pools and must still admit and run
-    them (https://nvbugs/6713231). Batch 2 co-schedules two
-    encoder-init requests, the shape that reached the unguarded cross-reuse
-    lookup in the C++ capacity scheduler. Distinct audio clips sharing the
-    decoder prompt must match their reuse-disabled results.
+    them (https://nvbugs/6713231). This checks the Python reuse override;
+    the C++ scheduler's missing-token guards are covered by its unit test.
+    Distinct audio clips sharing the decoder prompt must match their
+    reuse-disabled results, both sequentially and in a mixed batch.
     """
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
@@ -278,6 +279,15 @@ def test_whisper_pytorch_block_reuse_requested(monkeypatch: pytest.MonkeyPatch) 
             enable_block_reuse=enable_block_reuse,
             use_python_scheduler=False,
         ) as llm:
+            executor = llm._executor.engine
+            for resource_type in (
+                ResourceManagerType.KV_CACHE_MANAGER,
+                ResourceManagerType.CROSS_KV_CACHE_MANAGER,
+            ):
+                manager = executor.resource_manager.get_resource_manager(resource_type)
+                assert manager is not None
+                assert manager.enable_block_reuse is False
+            assert executor.model_engine.attn_runtime_features.cache_reuse is False
             for batch in batches:
                 outputs = llm.generate(
                     [_audio_prompt(clip, sample_rate) for clip in batch],

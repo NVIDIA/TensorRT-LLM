@@ -253,8 +253,8 @@ positions regardless of clip length, and the cross-KV pool is sized from `max_in
 Whisper automatically disables block reuse for both the decoder self-attention
 and cross-attention KV caches, even when `KvCacheConfig.enable_block_reuse=True`.
 Both caches depend on the audio features, which cannot be safely identified by
-decoder token IDs alone. The runtime logs this adjustment; the supplied
-`KvCacheConfig` retains its requested value.
+decoder token IDs alone. The runtime logs this adjustment and updates
+`KvCacheConfig.enable_block_reuse` to reflect the effective setting.
 
 The audio item accepts a file path or URL, an `(array, sample_rate)` tuple, or a
 `{"array": ..., "sampling_rate": ...}` mapping. Supply exactly one clip per

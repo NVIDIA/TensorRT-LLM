@@ -301,19 +301,23 @@ class TestSplitKvCacheBudgetForCross:
         assert self_config.free_gpu_memory_fraction == pytest.approx(0.4)
         assert config.free_gpu_memory_fraction == pytest.approx(0.8)
 
-    def test_wrapped_feature_encoder_disables_reuse_for_both_pools(self):
-        """Feature detection survives a torch.compile-style model wrapper."""
+    @pytest.mark.parametrize("enable_block_reuse", [False, True])
+    def test_split_preserves_effective_reuse_for_wrapped_feature_encoder(
+        self, enable_block_reuse: bool
+    ) -> None:
+        """Budget splitting preserves the executor's effective reuse setting."""
         config = _make_kv_cache_config(cross_kv_cache_fraction=0.5)
+        config.enable_block_reuse = enable_block_reuse
         creator = _make_creator(config, is_enc_dec=True)
         creator._model_engine.model = _FakeCompiledModel(creator._model_engine.model)
         creator._model_engine.input_processor.requires_encoder_features = True
 
         self_config, cross_config = creator._split_kv_cache_budget_for_cross()
 
-        assert config.enable_block_reuse
-        assert not self_config.enable_block_reuse
-        assert not cross_config.enable_block_reuse
-        assert not creator._model_engine.attn_runtime_features.cache_reuse
+        assert config.enable_block_reuse is enable_block_reuse
+        assert self_config.enable_block_reuse is enable_block_reuse
+        assert cross_config.enable_block_reuse is enable_block_reuse
+        assert creator._model_engine.attn_runtime_features.cache_reuse is enable_block_reuse
 
     def test_token_encoder_preserves_reuse_for_both_pools(self) -> None:
         """Token inputs retain reusable identities for both KV pools."""
@@ -721,7 +725,7 @@ class TestCrossKvCacheConstruction:
         ]
 
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
-    def test_build_managers_disables_feature_encoder_reuse(
+    def test_build_managers_preserves_disabled_feature_encoder_reuse(
         self, use_kv_cache_manager_v2: bool
     ) -> None:
         """Pass reuse-disabled configs to both feature-encoder managers."""
@@ -730,6 +734,7 @@ class TestCrossKvCacheConstruction:
             max_gpu_total_bytes=8 * (1 << 30),
             use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         )
+        config.enable_block_reuse = False
         creator = _make_creator(config, is_enc_dec=True)
         creator.configure_kv_cache_capacity = Mock()
         creator._model_engine.input_processor.requires_encoder_features = True
@@ -741,7 +746,7 @@ class TestCrossKvCacheConstruction:
 
         self_config = creator._create_kv_cache_manager.call_args.kwargs["kv_cache_config_override"]
         cross_config = creator._create_cross_kv_cache_manager.call_args.args[0]
-        assert config.enable_block_reuse
+        assert not config.enable_block_reuse
         assert not self_config.enable_block_reuse
         assert not cross_config.enable_block_reuse
         assert not creator._model_engine.attn_runtime_features.cache_reuse
