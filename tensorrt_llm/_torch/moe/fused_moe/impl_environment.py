@@ -39,6 +39,11 @@ class MoEDep(str, Enum):
     DEEPGEMM_MEGAMOE = "deepgemm_megamoe"
     #: ``nvidia-cutlass-dsl[cu13]`` is new enough for the MegaMoE CuteDSL ABI.
     MEGAMOE_CUTEDSL_RUNTIME = "megamoe_cutedsl_runtime"
+    #: The active ``nvidia-cutlass-dsl`` native payload targets CUDA 13 or
+    #: newer. Gates the NVFP4 decode kernel of ``CuteDslB12xFusedMoE``: the
+    #: CUDA 12.x payload lowers the SM12x NVFP4 MMA atom to PTX that ptxas
+    #: rejects.
+    CUTEDSL_CUDA13 = "cutedsl_cuda13"
     #: The ``trtllm::cute_dsl_megamoe_nvfp4_*`` custom ops are registered.
     MEGAMOE_CUTEDSL_OP = "megamoe_cutedsl_op"
     #: The installed CuTe DSL exposes the Rubin helpers the SM107 CuteDSL
@@ -61,6 +66,10 @@ class MoEEnvFlag(str, Enum):
     #: otherwise share a fingerprint while building differently shaped layers.
     SHARED_EXPERT_FUSION = "TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION"
 
+
+# Oldest CUDA major whose CuTe DSL payload emits the public
+# ``mma.sync.aligned...kind::mxf4nvf4`` opcode for the SM12x NVFP4 MMA atom.
+_MIN_CUTEDSL_CUDA_MAJOR = 13
 
 # Probe details are logged but excluded from the stable fingerprint.
 DepProbe = Callable[[], Tuple[bool, str]]
@@ -106,6 +115,24 @@ def _probe_megamoe_cutedsl_runtime() -> Tuple[bool, str]:
     return bool(available), "" if available else str(reason)
 
 
+def _probe_cutedsl_cuda13() -> Tuple[bool, str]:
+    try:
+        import cutlass
+    except ImportError as exc:
+        return False, f"import cutlass failed: {exc}"
+    # ``cutlass.CUDA_VERSION`` is the public spelling of
+    # ``cutlass.base_dsl.version_info.CUDA_VERSION``. It reports the CUDA
+    # version of the native payload that is actually loaded, which can still
+    # be 12.x with ``nvidia-cutlass-dsl-libs-cu13`` installed when the base
+    # payload shadows it.
+    major = getattr(getattr(cutlass, "CUDA_VERSION", None), "major", None)
+    if not isinstance(major, int):
+        return False, "cutlass.CUDA_VERSION.major is unavailable"
+    if major < _MIN_CUTEDSL_CUDA_MAJOR:
+        return False, f"active CuTe DSL payload targets CUDA {major}.x"
+    return True, ""
+
+
 def _probe_cutedsl_rubin() -> Tuple[bool, str]:
     from ...cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 
@@ -137,6 +164,7 @@ _DEP_PROBES: Dict[MoEDep, DepProbe] = {
     MoEDep.DEEPGEMM_MEGAMOE: _probe_deepgemm_megamoe,
     MoEDep.MEGAMOE_CUTEDSL_RUNTIME: _probe_megamoe_cutedsl_runtime,
     MoEDep.MEGAMOE_CUTEDSL_OP: _probe_megamoe_cutedsl_op,
+    MoEDep.CUTEDSL_CUDA13: _probe_cutedsl_cuda13,
     MoEDep.CUTEDSL_RUBIN: _probe_cutedsl_rubin,
     MoEDep.LOCALITY_DOMAIN: _probe_locality_domain,
 }

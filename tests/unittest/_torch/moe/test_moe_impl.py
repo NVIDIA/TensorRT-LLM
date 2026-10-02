@@ -1981,7 +1981,9 @@ def test_cutlass_build_gate_does_not_answer_for_an_unsupported_sm():
                 use_dp=False,
                 num_slots=8,
                 env=MoEEnvironment(
-                    sm=120, oss_cutlass_moe=False, available_deps=(MoEDep.FLASHINFER,)
+                    sm=120,
+                    oss_cutlass_moe=False,
+                    available_deps=(MoEDep.FLASHINFER, MoEDep.CUTEDSL_CUDA13),
                 ),
             ),
             MoERejectReason.TOPOLOGY_UNSUPPORTED,
@@ -2653,7 +2655,11 @@ def test_b12x_cutlass_build_mode_resolution(is_oss, sm, quant_algo, activation, 
             use_dp=False,
             num_slots=8,
             force_dynamic_quantization=dynamic,
-            env=MoEEnvironment(sm=sm, oss_cutlass_moe=is_oss, available_deps=(MoEDep.FLASHINFER,)),
+            env=MoEEnvironment(
+                sm=sm,
+                oss_cutlass_moe=is_oss,
+                available_deps=(MoEDep.FLASHINFER, MoEDep.CUTEDSL_CUDA13),
+            ),
         ),
     )
     rejection = not is_oss and quant_algo == QuantAlgo.NVFP4 and (activation == "Relu2" or dynamic)

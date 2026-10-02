@@ -22,6 +22,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
     CuteDslB12xFusedMoE,
     CuteDslB12xNvfp4FusedMoE,
@@ -35,7 +36,12 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoERejectReason,
     canonical_quant,
 )
-from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep, _probe_cutedsl_cuda13
+from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
+    backend_family_of,
+    impl_class_for,
+    resolve_moe_impl,
+)
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     NVFP4CuteDslB12xFusedMoEMethod,
     NVFP4CutlassFusedMoEMethod,
@@ -65,6 +71,7 @@ def _deployment(
     sm: int,
     *,
     flashinfer: bool = True,
+    cutedsl_cuda13: bool = True,
     ep_size: int = 1,
     tp_size: int = 1,
     use_dp: bool = False,
@@ -72,6 +79,11 @@ def _deployment(
     eplb: bool = False,
 ) -> MoEDeployment:
     """Declare the machine rather than patching the probes that read it."""
+    deps = []
+    if flashinfer:
+        deps.append(MoEDep.FLASHINFER.value)
+    if cutedsl_cuda13:
+        deps.append(MoEDep.CUTEDSL_CUDA13.value)
     return MoEDeployment(
         ep_size=ep_size,
         tp_size=tp_size,
@@ -81,7 +93,7 @@ def _deployment(
         eplb_enabled=eplb,
         env=MoEEnvironment(
             sm=sm,
-            available_deps=(MoEDep.FLASHINFER.value,) if flashinfer else (),
+            available_deps=tuple(deps),
         ),
     )
 
@@ -172,6 +184,91 @@ def test_can_implement_rejects_missing_flashinfer():
     verdict = NVFP4_LEAF.can_implement(_problem(), _deployment(120, flashinfer=False))
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.DEP_MISSING
+
+
+@pytest.mark.parametrize("sm_version", SUPPORTED_SM)
+def test_can_implement_rejects_nvfp4_without_cuda13_cute_dsl(sm_version):
+    """CUDA 12.x CuTe DSL emits PTX that ptxas rejects for the NVFP4 MMA."""
+    verdict = NVFP4_LEAF.can_implement(
+        _problem(), _deployment(sm_version, cutedsl_cuda13=False)
+    )
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.DEP_MISSING
+    assert "CUDA 13 native payload" in verdict.detail
+    assert "Unexpected instruction types" in verdict.detail
+
+
+@pytest.mark.parametrize("sm_version", SUPPORTED_SM)
+def test_can_implement_cuda13_gate_is_limited_to_pure_nvfp4(sm_version):
+    """Only the pure-NVFP4 decode kernel instantiates the NVFP4 MMA atom."""
+    verdict = CuteDslB12xW4a16Nvfp4FusedMoE.can_implement(
+        _problem(QuantAlgo.W4A16_NVFP4), _deployment(sm_version, cutedsl_cuda13=False)
+    )
+    assert verdict.eligible
+
+
+def _cutedsl_model_config() -> ModelConfig:
+    cfg = ModelConfig()
+    cfg.moe_backend = "CUTEDSL"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    return cfg
+
+
+@pytest.mark.parametrize("sm_version", SUPPORTED_SM)
+def test_cutedsl_degrades_to_cutlass_without_cuda13_cute_dsl(sm_version):
+    """CUTEDSL + NVFP4 + SM12x avoids the unsupported CuTe DSL JIT path."""
+    report = resolve_moe_impl(
+        _cutedsl_model_config(),
+        problem=_problem(),
+        deployment=_deployment(sm_version, cutedsl_cuda13=False),
+    )
+    assert backend_family_of(impl_class_for(report)) == "CUTLASS"
+    assert report.degraded
+    b12x_rejections = [r for r in report.rejected if r.legacy_backend == NVFP4_LEAF.__name__]
+    assert len(b12x_rejections) == 1
+    assert b12x_rejections[0].reason is MoERejectReason.DEP_MISSING
+    assert "CUDA 13 native payload" in b12x_rejections[0].detail
+
+
+@pytest.mark.parametrize("sm_version", SUPPORTED_SM)
+def test_cutedsl_selects_b12x_with_cuda13_cute_dsl(sm_version):
+    report = resolve_moe_impl(
+        _cutedsl_model_config(),
+        problem=_problem(),
+        deployment=_deployment(sm_version),
+    )
+    assert impl_class_for(report) is NVFP4_LEAF
+    assert not report.degraded
+
+
+def test_probe_cutedsl_cuda13_reports_missing_cutlass(monkeypatch):
+    # A ``None`` entry in ``sys.modules`` makes ``import cutlass`` raise
+    # ImportError without touching an installed package.
+    monkeypatch.setitem(sys.modules, "cutlass", None)
+    available, detail = _probe_cutedsl_cuda13()
+    assert not available
+    assert "import cutlass failed" in detail
+
+
+@pytest.mark.parametrize(
+    ("cuda_version", "expected"),
+    [
+        (None, False),
+        (types.SimpleNamespace(), False),
+        (types.SimpleNamespace(major="13"), False),
+        (types.SimpleNamespace(major=12), False),
+        (types.SimpleNamespace(major=13), True),
+        (types.SimpleNamespace(major=14), True),
+    ],
+)
+def test_probe_cutedsl_cuda13_reads_public_cutlass_api(monkeypatch, cuda_version, expected):
+    cutlass_module = types.ModuleType("cutlass")
+    if cuda_version is not None:
+        cutlass_module.CUDA_VERSION = cuda_version
+    monkeypatch.setitem(sys.modules, "cutlass", cutlass_module)
+    available, detail = _probe_cutedsl_cuda13()
+    assert available is expected
+    assert bool(detail) is not expected
 
 
 def test_can_implement_rejects_eplb():

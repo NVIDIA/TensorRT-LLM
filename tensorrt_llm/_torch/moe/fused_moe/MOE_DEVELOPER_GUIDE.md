@@ -692,6 +692,14 @@ tensor cores. This is what makes Cutlass the landing spot when a W4A16 NVFP4
 layer finds no specialized backend — the B12x W4A16 leaf without flashinfer,
 or any SM outside Marlin's 89-99 and B12x's 120/121.
 
+On SM120/121 the B12x NVFP4 leaf `CuteDslB12xNvfp4FusedMoE` additionally needs
+`MoEDep.CUTEDSL_CUDA13`: the active `nvidia-cutlass-dsl` native payload must
+report CUDA 13 or newer through `cutlass.CUDA_VERSION`. The CUDA 12.x payload
+lowers the SM12x NVFP4 MMA atom to PTX that ptxas rejects, so without it the
+leaf is `DEP_MISSING` and falls back to Cutlass instead of failing in the
+decode-kernel JIT. The W4A16 NVFP4 leaf does not instantiate that atom and is
+not gated.
+
 ‡ No CuteDSL leaf publishes `fp8_block_scales`; the DeepGEMM and TRTLLM-Gen
 leaves own the format on SM100/103/107 and Cutlass on SM90/SM120. Because a
 `CUTEDSL` request considers only the CuteDSL family plus the Cutlass fallback,
