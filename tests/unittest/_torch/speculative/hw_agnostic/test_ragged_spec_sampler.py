@@ -691,6 +691,7 @@ def test_step_windows_survive_request_and_output_reuse(
     assert first.py_draft_tokens == [6, 7, 8]
     assert first.py_decoding_iter == 1
     assert context.py_num_draft_tokens_verified == 0
+    assert context.py_rewind_len == (0 if authority == "device" else 3)
     assert complete.tokens == []
     assert complete.py_decoding_iter == 0
 
@@ -712,3 +713,78 @@ def test_device_windows_require_request_aligned_integer_vector(cpu_sampler, inva
     with pytest.raises(ValueError, match="verify_lens"):
         sampler.sample_async(scheduled, outputs, [])
     assert transfers == []
+
+
+@pytest.mark.parametrize(
+    "token_window, num_new_tokens", [(1, 1), (2, 1), (2, 2), (4, 1), (4, 2), (4, 4)]
+)
+def test_executed_device_window_is_not_host_plan_or_acceptance(
+    cpu_sampler, token_window, num_new_tokens
+):
+    sampler, _ = cpu_sampler
+    scheduled, outputs, context, first, _ = _sampling_step()
+    # A device redistribution need not preserve the host's draft shape split.
+    first.py_verify_len = 0
+    outputs["verify_lens"] = torch.tensor([99, 1, token_window, 4, 99], dtype=torch.int32)
+    outputs["new_tokens_lens"][2] = num_new_tokens
+    state = sampler.sample_async(scheduled, outputs, [])
+    first.py_verify_len = 5
+    first.py_draft_tokens = [99] * 5
+    sampler.update_requests(state)
+
+    assert state.verify_lens_snapshot is None
+    assert first.py_num_accepted_draft_tokens == num_new_tokens - 1
+    assert first.py_num_draft_tokens_verified == token_window - 1
+    assert first.py_rewind_len == token_window - num_new_tokens
+    assert len(first.tokens) == num_new_tokens
+    assert context.py_num_draft_tokens_verified == 0
+    assert context.py_rewind_len == 0
+
+
+def test_two_pending_steps_keep_separate_window_and_token_copies(cpu_sampler):
+    sampler, transfers = cpu_sampler
+    scheduled, outputs, _, first, _ = _sampling_step()
+    outputs["verify_lens"] = torch.tensor([99, 1, 4, 4, 99], dtype=torch.int32)
+    earlier = sampler.sample_async(scheduled, outputs, [])
+
+    # The next step reuses both worker outputs and the slot-indexed sampler store.
+    outputs["verify_lens"][2] = 2
+    outputs["new_tokens_lens"][2] = 1
+    outputs["new_tokens"][2, 0] = 77
+    later = sampler.sample_async(scheduled, outputs, [])
+    assert earlier.host.verify_lens.data_ptr() != later.host.verify_lens.data_ptr()
+    outputs["verify_lens"].fill_(99)
+    outputs["new_tokens"].fill_(99)
+    first.py_verify_len = 5
+
+    sampler.update_requests(earlier)
+    assert first.tokens == [8, 9]
+    assert first.py_num_draft_tokens_verified == 3
+    assert first.py_rewind_len == 2
+    sampler.update_requests(later)
+    assert first.tokens == [8, 9, 77]
+    assert first.py_num_accepted_draft_tokens == 0
+    assert first.py_num_draft_tokens_verified == 1
+    assert first.py_rewind_len == 1
+    assert sum(event == "sync" for event, _ in transfers) == 2
+
+
+def test_completed_request_slot_reuse_does_not_rebind_pending_windows(cpu_sampler):
+    sampler, _ = cpu_sampler
+    scheduled, outputs, _, first, complete = _sampling_step()
+    outputs["verify_lens"] = torch.tensor([99, 1, 2, 4, 99], dtype=torch.int32)
+    earlier = sampler.sample_async(scheduled, outputs, [])
+    complete.state = LlmRequestState.GENERATION_COMPLETE
+
+    next_scheduled, next_outputs, _, _, replacement = _sampling_step()
+    replacement.py_request_id = 10
+    assert replacement.py_seq_slot == complete.py_seq_slot
+    next_outputs["verify_lens"] = torch.tensor([99, 1, 4, 2, 99], dtype=torch.int32)
+    later = sampler.sample_async(next_scheduled, next_outputs, [])
+    sampler.update_requests(earlier)
+    assert first.py_num_draft_tokens_verified == 1
+    assert complete.tokens == []
+    assert replacement.tokens == []
+    sampler.update_requests(later)
+    assert replacement.py_num_draft_tokens_verified == 1
+    assert replacement.py_rewind_len == 0
