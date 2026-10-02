@@ -3115,12 +3115,10 @@ class PyExecutor:
                             if batch_outputs is None:
                                 # _forward_step hit an exception; _handle_errors
                                 # already responded to the affected requests.
-                                # Under pipeline parallelism the peer ranks are
-                                # inside inter-PP communication for this
-                                # microbatch and cannot skip it in lockstep, so
-                                # the iteration is not survivable here; raise an
-                                # explicit fatal instead of the opaque TypeError
-                                # from dereferencing batch_outputs['logits'].
+                                # Peer PP ranks are inside inter-PP
+                                # communication for this microbatch and cannot
+                                # skip it in lockstep, so the iteration is not
+                                # survivable here.
                                 raise RuntimeError(
                                     "model forward failed on the last PP rank; "
                                     "see the preceding forward error")
@@ -4718,13 +4716,10 @@ class PyExecutor:
                                 self.dwdp_manager.prefetch_first_layers()
                             batch_outputs = self._forward_step(scheduled_batch)
 
-                        # A None means _forward_step hit an exception and
+                        # None: _forward_step hit an exception and
                         # _handle_errors already failed the affected requests
-                        # and enqueued (or buffered, under attention DP) their
-                        # error responses. A non-fatal forward error is meant
-                        # to be survivable, so skip this iteration's sampling
-                        # and bookkeeping instead of dereferencing
-                        # batch_outputs['logits'] and taking down every rank.
+                        # and enqueued their error responses. Skip this
+                        # iteration's sampling and bookkeeping.
                         if batch_outputs is not None:
                             self._maybe_prefetch_next_iter_mm_encoders(
                                 scheduled_batch)
@@ -4799,14 +4794,11 @@ class PyExecutor:
                         if self.enable_kv_cache_events:
                             self._add_kv_cache_events()
                     else:
-                        # This rank survived a forward failure and skipped the
-                        # bookkeeping above, including the _handle_responses
-                        # response gather. Healthy attention-DP peers still
-                        # enter that gather, and collectives pair by call
-                        # order, so enter it here with an empty response list
-                        # to keep the group aligned; rank-symmetric companion
-                        # to the _enqueue_responses([]) else branch in the
-                        # overlap loop. No-op without attention DP.
+                        # Healthy attention-DP peers still enter the
+                        # _handle_responses gather this rank just skipped, and
+                        # collectives pair by call order, so enter it with an
+                        # empty response list to keep the group aligned. No-op
+                        # without attention DP.
                         self._enqueue_responses([])
 
                 # Drain timeout buffer outside ``if can_queue`` so the synced
@@ -5620,19 +5612,13 @@ class PyExecutor:
                                 scheduled_batch, previous_tensors_device)
 
                     if batch_outputs is None:
-                        # _forward_step hit an exception and _handle_errors has
-                        # already failed the affected requests and enqueued (or
-                        # buffered, under attention DP) their error responses.
-                        # A non-fatal forward error is meant to be survivable,
-                        # so fall back to the empty-batch bookkeeping for the
-                        # rest of this iteration instead of dereferencing
-                        # batch_outputs['logits'] and taking down every rank.
-                        # The previous batch's requests were failed with the
-                        # rest of active_requests, so drop it rather than
-                        # updating terminated requests. Dropping it skips
-                        # _process_iter_stats, which normally returns its
-                        # borrowed timing events to the pool, so return them
-                        # here.
+                        # _forward_step hit an exception; _handle_errors
+                        # already failed the affected requests (the previous
+                        # batch's included) and enqueued their error responses.
+                        # Drop the previous batch rather than updating
+                        # terminated requests; that skips _process_iter_stats,
+                        # which normally returns the borrowed timing events to
+                        # the pool, so release them here.
                         can_queue = False
                         can_queue_this_rank = False
                         should_process_previous_batch = False
@@ -6082,11 +6068,9 @@ class PyExecutor:
         # Check if request has enough budget
         self._validate_request_budget(request)
 
-        # Model-specific multimodal admission checks (e.g. an image whose
-        # vision-attention segment exceeds the encoder budget). The same
-        # condition raised inside the model forward is handled batch-wide and
-        # fails every request scheduled alongside the bad one; rejecting here
-        # fails only this request.
+        # Model-specific multimodal admission checks: rejecting here fails
+        # only this request; the same condition raised inside forward is
+        # handled batch-wide.
         mm_data = getattr(request, 'py_multimodal_data', None)
         if mm_data:
             validate_mm = getattr(self.model_engine.model,

@@ -2,22 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Forward-failure survival and multimodal admission validation.
 
-``_forward_step`` returns None after a non-fatal forward exception:
-``_handle_errors`` has already failed the affected requests and enqueued
-their error responses. These tests pin the two layers that make such an
-iteration survivable:
-
-- the executor loops handle a None forward result — the overlap and
+- The executor loops handle a None forward result: the overlap and
   non-overlap loops skip the iteration's sampling and bookkeeping and keep
   running, while the PP loop raises an explicit fatal on the last PP rank
-  (inter-PP peers cannot skip a microbatch in lockstep);
-- ``PyExecutor._validate_request`` calls the model-provided
-  ``validate_multimodal_request_data`` hook so a model can reject a bad
-  multimodal payload at admission, failing only that request instead of
-  the whole scheduled batch at forward time.
+  (inter-PP peers cannot skip a microbatch in lockstep).
+- `PyExecutor._validate_request` calls the model-provided
+  `validate_multimodal_request_data` hook so a model can reject a bad
+  multimodal payload at admission, failing only that request.
 
 All CUDA/MPI machinery is bypassed via object.__new__ + attribute
-injection; the loop bodies and the ``_validate_request`` call site are
+injection; the loop bodies and the `_validate_request` call site are
 real code.
 """
 
