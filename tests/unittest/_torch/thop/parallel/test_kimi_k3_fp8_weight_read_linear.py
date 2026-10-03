@@ -12,23 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Coverage for Kimi K3's CuTe-only FP8 weight-read linear.
+"""Coverage for Kimi K3's FP8 block-scale weight-read linear.
 
 This module is hand-built rather than a ``Linear`` + ``FP8BlockScalesLinearMethod``,
-so the shipping FP8-block-scale tests never reach it. These tests pin the
-single-scale loader contract and the specialized quant + CuTe path.
+so the shipping FP8-block-scale tests never reach it. These tests pin its two
+construction routes and the deferred scale-preparation contract.
 """
 
 import pytest
 import torch
 from _torch.helpers import calc_diff, per_block_cast_to_fp8
-from utils.util import getSMVersion
+from utils.util import getSMVersion, isSM100Family
 
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
     _get_kimi_k3_mxfp8_tuning_buckets,
     _kimi_k3_mxfp8_tuning_bucket,
 )
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.models.modeling_kimi_linear import (
     _Fp8BlockScaleWeightReadLinear as K3Fp8Linear,
 )
@@ -37,12 +36,11 @@ from tensorrt_llm._torch.models.modeling_kimi_linear import (
 SHAPES = [(512, 1024), (2048, 1024)]
 MS = [1, 32, 128]
 
-# The Rubin MXFP8 weight-read path needs both SM107 and the internal CuTe DSL
-# build; keep the predicate local so the gate does not depend on a helper that
-# lives outside this change.
-RUBIN = pytest.mark.skipif(
-    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
-    reason="needs SM107 with Rubin CuTe DSL support",
+# The weight read serves every GEMM through deep_gemm's fp8_swap_ab_gemm, which
+# ships for the SM100 family only.
+DEEP_GEMM = pytest.mark.skipif(
+    not isSM100Family(),
+    reason="FP8 block-scale weight read needs SM100family. Current SM is %d." % getSMVersion(),
 )
 
 
@@ -58,124 +56,136 @@ def _check(out, expected, tag):
     assert diff < 5e-3, f"{tag}: calc_diff={diff}"
 
 
-def _make(out_features, in_features, seed=0):
+def _bf16_weight(out_features, in_features, seed=0):
     torch.random.manual_seed(seed)
-    w = (
+    return (
         torch.randn((out_features, in_features), device="cuda", dtype=torch.bfloat16)
         / in_features**0.5
     )
+
+
+def _make(out_features, in_features, seed=0):
+    """Build via ``quantize_weight`` — the BF16 conversion route."""
+    w = _bf16_weight(out_features, in_features, seed)
     weight, weight_scale = K3Fp8Linear.quantize_weight(w)
     return w, K3Fp8Linear(weight, weight_scale, out_features)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@RUBIN
+def _make_deferred(out_features, in_features, seed=0):
+    """Build the way the checkpoint branch of ``from_linear`` leaves a module:
+    raw checkpoint FP8 codes plus the FP32 128x128 grid, scales unprepared."""
+    w = _bf16_weight(out_features, in_features, seed)
+    weight, weight_scale = per_block_cast_to_fp8(w)
+    mod = K3Fp8Linear(weight, weight_scale.float(), out_features)
+    mod._weights_transformed = False
+    return w, mod
+
+
+@DEEP_GEMM
 @pytest.mark.parametrize("out_features, in_features", SHAPES)
 @pytest.mark.parametrize("m", MS)
 def test_forward_matches_bf16(m, out_features, in_features):
-    """The CuTe-only path must preserve the FP8 block-scale numerics."""
+    """The FP8 weight read must preserve the block-scale numerics."""
     w, mod = _make(out_features, in_features)
     x = torch.randn((m, in_features), device="cuda", dtype=torch.bfloat16)
     out = mod(x)
     _check(out, _ref(x, w), f"m={m} n={out_features} k={in_features}")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@RUBIN
-def test_forward_prequantized_matches_bf16():
-    """D-Spark's fused KDA output must use the same CuTe scale ABI."""
-    w, mod = _make(512, 1024, seed=9)
+@DEEP_GEMM
+def test_checkpoint_route_matches_bf16_after_transform():
+    """A deferred checkpoint pair must match BF16 once transformed."""
+    w, mod = _make_deferred(512, 1024, seed=9)
+    mod.transform_weights()
     x = torch.randn((16, 1024), device="cuda", dtype=torch.bfloat16)
-    activation, activation_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x)
 
-    out = mod.forward_prequantized(activation, activation_scale)
-
-    _check(out, _ref(x, w), "prequantized")
+    _check(mod(x), _ref(x, w), "checkpoint route")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@RUBIN
-def test_forward_uses_specialized_quant():
-    """Every call must use the specialized quantizer and fine-M runner."""
+@DEEP_GEMM
+def test_transform_weights_is_idempotent():
+    """The loader walks post_load_weights over every module, so a second pass
+    must not resmooth already-prepared codes into garbage."""
+    w, mod = _make_deferred(512, 1024, seed=4)
+    mod.post_load_weights()
+    prepared_weight = mod.weight.clone()
+    prepared_scale = mod.weight_scale.clone()
+
+    mod.post_load_weights()
+
+    torch.testing.assert_close(
+        mod.weight.view(torch.uint8), prepared_weight.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(mod.weight_scale, prepared_scale, rtol=0, atol=0)
+    x = torch.randn((32, 1024), device="cuda", dtype=torch.bfloat16)
+    _check(mod(x), _ref(x, w), "second transform")
+
+
+@DEEP_GEMM
+def test_forward_uses_the_swap_ab_gemm(monkeypatch):
+    """Every call must route through deep_gemm's swap-AB block-scale GEMM."""
     _, mod = _make(512, 1024, seed=8)
     x = torch.randn((64, 1024), device="cuda", dtype=torch.bfloat16)
     mod(x)
 
-    quant_calls = []
-    fine_grained_m = []
-    real_quant = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0
-    real_gemm = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin
+    observed_m = []
+    real_gemm = torch.ops.trtllm.fp8_swap_ab_gemm
 
-    class _QuantSpy:
-        def __call__(self, *args, **kwargs):
-            quant_calls.append(args[0].shape[0])
-            return real_quant(*args, **kwargs)
+    def spy(*args, **kwargs):
+        observed_m.append(args[0].shape[0])
+        return real_gemm(*args, **kwargs)
 
-    class _GemmSpy:
-        def __call__(self, *args, **kwargs):
-            fine_grained_m.append(kwargs["fine_grained_m"])
-            return real_gemm(*args, **kwargs)
+    monkeypatch.setattr(torch.ops.trtllm, "fp8_swap_ab_gemm", spy)
+    mod(x)
+    mod(x)
 
-    torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0 = _QuantSpy()
-    torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin = _GemmSpy()
-    try:
-        mod(x)
-        mod(x)
-    finally:
-        torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0 = real_quant
-        torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin = real_gemm
-
-    assert quant_calls == [64, 64]
-    assert fine_grained_m == [True, True]
+    assert observed_m == [64, 64]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@RUBIN
-def test_single_cute_scale_is_built_on_rubin():
-    """The CuTe layout must be prepared at load time, not during capture."""
+@DEEP_GEMM
+def test_prepared_scale_is_the_packed_deep_gemm_layout():
+    """``quantize_weight`` must return the packed scale the GEMM consumes.
+
+    ``fp8_swap_ab_gemm`` runs with ``disable_ue8m0_cast=True``, so it reads a
+    packed UE8M0 scale; the checkpoint's FP32 grid would be misread.
+    """
     _, mod = _make(2048, 1024, seed=5)
+    assert mod.weight.dtype is torch.float8_e4m3fn
     assert mod.weight_scale.numel() > 0
-    assert mod.weight_scale.dtype is torch.uint8
-    assert not hasattr(mod, "weight_scale_mx")
-    assert not hasattr(mod, "gemm_alpha")
+    assert mod.weight_scale.dtype is torch.int32
+    assert mod._weights_transformed
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@RUBIN
-def test_placeholder_load_carries_cute_scale():
-    """A loader-filled placeholder must receive the CuTe scale layout."""
-    in_features, parts = 1024, [512, 512]
-    torch.random.manual_seed(6)
-    pairs = []
-    for p in parts:
-        wp = torch.randn((p, in_features), device="cuda", dtype=torch.bfloat16) / in_features**0.5
-        q, s = per_block_cast_to_fp8(wp)
-        pairs.append((q, s.float()))
+@DEEP_GEMM
+def test_deferred_module_reports_untransformed_scales():
+    """The checkpoint route must stay flagged until transform_weights runs."""
+    _, mod = _make_deferred(512, 1024, seed=6)
+    assert not mod._weights_transformed
+    assert mod.weight_scale.dtype is torch.float32
 
-    mod = K3Fp8Linear.empty_placeholder(sum(parts), in_features)
-    mod.load_checkpoint_pair(pairs)
-    assert not mod.is_placeholder
-    assert mod.weight_scale.numel() > 0
-    assert mod.weight_scale.dtype is torch.uint8
-    assert not hasattr(mod, "gemm_alpha")
+    mod.transform_weights()
+
+    assert mod._weights_transformed
+    assert mod.weight_scale.dtype is torch.int32
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_weight_preparation_returns_only_cute_pair():
-    """Both construction routes return exactly FP8 weight + CuTe scale."""
-    torch.random.manual_seed(7)
-    w = torch.randn((512, 1024), device="cuda", dtype=torch.bfloat16) / 32
+    """Both construction routes return exactly FP8 weight + prepared scale."""
+    w = _bf16_weight(512, 1024, seed=7)
     assert len(K3Fp8Linear.quantize_weight(w)) == 2
 
     q, s = per_block_cast_to_fp8(w)
-    assert len(K3Fp8Linear.prepare_checkpoint_scale(q, s.float())) == 2
+    assert len(K3Fp8Linear._prepare_weights(q, s.float())) == 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_unfilled_placeholder_raises():
-    mod = K3Fp8Linear.empty_placeholder(256, 256)
+    """An unprepared scale must fail loudly, not silently produce NaN."""
+    _, mod = _make_deferred(256, 256, seed=2)
     x = torch.randn((2, 256), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="never filled"):
+
+    with pytest.raises(RuntimeError, match="before its scales were prepared"):
         mod(x)
 
 

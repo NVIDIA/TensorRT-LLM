@@ -908,6 +908,13 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
+        if not self._weights_transformed:
+            # The GEMM reads an unprepared FP32 grid as packed UE8M0 and returns
+            # silent NaN rather than failing, so refuse the call instead.
+            raise RuntimeError(
+                "Kimi K3 FP8 weight read ran before its scales were prepared; "
+                "transform_weights must run before forward."
+            )
         out_shape = (*x.shape[:-1], self.out_features)
         out = torch.ops.trtllm.fp8_swap_ab_gemm(
             x.reshape(-1, x.shape[-1]),
