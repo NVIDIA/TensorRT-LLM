@@ -21,8 +21,8 @@ experts, intermediate 768 per rank), at every M in 1..64, for these routings:
 - hot: one local expert in every token's top-16 (8 groups of it at M = 64);
 - group_cap: 100 experts with 9 of the 64 tokens and 124 with one (324 groups at M = 64: the kernel's group capacity);
 - none_local: no local expert;
-- rtb2 (with K3_ROUTING_DUMP naming the campaign's router dump): 4 draws of 8 decode forwards of 8 tokens each, the
-  step's busiest EP group mapped onto this rank (M tokens: the first M of the draw).
+- skewed: 4 seeded draws of 64 tokens whose experts follow a skewed popularity, as a trained router's do (popular
+  experts recur across tokens), each draw's busiest EP group mapped onto this rank (M tokens: the first M of the draw).
 Checks: against the stock path (trtllm::kimi_k3_noaux_tc_mxfp8_quant, then the TRTLLM-Gen W4A8_MXFP4_MXFP8 MoE runner
 with those ids) and an fp64 reference over the dequantized MXFP4 experts (op-catalog gates: 8 ulp of the row max per
 element, 4 ulp relative RMS); run-to-run identical bits; the slab armed and the layer's counters zero after every
@@ -32,7 +32,6 @@ refused. Weights are random checkpoint-format MXFP4 experts put through TRT-LLM'
 
 import functools
 import math
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -59,7 +58,6 @@ ULP = 2.0**-8
 E4M3_MAX = 448.0
 M_MAX = 64
 M_ALL = list(range(1, M_MAX + 1))
-ROUTING_DUMP = os.environ.get("K3_ROUTING_DUMP")
 
 
 def _ops():
@@ -253,7 +251,7 @@ def _scratch_rearmed(state, *layers):
 
 
 CASES = ["random", "16_local", "disjoint", "hot", "group_cap", "none_local"]
-RTB2_DRAWS = 4
+SKEWED_DRAWS = 4
 
 
 def _chosen_logits(chosen, gen):
@@ -267,33 +265,30 @@ def _chosen_logits(chosen, gen):
 
 
 @functools.lru_cache(maxsize=None)
-def _rtb2_steps(path, draws, seed=11):
-    """R decode forwards of 8 tokens each from the router dump (one random layer per draw), R = 8 (64 tokens): each
-    step's ids rotated so that its busiest EP group (most distinct experts) is this rank's."""
-    import numpy as np
-
-    z = np.load(path)
-    ntok = z["fwd_ntok"]
-    starts = np.concatenate([[0], np.cumsum(ntok)[:-1]])
-    decode = [i for i, n in enumerate(ntok) if n == 8]
-    layers = [int(v) for v in z["layers"]]
-    rng = np.random.default_rng(seed)
+def _skewed_steps(draws, seed=11):
+    """Per draw, 64 tokens' top-16 experts under a skewed popularity: each expert's log-popularity ~ N(0, 1.5) for the
+    draw, each token's 16 distinct experts the top-16 of log-popularity plus Gumbel noise (a weighted draw without
+    replacement), so popular experts recur across tokens. Each draw's ids are rotated so that its busiest EP group
+    (most distinct experts) is this rank's."""
+    gen = torch.Generator().manual_seed(seed)
     steps = []
     for _ in range(draws):
-        fwds = rng.choice(decode, size=M_MAX // 8, replace=False)
-        toks = np.concatenate([np.arange(starts[f], starts[f] + 8) for f in fwds])
-        ids = z[f"ids_{rng.choice(layers)}"][toks].astype(np.int64)
-        counts = np.bincount(ids.reshape(-1), minlength=NUM_EXPERTS).reshape(4, E_LOCAL)
-        busiest = int(np.argmax((counts > 0).sum(axis=1)))
+        log_pop = torch.randn(NUM_EXPERTS, generator=gen) * 1.5
+        uniform = torch.rand(M_MAX, NUM_EXPERTS, generator=gen).clamp_min(1e-20)
+        ids = (log_pop - torch.log(-torch.log(uniform))).topk(TOP_K, dim=1).indices
+        counts = torch.bincount(ids.reshape(-1), minlength=NUM_EXPERTS).reshape(
+            NUM_EXPERTS // E_LOCAL, E_LOCAL
+        )
+        busiest = int((counts > 0).sum(dim=1).argmax())
         ids = (ids + (EP_RANK - busiest) * E_LOCAL) % NUM_EXPERTS
-        steps.append([set(int(e) for e in row) for row in ids])
+        steps.append([sorted(int(e) for e in row) for row in ids.tolist()])
     return steps
 
 
 @functools.lru_cache(maxsize=None)
 def _tokens(case: str, seed: int = 7):
     """64 tokens: router logits and the latent rows (M tokens use the first M)."""
-    salt = CASES.index(case) if case in CASES else len(CASES) + int(case[5:])
+    salt = CASES.index(case) if case in CASES else len(CASES) + int(case.split(".")[1])
     gen = torch.Generator(device="cuda").manual_seed(seed + salt)
     cpu = torch.Generator().manual_seed(seed + salt)
     x = torch.randn(M_MAX, H, generator=gen, device="cuda").bfloat16()
@@ -330,8 +325,8 @@ def _tokens(case: str, seed: int = 7):
                 chosen[t].append(e)
                 free[t] -= 1
         assert all(f == 0 for f in free)
-    elif case.startswith("rtb2."):
-        chosen = [sorted(e) for e in _rtb2_steps(ROUTING_DUMP, RTB2_DRAWS)[int(case[5:])]]
+    elif case.startswith("skewed."):
+        chosen = _skewed_steps(SKEWED_DRAWS)[int(case.split(".")[1])]
     else:
         raise ValueError(case)
     return _chosen_logits(chosen, gen), x
@@ -396,11 +391,10 @@ def test_k3_moe_wide(case, m):
     _check(case, m)
 
 
-@pytest.mark.skipif(not ROUTING_DUMP, reason="K3_ROUTING_DUMP names no router dump")
 @pytest.mark.parametrize("m", M_ALL)
-@pytest.mark.parametrize("draw", range(RTB2_DRAWS))
-def test_k3_moe_wide_rtb2(draw, m):
-    _check(f"rtb2.{draw}", m)
+@pytest.mark.parametrize("draw", range(SKEWED_DRAWS))
+def test_k3_moe_wide_skewed(draw, m):
+    _check(f"skewed.{draw}", m)
 
 
 def test_k3_moe_wide_mixed_sequence():
