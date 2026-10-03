@@ -382,19 +382,29 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
       model_cls.get_preferred_transceiver_runtime(), NIXL-gated, via the
       REAL llm_utils._resolve_transceiver_runtime_auto (mutates cache_cfg).
 
-    Resolution errors propagate so the precheck cannot silently exercise a
-    different runtime/cache-manager combination from serving. Returns the
-    effective use_v2 bool.
+    The model class comes from the checkpoint's config.json when it is staged,
+    and otherwise from the yaml's declared `metadata.architectures`: the
+    preference hooks key off the architecture, so an unstaged checkpoint must
+    not decide the manager version. Resolution errors propagate so the
+    precheck cannot silently exercise a different runtime/cache-manager
+    combination from serving. Returns the effective use_v2 bool.
     """
     import types
 
     api = load_internal_apis()
     model_cls, hf_view = _lookup_model_cls(model_dir)
+    declared = side.get("architectures") or []
+    if model_cls is None and declared:
+        # Same first-architecture lookup as the config.json path above.
+        model_cls = api.get_registered_model_class(declared[0])
     setting = side["use_kv_cache_manager_v2"]
     if setting == "auto" and model_cls is None:
         raise RuntimeError(
             "use_kv_cache_manager_v2 is 'auto', but the precheck could not resolve "
-            f"a registered model class from model_dir={model_dir!r}; refusing to assume V1"
+            f"a registered model class from model_dir={model_dir!r} or from "
+            f"metadata.architectures={declared}; refusing to assume V1. Stage the "
+            "checkpoint under LLM_MODELS_ROOT, or declare the checkpoint's "
+            "architectures in the yaml's metadata block"
         )
 
     # Runtime BEFORE V2, like serving: the V2 resolver's disagg gating reads
@@ -413,7 +423,10 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
         try:
             parallel = side["parallel"]
             llm_args_kwargs = {
-                "model": model_dir,
+                # Required field, and the resolver reads only the kv-cache /
+                # transceiver / parallel inputs below, so an unresolved
+                # checkpoint passes through as an empty path rather than None.
+                "model": model_dir or "",
                 "tensor_parallel_size": parallel["tp"],
                 "pipeline_parallel_size": parallel["pp"],
                 "context_parallel_size": parallel["cp"],

@@ -88,7 +88,9 @@ MAX_STEP_TIMEOUT_S = 1800
 
 # Fallback KV shape for dry-runs and explicitly selected manager versions when
 # the model directory cannot be resolved. Manager-version "auto" resolution
-# fails fast instead of silently pairing this shape with V1.
+# never silently pairs this shape with V1: it resolves the architecture from
+# metadata.architectures instead (see declared_architectures) and fails fast
+# when neither the checkpoint nor the yaml names one.
 FALLBACK_KV_SHAPE = {
     "num_layers": 32,
     "num_kv_heads": 8,
@@ -439,6 +441,7 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         ),
         "rendezvous_timeout_s": rendezvous_timeout_s,
         "verify_data": bool(knobs["verify_data"]),
+        "architectures": declared_architectures(cfg),
     }
     for role, side, xcvr in (("ctx", ctx_side, ctx_xcvr), ("gen", gen_side, gen_xcvr)):
         kv_cfg = side.get("kv_cache_config") or {}
@@ -485,6 +488,7 @@ def side_plan(plan, role):
         "num_nextn_predict_layers": plan[f"{role}_num_nextn_predict_layers"],
         "use_kv_cache_manager_v2": plan[f"{role}_use_kv_cache_manager_v2"],
         "num_peers": plan["num_gen_servers" if role == "ctx" else "num_ctx_servers"],
+        "architectures": plan["architectures"],
     }
 
 
@@ -565,6 +569,24 @@ def resolve_model_dir(cfg, llm_src=None, llm_models_root=None):
         if os.path.isfile(os.path.join(cand, "config.json")):
             return cand
     return None
+
+
+def declared_architectures(cfg):
+    """HF architecture names the yaml declares in `metadata.architectures`.
+
+    The checkpoint's own `config.json` is the primary source for the model
+    class, but a perf-sanity lane can be scheduled on a cluster where the
+    weights are not staged yet (resolve_model_dir -> None). The architecture
+    itself does not depend on the weights, so declaring it in the yaml keeps
+    manager-version/runtime "auto" resolvable there, instead of leaving the
+    precheck a choice between assuming V1 and aborting the whole lane.
+
+    Shaped like config.json's own `architectures` list; a bare string is
+    accepted so a hand-edited yaml cannot split into characters.
+    """
+    metadata = cfg.get("metadata", {}) or {}
+    archs = metadata.get("architectures") or []
+    return [archs] if isinstance(archs, str) else list(archs)
 
 
 def unmodelable_kv_reason(hf_cfg):
