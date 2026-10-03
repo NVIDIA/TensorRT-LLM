@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from tensorrt_llm.quantization.mode import QuantAlgo
+
 from ..._router_index import NULL_TRACE, ModelingV2Context, Trace
 
 # The one GPU architecture these targets are written for. sm is part of a
@@ -59,13 +61,15 @@ def _field(config: Any, name: str) -> Any:
 def _mxfp4(quant_config: Any) -> bool:
     """Whether the checkpoint is the MXFP4 one these targets load.
 
-    The MXFP4 checkpoint declares its quantization only inside
-    ``text_config.quantization_config`` (compressed-tensors), which the model
-    config does not surface, so it reads as no quantization at all. The NVFP4
-    requant ships ``hf_quant_config.json`` and reads as MIXED_PRECISION; its
-    experts would land in a loader that reads packed MXFP4 tensors.
+    The MXFP4 checkpoint declares its quantization inside
+    ``text_config.quantization_config`` (compressed-tensors,
+    ``mxfp4-pack-quantized``); ``KimiK3Config`` surfaces it and the model
+    config reads it as W4A16_MXFP4. The NVFP4 requant ships
+    ``hf_quant_config.json`` and reads as MIXED_PRECISION, and a checkpoint
+    without quantization reads as none; the experts of either would land in a
+    loader that reads packed MXFP4 tensors.
     """
-    return quant_config is None or quant_config.quant_algo is None
+    return quant_config is not None and quant_config.quant_algo == QuantAlgo.W4A16_MXFP4
 
 
 def _parallel(m) -> Optional[str]:
