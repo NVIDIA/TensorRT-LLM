@@ -22,7 +22,9 @@ followed by the TP-gathered greedy sampler computes.
 
 The ranks exchange one (value, index) entry per CTA and position through this module's own MNNVL multicast buffers
 (``markov_workspace``), allocated collectively on the first call of a TP group, which must happen outside CUDA-graph
-capture (the kernel also compiles there).
+capture (the kernel also compiles there). Every CTA spins on the other ranks' entries, so all of the grid's CTAs (at
+most the SM count) must be resident at once: no concurrent kernel may hold SMs while it waits on this grid, and no SM
+cap (MPS or green contexts) may sit below the grid.
 """
 
 from __future__ import annotations
