@@ -958,7 +958,8 @@ def _create_py_executor_impl(
                     "Disabling partial reuse: the mooncake-store connector addresses "
                     "whole blocks, so a partial match leaves the matched length off a "
                     "block boundary and the connector declines the lookup, trading part "
-                    "of one block for every stored block of the remaining prefix.")
+                    "of one block for every stored block of the remaining prefix."
+                )
                 kv_cache_config.enable_partial_reuse = False
     else:
         kv_connector_manager = None

@@ -42,11 +42,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
     MooncakeStoreConnectorScheduler,
 )
-from tensorrt_llm.llmapi.llm_args import (
-    KvCacheConfig,
-    KvCacheConnectorConfig,
-    MooncakeStoreConfig,
-)
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig, MooncakeStoreConfig
 
 from ..conftest import llm_models_root
 from .test_llm_api_connector import E2E_MIN_TOKEN_AGREEMENT
@@ -93,8 +89,7 @@ def assert_tokens_agree(reference, replayed, *, context: str) -> None:
     `test_llm_api_connector.test_connector_e2e_persistent_cache`.
     """
     assert len(replayed) == len(reference), (
-        f"{context}: generation length changed, {len(reference)} tokens against "
-        f"{len(replayed)}."
+        f"{context}: generation length changed, {len(reference)} tokens against {len(replayed)}."
     )
 
     common = _common_prefix(reference, replayed)
@@ -159,9 +154,7 @@ def llm_kwargs(pool, **overrides) -> dict:
         ),
         cuda_graph_config=None,
         disable_overlap_scheduler=True,
-        kv_cache_config=KvCacheConfig(
-            free_gpu_memory_fraction=0.2, use_kv_cache_manager_v2=True
-        ),
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.2, use_kv_cache_manager_v2=True),
     )
     kwargs.update(overrides)
     return kwargs
@@ -182,9 +175,7 @@ def matched_token_counts(monkeypatch):
         counts.append(result[0])
         return result
 
-    monkeypatch.setattr(
-        MooncakeStoreConnectorScheduler, "get_num_new_matched_tokens", recording
-    )
+    monkeypatch.setattr(MooncakeStoreConnectorScheduler, "get_num_new_matched_tokens", recording)
     return counts
 
 
@@ -233,9 +224,7 @@ def test_mooncake_e2e_cross_engine_prefix_reuse(
         "would pass with the connector disabled."
     )
 
-    assert_tokens_agree(
-        cold_token_ids, warm_token_ids, context="Cross-engine prefix reuse"
-    )
+    assert_tokens_agree(cold_token_ids, warm_token_ids, context="Cross-engine prefix reuse")
 
 
 @pytest.mark.skip_less_device(2)

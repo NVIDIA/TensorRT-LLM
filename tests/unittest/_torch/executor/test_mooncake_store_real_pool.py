@@ -274,9 +274,7 @@ def _page_transfers(request_id: int, page_index: int) -> list[RequestTransfers]:
 
 def save_page(worker: MooncakeStoreConnectorWorker, request_id: int, page_index: int) -> None:
     """Publish a page and wait for the background save thread to drain it."""
-    worker.bind_connector_meta(
-        MooncakeStoreMetadata(saves=_page_transfers(request_id, page_index))
-    )
+    worker.bind_connector_meta(MooncakeStoreMetadata(saves=_page_transfers(request_id, page_index)))
     worker.wait_for_save(torch.cuda.current_stream())
 
     deadline = time.monotonic() + SAVE_TIMEOUT_SECONDS
@@ -296,16 +294,12 @@ def load_page(worker: MooncakeStoreConnectorWorker, request_id: int, page_index:
     # Zero copy lands bytes by RDMA, outside this stream's ordering, so work
     # the test queued against the KV buffer has to have retired first.
     torch.cuda.current_stream().synchronize()
-    worker.bind_connector_meta(
-        MooncakeStoreMetadata(loads=_page_transfers(request_id, page_index))
-    )
+    worker.bind_connector_meta(MooncakeStoreMetadata(loads=_page_transfers(request_id, page_index)))
     worker.start_load_kv(torch.cuda.current_stream())
     torch.cuda.current_stream().synchronize()
 
 
-@pytest.mark.parametrize(
-    "stage_through_host", [False, True], ids=["zero_copy", "host_staged"]
-)
+@pytest.mark.parametrize("stage_through_host", [False, True], ids=["zero_copy", "host_staged"])
 def test_a_saved_page_comes_back_byte_identical(mooncake_pool, stage_through_host):
     """Save a page, lose it, load it back, and compare the bytes.
 
@@ -318,9 +312,7 @@ def test_a_saved_page_comes_back_byte_identical(mooncake_pool, stage_through_hos
     page_index = 3
     expected = _snapshot(buffer, page_index)
 
-    with open_worker(
-        mooncake_pool, buffer=buffer, stage_through_host=stage_through_host
-    ) as worker:
+    with open_worker(mooncake_pool, buffer=buffer, stage_through_host=stage_through_host) as worker:
         save_page(worker, request_id=1, page_index=page_index)
         buffer.zero_()
         load_page(worker, request_id=2, page_index=page_index)
@@ -360,9 +352,7 @@ def test_a_page_written_by_one_worker_is_read_back_by_another(mooncake_pool):
         )
         load_page(reader, request_id=2, page_index=reader_page)
 
-    assert_page_matches(
-        reader_buffer, reader_page, expected, context="Replay by a second worker"
-    )
+    assert_page_matches(reader_buffer, reader_page, expected, context="Replay by a second worker")
 
 
 def test_a_prefix_counts_only_once_every_rank_has_its_shard(mooncake_pool, monkeypatch):
