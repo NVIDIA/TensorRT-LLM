@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -606,6 +606,16 @@ int get_sm_count()
     return sm_count;
 }
 
+//! Number of \p block_size-thread blocks of \p kernel that can be resident on one SM at once.
+template <typename KernelFunc>
+int get_max_blocks_per_sm(KernelFunc kernel, int block_size)
+{
+    int blocks_per_sm = 0;
+    // Zero dynamic shared memory: the kernels here declare all of their shared memory statically.
+    TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_size, 0));
+    return std::max(blocks_per_sm, 1);
+}
+
 template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc, bool TriggerCompletionAtEnd = true>
 void launch_oneshot_lamport(AllReduceFusionParams const& params, cudaLaunchConfig_t& cfg)
 {
@@ -684,7 +694,26 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     int block_size = threads_per_block;
     TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
 
-    int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
+    // Block budget for the case where there are more clusters of work than SMs.
+    //
+    // The two-shot kernel stays at one cluster per SM. Its Barrier makes every block wait on the
+    // peer rank's block with the same blockIdx.x, and the flag array holds one entry per block up
+    // to kBarrierFlagCount, so a grid whose blocks are not all co-resident can deadlock.
+    //
+    // The one-shot kernel has no block-to-block coupling -- its Lamport handshake is per element
+    // and all of its loops are grid-strided -- so it is sized to fill the SMs instead. One block
+    // per SM leaves most of the warp slots idle (a 256-thread block is 8 of the 64 warps an SM
+    // holds on sm_100), which is too little parallelism to keep enough of the uncacheable peer
+    // loads it spins on in flight.
+    int block_budget = sm_count;
+    if (oneshot)
+    {
+        auto kernel = params.trigger_completion_at_end
+            ? &allreduce_fusion_kernel_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc, true>
+            : &allreduce_fusion_kernel_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc, false>;
+        block_budget = sm_count * get_max_blocks_per_sm(kernel, block_size);
+    }
+    int grid_size = (std::min(block_budget, cluster_num * cluster_size) / cluster_size) * cluster_size;
     cudaLaunchConfig_t cfg;
     cudaLaunchAttribute attribute[2];
     cfg.gridDim = grid_size;
