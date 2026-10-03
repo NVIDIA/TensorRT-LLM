@@ -88,13 +88,17 @@ every word empty, every counter zero.
 **Who creates it, and when.** The target, in `post_load_weights`, with
 `K3SandwichWorkspace.create(mapping, fabric_handle=None)`:
 
-- collective over `mapping`'s TP group: every rank calls it at the same point;
+- collective over `mapping`'s TP group only: every rank of the group, and no other rank of the session, calls it
+  at the same point. Under MPI its communicator is made from the group's ranks alone (`MPI_Comm_create_group`;
+  certified in `comm/k3_latent_reduce`'s matrix: with the job split into two TP groups of `W / 2`, one group
+  makes its communicator while the other's ranks do not call); a rank that calls it while its group's peers do
+  not waits for them;
 - failure model:
   - before allocating, the ranks agree that each of them can (not capturing, the buffer within that rank's free
     device memory). If one cannot, every rank raises `RuntimeError`, none allocates, and under MPI each frees the
-    communicator it split for the call (certified: one rank capturing while its peers call it eagerly, every rank
+    communicator made for the call (certified: one rank capturing while its peers call it eagerly, every rank
     raises, the capturing rank naming the capture and its peers another rank; no rank reaches the allocation,
-    every rank frees its split, and the next call is correct);
+    every rank frees that communicator, and the next call is correct);
   - a failure that returns from the allocation is agreed and handled the same way;
   - a rank that fails inside the allocation's handle exchange can leave its peers waiting in that exchange; this
     is not turned into an error on the other ranks;

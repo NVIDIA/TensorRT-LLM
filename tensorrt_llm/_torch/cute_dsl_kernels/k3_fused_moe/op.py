@@ -114,16 +114,17 @@ def is_supported(w3_w1_weight: torch.Tensor, w3_w1_weight_scale: torch.Tensor, w
 def create_mcast_state(name: str, mapping, words: int, fabric_handle: Optional[bool], build):
     """``build(uc, mc, handle, comm)`` over a new multicast buffer of ``words`` int32 per rank of ``mapping``'s TP
     group, every word empty (``uc``: this rank's words; ``mc``: the same words through the multicast mapping).
-    Collective and eager: every rank of the group calls it at the same point.
+    Collective over the TP group only, and eager: every rank of the group, and no other rank, calls it at the same
+    point (its communicator is made from the group's ranks alone).
 
     Failure model (as ``MnnvlWorkspace.create``): before allocating, the ranks agree that each of them can (not
     capturing a CUDA graph, the buffer within its device's free memory); if one cannot, every rank raises
-    ``RuntimeError``, none allocates, and under MPI each frees the communicator it split for the call. A failure that
+    ``RuntimeError``, none allocates, and under MPI each frees the communicator made for the call. A failure that
     returns from the allocation or from ``build`` is agreed and handled the same way. A rank that fails inside the
     allocation's handle exchange can leave its peers waiting in that exchange: that failure is not turned into an
     error on the other ranks."""
     from tensorrt_llm._torch.distributed.ops import (
-        _get_mnnvl_workspace_comm,
+        _get_mnnvl_tp_group_comm,
         _make_mnnvl_mcast_buffer,
         _mnnvl_device_index,
         _mnnvl_workspace_all_succeeded,
@@ -131,7 +132,7 @@ def create_mcast_state(name: str, mapping, words: int, fabric_handle: Optional[b
     from tensorrt_llm._utils import mpi_disabled
 
     use_fabric_handle = mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
-    comm = _get_mnnvl_workspace_comm(mapping)
+    comm = _get_mnnvl_tp_group_comm(mapping)
     # Every condition one rank alone can fail is checked before the allocation, and the ranks agree on it: a rank
     # failing inside the allocation would leave its peers in the handle exchange.
     problem: Optional[str] = None
@@ -142,7 +143,7 @@ def create_mcast_state(name: str, mapping, words: int, fabric_handle: Optional[b
         if free_bytes < words * 4:
             problem = f"its {words * 4} bytes exceed the {free_bytes} free on this rank's device"
     if not _mnnvl_workspace_all_succeeded(comm, problem is None):
-        # Every rank takes this path: free the MPI communicator split above (a ProcessGroup is c10d's).
+        # Every rank takes this path: free the MPI communicator made above (a ProcessGroup is c10d's).
         if not mpi_disabled():
             comm.Free()
         raise RuntimeError(

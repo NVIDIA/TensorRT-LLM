@@ -192,6 +192,7 @@ def k3_moe_front(
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     key = (
+        device.index if device.index is not None else torch.cuda.current_device(),
         ag_world,
         shared_cols,
         ht + st,

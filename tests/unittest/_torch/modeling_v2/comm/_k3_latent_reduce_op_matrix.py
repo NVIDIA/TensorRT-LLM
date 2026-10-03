@@ -247,15 +247,48 @@ def check_exchange_is_armed_and_sized() -> None:
     assert EX_A.state.flags.data_ptr() != EX_B.state.flags.data_ptr(), "two exchanges, two counts"
 
 
+def check_create_needs_only_the_tp_group() -> None:
+    """Under MPI a create() makes its communicator from its TP group's ranks alone (the helper every Kimi K3 state's
+    create() uses). With the job split into two TP groups of W / 2 (pipeline parallel 2), the first group's ranks make
+    theirs while the second group's ranks do not call at all; each communicator holds exactly its group, in TP-rank
+    order. The exchanges in use also hold their TP group's communicator."""
+    from tensorrt_llm._torch.distributed import ops
+    from tensorrt_llm.mapping import Mapping
+
+    for ex in (EX_A, EX_B):
+        assert ex.state.comm.Get_size() == R.world and ex.state.comm.Get_rank() == R.rank
+    half = Mapping(
+        world_size=R.world,
+        rank=R.rank,
+        gpus_per_node=R.mapping.gpus_per_node,
+        tp_size=R.world // 2,
+        pp_size=2,
+    )
+    R.barrier()
+    ok = True
+    if half.pp_rank == 0:
+        comm = ops._get_mnnvl_tp_group_comm(half)
+        ok = (
+            comm.Get_size() == half.tp_size
+            and comm.Get_rank() == half.tp_rank
+            and comm.allgather(R.rank) == list(half.tp_group)
+        )
+        comm.Free()
+    R.comm.Barrier()
+    assert R.all_true(ok), (
+        f"rank {R.rank}: the first TP group's communicator is not exactly that group"
+    )
+
+
 def check_capture_refusals() -> None:
     """``K3LatentExchange.create`` is collective: every rank joins the TP group's communicator, and before allocating
     the ranks agree that each of them can. With every rank capturing a CUDA graph, and with one rank capturing while its
     peers call it eagerly at the same point, every rank raises RuntimeError, and a capturing rank's message names the
     capture. Every rank raises at that agreement ("not every rank can allocate"; a failure after allocating reads
-    "allocation failed"), so nothing is allocated, and each frees the communicator it split. The op's first call, which
-    would compile the kernel, is refused per rank: under capture it raises on every rank before it launches anything.
-    The exchange is untouched and the next call is correct. Runs before every eager call of the op: the compile cache
-    must still be cold."""
+    "allocation failed"), so nothing is allocated, and each frees the communicator made for it. The op's first call,
+    which would compile the kernel, is refused per rank: under capture it raises on every rank before it launches
+    anything. The exchange is untouched and the next call is correct. Runs before every eager call of the op: the
+    compile cache must still be cold."""
     # Imported by the op's first call; imported here so that nothing is imported inside the capture.
     import cutlass.cute.runtime  # noqa: F401
 
@@ -276,14 +309,14 @@ def check_capture_refusals() -> None:
 
     from tensorrt_llm._torch.distributed import ops
 
-    split = ops._get_mnnvl_workspace_comm
+    make = ops._get_mnnvl_tp_group_comm
     comms = []
 
-    def recording_split(mapping):
-        comms.append(split(mapping))
+    def recording_make(mapping):
+        comms.append(make(mapping))
         return comms[-1]
 
-    ops._get_mnnvl_workspace_comm = recording_split
+    ops._get_mnnvl_tp_group_comm = recording_make
     try:
         for case, capturing in (("every rank", True), ("one rank", R.rank == R.world - 1)):
             R.barrier()
@@ -294,9 +327,9 @@ def check_capture_refusals() -> None:
                 f"{case} capturing: rank {R.rank} (capturing {capturing}) got {message!r}"
             )
     finally:
-        ops._get_mnnvl_workspace_comm = split
+        ops._get_mnnvl_tp_group_comm = make
     freed = len(comms) == 2 and all(c == R.MPI.COMM_NULL for c in comms)
-    assert R.all_true(freed), "a refused create kept the communicator it split"
+    assert R.all_true(freed), "a refused create kept the communicator made for it"
     R.barrier()
     first = raised_under_capture(lambda: entry(MAX_TOKENS, EX_A.state))
     assert R.all_true("outside CUDA-graph capture first" in first), f"first call: {first!r}"
@@ -570,6 +603,7 @@ def check_token_count_mismatch_returns_stale_rows() -> None:
 
 CHECKS = [
     check_exchange_is_armed_and_sized,
+    check_create_needs_only_the_tp_group,
     # Before every eager call of the op: it needs a cold compile cache.
     check_capture_refusals,
     check_single_calls,

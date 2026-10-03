@@ -117,19 +117,21 @@ at `W` 4, 8 and 16 (certified at 4):
 The size depends on `W` only, not on `M`: every call fits.
 
 **Who creates it, and when.** The target, in `post_load_weights`, with `K3MoeHeadWorkspace.create(mapping,
-fabric_handle=None)`: collective over `mapping`'s TP group and eager, every rank of the group calling it at the same
-point. Under MPI each call first splits the group's communicator off the session's, a collective of every rank of the
-session (`_get_mnnvl_workspace_comm`). Before allocating, the ranks agree that each of them can: not capturing a CUDA
-graph, the buffer within its device's free memory. If one cannot, every rank raises `RuntimeError` ("not every rank
-can allocate"), none allocates, and under MPI each frees the communicator it split for the call. A failure returned by
-the allocation is agreed and handled the same way, and that second agreement is also the barrier that keeps any rank
-from pushing into a peer's buffer before the peer has emptied it; a rank that fails inside the allocation's handle
-exchange can leave its peers waiting there (the op module's statements). Certified: with every rank capturing, and
-with the last rank capturing while its peers call it eagerly, every rank raises `RuntimeError` (the capturing ranks'
-messages naming the capture) and frees its split, and the existing workspace keeps its bits. So even a refusal needs
-every rank to call `create()`: a rank calling it alone waits for its peers. It empties every word and zeroes `flags`
-and `ready` (certified, both of the matrix's workspaces). `fabric_handle`: share the memory by fabric handle (required
-across nodes) or POSIX file descriptor; default `mapping.is_multi_node()`. No environment variable is read.
+fabric_handle=None)`: collective over `mapping`'s TP group only and eager: every rank of the group, and no other rank
+of the session, calls it at the same point. Under MPI its communicator is made from the group's ranks alone
+(`MPI_Comm_create_group`; certified in `comm/k3_latent_reduce`'s matrix, where one of two TP groups makes its
+communicator while the other's ranks do not call). Before allocating, the ranks agree that each of them can: not
+capturing a CUDA graph, the buffer within its device's free memory. If one cannot, every rank raises `RuntimeError`
+("not every rank can allocate"), none allocates, and under MPI each frees the communicator made for the call. A
+failure returned by the allocation is agreed and handled the same way, and that second agreement is also the barrier
+that keeps any rank from pushing into a peer's buffer before the peer has emptied it; a rank that fails inside the
+allocation's handle exchange can leave its peers waiting there (the op module's statements). Certified: with every
+rank capturing, and with the last rank capturing while its peers call it eagerly, every rank raises `RuntimeError`
+(the capturing ranks' messages naming the capture) and frees that communicator, and the existing workspace keeps its
+bits. So even a refusal needs every rank of the group to call `create()`: a rank calling it alone waits for its peers.
+It empties every word and zeroes `flags` and `ready` (certified, both of the matrix's workspaces). `fabric_handle`:
+share the memory by fabric handle (required across nodes) or POSIX file descriptor; default `mapping.is_multi_node()`.
+No environment variable is read.
 
 **Which ops may share one object.** Every MoE front call of the TP group: this entry, plain or publishing
 (`publish=True`, the front a head_flags `k3_moe` pairs with). The head_flags calls of `moe/k3_moe` (`head=workspace`)
@@ -195,10 +197,10 @@ never push.
 
 Besides `workspace` (an explicit argument):
 
-- A process-wide cache of compiled kernels keyed by (`W`, `shared_cols`, tiles, clusters, `K`, ring, `gate_cap`,
-  `linear_cap`, publish, PDL, half-tile head). The first call of a key compiles (seconds) and must be eager: under
-  capture it raises `RuntimeError` ("must run once per configuration outside CUDA-graph capture first") before any
-  launch, the workspace untouched (certified with other SiTU caps). The cache is result-neutral.
+- A process-wide cache of compiled kernels keyed by (device, `W`, `shared_cols`, tiles, clusters, `K`, ring,
+  `gate_cap`, `linear_cap`, publish, PDL, half-tile head). The first call of a key compiles (seconds) and must be
+  eager: under capture it raises `RuntimeError` ("must run once per configuration outside CUDA-graph capture first")
+  before any launch, the workspace untouched (certified with other SiTU caps). The cache is result-neutral.
 - `TRTLLM_ENABLE_PDL` (default on), read on every call and part of the key; it changes scheduling, not results (the
   op's statement).
 - The device's cluster capacity (`max_clusters`, cached per device), which sizes the grid and picks the head's

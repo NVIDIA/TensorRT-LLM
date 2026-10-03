@@ -520,34 +520,34 @@ def create_refuses_capture(workspace_type, ws, next_call: Call) -> None:
     rank raise RuntimeError. (a) Every rank captures: every rank raises, naming the capture. (b) The last rank captures
     while its peers call ``create`` eagerly at the same point: every rank raises, the capturing rank naming the
     capture, its peers saying another rank cannot. No rank reaches the allocation in either case (the counted
-    multicast allocation, which the workspaces in use went through), each rank frees the communicator it split, no
+    multicast allocation, which the workspaces in use went through), each rank frees the communicator made for it, no
     stream is left capturing, and the workspace in use is untouched: the next call is correct."""
     from tensorrt_llm._torch.distributed import ops
 
     assert ALLOCATIONS[0] > 0, "the counter did not see the workspaces in use being created"
     before = ALLOCATIONS[0]
-    split = ops._get_mnnvl_workspace_comm
+    make = ops._get_mnnvl_tp_group_comm
     comms = []
 
-    def recording_split(mapping):
-        comms.append(split(mapping))
+    def recording_make(mapping):
+        comms.append(make(mapping))
         return comms[-1]
 
     capturing = R.world - 1
-    ops._get_mnnvl_workspace_comm = recording_split
+    ops._get_mnnvl_tp_group_comm = recording_make
     try:
         every = _create(workspace_type, capture=True)
         R.barrier()
         one = _create(workspace_type, capture=R.rank == capturing)
     finally:
-        ops._get_mnnvl_workspace_comm = split
+        ops._get_mnnvl_tp_group_comm = make
     every_ok = CAPTURE_REFUSED in every
     one_ok = (CAPTURE_REFUSED if R.rank == capturing else PEER_REFUSED) in one
     allocated = ALLOCATIONS[0] - before
     freed = len(comms) == 2 and all(c == R.MPI.COMM_NULL for c in comms)
     assert R.all_true(every_ok and one_ok and allocated == 0 and freed), (
         f"every rank capturing: {every!r}; rank {capturing} capturing: {one!r}; allocations reached {allocated}; "
-        f"communicator splits freed {freed}"
+        f"communicators freed {freed}"
     )
     next_call.verify(next_call.run(ws), "after the refused creates")
 

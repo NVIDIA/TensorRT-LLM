@@ -136,9 +136,11 @@ counters. Layers of one state may be built over the same weight buffers (two cou
 (certified, both). Separate states share nothing: with calls on two `K3MoeState`s and a `K3MoeWideState` interleaved
 in an irregular pattern (26 calls, back to back), each returns the bits of the same call made alone (certified). The
 entry passes `head` for, and only for, a head_flags state's layers: both mismatches raise `ValueError` before any
-launch (certified). A head_flags state's calls pair with the front's on one `K3MoeHeadWorkspace`: the front call
-before each must publish the workspace's ready words (the `moe/k3_moe_front` entry with `publish=True`), and each
-publishing front call must be followed by exactly one such `k3_moe` call on that workspace (*Preconditions*).
+launch (certified). The op itself picks the head_flags build by whether `head_ready` / `head_flags` are passed; this
+check, and the same one in `K3MoeLayer`, is what ties the build to the state. A head_flags state's calls pair with the
+front's on one `K3MoeHeadWorkspace`: the front call before each must publish the workspace's ready words (the
+`moe/k3_moe_front` entry with `publish=True`), and each publishing front call must be followed by exactly one such
+`k3_moe` call on that workspace (*Preconditions*).
 
 **Call-order invariant.** The calls on all layers of one state run one after the other in one stream order. Every
 call needs the slab armed and its layer's counters at zero, which only the end of the previous call on the state

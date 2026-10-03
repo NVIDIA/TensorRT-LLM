@@ -676,7 +676,7 @@ def check_create_and_first_compile_refuse_capture() -> None:
     K3MoeHeadWorkspace.create has the ranks agree before allocating that each of them can (not capturing, enough free
     memory): with every rank capturing, and with the last rank capturing while its peers call it eagerly, every rank
     raises RuntimeError at that agreement ("not every rank can allocate", a capturing rank's message naming the
-    capture), so none allocates, and each frees the communicator it split for the call. Every rank must call it: a
+    capture), so none allocates, and each frees the communicator made for the call. Every rank must call it: a
     rank calling it alone would wait for its peers. A front call of a configuration not yet compiled (other SiTU caps)
     raises RuntimeError under capture before any launch. The workspace keeps its bits and the next call returns the
     bits of the same call made alone.
@@ -690,21 +690,21 @@ def check_create_and_first_compile_refuse_capture() -> None:
     def create():
         OPS.workspace.create(R.mapping, fabric_handle=R.fabric)
 
-    split = ops._get_mnnvl_workspace_comm
+    make = ops._get_mnnvl_tp_group_comm
     comms = []
 
-    def recording_split(mapping):
-        comms.append(split(mapping))
+    def recording_make(mapping):
+        comms.append(make(mapping))
         return comms[-1]
 
     capturing = R.world - 1
-    ops._get_mnnvl_workspace_comm = recording_split
+    ops._get_mnnvl_tp_group_comm = recording_make
     try:
         every = raised_under_capture(create)
         R.barrier()
         one = raised_under_capture(create) if R.rank == capturing else raised_eagerly(create)
     finally:
-        ops._get_mnnvl_workspace_comm = split
+        ops._get_mnnvl_tp_group_comm = make
     R.barrier()
     first = raised_under_capture(
         lambda: OPS.front(
@@ -723,7 +723,7 @@ def check_create_and_first_compile_refuse_capture() -> None:
         f"uncompiled front {first!r}"
     )
     freed = len(comms) == 2 and all(c == R.MPI.COMM_NULL for c in comms)
-    assert R.all_true(freed), "a refused create kept the communicator it split"
+    assert R.all_true(freed), "a refused create kept the communicator made for it"
     after = workspace_snapshot(WS_A)
     assert all(same(a, b) for a, b in zip(before, after)), (
         "a refused call touched the head workspace"
