@@ -232,17 +232,21 @@ def test_k3_latent_reduce(mpi_pool_executor):
     assert all(row["ok"] for rows in per_rank for row in rows)
 
 
-def test_latent_exchange_refuses_graph_capture():
-    """The exchange is created collectively (an MNNVL multicast allocation over the TP group): creating it under
-    CUDA-graph capture raises instead of entering the collective. One process, a group of one."""
+def test_latent_exchange_refuses_unsupported_tp_size():
+    """The exchange serves TP groups of 4, 8 or 16 ranks: another size raises ValueError before any collective step
+    (the size is the same on every rank of a group), eagerly and under CUDA-graph capture alike. One process, a group
+    of one. Its refusal of capture at a supported size is a collective agreement: the 4-rank matrix
+    (tests/unittest/_torch/modeling_v2/comm/_k3_latent_reduce_op_matrix.py) checks it."""
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import latent_op
     from tensorrt_llm.mapping import Mapping
 
     mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    with pytest.raises(ValueError, match="supports 4, 8 and 16"):
+        latent_op.K3LatentExchange.create(mapping)
     graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
     with torch.cuda.graph(graph, stream=stream):
-        with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
+        with pytest.raises(ValueError, match="supports 4, 8 and 16"):
             latent_op.K3LatentExchange.create(mapping)
 
 
