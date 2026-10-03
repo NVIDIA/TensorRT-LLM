@@ -16,7 +16,6 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.kda_decode import kda_decode
 
-assert torch.cuda.is_available(), "kda_decode requires a CUDA device"
 pytestmark = pytest.mark.skipif(not kc.sm100(), reason="certified on SM100 only")
 
 LAYERS = 3
