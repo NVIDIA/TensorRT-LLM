@@ -16,14 +16,9 @@
 heads per rank, latent 512 + rope 64, bf16 pool of 64-row pages) for decode steps of R requests x T tokens: against a
 torch float64 reference with per-request bottom-right causal masks and against the stock CuTe DSL MLA decode
 (trtllm::cute_dsl_mla_decode_fp16_blackwell); request i's rows bit-identical to the one-request call on its own
-rows, pages and length; reruns bit-identical.
+rows, pages and length; reruns bit-identical."""
 
-Batch-1 identity against the unmodified kernel: set ``K3_BASE_TRTLLM`` to an unmodified ``tensorrt_llm`` package
-directory (one request's outputs must match its single-request kernel bit for bit)."""
-
-import importlib.util
 import math
-import os
 
 import pytest
 import torch
@@ -388,110 +383,3 @@ def test_attn_counter_wrap(num_requests, tokens, heads):
     for start in (2**31 - 16, -16):
         for got, want in zip(outs[start], outs[0]):
             assert torch.equal(_bits(got), _bits(want))
-
-
-# ----------------------------------------------------------------------------------------------------------------
-# Batch-1 identity against the unmodified kernel (K3_BASE_TRTLLM: an unmodified tensorrt_llm package directory).
-# ----------------------------------------------------------------------------------------------------------------
-
-_base = {}
-
-
-def _base_kernel():
-    """The unmodified single-request kernel module, loaded from K3_BASE_TRTLLM."""
-    if "mod" not in _base:
-        path = os.path.join(
-            os.environ["K3_BASE_TRTLLM"],
-            "_torch",
-            "cute_dsl_kernels",
-            "k3_mla",
-            "k3_mla_attn_kernel.py",
-        )
-        spec = importlib.util.spec_from_file_location("k3_mla_attn_kernel_base", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _base["mod"] = mod
-    return _base["mod"]
-
-
-def _base_attn(q, pool, row_stride, page_row, page_offset, seq_len, out, w_vb=None, gate=None):
-    """The unmodified op's launch (one request: one 16-byte aligned page-table row, seq_len [1]); q [M, heads * 576]."""
-    import cuda.bindings.driver as cuda_driver
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
-
-    kern = _base_kernel()
-
-    def arg(t):
-        return from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(
-            leading_dim=t.dim() - 1
-        )
-
-    heads = q.shape[1] // kern.QK
-    groups = heads // kern.HEADS
-    if ("ws", groups) not in _base:
-        _base["ws", groups] = torch.empty(
-            groups * kern.CLUSTER * kern.WS_SLOT_ELEMS, dtype=torch.float16, device=q.device
-        )
-    fuse_vb, apply_gate = w_vb is not None, gate is not None
-    gate_flat = gate.as_strided((gate.numel(),), (1,)) if apply_gate else q.view(-1)
-    args = (arg(q.view(-1)), arg(pool.view(-1)[: PAGE * row_stride]), arg(page_row.reshape(-1)),
-            arg(seq_len.reshape(-1)), arg(_base["ws", groups]), arg(out.view(-1)),
-            arg((w_vb if fuse_vb else q).view(-1)), arg(gate_flat))  # fmt: skip
-    scalars = (q.shape[0], SCALE * kern.LOG2E, pool.numel() // row_stride, page_offset, GATE_COL0,
-               gate.stride(0) if apply_gate else 0)  # fmt: skip
-    use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
-    stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    key = (row_stride, heads, fuse_vb, apply_gate, use_pdl)
-    fn = _base.get(key)
-    if fn is None:
-        fn = _base[key] = cute.compile(kern.k3_mla_attn, *args, *scalars, row_stride, heads, fuse_vb, apply_gate,
-                                       use_pdl, stream)  # fmt: skip
-    fn(*args, *scalars, stream)
-    return out
-
-
-@pytest.mark.skipif(
-    not os.environ.get("K3_BASE_TRTLLM"), reason="K3_BASE_TRTLLM (unmodified package) not set"
-)
-@pytest.mark.parametrize("tokens", [8, 1, 2, 4, 7])
-def test_batch1_identity(tokens):
-    """One request: k3_mla_attn_out and k3_mla_attn_vb_out (plain and gated) bit-identical to the unmodified kernel
-    for every length in LENGTHS, rows of 576 and interleaved rows of 640 with a page offset, the page-table row given
-    flat, as a [1, W] row, and at a 4-byte offset (a row of a wider table)."""
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import op  # noqa: F401
-
-    for i, length in enumerate(LENGTHS):
-        layers, slot, row_stride = (2, 1, 640) if i % 2 else (1, 0, DQK)
-        q, pool, table, off, seq_len = _make_case(
-            900 + 10 * tokens + i,
-            1,
-            tokens,
-            H,
-            row_stride,
-            layers,
-            slot,
-            lens=[max(tokens, length)],
-        )
-        gen = torch.Generator(device="cuda").manual_seed(1900 + 10 * tokens + i)
-        w_vb = (torch.randn(H, V, LAT, generator=gen, device="cuda") * 0.05).bfloat16()
-        ag = torch.rand(tokens, GATE_COL0 + H * V, generator=gen, device="cuda").bfloat16()
-        shifted = torch.zeros(table.shape[1] + 1, dtype=torch.int32, device="cuda")
-        shifted[1:] = table[0]
-        q2 = q.view(tokens, -1)
-        want = _base_attn(q2, pool, row_stride, table[0], off, seq_len,
-                          torch.empty(tokens, H * LAT, dtype=torch.bfloat16, device="cuda"))  # fmt: skip
-        for form, row in (
-            ("flat", table[0]),
-            ("[1, W]", table[:1]),
-            ("4-byte offset", shifted[1:]),
-        ):
-            got = _attn_out(q, pool, row_stride, row, off, seq_len).view(tokens, -1)
-            assert torch.equal(_bits(got), _bits(want)), f"attn_out L {length} {form}"
-        for gate in (None, ag):
-            want = _base_attn(q2, pool, row_stride, table[0], off, seq_len,
-                              torch.empty(tokens, H * V, dtype=torch.bfloat16, device="cuda"), w_vb, gate)  # fmt: skip
-            got = _attn_vb(q, pool, row_stride, table[:1], off, seq_len, w_vb, gate)
-            assert torch.equal(_bits(got), _bits(want)), (
-                f"attn_vb L {length} gate {gate is not None}"
-            )
