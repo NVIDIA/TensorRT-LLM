@@ -144,6 +144,10 @@ l0_b200:
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_head_gemv.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_cluster_waits.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_tcgen05_fences.py
+  # The Kimi K3 targets' routing and the claims check of their stock imports. l0_b300's modeling_v2
+  # entry, the only other one that collects them, is waived (nvbugs/6853741).
+  - unittest/_torch/modeling_v2/test_modeling_v2_routing.py -k "kimi_k3"
+  - unittest/_torch/modeling_v2/test_modeling_v2_claims.py::test_uncertified_generic_calls_name_every_stock_import
   # modeling_v2 catalog entries with sm_100 receipts (the K3 ones skip on
   # other architectures).
   - unittest/_torch/modeling_v2/norm/test_modeling_v2_k3_embed_norm.py
