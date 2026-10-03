@@ -25,6 +25,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from test_common import magic_import_hooks
 from test_common.magic_import import MagicFinder
 from test_common.magic_import_hooks import (
     _NON_TEST_TREES,
@@ -806,6 +807,57 @@ def test_sys_path_check_matches_exempt_trees_by_path_component(sys_path_report, 
     sibling.mkdir(parents=True)
 
     assert sys_path_report(sibling) == [(exempt + "_other").replace("/", os.sep)]
+
+
+@pytest.fixture
+def in_tree_venv(tree, monkeypatch):
+    """Points the interpreter-root exemption at a venv inside the project.
+
+    Patches the resolved roots rather than ``sys.prefix``, which the module
+    reads once at import time.
+    """
+    venv = tree.project_root / ".venv-3.12"
+    site_packages = venv / "lib" / "python3.12" / "site-packages"
+    site_packages.mkdir(parents=True)
+    monkeypatch.setattr(magic_import_hooks, "_INTERPRETER_ROOTS", (str(venv),))
+    return SimpleNamespace(prefix=venv, site_packages=site_packages)
+
+
+def test_sys_path_check_accepts_an_in_tree_virtual_environment(sys_path_report, in_tree_venv):
+    """A venv under the project root is supported layout, not a leak.
+
+    build_wheel.py defaults to ``<project>/.venv-<pyver>``, so a developer who
+    builds that way and then runs pytest from it would otherwise have the
+    interpreter's own library directories reported as if a test file had added
+    them.
+    """
+    vendored = in_tree_venv.site_packages / "some_pkg" / "vendored"
+
+    assert sys_path_report(in_tree_venv.prefix / "bin", vendored) == []
+
+
+def test_sys_path_check_still_reports_a_sibling_of_the_venv(sys_path_report, tree, in_tree_venv):
+    """The venv exemption matches whole components, so a sibling still counts."""
+    sibling = tree.project_root / (in_tree_venv.prefix.name + "-notes")
+    sibling.mkdir(parents=True)
+
+    assert sys_path_report(sibling) == [sibling.name]
+
+
+def test_sys_path_check_ignores_an_interpreter_root_above_the_project(
+    sys_path_report, tree, monkeypatch
+):
+    """A prefix containing the project root must not exempt the whole tree.
+
+    Honouring it would place every entry under the root inside the exemption,
+    so the check would report nothing at all -- sys.base_prefix is ``/usr`` on a
+    system interpreter, which contains a checkout under ``/usr/local``.
+    """
+    helpers = tree.project_root / "tests" / "helpers"
+    helpers.mkdir(parents=True)
+    monkeypatch.setattr(magic_import_hooks, "_INTERPRETER_ROOTS", (str(tree.project_root.parent),))
+
+    assert sys_path_report(helpers) == [os.path.join("tests", "helpers")]
 
 
 def test_sys_path_check_accepts_pythonpath_ini_entries(sys_path_report, tree):
