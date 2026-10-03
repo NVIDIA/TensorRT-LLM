@@ -236,7 +236,7 @@ def load_audio(
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
-    audio = soundfile.read(audio)
+    audio = soundfile.read(audio, dtype="float32")
     return audio
 
 
@@ -248,7 +248,7 @@ async def async_load_audio(
 ) -> Tuple[np.ndarray, int]:
     if is_base64:
         raw_bytes = base64.b64decode(audio)
-        return soundfile.read(BytesIO(raw_bytes))
+        return soundfile.read(BytesIO(raw_bytes), dtype="float32")
 
     parsed_url = urlparse(audio)
 
@@ -262,7 +262,7 @@ async def async_load_audio(
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
-    return await asyncio.to_thread(soundfile.read, audio)
+    return await asyncio.to_thread(soundfile.read, audio, dtype="float32")
 
 
 def encode_base64_content_from_url(content_url: str) -> str:

@@ -986,17 +986,17 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
             )
 
     def load_bytes(self, data: bytes) -> Tuple[np.ndarray, int]:
-        return soundfile.read(BytesIO(data))
+        return soundfile.read(BytesIO(data), dtype="float32")
 
     def load_base64(self, media_type: str, data: str) -> Tuple[np.ndarray, int]:
-        return soundfile.read(BytesIO(base64.b64decode(data)))
+        return soundfile.read(BytesIO(base64.b64decode(data)), dtype="float32")
 
     def load_file(self, url: str) -> Tuple[np.ndarray, int]:
         # Strip `file://` and unquote the path for `file:` URIs; pass
         # empty-scheme URLs through verbatim.
         parsed = urlparse(url)
         path = _normalize_file_uri(url) if parsed.scheme == "file" else url
-        return soundfile.read(path)
+        return soundfile.read(path, dtype="float32")
 
 
 class VideoMediaIO(BaseMediaIO[VideoData]):
