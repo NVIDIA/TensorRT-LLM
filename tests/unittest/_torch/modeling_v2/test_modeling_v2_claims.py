@@ -17,6 +17,7 @@ gate records are for.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -215,3 +216,70 @@ def test_targets_do_not_share_files():
                         f"directory for {tail!r}; targets may import the "
                         f"catalog and nothing else"
                     )
+
+
+#: tensorrt_llm imports that compute nothing, so a target's generic path need not declare them: types and configs
+#: it reads, enums it passes, the metadata it is handed, its registration and its logger.
+_NON_COMPUTE_IMPORTS = frozenset(
+    {
+        "AllReduceStrategy",
+        "AttentionMetadata",
+        "AuxStreamType",
+        "MambaHybridCacheManagerV2",
+        "Mapping",
+        "ModelConfig",
+        "MoESchedulerKind",
+        "QuantAlgo",
+        "QuantConfig",
+        "SiTuActivation",
+        "logger",
+        "register_auto_model",
+    }
+)
+
+
+def _declared_tuple(tree: ast.Module, name: str):
+    """The string tuple assigned to ``name`` at module level, or None when the module does not assign it."""
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name for target in node.targets
+        ):
+            return tuple(ast.literal_eval(node.value))
+    return None
+
+
+def test_uncertified_generic_calls_name_every_stock_import():
+    """A target whose generic path runs stock code (``UNCERTIFIED_GENERIC_CALLS``) declares every tensorrt_llm
+    name it imports outside the catalog, module level or function local, unless the name computes nothing; and it
+    declares nothing it does not import, so the list cannot go stale as entries replace stock calls."""
+    checked = 0
+    for arch in _ARCHS:
+        routing = routing_module(arch)
+        for name, dotted in routing.TARGET_MODULES.items():
+            tree = ast.parse(_module_path(dotted).read_text())
+            declared = _declared_tuple(tree, "UNCERTIFIED_GENERIC_CALLS")
+            if declared is None:
+                continue
+            checked += 1
+            imported = set()
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and node.level == 0
+                    and node.module is not None
+                    and node.module.split(".")[0] == "tensorrt_llm"
+                    and ".modeling_v2.catalog" not in node.module
+                ):
+                    imported.update(
+                        f"{node.module}.{alias.name}"
+                        for alias in node.names
+                        if alias.name not in _NON_COMPUTE_IMPORTS
+                    )
+            assert imported <= set(declared), (
+                f"{name}: imported but not in UNCERTIFIED_GENERIC_CALLS: {sorted(imported - set(declared))}"
+            )
+            assert set(declared) <= imported, (
+                f"{name}: UNCERTIFIED_GENERIC_CALLS names what it does not import: "
+                f"{sorted(set(declared) - imported)}"
+            )
+    assert checked, "no target declares UNCERTIFIED_GENERIC_CALLS"

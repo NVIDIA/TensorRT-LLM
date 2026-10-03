@@ -122,15 +122,21 @@ REQUIRED_ENGINE_FIELDS = {
     "kv_cache_manager": ("enable_block_reuse",),
 }
 
-#: Calls the generic path makes outside the catalog, declared so they are not consumed silently. A call leaves this
-#: list when a catalog entry replaces it.
+#: Stock code the generic path runs outside the catalog, declared so it is not consumed silently: every
+#: tensorrt_llm import of this module that computes (test_modeling_v2_claims.py checks the list both ways). An entry
+#: leaves the list when a catalog entry replaces it.
 UNCERTIFIED_GENERIC_CALLS = (
-    # The checkpoint load and the engine hooks this target inherits.
+    # The checkpoint load and the engine hooks this target inherits, and the causal LM around the text model.
     "tensorrt_llm._torch.models.modeling_kimi_linear.KimiLinearForCausalLM",
+    "tensorrt_llm._torch.models.modeling_speculative.SpecDecOneEngineForCausalLM",
+    "tensorrt_llm._torch.models.modeling_utils.DecoderModel",
     # The text model's stock modules.
     "tensorrt_llm._torch.modules.kimi_kda.KimiKDALinearAttention",
     "tensorrt_llm._torch.modules.kimi_k3_mla.KimiK3MLAAttention",
     "tensorrt_llm._torch.moe.fused_moe.create_moe",
+    "tensorrt_llm._torch.moe.fused_moe.ConfigurableMoE",
+    "tensorrt_llm._torch.moe.fused_moe.TRTLLMGenFusedMoE",
+    "tensorrt_llm._torch.moe.fused_moe.routing.DeepSeekV3MoeRoutingMethod",
     "tensorrt_llm._torch.modules.gated_mlp.GatedMLP",
     "tensorrt_llm._torch.modules.situ.SituAndMul",
     "tensorrt_llm._torch.modules.rms_norm.RMSNorm",
