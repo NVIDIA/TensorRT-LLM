@@ -21,13 +21,17 @@ import shutil
 import sys
 import tempfile
 import time
+from contextlib import ExitStack
+from threading import Event
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    V2_RETENTION_IGNORED_LOG_KEY, KvCacheConnectorWorker)
+    V2_RETENTION_IGNORED_LOG_KEY, KvCacheConnectorManager,
+    KvCacheConnectorWorker, PrefixLoad, SchedulerOutput)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -108,12 +112,16 @@ def use_kv_cache_manager_v2(request):
 @pytest.fixture(scope="function")
 def model_with_connector(use_kv_cache_manager_v2):
     with patch("tensorrt_llm._torch.pyexecutor.py_executor_creator.importlib"
-               ) as importlib_mock:
+               ) as importlib_mock, ExitStack() as models:
         mock_scheduler = MagicMock()
         mock_worker = MagicMock()
+        mock_scheduler.request_finished.return_value = False
+        mock_worker.get_finished.return_value = [], []
 
         importlib_mock.import_module.return_value.KvConnectorScheduler.return_value = mock_scheduler
         importlib_mock.import_module.return_value.KvConnectorWorker.return_value = mock_worker
+        # Registration calls retain GPU tensors until the mock history is cleared.
+        models.callback(importlib_mock.reset_mock)
 
         # A cache that reports per layer group always calls the per-group form,
         # so mirror what a real connector's default does with it: fold a single
@@ -165,7 +173,9 @@ def model_with_connector(use_kv_cache_manager_v2):
             if kv_cache_config is not None:
                 kv_cache_config.use_kv_cache_manager_v2 = use_kv_cache_manager_v2
 
-            return LLM(*args, **merged_kwargs)
+            model = LLM(*args, **merged_kwargs)
+            models.callback(model.shutdown)
+            return model
 
         yield model_fn, mock_scheduler, mock_worker
 
@@ -1164,11 +1174,10 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
         scheduler.request_finished.return_value = False
         worker.get_finished.return_value = [], []
 
-    result = generate_and_wait(prefill_worker,
-                               scheduler,
-                               worker, [0] * 48,
-                               sampling_params=sampling_params,
-                               disaggregated_params=disaggregated_params)
+    # The prefill transfer cannot drain until decode requests its KV cache.
+    result = prefill_worker.generate([0] * 48,
+                                     sampling_params=sampling_params,
+                                     disaggregated_params=disaggregated_params)
 
     gen_disagg_params = result.disaggregated_params
     gen_disagg_params.request_type = "generation_only"
@@ -1627,8 +1636,8 @@ def test_connector_e2e_persistent_cache(enforce_single_worker,
         # to the root logger, so read it from the return value instead.
         matched_tokens = []
         leader_cls = llm_kv_cache_connector.PersistentKvCacheConnectorLeader
-        original_get_num_new_matched_tokens = (
-            leader_cls.get_num_new_matched_tokens)
+        original_get_num_new_matched_tokens = leader_cls.get_num_new_matched_tokens
+        original_reserve_prefix = leader_cls.reserve_prefix
 
         def recording_get_num_new_matched_tokens(self, request,
                                                  num_computed_tokens):
@@ -1637,8 +1646,17 @@ def test_connector_e2e_persistent_cache(enforce_single_worker,
             matched_tokens.append(result[0])
             return result
 
+        def recording_reserve_prefix(self, request, num_computed_tokens,
+                                     reservation_id):
+            result = original_reserve_prefix(self, request, num_computed_tokens,
+                                             reservation_id)
+            matched_tokens.append(result[0])
+            return result
+
         monkeypatch.setattr(leader_cls, "get_num_new_matched_tokens",
                             recording_get_num_new_matched_tokens)
+        monkeypatch.setattr(leader_cls, "reserve_prefix",
+                            recording_reserve_prefix)
 
         kv_connector_config = KvCacheConnectorConfig(
             connector_module="llm_kv_cache_connector",
@@ -1736,6 +1754,251 @@ def test_connector_e2e_persistent_cache(enforce_single_worker,
             sys.path.remove(examples_dir)
 
         shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+def test_connector_reservations_hold_source_without_transmission(
+        monkeypatch, tmp_path):
+    """Range release and cache-key removal preserve another promised source."""
+    import torch
+
+    examples_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "..",
+                     "examples", "llm-api"))
+    monkeypatch.syspath_prepend(examples_dir)
+    monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path))
+    import llm_kv_cache_connector as persistent
+
+    args = SimpleNamespace(kv_cache_config=SimpleNamespace(tokens_per_block=4))
+    leader = persistent.PersistentKvCacheConnectorLeader(args)
+    request = SimpleNamespace(request_id=7,
+                              cache_salt="test",
+                              get_tokens=lambda beam: [1, 2, 3, 4, 5])
+    key = leader._hash_tokens([1, 2, 3, 4], request.cache_salt)
+    source_path = leader._file_path(key)
+    source = torch.arange(4)
+    torch.save(source, source_path)
+
+    with patch.object(torch,
+                      "load",
+                      side_effect=AssertionError("Premature read")):
+        assert leader.reserve_prefix(request, 0, 11) == (4, False)
+        assert leader.reserve_prefix(request, 0, 12) == (4, False)
+        source_path.unlink()
+        torch.save(source + 100, source_path)
+        leader.release_prefix_reservation(request, 11, 0, 2)
+        assert leader._reserved_files[11][0].exists()
+        leader.release_prefix_reservation(request, 11, 2, 4)
+        assert 11 not in leader._reserved_files
+        assert leader._reserved_files[12][0].exists()
+        metadata = leader.build_connector_meta(
+            SchedulerOutput(prefix_loads=[
+                PrefixLoad(reservation_id=12,
+                           request_id=request.request_id,
+                           start=0,
+                           end=4,
+                           is_async=False,
+                           block_ids_by_layer_group=[[1]],
+                           tokens=[1, 2, 3, 4, 5],
+                           cache_salt=request.cache_salt)
+            ]))
+
+    worker = persistent.PersistentKvCacheConnectorWorker(args)
+    destination = torch.zeros((2, 4), dtype=source.dtype)
+    worker.register_kv_caches(destination)
+    worker._metadata = metadata
+    assert worker.get_finished_prefix_loads() == []
+    worker.start_load_kv(None)
+    assert torch.equal(destination[1], source)
+    assert not destination[0].any()
+    assert worker.get_finished_prefix_loads() == [12]
+    assert worker.get_finished_prefix_loads() == []
+    leader.release_prefix_reservation(request, 12, 0, 4)
+    assert not leader._reserved_files
+    assert not leader._reserved_ranges
+
+
+@pytest.fixture
+def controlled_prefix_connector(enforce_single_worker, monkeypatch, tmp_path):
+    """Keep real disk-to-device writes pending until the test releases them."""
+    examples_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "..",
+                     "examples", "llm-api"))
+    monkeypatch.syspath_prepend(examples_dir)
+    monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path))
+    import llm_kv_cache_connector as persistent
+    import torch
+
+    control = SimpleNamespace(started=Event(),
+                              allow_copy=Event(),
+                              copied=Event(),
+                              cancellation_seen=Event(),
+                              freed=Event(),
+                              source_released=Event(),
+                              request_id=None,
+                              accepted=None,
+                              copies=0,
+                              compute_ids=[])
+
+    class ControlledLeader(persistent.PersistentKvCacheConnectorLeader):
+
+        def reserve_prefix(self, request, num_computed_tokens, reservation_id):
+            count, _ = super().reserve_prefix(request, num_computed_tokens,
+                                              reservation_id)
+            return count, bool(count)
+
+        def build_connector_meta(self, scheduler_output):
+            control.compute_ids.extend(
+                req.request_id for req in scheduler_output.new_requests +
+                scheduler_output.cached_requests)
+            for load in scheduler_output.prefix_loads:
+                assert control.accepted is None, "Load dispatched twice"
+                control.accepted = load
+                control.request_id = load.request_id
+            return super().build_connector_meta(scheduler_output)
+
+        def release_prefix_reservation(self, request, reservation_id, start,
+                                       end):
+            accepted = control.accepted
+            if (accepted is not None
+                    and reservation_id == accepted.reservation_id
+                    and start < accepted.end and end > accepted.start):
+                assert control.copied.is_set(), "Source released before copy"
+                control.source_released.set()
+            super().release_prefix_reservation(request, reservation_id, start,
+                                               end)
+
+    class ControlledWorker(persistent.PersistentKvCacheConnectorWorker):
+
+        def __init__(self, llm_args):
+            super().__init__(llm_args)
+            self.pending = None
+
+        def start_load_kv(self, stream):
+            if not self._metadata.prefix_load_ids:
+                return
+            assert self.pending is None, "Load dispatched twice"
+            self.pending = self._metadata
+            assert control.accepted is not None
+            control.started.set()
+
+        def get_finished_prefix_loads(self):
+            if self.pending is None or not control.allow_copy.is_set():
+                return []
+            for path, slot in self.pending.load:
+                source = torch.load(path, map_location="cpu")
+                self.kv_cache_tensor[slot].copy_(source, non_blocking=False)
+                assert torch.equal(self.kv_cache_tensor[slot].cpu(), source)
+                control.copies += 1
+            finished = self.pending.prefix_load_ids
+            self.pending = None
+            control.copied.set()
+            return finished
+
+    original_defer = KvCacheConnectorManager.defer_load_termination
+    original_free = KVCacheManagerV2.free_resources
+
+    def record_defer(manager, request):
+        deferred = original_defer(manager, request)
+        if deferred and request.request_id == control.request_id:
+            control.cancellation_seen.set()
+        return deferred
+
+    def record_free(manager, request):
+        target = request.request_id == control.request_id
+        if target:
+            assert control.copied.is_set(), "Destination freed before copy"
+        result = original_free(manager, request)
+        if target:
+            control.freed.set()
+        return result
+
+    monkeypatch.setattr(persistent,
+                        "ControlledLeader",
+                        ControlledLeader,
+                        raising=False)
+    monkeypatch.setattr(persistent,
+                        "ControlledWorker",
+                        ControlledWorker,
+                        raising=False)
+    monkeypatch.setattr(KvCacheConnectorManager, "defer_load_termination",
+                        record_defer)
+    monkeypatch.setattr(KVCacheManagerV2, "free_resources", record_free)
+    yield persistent, control
+    control.allow_copy.set()
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_overlap_scheduler", [True, False])
+@pytest.mark.parametrize("other_traffic", [False, True],
+                         ids=["alone", "traffic"])
+def test_connector_cancel_drains_real_prefix_load(controlled_prefix_connector,
+                                                  use_overlap_scheduler,
+                                                  other_traffic):
+    """Cancellation retains source and destination until real writes finish."""
+    persistent, control = controlled_prefix_connector
+    kwargs = dict(
+        model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
+        backend="pytorch",
+        cuda_graph_config=None,
+        disable_overlap_scheduler=not use_overlap_scheduler,
+        max_seq_len=256,
+        max_num_tokens=128,
+        max_batch_size=2,
+        enable_chunked_prefill=False,
+        scheduler_config=SchedulerConfig(enable_prefix_aware_scheduling=True),
+        kv_cache_config=KvCacheConfig(max_tokens=192,
+                                      tokens_per_block=32,
+                                      use_kv_cache_manager_v2=True),
+    )
+    params = SamplingParams(max_tokens=2, ignore_eos=True)
+    prompt = [100] * 96
+    cold = LLM(**kwargs,
+               kv_connector_config=KvCacheConnectorConfig(
+                   connector_module=persistent.__name__,
+                   connector_scheduler_class="PersistentKvCacheConnectorLeader",
+                   connector_worker_class="PersistentKvCacheConnectorWorker"))
+    try:
+        cold.generate(prompt, params)
+    finally:
+        cold.shutdown()
+
+    warm = LLM(**kwargs,
+               kv_connector_config=KvCacheConnectorConfig(
+                   connector_module=persistent.__name__,
+                   connector_scheduler_class="ControlledLeader",
+                   connector_worker_class="ControlledWorker"))
+    try:
+        cancelled = warm.generate_async(prompt, params)
+        assert control.started.wait(
+            60), "Confirmed async load was not dispatched"
+        assert control.accepted.is_async
+        assert control.accepted.end > control.accepted.start
+        assert control.copies == 0
+        cancelled.abort()
+        assert control.cancellation_seen.wait(
+            60), "Cancellation was not consumed"
+        assert not control.freed.is_set()
+        assert not control.source_released.is_set()
+
+        if other_traffic:
+            other = warm.generate_async([200] * 32, params)
+            assert len(other.result(timeout=60).outputs[0].token_ids) == 2
+            assert not control.freed.is_set()
+
+        control.allow_copy.set()
+        assert control.freed.wait(
+            60), "Cancelled load never released its allocation"
+        assert control.copied.is_set()
+        assert control.source_released.is_set()
+        assert control.copies > 0
+        assert control.request_id not in control.compute_ids
+
+        # This request needs more capacity than remains while the load owns KV.
+        after = warm.generate_async([300] * 128, params)
+        assert len(after.result(timeout=60).outputs[0].token_ids) == 2
+    finally:
+        control.allow_copy.set()
+        warm.shutdown()
 
 
 # The VSWA end-to-end sizes. The window is deliberately larger than the whole

@@ -58,6 +58,12 @@ BOLT_OVERLAY_ENABLED = (params.boltOverlayEnabled ?: env.boltOverlayEnabled ?: "
 // carries profiles). Left false until the enable PR wires it true for the
 // release/nightly path; premerge/new-branch stays lenient (retag plain build).
 BOLT_PROFILES_REQUIRED = (params.boltProfilesRequired ?: env.boltProfilesRequired ?: "false").toString() == "true"
+// The bundle this pipeline pinned, hoisted out of globalVars in launchBuildJobs
+// because overlayBoltBundle runs well below the scope globalVars is passed into.
+// Empty means unpinned, i.e. take whatever `latest` is.
+BOLT_PINNED_REF = ""
+// The branch that pin lives under. Set only together with the ref.
+BOLT_PINNED_BRANCH = ""
 // <<< BOLT profile-bundle overlay <<<
 
 ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
@@ -80,12 +86,22 @@ def ACTION_INFO = "action_info"
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
+    // Pre-declared so updateMapWithJson() populates it from the parent: that
+    // helper only updates keys already present here, so an absent key is
+    // silently dropped -- which for this one would mean running unpinned
+    // without saying so.
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PROFILE_BRANCH): "",
 ]
 
 @Field
@@ -339,10 +355,21 @@ def overlayBoltBundle(pairs, arch, action) {
     //    (manifest + >=1 profile) so "pulled but empty" is not accepted. First hit wins.
     def haveBundle = false
     def branch = null
+    // The overlay is a consumer like any other, so it takes the pipeline's pin
+    // rather than resolving `latest` when it happens to run. Without this the
+    // released image could carry a profile bundle that no other artifact in the
+    // run was built from. Empty means unpinned and pull-latest behaves exactly
+    // as before; pinned, the pin supplies its own branch and the candidate walk
+    // collapses to it, because the ref names one object under one directory.
+    if (BOLT_PINNED_REF && BOLT_PINNED_BRANCH) {
+        candidates = [BOLT_PINNED_BRANCH]
+        echo "[BOLT] overlay pinned to bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
+    }
     for (cand in candidates) {
         for (int attempt = 1; attempt <= 3 && !haveBundle; attempt++) {
             def rc = sh(script: """
                 rm -rf ${ctxDir} && mkdir -p ${ctxDir}/${bundleSub} && \
+                export BOLT_PROFILE_REF='${BOLT_PINNED_REF}' && \
                 cd ${LLM_ROOT} && bash scripts/bolt/internal/artifactory.sh pull-latest ${cand} ${triple} ${ctxDir}/${bundleSub}
             """, returnStatus: true)
             if (rc == 0) {
@@ -645,6 +672,8 @@ def buildImage(config, imageKeyToTag, versionOverride)
 
 def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
+    BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
+    BOLT_PINNED_BRANCH = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
     def defaultBuildConfig = [
         target: "tritondevel",
         action: params.action,

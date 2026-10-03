@@ -1,11 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ...utils import Fp4QuantizedTensor
@@ -96,19 +111,26 @@ class Attention(nn.Module):
         ulysses_size = vgm.ulysses_size if vgm else 1
         cp_size = vgm.cp_size if vgm else 1
         base_backend = config.attention.backend
-        _sa_cfg = config.attention.sparse_attention_config
-        _sa_algo = getattr(_sa_cfg, "algorithm", None) if _sa_cfg is not None else None
-        _is_vsa = base_backend == "CUTEDSL" and _sa_algo == "vsa"
-        _is_sol_attn = base_backend == "CUTEDSL" and _sa_algo == "sol_attn"
-        separate_qkv_cross_attention = (
+        sparse_config = config.attention.sparse_attention_config
+        sparse_algorithm = getattr(sparse_config, "algorithm", None)
+        is_vsa = sparse_algorithm == "vsa"
+        is_sol = sparse_algorithm == "sol_attn"
+        is_separate_qkv_cross_attention = (
             self.qkv_mode == QKVMode.SEPARATE_QKV and not separate_qkv_is_self_attention
         )
 
-        # Cross-attention fallback: TRTLLM and CUTEDSL VSA are self-attn only.
-        # Sol-Attn is absent by design; see SolAttention._can_serve.
-        if separate_qkv_cross_attention and (base_backend == "TRTLLM" or _is_vsa):
+        # Cross-attention fallback: every TRTLLM backend and every VSA backend are
+        # self-attention only. The CuTeDSL SOL backend delegates cross-attention per
+        # call instead; see SOLCuTeDSLAttention._can_serve.
+        if is_separate_qkv_cross_attention and (base_backend == "TRTLLM" or is_vsa):
             backend_name = "VANILLA"
-            requested = f"{base_backend} (VSA)" if _is_vsa else base_backend
+            requested = (
+                f"{base_backend} (VSA)"
+                if is_vsa
+                else f"{base_backend} (SOL)"
+                if is_sol
+                else base_backend
+            )
             # Warn once per (module class, requested, resolved) triple so the
             # fallback is visible without per-module-instance log spam.
             logger.warning_once(
@@ -121,10 +143,10 @@ class Attention(nn.Module):
 
         # Every sparse algorithm here routes over the whole token sequence, so
         # none of them can be split across context-parallel ranks.
-        if (_is_vsa or _is_sol_attn) and cp_size > 1:
-            _algo_name = "VSA" if _is_vsa else "Sol-Attn"
+        if (is_vsa or is_sol) and cp_size > 1:
+            algorithm_name = "VSA" if is_vsa else "SOL"
             raise ValueError(
-                f"{_algo_name} needs the full token sequence per rank, so it is incompatible "
+                f"{algorithm_name} needs the full token sequence per rank, so it is incompatible "
                 f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
                 f"ulysses or cfg parallelism instead."
             )
@@ -225,18 +247,22 @@ class Attention(nn.Module):
             backend_num_heads = self.local_num_attention_heads
             backend_num_kv_heads = self.local_num_key_value_heads
 
-        # Lower the shared SkipSoftmax user/checkpoint config for each backend
-        # whose kernel consumes SkipSoftmaxParams.
+        # Lower the user/checkpoint sparse config for each backend whose kernel
+        # consumes the lowered SparseParams.
         sparse_params = None
-        ss_cfg = config.attention.sparse_attention_config
-        if isinstance(ss_cfg, SkipSoftmaxAttentionConfig) and backend_name in (
+        if isinstance(sparse_config, SkipSoftmaxAttentionConfig) and backend_name in (
             "TRTLLM",
             "CUTEDSL",
         ):
-            sparse_params = ss_cfg.to_sparse_params(
+            sparse_params = sparse_config.to_sparse_params(
                 module_name=self.module_name,
                 pretrained_config=config.pretrained_config,
             )
+        elif isinstance(sparse_config, SolAttentionConfig) and backend_name in (
+            "TRTLLM",
+            "CUTEDSL",
+        ):
+            sparse_params = sparse_config.to_sparse_params()
         self.sparse_params = sparse_params
 
         # Create compute backend
@@ -253,12 +279,7 @@ class Attention(nn.Module):
             sparse_params=sparse_params,
         )
 
-        if (
-            enable_sequence_parallel
-            and self.qkv_mode == QKVMode.SEPARATE_QKV
-            and not separate_qkv_is_self_attention
-            and vgm is not None
-        ):
+        if enable_sequence_parallel and is_separate_qkv_cross_attention and vgm is not None:
             ring_size = vgm.ring_size
             if ring_size > 1:
                 raise ValueError(
@@ -533,7 +554,7 @@ class Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """
         Call attention backend with appropriate tensor layout.
@@ -600,7 +621,7 @@ class Attention(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor:
         # hidden_states may be [B, S, H] or an Fp4QuantizedTensor from an upstream
         # fused norm+quant kernel; downstream Linear accepts either.
@@ -650,6 +671,7 @@ class Attention(nn.Module):
         hidden_states: torch.Tensor,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """Async-Ulysses self-attn driver. Structurally mirrors ``forward``:
         each closure does ``to_{q,k,v}`` + (optional) fused norm+RoPE on the
@@ -689,8 +711,8 @@ class Attention(nn.Module):
             )
 
         B, S = hidden_states.shape[:2]
-        H = self.num_attention_heads
-        KV = self.num_key_value_heads
+        H = self.local_num_attention_heads
+        KV = self.local_num_key_value_heads
         D = self.head_dim
         # Mirrors forward()'s fused gate. qkv_mode is implicitly SEPARATE_QKV
         # under async (caller-enforced), so the FUSE_QKV check in forward()
@@ -746,6 +768,17 @@ class Attention(nn.Module):
         def compute_v():
             return self.to_v(qkv_input).view(B, S, KV, D)
 
-        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v, timestep=timestep)
+        for gate_key in ("gate_compress", "gate_fine"):
+            gate = kwargs.get(gate_key)
+            if gate is not None:
+                kwargs[gate_key] = gate.view(B, S, self.local_num_attention_heads, D)
+
+        out_4d = self.attn.forward_async(
+            compute_q,
+            compute_k,
+            compute_v,
+            timestep=timestep,
+            **kwargs,
+        )
         b, t = out_4d.shape[:2]
         return self.to_out[0](out_4d.reshape(b, t, H * D))

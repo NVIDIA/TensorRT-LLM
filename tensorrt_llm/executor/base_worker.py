@@ -49,7 +49,8 @@ from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs, get_metrics_dict)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    bucket_responses_by_frontend, frontend_lane_index,
+                    bucket_responses_by_frontend,
+                    context_length_exceeded_message, frontend_lane_index,
                     is_llm_response)
 
 if TYPE_CHECKING:
@@ -134,7 +135,7 @@ class BaseWorker(GenerationExecutor):
         self._client_id_to_request_id: Dict[int, int] = {}
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
-        self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
+        self._is_pytorch_backend = self._backend == "pytorch"
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
         self._resource_governor_queue = None
 
@@ -178,15 +179,6 @@ class BaseWorker(GenerationExecutor):
                 args["llm_args"] = self.llm_args
                 args["checkpoint_dir"] = self._hf_model_dir
                 args["tokenizer"] = self._tokenizer
-            elif self._backend == "_autodeploy":
-                from tensorrt_llm._torch.auto_deploy.llm_args import \
-                    LlmArgs as ADLlmArgs
-                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
-                    create_autodeploy_executor
-                create_executor = create_autodeploy_executor
-                assert isinstance(self.llm_args, ADLlmArgs)
-                args["ad_config"] = self.llm_args
-                args["tokenizer"] = self._tokenizer
             else:
                 raise ValueError(f"Unsupported backend config: {self._backend}")
 
@@ -201,7 +193,6 @@ class BaseWorker(GenerationExecutor):
                     _construct_checkpoint_loader
                 partial_model_loading = self.llm_args.is_partial_model_loading
                 self.checkpoint_loader = _construct_checkpoint_loader(
-                    self.llm_args.backend,
                     self.llm_args.checkpoint_loader,
                     self.llm_args.checkpoint_format,
                     mx_config=self.llm_args.mx_config,
@@ -461,11 +452,15 @@ class BaseWorker(GenerationExecutor):
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
             default_max_tokens = max_seq_len - splited_prompt_len
             if default_max_tokens <= 0:
-                # Raise error on `default_max_tokens` not enough, since max_tokens should be less than `default_max_tokens``
+                # Reject (never truncate): the prompt leaves no room for even
+                # one generated token. The message reports request-level
+                # totals, not per-CP-rank arithmetic: splited_prompt_len >=
+                # max_seq_len implies len(prompt_token_ids) >= max_seq_len *
+                # cp_size.
                 raise ValueError(
-                    f"`default_max_tokens` ({default_max_tokens}) must be greater than 0, "
-                    f"`default_max_tokens` ({default_max_tokens}) = max_seq_len ({max_seq_len})"
-                    f" - `splited_prompt_len` ({splited_prompt_len})")
+                    context_length_exceeded_message(
+                        max_context_length=max_seq_len * cp_size,
+                        num_prompt_tokens=len(prompt_token_ids)))
 
             # default_max_tokens is the biggest available value
             if max_tokens is None:
@@ -607,10 +602,6 @@ class BaseWorker(GenerationExecutor):
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
         """
-        # _autodeploy is intentionally excluded: its allocations are not tagged
-        # under sleep_config VMM scopes, so release_with_tag would silently
-        # no-op instead of actually freeing GPU memory.  Use _backend directly
-        # rather than _is_pytorch_backend, which also covers _autodeploy.
         if self._backend != "pytorch":
             raise ValueError(
                 f"{method}() is only available for the PyTorch (TorchLLM) "
@@ -1061,6 +1052,19 @@ class BaseWorker(GenerationExecutor):
             return {}
 
         startup_metrics = {}
+        executor_metrics = dict(getattr(self.engine, "metrics", {}))
+        for model_engine_stage in (
+                "initial_model_engine",
+                "final_model_engine",
+                "initial_draft_model_engine",
+                "final_draft_model_engine",
+        ):
+            model_engine_metrics = executor_metrics.pop(model_engine_stage,
+                                                        None)
+            if model_engine_metrics is not None:
+                startup_metrics[model_engine_stage] = dict(model_engine_metrics)
+        startup_metrics["py_executor"] = executor_metrics
+
         model_engine = getattr(self.engine, "model_engine", None)
         model_loader = getattr(model_engine, "model_loader", None)
         if model_loader is not None:
