@@ -690,11 +690,53 @@ Two consequences worth stating plainly:
   performs. If you conclude such an edit is genuinely the fix, say so
   explicitly in the item rationale rather than making it quietly.
 
+### Running it
+
+You do not build the command, size the job, or write a Slurm script by hand.
+`task.yaml`'s `test_case.resolved` block already carries what a runner needs, and
+it was derived from the config in the checkout under test:
+
+- `devices`, `devices_per_node`, `nodes` — the allocation. **Pass these to the
+  runner explicitly.** Nothing downstream derives them from a test id: the
+  in-repo executor's own documentation says it performs "no auto-derivation from
+  the test ID", and its fallback is a *single GPU* — which submits a multi-node
+  case as a one-device job that runs, reports a number, and means nothing.
+- `config` — the perf-sanity YAML the id resolved to, for the family that reads
+  one. Hand it over rather than letting a runner search: the search has two
+  candidate folders and no fallback beyond them.
+- `family`, `runtime`, `benchmark_mode`, `select_pattern` — what the id selected.
+
+**Load a skill to run it; do not improvise a submission.** Which one depends on
+what is installed, and you should check in this order:
+
+1. **`run-test`** — if present. It owns template selection, script generation,
+   submission and parsing for both families, and it is what the surrounding
+   system already uses for every other measurement of this test case. Prefer it
+   whenever it exists, so your numbers are produced the same way as the ones you
+   are compared against.
+2. **`trtllm-case-executor`** — the in-repo fallback. Pass the pytest command as
+   `test_cmd`, the resolved YAML as `perf_config_yaml`, and the three allocation
+   counts as `total_required_devices` / `required_devices_per_node` /
+   `node_count`. For `test_perf.py` there is no config YAML and the family is
+   single-node, so per-node equals the total.
+
+If neither is available, stop and say so. A hand-rolled `sbatch` will differ from
+the measurement this campaign is scored against in ways nobody can see afterwards.
+
 ### Reading the result
 
 Read the metric named by `optimize.target_metric` from the harness's own
 output, and **state which direction counts as better** next to the first
 number you report.
+
+**A rep counts as measured when the parser says so, not when Slurm says the job
+succeeded.** These are different questions and on some cases they disagree
+permanently, in the direction that throws away good data: a case can fail pytest
+while emitting a complete, correct measurement for the metric under test, and
+such a job reads as failed on every run forever. Authoritative, in order: the
+parser's own result file carries a non-null value per rep; else the trigger's exit
+status, which *is* the parser verdict. Not authoritative: the Slurm job state, the
+pytest summary, or a non-zero wait status.
 
 ### Gates that keep a green run honest
 

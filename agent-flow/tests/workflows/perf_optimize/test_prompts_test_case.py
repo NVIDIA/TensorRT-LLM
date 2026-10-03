@@ -208,3 +208,38 @@ def test_directive_is_empty_for_a_plain_campaign(tmp_path):
         encoding="utf-8",
     )
     assert _workflow_for(task)._measurement_directive() == ""
+
+
+def test_the_section_says_how_to_run_the_case():
+    """Naming the runner is what stops the agent improvising a submission.
+
+    A fragment that says what is measured but not how to run it leaves an agent to
+    invent an sbatch on a GPU cluster.
+    """
+    flat = _flat(TEST_CASE_CAMPAIGN)
+    assert "Load a skill to run it; do not improvise a submission" in flat
+    assert "run-test" in flat
+    assert "trtllm-case-executor" in flat
+
+
+def test_the_section_requires_the_allocation_to_be_passed():
+    """The allocation has to be handed over, not derived.
+
+    The in-repo executor derives nothing from a test id and falls back to one GPU,
+    which submits a multi-node case as a one-device job that still reports.
+    """
+    flat = _flat(TEST_CASE_CAMPAIGN)
+    assert "total_required_devices" in flat
+    assert "single GPU" in flat
+    assert "no auto-derivation from the test ID" in flat
+
+
+def test_the_section_carries_the_parser_gate():
+    """A case can fail pytest while measuring correctly, forever."""
+    flat = _flat(TEST_CASE_CAMPAIGN)
+    assert "when the parser says so, not when Slurm says the job" in flat
+    assert "Not authoritative" in flat
+
+
+def test_the_section_tells_the_agent_to_stop_rather_than_hand_roll():
+    assert "hand-rolled `sbatch`" in _flat(TEST_CASE_CAMPAIGN)
