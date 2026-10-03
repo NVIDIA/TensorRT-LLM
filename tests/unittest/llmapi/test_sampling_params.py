@@ -25,7 +25,12 @@ from tensorrt_llm.llmapi.thinking_budget import (
     ThinkingBudgetLogitsProcessor,
     add_thinking_budget_logits_processor,
 )
-from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS, SamplingParams, check_logprobs_limit
+from tensorrt_llm.sampling_params import (
+    MAX_TOP_LOGPROBS,
+    GuidedDecodingParams,
+    SamplingParams,
+    check_logprobs_limit,
+)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -47,6 +52,50 @@ class _TestLLM(BaseLLM):
             skip_tokenizer_init=True,
             **args_overrides,
         )
+
+
+def test_check_arguments_rejects_guided_decoding_without_backend():
+    llm = _TestLLM(guided_decoding_backend=None)
+    sampling_params = SamplingParams(guided_decoding=GuidedDecodingParams(json={"type": "object"}))
+
+    with pytest.raises(ValueError, match="guided_decoding_backend"):
+        llm._check_arguments(
+            prompt_len=1,
+            sampling_params=sampling_params,
+            is_gen_only=False,
+        )
+
+
+def test_check_arguments_accepts_noop_guided_decoding_without_backend():
+    llm = _TestLLM(guided_decoding_backend=None)
+    sampling_params = SamplingParams(guided_decoding=GuidedDecodingParams())
+
+    llm._check_arguments(
+        prompt_len=1,
+        sampling_params=sampling_params,
+        is_gen_only=False,
+    )
+
+
+def test_check_arguments_accepts_request_without_guided_decoding():
+    llm = _TestLLM(guided_decoding_backend=None)
+
+    llm._check_arguments(
+        prompt_len=1,
+        sampling_params=SamplingParams(),
+        is_gen_only=False,
+    )
+
+
+def test_check_arguments_accepts_guided_decoding_with_backend():
+    llm = _TestLLM(guided_decoding_backend="xgrammar")
+    sampling_params = SamplingParams(guided_decoding=GuidedDecodingParams(json={"type": "object"}))
+
+    llm._check_arguments(
+        prompt_len=1,
+        sampling_params=sampling_params,
+        is_gen_only=False,
+    )
 
 
 def _apply_generation_config_sampling_defaults(
