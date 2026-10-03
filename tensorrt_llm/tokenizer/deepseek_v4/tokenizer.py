@@ -445,7 +445,16 @@ class DeepseekV4Tokenizer(TransformersTokenizer):
         conversation = kwargs.get("conversation", messages)
         messages = list(conversation)
         if tools:
-            messages.insert(0, {"role": "system", "tools": tools})
+            # The reference encoding attaches tools to the *existing* system
+            # message: a system turn renders as ``content + "\n\n" + tools``.
+            # Inserting a separate system message at index 0 instead emits the
+            # tool schemas first and the caller's system prompt after them, with
+            # no separator. Merge when there is a leading system message, and
+            # only insert a synthetic one when there is not.
+            if messages and messages[0].get("role") == "system":
+                messages[0] = {**messages[0], "tools": tools}
+            else:
+                messages.insert(0, {"role": "system", "tools": tools})
 
         rendered = _encode_messages(
             messages=messages,
