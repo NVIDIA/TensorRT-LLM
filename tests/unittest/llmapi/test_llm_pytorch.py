@@ -59,7 +59,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
 
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from dataclasses import replace
 
 # isort: on
@@ -233,7 +233,7 @@ def test_llm_perf_metrics():
 @pytest.mark.part3
 @pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
 def test_llm_prefix_cache_reuse(attn_backend):
-    model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    model_path = get_model_path("Qwen3/Qwen3-0.6B")
     prompt = "The future of AI is " * 20
     sampling_params = SamplingParams(temperature=0,
                                      max_tokens=5,
@@ -296,12 +296,13 @@ def test_embedding_bias_with_torch_sampler_strategies():
     """Test embedding bias application in TorchSampler."""
     tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
-    vocab_size_padded = 32000
+    vocab_size_padded = AutoConfig.from_pretrained(llama_model_path).vocab_size
     embedding_bias = torch.zeros(vocab_size_padded)
     embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
 
+    max_tokens = 6
     sampling_kwargs = {
-        "max_tokens": 6,
+        "max_tokens": max_tokens,
         "embedding_bias": embedding_bias,
     }
 
@@ -309,10 +310,15 @@ def test_embedding_bias_with_torch_sampler_strategies():
 
     sampling_params = SamplingParams(**sampling_kwargs)
 
+    # The biased token's decoded text (e.g. with or without a leading space)
+    # is tokenizer-specific, so derive the expected repeated-token output
+    # rather than hardcoding a particular tokenizer's rendering.
+    expected_output = tokenizer.decode([biased_word_id] * max_tokens)
+
     llm_test_harness(
         llama_model_path,
         prompts,
-        ["Z Z Z Z Z Z"],
+        [expected_output],
         sampling_params=sampling_params,
         backend="pytorch",
     )

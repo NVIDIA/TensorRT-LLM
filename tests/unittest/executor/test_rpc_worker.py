@@ -10,7 +10,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from utils.llm_data import llm_models_root
 # isort: on
 
-model_path = llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+model_path = llm_models_root() / "Qwen3/Qwen3-0.6B"
 assert model_path.exists()
 
 
