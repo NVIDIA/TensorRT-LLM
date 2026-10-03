@@ -78,6 +78,7 @@ from tensorrt_llm.llmapi.llm_utils import (
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    GPU_LEVEL,
     AttentionLayerConfig,
     BatchDesc,
     BufferConfig,
@@ -3747,16 +3748,9 @@ def test_v2_kda_replay_validates_configuration(
         )
 
 
-@pytest.mark.parametrize(
-    ("kda_token_states", "enable_block_reuse", "at_floor"),
-    [(True, False, True), (False, False, False), (True, True, False)],
-)
-def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
-    kda_token_states, enable_block_reuse, at_floor
-):
-    """The per-token KDA states take memory per SSM slot outside the cache quota. Without block reuse the SSM pool
-    keeps only its live floor and attention gets the rest of the quota; otherwise (replay caches only, or block reuse)
-    the typical step's ratio sizes it."""
+def _v2_kda_token_state_manager(kda_token_states, enable_block_reuse):
+    """A V2 hybrid manager stub for _build_cache_config: one KDA layer with the replay caches and one attention
+    layer."""
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
@@ -3794,6 +3788,20 @@ def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
         enable_block_reuse=enable_block_reuse,
         enable_partial_reuse=False,
     )
+    return mgr
+
+
+@pytest.mark.parametrize(
+    ("kda_token_states", "enable_block_reuse", "at_floor"),
+    [(True, False, True), (False, False, False), (True, True, False)],
+)
+def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
+    kda_token_states, enable_block_reuse, at_floor
+):
+    """The per-token KDA states take memory per SSM slot beside the V2 pools. Without block reuse the SSM pool keeps
+    only its live floor, the states' bytes come out of the quota, and attention gets the rest; otherwise (replay caches
+    only, or block reuse) the typical step's ratio sizes the pool."""
+    mgr = _v2_kda_token_state_manager(kda_token_states, enable_block_reuse)
     base_config = KVCacheManagerConfig(
         tokens_per_block=32,
         cache_tiers=[GpuCacheTierConfig(quota=128 << 20)],
@@ -3806,6 +3814,7 @@ def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
             sizes = stats.slot_sizes if hasattr(stats, "slot_sizes") else stats.slot_size
             role = "ssm" if mgr.ssm_bytes in [int(s) for s in sizes] else "attention"
             slots[role] = int(stats.total)
+        pool_bytes = runtime_manager.get_quota(GPU_LEVEL)
     finally:
         runtime_manager.shutdown()
 
@@ -3813,10 +3822,51 @@ def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
     if at_floor:
         # The floor's min-slots constraint is scaled by 1 / max_util_for_resume (0.97).
         assert floor <= slots["ssm"] <= floor + 1
-        # Every other 2 MiB grain goes to attention's 256-byte pages.
-        assert slots["attention"] >= ((128 << 20) // (2 << 20) - (floor + 2)) * ((2 << 20) // 256)
+        # kda_state_tok, allocated beside the pools: (layers, SSM slots, num_spec, *ssm_state_shape) fp32.
+        token_state_bytes = (
+            mgr.local_num_mamba_layers
+            * slots["ssm"]
+            * mgr._kda_replay_num_spec
+            * math.prod(mgr.ssm_state_shape)
+            * 4
+        )
+        # The pools and the states fit in the quota, and attention takes the rest of it, to within one 2 MiB grain.
+        assert (128 << 20) - (2 << 20) < pool_bytes + token_state_bytes <= 128 << 20
     else:
         assert slots["ssm"] > 10 * floor
+
+
+def test_v2_kda_token_states_reserve_quota_before_sizing():
+    """At the live floor the token states of every slot the SSM pool keeps come out of the GPU quota before the pools
+    are sized, and the minimum quota and the quota for max_tokens count them all."""
+    mgr = _v2_kda_token_state_manager(kda_token_states=True, enable_block_reuse=False)
+    plain = _v2_kda_token_state_manager(kda_token_states=False, enable_block_reuse=False)
+    assert mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots == 3
+    # The pool keeps ceil(3 / max_util_for_resume) = 4 slots, each with 2 fp32 token states of 2 MiB; the quotas
+    # without token states differ by exactly those.
+    reserved = 4 * 2 * (2 << 20)
+    minimum = mgr._minimum_live_gpu_quota()
+    assert minimum - plain._minimum_live_gpu_quota() == reserved
+    for max_tokens in (0, 4096):
+        assert (
+            mgr._get_quota_from_max_tokens(max_tokens)
+            - plain._get_quota_from_max_tokens(max_tokens)
+            == reserved
+        )
+
+    def build(quota):
+        return mgr._build_cache_config(
+            KVCacheManagerConfig(
+                tokens_per_block=32,
+                cache_tiers=[GpuCacheTierConfig(quota=quota)],
+                layers=_base_attention_layer_configs(2),
+            )
+        )
+
+    with pytest.raises(ValueError, match="too small for live recurrent states"):
+        build(minimum - 1)
+    assert build(minimum).cache_tiers[0].quota == minimum - reserved
+    assert build(128 << 20).cache_tiers[0].quota == (128 << 20) - reserved
 
 
 def test_mamba_cache_manager_delegates_kda_replay_capability() -> None:
