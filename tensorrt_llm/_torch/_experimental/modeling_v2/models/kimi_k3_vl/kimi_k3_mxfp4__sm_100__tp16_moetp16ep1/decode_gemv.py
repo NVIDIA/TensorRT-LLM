@@ -326,9 +326,12 @@ class K3DecodeGemvs:
             self._ran.add(key)
         return y.view(*x.shape[:-1], spec.n)
 
-    def lm_head_logits(self, rows: torch.Tensor, lm_head: nn.Module) -> Optional[torch.Tensor]:
+    def lm_head_logits(
+        self, rows: torch.Tensor, lm_head: nn.Module, gather: bool = True
+    ) -> Optional[torch.Tensor]:
         """``lm_head(rows)``, the gathered bf16 logits ``[M, vocab]``, with this rank's shard on
-        ``gemm/k3_head_gemv``; None where it does not take the call (more than `MAX_ROWS` rows, another head, ...)."""
+        ``gemm/k3_head_gemv`` (``gather`` False: the shard alone, ``[M, vocab / TP]``); None where it does not take
+        the call (more than `MAX_ROWS` rows, another head, ...)."""
         workspace = self.head_workspace
         if workspace is None or not _head_takes_module(lm_head):
             return None
@@ -345,13 +348,13 @@ class K3DecodeGemvs:
         if _capturing() and ("lm_head",) not in self._ran:
             return None
         group = lm_head.mapping.tp_group
-        if len(group) > 1 and mpi_disabled():
+        if gather and len(group) > 1 and mpi_disabled():
             return None
         x = _dense_rows(rows)
         if not _head_op.supports(x, weight):
             return None
         local = k3_head_gemv(x, weight, workspace)
-        if len(group) == 1:
+        if not gather or len(group) == 1:
             return local
         gathered = allgather(local, None, group)
         return concat(list(split(gathered, rows.shape[0], dim=0)), dim=-1)
@@ -454,3 +457,11 @@ class K3LogitsProcessor(nn.Module):
     ) -> torch.Tensor:
         head = lm_head if self.gemvs is None else _K3Head(self.gemvs, lm_head)
         return self.stock.forward(hidden_states, head, attn_metadata, return_context_logits)
+
+    def lm_head_shard(self, rows: torch.Tensor, lm_head: nn.Module) -> Optional[torch.Tensor]:
+        """This rank's bf16 vocabulary shard of ``lm_head(rows)`` on ``gemm/k3_head_gemv``, without the gather, or
+        None where ``gemvs`` does not take the rows. A speculative worker that keeps its logits vocabulary-sharded
+        computes them here, so they hold the values of the logits this processor gathers."""
+        if self.gemvs is None:
+            return None
+        return self.gemvs.lm_head_logits(rows, lm_head, gather=False)
