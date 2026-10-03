@@ -8,6 +8,7 @@ import anyio
 
 from .backends import create_backend
 from .backends.base import Backend, BackendClient, ResultEvent
+from .backends.claude_code import StreamIdleError
 from .config import AgentLayerConfig, HumanRequest, HumanRequestOption
 from .console import (
     print_agent_completed,
@@ -113,6 +114,11 @@ def _read_human_reply(request: HumanRequest) -> str:
             if opt.label.strip().lower() == lowered:
                 return opt.label
     return raw
+
+
+# Replacing a hung session costs a fresh CLI subprocess and this layer's
+# conversation history, so the budget is one replacement, not a ladder of them.
+STREAM_IDLE_RETRIES = 1
 
 
 class AgentLayer(Module):
@@ -526,15 +532,26 @@ class AgentLayer(Module):
         if request.system_prompt is None:
             request.system_prompt = self.config.system_prompt
 
-        try:
-            client, created = await self._ensure_persistent_client(request.system_prompt)
-            assert self._backend is not None
-            return await self._run_with_client(
-                request, client, self._backend, report_baseline=created
-            )
-        except Exception:
-            await self._drop_persistent_client()
-            raise
+        # A hung session cannot be retried in place: its CLI subprocess is still
+        # sitting on the dead request, so a second message queues behind it and
+        # hangs too. Dropping the client kills that subprocess and the next pass
+        # builds a fresh one. The cost is this layer's conversation history,
+        # which is why the budget is one replacement rather than a ladder.
+        for attempt in range(STREAM_IDLE_RETRIES + 1):
+            try:
+                client, created = await self._ensure_persistent_client(request.system_prompt)
+                assert self._backend is not None
+                return await self._run_with_client(
+                    request, client, self._backend, report_baseline=created
+                )
+            except StreamIdleError:
+                await self._drop_persistent_client()
+                if attempt == STREAM_IDLE_RETRIES:
+                    raise
+            except Exception:
+                await self._drop_persistent_client()
+                raise
+        raise AssertionError("unreachable")  # pragma: no cover
 
     async def _dispatch_human_request(self, request: HumanRequest) -> str | None:
         """Surface an ``ask_human`` request to the human via stdin.
