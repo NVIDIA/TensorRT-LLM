@@ -2273,13 +2273,15 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
             multimodal_params=list(multimodal_params))
         return mm_embeds[0]
 
-    def apply_llm_torch_compile(self, *, backend: Any, fullgraph: bool) -> None:
+    def apply_llm_torch_compile(self, *, backend: Any, fullgraph: bool,
+                                recompile_limit: int) -> None:
         # TODO: Move this hook to MultimodalModelMixin once multimodal models
         # consistently expose an LLM compile contract.
         """Compile only the LLM decoder; the vision encoder stays eager."""
         self.llm.model = torch.compile(self.llm.model,
                                        backend=backend,
-                                       fullgraph=fullgraph)
+                                       fullgraph=fullgraph,
+                                       recompile_limit=recompile_limit)
 
     @nvtx_range("Qwen2.5-VL prepare_mrope_config")
     def prepare_mrope_config(
