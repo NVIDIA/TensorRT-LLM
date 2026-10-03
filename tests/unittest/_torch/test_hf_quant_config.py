@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+
 import pytest
 
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -62,6 +64,95 @@ def test_load_hf_quant_config_parses_nvfp4_with_kv_cache_scheme():
     assert quant_config.group_size == 16
     assert quant_config.kv_cache_quant_algo == QuantAlgo.FP8
     assert set(quant_config.exclude_modules) == {gate_exclude, "lm_head"}
+
+
+@pytest.mark.parametrize("group_size", [64, 128])
+@pytest.mark.parametrize("checkpoint_format", ["gptq", "gptq_v2"])
+def test_load_hf_gptq_config(group_size, checkpoint_format):
+    config, per_layer = ModelConfig.load_hf_quant_config(
+        {
+            "quant_method": "gptq",
+            "bits": 4,
+            "group_size": group_size,
+            "checkpoint_format": checkpoint_format,
+            "desc_act": False,
+            "modules_to_not_convert": ["model.layers.0.self_attn.o_proj"],
+        },
+        moe_backend="CUTLASS",
+    )
+    assert config.quant_algo == QuantAlgo.W4A16_GPTQ
+    assert config.group_size == group_size
+    assert config.has_zero_point
+    assert config.exclude_modules == ["model.layers.0.self_attn.o_proj", "lm_head"]
+    assert per_layer is None
+
+
+@pytest.mark.parametrize(
+    "override,error",
+    [
+        ({"bits": 8}, "bits=4"),
+        ({"group_size": 32}, "group_size"),
+        ({"desc_act": True}, "desc_act"),
+        ({"checkpoint_format": "marlin"}, "checkpoint_format"),
+        ({"dynamic": {".*": {"bits": 8}}}, "dynamic"),
+        ({"modules_in_block_to_quantize": [["q_proj"]]}, "modules_in_block"),
+        ({"lm_head": True}, "lm_head"),
+    ],
+)
+def test_load_hf_gptq_config_rejects_unsupported(override, error):
+    config = {"quant_method": "gptq", "bits": 4, "group_size": 128}
+    config.update(override)
+    with pytest.raises(ValueError, match=error):
+        ModelConfig.load_hf_quant_config(config, moe_backend="CUTLASS")
+
+
+@pytest.mark.parametrize("from_model_kwargs", [False, True])
+@pytest.mark.parametrize(
+    "kv_dtype,existing_kv_quant_algo",
+    [
+        ("auto", None),
+        ("auto", QuantAlgo.FP8),
+        ("auto", QuantAlgo.NVFP4),
+        ("fp8", QuantAlgo.FP8),
+    ],
+)
+def test_llm_api_loads_gptq_config(tmp_path, from_model_kwargs, kv_dtype, existing_kv_quant_algo):
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
+    from tensorrt_llm.llmapi.llm_utils import ModelLoader
+
+    hf_config = {"quant_method": "gptq", "bits": 4, "group_size": 128, "desc_act": False}
+    kwargs = {"quantization_config": hf_config} if from_model_kwargs else None
+    if not from_model_kwargs:
+        (tmp_path / "config.json").write_text(json.dumps({"quantization_config": hf_config}))
+    args = TorchLlmArgs(
+        model=str(tmp_path),
+        gpus_per_node=1,
+        model_kwargs=kwargs,
+        kv_cache_config=KvCacheConfig(dtype=kv_dtype),
+    )
+    if kv_dtype == "auto":
+        args.quant_config.kv_cache_quant_algo = existing_kv_quant_algo
+    loader = ModelLoader(args)
+    assert loader._update_from_hf_quant_config() is True
+    assert args.quant_config.quant_algo == QuantAlgo.W4A16_GPTQ
+    assert args.quant_config.group_size == 128
+    assert args.quant_config.has_zero_point
+    assert args.quant_config.exclude_modules == ["lm_head"]
+    assert args.quant_config.kv_cache_quant_algo == existing_kv_quant_algo
+
+
+@pytest.mark.parametrize("from_model_kwargs", [False, True])
+def test_llm_api_rejects_gptq_activation_order(tmp_path, from_model_kwargs):
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.llmapi.llm_utils import ModelLoader
+
+    hf_config = {"quant_method": "gptq", "bits": 4, "group_size": 128, "desc_act": True}
+    kwargs = {"quantization_config": hf_config} if from_model_kwargs else None
+    if not from_model_kwargs:
+        (tmp_path / "config.json").write_text(json.dumps({"quantization_config": hf_config}))
+    args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=1, model_kwargs=kwargs)
+    with pytest.raises(ValueError, match="desc_act"):
+        ModelLoader(args)._update_from_hf_quant_config()
 
 
 def _modelopt_hf_quant_config(

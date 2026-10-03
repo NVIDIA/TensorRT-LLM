@@ -222,6 +222,15 @@ class ModelLoader:
                 else:
                     # Ministral 3 static quant
                     quant_config.quant_algo = QuantAlgo.FP8
+            elif hf_quant_config.get("quant_method") == "gptq":
+                from .._torch.model_config import ModelConfig
+                parsed, _ = ModelConfig.load_hf_quant_config(
+                    hf_quant_config, self.llm_args.moe_config.backend)
+                # Preserve independently configured KV-cache quantization.
+                quant_config.quant_algo = parsed.quant_algo
+                quant_config.group_size = parsed.group_size
+                quant_config.has_zero_point = parsed.has_zero_point
+                quant_config.exclude_modules = parsed.exclude_modules
             elif hf_quant_config.get("quant_method") == "mxfp4":
                 from .._torch.model_config import ModelConfig
                 quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
