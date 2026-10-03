@@ -762,7 +762,8 @@ protected:
         tensorrt_llm::DataType dataType, int kvFactor = 2, bool isMLA = false, bool enableDPAttention = false,
         bool isWindow = false, bool isIndexerKCache = true, int indexerDimPerHead = 0,
         int indexerKCacheQuantBlockSize = 128,
-        std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt)
+        std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt,
+        SizeType32 blocksInSecondaryPool = 0)
     {
         mIsWindowAttention = isWindow;
 
@@ -873,8 +874,6 @@ protected:
         auto numBlocksPerSeq = numSharedBlocks + (maxBlocksPerSeq - numSharedBlocks) * maxBeamWidth;
 
         auto totalNumBlocks = mMaxNumSequences * numBlocksPerSeq;
-        auto constexpr blocksInSecondaryPool = 0;
-
         auto constexpr enableBlockReuse = false;
         CacheType cacheType = CacheType::kSELF;
         if (kvFactor == 1)
@@ -1159,7 +1158,8 @@ protected:
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
-    std::future<void> addRequestAndTransportCacheForContext(std::shared_ptr<WrappedLlmRequest> const& request)
+    std::future<void> addRequestAndTransportCacheForContext(
+        std::shared_ptr<WrappedLlmRequest> const& request, bool offloadFirstBlockBeforeTransfer = false)
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
@@ -1208,6 +1208,10 @@ protected:
         auto const onlyWindowSize = blockManager.getPoolWindowSize(0);
 
         blockManager.getBufferManager(onlyWindowSize).getStream().synchronize();
+        if (offloadFirstBlockBeforeTransfer)
+        {
+            offloadFirstBlockInRange(blockRange);
+        }
         auto future = mSender->sendAsync(llmRequest);
         return future;
     }
@@ -1282,6 +1286,26 @@ protected:
                 blockIdx++;
             }
         }
+    }
+
+    void offloadFirstBlockInRange(BlockRange const& blockRange)
+    {
+        auto& blockManager = tensorrt_llm::testing::KvCacheManagerTestUtil::mutableBlockManager(*mManager);
+        for (auto const& [windowSize, blockIds] : blockRange.getBlockIdsPerWindow())
+        {
+            if (blockIds.empty())
+            {
+                continue;
+            }
+
+            auto block = blockManager.getBlockById(blockIds.front(), windowSize);
+            TLLM_CHECK(block != nullptr);
+            TLLM_CHECK(block->isPrimary());
+            blockManager.offloadBlock(block, windowSize);
+            TLLM_CHECK(!block->isPrimary());
+            return;
+        }
+        TLLM_CHECK_WITH_INFO(false, "Expected at least one block to offload before transfer");
     }
 
     void fillBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial, int windowSize = 0,
@@ -1649,6 +1673,75 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     tensorrt_llm::mpi::MpiComm::world().barrier();
 }
 
+class OffloadedSendRangeCacheTest : public AsymmetricalCacheTest
+{
+};
+
+TEST_P(OffloadedSendRangeCacheTest, OffloadedBlockRoundTrips)
+{
+    if (!(tensorrt_llm::common::getEnvUseUCXKvCache()))
+    {
+        setenv("UCX_TLS", "^cuda_ipc", 1); // disable cuda_ipc for testing for mpi
+    }
+    else
+    {
+        setenv("UCX_TCP_CM_REUSEADDR", "y",
+            1); // tests creates and destroies ucxCacheCommunicatoers frequently, so listener ports must be reused
+    }
+
+    AsymmetricTestParam param = GetParam();
+    int contextTp = std::get<0>(param);
+    int contextPp = std::get<1>(param);
+    int contextCp = std::get<2>(param);
+    int genTp = std::get<3>(param);
+    int genPp = std::get<4>(param);
+    int genCp = std::get<5>(param);
+    int numLayers = std::get<6>(param);
+    int numHeads = std::get<7>(param);
+    int sizePerHead = std::get<8>(param);
+    int tokensPerBlock = std::get<9>(param);
+    tensorrt_llm::DataType dataType = std::get<10>(param);
+    int kvFactor = std::get<11>(param);
+    bool isMLA = std::get<12>(param);
+    bool contextDP = std::get<13>(param);
+    bool generationDP = std::get<14>(param);
+    bool isWindow = std::get<15>(param);
+    bool isIndexerKCache = std::get<16>(param);
+    int indexerDimPerHead = std::get<17>(param);
+    int indexerKCacheQuantBlockSize = std::get<18>(param);
+
+    setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
+
+    if (mIsContext || mIsGeneration)
+    {
+        auto constexpr kBlocksInSecondaryPool = 4;
+        setUpCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, false, isWindow,
+            isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize, std::nullopt, kBlocksInSecondaryPool);
+        setUpCacheTransceiver();
+        std::shared_ptr<WrappedLlmRequest> request{makeLlmRequest(30)};
+
+        if (mIsContext)
+        {
+            auto contextFuture
+                = addRequestAndTransportCacheForContext(request, /*offloadFirstBlockBeforeTransfer=*/true);
+            mComm->barrier();
+            contextFuture.get();
+        }
+        else
+        {
+            mComm->barrier();
+            auto generationFuture = addRequestAndTransportCacheForGeneration(request);
+            generationFuture.get();
+            generationVerifyKVCache(request);
+        }
+
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request->mLlmRequest);
+        mManager->removeSequence(request->mLlmRequest->mRequestId, request->mLlmRequest);
+        mComm->barrier();
+    }
+    tensorrt_llm::mpi::MpiComm::world().barrier();
+}
+
 class AsymmetricalCacheTestWithDP : public AsymmetricalCacheTest
 {
 };
@@ -1965,6 +2058,13 @@ INSTANTIATE_TEST_CASE_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRace
         testing::Values(0), testing::Values(128)));
 
 // Waive off isWindow test for now
+INSTANTIATE_TEST_CASE_P(OffloadedSendRangeCase, OffloadedSendRangeCacheTest,
+    testing::Combine(testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1),
+        testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4), testing::Values(16),
+        testing::Values(tensorrt_llm::DataType::kFLOAT), testing::Values(2), testing::Values(false),
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false),
+        testing::Values(0), testing::Values(128)));
+
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
