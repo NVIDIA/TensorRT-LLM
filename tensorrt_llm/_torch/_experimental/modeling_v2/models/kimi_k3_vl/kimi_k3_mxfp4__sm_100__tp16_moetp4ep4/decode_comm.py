@@ -276,11 +276,14 @@ class K3DecodeComm:
         res_norm: nn.Module,
         out_norm: nn.Module,
         updated_out: Optional[torch.Tensor] = None,
+        tap: Optional[torch.Tensor] = None,
+        tap_updated: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(normed, updated)`` as ``allreduce_attn_res`` of a MoE layer's row-parallel tail ``pending``
         (``[RMSNorm(latent)[:, lo:lo + 224] | act] @ weight.T``), in one ``comm/k3_sandwich_tail`` call.
         ``updated_out``: a bf16 ``[T, H]`` tensor the call stores ``updated`` into (the consumer's snapshot bank row),
-        returned as ``updated``."""
+        returned as ``updated``. ``tap``: a bf16 ``[T, H]`` view (a speculative capture slot) the call also stores
+        the pre-norm attention-residual mixture into, or ``updated`` with ``tap_updated``."""
         return k3_sandwich_tail(
             pending.latent,
             pending.act,
@@ -291,6 +294,8 @@ class K3DecodeComm:
             block_residual,
             *_res_args(res_proj, res_norm, out_norm),
             self.sandwich,
+            tap=tap,
+            tap_updated=tap_updated,
             updated_out=updated_out,
         )
 

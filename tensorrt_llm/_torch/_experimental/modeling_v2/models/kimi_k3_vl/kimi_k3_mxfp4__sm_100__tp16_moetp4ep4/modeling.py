@@ -1538,7 +1538,10 @@ class KimiLinearDecoderLayer(nn.Module):
         ``hidden_states`` is the prefix sum without it, and this layer's
         pre-attention step reduces and adds it: a ``PendingTail`` in one
         ``K3DecodeComm.sandwich_tail`` call, a wide decode step's tensor by its
-        all-reduce and the fused add + attn_res + RMSNorm.
+        all-reduce and the fused add + attn_res + RMSNorm. On a tapped layer
+        the ``sandwich_tail`` call also stores the tap into the capture slot
+        where the speculative metadata exposes it (``capture_view``); other
+        tapped layers take the tap after the step.
 
         ``defer_moe_tail``: return ``(prefix_sum, num_snapshots, partial)``
         instead, ``partial`` this layer's MoE output unreduced, for the next
@@ -1557,6 +1560,12 @@ class KimiLinearDecoderLayer(nn.Module):
         snapshot_row = None
         if tail is not None and self.layer_idx % self.attn_res_block_size == 0:
             snapshot_row = block_residual[num_snapshots]
+        # A tapped layer whose pre-attention step is the sandwich tail has the kernel store the tap straight into the
+        # layer's capture slot, where the speculative metadata exposes that slot as a view (``capture_view``).
+        tap_view = None
+        if tail is not None and capture is not None:
+            view_of = getattr(capture[0], "capture_view", None)
+            tap_view = view_of(capture[1], prefix_sum.shape[0]) if view_of is not None else None
 
         if prenormed:
             assert num_snapshots == 0 and self.layer_idx % self.attn_res_block_size == 0
@@ -1570,6 +1579,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_norm,
                 self.input_layernorm,
                 updated_out=snapshot_row,
+                tap=tap_view,
+                tap_updated=not _AUX_ATTN_RES_STREAM_ENABLED,
             )
         elif pending_moe_partial is not None:
             prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
@@ -1610,9 +1621,9 @@ class KimiLinearDecoderLayer(nn.Module):
         else:
             hidden_states = self.input_layernorm(hidden_states)
 
-        if capture is not None and pending_moe_partial is not None:
-            # The tapped layer handed its MoE output on: the step above reduced it into prefix_sum. Tap that value's
-            # pre-norm attn_res mixture, what the split path captures.
+        if capture is not None and pending_moe_partial is not None and tap_view is None:
+            # The tapped layer handed its MoE output on and no kernel wrote the tap: the step above reduced the output
+            # into prefix_sum. Tap that value's pre-norm attn_res mixture, what the split path captures.
             tapped = (
                 _apply_attn_res(
                     prefix_sum,

@@ -37,6 +37,10 @@ Checks:
     comm/k3_sandwich_tail (layer 24's kernel stores the prefix sum into the bank row it takes), against the same layers
     with the tail reduced in torch and added before the built-in pre-attention step: the consumer's attention input,
     its outputs and the bank within TOL; the deferred chain captured and replayed equals eager bit for bit.
+  * MoE tail tap: layer 23 or 24 as a tapped layer (its speculative metadata a stand-in) consuming layer 22's tail.
+    With the metadata's ``capture_view`` the sandwich tail stores the tap into the capture slot and the layer captures
+    nothing more; without it the layer captures the split path's tap (``_apply_attn_res``). The two taps within TOL,
+    every other output of the chain bit for bit the same.
   * Every output bitwise equal across the ranks.
 
 Every rank draws the replicated tensors (prefix sum, snapshot bank, norms) from one seed and its own o_proj, core and
@@ -473,9 +477,12 @@ def _pending(seed, tokens):
     return T._decode_comm.PendingTail(latent, act, weight.contiguous(), R.rank * LAT_SLICE, 1e-5)
 
 
-def _tail_chain(producer, consumer, x, bank, step, pending, defer, consumer_core, producer_core):
+def _tail_chain(
+    producer, consumer, x, bank, step, pending, defer, consumer_core, producer_core, capture=None
+):
     """The producer layer (its MoE handing ``pending`` on with ``defer``, else adding its reduced tail), then the
-    consumer layer. Returns the consumer's attention input, its returned prefix sum, its MoE input and the bank."""
+    consumer layer (with ``capture``, a tapped layer). Returns the consumer's attention input, its returned prefix
+    sum, its MoE input and the bank."""
     _attention(producer).core = producer_core
     _attention(consumer).core = consumer_core
     producer.block_sparse_moe.pending = pending
@@ -491,7 +498,13 @@ def _tail_chain(producer, consumer, x, bank, step, pending, defer, consumer_core
     else:
         (prefix, snapshots), partial = out, None
     prefix_c, snapshots_c = consumer(
-        prefix, bank, snapshots, SimpleNamespace(), step=step, pending_moe_partial=partial
+        prefix,
+        bank,
+        snapshots,
+        SimpleNamespace(),
+        capture=capture,
+        step=step,
+        pending_moe_partial=partial,
     )
     return (
         _attention(consumer).last_input,
@@ -529,6 +542,59 @@ def check_moe_tail_deferral():
             assert all(torch.isfinite(t.float()).all() for t in got)
             assert all(e < TOL for e in errs), (consumer_idx, tokens, dict(zip(names, errs)))
             assert R.same_on_ranks(*got), (consumer_idx, tokens, "ranks differ")
+
+
+class _CaptureMetadata:
+    """Stand-in for the speculative metadata a tapped layer captures into: ``maybe_capture_hidden_states`` records
+    each value it is handed, and with ``views`` the metadata also exposes ``capture_view``, slot 2 of a NaN-filled
+    ``[T, 5 x H]`` capture buffer, as DSpark's does."""
+
+    SLOT = 2
+
+    def __init__(self, tokens, views):
+        self.buf = torch.full((tokens, 5 * H), float("nan"), dtype=torch.bfloat16, device="cuda")
+        self.captured = []
+        if views:
+            self.capture_view = self.view
+
+    def view(self, layer_id, num_tokens):
+        return self.buf[:num_tokens, self.SLOT * H : (self.SLOT + 1) * H]
+
+    def maybe_capture_hidden_states(self, layer_id, hidden_states, residual=None):
+        self.captured.append(hidden_states.clone())
+
+
+def check_moe_tail_tap():
+    seed = 3500
+    for consumer_idx in (23, 24):
+        producer, consumer = LAYERS_BUILT[22], LAYERS_BUILT[consumer_idx]
+        for tokens in (1, 3, 8):
+            seed += 1
+            step = T.DecodeStep(tokens, tokens, 1)
+            case = Case(seed, 22, tokens)
+            gr = _gen(seed * 13 + 5 + R.rank)
+            core_c = ls.exact_bf16(gr, (tokens, K_IN), -4, 5, 1 / 8)
+            pending = _pending(seed, tokens)
+            fused, split = _CaptureMetadata(tokens, True), _CaptureMetadata(tokens, False)
+            got = _tail_chain(producer, consumer, case.x.clone(), case.bank.clone(), step, pending, True, core_c,
+                              case.core, capture=(fused, consumer_idx - 1))  # fmt: skip
+            got = [t.clone() for t in got]
+            want = _tail_chain(producer, consumer, case.x.clone(), case.bank.clone(), step, pending, True, core_c,
+                               case.core, capture=(split, consumer_idx - 1))  # fmt: skip
+            torch.cuda.synchronize()
+            assert not fused.captured and len(split.captured) == 1, (consumer_idx, tokens)
+            tap, split_tap = fused.view(consumer_idx - 1, tokens), split.captured[0]
+            err = _err(tap, split_tap)
+            differ = int((tap.view(torch.int16) != split_tap.view(torch.int16)).sum())
+            if R.rank == 0:
+                print(
+                    f"[rank 0] tail tap {22}->{consumer_idx} T={tokens}: kernel vs split {err:.2e}, "
+                    f"{differ} of {tap.numel()} elements differ",
+                    flush=True,
+                )
+            assert torch.isfinite(tap.float()).all() and err < TOL, (consumer_idx, tokens, err)
+            assert all(torch.equal(a, b) for a, b in zip(got, want)), (consumer_idx, tokens)
+            assert R.same_on_ranks(tap, *got), (consumer_idx, tokens, "ranks differ")
 
 
 def check_moe_tail_graph():
@@ -715,6 +781,7 @@ CHECKS = [
     check_sandwich_vs_mnnvl_bitwise,
     check_graph_capture_and_replay,
     check_moe_tail_deferral,
+    check_moe_tail_tap,
     check_moe_tail_graph,
 ]
 
