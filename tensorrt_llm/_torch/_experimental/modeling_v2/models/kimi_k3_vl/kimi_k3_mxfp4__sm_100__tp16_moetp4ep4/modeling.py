@@ -82,6 +82,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
+from . import decode_gemv as _decode_gemv
 from . import weights as _weights
 
 if TYPE_CHECKING:
@@ -105,6 +106,12 @@ REQUIRED_TRTLLM_OPS = (
     "kda_mtp_decode",
     "dsv3_router_gemm_op",
     "dsv3_fused_a_gemm_op",
+    # The decode path's GEMVs, LM head and embedding (decode_gemv.py).
+    "k3_decode_gemv",
+    "k3_ctm_gemv_wide",
+    "k3_head_gemv",
+    "k3_embed_norm",
+    "allgather",
 )
 
 #: The engine surface the first forward checks before this target relies on it: per object, the attributes read.
@@ -1416,6 +1423,7 @@ class KimiLinearDecoderLayer(nn.Module):
         num_snapshots: int,
         attn_metadata: AttentionMetadata,
         capture: Optional[Tuple[Any, int]] = None,
+        prenormed: bool = False,
     ) -> Tuple[torch.Tensor, int]:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
 
@@ -1429,11 +1437,17 @@ class KimiLinearDecoderLayer(nn.Module):
         below already is it. Reading it here beats recomputing it, and is only
         possible because K3 asserts pp_size == 1 -- layer j+1 is always local.
         PP support would need a recompute at the rank boundary.
+
+        ``prenormed`` (layer 0 on a decode step): ``hidden_states`` already is
+        this layer's input norm, and the layer's input, the step's embedding,
+        already is in ``block_residual[0]`` (``K3DecodeGemvs.embed_norm``).
         """
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
 
-        if capture is not None:
+        if prenormed:
+            assert num_snapshots == 0 and self.layer_idx % self.attn_res_block_size == 0
+        elif capture is not None:
             # The mixture tap needs the PRE-norm value, which the fused
             # attn-res + RMSNorm kernel does not expose. Keep the two steps
             # split on captured layers only and fuse everywhere else.
@@ -1462,7 +1476,8 @@ class KimiLinearDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
 
         if self.layer_idx % self.attn_res_block_size == 0:
-            block_residual[num_snapshots].copy_(prefix_sum)
+            if not prenormed:
+                block_residual[num_snapshots].copy_(prefix_sum)
             num_snapshots += 1
             valid_block_residual = block_residual[:num_snapshots]
             prefix_sum = None
@@ -1550,6 +1565,9 @@ class KimiLinearModel(DecoderModel):
         self.num_attn_res_snapshots = (
             cfg.num_hidden_layers + cfg.attn_res_block_size - 1
         ) // cfg.attn_res_block_size
+        # The decode path's GEMVs and embedding (decode_gemv.py), built by the target's cache_derived_state once the
+        # weights are final. None: every step embeds on the generic path.
+        self.decode_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
 
         # Which convention the drafter tap is on is not recoverable from the
         # served output -- a mismatch only lowers acceptance -- so state it once
@@ -1573,15 +1591,33 @@ class KimiLinearModel(DecoderModel):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-        hidden_states = inputs_embeds
-
-        block_residual = hidden_states.new_empty(
-            self.num_attn_res_snapshots,
-            hidden_states.shape[0],
-            hidden_states.shape[1],
-        )
+        num_tokens = (input_ids if inputs_embeds is None else inputs_embeds).shape[0]
+        step = decode_step(attn_metadata, num_tokens)
+        # A decode step embeds and norms for layer 0 in one launch, the embedding written as layer 0's first snapshot.
+        prenormed = None
+        if (
+            inputs_embeds is None
+            and step is not None
+            and self.decode_gemvs is not None
+            and len(self.layers) > 0
+            and self.num_attn_res_snapshots > 0
+        ):
+            table = self.embed_tokens.weight
+            block_residual = table.new_empty(
+                self.num_attn_res_snapshots, num_tokens, table.shape[1]
+            )
+            prenormed = self.decode_gemvs.embed_norm(
+                input_ids, table, self.layers[0].input_layernorm, block_residual
+            )
+        if prenormed is not None:
+            hidden_states = prenormed
+        else:
+            hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+            block_residual = hidden_states.new_empty(
+                self.num_attn_res_snapshots,
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+            )
         num_snapshots = 0
         capture_set = (
             getattr(spec_metadata, "_capture_layer_set", None)
@@ -1607,7 +1643,12 @@ class KimiLinearModel(DecoderModel):
             ):
                 capture = (spec_metadata, self.layers[i - 1].layer_idx)
             hidden_states, num_snapshots = layer(
-                hidden_states, block_residual, num_snapshots, attn_metadata, capture=capture
+                hidden_states,
+                block_residual,
+                num_snapshots,
+                attn_metadata,
+                capture=capture,
+                prenormed=i == 0 and prenormed is not None,
             )
 
         # The last layer has no successor, so this one recompute is
@@ -1807,6 +1848,13 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
             vocab_size=cfg.vocab_size,
         )
         self._step_checked = False
+        # The LM head on gemm/k3_head_gemv at decode size, once cache_derived_state has built its state. It is the
+        # processor the speculative worker's target logits and a parallel drafter's logits call too.
+        stock_logits_processor = self.logits_processor
+        self.logits_processor = _decode_gemv.K3LogitsProcessor(stock_logits_processor)
+        draft_model = getattr(self, "draft_model", None)
+        if getattr(draft_model, "logits_processor", None) is stock_logits_processor:
+            draft_model.logits_processor = self.logits_processor
         # The fused decode path and the state its kernels share, built in post_load_weights once the catalog entries
         # it calls exist. None: every step takes the generic path.
         self._fused_decode = None
@@ -1818,6 +1866,26 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
 
     def load_weights(self, weights, *args, **kwargs):
         _weights.load(self, weights)
+
+    def cache_derived_state(self) -> None:
+        """Build the decode GEMVs' state from the final weights: the LM head's workspace, and one eager call of each
+        decode GEMV kernel (the MLA projections' shapes, read off the first MLA layer), so none compiles under
+        capture."""
+        super().cache_derived_state()
+        mla = next((layer.self_attn.mixer for layer in self.model.layers if not layer.is_kda), None)
+        sites = {}
+        if mla is not None:
+            for site, name in (
+                ("kv_a", "kv_a_proj_with_mqa"),
+                ("q_b", "q_b_proj"),
+                ("g_proj", "g_proj"),
+            ):
+                module = getattr(mla, name, None)
+                if module is not None:
+                    sites[site] = module.weight
+        gemvs = _decode_gemv.K3DecodeGemvs.create(self.lm_head, sites)
+        self.model.decode_gemvs = gemvs
+        self.logits_processor.gemvs = gemvs
 
     def _check_step_contract(self, attn_metadata: AttentionMetadata) -> None:
         """First-forward checks of the engine surface and the per-engine settings."""

@@ -1,0 +1,282 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""The decode path's GEMVs, LM head and embedding on the catalog's single-GPU Kimi K3 entries.
+
+* **Per-site GEMVs** (`K3DecodeGemvs.project`): an MLA projection of at most `MAX_ROWS` rows runs on the kernel
+  measured fastest at its weight shape at every row count 1..8 (`SITES`): `gemm/k3_decode_gemv` for the fused
+  q_a / kv_a projection, `gemm/k3_ctm_gemv_wide` for q_b and the output gate.
+* **LM head** (`K3LogitsProcessor`): at most `MAX_ROWS` rows of this rank's vocabulary shard on
+  `gemm/k3_head_gemv` over the target's `K3HeadGemvWorkspace`, then the shards gathered (`comm/allgather`) as the
+  stock head gathers them. It is the shell's logits processor, so the speculative worker's target logits and the
+  drafter's logits on the same head take it too.
+* **Embedding** (`K3DecodeGemvs.embed_norm`): a decode step's embedding rows written into the attention-residual
+  bank's slot 0 (layer 0's first snapshot) and layer 0's input RMSNorm applied, in one `norm/k3_embed_norm` launch.
+
+Each returns None where its kernel does not take the call, and the caller then runs the generic path's module.
+
+A kernel compiles on its first call for a shape, which must not happen under CUDA-graph capture.
+`K3DecodeGemvs.create`, run once the weights are final, runs every site's kernel and the head once, eagerly. The
+embedding kernel compiles per token count, on the eager warm-up step before each capture. Under capture, a call
+whose kernel has not run eagerly is refused.
+
+The head's workspace serves every `k3_head_gemv` call of its weight shape, so those calls must be ordered on one
+stream: the logits are computed on the model's stream (see the `gemm/k3_head_gemv` contract's State section).
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Optional, Set, Tuple
+
+import torch
+from torch import nn
+
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import allgather
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_wide import (
+    k3_ctm_gemv_wide,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_decode_gemv import k3_decode_gemv
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_head_gemv import (
+    K3HeadGemvWorkspace,
+    k3_head_gemv,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.k3_embed_norm import k3_embed_norm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.concat import concat
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.torch.split import split
+
+# The kernels' support predicates: metadata reads only.
+from tensorrt_llm._torch.cute_dsl_kernels.k3_ctm_gemv import op as _ctm_op
+from tensorrt_llm._torch.cute_dsl_kernels.k3_decode_gemv import op as _decode_op
+from tensorrt_llm._torch.cute_dsl_kernels.k3_embed import op as _embed_op
+from tensorrt_llm._torch.cute_dsl_kernels.k3_head_gemv import op as _head_op
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from tensorrt_llm._utils import mpi_disabled
+
+# The row limit of the decode GEMV and head kernels (one token tile).
+MAX_ROWS = 8
+
+#: Site -> (N, K) of its weight at this target's per-rank shapes, and the kernel that runs it at 1..MAX_ROWS rows.
+SITES: Dict[str, Tuple[int, int, str]] = {
+    # MLA kv_a_proj_with_mqa: [q_a 1536 | kv_a 512 | k_pe 64] of the hidden size.
+    "kv_a": (2112, 7168, "decode"),
+    # MLA q_b_proj: 6 heads x 192 of q_lora_rank.
+    "q_b": (1152, 1536, "wide"),
+    # MLA output gate: 6 heads x 128 of the hidden size.
+    "g_proj": (768, 7168, "wide"),
+}
+
+
+def _capturing() -> bool:
+    return not torch.compiler.is_compiling() and torch.cuda.is_current_stream_capturing()
+
+
+def _dense_rows(x2d: torch.Tensor) -> torch.Tensor:
+    """``x2d`` itself, or a dense copy: the kernels' TMA descriptors need dense, 16-byte-aligned rows."""
+    if x2d.stride() != (x2d.shape[1], 1) or x2d.data_ptr() % 16:
+        return x2d.clone(memory_format=torch.contiguous_format)
+    return x2d
+
+
+def _head_takes_module(lm_head: nn.Module) -> bool:
+    """Whether ``lm_head(rows)`` is a plain vocabulary-parallel GEMM of a bf16 weight whose shards it gathers along
+    the vocabulary in rank order, with nothing else applied: the stock head this path reproduces."""
+    weight = getattr(lm_head, "weight", None)
+    mapping = getattr(lm_head, "mapping", None)
+    return (
+        isinstance(weight, torch.Tensor)
+        and weight.dim() == 2
+        and weight.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        and getattr(getattr(lm_head, "tp_mode", None), "name", None) == "COLUMN"
+        and getattr(lm_head, "gather_output", False)
+        and getattr(lm_head, "gather_output_sizes", None) is None
+        and getattr(lm_head, "padding_size", None) == 0
+        and getattr(lm_head, "bias", None) is None
+        and not getattr(lm_head, "has_any_quant", True)
+        and mapping is not None
+        and not mapping.enable_attention_dp
+    )
+
+
+def _plain_rmsnorm(norm: nn.Module) -> bool:
+    """Whether ``norm`` is the stock RMSNorm that runs flashinfer's kernel, which ``k3_embed_norm`` reproduces bit for
+    bit. An unknown module fails closed."""
+    weight = getattr(norm, "weight", None)
+    return (
+        IS_FLASHINFER_AVAILABLE
+        and isinstance(weight, torch.Tensor)
+        and weight.dtype == torch.bfloat16
+        and not getattr(norm, "use_gemma", True)
+        and not getattr(norm, "is_nvfp4", True)
+        and not getattr(norm, "use_cuda_tile", True)
+        and not getattr(norm, "return_hp_output", True)
+        and getattr(norm, "nvfp4_scale", None) is None
+        and hasattr(norm, "variance_epsilon")
+    )
+
+
+class K3DecodeGemvs:
+    """The decode GEMVs' state for one target: the LM head's `K3HeadGemvWorkspace`, and the calls whose kernels ran
+    eagerly (compiled), which are the only ones a CUDA-graph capture may take. Built by `create` once the weights are
+    final; owned by the target."""
+
+    def __init__(self, head_workspace: Optional[K3HeadGemvWorkspace] = None) -> None:
+        self.head_workspace = head_workspace
+        self._ran: Set[tuple] = set()
+
+    @classmethod
+    def create(
+        cls, lm_head: Optional[nn.Module], site_weights: Dict[str, torch.Tensor]
+    ) -> "K3DecodeGemvs":
+        """The state for ``lm_head`` and the site weights (one weight per `SITES` key; every weight of a site has its
+        shape). Eager: it allocates the head's workspace and runs each kernel once on a zero row, so they compile here
+        rather than under a capture. A site or head its kernel does not take keeps the generic path."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "K3DecodeGemvs.create allocates and compiles: run it before CUDA-graph capture"
+            )
+        state = cls()
+        for site, weight in site_weights.items():
+            state._project(site, weight.new_zeros(1, weight.shape[1]), weight, warm=True)
+        if lm_head is not None and _head_takes_module(lm_head):
+            weight = lm_head.weight
+            x = weight.new_zeros(1, weight.shape[1])
+            if _head_op.supports(x, weight):
+                workspace = K3HeadGemvWorkspace.create(
+                    weight.shape[0], weight.shape[1], weight.device
+                )
+                k3_head_gemv(x, weight, workspace)
+                state.head_workspace = workspace
+                state._ran.add(("lm_head",))
+        torch.cuda.synchronize()
+        return state
+
+    def project(self, site: str, x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
+        """``x @ weight.T`` (bf16 ``[..., N]``) for ``site``'s weight on its decode kernel, or None where the kernel
+        does not take the call: more than `MAX_ROWS` rows, another shape or dtype, or, under capture, a kernel that
+        has not run eagerly."""
+        return self._project(site, x, weight, warm=False)
+
+    def _project(
+        self, site: str, x: torch.Tensor, weight: torch.Tensor, warm: bool
+    ) -> Optional[torch.Tensor]:
+        n, k, kernel = SITES[site]
+        if (
+            weight.dtype != torch.bfloat16
+            or tuple(weight.shape) != (n, k)
+            or not weight.is_contiguous()
+            or x.dtype != torch.bfloat16
+            or x.dim() < 1
+            or x.shape[-1] != k
+        ):
+            return None
+        rows = x.numel() // k
+        if not 0 < rows <= MAX_ROWS:
+            return None
+        key = (site,)
+        capturing = _capturing()
+        if capturing and not warm and key not in self._ran:
+            return None
+        x2d = _dense_rows(x.reshape(rows, k))
+        if kernel == "decode":
+            if not _decode_op.supports(x2d, weight):
+                return None
+            y = k3_decode_gemv(x2d, weight)
+        else:
+            if not _ctm_op.supports_wide(x2d, weight, -1, False):
+                return None
+            y = k3_ctm_gemv_wide(x2d, weight)
+        if not capturing:
+            self._ran.add(key)
+        return y.view(*x.shape[:-1], n)
+
+    def lm_head_logits(self, rows: torch.Tensor, lm_head: nn.Module) -> Optional[torch.Tensor]:
+        """``lm_head(rows)``, the gathered bf16 logits ``[M, vocab]``, with this rank's shard on
+        ``gemm/k3_head_gemv``; None where it does not take the call (more than `MAX_ROWS` rows, another head, ...)."""
+        workspace = self.head_workspace
+        if workspace is None or not _head_takes_module(lm_head):
+            return None
+        weight = lm_head.weight
+        if (
+            tuple(weight.shape) != (workspace.n_out, workspace.k_in)
+            or weight.device != workspace.partials.device
+            or rows.dim() != 2
+            or rows.dtype != torch.bfloat16
+            or not 0 < rows.shape[0] <= MAX_ROWS
+            or rows.shape[1] != workspace.k_in
+        ):
+            return None
+        if _capturing() and ("lm_head",) not in self._ran:
+            return None
+        group = lm_head.mapping.tp_group
+        if len(group) > 1 and mpi_disabled():
+            return None
+        x = _dense_rows(rows)
+        if not _head_op.supports(x, weight):
+            return None
+        local = k3_head_gemv(x, weight, workspace)
+        if len(group) == 1:
+            return local
+        gathered = allgather(local, None, group)
+        return concat(list(split(gathered, rows.shape[0], dim=0)), dim=-1)
+
+    def embed_norm(
+        self,
+        input_ids: torch.Tensor,
+        table: torch.Tensor,
+        norm: nn.Module,
+        bank: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Layer 0's normed input for the step's tokens, with their embedding rows written into ``bank[0]``, in one
+        ``norm/k3_embed_norm`` launch: bit-identical to the embedding followed by ``norm``. None where it does not
+        apply (another norm, a token count or table the kernel does not take, or, under capture, a token count whose
+        kernel has not run eagerly)."""
+        if not _plain_rmsnorm(norm):
+            return None
+        ids = input_ids.reshape(-1)
+        if not _embed_op.supports_norm(ids, table, norm.weight, bank[0]):
+            return None
+        key = ("embed_norm", ids.numel(), ids.dtype)
+        capturing = _capturing()
+        if capturing and key not in self._ran:
+            return None
+        normed = k3_embed_norm(ids, table, norm.weight, norm.variance_epsilon, bank[0])
+        if not capturing:
+            self._ran.add(key)
+        return normed
+
+
+class _K3Head:
+    """``lm_head(rows)``, with the rows on ``k3_head_gemv`` where it takes them."""
+
+    __slots__ = ("_gemvs", "_lm_head")
+
+    def __init__(self, gemvs: K3DecodeGemvs, lm_head: nn.Module) -> None:
+        self._gemvs = gemvs
+        self._lm_head = lm_head
+
+    def __call__(self, rows: torch.Tensor) -> torch.Tensor:
+        logits = self._gemvs.lm_head_logits(rows, self._lm_head)
+        return self._lm_head(rows) if logits is None else logits
+
+
+class K3LogitsProcessor(nn.Module):
+    """The shell's logits processor, with its LM head call on ``gemm/k3_head_gemv`` where ``gemvs`` takes the rows.
+
+    It wraps the stock processor instead of repeating it: the row selection and the fp32 conversion stay the stock
+    processor's. ``gemvs`` is set once the weights are final; until then every call is the stock one.
+    """
+
+    def __init__(self, stock: nn.Module) -> None:
+        super().__init__()
+        self.stock = stock
+        self.gemvs: Optional[K3DecodeGemvs] = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: nn.Module,
+        attn_metadata,
+        return_context_logits: bool = False,
+    ) -> torch.Tensor:
+        head = lm_head if self.gemvs is None else _K3Head(self.gemvs, lm_head)
+        return self.stock.forward(hidden_states, head, attn_metadata, return_context_logits)
