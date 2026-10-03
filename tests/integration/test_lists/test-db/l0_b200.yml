@@ -162,6 +162,10 @@ l0_b200:
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_gemv.py
   # The Kimi K3 target's DSpark drafter on the drafter entries, against the stock block forward.
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_drafter.py
+  # The Kimi K3 targets' construction checks and the drift check of tp16_moetp16ep1's copied modules.
+  # l0_b300's modeling_v2 entry, the only other one that collects them, is waived (nvbugs/6853741).
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_construction.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_drift.py
   # KDA runtime: host-derived prefill metadata and the bf16 state pool
   # round-trip. Both are single-device cases that use GPU 0 only.
   - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
