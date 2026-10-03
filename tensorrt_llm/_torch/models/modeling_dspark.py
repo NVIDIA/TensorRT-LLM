@@ -2673,7 +2673,22 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
         """Take the DSpark head weights, then hand the rest to DFlash."""
         weights, _ = self._take_dspark_head_weights(weights)
+        self._keep_trained_mask_embedding(weights)
         return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
+
+    def _keep_trained_mask_embedding(self, weights: Dict) -> None:
+        """Keep the checkpoint's own embedding row for the mask token.
+
+        This drafter takes the target's embedding (``load_weights_from_target_model``). A drafter checkpoint that ships
+        an embedding has trained the mask token's row, which the target's embedding does not have: the block decode
+        reads ``mask_token_embedding`` for every masked slot instead of the shared lookup.
+        """
+        names = [k for k in ("embed_tokens.weight", "model.embed_tokens.weight") if k in weights]
+        if not names:
+            return
+        weight = weights[names[0]]
+        row = weight[self.mask_token_id : self.mask_token_id + 1]
+        self.mask_token_embedding = torch.as_tensor(row).reshape(-1).to("cuda")
 
 
 class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
