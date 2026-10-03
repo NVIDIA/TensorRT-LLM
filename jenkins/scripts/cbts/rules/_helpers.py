@@ -21,6 +21,7 @@ from typing import Iterable, Iterator
 from blocks import Stage, YAMLIndex, _entry_target, _target_in_filter_subtree, block_matches_stage
 
 _HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_FULL_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _COMMENT_BODY_RE = re.compile(r"^\s*#")
 
 
@@ -133,6 +134,70 @@ def iter_diff_deleted_post_lines(diff: str) -> dict[int, list[str]]:
         elif sign in (" ", "+"):
             new_line += 1
     return out
+
+
+def reconstruct_diff_pre_image(post_source: str, diff: str) -> str | None:
+    """Reverse a verified unified diff to recover the complete pre-image.
+
+    Every hunk's context and added lines must exactly match ``post_source``.
+    Returning ``None`` on malformed or mismatched input keeps callers from
+    deriving static facts from a guessed pre-image.
+    """
+    hunks: list[tuple[int, int, list[str], list[str]]] = []
+    current: tuple[int, int, int, list[str], list[str]] | None = None
+
+    def finish_hunk() -> bool:
+        nonlocal current
+        if current is None:
+            return True
+        old_count, new_start, new_count, pre_lines, post_lines = current
+        if len(pre_lines) != old_count or len(post_lines) != new_count:
+            return False
+        hunks.append((new_start, new_count, pre_lines, post_lines))
+        current = None
+        return True
+
+    for line in diff.splitlines():
+        match = _FULL_HUNK_HEADER_RE.match(line)
+        if match is not None:
+            if not finish_hunk():
+                return None
+            old_count = int(match.group(2) or 1)
+            new_start = int(match.group(3))
+            new_count = int(match.group(4) or 1)
+            current = (old_count, new_start, new_count, [], [])
+            continue
+        if current is None:
+            continue
+        if line.startswith("\\ No newline at end of file"):
+            continue
+        if not line or line[0] not in (" ", "+", "-"):
+            if not finish_hunk():
+                return None
+            continue
+        sign, body = line[0], line[1:]
+        if sign != "+":
+            current[3].append(body)
+        if sign != "-":
+            current[4].append(body)
+    if not finish_hunk() or not hunks:
+        return None
+
+    post_lines = post_source.splitlines()
+    pre_lines: list[str] = []
+    cursor = 0
+    for new_start, new_count, hunk_pre, hunk_post in hunks:
+        start = new_start if new_count == 0 else new_start - 1
+        if start < cursor or post_lines[start : start + new_count] != hunk_post:
+            return None
+        pre_lines.extend(post_lines[cursor:start])
+        pre_lines.extend(hunk_pre)
+        cursor = start + new_count
+    pre_lines.extend(post_lines[cursor:])
+    pre_source = "\n".join(pre_lines)
+    if pre_lines and post_source.endswith(("\n", "\r")):
+        pre_source += "\n"
+    return pre_source
 
 
 def iter_diff_added_post_line_numbers(diff: str) -> set[int]:

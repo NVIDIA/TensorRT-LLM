@@ -46,9 +46,13 @@ sys.path.insert(0, str(CBTS_ROOT / "coverage_utils"))
 
 from blocks import Stage, YAMLIndex  # noqa: E402
 from compact_db import write_leaf_database  # noqa: E402
-from python_change_analysis import analyze_python_changes  # noqa: E402
+from python_change_analysis import ImportTarget, analyze_python_changes  # noqa: E402
 from repository_reference import RepositoryReferenceIndex  # noqa: E402
-from rules._helpers import iter_diff_deleted_post_lines, iter_diff_post_line_numbers  # noqa: E402
+from rules._helpers import (  # noqa: E402
+    iter_diff_deleted_post_lines,
+    iter_diff_post_line_numbers,
+    reconstruct_diff_pre_image,
+)
 from rules.base import PRInputs  # noqa: E402
 from rules.tests_def_rule import (  # noqa: E402
     ACCURACY_DIR,
@@ -59,6 +63,7 @@ from rules.tests_def_rule import (  # noqa: E402
     _yaml_top_keys_from_deletions,
 )
 from rules.tests_def_rule import TestsDefRule as CbtsTestsDefRule  # noqa: E402
+from selector import CoverageSelector  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -368,6 +373,7 @@ def _analyze(source: str, diff: str):
         source,
         iter_diff_post_line_numbers(diff),
         iter_diff_deleted_post_lines(diff),
+        pre_source=reconstruct_diff_pre_image(source, diff),
     )
 
 
@@ -415,6 +421,265 @@ def test_replaced_effectful_assignment_remains_fail_closed() -> None:
     analysis = _analyze(source, diff)
 
     assert analysis.limitation == "unresolved import replacement"
+
+
+def test_same_module_import_from_replacement_resolves_consumers_and_targets() -> None:
+    source = "from .helpers import new_helper, stable\n\ndef consumer():\n    return new_helper()\n"
+    diff = (
+        "@@ -1,4 +1,4 @@\n"
+        "-from .helpers import old_helper, stable\n"
+        "+from .helpers import new_helper, stable\n"
+        " \n"
+        " def consumer():\n"
+        "-    return old_helper()\n"
+        "+    return new_helper()\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"old_helper", "new_helper"}
+    assert analysis.binding_consumers == {"consumer"}
+    assert analysis.old_import_targets == {ImportTarget("helpers", 1, "old_helper")}
+    assert analysis.new_import_targets == {ImportTarget("helpers", 1, "new_helper")}
+    assert analysis.new_import_bindings == {"new_helper"}
+
+
+def test_multiline_import_from_addition_resolves_consumer_and_new_target() -> None:
+    source = (
+        "from .helpers import (new_helper,\n"
+        "                      stable)\n\n"
+        "def consumer():\n"
+        "    return new_helper()\n"
+    )
+    diff = (
+        "@@ -1,4 +1,5 @@\n"
+        "-from .helpers import (stable)\n"
+        "+from .helpers import (new_helper,\n"
+        "+                      stable)\n"
+        " \n"
+        " def consumer():\n"
+        "     return new_helper()\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"new_helper"}
+    assert analysis.binding_consumers == {"consumer"}
+    assert not analysis.old_import_targets
+    assert analysis.new_import_targets == {ImportTarget("helpers", 1, "new_helper")}
+    assert analysis.new_import_bindings == {"new_helper"}
+
+
+def test_new_import_from_statement_resolves_consumer_and_target() -> None:
+    source = (
+        "from .helpers import stable\n"
+        "from .new_helpers import new_helper\n\n"
+        "def consumer():\n"
+        "    return new_helper()\n"
+    )
+    diff = (
+        "@@ -1,4 +1,5 @@\n"
+        " from .helpers import stable\n"
+        "+from .new_helpers import new_helper\n"
+        " \n"
+        " def consumer():\n"
+        "     return new_helper()\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"new_helper"}
+    assert analysis.binding_consumers == {"consumer"}
+    assert not analysis.old_import_targets
+    assert analysis.new_import_targets == {ImportTarget("new_helpers", 1, "new_helper")}
+    assert analysis.new_import_bindings == {"new_helper"}
+
+
+def test_import_addition_is_not_new_when_pre_image_already_bound_the_name() -> None:
+    source = "new_helper = None\nfrom .helpers import new_helper, stable\n"
+    diff = (
+        "@@ -1,2 +1,2 @@\n"
+        " new_helper = None\n"
+        "-from .helpers import stable\n"
+        "+from .helpers import new_helper, stable\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"new_helper"}
+    assert not analysis.new_import_bindings
+
+
+def test_optional_parameter_addition_resolves_function_and_method() -> None:
+    source = (
+        "from typing import Optional\n\n"
+        "def helper(value: int, option: Optional[int] = None):\n"
+        "    return value\n\n"
+        "class Example:\n"
+        "    def method(self, value: int, option: Optional[int] = None):\n"
+        "        return value\n"
+    )
+    diff = (
+        "@@ -1,8 +1,8 @@\n"
+        " from typing import Optional\n"
+        " \n"
+        "-def helper(value: int):\n"
+        "+def helper(value: int, option: Optional[int] = None):\n"
+        "     return value\n"
+        " \n"
+        " class Example:\n"
+        "-    def method(self, value: int):\n"
+        "+    def method(self, value: int, option: Optional[int] = None):\n"
+        "         return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"helper", "Example.method"}
+
+
+def test_keyword_only_optional_parameter_addition_resolves_method() -> None:
+    source = (
+        "from typing import Optional\n\n"
+        "class Example:\n"
+        "    def method(self, value: int, *, option: Optional[int] = None, **kwargs):\n"
+        "        return value\n"
+    )
+    diff = (
+        "@@ -1,5 +1,5 @@\n"
+        " from typing import Optional\n"
+        " \n"
+        " class Example:\n"
+        "-    def method(self, value: int, **kwargs):\n"
+        "+    def method(self, value: int, *, option: Optional[int] = None, **kwargs):\n"
+        "         return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Example.method"}
+
+
+def test_required_keyword_only_parameter_addition_remains_fail_closed() -> None:
+    source = (
+        "class Example:\n"
+        "    def method(self, value: int, *, option: int, **kwargs):\n"
+        "        return value\n"
+    )
+    diff = (
+        "@@ -1,3 +1,3 @@\n"
+        " class Example:\n"
+        "-    def method(self, value: int, **kwargs):\n"
+        "+    def method(self, value: int, *, option: int, **kwargs):\n"
+        "         return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize(
+    "new_parameter",
+    (
+        "required: int",
+        "option: Optional[int] = factory()",
+        "option: CustomType = None",
+    ),
+)
+def test_unsafe_parameter_addition_remains_fail_closed(new_parameter: str) -> None:
+    source = (
+        "from typing import Optional\n\n"
+        f"def helper(value: int, {new_parameter}):\n"
+        "    return value\n"
+    )
+    diff = (
+        "@@ -1,4 +1,4 @@\n"
+        " from typing import Optional\n"
+        " \n"
+        "-def helper(value: int):\n"
+        f"+def helper(value: int, {new_parameter}):\n"
+        "     return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_reconstruct_diff_pre_image_rejects_mismatched_post_source() -> None:
+    diff = "@@ -1 +1 @@\n-old\n+new\n"
+
+    assert reconstruct_diff_pre_image("different\n", diff) is None
+
+
+def test_import_from_replacement_from_different_module_resolves_targets() -> None:
+    source = "from .new_helpers import helper\n"
+    diff = "@@ -1 +1 @@\n-from .old_helpers import helper\n+from .new_helpers import helper\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"helper"}
+    assert analysis.old_import_targets == {ImportTarget("old_helpers", 1, "helper")}
+    assert analysis.new_import_targets == {ImportTarget("new_helpers", 1, "helper")}
+    assert not analysis.new_import_bindings
+
+
+def test_import_only_type_checking_addition_is_ignored() -> None:
+    source = (
+        "from typing import TYPE_CHECKING\n\n"
+        "if TYPE_CHECKING:\n"
+        "    from .model import Model\n"
+        "    from .scheduler import ScheduledRequests\n"
+    )
+    diff = (
+        "@@ -1,4 +1,5 @@\n"
+        " from typing import TYPE_CHECKING\n"
+        " \n"
+        " if TYPE_CHECKING:\n"
+        "+    from .model import Model\n"
+        "     from .scheduler import ScheduledRequests\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert not analysis.changed_bindings
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        (
+            "from typing import TYPE_CHECKING\n"
+            "TYPE_CHECKING = enabled()\n\n"
+            "if TYPE_CHECKING:\n"
+            "    from .model import Model\n"
+            "    from .scheduler import ScheduledRequests\n"
+        ),
+        (
+            "from typing import TYPE_CHECKING\n\n"
+            "if TYPE_CHECKING:\n"
+            "    initialize()\n"
+            "    from .model import Model\n"
+            "    from .scheduler import ScheduledRequests\n"
+        ),
+    ),
+)
+def test_untrusted_type_checking_import_addition_remains_fail_closed(source: str) -> None:
+    added_line = 5
+    diff = f"@@ -{added_line - 1},0 +{added_line} @@\n+    from .model import Model\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "effectful module statement"
 
 
 @pytest.mark.parametrize("body", ("", "# explanatory comment"))
@@ -516,6 +781,197 @@ def test_plain_function_declaration_with_postponed_annotations_is_safe() -> None
     assert analysis.binding_consumers == {"_helper"}
 
 
+def test_added_module_function_with_safe_definition_expressions_is_resolved() -> None:
+    source = (
+        "from .request import Request\n\n"
+        "def helper(request: Request, retries: int = 1, *, timeout: int | None = None):\n"
+        "    return request\n"
+    )
+    diff = (
+        "@@ -1 +1,4 @@\n"
+        " from .request import Request\n"
+        "+\n"
+        "+def helper(request: Request, retries: int = 1, *, timeout: int | None = None):\n"
+        "+    return request\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"helper"}
+    assert analysis.binding_consumers == {"helper"}
+    assert analysis.new_declaration_bindings == {"helper"}
+
+
+def test_added_method_can_use_earlier_module_class_annotation() -> None:
+    source = (
+        "class Budget:\n"
+        "    pass\n\n"
+        "class Scheduler:\n"
+        "    def existing(self):\n"
+        "        return 0\n\n"
+        "    def has_budget(self, budget: Budget) -> bool:\n"
+        "        return True\n"
+    )
+    diff = (
+        "@@ -1,6 +1,9 @@\n"
+        " class Budget:\n"
+        "     pass\n"
+        " \n"
+        " class Scheduler:\n"
+        "     def existing(self):\n"
+        "         return 0\n"
+        "+\n"
+        "+    def has_budget(self, budget: Budget) -> bool:\n"
+        "+        return True\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Scheduler.has_budget"}
+
+
+def test_added_function_cannot_use_later_module_binding_annotation() -> None:
+    source = "VALUE = 1\n\ndef helper(value: Later):\n    return value\n\nclass Later:\n    pass\n"
+    diff = (
+        "@@ -1,4 +1,7 @@\n"
+        " VALUE = 1\n"
+        "+\n"
+        "+def helper(value: Later):\n"
+        "+    return value\n"
+        " \n"
+        " class Later:\n"
+        "     pass\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_added_plain_and_builtin_decorated_methods_are_resolved() -> None:
+    source = (
+        "class Example:\n"
+        "    def existing(self):\n"
+        "        return 0\n\n"
+        "    def plain(self, required, option=None):\n"
+        "        return required\n\n"
+        "    @property\n"
+        "    def value(self):\n"
+        "        return 1\n\n"
+        "    @staticmethod\n"
+        "    def static(value):\n"
+        "        return value\n\n"
+        "    @classmethod\n"
+        "    def create(cls):\n"
+        "        return cls()\n"
+    )
+    diff = (
+        "@@ -1,3 +1,18 @@\n"
+        " class Example:\n"
+        "     def existing(self):\n"
+        "         return 0\n"
+        "+\n"
+        "+    def plain(self, required, option=None):\n"
+        "+        return required\n"
+        "+\n"
+        "+    @property\n"
+        "+    def value(self):\n"
+        "+        return 1\n"
+        "+\n"
+        "+    @staticmethod\n"
+        "+    def static(value):\n"
+        "+        return value\n"
+        "+\n"
+        "+    @classmethod\n"
+        "+    def create(cls):\n"
+        "+        return cls()\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {
+        "Example.create",
+        "Example.plain",
+        "Example.static",
+        "Example.value",
+    }
+    assert not analysis.new_declaration_bindings
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    (
+        "@decorate\ndef helper():\n    return 1",
+        "def helper(value=factory()):\n    return value",
+    ),
+)
+def test_added_function_with_effectful_definition_expression_falls_back(
+    declaration: str,
+) -> None:
+    source = f"VALUE = 1\n\n{declaration}\n"
+    added = "\n".join(f"+{line}" for line in declaration.splitlines())
+    diff = f"@@ -1 +1,{len(declaration.splitlines()) + 2} @@\n VALUE = 1\n+\n{added}\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_added_function_with_custom_subscript_annotation_falls_back() -> None:
+    source = "from .types import Custom\n\ndef helper(value: Custom[int]):\n    return value\n"
+    diff = (
+        "@@ -1 +1,4 @@\n"
+        " from .types import Custom\n"
+        "+\n"
+        "+def helper(value: Custom[int]):\n"
+        "+    return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_shadowed_builtin_method_decorator_falls_back() -> None:
+    source = (
+        "property = decorate\n\n"
+        "class Example:\n"
+        "    def existing(self):\n"
+        "        return 0\n\n"
+        "    @property\n"
+        "    def value(self):\n"
+        "        return 1\n"
+    )
+    diff = (
+        "@@ -1,5 +1,9 @@\n"
+        " property = decorate\n"
+        " \n"
+        " class Example:\n"
+        "     def existing(self):\n"
+        "         return 0\n"
+        "+\n"
+        "+    @property\n"
+        "+    def value(self):\n"
+        "+        return 1\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_replaced_module_binding_is_not_treated_as_new_function() -> None:
+    source = "def helper():\n    return 1\n"
+    diff = "@@ -1 +1,2 @@\n-helper = None\n+def helper():\n+    return 1\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
 def test_local_shadow_does_not_create_direct_caller_edge() -> None:
     source = (
         "_VALUE = 521\n"
@@ -566,6 +1022,275 @@ def test_function_alias_marks_caller_graph_incomplete() -> None:
     assert analysis.binding_consumers == {"helper"}
     assert analysis.callers == {}
     assert analysis.callable_escapes == {"helper"}
+
+
+class _FakeDB:
+    def __init__(self) -> None:
+        self.rows = {
+            "helper": set(),
+            "caller": {"A10-PyTorch-1/test_caller"},
+        }
+
+    def file_has_touch_rows(self, _path: str) -> bool:
+        return True
+
+    def tests_touching_func(self, _path: str, qualname: str) -> set[str]:
+        return set(self.rows.get(qualname, set()))
+
+    def tests_touching_file(self, _path: str) -> set[str]:
+        return {
+            "A10-PyTorch-1/test_caller",
+            "A10-PyTorch-1/test_unrelated",
+        }
+
+    def known_by_family(self) -> dict[str, set[str]]:
+        return {"A10-PyTorch": {"test_caller", "test_unrelated"}}
+
+    def untrusted_tests(self, *_args) -> set[str]:
+        return set()
+
+
+class _ImportReplacementDB(_FakeDB):
+    def __init__(self) -> None:
+        self.rows_by_symbol = {
+            ("tensorrt_llm/pkg/helpers.py", "old_helper"): {"A10-PyTorch-1/test_old"},
+            ("tensorrt_llm/pkg/helpers.py", "new_helper"): {"A10-PyTorch-1/test_new"},
+            ("tensorrt_llm/pkg/consumer.py", "consumer"): {"A10-PyTorch-1/test_consumer"},
+        }
+
+    def tests_touching_func(self, path: str, qualname: str) -> set[str]:
+        return set(self.rows_by_symbol.get((path, qualname), set()))
+
+    def tests_touching_file(self, path: str) -> set[str]:
+        return {
+            test
+            for (row_path, _), tests in self.rows_by_symbol.items()
+            if row_path == path
+            for test in tests
+        }
+
+    def known_by_family(self) -> dict[str, set[str]]:
+        return {
+            "A10-PyTorch": {
+                "test_old",
+                "test_new",
+                "test_consumer",
+                "test_unrelated",
+            }
+        }
+
+
+def test_selector_uses_local_caller_rows_for_no_data_import_consumer() -> None:
+    path = "tensorrt_llm/example.py"
+    source = (
+        "VALUE = 521\n\ndef helper():\n    return VALUE\n\ndef caller():\n    return helper()\n"
+    )
+    diff = "@@ -0,0 +1 @@\n+VALUE = 521\n"
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_caller"}}
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
+    assert result.no_data_funcs == ["tensorrt_llm/example.py::helper"]
+    assert result.caller_bounded_funcs == ["tensorrt_llm/example.py::helper"]
+
+
+def _write_import_replacement_files(
+    tmp_path: Path,
+    *,
+    include_old_binding: bool = True,
+    include_new_helper: bool = True,
+) -> tuple[str, str]:
+    package = tmp_path / "tensorrt_llm/pkg"
+    package.mkdir(parents=True)
+    old_binding = "old_helper = object()\n" if include_old_binding else ""
+    new_helper = "\ndef new_helper():\n    return 2\n" if include_new_helper else ""
+    (package / "helpers.py").write_text(f"{old_binding}{new_helper}")
+    (package / "consumer.py").write_text(
+        "from .helpers import new_helper\n\ndef consumer():\n    return new_helper()\n"
+    )
+    path = "tensorrt_llm/pkg/consumer.py"
+    diff = (
+        "@@ -1,4 +1,4 @@\n"
+        "-from .helpers import old_helper\n"
+        "+from .helpers import new_helper\n"
+        " \n"
+        " def consumer():\n"
+        "-    return old_helper()\n"
+        "+    return new_helper()\n"
+    )
+    return path, diff
+
+
+def test_selector_ignores_old_binding_rows_and_uses_new_function_and_consumer_rows(
+    tmp_path: Path,
+) -> None:
+    path, diff = _write_import_replacement_files(tmp_path)
+    checked_bindings: list[set[str]] = []
+
+    def external_references(_path: str, names: set[str]) -> set[str]:
+        checked_bindings.append(names)
+        return names & {"new_helper"}
+
+    selector = CoverageSelector(
+        _ImportReplacementDB(),
+        tmp_path,
+        external_references=external_references,
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_new", "test_consumer"}}
+    assert result.skippable == {"A10-PyTorch": {"test_old", "test_unrelated"}}
+    assert checked_bindings == [{"old_helper"}]
+
+
+def test_selector_keeps_external_check_for_rebound_import_binding(tmp_path: Path) -> None:
+    path, diff = _write_import_replacement_files(tmp_path)
+    selector = CoverageSelector(
+        _ImportReplacementDB(),
+        tmp_path,
+        external_references=lambda _path, names: names & {"old_helper"},
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert not result.ok
+    assert "external binding reference(s)" in result.reason
+    assert "old_helper" in result.reason
+
+
+def test_selector_declines_missing_old_static_binding(tmp_path: Path) -> None:
+    path, diff = _write_import_replacement_files(tmp_path, include_old_binding=False)
+    selector = CoverageSelector(
+        _ImportReplacementDB(),
+        tmp_path,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert not result.ok
+    assert "old import target is not a static binding" in result.reason
+
+
+def test_selector_declines_missing_imported_function(tmp_path: Path) -> None:
+    path, diff = _write_import_replacement_files(tmp_path, include_new_helper=False)
+    selector = CoverageSelector(
+        _ImportReplacementDB(),
+        tmp_path,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert not result.ok
+    assert "import target is not a static function" in result.reason
+
+
+def test_selector_allows_new_imported_function_without_coverage(tmp_path: Path) -> None:
+    path, diff = _write_import_replacement_files(tmp_path)
+    db = _ImportReplacementDB()
+    db.rows_by_symbol[("tensorrt_llm/pkg/helpers.py", "new_helper")] = set()
+    selector = CoverageSelector(
+        db,
+        tmp_path,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_consumer"}}
+    assert result.skippable == {"A10-PyTorch": {"test_old", "test_new", "test_unrelated"}}
+
+
+def test_selector_declines_when_changed_binding_has_external_reference() -> None:
+    path = "tensorrt_llm/example.py"
+    source = "VALUE = 521\n\ndef helper():\n    return VALUE\n"
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, names: names & {"VALUE"},
+    )
+
+    result = selector.decide([path], {path: "@@ -0,0 +1 @@\n+VALUE = 521\n"})
+
+    assert not result.ok
+    assert "external binding reference(s)" in result.reason
+
+
+def test_selector_ignores_external_reference_for_pure_new_function() -> None:
+    path = "tensorrt_llm/example.py"
+    source = "VALUE = 1\n\ndef helper():\n    return VALUE\n"
+    diff = "@@ -1 +1,4 @@\n VALUE = 1\n+\n+def helper():\n+    return VALUE\n"
+    checked_bindings: list[set[str]] = []
+
+    def external_references(_path: str, names: set[str]) -> set[str]:
+        checked_bindings.append(names)
+        return names & {"helper"}
+
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=external_references,
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok
+    assert checked_bindings == [set()]
+
+
+def test_selector_uses_file_fallback_when_consumer_escapes() -> None:
+    path = "tensorrt_llm/example.py"
+    source = (
+        "VALUE = 521\n\n"
+        "def helper():\n"
+        "    return VALUE\n\n"
+        "def caller():\n"
+        "    alias = helper\n"
+        "    return alias()\n"
+    )
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: "@@ -0,0 +1 @@\n+VALUE = 521\n"})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_caller", "test_unrelated"}}
+    assert result.caller_bounded_funcs == []
+
+
+def test_ordinary_no_data_function_change_keeps_file_fallback() -> None:
+    path = "tensorrt_llm/example.py"
+    source = "def helper():\n    return 2\n\ndef caller():\n    return helper()\n"
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: "@@ -2 +2 @@\n-    return 1\n+    return 2\n"})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_caller", "test_unrelated"}}
+    assert result.caller_bounded_funcs == []
 
 
 @pytest.fixture()

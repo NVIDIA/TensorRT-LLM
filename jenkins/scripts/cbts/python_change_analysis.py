@@ -30,6 +30,15 @@ class _Scope:
     sig_attr: str
 
 
+@dataclass(frozen=True, order=True)
+class ImportTarget:
+    """A statically named binding imported from one module."""
+
+    module: str
+    level: int
+    name: str
+
+
 @dataclass
 class PythonChangeFacts:
     """Static facts about changed module bindings and local dependencies."""
@@ -39,6 +48,10 @@ class PythonChangeFacts:
     callers: dict[str, set[str]]
     limitation: str = ""
     callable_escapes: set[str] = field(default_factory=set)
+    new_import_targets: set[ImportTarget] = field(default_factory=set)
+    old_import_targets: set[ImportTarget] = field(default_factory=set)
+    new_import_bindings: set[str] = field(default_factory=set)
+    new_declaration_bindings: set[str] = field(default_factory=set)
 
 
 def _substatements(node: ast.stmt):
@@ -182,13 +195,292 @@ def _module_binding_names(node: ast.stmt, future_annotations: bool) -> set[str] 
     return None
 
 
-def _safe_added_function(
-    node: ast.stmt, future_annotations: bool
-) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
-    """Return a side-effect-free added function declaration, else None."""
-    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+def _import_from_bindings(node: ast.stmt) -> dict[str, ImportTarget] | None:
+    """Return local bindings for one statically named ``from`` import."""
+    if not isinstance(node, ast.ImportFrom) or node.module is None:
         return None
+    if any(alias.name == "*" for alias in node.names):
+        return None
+    bindings = {
+        alias.asname or alias.name: ImportTarget(node.module, node.level, alias.name)
+        for alias in node.names
+    }
+    return bindings if len(bindings) == len(node.names) else None
+
+
+def _module_import_from_bindings(tree: ast.Module) -> dict[str, ImportTarget] | None:
+    """Return unambiguous direct ``from``-import bindings for one module."""
+    bindings: dict[str, ImportTarget] = {}
+    binding_counts: dict[str, int] = {}
+    for node in tree.body:
+        for local in _direct_scope_bindings([node]):
+            binding_counts[local] = binding_counts.get(local, 0) + 1
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        imported = _import_from_bindings(node)
+        if imported is None or imported.keys() & bindings.keys():
+            return None
+        bindings.update(imported)
+    if any(binding_counts[local] != 1 for local in bindings):
+        return None
+    return bindings
+
+
+def _module_import_from_delta(
+    tree: ast.Module, old_tree: ast.Module
+) -> tuple[set[str], set[ImportTarget], set[ImportTarget], set[str]] | None:
+    """Describe the complete direct ``from``-import binding delta."""
+    current = _module_import_from_bindings(tree)
+    previous = _module_import_from_bindings(old_tree)
+    if current is None or previous is None:
+        return None
+    changed_locals = {
+        local
+        for local in previous.keys() | current.keys()
+        if previous.get(local) != current.get(local)
+    }
+    return (
+        changed_locals,
+        {previous[local] for local in changed_locals if local in previous},
+        {current[local] for local in changed_locals if local in current},
+        current.keys() - previous.keys(),
+    )
+
+
+def _statically_bound_names(tree: ast.Module) -> set[str]:
+    """Over-approximate names that static syntax could bind in a module."""
+    names = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Import):
+            names.update(alias.asname or alias.name.partition(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(alias.asname or alias.name for alias in node.names)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            names.add(node.name)
+    return names
+
+
+def _import_from_replacement(
+    node: ast.stmt,
+    deleted: list[str],
+    old_module_nodes: list[ast.stmt] | None,
+) -> tuple[set[str], set[ImportTarget], set[ImportTarget], set[str]] | None:
+    """Describe a same-module static ``from``-import replacement."""
+    current = _import_from_bindings(node)
+    if current is None or not isinstance(node, ast.ImportFrom):
+        return None
+    if old_module_nodes is not None:
+        candidates = [
+            old_node
+            for old_node in old_module_nodes
+            if isinstance(old_node, ast.ImportFrom)
+            and old_node.module == node.module
+            and old_node.level == node.level
+        ]
+        if len(candidates) != 1:
+            return None
+        old_node = candidates[0]
+    else:
+        try:
+            old_tree = ast.parse("\n".join(deleted))
+        except SyntaxError:
+            return None
+        if len(old_tree.body) != 1 or not isinstance(old_tree.body[0], ast.ImportFrom):
+            return None
+        old_node = old_tree.body[0]
+    previous = _import_from_bindings(old_node)
+    if previous is None or old_node.module != node.module or old_node.level != node.level:
+        return None
+
+    changed_locals = {
+        local
+        for local in previous.keys() | current.keys()
+        if previous.get(local) != current.get(local)
+    }
+    old_targets = {previous[local] for local in changed_locals if local in previous}
+    new_targets = {current[local] for local in changed_locals if local in current}
+    added_locals = current.keys() - previous.keys()
+    return changed_locals, old_targets, new_targets, added_locals
+
+
+def _trusted_type_checking_guard(node: ast.If, module_nodes: list[ast.stmt]) -> bool:
+    """Return whether ``node`` is a trusted, import-only TYPE_CHECKING block."""
+    if (
+        node.orelse
+        or not node.body
+        or not all(isinstance(statement, (ast.Import, ast.ImportFrom)) for statement in node.body)
+    ):
+        return False
+
+    if isinstance(node.test, ast.Name):
+        guard_root = node.test.id
+
+        def establishes_guard(statement: ast.stmt) -> bool:
+            return (
+                isinstance(statement, ast.ImportFrom)
+                and statement.module == "typing"
+                and any(
+                    alias.name == "TYPE_CHECKING" and (alias.asname or alias.name) == guard_root
+                    for alias in statement.names
+                )
+            )
+
+    elif (
+        isinstance(node.test, ast.Attribute)
+        and node.test.attr == "TYPE_CHECKING"
+        and isinstance(node.test.value, ast.Name)
+    ):
+        guard_root = node.test.value.id
+
+        def establishes_guard(statement: ast.stmt) -> bool:
+            return isinstance(statement, ast.Import) and any(
+                alias.name == "typing" and (alias.asname or alias.name) == guard_root
+                for alias in statement.names
+            )
+
+    else:
+        return False
+
+    trusted = False
+    for statement in module_nodes:
+        if statement is node:
+            break
+        if guard_root in _direct_scope_bindings([statement]):
+            trusted = establishes_guard(statement)
+    return trusted
+
+
+def _line_in_import_only_block(node: ast.If, line: int) -> bool:
+    """Return whether ``line`` belongs to an import inside ``node``."""
+    return any(statement.lineno <= line <= statement.end_lineno for statement in node.body)
+
+
+_SAFE_ANNOTATION_BUILTINS = {
+    "bool",
+    "bytes",
+    "complex",
+    "dict",
+    "float",
+    "frozenset",
+    "int",
+    "list",
+    "object",
+    "set",
+    "str",
+    "tuple",
+    "type",
+}
+_SAFE_BUILTIN_DECORATORS = {"classmethod", "property", "staticmethod"}
+
+
+def _trusted_annotation_bindings(
+    tree: ast.Module, before_line: int
+) -> tuple[set[str], set[str], set[str]]:
+    """Return load-safe names, subscript-safe names, and trusted modules."""
+    load_names = set(_SAFE_ANNOTATION_BUILTINS)
+    generic_names = set(_SAFE_ANNOTATION_BUILTINS)
+    modules: set[str] = set()
+    for node in tree.body:
+        if node.end_lineno >= before_line:
+            continue
+        if isinstance(node, ast.ImportFrom):
+            imported_names = {
+                alias.asname or alias.name for alias in node.names if alias.name != "*"
+            }
+            load_names.update(imported_names)
+            if node.module in {"collections.abc", "typing"}:
+                generic_names.update(imported_names)
+        elif isinstance(node, ast.Import):
+            modules.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name in {"collections.abc", "typing"}
+            )
+    return load_names, generic_names, modules
+
+
+def _safe_annotation(
+    node: ast.expr | None,
+    load_names: set[str],
+    generic_names: set[str],
+    modules: set[str],
+) -> bool:
+    """Return whether evaluating a newly added annotation is side-effect-free."""
+    if node is None or isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.Name):
+        return node.id in load_names
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return node.value.id in modules
+    if isinstance(node, ast.Subscript):
+        base_is_safe = (
+            isinstance(node.value, ast.Name)
+            and node.value.id in generic_names
+            or isinstance(node.value, ast.Attribute)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id in modules
+        )
+        return base_is_safe and _safe_annotation(node.slice, load_names, generic_names, modules)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _safe_annotation_operator_operand(
+            node.left, generic_names, modules
+        ) and _safe_annotation_operator_operand(node.right, generic_names, modules)
+    if isinstance(node, ast.Tuple):
+        return all(_safe_annotation(item, load_names, generic_names, modules) for item in node.elts)
+    return False
+
+
+def _safe_annotation_operator_operand(
+    node: ast.expr, generic_names: set[str], modules: set[str]
+) -> bool:
+    """Return whether an annotation operand has trusted type operators."""
+    if isinstance(node, ast.Constant):
+        return node.value is None
+    if isinstance(node, ast.Name):
+        return node.id in generic_names
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return node.value.id in modules
+    if isinstance(node, ast.Subscript):
+        return _safe_annotation(node, generic_names, generic_names, modules)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _safe_annotation_operator_operand(
+            node.left, generic_names, modules
+        ) and _safe_annotation_operator_operand(node.right, generic_names, modules)
+    return False
+
+
+def _safe_added_function(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    *,
+    future_annotations: bool,
+    annotation_load_names: set[str],
+    annotation_generic_names: set[str],
+    annotation_modules: set[str],
+    trusted_decorators: set[str],
+) -> bool:
+    """Return whether evaluating an added function declaration is low risk."""
+    if any(
+        not isinstance(decorator, ast.Name) or decorator.id not in trusted_decorators
+        for decorator in node.decorator_list
+    ):
+        return False
     arguments = node.args
+    if not all(_is_literal_expression(default) for default in arguments.defaults) or not all(
+        default is None or _is_literal_expression(default) for default in arguments.kw_defaults
+    ):
+        return False
+    if future_annotations:
+        return True
     annotations = [
         *(argument.annotation for argument in arguments.posonlyargs),
         *(argument.annotation for argument in arguments.args),
@@ -197,14 +489,152 @@ def _safe_added_function(
         arguments.kwarg.annotation if arguments.kwarg else None,
         node.returns,
     ]
-    if (
-        node.decorator_list
-        or arguments.defaults
-        or any(default is not None for default in arguments.kw_defaults)
-        or (not future_annotations and any(annotation is not None for annotation in annotations))
+    return all(
+        _safe_annotation(
+            annotation,
+            annotation_load_names,
+            annotation_generic_names,
+            annotation_modules,
+        )
+        for annotation in annotations
+    )
+
+
+def _same_ast(left: ast.AST | None, right: ast.AST | None) -> bool:
+    if left is None or right is None:
+        return left is right
+    return ast.dump(left) == ast.dump(right)
+
+
+def _safe_optional_parameter_addition(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    old_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    annotation_load_names: set[str],
+    annotation_generic_names: set[str],
+    annotation_modules: set[str],
+) -> bool:
+    """Return whether a signature only appends literal-default parameters."""
+    if type(node) is not type(old_node):
+        return False
+    if not _same_ast(node.returns, old_node.returns) or node.type_comment != old_node.type_comment:
+        return False
+    if len(node.decorator_list) != len(old_node.decorator_list) or any(
+        not _same_ast(new, old) for new, old in zip(node.decorator_list, old_node.decorator_list)
     ):
-        return None
-    return node
+        return False
+
+    arguments = node.args
+    old_arguments = old_node.args
+    added_positional_count = len(arguments.args) - len(old_arguments.args)
+    added_keyword_only_count = len(arguments.kwonlyargs) - len(old_arguments.kwonlyargs)
+    if (
+        (added_positional_count <= 0 and added_keyword_only_count <= 0)
+        or added_positional_count < 0
+        or added_keyword_only_count < 0
+        or len(arguments.posonlyargs) != len(old_arguments.posonlyargs)
+        or not _same_ast(arguments.vararg, old_arguments.vararg)
+        or not _same_ast(arguments.kwarg, old_arguments.kwarg)
+        or any(
+            not _same_ast(new, old)
+            for new, old in zip(arguments.posonlyargs, old_arguments.posonlyargs)
+        )
+        or any(not _same_ast(new, old) for new, old in zip(arguments.args, old_arguments.args))
+        or any(
+            not _same_ast(new, old)
+            for new, old in zip(arguments.kwonlyargs, old_arguments.kwonlyargs)
+        )
+        or len(arguments.defaults) != len(old_arguments.defaults) + added_positional_count
+        or any(
+            not _same_ast(new, old) for new, old in zip(arguments.defaults, old_arguments.defaults)
+        )
+        or len(arguments.kw_defaults) != len(old_arguments.kw_defaults) + added_keyword_only_count
+        or any(
+            not _same_ast(new, old)
+            for new, old in zip(arguments.kw_defaults, old_arguments.kw_defaults)
+        )
+    ):
+        return False
+
+    added_arguments = arguments.args[len(old_arguments.args) :]
+    added_defaults = arguments.defaults[len(old_arguments.defaults) :]
+    added_keyword_only = arguments.kwonlyargs[len(old_arguments.kwonlyargs) :]
+    added_keyword_defaults = arguments.kw_defaults[len(old_arguments.kw_defaults) :]
+    return (
+        all(_is_literal_expression(default) for default in added_defaults)
+        and all(
+            default is not None and _is_literal_expression(default)
+            for default in added_keyword_defaults
+        )
+        and all(
+            _safe_annotation(
+                argument.annotation,
+                annotation_load_names,
+                annotation_generic_names,
+                annotation_modules,
+            )
+            for argument in [*added_arguments, *added_keyword_only]
+        )
+    )
+
+
+class _DirectScopeBindings(ast.NodeVisitor):
+    """Collect names bound directly in one module or class scope."""
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.names.add(node.id)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.names.add(node.name)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.names.add(node.name)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.names.add(node.name)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        pass
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self.names.update(alias.asname or alias.name.partition(".")[0] for alias in node.names)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self.names.update(alias.asname or alias.name for alias in node.names)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.name:
+            self.names.add(node.name)
+        self.generic_visit(node)
+
+    def visit_MatchAs(self, node: ast.MatchAs) -> None:
+        if node.name:
+            self.names.add(node.name)
+        self.generic_visit(node)
+
+    def visit_MatchStar(self, node: ast.MatchStar) -> None:
+        if node.name:
+            self.names.add(node.name)
+
+
+def _direct_scope_bindings(statements: list[ast.stmt]) -> set[str]:
+    bindings = _DirectScopeBindings()
+    for statement in statements:
+        bindings.visit(statement)
+    return bindings.names
+
+
+def _direct_scope_bindings_before(statements: list[ast.stmt], line: int) -> set[str]:
+    return _direct_scope_bindings(
+        [statement for statement in statements if statement.end_lineno < line]
+    )
+
+
+def _definition_start(node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+    return min([node.lineno, *(decorator.lineno for decorator in node.decorator_list)])
 
 
 def _node_for_line(nodes: list[ast.stmt], line: int) -> ast.stmt | None:
@@ -226,6 +656,22 @@ def _recorded_functions(
 
     walk(tree.body, "")
     return functions
+
+
+def _recorded_classes(tree: ast.Module | None) -> dict[str, ast.ClassDef]:
+    classes: dict[str, ast.ClassDef] = {}
+    if tree is None:
+        return classes
+
+    def walk(statements: list[ast.stmt], prefix: str) -> None:
+        for node in statements:
+            if isinstance(node, ast.ClassDef):
+                qualname = prefix + node.name
+                classes[qualname] = node
+                walk(node.body, qualname + ".")
+
+    walk(tree.body, "")
+    return classes
 
 
 class _FunctionNames(ast.NodeVisitor):
@@ -312,18 +758,30 @@ class _FunctionNames(ast.NodeVisitor):
 
 
 def analyze_python_changes(
-    source: str, changed_lines: set[int], deleted_lines: dict[int, list[str]]
+    source: str,
+    changed_lines: set[int],
+    deleted_lines: dict[int, list[str]],
+    *,
+    pre_source: str | None = None,
 ) -> PythonChangeFacts:
     """Describe low-risk import-time bindings and their local references.
 
-    Literal assignments (including literal replacements), plain function
-    declarations, and newly added builtin-module imports are represented.
-    Unsupported syntax is returned as an unresolved fact for policy callers.
+    Literal assignments (including literal replacements), low-risk added
+    function declarations, newly added builtin-module imports, and static
+    top-level ``ImportFrom`` binding deltas are represented. Unsupported syntax
+    is returned as an unresolved fact for policy callers.
     """
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return PythonChangeFacts(set(), set(), {}, "unparsable source")
+    try:
+        old_tree = ast.parse(pre_source) if pre_source is not None else None
+    except SyntaxError:
+        return PythonChangeFacts(set(), set(), {}, "unparsable pre-image")
+    old_module_nodes = list(old_tree.body) if old_tree is not None else None
+    old_bound_names = _statically_bound_names(old_tree) if old_tree is not None else set()
+    import_from_delta = _module_import_from_delta(tree, old_tree) if old_tree is not None else None
 
     scopes = _collect_scopes(tree)
     import_qualnames = import_executed_qualnames(source)
@@ -335,20 +793,149 @@ def analyze_python_changes(
         and any(alias.name == "annotations" for alias in node.names)
         for node in tree.body
     )
+    functions = _recorded_functions(tree)
+    old_functions = _recorded_functions(old_tree) if old_tree is not None else {}
+    classes = _recorded_classes(tree)
+    old_classes = _recorded_classes(old_tree)
+    module_bindings = _direct_scope_bindings(tree.body)
+    old_module_bindings = _direct_scope_bindings(old_tree.body) if old_tree is not None else set()
 
     binding_names: set[str] = set()
     deleted_binding_names: set[str] = set()
     direct_consumers: set[str] = set()
+    new_import_targets: set[ImportTarget] = set()
+    old_import_targets: set[ImportTarget] = set()
+    new_import_bindings: set[str] = set()
+    new_declaration_bindings: set[str] = set()
+    handled_module_nodes: set[int] = set()
+    handled_signatures: set[str] = set()
+    handled_import_from_delta = False
     for line in sorted(import_lines):
+        scope = _innermost(line, scopes)
+        signature_qualname = (
+            scope.qualname
+            if scope is not None and line < scope.body_start and scope.qualname in functions
+            else None
+        )
+        old_function = old_functions.get(signature_qualname or "")
+        if signature_qualname is not None and old_function is not None:
+            function = functions[signature_qualname]
+            definition_line = _definition_start(function)
+            annotation_load_names, annotation_generic_names, annotation_modules = (
+                _trusted_annotation_bindings(tree, definition_line)
+            )
+            annotation_load_names.update(_direct_scope_bindings_before(tree.body, definition_line))
+            parent_qualname = signature_qualname.rpartition(".")[0]
+            if parent_qualname:
+                annotation_load_names.update(
+                    _direct_scope_bindings_before(classes[parent_qualname].body, definition_line)
+                )
+            decorators_unchanged = len(function.decorator_list) == len(
+                old_function.decorator_list
+            ) and all(
+                _same_ast(new, old)
+                for new, old in zip(function.decorator_list, old_function.decorator_list)
+            )
+            if decorators_unchanged:
+                if signature_qualname in handled_signatures:
+                    continue
+                handled_signatures.add(signature_qualname)
+                if not _safe_optional_parameter_addition(
+                    function,
+                    old_function,
+                    annotation_load_names,
+                    annotation_generic_names,
+                    annotation_modules,
+                ):
+                    return PythonChangeFacts(set(), set(), {}, "class/signature import change")
+                direct_consumers.add(signature_qualname)
+                continue
+        if signature_qualname is not None and old_function is None:
+            if signature_qualname in handled_signatures:
+                continue
+            if old_tree is None or line in deleted_lines:
+                return PythonChangeFacts(set(), set(), {}, "class/signature import change")
+            function = functions[signature_qualname]
+            definition_line = _definition_start(function)
+            annotation_load_names, annotation_generic_names, annotation_modules = (
+                _trusted_annotation_bindings(tree, definition_line)
+            )
+            annotation_load_names.update(_direct_scope_bindings_before(tree.body, definition_line))
+            parent_qualname, separator, local_name = signature_qualname.rpartition(".")
+            if separator:
+                old_parent = old_classes.get(parent_qualname)
+                current_parent = classes.get(parent_qualname)
+                if (
+                    old_parent is None
+                    or current_parent is None
+                    or local_name in _direct_scope_bindings(old_parent.body)
+                ):
+                    return PythonChangeFacts(set(), set(), {}, "class/signature import change")
+                annotation_load_names.update(
+                    _direct_scope_bindings_before(current_parent.body, definition_line)
+                )
+                decorator_scope_bindings = module_bindings | _direct_scope_bindings(
+                    current_parent.body
+                )
+            else:
+                if local_name in old_module_bindings:
+                    return PythonChangeFacts(set(), set(), {}, "class/signature import change")
+                decorator_scope_bindings = module_bindings
+            trusted_decorators = _SAFE_BUILTIN_DECORATORS - decorator_scope_bindings
+            if not _safe_added_function(
+                function,
+                future_annotations=future_annotations,
+                annotation_load_names=annotation_load_names,
+                annotation_generic_names=annotation_generic_names,
+                annotation_modules=annotation_modules,
+                trusted_decorators=trusted_decorators,
+            ):
+                return PythonChangeFacts(set(), set(), {}, "class/signature import change")
+            handled_signatures.add(signature_qualname)
+            direct_consumers.add(signature_qualname)
+            if not separator:
+                binding_names.add(local_name)
+                new_declaration_bindings.add(local_name)
+            continue
         if _attribute(line, scopes) != "<module>":
             return PythonChangeFacts(set(), set(), {}, "class/signature import change")
         node = _node_for_line(module_nodes, line)
-        added_function = (
-            _safe_added_function(node, future_annotations) if node is not None else None
-        )
-        if added_function is not None and line not in deleted_lines:
-            binding_names.add(added_function.name)
-            direct_consumers.add(added_function.name)
+        if node is not None and id(node) in handled_module_nodes:
+            continue
+        if node is not None:
+            handled_module_nodes.add(id(node))
+        if (
+            isinstance(node, ast.If)
+            and _line_in_import_only_block(node, line)
+            and _trusted_type_checking_guard(node, module_nodes)
+        ):
+            continue
+        if isinstance(node, ast.ImportFrom) and import_from_delta is not None:
+            current_bindings = _import_from_bindings(node)
+            changed_locals, old_targets, new_targets, added_locals = import_from_delta
+            if current_bindings is None or not current_bindings.keys() & changed_locals:
+                return PythonChangeFacts(set(), set(), {}, "unresolved import replacement")
+            if not handled_import_from_delta:
+                binding_names.update(changed_locals)
+                old_import_targets.update(old_targets)
+                new_import_targets.update(new_targets)
+                new_import_bindings.update(added_locals - old_bound_names)
+                handled_import_from_delta = True
+            continue
+        if isinstance(node, ast.ImportFrom) and (
+            old_module_nodes is not None or line in deleted_lines
+        ):
+            replacement = _import_from_replacement(
+                node, deleted_lines.get(line, []), old_module_nodes
+            )
+            if replacement is None:
+                return PythonChangeFacts(set(), set(), {}, "unresolved import replacement")
+            changed_locals, old_targets, new_targets, added_locals = replacement
+            binding_names.update(changed_locals)
+            old_import_targets.update(old_targets)
+            new_import_targets.update(new_targets)
+            if old_module_nodes is not None:
+                new_import_bindings.update(added_locals - old_bound_names)
             continue
         names = _module_binding_names(node, future_annotations) if node is not None else None
         if node is None and line in deleted_lines:
@@ -385,13 +972,13 @@ def analyze_python_changes(
     if not deleted_binding_names <= binding_names:
         return PythonChangeFacts(set(), set(), {}, "unresolved import replacement")
 
-    functions = _recorded_functions(tree)
     facts = {qualname: _FunctionNames(node) for qualname, node in functions.items()}
     consumers = direct_consumers | {
         qualname
         for qualname, fact in facts.items()
         if (
             fact.nested_loaded
+            | fact.calls
             | {name for name in fact.loaded if name not in fact.bound or name in fact.globals}
         )
         & binding_names
@@ -443,4 +1030,8 @@ def analyze_python_changes(
         consumers,
         callers,
         callable_escapes=callable_escapes,
+        new_import_targets=new_import_targets,
+        old_import_targets=old_import_targets,
+        new_import_bindings=new_import_bindings,
+        new_declaration_bindings=new_declaration_bindings,
     )
