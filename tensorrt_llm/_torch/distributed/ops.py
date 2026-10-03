@@ -983,6 +983,47 @@ class MNNVLAllReduce(nn.Module):
         )
         return tuple(outputs) if is_fusion else outputs[0]
 
+    def allreduce_attn_res_rmsnorm(
+        self,
+        input: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+        res_weight: torch.Tensor,
+        rms_weight: torch.Tensor,
+        output_rms_weight: torch.Tensor,
+        rms_eps: float,
+        output_rms_eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One-shot all-reduce of ``input`` with Kimi K3's residual update as its epilogue.
+
+        Computes ``updated = prefix_sum + allreduce(input)`` (``allreduce(input)`` when
+        ``prefix_sum`` is None), then the attention-residual selection over
+        ``block_residual`` ``[num_snapshots, num_tokens, hidden]`` and ``updated``, then an
+        RMSNorm with ``output_rms_weight``. Returns ``(normed, updated)``, rounded like the
+        unfused all-reduce followed by ``trtllm::attn_res_add_rmsnorm_fwd``.
+
+        The workspace is grown to the one-shot footprint when needed, so the first call for a
+        shape must happen outside CUDA graph capture (warmup does this).
+        """
+        num_tokens, hidden_dim = input.shape
+        one_shot_bytes = (num_tokens * hidden_dim * self.mapping.tp_size *
+                          input.element_size())
+        workspace = get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping, self.dtype, buffer_size_bytes=one_shot_bytes)
+        normed, updated = torch.ops.trtllm.mnnvl_allreduce_attn_res(
+            input,
+            prefix_sum,
+            block_residual,
+            res_weight,
+            rms_weight,
+            output_rms_weight,
+            rms_eps,
+            output_rms_eps,
+            workspace["uc_buffer"].view(self.dtype).view(3, -1),
+            workspace["buffer_flags"],
+        )
+        return normed, updated
+
 
 class AllReduce(nn.Module):
 

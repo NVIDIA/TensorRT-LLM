@@ -52,6 +52,7 @@ l0_gb200_multi_gpus:
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_checkpoint_rejects_wrong_group_membership
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_growth_keeps_captured_graphs
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_mnnvl_allreduce_attn_res_op_matrix.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mnnvl_comm.py
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_checkpoint_preserves_moe_graph_addresses
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_engine_checkpoint_coordination
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_checkpoint_failure_is_collective_and_bounded
