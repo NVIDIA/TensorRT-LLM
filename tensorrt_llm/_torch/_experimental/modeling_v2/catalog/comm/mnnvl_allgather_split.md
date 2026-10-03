@@ -99,15 +99,16 @@ two-shot `[64, 7168]` all-reduce of its shared-workspace sequence).
 **Who creates it, and when.** The target, in `post_load_weights`, with
 `MnnvlWorkspace.create(mapping, buffer_bytes, fabric_handle=None)` (see `mnnvl_allreduce_attn_res.md`):
 
-- collective over the TP group: every rank calls it at the same point;
+- collective over `mapping`'s TP group only: every rank of the group calls it at the same point, and ranks outside
+  the group take no part (certified in `mnnvl_allreduce_attn_res`'s matrix);
 - failure model:
-  - before allocating, the ranks agree that each of them can (not capturing, a valid `buffer_bytes`, the three
-    buffers within that rank's free device memory). If one cannot, every rank raises `RuntimeError` and none
-    allocates (certified: one rank inside a CUDA-graph capture while the others are not, and then every rank
-    capturing; each time every rank raises, the capturing ranks' message naming the capture, and the workspaces in
-    use are untouched; a create right after, eager on every rank, returns an armed workspace whose first call is
-    correct);
-  - a failure that returns from the allocation is agreed the same way;
+  - before allocating, the ranks agree that each of them can (not capturing, a valid `buffer_bytes`, the three buffers
+    within that rank's free device memory). If one cannot, every rank raises `RuntimeError`, none allocates, and under
+    MPI each frees the communicator it made for the call (certified: one rank inside a CUDA-graph capture while the
+    others are not, and then every rank capturing; each time every rank raises, the capturing ranks' message naming
+    the capture, and the workspaces in use are untouched; a create right after, eager on every rank, returns an armed
+    workspace whose first call is correct);
+  - a failure that returns from the allocation is agreed and handled the same way;
   - a rank that fails inside the allocation's handle exchange can leave its peers waiting in that exchange; this
     is not turned into an error on the other ranks;
 - eager: it allocates and exchanges handles, so it refuses to run under CUDA-graph capture (every rank raises);
