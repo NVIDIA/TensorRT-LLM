@@ -35,13 +35,37 @@ from tensorrt_llm.logger import logger
 
 @functools.lru_cache(maxsize=1)
 def _quack_gemm_act():
+    """Import QuACK's gemm_act and compile it once on a probe problem.
+
+    The pinned QuACK release is compiled against a range of CUTLASS DSL builds; when
+    the installed DSL does not match, the failure surfaces at kernel compile time
+    (for example a tile-scheduler tuple mismatch), not at import. Probing here keeps
+    GatedMLP on the unfused path in that environment instead of failing the model's
+    first forward.
+    """
     try:
         from tensorrt_llm._torch.cute_dsl_utils import install_cutlass_dsl_compatibility
 
         install_cutlass_dsl_compatibility()  # CuTe aliases the pinned QuACK release still imports
         from quack.gemm_interface import gemm_act
-    except (ImportError, AttributeError, RuntimeError) as exc:
-        logger.warning(f"QuACK gemm_act unavailable; GatedMLP keeps the unfused SwiGLU path: {exc}")
+
+        x = torch.randn((64, 256), device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn((512, 256), device="cuda", dtype=torch.bfloat16)
+        _, out = gemm_act(
+            x,
+            weight.t(),
+            activation="swiglu",
+            store_preact=False,
+            tuned=False,
+            concat_layout=("B",),
+        )
+        torch.cuda.synchronize()
+        if out.shape != (64, 256):
+            raise RuntimeError(f"unexpected probe output shape {tuple(out.shape)}")
+    except Exception as exc:  # noqa: BLE001  (any import or compile failure means: stay unfused)
+        logger.warning(
+            f"QuACK gemm_act unavailable; GatedMLP keeps the unfused SwiGLU path: {exc!r}"
+        )
         return None
     return gemm_act
 
