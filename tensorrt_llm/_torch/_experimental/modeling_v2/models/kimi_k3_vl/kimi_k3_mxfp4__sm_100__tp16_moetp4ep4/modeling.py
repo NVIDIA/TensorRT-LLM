@@ -46,8 +46,9 @@ lives in typed objects this target creates in `post_load_weights`, before any gr
 experts, the sandwiches and the residual epilogues come with their own entries; until then they run the generic path
 on every step.
 
-**What this target asserts rather than adapts**: SM 10.0; the topology above; the MXFP4 checkpoint's quantization (none
-the model config reads, so the routed experts keep the MXFP4 default); bf16 weights and a bf16 KV pool;
+**What this target asserts rather than adapts**: SM 10.0; the topology above; the MXFP4 checkpoint's quantization
+(W4A16_MXFP4 with no per-layer declarations, so the routed experts run the W4A8_MXFP4_MXFP8 default and the excluded
+modules stay bf16); bf16 weights and a bf16 KV pool;
 tokens_per_block 64 (the MLA generation kernels K3's 96 heads reach exist only at 64); the V2 hybrid KV / state
 manager, which holds the KDA states, with block reuse off and fp32 recurrent states; an all-reduce strategy of AUTO or
 MNNVL. The construction-time ones fail in `__init__`, the per-engine ones on the first forward, each naming the
@@ -2158,10 +2159,10 @@ def _check_construction(model_config: ModelConfig) -> None:
         f"this target's MLA kernels read a bf16 KV pool; kv_cache_config.dtype resolved to {kv_algo}"
     )
     quant_algo = model_config.quant_config.quant_algo
-    assert quant_algo is None and not model_config.quant_config_dict, (
-        "this target loads the MXFP4 checkpoint, which declares no quantization the model config reads (its routed "
-        f"experts keep the W4A8_MXFP4_MXFP8 default); the engine read {quant_algo} with "
-        f"{len(model_config.quant_config_dict or {})} per-layer declarations"
+    assert quant_algo == QuantAlgo.W4A16_MXFP4 and not model_config.quant_config_dict, (
+        "this target loads the MXFP4 checkpoint, whose compressed-tensors config the model config reads as "
+        "W4A16_MXFP4 with no per-layer declarations (its routed experts run the W4A8_MXFP4_MXFP8 default); the "
+        f"engine read {quant_algo} with {len(model_config.quant_config_dict or {})} per-layer declarations"
     )
     strategy = model_config.allreduce_strategy
     assert strategy in (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL), (
