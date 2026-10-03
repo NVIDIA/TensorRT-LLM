@@ -222,6 +222,14 @@ def k3_kda_attn(
                 "trtllm::k3_kda_attn must run once per configuration outside CUDA-graph capture first "
                 "(it compiles its kernel on the first call)."
             )
+        # The verify CTAs, launched right after the first two stream clusters, spin with no timeout on words the other
+        # stream clusters write: the launch is built for all FUSED_CTAS CTAs resident at once, one per SM.
+        sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+        if sms < FUSED_CTAS:
+            raise ValueError(
+                f"k3_kda_attn needs a device with at least {FUSED_CTAS} SMs (one per CTA, all resident at once); "
+                f"this one has {sms}"
+            )
         import cutlass.cute as cute
 
         with _lock:

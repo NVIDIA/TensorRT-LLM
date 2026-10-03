@@ -173,6 +173,12 @@ ahead of this launch.
 ## Preconditions
 
 - sm_100: the kernel uses tcgen05, TMA and clusters.
+- A device with at least `FUSED_CTAS` (128) SMs. The launch is built to have its 128 CTAs (32 clusters of 4, one CTA
+  per SM) resident at once: the verify CTAs, scheduled right after the first two stream clusters, spin with no
+  timeout on words the other stream clusters write, so without SMs for those producers the launch never finishes. On
+  a device with fewer SMs the op raises `ValueError` where it compiles the kernel, i.e. before the first launch of a
+  configuration. It reads the device's SM count, so it cannot see a lower limit that MPS or a green context sets; such
+  a limit must leave the launch 128 SMs.
 - The op checks `x`, `w`, `w_fb` (shape, dtype, contiguity), `num_spec` = 7, `ssm` / `state_tok` (shape, fp32,
   `ssm.stride()[1:] == (16384, 128, 1)`, `state_tok` contiguous), `cs_q`'s window width, the fp32 dtypes, `slots`
   (one int32 element), `pending` (int32) and the set's sizes (`epoch` of 128), and raises `ValueError` before a launch.

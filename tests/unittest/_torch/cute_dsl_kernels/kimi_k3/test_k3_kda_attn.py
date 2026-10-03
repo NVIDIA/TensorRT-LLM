@@ -21,11 +21,14 @@ on a copy of the same pools: the same arithmetic, so outputs, conv caches, pool 
 compared bit for bit. A request keeps its slot for several rounds, so its pending count (the drafts the previous
 round accepted) runs through 0..7, then the next request starts on another slot; slots outside the batch stay
 untouched; pools dense and strided. Also: CUDA-graph replays with rewritten inputs, the launch counter near 2^31
-(buffers inside guard bands: nothing written outside them, the same bits as a run from zero), and the slot and the
-pending counts given as slices of longer index tensors at any element offset.
+(buffers inside guard bands: nothing written outside them, the same bits as a run from zero), the slot and the
+pending counts given as slices of longer index tensors at any element offset, and a device with fewer SMs than the
+launch's CTAs refused before any write.
 
   pytest test_k3_kda_attn.py
 """
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -285,6 +288,29 @@ def test_epoch_wrap():
         assert all(torch.equal(a, b) for a, b in zip(got, want))
         assert same_pools(wrapped.p, fresh.p)
         assert bool(((epoch >= 0) & (epoch < 3)).all()), epoch.unique().tolist()
+
+
+def test_refuses_fewer_sms_than_ctas(monkeypatch):
+    """A device reporting fewer SMs than the launch's FUSED_CTAS CTAs: ValueError before the kernel is compiled or
+    launched, with the pools and the Lamport buffers unchanged."""
+    op = _ops()
+    with torch.inference_mode():
+        fused = Fused(make_weights(140), make_pools(240, "dense"))
+        before = {n: fused.p[n].clone() for n in POOL_NAMES}
+        bufs = [b.clone() for b in fused.bufs]
+        x = torch.randn(NT, K_IN, device="cuda").bfloat16()
+        slot = torch.tensor([3], dtype=torch.int32, device="cuda")
+        torch.cuda.synchronize()
+        fewer = SimpleNamespace(multi_processor_count=op.FUSED_CTAS - 1)
+        # The op checks the device where it compiles the kernel, once per configuration: start with no kernel.
+        monkeypatch.setattr(op, "_compiled", {})
+        monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device=None: fewer)
+        with pytest.raises(ValueError, match=f"at least {op.FUSED_CTAS} SMs"):
+            fused(x, slot)
+        monkeypatch.undo()
+        torch.cuda.synchronize()
+        assert same_pools(fused.p, before)
+        assert all(torch.equal(a, b) for a, b in zip(fused.bufs, bufs))
 
 
 def _at_offset(t: torch.Tensor, offset: int) -> torch.Tensor:
