@@ -239,8 +239,8 @@ follows `T`, `H` and the device's SM count, and in the fused form it sets the or
   the per-call time of back-to-back captured calls is within -0.56 / +0.12 us of theirs (noise 0.10 us). Every
   MNNVL kernel's SASS changes, since the kernel parameters gained `earlyTrigger`; in the one-shot kernel's, the
   dependents' launch sits right after the grid-dependency wait.
-- At `W` = 16 the one-shot kernel adds the ranks in two chunks of 8, a branch a 4-rank run never reaches. The 16-rank
-  receipt is pending.
+- At `W` = 16 the one-shot kernel adds the ranks in two chunks of 8, a branch a 4-rank run never reaches. At 16 ranks
+  (four GB200 trays of one rack, fabric handles) the matrix passes, every check on every rank, in a recorded run.
 - Kimi K3's calls (its decode path, not this test): the model sets every `MNNVLAllReduce` of the target, its
   LM head and a drafter to `one_shot_max_bytes` = 4 MiB (`DECODE_AR_ONE_SHOT_MAX_BYTES`, against main's 1 MiB), and
   a wide decode step (9 to 64 tokens) passes 1 MiB per call (`WIDE_AR_ONE_SHOT_MAX_BYTES`). Plain: the routed-latent

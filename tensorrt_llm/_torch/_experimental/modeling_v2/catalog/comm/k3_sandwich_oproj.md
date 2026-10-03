@@ -186,10 +186,11 @@ it changes scheduling, not results.
   `normed` against an fp32 reference within 2e-2 of its largest magnitude.
 - World sizes: the matrix takes `--world-size` and `--launcher` (`mpirun` on one tray, `srun` across trays). The
   kernel sums ranks in chunks of 8, so a run at `W` <= 8 exercises one chunk; Kimi K3 runs `W` = 16 over four trays.
-  This entry's 16-rank receipt is pending. The op's kernel test
-  (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py`; this op bit for bit against `o_proj` and
-  the MNNVL one-shot) passed every case at 16 ranks on four trays in a recorded run: the kernel's record, not this
-  entry's receipt.
+  At 16 ranks (four GB200 trays of one rack, fabric handles) this entry's matrix passes, every check on every rank, in
+  a recorded run; CI runs it at 4. The op's kernel test
+  (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py`; this op bit for bit against `o_proj` and the
+  MNNVL one-shot) passed every case at 16 ranks on four trays in a recorded run: the kernel's record, not this entry's
+  receipt.
 - State: `mutates_args` names `ws_uc`, `ws_mc` and `ws_flags` — every call pushes through `ws_mc` into every rank's
   `ws_uc`, empties the words it read in `ws_uc` and advances `ws_flags` — and `x_slab`. The op module keeps no
   workspace registry: the caller passes the object it created. The compile cache is the documented process-wide cache

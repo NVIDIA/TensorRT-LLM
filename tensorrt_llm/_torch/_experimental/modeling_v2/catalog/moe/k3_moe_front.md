@@ -211,9 +211,9 @@ Besides `workspace` (an explicit argument):
   GEMV clusters of the 13 left. At `W` 8 (560 rows, 9 half-tiles) and `W` 4 (1120 rows, 18) they do not fit, and the
   head runs as 5 and 9 tiles of 128 rows. The CPU test
   `tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_front_geometry.py` checks this choice and that
-  `front_weight`'s rows are the rows each plan reads. So this entry's 4-rank matrix runs 128-row tiles only; the
-  half-tile path's 16-rank record is the kernel test `test_k3_moe_front.py` run as 16 processes (the model's TP16
-  shapes), not this matrix.
+  `front_weight`'s rows are the rows each plan reads. So this entry's 4-rank matrix runs 128-row tiles only; at 16
+  ranks (a recorded run on four GB200 trays of one rack) the matrix runs the half-tile path and passes, every check
+  on every rank, as does the kernel test `test_k3_moe_front.py` run as 16 processes.
 
 ## Preconditions
 
@@ -237,7 +237,7 @@ Besides `workspace` (an explicit argument):
 - Certified path: 4 ranks of one GB200 tray (sm_100), one rank per GPU, the head sharded over those 4 ranks (1120
   rows per rank, 128-row tiles), the shared activation at TP16's per-rank width (384). Kimi K3 TP16 shards the head
   over 16 ranks on four trays (280 rows per rank, the half-tile geometry: *Metadata consumed*); the matrix takes
-  `--world-size` and `--launcher`, and its 16-rank receipt is pending.
+  `--world-size` and `--launcher`; at 16 ranks it passes in a recorded run (above).
 - Test: `tests/unittest/_torch/modeling_v2/comm/_k3_moe_front_op_matrix.py` (rank body), collected by
   `tests/unittest/_torch/modeling_v2/moe/test_modeling_v2_k3_moe_front_op_matrix.py`. It also certifies
   `moe/k3_moe` behind the front, on a plain and on a head_flags `K3MoeState`.

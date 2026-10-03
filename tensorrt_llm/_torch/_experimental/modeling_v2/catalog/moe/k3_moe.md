@@ -280,7 +280,7 @@ Besides the state objects (explicit arguments):
   intermediate 768), with random checkpoint-format MXFP4 experts put through TRT-LLM's own loader, routed by
   `moe/k3_route_quant`. The head_flags build and the front as producer: 4 ranks of one GB200 tray in
   `tests/unittest/_torch/modeling_v2/comm/_k3_moe_front_op_matrix.py` (entry point
-  `moe/test_modeling_v2_k3_moe_front_op_matrix.py`); its 16-rank receipt is pending with `moe/k3_moe_front`'s.
+  `moe/test_modeling_v2_k3_moe_front_op_matrix.py`), which also passes at 16 ranks in a recorded run.
 - The push form: 4 ranks of one GB200 tray in `tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_push.py`
   (`k3_moe_push`: `K3MoeLayer.push` into a 4-slot exchange, this entry's `k3_moe_push` into a 16-slot one); its
   16-rank receipt is pending.

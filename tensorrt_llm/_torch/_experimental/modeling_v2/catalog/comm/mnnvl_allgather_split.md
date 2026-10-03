@@ -198,7 +198,8 @@ depend on it.
   call sequences on real state (layers x steps, calls queued without host synchronization, capture + replay, two
   objects interleaved) plus a negative control; every written buffer named in the schema; the matrix takes
   `--world-size` and `--launcher` (`mpirun` on one node, `srun` across trays) and CI runs it at 4 ranks on one GB200
-  tray; one `MnnvlWorkspace` shared by every MNNVL entry of the TP group. The 16-rank receipt is pending.
+  tray; one `MnnvlWorkspace` shared by every MNNVL entry of the TP group. At 16 ranks (four GB200 trays of one
+  rack, fabric handles) the matrix passes, every check on every rank, in a recorded run.
 - Not exercised: `B` = 0 or `F` = 0 (the op accepts both), denormal and non-finite values in the bf16 columns, an
   accepted call of more than 64 tokens, the fake implementation.
 - In the model today the call is `MNNVLAllReduce.allgather_split(input, bf16_columns)` on `MNNVLAllReduce`'s workspace
