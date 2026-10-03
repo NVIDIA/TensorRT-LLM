@@ -4,10 +4,11 @@
 
 * **Per-site GEMVs** (`K3DecodeGemvs.project`): a projection of a decode step runs on the kernel measured fastest
   at its call site's weight shape (`SITES`): at most `MAX_ROWS` rows on `gemm/k3_decode_gemv`,
-  `gemm/k3_ctm_gemv_wide` or `gemm/k3_ctm_gemv_long`, and, where the site lists it, up to `WIDE_ROWS` rows on
-  `gemm/k3_ctm_gemv_wide`. The sites are the decode kernels' fused projections (MLA's [W_a; W_g] with the gate rows
-  through a sigmoid, KDA's [q | k | v | g | f_a | b]), the attention output projection, and the built-in MLA path's
-  q_a / kv_a, q_b and gate projections.
+  `gemm/k3_ctm_gemv_wide` or `gemm/k3_ctm_gemv_long`, and, where the site lists it, more rows (up to `WIDE_ROWS`)
+  on `gemm/k3_ctm_gemv_wide`. The sites are the decode kernels' fused projections (MLA's [W_a; W_g] with the gate
+  rows through a sigmoid, KDA's [q | k | v | g | f_a | b]), the attention output projection, the built-in MLA path's
+  q_a / kv_a, q_b and gate projections, and the MoE decode path's projections (`decode_moe.py`), two of them with
+  fp32 outputs.
 * **LM head** (`K3LogitsProcessor`): at most `MAX_ROWS` rows of this rank's vocabulary shard on
   `gemm/k3_head_gemv` over the target's `K3HeadGemvWorkspace`, then the shards gathered (`comm/allgather`) as the
   stock head gathers them. It is the shell's logits processor, so the speculative worker's target logits and the
@@ -72,9 +73,10 @@ WIDE_ROWS = 64
 @dataclass(frozen=True)
 class Site:
     """A call site's weight shape (this target's per-rank shapes) and its kernels: ``small`` at 1..MAX_ROWS rows
-    ("decode", "wide" or "long"), and k3_ctm_gemv_wide at MAX_ROWS+1..WIDE_ROWS rows where ``wide``. Output columns
-    from ``sig_col0`` on are stored through a sigmoid. ``split`` / ``ring`` / ``push``: k3_ctm_gemv_long's CTAs per
-    128-row weight tile, weight-ring stages, and whether the partial sums are pushed to each row's owner."""
+    ("decode", "wide" or "long"), and k3_ctm_gemv_wide at MAX_ROWS+1..``wide_rows`` rows where ``wide``. Output columns
+    from ``sig_col0`` on are stored through a sigmoid; ``out_fp32``: an fp32 output (k3_ctm_gemv_wide only).
+    ``split`` / ``ring`` / ``push``: k3_ctm_gemv_long's CTAs per 128-row weight tile, weight-ring stages, and whether
+    the partial sums are pushed to each row's owner."""
 
     n: int
     k: int
@@ -84,6 +86,8 @@ class Site:
     split: int = 0
     ring: int = 0
     push: bool = False
+    out_fp32: bool = False
+    wide_rows: int = WIDE_ROWS
 
 
 SITES: Dict[str, Site] = {
@@ -101,6 +105,14 @@ SITES: Dict[str, Site] = {
     # Layer 0's dense MLP split over the 16-way TP group: gate_up [gate 2112 | up 2112] and down.
     "dense_gate_up": Site(4224, 7168, "long", split=4, ring=5),
     "dense_down": Site(7168, 2112, "long", split=2, ring=6),
+    # The MoE decode path (decode_moe.py): this rank's head slice [latent down 224 | router 56] with an fp32 output,
+    # the shared experts' gate_up, the row-parallel tail [latent up 224 | padding 32 | shared down 384] and the
+    # replicated tail's latent up projection with an fp32 output. The wide kernel takes the head slice and the tail up
+    # to 32 rows, where it is faster than the stock GEMM.
+    "moe_head": Site(280, 7168, "wide", wide=True, out_fp32=True, wide_rows=32),
+    "moe_shared_gate_up": Site(768, 7168, "wide", wide=True),
+    "moe_tail": Site(7168, 640, "wide", wide=True, wide_rows=32),
+    "moe_up": Site(7168, 3584, "wide", out_fp32=True),
 }
 
 
@@ -115,13 +127,15 @@ def _run(
 ) -> Optional[torch.Tensor]:
     """``spec``'s ``kernel`` on dense rows ``x2d``, or None where it does not take them."""
     if kernel == "decode":
-        if spec.sig_col0 >= 0 or not _decode_op.supports(x2d, weight):
+        if spec.sig_col0 >= 0 or spec.out_fp32 or not _decode_op.supports(x2d, weight):
             return None
         return k3_decode_gemv(x2d, weight)
     if kernel == "wide":
-        if not _ctm_op.supports_wide(x2d, weight, spec.sig_col0, False):
+        if not _ctm_op.supports_wide(x2d, weight, spec.sig_col0, spec.out_fp32):
             return None
-        return k3_ctm_gemv_wide(x2d, weight, sig_col0=spec.sig_col0)
+        return k3_ctm_gemv_wide(x2d, weight, sig_col0=spec.sig_col0, out_fp32=spec.out_fp32)
+    if spec.out_fp32:
+        return None
     # One wave of the GPU's SMs: beyond it the long GEMV loses to the others.
     sms = torch.cuda.get_device_properties(x2d.device).multi_processor_count
     if math.ceil(spec.n / 128) * spec.split > sms or not _ctm_op.supports_long(
@@ -224,6 +238,8 @@ class K3DecodeGemvs:
             spec = SITES[site]
             weight = torch.zeros(spec.n, spec.k, dtype=torch.bfloat16, device=device)
             for rows in (1, 16, 32, 64) if spec.wide else (1,):
+                if rows > spec.wide_rows:
+                    continue
                 state._project(site, weight.new_zeros(rows, spec.k), weight, warm=True)
             del weight
         if "dense_gate_up" in sites:
@@ -245,9 +261,10 @@ class K3DecodeGemvs:
         return state
 
     def project(self, site: str, x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
-        """``x @ weight.T`` (bf16 ``[..., N]``, the site's sigmoid columns through the sigmoid) for ``site``'s weight
-        on its decode kernel, or None where none takes the call: more rows than the site's kernels take, another
-        shape or dtype, or, under capture, a kernel that has not run eagerly. The caller then runs its GEMM."""
+        """``x @ weight.T`` (``[..., N]``: bf16, the site's sigmoid columns through the sigmoid; fp32 at an
+        ``out_fp32`` site) for ``site``'s weight on its decode kernel, or None where none takes the call: more rows
+        than the site's kernels take, another shape or dtype, or, under capture, a kernel that has not run eagerly.
+        The caller then runs its GEMM."""
         return self._project(site, x, weight, warm=False)
 
     def _project(
@@ -266,7 +283,7 @@ class K3DecodeGemvs:
         rows = x.numel() // spec.k
         if 0 < rows <= MAX_ROWS:
             kernel = spec.small
-        elif spec.wide and MAX_ROWS < rows <= WIDE_ROWS:
+        elif spec.wide and MAX_ROWS < rows <= spec.wide_rows:
             kernel = "wide"
         else:
             return None
