@@ -36,7 +36,12 @@ parameter exactly once, and asserts full bidirectional coverage — every
 target parameter written, every checkpoint key consumed.
 """
 
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any, Callable
+
 import torch
+import torch.nn as nn
 
 SCALE_BLOCK = 32  # mxfp4: one E8M0 exponent per 32 elements along K
 
@@ -160,6 +165,153 @@ def _prep_fc2_bias(bias: torch.Tensor, core) -> torch.Tensor:
 def _to_fp32(t: torch.Tensor, core) -> torch.Tensor:
     """bf16 -> fp32 promotion for tensors the kernels require in fp32."""
     return t.float()
+
+
+@dataclass(frozen=True)
+class W:
+    """One weight role: what it is, where its bytes come from, what happens on the way.
+
+    Three facts that used to live in three places -- the shape in the model's
+    declaration block, the checkpoint key in the manifest, the transform in a
+    function far from either. A reader who wants to know what `fc1_w` is now
+    reads one entry.
+
+    `shape` is a callable rather than a constant because every shape here is
+    derived from configuration: `fc1_k_pad` is a padded width, `q_width` is a
+    product. It takes the dimension bundle `declare` is given.
+
+    `src` is a checkpoint key template with `{p}` standing for the layer
+    prefix, or a sequence of `(template, slice_fn)` pairs when one parameter is
+    assembled from several checkpoint tensors -- `qkv` is three.
+
+    `transform` runs on the source tensor before the copy, on the destination's
+    device. `None` means the checkpoint tensor is already the declared shape.
+    """
+
+    name: str
+    shape: Callable[[Any], tuple[int, ...]]
+    src: str | tuple[tuple[str, Callable], ...]
+    dtype: torch.dtype | None = None
+    transform: Callable | None = None
+    per_layer: bool = True
+
+
+WEIGHTS: tuple[W, ...] = (
+    W("norm1", shape=lambda d: (d.hidden,), src="{p}.input_layernorm.weight"),
+    W(
+        "qkv",
+        shape=lambda d: (d.q_width + 2 * d.kv_width, d.hidden),
+        src=(
+            ("{p}.self_attn.q_proj.weight", lambda d: (slice(0, d.q_width),)),
+            (
+                "{p}.self_attn.k_proj.weight",
+                lambda d: (slice(d.q_width, d.q_width + d.kv_width),),
+            ),
+            (
+                "{p}.self_attn.v_proj.weight",
+                lambda d: (slice(d.q_width + d.kv_width, d.q_width + 2 * d.kv_width),),
+            ),
+        ),
+    ),
+    W(
+        "qkv_bias",
+        shape=lambda d: (d.q_width + 2 * d.kv_width,),
+        src=(
+            ("{p}.self_attn.q_proj.bias", lambda d: (slice(0, d.q_width),)),
+            (
+                "{p}.self_attn.k_proj.bias",
+                lambda d: (slice(d.q_width, d.q_width + d.kv_width),),
+            ),
+            (
+                "{p}.self_attn.v_proj.bias",
+                lambda d: (slice(d.q_width + d.kv_width, d.q_width + 2 * d.kv_width),),
+            ),
+        ),
+    ),
+    W(
+        "sinks",
+        shape=lambda d: (d.heads_q,),
+        dtype=torch.float32,
+        src="{p}.self_attn.sinks",
+        transform=_to_fp32,
+    ),
+    W("o", shape=lambda d: (d.hidden, d.q_width), src="{p}.self_attn.o_proj.weight"),
+    W("o_bias", shape=lambda d: (d.hidden,), src="{p}.self_attn.o_proj.bias"),
+    W("norm2", shape=lambda d: (d.hidden,), src="{p}.post_attention_layernorm.weight"),
+    W("router", shape=lambda d: (d.num_experts, d.hidden), src="{p}.mlp.router.weight"),
+    W("router_bias", shape=lambda d: (d.num_experts,), src="{p}.mlp.router.bias"),
+    W(
+        "fc1_w",
+        shape=lambda d: (d.num_experts, d.fc1_rows, d.fc1_k_pad // 2),
+        dtype=torch.uint8,
+        src="{p}.mlp.experts.gate_up_proj_blocks",
+        transform=_prep_fc1_weight,
+    ),
+    W(
+        "fc1_s",
+        shape=lambda d: (d.num_experts, d.fc1_rows, d.fc1_k_pad // 32),
+        dtype=torch.uint8,
+        src="{p}.mlp.experts.gate_up_proj_scales",
+        transform=_prep_fc1_scale,
+    ),
+    W(
+        "fc1_b",
+        shape=lambda d: (d.num_experts, d.fc1_rows),
+        dtype=torch.float32,
+        src="{p}.mlp.experts.gate_up_proj_bias",
+        transform=_prep_fc1_bias,
+    ),
+    W(
+        "fc2_w",
+        shape=lambda d: (d.num_experts, d.fc2_rows_pad, d.inter_pad // 2),
+        dtype=torch.uint8,
+        src="{p}.mlp.experts.down_proj_blocks",
+        transform=_prep_fc2_weight,
+    ),
+    W(
+        "fc2_s",
+        shape=lambda d: (d.num_experts, d.fc2_rows_pad, d.inter_pad // 32),
+        dtype=torch.uint8,
+        src="{p}.mlp.experts.down_proj_scales",
+        transform=_prep_fc2_scale,
+    ),
+    W(
+        "fc2_b",
+        shape=lambda d: (d.num_experts, d.fc2_rows_pad),
+        dtype=torch.float32,
+        src="{p}.mlp.experts.down_proj_bias",
+        transform=_prep_fc2_bias,
+    ),
+    W("final_norm", shape=lambda d: (d.hidden,), src="model.norm.weight", per_layer=False),
+    W(
+        "embed",
+        shape=lambda d: (d.vocab, d.hidden),
+        src="model.embed_tokens.weight",
+        per_layer=False,
+    ),
+)
+
+
+def declare(**dims: Any) -> nn.ParameterDict:
+    """Allocate every weight the table declares.
+
+    Takes the dimensions explicitly rather than reading them off the core: the
+    core no longer carries them, having stopped forwarding configuration, and
+    passing them is what keeps it that way.
+
+    Meta-init intercepts `torch.empty` here -- real CUDA storage arrives when
+    the engine materializes the registry.
+    """
+    d = SimpleNamespace(**dims)
+    w = nn.ParameterDict()
+    for entry in WEIGHTS:
+        dtype = entry.dtype or d.dtype
+        keys = (
+            [f"l{i}_{entry.name}" for i in range(d.num_layers)] if entry.per_layer else [entry.name]
+        )
+        for key in keys:
+            w[key] = nn.Parameter(torch.empty(*entry.shape(d), dtype=dtype), requires_grad=False)
+    return w
 
 
 def _manifest(core) -> dict:
