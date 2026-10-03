@@ -419,6 +419,18 @@ remain invariant for its lifetime. Request-varying capability requirements
 must be represented in `FmhaManager._make_cache_key`, because a cache hit
 reuses the selected library without rechecking support.
 
+A third check point, `validate_metadata(cls, metadata)`, runs once per
+`TrtllmAttentionMetadata` construction for every enabled library. It is for
+configurations a library would serve *incorrectly* rather than not at all:
+failures inside the library's own kernels that selection cannot see or route
+around. The hook raises with an actionable error instead of returning a
+bool, so a doomed configuration fails at construction with the cause and the
+remedy named, not at first forward with a generic no-library error. The
+default accepts everything. `FallbackFmha` uses it to refuse paged-context
+FMHA on (SM, head_dim) combinations whose fused context kernel is proven
+absent, where the C++ op would silently fall back to unfused MHA and corrupt
+the cached prefix.
+
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.
