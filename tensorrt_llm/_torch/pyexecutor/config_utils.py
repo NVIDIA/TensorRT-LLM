@@ -1116,6 +1116,22 @@ def load_pretrained_config(model_name_or_path: str,
             text_dict["quantization_config"] = quantization_config
         model_config = Qwen4ExpTextConfig.from_dict(text_dict)
         model_config.architectures = ["Qwen4ExpForCausalLM"]
+    elif model_type in ("apertus1p5", "apertus1p5_text"):
+        # Apertus 1.5 runs text-only on the Apertus decoder; its image and
+        # audio tokenizers are not supported.
+        text_dict = dict(config_dict.get("text_config") or config_dict)
+        text_dict["model_type"] = "apertus"
+        # The input embedding also covers the image and audio codes; the
+        # runtime's vocab_size is the output (lm_head) vocabulary.
+        output_vocab_size = text_dict.get("output_vocab_size")
+        if output_vocab_size is not None:
+            text_dict["input_vocab_size"] = text_dict["vocab_size"]
+            text_dict["vocab_size"] = output_vocab_size
+        if "quantization_config" in config_dict:
+            text_dict.setdefault("quantization_config",
+                                 config_dict["quantization_config"])
+        model_config = transformers.ApertusConfig.from_dict(text_dict)
+        model_config.architectures = ["Apertus1p5ForConditionalGeneration"]
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
