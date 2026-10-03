@@ -321,7 +321,50 @@ SYSTEM_PROMPT_EXTENSION = "\n".join(
     ]
 )
 
+
 # Stage/Goal control flow is only wired when the workflow runs with
 # --replan-on-qa; ``build_modeling_bringup_prompts`` appends this block
 # on top of ``SYSTEM_PROMPT_EXTENSION`` in that mode only.
 STAGE_GOAL_EXTENSION = _STAGE_GOAL_REVIEW_RULES
+
+_CONCURRENT_PLAN_REVIEW_RULES = """\
+## Concurrent execution-graph review
+
+In concurrent mode `plan.md` must carry a machine-readable
+`## Execution Graph` block and `acceptance-criteria.md` must be node-id
+keyed. In addition to the bring-up REJECT triggers above, REJECT the plan
+when:
+
+- `plan.md` has no `## Execution Graph` heading, or the heading is not
+  followed by a single fenced `yaml` block. The orchestrator cannot build
+  the DAG without it.
+- The `## Execution Graph` block is not valid-looking: its body is not a
+  mapping with a top-level `nodes:` list, a node is missing `id` or
+  `type`, `type` is not `stage` / `goal`, `kind` is not `impl` / `merge`,
+  `isolation` (when present) is not `worktree` / `shared`, a `depends_on`
+  entry does not resolve to a same-level sibling, ids are not globally
+  unique, or any sibling level has a dependency cycle.
+- Stage nodes do not hold their Goals as `children`, the per-Stage wiring
+  / integration Goal is not `kind: merge` depending on the module Goals,
+  or cross-Stage ordering is not expressed as `depends_on` between the
+  Stage nodes.
+- `acceptance-criteria.md` is not partitioned into one `## <node-id>`
+  subsection per node (node-id keyed), or its node ids do not match the
+  `## Execution Graph` ids exactly. A `## Stage N` ordinal partition, or a
+  single flat checklist, is a REJECT in concurrent mode.
+- `plan.md` or `acceptance-criteria.md` still carries a single-cursor
+  status table or a replan lock matrix. Concurrent mode has no shared
+  status table — the orchestrator owns graph state — so those artifacts
+  are stale scope creep.
+
+These concurrent-mode checks replace the Stage/Goal-table schema
+enforcement used under `--replan-on-qa`; the two modes are distinct. The
+substantive bring-up REJECT triggers (architecture decision, validation
+matrix, evidence labels, Python-first) still apply to the plan as a whole.
+"""
+
+# Concurrent DAG control flow is only wired when the workflow runs with
+# --concurrent; ``build_modeling_bringup_prompts`` appends this block on top of
+# ``SYSTEM_PROMPT_EXTENSION`` in that mode only (INSTEAD of STAGE_GOAL_EXTENSION
+# — concurrent is a distinct mode).
+CONCURRENT_EXTENSION = _CONCURRENT_PLAN_REVIEW_RULES
