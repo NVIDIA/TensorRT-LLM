@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_100: {status: pending, world_size: 4}
+  sm_100: {status: passed, tests: 62}
 ---
 
 # k3_moe

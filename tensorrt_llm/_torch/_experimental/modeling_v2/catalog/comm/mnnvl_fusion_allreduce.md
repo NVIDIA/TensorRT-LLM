@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_100: {status: pending, world_size: 4}
+  sm_100: {status: passed, world_size: 4}
 ---
 
 # mnnvl_fusion_allreduce
@@ -233,8 +233,12 @@ follows `T`, `H` and the device's SM count, and in the fused form it sets the or
   so a dependent kernel (a GEMV) can launch and stream its weights while this kernel waits for its peers; a
   dependent still reads the output and the flags only after its own grid wait. Its Lamport reduction is the shared
   `reduceOneshotLamport` of the attention-residual one-shot kernel: the code is moved, not changed, and the reduction
-  order is the same. Results unchanged (main's MNNVL test bodies pass on this build; the kernel's SASS changes).
-  EVIDENCE: <filled by comm16>
+  order is the same. Certified on sm_100: main's MNNVL test bodies (`multi_gpu/test_mnnvl_allreduce.py`, 110 cases
+  at 4 ranks and 109 at 2, and its graph-capture cases) pass on this build. At `[M, 7168]` bf16, `M` 1 to 2048,
+  plain and fused, one-shot and two-shot, 4 ranks, this build's outputs equal the previous kernels' bit for bit, and
+  the per-call time of back-to-back captured calls is within -0.56 / +0.12 us of theirs (noise 0.10 us). Every
+  MNNVL kernel's SASS changes, since the kernel parameters gained `earlyTrigger`; in the one-shot kernel's, the
+  dependents' launch sits right after the grid-dependency wait.
 - At `W` = 16 the one-shot kernel adds the ranks in two chunks of 8, a branch a 4-rank run never reaches. The 16-rank
   receipt is pending.
 - Kimi K3's calls (its decode path, not this test): the model sets every `MNNVLAllReduce` of the target, its

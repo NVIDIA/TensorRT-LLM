@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_100: {status: pending, tests: 18}
+  sm_100: {status: passed, tests: 18}
 ---
 
 # k3_route_quant

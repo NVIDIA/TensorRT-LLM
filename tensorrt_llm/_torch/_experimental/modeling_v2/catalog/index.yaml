@@ -28,7 +28,7 @@
 # limits, e.g. no float8 arithmetic, are noted in the entry docstring).
 # Entries wrapping trtllm ops carry all three.
 #
-# ── RECEIPT STATUS: 19 entries certified on sm_103, 13 on sm_100 ──────────
+# ── RECEIPT STATUS: 19 entries certified on sm_103, 23 on sm_100 ──────────
 #
 # A receipt says this entry's test passed on a stated GPU architecture. The
 # architecture is the whole key: it is a real axis -- see the
@@ -75,8 +75,8 @@
 #
 # The Kimi K3 entries (k3_*, attn_res_*) are certified on sm_100 (B200 /
 # GB200), where their first caller runs, and their tests skip on any other
-# architecture. cublas_mm and flashinfer_rmsnorm, which that caller also
-# uses, keep their sm_103 receipts and add sm_100 ones.
+# architecture. cublas_mm, flashinfer_rmsnorm and allgather, which that
+# caller also uses, keep their sm_103 receipts and add sm_100 ones.
 # ──────────────────────────────────────────────────────────────────────────
 #
 # STATEFUL ENTRIES. When an op's result depends on state that outlives the
