@@ -27,16 +27,29 @@ classification decides which kernels each module runs:
 Every other step (prefill, mixed steps, decode steps above those bounds) runs the **generic path**: this target's
 text model (`KimiLinearModel` below: decoder layers, attention residuals, the MLA / KDA / MoE runtimes), computed
 exactly as the built-in Kimi K3 text model computes it, on stock modules and ops that have no catalog entries yet.
-`UNCERTIFIED_GENERIC_CALLS` names them. The **fused decode path** runs the steps `decode_step` classifies on the K3
-decode kernels' catalog entries. The state those
-kernels share (MNNVL workspace, sandwich and MoE Lamport buffers, KDA / MLA scratch) lives in typed objects this
-target creates collectively in `post_load_weights`, before any graph capture. Until those entries exist
-`_fused_decode` stays None, and every step takes the generic path.
+`UNCERTIFIED_GENERIC_CALLS` names them.
+
+The text model hands each step's classification to its attention modules, which run a **decode step** on the K3
+decode kernels' catalog entries:
+
+* KDA (`K3DecodeKDA`): one token per request, the fused input projection and the plain decode in one
+  `ssm/k3_kda_decode_attn` launch. Verify tokens (DFlash / DSpark at an even verify width up to 8): the cache manager
+  then keeps the KDA state after every verify token, and every verify of the layer, on any step, runs the kernels
+  that keep it: `ssm/k3_kda_attn` for one request of 8 tokens (the projection fused in), else `ssm/k3_kda_verify`.
+* MLA (`K3DecodeMLA`): `attention/k3_mla_qkv` (the query path and the step's latent KV rows into the paged cache),
+  then `attention/k3_mla_attn_vb_out` (the attention, v_b and the output gate in one launch).
+
+The state those kernels share (the KDA projection's Lamport buffers, the MLA attention workspace) lives in typed
+objects this target creates in `post_load_weights`, before any graph capture. The token-count kernels (the decode
+GEMVs, the MoE front and routed experts, the sandwiches, the embedding and residual epilogues) come with their own
+entries; until then every module but the attention runs the generic path on every step, as do the projections around
+the attention kernels (the [W_a; W_g] and verify-row GEMMs, `o_proj` and its all-reduce).
 
 **What this target asserts rather than adapts**: SM 10.0; the topology above; bf16 weights and a bf16 KV pool;
 tokens_per_block 64 (the MLA generation kernels K3's 96 heads reach exist only at 64); the V2 hybrid KV / state
-manager, which holds the KDA states, with block reuse off; an all-reduce strategy of AUTO or MNNVL. The
-construction-time ones fail in `__init__`, the per-engine ones on the first forward, each naming the setting.
+manager, which holds the KDA states, with block reuse off and fp32 recurrent states; an all-reduce strategy of AUTO or
+MNNVL. The construction-time ones fail in `__init__`, the per-engine ones on the first forward, each naming the
+setting. A layer the decode kernels do not take fails the weight load.
 
 **Text only.** The checkpoint is the vision-language wrapper. This target builds and loads no vision tower (its
 weights are a predicted non-load, `weights.py`), and a step carrying multimodal input raises.
@@ -56,13 +69,28 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, NamedTuple, Opti
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_mla_attn_vb_out import (
+    k3_mla_attn_vb_out,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_mla_attn_workspace import (
+    K3MlaAttnWorkspace,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_mla_qkv import k3_mla_qkv
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_attn import k3_kda_attn
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_buffers import K3KdaBuffers
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_decode_attn import (
+    k3_kda_decode_attn,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_verify import k3_kda_verify
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import k3_mla_decode_view
 from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, register_auto_model
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.modules.kimi_k3_mla import KimiK3MLAAttention
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -75,6 +103,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.functional import AllReduceStrategy
@@ -94,8 +123,8 @@ if TYPE_CHECKING:
 _SM = (10, 0)
 
 #: Every trtllm op this target reaches for, in its forward and in the weight load. Declared here, asserted in
-#: tests/unittest/_torch/modeling_v2. Today these are the K3-specific ops of the generic path (attention residuals,
-#: KDA, the router and fused-A GEMMs); the fused decode path adds its own.
+#: tests/unittest/_torch/modeling_v2: the K3-specific ops of the generic path (attention residuals, KDA, the router
+#: and fused-A GEMMs), then the decode kernels'.
 REQUIRED_TRTLLM_OPS = (
     "attn_res_fwd",
     "attn_res_rmsnorm_fwd",
@@ -106,6 +135,11 @@ REQUIRED_TRTLLM_OPS = (
     "kda_mtp_decode",
     "dsv3_router_gemm_op",
     "dsv3_fused_a_gemm_op",
+    "k3_kda_decode_attn",
+    "k3_kda_attn",
+    "k3_kda_verify",
+    "k3_mla_qkv",
+    "k3_mla_attn_vb_out",
     # The decode path's GEMVs, LM head and embedding (decode_gemv.py).
     "k3_decode_gemv",
     "k3_ctm_gemv_wide",
@@ -125,19 +159,26 @@ REQUIRED_ENGINE_FIELDS = {
         "seq_lens",
         "tokens_per_block",
         "kv_cache_manager",
+        "mamba_metadata",
     ),
-    "kv_cache_manager": ("enable_block_reuse",),
+    "kv_cache_manager": ("enable_block_reuse", "mamba_layer_cache"),
 }
 
-#: Calls the generic path makes outside the catalog, declared so they are not consumed silently. A call leaves this
-#: list when a catalog entry replaces it.
+#: Stock code the generic path runs outside the catalog, declared so it is not consumed silently: every
+#: tensorrt_llm import of this module that computes (test_modeling_v2_claims.py checks the list both ways). An entry
+#: leaves the list when a catalog entry replaces it.
 UNCERTIFIED_GENERIC_CALLS = (
-    # The checkpoint load and the engine hooks this target inherits.
+    # The checkpoint load and the engine hooks this target inherits, and the causal LM around the text model.
     "tensorrt_llm._torch.models.modeling_kimi_linear.KimiLinearForCausalLM",
+    "tensorrt_llm._torch.models.modeling_speculative.SpecDecOneEngineForCausalLM",
+    "tensorrt_llm._torch.models.modeling_utils.DecoderModel",
     # The text model's stock modules.
     "tensorrt_llm._torch.modules.kimi_kda.KimiKDALinearAttention",
     "tensorrt_llm._torch.modules.kimi_k3_mla.KimiK3MLAAttention",
     "tensorrt_llm._torch.moe.fused_moe.create_moe",
+    "tensorrt_llm._torch.moe.fused_moe.ConfigurableMoE",
+    "tensorrt_llm._torch.moe.fused_moe.TRTLLMGenFusedMoE",
+    "tensorrt_llm._torch.moe.fused_moe.routing.DeepSeekV3MoeRoutingMethod",
     "tensorrt_llm._torch.modules.gated_mlp.GatedMLP",
     "tensorrt_llm._torch.modules.situ.SituAndMul",
     "tensorrt_llm._torch.modules.rms_norm.RMSNorm",
@@ -160,7 +201,8 @@ _LANG_PREFIX = "language_model."
 
 # ----------------------------------------------------------------------------------------------------------------------
 # The text model: Kimi K3's decoder (93 layers: KDA / MLA attention, attention residuals, the dense layer-0 MLP and
-# the latent MoE), its generic path.
+# the latent MoE), its generic path. Each step's classification goes to the attention modules (`K3DecodeKDA`,
+# `K3DecodeMLA` below).
 # ----------------------------------------------------------------------------------------------------------------------
 
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
@@ -1230,8 +1272,6 @@ class KimiMLARuntime(nn.Module):
     ) -> None:
         super().__init__()
 
-        from tensorrt_llm._torch.modules.kimi_k3_mla import KimiK3MLAAttention
-
         max_positions = int(
             os.environ.get(
                 _KIMI_K3_MLA_MAX_POSITIONS_ENV,
@@ -1275,7 +1315,7 @@ class KimiMLARuntime(nn.Module):
             else None
         )
         attention_config._frozen = model_config._frozen
-        self.mixer = KimiK3MLAAttention(
+        self.mixer = K3DecodeMLA(
             hidden_size=cfg.hidden_size,
             num_heads=cfg.num_attention_heads,
             q_lora_rank=cfg.q_lora_rank,
@@ -1294,10 +1334,13 @@ class KimiMLARuntime(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        step: Optional[DecodeStep] = None,
     ) -> torch.Tensor:
         # MLA.forward takes position_ids first; K3 is NoPE, so pass None.
-        out = self.mixer(None, hidden_states, attn_metadata)
+        out = self.mixer(None, hidden_states, attn_metadata, step=step)
         if self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.
@@ -1332,7 +1375,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 for name in projection_names
             }
             attention_config._frozen = model_config._frozen
-            self.linear_attn = KimiKDALinearAttention(
+            self.linear_attn = K3DecodeKDA(
                 cfg,
                 layer_idx,
                 mapping=model_config.mapping,
@@ -1423,6 +1466,7 @@ class KimiLinearDecoderLayer(nn.Module):
         num_snapshots: int,
         attn_metadata: AttentionMetadata,
         capture: Optional[Tuple[Any, int]] = None,
+        step: Optional[DecodeStep] = None,
         prenormed: bool = False,
     ) -> Tuple[torch.Tensor, int]:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
@@ -1437,6 +1481,9 @@ class KimiLinearDecoderLayer(nn.Module):
         below already is it. Reading it here beats recomputing it, and is only
         possible because K3 asserts pp_size == 1 -- layer j+1 is always local.
         PP support would need a recompute at the rank boundary.
+
+        ``step`` is the step's classification (``decode_step``), handed to the
+        attention module.
 
         ``prenormed`` (layer 0 on a decode step): ``hidden_states`` already is
         this layer's input norm, and the layer's input, the step's embedding,
@@ -1482,9 +1529,9 @@ class KimiLinearDecoderLayer(nn.Module):
             valid_block_residual = block_residual[:num_snapshots]
             prefix_sum = None
         if self.is_kda:
-            hidden_states = self.linear_attn(hidden_states, attn_metadata)
+            hidden_states = self.linear_attn(hidden_states, attn_metadata, step=step)
         else:
-            hidden_states = self.self_attn(hidden_states, attn_metadata)
+            hidden_states = self.self_attn(hidden_states, attn_metadata, step=step)
 
         if prefix_sum is None:
             prefix_sum = hidden_states
@@ -1579,6 +1626,20 @@ class KimiLinearModel(DecoderModel):
             key="kimi_k3_aux_capture_mode",
         )
 
+    @property
+    def kda_token_states(self) -> bool:
+        """Whether the hybrid cache manager keeps the KDA state after every verify token, the protocol of
+        ``ssm/k3_kda_verify`` and ``ssm/k3_kda_attn``. The engine reads it once the weights are loaded, to build the
+        manager: DFlash / DSpark drafts of an even verify width up to 8, every KDA layer taking the K3 kernels.
+        Otherwise the KDA verify replays the accepted drafts (the built-in verify)."""
+        spec_config = getattr(self.model_config, "spec_config", None)
+        return bool(
+            spec_config is not None
+            and (spec_config.spec_dec_mode.is_dflash() or spec_config.spec_dec_mode.is_dspark())
+            and spec_config.tokens_per_gen_step in (2, 4, 6, 8)
+            and all(layer.linear_attn.takes_k3_kernels for layer in self.layers if layer.is_kda)
+        )
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1648,6 +1709,7 @@ class KimiLinearModel(DecoderModel):
                 num_snapshots,
                 attn_metadata,
                 capture=capture,
+                step=step,
                 prenormed=i == 0 and prenormed is not None,
             )
 
@@ -1678,6 +1740,332 @@ class KimiLinearModel(DecoderModel):
             self.output_attn_res_norm,
             self.norm,
         )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# The attention modules: the built-in KDA and MLA modules, with the steps the decode kernels take on those kernels.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+class K3DecodeKDA(KimiKDALinearAttention):
+    """Kimi K3's KDA attention: the built-in module, with the decode kernels on the steps they take.
+
+    * A decode step of one token per request runs the fused input projection and the plain decode in one
+      ``ssm/k3_kda_decode_attn`` launch, then the module's ``o_proj`` and all-reduce.
+    * With the cache manager's per-token states (``KimiLinearModel.kda_token_states``), every verify of the layer, on
+      any step, runs the kernels that keep them: ``ssm/k3_kda_attn`` for one request of 8 tokens (the projection fused
+      in), else ``ssm/k3_kda_verify`` on the projection's rows. The built-in verify replays drafts from caches these
+      kernels do not fill, so the two never run on one manager.
+
+    Every other step runs the built-in module. The kernels read one ``[q | k | v | g | f_a | b]`` weight, built at the
+    checkpoint load from the module's own, and the device's ``K3KdaBuffers``, which the target sets in
+    ``post_load_weights``.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # The fused [q | k | v | g | f_a | b | pad] projection weight; the six projections' weights and the built-in
+        # fused [q | k | v | g] and [f_a | b | pad] ones are views of it.
+        self.k3_proj_weight: Optional[torch.Tensor] = None
+        # The fused projection's Lamport buffers: one set per device, shared by every KDA layer.
+        self.k3_buffers: Optional[K3KdaBuffers] = None
+
+    @property
+    def takes_k3_kernels(self) -> bool:
+        """Whether the decode kernels can run this layer: its fused projection weight is built."""
+        return self.k3_proj_weight is not None
+
+    def finalize_decode_weights(self) -> None:
+        """The built-in fused weights, then one ``[q | k | v | g | f_a | b | pad]`` weight of both."""
+        super().finalize_decode_weights()
+        assert (
+            self.use_full_rank_gate
+            and self.gate_lower_bound is not None
+            and self._qkvg_proj_weight is not None
+            and self._bfa_proj_weight is not None
+            and self._qkvg_proj_weight.dtype == self._bfa_proj_weight.dtype == torch.bfloat16
+        ), (
+            f"Kimi K3 KDA layer {self.layer_idx}: the decode kernels read the bf16 fused projections the built-in "
+            "module builds on CUDA at head dim 128, with a full-rank output gate and a gate lower bound"
+        )
+        rows = self._qkvg_proj_weight.shape[0]
+        with torch.no_grad():
+            fused = self._merge_projection_weights(
+                (self.q_proj, self.k_proj, self.v_proj, self.g_proj, self.f_a_proj, self.b_proj),
+                pad_rows_to=8,
+            )
+        self.k3_proj_weight = fused
+        self._qkvg_proj_weight, self._bfa_proj_weight = fused[:rows], fused[rows:]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        step: Optional[DecodeStep] = None,
+    ) -> torch.Tensor:
+        """The built-in forward, except on a decode step of one token per request."""
+        if (
+            step is not None
+            and step.decode
+            and step.tokens_per_request == 1
+            and self.takes_k3_kernels
+            and self.k3_buffers is not None
+            and not is_in_breakable_cuda_graph()
+        ):
+            return self._project_output(
+                self._k3_decode(hidden_states[: step.num_tokens], attn_metadata)
+            )
+        return super().forward(hidden_states, attn_metadata)
+
+    def _k3_decode(self, x: torch.Tensor, attn_metadata: AttentionMetadata) -> torch.Tensor:
+        """``ssm/k3_kda_decode_attn``: the core output ``[R, H, 128]`` of one token of each of the step's R requests;
+        each slot's conv window and state advance in place."""
+        mamba_metadata = attn_metadata.mamba_metadata
+        slots = getattr(mamba_metadata, "generation_state_indices", None)
+        if slots is None:
+            slots = mamba_metadata.state_indices[: x.shape[0]]
+        layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
+        w_q, w_k, w_v = self._get_mtp_conv_weights()
+        core = k3_kda_decode_attn(
+            x.contiguous(),
+            self.k3_proj_weight,
+            self.f_b_proj.weight,
+            w_q,
+            w_k,
+            w_v,
+            self._A_log_f32,
+            self._dt_bias_f32,
+            self._onorm_w_f32,
+            layer_cache.conv,
+            layer_cache.temporal,
+            slots,
+            self.k3_buffers,
+            float(self.gate_lower_bound),
+            self.head_k_dim**-0.5,
+            float(self.o_norm.eps),
+        )
+        # Speculative decoding's replay caches keep their committed conv window in step with the pool's.
+        self._sync_kda_replay_conv_window(layer_cache, slots, layer_cache.conv)
+        return core
+
+    def forward_verify(
+        self,
+        x2d,
+        num_steps,
+        layer_cache,
+        conv_pool,
+        ssm_pool,
+        slot_indices,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """The built-in verify, unless the cache manager keeps the per-token states; then the decode kernels'."""
+        if not (layer_cache.has_kda_replay_caches and layer_cache.kda_state_tok is not None):
+            return super().forward_verify(
+                x2d, num_steps, layer_cache, conv_pool, ssm_pool, slot_indices, output=output
+            )
+        assert self.takes_k3_kernels and self.k3_buffers is not None, (
+            f"Kimi K3 KDA layer {self.layer_idx}: the cache manager keeps the per-token verify states, which only "
+            "the decode kernels write, and this layer has no fused projection weight or buffers"
+        )
+        core = self._k3_verify(x2d, num_steps, layer_cache, ssm_pool, slot_indices)
+        return self._store_core(core, output)
+
+    def _k3_verify(self, x, num_steps, layer_cache, ssm_pool, slot_indices) -> torch.Tensor:
+        """The core output ``[N T, H, 128]`` of N requests of T verify tokens: ``ssm/k3_kda_attn`` for one request of
+        8 tokens, else ``ssm/k3_kda_verify`` on the projection's rows. Each slot's state after the golden token, its
+        drafts' states and its conv window are written in place."""
+        num_requests = x.shape[0] // num_steps
+        slots = slot_indices[:num_requests]
+        w_q, w_k, w_v = self._get_mtp_conv_weights()
+        constants = (float(self.gate_lower_bound), self.head_k_dim**-0.5, float(self.o_norm.eps))
+        if num_requests == 1 and num_steps == 8:
+            out = k3_kda_attn(
+                x.contiguous(),
+                self.k3_proj_weight,
+                self.f_b_proj.weight,
+                w_q,
+                w_k,
+                w_v,
+                self._A_log_f32,
+                self._dt_bias_f32,
+                self._onorm_w_f32,
+                layer_cache.kda_conv_q,
+                layer_cache.kda_conv_k,
+                layer_cache.kda_conv_v,
+                ssm_pool,
+                layer_cache.kda_state_tok,
+                slots,
+                layer_cache.prev_num_accepted_tokens,
+                self.k3_buffers,
+                num_steps - 1,
+                *constants,
+            )
+        else:
+            out = k3_kda_verify(
+                torch.nn.functional.linear(x, self.k3_proj_weight),
+                self.f_b_proj.weight,
+                w_q,
+                w_k,
+                w_v,
+                self._A_log_f32,
+                self._dt_bias_f32,
+                self._onorm_w_f32,
+                layer_cache.kda_conv_q,
+                layer_cache.kda_conv_k,
+                layer_cache.kda_conv_v,
+                ssm_pool,
+                layer_cache.kda_state_tok,
+                slots,
+                layer_cache.prev_num_accepted_tokens,
+                num_steps - 1,
+                *constants,
+            )
+        return out.view(-1, self.num_heads, self.head_dim)
+
+
+class K3DecodeMLA(KimiK3MLAAttention):
+    """Kimi K3's MLA attention: the built-in module, with a decode step's attention on the decode kernels.
+
+    A decode step runs ``x [W_a; W_g]^T`` as one GEMM with the gate columns through a sigmoid, then
+    ``attention/k3_mla_qkv`` (the q_a / kv_a RMSNorms, q_b and the k_b absorption into the fused query, the step's
+    latent rows stored into the paged cache) and ``attention/k3_mla_attn_vb_out`` (the attention over the paged cache,
+    v_b and the output gate in one launch), then the module's ``o_proj``. Every other step, and a decode step whose
+    cache the kernels do not read (``k3_mla_decode_view`` says why), runs the built-in module.
+
+    ``[W_a; W_g]`` is built at load from the module's weights, which become views of it. The attention workspace is
+    the device's ``K3MlaAttnWorkspace``, which the target sets in ``post_load_weights``.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        # [W_a; W_g]: the fused q_a / kv_a projection's rows, then the output gate's.
+        self.k3_ag_weight: Optional[torch.Tensor] = None
+        # The decode attention's workspace: one per device, shared by every MLA layer.
+        self.k3_workspace: Optional[K3MlaAttnWorkspace] = None
+
+    def post_load_weights(self) -> None:
+        """The built-in post-load, then ``[W_a; W_g]`` (once: CUDA graphs captured since read it)."""
+        super().post_load_weights()
+        if self.k3_ag_weight is not None:
+            return
+        gaps = self._k3_layout_gaps()
+        assert not gaps, (
+            f"Kimi K3 MLA layer {self.layer_idx}: the decode kernels do not take {'; '.join(gaps)}"
+        )
+        qkv_a, gate = self.kv_a_proj_with_mqa, self.g_proj
+        rows = qkv_a.weight.shape[0]
+        with torch.no_grad():
+            fused = torch.cat([qkv_a.weight, gate.weight])
+        qkv_a.weight = nn.Parameter(fused[:rows], requires_grad=False)
+        gate.weight = nn.Parameter(fused[rows:], requires_grad=False)
+        self.k3_ag_weight = fused
+
+    def _k3_layout_gaps(self) -> list:
+        """What of this layer the decode kernels do not take (empty when they take all of it)."""
+        if not (self.use_output_gate and self.fuse_qkv_a_proj and not self.is_lite):
+            return ["a layer without the output gate or the fused q_a / kv_a projection"]
+        linears = (self.kv_a_proj_with_mqa, self.g_proj, self.q_b_proj, self.o_proj)
+        checks = (
+            (not self.mapping.has_cp_helix(), "helix context parallelism"),
+            (not self.apply_rotary_emb and not self.llama_4_scaling, "RoPE or llama-4 scaling"),
+            (self.sparse_attn_hooks is None, "sparse attention"),
+            (
+                self.kv_cache_dtype != "fp8_ds_mla"
+                and not getattr(self.mqa, "has_fp8_kv_cache", False)
+                and not getattr(self.mqa, "has_fp4_kv_cache", False),
+                "a quantized KV cache",
+            ),
+            (
+                all(m.weight.dtype == torch.bfloat16 and m.bias is None for m in linears)
+                and self.k_b_proj_trans.dtype == self.v_b_proj.dtype == torch.bfloat16,
+                "projections other than bf16 and unbiased",
+            ),
+            (
+                not getattr(self.q_a_layernorm, "is_nvfp4", False)
+                and not getattr(self.kv_a_layernorm, "use_gemma", False),
+                "an NVFP4 q_a norm or a Gemma kv_a norm",
+            ),
+            (
+                self.num_heads_tp % 6 == 0
+                and self.kv_lora_rank == 512
+                and self.qk_rope_head_dim == 64
+                and self.q_lora_rank == 1536,
+                f"{self.num_heads_tp} heads, latent {self.kv_lora_rank}, rope {self.qk_rope_head_dim}, "
+                f"q_lora {self.q_lora_rank}",
+            ),
+        )
+        return [why for ok, why in checks if not ok]
+
+    def forward(
+        self,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        all_reduce_params=None,
+        latent_cache_gen: Optional[torch.Tensor] = None,
+        step: Optional[DecodeStep] = None,
+    ) -> torch.Tensor:
+        """The built-in forward, except on a decode step whose cache the decode kernels read."""
+        view = None
+        if (
+            step is not None
+            and step.decode
+            and latent_cache_gen is None
+            and self.k3_ag_weight is not None
+            and self.k3_workspace is not None
+            and not is_in_breakable_cuda_graph()
+        ):
+            view = self._k3_decode_view(attn_metadata, step.num_tokens)
+        if view is None:
+            return super().forward(
+                position_ids, hidden_states, attn_metadata, all_reduce_params, latent_cache_gen
+            )
+        x = hidden_states[: step.num_tokens].contiguous()
+        rows = self.kv_a_proj_with_mqa.weight.shape[0]
+        ag = torch.nn.functional.linear(x, self.k3_ag_weight)
+        ag[:, rows:].sigmoid_()
+        fused_q = k3_mla_qkv(
+            ag,
+            self.q_a_layernorm.weight,
+            float(self.q_a_layernorm.variance_epsilon),
+            self.q_b_proj.weight,
+            self.k_b_proj_trans,
+            self.kv_a_layernorm.weight,
+            float(self.kv_a_layernorm.variance_epsilon),
+            view["pool"],
+            view["row_stride"],
+            view["page_table"],
+            view["page_offset"],
+            view["seq_len"],
+        )
+        attn_output = self.create_output(x, 0)
+        k3_mla_attn_vb_out(
+            fused_q,
+            view["pool"],
+            view["row_stride"],
+            view["page_table"],
+            view["page_offset"],
+            view["seq_len"],
+            view["softmax_scale"],
+            self.v_b_proj,
+            attn_output,
+            self.k3_workspace,
+            gate=ag,
+            gate_col0=rows,
+        )
+        return self._project_output([attn_output], position_ids, attn_metadata, all_reduce_params)
+
+    def _k3_decode_view(self, attn_metadata: AttentionMetadata, num_tokens: int) -> Optional[dict]:
+        """The paged latent cache as the decode kernels read it this step, or None when they do not read it (the
+        reason is logged once)."""
+        view = k3_mla_decode_view(self.mqa, attn_metadata, num_tokens)
+        if isinstance(view, str):
+            logger.info_once(
+                f"Kimi K3 MLA: the built-in path for a decode step the decode kernels do not read ({view})",
+                key=f"k3_mla_decode_view_{view}",
+            )
+            return None
+        return view
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -1855,9 +2243,6 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
         draft_model = getattr(self, "draft_model", None)
         if getattr(draft_model, "logits_processor", None) is stock_logits_processor:
             draft_model.logits_processor = self.logits_processor
-        # The fused decode path and the state its kernels share, built in post_load_weights once the catalog entries
-        # it calls exist. None: every step takes the generic path.
-        self._fused_decode = None
         # The executor reads generation settings (eos_token_id, ...) off the model config the engine holds, which
         # must therefore be the text config, as the built-in wrapper leaves it.
         model_config._frozen = False
@@ -1874,6 +2259,27 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
         gemvs = _decode_gemv.K3DecodeGemvs.create(self.lm_head)
         self.model.decode_gemvs = gemvs
         self.logits_processor.gemvs = gemvs
+
+    def post_load_weights(self) -> None:
+        """The state the decode kernels share, built once per device before any CUDA-graph capture and handed to
+        every layer of its kind: the KDA projection's Lamport buffers and the MLA decode attention's workspace."""
+        super().post_load_weights()
+        kda = [layer.linear_attn for layer in self.model.layers if layer.is_kda]
+        mla = [layer.self_attn.mixer for layer in self.model.layers if not layer.is_kda]
+        if kda[0].k3_buffers is not None:
+            return  # built by an earlier call; CUDA graphs captured since hold it
+        device = self.model.embed_tokens.weight.device
+        buffers = K3KdaBuffers.create(device)
+        workspace = K3MlaAttnWorkspace.create(device, mla[0].num_heads_tp // 6)
+        for module in kda:
+            module.k3_buffers = buffers
+        for module in mla:
+            module.k3_workspace = workspace
+        logger.info(
+            "Kimi K3 decode kernels: KDA on k3_kda_decode_attn, k3_kda_attn and k3_kda_verify "
+            f"({sum(m.takes_k3_kernels for m in kda)} / {len(kda)} layers take them), MLA on k3_mla_qkv and "
+            f"k3_mla_attn_vb_out ({len(mla)} layers)"
+        )
 
     def _check_step_contract(self, attn_metadata: AttentionMetadata) -> None:
         """First-forward checks of the engine surface and the per-engine settings."""
@@ -1901,6 +2307,12 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
         assert not manager.enable_block_reuse, (
             "this target runs with kv_cache_config.enable_block_reuse false; the engine enabled it"
         )
+        kda_layer = next(layer.layer_idx for layer in self.model.layers if layer.is_kda)
+        state_dtype = manager.mamba_layer_cache(kda_layer).temporal.dtype
+        assert state_dtype == torch.float32, (
+            "this target's KDA kernels keep fp32 recurrent states (kv_cache_config.mamba_ssm_cache_dtype float32 or "
+            f"auto); the engine built a {state_dtype} state pool"
+        )
         self._step_checked = True
 
     def forward(
@@ -1920,19 +2332,6 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
             )
         if not self._step_checked:
             self._check_step_contract(attn_metadata)
-        if self._fused_decode is not None:
-            rows = input_ids if input_ids is not None else inputs_embeds
-            step = None if rows is None else decode_step(attn_metadata, rows.shape[0])
-            if step is not None:
-                return self._fused_decode(
-                    step,
-                    attn_metadata=attn_metadata,
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    spec_metadata=spec_metadata,
-                    resource_manager=resource_manager,
-                    **kwargs,
-                )
         return super().forward(
             attn_metadata,
             input_ids,

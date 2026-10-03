@@ -330,6 +330,14 @@ class BaseMambaCacheManager(ABC):
         """Whether KDA fused verification owns per-slot replay caches."""
         return getattr(self, "_use_kda_replay_update", False)
 
+    @property
+    def keeps_kda_token_states(self) -> bool:
+        """Whether the KDA replay caches come with the state after every
+        draft of the last verify round (``kda_state_tok``), so that a verify
+        kernel can start the next round from the state after the accepted
+        drafts instead of replaying them."""
+        return False
+
     @abstractmethod
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         """Return conv states for specific layer.
@@ -438,6 +446,14 @@ class PythonMambaCacheManager(BaseResourceManager):
         kda_qkg_cache: torch.Tensor | None = None
         kda_v_cache: torch.Tensor | None = None
         kda_beta_cache: torch.Tensor | None = None
+        # Optional: the state after every draft of the last verify round,
+        # [slots, num_spec, H, V, K] fp32 (the SSM pool holds the state
+        # after the round's first, non-draft token). A verify kernel starts
+        # the next round from entry n - 1 when the round accepted n > 0
+        # drafts (prev_num_accepted_tokens) instead of replaying them from
+        # the caches above; a slot reset for a new request has n = 0, so a
+        # previous owner's entries are never read.
+        kda_state_tok: torch.Tensor | None = None
 
         # Replay path: compact double-buffered cache
         # prev_num_accepted_tokens: # accepted tokens (always >= 1 if drafting).
@@ -3024,6 +3040,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c",
         kda_replay_num_spec: Optional[int] = None,
         qwen4_exp_ple_cache_params: Optional["Qwen4ExpPLECacheParams"] = None,
+        kda_token_states: bool = False,
         **kwargs,
     ) -> None:
         if conv_state_layout not in ("x_b_c", "q_k_v"):
@@ -3040,6 +3057,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._kda_replay_num_spec = kda_replay_num_spec
         self._use_kda_replay_update = kda_replay_num_spec is not None
+        # Only with the KDA replay caches: also keep the state after every
+        # verify token (kda_state_tok).
+        self._kda_token_states = kda_token_states and self._use_kda_replay_update
         if self._use_kda_replay_update:
             if use_replay_state_update:
                 raise ValueError(
@@ -3420,6 +3440,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:
         return getattr(self, "_use_gdn_cached_replay_all_layer_commit", False)
 
+    @property
+    def keeps_kda_token_states(self) -> bool:
+        return getattr(self, "kda_state_tok", None) is not None
+
     def _setup_mtp_intermediate_states(self, spec_config,
                                        max_batch_size: int) -> None:
         if not self.use_kda_replay_update:
@@ -3450,6 +3474,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.kda_qkg_cache = None
         self.kda_v_cache = None
         self.kda_beta_cache = None
+        self.kda_state_tok = None
 
         if (not self.use_kda_replay_update or self.local_num_mamba_layers == 0):
             return allocated
@@ -3504,8 +3529,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
              self.ssm_state_shape[0]),
             device,
         )
+        if self._kda_token_states:
+            self.kda_state_tok = torch.zeros(
+                (self.local_num_mamba_layers, cache_size, num_spec,
+                 *self.ssm_state_shape),
+                dtype=torch.float32,
+                device=device,
+            )
+        per_token = (", with per-token states"
+                     if self.kda_state_tok is not None else "")
         logger.info("Mamba Cache (kda-replay) is allocated for "
-                    f"{cache_size} state slots")
+                    f"{cache_size} state slots{per_token}")
         return True
 
     def _commit_gdn_cached_replay_history_layers(
@@ -3801,6 +3835,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _mamba_state_bytes_per_slot(self) -> int:
         base_bytes = self.local_num_mamba_layers * (self.ssm_bytes +
                                                     self.conv_bytes)
+        if getattr(self, "_kda_token_states", False):
+            # kda_state_tok: an fp32 SSM state per draft of every slot.
+            base_bytes += (self.local_num_mamba_layers *
+                           self._kda_replay_num_spec *
+                           math.prod(self.ssm_state_shape) *
+                           torch.float32.itemsize)
         local_ple_layers = sum(layer_id in self.pp_layers
                                for layer_id in self._ple_layer_ids)
         if local_ple_layers == 0:
@@ -3945,6 +3985,32 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             state_quota + attention_block_quota,
         )
 
+    def _ssm_pool_at_live_floor(self, kv_cache_config: KvCacheConfig) -> bool:
+        """Whether the SSM pool group keeps only its min-slots floor (one slot
+        per resident sequence plus the reserved dummies) instead of its share
+        of the typical step's ratio.
+
+        With per-token KDA states, ``kda_state_tok`` takes num_spec states per
+        SSM slot outside the cache quota (``_allocate_pool_replay_buffers``),
+        addressed by the request's SSM slot. Without block reuse no SSM slot
+        holds anything but a live request or a reserved dummy, so slots past
+        the floor are never used and would only add that memory.
+        """
+        return (getattr(self, "_kda_token_states", False)
+                and self.local_num_mamba_layers > 0
+                and not kv_cache_config.enable_block_reuse
+                and self._attention_cache_bytes_per_token() > 0)
+
+    def _quota_filling_request_capacity(self, gpu_quota: int) -> int:
+        """A typical request capacity whose resident requests' attention pages
+        alone take ``gpu_quota``. The typical step's ratio then gives the SSM
+        pool group fewer slots than its floor, so the min-slots constraint
+        sets its size and attention gets the rest of the quota."""
+        bytes_per_token = (self._max_resident_sequences() *
+                           self._attention_cache_bytes_per_token())
+        # KVCacheDesc.capacity is a 32-bit int.
+        return min(-(-gpu_quota // bytes_per_token), 1 << 30)
+
     def _build_cache_config(
             self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         kv_cache_config = self.kv_cache_config
@@ -3990,6 +4056,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if config.initial_pool_ratio is None:
             typical_capacity = self._get_typical_request_capacity(
                 kv_cache_config)
+            if self._ssm_pool_at_live_floor(kv_cache_config):
+                typical_capacity = max(
+                    typical_capacity,
+                    self._quota_filling_request_capacity(gpu_quota))
             request_descs = self._typical_request_descs(typical_capacity,
                                                         kv_cache_config)
             typical_step = BatchDesc(request_descs *
@@ -4285,16 +4355,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         destination_slots = torch.tensor([new for _, new in moves],
                                          dtype=torch.long,
                                          device=device)
-        replay_buffers = (
+        replay_buffers = [
             self.kda_conv_q,
             self.kda_conv_k,
             self.kda_conv_v,
             self.kda_qkg_cache,
             self.kda_v_cache,
             self.kda_beta_cache,
-        )
+        ]
+        assert all(replay_buffer is not None
+                   for replay_buffer in replay_buffers)
+        # The per-token verify states belong to the slot as well.
+        if self.kda_state_tok is not None:
+            replay_buffers.append(self.kda_state_tok)
         for replay_buffer in replay_buffers:
-            assert replay_buffer is not None
             replay_buffer.index_copy_(
                 1,
                 destination_slots,
@@ -4498,6 +4572,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             "kda_v_cache": self.kda_v_cache[layer_offset],
             "kda_beta_cache": self.kda_beta_cache[layer_offset],
         }
+        if self.kda_state_tok is not None:
+            spec_kwargs["kda_state_tok"] = self.kda_state_tok[layer_offset]
         if self.mamba_ssm_rand_seed is not None:
             spec_kwargs["mamba_ssm_rand_seed"] = self.mamba_ssm_rand_seed
         return PythonMambaCacheManager.SpeculativeState(
@@ -4781,4 +4857,5 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.kda_qkg_cache = None
         self.kda_v_cache = None
         self.kda_beta_cache = None
+        self.kda_state_tok = None
         super().shutdown()

@@ -400,6 +400,17 @@ l0_b200:
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_public_visual_gen_api_smoke TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (30)
+  # ------------- Kimi K3 KDA / MLA decode kernels (sm_100) and their modeling_v2 entries ---------------
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_kda_attn.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_kda_decode_attn.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_kda_pools_past_2g.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_kda_verify.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_attn.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_q.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_decode_view.py
+  - unittest/_torch/modeling_v2/ssm
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_mla_qkv.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_mla_attn_vb_out.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
