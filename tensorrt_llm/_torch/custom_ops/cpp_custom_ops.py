@@ -133,7 +133,8 @@ def _register_fake():
         return [
             input.new_empty((num_tokens, world_size * bf16_columns),
                             dtype=torch.bfloat16),
-            input.new_empty((num_tokens, world_size * (columns - bf16_columns))),
+            input.new_empty(
+                (num_tokens, world_size * (columns - bf16_columns))),
         ]
 
     # MNNVL Allreduce
