@@ -1613,14 +1613,14 @@ class Qwen2_5_VLVisionAttention(Attention):
         k = k.view(seq_len, -1, self.head_dim)
         v = v.view(seq_len, -1, self.head_dim)
         if _flash_attn_apply_rotary is None:
-            q = RotaryEmbedding.apply_rotary_pos_emb(q.unsqueeze(0),
-                                                     cos,
-                                                     sin,
-                                                     unsqueeze_dim=1).squeeze(0)
-            k = RotaryEmbedding.apply_rotary_pos_emb(k.unsqueeze(0),
-                                                     cos,
-                                                     sin,
-                                                     unsqueeze_dim=1).squeeze(0)
+            # Rotate in place, like the FlashInfer and flash_attn paths, so
+            # `forward` can pass the fused QKV projection buffer directly.
+            q.copy_(
+                RotaryEmbedding.apply_rotary_pos_emb(
+                    q.unsqueeze(0), cos, sin, unsqueeze_dim=1).squeeze(0))
+            k.copy_(
+                RotaryEmbedding.apply_rotary_pos_emb(
+                    k.unsqueeze(0), cos, sin, unsqueeze_dim=1).squeeze(0))
         else:
             # flash_attn Triton kernel: single launch per tensor. cos/sin
             # are expected as `[seqlen, head_dim/2]`. The PyTorch path
@@ -1661,7 +1661,10 @@ class Qwen2_5_VLVisionAttention(Attention):
         q, k, v = self.split_qkv(q, k, v)
 
         q, k, v = self.apply_rope(q, k, v, position_ids, position_embeddings)
-        q, k, v = self.convert_qkv(q, k, v)
+        if self.support_fused_qkv:
+            # RoPE updates Q/K in their views of the fused projection. Reuse
+            # that buffer instead of copying Q/K/V back together every layer.
+            q, k, v = qkv, None, None
 
         output = self.forward_impl(
             q=q,
@@ -2060,7 +2063,17 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor,
                 **kwargs) -> torch.Tensor:
 
-        hidden_states = self.patch_embed(pixel_values)
+        # `patch_embed.proj` is a Conv3d with kernel_size == stride == one
+        # patch, and each row of `pixel_values` is one flattened patch, so the
+        # convolution is exactly a linear projection with the same weight and
+        # bias. Run it as a GEMM, which is much faster than the Conv3d kernel.
+        patch_weight = self.patch_embed.proj.weight
+        hidden_states = F.linear(
+            pixel_values.reshape(-1, patch_weight[0].numel()).to(
+                patch_weight.dtype),
+            patch_weight.flatten(1),
+            self.patch_embed.proj.bias,
+        )
 
         seq_len, _ = hidden_states.size()
         grid_rows = grid_thw.tolist()

@@ -507,6 +507,45 @@ def test_qwen3_vision_prepare_metadata_passes_fixed_max_seq_len(
     assert calls == [(seq_lens, metadata, fixed_max_seq_len)]
 
 
+@pytest.mark.cpu_only
+def test_qwen3_vision_patch_projection_matches_conv3d() -> None:
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionPatchEmbed
+
+    config = SimpleNamespace(
+        patch_size=4,
+        temporal_patch_size=2,
+        in_channels=3,
+        hidden_size=8,
+    )
+    patch_embed = Qwen3VLVisionPatchEmbed(config)
+    pixel_values = torch.randn(6, 3 * 2 * 4 * 4)
+    expected = patch_embed(pixel_values)
+    # The model must reuse the Conv3d parameters as a GEMM, not run the Conv3d.
+    patch_embed.proj.register_forward_pre_hook(
+        lambda module, args: pytest.fail("patch projection ran the Conv3d")
+    )
+
+    vision = Qwen3VisionModel.__new__(Qwen3VisionModel)
+    torch.nn.Module.__init__(vision)
+    vision.patch_embed = patch_embed
+    vision.attn_metadata = object()
+    vision._rope_position_ids_buffer = None
+    vision.rot_pos_emb = lambda grid: (
+        torch.empty(6, 0),
+        torch.empty(6, 0),
+    )
+    vision.fast_pos_embed_interpolate = lambda grid: torch.zeros_like(expected)
+    vision.prepare_attn_metadata = lambda seq_lens, metadata: metadata
+    vision.blocks = torch.nn.ModuleList()
+    vision._deepstack_layer_to_merger_idx = {}
+    vision.merger = torch.nn.Identity()
+
+    actual, deepstack = vision(pixel_values, torch.tensor([[1, 2, 3]]))
+
+    torch.testing.assert_close(actual, expected)
+    assert deepstack == []
+
+
 def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:
     max_pixels = 16_777_216
     expected_max_tokens_per_item = {"image": 65_536}
