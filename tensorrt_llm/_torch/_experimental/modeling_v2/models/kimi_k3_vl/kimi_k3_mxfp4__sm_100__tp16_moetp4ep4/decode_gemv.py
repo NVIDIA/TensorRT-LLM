@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """The decode path's GEMVs, LM head and embedding on the catalog's single-GPU Kimi K3 entries.
 
-* **Per-site GEMVs** (`K3DecodeGemvs.project`): an MLA projection of at most `MAX_ROWS` rows runs on the kernel
-  measured fastest at its weight shape at every row count 1..8 (`SITES`): `gemm/k3_decode_gemv` for the fused
-  q_a / kv_a projection, `gemm/k3_ctm_gemv_wide` for q_b and the output gate.
+* **Per-site GEMVs** (`K3DecodeGemvs.project`): a projection of a decode step runs on the kernel measured fastest
+  at its call site's weight shape (`SITES`): at most `MAX_ROWS` rows on `gemm/k3_decode_gemv`,
+  `gemm/k3_ctm_gemv_wide` or `gemm/k3_ctm_gemv_long`, and, where the site lists it, up to `WIDE_ROWS` rows on
+  `gemm/k3_ctm_gemv_wide`. The sites are the decode kernels' fused projections (MLA's [W_a; W_g] with the gate rows
+  through a sigmoid, KDA's [q | k | v | g | f_a | b]), the attention output projection, and the built-in MLA path's
+  q_a / kv_a, q_b and gate projections.
 * **LM head** (`K3LogitsProcessor`): at most `MAX_ROWS` rows of this rank's vocabulary shard on
   `gemm/k3_head_gemv` over the target's `K3HeadGemvWorkspace`, then the shards gathered (`comm/allgather`) as the
   stock head gathers them. It is the shell's logits processor, so the speculative worker's target logits and the
@@ -25,12 +28,17 @@ stream: the logits are computed on the model's stream (see the `gemm/k3_head_gem
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Set, Tuple
+import math
+from dataclasses import dataclass
+from typing import Dict, Iterable, Optional, Set
 
 import torch
 from torch import nn
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import allgather
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_long import (
+    k3_ctm_gemv_long,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_wide import (
     k3_ctm_gemv_wide,
 )
@@ -51,18 +59,76 @@ from tensorrt_llm._torch.cute_dsl_kernels.k3_head_gemv import op as _head_op
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import mpi_disabled
 
-# The row limit of the decode GEMV and head kernels (one token tile).
+# The row limit of the decode GEMV and head kernels (one token tile), and of k3_ctm_gemv_wide (a decode step of 8
+# requests of 8 tokens).
 MAX_ROWS = 8
+WIDE_ROWS = 64
 
-#: Site -> (N, K) of its weight at this target's per-rank shapes, and the kernel that runs it at 1..MAX_ROWS rows.
-SITES: Dict[str, Tuple[int, int, str]] = {
-    # MLA kv_a_proj_with_mqa: [q_a 1536 | kv_a 512 | k_pe 64] of the hidden size.
-    "kv_a": (2112, 7168, "decode"),
-    # MLA q_b_proj: 6 heads x 192 of q_lora_rank.
-    "q_b": (1152, 1536, "wide"),
-    # MLA output gate: 6 heads x 128 of the hidden size.
-    "g_proj": (768, 7168, "wide"),
+
+@dataclass(frozen=True)
+class Site:
+    """A call site's weight shape (this target's per-rank shapes) and its kernels: ``small`` at 1..MAX_ROWS rows
+    ("decode", "wide" or "long"), and k3_ctm_gemv_wide at MAX_ROWS+1..WIDE_ROWS rows where ``wide``. Output columns
+    from ``sig_col0`` on are stored through a sigmoid. ``split`` / ``ring``: k3_ctm_gemv_long's CTAs per 128-row
+    weight tile and weight-ring stages."""
+
+    n: int
+    k: int
+    small: str
+    wide: bool = False
+    sig_col0: int = -1
+    split: int = 0
+    ring: int = 0
+
+
+SITES: Dict[str, Site] = {
+    # MLA's [W_a; W_g] on a decode step: [q_a 1536 | kv_a 512 | k_pe 64] then the output gate (6 heads x 128),
+    # the gate rows through a sigmoid.
+    "mla_ag": Site(2880, 7168, "long", wide=True, sig_col0=2112, split=6, ring=6),
+    # KDA's [q | k | v | g | f_a | b] on a decode step (6 heads x 128 each, then 128 and 6, padded to 3208 rows).
+    "kda_proj": Site(3208, 7168, "long", wide=True, split=5, ring=6),
+    # The attention output projection (row parallel; 6 heads x 128 in).
+    "o_proj": Site(7168, 768, "decode", wide=True),
+    # The built-in MLA path's projections: kv_a_proj_with_mqa, q_b_proj and the output gate.
+    "kv_a": Site(2112, 7168, "decode"),
+    "q_b": Site(1152, 1536, "wide"),
+    "g_proj": Site(768, 7168, "wide"),
 }
+
+
+def _wide_tile(rows: int) -> int:
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_ctm_gemv import k3_ctm_gemv_kernel
+
+    return k3_ctm_gemv_kernel.wide_tile(rows)
+
+
+def _run(
+    spec: Site, kernel: str, x2d: torch.Tensor, weight: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """``spec``'s ``kernel`` on dense rows ``x2d``, or None where it does not take them."""
+    if kernel == "decode":
+        if spec.sig_col0 >= 0 or not _decode_op.supports(x2d, weight):
+            return None
+        return k3_decode_gemv(x2d, weight)
+    if kernel == "wide":
+        if not _ctm_op.supports_wide(x2d, weight, spec.sig_col0, False):
+            return None
+        return k3_ctm_gemv_wide(x2d, weight, sig_col0=spec.sig_col0)
+    # One wave of the GPU's SMs: beyond it the long GEMV loses to the others.
+    sms = torch.cuda.get_device_properties(x2d.device).multi_processor_count
+    if math.ceil(spec.n / 128) * spec.split > sms or not _ctm_op.supports_long(
+        x2d, weight, spec.split, spec.ring
+    ):
+        return None
+    return k3_ctm_gemv_long(
+        x2d,
+        weight,
+        sig_col0=spec.sig_col0,
+        split=spec.split,
+        ring=spec.ring,
+        trigger_early=True,
+        push=True,
+    )
 
 
 def _capturing() -> bool:
@@ -125,69 +191,81 @@ class K3DecodeGemvs:
 
     @classmethod
     def create(
-        cls, lm_head: Optional[nn.Module], site_weights: Dict[str, torch.Tensor]
+        cls,
+        lm_head: Optional[nn.Module] = None,
+        sites: Iterable[str] = tuple(SITES),
+        device: Optional[torch.device] = None,
     ) -> "K3DecodeGemvs":
-        """The state for ``lm_head`` and the site weights (one weight per `SITES` key; every weight of a site has its
-        shape). Eager: it allocates the head's workspace and runs each kernel once on a zero row, so they compile here
-        rather than under a capture. A site or head its kernel does not take keeps the generic path."""
+        """The state for ``lm_head`` and ``sites`` on ``device`` (default: the head's, else the current one). Eager:
+        it allocates the head's workspace and runs every kernel of every site once (each wide row class once) on
+        zero rows of a zero weight of the site's shape, so they compile here and not under a capture. A site or
+        head whose kernel does not take its shape keeps the generic path."""
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "K3DecodeGemvs.create allocates and compiles: run it before CUDA-graph capture"
             )
+        head_weight = getattr(lm_head, "weight", None) if lm_head is not None else None
+        if device is None:
+            device = (
+                head_weight.device
+                if isinstance(head_weight, torch.Tensor)
+                else torch.device("cuda", torch.cuda.current_device())
+            )
         state = cls()
-        for site, weight in site_weights.items():
-            state._project(site, weight.new_zeros(1, weight.shape[1]), weight, warm=True)
+        for site in sites:
+            spec = SITES[site]
+            weight = torch.zeros(spec.n, spec.k, dtype=torch.bfloat16, device=device)
+            for rows in (1, 16, 32, 64) if spec.wide else (1,):
+                state._project(site, weight.new_zeros(rows, spec.k), weight, warm=True)
+            del weight
         if lm_head is not None and _head_takes_module(lm_head):
-            weight = lm_head.weight
-            x = weight.new_zeros(1, weight.shape[1])
-            if _head_op.supports(x, weight):
+            x = head_weight.new_zeros(1, head_weight.shape[1])
+            if _head_op.supports(x, head_weight):
                 workspace = K3HeadGemvWorkspace.create(
-                    weight.shape[0], weight.shape[1], weight.device
+                    head_weight.shape[0], head_weight.shape[1], head_weight.device
                 )
-                k3_head_gemv(x, weight, workspace)
+                k3_head_gemv(x, head_weight, workspace)
                 state.head_workspace = workspace
                 state._ran.add(("lm_head",))
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
         return state
 
     def project(self, site: str, x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
-        """``x @ weight.T`` (bf16 ``[..., N]``) for ``site``'s weight on its decode kernel, or None where the kernel
-        does not take the call: more than `MAX_ROWS` rows, another shape or dtype, or, under capture, a kernel that
-        has not run eagerly."""
+        """``x @ weight.T`` (bf16 ``[..., N]``, the site's sigmoid columns through the sigmoid) for ``site``'s weight
+        on its decode kernel, or None where none takes the call: more rows than the site's kernels take, another
+        shape or dtype, or, under capture, a kernel that has not run eagerly. The caller then runs its GEMM."""
         return self._project(site, x, weight, warm=False)
 
     def _project(
         self, site: str, x: torch.Tensor, weight: torch.Tensor, warm: bool
     ) -> Optional[torch.Tensor]:
-        n, k, kernel = SITES[site]
+        spec = SITES[site]
         if (
             weight.dtype != torch.bfloat16
-            or tuple(weight.shape) != (n, k)
+            or tuple(weight.shape) != (spec.n, spec.k)
             or not weight.is_contiguous()
             or x.dtype != torch.bfloat16
             or x.dim() < 1
-            or x.shape[-1] != k
+            or x.shape[-1] != spec.k
         ):
             return None
-        rows = x.numel() // k
-        if not 0 < rows <= MAX_ROWS:
+        rows = x.numel() // spec.k
+        if 0 < rows <= MAX_ROWS:
+            kernel = spec.small
+        elif spec.wide and MAX_ROWS < rows <= WIDE_ROWS:
+            kernel = "wide"
+        else:
             return None
-        key = (site,)
+        key = (site, kernel, _wide_tile(rows) if kernel == "wide" else 0)
         capturing = _capturing()
         if capturing and not warm and key not in self._ran:
             return None
-        x2d = _dense_rows(x.reshape(rows, k))
-        if kernel == "decode":
-            if not _decode_op.supports(x2d, weight):
-                return None
-            y = k3_decode_gemv(x2d, weight)
-        else:
-            if not _ctm_op.supports_wide(x2d, weight, -1, False):
-                return None
-            y = k3_ctm_gemv_wide(x2d, weight)
+        y = _run(spec, kernel, _dense_rows(x.reshape(rows, spec.k)), weight)
+        if y is None:
+            return None
         if not capturing:
             self._ran.add(key)
-        return y.view(*x.shape[:-1], n)
+        return y.view(*x.shape[:-1], spec.n)
 
     def lm_head_logits(self, rows: torch.Tensor, lm_head: nn.Module) -> Optional[torch.Tensor]:
         """``lm_head(rows)``, the gathered bf16 logits ``[M, vocab]``, with this rank's shard on

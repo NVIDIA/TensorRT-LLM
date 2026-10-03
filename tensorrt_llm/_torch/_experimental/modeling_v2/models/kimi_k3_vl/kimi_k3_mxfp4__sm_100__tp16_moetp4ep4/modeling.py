@@ -1868,22 +1868,10 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
         _weights.load(self, weights)
 
     def cache_derived_state(self) -> None:
-        """Build the decode GEMVs' state from the final weights: the LM head's workspace, and one eager call of each
-        decode GEMV kernel (the MLA projections' shapes, read off the first MLA layer), so none compiles under
-        capture."""
+        """Build the decode GEMVs' state once the weights are final: the LM head's workspace, and one eager call of
+        every decode GEMV kernel at its site's shape (decode_gemv.SITES), so none compiles under capture."""
         super().cache_derived_state()
-        mla = next((layer.self_attn.mixer for layer in self.model.layers if not layer.is_kda), None)
-        sites = {}
-        if mla is not None:
-            for site, name in (
-                ("kv_a", "kv_a_proj_with_mqa"),
-                ("q_b", "q_b_proj"),
-                ("g_proj", "g_proj"),
-            ):
-                module = getattr(mla, name, None)
-                if module is not None:
-                    sites[site] = module.weight
-        gemvs = _decode_gemv.K3DecodeGemvs.create(self.lm_head, sites)
+        gemvs = _decode_gemv.K3DecodeGemvs.create(self.lm_head)
         self.model.decode_gemvs = gemvs
         self.logits_processor.gemvs = gemvs
 

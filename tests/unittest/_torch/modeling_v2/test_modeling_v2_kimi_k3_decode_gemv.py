@@ -3,8 +3,9 @@
 """The Kimi K3 target's decode GEMVs, LM head and embedding on the catalog's single-GPU entries (``decode_gemv.py``
 of ``kimi_k3_mxfp4__sm_100__tp16_moetp4ep4``), on one GPU.
 
-* Each MLA projection site at 1..8 rows: the bits of its catalog entry's call, within 8e-3 of ``max |ref|`` of a
-  float64 product; declined above 8 rows, at another shape or dtype, and under capture before an eager call.
+* Each GEMV site at every row count it takes (1..8, and 9..64 where k3_ctm_gemv_wide takes it): the bits of its
+  catalog entry's call, within 8e-3 of ``max |ref|`` of a float64 product (the sigmoid columns within 1e-2 of the
+  sigmoid of it); declined above its rows, at another shape or dtype, and under capture before an eager call.
 * The LM head through ``K3LogitsProcessor`` on a real ``LMHead`` (one rank): fp32 logits from ``k3_head_gemv``
   within the same bound, the stock processor's rows selected, the stock path above 8 rows and before the state is
   built.
@@ -18,6 +19,9 @@ import pytest
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_long import (
+    k3_ctm_gemv_long,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_wide import (
     k3_ctm_gemv_wide,
 )
@@ -51,6 +55,17 @@ def _rows(m, k, seed):
     return torch.randn(m, k, generator=g, device="cuda").to(torch.bfloat16)
 
 
+def _check_product(y, x, w, sig_col0=-1):
+    """Within TOL of the float64 product (columns from ``sig_col0`` on: within 1e-2 of its sigmoid)."""
+    ref = x.double() @ w.double().t()
+    sig = ref.shape[1] if sig_col0 < 0 else sig_col0
+    lin = ((y[:, :sig].double() - ref[:, :sig]).abs().max() / ref[:, :sig].abs().max()).item()
+    assert lin <= TOL, lin
+    if sig < ref.shape[1]:
+        err = (y[:, sig:].double() - ref[:, sig:].sigmoid()).abs().max().item()
+        assert err <= 1e-2, err
+
+
 def _rel_err(y, x, w):
     ref = x.double() @ w.double().t()
     return ((y.double() - ref).abs().max() / ref.abs().max()).item()
@@ -60,53 +75,73 @@ def _bits(t):
     return t.contiguous().view(torch.int16)
 
 
+def _entry(spec, rows, x, w):
+    """The site's catalog entry called directly: what ``project`` must reproduce bit for bit."""
+    if rows > decode_gemv.MAX_ROWS or spec.small == "wide":
+        return k3_ctm_gemv_wide(x, w, sig_col0=spec.sig_col0)
+    if spec.small == "decode":
+        return k3_decode_gemv(x, w)
+    return k3_ctm_gemv_long(
+        x, w, sig_col0=spec.sig_col0, split=spec.split, ring=spec.ring, push=True
+    )
+
+
+def _site_rows(spec):
+    return list(ROWS) + ([9, 16, 24, 40, 64] if spec.wide else [])
+
+
 @pytest.mark.parametrize("site", list(decode_gemv.SITES))
 def test_site(site):
-    """Every row count 1..8 runs the site's catalog entry: its bits, within TOL of the float64 product."""
-    n, k, kernel = decode_gemv.SITES[site]
-    w = _weight(n, k, seed=len(site))
-    gemvs = decode_gemv.K3DecodeGemvs.create(None, {site: w})
-    entry = k3_decode_gemv if kernel == "decode" else k3_ctm_gemv_wide
-    for m in ROWS:
-        x = _rows(m, k, seed=m)
+    """Every row count the site takes runs its catalog entry: its bits, within TOL of the float64 product."""
+    spec = decode_gemv.SITES[site]
+    w = _weight(spec.n, spec.k, seed=len(site))
+    gemvs = decode_gemv.K3DecodeGemvs.create(None, sites=[site])
+    for m in _site_rows(spec):
+        x = _rows(m, spec.k, seed=m)
         y = gemvs.project(site, x, w)
-        assert y is not None and y.shape == (m, n), (site, m)
-        assert torch.equal(_bits(y), _bits(entry(x, w))), (site, m)
-        assert _rel_err(y, x, w) <= TOL, (site, m)
+        assert y is not None and y.shape == (m, spec.n), (site, m)
+        assert torch.equal(_bits(y), _bits(_entry(spec, m, x, w))), (site, m)
+        _check_product(y, x, w, spec.sig_col0)
 
 
-def test_site_declines():
-    """Above 8 rows, another weight shape, a non-bf16 input, and under capture before any eager call: None, nothing
-    launched."""
-    n, k, _ = decode_gemv.SITES["kv_a"]
-    w = _weight(n, k, seed=1)
-    gemvs = decode_gemv.K3DecodeGemvs.create(None, {"kv_a": w})
-    assert gemvs.project("kv_a", _rows(9, k, seed=9), w) is None
-    assert gemvs.project("kv_a", _rows(4, k, seed=4), _weight(n + 128, k, seed=2)) is None
-    assert gemvs.project("kv_a", _rows(4, k, seed=4).float(), w) is None
+@pytest.mark.parametrize("site", ["kv_a", "mla_ag"])
+def test_site_declines(site):
+    """More rows than the site takes, another weight shape, a non-bf16 input, and under capture before any eager
+    call: None, nothing launched."""
+    spec = decode_gemv.SITES[site]
+    w = _weight(spec.n, spec.k, seed=1)
+    gemvs = decode_gemv.K3DecodeGemvs.create(None, sites=[site])
+    too_many = decode_gemv.WIDE_ROWS + 1 if spec.wide else decode_gemv.MAX_ROWS + 1
+    assert gemvs.project(site, _rows(too_many, spec.k, seed=9), w) is None
+    assert (
+        gemvs.project(site, _rows(4, spec.k, seed=4), _weight(spec.n + 128, spec.k, seed=2)) is None
+    )
+    assert gemvs.project(site, _rows(4, spec.k, seed=4).float(), w) is None
     fresh = decode_gemv.K3DecodeGemvs()
-    x = _rows(4, k, seed=4)
+    x = _rows(4, spec.k, seed=4)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        y = fresh.project("kv_a", x, w)
+        y = fresh.project(site, x, w)
     assert y is None
 
 
-def test_site_capture_replays_the_eager_bits():
-    """A captured call, its input rewritten in place before each replay, gives the eager call's bits."""
-    n, k, _ = decode_gemv.SITES["g_proj"]
-    w = _weight(n, k, seed=3)
-    gemvs = decode_gemv.K3DecodeGemvs.create(None, {"g_proj": w})
-    x = _rows(4, k, seed=4)
+@pytest.mark.parametrize("rows", [4, 16])
+def test_site_capture_replays_the_eager_bits(rows):
+    """A captured call (the long kernel at 4 rows, the wide one at 16, the gate columns through the sigmoid), its
+    input rewritten in place before each replay, gives the eager call's bits."""
+    spec = decode_gemv.SITES["mla_ag"]
+    w = _weight(spec.n, spec.k, seed=3)
+    gemvs = decode_gemv.K3DecodeGemvs.create(None, sites=["mla_ag"])
+    x = _rows(rows, spec.k, seed=4)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        y = gemvs.project("g_proj", x, w)
+        y = gemvs.project("mla_ag", x, w)
     assert y is not None
     for seed in (5, 6):
-        x.copy_(_rows(4, k, seed=seed))
+        x.copy_(_rows(rows, spec.k, seed=seed))
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(_bits(y), _bits(gemvs.project("g_proj", x, w)))
+        assert torch.equal(_bits(y), _bits(gemvs.project("mla_ag", x, w)))
 
 
 def _lm_head():
@@ -131,7 +166,7 @@ def test_lm_head():
     for m in (1, 9):
         x = _rows(m, HIDDEN, seed=m)
         assert torch.equal(processor(x, head, None, True), stock(x, head, None, True))
-    processor.gemvs = decode_gemv.K3DecodeGemvs.create(head, {})
+    processor.gemvs = decode_gemv.K3DecodeGemvs.create(head, sites=())
     assert processor.gemvs.head_workspace is not None
     for m in ROWS:
         x = _rows(m, HIDDEN, seed=m)
@@ -146,7 +181,7 @@ def test_lm_head_selects_the_stock_rows():
     """Without context logits, the stock processor's last-token selection feeds the head."""
     head = _lm_head()
     processor = decode_gemv.K3LogitsProcessor(LogitsProcessor())
-    processor.gemvs = decode_gemv.K3DecodeGemvs.create(head, {})
+    processor.gemvs = decode_gemv.K3DecodeGemvs.create(head, sites=())
     x = _rows(7, HIDDEN, seed=3)
     metadata = types.SimpleNamespace(
         seq_lens_cuda=torch.tensor([3, 1, 3], dtype=torch.int32, device="cuda")
@@ -158,7 +193,7 @@ def test_lm_head_selects_the_stock_rows():
 
 def test_lm_head_capture_replays_the_eager_bits():
     head = _lm_head()
-    gemvs = decode_gemv.K3DecodeGemvs.create(head, {})
+    gemvs = decode_gemv.K3DecodeGemvs.create(head, sites=())
     x = _rows(8, HIDDEN, seed=8)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
