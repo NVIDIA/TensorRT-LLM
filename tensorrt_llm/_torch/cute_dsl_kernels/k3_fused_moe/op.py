@@ -73,7 +73,8 @@ def _kernel_module(config: dict):
 def _view(t: torch.Tensor, align: int, leading_dim: int, element_type=None):
     from cutlass.cute.runtime import from_dlpack
 
-    v = from_dlpack(t, assumed_align=align).mark_layout_dynamic(leading_dim=leading_dim)
+    # DLPack refuses tensors that require grad.
+    v = from_dlpack(t.detach(), assumed_align=align).mark_layout_dynamic(leading_dim=leading_dim)
     if element_type is not None:
         v.element_type = element_type
     return v

@@ -607,6 +607,34 @@ def test_k3_moe_wide_single_call(case, m):
     assert det and rearmed
 
 
+def test_routing_from_a_parameter_that_requires_grad():
+    """A model's first k3_moe calls (a load-time warm-up) can run outside inference mode, routed with a bias that is an
+    ``nn.Parameter``: the routing weights then require grad. The op hands the kernel tensors DLPack exports (it refuses
+    tensors that require grad), so the first call compiles, and it and a compiled call return the bits of the same call
+    in inference mode."""
+    proc, _, _ = _experts()
+    logits, x = _draw(8100, DECODE_MAX)
+    want = _call(_decode()[1][0], logits, x)
+    got = []
+    with torch.inference_mode(False):
+        state = K3MoeState(_device(), I_TP, E_LOCAL)
+        layer = state.layer(*_weights(proc))
+        bias = torch.nn.Parameter(_bias().clone())
+        with _cold_k3_moe_cache():
+            for _ in range(2):  # the compiling call, then a compiled one
+                ids, weights, x_fp8, x_sf = k3_route_quant(
+                    logits.clone(), bias, x.clone(), RSF, early_trigger=state.use_pdl
+                )
+                assert weights.requires_grad, (
+                    "the routing weights do not require grad: the check misses its case"
+                )
+                got.append(k3_moe(x_fp8, x_sf, ids, weights, OFFSET, layer).detach())
+        torch.cuda.synchronize()
+    assert all(_same(y, want) for y in got), (
+        "a call on routing that requires grad differs from the same call in inference mode"
+    )
+
+
 @pytest.mark.parametrize("build,m", [("m8", 3), ("m8", 8), ("m64", 9), ("m64", 64)])
 def test_k3_moe_out_buffer(build, m):
     """``out``: the call writes out[:M], the bits of the call without ``out``, and returns an empty [0, 3584] tensor.
