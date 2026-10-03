@@ -119,6 +119,7 @@ class TestSplitGpuBudgetForDraft:
         c._max_batch_size = max_batch_size
         c._max_num_tokens = 8192
         c._mapping = Mock(enable_attention_dp=False, tp_size=2)
+        c._mapping.has_cp_helix.return_value = False
         c._mapping.pp_layers.return_value = list(range(24))
         c._mapping.is_last_pp_rank.return_value = True
         c._speculative_config = SimpleNamespace(
@@ -226,6 +227,7 @@ class TestSplitGpuBudgetForDraft:
         creator._kv_connector_manager = None
         creator._cache_transceiver_config = None
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
+        creator._mapping.has_cp_helix.return_value = False
         creator._mapping.pp_layers.return_value = [0]
         creator._mapping.is_last_pp_rank.return_value = True
         creator._speculative_config = SimpleNamespace(
@@ -1069,6 +1071,7 @@ class TestExternalDrafterKvDtype:
     def _creator(self, mocker, draft_quant_config):
         class DraftModelConfig:
             quant_config = draft_quant_config
+            sparse_attention_config = None
             pretrained_config = SimpleNamespace(
                 num_hidden_layers=TestExternalDrafterKvDtype.DRAFT_LAYERS,
                 hidden_size=32,
@@ -1105,6 +1108,7 @@ class TestExternalDrafterKvDtype:
         c._tokens_per_block = 64
         c._max_seq_len = 16384
         c._max_batch_size = 1
+        c._max_beam_width = 1
         # Read by _build_managers on the draft path (_util.py); the cost
         # assertions below are per-token, so the value only has to exist.
         c._max_num_tokens = 8192
@@ -1121,6 +1125,7 @@ class TestExternalDrafterKvDtype:
         c._draft_config = draft_model_config
         c._kv_cache_manager_cls = ProbeKVCacheManager
         c._is_disagg = True
+        c._cache_transceiver_config = None
         c._is_encoder_decoder = Mock(return_value=False)
         c._should_create_separate_draft_kv_cache = Mock(return_value=True)
         c._get_num_draft_layers = Mock(return_value=self.DRAFT_LAYERS)
