@@ -29,6 +29,19 @@ import pytest
 # Kernel module -> the barriers in it that other CTAs complete with st.async.
 MAILBOXES = {
     "tensorrt_llm._torch.cute_dsl_kernels.k3_ctm_gemv.k3_ctm_gemv_kernel": ("mail_full",),
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.k3_moe_front": ("mail_full",),
+    # rms_full: stage 0 only (filled by the cluster CTAs' st.async pushes); its other stages are completed by this
+    # CTA's own arrive or bulk copy.
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich.k3_sandwich_kernel": (
+        "b_ready",
+        "lat_full",
+        r"rms_full\.subview\(0",
+        "mb_rms",
+        "mb_snap",
+        "mb_ts",
+        "mb_upd",
+        "mb_sq",
+    ),
 }
 # Kernel module -> the header of the blocks whose mailbox waits are on this CTA's own arrival and keep CTA scope (a
 # kernel that arrives on its mailbox itself and acquires the other CTAs' data through a counter).

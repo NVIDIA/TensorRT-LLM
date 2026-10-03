@@ -27,6 +27,7 @@
 #include "tensorrt_llm/kernels/communicationKernels/MiniMaxReduceRMSKernel.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
+#include "tensorrt_llm/kernels/communicationKernels/mnnvlAllGatherKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/mnnvlAllreduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/moe/communication/moeAllReduceFusionKernels.h"
@@ -2061,7 +2062,8 @@ bool hasMnnvlNormOutput(AllReduceFusionOp fusionOp)
 
 std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::optional<torch::Tensor> const& gamma,
     torch::optional<torch::Tensor> const& residual_in, torch::optional<double> epsilon, torch::Tensor& comm_buffer,
-    torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_)
+    torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_,
+    int64_t one_shot_max_bytes)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
@@ -2187,11 +2189,11 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     allreduce_params.rmsNormFusion = hasRmsNormFusion;
     allreduce_params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-    // Threshold to switch between one-shot and two-shot allreduce kernel.
-    // Empirical value from the MNNVL sweep, matching FlashInfer's byte threshold.
-    constexpr size_t kOneShotSizeThreshold = 64 * 1024 * 8 * 2;
+    // Largest message sent one-shot; larger ones go two-shot. MNNVLAllReduce sizes the workspace with the same
+    // value (default: the empirical value from the MNNVL sweep, matching FlashInfer's byte threshold).
+    TORCH_CHECK(one_shot_max_bytes >= 0, "[mnnvlFusionAllReduce] one_shot_max_bytes must be non-negative");
 
-    if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= kOneShotSizeThreshold)
+    if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= static_cast<size_t>(one_shot_max_bytes))
     {
         tensorrt_llm::kernels::mnnvl::oneshotAllreduceFusionOp(allreduce_params);
     }
@@ -2287,6 +2289,70 @@ std::vector<torch::Tensor> mnnvlAllReduceAttnRes(torch::Tensor const& input,
 
     tensorrt_llm::kernels::mnnvl::oneshotAllreduceAttnResOp(params, epilogue);
     return {normOut, prefixOut};
+}
+
+// One-shot all-gather over the MNNVL workspace of this rank's fp32 rows [num_tokens, columns]:
+// the first bf16_columns columns of every rank are gathered as bf16 into [num_tokens, nRanks *
+// bf16_columns], the rest as fp32 into [num_tokens, nRanks * (columns - bf16_columns)]; see
+// tensorrt_llm::kernels::mnnvl::mnnvlAllGatherSplitOp.
+namespace
+{
+
+// The all-gather's checks, outputs and params.
+tensorrt_llm::kernels::mnnvl::AllGatherSplitParams makeAllGatherSplitParams(torch::Tensor const& input,
+    int64_t bf16_columns, int64_t world_size, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags,
+    torch::Tensor& bf16Out, torch::Tensor& fp32Out)
+{
+    namespace mnnvl = tensorrt_llm::kernels::mnnvl;
+    auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    TORCH_CHECK(
+        mcast_mem != nullptr, "[mnnvlAllGatherSplit] comm_buffer must be obtained from a mcastBuffer instance.");
+    TORCH_CHECK(mcast_mem->isMapped(), "[mnnvlAllGatherSplit] MNNVL workspace handles are not attached.");
+    TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat32 && input.is_contiguous() && input.dim() == 2,
+        "[mnnvlAllGatherSplit] input must be a contiguous [num_tokens, columns] fp32 CUDA tensor");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(input.const_data_ptr()) % 16 == 0,
+        "[mnnvlAllGatherSplit] input must be 16-byte aligned");
+    int64_t const numTokens = input.size(0);
+    int64_t const fp32Columns = input.size(1) - bf16_columns;
+    TORCH_CHECK(bf16_columns >= 0 && fp32Columns >= 0 && bf16_columns % 8 == 0 && fp32Columns % 4 == 0,
+        "[mnnvlAllGatherSplit] needs bf16_columns a multiple of 8 and the remaining columns a multiple of 4");
+    int64_t const nRanks = mcast_mem->getWorldSize();
+    TORCH_CHECK(world_size == nRanks, "[mnnvlAllGatherSplit] world_size ", world_size, " is not the workspace's ",
+        nRanks, " ranks");
+    TORCH_CHECK(mnnvl::mnnvlAllGatherSplitFootprint(numTokens, bf16_columns, fp32Columns, nRanks)
+            <= comm_buffer.size(-1) * comm_buffer.element_size(),
+        "[mnnvlAllGatherSplit] the exchange does not fit in one Lamport buffer");
+
+    auto const options = input.options();
+    bf16Out = torch::empty({numTokens, nRanks * bf16_columns}, options.dtype(torch::kBFloat16));
+    fp32Out = torch::empty({numTokens, nRanks * fp32Columns}, options);
+    mnnvl::AllGatherSplitParams params{};
+    params.input = input.const_data_ptr<float>();
+    params.bf16Output = reinterpret_cast<__nv_bfloat16*>(bf16Out.mutable_data_ptr());
+    params.fp32Output = fp32Out.mutable_data_ptr<float>();
+    params.numTokens = static_cast<int>(numTokens);
+    params.bf16Columns = static_cast<int>(bf16_columns);
+    params.fp32Columns = static_cast<int>(fp32Columns);
+    params.nRanks = static_cast<int>(nRanks);
+    params.rank = mcast_mem->getRank();
+    params.bufferPtrsDev = reinterpret_cast<void**>(mcast_mem->getBufferPtrsDev());
+    params.multicastPtr = mcast_mem->getMulticastPtr();
+    params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
+    params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    return params;
+}
+
+} // namespace
+
+std::vector<torch::Tensor> mnnvlAllGatherSplit(torch::Tensor const& input, int64_t bf16_columns, int64_t world_size,
+    torch::Tensor& comm_buffer, torch::Tensor& buffer_flags)
+{
+    torch::Tensor bf16Out;
+    torch::Tensor fp32Out;
+    auto const params
+        = makeAllGatherSplitParams(input, bf16_columns, world_size, comm_buffer, buffer_flags, bf16Out, fp32Out);
+    tensorrt_llm::kernels::mnnvl::mnnvlAllGatherSplitOp(params);
+    return {bf16Out, fp32Out};
 }
 
 torch::Tensor minimax_allreduce_rms(torch::Tensor const& input, torch::Tensor const& norm_weight,
@@ -2387,12 +2453,15 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "mnnvl_fusion_allreduce(Tensor input, Tensor? gamma, Tensor? residual, "
-        "float? epsilon, Tensor(a!) comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
-        "Tensor? scale=None, int fusion_op=0) -> "
+        "float? epsilon, Tensor(a!) comm_buffer, Tensor(b!) buffer_flags, bool rmsnorm_fusion, "
+        "Tensor? scale=None, int fusion_op=0, int one_shot_max_bytes=1048576) -> "
         "Tensor[]");
     m.def(
         "mnnvl_allreduce_attn_res(Tensor input, Tensor? prefix_sum, Tensor block_residual, Tensor res_weight, "
         "Tensor rms_weight, Tensor output_rms_weight, float rms_eps, float output_rms_eps, Tensor(a!) comm_buffer, "
+        "Tensor(b!) buffer_flags) -> Tensor[]");
+    m.def(
+        "mnnvl_allgather_split(Tensor input, int bf16_columns, int world_size, Tensor(a!) comm_buffer, "
         "Tensor(b!) buffer_flags) -> Tensor[]");
     m.def(
         "allreduce("
@@ -2493,6 +2562,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("mnnvl_fusion_allreduce", &tensorrt_llm::torch_ext::mnnvlFusionAllReduce);
     m.impl("mnnvl_allreduce_attn_res", &tensorrt_llm::torch_ext::mnnvlAllReduceAttnRes);
+    m.impl("mnnvl_allgather_split", &tensorrt_llm::torch_ext::mnnvlAllGatherSplit);
     m.impl("allreduce", &tensorrt_llm::torch_ext::allreduce_raw);
     m.impl("autotuned_allreduce", &tensorrt_llm::torch_ext::autotunedAllreduce);
     m.impl("register_allreduce_tactic", &tensorrt_llm::torch_ext::registerAllReduceTactic);

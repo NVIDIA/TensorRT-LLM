@@ -17,12 +17,16 @@ run (4 on one GB200 tray), at every M in 1..8 and at 16, 32, 64 tokens:
   trtllm::mnnvl_allreduce_attn_res (MNNVLAllReduce.allreduce_attn_res_rmsnorm): against the unfused path it replaces,
     the MNNVL all-reduce then trtllm::attn_res_add_rmsnorm_fwd (attn_res_rmsnorm_fwd without a prefix sum): the
     updated prefix sum bit for bit, the normed rows within 1e-2 (max |d| / max |ref|), both against an fp32 port of the
-    attention-residual selection within 2e-2; 0, 1, 3, 8 and 11 snapshots, with and without the prefix;
+    attention-residual selection within 2e-2; 0, 1, 3, 8 and 11 snapshots, with and without the prefix; the reference
+    all-reduce sent one-shot (the fused op's order);
+  trtllm::mnnvl_allgather_split (MNNVLAllReduce.allgather_split): bit for bit against the same gather on the host (bf16
+    columns rounded to nearest, -0.0 arriving as +0.0), at the K3 sharded MoE head's per-rank widths for TP16 (224 bf16
+    + 56 fp32 columns) and TP4 (896 + 224), interleaved with all-reduces on the same Lamport rotation;
 each with run-to-run identical bits, the same bits on every rank, each M's rows bit-identical to the same rows of the
 64-row call, and one rank's perturbed input changing every rank's result.
 
 Run under pytest (a pool of 4 MPI workers) or directly, one process per GPU:
-  srun -N1 -n4 --mpi=pmix python3 test_k3_mnnvl_comm.py [attn_res]
+  srun -N1 -n4 --mpi=pmix python3 test_k3_mnnvl_comm.py [attn_res allgather]
 """
 
 import hashlib
@@ -46,7 +50,7 @@ if cloudpickle is not None:
     MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 
 WORLD = 4
-H = 7168
+H, LATENT, EXPERTS = 7168, 3584, 896
 EPS, OUT_EPS = 1e-6, 1e-5
 M_CASES = list(range(1, 9)) + [16, 32, 64]
 M_MAX = 64
@@ -99,12 +103,13 @@ def _context():
 
 
 def _allreduce(ctx, x):
-    """The plain MNNVL all-reduce. Up to 8 ranks its one-shot and two-shot kernels both sum the ranks in rank order in
-    fp32, the fused op's order, so the reference is exact whichever one the size picks."""
+    """The plain MNNVL all-reduce, sent one-shot (the fused ops' order; above 8 ranks two-shot sums the ranks in
+    another order)."""
     from tensorrt_llm._torch.distributed import AllReduceParams
 
-    assert ctx.world <= 8, "above 8 ranks the two-shot kernel sums the ranks in another order"
-    return ctx.mnnvl(x, AllReduceParams())
+    return ctx.mnnvl(
+        x, AllReduceParams(), one_shot_max_bytes=x.numel() * ctx.world * x.element_size()
+    )
 
 
 def _all_ranks(ctx, good) -> bool:
@@ -199,7 +204,73 @@ def check_attn_res(ctx):
     return results
 
 
-CHECKS = {"attn_res": check_attn_res}
+def _gather_input(rows, bf16_cols, fp32_cols, rank):
+    gen = torch.Generator(device="cuda").manual_seed(7919 * bf16_cols + 131 * rank + fp32_cols)
+    x = torch.randn(rows, bf16_cols + fp32_cols, generator=gen, device="cuda") * 3
+    flat = x.view(-1)
+    flat[0], flat[1], flat[2], flat[-1] = -0.0, 0.0, 3.0e38, -0.0
+    return x.contiguous()
+
+
+def _host_gather(inputs, bf16_cols):
+    """The same gather on the host: bf16 part rounded to nearest, -0.0 as +0.0."""
+    return (
+        torch.cat([x[:, :bf16_cols].bfloat16() + 0.0 for x in inputs], dim=1),
+        torch.cat([x[:, bf16_cols:] + 0.0 for x in inputs], dim=1),
+    )
+
+
+def check_allgather(ctx):
+    results = []
+    # The sharded MoE head per rank: 3584 / TP latent columns (bf16 after the gather) + 896 / TP router logits.
+    heads = (
+        ("tp16_head", (LATENT // 16, EXPERTS // 16)),
+        ("tp4_head", (LATENT // 4, EXPERTS // 4)),
+    )
+    for label, (bf16_cols, fp32_cols) in heads:
+        mine64 = _gather_input(M_MAX, bf16_cols, fp32_cols, ctx.rank)
+        b64, f64 = ctx.mnnvl.allgather_split(mine64, bf16_cols)
+        for m in M_CASES:
+            mine = mine64[:m].contiguous()
+            everyone = [torch.from_numpy(a).cuda() for a in ctx.comm.allgather(mine.cpu().numpy())]
+            want_b, want_f = _host_gather(everyone, bf16_cols)
+            got_b, got_f = ctx.mnnvl.allgather_split(mine, bf16_cols)
+            exact = _same(got_b, want_b) and _same(got_f, want_f)
+            interleaved = True
+            partial = torch.randn(m, H, device="cuda").bfloat16()
+            for i in range(
+                6
+            ):  # two turns of the three-buffer Lamport rotation, mixed with the other collectives
+                _allreduce(ctx, partial)
+                if i % 2:
+                    block = torch.randn(2, m, H, device="cuda").bfloat16()
+                    ones = torch.ones(H, device="cuda").bfloat16()
+                    ctx.mnnvl.allreduce_attn_res_rmsnorm(
+                        partial, None, block, ones, ones, ones, EPS, EPS
+                    )
+                b, f = ctx.mnnvl.allgather_split(mine, bf16_cols)
+                interleaved &= _same(b, want_b) and _same(f, want_f)
+            bad = mine.clone()
+            if ctx.rank == min(1, ctx.world - 1):
+                bad.view(-1)[3] += 1.0
+            bad_b, bad_f = ctx.mnnvl.allgather_split(bad, bf16_cols)
+            row = dict(
+                op="mnnvl_allgather_split",
+                case=label,
+                M=m,
+                exact=exact,
+                interleaved_x6=interleaved,
+                rows_as_m64=_same(got_b, b64[:m]) and _same(got_f, f64[:m]),
+                control=not (_same(bad_b, want_b) and _same(bad_f, want_f)),
+            )
+            row["ok"] = _all_ranks(
+                ctx, row["exact"] and interleaved and row["rows_as_m64"]
+            ) and _all_ranks(ctx, row["control"])
+            results.append(row)
+    return results
+
+
+CHECKS = {"attn_res": check_attn_res, "allgather": check_allgather}
 
 
 def _run_checks(names):
