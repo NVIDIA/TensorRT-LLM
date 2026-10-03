@@ -970,12 +970,20 @@ class ModelingV2Core(DecoderModel):
             "head_norm": w["mtp_head_norm"],
         }
 
-    def _check_step_contract(self, md, position_ids) -> None:
+    def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE
         asks for it: the metadata fields this target consumes must exist
         (private trtllm surface), and the rope table is grown to cover every
         position the engine admits. Everything checked is fixed at
-        engine construction — once per model instance is sound."""
+        engine construction — once per model instance is sound.
+
+        Called unconditionally every forward; the early return below is the
+        gate. That costs one Python call per forward, not per layer, against
+        a decode step measured in milliseconds -- accepted in exchange for
+        not scattering the `_contract_pending` check across every call site.
+        """
+        if not self._contract_pending:
+            return
         # Calling the projection is the check: it reads every metadata field
         # this target consumes, so a rename or removal upstream surfaces
         # here rather than mid-forward. Deriving it this way is the point --
@@ -1059,6 +1067,16 @@ class ModelingV2Core(DecoderModel):
         lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        # "A new engine step has begun" is this forward's knowledge, stated
+        # once here before anything below binds per-step state: it is what
+        # lets validating() catch a later bind_const call running against
+        # last step's metadata. `MTPLayer`, below, is replayed once per draft
+        # step but runs inside this same engine forward and does not call
+        # this itself -- it must not start a new generation -- so calling it
+        # here, exactly once, is what keeps that correct without anyone
+        # having to remember it there.
+        advance_step_generation()
+
         # Locals, read straight off cfg: see the comment in __init__ for why
         # the core carries none of this as a forwarded attribute.
         cfg = self.model_config.pretrained_config
@@ -1073,16 +1091,11 @@ class ModelingV2Core(DecoderModel):
         dense_layers = cfg.first_k_dense_replace
 
         md = attn_metadata
-        if self._contract_pending:
-            self._check_step_contract(md, position_ids)
+        self._check_step_contract(md)
         # Read after the contract check: that is where a table too short for
         # the engine's admitted max_seq_len is regrown.
         rope = self._rope
 
-        # advance_step_generation must run before any bind_const this forward
-        # makes: it is what lets validating() catch a target that forgot to
-        # rebind and is running an op against last step's metadata.
-        advance_step_generation()
         step = _build_step_args(md)
         self._attn_ctx.bind_const(**step, **rope)
         self._attn_gen.bind_const(**step, **rope)
