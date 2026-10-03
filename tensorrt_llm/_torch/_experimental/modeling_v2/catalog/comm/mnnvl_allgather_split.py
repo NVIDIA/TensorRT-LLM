@@ -44,6 +44,7 @@ def mnnvl_allgather_split(
     bf16_out, fp32_out = torch.ops.trtllm.mnnvl_allgather_split(
         input,
         bf16_columns,
+        workspace.world_size,
         workspace.comm_buffer(torch.bfloat16),
         workspace.buffer_flags,
     )

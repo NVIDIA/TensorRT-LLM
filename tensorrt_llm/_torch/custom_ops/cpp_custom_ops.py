@@ -127,6 +127,15 @@ def _register_fake():
           buffer_flags):
         return [torch.empty_like(input), torch.empty_like(input)]
 
+    @torch.library.register_fake("trtllm::mnnvl_allgather_split")
+    def _(input, bf16_columns, world_size, comm_buffer, buffer_flags):
+        num_tokens, columns = input.shape
+        return [
+            input.new_empty((num_tokens, world_size * bf16_columns),
+                            dtype=torch.bfloat16),
+            input.new_empty((num_tokens, world_size * (columns - bf16_columns))),
+        ]
+
     # MNNVL Allreduce
     @torch.library.register_fake("trtllm::mnnvl_fusion_allreduce")
     def _(input,

@@ -1075,6 +1075,7 @@ class MNNVLAllReduce(nn.Module):
         bf16_out, fp32_out = torch.ops.trtllm.mnnvl_allgather_split(
             input,
             bf16_columns,
+            self.mapping.tp_size,
             workspace["uc_buffer"].view(self.dtype).view(3, -1),
             workspace["buffer_flags"],
         )

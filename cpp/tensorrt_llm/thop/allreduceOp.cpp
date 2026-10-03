@@ -2300,8 +2300,8 @@ namespace
 
 // The all-gather's checks, outputs and params.
 tensorrt_llm::kernels::mnnvl::AllGatherSplitParams makeAllGatherSplitParams(torch::Tensor const& input,
-    int64_t bf16_columns, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags, torch::Tensor& bf16Out,
-    torch::Tensor& fp32Out)
+    int64_t bf16_columns, int64_t world_size, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags,
+    torch::Tensor& bf16Out, torch::Tensor& fp32Out)
 {
     namespace mnnvl = tensorrt_llm::kernels::mnnvl;
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
@@ -2317,6 +2317,8 @@ tensorrt_llm::kernels::mnnvl::AllGatherSplitParams makeAllGatherSplitParams(torc
     TORCH_CHECK(bf16_columns >= 0 && fp32Columns >= 0 && bf16_columns % 8 == 0 && fp32Columns % 4 == 0,
         "[mnnvlAllGatherSplit] needs bf16_columns a multiple of 8 and the remaining columns a multiple of 4");
     int64_t const nRanks = mcast_mem->getWorldSize();
+    TORCH_CHECK(world_size == nRanks, "[mnnvlAllGatherSplit] world_size ", world_size, " is not the workspace's ",
+        nRanks, " ranks");
     TORCH_CHECK(mnnvl::mnnvlAllGatherSplitFootprint(numTokens, bf16_columns, fp32Columns, nRanks)
             <= comm_buffer.size(-1) * comm_buffer.element_size(),
         "[mnnvlAllGatherSplit] the exchange does not fit in one Lamport buffer");
@@ -2342,12 +2344,13 @@ tensorrt_llm::kernels::mnnvl::AllGatherSplitParams makeAllGatherSplitParams(torc
 
 } // namespace
 
-std::vector<torch::Tensor> mnnvlAllGatherSplit(
-    torch::Tensor const& input, int64_t bf16_columns, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags)
+std::vector<torch::Tensor> mnnvlAllGatherSplit(torch::Tensor const& input, int64_t bf16_columns, int64_t world_size,
+    torch::Tensor& comm_buffer, torch::Tensor& buffer_flags)
 {
     torch::Tensor bf16Out;
     torch::Tensor fp32Out;
-    auto const params = makeAllGatherSplitParams(input, bf16_columns, comm_buffer, buffer_flags, bf16Out, fp32Out);
+    auto const params
+        = makeAllGatherSplitParams(input, bf16_columns, world_size, comm_buffer, buffer_flags, bf16Out, fp32Out);
     tensorrt_llm::kernels::mnnvl::mnnvlAllGatherSplitOp(params);
     return {bf16Out, fp32Out};
 }
@@ -2450,7 +2453,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "mnnvl_fusion_allreduce(Tensor input, Tensor? gamma, Tensor? residual, "
-        "float? epsilon, Tensor(a!) comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
+        "float? epsilon, Tensor(a!) comm_buffer, Tensor(b!) buffer_flags, bool rmsnorm_fusion, "
         "Tensor? scale=None, int fusion_op=0, int one_shot_max_bytes=1048576) -> "
         "Tensor[]");
     m.def(
@@ -2458,8 +2461,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor rms_weight, Tensor output_rms_weight, float rms_eps, float output_rms_eps, Tensor(a!) comm_buffer, "
         "Tensor(b!) buffer_flags) -> Tensor[]");
     m.def(
-        "mnnvl_allgather_split(Tensor input, int bf16_columns, Tensor(a!) comm_buffer, Tensor(b!) buffer_flags) "
-        "-> Tensor[]");
+        "mnnvl_allgather_split(Tensor input, int bf16_columns, int world_size, Tensor(a!) comm_buffer, "
+        "Tensor(b!) buffer_flags) -> Tensor[]");
     m.def(
         "allreduce("
         "Tensor input,"
