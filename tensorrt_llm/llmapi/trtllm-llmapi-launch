@@ -10,11 +10,16 @@ mpi_rank=${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMI_ID:-0}}}}
 
 flashinfer_workspace_lock_held=0
 flashinfer_temporary_workspace=
+owned_child_pids=()
 
 log_stderr() { echo -e "\033[33m$@\033[0m" >&2; }
 log_stderr "mpi_rank: $mpi_rank"
 
-pid=$(ps -o pid= -p $$ | tr -d ' ')
+stop_timeout=${TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT:-120}
+if [[ ! "$stop_timeout" =~ ^[1-9][0-9]*$ ]] || [ "${#stop_timeout}" -gt 6 ]; then
+    log_stderr "TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT must be a positive integer of at most six digits"
+    exit 2
+fi
 
 # Tell TRTLLM to spawn a additional process for the Proxy
 export TLLM_SPAWN_PROXY_PROCESS=1
@@ -31,8 +36,37 @@ function mpi_world_size {
     fi
 }
 
-function cleanup_flashinfer_temporary_workspace {
+function cleanup_owned_children {
+    local child_pid
+    local cleanup_deadline=$((SECONDS + 2))
+    local children_alive
+
+    # Each background child leads a process group created by job control. This
+    # also reaches its descendants, without targeting the caller's process group.
+    for child_pid in "${owned_child_pids[@]}"; do
+        kill -TERM -- "-$child_pid" 2>/dev/null || true
+    done
+    while [ "$SECONDS" -lt "$cleanup_deadline" ]; do
+        children_alive=0
+        for child_pid in "${owned_child_pids[@]}"; do
+            if kill -0 -- "-$child_pid" 2>/dev/null; then
+                children_alive=1
+            fi
+        done
+        [ "$children_alive" -eq 0 ] && break
+        sleep 0.1
+    done
+    for child_pid in "${owned_child_pids[@]}"; do
+        kill -KILL -- "-$child_pid" 2>/dev/null || true
+        wait "$child_pid" 2>/dev/null || true
+    done
+}
+
+function cleanup_launcher {
     local exit_status=$?
+
+    trap - INT TERM
+    cleanup_owned_children
 
     if [ -n "$flashinfer_temporary_workspace" ]; then
         if ! rm -rf -- "$flashinfer_temporary_workspace"; then
@@ -44,7 +78,7 @@ function cleanup_flashinfer_temporary_workspace {
     exit "$exit_status"
 }
 
-trap cleanup_flashinfer_temporary_workspace EXIT
+trap cleanup_launcher EXIT
 
 function use_unique_flashinfer_workspace {
     local temporary_root=${TMPDIR:-/tmp}
@@ -179,6 +213,9 @@ unset TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
 # The launcher owns the workspace lock. Long-lived child commands close its
 # descriptor so detached descendants cannot keep a stale slot locked.
 if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
     if ! hmac_key=$(openssl rand -hex 32); then
         log_stderr "Failed to generate TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"
         exit 1
@@ -204,8 +241,15 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         I_MPI_ HYDRA_ KMP_ MPICH_ MV2_ CRAY_
     )
 
-    (
-        # Remove MPI-related variables only in the subshell context
+    function exec_child_command {
+        if [ "$flashinfer_workspace_lock_held" -eq 1 ]; then
+            exec 200>&-
+        fi
+        exec "$@"
+    }
+
+    function exec_without_mpi_environment {
+        local var prefix
         for var in $(compgen -e); do
             for prefix in "${mpi_blacklist[@]}"; do
                 if [[ "$var" == "$prefix"* ]]; then
@@ -214,53 +258,82 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
                 fi
             done
         done
+        exec_child_command "$@"
+    }
 
-        # Turn off "exit on error" so the following lines always run
-        set +e
-
-        # Execute the task with cleaned environment
-        run_child_command "${task_with_command[@]}"
-        task_exit_code=$?
-        log_stderr "Rank${mpi_rank} Task exit code: $task_exit_code"
-
-        # Stop the MPI Comm server
-        run_child_command python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop
-        mpi_exit_code=$?
-        log_stderr "Rank${mpi_rank} MPI Comm server exit code: $mpi_exit_code"
-
-        # Propagate task exit status
-        if [ $task_exit_code -ne 0 ]; then
-            exit $task_exit_code
-        else
-            exit $mpi_exit_code
-        fi
-    ) &
-
-    # Turn off "exit on error" so the following lines always run
+    # Job control gives each child its own process group. Keep the actual child
+    # PIDs so cleanup never depends on a process-name search or a shell wrapper.
+    set -m
     set +e
+    exec_child_command python3 -m tensorrt_llm.llmapi.mgmn_leader_node &
+    server_pid=$!
+    owned_child_pids+=("$server_pid")
+    exec_without_mpi_environment "${task_with_command[@]}" < /dev/null &
+    task_pid=$!
+    owned_child_pids+=("$task_pid")
+    log_stderr "Rank${mpi_rank} task PID: $task_pid; MPI Comm server PID: $server_pid"
 
-    # Capture subshell PID
-    subshell_pid=$!
-    log_stderr "Rank${mpi_rank} Subshell PID: $subshell_pid"
+    while kill -0 "$task_pid" 2>/dev/null; do
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            wait "$server_pid"
+            server_exit_code=$?
+            log_stderr "MPI Comm server exited before the task (status $server_exit_code); terminating task"
+            # Even a successful server exit is a failure while its task is alive.
+            [ "$server_exit_code" -eq 0 ] && server_exit_code=1
+            exit "$server_exit_code"
+        fi
+        sleep 0.1
+    done
+    wait "$task_pid"
+    task_exit_code=$?
+    log_stderr "Rank${mpi_rank} Task exit code: $task_exit_code"
 
-    log_stderr "Rank${mpi_rank} run mgmn leader node with mpi_world_size: $(mpi_world_size) ..."
-    log_stderr "Rank0 host: $HOSTNAME"
-    run_child_command python3 -m tensorrt_llm.llmapi.mgmn_leader_node
-    mgmn_leader_node_exit_code=$?
-    log_stderr "Rank${mpi_rank} MGMN leader node exit code: $mgmn_leader_node_exit_code"
-
-    # Wait for subshell
-    wait $subshell_pid
-    # This is subshell's exit code
-    subshell_exit_code=$?
-    log_stderr "Rank${mpi_rank} Subshell exit code: $subshell_exit_code"
-
-    # Propagate subshell exit status
-    if [ $subshell_exit_code -ne 0 ]; then
-        exit $subshell_exit_code
-    else
-        exit $mgmn_leader_node_exit_code
+    # The deadline covers the stop helper's imports, connection, send and queue
+    # cleanup as well as the MPI server. Neither child can block this supervisor.
+    shutdown_deadline=$((SECONDS + stop_timeout))
+    stop_pid=
+    if kill -0 "$server_pid" 2>/dev/null; then
+        exec_without_mpi_environment python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop &
+        stop_pid=$!
+        owned_child_pids+=("$stop_pid")
     fi
+
+    shutdown_timed_out=0
+    while true; do
+        if [ -n "$stop_pid" ] && ! kill -0 "$stop_pid" 2>/dev/null; then
+            wait "$stop_pid"
+            stop_exit_code=$?
+            stop_pid=
+            log_stderr "Rank${mpi_rank} stop helper exit code: $stop_exit_code"
+            # A failed helper cannot be relied on to stop the server.
+            if [ "$stop_exit_code" -ne 0 ]; then
+                [ "$task_exit_code" -ne 0 ] && exit "$task_exit_code"
+                exit "$stop_exit_code"
+            fi
+        fi
+        if ! kill -0 "$server_pid" 2>/dev/null && [ -z "$stop_pid" ]; then
+            break
+        fi
+        if [ "$SECONDS" -ge "$shutdown_deadline" ]; then
+            log_stderr "MPI Comm shutdown exceeded ${stop_timeout}s; terminating owned processes"
+            shutdown_timed_out=1
+            break
+        fi
+        sleep 0.1
+    done
+
+    if [ "$shutdown_timed_out" -ne 0 ]; then
+        [ "$task_exit_code" -ne 0 ] && exit "$task_exit_code"
+        exit 124
+    fi
+    wait "$server_pid"
+    server_exit_code=$?
+    log_stderr "Rank${mpi_rank} MPI Comm server exit code: $server_exit_code"
+
+    # Preserve the original task failure; otherwise surface teardown failures.
+    [ "$task_exit_code" -ne 0 ] && exit "$task_exit_code"
+    exit "$server_exit_code"
+
 else
     # Turn off "exit on error" so the following lines always run
     set +e
