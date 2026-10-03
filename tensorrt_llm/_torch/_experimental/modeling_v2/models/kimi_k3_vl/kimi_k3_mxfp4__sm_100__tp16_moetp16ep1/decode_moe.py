@@ -8,7 +8,11 @@
   GEMV, the slices' all-gather over the TP group's `K3MoeHeadWorkspace`, the top-16 routing, the MXFP8 latent, and
   the shared experts' gate_up + SiTU;
 * `moe/k3_moe`: this rank's routed partial over its experts (on a `K3MoeState`);
-* the latent all-reduce: the routed experts' all-reduce (one-shot, as `decode_comm.use_decode_one_shot` sets);
+* the latent all-reduce. On a pushing step (`DecodeStep.latent_push`: a pure decode step captured into a CUDA graph
+  whose attention layers all run the decode kernels) the routed experts run as `moe/k3_moe`'s push form, which stores
+  this rank's partial into every rank's `K3LatentExchange`, and `comm/k3_latent_reduce` sums the partials in the MNNVL
+  one-shot's order, so with the same bits, while the experts' grid completes. On every other step it is the routed
+  experts' all-reduce (one-shot, as `decode_comm.use_decode_one_shot` sets);
 * the tail. The latent norm's weight is folded into the latent up projection at load, so
   `[RMSNorm(latent) slice | shared activation] @ [latent up columns | shared down]` is this rank's share of the MoE
   output. Where the next layer's pre-attention step (or the final norm) reduces it, the layer hands it on unreduced
@@ -24,10 +28,16 @@ which the consumer reduces with a plain all-reduce.
 
 The GEMVs run on the decode GEMV sites of `decode_gemv.py` where they take the call, else on the stock GEMM ops.
 
-`K3DecodeMoe` holds what every MoE layer shares: the head workspace (collective over the TP group), the two
-`k3_moe` builds' scratch, and the TP group's MNNVL workspace (`decode_comm.K3DecodeComm`'s). `K3DecodeMoeLayer`
-holds one layer's decode weights and its `k3_moe` counters. The target builds both in `post_load_weights`, before
-any CUDA-graph capture, and runs every kernel once there so none compiles under a capture.
+`K3DecodeMoe` holds what every MoE layer shares: the head workspace and the latent exchange (both collective over
+the TP group), the two `k3_moe` builds' scratch, and the TP group's MNNVL workspace (`decode_comm.K3DecodeComm`'s).
+`K3DecodeMoeLayer` holds one layer's decode weights and its `k3_moe` counters. The target builds both in
+`post_load_weights`, before any CUDA-graph capture, and runs every kernel once there so none compiles under a capture.
+
+Every MoE layer's push and reduce go to the one exchange, in the stream's order: each push is followed by exactly one
+reduce of the same token count before the next push, on every rank in the same order (the exchange's call-order
+invariant, `comm/k3_latent_reduce`). Every kernel between a reduce and the next push waits for its predecessor (or
+launches without programmatic dependent launch), which the decode kernels a pushing step runs do; pushes run only in
+CUDA-graph replays, so no other step's kernels sit between two pushes.
 """
 
 from __future__ import annotations
@@ -38,6 +48,10 @@ from typing import Optional, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_latent_reduce import (
+    K3LatentExchange,
+    k3_latent_reduce,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allgather_split import (
     mnnvl_allgather_split,
 )
@@ -51,6 +65,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe import (
     K3MoeWideState,
     is_supported,
     k3_moe,
+    k3_moe_push,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe_front import (
     front_weight,
@@ -75,25 +90,38 @@ TAIL_K_TILE = 256
 class K3DecodeMoe:
     """What every MoE layer's decode path shares on one device: the TP group's ``K3MoeHeadWorkspace`` (the front's
     all-gather), the ``k3_moe`` builds for up to 8 and up to 64 tokens (their scratch; the layers run one at a time on
-    one stream), and the TP group's ``MnnvlWorkspace`` for a wide step's head all-gather. Built by `create`."""
+    one stream), the TP group's ``MnnvlWorkspace`` for a wide step's head all-gather, and the TP group's
+    ``K3LatentExchange`` for a pushing step's latent all-reduce (None: every step keeps the routed experts'
+    all-reduce). Built by `create`."""
 
     head: K3MoeHeadWorkspace
     small: K3MoeState
     wide: K3MoeWideState
     mnnvl: MnnvlWorkspace
+    exchange: Optional[K3LatentExchange] = None
 
     @classmethod
     def create(
-        cls, mapping, device, i_tp: int, num_local: int, mnnvl: MnnvlWorkspace
+        cls, mapping, device, i_tp: int, num_local: int, mnnvl: MnnvlWorkspace, push: bool = True
     ) -> "K3DecodeMoe":
         """The state for ``mapping``'s TP group on ``device``, for experts of ``i_tp`` intermediate columns per rank,
-        ``num_local`` of them on this rank. Collective (the head workspace): every rank of the group calls it at the
-        same point, eagerly, before any CUDA-graph capture."""
+        ``num_local`` of them on this rank. Collective (the head workspace and the latent exchange): every rank of the
+        group calls it at the same point, eagerly, before any CUDA-graph capture. ``push``: build the latent exchange
+        (where it takes the TP size: 4, 8 or 16 ranks); without it every step keeps the routed experts' all-reduce."""
+        head = K3MoeHeadWorkspace.create(mapping)
+        exchange = None
+        if push:
+            try:
+                exchange = K3LatentExchange.create(mapping)
+            # Raised before any collective step, on every rank of the group alike: a TP size the exchange does not take.
+            except ValueError:
+                exchange = None
         return cls(
-            K3MoeHeadWorkspace.create(mapping),
+            head,
             K3MoeState(device, i_tp, num_local),
             K3MoeWideState(device, i_tp, num_local),
             mnnvl,
+            exchange,
         )
 
 
@@ -237,12 +265,18 @@ class K3DecodeMoeLayer:
 
     def warm_up(self, moe: nn.Module) -> None:
         """One call of every kernel of the decode path on zero inputs (M = 1), so none compiles under a capture: the
-        front (collective: every rank makes the same call), both ``k3_moe`` builds and ``k3_route_quant``."""
+        front (collective: every rank makes the same call), both ``k3_moe`` builds, ``k3_route_quant`` and, with the
+        latent exchange, the push build and the reduce (one push + reduce pair, collective). Once per model: every
+        layer's calls compile the same builds."""
         device = self.front_weight.device
         x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
         ids, weights, x_fp8, x_sf, _ = self._front(moe, x)
         offset = moe.routed_experts.backend.slot_start
         k3_moe(x_fp8, x_sf, ids, weights, offset, self.small)
+        exchange = self.state.exchange
+        if exchange is not None:
+            k3_moe_push(x_fp8, x_sf, ids, weights, offset, self.small, exchange)
+            k3_latent_reduce(1, exchange)
         logits = torch.zeros(1, moe.num_experts, dtype=torch.float32, device=device)
         latent = torch.zeros(1, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
         ids, weights, x_fp8, x_sf = k3_route_quant(
@@ -271,18 +305,29 @@ class K3DecodeMoeLayer:
         return 0 < rows <= MAX_TOKENS or (partial_tail and step.wide and rows <= WIDE_MAX_TOKENS)
 
     def forward(
-        self, moe: nn.Module, hidden_states: torch.Tensor, gemvs, partial_tail: bool
+        self,
+        moe: nn.Module,
+        hidden_states: torch.Tensor,
+        gemvs,
+        partial_tail: bool,
+        push: bool = False,
     ) -> Union[torch.Tensor, PendingTail]:
         """The MoE output of ``hidden_states`` (``takes`` holds): with ``partial_tail``, this rank's unreduced share
         (a ``PendingTail`` at most `MAX_TOKENS` tokens); else the reduced output. ``gemvs``: the decode GEMVs' state,
-        or None."""
+        or None. ``push`` (the step's ``DecodeStep.latent_push``): at most `MAX_TOKENS` tokens, the latent all-reduce
+        is the routed experts' push form plus ``comm/k3_latent_reduce`` on the state's exchange (the same bits as the
+        routed experts' all-reduce); a state without the exchange ignores it."""
         if hidden_states.shape[0] > MAX_TOKENS:
             return self._wide(moe, hidden_states, gemvs)
         ids, weights, x_fp8, x_sf, shared_act = self._front(moe, hidden_states)
-        routed = k3_moe(
-            x_fp8, x_sf, ids, weights, moe.routed_experts.backend.slot_start, self.small
-        )
-        latent = moe.routed_experts.all_reduce(routed)
+        offset = moe.routed_experts.backend.slot_start
+        exchange = self.state.exchange
+        if push and exchange is not None:
+            k3_moe_push(x_fp8, x_sf, ids, weights, offset, self.small, exchange)
+            latent = k3_latent_reduce(hidden_states.shape[0], exchange)
+        else:
+            routed = k3_moe(x_fp8, x_sf, ids, weights, offset, self.small)
+            latent = moe.routed_experts.all_reduce(routed)
         if partial_tail:
             return PendingTail(
                 latent.contiguous(),

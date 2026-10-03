@@ -82,7 +82,7 @@ from __future__ import annotations
 import copy
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -186,6 +186,7 @@ REQUIRED_TRTLLM_OPS = (
     "k3_sandwich_tail",
     "k3_moe_front",
     "k3_moe",
+    "k3_latent_reduce",
     "k3_route_quant",
     "mnnvl_allgather_split",
     # The DSpark drafter's decode path (K3DSparkDrafter): its GEMV sites, its block attention, and its all-reduces
@@ -1199,7 +1200,9 @@ class KimiK3MoERuntime(nn.Module):
         most 8 tokens, a tensor on a wide decode step."""
         decode = self.decode_moe
         if decode is not None and decode.takes(hidden_states, step, partial_tail):
-            return decode.forward(self, hidden_states, self.decode_gemvs, partial_tail)
+            return decode.forward(
+                self, hidden_states, self.decode_gemvs, partial_tail, push=step.latent_push
+            )
         if partial_tail:
             raise RuntimeError("the row-parallel MoE tail needs the decode path to take the step")
         identity = hidden_states
@@ -1810,7 +1813,30 @@ class KimiLinearModel(DecoderModel):
         )
 
     # >>> route B: no per-token KDA verify states (kda_token_states): no speculative decoding
+    @property
+    def kda_token_states(self) -> bool:
+        """False: this target decodes without speculation, so the hybrid cache manager keeps no KDA state after
+        each verify token, and a captured step's latent-push decision (``_latent_push``) reads that."""
+        return False
+
     # <<< route B
+
+    def _latent_push(self, attn_metadata: AttentionMetadata, step: DecodeStep) -> bool:
+        """Whether the MoE layers push on ``step`` (``latent_push``): read only while a CUDA graph is being captured,
+        from what the graph's key fixes (the step's shape, the attention metadata the decode kernels read) and from
+        load-time state, so every rank and every replay of the graph decides alike."""
+        if not torch.cuda.is_current_stream_capturing():
+            return False
+        kda = [layer.linear_attn for layer in self.layers if layer.is_kda]
+        mla = [layer.self_attn for layer in self.layers if not layer.is_kda]
+        return latent_push(
+            step,
+            capturing=True,
+            breakable=is_in_breakable_cuda_graph(),
+            kda_token_states=self.kda_token_states,
+            kda_decode_kernels=all(m.takes_k3_kernels and m.k3_buffers is not None for m in kda),
+            mla_decode_branch=all(m.will_run_decode_branch(attn_metadata, step) for m in mla[:1]),
+        )
 
     def _defer_moe_tail(
         self,
@@ -1849,6 +1875,8 @@ class KimiLinearModel(DecoderModel):
 
         num_tokens = (input_ids if inputs_embeds is None else inputs_embeds).shape[0]
         step = decode_step(attn_metadata, num_tokens)
+        if step is not None and self._latent_push(attn_metadata, step):
+            step = replace(step, latent_push=True)
         # A decode step embeds and norms for layer 0 in one launch, the embedding written as layer 0's first snapshot.
         prenormed = None
         if (
@@ -2897,6 +2925,9 @@ class DecodeStep:
     num_tokens: int
     num_requests: Optional[int] = None
     tokens_per_request: Optional[int] = None
+    #: Whether the MoE layers' latent all-reduce is the routed experts' push form plus ``comm/k3_latent_reduce``
+    #: (``decode_moe.py``): set by ``KimiLinearModel.forward`` from ``latent_push``.
+    latent_push: bool = False
 
     @property
     def small(self) -> bool:
@@ -2913,6 +2944,30 @@ class DecodeStep:
         """Whether the step is a pure decode step of more than one token tile: its token-count work keeps the decode
         layout's MoE head and tail, on M-general ops."""
         return self.decode and not self.small
+
+
+def latent_push(
+    step: Optional[DecodeStep],
+    *,
+    capturing: bool,
+    breakable: bool,
+    kda_token_states: bool,
+    kda_decode_kernels: bool,
+    mla_decode_branch: bool,
+) -> bool:
+    """Whether a step's MoE layers push their routed partials (``DecodeStep.latent_push``): a pure decode step of at
+    most 8 tokens whose attention layers all run the decode kernels, captured into a CUDA graph and not inside a
+    breakable one. The KDA layers run them on one token per request with every KDA layer taking the K3 kernels
+    (``kda_decode_kernels``), and on every verify width with the per-token states (``kda_token_states``); the MLA
+    layers where their decode branch takes the step (``mla_decode_branch``, the same for every MLA layer of a step).
+    Every other step keeps the routed experts' all-reduce: the exchange's call-order invariant needs every kernel
+    between a reduce and the next push to wait for its predecessor, which only those kernels were checked for, and a
+    graph launch orders every pushing replay behind whatever ran before it."""
+    if step is None or not (step.decode and step.small) or not capturing or breakable:
+        return False
+    if not (kda_token_states or (step.tokens_per_request == 1 and kda_decode_kernels)):
+        return False
+    return mla_decode_branch
 
 
 def decode_step(attn_metadata: AttentionMetadata, num_tokens: int) -> Optional[DecodeStep]:
@@ -3183,6 +3238,15 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
             moe.decode_gemvs = self.model.decode_gemvs
         first = takes[0].decode_moe
         first.warm_up(takes[0])
+        logger.info(
+            "Kimi K3 MoE decode path: the latent all-reduce at <= 8 tokens on "
+            + (
+                "the routed experts' push form and k3_latent_reduce on pushing steps (a pure decode step captured "
+                "into a CUDA graph on the decode kernels), else the routed experts' all-reduce"
+                if state.exchange is not None
+                else f"the routed experts' all-reduce (no latent exchange at TP {mapping.tp_size})"
+            )
+        )
         comm.compile_tail(takes[0].moe_hidden_size, first.shared_cols, first.tail_weight)
         return len(takes)
 

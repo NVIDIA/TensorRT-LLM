@@ -74,3 +74,24 @@ def test_tp16_moetp16ep1_decodes_without_speculation():
         AssertionError, match="moe_tensor_parallel_size 4 and moe_expert_parallel_size 4"
     ):
         route_b._check_construction(_config(16, 1, spec_config=object()))
+
+
+def test_tp16_moetp16ep1_keeps_no_per_token_kda_states(monkeypatch):
+    """The text model answers ``kda_token_states`` (False, without speculation), which a captured step's latent-push
+    decision reads: a pure decode step on the decode kernels pushes, as on ``tp16_moetp4ep4`` without per-token
+    states."""
+    model = route_b.KimiLinearModel.__new__(route_b.KimiLinearModel)
+    assert model.kda_token_states is False
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(route_b, "is_in_breakable_cuda_graph", lambda: False)
+    kda = types.SimpleNamespace(
+        is_kda=True,
+        linear_attn=types.SimpleNamespace(takes_k3_kernels=True, k3_buffers=object()),
+    )
+    mla = types.SimpleNamespace(
+        is_kda=False,
+        self_attn=types.SimpleNamespace(will_run_decode_branch=lambda metadata, step: True),
+    )
+    object.__setattr__(model, "layers", [kda, mla])
+    assert model._latent_push(None, route_b.DecodeStep(1, 1, 1))
+    assert not model._latent_push(None, route_b.DecodeStep(8, 1, 8))
