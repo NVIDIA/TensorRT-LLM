@@ -261,6 +261,8 @@ public:
         if constexpr (UseCGA)
         {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+            // Every thread arrives on the cluster barrier but only rank 0's first warp waits, so a kernel using this
+            // must not arrive on the cluster barrier again (each thread arrives and waits once per phase).
             cg::cluster_group cluster = cg::this_cluster();
             __cluster_barrier_arrive();
             if (cluster.block_rank() == 0 && threadIdx.x < kWARP_SIZE)
