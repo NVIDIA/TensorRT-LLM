@@ -1408,7 +1408,11 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.mlp_tp_size = 1
             else:
                 self.mlp_tp_size = math.gcd(cfg.intermediate_size, model_config.mapping.tp_size)
-                if self.mlp_tp_size > model_config.mapping.gpus_per_node:
+                # Over MNNVL (one NVLink domain across the nodes, where a cross-node all-reduce costs what a node's
+                # does) the MLP stays split over the whole TP group, the per-rank shapes its decode GEMVs take
+                # (decode_gemv.SITES); otherwise it stays within one node.
+                spans_nodes = self._mnnvl_allreduce() is not None
+                if self.mlp_tp_size > model_config.mapping.gpus_per_node and not spans_nodes:
                     self.mlp_tp_size = math.gcd(
                         self.mlp_tp_size, model_config.mapping.gpus_per_node
                     )
@@ -1416,8 +1420,7 @@ class KimiLinearDecoderLayer(nn.Module):
             mlp_model_config.quant_config = QuantConfig()
             # K3's dense layer is BF16, so a unit block size gives the same
             # subgroup selection as DeepSeek-V3. Attention DP replicates the
-            # MLP because ranks own different tokens; otherwise the subgroup
-            # is block-aligned and stays within one node.
+            # MLP because ranks own different tokens.
             self.mlp = GatedMLP(
                 hidden_size=cfg.hidden_size,
                 intermediate_size=cfg.intermediate_size,
@@ -1433,6 +1436,9 @@ class KimiLinearDecoderLayer(nn.Module):
                 reduce_output=self.mlp_tp_size > 1,
                 layer_idx=layer_idx,
             )
+            self._situ = (situ_beta, situ_linear_beta)
+            # The decode GEMVs' state (decode_gemv.py), set by the target's cache_derived_state.
+            self.decode_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
 
         # Stock fused RMSNorm for the plain (whole-tensor) norms; numerics
         # are drop-in for KimiK3RMSNorm (fp32 variance, weight applied
@@ -1556,10 +1562,30 @@ class KimiLinearDecoderLayer(nn.Module):
                 hidden_states, getattr(attn_metadata, "all_rank_num_tokens", None)
             )
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self._dense_mlp(hidden_states, step)
 
         prefix_sum = prefix_sum + hidden_states
         return prefix_sum, num_snapshots
+
+    def _dense_mlp(self, hidden_states: torch.Tensor, step: Optional[DecodeStep]) -> torch.Tensor:
+        """The dense MLP: on a step of at most DECODE_MAX_TOKENS tokens, its GEMVs and activation on the decode
+        kernels (``K3DecodeGemvs.dense_mlp``), then the down projection's all-reduce; else the module."""
+        gemvs = self.decode_gemvs
+        if gemvs is not None and step is not None and step.small:
+            out = gemvs.dense_mlp(
+                hidden_states,
+                self.mlp.gate_up_proj.weight,
+                self.mlp.down_proj.weight,
+                *self._situ,
+            )
+            if out is not None:
+                return self.mlp.down_proj.all_reduce(out) if self.mlp_tp_size > 1 else out
+        return self.mlp(hidden_states)
+
+    def _mnnvl_allreduce(self):
+        """The MNNVL all-reduce of this layer's attention output, or None."""
+        attention = self.linear_attn if self.is_kda else self.self_attn
+        return getattr(getattr(attention, "_o_allreduce", None), "mnnvl_allreduce", None)
 
     def skip_forward(
         self,
@@ -2262,6 +2288,9 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
         gemvs = _decode_gemv.K3DecodeGemvs.create(self.lm_head)
         self.model.decode_gemvs = gemvs
         self.logits_processor.gemvs = gemvs
+        for layer in self.model.layers:
+            if not layer.is_moe:
+                layer.decode_gemvs = gemvs
 
     def post_load_weights(self) -> None:
         """The state the decode kernels share, built once per device before any CUDA-graph capture and handed to

@@ -10,6 +10,8 @@ of ``kimi_k3_mxfp4__sm_100__tp16_moetp4ep4``), on one GPU.
   within the same bound, the stock processor's rows selected, the stock path above 8 rows and before the state is
   built.
 * The embedding: bit-identical to ``nn.Embedding`` followed by the stock RMSNorm, the rows in the bank's slot 0.
+* Layer 0's dense MLP at 1..8 rows: the bits of its three entries chained, within 3e-2 of ``max |ref|`` of the
+  float64 SituAndMul MLP; declined above 8 rows, at linear_beta 0 and under capture before an eager call.
 * CUDA-graph replays give the eager bits.
 """
 
@@ -19,6 +21,7 @@ import pytest
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.k3_situ_mul import k3_situ_mul
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_long import (
     k3_ctm_gemv_long,
 )
@@ -82,7 +85,7 @@ def _entry(spec, rows, x, w):
     if spec.small == "decode":
         return k3_decode_gemv(x, w)
     return k3_ctm_gemv_long(
-        x, w, sig_col0=spec.sig_col0, split=spec.split, ring=spec.ring, push=True
+        x, w, sig_col0=spec.sig_col0, split=spec.split, ring=spec.ring, push=spec.push
     )
 
 
@@ -247,3 +250,66 @@ def test_embed_norm_capture():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(_bits(captured), _bits(eager))
+
+
+SITU = (4.0, 25.0)  # the Kimi K3 checkpoint's (beta, linear_beta)
+
+
+def _dense_weights():
+    gate_up, down = decode_gemv.SITES["dense_gate_up"], decode_gemv.SITES["dense_down"]
+    return _weight(gate_up.n, gate_up.k, seed=41), _weight(down.n, down.k, seed=42)
+
+
+def _dense_reference(x, w_gu, w_down, beta, linear_beta):
+    gu = x.double() @ w_gu.double().t()
+    g, u = gu.chunk(2, dim=1)
+    a = beta * torch.tanh(g / beta) * torch.sigmoid(g)
+    v = u if linear_beta is None else linear_beta * torch.tanh(u / linear_beta)
+    return (a * v) @ w_down.double().t()
+
+
+@pytest.mark.parametrize("situ", [SITU, (1.0, None)], ids=["k3", "default"])
+def test_dense_mlp(situ):
+    """At 1..8 rows: the bits of the gate_up GEMV, k3_situ_mul and the down GEMV called directly, within 3e-2 of the
+    float64 MLP."""
+    w_gu, w_down = _dense_weights()
+    gemvs = decode_gemv.K3DecodeGemvs.create(None, sites=["dense_gate_up", "dense_down"])
+    gate_up, down = decode_gemv.SITES["dense_gate_up"], decode_gemv.SITES["dense_down"]
+    for m in ROWS:
+        x = _rows(m, HIDDEN, seed=m)
+        y = gemvs.dense_mlp(x, w_gu, w_down, *situ)
+        assert y is not None and y.shape == (m, down.n), m
+        gu = k3_ctm_gemv_long(x, w_gu, split=gate_up.split, ring=gate_up.ring)
+        want = k3_ctm_gemv_long(k3_situ_mul(gu, *situ), w_down, split=down.split, ring=down.ring)
+        assert torch.equal(_bits(y), _bits(want)), m
+        ref = _dense_reference(x, w_gu, w_down, *situ)
+        err = ((y.double() - ref).abs().max() / ref.abs().max()).item()
+        assert err <= 3e-2, (m, err)
+
+
+def test_dense_mlp_declines():
+    """9 rows, linear_beta 0 (the activation would run it as 1), and under capture before any eager call: None."""
+    w_gu, w_down = _dense_weights()
+    gemvs = decode_gemv.K3DecodeGemvs.create(None, sites=["dense_gate_up", "dense_down"])
+    assert gemvs.dense_mlp(_rows(9, HIDDEN, seed=9), w_gu, w_down, *SITU) is None
+    assert gemvs.dense_mlp(_rows(4, HIDDEN, seed=4), w_gu, w_down, 4.0, 0.0) is None
+    fresh = decode_gemv.K3DecodeGemvs()
+    x = _rows(4, HIDDEN, seed=4)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y = fresh.dense_mlp(x, w_gu, w_down, *SITU)
+    assert y is None
+
+
+def test_dense_mlp_capture_replays_the_eager_bits():
+    w_gu, w_down = _dense_weights()
+    gemvs = decode_gemv.K3DecodeGemvs.create(None, sites=["dense_gate_up", "dense_down"])
+    x = _rows(8, HIDDEN, seed=8)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y = gemvs.dense_mlp(x, w_gu, w_down, *SITU)
+    assert y is not None
+    x.copy_(_rows(8, HIDDEN, seed=12))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(y), _bits(gemvs.dense_mlp(x, w_gu, w_down, *SITU)))

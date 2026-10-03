@@ -14,6 +14,9 @@
   drafter's logits on the same head take it too.
 * **Embedding** (`K3DecodeGemvs.embed_norm`): a decode step's embedding rows written into the attention-residual
   bank's slot 0 (layer 0's first snapshot) and layer 0's input RMSNorm applied, in one `norm/k3_embed_norm` launch.
+* **Dense MLP** (`K3DecodeGemvs.dense_mlp`): layer 0's MLP at most `MAX_ROWS` rows, split over the whole TP group:
+  gate_up on `gemm/k3_ctm_gemv_long`, `activation/k3_situ_mul`, down on `gemm/k3_ctm_gemv_long`; the caller then
+  runs the down projection's all-reduce.
 
 Each returns None where its kernel does not take the call, and the caller then runs the generic path's module.
 
@@ -35,6 +38,7 @@ from typing import Dict, Iterable, Optional, Set
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.k3_situ_mul import k3_situ_mul
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import allgather
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_long import (
     k3_ctm_gemv_long,
@@ -69,8 +73,8 @@ WIDE_ROWS = 64
 class Site:
     """A call site's weight shape (this target's per-rank shapes) and its kernels: ``small`` at 1..MAX_ROWS rows
     ("decode", "wide" or "long"), and k3_ctm_gemv_wide at MAX_ROWS+1..WIDE_ROWS rows where ``wide``. Output columns
-    from ``sig_col0`` on are stored through a sigmoid. ``split`` / ``ring``: k3_ctm_gemv_long's CTAs per 128-row
-    weight tile and weight-ring stages."""
+    from ``sig_col0`` on are stored through a sigmoid. ``split`` / ``ring`` / ``push``: k3_ctm_gemv_long's CTAs per
+    128-row weight tile, weight-ring stages, and whether the partial sums are pushed to each row's owner."""
 
     n: int
     k: int
@@ -79,20 +83,24 @@ class Site:
     sig_col0: int = -1
     split: int = 0
     ring: int = 0
+    push: bool = False
 
 
 SITES: Dict[str, Site] = {
     # MLA's [W_a; W_g] on a decode step: [q_a 1536 | kv_a 512 | k_pe 64] then the output gate (6 heads x 128),
     # the gate rows through a sigmoid.
-    "mla_ag": Site(2880, 7168, "long", wide=True, sig_col0=2112, split=6, ring=6),
+    "mla_ag": Site(2880, 7168, "long", wide=True, sig_col0=2112, split=6, ring=6, push=True),
     # KDA's [q | k | v | g | f_a | b] on a decode step (6 heads x 128 each, then 128 and 6, padded to 3208 rows).
-    "kda_proj": Site(3208, 7168, "long", wide=True, split=5, ring=6),
+    "kda_proj": Site(3208, 7168, "long", wide=True, split=5, ring=6, push=True),
     # The attention output projection (row parallel; 6 heads x 128 in).
     "o_proj": Site(7168, 768, "decode", wide=True),
     # The built-in MLA path's projections: kv_a_proj_with_mqa, q_b_proj and the output gate.
     "kv_a": Site(2112, 7168, "decode"),
     "q_b": Site(1152, 1536, "wide"),
     "g_proj": Site(768, 7168, "wide"),
+    # Layer 0's dense MLP split over the 16-way TP group: gate_up [gate 2112 | up 2112] and down.
+    "dense_gate_up": Site(4224, 7168, "long", split=4, ring=5),
+    "dense_down": Site(7168, 2112, "long", split=2, ring=6),
 }
 
 
@@ -127,7 +135,7 @@ def _run(
         split=spec.split,
         ring=spec.ring,
         trigger_early=True,
-        push=True,
+        push=spec.push,
     )
 
 
@@ -218,6 +226,12 @@ class K3DecodeGemvs:
             for rows in (1, 16, 32, 64) if spec.wide else (1,):
                 state._project(site, weight.new_zeros(rows, spec.k), weight, warm=True)
             del weight
+        if "dense_gate_up" in sites:
+            gu = torch.zeros(1, SITES["dense_gate_up"].n, dtype=torch.bfloat16, device=device)
+            if _ctm_op.supports_situ_mul(gu):
+                for linear_beta in (None, 1.0):
+                    k3_situ_mul(gu, 1.0, linear_beta)
+                    state._ran.add(("situ_mul", linear_beta is not None))
         if lm_head is not None and _head_takes_module(lm_head):
             x = head_weight.new_zeros(1, head_weight.shape[1])
             if _head_op.supports(x, head_weight):
@@ -296,6 +310,43 @@ class K3DecodeGemvs:
             return local
         gathered = allgather(local, None, group)
         return concat(list(split(gathered, rows.shape[0], dim=0)), dim=-1)
+
+    def dense_mlp(
+        self,
+        x: torch.Tensor,
+        gate_up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+        beta: float,
+        linear_beta: Optional[float],
+    ) -> Optional[torch.Tensor]:
+        """Layer 0's dense MLP of at most `MAX_ROWS` rows, before its down projection's all-reduce: gate_up on
+        ``gemm/k3_ctm_gemv_long``, ``SituAndMul(beta, linear_beta)`` on ``activation/k3_situ_mul``, down on
+        ``gemm/k3_ctm_gemv_long``. None, with nothing launched, where a kernel does not take the call; the caller then
+        runs the module."""
+        gate_up, down = SITES["dense_gate_up"], SITES["dense_down"]
+        rows = x.shape[0] if x.dim() == 2 else 0
+        if (
+            not 0 < rows <= MAX_ROWS
+            or linear_beta == 0.0
+            or tuple(gate_up_weight.shape) != (gate_up.n, gate_up.k)
+            or tuple(down_weight.shape) != (down.n, down.k)
+            or gate_up.n != 2 * down.k
+        ):
+            return None
+        if (
+            _capturing()
+            and not {
+                ("dense_gate_up", "long", 0),
+                ("dense_down", "long", 0),
+                ("situ_mul", linear_beta is not None),
+            }
+            <= self._ran
+        ):
+            return None
+        gu = self.project("dense_gate_up", x, gate_up_weight)
+        if gu is None or not _ctm_op.supports_situ_mul(gu):
+            return None
+        return self.project("dense_down", k3_situ_mul(gu, beta, linear_beta), down_weight)
 
     def embed_norm(
         self,
