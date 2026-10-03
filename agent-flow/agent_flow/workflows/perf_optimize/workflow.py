@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime
@@ -60,6 +61,7 @@ from .state import (
 )
 from .task_schema import (
     OPTIMIZE_DEFAULTS,
+    VALID_METRICS,
     concurrency_points,
     dump_task_yaml,
     focus_concurrencies,
@@ -70,6 +72,9 @@ from .task_schema import (
     profile_ranks,
     sol_enabled,
 )
+from .task_schema import test_case_allocation_spec as task_case_allocation_spec
+from .task_schema import test_case_config_path as task_case_config_path
+from .task_schema import test_case_name as task_case_name
 
 
 def _progress_has_entries(path: Path) -> bool:
@@ -119,6 +124,8 @@ def _make_agent(
         )
     )
 
+
+METRIC_DIRECTIONS = ("higher", "lower")
 
 _ROLES = ROLES
 
@@ -1289,7 +1296,7 @@ class PerfOptimizeWorkflow:
             clear_stale_benchmark_results(integration_dir)
             self._stamp_progress(state, round_no=round_no)
             self.integrator(
-                self._disagg_directive() + f"Workspace: {self.workspace}\n"
+                self._measurement_directive() + f"Workspace: {self.workspace}\n"
                 f"Round: {round_no}\n"
                 f"Integration worktree: {state.integration_worktree_path}\n"
                 f"Integration branch: {state.integration_branch}\n"
@@ -1379,11 +1386,15 @@ class PerfOptimizeWorkflow:
                         "integrator curve verdict does not cover the configured concurrency points"
                     )
                 metric = str(self._optimize_block()["target_metric"])
+                direction = self._metric_direction(roadmap)
                 regression_budget = self._regression_budget()
                 allowed_regression = noise_floor if regression_budget is None else regression_budget
                 for point in sorted(expected_points):
                     gain = self._normalized_gain_pct(
-                        reference_by_point[point], measured_by_point[point], metric
+                        reference_by_point[point],
+                        measured_by_point[point],
+                        metric,
+                        direction,
                     )
                     if gain is None or gain < -allowed_regression:
                         raise RuntimeError(
@@ -1549,31 +1560,61 @@ class PerfOptimizeWorkflow:
         """True iff ``path`` exists and holds non-whitespace content."""
         return path.is_file() and bool(path.read_text(encoding="utf-8").strip())
 
-    def _disagg_directive(self) -> str:
-        """The disagg override every stage prompt opens with, or ``""``.
+    def _measurement_directive(self) -> str:
+        """The measurement-mode override every stage prompt opens with.
+
+        ``""`` for the default single-server campaign.
 
         The role prompts are composed of two layers: a system prompt built
         from shared fragments, and the per-stage instruction this
-        orchestrator writes. ``DISAGG_CAMPAIGN`` supersedes the
-        single-server guidance in the *first* layer — but the second layer
-        also names ``trtllm-serve``, ``--extra_llm_api_options`` and a
-        readiness poll, and it arrives last and reads as the more specific
-        of the two. Without this the agent is handed a contradiction and
-        the disagg section can lose on specificity.
+        orchestrator writes. ``DISAGG_CAMPAIGN`` and
+        ``TEST_CASE_CAMPAIGN`` supersede the single-server guidance in the
+        *first* layer — but the second layer also names ``trtllm-serve``,
+        ``--extra_llm_api_options`` and a readiness poll, and it arrives
+        last and reads as the more specific of the two. Without this the
+        agent is handed a contradiction and the governing section can lose
+        on specificity.
 
         So the stage prompt states the mode up front and points at the
         section that governs it, rather than every stage's instruction
-        growing a disagg variant of its own.
+        growing a variant per mode. The two modes are mutually exclusive
+        (the task schema rejects a spec carrying both), so this returns at
+        most one override.
         """
-        if not has_disagg(self._task_data()):
-            return ""
-        config = disagg_config_path(self._task_data())
-        return (
-            f"⚠️ **This campaign is DISAGGREGATED** (harness config: `{config}`). "
-            f"Nothing below that mentions `trtllm-serve`, `--extra_llm_api_options` "
-            f"or polling a server applies — your system prompt's "
-            f"*Disaggregated serving* section replaces all of it.\n\n"
-        )
+        task_data = self._task_data()
+        name = task_case_name(task_data)
+        if name is not None:
+            config = task_case_config_path(task_data)
+            where = f", config: `{config}`" if config else ""
+            sizing = task_case_allocation_spec(task_data)
+            # Stated explicitly because a runner told only the test id has
+            # nothing to derive from and falls back to a single GPU, which
+            # turns a multi-node case into a one-device job that still
+            # reports numbers.
+            needs = (
+                f"Allocate **{sizing['devices']} GPU(s)** over "
+                f"**{sizing['nodes']} node(s)** at {sizing['devices_per_node']} per "
+                f"node, and pass those counts to the runner explicitly — it derives "
+                f"nothing from the test id.\n\n"
+                if sizing
+                else ""
+            )
+            return (
+                f"⚠️ **This campaign measures a TEST CASE** (`{name}`{where}). "
+                f"Nothing below that mentions `trtllm-serve`, "
+                f"`--extra_llm_api_options`, `benchmark_serving.py` or polling a "
+                f"server applies — your system prompt's *Test-case workload* "
+                f"section replaces all of it.\n\n{needs}"
+            )
+        if has_disagg(task_data):
+            config = disagg_config_path(task_data)
+            return (
+                f"⚠️ **This campaign is DISAGGREGATED** (harness config: `{config}`). "
+                f"Nothing below that mentions `trtllm-serve`, `--extra_llm_api_options` "
+                f"or polling a server applies — your system prompt's "
+                f"*Disaggregated serving* section replaces all of it.\n\n"
+            )
+        return ""
 
     def _require_baseline_measurement(self) -> None:
         """Fail loudly when the baseline stage produced no measurement.
@@ -1892,17 +1933,71 @@ class PerfOptimizeWorkflow:
         return any(item.get("status") == "accepted" for item in roadmap.get("items", []))
 
     @staticmethod
-    def _normalized_gain_pct(reference: float, measured: float, metric: str) -> float | None:
+    def _normalized_gain_pct(
+        reference: float, measured: float, metric: str, direction: str | None = None
+    ) -> float | None:
         """Signed % gain of ``measured`` vs ``reference``, positive = better.
 
-        Mirrors the prompts' measurement protocol: throughput metrics
-        improve upward, ``*_ms`` latency metrics improve downward.
+        ``direction`` is ``"higher"`` or ``"lower"`` and decides the sign.
+        When it is ``None`` the metric name decides, which mirrors the
+        prompts' measurement protocol and is only sound for a metric this
+        workflow already knows: throughput improves upward, ``*_ms``
+        latency improves downward. :meth:`_metric_direction` resolves it
+        and is what refuses to guess for anything else.
         """
         if reference == 0:
             return None
-        if metric.endswith("_ms"):
+        if direction is None:
+            direction = "lower" if metric.endswith("_ms") else "higher"
+        if direction == "lower":
             return (reference - measured) / reference * 100.0
         return (measured - reference) / reference * 100.0
+
+    def _metric_direction(self, roadmap: Mapping[str, Any] | None = None) -> str:
+        """Whether the target metric is better when higher or lower.
+
+        Resolved in three tiers, most specific first:
+
+        1. ``direction`` on the roadmap's ``baseline`` block — the
+           benchmarker's own determination, carried in by the analyzer.
+           This is the normal path: the benchmarker is the first stage to
+           read the metric out of a result, so it classifies it there, and
+           nothing earlier needs the answer because a gain needs two
+           numbers and the baseline is only the first.
+        2. ``optimize.direction`` in ``task.yaml`` — an explicit override,
+           and the only available source when the benchmarker does not run.
+        3. The metric name, for the metrics in
+           :data:`task_schema.VALID_METRICS`.
+
+        Raises when none of the three applies. A metric from outside the
+        known set whose name does not end in ``_ms`` would otherwise be
+        read as better-when-higher, so a latency-like metric such as
+        ``prev_device_step_time`` would score a slowdown as a gain — and
+        every later comparison, the target gate and the final report would
+        agree with it.
+        """
+        if isinstance(roadmap, Mapping):
+            baseline = roadmap.get("baseline")
+            if isinstance(baseline, Mapping):
+                recorded = baseline.get("direction")
+                if recorded in METRIC_DIRECTIONS:
+                    return str(recorded)
+        configured = self._optimize_block().get("direction")
+        if configured in METRIC_DIRECTIONS:
+            return str(configured)
+        metric = str(self._optimize_block()["target_metric"])
+        if metric.endswith("_ms"):
+            return "lower"
+        if metric in VALID_METRICS:
+            return "higher"
+        raise RuntimeError(
+            f"cannot tell whether '{metric}' is better when higher or lower: it is "
+            f"not one of the metrics this workflow knows ({', '.join(sorted(VALID_METRICS))}) "
+            f"and its name does not end in '_ms'. Set 'optimize.direction' to "
+            f"'higher' or 'lower' in task.yaml, or have the baseline stage record "
+            f"'direction' on the roadmap's baseline block. Guessing would risk "
+            f"scoring a regression as an improvement."
+        )
 
     def _target_met(self) -> tuple[bool, float | None]:
         """Whether ``optimize.target_improvement_pct`` is met, plus the gain.
@@ -1931,6 +2026,7 @@ class PerfOptimizeWorkflow:
             return (False, None)
         metric = str(roadmap.get("target_metric") or optimize["target_metric"])
 
+        direction = self._metric_direction(roadmap)
         gains: list[float] = []
         base_curve = baseline.get("curve")
         best_curve = best.get("curve")
@@ -1945,14 +2041,16 @@ class PerfOptimizeWorkflow:
                 reference = reference_by_point.get(point["concurrency"])
                 if reference is None:
                     continue
-                gain = self._normalized_gain_pct(reference, float(point["value"]), metric)
+                gain = self._normalized_gain_pct(
+                    reference, float(point["value"]), metric, direction
+                )
                 if gain is not None:
                     gains.append(gain)
         if gains:
             cumulative = sum(gains) / len(gains)
         else:
             cumulative = self._normalized_gain_pct(
-                float(baseline["value"]), float(best["value"]), metric
+                float(baseline["value"]), float(best["value"]), metric, direction
             )
         if cumulative is None:
             return (False, None)
@@ -2148,7 +2246,7 @@ class PerfOptimizeWorkflow:
                 "the roadmap's `baseline.value`. "
             )
         self.benchmarker(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n\n"
+            self._measurement_directive() + f"Workspace: {self.workspace}\n\n"
             f"Read `{self.task_path}` for the spec — resolve `checkpoint_path`, "
             f"`trtllm_repo_path`, and the `benchmark` / `optimize` blocks.\n\n"
             + self._casebook_instruction(
@@ -2272,7 +2370,7 @@ class PerfOptimizeWorkflow:
                 f"`{analysis_dir}` — do not re-derive it.\n\n"
             )
         self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._measurement_directive() + f"Workspace: {self.workspace}\n"
             f"Round: 1 (**reused analysis** — no profiling this round)\n"
             f"Analysis directory (already populated): {analysis_dir}\n\n"
             f"This campaign was launched with "
@@ -2436,7 +2534,7 @@ class PerfOptimizeWorkflow:
                 f"cannot be closed in this campaign.\n\n"
             )
         self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._measurement_directive() + f"Workspace: {self.workspace}\n"
             f"Round: {round_no}\n"
             f"Analysis directory (write your artifacts here): {analysis_dir}\n\n"
             f"Read `{self.task_path}` and `{self.baseline_results_path}` to "
@@ -2558,7 +2656,7 @@ class PerfOptimizeWorkflow:
                 f"campaign.\n\n"
             )
         self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._measurement_directive() + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} (**replan only** — no profiling this round)\n"
             f"Analysis directory (write your artifacts here): {analysis_dir}\n\n"
             f"Round {state.round_index} accepted **nothing**. "
@@ -2688,7 +2786,7 @@ class PerfOptimizeWorkflow:
                 f"your summary, not a claim to re-assert.\n\n"
             )
         (agent or self.optimizer)(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._measurement_directive() + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} — item {state.item_index + 1} of at most "
             f"{state.max_items_per_round} this round — attempt {attempt_no} "
             f"of {state.max_attempts_per_item}\n"
@@ -2888,7 +2986,7 @@ class PerfOptimizeWorkflow:
         else:
             attempt_note = ""
         (agent or self.evaluator)(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._measurement_directive() + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} — item {state.item_index + 1} of at most "
             f"{state.max_items_per_round} this round — attempt {attempt_no} "
             f"of {state.max_attempts_per_item}\n"
@@ -2999,7 +3097,7 @@ class PerfOptimizeWorkflow:
                 "`cumulative_improvement_pct` — from your own measurement"
             )
         self.qa(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._measurement_directive() + f"Workspace: {self.workspace}\n"
             f"Campaign: the optimization loop is over ({state.round_index} "
             f"round(s) ran); the system under test is the final accepted "
             f"state.\n"

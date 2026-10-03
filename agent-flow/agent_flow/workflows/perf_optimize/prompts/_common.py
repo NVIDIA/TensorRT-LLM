@@ -489,11 +489,20 @@ the same recipe:
   and latency keys `mean_ttft_ms` / `median_ttft_ms` / `p99_ttft_ms`
   (likewise `*_tpot_ms`, `*_itl_ms`, `*_e2el_ms`). The active target is
   `optimize.target_metric` in `task.yaml`.
-- **Direction rule:** throughput metrics are better when higher; `*_ms`
-  latency metrics are better when lower. Always report `gain_pct`
-  normalized so **positive = improvement**:
-  - throughput: `gain_pct = (new − reference) / reference × 100`
-  - latency (`*_ms`): `gain_pct = (reference − new) / reference × 100`
+- **Direction rule:** classify the target metric by *what it measures*, not
+  by how it is spelled.
+  - **Throughput / rate → HIGHER is better.** Output token throughput,
+    total token throughput, request throughput.
+  - **Latency / time / duration → LOWER is better.** End-to-end latency,
+    TTFT, TPOT, ITL, per-iteration time, device step time.
+
+  Always report `gain_pct` normalized so **positive = improvement**:
+  - higher-is-better: `gain_pct = (new − reference) / reference × 100`
+  - lower-is-better: `gain_pct = (reference − new) / reference × 100`
+
+  **State the direction you used** next to the first gain you report. A
+  metric whose name carries no unit suffix is exactly the case where an
+  unstated assumption turns a regression into an apparent win.
 - State which reference you compared against (baseline vs current best)
   next to every gain you report. In curve mode, gains are per point
   (same-concurrency reference entry) and aggregate as the **mean** —
@@ -624,6 +633,121 @@ profiling:
   fabricate a trace.
 - KV-cache transfer (ctx to gen) is a first-class cost here that an
   aggregate campaign does not have; classify it as `communication`.
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Test-case campaign (every server-launching role)
+# --------------------------------------------------------------------------- #
+
+TEST_CASE_CAMPAIGN = """\
+## Test-case workload (supersedes the server-lifecycle, tuning, and benchmark guidance above)
+
+**This campaign measures a named test case.** The orchestrator composes
+this section only for such a campaign, so it applies unconditionally.
+Nothing above that mentions `trtllm-serve`, `--extra_llm_api_options`,
+`benchmark_serving.py` or polling a server applies: you do not launch or
+tear down a server, and there is no tuning YAML. The workload is one
+pytest invocation of the id in `task.yaml`'s `test_case.name`, and the
+harness owns the server lifecycle, the client, and the metrics it prints.
+
+### The id is the identity of the measurement
+
+The id is what CI, the regression report and the stored result series are
+all keyed on. **Never change it, and never run a different one** — a
+number measured at a different operating point does not answer the
+question this campaign was opened on.
+
+Everything the id spells out is therefore fixed. What remains editable
+depends on the family:
+
+**`test_perf_sanity.py::test_e2e[...]`** — the id selects a config YAML
+under `tests/scripts/perf-sanity/` and, for the plain aggregated shape,
+one `server_configs` entry of it. Editable: that entry's tuning fields —
+`max_batch_size`, `max_num_tokens`, `moe_config`, `attn_backend`,
+`cuda_graph_config`, `kv_cache_config`.
+
+**`test_perf.py::test_perf[...]`** — the id *is* the configuration: every
+`key:value` label in it is a pinned knob. Editable:
+`tests/integration/defs/perf/pytorch_model_config.py`, whose tables supply
+everything the id does not spell out.
+
+Two consequences worth stating plainly:
+
+- **A config edit is a `code` item, not a `config` item.** Both families
+  read their configuration from the checkout under test, so the edit is a
+  source change in your worktree like any other, and it is picked up with
+  no further action. There is no tuning file to write; one named in any
+  guidance above is not read by this harness.
+- **Do not edit a field the id encodes.** For `test_perf` the id *is* the
+  serialized config, so changing `maxbs:512` means running a different
+  test case — one that need not even exist in
+  `tests/integration/test_lists/`, in which case CI never runs the test
+  the fix claims to repair. For perf-sanity the harness parses only the
+  config stem and the entry selection, so a token like `con128` inside the
+  stem is not read at all: editing the matching YAML field changes nothing
+  mechanically and still leaves the id describing a run it no longer
+  performs. If you conclude such an edit is genuinely the fix, say so
+  explicitly in the item rationale rather than making it quietly.
+
+### Running it
+
+You do not build the command, size the job, or write a Slurm script by hand.
+`task.yaml`'s `test_case.resolved` block already carries what a runner needs, and
+it was derived from the config in the checkout under test:
+
+- `devices`, `devices_per_node`, `nodes` — the allocation. **Pass these to the
+  runner explicitly.** Nothing downstream derives them from a test id: the
+  in-repo executor's own documentation says it performs "no auto-derivation from
+  the test ID", and its fallback is a *single GPU* — which submits a multi-node
+  case as a one-device job that runs, reports a number, and means nothing.
+- `config` — the perf-sanity YAML the id resolved to, for the family that reads
+  one. Hand it over rather than letting a runner search: the search has two
+  candidate folders and no fallback beyond them.
+- `family`, `runtime`, `benchmark_mode`, `select_pattern` — what the id selected.
+
+**Load a skill to run it; do not improvise a submission.** Which one depends on
+what is installed, and you should check in this order:
+
+1. **`run-test`** — if present. It owns template selection, script generation,
+   submission and parsing for both families, and it is what the surrounding
+   system already uses for every other measurement of this test case. Prefer it
+   whenever it exists, so your numbers are produced the same way as the ones you
+   are compared against.
+2. **`trtllm-case-executor`** — the in-repo fallback. Pass the pytest command as
+   `test_cmd`, the resolved YAML as `perf_config_yaml`, and the three allocation
+   counts as `total_required_devices` / `required_devices_per_node` /
+   `node_count`. For `test_perf.py` there is no config YAML and the family is
+   single-node, so per-node equals the total.
+
+If neither is available, stop and say so. A hand-rolled `sbatch` will differ from
+the measurement this campaign is scored against in ways nobody can see afterwards.
+
+### Reading the result
+
+Read the metric named by `optimize.target_metric` from the harness's own
+output, and **state which direction counts as better** next to the first
+number you report.
+
+**A rep counts as measured when the parser says so, not when Slurm says the job
+succeeded.** These are different questions and on some cases they disagree
+permanently, in the direction that throws away good data: a case can fail pytest
+while emitting a complete, correct measurement for the metric under test, and
+such a job reads as failed on every run forever. Authoritative, in order: the
+parser's own result file carries a non-null value per rep; else the trigger's exit
+status, which *is* the parser verdict. Not authoritative: the Slurm job state, the
+pytest summary, or a non-zero wait status.
+
+### Gates that keep a green run honest
+
+- **Never gate on the exit code.** A pruned or empty test selection runs
+  nothing and still exits `0` with every other check passing. Require the
+  benchmark log to exist and to report `Successful requests` > 0 before
+  you treat a run as a measurement.
+- A run whose id, commit or cluster differs from the campaign's is not
+  this campaign's data, whatever directory it is sitting in. Check those
+  before reusing an existing log, and check its timestamp — a stale
+  artifact from an earlier run reads exactly like a fresh one.
 """
 
 
