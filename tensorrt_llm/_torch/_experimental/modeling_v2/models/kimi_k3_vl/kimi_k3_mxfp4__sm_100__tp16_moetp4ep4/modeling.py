@@ -40,11 +40,12 @@ decode kernels' catalog entries:
   then `attention/k3_mla_attn_vb_out` (the attention, v_b and the output gate in one launch).
 
 The projections around them run on the decode GEMV sites of `decode_gemv.py` (the [W_a; W_g] and KDA verify-row
-projections, `o_proj` on every classified step), as do the LM head, the embedding and layer 0's dense MLP. The state
-those kernels share (the KDA projection's Lamport buffers, the MLA attention workspace, the decode GEMVs' state)
-lives in typed objects this target creates in `post_load_weights`, before any graph capture. The MoE front and routed
-experts, the sandwiches and the residual epilogues come with their own entries; until then they run the generic path
-on every step.
+projections, `o_proj` on every classified step), as do the LM head, the embedding and layer 0's dense MLP. A
+classified step's attention-residual epilogues (the selection and the RMSNorm after it) take the fused kernels up to
+one token tile, 32 tokens on a wide decode step. The state those kernels share (the KDA projection's Lamport buffers,
+the MLA attention workspace, the decode GEMVs' state) lives in typed objects this target creates in
+`post_load_weights`, before any graph capture. The MoE front and routed experts and the sandwiches come with their
+own entries; until then they run the generic path on every step.
 
 **What this target asserts rather than adapts**: SM 10.0; the topology above; the MXFP4 checkpoint's quantization
 (W4A16_MXFP4 with no per-layer declarations, so the routed experts run the W4A8_MXFP4_MXFP8 default and the excluded
@@ -448,20 +449,20 @@ def _persistent_attn_res_applicable(M: int, H: int, N: int) -> bool:
     return H == 7168 and 2 <= N <= 9
 
 
-def _use_persistent_attn_res(M: int, H: int, N: int) -> bool:
+def _use_persistent_attn_res(M: int, H: int, N: int, max_fused_tokens: int) -> bool:
     """Pick between the two fused kernels for this call site.
 
     ``persistent`` takes the persistent kernel at every shape it implements;
-    ``split`` takes it only above ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` tokens,
-    which stands in for the prefill/decode boundary. Shapes the persistent
-    kernel does not implement fall through to the caller's existing gate and
-    land on the unfused path.
+    ``split`` takes it only above ``max_fused_tokens`` tokens, which stands in
+    for the prefill/decode boundary. Shapes the persistent kernel does not
+    implement fall through to the caller's existing gate and land on the
+    unfused path.
     """
     if not _persistent_attn_res_applicable(M, H, N):
         return False
     if _ATTN_RES_TOPOLOGY == "persistent":
         return True
-    return _ATTN_RES_TOPOLOGY == "split" and M > _FUSED_ATTN_RES_MAX_TOKENS
+    return _ATTN_RES_TOPOLOGY == "split" and M > max_fused_tokens
 
 
 def _apply_attn_res_fused(
@@ -528,8 +529,12 @@ def _apply_attn_res_rmsnorm_fused(
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
+    max_fused_tokens: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
-    """Fuse attention-residual mixing with its immediately following norm."""
+    """Fuse attention-residual mixing with its immediately following norm (at most ``max_fused_tokens`` tokens,
+    default ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``)."""
+    if max_fused_tokens is None:
+        max_fused_tokens = _FUSED_ATTN_RES_MAX_TOKENS
     if (
         prefix_sum.dtype is not torch.bfloat16
         or not prefix_sum.is_cuda
@@ -539,10 +544,10 @@ def _apply_attn_res_rmsnorm_fused(
     M, H = prefix_sum.shape
     K = int(block_residual.shape[0])
     N = K + 1
-    # The fused path is taken for M <= _FUSED_ATTN_RES_MAX_TOKENS, H == 7168 and
-    # N <= 12, which is the measured window; larger token counts have not been
-    # measured and fall back to the unfused add + attn_res_fwd + RMSNorm path.
-    if _use_persistent_attn_res(M, H, N):
+    # The fused path is taken for M <= max_fused_tokens, H == 7168 and N <= 12,
+    # which is the measured window; larger token counts have not been measured
+    # and fall back to the unfused add + attn_res_fwd + RMSNorm path.
+    if _use_persistent_attn_res(M, H, N, max_fused_tokens):
         try:
             persistent_op = torch.ops.trtllm.attn_res_add_rmsnorm_persistent_fwd
         except (AttributeError, RuntimeError):
@@ -560,7 +565,7 @@ def _apply_attn_res_rmsnorm_fused(
         _note_attn_res_fusion("attn_res+norm/persistent", True, M, H, N)
         return output.reshape(M, H)
 
-    if M > _FUSED_ATTN_RES_MAX_TOKENS or H != 7168 or N > 12:
+    if M > max_fused_tokens or H != 7168 or N > 12:
         _note_attn_res_fusion("attn_res+norm", False, M, H, N)
         return None
     try:
@@ -589,8 +594,10 @@ def _apply_attn_res_add_rmsnorm_fused(
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
+    max_fused_tokens: Optional[int] = None,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """Fuse ``prefix_sum + addend``, attention-residual, and trailing norm.
+    """Fuse ``prefix_sum + addend``, attention-residual, and trailing norm (``max_fused_tokens`` as in
+    ``_apply_attn_res_rmsnorm_fused``).
 
     The production residual add produces a BF16 tensor that remains live across
     the following MLP. The kernel therefore returns that materialized,
@@ -598,6 +605,8 @@ def _apply_attn_res_add_rmsnorm_fused(
     while avoiding a separate add launch and a re-read of the intermediate by
     attention-residual selection.
     """
+    if max_fused_tokens is None:
+        max_fused_tokens = _FUSED_ATTN_RES_MAX_TOKENS
     if (
         prefix_sum.dtype is not torch.bfloat16
         or addend.dtype is not torch.bfloat16
@@ -611,7 +620,7 @@ def _apply_attn_res_add_rmsnorm_fused(
     K = int(block_residual.shape[0])
     N = K + 1
     # Same measured window as _apply_attn_res_rmsnorm_fused above.
-    if _use_persistent_attn_res(M, H, N):
+    if _use_persistent_attn_res(M, H, N, max_fused_tokens):
         try:
             persistent_op = torch.ops.trtllm.attn_res_add_rmsnorm_persistent_fwd
         except (AttributeError, RuntimeError):
@@ -629,7 +638,7 @@ def _apply_attn_res_add_rmsnorm_fused(
         _note_attn_res_fusion("add+attn_res+norm/persistent", True, M, H, N)
         return updated_prefix_sum.reshape(M, H), output.reshape(M, H)
 
-    if M > _FUSED_ATTN_RES_MAX_TOKENS or H != 7168 or N > 12:
+    if M > max_fused_tokens or H != 7168 or N > 12:
         _note_attn_res_fusion("add+attn_res+norm", False, M, H, N)
         return None
     try:
@@ -687,10 +696,14 @@ def _apply_attn_res_and_rmsnorm(
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
+    max_fused_tokens: Optional[int] = None,
 ) -> torch.Tensor:
-    """Apply attention-residual selection and the next RMSNorm."""
+    """Apply attention-residual selection and the next RMSNorm. ``max_fused_tokens``: the largest token count the
+    fused kernel takes (default ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``)."""
     if _FUSED_ATTN_RES_ENABLED:
-        fused = _apply_attn_res_rmsnorm_fused(prefix_sum, block_residual, proj, norm, output_norm)
+        fused = _apply_attn_res_rmsnorm_fused(
+            prefix_sum, block_residual, proj, norm, output_norm, max_fused_tokens
+        )
         if fused is not None:
             return fused
     return output_norm(_apply_attn_res(prefix_sum, block_residual, proj, norm))
@@ -703,18 +716,34 @@ def _apply_attn_res_add_and_rmsnorm(
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
+    max_fused_tokens: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Add an attention output to the running residual, then select and norm."""
+    """Add an attention output to the running residual, then select and norm (``max_fused_tokens`` as in
+    ``_apply_attn_res_and_rmsnorm``)."""
     if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_add_rmsnorm_fused(
-            prefix_sum, addend, block_residual, proj, norm, output_norm
+            prefix_sum, addend, block_residual, proj, norm, output_norm, max_fused_tokens
         )
         if fused is not None:
             return fused
     updated_prefix_sum = prefix_sum + addend
     return updated_prefix_sum, _apply_attn_res_and_rmsnorm(
-        updated_prefix_sum, block_residual, proj, norm, output_norm
+        updated_prefix_sum, block_residual, proj, norm, output_norm, max_fused_tokens
     )
+
+
+# A wide decode step's residual epilogues take the fused add + attn_res + RMSNorm kernels up to this many tokens, where
+# they are faster than the add -> attn_res -> RMSNorm chain.
+_WIDE_ATTN_RES_MAX_TOKENS = 32
+
+
+def _attn_res_max_tokens(step: Optional[DecodeStep]) -> Optional[int]:
+    """The most tokens of ``step`` the fused attn_res kernels take: one token tile (``DECODE_MAX_TOKENS``) on a step
+    ``decode_step`` classifies, ``_WIDE_ATTN_RES_MAX_TOKENS`` on a wide decode step; None on any other step (the
+    generic path's ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``)."""
+    if step is None:
+        return None
+    return _WIDE_ATTN_RES_MAX_TOKENS if step.wide else DECODE_MAX_TOKENS
 
 
 _K3_ROUTED_EXPERT_KEY_SUFFIXES = ("block_sparse_moe.experts", "mlp.experts")
@@ -1421,6 +1450,7 @@ class KimiLinearDecoderLayer(nn.Module):
         """
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
+        attn_res_max_tokens = _attn_res_max_tokens(step)
 
         if prenormed:
             assert num_snapshots == 0 and self.layer_idx % self.attn_res_block_size == 0
@@ -1448,6 +1478,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
                 self.input_layernorm,
+                attn_res_max_tokens,
             )
         else:
             hidden_states = self.input_layernorm(hidden_states)
@@ -1471,6 +1502,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 self.post_attention_layernorm,
+                attn_res_max_tokens,
             )
         else:
             prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
@@ -1480,6 +1512,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 self.post_attention_layernorm,
+                attn_res_max_tokens,
             )
         if self.is_moe:
             hidden_states = self.block_sparse_moe(
@@ -1689,6 +1722,7 @@ class KimiLinearModel(DecoderModel):
             self.output_attn_res_proj,
             self.output_attn_res_norm,
             self.norm,
+            _attn_res_max_tokens(step),
         )
 
 
