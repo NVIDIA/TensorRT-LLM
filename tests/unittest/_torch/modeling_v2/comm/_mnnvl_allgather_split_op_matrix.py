@@ -6,10 +6,11 @@ The op takes one turn of the workspace's Lamport rotation, which every MNNVL op 
 ``comm/mnnvl_fusion_allreduce`` on either path and ``comm/mnnvl_allreduce_attn_res``). So beyond single calls (every
 certified split at every certified token count against a bit-exact reference) this drives call *sequences*: decode
 steps whose token count dips and grows back with a random rank late at every call; two workspaces interleaved; the
-three MNNVL ops interleaved on one workspace; CUDA-graph capture and replay mixed with eager calls; and a negative
-control in which one rank swaps two calls and every rank gets a wrong answer without an error. After every eager call
-the workspace's ``buffer_flags`` are compared with this file's model of the rotation (``Rotation``): one turn per call
-whatever the op, one stage, the bytes the call wrote.
+three MNNVL ops interleaved on one workspace; the same mix queued with no host synchronization between calls while
+ranks run ahead of one another; CUDA-graph capture and replay mixed with eager calls; ``MnnvlWorkspace.create``'s
+failure model; and a negative control in which one rank swaps two calls and every rank gets a wrong answer without
+an error. After every eager call the workspace's ``buffer_flags`` are compared with this file's model of the rotation
+(``Rotation``): one turn per call whatever the op, one stage, the bytes the call wrote.
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _mnnvl_allgather_split_op_matrix.py [--world-size 4]
     srun -N 4 --ntasks-per-node 4 --mpi=pmix python _mnnvl_allgather_split_op_matrix.py --launcher srun \
@@ -64,16 +65,21 @@ SPECIAL_WORDS = (0x7F800000, -0x00800000, 0x7FC00000, 1, -0x7FFFFFFF, 0x7F7FFFFF
 LAYERS = 6
 DIP_STEPS = (8, 8, 8, 2, 7, 8, 1, 1, 64, 3, 32, 8, 16, 1, 64, 8)
 SHARED_STEPS = (8, 2, 16, 64, 1, 7, 32, 8, 3, 16)
+QUEUED_STEPS = (8, 2, 64, 16, 1, 32, 7)  # one round of the queued check: 52 calls
+QUEUED_ROUNDS = 3
+QUEUE_LATE_S = 0.02
 INTERLEAVED_TOKENS = (3, 8, 1, 64, 5, 16, 2)
 
 R = None
 allgather_split = None
 required_buffer_bytes = None
 fusion_allreduce = None
+allreduce_attn_res = None
 MnnvlWorkspace = None
 BUFFER_BYTES = None
 WS_A = None
 WS_B = None
+WS_C = None  # created by the failure-model check after the refused creates
 ROT = {}
 STATS = {"normed_err": 0.0, "attn_res_err": 0.0}
 
@@ -250,6 +256,11 @@ class AR:
             seed, self.tokens, self.hidden, residual=True if self.fused else None, path=self.path
         )
 
+    def chain_from(self, updated: torch.Tensor) -> None:
+        """Take an earlier fused call's ``updated`` as this fused call's residual (as a layer's residual stream)."""
+        assert self.fused
+        self.residual = updated
+
     def run(self, ws, x=None, residual=None):
         x = self.inputs[R.rank] if x is None else x
         if not self.fused:
@@ -302,8 +313,8 @@ class AR:
 
 
 class AttnRes:
-    """One comm/mnnvl_allreduce_attn_res call (G1's entry, called through its op on the workspace's comm_buffer and
-    buffer_flags, as that entry's wrapper does) and its reference. ``prefix``: a tensor (chained) or True (drawn)."""
+    """One comm/mnnvl_allreduce_attn_res call (the entry's wrapper, on the same workspace) and its reference.
+    ``prefix``: a tensor (chained) or True (drawn)."""
 
     def __init__(self, seed, tokens, snapshots, prefix=True):
         g = torch.Generator(device="cuda").manual_seed(seed)
@@ -317,8 +328,12 @@ class AttnRes:
         self.rms_w = (1.0 + 0.1 * torch.randn(H_MODEL, generator=g, device="cuda")).bfloat16()
         self.out_w = (1.0 + 0.1 * torch.randn(H_MODEL, generator=g, device="cuda")).bfloat16()
 
+    def chain_from(self, updated: torch.Tensor) -> None:
+        """Take an earlier call's ``updated`` as this call's prefix sum (as the next layer does)."""
+        self.prefix = updated
+
     def run(self, ws):
-        normed, updated = torch.ops.trtllm.mnnvl_allreduce_attn_res(
+        return allreduce_attn_res(
             self.inputs[R.rank],
             self.prefix,
             self.block,
@@ -327,10 +342,8 @@ class AttnRes:
             self.out_w,
             EPS,
             EPS,
-            ws.comm_buffer(torch.bfloat16),
-            ws.buffer_flags,
+            ws,
         )
-        return normed, updated
 
     def ref(self):
         updated = (sum(x.float() for x in self.inputs) + self.prefix.float()).bfloat16()
@@ -420,7 +433,8 @@ def check_single_calls() -> None:
 def check_unsupported_calls_raise_on_every_rank() -> None:
     """Refused on every rank before the workspace is touched (its flags do not move), and the next call is correct:
     more rows than one Lamport buffer holds (the wrapper's ValueError); bf16 columns not a multiple of 8, remaining
-    columns not a multiple of 4, a bf16 input, no rows (the op's RuntimeError)."""
+    columns not a multiple of 4, a bf16 input, no rows, and -- through the op itself, as the wrapper always passes
+    the workspace's -- a world_size other than the workspace's rank count (the op's RuntimeError)."""
     b, f = k3_split()
     t = BUFFER_BYTES // (R.world * (2 * b + 4 * f)) + 1
     over = AG(2000, t, b, f)
@@ -431,6 +445,13 @@ def check_unsupported_calls_raise_on_every_rank() -> None:
     expect_refusal(lambda: allgather_split(narrow, 8, WS_A), RuntimeError, "2 fp32 columns")
     expect_refusal(lambda: allgather_split(rows.bfloat16(), 8, WS_A), RuntimeError, "bf16 rows")
     expect_refusal(lambda: allgather_split(rows[:0], 8, WS_A), RuntimeError, "no rows")
+    expect_refusal(
+        lambda: torch.ops.trtllm.mnnvl_allgather_split(
+            rows, 8, R.world + 1, WS_A.comm_buffer(torch.bfloat16), WS_A.buffer_flags
+        ),
+        RuntimeError,
+        f"world_size {R.world + 1}",
+    )
     call_and_check(AG(2001, 8, b, f), WS_A, "after the refused calls")
 
 
@@ -488,6 +509,60 @@ def check_one_workspace_three_ops() -> None:
                 residual = call_late(fused, WS_A, f"{where} fused", late)[1]
 
 
+def queued_plan(seed: int):
+    """One round of the queued check, in issue order: per step of QUEUED_STEPS, two layers of Kimi K3's calls -- a
+    step of at most 16 tokens: the attention-residual all-reduce, the head all-gather, the latent all-reduce and the
+    fused all-reduce, the two all-reduces on opposite paths, alternating from layer to layer; a wide step: the wide
+    all-reduce [T, 7168], the all-gather and the latent all-reduce at Kimi K3's ceiling. The second layer's prefix sum
+    and residual are the first layer's outputs. Returns ``[(call, index of the call it chains from, or None)]``."""
+    b, f = k3_split()
+    plan = []
+    for i, t in enumerate(QUEUED_STEPS):
+        decode = t <= ATTN_RES_MAX_TOKENS
+        prev_attn = prev_fused = None
+        for layer in range(2):
+            s = seed + 100 * i + 10 * layer
+            one, two = ("one", "two") if (i + layer) % 2 == 0 else ("two", "one")
+            if decode:
+                plan.append((AttnRes(s, t, (0, 2, 5)[(i + layer) % 3]), prev_attn))
+                prev_attn = len(plan) - 1
+            else:
+                plan.append((AR(s, t, H_MODEL), None))
+            plan.append((AG(s + 1, t, b, f), None))
+            plan.append((AR(s + 2, t, LATENT, path=one if decode else "k3"), None))
+            if decode:
+                plan.append((AR(s + 3, t, H_MODEL, residual=True, path=two), prev_fused))
+                prev_fused = len(plan) - 1
+    return plan
+
+
+def check_queued_calls_without_host_sync() -> None:
+    """Ranks running ahead of one another: in each round every rank enqueues the same 52 calls on one workspace (the
+    three ops, both all-reduce paths, Kimi K3's step sizes dipping and growing back, a layer's prefix sum and residual
+    taken from the previous layer's outputs on the device) with no host synchronization between them -- no barrier,
+    no .item(), no synchronize -- a random rank sleeping 20 ms before it starts enqueueing and another pausing 20 ms
+    halfway, so the other ranks' queues run deep while it is idle. Then every result is checked, and the flags. This
+    cannot deadlock: a call waits only for its peers' words of the same call, every rank enqueues every call, and a
+    stream runs its calls in order, so the ranks' earliest pending call always completes."""
+    late = random.Random(13)
+    for rnd in range(QUEUED_ROUNDS):
+        plan = queued_plan(60_000 + 1000 * rnd)
+        sleeper, pauser = late.randrange(R.world), late.randrange(R.world)
+        R.barrier()
+        R.late(sleeper, QUEUE_LATE_S)
+        outs = []
+        for k, (call, src) in enumerate(plan):
+            if k == len(plan) // 2:
+                R.late(pauser, QUEUE_LATE_S)
+            if src is not None:
+                call.chain_from(outs[src][1])
+            outs.append(call.run(WS_A))
+        torch.cuda.synchronize()
+        for k, ((call, _), got) in enumerate(zip(plan, outs)):
+            call.verify(got, f"queued round {rnd} call {k}")
+        rot(WS_A).advance(plan[-1][0].record(), f"queued round {rnd}", calls=len(plan))
+
+
 def check_graph_capture_and_replay() -> None:
     """A captured step of five calls on WS_B, the MoE layers of a decode step: the head all-gather (T 8), the
     routed-latent all-reduce one-shot, the head all-gather again, a [32, 3584] all-reduce sent two-shot and the head
@@ -537,20 +612,50 @@ def check_graph_capture_and_replay() -> None:
     del graph
 
 
-def check_create_under_capture_raises() -> None:
-    """MnnvlWorkspace.create allocates and exchanges handles, so it refuses CUDA-graph capture: with every rank
-    capturing, it raises RuntimeError on every rank (before any communication), and the next call on a workspace in
-    use is correct."""
-    graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
-    raised = False
-    with torch.cuda.graph(graph, stream=stream):
-        try:
+def try_create(capturing: bool):
+    """Every rank calls MnnvlWorkspace.create; this one inside a CUDA-graph capture if ``capturing``. Returns the
+    RuntimeError's message, or None if it returned a workspace."""
+    try:
+        if not capturing:
             MnnvlWorkspace.create(R.mapping, BUFFER_BYTES, fabric_handle=R.fabric)
-        except RuntimeError as exc:
-            raised = "before capture" in str(exc)
-    del graph
-    assert R.all_true(raised), "create() under capture did not raise on every rank"
-    call_and_check(AG(8500, 8, *k3_split()), WS_A, "after the refused create")
+            return None
+        graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                MnnvlWorkspace.create(R.mapping, BUFFER_BYTES, fabric_handle=R.fabric)
+        finally:
+            del graph
+        return None
+    except RuntimeError as exc:
+        return str(exc)
+
+
+def check_create_refuses_on_every_rank() -> None:
+    """MnnvlWorkspace.create's failure model: before allocating, the ranks agree that each of them can. With one
+    random rank inside a CUDA-graph capture and the others not, and then with every rank capturing, every rank raises
+    RuntimeError and none allocates; the capturing ranks' message names the capture. A create right after, eager on
+    every rank, returns an armed workspace whose first call is correct, and the workspaces in use are untouched."""
+    global WS_C
+    capturer = random.Random(17).randrange(R.world)
+    b, f = k3_split()
+    for every in (False, True):
+        capturing = every or R.rank == capturer
+        message = try_create(capturing)
+        refused = message is not None and "not every rank can allocate" in message
+        named = not capturing or (refused and "before capture" in message)
+        assert R.all_true(refused and named), (
+            f"{'every rank' if every else f'rank {capturer}'} capturing: not refused on every rank ({message})"
+        )
+        rot(WS_A).unchanged("after the refused create")
+    WS_C = MnnvlWorkspace.create(R.mapping, BUFFER_BYTES, fabric_handle=R.fabric)
+    ROT[id(WS_C)] = Rotation(WS_C)
+    armed = WS_C.lamport.view(torch.int32)
+    assert bool((armed == torch.tensor(INT32_MIN, dtype=torch.int32, device="cuda")).all()), (
+        "the workspace created after the refusals: every word -0.0"
+    )
+    rot(WS_C).unchanged("created after the refusals")
+    call_and_check(AG(8500, 8, b, f), WS_C, "first call on the new workspace")
+    call_and_check(AG(8501, 8, b, f), WS_A, "after the refusals")
 
 
 def check_wrong_call_order_is_detected() -> None:
@@ -588,20 +693,24 @@ CHECKS = [
     check_dip_and_regrow_sequence,
     check_two_workspaces_interleaved,
     check_one_workspace_three_ops,
+    check_queued_calls_without_host_sync,
     check_graph_capture_and_replay,
-    check_create_under_capture_raises,
+    check_create_refuses_on_every_rank,
     # Stays last: it deliberately disagrees on call order.
     check_wrong_call_order_is_detected,
 ]
 
 
 def _run_one_rank(args) -> int:
-    global R, allgather_split, required_buffer_bytes, fusion_allreduce, MnnvlWorkspace
-    global BUFFER_BYTES, WS_A, WS_B
+    global R, allgather_split, required_buffer_bytes, fusion_allreduce, allreduce_attn_res
+    global MnnvlWorkspace, BUFFER_BYTES, WS_A, WS_B
     R = ls.Rank(args)
     assert R.world in (2, 4, 8, 16), f"K3's shapes shard over 2, 4, 8 or 16 ranks, not {R.world}"
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (
         mnnvl_allgather_split as module,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (
+        mnnvl_allreduce_attn_res as attn_res_module,
     )
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (
         mnnvl_fusion_allreduce as reduce_module,
@@ -610,6 +719,7 @@ def _run_one_rank(args) -> int:
     allgather_split = module.mnnvl_allgather_split
     required_buffer_bytes = module.required_buffer_bytes
     fusion_allreduce = reduce_module.mnnvl_fusion_allreduce
+    allreduce_attn_res = attn_res_module.mnnvl_allreduce_attn_res
     MnnvlWorkspace = module.MnnvlWorkspace
     BUFFER_BYTES = buffer_bytes(R.world)
     with torch.inference_mode():

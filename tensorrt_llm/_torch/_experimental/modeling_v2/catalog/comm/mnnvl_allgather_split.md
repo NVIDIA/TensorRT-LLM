@@ -26,6 +26,13 @@ rounded), exact midpoints between two bf16 values in every fourth of them (ties 
 fourth column of each part, and in the fp32 part infinities, a NaN, signed denormals and the largest float, which
 arrive unchanged. The result is bitwise the same on every rank (certified, every call of the test).
 
+The op also takes `world_size`, the number of ranks it sizes the outputs for (`world_size x B` and `world_size x F`
+columns). It must equal the workspace's rank count, which the op checks: another value raises `RuntimeError` on every
+rank before the workspace is touched (certified, calling the op directly). The wrapper passes `workspace.world_size`,
+so its own signature has no such argument. With the output widths given by an argument, the op has a fake (shape-only)
+implementation (`tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py`), so fake-tensor tracing such as `torch.compile`
+can run it.
+
 Kimi K3's use: the row-sharded MoE head of a wide decode step (9 to 64 tokens), and of a
 decode step of at most 8 tokens where the fused MoE front kernel does not run. Rank `r`'s GEMV gives fp32
 `[T, 3584/W + 896/W]`: the latent down projection's columns `[r * 3584/W, (r+1) * 3584/W)`, then the router logits of
@@ -37,9 +44,9 @@ Fusion boundary. Inside: the bf16 rounding of the leading columns and the exchan
 `k3_fused_moe/k3_route_quant_ag.py` fuses this exchange with them and states it is bit for bit this op followed by
 `k3_route_quant`).
 
-The kernel releases its programmatic dependents as soon as it starts; its outputs are complete only when its grid is,
-so a kernel launched as its programmatic dependent must wait for the grid before reading them (the kernel's
-statement).
+The kernel releases its programmatic dependents as soon as its own grid-dependency wait returns; its outputs are
+complete only when its grid is, so a kernel launched as its programmatic dependent must wait for the grid before
+reading them (the kernel's statement).
 
 ## Signature
 
@@ -53,6 +60,14 @@ def mnnvl_allgather_split(
 def required_buffer_bytes(num_tokens: int, bf16_columns: int, fp32_columns: int, world_size: int) -> int
 ```
 
+The wrapper makes one op call, passing `workspace.world_size`, `workspace.comm_buffer(torch.bfloat16)` and
+`workspace.buffer_flags` for the op's last three arguments:
+
+```
+mnnvl_allgather_split(Tensor input, int bf16_columns, int world_size, Tensor(a!) comm_buffer,
+                      Tensor(b!) buffer_flags) -> Tensor[]
+```
+
 ### Certified arguments
 
 | Argument | Shape | Dtype | Layout | Device |
@@ -62,8 +77,9 @@ def required_buffer_bytes(num_tokens: int, bf16_columns: int, fp32_columns: int,
 | `workspace` | an `MnnvlWorkspace` of this rank's TP group whose buffers hold the call (see *State*) | — | — | — |
 | returns | `(bf16_out, fp32_out)`: `[T, W x B]` and `[T, W x F]` | bf16, fp32 | contiguous, newly allocated | = `input.device` |
 
-`input` is read only. `required_buffer_bytes` = `T x W x (2B + 4F)`, the bytes the call writes into one Lamport
-buffer (certified equal to what the call records, every call of the split grid).
+`input` is read only. The op writes the workspace's buffers and flag words; its schema declares both mutable.
+`required_buffer_bytes` = `T x W x (2B + 4F)`, the bytes the call writes into one Lamport buffer (certified equal to
+what the call records, every call of the split grid).
 
 ## State
 
@@ -81,10 +97,21 @@ buffer; the flags do not move and the next call is correct; the op has the same 
 two-shot `[64, 7168]` all-reduce of its shared-workspace sequence).
 
 **Who creates it, and when.** The target, in `post_load_weights`, with
-`MnnvlWorkspace.create(mapping, buffer_bytes, fabric_handle=None)`: collective over the TP group, eager, every word
-and flag armed before any rank returns (see `mnnvl_allreduce_attn_res.md`). It refuses CUDA-graph capture: certified
-with every rank capturing, each raising `RuntimeError`. The check runs before any communication, so a rank that is
-not capturing while its peers are would go on into the communicator split and wait for them (code).
+`MnnvlWorkspace.create(mapping, buffer_bytes, fabric_handle=None)` (see `mnnvl_allreduce_attn_res.md`):
+
+- collective over the TP group: every rank calls it at the same point;
+- failure model:
+  - before allocating, the ranks agree that each of them can (not capturing, a valid `buffer_bytes`, the three
+    buffers within that rank's free device memory). If one cannot, every rank raises `RuntimeError` and none
+    allocates (certified: one rank inside a CUDA-graph capture while the others are not, and then every rank
+    capturing; each time every rank raises, the capturing ranks' message naming the capture, and the workspaces in
+    use are untouched; a create right after, eager on every rank, returns an armed workspace whose first call is
+    correct);
+  - a failure that returns from the allocation is agreed the same way;
+  - a rank that fails inside the allocation's handle exchange can leave its peers waiting in that exchange; this
+    is not turned into an error on the other ranks;
+- eager: it allocates and exchanges handles, so it refuses to run under CUDA-graph capture (every rank raises);
+- it arms every buffer word and the flags before any rank returns.
 
 **Which ops may share one object.** Every MNNVL op of the group takes the same `comm_buffer` / `buffer_flags`:
 `comm/mnnvl_allreduce_attn_res`, `comm/mnnvl_fusion_allreduce` on either path, and this entry. Their calls form one
@@ -101,7 +128,14 @@ ranks issuing B-then-A against A-then-B deadlocked; this op waits for its peers 
 
 **Call-order invariant.** Every rank of the group makes the same sequence of calls on one workspace — the same
 number, the `k`-th with the same op, `T`, `B` and `F` — across layers and decode steps, eager calls and graph replays
-alike; and on one stream the same order of calls across workspaces.
+alike; and on one stream the same order of calls across workspaces. The invariant is on the order of calls, not on
+their timing: a rank may enqueue any number of calls ahead of its peers, since each call waits on the device for its
+peers' words of that call only, and every rank's earliest pending call can always complete. Certified: three rounds
+of 52 calls on one workspace — the three MNNVL ops (an all-gather in every layer), both all-reduce paths, `T` = 8, 2,
+64, 16, 1, 32, 7, two layers each, the second layer's prefix sum and residual taken from the first layer's outputs on
+the device — enqueued by every rank with no host synchronization between calls, a random rank 20 ms late before it
+starts enqueueing and another pausing 20 ms halfway; then every result against the reference and the flags against
+the model.
 
 **What a later launch reads.** `buffer_flags`, which every call leaves as: current = its own buffer plus one, mod 3;
 dirty = its own buffer; bytes per buffer unchanged; dirty stage count 1; bytes to clear `(T x W x (2B + 4F), 0, 0,
@@ -139,9 +173,11 @@ depend on it.
 
 ## Preconditions
 
-- `input` fp32, contiguous, 2-D, 16-byte aligned; `B` a multiple of 8 and `F` a multiple of 4; `T` at least 1.
-  Otherwise the op raises `RuntimeError` on every rank before it touches the workspace (certified: `B` = 12, `F` = 2,
-  a bf16 input, `T` = 0; the flags do not move and the next call is correct).
+- `input` fp32, contiguous, 2-D, 16-byte aligned; `B` a multiple of 8 and `F` a multiple of 4; `T` at least 1; the
+  op's `world_size` equal to the workspace's rank count (the wrapper passes it). Otherwise the op raises
+  `RuntimeError` on every rank before it touches the workspace (certified: `B` = 12, `F` = 2, a bf16 input, `T` = 0,
+  and, calling the op directly, `world_size` one more than the workspace's; the flags do not move and the next call
+  is correct).
 - `required_buffer_bytes(T, B, F, W) <= workspace.buffer_bytes` (*State*).
 - Every rank calls with the same `T`, `B` and `F`; the call order is the *State* invariant.
 - `workspace` was created before any capture. Calls may be captured: certified with a captured step of five calls on
@@ -158,16 +194,12 @@ depend on it.
   and exact; this op's outputs are compared bit for bit. The all-reduce and attention-residual calls of its sequences
   are checked as in their own matrices (sums bit for bit, normed outputs within a tolerance).
 - State and test design: a typed state object built by an explicit, collective, eager `create()`; a test that drives
-  call sequences on real state (layers x steps, capture + replay, two objects interleaved) plus a negative control;
-  every written buffer named in the schema (the op falls short there, see the gaps below); the matrix takes
+  call sequences on real state (layers x steps, calls queued without host synchronization, capture + replay, two
+  objects interleaved) plus a negative control; every written buffer named in the schema; the matrix takes
   `--world-size` and `--launcher` (`mpirun` on one node, `srun` across trays) and CI runs it at 4 ranks on one GB200
   tray; one `MnnvlWorkspace` shared by every MNNVL entry of the TP group. The 16-rank receipt is pending.
 - Not exercised: `B` = 0 or `F` = 0 (the op accepts both), denormal and non-finite values in the bf16 columns, an
-  accepted call of more than 64 tokens.
-- Gaps (the op is unchanged by this entry): the schema marks `comm_buffer` mutable `(a!)` but not `buffer_flags`,
-  which every call advances; the op has no `register_fake`
-  (`tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py` registers one for the other two MNNVL ops), so fake-tensor
-  tracing, e.g. `torch.compile`, cannot run it.
+  accepted call of more than 64 tokens, the fake implementation.
 - In the model today the call is `MNNVLAllReduce.allgather_split(input, bf16_columns)` on `MNNVLAllReduce`'s workspace
   (a dict keyed by `Mapping`, grown to the call's footprint by the first eager call that needs more). This entry takes
   the explicit object instead, sized at construction.

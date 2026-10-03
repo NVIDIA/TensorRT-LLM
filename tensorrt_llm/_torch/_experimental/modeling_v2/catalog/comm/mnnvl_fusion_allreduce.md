@@ -34,6 +34,8 @@ call leaves in the workspace's flags shows (*State*).
 
 - One-shot: one kernel. Each rank writes its rows into every rank's buffer through the multicast mapping, waits for
   all `W` rows of every token in its own copy and sums them; the residual add and the RMSNorm run in the same kernel.
+  It releases its programmatic dependents as soon as its own grid-dependency wait returns, before it waits for its
+  peers (see *Notes* for this change).
 - Two-shot: each rank writes token `t`'s row into rank `t mod W`'s buffer, which sums the `W` rows of its tokens and
   writes the bf16 sums into every rank's buffer through the multicast mapping. Plain, the same kernel then waits for
   every token's sum and copies it out; fused, a second kernel does that and adds the residual and normalizes.
@@ -84,9 +86,10 @@ def required_buffer_bytes(
 | `eps` | `None`, or a float with `residual`; 1e-5 certified | Python float | — | — |
 | returns | plain: the sum `[T, H]`; fused: `(normed, updated)`, each `[T, H]` | bf16 | contiguous, newly allocated | = `input.device` |
 
-`input`, `residual` and `norm_weight` are read only. `required_buffer_bytes` is the space one Lamport buffer must
-have for the call: `T x H x W x 2` one-shot, `2 x ceil(T / W) x W x H x 2` two-shot (two stages); certified equal to
-the space the call's stages take, every call of the shape grid.
+`input`, `residual` and `norm_weight` are read only. The op writes the workspace's buffers and flag words; its
+schema declares both mutable (`comm_buffer` `Tensor(a!)`, `buffer_flags` `Tensor(b!)`). `required_buffer_bytes` is
+the space one Lamport buffer must have for the call: `T x H x W x 2` one-shot, `2 x ceil(T / W) x W x H x 2` two-shot
+(two stages); certified equal to the space the call's stages take, every call of the shape grid.
 
 ## State
 
@@ -108,10 +111,21 @@ calls of this op (arithmetic, not a test). The test's buffer is the one-shot foo
 `W` = 4.
 
 **Who creates it, and when.** The target, in `post_load_weights`, with
-`MnnvlWorkspace.create(mapping, buffer_bytes, fabric_handle=None)`: collective over the TP group, eager, every word
-and flag armed before any rank returns (see `mnnvl_allreduce_attn_res.md`). It refuses CUDA-graph capture: certified
-with every rank capturing, each raising `RuntimeError`. The check runs before any communication, so a rank that is
-not capturing while its peers are would go on into the communicator split and wait for them (code).
+`MnnvlWorkspace.create(mapping, buffer_bytes, fabric_handle=None)` (see `mnnvl_allreduce_attn_res.md`):
+
+- collective over the TP group: every rank calls it at the same point;
+- failure model:
+  - before allocating, the ranks agree that each of them can (not capturing, a valid `buffer_bytes`, the three
+    buffers within that rank's free device memory). If one cannot, every rank raises `RuntimeError` and none
+    allocates (certified: one rank inside a CUDA-graph capture while the others are not, and then every rank
+    capturing; each time every rank raises, the capturing ranks' message naming the capture, and the workspaces in
+    use are untouched; a create right after, eager on every rank, returns an armed workspace whose first call is
+    correct);
+  - a failure that returns from the allocation is agreed the same way;
+  - a rank that fails inside the allocation's handle exchange can leave its peers waiting in that exchange; this
+    is not turned into an error on the other ranks;
+- eager: it allocates and exchanges handles, so it refuses to run under CUDA-graph capture (every rank raises);
+- it arms every buffer word and the flags before any rank returns.
 
 **Which ops may share one object.** Every MNNVL op of the group takes the same `comm_buffer` / `buffer_flags`:
 `comm/mnnvl_allreduce_attn_res`, this entry on either path, and `comm/mnnvl_allgather_split`. Their calls form one
@@ -130,7 +144,13 @@ the same way).
 number, the `k`-th with the same op, `T`, `H`, fusion and path — across layers and decode steps, eager calls and
 graph replays alike; and on one stream the same order of calls across workspaces. The path is part of the sequence:
 the two paths write and wait for different words, so the ranks' `one_shot_max_bytes` must pick the same path (they do
-when they pass the same value).
+when they pass the same value). The invariant is on the order of calls, not on their timing: a rank may enqueue any
+number of calls ahead of its peers, since each call waits on the device for its peers' words of that call only, and
+every rank's earliest pending call can always complete. Certified: three rounds of 52 calls on one workspace — the
+three MNNVL ops, both paths, `T` = 8, 2, 64, 16, 1, 32, 7, two layers each, the second layer's prefix sum and residual
+taken from the first layer's outputs on the device — enqueued by every rank with no host synchronization between
+calls, a random rank 20 ms late before it starts enqueueing and another pausing 20 ms halfway; then every result
+against the reference and the flags against the model.
 
 **What a later launch reads.** `buffer_flags`, which every call leaves as: current = its own buffer plus one, mod 3;
 dirty = its own buffer; bytes per buffer unchanged; dirty stage count 1 (one-shot) or 2 (two-shot); bytes to clear
@@ -170,9 +190,9 @@ None besides `workspace` and `one_shot_max_bytes`, both explicit. The op keeps n
 (precompiled kernels). It finds the multicast mapping by looking `comm_buffer`'s address up in a process registry of
 multicast buffers, which the workspace's handle keeps registered. `TRTLLM_ENABLE_PDL` (read once per process,
 default on at SM 90 and newer) launches the kernels as programmatic dependents: the one-shot kernel releases its own
-dependents as it starts, the two-shot one after its scatter; consumers of the outputs wait for the grid (the kernels'
-statement); results do not depend on it. The launch shape (CTAs per token, cluster size) follows `T`, `H` and the
-device's SM count, and in the fused form it sets the order in which the squares are summed.
+dependents right after its grid-dependency wait, the two-shot one after its scatter; consumers of the outputs wait
+for the grid (the kernels' statement); results do not depend on it. The launch shape (CTAs per token, cluster size)
+follows `T`, `H` and the device's SM count, and in the fused form it sets the order in which the squares are summed.
 
 ## Preconditions
 
@@ -202,11 +222,18 @@ device's SM count, and in the fused form it sets the order in which the squares 
   `updated` are compared bit for bit, `normed` against the fp32 RMSNorm of `updated` within 1e-2 of its largest
   magnitude (the bf16 squares cost at most 2^-9 on `rcp`, the bf16 output 2^-8).
 - State and test design: a typed state object built by an explicit, collective, eager `create()`; a test that drives
-  call sequences on real state (layers x steps, capture + replay, two objects interleaved) plus a negative control;
-  every written buffer named in the schema (the op falls short there, see the gaps below); the matrix takes
+  call sequences on real state (layers x steps, calls queued without host synchronization, capture + replay, two
+  objects interleaved) plus a negative control; every written buffer named in the schema; the matrix takes
   `--world-size` and `--launcher` (`mpirun` on one node, `srun` across trays) and CI runs it at 4 ranks on one GB200
   tray; one caller-owned `MnnvlWorkspace` shared by every MNNVL entry of the TP group, and
   `one_shot_max_bytes` per call.
+- The one-shot kernel differs from main's for every caller, main's `MNNVLAllReduce` included. It releases its
+  programmatic dependents right after its own grid-dependency wait, where main's released them after the reduction,
+  so a dependent kernel (a GEMV) can launch and stream its weights while this kernel waits for its peers; a
+  dependent still reads the output and the flags only after its own grid wait. Its Lamport reduction is the shared
+  `reduceOneshotLamport` of the attention-residual one-shot kernel: the code is moved, not changed, and the reduction
+  order is the same. Results unchanged (main's MNNVL test bodies pass on this build; the kernel's SASS changes).
+  EVIDENCE: <filled by comm16>
 - At `W` = 16 the one-shot kernel adds the ranks in two chunks of 8, a branch a 4-rank run never reaches. The 16-rank
   receipt is pending.
 - Kimi K3's calls (its decode path, not this test): the model sets every `MNNVLAllReduce` of the target, its
@@ -217,13 +244,12 @@ device's SM count, and in the fused form it sets the order in which the squares 
   `k3_sandwich_plain` does not take the call. At 4 MiB a `[T, 7168]` call goes one-shot up to `T` = 18 at `W` = 16
   (73 at `W` = 4) and a `[T, 3584]` one up to 36 (146); at 1 MiB `[T, 7168]` up to 4 (18) and `[T, 3584]` up to 9
   (36).
-- Gaps (the op is unchanged by this entry): the schema marks `comm_buffer` mutable `(a!)` but not `buffer_flags`,
-  which every call advances; the op does not check that the call fits `comm_buffer` (the
-  attention-residual and all-gather ops do), so a direct op call over one buffer writes past it — the wrapper's
-  `required_buffer_bytes` check is the guard; `MnnvlWorkspace.create` accepts any multiple of 16 bytes, but the
-  two-shot broadcast stage starts at `buffer_bytes / 2` and is accessed in 16-byte vectors, so a two-shot call needs
-  `buffer_bytes` to be a multiple of 32 (code; every buffer in the test is); the schema's default
-  `one_shot_max_bytes=1048576` applies to a direct op call (the wrapper always passes one).
+- Gaps: the op does not check that the call fits `comm_buffer` (the attention-residual and all-gather ops do), so a
+  direct op call over one buffer writes past it — the wrapper's `required_buffer_bytes` check is the guard;
+  `MnnvlWorkspace.create` accepts any multiple of 16 bytes, but the two-shot broadcast stage starts at
+  `buffer_bytes / 2` and is accessed in 16-byte vectors, so a two-shot call needs `buffer_bytes` to be a multiple of
+  32 (code; every buffer in the test is); the schema's default `one_shot_max_bytes=1048576` applies to a direct op
+  call (the wrapper always passes one).
 - In the model today the workspace is `MNNVLAllReduce`'s (a dict keyed by `Mapping`, grown on demand by the first
   eager call that needs more, in 8 MiB steps) and the one-shot ceiling is a module attribute with a per-call override.
   This entry takes both explicitly: the workspace sized at construction, the ceiling per call.
