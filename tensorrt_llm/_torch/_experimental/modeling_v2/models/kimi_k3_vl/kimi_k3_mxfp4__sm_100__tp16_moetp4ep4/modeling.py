@@ -39,11 +39,12 @@ decode kernels' catalog entries:
 * MLA (`K3DecodeMLA`): `attention/k3_mla_qkv` (the query path and the step's latent KV rows into the paged cache),
   then `attention/k3_mla_attn_vb_out` (the attention, v_b and the output gate in one launch).
 
-The state those kernels share (the KDA projection's Lamport buffers, the MLA attention workspace) lives in typed
-objects this target creates in `post_load_weights`, before any graph capture. The token-count kernels (the decode
-GEMVs, the MoE front and routed experts, the sandwiches, the embedding and residual epilogues) come with their own
-entries; until then every module but the attention runs the generic path on every step, as do the projections around
-the attention kernels (the [W_a; W_g] and verify-row GEMMs, `o_proj` and its all-reduce).
+The projections around them run on the decode GEMV sites of `decode_gemv.py` (the [W_a; W_g] and KDA verify-row
+projections, `o_proj` on every classified step), as do the LM head, the embedding and layer 0's dense MLP. The state
+those kernels share (the KDA projection's Lamport buffers, the MLA attention workspace, the decode GEMVs' state)
+lives in typed objects this target creates in `post_load_weights`, before any graph capture. The MoE front and routed
+experts, the sandwiches and the residual epilogues come with their own entries; until then they run the generic path
+on every step.
 
 **What this target asserts rather than adapts**: SM 10.0; the topology above; bf16 weights and a bf16 KV pool;
 tokens_per_block 64 (the MLA generation kernels K3's 96 heads reach exist only at 64); the V2 hybrid KV / state
@@ -1777,15 +1778,18 @@ class K3DecodeKDA(KimiKDALinearAttention):
     """Kimi K3's KDA attention: the built-in module, with the decode kernels on the steps they take.
 
     * A decode step of one token per request runs the fused input projection and the plain decode in one
-      ``ssm/k3_kda_decode_attn`` launch, then the module's ``o_proj`` and all-reduce.
+      ``ssm/k3_kda_decode_attn`` launch.
     * With the cache manager's per-token states (``KimiLinearModel.kda_token_states``), every verify of the layer, on
       any step, runs the kernels that keep them: ``ssm/k3_kda_attn`` for one request of 8 tokens (the projection fused
-      in), else ``ssm/k3_kda_verify`` on the projection's rows. The built-in verify replays drafts from caches these
-      kernels do not fill, so the two never run on one manager.
+      in), else ``ssm/k3_kda_verify`` on the projection's rows (the ``kda_proj`` decode GEMV site where it takes
+      them). The built-in verify replays drafts from caches these kernels do not fill, so the two never run on one
+      manager.
+    * On every step ``decode_step`` classifies, ``o_proj`` runs on the ``o_proj`` decode GEMV site where it takes the
+      rows, then the module's all-reduce.
 
     Every other step runs the built-in module. The kernels read one ``[q | k | v | g | f_a | b]`` weight, built at the
-    checkpoint load from the module's own, and the device's ``K3KdaBuffers``, which the target sets in
-    ``post_load_weights``.
+    checkpoint load from the module's own, and the device's ``K3KdaBuffers`` and decode GEMVs' state, which the
+    target sets in ``post_load_weights``.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -1795,6 +1799,8 @@ class K3DecodeKDA(KimiKDALinearAttention):
         self.k3_proj_weight: Optional[torch.Tensor] = None
         # The fused projection's Lamport buffers: one set per device, shared by every KDA layer.
         self.k3_buffers: Optional[K3KdaBuffers] = None
+        # The decode GEMVs' state (decode_gemv.py), shared by the target's layers.
+        self.decode_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
 
     @property
     def takes_k3_kernels(self) -> bool:
@@ -1829,19 +1835,33 @@ class K3DecodeKDA(KimiKDALinearAttention):
         attn_metadata: AttentionMetadata,
         step: Optional[DecodeStep] = None,
     ) -> torch.Tensor:
-        """The built-in forward, except on a decode step of one token per request."""
+        """The built-in forward on a step ``decode_step`` does not classify, and under a breakable CUDA graph. On the
+        others: the plain decode on ``ssm/k3_kda_decode_attn`` on a decode step of one token per request, else the
+        built-in dispatch; then ``o_proj`` on its decode GEMV site."""
+        if step is None or is_in_breakable_cuda_graph():
+            return super().forward(hidden_states, attn_metadata)
         if (
-            step is not None
-            and step.decode
+            step.decode
             and step.tokens_per_request == 1
             and self.takes_k3_kernels
             and self.k3_buffers is not None
-            and not is_in_breakable_cuda_graph()
         ):
-            return self._project_output(
-                self._k3_decode(hidden_states[: step.num_tokens], attn_metadata)
+            core = self._k3_decode(hidden_states[: step.num_tokens], attn_metadata)
+        else:
+            core = self._forward_impl(hidden_states, attn_metadata)
+        return self._k3_project_output(core)
+
+    def _k3_project_output(self, core: torch.Tensor) -> torch.Tensor:
+        """``o_proj`` on the ``o_proj`` decode GEMV site where it takes the rows (else the module), then the TP
+        all-reduce."""
+        out = None
+        if self.decode_gemvs is not None:
+            out = self.decode_gemvs.project(
+                "o_proj", core.reshape(-1, self.proj_size), self.o_proj.weight
             )
-        return super().forward(hidden_states, attn_metadata)
+        if out is None:
+            return self._project_output(core)
+        return out if self._o_allreduce is None else self._o_allreduce(out)
 
     def _k3_decode(self, x: torch.Tensor, attn_metadata: AttentionMetadata) -> torch.Tensor:
         """``ssm/k3_kda_decode_attn``: the core output ``[R, H, 128]`` of one token of each of the step's R requests;
@@ -1898,8 +1918,9 @@ class K3DecodeKDA(KimiKDALinearAttention):
 
     def _k3_verify(self, x, num_steps, layer_cache, ssm_pool, slot_indices) -> torch.Tensor:
         """The core output ``[N T, H, 128]`` of N requests of T verify tokens: ``ssm/k3_kda_attn`` for one request of
-        8 tokens, else ``ssm/k3_kda_verify`` on the projection's rows. Each slot's state after the golden token, its
-        drafts' states and its conv window are written in place."""
+        8 tokens, else ``ssm/k3_kda_verify`` on the projection's rows (the ``kda_proj`` decode GEMV site where it
+        takes them). Each slot's state after the golden token, its drafts' states and its conv window are written in
+        place."""
         num_requests = x.shape[0] // num_steps
         slots = slot_indices[:num_requests]
         w_q, w_k, w_v = self._get_mtp_conv_weights()
@@ -1927,8 +1948,13 @@ class K3DecodeKDA(KimiKDALinearAttention):
                 *constants,
             )
         else:
+            rows = None
+            if self.decode_gemvs is not None:
+                rows = self.decode_gemvs.project("kda_proj", x, self.k3_proj_weight)
+            if rows is None:
+                rows = torch.nn.functional.linear(x, self.k3_proj_weight)
             out = k3_kda_verify(
-                torch.nn.functional.linear(x, self.k3_proj_weight),
+                rows,
                 self.f_b_proj.weight,
                 w_q,
                 w_k,
@@ -1952,14 +1978,16 @@ class K3DecodeKDA(KimiKDALinearAttention):
 class K3DecodeMLA(KimiK3MLAAttention):
     """Kimi K3's MLA attention: the built-in module, with a decode step's attention on the decode kernels.
 
-    A decode step runs ``x [W_a; W_g]^T`` as one GEMM with the gate columns through a sigmoid, then
-    ``attention/k3_mla_qkv`` (the q_a / kv_a RMSNorms, q_b and the k_b absorption into the fused query, the step's
-    latent rows stored into the paged cache) and ``attention/k3_mla_attn_vb_out`` (the attention over the paged cache,
-    v_b and the output gate in one launch), then the module's ``o_proj``. Every other step, and a decode step whose
+    A decode step runs ``x [W_a; W_g]^T`` with the gate columns through a sigmoid (the ``mla_ag`` decode GEMV site
+    where it takes the rows, else one GEMM), then ``attention/k3_mla_qkv`` (the q_a / kv_a RMSNorms, q_b and the k_b
+    absorption into the fused query, the step's latent rows stored into the paged cache) and
+    ``attention/k3_mla_attn_vb_out`` (the attention over the paged cache, v_b and the output gate in one launch), then
+    ``o_proj`` (the ``o_proj`` site where it takes the rows, else the module). Every other step, and a decode step whose
     cache the kernels do not read (``k3_mla_decode_view`` says why), runs the built-in module.
 
     ``[W_a; W_g]`` is built at load from the module's weights, which become views of it. The attention workspace is
-    the device's ``K3MlaAttnWorkspace``, which the target sets in ``post_load_weights``.
+    the device's ``K3MlaAttnWorkspace``; it and the decode GEMVs' state are set by the target in
+    ``post_load_weights``.
     """
 
     def __init__(self, **kwargs) -> None:
@@ -1968,6 +1996,8 @@ class K3DecodeMLA(KimiK3MLAAttention):
         self.k3_ag_weight: Optional[torch.Tensor] = None
         # The decode attention's workspace: one per device, shared by every MLA layer.
         self.k3_workspace: Optional[K3MlaAttnWorkspace] = None
+        # The decode GEMVs' state (decode_gemv.py), shared by the target's layers.
+        self.decode_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
 
     def post_load_weights(self) -> None:
         """The built-in post-load, then ``[W_a; W_g]`` (once: CUDA graphs captured since read it)."""
@@ -2048,8 +2078,11 @@ class K3DecodeMLA(KimiK3MLAAttention):
             )
         x = hidden_states[: step.num_tokens].contiguous()
         rows = self.kv_a_proj_with_mqa.weight.shape[0]
-        ag = torch.nn.functional.linear(x, self.k3_ag_weight)
-        ag[:, rows:].sigmoid_()
+        gemvs = self.decode_gemvs
+        ag = None if gemvs is None else gemvs.project("mla_ag", x, self.k3_ag_weight)
+        if ag is None:
+            ag = torch.nn.functional.linear(x, self.k3_ag_weight)
+            ag[:, rows:].sigmoid_()
         fused_q = k3_mla_qkv(
             ag,
             self.q_a_layernorm.weight,
@@ -2079,7 +2112,12 @@ class K3DecodeMLA(KimiK3MLAAttention):
             gate=ag,
             gate_col0=rows,
         )
-        return self._project_output([attn_output], position_ids, attn_metadata, all_reduce_params)
+        out = None if gemvs is None else gemvs.project("o_proj", attn_output, self.o_proj.weight)
+        if out is None:
+            out = self._project_output(
+                [attn_output], position_ids, attn_metadata, all_reduce_params
+            )
+        return out
 
     def _k3_decode_view(self, attn_metadata: AttentionMetadata, num_tokens: int) -> Optional[dict]:
         """The paged latent cache as the decode kernels read it this step, or None when they do not read it (the
@@ -2294,7 +2332,8 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
 
     def post_load_weights(self) -> None:
         """The state the decode kernels share, built once per device before any CUDA-graph capture and handed to
-        every layer of its kind: the KDA projection's Lamport buffers and the MLA decode attention's workspace."""
+        every layer of its kind: the KDA projection's Lamport buffers and the MLA decode attention's workspace; and
+        the decode GEMVs' state (built by ``cache_derived_state``) handed to every attention module."""
         super().post_load_weights()
         kda = [layer.linear_attn for layer in self.model.layers if layer.is_kda]
         mla = [layer.self_attn.mixer for layer in self.model.layers if not layer.is_kda]
@@ -2307,6 +2346,8 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
             module.k3_buffers = buffers
         for module in mla:
             module.k3_workspace = workspace
+        for module in kda + mla:
+            module.decode_gemvs = self.model.decode_gemvs
         logger.info(
             "Kimi K3 decode kernels: KDA on k3_kda_decode_attn, k3_kda_attn and k3_kda_verify "
             f"({sum(m.takes_k3_kernels for m in kda)} / {len(kda)} layers take them), MLA on k3_mla_qkv and "
