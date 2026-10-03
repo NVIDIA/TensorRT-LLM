@@ -33,6 +33,8 @@ KERNELS = [
     "tensorrt_llm._torch.cute_dsl_kernels.k3_decode_gemv.k3_decode_gemv_kernel",
     "tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.k3_moe_front",
     "tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.k3_moe_kernel",
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.k3_moe_m1_kernel",
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.k3_moe_m2_kernel",
     "tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich.k3_sandwich_kernel",
 ]
 

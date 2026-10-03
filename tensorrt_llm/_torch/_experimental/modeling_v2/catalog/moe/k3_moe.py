@@ -3,11 +3,14 @@
 """Kimi K3's routed experts at decode size: ``trtllm::k3_moe``, this rank's routed partial from the persistent CuTe
 DSL kernel (FC1 + SiTU + FC2 with the routing-weighted combine over the TRTLLM-Gen W4A8_MXFP4_MXFP8 buffers, read in
 place), on caller-owned state: a :class:`K3MoeState` (up to 8 tokens) or :class:`K3MoeWideState` (up to 64) and one
-:class:`K3MoeLayer` per MoE layer. Its inputs are the outputs of ``moe/k3_route_quant`` or ``moe/k3_moe_front``."""
+:class:`K3MoeLayer` per MoE layer. Its inputs are the outputs of ``moe/k3_route_quant`` or ``moe/k3_moe_front``. The
+push form stores the partial into every rank's ``K3LatentExchange`` for ``comm/k3_latent_reduce`` instead."""
 
 from typing import Optional
 
 import torch
+
+from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.latent_op import K3LatentExchange
 
 # The state types (they launch nothing per call); importing the op module registers trtllm::k3_moe. is_supported reads
 # metadata only.
@@ -26,6 +29,7 @@ __all__ = [
     "K3MoeWideState",
     "is_supported",
     "k3_moe",
+    "k3_moe_push",
 ]
 
 
@@ -58,4 +62,33 @@ def k3_moe(
         x_fp8, x_sf, topk_ids, topk_weights, *layer.weights, state.c, state.cs, state.part, layer.counters,
         local_expert_offset, state.num_local, state.num_ctas, state.m_max, state.use_pdl,
         None if head is None else head.ready, None if head is None else head.flags, out,
+    )  # fmt: skip
+
+
+def k3_moe_push(
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    local_expert_offset: int,
+    layer: K3MoeLayer,
+    exchange: K3LatentExchange,
+    slot: Optional[int] = None,
+    head: Optional[K3MoeHeadWorkspace] = None,
+) -> None:
+    """The push form of :func:`k3_moe` for ``M <= 8`` on a K3MoeState: the same partial, stored into slot ``slot``
+    (default ``exchange.rank``) of every rank's ``exchange`` (a TP group's ``K3LatentExchange``) instead of returned.
+    One ``comm/k3_latent_reduce`` of the M tokens on that exchange must follow before the next push, on every rank in
+    the same order. ``head`` as in :func:`k3_moe`. Writes the state's slab (left armed) and partial rows, the layer's
+    counters (left zero), and every rank's exchange."""
+    state = layer.state
+    if (head is not None) != state.head_flags:
+        raise ValueError(
+            "k3_moe_push: head is given for, and only for, the layers of a head_flags K3MoeState"
+        )
+    torch.ops.trtllm.k3_moe(
+        x_fp8, x_sf, topk_ids, topk_weights, *layer.weights, state.c, state.cs, state.part, layer.counters,
+        local_expert_offset, state.num_local, state.num_ctas, state.m_max, state.use_pdl,
+        None if head is None else head.ready, None if head is None else head.flags, None,
+        exchange.uc, exchange.mc, exchange.flags, exchange.rank if slot is None else slot,
     )  # fmt: skip

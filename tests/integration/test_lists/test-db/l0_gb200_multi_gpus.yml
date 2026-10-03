@@ -57,6 +57,7 @@ l0_gb200_multi_gpus:
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_front.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_latent_reduce.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_push.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_oproj_op_matrix.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_tail_op_matrix.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_plain_op_matrix.py
