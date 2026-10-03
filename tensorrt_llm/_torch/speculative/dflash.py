@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import inspect
 import os
 from collections import deque
 from dataclasses import dataclass
@@ -494,6 +496,24 @@ def dflash_allocated_ctx_limit(
     per-request guarantee into it there.
     """
     return (block_counts * page_size - block_size).clamp(min=0)
+
+
+@functools.lru_cache(maxsize=None)
+def _takes_ctx_rows_start_cls(cls) -> bool:
+    return "ctx_rows_start" in inspect.signature(cls.dflash_forward).parameters
+
+
+def _takes_ctx_rows_start(draft_model) -> bool:
+    """Whether the draft model's ``dflash_forward`` accepts ``ctx_rows_start``."""
+    return _takes_ctx_rows_start_cls(type(draft_model))
+
+
+def dflash_ctx_rows_kwargs(draft_model, ctx_rows_start: Optional[int]) -> dict:
+    """The ``ctx_rows_start`` keyword (from ``prepare_1st_drafter_inputs``) for a draft model whose ``dflash_forward``
+    takes it; no keyword for another draft model or without a start."""
+    if ctx_rows_start is None or not _takes_ctx_rows_start(draft_model):
+        return {}
+    return {"ctx_rows_start": ctx_rows_start}
 
 
 @dataclass
@@ -2185,6 +2205,7 @@ class DFlashWorker(SpecWorkerBase):
                     ctx_cache_batch_idx=inputs["ctx_cache_batch_idx"],
                     ctx_kv_cache=inputs["ctx_kv_cache"],
                     ctx_page_table=inputs["ctx_page_table"],
+                    **dflash_ctx_rows_kwargs(draft_model, inputs["ctx_rows_start"]),
                 )
 
                 # Gather K logits per gen request from the block outputs.
@@ -2468,6 +2489,17 @@ class DFlashWorker(SpecWorkerBase):
         block_logits = gen_logits.new_full((*gen_logits.shape[:-1], full_vocab), float("-inf"))
         return candidate_ids, unary_logits, block_logits
 
+    def _ctx_rows_start(self, num_contexts: int, num_gens: int) -> Optional[int]:
+        """The first row of the gen requests' page-table rows where those rows are one contiguous run, else None.
+
+        The manager's block table is keyed by batch position, so the gen requests' rows are [num_contexts,
+        num_contexts + num_gens): a drafter can view them instead of gathering ``ctx_cache_batch_idx``'s rows. The
+        private arena's table is keyed by slot, which need not be contiguous.
+        """
+        if num_gens > 0 and self._ctx_block_tables is not None:
+            return num_contexts
+        return None
+
     def prepare_1st_drafter_inputs(
         self,
         input_ids: torch.LongTensor,
@@ -2492,6 +2524,9 @@ class DFlashWorker(SpecWorkerBase):
         - num_ctx_per_req: per-request context length in the pool
         - ctx_k_cache / ctx_v_cache / ctx_cache_batch_idx: slot-indexed
           views of the persistent per-layer K/V pool.
+        - ctx_rows_start: where ctx_cache_batch_idx is the contiguous rows
+          [ctx_rows_start, ctx_rows_start + num_gens) of ctx_page_table, their
+          start (``_ctx_rows_start``), else None.
         """
         num_contexts = attn_metadata.num_contexts
         batch_size = attn_metadata.num_seqs
@@ -2686,4 +2721,5 @@ class DFlashWorker(SpecWorkerBase):
                 if self._ctx_block_tables is not None
                 else self._ctx_page_table
             ),
+            "ctx_rows_start": self._ctx_rows_start(num_contexts, num_gens),
         }

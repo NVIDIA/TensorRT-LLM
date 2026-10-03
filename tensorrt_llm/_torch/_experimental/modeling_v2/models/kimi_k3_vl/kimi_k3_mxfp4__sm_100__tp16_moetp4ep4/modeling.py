@@ -2646,9 +2646,12 @@ class K3DSparkDrafter(GQADSparkForCausalLM):
         ctx_cache_batch_idx: torch.Tensor,
         ctx_kv_cache: Optional[torch.Tensor] = None,
         ctx_page_table: Optional[torch.Tensor] = None,
+        ctx_rows_start: Optional[int] = None,
     ) -> torch.Tensor:
         """The block's hidden states ``[B * block, hidden]``: on the drafter entries where they take it (the class
-        docstring), else the stock forward."""
+        docstring), else the stock forward. ``ctx_rows_start``: where ``ctx_cache_batch_idx`` is the contiguous rows
+        ``[ctx_rows_start, ctx_rows_start + B)`` of ``ctx_page_table``, their start; the entries then read those rows
+        as a view instead of gathering them."""
         keys = self._k3_block_keys(noise_embedding, ctx_kv_cache, ctx_page_table)
         if keys is None:
             return super().dflash_forward(
@@ -2668,6 +2671,7 @@ class K3DSparkDrafter(GQADSparkForCausalLM):
             ctx_cache_batch_idx,
             ctx_kv_cache,
             ctx_page_table,
+            ctx_rows_start,
         )
         if not torch.cuda.is_current_stream_capturing():
             self._k3_attn_ran |= keys
@@ -2774,11 +2778,16 @@ class K3DSparkDrafter(GQADSparkForCausalLM):
         ctx_cache_batch_idx: torch.Tensor,
         ctx_kv_cache: torch.Tensor,
         ctx_page_table: torch.Tensor,
+        ctx_rows_start: Optional[int] = None,
     ) -> torch.Tensor:
         batch, block = noise_embedding.shape[:2]
         rows = batch * block
         ctx_len = num_ctx_per_req[:batch].to(torch.int32)
-        page_table = ctx_page_table.index_select(0, ctx_cache_batch_idx.to(torch.long))
+        if ctx_rows_start is None:
+            page_table = ctx_page_table.index_select(0, ctx_cache_batch_idx.to(torch.long))
+        else:
+            # The batch's page-table rows are one contiguous run: a view, no gather.
+            page_table = ctx_page_table[ctx_rows_start : ctx_rows_start + batch]
         positions = query_positions.reshape(-1).contiguous()
         hidden = noise_embedding.reshape(rows, -1)
         layers = self.model.layers

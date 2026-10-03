@@ -11,6 +11,8 @@ at one TP16 rank's drafter shapes: 6 query heads and 1 KV head of 64, hidden 716
 * A split the entry does not certify runs the stock forward, bit for bit, without the entry.
 * Under CUDA-graph capture, the entries take a block only once its attention compile key has run eagerly.
 * Negative control: a weight changed between the two forwards fails the comparison.
+* With ``ctx_rows_start`` the entries read the batch's page-table rows as a view of a larger table (the manager's,
+  rows from the first gen request on), not a gathered copy, and give the gather's result bit for bit.
 
 On the TP group's collective state (``use_decode_comm``), here a group of one rank whose collectives are torch
 stand-ins counted per call (the ops themselves are certified by their multi-GPU op matrices):
@@ -352,6 +354,38 @@ def test_negative_control_a_changed_weight_fails(drafter):
             weight.copy_(saved)
     ref = DFlashForCausalLM.dflash_forward(drafter, **stock_inputs)
     assert _rel_l2(out, ref) > REL_L2
+
+
+@pytest.mark.parametrize("split", [(1, 7), (3, 1), (8, 7)])
+def test_page_table_rows_as_a_view(drafter, gemvs, monkeypatch, split):
+    batch, block = split
+    start = 2
+    tables = []
+    entry = target.k3_drafter_attn_qknorm
+
+    def recorded(*args):
+        tables.append(args[7])  # the page table
+        return entry(*args)
+
+    monkeypatch.setattr(target, "k3_drafter_attn_qknorm", recorded)
+    drafter.decode_gemvs = gemvs
+    inputs = _block(batch, block, seed=batch * 10 + block + 2)
+    # The batch's rows sit at [start, start + batch) of a larger table; the other rows hold no page.
+    table = inputs["ctx_page_table"]
+    padded = torch.full((start + batch + 1, table.shape[1]), -1, dtype=torch.int32, device="cuda")
+    padded[start : start + batch] = table
+    inputs["ctx_page_table"] = padded
+    inputs["ctx_cache_batch_idx"] = torch.arange(
+        start, start + batch, dtype=torch.long, device="cuda"
+    )
+    gathered = drafter.dflash_forward(**_copy(inputs))
+    viewed = drafter.dflash_forward(**inputs, ctx_rows_start=start)
+    torch.cuda.synchronize()
+    assert torch.equal(viewed, gathered)
+    assert len(tables) == 2 * LAYERS and all(torch.equal(t, table) for t in tables)
+    # The gather's rows are a copy; the view's are the table's own rows.
+    assert all(t.data_ptr() != padded[start].data_ptr() for t in tables[:LAYERS])
+    assert all(t.data_ptr() == padded[start].data_ptr() for t in tables[LAYERS:])
 
 
 @pytest.mark.parametrize("rows", [1, 8, DECODE_ROWS, 200])
