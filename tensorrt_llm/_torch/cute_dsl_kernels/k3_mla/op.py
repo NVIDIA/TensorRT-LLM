@@ -478,7 +478,8 @@ def _launch_attn(
     clusters = num_requests * groups
     no_cluster = (
         clusters > kernel.CLUSTER_WAVE
-        and clusters * kernel.CLUSTER <= torch.cuda.get_device_properties(q.device).multi_processor_count
+        and clusters * kernel.CLUSTER
+        <= torch.cuda.get_device_properties(q.device).multi_processor_count
     )
     if out is None:
         out = torch.empty(num_tokens, total_heads * width, dtype=torch.bfloat16, device=q.device)

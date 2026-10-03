@@ -57,7 +57,13 @@ try:
 except ImportError:  # older DSL layout
     from cutlass.utils import SmemAllocator
 
-from ..k3_kda_verify.k3_kda_verify_kernel import _bf16, _butterfly, _st_async_f32, _store8, _test_wait_cluster
+from ..k3_kda_verify.k3_kda_verify_kernel import (
+    _bf16,
+    _butterfly,
+    _st_async_f32,
+    _store8,
+    _test_wait_cluster,
+)
 
 K_IN = 7168
 HK = 768  # 6 local heads x 128
@@ -952,7 +958,9 @@ def _head_role(
         tmem_acc = cutlass.inttoptr(tmem_holder.load(), 6, cutlass.Int32)
         while not cute.arch.mbarrier_test_wait(w_full.data_ptr(), 0):
             pass
-        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)  # f_a came from the other threads' smem stores
+        prims.tcgen05_fence(
+            prims.Tcgen05Fence.AFTER_THREAD_SYNC
+        )  # f_a came from the other threads' smem stores
         for kb in cutlass.range_constexpr(2 * (BOX_K // MMA_K)):
             box = kb // (BOX_K // MMA_K)
             within = kb % (BOX_K // MMA_K)
@@ -1218,7 +1226,8 @@ def _head_role(
     xq_last = _rows_out([r_st.load(idx=R_Q + r) for r in range(REC_ROWS)], lane)
     if (lane & cutlass.Int32(7)) == cutlass.Int32(0):
         s_o.store(
-            _bf16(xq_last), idx=(NT - 1) * V_CTA + warp * REC_ROWS + (lane >> 4) * 2 + ((lane >> 3) & 1)
+            _bf16(xq_last),
+            idx=(NT - 1) * V_CTA + warp * REC_ROWS + (lane >> 4) * 2 + ((lane >> 3) & 1),
         )
 
     # ---- Phase 3 (the output gate), then the gated RMSNorm over V: every CTA sends its two 16-row sums of squares
