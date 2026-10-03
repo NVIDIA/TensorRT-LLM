@@ -43,22 +43,22 @@ def main() -> None:
         help="Path to save the generated video and audio.",
     )
     parser.add_argument(
-        "--image_reference",
+        "--image",
         action="append",
         default=[],
-        help="Ref2VA image path; repeat for multiple images.",
+        help="Ref2VA reference image path; repeat for multiple images.",
     )
     parser.add_argument(
-        "--video_reference",
+        "--video",
         action="append",
         default=[],
-        help="Ref2VA video path, including its soundtrack.",
+        help="Ref2VA reference video path, including its soundtrack.",
     )
     parser.add_argument(
-        "--audio_reference",
+        "--audio",
         action="append",
         default=[],
-        help="Ref2VA audio path; requires an image or video.",
+        help="Ref2VA reference audio path; requires an image or video.",
     )
     parser.add_argument(
         "--reference_order",
@@ -82,7 +82,7 @@ def main() -> None:
     params.seed = 42
 
     for kind in ("image", "video", "audio"):
-        paths = getattr(args, f"{kind}_reference")
+        paths = getattr(args, kind)
         if paths:
             setattr(
                 params,

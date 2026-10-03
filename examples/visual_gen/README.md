@@ -49,12 +49,12 @@ Use the converted checkpoint containing both partitions and the shared encoders/
 ```bash
 python models/minimax_h3.py --model <approved-checkpoint> \
   --visual_gen_args configs/minimax-h3-ref2va-bf16-1gpu.yaml \
-  --image_reference subject.png --audio_reference voice.wav \
+  --image subject.png --audio voice.wav \
   --prompt 'The person in <Picture 1> speaks with the voice in <Audio 1>.' \
   --output_path ref2va.mp4
 ```
 
-Repeat `--image_reference`, `--video_reference`, or `--audio_reference` for multiple
+Repeat `--image`, `--video`, or `--audio` for multiple
 references (up to 9 images, 3 videos, 3 audio clips, 12 total). Audio alone is not
 supported. Video references include their soundtrack when present. Media files
 retain their frame/sample rates; PyAV decodes video/audio, and torchaudio is needed
