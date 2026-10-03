@@ -70,7 +70,10 @@ def check_single_calls() -> None:
             for with_prefix in (True, False):
                 call = cm.TailCall(1000 + 37 * t + s, t, s, prefix=with_prefix or None, weights=t % cm.WEIGHT_SETS,
                                    shift=i)  # fmt: skip
-                call.verify(call.run(WS_A), f"M {t} snapshots {s} prefix {with_prefix} lo {call.los[R.rank]}")
+                call.verify(
+                    call.run(WS_A),
+                    f"M {t} snapshots {s} prefix {with_prefix} lo {call.los[R.rank]}",
+                )
                 i += 1
 
 
@@ -101,7 +104,9 @@ def check_unsupported_calls_raise_on_every_rank() -> None:
     big = cm.TailCall(2000, 9, 1)
     misaligned = cm.TailCall(2001, 4, 1)
     store = torch.zeros(4 * cm.LATENT + 8, dtype=torch.bfloat16, device="cuda")
-    shifted = store[1 : 1 + 4 * cm.LATENT].view(4, cm.LATENT)  # contiguous, 2 bytes past an aligned address
+    shifted = store[1 : 1 + 4 * cm.LATENT].view(
+        4, cm.LATENT
+    )  # contiguous, 2 bytes past an aligned address
     shifted.copy_(misaligned.latent)
     misaligned.latent = shifted
     strided = cm.TailCall(2002, 4, 1)
@@ -123,8 +128,17 @@ def _step(seed, tokens, options=None):
     maps a layer to its tap / updated_out."""
     options = options or {}
     return [
-        ("target", cm.TailCall(seed + 1 + layer, tokens, layer % 9, prefix=True if layer == 0 else None,
-                               weights=layer % cm.WEIGHT_SETS, **options.get(layer, {})))  # fmt: skip
+        (
+            "target",
+            cm.TailCall(
+                seed + 1 + layer,
+                tokens,
+                layer % 9,
+                prefix=True if layer == 0 else None,
+                weights=layer % cm.WEIGHT_SETS,
+                **options.get(layer, {}),
+            ),
+        )  # fmt: skip
         for layer in range(LAYERS)
     ]
 
@@ -151,7 +165,9 @@ def check_graph_capture_and_replay() -> None:
     cm.capture_and_replay(
         WS_B,
         lambda seed: _step(seed, 8, CAPTURED_OPTIONS),
-        lambda rep: [cm.TailCall(7000 + rep, (3, 1, 6, 5)[rep % 4], rep % 9, weights=rep % cm.WEIGHT_SETS)],
+        lambda rep: [
+            cm.TailCall(7000 + rep, (3, 1, 6, 5)[rep % 4], rep % 9, weights=rep % cm.WEIGHT_SETS)
+        ],
         "captured step",
     )
 

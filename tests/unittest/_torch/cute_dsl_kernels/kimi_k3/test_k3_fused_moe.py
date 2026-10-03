@@ -41,7 +41,10 @@ pytestmark = pytest.mark.skipif(not _is_sm100(), reason="k3_fused_moe needs sm_1
 H, TOP_K, NUM_EXPERTS, SV = 3584, 16, 896, 32
 I_TP, E_LOCAL, MOE_TP, TP_RANK, EP_RANK = 768, 224, 4, 1, 1  # one rank of experts TP4 x EP4
 OFFSET = EP_RANK * E_LOCAL
-GATE_CAP, LINEAR_CAP = 4.0, 25.0  # the SiTU caps (activation_situ_beta, activation_situ_linear_beta)
+GATE_CAP, LINEAR_CAP = (
+    4.0,
+    25.0,
+)  # the SiTU caps (activation_situ_beta, activation_situ_linear_beta)
 RSF = 2.827
 ULP = 2.0**-8
 E4M3_MAX = 448.0
@@ -64,7 +67,9 @@ def _rand_mxfp4(rows, k, gen):
     dot product lands near std 3."""
     codes = torch.randint(0, 16, (rows, k), dtype=torch.uint8, device="cuda", generator=gen)
     base = 127 + round(0.5 * math.log2(0.01057 / k))
-    exps = torch.randint(base, base + 6, (rows, k // SV), dtype=torch.uint8, device="cuda", generator=gen)
+    exps = torch.randint(
+        base, base + 6, (rows, k // SV), dtype=torch.uint8, device="cuda", generator=gen
+    )
     return (codes[:, 0::2] | (codes[:, 1::2] << 4)).contiguous(), exps
 
 
@@ -121,7 +126,9 @@ def _deq_w(packed, sf):
 
 def _deq_x(x_fp8, x_sf):
     rows, k = x_fp8.shape
-    return x_fp8.float() * torch.exp2(x_sf.reshape(rows, k // SV).float() - 127.0).repeat_interleave(SV, dim=1)
+    return x_fp8.float() * torch.exp2(
+        x_sf.reshape(rows, k // SV).float() - 127.0
+    ).repeat_interleave(SV, dim=1)
 
 
 def _requant(act):
@@ -152,7 +159,9 @@ def _reference(raw, x_deq, ids, weights):
             gate = (xe @ _deq_w(raw["gate"][e], raw["gate_s"][e]).double().t()).float()
             act = GATE_CAP * torch.tanh(gate / GATE_CAP) * torch.sigmoid(gate)
             act = act * (LINEAR_CAP * torch.tanh(up / LINEAR_CAP))
-            y = (_requant(act).double() @ _deq_w(raw["down"][e], raw["down_s"][e]).double().t()).float()
+            y = (
+                _requant(act).double() @ _deq_w(raw["down"][e], raw["down_s"][e]).double().t()
+            ).float()
             out.index_add_(0, tok, y * weights[tok, slot].float().unsqueeze(1))
         return out
     finally:
@@ -297,8 +306,14 @@ def test_k3_fused_moe_mixed_m_sequence():
     _ops()
     proc, _, bias = _experts()
     logits8, x8 = _tokens("random")
-    alone = {m: _fused(proc, bias, x8[:m].contiguous(), logits8[:m].contiguous()) for m in (1, 2, 5, 7, 8)}
-    seq = [(m, _fused(proc, bias, x8[:m].contiguous(), logits8[:m].contiguous())) for m in (8, 1, 5, 2, 8, 7)]
+    alone = {
+        m: _fused(proc, bias, x8[:m].contiguous(), logits8[:m].contiguous())
+        for m in (1, 2, 5, 7, 8)
+    }
+    seq = [
+        (m, _fused(proc, bias, x8[:m].contiguous(), logits8[:m].contiguous()))
+        for m in (8, 1, 5, 2, 8, 7)
+    ]
     assert all(torch.equal(_bits(y), _bits(alone[m])) for m, y in seq)
     assert _scratch_rearmed()
 

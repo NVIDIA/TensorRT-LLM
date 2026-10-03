@@ -46,7 +46,9 @@ OUT_EPS = 1e-6
 LAT_EPS = 1e-6
 EPS = 1e-6
 TOL = 2e-2  # normed and the tap: max |err| / max |ref|
-TOL_TAIL = 8e-3  # the tail's updated: max |err| / max |ref|, about one bf16 ulp of its largest elements
+TOL_TAIL = (
+    8e-3  # the tail's updated: max |err| / max |ref|, about one bf16 ulp of its largest elements
+)
 GATES = (0.0, 32.0, 64.0)  # swiglu gate values on which silu is exact in fp32 (see PlainCall)
 WEIGHT_SETS = 3
 TOKENS = (1, 2, 3, 4, 5, 6, 7, 8)
@@ -156,7 +158,9 @@ def attn_res_mixture(updated, block, res_w, rms_w) -> torch.Tensor:
     return (probs[..., None] * v).sum(dim=0).bfloat16()
 
 
-def _within(got: torch.Tensor, want: torch.Tensor, tol: float, key: str, where: str, what: str) -> None:
+def _within(
+    got: torch.Tensor, want: torch.Tensor, tol: float, key: str, where: str, what: str
+) -> None:
     err = ls.rel_err(got, want)
     STATS[key] = max(STATS[key], err)
     assert err <= tol, f"{where}: {what} rel err {err:.3e} > {tol}"
@@ -185,7 +189,9 @@ class Call:
     def verify(self, got, where: str) -> None:
         normed, updated = got
         want_normed, want_updated = self.ref()
-        assert torch.equal(updated, want_updated), f"{where}: updated differs from the exact reference"
+        assert torch.equal(updated, want_updated), (
+            f"{where}: updated differs from the exact reference"
+        )
         _within(normed, want_normed, TOL, "normed", where, "normed")
         assert R.same_on_ranks(normed, updated), f"{where}: ranks disagree"
 
@@ -211,7 +217,9 @@ class OprojCall(Call):
         self.block, self.res_w, self.rms_w, self.out_w = _attn_res_inputs(g, snapshots, tokens)
 
     def ref(self):
-        updated = reduce_ref([bf16_partial(c, w) for c, w in zip(self.cores, self.weights)], self.carry)
+        updated = reduce_ref(
+            [bf16_partial(c, w) for c, w in zip(self.cores, self.weights)], self.carry
+        )
         normed = ls.residual_update_ref(
             updated, self.block, self.res_w, self.rms_w, RMS_EPS, self.out_w, OUT_EPS
         )
@@ -237,7 +245,17 @@ class TailCall(Call):
     [2 H, 3 H) of a NaN-filled [M, 5 H] capture buffer) or "updated" (``updated`` into its columns [4 H, 5 H));
     ``updated_out``: store ``updated`` into row 1 of a NaN-filled [3, M, H] bank."""
 
-    def __init__(self, seed, tokens, snapshots, prefix=True, weights=0, shift=None, tap=None, updated_out=False):
+    def __init__(
+        self,
+        seed,
+        tokens,
+        snapshots,
+        prefix=True,
+        weights=0,
+        shift=None,
+        tap=None,
+        updated_out=False,
+    ):
         g = _gen(seed)
         self.tokens = tokens
         self.latent = ls.exact_bf16(g, (tokens, LATENT), -16, 17, 1 / 8)
@@ -252,11 +270,15 @@ class TailCall(Call):
     def _set_options(self, tap, updated_out) -> None:
         self.tap_kind, self.cap, self.tap = tap, None, None
         if tap is not None:
-            self.cap = torch.full((self.tokens, 5 * H), float("nan"), dtype=torch.bfloat16, device="cuda")
+            self.cap = torch.full(
+                (self.tokens, 5 * H), float("nan"), dtype=torch.bfloat16, device="cuda"
+            )
             self.tap = self.cap[:, self._tap_col() * H : (self._tap_col() + 1) * H]
         self.bank, self.updated_out = None, None
         if updated_out:
-            self.bank = torch.full((3, self.tokens, H), float("nan"), dtype=torch.bfloat16, device="cuda")
+            self.bank = torch.full(
+                (3, self.tokens, H), float("nan"), dtype=torch.bfloat16, device="cuda"
+            )
             self.updated_out = self.bank[1]
 
     def _tap_col(self) -> int:
@@ -309,17 +331,25 @@ class TailCall(Call):
         _within(normed, want_normed, TOL, "normed", where, "normed")
         outputs = [normed, updated]
         if self.updated_out is not None:
-            assert updated.data_ptr() == self.updated_out.data_ptr(), f"{where}: updated is not updated_out"
-            assert bool(torch.isnan(self.bank[0::2].float()).all()), f"{where}: another bank row was written"
+            assert updated.data_ptr() == self.updated_out.data_ptr(), (
+                f"{where}: updated is not updated_out"
+            )
+            assert bool(torch.isnan(self.bank[0::2].float()).all()), (
+                f"{where}: another bank row was written"
+            )
         if self.tap is not None:
             col = self._tap_col()
             rest = torch.cat([self.cap[:, : col * H], self.cap[:, (col + 1) * H :]], dim=1)
-            assert bool(torch.isnan(rest.float()).all()), f"{where}: the capture buffer was written outside the tap"
+            assert bool(torch.isnan(rest.float()).all()), (
+                f"{where}: the capture buffer was written outside the tap"
+            )
             if self.tap_kind == "mix":
                 mix = attn_res_mixture(want_updated, self.block, self.res_w, self.rms_w)
                 _within(self.tap, mix, TOL, "tap", where, "tapped mixture")
             else:
-                assert torch.equal(bits(self.tap), bits(updated)), f"{where}: the tap is not updated"
+                assert torch.equal(bits(self.tap), bits(updated)), (
+                    f"{where}: the tap is not updated"
+                )
             outputs.append(self.tap)
         assert R.same_on_ranks(*outputs), f"{where}: ranks disagree"
 
@@ -347,7 +377,13 @@ class PlainCall(Call):
         self.swiglu = swiglu
         if swiglu:
             self.xs = [
-                torch.cat([_gates(g, (tokens, DOWN_K)), ls.exact_bf16(g, (tokens, DOWN_K), -2, 3, 1 / 64)], dim=1)
+                torch.cat(
+                    [
+                        _gates(g, (tokens, DOWN_K)),
+                        ls.exact_bf16(g, (tokens, DOWN_K), -2, 3, 1 / 64),
+                    ],
+                    dim=1,
+                )
                 for _ in range(R.world)
             ]
             self.weights = WEIGHTS["down"][weights]
@@ -367,12 +403,16 @@ class PlainCall(Call):
         partials = [bf16_partial(self.operand(x), w) for x, w in zip(self.xs, self.weights)]
         updated = reduce_ref(partials, self.carry)
         u = updated.float()
-        normed = (u * (u.square().mean(dim=-1, keepdim=True) + EPS).rsqrt() * self.norm_w.float()).bfloat16()
+        normed = (
+            u * (u.square().mean(dim=-1, keepdim=True) + EPS).rsqrt() * self.norm_w.float()
+        ).bfloat16()
         return normed, updated
 
     def run(self, ws):
         r = R.rank
-        return OPS["plain"](self.xs[r], self.weights[r], self.carry, self.norm_w, EPS, ws, swiglu=self.swiglu)
+        return OPS["plain"](
+            self.xs[r], self.weights[r], self.carry, self.norm_w, EPS, ws, swiglu=self.swiglu
+        )
 
     def refill(self, fresh, carry):
         for mine, new in zip(self.xs, fresh.xs):
@@ -385,7 +425,9 @@ def _label(i: int, call: Call) -> str:
     return f"call {i} ({type(call).__name__} M {call.tokens})"
 
 
-def run_sequence(seq, ws, verify: bool = True, late: Optional[random.Random] = None, where: str = "sequence"):
+def run_sequence(
+    seq, ws, verify: bool = True, late: Optional[random.Random] = None, where: str = "sequence"
+):
     """Run ``seq`` -- (chain, call) pairs -- in order on ``ws``. A call's carry is the ``updated`` of the previous call
     of its chain (a chain's first call keeps its own), as the model chains its residual streams. With ``late`` (a
     random.Random seeded alike on every rank) every call starts after a barrier, a random rank 5 ms late; with
@@ -448,7 +490,9 @@ def create_refuses_capture(workspace_type, ws, next_call: Call) -> None:
     every = attempt()
     R.barrier()
     alone = attempt() if R.rank == R.world - 1 else True
-    assert R.all_true(every and alone), f"create under capture: every rank raised {every}, one rank alone {alone}"
+    assert R.all_true(every and alone), (
+        f"create under capture: every rank raised {every}, one rank alone {alone}"
+    )
     next_call.verify(next_call.run(ws), "after the refused creates")
 
 

@@ -14,7 +14,9 @@ from .mnnvl_workspace import MnnvlWorkspace
 __all__ = ["MnnvlWorkspace", "mnnvl_allgather_split", "required_buffer_bytes"]
 
 
-def required_buffer_bytes(num_tokens: int, bf16_columns: int, fp32_columns: int, world_size: int) -> int:
+def required_buffer_bytes(
+    num_tokens: int, bf16_columns: int, fp32_columns: int, world_size: int
+) -> int:
     """Bytes of one Lamport buffer a call occupies: every rank's rows, the bf16 columns at 2 bytes and the fp32 columns
     at 4."""
     return num_tokens * world_size * (bf16_columns * 2 + fp32_columns * 4)
@@ -31,7 +33,9 @@ def mnnvl_allgather_split(
     Takes one turn of the workspace's Lamport rotation, as an all-reduce on it does: every rank of the group makes the
     same MNNVL calls on it in the same order."""
     num_tokens, columns = input.shape
-    need = required_buffer_bytes(num_tokens, bf16_columns, columns - bf16_columns, workspace.world_size)
+    need = required_buffer_bytes(
+        num_tokens, bf16_columns, columns - bf16_columns, workspace.world_size
+    )
     if need > workspace.buffer_bytes:
         raise ValueError(
             f"mnnvl_allgather_split: the call needs {need} bytes per Lamport buffer, the workspace has "

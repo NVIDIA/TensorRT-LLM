@@ -544,7 +544,9 @@ def check_graph_capture_and_replay() -> None:
     buffers are empty, WS_B's epoch advanced once per head_flags call, replayed or eager, with every ready word at it,
     and both states armed.
     """
-    static_bufs = [torch.zeros(8, HIDDEN, dtype=torch.bfloat16, device="cuda") for _ in range(LAYERS)]
+    static_bufs = [
+        torch.zeros(8, HIDDEN, dtype=torch.bfloat16, device="cuda") for _ in range(LAYERS)
+    ]
     shells = [
         Call(0, 0, layer=layer, kind=KINDS[layer], x=static_bufs[layer]) for layer in range(LAYERS)
     ]

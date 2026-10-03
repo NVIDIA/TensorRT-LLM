@@ -46,7 +46,11 @@ def _ops():
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
-    view = {torch.bfloat16: torch.int16, torch.float32: torch.int32, torch.float8_e4m3fn: torch.uint8}
+    view = {
+        torch.bfloat16: torch.int16,
+        torch.float32: torch.int32,
+        torch.float8_e4m3fn: torch.uint8,
+    }
     return t.contiguous().view(view.get(t.dtype, t.dtype))
 
 
@@ -66,7 +70,12 @@ def _unfused(scores, bias, hidden):
     weights, ids = ops.noaux_tc_op(scores, bias, 1, 1, K, SCALE)
     quantized, scales = ops.mxfp8_quantize(hidden, False, alignment=256)
     m = scores.shape[0]
-    return ids.int(), weights.to(torch.bfloat16), quantized.view(torch.float8_e4m3fn), scales.view(m, -1)
+    return (
+        ids.int(),
+        weights.to(torch.bfloat16),
+        quantized.view(torch.float8_e4m3fn),
+        scales.view(m, -1),
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -114,7 +123,12 @@ def _edge_cases():
     b_tied = b.clone()
     b_tied[100:140] = 0.25  # 40 equal keys compete for the top 16: ties go to the lower id
     yield "40_tied_keys", s, b_tied, h
-    yield "all_equal_logits", torch.full((m, E), 0.3, device="cuda"), torch.zeros(E, device="cuda"), h
+    yield (
+        "all_equal_logits",
+        torch.full((m, E), 0.3, device="cuda"),
+        torch.zeros(E, device="cuda"),
+        h,
+    )
     yield "huge_logits", torch.randn(m, E, generator=gen, device="cuda") * 40.0, b, h
     s = torch.randn(m, E, generator=gen, device="cuda")
     s[:, 3::32] += 20.0  # every winner in one selection lane (the exact fallback)
@@ -129,7 +143,12 @@ def _edge_cases():
     h2[3, ::7] = torch.tensor(1e-39).bfloat16()
     h2[4, 5] = torch.tensor(-3e38).bfloat16()
     yield "zero_large_denormal_rows", torch.randn(m, E, generator=gen, device="cuda"), b, h2
-    yield "bias_parameter", torch.randn(m, E, generator=gen, device="cuda"), torch.nn.Parameter(b.clone()), h
+    yield (
+        "bias_parameter",
+        torch.randn(m, E, generator=gen, device="cuda"),
+        torch.nn.Parameter(b.clone()),
+        h,
+    )
 
 
 EDGE_CASES = [
@@ -148,7 +167,9 @@ def test_k3_route_quant_edge_cases(case):
     """The PyTorch sort is reported, not asserted: its sigmoid may tie or split keys the kernels' sigmoid does not."""
     name, s, b, h = next(c for c in _edge_cases() if c[0] == case)
     for m in (1, 3, 8):
-        _, vs_cpp, vs_unfused, _, rerun, early = _check(name, s[:m].contiguous(), b, h[:m].contiguous())
+        _, vs_cpp, vs_unfused, _, rerun, early = _check(
+            name, s[:m].contiguous(), b, h[:m].contiguous()
+        )
         assert vs_cpp and vs_unfused and rerun and early
 
 

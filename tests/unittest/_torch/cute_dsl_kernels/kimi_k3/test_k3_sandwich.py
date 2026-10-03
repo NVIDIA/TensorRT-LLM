@@ -144,7 +144,9 @@ def _plain(ctx, x, w, residual, norm_w, swiglu=False):
 
 def _attn_res_ar(ctx, partial, prefix, block, res_w, rms_w, out_w):
     """The unfused post-projection step: the MNNVL one-shot all-reduce with the attention-residual epilogue."""
-    return ctx.mnnvl.allreduce_attn_res_rmsnorm(partial, prefix, block, res_w, rms_w, out_w, EPS, EPS)
+    return ctx.mnnvl.allreduce_attn_res_rmsnorm(
+        partial, prefix, block, res_w, rms_w, out_w, EPS, EPS
+    )
 
 
 def _tail_partial(latent, act, w, lo):
@@ -163,7 +165,9 @@ def _residual_rms_ar(ctx, partial, residual, norm_w):
 
     params = AllReduceParams(fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM, residual=residual, norm_weight=norm_w,
                              eps=EPS)  # fmt: skip
-    out = ctx.mnnvl(partial, params, one_shot_max_bytes=partial.numel() * ctx.world * partial.element_size())
+    out = ctx.mnnvl(
+        partial, params, one_shot_max_bytes=partial.numel() * ctx.world * partial.element_size()
+    )
     return out[0], out[1]
 
 
@@ -180,7 +184,15 @@ def _oproj_inputs(ctx, snapshots, seed):
     w = _rand((H, K_O), seed + 1000 * r + 2, 0.03)
     prefix8 = _rand((8, H), seed + 3)
     block8 = _rand((snapshots, 8, H), seed + 4)
-    return core8, w, prefix8, block8, _rand((H,), seed + 5, 0.05), _norm_w(seed + 6), _norm_w(seed + 7)
+    return (
+        core8,
+        w,
+        prefix8,
+        block8,
+        _rand((H,), seed + 5, 0.05),
+        _norm_w(seed + 6),
+        _norm_w(seed + 7),
+    )
 
 
 def _tail_inputs(ctx, snapshots, seed):
@@ -191,8 +203,17 @@ def _tail_inputs(ctx, snapshots, seed):
     w[:, WIDTH:PAD] = 0
     prefix8 = _rand((8, H), seed + 14)
     block8 = _rand((snapshots, 8, H), seed + 15)
-    return latent8, act8, w, r * WIDTH, prefix8, block8, _rand((H,), seed + 16, 0.05), _norm_w(seed + 17), _norm_w(
-        seed + 18)
+    return (
+        latent8,
+        act8,
+        w,
+        r * WIDTH,
+        prefix8,
+        block8,
+        _rand((H,), seed + 16, 0.05),
+        _norm_w(seed + 17),
+        _norm_w(seed + 18),
+    )
 
 
 def _first(m, prefix8, block8, with_prefix):
@@ -211,7 +232,9 @@ def check_oproj(ctx):
     results = []
     for snapshots in SNAPSHOTS:
         for with_prefix in (True, False):
-            core8, w, prefix8, block8, res_w, rms_w, out_w = _oproj_inputs(ctx, snapshots, 100 * snapshots)
+            core8, w, prefix8, block8, res_w, rms_w, out_w = _oproj_inputs(
+                ctx, snapshots, 100 * snapshots
+            )
             pre8, _ = _first(8, prefix8, block8, with_prefix)
             n8, u8 = _oproj(ctx, core8, w, pre8, block8, res_w, rms_w, out_w)
             for m in M_ALL:
@@ -221,14 +244,18 @@ def check_oproj(ctx):
                 want_n, want_u = _attn_res_ar(ctx, _row8(lambda x: F.linear(x, w), core, m), pre, block, res_w, rms_w,
                                               out_w)  # fmt: skip
                 again = [_oproj(ctx, core, w, pre, block, res_w, rms_w, out_w) for _ in range(2)]
-                bad_n, bad_u = _oproj(ctx, _perturbed(ctx, core), w, pre, block, res_w, rms_w, out_w)
+                bad_n, bad_u = _oproj(
+                    ctx, _perturbed(ctx, core), w, pre, block, res_w, rms_w, out_w
+                )
                 row = dict(
                     op="k3_sandwich_oproj", case=f"S{snapshots}_{'prefix' if with_prefix else 'noprefix'}", M=m,
                     eq_unfused=_same(n, want_n) and _same(u, want_u), rel_updated=_rel(u, want_u),
                     rel_normed=_rel(n, want_n), det=all(_same(a, n) and _same(b, u) for a, b in again),
                     rows_as_m8=_same(n, n8[:m]) and _same(u, u8[:m]), control=not _same(bad_u, u),
                 )  # fmt: skip
-                row["ok"] = _all_ranks(ctx, row["eq_unfused"] and row["det"] and row["rows_as_m8"] and row["control"])
+                row["ok"] = _all_ranks(
+                    ctx, row["eq_unfused"] and row["det"] and row["rows_as_m8"] and row["control"]
+                )
                 results.append(row)
     return results
 
@@ -246,7 +273,9 @@ def check_tail(ctx):
     results = []
     for snapshots in SNAPSHOTS:
         for with_prefix in (True, False):
-            latent8, act8, w, lo, prefix8, block8, res_w, rms_w, out_w = _tail_inputs(ctx, snapshots, 50 + snapshots)
+            latent8, act8, w, lo, prefix8, block8, res_w, rms_w, out_w = _tail_inputs(
+                ctx, snapshots, 50 + snapshots
+            )
             pre8, _ = _first(8, prefix8, block8, with_prefix)
             n8, u8 = _tail(ctx, latent8, act8, w, lo, pre8, block8, res_w, rms_w, out_w)
             for m in M_ALL:
@@ -255,8 +284,13 @@ def check_tail(ctx):
                 n, u = _tail(ctx, latent, act, w, lo, pre, block, res_w, rms_w, out_w)
                 part = _tail_partial(latent, act, w, lo)
                 want_n, want_u = _attn_res_ar(ctx, part, pre, block, res_w, rms_w, out_w)
-                again = [_tail(ctx, latent, act, w, lo, pre, block, res_w, rms_w, out_w) for _ in range(2)]
-                bad_n, bad_u = _tail(ctx, latent, _perturbed(ctx, act), w, lo, pre, block, res_w, rms_w, out_w)
+                again = [
+                    _tail(ctx, latent, act, w, lo, pre, block, res_w, rms_w, out_w)
+                    for _ in range(2)
+                ]
+                bad_n, bad_u = _tail(
+                    ctx, latent, _perturbed(ctx, act), w, lo, pre, block, res_w, rms_w, out_w
+                )
                 row = dict(
                     op="k3_sandwich_tail", case=f"S{snapshots}_{'prefix' if with_prefix else 'noprefix'}", M=m,
                     rel_updated=_rel(u, want_u), rel_normed=_rel(n, want_n),
@@ -311,7 +345,9 @@ def _check_plain(ctx, swiglu):
     results = []
     name = "k3_sandwich_plain_swiglu" if swiglu else "k3_sandwich_plain"
     for seed in (0, 1):
-        x8, w, res8, norm_w = _plain_inputs(ctx, 2 * DOWN_K if swiglu else PLAIN_K, 300 + 10 * seed + int(swiglu))
+        x8, w, res8, norm_w = _plain_inputs(
+            ctx, 2 * DOWN_K if swiglu else PLAIN_K, 300 + 10 * seed + int(swiglu)
+        )
 
         def gemv(x):
             if swiglu:
@@ -324,14 +360,18 @@ def _check_plain(ctx, swiglu):
             n, u = _plain(ctx, x, w, res, norm_w, swiglu)
             want_n, want_u = _residual_rms_ar(ctx, gemv(x), res, norm_w)
             again = [_plain(ctx, x, w, res, norm_w, swiglu) for _ in range(2)]
-            bad_n, bad_u = _plain(ctx, _perturbed(ctx, x, DOWN_K if swiglu else 0), w, res, norm_w, swiglu)
+            bad_n, bad_u = _plain(
+                ctx, _perturbed(ctx, x, DOWN_K if swiglu else 0), w, res, norm_w, swiglu
+            )
             row = dict(
                 op=name, case=f"seed{seed}", M=m, eq_unfused=_same(n, want_n) and _same(u, want_u),
                 rel_updated=_rel(u, want_u), rel_normed=_rel(n, want_n),
                 det=all(_same(a, n) and _same(b, u) for a, b in again),
                 rows_as_m8=_same(n, n8[:m]) and _same(u, u8[:m]), control=not _same(bad_u, u),
             )  # fmt: skip
-            row["ok"] = _all_ranks(ctx, row["eq_unfused"] and row["det"] and row["rows_as_m8"] and row["control"])
+            row["ok"] = _all_ranks(
+                ctx, row["eq_unfused"] and row["det"] and row["rows_as_m8"] and row["control"]
+            )
             results.append(row)
     return results
 
@@ -353,7 +393,15 @@ def check_replay(ctx):
         core8, w_o, prefix8, block8, res_w, rms_w, out_w = _oproj_inputs(ctx, 3, 700)
         latent8, act8, w_t, lo, t_prefix8, t_block8, t_res, t_rms, t_out = _tail_inputs(ctx, 3, 710)
         x8, w_p, res8, norm_w = _plain_inputs(ctx, PLAIN_K, 720)
-        a_in = [core8[:m].clone(), w_o, prefix8[:m].clone(), block8[:, :m].clone(), res_w, rms_w, out_w]
+        a_in = [
+            core8[:m].clone(),
+            w_o,
+            prefix8[:m].clone(),
+            block8[:, :m].clone(),
+            res_w,
+            rms_w,
+            out_w,
+        ]
         b_in = [latent8[:m].clone(), act8[:m].clone(), w_t, lo, t_prefix8[:m].clone(), t_block8[:, :m].clone(), t_res,
                 t_rms, t_out]  # fmt: skip
         c_in = [x8[:m].clone(), w_p, res8[:m].clone(), norm_w]
@@ -387,7 +435,15 @@ def check_replay(ctx):
         want = [_oproj(ctx, *a_in), _tail(ctx, *b_in), _plain(ctx, *c_in)]
         torch.cuda.synchronize()
         same = all(_same(g, x) for go, wo in zip(got, want) for g, x in zip(go, wo))
-        results.append(dict(op="k3_sandwich_replay", case=f"replay{it}", M=m, eq_eager=same, ok=_all_ranks(ctx, same)))
+        results.append(
+            dict(
+                op="k3_sandwich_replay",
+                case=f"replay{it}",
+                M=m,
+                eq_eager=same,
+                ok=_all_ranks(ctx, same),
+            )
+        )
     del graphs
     return results
 
@@ -425,7 +481,14 @@ def check_wrap(ctx):
     wrapped = run()
     after = int(flags[0].item())
     same = all(_same(a, b) for f_out, w_out in zip(fresh, wrapped) for a, b in zip(f_out, w_out))
-    row = dict(op="k3_sandwich_wrap", case="int32_wrap", M=8, eq_fresh=same, crossed=after < 0, calls=len(calls))
+    row = dict(
+        op="k3_sandwich_wrap",
+        case="int32_wrap",
+        M=8,
+        eq_fresh=same,
+        crossed=after < 0,
+        calls=len(calls),
+    )
     row["ok"] = _all_ranks(ctx, same and row["crossed"])
     return [row]
 
@@ -443,7 +506,9 @@ def check_fold_wrap(ctx):
     lanes = ex.mc.view(2, 8, ctx.world, LATENT // 2)
     latent8, act8, w, lo, prefix8, block8, res_w, rms_w, out_w = _tail_inputs(ctx, 3, 830)
     part8 = _rand((8, LATENT), 840 + 1000 * ctx.rank, 0.3)
-    part8[part8 == 0] = 0.0  # pushes never send -0.0: with +0.0 beside it, that word would read as empty
+    part8[part8 == 0] = (
+        0.0  # pushes never send -0.0: with +0.0 beside it, that word would read as empty
+    )
     slab = slice(kernel.LAT_SCALES, kernel.LAT_SCALES + kernel.LAT_SCALE_BUFS * 8)
 
     def run():
@@ -460,7 +525,9 @@ def check_fold_wrap(ctx):
                         lat_uc=ex.uc, lat_flags=flags)  # fmt: skip
             torch.cuda.synchronize()
             outs.append([t.clone() for t in out])
-            others.append(torch.equal(before, torch.cat([flags[1 : slab.start], flags[slab.stop :]])))
+            others.append(
+                torch.equal(before, torch.cat([flags[1 : slab.start], flags[slab.stop :]]))
+            )
         return outs, others
 
     fresh, fresh_kept = run()

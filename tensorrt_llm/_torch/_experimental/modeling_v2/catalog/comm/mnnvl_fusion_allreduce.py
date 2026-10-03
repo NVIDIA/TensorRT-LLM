@@ -46,7 +46,9 @@ def mnnvl_fusion_allreduce(
         raise ValueError("mnnvl_fusion_allreduce: residual, norm_weight and eps go together")
     hidden = input.shape[-1]
     num_tokens = input.numel() // hidden
-    need = required_buffer_bytes(num_tokens, hidden, workspace.world_size, input.dtype, one_shot_max_bytes)
+    need = required_buffer_bytes(
+        num_tokens, hidden, workspace.world_size, input.dtype, one_shot_max_bytes
+    )
     if need > workspace.buffer_bytes:
         raise ValueError(
             f"mnnvl_fusion_allreduce: the call needs {need} bytes per Lamport buffer, the workspace has "

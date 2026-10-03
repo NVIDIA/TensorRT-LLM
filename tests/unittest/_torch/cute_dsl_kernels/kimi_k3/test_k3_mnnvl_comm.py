@@ -238,12 +238,16 @@ def check_allgather(ctx):
             exact = _same(got_b, want_b) and _same(got_f, want_f)
             interleaved = True
             partial = torch.randn(m, H, device="cuda").bfloat16()
-            for i in range(6):  # two turns of the three-buffer Lamport rotation, mixed with the other collectives
+            for i in range(
+                6
+            ):  # two turns of the three-buffer Lamport rotation, mixed with the other collectives
                 _allreduce(ctx, partial)
                 if i % 2:
                     block = torch.randn(2, m, H, device="cuda").bfloat16()
                     ones = torch.ones(H, device="cuda").bfloat16()
-                    ctx.mnnvl.allreduce_attn_res_rmsnorm(partial, None, block, ones, ones, ones, EPS, EPS)
+                    ctx.mnnvl.allreduce_attn_res_rmsnorm(
+                        partial, None, block, ones, ones, ones, EPS, EPS
+                    )
                 b, f = ctx.mnnvl.allgather_split(mine, bf16_cols)
                 interleaved &= _same(b, want_b) and _same(f, want_f)
             bad = mine.clone()
@@ -259,9 +263,9 @@ def check_allgather(ctx):
                 rows_as_m64=_same(got_b, b64[:m]) and _same(got_f, f64[:m]),
                 control=not (_same(bad_b, want_b) and _same(bad_f, want_f)),
             )
-            row["ok"] = _all_ranks(ctx, row["exact"] and interleaved and row["rows_as_m64"]) and _all_ranks(
-                ctx, row["control"]
-            )
+            row["ok"] = _all_ranks(
+                ctx, row["exact"] and interleaved and row["rows_as_m64"]
+            ) and _all_ranks(ctx, row["control"])
             results.append(row)
     return results
 

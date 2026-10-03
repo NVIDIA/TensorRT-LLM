@@ -9,7 +9,10 @@ import torch
 
 # Importing front_op registers trtllm::k3_moe_front. front_weight packs the front's one weight at load time;
 # weight_supported reads metadata only.
-from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.front_op import front_weight, weight_supported
+from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.front_op import (
+    front_weight,
+    weight_supported,
+)
 from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.op import K3MoeHeadWorkspace
 
 __all__ = ["K3MoeHeadWorkspace", "front_weight", "k3_moe_front", "weight_supported"]

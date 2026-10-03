@@ -77,7 +77,10 @@ def check_unsupported_calls_raise_on_every_rank() -> None:
     ValueError on every rank before any launch; the next call is correct."""
     big = cm.PlainCall(2000, 9)
     narrow = cm.PlainCall(2001, 4)
-    narrow.swiglu, narrow.xs = True, [torch.cat([x, x], dim=1) for x in narrow.xs]  # [4, 768] on a K 384 slice
+    narrow.swiglu, narrow.xs = (
+        True,
+        [torch.cat([x, x], dim=1) for x in narrow.xs],
+    )  # [4, 768] on a K 384 slice
     wide = cm.PlainCall(2002, 4)
     wide.xs = [torch.zeros(4, 512, dtype=torch.bfloat16, device="cuda") for _ in wide.xs]
     cm.unsupported_raises(
@@ -98,7 +101,12 @@ def _step(seed, tokens):
     for layer in range(DRAFTER_LAYERS):
         s = seed + 2 * layer
         w = layer % cm.WEIGHT_SETS
-        seq.append(("drafter", cm.PlainCall(s + 1, tokens, residual=True if layer == 0 else None, weights=w)))
+        seq.append(
+            (
+                "drafter",
+                cm.PlainCall(s + 1, tokens, residual=True if layer == 0 else None, weights=w),
+            )
+        )
         seq.append(("drafter", cm.PlainCall(s + 2, tokens, swiglu=True, residual=None, weights=w)))
     return seq
 
@@ -115,7 +123,9 @@ def check_two_workspaces_interleaved() -> None:
     cm.interleaved(
         WS_A,
         WS_B,
-        lambda i: cm.PlainCall(4000 + i, (3, 8, 1, 8, 5)[i % 5], swiglu=i % 3 == 1, weights=i % cm.WEIGHT_SETS),
+        lambda i: cm.PlainCall(
+            4000 + i, (3, 8, 1, 8, 5)[i % 5], swiglu=i % 3 == 1, weights=i % cm.WEIGHT_SETS
+        ),
     )
 
 
@@ -125,8 +135,11 @@ def check_graph_capture_and_replay() -> None:
     cm.capture_and_replay(
         WS_B,
         lambda seed: _step(seed, 8),
-        lambda rep: [cm.PlainCall(7000 + rep, (3, 1, 6, 5)[rep % 4], swiglu=rep % 2 == 1,
-                                  weights=rep % cm.WEIGHT_SETS)],  # fmt: skip
+        lambda rep: [
+            cm.PlainCall(
+                7000 + rep, (3, 1, 6, 5)[rep % 4], swiglu=rep % 2 == 1, weights=rep % cm.WEIGHT_SETS
+            )
+        ],  # fmt: skip
         "captured step",
     )
 
@@ -135,7 +148,9 @@ def check_wrong_call_order_is_detected() -> None:
     """Negative control: rank 0 swaps two same-shaped calls on one workspace. Every call returns and nothing raises
     or hangs, but every rank's two results are wrong (more than half the ``updated`` elements differ); then a plain
     call is correct again."""
-    cm.swapped_pair_is_wrong(WS_A, cm.PlainCall(8000, 8), cm.PlainCall(8001, 8, weights=1), cm.PlainCall(8002, 8))
+    cm.swapped_pair_is_wrong(
+        WS_A, cm.PlainCall(8000, 8), cm.PlainCall(8001, 8, weights=1), cm.PlainCall(8002, 8)
+    )
 
 
 CHECKS = [

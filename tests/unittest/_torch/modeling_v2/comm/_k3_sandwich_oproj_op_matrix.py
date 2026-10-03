@@ -84,8 +84,16 @@ def check_unsupported_shape_raises_on_every_rank() -> None:
 def _step(seed, tokens):
     """One decode step: ``LAYERS`` chained calls, each layer's prefix the previous layer's ``updated``."""
     return [
-        ("target", cm.OprojCall(seed + 1 + layer, tokens, layer % 9, prefix=True if layer == 0 else None,
-                                weights=layer % cm.WEIGHT_SETS))  # fmt: skip
+        (
+            "target",
+            cm.OprojCall(
+                seed + 1 + layer,
+                tokens,
+                layer % 9,
+                prefix=True if layer == 0 else None,
+                weights=layer % cm.WEIGHT_SETS,
+            ),
+        )  # fmt: skip
         for layer in range(LAYERS)
     ]
 
@@ -111,7 +119,9 @@ def check_graph_capture_and_replay() -> None:
     cm.capture_and_replay(
         WS_B,
         lambda seed: _step(seed, 8),
-        lambda rep: [cm.OprojCall(7000 + rep, (3, 1, 6, 5)[rep % 4], rep % 9, weights=rep % cm.WEIGHT_SETS)],
+        lambda rep: [
+            cm.OprojCall(7000 + rep, (3, 1, 6, 5)[rep % 4], rep % 9, weights=rep % cm.WEIGHT_SETS)
+        ],
         "captured step",
     )
 
@@ -127,9 +137,18 @@ def _shared_step(seed, t_tokens, d_tokens):
         s = seed + 10 * layer
         seq.append(("target", cm.OprojCall(s + 1, t_tokens, (4 * layer) % 9, prefix=True if layer == 0 else None,
                                            weights=layer)))  # fmt: skip
-        seq.append(("target", cm.TailCall(s + 2, t_tokens, (4 * layer + 1) % 9, prefix=None, updated_out=layer == 1)))
+        seq.append(
+            (
+                "target",
+                cm.TailCall(
+                    s + 2, t_tokens, (4 * layer + 1) % 9, prefix=None, updated_out=layer == 1
+                ),
+            )
+        )
         if layer != 1:
-            seq.append(("drafter", cm.PlainCall(s + 3, d_tokens, residual=True if layer == 0 else None)))
+            seq.append(
+                ("drafter", cm.PlainCall(s + 3, d_tokens, residual=True if layer == 0 else None))
+            )
             seq.append(("drafter", cm.PlainCall(s + 4, d_tokens, swiglu=True, residual=None)))
     return seq
 
@@ -138,12 +157,22 @@ def check_shared_sequence() -> None:
     """The three sandwich ops on one workspace, as the model runs them (``_shared_step``, 10 calls): steps at (target
     M, drafter M) = (8, 3), (2, 8), (7, 7), a random rank late at every call, every call against its reference.
     The three wrappers export one workspace type."""
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import k3_sandwich_plain, k3_sandwich_tail
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (
+        k3_sandwich_plain,
+        k3_sandwich_tail,
+    )
 
-    assert k3_sandwich_tail.K3SandwichWorkspace is WORKSPACE is k3_sandwich_plain.K3SandwichWorkspace
+    assert (
+        k3_sandwich_tail.K3SandwichWorkspace is WORKSPACE is k3_sandwich_plain.K3SandwichWorkspace
+    )
     late = random.Random(11)
     for i, (t, d) in enumerate(SHARED_STEPS):
-        cm.run_sequence(_shared_step(9000 + 100 * i, t, d), WS_A, late=late, where=f"shared step {i} M {t} / {d}")
+        cm.run_sequence(
+            _shared_step(9000 + 100 * i, t, d),
+            WS_A,
+            late=late,
+            where=f"shared step {i} M {t} / {d}",
+        )
 
 
 def check_shared_sequence_captured() -> None:
@@ -169,7 +198,10 @@ def check_wrong_call_order_is_detected() -> None:
     or hangs, but every rank's two results are wrong (more than half the ``updated`` elements differ); then a plain
     call is correct again."""
     cm.swapped_pair_is_wrong(
-        WS_A, cm.OprojCall(8000, 8, 3), cm.OprojCall(8001, 8, 3, weights=1), cm.OprojCall(8002, 8, 3)
+        WS_A,
+        cm.OprojCall(8000, 8, 3),
+        cm.OprojCall(8001, 8, 3, weights=1),
+        cm.OprojCall(8002, 8, 3),
     )
 
 

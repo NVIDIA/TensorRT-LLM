@@ -235,11 +235,18 @@ class K3SandwichLatentExchange:
         from . import k3_sandwich_kernel as kernel
 
         def arm(flags: torch.Tensor) -> None:
-            scales = slice(kernel.LAT_SCALES, kernel.LAT_SCALES + kernel.LAT_SCALE_BUFS * MAX_TOKENS)
+            scales = slice(
+                kernel.LAT_SCALES, kernel.LAT_SCALES + kernel.LAT_SCALE_BUFS * MAX_TOKENS
+            )
             flags[scales] = kernel.SCALE_SENTINEL
 
         return _create_buffer(
-            cls, mapping, kernel.lat_buffer_words(mapping.tp_size), kernel.LAT_FLAG_WORDS, fabric_handle, arm
+            cls,
+            mapping,
+            kernel.lat_buffer_words(mapping.tp_size),
+            kernel.LAT_FLAG_WORDS,
+            fabric_handle,
+            arm,
         )
 
 
@@ -393,7 +400,16 @@ def supports_tail(
 
 @torch.library.custom_op(
     "trtllm::k3_sandwich_tail",
-    mutates_args=("ws_uc", "ws_mc", "ws_flags", "x_slab", "lat_uc", "lat_flags", "tap", "updated_out"),
+    mutates_args=(
+        "ws_uc",
+        "ws_mc",
+        "ws_flags",
+        "x_slab",
+        "lat_uc",
+        "lat_flags",
+        "tap",
+        "updated_out",
+    ),
 )
 def k3_sandwich_tail(
     latent: torch.Tensor,

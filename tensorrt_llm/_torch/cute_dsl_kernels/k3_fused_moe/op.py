@@ -162,7 +162,9 @@ class K3MoeHeadWorkspace:
         from . import k3_route_quant_ag as layout
 
         words = layout.workspace_words(mapping.tp_size)
-        use_fabric_handle = mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
+        use_fabric_handle = (
+            mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
+        )
         comm = _get_mnnvl_workspace_comm(mapping)
         error: Optional[Exception] = None
         workspace = None
@@ -188,7 +190,9 @@ class K3MoeHeadWorkspace:
             error = exc
         # Also the barrier that keeps any rank from pushing into a peer's buffer before the peer has emptied it.
         if not _mnnvl_workspace_all_succeeded(comm, error is None):
-            raise RuntimeError("K3MoeHeadWorkspace: allocation failed on at least one rank") from error
+            raise RuntimeError(
+                "K3MoeHeadWorkspace: allocation failed on at least one rank"
+            ) from error
         return workspace
 
 
@@ -212,7 +216,9 @@ class K3MoeState:
         config: Optional[dict] = None,
     ):
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("K3MoeState allocates its scratch: build it outside CUDA-graph capture")
+            raise RuntimeError(
+                "K3MoeState allocates its scratch: build it outside CUDA-graph capture"
+            )
         # One persistent CTA per SM (config "num_ctas" caps it, e.g. for a grid-size A/B).
         num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
         cfg = {
@@ -225,7 +231,9 @@ class K3MoeState:
         cfg.update(config or {})
         self.mod = mod = _kernel_module(cfg)
         if mod.FUSED_AR or mod.FOLD or mod.LAT_SLAB or mod.WIDE:
-            raise ValueError("K3MoeState is the M <= 8 build without the fused all-reduce, the fold or the slab")
+            raise ValueError(
+                "K3MoeState is the M <= 8 build without the fused all-reduce, the fold or the slab"
+            )
         self.device = device
         self.i_tp = i_tp
         self.num_local = num_local
@@ -259,7 +267,9 @@ class K3MoeState:
         # The route+quant kernel triggers k3_moe's launch right after its own grid dependency:
         # k3_moe waits for the whole route+quant grid before reading its outputs.
         self.route_kwargs = {"early_trigger": True} if mod.USE_PDL else {}
-        from ..k3_route_quant import op as _k3_route_quant_op  # noqa: F401  (registers trtllm::k3_route_quant)
+        from ..k3_route_quant import (
+            op as _k3_route_quant_op,  # noqa: F401  (registers trtllm::k3_route_quant)
+        )
 
         self.compiled = None
 
@@ -287,7 +297,9 @@ class K3MoeLayer:
         w2_weight_scale: torch.Tensor,
     ):
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("K3MoeLayer allocates its counters: build it outside CUDA-graph capture")
+            raise RuntimeError(
+                "K3MoeLayer allocates its counters: build it outside CUDA-graph capture"
+            )
         ok, why = is_supported(
             w3_w1_weight, w3_w1_weight_scale, w2_weight, w2_weight_scale, state.num_local
         )
@@ -324,7 +336,9 @@ class K3MoeLayer:
         ``[local_expert_offset, local_expert_offset + num_local)``."""
         st = self.state
         if st.head_flags:
-            raise ValueError("a head_flags build takes the front's ready words: call K3MoeLayer.front")
+            raise ValueError(
+                "a head_flags build takes the front's ready words: call K3MoeLayer.front"
+            )
         _check_tokens(hidden_states)
         ids, weights, x_fp8, x_sf = torch.ops.trtllm.k3_route_quant(
             router_logits.contiguous(), e_score_correction_bias, hidden_states.contiguous(),
@@ -361,7 +375,9 @@ class K3MoeLayer:
         flag_in = None
         if st.head_flags:
             flag_in = (_view(head.ready.view(-1), 16, 0), _view(head.flags.view(-1), 16, 0))
-        y = self._launch(ids, weights, x_fp8, x_sf, local_expert_offset, routed_scaling_factor, flag_in)
+        y = self._launch(
+            ids, weights, x_fp8, x_sf, local_expert_offset, routed_scaling_factor, flag_in
+        )
         return y, shared
 
     def _launch(self, ids, weights, x_fp8, x_sf, local_offset, scale, flag_in=None) -> torch.Tensor:
@@ -427,7 +443,9 @@ class K3MoeWideState:
 
     def __init__(self, device: torch.device, i_tp: int, num_local: int, use_pdl: bool = True):
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("K3MoeWideState allocates its scratch: build it outside CUDA-graph capture")
+            raise RuntimeError(
+                "K3MoeWideState allocates its scratch: build it outside CUDA-graph capture"
+            )
         num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
         config = {
             "i_tp": i_tp,
@@ -508,7 +526,9 @@ class K3MoeWideLayer:
         w2_weight_scale: torch.Tensor,
     ):
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("K3MoeWideLayer allocates its counters: build it outside CUDA-graph capture")
+            raise RuntimeError(
+                "K3MoeWideLayer allocates its counters: build it outside CUDA-graph capture"
+            )
         ok, why = is_supported(
             w3_w1_weight, w3_w1_weight_scale, w2_weight, w2_weight_scale, state.num_local
         )

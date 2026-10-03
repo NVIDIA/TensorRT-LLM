@@ -19,7 +19,9 @@ from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.op import (
     K3MoeWideState,
     is_supported,
 )
-from tensorrt_llm._torch.cute_dsl_kernels.k3_route_quant import op as _k3_route_quant_op  # noqa: F401
+from tensorrt_llm._torch.cute_dsl_kernels.k3_route_quant import (
+    op as _k3_route_quant_op,  # noqa: F401
+)
 
 __all__ = [
     "K3MoeHeadWorkspace",
@@ -46,7 +48,9 @@ def k3_moe(
     ``router_logits`` (fp32 ``[M, 896]``) and ``latent`` (bf16 ``[M, 3584]``), then ``k3_moe`` on ``layer``'s experts
     (global ids ``[local_expert_offset, local_expert_offset + num_local)``). Writes ``layer``'s state's scratch (left
     armed) and ``layer``'s counters (left zero)."""
-    return layer(latent, router_logits, e_score_correction_bias, local_expert_offset, routed_scaling_factor)
+    return layer(
+        latent, router_logits, e_score_correction_bias, local_expert_offset, routed_scaling_factor
+    )
 
 
 def k3_moe_fused_front(

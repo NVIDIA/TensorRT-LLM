@@ -445,7 +445,10 @@ def test_k3_moe_wide_mixed_sequence():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream):
         with torch.cuda.graph(graph, stream=stream):
-            outs = [_wide_call(layer, bias, static_x[:m], static_logits[:m], routed) for layer, m in calls]
+            outs = [
+                _wide_call(layer, bias, static_x[:m], static_logits[:m], routed)
+                for layer, m in calls
+            ]
     static_x.copy_(x64)
     static_logits.copy_(logits64)
     graph.replay()

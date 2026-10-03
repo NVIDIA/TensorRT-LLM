@@ -145,9 +145,7 @@ LAT_SLICE = 224  # latent columns of a rank's slice
 LAT_SLICE_VECS = LAT_SLICE // 8  # its 16-byte vectors per token row
 LAT_WORDS = 3584 // 2  # int32 words of one latent row
 LAT_VECS = 3584 // 8  # 16-byte vectors of one latent row
-LAT_FLAG_WORDS = (
-    64  # int32: [0] the tail's call count mod 6, [LAT_SCALES + 8 b + t] buffer b of the latent scale slab
-)
+LAT_FLAG_WORDS = 64  # int32: [0] the tail's call count mod 6, [LAT_SCALES + 8 b + t] buffer b of the latent scale slab
 LAT_SCALES = 32
 LAT_SCALE_BUFS = 3
 SCALE_SENTINEL = -1  # 0xFFFFFFFF: an unwritten scale (a computed rsqrt is never this NaN pattern)
@@ -1884,7 +1882,11 @@ def sandwich_role(
             # the scale buffer. Every CTA of this call has read this one (CTA 0's phase 2 needed every CTA's push).
             if (bx == cutlass.Int32(0)) & (tid == cutlass.Int32(0)):
                 count_period = cutlass.Int32(2 * LAT_SCALE_BUFS)
-                lat_flags.store((n_calls % count_period + cutlass.Int32(1)) % count_period, idx=0, is_volatile=True)
+                lat_flags.store(
+                    (n_calls % count_period + cutlass.Int32(1)) % count_period,
+                    idx=0,
+                    is_volatile=True,
+                )
 
 
 @cute.kernel

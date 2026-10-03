@@ -91,7 +91,9 @@ class K3LatentExchange:
         )
 
         words = _kernel().buffer_words(mapping.tp_size)
-        use_fabric_handle = mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
+        use_fabric_handle = (
+            mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
+        )
         comm = _get_mnnvl_workspace_comm(mapping)
         error: Optional[Exception] = None
         exchange = None
@@ -115,7 +117,9 @@ class K3LatentExchange:
             error = exc
         # Also the barrier that keeps any rank from pushing into a peer's buffer before the peer has emptied it.
         if not _mnnvl_workspace_all_succeeded(comm, error is None):
-            raise RuntimeError("K3LatentExchange: allocation failed on at least one rank") from error
+            raise RuntimeError(
+                "K3LatentExchange: allocation failed on at least one rank"
+            ) from error
         return exchange
 
     def push_args(self):

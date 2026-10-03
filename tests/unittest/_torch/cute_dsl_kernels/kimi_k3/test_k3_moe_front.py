@@ -487,7 +487,9 @@ def check_publish_order(ctx, num_ctas=None):
             t0 = time.perf_counter()
             y, _ = fused(x)
             torch.cuda.synchronize()
-            ms = (time.perf_counter() - t0) * 1e3  # ~20 ms: the hold ran out, no epoch moved during it
+            ms = (
+                time.perf_counter() - t0
+            ) * 1e3  # ~20 ms: the hold ran out, no epoch moved during it
             after, words = _quiet_check(ctx, lambda: (int(flags[2].item()), ready[:16].tolist()))
             row.update(
                 epoch_advanced=after == want, off_epoch=[(i, w) for i, w in enumerate(words) if w != want],
@@ -495,7 +497,12 @@ def check_publish_order(ctx, num_ctas=None):
                 y_zero=bool((y == 0).all()) if ctx.rank == idle else True,
                 call_ms=[round(v, 2) for v in ctx.comm.allgather(ms)],
             )  # fmt: skip
-            good = row["epoch_advanced"] and not row["off_epoch"] and row["buffers_empty"] and row["y_zero"]
+            good = (
+                row["epoch_advanced"]
+                and not row["off_epoch"]
+                and row["buffers_empty"]
+                and row["y_zero"]
+            )
             row["rank"], row["good"] = ctx.rank, bool(good)
             row["ok"] = _all_ranks(ctx, good)
             results.append(row)
