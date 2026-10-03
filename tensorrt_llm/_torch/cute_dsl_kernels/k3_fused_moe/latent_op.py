@@ -77,50 +77,24 @@ class K3LatentExchange:
     @classmethod
     def create(cls, mapping, fabric_handle: Optional[bool] = None) -> "K3LatentExchange":
         """Allocate and arm an exchange for ``mapping``'s TP group. Collective: every rank of the group calls it at the
-        same point, eagerly (not under CUDA-graph capture); it returns on every rank or raises on every rank.
+        same point, eagerly (not under CUDA-graph capture); the failure model is ``op.create_mcast_state``'s.
         ``fabric_handle``: share the memory by fabric handle (required across nodes) rather than POSIX file
         descriptor; default ``mapping.is_multi_node()``."""
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "K3LatentExchange.create is collective and allocates: call it outside CUDA-graph capture"
-            )
-        from tensorrt_llm._torch.distributed.ops import (
-            _get_mnnvl_workspace_comm,
-            _make_mnnvl_mcast_buffer,
-            _mnnvl_workspace_all_succeeded,
-        )
+        from .op import create_mcast_state
 
-        words = _kernel().buffer_words(mapping.tp_size)
-        use_fabric_handle = (
-            mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
-        )
-        comm = _get_mnnvl_workspace_comm(mapping)
-        error: Optional[Exception] = None
-        exchange = None
-        try:
-            handle = _make_mnnvl_mcast_buffer(comm, words * 4, mapping, use_fabric_handle)
-            uc = handle.get_uc_buffer(mapping.tp_rank, (words,), torch.int32, 0)
-            mc = handle.get_mc_buffer((words,), torch.int32, 0)
-            uc.fill_(EMPTY_WORD)
-            flags = torch.zeros(4, dtype=torch.int32, device=uc.device)
-            torch.cuda.synchronize()
-            exchange = cls(
+        def build(uc, mc, handle, comm):
+            return cls(
                 uc=uc,
                 mc=mc,
-                flags=flags,
+                flags=torch.zeros(4, dtype=torch.int32, device=uc.device),
                 rank=mapping.tp_rank,
                 world_size=mapping.tp_size,
                 handle=handle,
                 comm=comm,
             )
-        except Exception as exc:  # noqa: BLE001 -- reported to every rank below, then re-raised
-            error = exc
-        # Also the barrier that keeps any rank from pushing into a peer's buffer before the peer has emptied it.
-        if not _mnnvl_workspace_all_succeeded(comm, error is None):
-            raise RuntimeError(
-                "K3LatentExchange: allocation failed on at least one rank"
-            ) from error
-        return exchange
+
+        words = _kernel().buffer_words(mapping.tp_size)
+        return create_mcast_state("K3LatentExchange", mapping, words, fabric_handle, build)
 
     def push_args(self):
         """``(ar_uc, ar_mc, ar_flags, ar_rank)`` of the push-only producers."""

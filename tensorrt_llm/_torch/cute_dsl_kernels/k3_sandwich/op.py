@@ -131,20 +131,36 @@ def _slab_args(x_slab: Optional[torch.Tensor], slab_buf: int, fallback: torch.Te
 def _create_buffer(cls, mapping, words: int, flag_words: int, fabric_handle: Optional[bool],
                    arm_flags: Optional[Callable[[torch.Tensor], None]] = None):  # fmt: skip
     """A ``cls`` over a new multicast buffer of ``words`` int32 per rank of ``mapping``'s TP group, every word empty,
-    and ``flag_words`` int32 flags, zero (then ``arm_flags``). Collective and eager: every rank of the group calls it at
-    the same point, outside CUDA-graph capture; it returns on every rank or raises on every rank."""
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            f"{cls.__name__}.create is collective and allocates: call it outside CUDA-graph capture"
-        )
+    and ``flag_words`` int32 flags, zero (then ``arm_flags``). Collective and eager: every rank of the group calls it
+    at the same point.
+
+    Failure model (as ``MnnvlWorkspace.create``): before allocating, the ranks agree that each of them can (not
+    capturing a CUDA graph, the buffer within its device's free memory); if one cannot, every rank raises
+    ``RuntimeError`` and none allocates. A failure that returns from the allocation is agreed the same way. A rank
+    that fails inside the allocation's handle exchange can leave its peers waiting in that exchange: that failure is
+    not turned into an error on the other ranks."""
     from tensorrt_llm._torch.distributed.ops import (
         _get_mnnvl_workspace_comm,
         _make_mnnvl_mcast_buffer,
+        _mnnvl_device_index,
         _mnnvl_workspace_all_succeeded,
     )
 
     use_fabric_handle = mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
     comm = _get_mnnvl_workspace_comm(mapping)
+    # Every condition one rank alone can fail is checked before the allocation, and the ranks agree on it: a rank
+    # failing inside the allocation would leave its peers in the handle exchange.
+    problem: Optional[str] = None
+    if torch.cuda.is_current_stream_capturing():
+        problem = "it is collective and allocates: call it outside CUDA-graph capture"
+    else:
+        free_bytes, _ = torch.cuda.mem_get_info(_mnnvl_device_index(mapping))
+        if free_bytes < words * 4:
+            problem = f"its {words * 4} bytes exceed the {free_bytes} free on this rank's device"
+    if not _mnnvl_workspace_all_succeeded(comm, problem is None):
+        raise RuntimeError(
+            f"{cls.__name__}.create: not every rank can allocate ({problem or 'another rank cannot'})"
+        )
     error: Optional[Exception] = None
     state = None
     try:
@@ -197,7 +213,7 @@ class K3SandwichWorkspace:
     @classmethod
     def create(cls, mapping, fabric_handle: Optional[bool] = None) -> "K3SandwichWorkspace":
         """Allocate and arm a workspace for ``mapping``'s TP group. Collective: every rank of the group calls it at the
-        same point, eagerly (not under CUDA-graph capture); it returns on every rank or raises on every rank.
+        same point, eagerly (not under CUDA-graph capture); the failure model is ``_create_buffer``'s.
         ``fabric_handle``: share the memory by fabric handle (required across nodes) rather than POSIX file
         descriptor; default ``mapping.is_multi_node()``."""
         from . import k3_sandwich_kernel as kernel

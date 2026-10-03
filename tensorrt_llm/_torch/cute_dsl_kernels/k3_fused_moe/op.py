@@ -117,6 +117,55 @@ def is_supported(w3_w1_weight: torch.Tensor, w3_w1_weight_scale: torch.Tensor, w
     return True, ""
 
 
+def create_mcast_state(name: str, mapping, words: int, fabric_handle: Optional[bool], build):
+    """``build(uc, mc, handle, comm)`` over a new multicast buffer of ``words`` int32 per rank of ``mapping``'s TP
+    group, every word empty (``uc``: this rank's words; ``mc``: the same words through the multicast mapping).
+    Collective and eager: every rank of the group calls it at the same point.
+
+    Failure model (as ``MnnvlWorkspace.create``): before allocating, the ranks agree that each of them can (not
+    capturing a CUDA graph, the buffer within its device's free memory); if one cannot, every rank raises
+    ``RuntimeError`` and none allocates. A failure that returns from the allocation or from ``build`` is agreed the
+    same way. A rank that fails inside the allocation's handle exchange can leave its peers waiting in that exchange:
+    that failure is not turned into an error on the other ranks."""
+    from tensorrt_llm._torch.distributed.ops import (
+        _get_mnnvl_workspace_comm,
+        _make_mnnvl_mcast_buffer,
+        _mnnvl_device_index,
+        _mnnvl_workspace_all_succeeded,
+    )
+
+    use_fabric_handle = mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
+    comm = _get_mnnvl_workspace_comm(mapping)
+    # Every condition one rank alone can fail is checked before the allocation, and the ranks agree on it: a rank
+    # failing inside the allocation would leave its peers in the handle exchange.
+    problem: Optional[str] = None
+    if torch.cuda.is_current_stream_capturing():
+        problem = "it is collective and allocates: call it outside CUDA-graph capture"
+    else:
+        free_bytes, _ = torch.cuda.mem_get_info(_mnnvl_device_index(mapping))
+        if free_bytes < words * 4:
+            problem = f"its {words * 4} bytes exceed the {free_bytes} free on this rank's device"
+    if not _mnnvl_workspace_all_succeeded(comm, problem is None):
+        raise RuntimeError(
+            f"{name}.create: not every rank can allocate ({problem or 'another rank cannot'})"
+        )
+    error: Optional[Exception] = None
+    state = None
+    try:
+        handle = _make_mnnvl_mcast_buffer(comm, words * 4, mapping, use_fabric_handle)
+        uc = handle.get_uc_buffer(mapping.tp_rank, (words,), torch.int32, 0)
+        mc = handle.get_mc_buffer((words,), torch.int32, 0)
+        uc.fill_(EMPTY_WORD)
+        state = build(uc, mc, handle, comm)
+        torch.cuda.synchronize()
+    except Exception as exc:  # noqa: BLE001 -- reported to every rank below, then re-raised
+        error = exc
+    # Also the barrier that keeps any rank from pushing into a peer's buffer before the peer has emptied it.
+    if not _mnnvl_workspace_all_succeeded(comm, error is None):
+        raise RuntimeError(f"{name}: allocation failed on at least one rank") from error
+    return state
+
+
 @dataclass(eq=False)
 class K3MoeHeadWorkspace:
     """One TP group's MoE head all-gather buffers, read and written by ``trtllm::k3_moe_front`` (alone, or as the
@@ -146,54 +195,25 @@ class K3MoeHeadWorkspace:
     @classmethod
     def create(cls, mapping, fabric_handle: Optional[bool] = None) -> "K3MoeHeadWorkspace":
         """Allocate and arm a workspace for ``mapping``'s TP group. Collective: every rank of the group calls it at the
-        same point, eagerly (not under CUDA-graph capture); it returns on every rank or raises on every rank.
+        same point, eagerly (not under CUDA-graph capture); the failure model is :func:`create_mcast_state`'s.
         ``fabric_handle``: share the memory by fabric handle (required across nodes) rather than POSIX file
         descriptor; default ``mapping.is_multi_node()``."""
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "K3MoeHeadWorkspace.create is collective and allocates: call it outside CUDA-graph capture"
-            )
-        from tensorrt_llm._torch.distributed.ops import (
-            _get_mnnvl_workspace_comm,
-            _make_mnnvl_mcast_buffer,
-            _mnnvl_workspace_all_succeeded,
-        )
-
         from . import k3_route_quant_ag as layout
 
-        words = layout.workspace_words(mapping.tp_size)
-        use_fabric_handle = (
-            mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
-        )
-        comm = _get_mnnvl_workspace_comm(mapping)
-        error: Optional[Exception] = None
-        workspace = None
-        try:
-            handle = _make_mnnvl_mcast_buffer(comm, words * 4, mapping, use_fabric_handle)
-            uc = handle.get_uc_buffer(mapping.tp_rank, (words,), torch.int32, 0)
-            mc = handle.get_mc_buffer((words,), torch.int32, 0)
-            uc.fill_(EMPTY_WORD)
-            flags = torch.zeros(4, dtype=torch.int32, device=uc.device)
-            ready = torch.zeros(32, dtype=torch.int32, device=uc.device)
-            torch.cuda.synchronize()
-            workspace = cls(
+        def build(uc, mc, handle, comm):
+            return cls(
                 uc=uc,
                 mc=mc,
-                flags=flags,
-                ready=ready,
+                flags=torch.zeros(4, dtype=torch.int32, device=uc.device),
+                ready=torch.zeros(32, dtype=torch.int32, device=uc.device),
                 rank=mapping.tp_rank,
                 world_size=mapping.tp_size,
                 handle=handle,
                 comm=comm,
             )
-        except Exception as exc:  # noqa: BLE001 -- reported to every rank below, then re-raised
-            error = exc
-        # Also the barrier that keeps any rank from pushing into a peer's buffer before the peer has emptied it.
-        if not _mnnvl_workspace_all_succeeded(comm, error is None):
-            raise RuntimeError(
-                "K3MoeHeadWorkspace: allocation failed on at least one rank"
-            ) from error
-        return workspace
+
+        words = layout.workspace_words(mapping.tp_size)
+        return create_mcast_state("K3MoeHeadWorkspace", mapping, words, fabric_handle, build)
 
 
 class K3MoeState:
