@@ -16,6 +16,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     is_disagg_inflight_cancel_enabled,
 )
+from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._utils import nvtx_range
@@ -245,6 +246,13 @@ class DisaggTransferCoordinator:
                     f"transfer timeout: elapsed {elapsed_ms:.0f}ms > "
                     f"kv_transfer_timeout_ms={timeout_ms}ms"
                 )
+                perf_log_manager.event(
+                    "timeout_observed",
+                    req,
+                    side="ctx" if kind == "context" else "gen",
+                    elapsed_ms=elapsed_ms,
+                    cancel=self.inflight_cancel_active(),
+                )
                 req.py_kv_transfer_timed_out = True
 
         # Context requests start their clock on the last chunk, which is also
@@ -274,6 +282,16 @@ class DisaggTransferCoordinator:
 
         controller = self._admission_controller
         admission_result = controller.select(self._registry.active_requests(), fitting_gen_init)
+        if perf_log_manager.lifecycle_enabled:
+            admitted_ids = {req.py_request_id for req in admission_result.admitted_requests}
+            for req in fitting_gen_init:
+                perf_log_manager.event(
+                    "gen_transfer_window",
+                    req,
+                    admitted=req.py_request_id in admitted_ids,
+                    active_blocks=admission_result.active_transfer_blocks,
+                    budget_blocks=controller.max_transfer_blocks,
+                )
         if admission_result.deferred_request_count > 0:
             logger.debug(
                 "Disagg transfer admission deferred "
@@ -309,6 +327,8 @@ class DisaggTransferCoordinator:
         ]
         if deferred_requests:
             self._effects.revert_ctx_alloc(deferred_requests)
+            for req in deferred_requests:
+                perf_log_manager.event("gen_kv_rollback", req)
 
     def _transfer_window_is_active(self) -> bool:
         """Whether the executor-level transfer window bounds admission."""
@@ -351,6 +371,7 @@ class DisaggTransferCoordinator:
             for req in admitted:
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                     req.py_kv_transfer_start_time = time.monotonic()
+                    perf_log_manager.event("timeout_started", req, side="gen")
 
         self.reap_gen_receives(0)
 
@@ -433,6 +454,7 @@ class DisaggTransferCoordinator:
                 # sends the final slice and (for the Python transceiver) moves
                 # the request toward completion.
                 self._transfers.start_transfer(req)
+                perf_log_manager.event("ctx_send_ready", req)
                 self._transceiver.respond_and_send_async(req)
                 # Bridge validation can reject before a transfer session exists.
                 # Release the claim right away: there is no physical accessor
@@ -446,6 +468,7 @@ class DisaggTransferCoordinator:
                     continue
                 if self._transceiver.kv_transfer_timeout_ms is not None:
                     req.py_kv_transfer_start_time = time.monotonic()
+                    perf_log_manager.event("timeout_started", req, side="ctx")
             elif (
                 self._transceiver.pipeline_transfer_enabled
                 and req.state != LlmRequestState.GENERATION_COMPLETE
@@ -656,6 +679,9 @@ class DisaggTransferCoordinator:
                 logger.warning(
                     f"Requesting cancellation for generation request "
                     f"{request.py_request_id} due to KV cache transfer timeout"
+                )
+                perf_log_manager.event(
+                    "timeout_observed", request, side="gen", elapsed_ms=elapsed_ms, cancel=True
                 )
                 request.py_kv_transfer_timed_out = True
 
