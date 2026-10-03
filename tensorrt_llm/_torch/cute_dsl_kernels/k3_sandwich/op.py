@@ -395,8 +395,8 @@ def k3_sandwich_tail(
     tap_updated: bool = False,
     updated_out: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
-    """``(normed, updated)`` of the row-parallel MoE tail (as ``trtllm::pdl_gemv_tail``: ``[rmsnorm(latent)[:,
-    lo:lo+224] | act] @ tail_weight^T``) followed by ``allreduce_attn_res_rmsnorm`` of that partial. ``latent`` is
+    """``(normed, updated)`` of the row-parallel MoE tail (``[rmsnorm(latent)[:, lo:lo+224] | act] @ tail_weight^T``,
+    the RMS on the fp32 latent accumulator) followed by ``allreduce_attn_res_rmsnorm`` of that partial. ``latent`` is
     the whole reduced latent row (16-byte aligned: its rows are bulk-copied), ``act`` the shared-expert activation,
     ``tail_weight`` [7168, 256 + 384] the latent up columns of the slice zero-padded to 256 and the shared down
     projection; ``src_slab`` (int32 [3, 8, 1792]) supplies the latent in buffer ``src_buf``; with ``lat_uc`` /

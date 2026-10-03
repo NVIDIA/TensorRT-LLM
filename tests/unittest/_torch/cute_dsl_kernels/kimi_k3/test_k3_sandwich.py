@@ -18,8 +18,9 @@ GB200 tray; the per-rank shapes do not depend on the group size, the reduction i
 in 1..8:
   oproj  against o_proj (cuBLAS, rows as in an 8-row call) -> MNNVLAllReduce.allreduce_attn_res_rmsnorm, bit for bit,
          0 / 1 / 3 / 8 snapshots, with and without the prefix sum;
-  tail   against pdl_gemv_tail -> allreduce_attn_res_rmsnorm (fp32 tolerance: different GEMV kernels), and with the
-         DSpark capture tap (the pre-norm mixture against trtllm::attn_res_fwd) and updated_out (a snapshot bank row);
+  tail   against the tail in torch (fp32 accumulators, the latent RMS on the latent one) -> allreduce_attn_res_rmsnorm
+         (fp32 tolerance: another summation order), and with the DSpark capture tap (the pre-norm mixture against
+         trtllm::attn_res_fwd) and updated_out (a snapshot bank row);
   plain  against k3_ctm_gemv -> the MNNVL one-shot RESIDUAL_RMS_NORM all-reduce, bit for bit (drafter o_proj, K 384),
          and the SwiGLU form against k3_ctm_gemv_swiglu split 2 -> the same all-reduce (drafter down, K 896);
 each with run-to-run identical bits, each M's rows bit-identical to the same rows of the 8-row call, every rank's
@@ -145,6 +146,15 @@ def _attn_res_ar(ctx, partial, prefix, block, res_w, rms_w, out_w):
     return ctx.mnnvl.allreduce_attn_res_rmsnorm(partial, prefix, block, res_w, rms_w, out_w, EPS, EPS)
 
 
+def _tail_partial(latent, act, w, lo):
+    """This rank's row-parallel tail partial with the kernel's arithmetic: fp32 accumulators of the latent slice and of
+    the activation, the latent one scaled by the RMS of the whole latent row, one bf16 rounding."""
+    lat = latent.float()
+    scale = torch.rsqrt(lat.pow(2).mean(dim=1, keepdim=True) + LAT_EPS)
+    acc_lat = lat[:, lo : lo + WIDTH] @ w[:, :WIDTH].float().t()
+    return (acc_lat * scale + act.float() @ w[:, PAD:].float().t()).bfloat16()
+
+
 def _residual_rms_ar(ctx, partial, residual, norm_w):
     """The unfused drafter step: the MNNVL all-reduce with the residual add + RMSNorm fusion, sent one-shot (the
     sandwich reproduces the one-shot kernel's order; above 8 ranks two-shot sums the ranks in another order)."""
@@ -242,7 +252,7 @@ def check_tail(ctx):
                 latent, act = latent8[:m].contiguous(), act8[:m].contiguous()
                 pre, block = _first(m, prefix8, block8, with_prefix)
                 n, u = _tail(ctx, latent, act, w, lo, pre, block, res_w, rms_w, out_w)
-                part = torch.ops.trtllm.pdl_gemv_tail(latent, act, w, lo, WIDTH, LAT_EPS)
+                part = _tail_partial(latent, act, w, lo)
                 want_n, want_u = _attn_res_ar(ctx, part, pre, block, res_w, rms_w, out_w)
                 again = [_tail(ctx, latent, act, w, lo, pre, block, res_w, rms_w, out_w) for _ in range(2)]
                 bad_n, bad_u = _tail(ctx, latent, _perturbed(ctx, act), w, lo, pre, block, res_w, rms_w, out_w)

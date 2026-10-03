@@ -17,7 +17,7 @@ top-16 routing, MXFP8 latent, shared gate_up + SiTU; then k3_moe on its grid), o
 this run, at every M in 1..8. The head is sharded over the group (TP W: 3584 / W latent + 896 / W router rows and
 2 x 6144 / W shared rows per rank; W = 4 on one GB200 tray, the model's TP16 shapes with 16 processes); the routed
 experts are one rank of experts TP4 x EP4 (224 local experts, intermediate 768), as in the TP16 deployment.
-  front : against the unfused chain (the head GEMV pdl_gemv in fp32 -> the gather ->
+  front : against the unfused chain (the head GEMV in fp32 torch -> the gather ->
           trtllm::kimi_k3_noaux_tc_mxfp8_quant; shared: cuBLAS gate_up -> trtllm::situ_and_mul): top-16 ids per
           token (a mismatch only at a reference
           16th / 17th key margin below 1e-4: the split-K head sums in another order), routing weights, MXFP8 codes and
@@ -186,9 +186,9 @@ def _front(ctx, x):
 
 
 def _reference(ctx, x):
-    """The unfused chain: this rank's head rows in fp32 (pdl_gemv), every rank's gathered (latent columns rounded to
+    """The unfused chain: this rank's head rows in fp32 (torch), every rank's gathered (latent columns rounded to
     bf16), the fused C++ routing + MXFP8 quantization; the shared expert's gate_up (cuBLAS) and SiTU-and-mul."""
-    head = torch.ops.trtllm.pdl_gemv(x, ctx.head, True, False)
+    head = x.float() @ ctx.head.float().t()
     parts = [torch.from_numpy(a).cuda() for a in ctx.comm.allgather(head.cpu().numpy())]
     latent = torch.cat([p[:, : ctx.wl] for p in parts], dim=1).bfloat16().contiguous()
     logits = torch.cat([p[:, ctx.wl :] for p in parts], dim=1).contiguous()
