@@ -504,6 +504,7 @@ pipeline {
         // Jobs in other folders (e.g. personal/dev pipelines) will have no cron trigger.
         parameterizedCron(env.JOB_NAME.startsWith('LLM/helpers/') ? '''
             H 2 * * * %ref=main;repoUrlKey=tensorrt_llm_github;scanMode=monitor
+            H 3 * * * %ref=release/1.3;repoUrlKey=tensorrt_llm_github;scanMode=monitor
         ''' : '')
     }
     stages {
