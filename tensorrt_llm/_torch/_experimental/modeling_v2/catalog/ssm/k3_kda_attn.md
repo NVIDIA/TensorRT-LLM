@@ -41,7 +41,7 @@ same pools (certified, every pool word). Repeated runs are bit-identical.
 **`k3_kda_qkvg`** runs phase 1 alone on `x` bf16 `[T <= 8, 7168]` and publishes the rows: buffer
 `e = buffers.epoch[0]` (before the call) holds q, k and f_a as bf16 bits in `p1`, and v, og and b as the fp32 bits of
 the two K-half partials in `part`. The projection is bf16 of their sum, the consumer's job. Measured against a float64
-`x @ w^T`: TBD(tray: test_modeling_v2_k3_kda_attn.py::test_qkvg_rows_match_the_projection).
+`x @ w^T`: the rows are within 2.5e-3 of the projection's largest magnitude at T = 1, and 2.4e-3 at T = 3 and 8.
 
 ## Signature
 
@@ -160,8 +160,8 @@ committed history; then layers x rounds on one shared set against a set per laye
 once and replayed with rewritten inputs and records.
 
 **What a wrong order does.** Two rounds of one request in swapped order (the test's negative control): nothing raises,
-and the second round's output and the slot's state are those of a different history. Measured on sm_100:
-TBD(tray: test_modeling_v2_k3_kda_attn.py::test_swapped_rounds_are_silently_wrong, its printed rel diffs).
+and the second round's output and the slot's state are those of a different history. Measured on sm_100: the second round's output is off by 1.00 and
+the state by 1.01 (the largest absolute difference over the in-order result's largest magnitude).
 
 ## Metadata consumed
 

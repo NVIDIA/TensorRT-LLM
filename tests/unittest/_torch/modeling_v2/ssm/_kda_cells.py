@@ -32,7 +32,8 @@ TOL_STATE = 1e-3  # fp32 states: approximate exp / rcp in the kernels and the bf
 
 
 def sm100() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+    """sm_100 exactly: the architecture these entries are certified on (a missing receipt reads as unknown)."""
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
 
 
 def load_ops():

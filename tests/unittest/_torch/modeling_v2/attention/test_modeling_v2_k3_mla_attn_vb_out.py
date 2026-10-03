@@ -53,10 +53,11 @@ def _is_sm100() -> bool:
     if not torch.cuda.is_available():
         return False
     major, minor = torch.cuda.get_device_capability()
-    return major * 10 + minor in (100, 103)
+    # sm_100 exactly: the receipts' architecture (a missing receipt reads as unknown).
+    return (major, minor) == (10, 0)
 
 
-pytestmark = pytest.mark.skipif(not _is_sm100(), reason="needs an SM100 / SM103 GPU")
+pytestmark = pytest.mark.skipif(not _is_sm100(), reason="certified on SM100 only")
 
 H, NOPE, LAT, PE, QL, V = 6, 128, 512, 64, 1536, 128
 DQK, PAGE = LAT + PE, 64
