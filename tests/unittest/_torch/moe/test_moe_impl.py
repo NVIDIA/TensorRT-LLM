@@ -141,7 +141,7 @@ def test_pinned_deepgemm_rejects_post_silu_clamping():
     assert "post-SiLU clamping" in report.rejected[-1].detail
 
 
-@pytest.mark.parametrize("sm, eligible", [(90, True), (120, False)])
+@pytest.mark.parametrize("sm, eligible", [(90, True), (120, False), (121, False)])
 def test_cutlass_post_silu_clamp_rejects_triton_fallback(sm, eligible):
     problem = MoEProblem(
         quant=canonical_quant(QuantAlgo.FP8_BLOCK_SCALES),
