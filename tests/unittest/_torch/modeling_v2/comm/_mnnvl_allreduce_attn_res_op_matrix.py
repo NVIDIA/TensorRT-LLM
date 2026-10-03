@@ -100,6 +100,27 @@ def check_workspace_is_armed_and_sized() -> None:
     assert WS_A.buffer_flags.view(torch.int32).tolist()[:3] == [0, 2, BUFFER_BYTES]
 
 
+def check_create_refuses_on_every_rank() -> None:
+    """One rank asks for three buffers past its device's free memory: every rank raises before any allocates, and the
+    workspaces in use stay correct."""
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace import (
+        MnnvlWorkspace,
+    )
+
+    free_bytes, _ = torch.cuda.mem_get_info()
+    too_big = (free_bytes // 3 // 16 + (64 << 20) // 16) * 16
+    try:
+        MnnvlWorkspace.create(
+            R.mapping, too_big if R.rank == 0 else BUFFER_BYTES, fabric_handle=R.fabric
+        )
+        raised = False
+    except RuntimeError as exc:
+        raised = "not every rank can allocate" in str(exc)
+    assert R.all_true(raised), "a rank short of memory did not make every rank raise"
+    call = Call(2100, 8, 3)
+    verify(call, call.run(WS_A), "after the refused create")
+
+
 def check_single_calls() -> None:
     for t in TOKENS:
         for s in SNAPSHOTS:
@@ -221,6 +242,7 @@ def check_wrong_call_order_is_detected() -> None:
 
 CHECKS = [
     check_workspace_is_armed_and_sized,
+    check_create_refuses_on_every_rank,
     check_single_calls,
     check_a_call_over_one_buffer_raises_on_every_rank,
     check_dip_and_regrow_sequence,

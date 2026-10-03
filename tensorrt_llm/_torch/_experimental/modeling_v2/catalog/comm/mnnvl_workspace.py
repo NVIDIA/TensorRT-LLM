@@ -54,28 +54,45 @@ class MnnvlWorkspace:
         cls, mapping, buffer_bytes: int, fabric_handle: Optional[bool] = None
     ) -> "MnnvlWorkspace":
         """Allocate and arm a workspace for ``mapping``'s TP group. Collective: every rank of the group calls it at
-        the same point, eagerly (not under CUDA-graph capture); it returns on every rank or raises on every rank.
+        the same point, eagerly (not under CUDA-graph capture).
+
+        Failure model: before allocating, the ranks agree that each of them can (not capturing, a valid
+        ``buffer_bytes``, the three buffers within its device's free memory); if one cannot, every rank raises
+        ``RuntimeError`` and none allocates. A failure that returns from the allocation is agreed the same way. A
+        rank that fails inside the allocation's handle exchange can leave its peers waiting in that exchange: that
+        failure is not turned into an error on the other ranks.
+
         ``fabric_handle``: share the memory by fabric handle (required across nodes) rather than POSIX file
         descriptor; default ``mapping.is_multi_node()``."""
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
             _initialize_allreduce_mnnvl_protocol,
             _make_mnnvl_mcast_buffer,
+            _mnnvl_device_index,
             _mnnvl_workspace_all_succeeded,
         )
 
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "MnnvlWorkspace.create is collective and allocates: call it before capture"
-            )
-        if buffer_bytes <= 0 or buffer_bytes % 16:
-            raise ValueError(f"buffer_bytes must be a positive multiple of 16, got {buffer_bytes}")
         use_fabric = mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
+        total = NUM_LAMPORT_BUFFERS * buffer_bytes
         comm = _get_mnnvl_workspace_comm(mapping)
+        # Every condition one rank alone can fail is checked before the allocation, and the ranks agree on it: a
+        # rank failing inside the allocation would leave its peers in the handle exchange.
+        problem: Optional[str] = None
+        if torch.cuda.is_current_stream_capturing():
+            problem = "it is collective and allocates: call it before capture"
+        elif buffer_bytes <= 0 or buffer_bytes % 16:
+            problem = f"buffer_bytes must be a positive multiple of 16, got {buffer_bytes}"
+        else:
+            free_bytes, _ = torch.cuda.mem_get_info(_mnnvl_device_index(mapping))
+            if free_bytes < total:
+                problem = f"its {total} bytes exceed the {free_bytes} free on this rank's device"
+        if not _mnnvl_workspace_all_succeeded(comm, problem is None):
+            raise RuntimeError(
+                f"MnnvlWorkspace.create: not every rank can allocate ({problem or 'another rank cannot'})"
+            )
         error: Optional[Exception] = None
         workspace = None
         try:
-            total = NUM_LAMPORT_BUFFERS * buffer_bytes
             handle = _make_mnnvl_mcast_buffer(comm, total, mapping, use_fabric)
             lamport = handle.get_uc_buffer(mapping.tp_rank, (total // 4,), torch.float32, 0)
             flags = torch.zeros(FLAG_WORDS, dtype=torch.uint32, device=lamport.device)

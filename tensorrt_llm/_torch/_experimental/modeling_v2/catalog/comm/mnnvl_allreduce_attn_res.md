@@ -80,9 +80,15 @@ a call over one buffer raises (below).
 **Who creates it, and when.** The target, in `post_load_weights`, with
 `MnnvlWorkspace.create(mapping, buffer_bytes, fabric_handle=None)`:
 
-- collective over `mapping`'s TP group: every rank calls it at the same point; it returns on every rank or raises
-  on every rank (the success of each rank's allocation is agreed before anyone proceeds);
-- eager: it allocates and exchanges handles, so it refuses to run under CUDA-graph capture;
+- collective over `mapping`'s TP group: every rank calls it at the same point;
+- failure model:
+  - before allocating, the ranks agree that each of them can (not capturing, a valid `buffer_bytes`, the three
+    buffers within that rank's free device memory). If one cannot, every rank raises `RuntimeError` and none
+    allocates (certified: one rank short of memory, every rank raises, the next call is correct);
+  - a failure that returns from the allocation is agreed the same way;
+  - a rank that fails inside the allocation's handle exchange can leave its peers waiting in that exchange; this
+    is not turned into an error on the other ranks;
+- eager: it allocates and exchanges handles, so it refuses to run under CUDA-graph capture (every rank raises);
 - it arms every buffer word and the flags, and returns only once every rank has armed its buffers, so no peer can
   push into memory a rank has not armed;
 - `fabric_handle`: share the memory by fabric handle (required across nodes) or POSIX file descriptor; default
