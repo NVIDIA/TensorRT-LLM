@@ -38,7 +38,6 @@ Run under pytest (a pool of 4 MPI workers) or directly, one process per GPU:
   srun -N1 -n4 --mpi=pmix python3 test_k3_moe_push.py [push k3_moe_push]
 """
 
-import functools
 import hashlib
 import math
 import os
@@ -59,6 +58,18 @@ except ImportError:  # the test is skipped below
 if cloudpickle is not None:
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
     MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
+
+
+def _trtllm():
+    """``torch.ops.trtllm``, named only in a nested function: the pool gets this module's functions by value, and
+    cloudpickle cannot pickle a function whose own code names ``torch.ops`` (it adds ``sys.modules["torch.ops"]`` to
+    the function's state)."""
+
+    def namespace():
+        return torch.ops.trtllm
+
+    return namespace()
+
 
 WORLD = 4
 H, NUM_EXPERTS, SV = 3584, 896, 32
@@ -112,11 +123,17 @@ def _rand_mxfp4(rows, k, k_full, gen):
     return (codes[:, 0::2] | (codes[:, 1::2] << 4)).contiguous(), exps
 
 
-@functools.lru_cache(maxsize=None)
+# _experts' buffers per seed. A dict, not functools.lru_cache: the pool's workers would get an lru_cache wrapper by
+# reference, from a module they cannot import.
+_EXPERTS = {}
+
+
 def _experts(seed: int):
     """This rank's TP16 experts through W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod's loader: the buffers the engines read,
     the 192-wide shard generated as rank 0 of tensors that hold exactly it (the loader slices it, then pads it to 256).
-    """
+    Built once per seed."""
+    if seed in _EXPERTS:
+        return _EXPERTS[seed]
     from tensorrt_llm._torch.moe.fused_moe.quantization import W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod
 
     method = W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod()
@@ -137,7 +154,8 @@ def _experts(seed: int):
         method.load_expert_w3_w1_weight_scale_mxfp4(module, gate_s, up_s, w31s[e])
         method.load_expert_w2_weight_scale_mxfp4(module, down_s, w2s[e])
     torch.cuda.synchronize()
-    return w31, w31s, w2, w2s
+    _EXPERTS[seed] = w31, w31s, w2, w2s
+    return _EXPERTS[seed]
 
 
 def _tokens(m: int, seed: int):
@@ -147,7 +165,7 @@ def _tokens(m: int, seed: int):
     x = torch.randn(m, H, generator=gen, device="cuda").bfloat16()
     logits = torch.randn(m, NUM_EXPERTS, generator=gen, device="cuda")
     bias = (torch.randn(NUM_EXPERTS, generator=gen, device="cuda") * 0.05).float()
-    ids, weights, x_fp8, x_sf = torch.ops.trtllm.k3_route_quant(logits, bias, x, RSF, True)
+    ids, weights, x_fp8, x_sf = _trtllm().k3_route_quant(logits, bias, x, RSF, True)
     return x_fp8, x_sf, ids, weights
 
 
@@ -178,7 +196,7 @@ class _Exchange:
         ctx.comm.Barrier()
 
     def reduce(self, m: int) -> torch.Tensor:
-        out = torch.ops.trtllm.k3_latent_reduce(self.uc, self.flags, m, 0)
+        out = _trtllm().k3_latent_reduce(self.uc, self.flags, m, 0)
         self.count = (self.count + 1 + 2**31) % 2**32 - 2**31  # int32 two's complement
         return out
 
@@ -327,11 +345,11 @@ def _k3_moe_routed(producer, inputs, front):
     argument order. k3_moe_front is collective over the run's ranks (the head all-gather on ``front.head``)."""
     if producer == "k3_route_quant":
         x, logits, bias = inputs
-        ids, weights, x_fp8, x_sf = torch.ops.trtllm.k3_route_quant(logits, bias, x, RSF, True)
+        ids, weights, x_fp8, x_sf = _trtllm().k3_route_quant(logits, bias, x, RSF, True)
         return x_fp8, x_sf, ids, weights, None
     x, bias = inputs
     head = front.head
-    ids, weights, x_fp8, x_sf, shared = torch.ops.trtllm.k3_moe_front(
+    ids, weights, x_fp8, x_sf, shared = _trtllm().k3_moe_front(
         x, front.weight, bias, RSF, front.inter, GATE_CAP, LINEAR_CAP, head.uc, head.mc, head.flags, head.rank,
         head.world_size,
     )  # fmt: skip

@@ -69,6 +69,18 @@ if cloudpickle is not None:
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
     MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 
+
+def _trtllm():
+    """``torch.ops.trtllm``, named only in a nested function: the pool gets this module's functions by value, and
+    cloudpickle cannot pickle a function whose own code names ``torch.ops`` (it adds ``sys.modules["torch.ops"]`` to
+    the function's state)."""
+
+    def namespace():
+        return torch.ops.trtllm
+
+    return namespace()
+
+
 WORLD = 4
 HIDDEN, LATENT, EXPERTS, TOP_K, SV = 7168, 3584, 896, 16, 32
 SHARED_INTER = 6144  # two shared experts of 3072
@@ -197,8 +209,8 @@ def _quiet_check(ctx, fn):
 
 
 def _front(ctx, x):
-    return torch.ops.trtllm.k3_moe_front(x, ctx.front, ctx.bias, RSF, ctx.inter, GATE_CAP, LINEAR_CAP, *ctx.ag,
-                                         ctx.world)  # fmt: skip
+    return _trtllm().k3_moe_front(x, ctx.front, ctx.bias, RSF, ctx.inter, GATE_CAP, LINEAR_CAP, *ctx.ag,
+                                  ctx.world)  # fmt: skip
 
 
 def _reference(ctx, x):
@@ -208,8 +220,8 @@ def _reference(ctx, x):
     parts = [torch.from_numpy(a).cuda() for a in ctx.comm.allgather(head.cpu().numpy())]
     latent = torch.cat([p[:, : ctx.wl] for p in parts], dim=1).bfloat16().contiguous()
     logits = torch.cat([p[:, ctx.wl :] for p in parts], dim=1).contiguous()
-    ids, w, q, s = torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(logits, ctx.bias, latent, RSF)
-    shared = torch.ops.trtllm.situ_and_mul(F.linear(x, ctx.gate_up), GATE_CAP, LINEAR_CAP)
+    ids, w, q, s = _trtllm().kimi_k3_noaux_tc_mxfp8_quant(logits, ctx.bias, latent, RSF)
+    shared = _trtllm().situ_and_mul(F.linear(x, ctx.gate_up), GATE_CAP, LINEAR_CAP)
     key = torch.sigmoid(logits) + ctx.bias
     top = key.sort(dim=1, descending=True).values
     return ids, w, q, s, shared, top[:, TOP_K - 1] - top[:, TOP_K], latent
@@ -294,7 +306,7 @@ def _fused(ctx, x, layer=None, bias=None):
     (y, shared). A head_flags layer's front publishes the ready words (``ag_ready``) and its k3_moe acquires them."""
     layer = layer or ctx.layer
     head = layer.state.head_flags
-    ids, w, q, s, shared = torch.ops.trtllm.k3_moe_front(
+    ids, w, q, s, shared = _trtllm().k3_moe_front(
         x, ctx.front, ctx.bias if bias is None else bias, RSF, ctx.inter, GATE_CAP, LINEAR_CAP, *ctx.ag, ctx.world,
         ag_ready=ctx.ws.ready if head else None,
     )  # fmt: skip
@@ -312,7 +324,7 @@ def _runner(ctx, ids, w, q, s):
     p = ctx.experts
     alpha = torch.full((E_LOCAL,), GATE_CAP, dtype=torch.float32, device="cuda")
     beta = torch.full((E_LOCAL,), LINEAR_CAP, dtype=torch.float32, device="cuda")
-    return torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+    return _trtllm().mxe4m3_mxe2m1_block_scale_moe_runner(
         None, None, q, s.view(-1), p["w31"], p["w31s"], None, alpha, beta, None, p["w2"], p["w2s"], None, EXPERTS,
         TOP_K, 1, 1, I_TP, LATENT, I_TP, ctx.offset, E_LOCAL, 1.0, int(RoutingMethodType.DeepSeekV3),
         int(ActType_TrtllmGen.SiTu), topk_weights=w, topk_ids=ids)  # fmt: skip

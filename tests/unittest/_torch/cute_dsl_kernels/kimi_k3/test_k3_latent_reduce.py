@@ -44,6 +44,18 @@ if cloudpickle is not None:
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
     MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 
+
+def _trtllm():
+    """``torch.ops.trtllm``, named only in a nested function: the pool gets this module's functions by value, and
+    cloudpickle cannot pickle a function whose own code names ``torch.ops`` (it adds ``sys.modules["torch.ops"]`` to
+    the function's state)."""
+
+    def namespace():
+        return torch.ops.trtllm
+
+    return namespace()
+
+
 WORLD = 4
 LATENT = 3584
 M_CASES = list(range(1, 9))
@@ -119,7 +131,7 @@ def _push(ctx, x, half):
 
 
 def _reduce(ctx, m, ctas):
-    out = torch.ops.trtllm.k3_latent_reduce(ctx.ex.uc, ctx.ex.flags, m, ctas)
+    out = _trtllm().k3_latent_reduce(ctx.ex.uc, ctx.ex.flags, m, ctas)
     ctx.count += 1
     return out
 
@@ -183,7 +195,7 @@ def check_graph(ctx):
             for i, m in enumerate(ms):
                 # the halves alternate, so the captured pairs follow the eager calls' parity
                 _push(ctx, inputs[i], (base + i) & 1)
-                outs[i] = torch.ops.trtllm.k3_latent_reduce(ctx.ex.uc, ctx.ex.flags, m, 0)
+                outs[i] = _trtllm().k3_latent_reduce(ctx.ex.uc, ctx.ex.flags, m, 0)
     torch.cuda.synchronize()
     ctx.comm.Barrier()
     for rep in range(3):

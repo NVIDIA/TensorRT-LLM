@@ -52,6 +52,18 @@ if cloudpickle is not None:
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
     MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 
+
+def _trtllm():
+    """``torch.ops.trtllm``, named only in a nested function: the pool gets this module's functions by value, and
+    cloudpickle cannot pickle a function whose own code names ``torch.ops`` (it adds ``sys.modules["torch.ops"]`` to
+    the function's state)."""
+
+    def namespace():
+        return torch.ops.trtllm
+
+    return namespace()
+
+
 WORLD = 4
 H, K_O, LATENT, WIDTH, PAD, ACT = 7168, 768, 3584, 224, 256, 384
 PLAIN_K, DOWN_K = 384, 896
@@ -126,20 +138,20 @@ def _all_ranks(ctx, good) -> bool:
 
 def _oproj(ctx, core, w, prefix, block, res_w, rms_w, out_w):
     ws = ctx.ws
-    return torch.ops.trtllm.k3_sandwich_oproj(core, w, prefix, block, res_w, rms_w, out_w, EPS, EPS, ws.uc, ws.mc,
-                                              ws.flags, ws.rank)  # fmt: skip
+    return _trtllm().k3_sandwich_oproj(core, w, prefix, block, res_w, rms_w, out_w, EPS, EPS, ws.uc, ws.mc,
+                                       ws.flags, ws.rank)  # fmt: skip
 
 
 def _tail(ctx, latent, act, w, lo, prefix, block, res_w, rms_w, out_w, **extra):
     ws = ctx.ws
-    return torch.ops.trtllm.k3_sandwich_tail(latent, act, w, lo, LAT_EPS, prefix, block, res_w, rms_w, out_w, EPS,
-                                             EPS, ws.uc, ws.mc, ws.flags, ws.rank, **extra)  # fmt: skip
+    return _trtllm().k3_sandwich_tail(latent, act, w, lo, LAT_EPS, prefix, block, res_w, rms_w, out_w, EPS,
+                                      EPS, ws.uc, ws.mc, ws.flags, ws.rank, **extra)  # fmt: skip
 
 
 def _plain(ctx, x, w, residual, norm_w, swiglu=False):
     ws = ctx.ws
-    return torch.ops.trtllm.k3_sandwich_plain(x, w, residual, norm_w, EPS, ws.uc, ws.mc, ws.flags, ws.rank,
-                                              swiglu=swiglu)  # fmt: skip
+    return _trtllm().k3_sandwich_plain(x, w, residual, norm_w, EPS, ws.uc, ws.mc, ws.flags, ws.rank,
+                                       swiglu=swiglu)  # fmt: skip
 
 
 def _attn_res_ar(ctx, partial, prefix, block, res_w, rms_w, out_w):
@@ -263,9 +275,9 @@ def check_oproj(ctx):
 def _tap_mixture(updated, block, res_w, rms_w):
     """The unfused path's pre-norm attention-residual mixture: trtllm::attn_res_fwd on the updated row and the bank."""
     m, s = updated.shape[0], block.shape[0]
-    out, _, _, _ = torch.ops.trtllm.attn_res_fwd(updated.reshape(m, 1, H).contiguous(),
-                                                 block.reshape(s, m, 1, H).contiguous(), res_w.reshape(-1).contiguous(),
-                                                 rms_w.contiguous(), EPS)  # fmt: skip
+    out, _, _, _ = _trtllm().attn_res_fwd(updated.reshape(m, 1, H).contiguous(),
+                                          block.reshape(s, m, 1, H).contiguous(), res_w.reshape(-1).contiguous(),
+                                          rms_w.contiguous(), EPS)  # fmt: skip
     return out.reshape(m, H)
 
 

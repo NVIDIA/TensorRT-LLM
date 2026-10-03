@@ -49,6 +49,18 @@ if cloudpickle is not None:
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
     MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 
+
+def _trtllm():
+    """``torch.ops.trtllm``, named only in a nested function: the pool gets this module's functions by value, and
+    cloudpickle cannot pickle a function whose own code names ``torch.ops`` (it adds ``sys.modules["torch.ops"]`` to
+    the function's state)."""
+
+    def namespace():
+        return torch.ops.trtllm
+
+    return namespace()
+
+
 WORLD = 4
 H, LATENT, EXPERTS = 7168, 3584, 896
 EPS, OUT_EPS = 1e-6, 1e-5
@@ -153,12 +165,12 @@ def _unfused(ctx, partial, prefix, block, res_w, rms_w, out_w):
     if s == 0:
         return None, (reduced if prefix is None else (prefix.float() + reduced.float()).bfloat16())
     if prefix is None:
-        out = torch.ops.trtllm.attn_res_rmsnorm_fwd(reduced.reshape(m, 1, H), block.reshape(s, m, 1, H), res_w, rms_w,
-                                                    out_w, EPS, OUT_EPS)  # fmt: skip
+        out = _trtllm().attn_res_rmsnorm_fwd(reduced.reshape(m, 1, H), block.reshape(s, m, 1, H), res_w, rms_w,
+                                             out_w, EPS, OUT_EPS)  # fmt: skip
         return out.reshape(m, H), reduced
-    updated, out = torch.ops.trtllm.attn_res_add_rmsnorm_fwd(prefix.reshape(m, 1, H), reduced.reshape(m, 1, H),
-                                                             block.reshape(s, m, 1, H), res_w, rms_w, out_w, EPS,
-                                                             OUT_EPS)  # fmt: skip
+    updated, out = _trtllm().attn_res_add_rmsnorm_fwd(prefix.reshape(m, 1, H), reduced.reshape(m, 1, H),
+                                                      block.reshape(s, m, 1, H), res_w, rms_w, out_w, EPS,
+                                                      OUT_EPS)  # fmt: skip
     return out.reshape(m, H), updated.reshape(m, H)
 
 
