@@ -34,14 +34,15 @@ rewritten in place (the buffer rotation inside a graph).
 Shapes: the rank's shard V / W of V = 163840 (W exchange slots), and TP16's 10240-column shard with every rank filling
 16 / W slots (the exchange of 16 ranks; ``--copies`` overrides).
 
-    srun -n W --mpi=pmix python3 test_k3_spec_accept_sharded.py [--copies C] [--time [--base]]
-    srun -n W --mpi=pmix python3 -m pytest test_k3_spec_accept_sharded.py
+    srun -n W --mpi=pmix python3 test_k3_spec_accept_sharded.py [report] [--copies C] [--time [--base]]
 
 ``--time`` also reports us per call at batch 1 and every split of the sharded kernel and of the kernel on the gathered
 fp32 logits (CUDA graphs of 20 back-to-back calls, the slowest rank of each replay, median over 12 replays in
 alternating order; the all-gather, cat and cast that the sharded path removes are not in the second number);
 ``--base`` adds the installed base package's kernel (``$K3_BASE_TRTLLM``) on the same sharded calls and workspace.
-Without an MPI job of 2 or more ranks the module skips.
+Under pytest (``python3 -m pytest test_k3_spec_accept_sharded.py``, 4 GPUs visible) one test runs the checks on 4
+ranks: this file under a local ``mpirun -n 4``, started from a fresh interpreter, under a deadline; with fewer GPUs the
+module is skipped.
 """
 
 import argparse
@@ -49,7 +50,9 @@ import contextlib
 import importlib.util
 import os
 import random
+import signal
 import statistics
+import subprocess
 import sys
 import time
 import traceback
@@ -97,19 +100,13 @@ GRAPH_SPLITS = [(1, 2), (2, 8), (4, 4), (8, 8)]
 GRAPH_KINDS = ("plain", "ties", "rank_ties", "nan", "negzero")
 
 
-def launcher_world_size() -> int:
-    """The world size an MPI launcher (mpirun, MPICH, srun) gave this process, from its environment: whether to skip
-    is decided without initializing MPI or CUDA."""
-    for name in ("OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "SLURM_STEP_NUM_TASKS"):
-        value = os.environ.get(name, "")
-        if value.isdigit():
-            return int(value)
-    return 1
-
+# The ranks of the pytest run (one GB200 tray) and its deadline: a broken exchange hangs rather than raising.
+WORLD = 4
+DEADLINE_S = 1200
 
 pytestmark = pytest.mark.skipif(
-    launcher_world_size() < 2 or not _sm100(),
-    reason="needs an MPI job of 2 or more ranks on SM100 GPUs (srun -n W --mpi=pmix python3 -m pytest ...)",
+    not _sm100() or torch.cuda.device_count() < WORLD,
+    reason=f"needs {WORLD} SM100 GPUs (MNNVL multicast)",
 )
 
 _env = {}
@@ -456,27 +453,50 @@ def run_config(env: dict, name: str, vocab: int, copies: int, time_it: bool = Fa
     return None, results, timings
 
 
-@pytest.mark.parametrize("config", [0, 1], ids=["V-over-W", "TP16-shard"])
-def test_sharded(config):
-    env = mpi_env()
-    if env["world"] < 2:
-        pytest.skip("needs an MPI job of 2 or more ranks")
-    name, vocab, copies = configs(env["world"])[config]
-    with torch.inference_mode():
-        skip, results, _ = on_every_rank(env, run_config, env, name, vocab, copies)
-    if skip:
-        pytest.skip(skip)
-    bad = [
-        {k: r[k] for k in ("config", "split", "case", "checks", "bad")}
-        for r in results
-        if not r["ok"]
-    ]
-    oks = env["comm"].allgather(not bad)
-    assert all(oks), (f"ranks ok: {oks}", bad)
+# ----------------------------------------------------------------------------------------------------------------
+# pytest (python3 -m pytest test_k3_spec_accept_sharded.py): the checks on WORLD ranks of this node.
+# ----------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.no_xdist
+def test_k3_spec_accept_sharded():
+    """``report`` on WORLD ranks: ``launch`` in a fresh interpreter, which starts this file under ``mpirun`` (a
+    process that has initialized MPI, as pytest's has, cannot start mpirun)."""
+    visible = [d for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d.strip()]
+    devices = (visible or [str(i) for i in range(torch.cuda.device_count())])[:WORLD]
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(devices))
+    done = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "launch"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=DEADLINE_S + 300,
+    )
+    print(done.stdout, flush=True)
+    assert done.returncode == 0 and "ALL PASS" in done.stdout, (
+        done.stdout[-20000:] + done.stderr[-20000:]
+    )
+
+
+def launch() -> int:
+    """This file's ``report`` under ``mpirun -n WORLD`` (one rank per visible device), killed with its process
+    group at the deadline."""
+    command = ["mpirun", "-n", str(WORLD), sys.executable, os.path.abspath(__file__), "report"]
+    print(f"[launch] {' '.join(command)}", flush=True)
+    process = subprocess.Popen(command, start_new_session=True)
+    try:
+        return process.wait(timeout=DEADLINE_S)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        print(
+            f"[launch] the {WORLD}-rank run did not finish in {DEADLINE_S} s (wedged)", flush=True
+        )
+        return 1
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# srun -n W --mpi=pmix python3 test_k3_spec_accept_sharded.py [--copies C] [--time]
+# srun -n W --mpi=pmix python3 test_k3_spec_accept_sharded.py [report] [--copies C] [--time]
 # ----------------------------------------------------------------------------------------------------------------
 
 
@@ -521,6 +541,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="trtllm::k3_spec_accept: vocabulary-sharded vs gathered logits"
     )
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        choices=("report", "launch"),
+        help="the checks (the default), or the checks on WORLD ranks under a local mpirun (launch; the pytest form)",
+    )
     parser.add_argument("--copies", type=int, default=None,
                         help="exchange slots every rank fills in the TP16 shape (default 16 / W)")  # fmt: skip
     parser.add_argument("--time", action="store_true",
@@ -533,6 +559,8 @@ def main() -> int:
     )
     parser.add_argument("--time-only", action="store_true", help="the timing without the checks")
     args = parser.parse_args()
+    if args.mode == "launch":
+        return launch()
     time_splits = None
     if args.splits:
         time_splits = [tuple(int(v) for v in sp.split("x")) for sp in args.splits.split(",")]
