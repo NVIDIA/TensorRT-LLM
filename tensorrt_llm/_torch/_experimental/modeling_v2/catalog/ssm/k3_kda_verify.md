@@ -1,5 +1,6 @@
 ---
-receipts: {}
+receipts:
+  sm_100: {status: passed, tests: 7}
 ---
 
 # k3_kda_verify

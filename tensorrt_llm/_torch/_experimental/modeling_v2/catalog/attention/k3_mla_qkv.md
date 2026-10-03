@@ -1,5 +1,6 @@
 ---
-receipts: {}
+receipts:
+  sm_100: {status: passed, tests: 8}
 ---
 
 # k3_mla_qkv

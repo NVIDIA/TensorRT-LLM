@@ -1,5 +1,6 @@
 ---
-receipts: {}
+receipts:
+  sm_100: {status: passed, tests: 14}
 ---
 
 # k3_kda_decode_attn
