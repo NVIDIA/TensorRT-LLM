@@ -151,9 +151,11 @@ REQUIRED_TRTLLM_OPS = (
     # <<< route B
     "k3_mla_qkv",
     "k3_mla_attn_vb_out",
-    # The decode path's GEMVs, LM head and embedding (decode_gemv.py).
+    # The decode path's GEMVs, the dense MLP's activation, the LM head and the embedding (decode_gemv.py).
     "k3_decode_gemv",
     "k3_ctm_gemv_wide",
+    "k3_ctm_gemv_long",
+    "k3_situ_mul",
     "k3_head_gemv",
     "k3_embed_norm",
     "allgather",
