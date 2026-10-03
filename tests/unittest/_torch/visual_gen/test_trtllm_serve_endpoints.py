@@ -2041,6 +2041,70 @@ class TestVideoGenerationAsync:
             f"GET never observed 'postprocessing' (saw {observed!r})"
         )
 
+    @pytest.mark.threadleak(enabled=False)  # offloaded encode uses a worker thread
+    @pytest.mark.asyncio
+    async def test_delete_during_encode_leaves_no_output_behind(
+        self, async_video_client, tmp_path, monkeypatch
+    ):
+        """DELETE issued mid-encode leaves nothing on disk.
+
+        Cancelling the task does not stop a callable the executor has already
+        started, so the delete has to outwait it: ``output_paths`` is still
+        unset at that point and the route's cleanup would find nothing.
+        """
+        import threading
+
+        entered = threading.Event()
+        release = threading.Event()
+        wrote = threading.Event()
+        original_save = VisualGenOutput.save
+
+        def _blocking_save(self, *args, **kwargs):
+            entered.set()
+            release.wait(timeout=5)
+            try:
+                return original_save(self, *args, **kwargs)
+            finally:
+                wrote.set()
+
+        seen = []
+        original_upsert = VIDEO_STORE.upsert
+
+        async def _spy_upsert(video_id, job):
+            seen.append(job.status)
+            return await original_upsert(video_id, job)
+
+        monkeypatch.setattr(VisualGenOutput, "save", _blocking_save)
+        monkeypatch.setattr(VIDEO_STORE, "upsert", _spy_upsert)
+
+        resp = await async_video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "delete during encode",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "auto",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        video_id = resp.json()["id"]
+
+        # The thread has to be inside the save already: a cancel that lands
+        # before the executor picks the callable up writes nothing at all, and
+        # the closing assertion would then hold without the cleanup running.
+        assert await asyncio.to_thread(entered.wait, 5)
+
+        deleting = asyncio.ensure_future(async_video_client.delete(f"/v1/videos/{video_id}"))
+        await asyncio.sleep(0.05)  # let DELETE reach the cancel while the save is held
+        release.set()
+        assert (await deleting).status_code == 200
+
+        assert await asyncio.to_thread(wrote.wait, 5)
+        assert "completed" not in seen  # the delete cancelled the encode
+        assert list(tmp_path.glob(f"{video_id}*")) == []
+
     def test_async_video_multipart(self, video_client, tmp_path):
         """Multipart async request with a real ``image_reference`` file."""
         ref_path = tmp_path / "ref.png"
