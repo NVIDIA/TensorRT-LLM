@@ -29,6 +29,7 @@ def test_save_load_round_trip(tmp_path):
         reuse_pending=True,
         campaign_git_branch="perf-optimize/ws-20260701-120000",
         campaign_git_base_commit="abc123def456",
+        has_accepted_native_changes=True,
         item_batch=[
             {
                 "current_item_id": "opt-002",
@@ -69,6 +70,7 @@ def test_defaults():
     assert s.reuse_pending is False
     assert s.campaign_git_branch == ""
     assert s.campaign_git_base_commit == ""
+    assert s.has_accepted_native_changes is False
     assert s.item_batch == []
     assert s.item_worktree_path == ""
     assert s.benchmarker_done is False
@@ -107,6 +109,7 @@ def test_load_defaults_item_fields_missing_from_old_checkpoints(tmp_path):
     # Likewise for the fields added with the analysis reuse.
     assert loaded.reuse_analysis_dir == ""
     assert loaded.reuse_pending is False
+    assert loaded.has_accepted_native_changes is False
     # A checkpoint without profile-currency evidence buys one conservative
     # profile rather than asserting that an unknown runtime is unchanged.
     assert loaded.profile_required is True
