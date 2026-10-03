@@ -12,30 +12,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kimi K3 routed experts for decode: the persistent CuTe DSL kernel ``k3_moe`` (``k3_moe_kernel.py``).
+"""Kimi K3 routed experts for decode: ``trtllm::k3_moe``, the persistent CuTe DSL kernel ``k3_moe``
+(``k3_moe_kernel.py``): this rank's (expert, token) groups in its prologue, then FC1 + SiTU + FC2 with the
+routing-weighted, deterministic combine, over the TRTLLM-Gen W4A8_MXFP4_MXFP8 buffers read in place.
 
-For M <= 8 tokens (:class:`K3MoeState`, :class:`K3MoeLayer`), two kernels on the current stream, no host
-synchronization:
+Its inputs are the routing and the MXFP8 latent of ``trtllm::k3_route_quant`` (the routing the TRTLLM-Gen path uses
+under separated routing: sigmoid, top-16 of sigmoid + bias, unbiased scores renormalized times the routed scaling
+factor, ties to the lower id; the CuTe DSL form of ``trtllm::kimi_k3_noaux_tc_mxfp8_quant`` with the same outputs bit
+for bit) or of ``trtllm::k3_moe_front`` (head GEMV, head all-gather, routing, MXFP8 latent, shared gate_up + SiTU),
+and it launches as their programmatic dependent. The result is this rank's routed partial ``[M, 3584]`` bf16, the
+tensor the TRTLLM-Gen W4A8_MXFP4_MXFP8 op returns, so the routed-latent all-reduce and the latent-up tail are
+unchanged.
 
-1. the routing and the MXFP8 input quantization: ``trtllm::k3_route_quant`` from the router logits and the latent
-   (the routing the TRTLLM-Gen path uses under separated routing: sigmoid, top-16 of sigmoid + bias, unbiased scores
-   renormalized times the routed scaling factor, ties to the lower id; the CuTe DSL form of
-   ``trtllm::kimi_k3_noaux_tc_mxfp8_quant`` with the same outputs bit for bit), or ``trtllm::k3_moe_front`` from the
-   MoE input (:meth:`K3MoeLayer.front`: head GEMV, head all-gather, routing, MXFP8 latent, shared gate_up + SiTU);
-2. ``k3_moe``, launched as a programmatic dependent of the first: this rank's (expert, token) groups in its prologue,
-   then FC1 + SiTU + FC2 with the routing-weighted, deterministic combine.
-
-The result is this rank's routed partial ``[M, 3584]`` bf16, the tensor the TRTLLM-Gen W4A8_MXFP4_MXFP8 op returns,
-so the routed-latent all-reduce and the latent-up tail are unchanged. Weights are the TRTLLM-Gen buffers, read in
-place.
-
-Steps of up to 64 tokens use :class:`K3MoeWideState` (the m_max 64 build of ``k3_moe``, launched after
-``trtllm::k3_route_quant``).
-
-The caller owns all state: the scratch a state's layers share (the intermediate slab, left armed by every call, and
-the FC2 partial rows), each layer's counters (left zero by every call), and the head all-gather buffers of the front
-(:class:`K3MoeHeadWorkspace`, collective over the TP group). Build them before CUDA-graph capture; each kernel compiles
-on its first call, which must also come before capture.
+Two builds: up to 8 tokens (:class:`K3MoeState`, optionally acquiring the front's outputs through the head
+workspace's ready words) and up to 64 (:class:`K3MoeWideState`). The caller owns all state: the scratch a state's
+layers share (the intermediate slab, left armed by every call, and the FC2 partial rows), each layer's counters
+(:class:`K3MoeLayer`, left zero by every call), and the head all-gather buffers of the front
+(:class:`K3MoeHeadWorkspace`, collective over the TP group). Build them before CUDA-graph capture; each build
+compiles on its first call, which must also come before capture.
 """
 
 from __future__ import annotations
@@ -216,82 +210,77 @@ class K3MoeHeadWorkspace:
         return create_mcast_state("K3MoeHeadWorkspace", mapping, words, fabric_handle, build)
 
 
-class K3MoeState:
-    """``k3_moe`` for 1..8 decode tokens on one device: its build and the scratch its layers share, i.e. the FC1 ->
-    FC2 intermediate slab (armed between calls: FP8 -0.0 values, E8M0 NaN scale words) and the FC2 partial rows. Build
-    it eagerly before CUDA-graph capture and keep it with the model; every layer takes its own counters from
-    :meth:`layer`. The layers of one state run in one stream order (they share the scratch). The kernel compiles on the
-    first call, which must therefore come before capture.
+WIDE_MAX_TOKENS = 64
 
-    ``head_flags``: the build in which k3_moe acquires the front's routing and MXFP8 rows through the head workspace's
-    ready words instead of waiting for the front's grid (:meth:`K3MoeLayer.front` only). ``config`` overrides kernel
-    options (tests and A/B runs: ``pdl``, ``num_ctas``, ...); anything it leaves out takes the kernel's default."""
+# The kernel's tensor arguments after the 18 it always reads: the fused all-reduce's buffers (3), the fold's inputs
+# (5), the head flags build's ready words and head flags (2), the latent slab (1). The builds this module compiles
+# read only the ready words and head flags (head_flags), so the others are given a stand-in they never touch.
+_OPTIONAL_ARGS = 11
+# (alignment, leading dim) of every tensor argument, in the kernel's order.
+_ALIGNS = [16, 16, 16, 16, 16, 4, 16, 16, 16, 16, 16, 16, 16, 16, 16, 4, 4, 4] + [16] * _OPTIONAL_ARGS
+_LEADING = [0, 0, 0, 1, 2, 2, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0] + [0] * _OPTIONAL_ARGS
+_compiled: Dict[tuple, object] = {}
+
+
+def _part_rows(mod) -> int:
+    """Rows of the FC2 partial buffer: the M <= 8 build's slices fit in its groups' rows, the wide build's are
+    PART_ROWS."""
+    return mod.PART_ROWS if mod.WIDE else mod.G_CAP * _TOKEN_SLOTS
+
+
+def _config(i_tp: int, num_ctas: int, num_local: int, m_max: int, use_pdl: bool, head_flags: bool) -> dict:
+    """The kernel options of one build (trace-time constants)."""
+    return {
+        "i_tp": i_tp,
+        "num_ctas": num_ctas,
+        "num_local": num_local,
+        "m_max": m_max,
+        "pdl": int(use_pdl),
+        "head_flags": int(head_flags),
+        "lat_slab": 0,
+    }
+
+
+class _K3MoeScratch:
+    """The scratch of one ``k3_moe`` build on one device, shared by the layers that run on it: the FC1 -> FC2
+    intermediate slab (armed between calls: FP8 -0.0 values, E8M0 NaN scale words) and the FC2 partial rows."""
 
     def __init__(
         self,
         device: torch.device,
         i_tp: int,
         num_local: int,
-        head_flags: bool = False,
-        config: Optional[dict] = None,
+        m_max: int,
+        use_pdl: bool,
+        head_flags: bool,
+        num_ctas: Optional[int],
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "K3MoeState allocates its scratch: build it outside CUDA-graph capture"
+                f"{type(self).__name__} allocates its scratch: build it outside CUDA-graph capture"
             )
-        # One persistent CTA per SM (config "num_ctas" caps it, e.g. for a grid-size A/B).
-        num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
-        cfg = {
-            "i_tp": i_tp,
-            "num_ctas": num_ctas,
-            "num_local": num_local,
-            "head_flags": int(head_flags),
-            "lat_slab": 0,
-        }
-        cfg.update(config or {})
-        self.mod = mod = _kernel_module(cfg)
-        if mod.FUSED_AR or mod.FOLD or mod.LAT_SLAB or mod.WIDE:
-            raise ValueError(
-                "K3MoeState is the M <= 8 build without the fused all-reduce, the fold or the slab"
-            )
+        # One persistent CTA per SM (num_ctas caps it, e.g. for a grid-size A/B).
+        if num_ctas is None:
+            num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
+        self.config = _config(i_tp, num_ctas, num_local, m_max, use_pdl, head_flags)
+        self.mod = mod = _kernel_module(self.config)
         self.device = device
         self.i_tp = i_tp
         self.num_local = num_local
-        self.head_flags = mod.HEAD_FLAGS
+        self.m_max = m_max
+        self.num_ctas = num_ctas
+        self.use_pdl = bool(use_pdl)
+        self.head_flags = bool(head_flags)
         g_cap = mod.G_CAP
         kw = dict(device=device)
-        # Lamport slab, armed: FP8 -0.0 values; E8M0 NaN in bytes 0..3 of each 16-byte scale
-        # group. Every call leaves the groups it used armed again.
+        # Lamport slab, armed: FP8 -0.0 values; E8M0 NaN in bytes 0..3 of each 16-byte scale group. Every call
+        # leaves the groups it used armed again.
         self.c = torch.full((g_cap, _TOKEN_SLOTS, i_tp), -128, dtype=torch.int8, **kw)
         self.cs = torch.zeros(g_cap, _TOKEN_SLOTS, mod.SF_STRIDE0, dtype=torch.int8, **kw)
         self.cs.view(g_cap, _TOKEN_SLOTS, mod.K2_TILES, mod.SFB_GROUP_BYTES)[..., :4] = -1
-        # FC2 partial rows. A call writes the rows of its M tokens; the combine also loads the rows past M (their sums
-        # are dropped), so the buffer starts zeroed and those loads never read unwritten memory.
-        self.part = torch.zeros(g_cap * _TOKEN_SLOTS, HIDDEN_SIZE, dtype=torch.float32, **kw)
-        self.c_t = _view(self.c, 16, 2)
-        self.cs_t = _view(self.cs, 4, 2)
-        self.c_words_t = _view(self.c.view(-1).view(torch.int32), 16, 0)
-        self.cs_words_t = _view(self.cs.view(-1).view(torch.int32), 16, 0)
-        self.b2_t = _view(self.c.permute(2, 1, 0), 16, 0, mod.b_dtype)
-        sfb2 = (
-            self.cs.view(torch.uint8)
-            .reshape(g_cap, _TOKEN_SLOTS, mod.K2_TILES, mod.SFB_GROUP_BYTES)
-            .permute(3, 2, 1, 0)
-        )
-        self.sfb2_t = _view(sfb2, 16, 0, mod.sf_dtype)
-        self.part_t = _view(self.part, 16, 1)
-        # Stand-in for the buffers of the options this build does not have (fused all-reduce, fold inputs, latent
-        # slab, and the ready words without head_flags).
-        self.unused = torch.zeros(4, dtype=torch.int32, **kw)
-        self.unused_t = _view(self.unused, 16, 0)
-        # The route+quant kernel triggers k3_moe's launch right after its own grid dependency:
-        # k3_moe waits for the whole route+quant grid before reading its outputs.
-        self.route_kwargs = {"early_trigger": True} if mod.USE_PDL else {}
-        from ..k3_route_quant import (
-            op as _k3_route_quant_op,  # noqa: F401  (registers trtllm::k3_route_quant)
-        )
-
-        self.compiled = None
+        # FC2 partial rows. A call writes the rows of its tokens; the M <= 8 build's combine also loads the rows past
+        # M (their sums are dropped), so the buffer starts zeroed and those loads never read unwritten memory.
+        self.part = torch.zeros(_part_rows(mod), HIDDEN_SIZE, dtype=torch.float32, **kw)
 
     def layer(
         self,
@@ -303,14 +292,55 @@ class K3MoeState:
         """A layer's handle: its experts' TRTLLM-Gen W4A8_MXFP4_MXFP8 buffers (read in place) and its counters."""
         return K3MoeLayer(self, w3_w1_weight, w3_w1_weight_scale, w2_weight, w2_weight_scale)
 
+    @property
+    def compiled(self) -> bool:
+        """Whether this build has been compiled on this device (by any state's first call)."""
+        return _compile_key(self.device, self.config) in _compiled
 
-class K3MoeLayer:
-    """One MoE layer on a :class:`K3MoeState`: its weights as the kernel reads them and its counters (int32, zero
-    between calls; every call leaves them zero)."""
+
+class K3MoeState(_K3MoeScratch):
+    """``k3_moe`` for 1..8 decode tokens on one device: the build's scratch, shared by its layers. Build it eagerly
+    before CUDA-graph capture and keep it with the model; every layer takes its own counters from :meth:`layer`. The
+    layers of one state run in one stream order (they share the scratch). The kernel compiles on its first call for
+    the build, which must therefore come before capture.
+
+    ``head_flags``: the build in which k3_moe acquires the MoE front's routing and MXFP8 rows through the head
+    workspace's ready words instead of waiting for the front's grid (``trtllm::k3_moe_front`` with ``ag_ready``, then
+    ``trtllm::k3_moe`` with the workspace's ``ready`` and ``flags``). ``use_pdl``: launch k3_moe as a programmatic
+    dependent of its producer (default ``TRTLLM_ENABLE_PDL``). ``num_ctas``: the persistent grid (default one CTA per
+    SM)."""
 
     def __init__(
         self,
-        state: K3MoeState,
+        device: torch.device,
+        i_tp: int,
+        num_local: int,
+        head_flags: bool = False,
+        use_pdl: Optional[bool] = None,
+        num_ctas: Optional[int] = None,
+    ):
+        if use_pdl is None:
+            use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+        super().__init__(device, i_tp, num_local, MAX_TOKENS, use_pdl, head_flags, num_ctas)
+
+
+class K3MoeWideState(_K3MoeScratch):
+    """``k3_moe`` for 1..64 tokens on one device (the m_max 64 build): its scratch, sized for 64 tokens and shared by
+    its layers, as :class:`K3MoeState`. ``use_pdl``: launch ``k3_moe`` as a programmatic dependent; its producer must
+    then be ``trtllm::k3_route_quant`` with ``early_trigger=True`` (or any kernel whose outputs ``k3_moe`` may read
+    once that grid has completed)."""
+
+    def __init__(self, device: torch.device, i_tp: int, num_local: int, use_pdl: bool = True):
+        super().__init__(device, i_tp, num_local, WIDE_MAX_TOKENS, use_pdl, False, None)
+
+
+class K3MoeLayer:
+    """One MoE layer on a :class:`K3MoeState` or :class:`K3MoeWideState`: its experts' weight buffers and its
+    counters (int32, zero between calls; every call leaves them zero)."""
+
+    def __init__(
+        self,
+        state: _K3MoeScratch,
         w3_w1_weight: torch.Tensor,
         w3_w1_weight_scale: torch.Tensor,
         w2_weight: torch.Tensor,
@@ -325,247 +355,9 @@ class K3MoeLayer:
         )
         if not ok or w3_w1_weight.shape[1] != 2 * state.i_tp:
             raise ValueError(f"k3_moe layer: {why or 'intermediate size differs from the state'}")
-        mod = state.mod
-        e, two_i, _ = w3_w1_weight.shape
-        i_tp = two_i // 2
-        sfa1 = w3_w1_weight_scale.view(e, two_i // 128, HIDDEN_SIZE // 128, 512).permute(3, 2, 1, 0)
-        sfa2 = w2_weight_scale.view(e, HIDDEN_SIZE // 128, i_tp // 128, 512).permute(3, 2, 1, 0)
         self.state = state
-        self.counters = torch.zeros(mod.NUM_STATE, dtype=torch.int32, device=state.device)
-        self.weights = (
-            _view(w3_w1_weight.view(torch.int8).permute(2, 1, 0), 16, 0),
-            _view(sfa1, 16, 0, mod.sf_dtype),
-            _view(w2_weight.view(torch.int8).permute(2, 1, 0), 16, 0),
-            _view(sfa2, 16, 0, mod.sf_dtype),
-        )
-        self.counters_t = _view(self.counters, 4, 0)
-
-    def __call__(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        e_score_correction_bias: torch.Tensor,
-        local_expert_offset: int,
-        routed_scaling_factor: float,
-    ) -> torch.Tensor:
-        """This rank's routed partial ``[M, 3584]`` bf16 for M <= 8 decode tokens: ``trtllm::k3_route_quant`` (the
-        routing and the MXFP8 latent), then ``k3_moe`` launched as its programmatic dependent.
-
-        ``hidden_states``: bf16 ``[M, 3584]`` latent; ``router_logits``: fp32 ``[M, 896]``;
-        ``e_score_correction_bias``: fp32 ``[896]``; the layer's experts hold global ids
-        ``[local_expert_offset, local_expert_offset + num_local)``."""
-        st = self.state
-        if st.head_flags:
-            raise ValueError(
-                "a head_flags build takes the front's ready words: call K3MoeLayer.front"
-            )
-        _check_tokens(hidden_states)
-        ids, weights, x_fp8, x_sf = torch.ops.trtllm.k3_route_quant(
-            router_logits.contiguous(), e_score_correction_bias, hidden_states.contiguous(),
-            float(routed_scaling_factor), **st.route_kwargs,
-        )  # fmt: skip
-        return self._launch(ids, weights, x_fp8, x_sf, local_expert_offset, routed_scaling_factor)
-
-    def front(
-        self,
-        x: torch.Tensor,
-        w_front: torch.Tensor,
-        e_score_correction_bias: torch.Tensor,
-        local_expert_offset: int,
-        routed_scaling_factor: float,
-        shared_cols: int,
-        gate_cap: float,
-        linear_cap: float,
-        head: K3MoeHeadWorkspace,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """``trtllm::k3_moe_front`` (head GEMV, head all-gather over ``head``, routing, MXFP8 latent, shared gate_up +
-        SiTU) then ``k3_moe`` for the MoE input ``x`` bf16 ``[M, 7168]`` (the same on every rank). Returns ``(y [M,
-        3584] bf16, shared activation [M, shared_cols] bf16)``. A ``head_flags`` build acquires the front's routing and
-        MXFP8 rows through ``head.ready`` instead of waiting for the front's grid, whose shared tiles may still be
-        running."""
-        from . import front_op  # noqa: F401  (registers trtllm::k3_moe_front)
-
-        st = self.state
-        _check_tokens(x)
-        ready = head.ready if st.head_flags else None
-        ids, weights, x_fp8, x_sf, shared = torch.ops.trtllm.k3_moe_front(
-            x.contiguous(), w_front, e_score_correction_bias, float(routed_scaling_factor), shared_cols, gate_cap,
-            linear_cap, head.uc, head.mc, head.flags, head.rank, head.world_size, ag_ready=ready,
-        )  # fmt: skip
-        flag_in = None
-        if st.head_flags:
-            flag_in = (_view(head.ready.view(-1), 16, 0), _view(head.flags.view(-1), 16, 0))
-        y = self._launch(
-            ids, weights, x_fp8, x_sf, local_expert_offset, routed_scaling_factor, flag_in
-        )
-        return y, shared
-
-    def _launch(self, ids, weights, x_fp8, x_sf, local_offset, scale, flag_in=None) -> torch.Tensor:
-        import cuda.bindings.driver as cuda_driver
-        import cutlass.cute as cute
-
-        st = self.state
-        mod = st.mod
-        num_tokens = ids.shape[0]
-        a1, sfa1, a2, sfa2 = self.weights
-        y = torch.empty(num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device=x_fp8.device)
-        stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-        b1 = _view(x_fp8.view(torch.uint8).permute(1, 0), 16, 0, mod.b_dtype)
-        sfb1 = _view(
-            x_sf.view(torch.uint8).view(num_tokens, HIDDEN_SIZE // _SF_VEC), 16, 1, mod.sf_dtype
-        )
-        u = st.unused_t
-        args = [
-            a1, b1, sfa1, sfb1, st.c_t, st.cs_t, st.c_words_t, st.cs_words_t, a2, st.b2_t, sfa2, st.sfb2_t,
-            _view(y, 16, 1), _view(y.view(torch.int32), 16, 1), st.part_t, _view(ids, 4, 1), _view(weights, 4, 1),
-            self.counters_t,
-            u, u, u,  # the fused all-reduce's buffers
-            u, u, u, u, u,  # the fold's inputs
-            *(flag_in or (u, u)),  # the ready words and the head flags (head_flags)
-            u,  # the latent slab
-        ]  # fmt: skip
-        scalars = (num_tokens, local_offset, st.num_local, 0, float(scale), 0, 0)
-        if st.compiled is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "k3_moe compiles on its first call: call it once before CUDA-graph capture"
-                )
-            st.compiled = cute.compile(mod.k3_moe, *args, *scalars, stream)
-        st.compiled(*args, *scalars, stream)
-        return y
-
-
-def _check_tokens(x: torch.Tensor) -> None:
-    if not 0 < x.shape[0] <= MAX_TOKENS:
-        raise ValueError(f"k3_moe handles 1 to {MAX_TOKENS} tokens, got {x.shape[0]}")
-
-
-# ---------------------------------------------------------------------------
-# Steps of up to 64 tokens (e.g. R x 8 speculative verify tokens): the m_max 64 build of
-# ``k3_moe``, one launch per call, after ``trtllm::k3_route_quant``. Its state belongs to the
-# caller: nothing here is cached per process beyond the kernel module of the configuration.
-
-WIDE_MAX_TOKENS = 64
-
-
-class K3MoeWideState:
-    """``k3_moe`` for 1..64 tokens on one device: the compiled kernel and the scratch its layers
-    share, i.e. the FC1 -> FC2 intermediate slab (armed between calls: FP8 -0.0 values, E8M0 NaN
-    scale words) and the FC2 slice partials, all sized for 64 tokens and kept at fixed addresses.
-    Build it eagerly before CUDA-graph capture and keep it with the model; every layer takes its
-    own counters from :meth:`layer`. The layers of one state run in one stream order (they share
-    the scratch). The kernel is compiled (TVM-FFI, explicit stream) by the first call, which must
-    therefore come before capture.
-
-    ``use_pdl``: launch ``k3_moe`` as a programmatic dependent; its producer must then be
-    ``trtllm::k3_route_quant`` with ``early_trigger=True`` (or any kernel whose outputs ``k3_moe``
-    may read once that grid has completed)."""
-
-    def __init__(self, device: torch.device, i_tp: int, num_local: int, use_pdl: bool = True):
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "K3MoeWideState allocates its scratch: build it outside CUDA-graph capture"
-            )
-        num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
-        config = {
-            "i_tp": i_tp,
-            "num_ctas": num_ctas,
-            "num_local": num_local,
-            "m_max": WIDE_MAX_TOKENS,
-            "pdl": int(use_pdl),
-        }
-        self.mod = mod = _kernel_module(config)
-        self.device = device
-        self.i_tp = i_tp
-        self.num_local = num_local
-        g_cap = mod.G_CAP
-        kw = dict(device=device)
-        self.c = torch.full((g_cap, _TOKEN_SLOTS, i_tp), -128, dtype=torch.int8, **kw)
-        self.cs = torch.zeros(g_cap, _TOKEN_SLOTS, mod.SF_STRIDE0, dtype=torch.int8, **kw)
-        self.cs.view(g_cap, _TOKEN_SLOTS, mod.K2_TILES, mod.SFB_GROUP_BYTES)[..., :4] = -1
-        self.part = torch.empty(mod.PART_ROWS, HIDDEN_SIZE, dtype=torch.float32, **kw)
-        # Stand-in for the buffers of the options this build does not have (fused all-reduce,
-        # fold, head flags, latent slab).
-        self.unused = torch.zeros(4, dtype=torch.int32, **kw)
-        # The kernel's views of the scratch, in its argument order (FP8 / E8M0 data as bytes).
-        sfb2 = (
-            self.cs.view(torch.uint8)
-            .reshape(g_cap, _TOKEN_SLOTS, mod.K2_TILES, mod.SFB_GROUP_BYTES)
-            .permute(3, 2, 1, 0)
-        )
-        self.scratch = (
-            self.c,
-            self.cs,
-            self.c.view(-1).view(torch.int32),
-            self.cs.view(-1).view(torch.int32),
-            self.c.view(torch.uint8).permute(2, 1, 0),
-            sfb2,
-            self.part,
-        )
-        self.compiled = None
-
-    def layer(
-        self,
-        w3_w1_weight: torch.Tensor,
-        w3_w1_weight_scale: torch.Tensor,
-        w2_weight: torch.Tensor,
-        w2_weight_scale: torch.Tensor,
-    ) -> "K3MoeWideLayer":
-        """A layer's handle: its experts' TRTLLM-Gen W4A8_MXFP4_MXFP8 buffers (read in place) and
-        its counters."""
-        return K3MoeWideLayer(self, w3_w1_weight, w3_w1_weight_scale, w2_weight, w2_weight_scale)
-
-    def _compile(self, args, scalars):
-        """TVM-FFI build for these torch arguments' types and layouts (any M up to 64)."""
-        import cutlass.cute as cute
-
-        # As the M <= 8 op's views: (alignment, leading dim) per tensor argument; the 11 stand-ins last.
-        aligns = [16, 16, 16, 16, 16, 4, 16, 16, 16, 16, 16, 16, 16, 16, 16, 4, 4, 4] + [16] * 11
-        leading = [0, 0, 0, 1, 2, 2, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0] + [0] * 11
-        assert len(args) == len(aligns)
-        signature = [_view(t, a, d) for t, a, d in zip(args, aligns, leading)]
-        return cute.compile(
-            self.mod.k3_moe,
-            *signature,
-            *scalars,
-            cute.runtime.make_fake_stream(),
-            options="--enable-tvm-ffi",
-        )
-
-
-class K3MoeWideLayer:
-    """One MoE layer on a :class:`K3MoeWideState`: its weights as the kernel reads them and its
-    counters (int32, zero between calls; every call leaves them zero)."""
-
-    def __init__(
-        self,
-        state: K3MoeWideState,
-        w3_w1_weight: torch.Tensor,
-        w3_w1_weight_scale: torch.Tensor,
-        w2_weight: torch.Tensor,
-        w2_weight_scale: torch.Tensor,
-    ):
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "K3MoeWideLayer allocates its counters: build it outside CUDA-graph capture"
-            )
-        ok, why = is_supported(
-            w3_w1_weight, w3_w1_weight_scale, w2_weight, w2_weight_scale, state.num_local
-        )
-        if not ok or w3_w1_weight.shape[1] != 2 * state.i_tp:
-            raise ValueError(
-                f"k3_moe wide layer: {why or 'intermediate size differs from the state'}"
-            )
-        e, two_i, _ = w3_w1_weight.shape
-        i_tp = two_i // 2
-        self.state = state
+        self.weights = (w3_w1_weight, w3_w1_weight_scale, w2_weight, w2_weight_scale)
         self.counters = torch.zeros(state.mod.NUM_STATE, dtype=torch.int32, device=state.device)
-        self.weights = (
-            w3_w1_weight.view(torch.int8).permute(2, 1, 0),
-            w3_w1_weight_scale.view(e, two_i // 128, HIDDEN_SIZE // 128, 512).permute(3, 2, 1, 0),
-            w2_weight.view(torch.int8).permute(2, 1, 0),
-            w2_weight_scale.view(e, HIDDEN_SIZE // 128, i_tp // 128, 512).permute(3, 2, 1, 0),
-        )
 
     def __call__(
         self,
@@ -574,58 +366,181 @@ class K3MoeWideLayer:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         local_expert_offset: int,
+        head_ready: Optional[torch.Tensor] = None,
+        head_flags: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """This rank's routed partial ``[M, 3584]`` bf16 for the outputs of
-        ``trtllm::k3_route_quant``: ``x_fp8`` float8_e4m3fn ``[M, 3584]``, ``x_sf`` its E8M0
-        scales (``M * 112`` bytes), ``topk_ids`` int32 ``[M, 16]`` global expert ids,
-        ``topk_weights`` bf16 ``[M, 16]``; 1 <= M <= 64. The layer's experts hold global ids
-        ``[local_expert_offset, local_expert_offset + num_local)``. ``out``: bf16, contiguous, at
-        least ``[M, 3584]``; its first M rows are the result (a fresh tensor without it). Writes
-        the state's slab (left armed) and partials and this layer's counters (left zero)."""
+        """``trtllm::k3_moe`` on this layer's experts, counters and its state's scratch: see the op."""
         st = self.state
-        num_tokens = topk_ids.shape[0]
-        if not 0 < num_tokens <= WIDE_MAX_TOKENS:
-            raise ValueError(f"k3_moe wide: M must be in [1, {WIDE_MAX_TOKENS}], got {num_tokens}")
-        if (
-            topk_ids.dtype != torch.int32
-            or tuple(topk_ids.shape) != (num_tokens, TOP_K)
-            or topk_weights.dtype != torch.bfloat16
-            or tuple(topk_weights.shape) != (num_tokens, TOP_K)
-            or x_fp8.dtype != torch.float8_e4m3fn
-            or tuple(x_fp8.shape) != (num_tokens, HIDDEN_SIZE)
-            or x_sf.numel() != num_tokens * (HIDDEN_SIZE // _SF_VEC)
-            or not (topk_ids.is_contiguous() and topk_weights.is_contiguous())
-            or not (x_fp8.is_contiguous() and x_sf.is_contiguous())
-        ):
-            raise ValueError("k3_moe wide: expects trtllm::k3_route_quant's outputs for M tokens")
-        if out is None:
-            y = torch.empty(num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device=x_fp8.device)
-        else:
-            if (
-                out.dtype != torch.bfloat16
-                or out.dim() != 2
-                or out.shape[0] < num_tokens
-                or out.shape[1] != HIDDEN_SIZE
-                or not out.is_contiguous()
-            ):
-                raise ValueError("k3_moe wide: out must be contiguous bf16 [>= M, 3584]")
-            y = out[:num_tokens]
-        a1, sfa1, a2, sfa2 = self.weights
-        c, cs, c_words, cs_words, b2, sfb2, part = st.scratch
-        u = st.unused
-        args = (
-            a1, x_fp8.view(torch.uint8).permute(1, 0), sfa1,
-            x_sf.view(torch.uint8).view(num_tokens, HIDDEN_SIZE // _SF_VEC), c, cs, c_words, cs_words, a2, b2,
-            sfa2, sfb2, y, y.view(torch.int32), part, topk_ids, topk_weights, self.counters,
-            u, u, u, u, u, u, u, u, u, u, u,
+        y = torch.ops.trtllm.k3_moe(
+            x_fp8, x_sf, topk_ids, topk_weights, *self.weights, st.c, st.cs, st.part, self.counters,
+            local_expert_offset, st.num_local, st.num_ctas, st.m_max, st.use_pdl, head_ready, head_flags, out,
         )  # fmt: skip
-        scalars = (num_tokens, local_expert_offset, st.num_local, 0, 1.0, 0, 0)
-        if st.compiled is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "k3_moe wide compiles on its first call: call it once before CUDA-graph capture"
-                )
-            st.compiled = st._compile(args, scalars)
-        st.compiled(*args, *scalars, torch.cuda.current_stream().cuda_stream)
-        return y
+        return y if out is None else out[: topk_ids.shape[0]]
+
+
+def _compile_key(device: torch.device, config: dict) -> tuple:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return (index, tuple(sorted(config.items())))
+
+
+def _compile(mod, args, scalars):
+    """TVM-FFI build of ``mod``'s k3_moe for these torch arguments' types and layouts (any M up to the build's)."""
+    import cutlass.cute as cute
+
+    assert len(args) == len(_ALIGNS)
+    signature = [_view(t, a, d) for t, a, d in zip(args, _ALIGNS, _LEADING)]
+    return cute.compile(
+        mod.k3_moe,
+        *signature,
+        *scalars,
+        cute.runtime.make_fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+
+
+@torch.library.custom_op(
+    "trtllm::k3_moe",
+    mutates_args=("c", "cs", "part", "counters", "head_ready", "head_flags", "out"),
+)
+def k3_moe(
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w3_w1_weight: torch.Tensor,
+    w3_w1_weight_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    c: torch.Tensor,
+    cs: torch.Tensor,
+    part: torch.Tensor,
+    counters: torch.Tensor,
+    local_expert_offset: int,
+    num_local: int,
+    num_ctas: int,
+    m_max: int,
+    use_pdl: bool,
+    head_ready: Optional[torch.Tensor] = None,
+    head_flags: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """This rank's routed partial ``[M, 3584]`` bf16 from the persistent ``k3_moe`` kernel: FC1 + SiTU + FC2 with the
+    routing-weighted, deterministic combine over this rank's experts.
+
+    ``x_fp8`` float8_e4m3fn ``[M, 3584]``, ``x_sf`` its E8M0 scales (``M * 112`` bytes), ``topk_ids`` int32
+    ``[M, 16]`` global expert ids and ``topk_weights`` bf16 ``[M, 16]``: the outputs of ``trtllm::k3_route_quant``
+    (or ``trtllm::k3_moe_front``). The weights are the TRTLLM-Gen W4A8_MXFP4_MXFP8 buffers of ``num_local`` experts,
+    which hold global ids ``[local_expert_offset, local_expert_offset + num_local)``, read in place. ``c``, ``cs``,
+    ``part``: the scratch of a :class:`K3MoeState` (``m_max`` 8) or :class:`K3MoeWideState` (``m_max`` 64) of this
+    build (``num_ctas``, ``use_pdl``); every call leaves the slab armed. ``counters``: the layer's, left zero.
+    ``head_ready`` / ``head_flags``: a ``head_flags`` build's ready words and head flags (a ``K3MoeHeadWorkspace``'s
+    ``ready`` and ``flags``), whose epoch the call advances. ``out``: bf16, contiguous, at least ``[M, 3584]``; the
+    call writes its first M rows and returns an empty ``[0, 3584]`` instead of a new tensor. 1 <= M <= ``m_max``."""
+    num_tokens = topk_ids.shape[0]
+    head = head_ready is not None
+    if head != (head_flags is not None):
+        raise ValueError("k3_moe: head_ready and head_flags go together")
+    if m_max not in (MAX_TOKENS, WIDE_MAX_TOKENS) or (head and m_max != MAX_TOKENS):
+        raise ValueError(
+            f"k3_moe: m_max is {MAX_TOKENS} (head flags possible) or {WIDE_MAX_TOKENS}, got {m_max}"
+        )
+    if not 0 < num_tokens <= m_max:
+        raise ValueError(f"k3_moe: M must be in [1, {m_max}], got {num_tokens}")
+    if (
+        topk_ids.dtype != torch.int32
+        or tuple(topk_ids.shape) != (num_tokens, TOP_K)
+        or topk_weights.dtype != torch.bfloat16
+        or tuple(topk_weights.shape) != (num_tokens, TOP_K)
+        or x_fp8.dtype != torch.float8_e4m3fn
+        or tuple(x_fp8.shape) != (num_tokens, HIDDEN_SIZE)
+        or x_sf.numel() != num_tokens * (HIDDEN_SIZE // _SF_VEC)
+        or not (topk_ids.is_contiguous() and topk_weights.is_contiguous())
+        or not (x_fp8.is_contiguous() and x_sf.is_contiguous())
+    ):
+        raise ValueError("k3_moe: expects trtllm::k3_route_quant's outputs for M tokens")
+    ok, why = is_supported(w3_w1_weight, w3_w1_weight_scale, w2_weight, w2_weight_scale, num_local)
+    if not ok:
+        raise ValueError(f"k3_moe: {why}")
+    e, two_i, _ = w3_w1_weight.shape
+    i_tp = two_i // 2
+    config = _config(i_tp, num_ctas, num_local, m_max, use_pdl, head)
+    mod = _kernel_module(config)
+    g_cap = mod.G_CAP
+    if (
+        c.dtype != torch.int8
+        or tuple(c.shape) != (g_cap, _TOKEN_SLOTS, i_tp)
+        or cs.dtype != torch.int8
+        or tuple(cs.shape) != (g_cap, _TOKEN_SLOTS, mod.SF_STRIDE0)
+        or part.dtype != torch.float32
+        or tuple(part.shape) != (_part_rows(mod), HIDDEN_SIZE)
+        or counters.dtype != torch.int32
+        or tuple(counters.shape) != (mod.NUM_STATE,)
+        or not all(t.is_contiguous() for t in (c, cs, part, counters))
+    ):
+        raise ValueError("k3_moe: c / cs / part / counters are not this build's scratch and layer counters")
+    if head and (
+        head_ready.dtype != torch.int32
+        or head_ready.numel() < 2 * MAX_TOKENS
+        or head_flags.dtype != torch.int32
+        or head_flags.numel() < 3
+    ):
+        raise ValueError("k3_moe: head_ready / head_flags must be a K3MoeHeadWorkspace's ready and flags")
+    if out is None:
+        y = torch.empty(num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device=x_fp8.device)
+    else:
+        if (
+            out.dtype != torch.bfloat16
+            or out.dim() != 2
+            or out.shape[0] < num_tokens
+            or out.shape[1] != HIDDEN_SIZE
+            or not out.is_contiguous()
+        ):
+            raise ValueError("k3_moe: out must be contiguous bf16 [>= M, 3584]")
+        y = out[:num_tokens]
+    sfb2 = (
+        cs.view(torch.uint8)
+        .reshape(g_cap, _TOKEN_SLOTS, mod.K2_TILES, mod.SFB_GROUP_BYTES)
+        .permute(3, 2, 1, 0)
+    )
+    # Stand-in for the options this build does not have (fused all-reduce, fold, latent slab, and the head flags
+    # without head_flags): the kernel never touches it.
+    unused = counters
+    flag_args = (head_ready.view(-1), head_flags.view(-1)) if head else (unused, unused)
+    args = (
+        w3_w1_weight.view(torch.int8).permute(2, 1, 0),
+        x_fp8.view(torch.uint8).permute(1, 0),
+        w3_w1_weight_scale.view(e, two_i // 128, HIDDEN_SIZE // 128, 512).permute(3, 2, 1, 0),
+        x_sf.view(torch.uint8).view(num_tokens, HIDDEN_SIZE // _SF_VEC),
+        c, cs, c.view(-1).view(torch.int32), cs.view(-1).view(torch.int32),
+        w2_weight.view(torch.int8).permute(2, 1, 0),
+        c.view(torch.uint8).permute(2, 1, 0),
+        w2_weight_scale.view(e, HIDDEN_SIZE // 128, i_tp // 128, 512).permute(3, 2, 1, 0),
+        sfb2, y, y.view(torch.int32), part, topk_ids, topk_weights, counters,
+        unused, unused, unused,  # the fused all-reduce's buffers
+        unused, unused, unused, unused, unused,  # the fold's inputs
+        *flag_args,  # the ready words and the head flags
+        unused,  # the latent slab
+    )  # fmt: skip
+    # (tokens, local offset, local experts, all-reduce rank, routed scaling factor (fold only), slab buffer, re-arm 0)
+    scalars = (num_tokens, local_expert_offset, num_local, 0, 1.0, 0, 0)
+    key = _compile_key(x_fp8.device, config)
+    fn = _compiled.get(key)
+    if fn is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "trtllm::k3_moe compiles on its first call for each build: call it once before CUDA-graph capture"
+            )
+        fn = _compiled[key] = _compile(mod, args, scalars)
+    fn(*args, *scalars, torch.cuda.current_stream(x_fp8.device).cuda_stream)
+    if out is not None:
+        return y.new_empty((0, HIDDEN_SIZE))
+    return y
+
+
+@k3_moe.register_fake
+def _(x_fp8, x_sf, topk_ids, topk_weights, w3_w1_weight, w3_w1_weight_scale, w2_weight, w2_weight_scale, c, cs,
+      part, counters, local_expert_offset, num_local, num_ctas, m_max, use_pdl, head_ready=None, head_flags=None,
+      out=None):  # fmt: skip
+    rows = 0 if out is not None else topk_ids.shape[0]
+    return x_fp8.new_empty((rows, HIDDEN_SIZE), dtype=torch.bfloat16)
