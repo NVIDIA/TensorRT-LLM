@@ -8,7 +8,8 @@ token count dipping and growing back and a random rank late, two workspaces inte
 replay mixed with eager calls, and a negative control in which one rank swaps two calls and every rank gets a wrong
 answer without an error. The workspace is also shared the way the model shares it: one decode step of target layers
 (this op, then ``k3_sandwich_tail``) with the drafter's ``k3_sandwich_plain`` calls interleaved, call by call, then
-that step captured and replayed between eager calls of the three ops. And ``create`` must refuse CUDA-graph capture.
+that step captured and replayed between eager calls of the three ops. And ``create`` must agree across the
+ranks before it allocates: when any rank is capturing a CUDA graph, every rank raises and none allocates.
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _k3_sandwich_oproj_op_matrix.py [--world-size 4]
     srun -n 16 --mpi=pmix python _k3_sandwich_oproj_op_matrix.py --launcher srun --world-size 16
@@ -56,8 +57,9 @@ def check_workspace_is_armed_and_sized() -> None:
 
 
 def check_create_refuses_capture() -> None:
-    """``create`` under CUDA-graph capture raises on every rank at once and on one rank alone (before any
-    collective); the workspace in use is untouched."""
+    """``create`` under CUDA-graph capture: every rank capturing, every rank raises; one rank capturing while its
+    peers call it eagerly, every rank raises too. No rank allocates, no stream is left capturing, and the workspace
+    in use is untouched."""
     cm.create_refuses_capture(WORKSPACE, WS_A, cm.OprojCall(600, 8, 2))
 
 

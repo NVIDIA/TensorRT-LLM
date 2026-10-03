@@ -84,11 +84,25 @@ CTAs, with the handle that owns the memory and the communicator. This op's parti
 target's sandwiches'. Certified after `create`: sized for the group, every word empty, every counter zero.
 
 **Who creates it, and when.** The target, in `post_load_weights`, with
-`K3SandwichWorkspace.create(mapping, fabric_handle=None)`: collective over the TP group (it returns on every rank or
-raises on every rank), eager, every word emptied and every counter zeroed before any rank returns. Under CUDA-graph
-capture it raises `RuntimeError` before it enters any collective: certified on every rank at once, and on one rank
-alone while its peers do not call it. Details in `k3_sandwich_oproj.md`. The drafter does not create its own: it
-takes the target's.
+`K3SandwichWorkspace.create(mapping, fabric_handle=None)`:
+
+- collective over `mapping`'s TP group: every rank calls it at the same point;
+- failure model:
+  - before allocating, the ranks agree that each of them can (not capturing, the buffer within that rank's free
+    device memory). If one cannot, every rank raises `RuntimeError` and none allocates (certified: one rank
+    capturing while its peers call it eagerly, every rank raises, the capturing rank naming the capture and its
+    peers another rank; no rank reaches the allocation, and the next call is correct);
+  - a failure that returns from the allocation is agreed the same way;
+  - a rank that fails inside the allocation's handle exchange can leave its peers waiting in that exchange; this
+    is not turned into an error on the other ranks;
+- eager: it allocates and exchanges handles, so it refuses to run under CUDA-graph capture (certified: every rank
+  capturing, every rank raises; no stream is left capturing);
+- it empties every word and zeroes every counter, and returns only once every rank has (the agreement after the
+  allocation), so no peer can push into a buffer its owner has not emptied yet;
+- `fabric_handle`: share the memory by fabric handle (required across nodes) or POSIX file descriptor; default
+  `mapping.is_multi_node()`. No environment variable is read.
+
+The drafter does not create its own workspace: its calls take the target's.
 
 **Which ops may share one object.** The three sandwich entries — `comm/k3_sandwich_oproj`, `comm/k3_sandwich_tail`
 and this one — take the same object, and in the model the drafter's calls run on the target's workspace of their TP

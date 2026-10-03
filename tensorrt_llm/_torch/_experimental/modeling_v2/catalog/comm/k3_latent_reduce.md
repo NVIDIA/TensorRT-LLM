@@ -81,12 +81,19 @@ of up to 8 tokens fits.
 **Who creates it, and when.** The target, in `post_load_weights`, with
 `K3LatentExchange.create(mapping, fabric_handle=None)`:
 
-- collective over `mapping`'s TP group: every rank calls it at the same point; it returns on every rank or raises on
-  every rank (each rank's success is agreed before anyone proceeds);
-- eager: it allocates and exchanges handles, so under CUDA-graph capture it raises `RuntimeError` before any
-  collective step (certified on every rank at once, and on one rank alone while its peers do not call it);
-- it empties every word and zeroes `flags`, synchronizes, and returns only once every rank has done so (the success
-  agreement is the barrier), so no producer can push into a buffer before its rank has armed it; armed and sized on
+- collective over `mapping`'s TP group: every rank calls it at the same point. Every rank first joins the split of
+  the TP group's communicator, so a rank that calls it while its peers do not waits for them there;
+- failure model (`k3_fused_moe.op.create_mcast_state`, the same as `MnnvlWorkspace.create`'s):
+  - before allocating, the ranks agree that each of them can (not capturing, the buffer within that rank's free
+    device memory). If one cannot, every rank raises `RuntimeError` and none allocates (certified: every rank
+    capturing, and one rank capturing while its peers call it eagerly at the same point; every rank raises at that
+    agreement, the capturing rank's message naming the capture, and the next call is correct);
+  - a failure that returns from the allocation is agreed the same way;
+  - a rank that fails inside the allocation's handle exchange can leave its peers waiting in that exchange; this
+    is not turned into an error on the other ranks;
+- eager: it allocates and exchanges handles, so it refuses to run under CUDA-graph capture (every rank raises);
+- it empties every word and zeroes `flags`, and returns only once every rank has done so (the agreement after the
+  allocation is the barrier), so no producer can push into a buffer before its rank has armed it; armed and sized on
   every rank right after `create` is certified;
 - `fabric_handle`: share the memory by fabric handle (required across nodes) or POSIX file descriptor; default
   `mapping.is_multi_node()`. No environment variable is read.
@@ -117,6 +124,19 @@ it calls `griddepcontrol.wait`, or it launches without programmatic dependent la
 the count before that reduce has advanced it and write into the half the reduce is still reading (the op's
 statement, `latent_op.py`).
 
+**How far ranks run apart.** Only the reduce waits, so a rank's host may enqueue any number of calls ahead of its
+peers, but its GPU runs at most one call ahead of the slowest peer: its push of a call lands only after its reduce of
+the previous call has ended, which waited for every rank's push of that call, and each of those landed after that
+rank's reduce of the call before. So a push lands only in a half that every rank has finished reading. Certified
+with the test's pushes, which are copies issued after the previous reduce on the same stream: one rank enqueues a
+whole step of 12 calls (`M` dipping and growing back) and waits until its first push has completed, while its peers
+are held at a host barrier. Before they issue anything, every peer finds that push in its buffer and the other half
+empty (the rank's second push is held behind its first reduce). Then the converse, every rank but one a whole step
+ahead of it. Every result is correct and the exchange ends clean. The random late rank of the sequence below adds
+per-call skew on top. Not certified here: a producer launched as a programmatic dependent starts before the previous
+reduce has ended and stores only after its grid-dependency wait; that ordering, and the condition above that it
+relies on, are not exercised by the copies.
+
 **What a later launch reads.** Before its grid-dependency wait the op reads `flags[0]` (its half) and counts each
 CTA into `flags[2]`. After the wait it reads rows `0..M-1` of every rank's slot of that half, polling until none of
 the words is empty. At its very end CTA 0 waits until all `M x CTAs` CTAs have counted in, then sets `flags[2]` back
@@ -144,7 +164,8 @@ push lands while the others' reduces poll), every call against the reference.
 
 - Swapped calls. Rank 0 makes two same-shaped calls in swapped order (it pushes its partial of the second call
   first). Nothing raises and nothing hangs, since the counts still agree, but every rank's two results are wrong:
-  each reduce sums rank 0's partial of the other call, and more than half of the elements differ on every rank. The
+  the `k`-th reduce sums every rank's `k`-th push, so each pairs rank 0's partial of one call with the others' of
+  the other (bit for bit), and more than half of the elements differ from the intended call's on every rank. The
   exchange is clean afterwards and a plain call right after is correct.
 - A token count that differs from the push. Every rank pushes 8 rows and rank 0 reduces 4: its 4 rows are right,
   but rows 4-7 of that half stay full in its buffer. Two calls later every rank pushes 4 rows into that half and rank

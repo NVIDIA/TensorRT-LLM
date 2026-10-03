@@ -56,8 +56,9 @@ def check_workspace_is_armed_and_sized() -> None:
 
 
 def check_create_refuses_capture() -> None:
-    """``create`` under CUDA-graph capture raises on every rank at once and on one rank alone (before any
-    collective); the workspace in use is untouched."""
+    """``create`` under CUDA-graph capture: every rank capturing, every rank raises; one rank capturing while its
+    peers call it eagerly, every rank raises too. No rank allocates, no stream is left capturing, and the workspace
+    in use is untouched."""
     cm.create_refuses_capture(WORKSPACE, WS_A, cm.TailCall(600, 8, 2))
 
 

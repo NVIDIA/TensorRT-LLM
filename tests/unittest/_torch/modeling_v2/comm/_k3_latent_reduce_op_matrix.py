@@ -6,9 +6,9 @@ The op is the consumer half of Kimi K3's latent all-reduce at decode size: every
 partial into the exchange, and the op, on every rank, sums the ranks' rows. Its correctness depends on state that
 outlives a call (the call count in ``flags[0]``, whose parity picks the half every push and reduce use, and the words
 a reduce empties for the push two calls later), so beyond single calls this drives call *sequences*: layers x steps
-with the token count dipping and growing back and a random rank late, two exchanges interleaved, CUDA-graph capture
-and replay mixed with eager calls, the count across its int32 wrap, and two negative controls in which ranks break
-the call order and get a wrong answer without an error.
+with the token count dipping and growing back and a random rank late, ranks a whole step apart, two exchanges
+interleaved, CUDA-graph capture and replay mixed with eager calls, the count across its int32 wrap, and two negative
+controls in which ranks break the call order and get a wrong answer without an error.
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _k3_latent_reduce_op_matrix.py [--world-size 4]
     srun -N 4 --ntasks-per-node 4 --mpi=pmix python _k3_latent_reduce_op_matrix.py --launcher srun --world-size 16
@@ -55,6 +55,8 @@ WORLDS = (4, 8, 16)  # the op's TP sizes
 TOKENS = (1, 2, 3, 4, 5, 6, 7, 8)
 LAYERS = 12  # even: a captured step keeps the halves' parity (check_graph_capture_and_replay)
 DIP_STEPS = (8, 8, 8, 2, 7, 8, 1, 1, 8, 3, 8)
+# One step of LAYERS calls whose M dips and grows back (check_ranks_run_a_step_apart).
+RUN_AHEAD_TOKENS = (8, 3, 8, 1, 5, 8, 2, 8, 7, 4, 8, 6)
 GRAPH_TOKENS = (8, 3)  # one captured step per batch size, as an engine keeps one graph per size
 EAGER_BETWEEN = (5, 1)  # an even number of eager calls between two replays
 REPLAYS = 4
@@ -246,26 +248,45 @@ def check_exchange_is_armed_and_sized() -> None:
 
 
 def check_capture_refusals() -> None:
-    """Under CUDA-graph capture ``K3LatentExchange.create`` raises RuntimeError on every rank at once, and on one rank
-    alone while its peers do not call it: before any collective step, where that rank would wait for its peers. The
-    op's first call, which would compile the kernel, raises on every rank before it launches anything. The exchange
-    is untouched. Runs before every eager call of the op: the compile cache must still be cold."""
+    """``K3LatentExchange.create`` is collective: every rank joins the TP group's communicator, and before allocating
+    the ranks agree that each of them can. With every rank capturing a CUDA graph, and with one rank capturing while
+    its peers call it eagerly at the same point, every rank raises RuntimeError, and a capturing rank's message names
+    the capture. Every rank raises at that agreement ("not every rank can allocate"; a failure after allocating reads
+    "allocation failed"), so nothing is allocated. The op's first call, which would compile the kernel, is refused per
+    rank: under capture it raises on every rank before it launches anything. The exchange is untouched and the next
+    call is correct. Runs before every eager call of the op: the compile cache must still be cold."""
     # Imported by the op's first call; imported here so that nothing is imported inside the capture.
     import cutlass.cute.runtime  # noqa: F401
 
     from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import k3_latent_reduce  # noqa: F401
 
-    def refused() -> bool:
-        message = raised_under_capture(lambda: create_exchange(R.mapping, fabric_handle=R.fabric))
-        return "outside CUDA-graph capture" in message
+    def create() -> None:
+        create_exchange(R.mapping, fabric_handle=R.fabric)
 
-    every = refused()
+    def refusal(capturing: bool) -> str:
+        """The message of the RuntimeError ``create`` raised on this rank ('' if it raised none)."""
+        if capturing:
+            return raised_under_capture(create)
+        try:
+            create()
+        except RuntimeError as exc:
+            return str(exc)
+        return ""
+
+    for case, capturing in (("every rank", True), ("one rank", R.rank == R.world - 1)):
+        R.barrier()
+        message = refusal(capturing)
+        refused = "not every rank can allocate" in message
+        named = "outside CUDA-graph capture" in message or not capturing
+        assert R.all_true(refused and named), (
+            f"{case} capturing: rank {R.rank} (capturing {capturing}) got {message!r}"
+        )
     R.barrier()
-    alone = refused() if R.rank == R.world - 1 else True
-    assert R.all_true(every and alone), f"create: every rank {every}, one rank alone {alone}"
     first = raised_under_capture(lambda: entry(MAX_TOKENS, EX_A.state))
     assert R.all_true("outside CUDA-graph capture first" in first), f"first call: {first!r}"
     assert_clean(EX_A, "after the refused calls")
+    call = Call(900, MAX_TOKENS)
+    verify(call, call.run(EX_A), "after the refused calls")
 
 
 def check_single_calls() -> None:
@@ -341,6 +362,49 @@ def check_dip_and_regrow_sequence() -> None:
     for i, t in enumerate(DIP_STEPS):
         run_step(EX_A, 10_000 + 100 * i, t, late)
         assert_clean(EX_A, f"after step {i} (M {t})")
+
+
+def check_ranks_run_a_step_apart() -> None:
+    """Calls queued across ranks. Rank 0 enqueues a whole step (LAYERS push + reduce pairs, M dipping and growing
+    back) and waits until its first push has completed, while its peers wait at a host barrier; only then do they
+    start. Before issuing anything, each peer finds rank 0's first push in its buffer and nothing of its second (the
+    other half is empty): a push is issued after its rank's previous reduce, which waits for every rank's push of its
+    call, so however far a rank's host runs ahead, its GPU runs at most one call ahead. Then the same with every rank
+    but the last a step ahead of the last. Every result is correct and the exchange ends clean."""
+    ex = EX_A
+    sizes = RUN_AHEAD_TOKENS
+    for phase, ahead in enumerate((range(1), range(R.world - 1))):
+        calls = [Call(90_000 + 100 * phase + layer, t) for layer, t in enumerate(sizes)]
+        half = ex.calls & 1
+        R.barrier()
+        outs = []
+        seen = (True, True, True)
+        if R.rank in ahead:
+            pushed = torch.cuda.Event()
+            for layer, call in enumerate(calls):
+                ex.push(call.parts[R.rank])
+                if layer == 0:
+                    pushed.record()
+                outs.append(ex.reduce(call.tokens))
+            # The event, not the stream: this rank's first reduce waits for the peers' pushes.
+            pushed.synchronize()
+            R.comm.Barrier()
+        else:
+            R.comm.Barrier()
+            rows = ex.state.uc.view(2, MAX_TOKENS, R.world, ROW_WORDS)
+            seen = (
+                all(bool((rows[half, : sizes[0], a] != EMPTY_WORD).all()) for a in ahead),
+                bool((rows[half, :, R.rank] == EMPTY_WORD).all()),
+                bool((rows[half ^ 1] == EMPTY_WORD).all()),
+            )
+        assert R.all_true(all(seen)), (
+            f"phase {phase}: rank {R.rank} saw (first pushes landed, own slot empty, other half empty) = {seen}"
+        )
+        if R.rank not in ahead:
+            outs = [call.run(ex) for call in calls]
+        for layer, (call, got) in enumerate(zip(calls, outs)):
+            verify(call, got, f"phase {phase} (ranks {list(ahead)} ahead), layer {layer}")
+        assert_clean(ex, f"after phase {phase}")
 
 
 def check_two_exchanges_interleaved() -> None:
@@ -426,18 +490,22 @@ def check_count_parity_across_the_int32_wrap() -> None:
 def check_swapped_calls_are_wrong() -> None:
     """Negative control: rank 0 makes two same-shaped calls in swapped order (it pushes its partial of the second call
     first). Every push is still followed by one reduce of its token count, so the counts agree and nothing raises or
-    hangs, but every rank's two results are wrong: each reduce sums rank 0's partial of the other call. The exchange
-    is clean afterwards and a plain call is correct."""
+    hangs, but every rank's two results are wrong: each reduce sums rank 0's partial of the other call (exactly the
+    position-paired sums, bit for bit), and more than half of each result differs from the intended call's. The
+    exchange is clean afterwards and a plain call is correct."""
     first, second = Call(70_000, MAX_TOKENS), Call(70_001, MAX_TOKENS)
+    order = (second, first) if R.rank == 0 else (first, second)
     R.barrier()
-    if R.rank == 0:
-        got_second, got_first = second.run(EX_A), first.run(EX_A)
-    else:
-        got_first, got_second = first.run(EX_A), second.run(EX_A)
-    torch.cuda.synchronize()
-    wrong = [differing(got, call.ref()) for call, got in ((first, got_first), (second, got_second))]
-    assert R.all_true(min(wrong) > 0.5), (
-        f"rank {R.rank}: the swap went unnoticed, wrong shares {wrong}"
+    got = [call.run(EX_A) for call in order]
+    # The k-th reduce sums every rank's k-th push: rank 0's partial of one call with the others' of the other.
+    paired = [
+        ordered_sum([second.parts[0]] + first.parts[1:], RANK_CHUNK),
+        ordered_sum([first.parts[0]] + second.parts[1:], RANK_CHUNK),
+    ]
+    exact = all(same_bits(g, p) for g, p in zip(got, paired))
+    wrong = [differing(g, call.ref()) for g, call in zip(got, order)]
+    assert R.all_true(exact and min(wrong) > 0.5), (
+        f"rank {R.rank}: position-paired sums {exact}, shares differing from the intended calls {wrong}"
     )
     assert_clean(EX_A, "after the swapped pair")
     call = Call(70_002, MAX_TOKENS)
@@ -492,6 +560,7 @@ CHECKS = [
     check_bit_identical_to_mnnvl_oneshot,
     check_unsupported_token_counts_raise_on_every_rank,
     check_dip_and_regrow_sequence,
+    check_ranks_run_a_step_apart,
     check_two_exchanges_interleaved,
     check_graph_capture_and_replay,
     check_count_parity_across_the_int32_wrap,

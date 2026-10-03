@@ -88,12 +88,19 @@ every word empty, every counter zero.
 **Who creates it, and when.** The target, in `post_load_weights`, with
 `K3SandwichWorkspace.create(mapping, fabric_handle=None)`:
 
-- collective over `mapping`'s TP group: every rank calls it at the same point; it returns on every rank or raises on
-  every rank (each rank's success is agreed before any returns, which is also the barrier that keeps a peer from
-  pushing into a buffer its owner has not emptied yet);
-- eager: it allocates and exchanges handles, so under CUDA-graph capture it raises `RuntimeError` before it enters
-  any collective — certified on every rank at once, and on one rank alone while its peers do not call it;
-- every word emptied and every counter zeroed before any rank returns;
+- collective over `mapping`'s TP group: every rank calls it at the same point;
+- failure model:
+  - before allocating, the ranks agree that each of them can (not capturing, the buffer within that rank's free
+    device memory). If one cannot, every rank raises `RuntimeError` and none allocates (certified: one rank
+    capturing while its peers call it eagerly, every rank raises, the capturing rank naming the capture and its
+    peers another rank; no rank reaches the allocation, and the next call is correct);
+  - a failure that returns from the allocation is agreed the same way;
+  - a rank that fails inside the allocation's handle exchange can leave its peers waiting in that exchange; this
+    is not turned into an error on the other ranks;
+- eager: it allocates and exchanges handles, so it refuses to run under CUDA-graph capture (certified: every rank
+  capturing, every rank raises; no stream is left capturing);
+- it empties every word and zeroes every counter, and returns only once every rank has (the agreement after the
+  allocation), so no peer can push into a buffer its owner has not emptied yet;
 - `fabric_handle`: share the memory by fabric handle (required across nodes) or POSIX file descriptor; default
   `mapping.is_multi_node()`. No environment variable is read.
 

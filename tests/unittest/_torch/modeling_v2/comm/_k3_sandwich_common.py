@@ -3,8 +3,8 @@
 """Shared pieces of the Kimi K3 sandwich matrices (``_k3_sandwich_oproj_op_matrix.py``,
 ``_k3_sandwich_tail_op_matrix.py``, ``_k3_sandwich_plain_op_matrix.py``): one class per op holding one call's
 arguments on every rank and its native-torch reference, a driver for call sequences (chained the way the model chains
-its residual streams; eager with a random rank late, or captured and replayed), and the A1 checks the three matrices
-run the same way on a ``K3SandwichWorkspace``.
+its residual streams; eager with a random rank late, or captured and replayed), and the state checks the three
+matrices run the same way on a ``K3SandwichWorkspace``.
 
 Started by file path like ``_lockstep`` (this tree is not a package). Importing it pulls in torch only; ``bind``
 (called by the rank body) imports the catalog wrappers.
@@ -57,15 +57,21 @@ INTERLEAVE = "AABABBAAAB" * 2
 REPLAYS = 8
 WEIGHT_SEEDS = {"oproj": 900, "tail": 910, "plain": 920, "down": 930}
 
+CAPTURE_REFUSED = "outside CUDA-graph capture"  # create()'s reason on a rank that is capturing
+PEER_REFUSED = "another rank cannot"  # its reason on the other ranks
+
 R = None  # this rank (a _lockstep.Rank), set by bind()
 OPS: Dict[str, Callable] = {}
 WEIGHTS: Dict[str, List[List[torch.Tensor]]] = {}
 STATS = {"normed": 0.0, "tail_updated": 0.0, "tap": 0.0}
+# The multicast allocations create() has reached on this rank, counted from bind() on.
+ALLOCATIONS = [0]
 
 
 def bind(rank: ls.Rank, weight_sets: Dict[str, int]) -> None:
-    """Bind this rank and the three catalog wrappers, and draw ``weight_sets[kind]`` weight sets of each kind ("oproj",
-    "tail", "plain", "down"), every rank's slice, from fixed seeds."""
+    """Bind this rank and the three catalog wrappers, draw ``weight_sets[kind]`` weight sets of each kind ("oproj",
+    "tail", "plain", "down"), every rank's slice, from fixed seeds, and count from here on the multicast allocations
+    ``create`` reaches (``ALLOCATIONS``), so that a refused ``create`` can be shown to allocate nothing."""
     global R
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (
         k3_sandwich_oproj,
@@ -82,6 +88,21 @@ def bind(rank: ls.Rank, weight_sets: Dict[str, int]) -> None:
         for s in range(sets):
             g = _gen(WEIGHT_SEEDS[kind] + s)
             WEIGHTS[kind].append([_weight(kind, g) for _ in range(R.world)])
+    _count_allocations()
+
+
+def _count_allocations() -> None:
+    """Wrap the multicast allocation ``K3SandwichWorkspace.create`` makes (``_make_mnnvl_mcast_buffer``, which it looks
+    up at every call) with a counter; the allocation itself is unchanged."""
+    from tensorrt_llm._torch.distributed import ops
+
+    allocate = ops._make_mnnvl_mcast_buffer
+
+    def counted(*args, **kwargs):
+        ALLOCATIONS[0] += 1
+        return allocate(*args, **kwargs)
+
+    ops._make_mnnvl_mcast_buffer = counted
 
 
 def report() -> None:
@@ -471,27 +492,47 @@ def armed_and_sized(ws) -> None:
     assert int(ws.flags.abs().sum()) == 0, "every counter 0"
 
 
-def create_refuses_capture(workspace_type, ws, next_call: Call) -> None:
-    """``create`` is collective and allocates: under CUDA-graph capture it raises RuntimeError on every rank at once,
-    and on one rank alone while its peers do not call it -- before any collective, since a rank inside one would wait
-    for its peers there. The workspace in use is untouched: the next call is correct."""
-
-    def attempt() -> bool:
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        graph = torch.cuda.CUDAGraph()
-        try:
+def _create(workspace_type, capture: bool) -> str:
+    """This rank's ``create``, under CUDA-graph capture on a side stream or eagerly; returns the message of the
+    RuntimeError it raised ("" if it returned), once neither stream is left capturing."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    message = ""
+    try:
+        if capture:
             with torch.cuda.graph(graph, stream=stream):
                 workspace_type.create(R.mapping, fabric_handle=R.fabric)
-        except RuntimeError as exc:
-            return "outside CUDA-graph capture" in str(exc)
-        return False
+        else:
+            workspace_type.create(R.mapping, fabric_handle=R.fabric)
+    except RuntimeError as exc:
+        message = str(exc)
+    with torch.cuda.stream(stream):
+        side_capturing = torch.cuda.is_current_stream_capturing()
+    assert not (torch.cuda.is_current_stream_capturing() or side_capturing), (
+        "a stream was left capturing"
+    )
+    return message
 
-    every = attempt()
+
+def create_refuses_capture(workspace_type, ws, next_call: Call) -> None:
+    """``create`` is collective and the ranks agree before it allocates, so a rank under CUDA-graph capture makes every
+    rank raise RuntimeError. (a) Every rank captures: every rank raises, naming the capture. (b) The last rank captures
+    while its peers call ``create`` eagerly at the same point: every rank raises, the capturing rank naming the
+    capture, its peers saying another rank cannot. No rank reaches the allocation in either case (the counted
+    multicast allocation, which the workspaces in use went through), no stream is left capturing, and the workspace
+    in use is untouched: the next call is correct."""
+    assert ALLOCATIONS[0] > 0, "the counter did not see the workspaces in use being created"
+    before = ALLOCATIONS[0]
+    every = _create(workspace_type, capture=True)
+    every_ok = CAPTURE_REFUSED in every
     R.barrier()
-    alone = attempt() if R.rank == R.world - 1 else True
-    assert R.all_true(every and alone), (
-        f"create under capture: every rank raised {every}, one rank alone {alone}"
+    capturing = R.world - 1
+    one = _create(workspace_type, capture=R.rank == capturing)
+    one_ok = (CAPTURE_REFUSED if R.rank == capturing else PEER_REFUSED) in one
+    allocated = ALLOCATIONS[0] - before
+    assert R.all_true(every_ok and one_ok and allocated == 0), (
+        f"every rank capturing: {every!r}; rank {capturing} capturing: {one!r}; allocations reached {allocated}"
     )
     next_call.verify(next_call.run(ws), "after the refused creates")
 
