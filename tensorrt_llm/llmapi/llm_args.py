@@ -6102,6 +6102,27 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats.",
         status="prototype")
 
+    iter_perf_stats_interval: PositiveInt = Field(
+        default=1,
+        description=
+        "Build an iteration statistics record only every N executor iterations "
+        "when enable_iter_perf_stats is true, which reduces the host overhead "
+        "of collecting the statistics (including the per-request statistics of "
+        "enable_iter_req_stats). A value of 1 builds a record every iteration. "
+        "With N > 1, numCompletedRequests, numNewActiveRequests and the KV "
+        "cache iteration deltas of skipped iterations are carried into a later "
+        "record, so their totals stay exact but can be reported late. Without "
+        "attention DP, one extra record is emitted when the last active "
+        "request finishes in a skipped iteration; with attention DP, what is "
+        "left after the last record of a busy period is reported when the "
+        "executor resumes. All other fields describe only the sampled "
+        "iteration, so Prometheus counters built from them (e.g. speculative "
+        "decoding draft and accepted token totals) reach only about 1/N of the "
+        "true totals, and gauges such as KV cache utilization refresh every N "
+        "iterations. With enable_iter_req_stats, requests that finish in a "
+        "skipped iteration get no requestStats entry.",
+        status="prototype")
+
     print_iter_log: bool = Field(default=False,
                                  description="Print iteration logs.",
                                  status="beta")
