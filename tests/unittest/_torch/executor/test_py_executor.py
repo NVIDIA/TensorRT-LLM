@@ -674,6 +674,27 @@ def test_get_kv_cache_capacity_without_manager():
     assert executor.get_kv_cache_capacity() == {}
 
 
+def test_update_v2_context_resources_advances_unpaired_draft():
+    """Draft history advances whenever a draft pool exists, not only joint reuse.
+
+    #18661: with block reuse off, the unpaired draft mirror still resizes during
+    prefill. Leaving history at 0 until generation update_resources races capacity
+    reclaim under MTP rewind.
+    """
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_manager = Mock()
+    executor.draft_kv_cache_manager = Mock()
+    executor.enable_joint_kv_cache_reuse = False
+    scheduled_batch = object()
+
+    PyExecutor._update_v2_context_resources(executor, scheduled_batch)
+
+    executor.kv_cache_manager.update_context_resources.assert_called_once_with(scheduled_batch)
+    executor.draft_kv_cache_manager.update_context_resources.assert_called_once_with(
+        scheduled_batch
+    )
+
+
 def test_get_kv_cache_capacity_from_stats():
     """KV capacity is available without consuming iteration stats."""
     kv_stats = Mock()
