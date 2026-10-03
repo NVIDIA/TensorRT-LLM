@@ -502,6 +502,34 @@ def test_regression_without_fix_would_overcount():
     assert result != wrong
 
 
+def test_integrated_gpu_estimation_ignores_affine_intercept():
+    """Unified-memory estimation must not clamp to zero just because the
+    recurrent-state fixed cost exceeds the mem_get_info-derived budget."""
+    tpb = 16
+    c = _make_creator(
+        tpb,
+        [_make_mock_request(63)],
+        enable_attention_dp=False,
+        tp_size=1,
+    )
+    # This regression covers the V1 memory-budget path; V2 returns before it.
+    c._is_kv_cache_manager_v2 = False
+
+    with (
+        patch("torch.cuda.mem_get_info", return_value=(100, 100)),
+        patch.object(
+            KvCacheCreator,
+            "_get_kv_size_per_token",
+            return_value=CacheCost(slope=1, intercept=128),
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.is_device_integrated",
+            return_value=True,
+        ),
+    ):
+        assert c._get_token_num_for_estimation() == 64
+
+
 @pytest.mark.parametrize(
     ("model_cls", "encoder_cache_max_bytes", "expected_reserve"),
     [
