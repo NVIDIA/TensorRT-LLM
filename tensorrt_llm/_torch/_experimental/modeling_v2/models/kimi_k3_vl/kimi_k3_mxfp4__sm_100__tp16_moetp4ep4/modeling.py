@@ -12,15 +12,24 @@ checkpoint's compressed-tensors default, read as W4A8_MXFP4_MXFP8); everything e
 `moe_expert_parallel_size: 4`, no attention data parallelism, all 16 GPUs in one NVLink domain. Attention is
 head-split (6 MLA query heads per rank), and every rank holds a quarter of the width of a quarter of the experts.
 
-**Each step takes one of two paths, chosen on the host from the step's shape** (`_step_path`):
+**Each step is classified once, on the host, from its shape** (`decode_step`, a `DecodeStep` or None), and the
+classification decides which kernels each module runs:
 
-* **The fused decode path**: pure decode steps of at most 8 tokens without speculation, or at most 64 with DSpark
-  (8 requests x 1 + 7 drafts), on the K3 decode kernels' catalog entries. The state those kernels share (MNNVL
-  workspace, sandwich and MoE Lamport buffers, KDA / MLA scratch) lives in typed objects this target creates
-  collectively in `post_load_weights`, before any graph capture. Until those entries exist `_fused_decode` stays
-  None, and every step takes the generic path.
-* **The generic path**: prefill, mixed steps, and decode steps above those bounds, on the built-in Kimi K3 text
-  model, whose modules and ops have no catalog entries yet. `UNCERTIFIED_GENERIC_CALLS` names them.
+* **small**: at most 8 tokens (`DECODE_MAX_TOKENS`, one token tile), context requests included. The token-count
+  kernels take it: decode GEMVs, the MoE front and routed experts, the sandwiches, the embedding and residual
+  epilogues.
+* **decode**: a pure decode step of R <= 8 generation requests with the same T <= 8 tokens each (one token without
+  speculation, 1 + 7 drafts with DSpark) and no context request, so at most 64 tokens. The request-aware kernels
+  take it: MLA attention and its KV store, the KDA verify, the drafter's attention.
+* **wide**: a decode step of more than one token tile (DSpark verify of several requests). It keeps the decode
+  layout's MoE head and tail, on M-general ops.
+
+Every other step (prefill, mixed steps, decode steps above those bounds) runs the **generic path**: the built-in Kimi
+K3 text model, whose modules and ops have no catalog entries yet. `UNCERTIFIED_GENERIC_CALLS` names them. The **fused
+decode path** runs the steps `decode_step` classifies on the K3 decode kernels' catalog entries. The state those
+kernels share (MNNVL workspace, sandwich and MoE Lamport buffers, KDA / MLA scratch) lives in typed objects this
+target creates collectively in `post_load_weights`, before any graph capture. Until those entries exist
+`_fused_decode` stays None, and every step takes the generic path.
 
 **What this target asserts rather than adapts**: SM 10.0; the topology above; bf16 weights and a bf16 KV pool;
 tokens_per_block 64 (the MLA generation kernels K3's 96 heads reach exist only at 64); the V2 hybrid KV / state
@@ -35,6 +44,7 @@ checkpoint, and SA. The worker and its kernels stay upstream code; this target d
 """
 
 import copy
+from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
 import torch
@@ -72,8 +82,10 @@ REQUIRED_TRTLLM_OPS = (
 REQUIRED_ENGINE_FIELDS = {
     "attn_metadata": (
         "num_contexts",
+        "num_generations",
         "num_seqs",
         "num_tokens",
+        "seq_lens",
         "tokens_per_block",
         "kv_cache_manager",
     ),
@@ -86,10 +98,11 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.models.modeling_kimi_linear.KimiLinearForCausalLM",
 )
 
-# The fused decode path's token bounds per step: one token per request without speculation (the K3 decode kernels
-# are built for up to 8 rows), and 1 + 7 drafts per request with DSpark at batch 8.
-_FUSED_MAX_TOKENS = 8
-_FUSED_MAX_TOKENS_SPEC = 64
+# The K3 decode kernels' bounds: the token-count kernels take one tile of DECODE_MAX_TOKENS rows; the request-aware
+# kernels take MAX_REQUESTS generation requests of at most MAX_TOKENS_PER_REQUEST tokens (1 + 7 drafts with DSpark).
+DECODE_MAX_TOKENS = 8
+MAX_REQUESTS = 8
+MAX_TOKENS_PER_REQUEST = 8
 
 # The MLA generation kernels for K3's 96 query heads exist only at a 64-token page (the built-in model's own
 # get_model_defaults sets it for the same reason).
@@ -122,6 +135,67 @@ def _text_model_config(model_config: ModelConfig) -> ModelConfig:
     text.skip_create_weights_in_init = True
     text._frozen = True
     return text
+
+
+@dataclass(frozen=True)
+class DecodeStep:
+    """A step the Kimi K3 decode kernels take: ``num_tokens`` rows and, on a pure decode step, ``num_requests``
+    generation requests of ``tokens_per_request`` tokens each (None on a step with context requests)."""
+
+    num_tokens: int
+    num_requests: Optional[int] = None
+    tokens_per_request: Optional[int] = None
+
+    @property
+    def small(self) -> bool:
+        """Whether the step fits one token tile of the token-count kernels."""
+        return self.num_tokens <= DECODE_MAX_TOKENS
+
+    @property
+    def decode(self) -> bool:
+        """Whether the step is a pure decode step the request-aware kernels take."""
+        return self.num_requests is not None
+
+    @property
+    def wide(self) -> bool:
+        """Whether the step is a pure decode step of more than one token tile: its token-count work keeps the decode
+        layout's MoE head and tail, on M-general ops."""
+        return self.decode and not self.small
+
+
+def decode_step(attn_metadata: AttentionMetadata, num_tokens: int) -> Optional[DecodeStep]:
+    """The step's shape if any Kimi K3 decode kernel takes it, else None (the generic path runs).
+
+    ``num_tokens`` is the step's token count (the rows of the model input). Read on the host from per-step integers
+    and the host copy of the sequence lengths only. A CUDA graph is captured per decode batch shape, and every input
+    here is fixed by that shape, so a captured step and its replays are classified alike.
+    """
+    if num_tokens <= 0:
+        return None
+    requests = _decode_requests(attn_metadata, num_tokens)
+    if requests is not None:
+        return DecodeStep(num_tokens, requests, num_tokens // requests)
+    if num_tokens <= DECODE_MAX_TOKENS:
+        return DecodeStep(num_tokens)
+    return None
+
+
+def _decode_requests(attn_metadata: AttentionMetadata, num_tokens: int) -> Optional[int]:
+    """R when the step is R <= 8 generation requests of the same T <= 8 tokens and no context request, else None."""
+    if attn_metadata.num_contexts != 0:
+        return None
+    requests = attn_metadata.num_generations
+    if not 0 < requests <= MAX_REQUESTS or num_tokens % requests != 0:
+        return None
+    tokens = num_tokens // requests
+    if not 0 < tokens <= MAX_TOKENS_PER_REQUEST:
+        return None
+    seq_lens = getattr(attn_metadata, "seq_lens", None)
+    if seq_lens is not None and seq_lens.device.type == "cpu":
+        lens = seq_lens[:requests]
+        if lens.numel() != requests or bool((lens != tokens).any()):
+            return None
+    return requests
 
 
 def _check_construction(model_config: ModelConfig) -> None:
@@ -215,17 +289,6 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
         )
         self._step_checked = True
 
-    def _step_path(self, attn_metadata: AttentionMetadata, spec_metadata) -> str:
-        """`"fused"` for a pure decode step within the fused path's bounds, else `"generic"`.
-
-        Read on the host from per-step integers only. A CUDA graph is captured per decode batch shape, and every
-        input here is fixed by that shape, so a captured step and its replays take the same path.
-        """
-        if attn_metadata.num_contexts:
-            return "generic"
-        bound = _FUSED_MAX_TOKENS if spec_metadata is None else _FUSED_MAX_TOKENS_SPEC
-        return "fused" if attn_metadata.num_tokens <= bound else "generic"
-
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -243,18 +306,19 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
             )
         if not self._step_checked:
             self._check_step_contract(attn_metadata)
-        if (
-            self._fused_decode is not None
-            and self._step_path(attn_metadata, spec_metadata) == "fused"
-        ):
-            return self._fused_decode(
-                attn_metadata=attn_metadata,
-                input_ids=input_ids,
-                position_ids=position_ids,
-                spec_metadata=spec_metadata,
-                resource_manager=resource_manager,
-                **kwargs,
-            )
+        if self._fused_decode is not None:
+            rows = input_ids if input_ids is not None else inputs_embeds
+            step = None if rows is None else decode_step(attn_metadata, rows.shape[0])
+            if step is not None:
+                return self._fused_decode(
+                    step,
+                    attn_metadata=attn_metadata,
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    spec_metadata=spec_metadata,
+                    resource_manager=resource_manager,
+                    **kwargs,
+                )
         return super().forward(
             attn_metadata,
             input_ids,
