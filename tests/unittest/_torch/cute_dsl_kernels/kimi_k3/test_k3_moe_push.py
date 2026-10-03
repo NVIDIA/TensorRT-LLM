@@ -19,9 +19,10 @@ loader; random checkpoint-format MXFP4, a seed per rank) and runs the same token
 
 push         trtllm::k3_moe_m1 at 1 and 2 tokens and trtllm::k3_moe_m2 at 2 (Layer.push), on tokens routed by
              trtllm::k3_route_quant;
-k3_moe_push  trtllm::k3_moe's push build (K3MoeLayer.push) at 1, 3 and 8 tokens, after trtllm::k3_route_quant and
-             after trtllm::k3_moe_front. The front's head and shared experts are sharded over the run's ranks; its
-             shared activation must be the same bits in every call of a set.
+k3_moe_push  trtllm::k3_moe's push build at 1, 3 and 8 tokens, after trtllm::k3_route_quant and after
+             trtllm::k3_moe_front: K3MoeLayer.push into the run's exchange, the moe/k3_moe entry's k3_moe_push into
+             the 16-slot one. The front's head and shared experts are sharded over the run's ranks; its shared
+             activation must be the same bits in every call of a set.
 
 Per op, token count and routing set, against the plain call (Layer.__call__, K3MoeLayer.__call__ after the same
 producer), whose partial must be nonzero:
@@ -338,6 +339,8 @@ def _k3_moe_routed(producer, inputs, front):
 
 
 def check_k3_moe_push(ctx):
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe import k3_moe_push
+
     results = []
     front = _front(ctx)
     layer = _k3_moe_layer(_experts(20260928 + ctx.rank))
@@ -362,7 +365,7 @@ def check_k3_moe_push(ctx):
                     # TP16's receive side: this rank's partial in slots 4 r .. 4 r + 3, one push each.
                     for c in range(copies16):
                         *routed, pushed = _k3_moe_routed(producer, inputs, front)
-                        layer.push(*routed, 0, ex16, ctx.rank * copies16 + c)
+                        k3_moe_push(*routed, 0, layer, ex16, ctx.rank * copies16 + c)
                         pushed_shared.append(pushed)
                     got16 = ex16.reduce(m)
                     state16 = ex16.state_ok(ctx)

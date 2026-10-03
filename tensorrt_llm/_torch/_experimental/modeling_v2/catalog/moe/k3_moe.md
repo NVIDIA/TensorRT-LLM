@@ -7,7 +7,7 @@ receipts:
 
 **Wraps** `torch.ops.trtllm.k3_moe` (one call), on caller-owned state: a `K3MoeState` (up to 8 tokens) or
 `K3MoeWideState` (up to 64) and one `K3MoeLayer` per MoE layer; for a head_flags state, also the TP group's
-`K3MoeHeadWorkspace`.
+`K3MoeHeadWorkspace`; for the push form (`k3_moe_push`), also the TP group's `K3LatentExchange`.
 
 ## Semantics
 
@@ -50,10 +50,22 @@ the wide build:
 With `moe/k3_moe_front` as the producer (certified in that entry's 4-rank matrix): `y` within the op-catalog gates of
 the stock runner on the front's own routing and latent, and on a head_flags state bit for bit the plain state's.
 
+**Push form.** `k3_moe_push` (`M` <= 8, a `K3MoeState`) computes the same partial and, instead of returning it,
+stores token `t`'s row into slot `slot` (default `exchange.rank`) of half `exchange.flags[0] & 1` of every rank's
+`K3LatentExchange` (int32 `[2][8][slots][1792]`: bf16 pairs, `0x80000000` empty, -0.0 stored as +0.0, zero rows when
+nothing is routed here) through its multicast mapping: the kernel's fused all-reduce in its push-only mode. It reads
+the half after its grid-dependency wait and writes no flags word; `comm/k3_latent_reduce` sums the slots in the MNNVL
+one-shot's order, empties the half it read and advances the count. Certified at 4 ranks, `M` 1, 3 and 8, after
+`moe/k3_route_quant` and after `moe/k3_moe_front`: a push and its reduce equal `MNNVLAllReduce`'s one-shot of the
+plain partials bit for bit, on every rank and run to run, and leave the exchange empty with its count advanced; the
+same into a 16-slot exchange filled 4 slots per rank (the one-shot's 16-slot order), and with the exchange's call
+count across the int32 wrap.
+
 Fusion boundary. Inside: the grouping of (expert, token) pairs, FC1, SiTU, the MXFP8 intermediate, FC2, the
 routing-weighted combine. Outside: the routing and the latent's MXFP8 quantization (`moe/k3_route_quant` or
 `moe/k3_moe_front`); the sum of the routed partials over the ranks that hold the other experts and intermediate
-slices (the routed-latent all-reduce); the latent-up projection; the shared experts; the residual.
+slices (the routed-latent all-reduce, or the push form plus `comm/k3_latent_reduce`); the latent-up projection; the
+shared experts; the residual.
 
 ## Signature
 
@@ -68,13 +80,26 @@ def k3_moe(
     head: Optional[K3MoeHeadWorkspace] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor
+
+def k3_moe_push(
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    local_expert_offset: int,
+    layer: K3MoeLayer,
+    exchange: K3LatentExchange,
+    slot: Optional[int] = None,
+    head: Optional[K3MoeHeadWorkspace] = None,
+) -> None
 ```
 
 The entry passes the layer's weight buffers and counters and its state's scratch and build options to the op:
 `trtllm::k3_moe(x_fp8, x_sf, topk_ids, topk_weights, w3_w1_weight, w3_w1_weight_scale, w2_weight, w2_weight_scale,
 c, cs, part, counters, local_expert_offset, num_local, num_ctas, m_max, use_pdl, head_ready=None, head_flags=None,
-out=None)`, with `mutates_args = (c, cs, part, counters, head_ready, head_flags, out)`: every buffer the kernel
-writes. The wrapper module re-exports `K3MoeState`, `K3MoeWideState`, `K3MoeLayer`, `K3MoeHeadWorkspace` and
+out=None, exchange_uc=None, exchange_mc=None, exchange_flags=None, exchange_slot=0)`, with `mutates_args = (c, cs,
+part, counters, head_ready, head_flags, out, exchange_uc, exchange_mc)`: every buffer the kernel writes. The push form
+passes the exchange's `uc`, `mc` and `flags` and the slot (`K3MoeLayer.push` makes the same call). The wrapper module re-exports `K3MoeState`, `K3MoeWideState`, `K3MoeLayer`, `K3MoeHeadWorkspace` and
 `is_supported`.
 
 ### Certified arguments
@@ -89,7 +114,9 @@ writes. The wrapper module re-exports `K3MoeState`, `K3MoeWideState`, `K3MoeLaye
 | `layer` | a `K3MoeLayer` of a plain or head_flags `K3MoeState`, or of a `K3MoeWideState` | — | — | — |
 | `head` | `None`; for and only for a head_flags state's layers, the TP group's `K3MoeHeadWorkspace` (certified in `moe/k3_moe_front`'s matrix) | — | — | — |
 | `out` | `None`, or `[>= M, 3584]`: the call writes `out[:M]` and returns an empty `[0, 3584]`; rows past `M` untouched (certified at `M` 3, 8 and 9, 64 on the two builds) | bf16 | contiguous | CUDA |
-| returns | `y [M, 3584]`, or `[0, 3584]` with `out` | bf16 | contiguous, newly allocated | the inputs' device |
+| `exchange` (push form) | the TP group's `K3LatentExchange` (4 ranks certified, and a 16-slot exchange) | — | — | — |
+| `slot` (push form) | `None` (this rank's) or a slot of the exchange (certified: each of 16 slots, 4 per rank) | Python int | — | — |
+| returns | `y [M, 3584]`, or `[0, 3584]` with `out`; `None` for the push form | bf16 | contiguous, newly allocated | the inputs' device |
 
 The four inputs are `moe/k3_route_quant`'s outputs for `M` tokens (certified) or `moe/k3_moe_front`'s (certified in
 its matrix). State construction certified: `K3MoeState(device, 768, 224)` (`head_flags` False or True; `use_pdl` and
@@ -140,7 +167,9 @@ launch (certified). The op itself picks the head_flags build by whether `head_re
 check, and the same one in `K3MoeLayer`, is what ties the build to the state. A head_flags state's calls pair with the
 front's on one `K3MoeHeadWorkspace`: the front call before each must publish the workspace's ready words (the
 `moe/k3_moe_front` entry with `publish=True`), and each publishing front call must be followed by exactly one such
-`k3_moe` call on that workspace (*Preconditions*).
+`k3_moe` call on that workspace (*Preconditions*). The push form shares the state with the plain calls. Its exchange
+is a separate, collective object (`comm/k3_latent_reduce`'s *State*): each push of `M` tokens is followed by one
+reduce of `M` tokens on that exchange before the next push, in the same order on every rank.
 
 **Call-order invariant.** The calls on all layers of one state run one after the other in one stream order. Every
 call needs the slab armed and its layer's counters at zero, which only the end of the previous call on the state
@@ -236,6 +265,11 @@ Besides the state objects (explicit arguments):
   - Either build lets its own dependents launch early (plain builds right after the wait, the head_flags build at
     launch): a consumer of `y` must wait for `k3_moe`'s grid (`griddepcontrol.wait`, or plain stream order) before
     reading it.
+- Push form: `M` <= 8 on a `K3MoeState`, no `out`; the exchange's words are int32 `[2][8][slots][1792]` (this
+  rank's and multicast) with int32 flags, and `slot` is one of its slots (`ValueError` otherwise, before any launch).
+  The exchange belongs to this rank's TP group, and one reduce of `M` tokens on it follows each push before the next,
+  on every rank in the same order. The push build compiles on its first push, which must be eager like the plain
+  build's.
 - Calls may be captured once the build's first call has run eagerly: certified with the captured step above, and in
   `moe/k3_moe_front`'s matrix on both K3MoeStates.
 
@@ -247,6 +281,9 @@ Besides the state objects (explicit arguments):
   `moe/k3_route_quant`. The head_flags build and the front as producer: 4 ranks of one GB200 tray in
   `tests/unittest/_torch/modeling_v2/comm/_k3_moe_front_op_matrix.py` (entry point
   `moe/test_modeling_v2_k3_moe_front_op_matrix.py`); its 16-rank receipt is pending with `moe/k3_moe_front`'s.
+- The push form: 4 ranks of one GB200 tray in `tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_push.py`
+  (`k3_moe_push`: `K3MoeLayer.push` into a 4-slot exchange, this entry's `k3_moe_push` into a 16-slot one); its
+  16-rank receipt is pending.
 - References: an fp64 reference over the dequantized experts (from the checkpoint-format tensors) and the stock path.
   The kernel tests (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_fused_moe.py`, `test_k3_moe_wide.py`)
   remain the exhaustive numerics; this entry's test copies their references.
