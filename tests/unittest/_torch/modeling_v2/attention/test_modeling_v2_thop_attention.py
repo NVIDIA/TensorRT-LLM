@@ -3712,6 +3712,57 @@ def test_kimi_k3_mla_context_bf16_page64() -> None:
         assert torch.equal(env.pool, pool_before), "the no-append context call touched the pool"
 
 
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_mla_generation_bf16_page64() -> None:
+    """Kimi K3's MLA generation calls (the generic path's decode steps above
+    the fused decode kernels' bounds): latent MQA over the bf16 pool, page 64,
+    6 heads per rank (TP16 attention) and 96 (one rank), one query row per
+    request (no speculation) and 8 (DSpark's token plus 7 drafts, bottom-right
+    causal), two steps each over histories of one exact page and of 31
+    tokens. Within the bf16 band of the fp32 latent-MQA reference; the pool is
+    only read. (At 24 heads per rank, TP4, the trtllm-gen FMHA kernel
+    selection raises for these calls; the contract records it.)
+    """
+    for heads in (6, 96):
+        for p in (1, 8):
+            torch.manual_seed(700 + heads + p)
+            env = _MlaPagedEnv(
+                num_heads=heads,
+                tokens_per_block=MLA_TOKENS_PER_BLOCK,
+                q_lora_rank=Q_LORA_RANK_DSV3,
+                q_scaling=1.0,
+                position_embedding_type=POSITION_EMBEDDING_TYPE_ROPE_GPT_NEOX,
+            )
+            table = env.rotary_cos_sin.reshape(-1)
+            table[0::2] = 1.0
+            table[1::2] = 0.0
+            lens = [64, 31]
+            for rid, ln in enumerate(lens):
+                env.add_request(rid, ln)
+            q, k, v, latent = _random_context_inputs(sum(lens), heads)
+            env.call_context([0, 1], lens, q, k, v, latent)
+            for _ in range(2):
+                for rid in (0, 1):
+                    for _ in range(p):
+                        env.append_decode_latent(
+                            rid,
+                            torch.randn(LATENT_DIM, dtype=torch.bfloat16, device="cuda") * 0.5,
+                        )
+                pool_before = env.pool.clone()
+                fused_q = (
+                    torch.randn(2 * p, heads * LATENT_DIM, dtype=torch.bfloat16, device="cuda")
+                    * 0.3
+                )
+                out = env.call_generation([0, 1], fused_q, predicted_tokens_per_seq=p)
+                ref = env.generation_reference([0, 1], fused_q, predicted_tokens_per_seq=p)
+                torch.testing.assert_close(out, ref, rtol=RTOL, atol=ATOL)
+                assert _bitwise_equal(pool_before, env.pool), (
+                    f"the MLA generation call wrote to the pool (H={heads}, P={p})"
+                )
+
+
 def _fp8_mla_env(
     num_heads: int = MLA_NUM_HEADS_H128,
     kv_scaling_factor: Optional[float] = 1.0,
