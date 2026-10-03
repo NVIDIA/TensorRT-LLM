@@ -183,6 +183,24 @@ def _get_mnnvl_workspace_comm(mapping: Mapping):
         mapping.tp_rank)
 
 
+def _get_mnnvl_tp_group_comm(mapping: Mapping):
+    """A new communicator of exactly mapping.tp_group (its rank i = TP rank i) for a caller-owned
+    MNNVL state's create(); only the group's ranks take part (MPI_Comm_create_group). The caller
+    frees it. Under Ray the TP ProcessGroup (c10d's).
+    """
+    if mpi_disabled():
+        pg = mapping.tp_group_pg
+        assert pg is not None, "TP ProcessGroup not initialised"
+        return pg
+    session = mpi_comm()
+    session_group = session.Get_group()
+    group = session_group.Incl(mapping.tp_group)
+    session_group.Free()
+    comm = session.Create_group(group)
+    group.Free()
+    return comm
+
+
 def _mnnvl_device_index(mapping: Mapping) -> int:
     """CUDA device index backing this rank's MNNVL buffers.
 

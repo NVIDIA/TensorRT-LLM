@@ -53,12 +53,12 @@ class MnnvlWorkspace:
     def create(
         cls, mapping, buffer_bytes: int, fabric_handle: Optional[bool] = None
     ) -> "MnnvlWorkspace":
-        """Allocate and arm a workspace for ``mapping``'s TP group. Collective: every rank of the group calls it at
-        the same point, eagerly (not under CUDA-graph capture).
+        """Allocate and arm a workspace for ``mapping``'s TP group. Collective over that group only: every rank of
+        the group calls it at the same point, eagerly (not under CUDA-graph capture); ranks outside it take no part.
 
         Failure model: before allocating, the ranks agree that each of them can (not capturing, a valid
         ``buffer_bytes``, the three buffers within its device's free memory); if one cannot, every rank raises
-        ``RuntimeError``, none allocates, and under MPI each frees the communicator it split for the call. A failure
+        ``RuntimeError``, none allocates, and under MPI each frees the communicator it made for the call. A failure
         that returns from the allocation is agreed and handled the same way. A rank that fails inside the
         allocation's handle exchange can leave its peers waiting in that exchange: that failure is not turned into
         an error on the other ranks.
@@ -66,7 +66,7 @@ class MnnvlWorkspace:
         ``fabric_handle``: share the memory by fabric handle (required across nodes) rather than POSIX file
         descriptor; default ``mapping.is_multi_node()``."""
         from tensorrt_llm._torch.distributed.ops import (
-            _get_mnnvl_workspace_comm,
+            _get_mnnvl_tp_group_comm,
             _initialize_allreduce_mnnvl_protocol,
             _make_mnnvl_mcast_buffer,
             _mnnvl_device_index,
@@ -76,7 +76,7 @@ class MnnvlWorkspace:
 
         use_fabric = mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
         total = NUM_LAMPORT_BUFFERS * buffer_bytes
-        comm = _get_mnnvl_workspace_comm(mapping)
+        comm = _get_mnnvl_tp_group_comm(mapping)
         # Every condition one rank alone can fail is checked before the allocation, and the ranks agree on it: a
         # rank failing inside the allocation would leave its peers in the handle exchange.
         problem: Optional[str] = None
@@ -89,7 +89,8 @@ class MnnvlWorkspace:
             if free_bytes < total:
                 problem = f"its {total} bytes exceed the {free_bytes} free on this rank's device"
         if not _mnnvl_workspace_all_succeeded(comm, problem is None):
-            # Every rank takes this path: free the MPI communicator split above (a ProcessGroup is c10d's).
+            # Every rank of the group takes this path: free the MPI communicator made above (a ProcessGroup is
+            # c10d's).
             if not mpi_disabled():
                 comm.Free()
             raise RuntimeError(

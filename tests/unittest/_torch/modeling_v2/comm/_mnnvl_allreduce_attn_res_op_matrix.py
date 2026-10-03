@@ -102,22 +102,22 @@ def check_workspace_is_armed_and_sized() -> None:
 
 def check_create_refuses_on_every_rank() -> None:
     """One rank asks for three buffers past its device's free memory: every rank raises before any allocates and frees
-    the communicator it split, and the workspaces in use stay correct."""
+    the communicator it made, and the workspaces in use stay correct."""
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace import (
         MnnvlWorkspace,
     )
     from tensorrt_llm._torch.distributed import ops
 
-    split = ops._get_mnnvl_workspace_comm
+    make = ops._get_mnnvl_tp_group_comm
     comms = []
 
-    def recording_split(mapping):
-        comms.append(split(mapping))
+    def recording_make(mapping):
+        comms.append(make(mapping))
         return comms[-1]
 
     free_bytes, _ = torch.cuda.mem_get_info()
     too_big = (free_bytes // 3 // 16 + (64 << 20) // 16) * 16
-    ops._get_mnnvl_workspace_comm = recording_split
+    ops._get_mnnvl_tp_group_comm = recording_make
     try:
         MnnvlWorkspace.create(
             R.mapping, too_big if R.rank == 0 else BUFFER_BYTES, fabric_handle=R.fabric
@@ -126,12 +126,49 @@ def check_create_refuses_on_every_rank() -> None:
     except RuntimeError as exc:
         raised = "not every rank can allocate" in str(exc)
     finally:
-        ops._get_mnnvl_workspace_comm = split
+        ops._get_mnnvl_tp_group_comm = make
     assert R.all_true(raised), "a rank short of memory did not make every rank raise"
     freed = len(comms) == 1 and comms[0] == R.MPI.COMM_NULL
-    assert R.all_true(freed), "a refused create kept the communicator it split"
+    assert R.all_true(freed), "a refused create kept the communicator it made"
     call = Call(2100, 8, 3)
     verify(call, call.run(WS_A), "after the refused create")
+
+
+def check_create_involves_only_the_tp_group() -> None:
+    """Under TP W/2 x PP 2 only the first TP group's ranks create a workspace, while the other group's ranks make no
+    MNNVL call: create() completes on the group without them, armed and sized for the group."""
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace import (
+        MnnvlWorkspace,
+    )
+    from tensorrt_llm.mapping import Mapping
+
+    if R.world < 4 or R.world % 2:
+        if R.rank == 0:
+            print(
+                f"[rank 0] check_create_involves_only_the_tp_group: not run at world {R.world}",
+                flush=True,
+            )
+        return
+    half = R.world // 2
+    mapping = Mapping(
+        world_size=R.world,
+        rank=R.rank,
+        gpus_per_node=torch.cuda.device_count(),
+        tp_size=half,
+        pp_size=2,
+    )
+    ok = True
+    if mapping.pp_rank == 0:
+        ws = MnnvlWorkspace.create(mapping, BUFFER_BYTES, fabric_handle=R.fabric)
+        armed = ws.lamport.view(torch.int32)
+        ok = (
+            ws.world_size == half
+            and ws.rank == mapping.tp_rank
+            and ws.comm.Get_size() == half
+            and bool((armed == torch.tensor(-(2**31), dtype=torch.int32, device="cuda")).all())
+        )
+        ws.comm.Free()
+    assert R.all_true(ok), "a TP group's create() did not complete without the other group's ranks"
 
 
 def check_single_calls() -> None:
@@ -256,6 +293,7 @@ def check_wrong_call_order_is_detected() -> None:
 CHECKS = [
     check_workspace_is_armed_and_sized,
     check_create_refuses_on_every_rank,
+    check_create_involves_only_the_tp_group,
     check_single_calls,
     check_a_call_over_one_buffer_raises_on_every_rank,
     check_dip_and_regrow_sequence,

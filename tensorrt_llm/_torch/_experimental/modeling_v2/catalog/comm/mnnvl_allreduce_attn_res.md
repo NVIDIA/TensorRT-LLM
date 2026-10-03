@@ -80,12 +80,14 @@ a call over one buffer raises (below).
 **Who creates it, and when.** The target, in `post_load_weights`, with
 `MnnvlWorkspace.create(mapping, buffer_bytes, fabric_handle=None)`:
 
-- collective over `mapping`'s TP group: every rank calls it at the same point;
+- collective over `mapping`'s TP group only: every rank of the group calls it at the same point, and ranks outside
+  the group take no part (certified: under TP W/2 x PP 2, one group creates a workspace while the other makes no
+  MNNVL call);
 - failure model:
   - before allocating, the ranks agree that each of them can (not capturing, a valid `buffer_bytes`, the three
     buffers within that rank's free device memory). If one cannot, every rank raises `RuntimeError`, none
-    allocates, and under MPI each frees the communicator it split for the call (certified: one rank short of
-    memory, every rank raises and frees its split, the next call is correct);
+    allocates, and under MPI each frees the communicator it made for the call (certified: one rank short of
+    memory, every rank raises and frees that communicator, the next call is correct);
   - a failure that returns from the allocation is agreed and handled the same way;
   - a rank that fails inside the allocation's handle exchange can leave its peers waiting in that exchange; this
     is not turned into an error on the other ranks;
