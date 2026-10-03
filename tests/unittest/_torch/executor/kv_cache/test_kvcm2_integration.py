@@ -36,6 +36,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _update_kv_cache_draft_token_location,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
@@ -888,7 +890,7 @@ def test_default_uses_allocator_fallback() -> None:
     assert config.constraints == []
 
 
-def test_avg_seq_len_builds_warmup_constraints() -> None:
+def test_avg_seq_len_builds_context_warmup_constraint() -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(host_cache_size=0, avg_seq_len=1024),
         max_batch_size=3,
@@ -901,16 +903,7 @@ def test_avg_seq_len_builds_warmup_constraints() -> None:
         [KVCacheDesc(capacity=2048, history_length=0)]
         + [KVCacheDesc(capacity=1024, history_length=1021)] * 2
     )
-    assert config.constraints == [
-        BatchDesc(
-            [
-                KVCacheDesc(capacity=1024, history_length=1023),
-                KVCacheDesc(capacity=3, history_length=0),
-                KVCacheDesc(capacity=3, history_length=0),
-            ]
-        ),
-        BatchDesc([KVCacheDesc(capacity=2048, history_length=0)]),
-    ]
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=2048, history_length=0)])]
 
 
 def test_avg_seq_len_updates_typical_step() -> None:
@@ -1164,7 +1157,7 @@ def test_extra_tokens_are_in_context_capacity() -> None:
     )
 
     assert config.typical_step == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
-    assert config.constraints[1] == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=258, history_length=0)])]
 
 
 def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
@@ -1571,6 +1564,61 @@ def test_external_draft_estimated_quota_supports_allocation_and_resume(
     finally:
         for cache in caches:
             cache.close()
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("draft_len", [0, 4])
+def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    spec_config = MTPDecodingConfig(max_draft_len=draft_len) if draft_len else None
+    manager = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=4 << 20),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=131072,
+        max_batch_size=2,
+        max_num_tokens=128,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        spec_config=spec_config,
+    )
+    try:
+        engine = SimpleNamespace(
+            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
+            spec_config=spec_config,
+            max_draft_len=draft_len,
+            max_draft_loop_tokens=draft_len,
+            max_seq_len=manager.max_seq_len,
+            max_beam_width=1,
+            use_mrope=False,
+            get_runtime_tokens_per_gen_step=lambda length: length + 1,
+            _get_draft_kv_cache_manager=lambda _: None,
+            _is_encoder_decoder_model=lambda: False,
+            model=SimpleNamespace(
+                model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
+            ),
+        )
+        resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+        batch = PyTorchModelEngine._create_cuda_graph_warmup_request(
+            engine, resources, batch_size=2, draft_len=draft_len
+        )
+        assert batch is not None
+        assert len(batch.generation_requests) == 2
+        longest_cache = manager.kv_cache_map[batch.generation_requests[0].py_request_id]
+        assert longest_cache.capacity % manager.tokens_per_block == 0
+        for request in batch.generation_requests:
+            cache = manager.kv_cache_map[request.py_request_id]
+            token_num = request.prompt_len + 1
+            assert cache.history_length == request.prompt_len
+            assert cache.capacity == token_num + manager.num_extra_kv_tokens + draft_len
+            manager.free_resources(request)
+        assert not manager.kv_cache_map
+    finally:
         manager.shutdown()
 
 
