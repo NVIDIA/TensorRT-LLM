@@ -32,13 +32,13 @@ import sys
 from pathlib import Path
 
 WORLD_SIZE = 4
-"""dep4's world size -- the topology these entries are certified for."""
+"""dep4's world size -- the default topology these entries are certified for (one node)."""
 
 _LAUNCHER_GRACE_S = 300
 """Headroom over the entry's own deadline, so its message wins the race."""
 
 
-def _devices() -> str:
+def _devices(world_size: int) -> str:
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible:
         devices = [d for d in visible.split(",") if d.strip()]
@@ -46,11 +46,10 @@ def _devices() -> str:
         import torch
 
         devices = [str(i) for i in range(torch.cuda.device_count())]
-    assert len(devices) >= WORLD_SIZE, (
-        f"this entry is certified at world size {WORLD_SIZE}; only "
-        f"{len(devices)} device(s) are visible"
+    assert len(devices) >= world_size, (
+        f"this run is at world size {world_size}; only {len(devices)} device(s) are visible"
     )
-    return ",".join(devices[:WORLD_SIZE])
+    return ",".join(devices[:world_size])
 
 
 def _load_launcher_constants(launcher: Path):
@@ -67,10 +66,15 @@ def _load_launcher_constants(launcher: Path):
     return module
 
 
-def run(entry: str) -> None:
-    """Run ``_<entry>_op_matrix``'s launcher over ``WORLD_SIZE`` devices."""
+def run(entry: str, world_size: int = WORLD_SIZE) -> None:
+    """Run ``_<entry>_op_matrix``'s launcher over ``world_size`` devices of this node (its local ``mpirun``).
+
+    A launcher that takes ``--world-size`` (the stateful entries' ``_lockstep`` launchers) also runs as one of N
+    ranks started by an external launcher, ``--launcher srun --world-size N``: that is how a multi-node receipt is
+    recorded, outside pytest; the others ignore the argument and size themselves from CUDA_VISIBLE_DEVICES.
+    """
     launcher = Path(__file__).resolve().with_name(f"_{entry}_op_matrix.py")
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices())
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices(world_size))
 
     # The ranks import tensorrt_llm absolutely, and a source checkout is not
     # necessarily installed. tests/unittest/_torch/modeling_v2/comm -> repo root.
@@ -89,7 +93,7 @@ def run(entry: str) -> None:
     timeout = constants.DEADLINE_S + getattr(constants, "WEDGE_CAP_S", 0) + _LAUNCHER_GRACE_S
 
     completed = subprocess.run(
-        [sys.executable, str(launcher)],
+        [sys.executable, str(launcher), "--world-size", str(world_size)],
         env=env,
         capture_output=True,
         text=True,
