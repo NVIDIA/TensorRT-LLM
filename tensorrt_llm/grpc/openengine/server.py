@@ -13,6 +13,7 @@ import grpc
 import uvloop
 
 from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm.grpc._protobuf import _warn_if_python_protobuf
 from tensorrt_llm.logger import logger
 
 from .bindings import openengine_pb2_grpc
@@ -148,6 +149,7 @@ def launch_server(
         llm_args: Arguments for LLM initialization.
         served_model_name: Model name accepted by Generate. Defaults to the model path.
     """
+    _warn_if_python_protobuf()
 
     async def serve() -> None:
         logger.info("Initializing TensorRT-LLM OpenEngine server...")
