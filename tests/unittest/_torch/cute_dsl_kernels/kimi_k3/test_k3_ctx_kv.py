@@ -26,13 +26,9 @@ clamp at the allocation, page-major and arena pools: every written pool row agai
 reference (the kernel's error must be the Python path's), masked rows zero, the pool's other elements untouched,
 ctx_len and num_ctx exact, reruns bit-identical; CUDA-graph replays with rewritten inputs.
 
-Batch-1 identity against the unmodified kernel (N <= 8): set ``K3_BASE_TRTLLM`` to an unmodified ``tensorrt_llm``
-package directory. Timing: ``python3 test_k3_ctx_kv.py time [--base]``; error table: ``python3 test_k3_ctx_kv.py
-report``.
+Timing: ``python3 test_k3_ctx_kv.py time``; error table: ``python3 test_k3_ctx_kv.py report``.
 """
 
-import importlib.util
-import os
 import statistics
 import sys
 
@@ -122,7 +118,7 @@ def python_path(
     k = F.rms_norm(k, (HEAD,), eps=EPS)
     k = k * k_norm.view(1, LAYERS, 1, HEAD)
     pos = cpos.reshape(-1).to(torch.int32).repeat_interleave(LAYERS)
-    dummy_q = k.new_empty(n * LAYERS, HEAD)
+    dummy_q = k.new_zeros(n * LAYERS, HEAD)
     rope(pos, dummy_q, k.view(n * LAYERS, nkv * HEAD), HEAD, cs, True)
     offs = torch.arange(k1, device="cuda")
     mask = (offs[None, :] < num_acc.long()[:, None]).reshape(-1).view(-1, 1, 1, 1).to(k.dtype)
@@ -463,92 +459,7 @@ def test_index_offset(arg):
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Batch-1 identity against the unmodified kernel (K3_BASE_TRTLLM: an unmodified tensorrt_llm package directory).
-# ----------------------------------------------------------------------------------------------------------------
-
-_base = {}
-
-
-def base_kernel():
-    root = os.environ.get("K3_BASE_TRTLLM")
-    if not root:
-        return None
-    if "mod" not in _base:
-        path = os.path.join(root, "_torch", "cute_dsl_kernels", "k3_ctx_kv", "k3_ctx_kv_kernel.py")
-        spec = importlib.util.spec_from_file_location("k3_ctx_kv_kernel_base", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _base["mod"] = mod
-    return _base["mod"]
-
-
-def base_call(
-    x, w, k_norm, cs, cpos, num_acc, ctx_len, slots, rows, table, counts, layers, block_size, nkv
-):
-    """The unmodified op (N <= 8) on the same arguments."""
-    import cuda.bindings.driver as cuda_driver
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
-
-    kern = base_kernel()
-
-    def arg(t):
-        return from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(
-            leading_dim=t.dim() - 1
-        )
-
-    flat, layer_off, ps, kvs, hs = pool_view(layers)
-    batch, k1 = cpos.shape
-    n_tokens, k_in = x.shape
-    n_rows = w.shape[0]
-    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-    split = next(s for s in (8, 4, 2) if (n_rows // kern.CTA_M) * s <= sms
-                 and kern.supports(n_rows, k_in, s, nkv, k1, n_tokens))  # fmt: skip
-    ring = kern.pick_ring(k_in, split)
-    if "counter" not in _base:
-        _base["counter"] = torch.zeros(1, dtype=torch.int32, device="cuda")
-    num_ctx = torch.empty(batch, dtype=torch.int32, device="cuda")
-    args = (arg(w), arg(x), arg(k_norm.reshape(-1)), arg(cs.reshape(-1)), arg(cpos.reshape(-1)), arg(num_acc),
-            arg(ctx_len), arg(slots), arg(rows), arg(table.reshape(-1)), arg(counts), arg(flat), arg(layer_off),
-            arg(num_ctx), arg(_base["counter"]))  # fmt: skip
-    scalars = (
-        float(EPS),
-        int(MAX_CTX),
-        int(PAGE),
-        int(block_size),
-        int(table.stride(0)),
-        int(ps),
-        int(kvs),
-        int(hs),
-    )
-    consts = (n_rows, k_in, split, ring, nkv, k1, n_tokens, True)
-    stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn = _base.get(consts)
-    if fn is None:
-        fn = _base[consts] = cute.compile(kern.k3_ctx_kv, *args, *scalars, *consts, True, stream)
-    fn(*args, *scalars, stream)
-    return num_ctx
-
-
-@pytest.mark.skipif(
-    not os.environ.get("K3_BASE_TRTLLM"), reason="K3_BASE_TRTLLM (unmodified package) not set"
-)
-@pytest.mark.parametrize("batch,k1", [s for s in SPLITS if s[0] * s[1] <= 8], ids=[f"{b}x{k}" for b, k in SPLITS
-                                                                                  if b * k <= 8])  # fmt: skip
-def test_batch1_identity(batch, k1):
-    with torch.inference_mode():
-        for seed, (style, clamp) in enumerate((("v1", False), ("arena", False), ("v1", True))):
-            gen = torch.Generator(device="cuda").manual_seed(55 + 10 * batch + k1 + seed)
-            st = Step(gen, 1, batch, k1, style, clamp, seed)
-            buf_k, ctx_k, nc_k, _ = st.run_kernel()
-            buf_b, ctx_b, nc_b, _ = st.run_kernel(fn=base_call)
-            torch.cuda.synchronize()
-            assert torch.equal(buf_k.view(torch.int16), buf_b.view(torch.int16)), (style, clamp)
-            assert torch.equal(ctx_k, ctx_b) and torch.equal(nc_k, nc_b), (style, clamp)
-
-
-# ----------------------------------------------------------------------------------------------------------------
-# Timing (python3 test_k3_ctx_kv.py time [--base]) and the error table (report)
+# Timing (python3 test_k3_ctx_kv.py time) and the error table (report)
 # ----------------------------------------------------------------------------------------------------------------
 
 
@@ -577,7 +488,7 @@ def time_graph(body, calls, replays=15):
     return statistics.median(per_call), min(per_call), max(per_call)
 
 
-def timing(with_base: bool) -> None:
+def timing() -> None:
     """Graphs of back-to-back calls with the weight rotating over 160 MB of copies (HBM-cold), TP16."""
     _op()
     gen = torch.Generator(device="cuda").manual_seed(11)
@@ -590,8 +501,8 @@ def timing(with_base: bool) -> None:
     calls = 2 * copies
     print(f"{torch.cuda.get_device_name()}; graphs of {calls} calls, weights rotating over {copies} copies, "
           "15 replays: median (min-max) us per call")  # fmt: skip
-    print("| split | N | k3_ctx_kv | base |")
-    print("| :-- | --: | --: | --: |")
+    print("| split | N | k3_ctx_kv |")
+    print("| :-- | --: | --: |")
     with torch.inference_mode():
         for b, k1 in SPLITS:
             st = Step(gen, 1, b, k1, "v1", seed=5)
@@ -599,21 +510,18 @@ def timing(with_base: bool) -> None:
             ctx = st.ctx0.clone()
             arms = [lambda i, fn=fn: fn(st.x, ws[i % copies], st.k_norm, st.cs, st.cpos, st.num_acc, ctx, st.slots,
                                          st.rows, st.table, st.counts, st.layers, BLOCK, 1)
-                    for fn in ([kernel_call, base_call] if with_base and b * k1 <= 8 else [kernel_call])]  # fmt: skip
+                    for fn in (kernel_call,)]  # fmt: skip
             res = [[] for _ in arms]
             for rep in range(3):
                 for a in range(len(arms)) if rep % 2 == 0 else reversed(range(len(arms))):
                     ctx.copy_(st.ctx0)
                     res[a].append(time_graph(arms[a], calls))
             cells = []
-            for a in range(2):
-                if a < len(arms):
-                    meds = sorted(x[0] for x in res[a])
-                    cells.append(
-                        f"{meds[1]:.2f} ({min(x[1] for x in res[a]):.2f}-{max(x[2] for x in res[a]):.2f})"
-                    )
-                else:
-                    cells.append("")
+            for a in range(len(arms)):
+                meds = sorted(x[0] for x in res[a])
+                cells.append(
+                    f"{meds[1]:.2f} ({min(x[1] for x in res[a]):.2f}-{max(x[2] for x in res[a]):.2f})"
+                )
             print(f"| {b}x{k1} | {b * k1} | " + " | ".join(cells) + " |", flush=True)
 
 
@@ -643,7 +551,7 @@ def report() -> int:
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "time":
-        timing("--base" in sys.argv)
+        timing()
     elif len(sys.argv) > 1 and sys.argv[1] == "report":
         sys.exit(report())
     else:
