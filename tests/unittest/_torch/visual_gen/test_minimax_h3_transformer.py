@@ -419,6 +419,51 @@ def _reference_rotary_emb(
     )
 
 
+@requires_cuda
+def test_rope_dispatch_compiles_fullgraph():
+    hidden_states = torch.randn((1, 17, 2, 128), device="cuda", dtype=torch.bfloat16)
+    angles = torch.randn((17, 96), device="cuda")
+    cos, sin = angles.cos(), angles.sin()
+    compiled = torch.compile(h3.apply_minimax_h3_rotary_emb, fullgraph=True)
+    assert torch.equal(
+        compiled(hidden_states, cos, sin), _reference_rotary_emb(hidden_states, cos, sin)
+    )
+
+
+@requires_cuda
+def test_rope_dispatches_to_fused_kernel(monkeypatch):
+    hidden_states = torch.randn((1, 7, 2, 8), device="cuda", dtype=torch.bfloat16)
+    angles = torch.randn((7, 6), device="cuda")
+    cos, sin = angles.cos(), angles.sin()
+    calls = []
+    fused = h3.apply_minimax_h3_rope_bf16
+
+    def tracked_fused(*args):
+        calls.append(True)
+        return fused(*args)
+
+    monkeypatch.setattr(h3, "apply_minimax_h3_rope_bf16", tracked_fused)
+    actual = h3.apply_minimax_h3_rotary_emb(hidden_states, cos, sin)
+    assert calls == [True]
+    assert torch.equal(actual, _reference_rotary_emb(hidden_states, cos, sin))
+
+
+@requires_cuda
+@pytest.mark.parametrize("grad_input", ["hidden_states", "cos", "sin"])
+def test_rope_preserves_autograd_fallback(grad_input):
+    hidden_states = torch.randn((1, 7, 2, 8), device="cuda", dtype=torch.bfloat16)
+    angles = torch.randn((7, 6), device="cuda")
+    cos, sin = angles.cos(), angles.sin()
+    target = {"hidden_states": hidden_states, "cos": cos, "sin": sin}[grad_input]
+    target.requires_grad_(True)
+    actual = h3.apply_minimax_h3_rotary_emb(hidden_states, cos, sin)
+    expected = _reference_rotary_emb(hidden_states, cos, sin)
+    (actual_grad,) = torch.autograd.grad(actual.sum(), target)
+    (expected_grad,) = torch.autograd.grad(expected.sum(), target)
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_grad, expected_grad)
+
+
 def _reference_rope(
     module: nn.Module,
     position_ids: torch.Tensor,
