@@ -114,18 +114,37 @@ def _max_rel(a, b, tokens, num_requests):
     return err
 
 
-def _attn_out(q, pool, row_stride, page_table, page_offset, seq_len):
+_workspaces = {}
+
+
+def _workspace(heads):
+    """This module's attention workspace for ``heads`` (heads / 6 head groups): one per group count on the current
+    device, made on first use and shared by every call of that shape, as a target shares one across its layers."""
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import op
+
+    groups = heads // H
+    if groups not in _workspaces:
+        _workspaces[groups] = op.make_attn_workspace(
+            torch.device("cuda", torch.cuda.current_device()), groups
+        )
+    return _workspaces[groups]
+
+
+def _attn_out(q, pool, row_stride, page_table, page_offset, seq_len, workspace=None):
     from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import op  # noqa: F401
 
     m, heads = q.shape[0], q.shape[1]
     out = torch.empty(m, heads * LAT, dtype=torch.bfloat16, device="cuda")
     torch.ops.trtllm.k3_mla_attn_out(
-        q.reshape(m, -1), pool.view(-1), row_stride, page_table, page_offset, seq_len, SCALE, out
-    )
+        q.reshape(m, -1), pool.view(-1), row_stride, page_table, page_offset, seq_len, SCALE, out,
+        _workspace(heads) if workspace is None else workspace,
+    )  # fmt: skip
     return out.view(m, heads, LAT)
 
 
-def _attn_vb(q, pool, row_stride, page_table, page_offset, seq_len, w_vb, gate=None):
+def _attn_vb(
+    q, pool, row_stride, page_table, page_offset, seq_len, w_vb, gate=None, workspace=None
+):
     from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import op  # noqa: F401
 
     m, heads = q.shape[0], q.shape[1]
@@ -140,6 +159,7 @@ def _attn_vb(q, pool, row_stride, page_table, page_offset, seq_len, w_vb, gate=N
         SCALE,
         w_vb,
         y,
+        _workspace(heads) if workspace is None else workspace,
         gate,
         GATE_COL0,
     )
@@ -179,7 +199,9 @@ def test_attn_returns(num_requests, tokens):
     q, pool, page_table, _, seq_len = _make_case(5 + num_requests, num_requests, tokens)
     m = q.shape[0]
     table = page_table[0] if num_requests == 1 else page_table
-    out = torch.ops.trtllm.k3_mla_attn(q.view(m, -1), pool.view(-1), DQK, table, seq_len, SCALE)
+    out = torch.ops.trtllm.k3_mla_attn(
+        q.view(m, -1), pool.view(-1), DQK, table, seq_len, SCALE, _workspace(H)
+    )
     ref = _attn_out(q, pool, DQK, page_table, 0, seq_len)
     assert torch.equal(_bits(out), _bits(ref.view(m, -1)))
 
@@ -251,7 +273,8 @@ def test_attn_vs_stock(num_requests, tokens):
 
 
 def test_attn_rejects():
-    """Calls outside R <= 8 requests of T <= 8 tokens, or page-table rows / lengths that do not match, are refused."""
+    """Calls outside R <= 8 requests of T <= 8 tokens, or page-table rows / lengths that do not match, are refused;
+    so is a workspace that is not one for the call's head groups and device (its words are left as they were)."""
     from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import op
 
     q, pool, page_table, _, seq_len = _make_case(1, 2, 4)
@@ -267,6 +290,13 @@ def test_attn_rejects():
     assert not op.supports_attn(q9.view(9, -1), flat, DQK, table9, len9)  # R = 9
     with pytest.raises(ValueError):
         _attn_out(q[:7], pool, DQK, page_table, 0, seq_len)
+    other = _workspace(4 * H)  # four head groups' layout; the call has one
+    before = other.clone()
+    for workspace in (other, other.float(), _workspace(H)[:-8]):
+        with pytest.raises(ValueError, match="workspace"):
+            _attn_out(q, pool, DQK, page_table, 0, seq_len, workspace)
+    torch.cuda.synchronize()
+    assert torch.equal(other.view(torch.int16), before.view(torch.int16))
 
 
 # Both launch modes (clusters; no_cluster past CLUSTER_WAVE clusters) at the TP16 and TP4 head counts, with folds
@@ -274,14 +304,12 @@ def test_attn_rejects():
 POISON_CASES = [(1, 1, H), (3, 5, H), (8, 1, H), (8, 8, H), (1, 8, 4 * H), (2, 4, 4 * H)]
 
 
-def _fill_workspace(heads, value):
-    """Fill the data words of the attention workspace: the per-CTA partial slots (fp16) and the no_cluster (m, l)
+def _fill_workspace(ws, heads, value):
+    """Fill the data words of an attention workspace: the per-CTA partial slots (fp16) and the no_cluster (m, l)
     exchange (fp32). The arrival counters after them keep their values."""
     from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import k3_mla_attn_kernel as kernel
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import op
 
     groups = heads // kernel.HEADS
-    ws = op._attn_workspace(torch.device("cuda", torch.cuda.current_device()), groups)
     slots = kernel.MAX_REQUESTS * groups * kernel.CLUSTER
     partials = slots * kernel.WS_SLOT_ELEMS
     exchange = slots * kernel.ROWS * 2  # fp32 words
@@ -296,22 +324,22 @@ def test_attn_workspace_poison(num_requests, tokens, heads):
     """A call reads only workspace words it wrote itself: with the partial slots and the (m, l) exchange refilled
     with NaN before each call, k3_mla_attn_out and the gated k3_mla_attn_vb_out give the bits of the same calls on a
     zero-filled workspace."""
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import op
+
     seed = 13 * num_requests + tokens
     q, pool, page_table, page_offset, seq_len = _make_case(seed, num_requests, tokens, heads)
     gen = torch.Generator(device="cuda").manual_seed(seed + 1)
     m = q.shape[0]
     w_vb = (torch.randn(heads, V, LAT, generator=gen, device="cuda") * 0.05).bfloat16()
     ag = torch.rand(m, GATE_COL0 + heads * V, generator=gen, device="cuda").bfloat16()
+    ws = op.make_attn_workspace(torch.device("cuda", torch.cuda.current_device()), heads // H)
     outs = {}
-    try:
-        for value in (0.0, float("nan")):
-            _fill_workspace(heads, value)
-            o = _attn_out(q, pool, DQK, page_table, page_offset, seq_len)
-            _fill_workspace(heads, value)
-            y = _attn_vb(q, pool, DQK, page_table, page_offset, seq_len, w_vb, ag)
-            outs[value == 0.0] = (o, y)
-    finally:
-        _fill_workspace(heads, 0.0)
+    for value in (0.0, float("nan")):
+        _fill_workspace(ws, heads, value)
+        o = _attn_out(q, pool, DQK, page_table, page_offset, seq_len, ws)
+        _fill_workspace(ws, heads, value)
+        y = _attn_vb(q, pool, DQK, page_table, page_offset, seq_len, w_vb, ag, ws)
+        outs[value == 0.0] = (o, y)
     torch.cuda.synchronize()
     for got, want in zip(outs[False], outs[True]):
         assert not torch.isnan(got).any()
@@ -322,13 +350,11 @@ def test_attn_workspace_poison(num_requests, tokens, heads):
 WRAP_CASES = [(8, 1, H), (8, 8, H), (2, 4, 4 * H)]
 
 
-def _set_counters(heads, value):
-    """Set every no_cluster arrival counter of the attention workspace (int32 words after the (m, l) exchange)."""
+def _set_counters(ws, heads, value):
+    """Set every no_cluster arrival counter of an attention workspace (int32 words after the (m, l) exchange)."""
     from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import k3_mla_attn_kernel as kernel
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import op
 
     groups = heads // kernel.HEADS
-    ws = op._attn_workspace(torch.device("cuda", torch.cuda.current_device()), groups)
     slots = kernel.MAX_REQUESTS * groups * kernel.CLUSTER
     start = (
         slots * kernel.WS_SLOT_ELEMS + 2 * slots * kernel.ROWS * 2
@@ -342,22 +368,22 @@ def _set_counters(heads, value):
 def test_attn_counter_wrap(num_requests, tokens, heads):
     """The no_cluster arrival counters only grow (16 per launch) and are compared by signed difference: calls with the
     counters just below the int32 wrap (2^31 - 16, and -16 just below 0) give the bits of calls on zeroed ones."""
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import op
+
     seed = 19 * num_requests + tokens
     q, pool, page_table, page_offset, seq_len = _make_case(seed, num_requests, tokens, heads)
     gen = torch.Generator(device="cuda").manual_seed(seed + 1)
     w_vb = (torch.randn(heads, V, LAT, generator=gen, device="cuda") * 0.05).bfloat16()
+    ws = op.make_attn_workspace(torch.device("cuda", torch.cuda.current_device()), heads // H)
     outs = {}
-    try:
-        for start in (0, 2**31 - 16, -16):
-            _set_counters(heads, start)
-            # Three launches: each crosses the wrap point once the counters start 16 below it.
-            outs[start] = [
-                _attn_out(q, pool, DQK, page_table, page_offset, seq_len),
-                _attn_vb(q, pool, DQK, page_table, page_offset, seq_len, w_vb),
-                _attn_out(q, pool, DQK, page_table, page_offset, seq_len),
-            ]
-    finally:
-        _set_counters(heads, 0)
+    for start in (0, 2**31 - 16, -16):
+        _set_counters(ws, heads, start)
+        # Three launches: each crosses the wrap point once the counters start 16 below it.
+        outs[start] = [
+            _attn_out(q, pool, DQK, page_table, page_offset, seq_len, ws),
+            _attn_vb(q, pool, DQK, page_table, page_offset, seq_len, w_vb, workspace=ws),
+            _attn_out(q, pool, DQK, page_table, page_offset, seq_len, ws),
+        ]
     torch.cuda.synchronize()
     for start in (2**31 - 16, -16):
         for got, want in zip(outs[start], outs[0]):

@@ -22,8 +22,9 @@ including its T new tokens, is ``seq_len[i]`` (int32 [R]).
 ``trtllm::k3_mla_q``: the decode query path (M <= 64; 6 heads per rank at TP16, 24 at TP4): q_a RMSNorm, q_b projection
 and k_b absorption in one launch, producing the attention's ``fused_q`` [M, heads * 576] = [q_nope @ W_kb^T | q_pe] per
 head; ``trtllm::k3_mla_qkv`` also stores the KV half (kv_a RMSNorm, rope columns) into the paged latent cache.
-``trtllm::k3_mla_attn`` and its ``_out`` / ``_vb_out`` forms: the attention of every request over its pages. Compiled
-on the first call for its shapes, which must happen outside CUDA-graph capture.
+``trtllm::k3_mla_attn`` and its ``_out`` / ``_vb_out`` forms: the attention of every request over its pages, over a
+caller-owned workspace (:func:`make_attn_workspace`). Compiled on the first call for its shapes, which must happen
+outside CUDA-graph capture.
 """
 
 from __future__ import annotations
@@ -347,27 +348,46 @@ def _(ag, w_qa, eps, w_qb, w_kb, w_kv, kv_eps, kv_out, trigger_early=True):
 # trtllm::k3_mla_attn: decode attention over the paged latent cache (R <= 8 requests of T <= 8 tokens, one cluster of
 # 16 CTAs per request and 6 heads)
 # ---------------------------------------------------------------------------------------------------------------
-_workspaces: Dict[tuple, torch.Tensor] = {}
-
-
-def _attn_workspace(device: torch.device, groups: int) -> torch.Tensor:
-    """The per-CTA partials of every (request, head group), then the no_cluster mode's (m, l) exchange and arrival
-    counters (zeroed): allocated once, for MAX_REQUESTS, on the first call."""
+def attn_workspace_elems(groups: int) -> int:
+    """fp16 elements of a ``k3_mla_attn`` workspace for calls of ``groups`` head groups (heads / 6): the per-CTA
+    partials of MAX_REQUESTS x groups x 16 slots, then the no_cluster mode's (m, l) exchange and arrival counters."""
     from . import k3_mla_attn_kernel as kernel
 
-    key = (device.index, groups)
-    ws = _workspaces.get(key)
-    if ws is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "trtllm::k3_mla_attn must run once outside CUDA-graph capture first (it allocates its workspace)."
-            )
-        slots = kernel.MAX_REQUESTS * groups * kernel.CLUSTER
-        ws = _workspaces[key] = torch.empty(
-            slots * kernel.WS_SLOT_ELEMS + kernel.ws_sync_elems(groups), dtype=torch.float16, device=device
-        )
-        ws[slots * kernel.WS_SLOT_ELEMS :].zero_()
+    return (
+        kernel.MAX_REQUESTS * groups * kernel.CLUSTER * kernel.WS_SLOT_ELEMS
+        + kernel.ws_sync_elems(groups)
+    )
+
+
+def make_attn_workspace(device: torch.device, groups: int) -> torch.Tensor:
+    """A new workspace for the ``k3_mla_attn`` calls of ``groups`` head groups on ``device``: fp16
+    [attn_workspace_elems(groups)], the partial slots uninitialized (a call reads only the words it wrote) and the
+    no_cluster tail zeroed (the arrival counters start at 0). It allocates, so it refuses to run under CUDA-graph
+    capture; the zeroing is ordered on the device's current stream."""
+    from . import k3_mla_attn_kernel as kernel
+
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("k3_mla_attn workspaces allocate: make them outside CUDA-graph capture.")
+    if groups < 1:
+        raise ValueError(f"k3_mla_attn workspace: {groups} head groups")
+    ws = torch.empty(attn_workspace_elems(groups), dtype=torch.float16, device=device)
+    ws[kernel.MAX_REQUESTS * groups * kernel.CLUSTER * kernel.WS_SLOT_ELEMS :].zero_()
     return ws
+
+
+def _check_attn_workspace(workspace: torch.Tensor, device: torch.device, groups: int) -> None:
+    elems = attn_workspace_elems(groups)
+    if not (
+        workspace.dtype == torch.float16
+        and workspace.dim() == 1
+        and workspace.is_contiguous()
+        and workspace.numel() == elems
+        and workspace.device == device
+    ):
+        raise ValueError(
+            f"k3_mla_attn: workspace {tuple(workspace.shape)} {workspace.dtype} on {workspace.device} is not one for "
+            f"{groups} head group(s) on {device}: fp16 [{elems}] (make_attn_workspace)"
+        )
 
 
 def supports_attn(
@@ -408,6 +428,7 @@ def _launch_attn(
     page_table,
     seq_len,
     softmax_scale,
+    workspace,
     out=None,
     page_offset=0,
     w_vb=None,
@@ -451,7 +472,7 @@ def _launch_attn(
             f"k3_mla_attn: gate {tuple(gate.shape)} {gate.dtype} col0 {gate_col0} does not fit the v_b output"
         )
     groups = total_heads // kernel.HEADS
-    ws_o = _attn_workspace(q.device, groups)
+    _check_attn_workspace(workspace, q.device, groups)
     # More 16-CTA clusters than co-reside would run a second wave: launch without a cluster instead when every CTA fits
     # on the SMs at once (one per SM; its waits are spins).
     clusters = num_requests * groups
@@ -472,8 +493,8 @@ def _launch_attn(
     total_rows = pool.numel() // row_stride
     gate_flat = gate.as_strided((gate.numel(),), (1,)) if apply_gate else q.view(-1)
     gate_ld = gate.stride(0) if apply_gate else 0
-    args = (_arg(q.view(-1)), _arg(_pool_base(pool, row_stride)), _arg(page_rows, 4), _arg(seq_len, 4), _arg(ws_o),
-            _arg(out.view(-1)), _arg((w_vb if fuse_vb else q).view(-1)), _arg(gate_flat))  # fmt: skip
+    args = (_arg(q.view(-1)), _arg(_pool_base(pool, row_stride)), _arg(page_rows, 4), _arg(seq_len, 4),
+            _arg(workspace), _arg(out.view(-1)), _arg((w_vb if fuse_vb else q).view(-1)), _arg(gate_flat))  # fmt: skip
     stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     use_pdl = _use_pdl()
     scale_log2 = float(softmax_scale) * kernel.LOG2E
@@ -509,7 +530,7 @@ def _launch_attn(
     return out
 
 
-@torch.library.custom_op("trtllm::k3_mla_attn", mutates_args=())
+@torch.library.custom_op("trtllm::k3_mla_attn", mutates_args=("workspace",))
 def k3_mla_attn(
     q: torch.Tensor,
     pool: torch.Tensor,
@@ -517,6 +538,7 @@ def k3_mla_attn(
     page_table: torch.Tensor,
     seq_len: torch.Tensor,
     softmax_scale: float,
+    workspace: torch.Tensor,
 ) -> torch.Tensor:
     """MLA decode attention of R <= 8 requests of T <= 8 tokens: ``q`` [M = R T, heads * 576] (``fused_q``, heads a
     multiple of 6, request-major) against the paged latent cache ``pool`` (flat bf16; row i of page p at ``(p * 64 +
@@ -524,11 +546,15 @@ def k3_mla_attn(
     = L_i (rows including its T new ones; see the module docstring), causal bottom-right (token t of request i sees
     rows <= L_i - T + t). Returns ``[M, heads * 512]`` bf16. The page table and lengths are read before the grid
     dependency wait (they must be written before the CUDA graph runs); q and the pages holding rows >= L_i - T after
-    it. Request i's rows are computed as the R = 1 call on its own rows, pages and length would compute them."""
-    return _launch_attn(q, pool, row_stride, page_table, seq_len, softmax_scale)
+    it. Request i's rows are computed as the R = 1 call on its own rows, pages and length would compute them.
+    ``workspace``: from :func:`make_attn_workspace` for this device and heads / 6 head groups. A call writes and reads
+    its partials there, all after its grid dependency wait, and in the no_cluster mode (more than CLUSTER_WAVE
+    clusters, all of whose CTAs fit on the SMs) adds 16 to the arrival counters of its requests' head groups; calls
+    on one workspace must run one at a time."""
+    return _launch_attn(q, pool, row_stride, page_table, seq_len, softmax_scale, workspace)
 
 
-@torch.library.custom_op("trtllm::k3_mla_attn_out", mutates_args=("out",))
+@torch.library.custom_op("trtllm::k3_mla_attn_out", mutates_args=("out", "workspace"))
 def k3_mla_attn_out(
     q: torch.Tensor,
     pool: torch.Tensor,
@@ -538,15 +564,24 @@ def k3_mla_attn_out(
     seq_len: torch.Tensor,
     softmax_scale: float,
     out: torch.Tensor,
+    workspace: torch.Tensor,
 ) -> None:
     """``k3_mla_attn`` into ``out`` (dense [M, heads * 512] bf16), with ``page_offset`` added to every page-table
     entry (the layer's slot in a layer-interleaved pool)."""
     _launch_attn(
-        q, pool, row_stride, page_table, seq_len, softmax_scale, out=out, page_offset=page_offset
+        q,
+        pool,
+        row_stride,
+        page_table,
+        seq_len,
+        softmax_scale,
+        workspace,
+        out=out,
+        page_offset=page_offset,
     )
 
 
-@torch.library.custom_op("trtllm::k3_mla_attn_vb_out", mutates_args=("out",))
+@torch.library.custom_op("trtllm::k3_mla_attn_vb_out", mutates_args=("out", "workspace"))
 def k3_mla_attn_vb_out(
     q: torch.Tensor,
     pool: torch.Tensor,
@@ -557,6 +592,7 @@ def k3_mla_attn_vb_out(
     softmax_scale: float,
     w_vb: torch.Tensor,
     out: torch.Tensor,
+    workspace: torch.Tensor,
     gate: Optional[torch.Tensor] = None,
     gate_col0: int = 0,
 ) -> None:
@@ -565,11 +601,11 @@ def k3_mla_attn_vb_out(
     (bf16 [M, C], sigmoid of head h's gate at columns ``gate_col0 + 128 h``) the output is ``bf16(y * s)``, the
     unfused output gate."""
     _launch_attn(
-        q, pool, row_stride, page_table, seq_len, softmax_scale, out=out, page_offset=page_offset, w_vb=w_vb,
-        gate=gate, gate_col0=gate_col0,
+        q, pool, row_stride, page_table, seq_len, softmax_scale, workspace, out=out, page_offset=page_offset,
+        w_vb=w_vb, gate=gate, gate_col0=gate_col0,
     )  # fmt: skip
 
 
 @k3_mla_attn.register_fake
-def _(q, pool, row_stride, page_table, seq_len, softmax_scale):
+def _(q, pool, row_stride, page_table, seq_len, softmax_scale, workspace):
     return q.new_empty((q.shape[0], q.shape[1] // 576 * 512), dtype=torch.bfloat16)
