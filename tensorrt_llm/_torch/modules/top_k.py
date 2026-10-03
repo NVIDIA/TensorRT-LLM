@@ -170,7 +170,7 @@ class TopK(nn.Module):
                 )
 
                 if self._prefill_capturing(scores) and not selfsampling_topk_prefill_ready(
-                    scores, output_indices
+                    scores, output_indices, max_row_len=scores.shape[1]
                 ):
                     # the engine never JIT-compiles under capture; an engine
                     # missed by warmup takes the exact radix path in the graph
@@ -189,7 +189,13 @@ class TopK(nn.Module):
                     # ks/ke are already in compressed column units; run_prefill
                     # writes the local (column - ks) frame with -1 pad and no
                     # host reads (envelope from scores.shape[1]).
-                    selfsampling_topk_run_prefill(scores, row_starts, row_ends, output_indices)
+                    selfsampling_topk_run_prefill(
+                        scores,
+                        row_starts,
+                        row_ends,
+                        output_indices,
+                        max_row_len=scores.shape[1],
+                    )
                     return output_indices
             else:
                 # engine hardware-format gate missed (e.g. a non-fp4 layer with
@@ -349,20 +355,19 @@ class TopK(nn.Module):
     ) -> torch.Tensor:
         if self.decode_implementation == TopKImplementation.CUTE_DSL_GVR and self.gvr_self_sampling:
             assert max_seq_len is not None
+            alignment_elements = 8 if scores.dtype == torch.bfloat16 else 4
             if (
                 # engine hardware-format gate (falls through otherwise):
-                # fp32 row-major scores with a float4-aligned row stride and
-                # a 16B-aligned base (the DSL paged-MQA arena view — column-
-                # sliced from a 256-aligned buffer — satisfies this; odd
-                # max_seq_len DeepGEMM layouts do not). Single-row batches
-                # derive their row window from shape[1] (arena last-row
-                # safety), so that width must satisfy the same float4 rule —
-                # otherwise run_varlen raises instead of falling through.
-                scores.dtype == torch.float32
+                # fp32/bf16 row-major scores with a 16B-aligned row stride
+                # and base. Single-row batches derive their row window from
+                # shape[1] (arena last-row safety), so that width must also
+                # satisfy the alignment rule; otherwise run_varlen raises
+                # instead of falling through.
+                scores.dtype in (torch.float32, torch.bfloat16)
                 and scores.stride(1) == 1
-                and scores.stride(0) % 4 == 0
+                and scores.stride(0) % alignment_elements == 0
                 and scores.data_ptr() % 16 == 0
-                and (scores.shape[0] > 1 or scores.shape[1] % 4 == 0)
+                and (scores.shape[0] > 1 or scores.shape[1] % alignment_elements == 0)
             ):
                 # hint-free k derives from the output width; pin it to the module's k
                 assert output_indices.shape[1] == self.top_k
