@@ -444,20 +444,26 @@ def _published_address(address: str, paths: Sequence[str]) -> Iterator[None]:
     Retracting on the way out matters as much as writing, since an address that
     outlives its master sends the next run's workers to a dead port.
     """
-    for path in paths:
-        directory = os.path.dirname(path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        # Renamed into place so a reader never sees a partial address.
-        staging = f"{path}.partial"
-        with open(staging, "w") as handle:
-            handle.write(f"{address}\n")
-        os.replace(staging, path)
-        logger.info(f"mooncake-store: published master {address} to {path}")
+    published: list[str] = []
     try:
+        for path in paths:
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            # Renamed into place so a reader never sees a partial address.
+            staging = f"{path}.partial"
+            try:
+                with open(staging, "w") as handle:
+                    handle.write(f"{address}\n")
+                os.replace(staging, path)
+                published.append(path)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(staging)
+            logger.info(f"mooncake-store: published master {address} to {path}")
         yield
     finally:
-        for path in paths:
+        for path in published:
             with contextlib.suppress(OSError):
                 os.remove(path)
                 logger.info(f"mooncake-store: withdrew the master address at {path}")
