@@ -76,10 +76,10 @@
 # so CI on the other architecture keeps re-certifying the existing ones. A
 # collective's receipt records the world size its matrix ran at.
 #
-# The Kimi K3 entries (k3_*, attn_res_*) are certified on sm_100 (B200 /
-# GB200), where their first caller runs, and their tests skip on any other
-# architecture. cublas_mm and flashinfer_rmsnorm, which that caller also
-# uses, keep their sm_103 receipts and add sm_100 ones.
+# The Kimi K3 entries (k3_*, attn_res_* and ssm/kda_decode) are certified on
+# sm_100 (B200 / GB200), where their first caller runs, and their tests skip on
+# any other architecture. cublas_mm and flashinfer_rmsnorm, which that caller
+# also uses, keep their sm_103 receipts and add sm_100 ones.
 # ──────────────────────────────────────────────────────────────────────────
 #
 # STATEFUL ENTRIES. When an op's result depends on state that outlives the
