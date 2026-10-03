@@ -1900,6 +1900,22 @@ def test_deepseek_streaming_preserves_withheld_text(
 
 
 @pytest.mark.parametrize(
+    "parser_cls",
+    [DeepSeekV3Parser, DeepSeekV31Parser, DeepSeekV32Parser, DeepSeekV4Parser])
+def test_deepseek_streaming_keeps_markdown_fences(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser]) -> None:
+    """Content without tool-call markup is streamed verbatim."""
+    text = "Here is the code:\n```python\nprint(1)\n```\nDone."
+
+    streamed = parser_cls().parse_streaming_increment(text,
+                                                      sample_tools).normal_text
+
+    assert streamed == text, f"Expected {text!r}, got {streamed!r}"
+    assert parser_cls().detect_and_parse(text, sample_tools).normal_text == text
+
+
+@pytest.mark.parametrize(
     "parser_cls, tool_call_text",
     [
         (
