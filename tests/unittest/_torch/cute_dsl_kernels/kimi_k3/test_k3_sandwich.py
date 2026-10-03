@@ -116,7 +116,8 @@ def _context():
 
     mapping = Mapping(world_size=world, rank=rank, gpus_per_node=gpus, tp_size=world)
     return SimpleNamespace(comm=comm, rank=rank, world=world, mapping=mapping,
-                           mnnvl=MNNVLAllReduce(mapping, torch.bfloat16), ws=sw_op.workspace(mapping))  # fmt: skip
+                           mnnvl=MNNVLAllReduce(mapping, torch.bfloat16),
+                           ws=sw_op.K3SandwichWorkspace.create(mapping, fabric_handle=True))  # fmt: skip
 
 
 def _all_ranks(ctx, good) -> bool:
@@ -125,20 +126,20 @@ def _all_ranks(ctx, good) -> bool:
 
 def _oproj(ctx, core, w, prefix, block, res_w, rms_w, out_w):
     ws = ctx.ws
-    return torch.ops.trtllm.k3_sandwich_oproj(core, w, prefix, block, res_w, rms_w, out_w, EPS, EPS, ws["uc"],
-                                              ws["mc"], ws["flags"], ws["rank"])  # fmt: skip
+    return torch.ops.trtllm.k3_sandwich_oproj(core, w, prefix, block, res_w, rms_w, out_w, EPS, EPS, ws.uc, ws.mc,
+                                              ws.flags, ws.rank)  # fmt: skip
 
 
 def _tail(ctx, latent, act, w, lo, prefix, block, res_w, rms_w, out_w, **extra):
     ws = ctx.ws
     return torch.ops.trtllm.k3_sandwich_tail(latent, act, w, lo, LAT_EPS, prefix, block, res_w, rms_w, out_w, EPS,
-                                             EPS, ws["uc"], ws["mc"], ws["flags"], ws["rank"], **extra)  # fmt: skip
+                                             EPS, ws.uc, ws.mc, ws.flags, ws.rank, **extra)  # fmt: skip
 
 
 def _plain(ctx, x, w, residual, norm_w, swiglu=False):
     ws = ctx.ws
-    return torch.ops.trtllm.k3_sandwich_plain(x, w, residual, norm_w, EPS, ws["uc"], ws["mc"], ws["flags"],
-                                              ws["rank"], swiglu=swiglu)  # fmt: skip
+    return torch.ops.trtllm.k3_sandwich_plain(x, w, residual, norm_w, EPS, ws.uc, ws.mc, ws.flags, ws.rank,
+                                              swiglu=swiglu)  # fmt: skip
 
 
 def _attn_res_ar(ctx, partial, prefix, block, res_w, rms_w, out_w):
@@ -414,7 +415,7 @@ def check_wrap(ctx):
         torch.cuda.synchronize()
         return outs
 
-    flags = ctx.ws["flags"]
+    flags = ctx.ws.flags
     fresh = run()
     count = int(flags[0].item())
     ctx.comm.Barrier()
@@ -437,9 +438,9 @@ def check_fold_wrap(ctx):
     from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich import k3_sandwich_kernel as kernel
     from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich import op as sw_op
 
-    ex = sw_op.latent_exchange(ctx.mapping)
-    flags = ex["flags"]
-    lanes = ex["mc"].view(2, 8, ctx.world, LATENT // 2)
+    ex = sw_op.K3SandwichLatentExchange.create(ctx.mapping, fabric_handle=True)
+    flags = ex.flags
+    lanes = ex.mc.view(2, 8, ctx.world, LATENT // 2)
     latent8, act8, w, lo, prefix8, block8, res_w, rms_w, out_w = _tail_inputs(ctx, 3, 830)
     part8 = _rand((8, LATENT), 840 + 1000 * ctx.rank, 0.3)
     part8[part8 == 0] = 0.0  # pushes never send -0.0: with +0.0 beside it, that word would read as empty
@@ -456,7 +457,7 @@ def check_fold_wrap(ctx):
             before = torch.cat([flags[1 : slab.start], flags[slab.stop :]]).clone()
             pre, block = _first(m, prefix8, block8, True)
             out = _tail(ctx, latent8[:m].contiguous(), act8[:m].contiguous(), w, lo, pre, block, res_w, rms_w, out_w,
-                        lat_uc=ex["uc"], lat_flags=flags)  # fmt: skip
+                        lat_uc=ex.uc, lat_flags=flags)  # fmt: skip
             torch.cuda.synchronize()
             outs.append([t.clone() for t in out])
             others.append(torch.equal(before, torch.cat([flags[1 : slab.start], flags[slab.stop :]])))
@@ -507,7 +508,7 @@ def test_k3_sandwich(mpi_pool_executor, check):
 
 
 def test_workspaces_refuse_graph_capture():
-    """The all-reduce buffer and the latent exchange are collective on first use: allocating either under CUDA-graph
+    """The all-reduce buffer and the latent exchange are created collectively: creating either under CUDA-graph
     capture raises instead of entering the collective, which could hang the group."""
     from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich import op
     from tensorrt_llm.mapping import Mapping
@@ -516,9 +517,9 @@ def test_workspaces_refuse_graph_capture():
     graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
     with torch.cuda.graph(graph, stream=stream):
         with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
-            op.workspace(mapping)
+            op.K3SandwichWorkspace.create(mapping)
         with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
-            op.latent_exchange(mapping)
+            op.K3SandwichLatentExchange.create(mapping)
 
 
 def main() -> int:

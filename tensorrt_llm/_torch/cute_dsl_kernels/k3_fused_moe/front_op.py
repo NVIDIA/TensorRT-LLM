@@ -14,10 +14,11 @@
 # limitations under the License.
 """``trtllm::k3_moe_front``: the Kimi K3 MoE front at decode size in one kernel (``k3_moe_front.py``).
 
-Replaces, per MoE layer: the sharded head GEMV, ``trtllm::k3_route_quant_ag`` (head all-gather, top-16 routing, MXFP8
-latent) and, on the shared-expert stream, the shared gate_up GEMV and SiTU-and-mul. The head all-gather uses
-``op.head_workspace``'s buffers and protocol, so the front and ``k3_route_quant_ag`` must not both serve one layer.
-The kernel compiles on the first call for each configuration, which must happen outside CUDA-graph capture.
+Replaces, per MoE layer: the sharded head GEMV, the head all-gather, the top-16 routing and the MXFP8 latent, and, on
+the shared-expert stream, the shared gate_up GEMV and SiTU-and-mul. The head all-gather runs over the TP group's
+:class:`~.op.K3MoeHeadWorkspace` (the caller's, created collectively before CUDA-graph capture), with the buffer
+layout and protocol of ``k3_route_quant_ag.py``. The kernel compiles on the first call for each configuration, which
+must happen outside CUDA-graph capture.
 """
 
 from __future__ import annotations
@@ -110,7 +111,9 @@ def supports(
     )
 
 
-@torch.library.custom_op("trtllm::k3_moe_front", mutates_args=())
+@torch.library.custom_op(
+    "trtllm::k3_moe_front", mutates_args=("ag_uc", "ag_mc", "ag_flags", "ag_ready")
+)
 def k3_moe_front(
     x: torch.Tensor,
     w_front: torch.Tensor,
@@ -128,9 +131,10 @@ def k3_moe_front(
     ag_ready: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``x`` bf16 ``[M <= 8, 7168]`` (the MoE input, the same on every rank), ``w_front`` from ``front_weight``,
-    ``bias`` the routing bias fp32 ``[896]``. Returns ``(topk_ids, topk_weights, quantized, scales, shared)``: what
-    ``trtllm::k3_route_quant_ag`` returns for the gathered head, and the shared experts' activation bf16
-    ``[M, shared_cols]``. With ``ag_ready`` it also releases the per-token ready words as route_quant_ag does."""
+    ``bias`` the routing bias fp32 ``[896]``, ``ag_*`` the fields of the TP group's ``K3MoeHeadWorkspace``. Returns
+    ``(topk_ids, topk_weights, quantized, scales, shared)``: what ``trtllm::k3_route_quant`` returns for the gathered
+    head's router logits and latent, and the shared experts' activation bf16 ``[M, shared_cols]``. With ``ag_ready``
+    it also releases the per-token ready words a ``head_flags`` build of k3_moe acquires."""
     import cuda.bindings.driver as cuda_driver
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
@@ -147,7 +151,7 @@ def k3_moe_front(
     if ag_uc.numel() < ag_words or ag_mc.numel() < ag_words:
         raise ValueError(
             f"k3_moe_front: the head workspace holds {ag_uc.numel()} words, the front needs {ag_words} "
-            "(op.head_workspace: the all-gather's buffers, then the router partials)"
+            "(K3MoeHeadWorkspace: the all-gather's buffers, then the router partials)"
         )
     num_tokens, k_in = x.shape
     device = x.device

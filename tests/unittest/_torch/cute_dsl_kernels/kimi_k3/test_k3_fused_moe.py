@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""trtllm::k3_fused_moe (k3_route_quant + the persistent k3_moe kernel, M <= 8) on one GPU, at the Kimi K3 TP16
+"""K3MoeLayer (trtllm::k3_route_quant + the persistent k3_moe kernel, M <= 8) on one GPU, at the Kimi K3 TP16
 deployment's routed-expert rank layout (experts TP4 x EP4: 224 local experts, intermediate 768 per rank), at every M
 in 1..8 with random routing, with 0, 4 and 16 of each token's experts local, and with 16 local experts per token none
 shared (16 M groups: the kernel's group capacity at M = 8): against the stock path
@@ -185,20 +185,29 @@ def _stock(proc, bias, x, logits):
     return y, ids, w, x_fp8, x_sf
 
 
+@functools.lru_cache(maxsize=None)
+def _layer():
+    """One K3MoeState on this GPU and the layer of _experts()' buffers on it."""
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op
+
+    _ops()
+    proc, _, _ = _experts()
+    state = op.K3MoeState(torch.device("cuda", torch.cuda.current_device()), I_TP, E_LOCAL)
+    return state.layer(proc["w31"], proc["w31s"], proc["w2"], proc["w2s"])
+
+
 def _fused(proc, bias, x, logits):
-    return _ops().k3_fused_moe(x, logits, bias, proc["w31"], proc["w31s"], proc["w2"], proc["w2s"], OFFSET, E_LOCAL,
-                               RSF)  # fmt: skip
+    return _layer()(x, logits, bias, OFFSET, RSF)
 
 
 def _scratch_rearmed():
-    """The intermediate slab armed again (FP8 -0.0 codes, E8M0 NaN scale words) and every layer's counters zero."""
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op
-
-    st = op._state(torch.device("cuda", torch.cuda.current_device()), I_TP, E_LOCAL)
+    """The intermediate slab armed again (FP8 -0.0 codes, E8M0 NaN scale words) and the layer's counters zero."""
+    layer = _layer()
+    st = layer.state
     mod = st.mod
     cs = st.cs.view(mod.G_CAP, 8, mod.K2_TILES, mod.SFB_GROUP_BYTES)
     armed = bool((st.c == -128).all()) and bool((cs[..., :4] == -1).all())
-    return armed and all(bool((layer[4] == 0).all()) for layer in st.layers.values())
+    return armed and bool((layer.counters == 0).all())
 
 
 CASES = ["random", "4_local", "16_local", "16_local_disjoint", "none_local"]
@@ -301,9 +310,9 @@ def test_k3_fused_moe_partial_rows_past_m():
 
     _ops()
     proc, _, bias = _experts()
-    fresh = op._K3FusedMoE(torch.device("cuda", torch.cuda.current_device()), I_TP, E_LOCAL)
+    fresh = op.K3MoeState(torch.device("cuda", torch.cuda.current_device()), I_TP, E_LOCAL)
     assert bool((fresh.part == 0).all())
-    st = op._state(torch.device("cuda", torch.cuda.current_device()), I_TP, E_LOCAL)
+    st = _layer().state
     logits8, x8 = _tokens("random")
     for m in M_ALL:
         logits, x = logits8[:m].contiguous(), x8[:m].contiguous()
@@ -324,18 +333,22 @@ def test_token_limit():
 
 
 def test_collective_workspaces_refuse_graph_capture():
-    """The head all-gather's buffers (the front's) and the fused all-reduce's are collective on first use (an MNNVL
-    multicast allocation over the TP group): a first use under CUDA-graph capture raises instead of entering the
-    collective, and nothing is cached for the group."""
+    """The head all-gather's buffers (the front's) are created collectively (an MNNVL multicast allocation over the TP
+    group): creating them under CUDA-graph capture raises instead of entering the collective. The per-rank state and
+    a layer's counters refuse capture too (they allocate)."""
     from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op
     from tensorrt_llm.mapping import Mapping
 
     _ops()
+    proc, _, _ = _experts()
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = op.K3MoeState(device, I_TP, E_LOCAL)
     mapping = Mapping(world_size=1, rank=0, tp_size=1)
     graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
     with torch.cuda.graph(graph, stream=stream):
         with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
-            op.head_workspace(mapping)
+            op.K3MoeHeadWorkspace.create(mapping)
         with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
-            op.ar_workspace(mapping)
-    assert mapping not in op._head_workspaces and mapping not in op._ar_workspaces
+            op.K3MoeState(device, I_TP, E_LOCAL)
+        with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
+            state.layer(proc["w31"], proc["w31s"], proc["w2"], proc["w2s"])

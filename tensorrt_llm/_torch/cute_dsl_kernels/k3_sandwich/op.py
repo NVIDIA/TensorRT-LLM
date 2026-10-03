@@ -18,19 +18,20 @@ all-reduce of its output and the residual update (attention-residual selection +
 ``trtllm::k3_sandwich_tail`` the pre-attention step (the MoE tail, then the next layer's input norm);
 ``trtllm::k3_sandwich_plain`` a row-parallel projection with a plain residual add + RMSNorm (the drafter layers).
 
-The all-reduce runs over a dedicated multicast buffer per TP group (:func:`workspace`), not the model's MNNVL
-all-reduce workspace, so it keeps its own call parity. The kernel compiles on the first call for each
-(world, publish, input source, PDL), which must happen outside CUDA-graph capture; the number of snapshots, the prefix
-and the slab buffer are runtime arguments.
+The all-reduce runs over a dedicated multicast buffer per TP group, a :class:`K3SandwichWorkspace` that the caller
+creates (collectively, before CUDA-graph capture) and passes to every call; it is not the model's MNNVL all-reduce
+workspace, so it keeps its own call parity. The kernel compiles on the first call for each (world, publish, input
+source, PDL), which must happen outside CUDA-graph capture; the number of snapshots, the prefix and the slab buffer are
+runtime arguments.
 
 Publishing (``x_slab``, ``slab_buf``): with a slab (``slab_tensor``) the normed rows are also written into buffer
 ``slab_buf`` (0-2) of it, sentinel-armed Lamport words the next kernel polls, and buffer ``(slab_buf + 1) % 3`` is
 re-armed. ``slab_buf`` is the ordinal of the call among this op's calls in the forward, mod 3.
 
-The latent all-reduce folded into the tail (``lat_uc``, ``lat_flags`` from :func:`latent_exchange`): k3_moe pushes
-its routed latent partial into every rank's exchange buffer and exits; ``k3_sandwich_tail`` sums the ranks' partials
-itself (bit-identical to the one-shot all-reduce) instead of reading a reduced ``latent``. Every push-only k3_moe call
-must be followed by exactly one such tail call on the same exchange.
+The latent all-reduce folded into the tail (``lat_uc``, ``lat_flags`` of a :class:`K3SandwichLatentExchange`): k3_moe
+pushes its routed latent partial into every rank's exchange buffer and exits; ``k3_sandwich_tail`` sums the ranks'
+partials itself (bit-identical to the one-shot all-reduce) instead of reading a reduced ``latent``. Every push-only
+k3_moe call must be followed by exactly one such tail call on the same exchange.
 
 Polling the input (``src_slab``, ``src_buf``): when the producer of phase 1's input (the attention output core for
 ``k3_sandwich_oproj``, the reduced latent for ``k3_sandwich_tail``) publishes it as such a slab (int32 [3][8][cols /
@@ -42,7 +43,8 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
@@ -53,8 +55,6 @@ SLAB_SENTINEL = -1
 
 _lock = threading.Lock()
 _compiled: Dict[tuple, object] = {}
-_workspaces: Dict[object, dict] = {}
-_lat_exchanges: Dict[object, dict] = {}
 
 
 def _arg(t: torch.Tensor):
@@ -128,97 +128,119 @@ def _slab_args(x_slab: Optional[torch.Tensor], slab_buf: int, fallback: torch.Te
     return x_slab.reshape(-1), int(slab_buf), 1
 
 
-def workspace(mapping) -> dict:
-    """The sandwich's all-reduce buffer for ``mapping``'s TP group: ``uc`` (this rank's words), ``mc`` (their
-    multicast mapping) and ``flags`` (int32, the call count of each CTA). Collective on first use: every rank of
-    the group must make its first call at the same point, outside CUDA-graph capture."""
-    ws = _workspaces.get(mapping)
-    if ws is not None:
-        return ws
+def _create_buffer(cls, mapping, words: int, flag_words: int, fabric_handle: Optional[bool],
+                   arm_flags: Optional[Callable[[torch.Tensor], None]] = None):  # fmt: skip
+    """A ``cls`` over a new multicast buffer of ``words`` int32 per rank of ``mapping``'s TP group, every word empty,
+    and ``flag_words`` int32 flags, zero (then ``arm_flags``). Collective and eager: every rank of the group calls it at
+    the same point, outside CUDA-graph capture; it returns on every rank or raises on every rank."""
     if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("k3_sandwich: the all-reduce buffer must be allocated outside CUDA-graph capture")
+        raise RuntimeError(
+            f"{cls.__name__}.create is collective and allocates: call it outside CUDA-graph capture"
+        )
     from tensorrt_llm._torch.distributed.ops import (
         _get_mnnvl_workspace_comm,
         _make_mnnvl_mcast_buffer,
         _mnnvl_workspace_all_succeeded,
     )
 
-    from . import k3_sandwich_kernel as kernel
-
-    world = mapping.tp_size
-    words = kernel.buffer_words(world)
+    use_fabric_handle = mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
     comm = _get_mnnvl_workspace_comm(mapping)
-    use_fabric_handle = (
-        os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or mapping.is_multi_node()
-    )
     error: Optional[Exception] = None
+    state = None
     try:
         handle = _make_mnnvl_mcast_buffer(comm, words * 4, mapping, use_fabric_handle)
         uc = handle.get_uc_buffer(mapping.tp_rank, (words,), torch.int32, 0)
         mc = handle.get_mc_buffer((words,), torch.int32, 0)
-        with torch.inference_mode():
-            uc.fill_(EMPTY_WORD)
-            flags = torch.zeros(kernel.FLAG_WORDS, dtype=torch.int32, device=uc.device)
+        uc.fill_(EMPTY_WORD)
+        flags = torch.zeros(flag_words, dtype=torch.int32, device=uc.device)
+        if arm_flags is not None:
+            arm_flags(flags)
         torch.cuda.synchronize()
-        ws = dict(
-            handle=handle, comm=comm, uc=uc, mc=mc, flags=flags, rank=mapping.tp_rank, world=world
+        state = cls(
+            uc=uc,
+            mc=mc,
+            flags=flags,
+            rank=mapping.tp_rank,
+            world_size=mapping.tp_size,
+            handle=handle,
+            comm=comm,
         )
     except Exception as exc:  # noqa: BLE001 -- reported to every rank below, then re-raised
         error = exc
     # Also the barrier that keeps any rank from pushing into a peer's buffer before the peer has emptied it.
     if not _mnnvl_workspace_all_succeeded(comm, error is None):
-        raise RuntimeError("k3_sandwich all-reduce buffer failed on at least one rank") from error
-    _workspaces[mapping] = ws
-    return ws
+        raise RuntimeError(f"{cls.__name__}: allocation failed on at least one rank") from error
+    return state
 
 
-def latent_exchange(mapping) -> dict:
-    """The latent exchange of ``mapping``'s TP group, shared by k3_moe (push-only: its ``ar_uc`` / ``ar_mc`` /
-    ``ar_flags``) and ``k3_sandwich_tail`` (``lat_uc`` / ``lat_flags``): ``uc`` (this rank's int32 [2][8][world][1792]
-    words, every word empty), ``mc`` (their multicast mapping, where k3_moe pushes) and ``flags`` (int32 [64]: [0] the
-    tail's call count mod 6, whose parity picks the half; the tail's scale slab after it). Collective on first use, as
-    :func:`workspace`."""
-    ex = _lat_exchanges.get(mapping)
-    if ex is not None:
-        return ex
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("k3_sandwich: the latent exchange must be allocated outside CUDA-graph capture")
-    from tensorrt_llm._torch.distributed.ops import (
-        _get_mnnvl_workspace_comm,
-        _make_mnnvl_mcast_buffer,
-        _mnnvl_workspace_all_succeeded,
-    )
+@dataclass(eq=False)
+class K3SandwichWorkspace:
+    """One TP group's sandwich all-reduce buffer, shared by ``k3_sandwich_oproj``, ``k3_sandwich_tail`` and
+    ``k3_sandwich_plain``: two alternating halves of [8 tokens][world][7168] bf16 per rank behind one multicast mapping,
+    and one call counter per CTA whose parity selects the half. Every sandwich call on it advances every counter, so all
+    of a group's ranks make the same calls on it in the same order. Pass ``uc``, ``mc``, ``flags`` and ``rank`` as the
+    ops' ``ws_uc``, ``ws_mc``, ``ws_flags`` and ``rank``."""
 
-    from . import k3_sandwich_kernel as kernel
+    uc: torch.Tensor
+    """int32 [2 * 8 * world * 3584]: this rank's words (0x80000000 = empty)."""
+    mc: torch.Tensor
+    """The same words through the multicast mapping (where the peers push)."""
+    flags: torch.Tensor
+    """int32 [64]: the call count of each of the kernel's 56 CTAs."""
+    rank: int
+    world_size: int
+    handle: Any
+    """The ``McastGPUBuffer`` that owns the memory; the workspace is valid while this object lives."""
+    comm: Any
+    """The TP-group communicator the handles were exchanged over."""
 
-    world = mapping.tp_size
-    words = kernel.lat_buffer_words(world)
-    comm = _get_mnnvl_workspace_comm(mapping)
-    use_fabric_handle = (
-        os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or mapping.is_multi_node()
-    )
-    error: Optional[Exception] = None
-    try:
-        handle = _make_mnnvl_mcast_buffer(comm, words * 4, mapping, use_fabric_handle)
-        uc = handle.get_uc_buffer(mapping.tp_rank, (words,), torch.int32, 0)
-        mc = handle.get_mc_buffer((words,), torch.int32, 0)
-        with torch.inference_mode():
-            uc.fill_(EMPTY_WORD)
-            flags = torch.zeros(kernel.LAT_FLAG_WORDS, dtype=torch.int32, device=uc.device)
-            flags[kernel.LAT_SCALES : kernel.LAT_SCALES + kernel.LAT_SCALE_BUFS * MAX_TOKENS] = (
-                kernel.SCALE_SENTINEL
-            )
-        torch.cuda.synchronize()
-        ex = dict(
-            handle=handle, comm=comm, uc=uc, mc=mc, flags=flags, rank=mapping.tp_rank, world=world
+    @classmethod
+    def create(cls, mapping, fabric_handle: Optional[bool] = None) -> "K3SandwichWorkspace":
+        """Allocate and arm a workspace for ``mapping``'s TP group. Collective: every rank of the group calls it at the
+        same point, eagerly (not under CUDA-graph capture); it returns on every rank or raises on every rank.
+        ``fabric_handle``: share the memory by fabric handle (required across nodes) rather than POSIX file
+        descriptor; default ``mapping.is_multi_node()``."""
+        from . import k3_sandwich_kernel as kernel
+
+        return _create_buffer(
+            cls, mapping, kernel.buffer_words(mapping.tp_size), kernel.FLAG_WORDS, fabric_handle
         )
-    except Exception as exc:  # noqa: BLE001 -- reported to every rank below, then re-raised
-        error = exc
-    # Also the barrier that keeps any rank from pushing into a peer's buffer before the peer has emptied it.
-    if not _mnnvl_workspace_all_succeeded(comm, error is None):
-        raise RuntimeError("k3_sandwich latent exchange failed on at least one rank") from error
-    _lat_exchanges[mapping] = ex
-    return ex
+
+
+@dataclass(eq=False)
+class K3SandwichLatentExchange:
+    """One TP group's latent exchange for ``k3_sandwich_tail`` with the latent all-reduce folded in: the push-only
+    k3_moe stores every rank's routed partial into two alternating halves of [8 tokens][world][3584] bf16 per rank
+    behind one multicast mapping, and the tail sums them. ``flags``: [0] the tail's call count mod 6 (its parity selects
+    the half), then the tail's latent scale slab. Pass ``uc`` and ``flags`` as the tail's ``lat_uc`` and ``lat_flags``.
+    Separate from :class:`K3SandwichWorkspace`."""
+
+    uc: torch.Tensor
+    """int32 [2 * 8 * world * 1792]: this rank's words (0x80000000 = empty)."""
+    mc: torch.Tensor
+    """The same words through the multicast mapping (where the producers push)."""
+    flags: torch.Tensor
+    """int32 [64]: [0] the call count mod 6, [32 + 8 b + t] buffer b of the latent scales (sentinel 0xFFFFFFFF)."""
+    rank: int
+    world_size: int
+    handle: Any
+    """The ``McastGPUBuffer`` that owns the memory; the exchange is valid while this object lives."""
+    comm: Any
+    """The TP-group communicator the handles were exchanged over."""
+
+    @classmethod
+    def create(cls, mapping, fabric_handle: Optional[bool] = None) -> "K3SandwichLatentExchange":
+        """Allocate and arm an exchange for ``mapping``'s TP group; collective and eager, as
+        :meth:`K3SandwichWorkspace.create`."""
+        from . import k3_sandwich_kernel as kernel
+
+        def arm(flags: torch.Tensor) -> None:
+            scales = slice(kernel.LAT_SCALES, kernel.LAT_SCALES + kernel.LAT_SCALE_BUFS * MAX_TOKENS)
+            flags[scales] = kernel.SCALE_SENTINEL
+
+        return _create_buffer(
+            cls, mapping, kernel.lat_buffer_words(mapping.tp_size), kernel.LAT_FLAG_WORDS, fabric_handle, arm
+        )
 
 
 def supports(core: torch.Tensor, o_weight: torch.Tensor, num_snapshots: int) -> bool:
@@ -256,7 +278,9 @@ def _compile_and_run(entry, key, args, runtime, consts, stream, name):
     fn(*args, *runtime, stream)
 
 
-@torch.library.custom_op("trtllm::k3_sandwich_oproj", mutates_args=("x_slab",))
+@torch.library.custom_op(
+    "trtllm::k3_sandwich_oproj", mutates_args=("ws_uc", "ws_mc", "ws_flags", "x_slab")
+)
 def k3_sandwich_oproj(
     core: torch.Tensor,
     o_weight: torch.Tensor,
@@ -280,7 +304,7 @@ def k3_sandwich_oproj(
 
     ``core`` bf16 [M, 768] is this rank's attention output, ``o_weight`` [7168, 768] its o_proj slice;
     ``prefix`` [M, 7168] (or None), ``block_residual`` [S, M, 7168] the S valid snapshots, the weights [7168];
-    ``ws_*`` from :func:`workspace`. ``x_slab`` (from :func:`slab_tensor`) also receives normed in buffer
+    ``ws_*`` from a :class:`K3SandwichWorkspace`. ``x_slab`` (from :func:`slab_tensor`) also receives normed in buffer
     ``slab_buf``; ``src_slab`` (int32 [3, 8, 384]) supplies core in buffer ``src_buf``."""
     import cuda.bindings.driver as cuda_driver
 
@@ -367,7 +391,10 @@ def supports_tail(
     )
 
 
-@torch.library.custom_op("trtllm::k3_sandwich_tail", mutates_args=("x_slab", "tap", "updated_out"))
+@torch.library.custom_op(
+    "trtllm::k3_sandwich_tail",
+    mutates_args=("ws_uc", "ws_mc", "ws_flags", "x_slab", "lat_uc", "lat_flags", "tap", "updated_out"),
+)
 def k3_sandwich_tail(
     latent: torch.Tensor,
     act: torch.Tensor,
@@ -400,12 +427,12 @@ def k3_sandwich_tail(
     the whole reduced latent row (16-byte aligned: its rows are bulk-copied), ``act`` the shared-expert activation,
     ``tail_weight`` [7168, 256 + 384] the latent up columns of the slice zero-padded to 256 and the shared down
     projection; ``src_slab`` (int32 [3, 8, 1792]) supplies the latent in buffer ``src_buf``; with ``lat_uc`` /
-    ``lat_flags`` (:func:`latent_exchange`) the kernel sums the ranks' pushed partials itself and ``latent`` gives only
-    the shape; with ``tap`` (bf16 [M, 7168], unit column stride, rows a multiple of 8 elements apart, 16-byte aligned:
-    e.g. a column slice of a capture buffer) it also stores there the pre-norm attn_res mixture rows (a DSpark
-    capture layer's tap) or, with ``tap_updated``, ``updated``; with ``updated_out`` (bf16 [M, 7168], contiguous,
-    16-byte aligned, e.g. the next row of the attention-residual snapshot bank, which this call does not read) it stores
-    ``updated`` there instead of a new tensor and returns an empty [0, 7168] in its place; the rest as
+    ``lat_flags`` (a :class:`K3SandwichLatentExchange`) the kernel sums the ranks' pushed partials itself and
+    ``latent`` gives only the shape; with ``tap`` (bf16 [M, 7168], unit column stride, rows a multiple of 8 elements
+    apart, 16-byte aligned: e.g. a column slice of a capture buffer) it also stores there the pre-norm attn_res mixture
+    rows (a DSpark capture layer's tap) or, with ``tap_updated``, ``updated``; with ``updated_out`` (bf16 [M, 7168],
+    contiguous, 16-byte aligned, e.g. the next row of the attention-residual snapshot bank, which this call does not
+    read) it stores ``updated`` there instead of a new tensor and returns an empty [0, 7168] in its place; the rest as
     ``k3_sandwich_oproj``."""
     import cuda.bindings.driver as cuda_driver
 
@@ -536,7 +563,7 @@ def supports_plain(x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor
     )
 
 
-@torch.library.custom_op("trtllm::k3_sandwich_plain", mutates_args=())
+@torch.library.custom_op("trtllm::k3_sandwich_plain", mutates_args=("ws_uc", "ws_mc", "ws_flags"))
 def k3_sandwich_plain(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -553,9 +580,9 @@ def k3_sandwich_plain(
     """``(normed, updated)`` of the row-parallel projection ``x @ weight^T`` followed by the TP all-reduce with the
     residual add and RMSNorm (``AllReduceFusionOp.RESIDUAL_RMS_NORM``): updated = residual + the sum,
     normed = RMSNorm(updated) * norm_weight. ``x`` bf16 [M, K], ``weight`` [7168, K] (K a multiple of 128 up to 896),
-    ``residual`` [M, 7168]; ``ws_*`` from :func:`workspace`. With ``swiglu``, ``x`` is a gate_up output [M, 2 K]
-    (gate columns first) and the projection is ``silu_and_mul(x) @ weight^T`` with ``k3_ctm_gemv_swiglu`` split 2's
-    arithmetic (the drafter MLP's down projection). The arithmetic and summation order are those of the
+    ``residual`` [M, 7168]; ``ws_*`` from a :class:`K3SandwichWorkspace`. With ``swiglu``, ``x`` is a gate_up output
+    [M, 2 K] (gate columns first) and the projection is ``silu_and_mul(x) @ weight^T`` with ``k3_ctm_gemv_swiglu``
+    split 2's arithmetic (the drafter MLP's down projection). The arithmetic and summation order are those of the
     all-reduce kernel the call replaces: the MNNVL one-shot's, or with ``ipc_order`` the IPC one-shot's
     (``allreduce_fusion_kernel_oneshot_lamport`` with fp32 accumulation, TP <= 8 within one node)."""
     import cuda.bindings.driver as cuda_driver

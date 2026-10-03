@@ -88,7 +88,7 @@ def _context():
 
     mapping = Mapping(world_size=world, rank=rank, gpus_per_node=gpus, tp_size=world)
     mnnvl = MNNVLAllReduce(mapping, torch.bfloat16)
-    ex = latent_op.LatentExchange(mapping)
+    ex = latent_op.K3LatentExchange.create(mapping, fabric_handle=True)
     return SimpleNamespace(comm=comm, rank=rank, world=world, mnnvl=mnnvl, ex=ex, count=0)
 
 
@@ -233,8 +233,8 @@ def test_k3_latent_reduce(mpi_pool_executor):
 
 
 def test_latent_exchange_refuses_graph_capture():
-    """The exchange is collective on construction (an MNNVL multicast allocation over the TP group): constructing it
-    under CUDA-graph capture raises instead of entering the collective. One process, a group of one."""
+    """The exchange is created collectively (an MNNVL multicast allocation over the TP group): creating it under
+    CUDA-graph capture raises instead of entering the collective. One process, a group of one."""
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import latent_op
     from tensorrt_llm.mapping import Mapping
@@ -243,7 +243,7 @@ def test_latent_exchange_refuses_graph_capture():
     graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
     with torch.cuda.graph(graph, stream=stream):
         with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
-            latent_op.LatentExchange(mapping)
+            latent_op.K3LatentExchange.create(mapping)
 
 
 def main() -> int:

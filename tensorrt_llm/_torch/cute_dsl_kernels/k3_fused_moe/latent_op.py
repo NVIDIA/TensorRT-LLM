@@ -15,9 +15,9 @@
 """``trtllm::k3_latent_reduce``: the Kimi K3 latent all-reduce at decode size as the consumer of the push-only k3_moe
 (``k3_latent_reduce.py``).
 
-``LatentExchange`` owns a TP group's buffers: the push-only ops (``trtllm::k3_fused_moe_push`` /
-``trtllm::k3_fused_moe_front_push``) store every rank's routed partial into them, and ``trtllm::k3_latent_reduce``
-returns the sum, bit-identical to ``MNNVLAllReduce``'s one-shot of the partials. Each push must be followed by exactly
+A :class:`K3LatentExchange` holds a TP group's buffers; the caller creates it (collectively, before CUDA-graph capture).
+The push-only k3_moe builds store every rank's routed partial into them, and ``trtllm::k3_latent_reduce`` returns the
+sum, bit-identical to ``MNNVLAllReduce``'s one-shot of the partials. Each push must be followed by exactly
 one reduce of the same token count on the same exchange before the next push, on every rank in the same order. A push
 reads the half from the call count after its grid-dependency wait and triggers its dependents only after that wait,
 and the reduce reads the count before its own wait, so every kernel from a reduce to the next push must end only after
@@ -29,7 +29,8 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -52,48 +53,72 @@ def default_ctas(world: int) -> int:
     return 4 if world <= 8 else 14
 
 
-class LatentExchange:
-    """The latent all-reduce buffers of ``mapping``'s TP group: int32 ``[2][8][world][1792]`` per rank behind one
-    multicast mapping, every word ``0x80000000``, and ``flags`` (int32 ``[4]``: the consumer's call count and its
-    CTA arrivals). Collective: every rank of the group constructs it at the same point (outside graph capture).
-    Separate from the MNNVL all-reduce workspace."""
+@dataclass(eq=False)
+class K3LatentExchange:
+    """The latent all-reduce buffers of a TP group: int32 ``[2][8][world][1792]`` per rank behind one multicast
+    mapping, every word ``0x80000000`` (empty), and ``flags`` (int32 ``[4]``: the consumer's call count, whose parity
+    selects the half, and its CTA arrivals). Separate from the MNNVL all-reduce workspace. Pass ``uc`` and ``flags``
+    as ``trtllm::k3_latent_reduce``'s ``lat_uc`` and ``lat_flags``; :meth:`push_args` gives the producers' arguments."""
 
-    def __init__(self, mapping):
+    uc: torch.Tensor
+    """int32 [2 * 8 * world * 1792]: this rank's words."""
+    mc: torch.Tensor
+    """The same words through the multicast mapping (where the producers push)."""
+    flags: torch.Tensor
+    """int32 [4]: [0] the consumer's call count, then its CTA arrivals."""
+    rank: int
+    world_size: int
+    handle: Any
+    """The ``McastGPUBuffer`` that owns the memory; the exchange is valid while this object lives."""
+    comm: Any
+    """The TP-group communicator the handles were exchanged over."""
+
+    @classmethod
+    def create(cls, mapping, fabric_handle: Optional[bool] = None) -> "K3LatentExchange":
+        """Allocate and arm an exchange for ``mapping``'s TP group. Collective: every rank of the group calls it at the
+        same point, eagerly (not under CUDA-graph capture); it returns on every rank or raises on every rank.
+        ``fabric_handle``: share the memory by fabric handle (required across nodes) rather than POSIX file
+        descriptor; default ``mapping.is_multi_node()``."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "K3LatentExchange.create is collective and allocates: call it outside CUDA-graph capture"
+            )
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
             _make_mnnvl_mcast_buffer,
             _mnnvl_workspace_all_succeeded,
         )
 
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Kimi K3 latent exchange buffers must be built outside CUDA-graph capture")
-        self.world = mapping.tp_size
-        self.rank = mapping.tp_rank
-        words = _kernel().buffer_words(self.world)
+        words = _kernel().buffer_words(mapping.tp_size)
+        use_fabric_handle = mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
         comm = _get_mnnvl_workspace_comm(mapping)
-        use_fabric_handle = (
-            os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or mapping.is_multi_node()
-        )
         error: Optional[Exception] = None
+        exchange = None
         try:
-            self.handle = _make_mnnvl_mcast_buffer(comm, words * 4, mapping, use_fabric_handle)
-            self.uc = self.handle.get_uc_buffer(self.rank, (words,), torch.int32, 0)
-            self.mc = self.handle.get_mc_buffer((words,), torch.int32, 0)
-            with torch.inference_mode():
-                self.uc.fill_(EMPTY_WORD)
-                self.flags = torch.zeros(4, dtype=torch.int32, device=self.uc.device)
+            handle = _make_mnnvl_mcast_buffer(comm, words * 4, mapping, use_fabric_handle)
+            uc = handle.get_uc_buffer(mapping.tp_rank, (words,), torch.int32, 0)
+            mc = handle.get_mc_buffer((words,), torch.int32, 0)
+            uc.fill_(EMPTY_WORD)
+            flags = torch.zeros(4, dtype=torch.int32, device=uc.device)
             torch.cuda.synchronize()
+            exchange = cls(
+                uc=uc,
+                mc=mc,
+                flags=flags,
+                rank=mapping.tp_rank,
+                world_size=mapping.tp_size,
+                handle=handle,
+                comm=comm,
+            )
         except Exception as exc:  # noqa: BLE001 -- reported to every rank below, then re-raised
             error = exc
-        # Also the barrier that keeps any rank from pushing into a peer's buffer before the peer has filled it.
+        # Also the barrier that keeps any rank from pushing into a peer's buffer before the peer has emptied it.
         if not _mnnvl_workspace_all_succeeded(comm, error is None):
-            raise RuntimeError(
-                "Kimi K3 latent exchange buffers failed on at least one rank"
-            ) from error
-        self.comm = comm
+            raise RuntimeError("K3LatentExchange: allocation failed on at least one rank") from error
+        return exchange
 
     def push_args(self):
-        """``(ar_uc, ar_mc, ar_flags, ar_rank)`` of the push-only ops."""
+        """``(ar_uc, ar_mc, ar_flags, ar_rank)`` of the push-only producers."""
         return self.uc, self.mc, self.flags, self.rank
 
 
@@ -106,7 +131,7 @@ def k3_latent_reduce(
     lat_uc: torch.Tensor, lat_flags: torch.Tensor, num_tokens: int, ctas_per_token: int = 0
 ) -> torch.Tensor:
     """The latent rows ``[num_tokens, 3584]`` bf16: the sum over the ranks of the routed partials the push-only k3_moe
-    stored into ``lat_uc`` (``LatentExchange.uc``) since the last call, in the MNNVL one-shot's order. Empties the
+    stored into ``lat_uc`` (``K3LatentExchange.uc``) since the last call, in the MNNVL one-shot's order. Empties the
     words it read and advances ``lat_flags``' call count. ``ctas_per_token``: 4, 14 or 28 (0: ``default_ctas``)."""
     import cuda.bindings.driver as cuda_driver
     import cutlass.cute as cute

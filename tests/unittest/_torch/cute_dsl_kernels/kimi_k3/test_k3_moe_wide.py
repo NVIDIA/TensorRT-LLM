@@ -26,7 +26,7 @@ intermediate 768 per rank), at every M in 1..64, for these routings:
 Checks: against the stock path (trtllm::kimi_k3_noaux_tc_mxfp8_quant, then the TRTLLM-Gen W4A8_MXFP4_MXFP8 MoE runner
 with those ids) and an fp64 reference over the dequantized MXFP4 experts (op-catalog gates: 8 ulp of the row max per
 element, 4 ulp relative RMS); run-to-run identical bits; the slab armed and the layer's counters zero after every
-call; at M <= 8, within one bf16 ulp of trtllm::k3_fused_moe (the decode build; bit-identity reported). Then: calls
+call; at M <= 8, within one bf16 ulp of K3MoeLayer (the decode build; bit-identity reported). Then: calls
 of two layers at mixed M on one stream and replayed from a CUDA graph give each call's bits alone; 0 and 65 tokens are
 refused. Weights are random checkpoint-format MXFP4 experts put through TRT-LLM's own loader."""
 
@@ -134,6 +134,16 @@ def _wide():
     state = op.K3MoeWideState(torch.device("cuda", torch.cuda.current_device()), I_TP, E_LOCAL)
     weights = (proc["w31"], proc["w31s"], proc["w2"], proc["w2s"])
     return state, state.layer(*weights), state.layer(*weights)
+
+
+@functools.lru_cache(maxsize=None)
+def _decode_layer():
+    """The same experts as a layer of the M <= 8 decode build (K3MoeState)."""
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op
+
+    proc, _, _ = _experts()
+    state = op.K3MoeState(torch.device("cuda", torch.cuda.current_device()), I_TP, E_LOCAL)
+    return state.layer(proc["w31"], proc["w31s"], proc["w2"], proc["w2s"])
 
 
 _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
@@ -357,8 +367,7 @@ def _check(case, m):
         assert groups == state.mod.G_CAP == 324
     decode = ""
     if m <= 8:
-        y8 = _ops().k3_fused_moe(x, logits, bias, proc["w31"], proc["w31s"], proc["w2"], proc["w2s"], OFFSET,
-                                 E_LOCAL, RSF)  # fmt: skip
+        y8 = _decode_layer()(x, logits, bias, OFFSET, RSF)
         ulp_dec = _max_ulp(y, y8)
         decode = f" max_ulp_vs_decode={ulp_dec} bits_as_decode={torch.equal(_bits(y), _bits(y8))}"
         assert ulp_dec <= 1
