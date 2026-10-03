@@ -35,12 +35,16 @@ _CHECKPOINTS = {
 
 _TARGETS = {
     ("kimi_k3_mxfp4", "tp16_moetp4ep4"): "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4",
+    ("kimi_k3_mxfp4", "tp16_moetp16ep1"): "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1",
 }
 
 # Synthetic architecture name -> the module whose import registers it.
 TARGET_MODULES = {
     "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4": (
         "models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling"
+    ),
+    "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1": (
+        "models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.modeling"
     ),
 }
 
@@ -67,20 +71,25 @@ def _mxfp4(quant_config: Any) -> bool:
 def _parallel(m) -> Optional[str]:
     """Name the parallel topology, or None if no target implements it.
 
-    Attention and the dense layers are sharded 16 ways; the routed experts are
-    split 4 ways by tensor and 4 ways by expert. The expert split decides which
-    expert weights each rank loads and into which shapes, so it selects a
-    target rather than a runtime branch.
+    Attention and the dense layers are sharded 16 ways. The routed experts are
+    split either 4 ways by tensor and 4 ways by expert, or 16 ways by tensor
+    with every expert on every rank. The expert split decides which expert
+    weights each rank loads and into which shapes, so it selects a target
+    rather than a runtime branch.
+
+    The 16-way tensor split counts only when the configuration asks for it. A
+    mapping with no expert split resolves to the same sizes, but the built-in
+    Kimi K3 model reads that default as expert parallelism over the 16 ranks
+    (`moe_tp_ep_user_specified`), and so does this tree: no target serves it.
     """
-    if (
-        m.world_size == 16
-        and m.tp_size == 16
-        and m.pp_size == 1
-        and m.moe_tp_size == 4
-        and m.moe_ep_size == 4
-        and not m.enable_attention_dp
+    if not (
+        m.world_size == 16 and m.tp_size == 16 and m.pp_size == 1 and not m.enable_attention_dp
     ):
+        return None
+    if m.moe_tp_size == 4 and m.moe_ep_size == 4:
         return "tp16_moetp4ep4"
+    if m.moe_tp_size == 16 and m.moe_ep_size == 1 and getattr(m, "moe_tp_ep_user_specified", False):
+        return "tp16_moetp16ep1"
     return None
 
 
@@ -114,7 +123,8 @@ def route(ctx: ModelingV2Context, trace: Trace = NULL_TRACE) -> Optional[str]:
     parallel = trace.resolve(
         "parallel",
         f"ws={m.world_size} tp={m.tp_size} pp={m.pp_size} moe_tp={m.moe_tp_size} "
-        f"moe_ep={m.moe_ep_size} attention_dp={m.enable_attention_dp}",
+        f"moe_ep={m.moe_ep_size} split_set={getattr(m, 'moe_tp_ep_user_specified', False)} "
+        f"attention_dp={m.enable_attention_dp}",
         _parallel(m),
     )
     if parallel is None:
