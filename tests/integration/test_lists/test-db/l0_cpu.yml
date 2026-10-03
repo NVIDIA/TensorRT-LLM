@@ -39,6 +39,8 @@ l0_cpu:
   # runs -m cpu_only, so this entry contributes only the 3 marked files under attention/.
   - unittest/_torch/attention
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
+  # Kimi K3 MLA decode view from the attention metadata: every test is cpu_only (CPU tensors).
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_decode_view.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
   - unittest/_torch/distributed
@@ -48,6 +50,8 @@ l0_cpu:
   - unittest/_torch/peft
   - unittest/_torch/memory
   - unittest/_torch/modeling
+  # l0_b300 selects unittest/_torch/modeling_v2 with -m "not cpu_only", so this entry is what runs it.
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_step.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
