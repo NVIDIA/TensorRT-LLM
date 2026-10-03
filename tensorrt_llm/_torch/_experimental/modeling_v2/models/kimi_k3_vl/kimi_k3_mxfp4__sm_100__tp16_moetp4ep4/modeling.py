@@ -42,10 +42,12 @@ decode kernels' catalog entries:
 The projections around them run on the decode GEMV sites of `decode_gemv.py` (the [W_a; W_g] and KDA verify-row
 projections, `o_proj` on every classified step), as do the LM head, the embedding and layer 0's dense MLP. A
 classified step's attention-residual epilogues (the selection and the RMSNorm after it) take the fused kernels up to
-one token tile, 32 tokens on a wide decode step. The state those kernels share (the KDA projection's Lamport buffers,
-the MLA attention workspace, the decode GEMVs' state) lives in typed objects this target creates in
-`post_load_weights`, before any graph capture. The MoE front and routed experts and the sandwiches come with their
-own entries; until then they run the generic path on every step.
+one token tile, 32 tokens on a wide decode step. On any step of at most 16 tokens but a wide one, the post-attention
+all-reduce carries the residual update in its epilogue (`decode_comm.py`, on `comm/mnnvl_allreduce_attn_res`). The
+state those kernels share (the KDA projection's Lamport buffers, the MLA attention workspace, the decode GEMVs' state,
+the TP group's MNNVL workspace) lives in typed objects this target creates in `post_load_weights`, before any graph
+capture. The MoE front and routed experts and the sandwiches come with their own entries; until then they run the
+generic path on every step.
 
 **What this target asserts rather than adapts**: SM 10.0; the topology above; the MXFP4 checkpoint's quantization
 (W4A16_MXFP4 with no per-layer declarations, so the routed experts run the W4A8_MXFP4_MXFP8 default and the excluded
@@ -119,6 +121,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
+from . import decode_comm as _decode_comm
 from . import decode_gemv as _decode_gemv
 from . import weights as _weights
 
@@ -156,6 +159,8 @@ REQUIRED_TRTLLM_OPS = (
     "k3_head_gemv",
     "k3_embed_norm",
     "allgather",
+    # The decode path's collectives (decode_comm.py).
+    "mnnvl_allreduce_attn_res",
 )
 
 #: The engine surface the first forward checks before this target relies on it: per object, the attributes read.
@@ -1417,6 +1422,8 @@ class KimiLinearDecoderLayer(nn.Module):
         self.mlp_res_norm = KimiK3RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps, dtype=dtype)
         self.self_attention_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False, dtype=dtype)
         self.mlp_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False, dtype=dtype)
+        # The decode path's collectives (decode_comm.py), set by the target's post_load_weights.
+        self.decode_comm: Optional[_decode_comm.K3DecodeComm] = None
 
     def forward(
         self,
@@ -1447,6 +1454,11 @@ class KimiLinearDecoderLayer(nn.Module):
         ``prenormed`` (layer 0 on a decode step): ``hidden_states`` already is
         this layer's input norm, and the layer's input, the step's embedding,
         already is in ``block_residual[0]`` (``K3DecodeGemvs.embed_norm``).
+
+        The post-attention step of at most ``AR_ATTN_RES_MAX_TOKENS`` tokens
+        runs the attention's all-reduce and the residual update in one
+        collective (``K3DecodeComm.allreduce_attn_res``) once the target has
+        built its ``decode_comm``.
         """
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
@@ -1489,13 +1501,20 @@ class KimiLinearDecoderLayer(nn.Module):
             num_snapshots += 1
             valid_block_residual = block_residual[:num_snapshots]
             prefix_sum = None
-        if self.is_kda:
-            hidden_states = self.linear_attn(hidden_states, attn_metadata, step=step)
-        else:
-            hidden_states = self.self_attn(hidden_states, attn_metadata, step=step)
-
-        if prefix_sum is None:
-            prefix_sum = hidden_states
+        attention = self.linear_attn if self.is_kda else self.self_attn
+        comm = self.decode_comm
+        if comm is not None and comm.takes_post_attention(hidden_states, step):
+            partial = attention(hidden_states, attn_metadata, step=step, reduce_output=False)
+            hidden_states, prefix_sum = comm.allreduce_attn_res(
+                partial,
+                prefix_sum,
+                valid_block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+            )
+        elif prefix_sum is None:
+            prefix_sum = attention(hidden_states, attn_metadata, step=step)
             hidden_states = _apply_attn_res_and_rmsnorm(
                 prefix_sum,
                 valid_block_residual,
@@ -1507,7 +1526,7 @@ class KimiLinearDecoderLayer(nn.Module):
         else:
             prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
                 prefix_sum,
-                hidden_states,
+                attention(hidden_states, attn_metadata, step=step),
                 valid_block_residual,
                 self.mlp_res_proj,
                 self.mlp_res_norm,
@@ -2349,8 +2368,10 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
 
     def post_load_weights(self) -> None:
         """The state the decode kernels share, built once per device before any CUDA-graph capture and handed to
-        every layer of its kind: the KDA projection's Lamport buffers and the MLA decode attention's workspace; and
-        the decode GEMVs' state (built by ``cache_derived_state``) handed to every attention module."""
+        every layer of its kind: the KDA projection's Lamport buffers and the MLA decode attention's workspace; the
+        decode GEMVs' state (built by ``cache_derived_state``) handed to every attention module; and, where every
+        attention all-reduce runs over MNNVL, the TP group's collective state (``K3DecodeComm``, collective: every
+        rank builds it here) handed to every layer."""
         super().post_load_weights()
         kda = [layer.linear_attn for layer in self.model.layers if layer.is_kda]
         mla = [layer.self_attn.mixer for layer in self.model.layers if not layer.is_kda]
@@ -2365,10 +2386,21 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
             module.k3_workspace = workspace
         for module in kda + mla:
             module.decode_gemvs = self.model.decode_gemvs
+        comm = None
+        if all(layer._mnnvl_allreduce() is not None for layer in self.model.layers):
+            comm = _decode_comm.K3DecodeComm.create(self.model_config.mapping)
+            for layer in self.model.layers:
+                layer.decode_comm = comm
         logger.info(
             "Kimi K3 decode kernels: KDA on k3_kda_decode_attn, k3_kda_attn and k3_kda_verify "
             f"({sum(m.takes_k3_kernels for m in kda)} / {len(kda)} layers take them), MLA on k3_mla_qkv and "
-            f"k3_mla_attn_vb_out ({len(mla)} layers)"
+            f"k3_mla_attn_vb_out ({len(mla)} layers); the post-attention all-reduce of at most "
+            f"{_decode_comm.AR_ATTN_RES_MAX_TOKENS} tokens "
+            + (
+                "with the residual update (mnnvl_allreduce_attn_res)"
+                if comm is not None
+                else "unfused (an attention all-reduce does not run over MNNVL)"
+            )
         )
 
     def _check_step_contract(self, attn_metadata: AttentionMetadata) -> None:
