@@ -407,7 +407,6 @@ l0_b200:
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_kda_verify.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_attn.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_q.py
-  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_decode_view.py
   - unittest/_torch/modeling_v2/ssm
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_mla_qkv.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_mla_attn_vb_out.py
