@@ -28,8 +28,19 @@ import pytest
 
 # Kernel module -> the barriers in it that other CTAs complete with st.async.
 MAILBOXES = {
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_kda_attn.k3_kda_attn_kernel": ("mbox_bar", "ss_ready"),
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_kda_attn.k3_kda_decode_kernel": ("ss_ready",),
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_kda_verify.k3_kda_verify_kernel": ("ss_ready",),
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_drafter.k3_drafter_attn_kernel": ("mail_full",),
     "tensorrt_llm._torch.cute_dsl_kernels.k3_ctm_gemv.k3_ctm_gemv_kernel": ("mail_full",),
     "tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.k3_moe_front": ("mail_full",),
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_mla.k3_mla_attn_kernel": ("ml_full",),
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_mla.k3_mla_q_kernel": (
+        "qn_full",
+        "norm_full",
+        "kb_full",
+        "mail_full",
+    ),
     # rms_full: stage 0 only (filled by the cluster CTAs' st.async pushes); its other stages are completed by this
     # CTA's own arrive or bulk copy.
     "tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich.k3_sandwich_kernel": (
@@ -43,9 +54,11 @@ MAILBOXES = {
         "mb_sq",
     ),
 }
-# Kernel module -> the header of the blocks whose mailbox waits are on this CTA's own arrival and keep CTA scope (a
-# kernel that arrives on its mailbox itself and acquires the other CTAs' data through a counter).
-OWN_ARRIVAL = {}
+# Kernel module -> the header of the blocks whose mailbox waits are on this CTA's own arrival and keep CTA scope
+# (k3_mla_attn's no_cluster mode arrives on ml_full itself and acquires the other CTAs' (m, l) through a counter).
+OWN_ARRIVAL = {
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_mla.k3_mla_attn_kernel": r"if cutlass\.const_expr\(no_cluster\):",
+}
 CTA_WAIT = re.compile(r"mbarrier_(test|try)_wait\(")
 CLUSTER_WAIT = re.compile(r"_(test|try)_wait_cluster\(")
 
