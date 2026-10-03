@@ -39,6 +39,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
     _decode_chunk_slices,
     _fp4_align_input_channels,
     _fp4_align_output_channels,
+    _fp4_cta_tile_k,
     _supports_nvfp4_conv3d,
     _supports_nvfp4_device,
     swap_wan_convs_to_fp4,
@@ -525,7 +526,23 @@ def test_fp4_input_channel_alignment(channels, expected):
 
 @pytest.mark.parametrize(
     ("channels", "expected"),
-    [(3, 8), (8, 8), (96, 96), (129, 256), (257, 512), (512, 512)],
+    [
+        (64, 64),
+        (96, 128),
+        (128, 128),
+        (192, 256),
+        (256, 256),
+        (384, 256),
+        (512, 256),
+    ],
+)
+def test_fp4_cta_tile_k(channels, expected):
+    assert _fp4_cta_tile_k(channels) == expected
+
+
+@pytest.mark.parametrize(
+    ("channels", "expected"),
+    [(3, 8), (8, 8), (96, 96), (129, 136), (257, 264), (512, 512)],
 )
 def test_fp4_output_channel_alignment(channels, expected):
     assert _fp4_align_output_channels(channels) == expected
