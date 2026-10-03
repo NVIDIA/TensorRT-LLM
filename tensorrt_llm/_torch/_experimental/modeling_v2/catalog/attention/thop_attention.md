@@ -1,6 +1,7 @@
 ---
 receipts:
   sm_103: {status: passed, tests: 47}
+  sm_100: {status: passed, tests: 49}
 ---
 
 # thop_attention
@@ -1942,3 +1943,12 @@ plays for the registered-layer entry points.)
   context flow), and the split-phase trtllm-gen bindings
   `thop.trtllm_gen_context_preprocess` / `thop.trtllm_gen_generation_preprocess`
   / `thop.trtllm_gen_context_postprocess`.
+- Kimi K3's MLA prefill calls it: bf16 latent pool, page 64, heads 6 / 12 / 24 / 96, `q_lora_rank` 1536, `q_scaling`
+  1.0, `position_embedding_type` 2 and its NoPE table (every (cos, sin) pair (1, 0)), in the fresh-prefill and the
+  cached-KV (no-append) context flavors: `test_kimi_k3_mla_context_bf16_page64`. So do its MLA decode steps above
+  the fused decode kernels' bounds: generation over the bf16 pool with 1 query row per request, or 8 (DSpark's token
+  plus 7 drafts), at 6 heads per rank (TP16 attention, both Kimi K3 targets) and 96 (one rank):
+  `test_kimi_k3_mla_generation_bf16_page64`. At 24 heads per rank (TP4) the trtllm-gen FMHA kernel selection
+  raises `RuntimeError: Internal error numHeadsQ=24, numHeadsPerCta=16, numCtasForAllHeads=1` for these calls, so
+  the cell does not take that head count. The sm_100 receipt covers the whole file (49 tests); the sm_103 receipt
+  predates the two Kimi K3 cells and covers the other 47.
