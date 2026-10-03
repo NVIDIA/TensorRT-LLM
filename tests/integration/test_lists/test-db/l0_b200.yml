@@ -160,6 +160,8 @@ l0_b200:
   - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_head_gemv.py
   # The Kimi K3 target's decode GEMVs, LM head and embedding on those entries.
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_gemv.py
+  # The Kimi K3 target's DSpark drafter on the drafter entries, against the stock block forward.
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_drafter.py
   # KDA runtime: host-derived prefill metadata and the bf16 state pool
   # round-trip. Both are single-device cases that use GPU 0 only.
   - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
