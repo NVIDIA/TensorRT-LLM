@@ -25,6 +25,12 @@ Covers the two classes of bug that ordinary op-math parity tests cannot see:
    against FLA. ``test_repeated_single_sequence_metadata_matches_fla``
    additionally covers the Phase 2.1 poisoning case (same cu_seqlens object,
    two calls).
+
+3. Scratch lifetime under the runtime's new-batch-shape-per-call pattern.
+   ``_buf_cache`` is LRU-bounded; anything outside an entry that keeps its
+   scratch alive (e.g. a module-level cache of CuTe wrappers) leaks a whole
+   entry per new shape until CUDA OOM under serving load.
+   ``test_evicted_prefill_scratch_is_released`` checks that evictions free it.
 """
 
 import gc
@@ -270,3 +276,30 @@ def test_repeated_single_sequence_metadata_matches_fla(
         )
         assert_kda_close(f"iteration_{iteration}/output", actual_output, expected_output)
         assert_kda_close(f"iteration_{iteration}/state", actual_state, expected_state)
+
+
+@torch.no_grad()
+def test_evicted_prefill_scratch_is_released(
+    dispatch_pair: tuple[KDAKernelDispatch, KDAKernelDispatch],
+    gate_params: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """Scratch evicted from the LRU-bounded ``_buf_cache`` is freed, not pinned."""
+    optimized, _ = dispatch_pair
+    module = _op_module()
+    new_shapes = 2 * module._BUF_CACHE_MAX_ENTRIES
+
+    def prefill_new_shapes(start: int) -> None:
+        for i in range(start, start + new_shapes):
+            lengths = [97 + 64 * i, 151]  # a new total token count -> a new _buf_cache entry
+            inputs = _make_inputs(sum(lengths), seed=70 + i)
+            run_indexed_prefill(optimized, gate_params, inputs, _make_cu_seqlens(lengths))
+        torch.cuda.synchronize()
+        gc.collect()
+
+    prefill_new_shapes(0)  # saturate every shape-keyed LRU cache
+    live_before = torch.cuda.memory_stats()["active.all.current"]
+    prefill_new_shapes(new_shapes)  # from here on, every call evicts an entry
+    live_after = torch.cuda.memory_stats()["active.all.current"]
+    assert live_after - live_before < 8, (
+        f"{live_after - live_before} CUDA allocations stayed alive across {new_shapes} evictions"
+    )
