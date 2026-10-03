@@ -247,4 +247,6 @@ A caller violating none of the above gets the result described under
   (DeepSeekV3) path, which is a different code path from this op. Catalog
   membership is `index.yaml`'s fact alone.
 - Kimi K3's routed experts route through it above 64 tokens: 896 experts, top-16, one group, `routed_scaling_factor`
-  1.0, fp32 logits and bias, at 1 to 8192 tokens: `test_kimi_k3_config`.
+  1.0, fp32 logits and bias, at 1 to 8192 tokens: `test_kimi_k3_config`. The cell passes on sm_100, where
+  `test_input_not_mutated_and_deterministic` fails after `test_degenerate_shapes` (the pending launch error above),
+  so the entry has no sm_100 receipt; the sm_103 receipt predates the cell and covers the other 16.

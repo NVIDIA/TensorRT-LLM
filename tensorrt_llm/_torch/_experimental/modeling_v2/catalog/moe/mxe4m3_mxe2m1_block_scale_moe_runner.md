@@ -1,6 +1,7 @@
 ---
 receipts:
   sm_103: {status: passed, tests: 18}
+  sm_100: {status: passed, tests: 19}
 ---
 
 # mxe4m3_mxe2m1_block_scale_moe_runner
@@ -487,7 +488,8 @@ A caller violating none of the above gets the result described under
 - Kimi K3's routed experts run on it: 224 of 896 experts per rank (the expert window at global id 448), hidden 3584,
   intermediate 768 per rank, top-16 pre-routed ids, SiTu (`act_type` 3) with its caps (gate 4.0 in `gemm1_alpha`,
   linear 25.0 in `gemm1_beta`), no biases, no clamp, `routing_method_type` 2 with one group, at 1 to 512 tokens. The
-  test's reference adds SiTu (`act="situ"`): `test_kimi_k3_situ_expert_window`.
+  test's reference adds SiTu (`act="situ"`): `test_kimi_k3_situ_expert_window`. The sm_100 receipt covers the whole
+  file (19 tests); the sm_103 receipt predates that cell and covers the other 18.
 
 
 ## The FC1 epilogue's block-scale recipe

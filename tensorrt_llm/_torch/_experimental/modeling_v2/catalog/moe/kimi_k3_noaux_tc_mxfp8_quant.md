@@ -1,5 +1,6 @@
 ---
-receipts: {}
+receipts:
+  sm_100: {status: passed, tests: 6}
 ---
 
 # kimi_k3_noaux_tc_mxfp8_quant

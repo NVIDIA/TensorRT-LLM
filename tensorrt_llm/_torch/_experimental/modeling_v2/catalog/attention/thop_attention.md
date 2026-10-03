@@ -1944,4 +1944,7 @@ plays for the registered-layer entry points.)
   / `thop.trtllm_gen_context_postprocess`.
 - Kimi K3's MLA prefill calls it: bf16 latent pool, page 64, heads 6 / 12 / 24 / 96, `q_lora_rank` 1536, `q_scaling`
   1.0, `position_embedding_type` 2 and its NoPE table (every (cos, sin) pair (1, 0)), in the fresh-prefill and the
-  cached-KV (no-append) context flavors: `test_kimi_k3_mla_context_bf16_page64`.
+  cached-KV (no-append) context flavors: `test_kimi_k3_mla_context_bf16_page64`. The cell passes on sm_100, but
+  28 of the file's other cells fail there at XQA's Jitify (21, "Uninitialized") or at the NVRTC compilation of
+  trtllm-gen generation kernels (7), so the entry has no sm_100 receipt; the sm_103 receipt predates the cell and
+  covers the other 47.

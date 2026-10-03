@@ -1,6 +1,7 @@
 ---
 receipts:
   sm_103: {status: passed, tests: 6}
+  sm_100: {status: passed, tests: 7}
 ---
 
 # mla_rope_append_paged_kv_assign_q
@@ -372,4 +373,5 @@ supported for now`. **NVFP4 is accepted by the op but not certified here** —
 no cell in this entry's test drives it, so it stays outside the envelope.
 - Kimi K3's MLA context append: bf16 latent pool, page 64, heads 6 / 12 / 24 / 96, its NoPE table, cached prefixes on
   a fresh page, a page boundary, mid-page and at position 1000, a trailing generation sequence; latent_cache and the
-  appended rows bit-exact, q as the file's other cells check it: `test_kimi_k3_bf16_page64_identity_rope`.
+  appended rows bit-exact, q as the file's other cells check it: `test_kimi_k3_bf16_page64_identity_rope`. The sm_100 receipt covers the whole file (7
+  tests); the sm_103 receipt predates that cell and covers the other 6.

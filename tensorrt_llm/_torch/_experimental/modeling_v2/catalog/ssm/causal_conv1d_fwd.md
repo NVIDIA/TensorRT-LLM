@@ -1,5 +1,6 @@
 ---
-receipts: {}
+receipts:
+  sm_100: {status: passed, tests: 7}
 ---
 
 # causal_conv1d_fwd

@@ -1,6 +1,7 @@
 ---
 receipts:
   sm_103: {status: passed, tests: 15}
+  sm_100: {status: passed, tests: 16}
 ---
 
 # mla_rope_generation
@@ -425,4 +426,5 @@ matches what the in-tree caller passes on the same path.
 | `quant_scale_qkv` | `None` | `q_nope` in `quant_q_buffer` is not pre-quantized. |
 - Kimi K3's MLA decode preprocessing: bf16 latent pool (`quant_mode` 0, every fp8 buffer None), page 64, heads 6 / 12
   / 24 / 96, `q_lora_rank` 1536, a strided `q_pe`, its NoPE table, P = 1, a leading context sequence; the outputs and
-  the appended rows are bit-exact copies: `test_kimi_k3_bf16_page64_identity_rope`.
+  the appended rows are bit-exact copies: `test_kimi_k3_bf16_page64_identity_rope`. The sm_100 receipt covers the
+  whole file (16 tests); the sm_103 receipt predates that cell and covers the other 15.

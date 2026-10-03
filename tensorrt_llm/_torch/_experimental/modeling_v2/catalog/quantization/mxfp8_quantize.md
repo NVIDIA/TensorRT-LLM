@@ -172,4 +172,6 @@ None. Stateless — no runtime, attention metadata, or workspace.
 - The op allocates both outputs itself: it is functional, with no `out=`
   parameter and no in-place mode.
 - Kimi K3's routed experts quantize their latent hidden through it above 64 tokens: K 3584 (7 x 512, no padding),
-  linear scales, alignment 512, at 1 to 8192 rows: `test_kimi_k3_routed_hidden`.
+  linear scales, alignment 512, at 1 to 8192 rows: `test_kimi_k3_routed_hidden`. The cell passes on sm_100, where
+  `test_input_not_mutated` fails after `test_zero_rows` (the pending launch error above), so the entry has no sm_100
+  receipt; the sm_103 receipt predates the cell and covers the other 12.

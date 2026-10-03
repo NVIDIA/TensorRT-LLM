@@ -1,5 +1,6 @@
 ---
-receipts: {}
+receipts:
+  sm_100: {status: passed, tests: 6}
 ---
 
 # rms_norm_gated_token_major
