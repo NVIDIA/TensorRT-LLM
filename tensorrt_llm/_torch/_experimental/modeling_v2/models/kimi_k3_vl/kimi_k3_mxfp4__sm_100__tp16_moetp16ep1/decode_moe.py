@@ -7,8 +7,8 @@
 
 * `moe/k3_moe_front`, one kernel: this rank's slice of the MoE head (its latent-down rows and its router rows) as one
   GEMV, the slices' all-gather over the TP group's `K3MoeHeadWorkspace`, the top-16 routing, the MXFP8 latent, and
-  the shared experts' gate_up + SiTU. The routing is the noaux_tc arithmetic of `moe/kimi_k3_noaux_tc_mxfp8_quant`;
-  the generic path's TRTLLM-Gen MoE routes inside its own kernel, so a near-tie can select another expert there;
+  the shared experts' gate_up + SiTU. The routing is the noaux_tc arithmetic of `moe/kimi_k3_noaux_tc_mxfp8_quant`,
+  as the generic path's (`KimiK3MoeRoutingMethod`), on the router logits of the front's head GEMV;
 * the routed experts of all 896 experts over this rank's intermediate slice: `moe/k3_moe_m1` at one token,
   `moe/k3_moe_m2` at two, `moe/k3_moe` (on a `K3MoeState`) at three to eight;
 * the latent all-reduce. On a pushing step (`DecodeStep.latent_push`: a pure decode step captured into a CUDA graph

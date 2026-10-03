@@ -28,7 +28,8 @@ Every other step (prefill, mixed steps, decode steps above those bounds) runs th
 text model (`KimiLinearModel` below: decoder layers, attention residuals, the MLA / KDA / MoE runtimes), computed as
 the built-in Kimi K3 text model computes it, on stock modules and ops that have no catalog entries yet. One weight
 differs: where the MoE decode path takes a layer, its latent norm's weight is folded into the latent up projection
-(the same function, rounded differently). `UNCERTIFIED_GENERIC_CALLS` names the stock code.
+(the same function, rounded differently). And the routed experts' top-16 is computed outside the TRTLLM-Gen kernel
+(`KimiK3MoeRoutingMethod`), with the kernel's arithmetic. `UNCERTIFIED_GENERIC_CALLS` names the stock code.
 
 The text model hands each step's classification to its attention modules, which run a **decode step** on the K3
 decode kernels' catalog entries:
@@ -284,6 +285,21 @@ _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
 _KIMI_K3_MLA_MAX_POSITIONS_ENV = "KIMI_K3_MLA_MAX_POSITIONS"
 
 
+class KimiK3MoeRoutingMethod(DeepSeekV3MoeRoutingMethod):
+    """DeepSeek-V3 routing, computed outside the TRTLLM-Gen MoE kernel.
+
+    The kernel's own top-16 of 896 experts is the slow part of a generic MoE call of a few tokens. Outside it, the
+    scheduler routes with the backend's fused route + MXFP8 quantize (``trtllm::k3_route_quant``) up to 64 tokens and
+    with ``noaux_tc_op`` above, and the kernel takes the expert ids and weights. Both compute the kernel's arithmetic
+    and break ties the same way; a bf16 weight can differ by one ulp where it lies within fp32 rounding of a bf16
+    rounding boundary. From about a thousand tokens on, ``noaux_tc_op`` takes longer than the kernel's routing.
+    """
+
+    @property
+    def requires_separated_routing(self) -> bool:
+        return True
+
+
 class KimiK3MoEGate(nn.Module):
     """Kimi K3 gate weights and routing method for ``ConfigurableMoE``."""
 
@@ -336,15 +352,15 @@ class KimiK3MoEGate(nn.Module):
         )
 
     @property
-    def routing_method(self) -> DeepSeekV3MoeRoutingMethod:
-        """Return the shared DeepSeek-V3 router used by ``ConfigurableMoE``."""
+    def routing_method(self) -> KimiK3MoeRoutingMethod:
+        """Return the DeepSeek-V3 router used by ``ConfigurableMoE``, computed outside the kernel."""
         if self.moe_router_activation_func != "sigmoid":
             raise ValueError("Kimi K3 ConfigurableMoE routing requires sigmoid scores.")
         if not self.moe_renormalize:
             raise ValueError(
                 "Kimi K3 ConfigurableMoE routing requires top-k weight renormalization."
             )
-        return DeepSeekV3MoeRoutingMethod(
+        return KimiK3MoeRoutingMethod(
             top_k=self.top_k,
             n_group=self.num_expert_group,
             topk_group=self.topk_group,

@@ -29,9 +29,10 @@ classification decides which kernels each module runs:
   request has one token. The request-aware kernels take it: MLA attention and its KV store.
 
 Every other step (prefill, mixed steps, decode steps above those bounds) runs the **generic path**: this target's
-text model (`KimiLinearModel` below: decoder layers, attention residuals, the MLA / KDA / MoE runtimes), computed
-exactly as the built-in Kimi K3 text model computes it, on stock modules and ops that have no catalog entries yet.
-`UNCERTIFIED_GENERIC_CALLS` names them.
+text model (`KimiLinearModel` below: decoder layers, attention residuals, the MLA / KDA / MoE runtimes), computed as
+the built-in Kimi K3 text model computes it, on stock modules and ops that have no catalog entries yet
+(`UNCERTIFIED_GENERIC_CALLS` names them), except that the routed experts' top-16 is computed outside the TRTLLM-Gen
+kernel (`KimiK3MoeRoutingMethod`), with the kernel's arithmetic.
 
 The text model hands each step's classification to its attention modules, which run a **decode step** on the K3
 decode kernels' catalog entries:
@@ -56,9 +57,10 @@ A MoE layer on a step of at most 8 tokens runs `decode_moe.py` with every expert
 then the routed experts as `moe/k3_moe_m1` at one token, `moe/k3_moe_m2` at two and `moe/k3_moe` over all 896 experts
 up to 8, the latent all-reduce and the row-parallel tail. On a pushing step (`DecodeStep.latent_push`) the engines
 push their partials into the TP group's `K3LatentExchange` and `comm/k3_latent_reduce` sums them; other steps use the
-routed experts' all-reduce, which sums in the same order. Its routing is the front's (the noaux_tc arithmetic), not
-the generic path's TRTLLM-Gen routing. Wider steps, and every step of a checkpoint whose SiTU caps differ from the ones
-the engines compile in, run the generic path: `k3_moe`'s wide build does not fit 896 local experts.
+routed experts' all-reduce, which sums in the same order. Its routing is the front's: the noaux_tc arithmetic, as on
+the generic path, on the router logits of the front's head GEMV. Wider steps, and every step of a checkpoint whose
+SiTU caps differ from the ones the engines compile in, run the generic path: `k3_moe`'s wide build does not fit 896
+local experts.
 
 **What this target asserts rather than adapts**: SM 10.0; the topology above, with the expert split set explicitly;
 no speculative decoding; the MXFP4 checkpoint's quantization (W4A16_MXFP4 with no per-layer declarations, so the
@@ -289,6 +291,21 @@ _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
 _KIMI_K3_MLA_MAX_POSITIONS_ENV = "KIMI_K3_MLA_MAX_POSITIONS"
 
 
+class KimiK3MoeRoutingMethod(DeepSeekV3MoeRoutingMethod):
+    """DeepSeek-V3 routing, computed outside the TRTLLM-Gen MoE kernel.
+
+    The kernel's own top-16 of 896 experts is the slow part of a generic MoE call of a few tokens. Outside it, the
+    scheduler routes with the backend's fused route + MXFP8 quantize (``trtllm::k3_route_quant``) up to 64 tokens and
+    with ``noaux_tc_op`` above, and the kernel takes the expert ids and weights. Both compute the kernel's arithmetic
+    and break ties the same way; a bf16 weight can differ by one ulp where it lies within fp32 rounding of a bf16
+    rounding boundary. From about a thousand tokens on, ``noaux_tc_op`` takes longer than the kernel's routing.
+    """
+
+    @property
+    def requires_separated_routing(self) -> bool:
+        return True
+
+
 class KimiK3MoEGate(nn.Module):
     """Kimi K3 gate weights and routing method for ``ConfigurableMoE``."""
 
@@ -341,15 +358,15 @@ class KimiK3MoEGate(nn.Module):
         )
 
     @property
-    def routing_method(self) -> DeepSeekV3MoeRoutingMethod:
-        """Return the shared DeepSeek-V3 router used by ``ConfigurableMoE``."""
+    def routing_method(self) -> KimiK3MoeRoutingMethod:
+        """Return the DeepSeek-V3 router used by ``ConfigurableMoE``, computed outside the kernel."""
         if self.moe_router_activation_func != "sigmoid":
             raise ValueError("Kimi K3 ConfigurableMoE routing requires sigmoid scores.")
         if not self.moe_renormalize:
             raise ValueError(
                 "Kimi K3 ConfigurableMoE routing requires top-k weight renormalization."
             )
-        return DeepSeekV3MoeRoutingMethod(
+        return KimiK3MoeRoutingMethod(
             top_k=self.top_k,
             n_group=self.num_expert_group,
             topk_group=self.topk_group,
