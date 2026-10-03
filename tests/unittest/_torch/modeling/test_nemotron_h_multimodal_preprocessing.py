@@ -117,6 +117,22 @@ def test_tiler_accepts_valid_params():
             18,
             id="landscape",
         ),
+        pytest.param(
+            (65536, 16),
+            256,
+            256,
+            (128, 2),
+            64,
+            id="panoramic_wide",
+        ),
+        pytest.param(
+            (16, 65536),
+            256,
+            256,
+            (2, 128),
+            64,
+            id="panoramic_tall",
+        ),
     ],
 )
 def test_process_media(img_size, budget, min_patches, expected_ps, expected_emb):
@@ -157,6 +173,21 @@ def test_compute_params_over_budget_scales_down():
     # After pixel-shuffle, the budget is scaled up by 4, so total token_count <= 50*4
     # but num_embeddings = token_count / 4, so num_embeddings <= 50.
     assert total_emb <= 50
+
+
+@pytest.mark.parametrize("img_size", [(65536, 16), (16, 65536)])
+@pytest.mark.parametrize("budget", [64, 256])
+def test_compute_params_panoramic_images(img_size, budget):
+    tiler = make_tiler(patch_size=16)
+    img = Image.new("RGB", img_size)
+    result = tiler.compute_params([img], num_tokens_available=budget)
+    assert len(result) == 1
+    params = result[0]
+    assert params.patch_size[0] >= 2
+    assert params.patch_size[1] >= 2
+    assert params.patch_size[0] % 2 == 0
+    assert params.patch_size[1] % 2 == 0
+    assert params.patch_size[0] * params.patch_size[1] <= budget * 4
 
 
 def test_compute_params_raises_on_unconvergeable():
