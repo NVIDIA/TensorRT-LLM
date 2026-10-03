@@ -97,6 +97,7 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModel, register_aut
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.kimi_k3_mla import KimiK3MLAAttention
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
+from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import maybe_bcg_kda_core_inplace
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.situ import SituAndMul
@@ -179,6 +180,7 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.models.modeling_utils.DecoderModel",
     # The text model's stock modules.
     "tensorrt_llm._torch.modules.kimi_kda.KimiKDALinearAttention",
+    "tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer.maybe_bcg_kda_core_inplace",
     "tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops",
     "tensorrt_llm._torch.modules.kimi_k3_mla.KimiK3MLAAttention",
     "tensorrt_llm._torch.moe.fused_moe.create_moe",
@@ -1751,7 +1753,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
         self, attn_metadata: AttentionMetadata, step: Optional[DecodeStep]
     ) -> bool:
         """Whether ``forward`` runs ``step`` on the decode branch: a step ``decode_step`` classifies, outside a
-        breakable CUDA graph. Only there does it return the unreduced ``o_proj`` output or the core."""
+        breakable CUDA graph."""
         return step is not None and not is_in_breakable_cuda_graph()
 
     def forward(
@@ -1766,14 +1768,13 @@ class K3DecodeKDA(KimiKDALinearAttention):
         on ``ssm/k3_kda_decode_attn`` on a decode step of one token per request, else the built-in dispatch; then
         ``o_proj`` on its decode GEMV site and the TP all-reduce.
 
-        On the decode branch only: ``reduce_output=False`` returns ``o_proj``'s TP partial (no all-reduce), and
+        On every path, ``reduce_output=False`` returns ``o_proj``'s TP partial (no all-reduce), and
         ``project_output=False`` the post-o_norm core ``[N, H * 128]`` (no ``o_proj``)."""
         if not self.will_run_decode_branch(attn_metadata, step):
-            if not (reduce_output and project_output):
-                raise ValueError(
-                    "reduce_output / project_output need a step will_run_decode_branch takes"
-                )
-            return super().forward(hidden_states, attn_metadata)
+            if reduce_output and project_output:
+                return super().forward(hidden_states, attn_metadata)
+            core = self._builtin_core(hidden_states, attn_metadata).reshape(-1, self.proj_size)
+            return self.o_proj(core) if project_output else core
         if (
             step.decode
             and step.tokens_per_request == 1
@@ -1786,6 +1787,19 @@ class K3DecodeKDA(KimiKDALinearAttention):
         if not project_output:
             return core.reshape(-1, self.proj_size)
         return self._k3_project_output(core, reduce_output)
+
+    def _builtin_core(
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> torch.Tensor:
+        """The built-in forward's core ``[N, H, 128]``: inside a breakable CUDA graph from the eager
+        ``maybe_bcg_kda_core_inplace``, else from ``_forward_impl``."""
+        if self.register_to_config and is_in_breakable_cuda_graph():
+            core = hidden_states.new_empty(
+                (hidden_states.shape[0], self.num_heads, self.head_dim), dtype=torch.bfloat16
+            )
+            maybe_bcg_kda_core_inplace(hidden_states, self.layer_idx_str, core)
+            return core
+        return self._forward_impl(hidden_states, attn_metadata)
 
     def _k3_project_output(self, core: torch.Tensor, reduce_output: bool = True) -> torch.Tensor:
         """``o_proj`` on the ``o_proj`` decode GEMV site where it takes the rows (else the module), then, with
