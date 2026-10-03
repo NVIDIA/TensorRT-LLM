@@ -36,7 +36,7 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import (
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline, PipelineComponent
-from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
+from tensorrt_llm.visual_gen.args import ParallelConfig, TorchCompileConfig, VisualGenArgs
 
 pytestmark = pytest.mark.cpu_only
 
@@ -344,7 +344,8 @@ def test_pipeline_keeps_torch_compile_enabled(
 
     def _config(torch_compile: TorchCompileConfig) -> SimpleNamespace:
         return SimpleNamespace(
-            mapping=SimpleNamespace(world_size=1),
+            mapping=SimpleNamespace(world_size=1, tp_size=1),
+            parallel=ParallelConfig(),
             attention=SimpleNamespace(backend="VANILLA"),
             cache=None,
             cpu_offload_config=SimpleNamespace(enable=False),
@@ -422,7 +423,8 @@ def test_trtllm_attention_rejects_unvalidated_gpu(
 ) -> None:
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
     config = SimpleNamespace(
-        mapping=SimpleNamespace(world_size=1),
+        mapping=SimpleNamespace(world_size=1, tp_size=1),
+        parallel=ParallelConfig(),
         attention=SimpleNamespace(backend="TRTLLM"),
     )
     with pytest.raises(NotImplementedError, match="SM100"):
@@ -438,13 +440,209 @@ def test_trtllm_attention_accepts_supported_gpu(
         h3_pipeline.BasePipeline, "__init__", lambda self, config: torch.nn.Module.__init__(self)
     )
     config = SimpleNamespace(
-        mapping=SimpleNamespace(world_size=1),
+        mapping=SimpleNamespace(world_size=1, tp_size=1),
+        parallel=ParallelConfig(),
         attention=SimpleNamespace(backend="TRTLLM"),
         cache=None,
         cpu_offload_config=SimpleNamespace(enable=False),
         cuda_graph=SimpleNamespace(enable=False),
     )
     MiniMaxH3Pipeline(config)
+
+
+def test_text_encoder_residency_skips_non_owner_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        h3_pipeline.BasePipeline,
+        "__init__",
+        lambda self, config: torch.nn.Module.__init__(self),
+    )
+    monkeypatch.setattr(MiniMaxH3Pipeline, "rank", property(lambda self: 1))
+    monkeypatch.setattr(MiniMaxH3Pipeline, "world_size", property(lambda self: 2))
+    config = SimpleNamespace(
+        mapping=SimpleNamespace(world_size=2, tp_size=1),
+        parallel=ParallelConfig(ulysses_size=2, text_encoder_tp_size=1),
+        attention=SimpleNamespace(backend="VANILLA"),
+        cache=None,
+        cpu_offload_config=SimpleNamespace(enable=False),
+        cuda_graph=SimpleNamespace(enable=False),
+    )
+    pipeline = MiniMaxH3Pipeline(config)
+
+    pipeline.load_standard_components(
+        "/tmp/checkpoint",
+        torch.device("cpu"),
+        skip_components=[
+            PipelineComponent.TOKENIZER,
+            PipelineComponent.PROCESSOR,
+            PipelineComponent.VAE,
+            PipelineComponent.AUDIO_VAE,
+            PipelineComponent.SCHEDULER,
+            PipelineComponent.AUDIO_SCHEDULER,
+        ],
+    )
+
+    assert pipeline.text_encoder is None
+
+
+def test_subset_tensor_parallel_text_encoder_loads_on_participant_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        h3_pipeline.BasePipeline,
+        "__init__",
+        lambda self, config: torch.nn.Module.__init__(self),
+    )
+    monkeypatch.setattr(MiniMaxH3Pipeline, "rank", property(lambda self: 1))
+    monkeypatch.setattr(MiniMaxH3Pipeline, "world_size", property(lambda self: 4))
+    sentinel = object()
+    calls = []
+
+    def load_text_encoder(self, checkpoint_dir: str, device: torch.device) -> object:
+        calls.append((checkpoint_dir, device))
+        return sentinel
+
+    monkeypatch.setattr(
+        MiniMaxH3Pipeline,
+        "_load_tensor_parallel_text_encoder",
+        load_text_encoder,
+    )
+    config = SimpleNamespace(
+        mapping=SimpleNamespace(world_size=4, tp_size=1),
+        parallel=ParallelConfig(ulysses_size=4, text_encoder_tp_size=2),
+        attention=SimpleNamespace(backend="VANILLA"),
+        cache=None,
+        cpu_offload_config=SimpleNamespace(enable=False),
+        cuda_graph=SimpleNamespace(enable=False),
+    )
+    pipeline = MiniMaxH3Pipeline(config)
+
+    pipeline.load_standard_components(
+        "/tmp/checkpoint",
+        torch.device("cpu"),
+        skip_components=[
+            PipelineComponent.TOKENIZER,
+            PipelineComponent.PROCESSOR,
+            PipelineComponent.VAE,
+            PipelineComponent.AUDIO_VAE,
+            PipelineComponent.SCHEDULER,
+            PipelineComponent.AUDIO_SCHEDULER,
+        ],
+    )
+
+    assert pipeline.text_encoder is sentinel
+    assert calls == [("/tmp/checkpoint", torch.device("cpu"))]
+
+
+@pytest.mark.parametrize(
+    "world_size, expected_prefetch",
+    [(2, True), (4, False)],
+)
+def test_tensor_parallel_text_encoder_loader_prefetch_matches_rank_residency(
+    monkeypatch: pytest.MonkeyPatch,
+    world_size: int,
+    expected_prefetch: bool,
+) -> None:
+    monkeypatch.setattr(
+        h3_pipeline.BasePipeline,
+        "__init__",
+        lambda self, config: torch.nn.Module.__init__(self),
+    )
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+    monkeypatch.setattr(MiniMaxH3Pipeline, "rank", property(lambda self: 1))
+    monkeypatch.setattr(MiniMaxH3Pipeline, "world_size", property(lambda self: world_size))
+    calls = []
+
+    class FakeTextEncoder:
+        def load_weights(self, weights: dict) -> None:
+            self.weights = weights
+
+        def eval(self) -> "FakeTextEncoder":
+            return self
+
+    def from_pretrained_config(checkpoint_dir, mapping, device):
+        calls.append(("config", checkpoint_dir, mapping, device))
+        return FakeTextEncoder()
+
+    class FakeWeightLoader:
+        def __init__(self, components) -> None:
+            self.components = components
+
+        def load_weights(self, checkpoint_dir, mapping, **kwargs):
+            calls.append(("weights", checkpoint_dir, mapping, kwargs))
+            return {"weight": torch.ones(1)}
+
+    monkeypatch.setattr(
+        h3_pipeline.MiniMaxH3TensorParallelTextEncoder,
+        "from_pretrained_config",
+        from_pretrained_config,
+    )
+    monkeypatch.setattr(h3_pipeline, "WeightLoader", FakeWeightLoader)
+    config = SimpleNamespace(
+        mapping=SimpleNamespace(world_size=world_size, tp_size=1),
+        parallel=ParallelConfig(ulysses_size=world_size, text_encoder_tp_size=2),
+        attention=SimpleNamespace(backend="VANILLA"),
+        cache=None,
+        cpu_offload_config=SimpleNamespace(enable=False),
+        cuda_graph=SimpleNamespace(enable=False),
+    )
+    pipeline = MiniMaxH3Pipeline(config)
+
+    text_encoder = pipeline._load_tensor_parallel_text_encoder(
+        "/tmp/checkpoint", torch.device("cpu")
+    )
+
+    assert isinstance(text_encoder, FakeTextEncoder)
+    _, _, mapping, kwargs = calls[1]
+    assert mapping.world_size == 2
+    assert mapping.tp_size == 2
+    assert kwargs == {"prefetch": expected_prefetch}
+
+
+def test_subset_tensor_parallel_text_encoder_skips_nonparticipant_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        h3_pipeline.BasePipeline,
+        "__init__",
+        lambda self, config: torch.nn.Module.__init__(self),
+    )
+    monkeypatch.setattr(MiniMaxH3Pipeline, "rank", property(lambda self: 3))
+    monkeypatch.setattr(MiniMaxH3Pipeline, "world_size", property(lambda self: 4))
+    config = SimpleNamespace(
+        mapping=SimpleNamespace(world_size=4, tp_size=1),
+        parallel=ParallelConfig(ulysses_size=4, text_encoder_tp_size=2),
+        attention=SimpleNamespace(backend="VANILLA"),
+        cache=None,
+        cpu_offload_config=SimpleNamespace(enable=False),
+        cuda_graph=SimpleNamespace(enable=False),
+    )
+    pipeline = MiniMaxH3Pipeline(config)
+
+    pipeline.load_standard_components(
+        "/tmp/checkpoint",
+        torch.device("cpu"),
+        skip_components=[
+            PipelineComponent.TOKENIZER,
+            PipelineComponent.PROCESSOR,
+            PipelineComponent.VAE,
+            PipelineComponent.AUDIO_VAE,
+            PipelineComponent.SCHEDULER,
+            PipelineComponent.AUDIO_SCHEDULER,
+        ],
+    )
+
+    assert pipeline.text_encoder is None
+
+
+def test_minimax_rejects_dit_tensor_parallelism() -> None:
+    config = SimpleNamespace(
+        mapping=SimpleNamespace(world_size=2, tp_size=2),
+        parallel=ParallelConfig(tp_size=2),
+    )
+    with pytest.raises(NotImplementedError, match="DiT tensor parallelism"):
+        MiniMaxH3Pipeline(config)
 
 
 def test_default_generation_steps_match_reference_app() -> None:

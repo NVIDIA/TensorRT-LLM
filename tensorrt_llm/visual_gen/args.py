@@ -340,6 +340,17 @@ class ParallelConfig(StrictBaseModel):
         status="prototype",
         description=("Tensor parallel group size. Heads are sharded across tp_size GPUs."),
     )
+    text_encoder_tp_size: int = Field(
+        1,
+        ge=1,
+        status="prototype",
+        description=(
+            "Text encoder tensor-parallel group size. MiniMax-H3 shards "
+            "its Qwen3-VL text encoder across ranks "
+            "[0, text_encoder_tp_size), then rank 0 broadcasts prompt "
+            "embeddings to the remaining ranks."
+        ),
+    )
 
     @property
     def seq_parallel_size(self) -> int:
@@ -387,6 +398,11 @@ class ParallelConfig(StrictBaseModel):
         if self.total_parallel_size > world_size:
             raise ValueError(
                 f"total_parallel_size ({self.total_parallel_size}) "
+                f"exceeds world_size ({world_size})"
+            )
+        if self.text_encoder_tp_size > world_size:
+            raise ValueError(
+                f"text_encoder_tp_size ({self.text_encoder_tp_size}) "
                 f"exceeds world_size ({world_size})"
             )
 

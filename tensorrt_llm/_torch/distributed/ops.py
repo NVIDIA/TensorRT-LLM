@@ -1174,6 +1174,32 @@ class AllReduce(nn.Module):
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
+        use_torch_distributed_allreduce = self._disable_mpi and getattr(
+            self.mapping, "_use_torch_distributed_allreduce", False)
+        if self._disable_mpi and torch.distributed.is_initialized():
+            # MiniMax-H3 can host its Qwen text encoder on a TP subgroup
+            # smaller than the visual-gen world. Some Qwen layers materialize
+            # fresh mappings that preserve the subgroup but not MiniMax's
+            # private marker, so recognize the subgroup directly here.
+            use_torch_distributed_allreduce = (
+                use_torch_distributed_allreduce
+                or self.mapping.world_size < torch.distributed.get_world_size())
+
+        if use_torch_distributed_allreduce:
+            if all_reduce_params.fusion_op != AllReduceFusionOp.NONE or any(
+                    value is not None for value in (
+                        all_reduce_params.residual,
+                        all_reduce_params.norm_weight,
+                        all_reduce_params.scale,
+                        all_reduce_params.bias,
+                    )):
+                raise NotImplementedError(
+                    "Torch distributed all-reduce fallback supports only "
+                    "plain all-reduce.")
+            output = input.clone()
+            torch.distributed.all_reduce(output, group=self.mapping.tp_group_pg)
+            return output
+
         # Try Symmetric Memory AllReduce first if available
         # Note: Currently only supports NONE fusion op (plain allreduce)
         if self.symm_mem_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE:
