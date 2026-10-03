@@ -118,6 +118,36 @@ def test_cute_dsl_radix_preserves_compressed_mtp_fallback(monkeypatch) -> None:
     assert runtime_call.kwargs["radix_aux_logits"].data_ptr() == radix_values.data_ptr()
 
 
+@pytest.mark.parametrize("implementation", list(TopKImplementation))
+def test_ragged_decode_preserves_caller_radix_workspace(monkeypatch, implementation) -> None:
+    radix = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", radix)
+    scores = torch.randn(3, 16)
+    output = torch.empty(3, 2, dtype=torch.int32)
+    logical = torch.tensor([16, 12], dtype=torch.int32)
+    scan = torch.tensor([4, 3], dtype=torch.int32)
+    row_scan = torch.tensor([3, 4, 3], dtype=torch.int32)
+    indices = torch.empty(3, 10, 2, dtype=torch.int32)
+    values = torch.empty(3, 10, 2)
+    result = TopK(2, decode_implementation=implementation, compress_ratio=4)(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=logical,
+        scan_lengths=scan,
+        row_scan_lengths=row_scan,
+        next_n=2,
+        radix_aux_indices=indices,
+        radix_aux_logits=values,
+    )
+    assert result is output
+    radix.assert_called_once()
+    call = radix.call_args
+    assert call.kwargs["radix_aux_indices"].data_ptr() == indices.data_ptr()
+    assert call.kwargs["radix_aux_logits"].data_ptr() == values.data_ptr()
+    assert call.kwargs["row_kv_lens"] is row_scan
+
+
 def test_gvr_uses_caller_prior_state(monkeypatch) -> None:
     gvr = Mock()
     monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_gvr_topk_decode", gvr)
