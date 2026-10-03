@@ -165,9 +165,9 @@ by the configuration), `compiled` (the compiled `k3_moe`, built by the state's f
 **Who creates it, and when.** The target, in `post_load_weights`, after the expert weights are final (a layer reads
 the buffers it was built over; see *What a wrong order does*): `K3MoeState(device, i_tp, num_local,
 head_flags=False)` once per device and `state.layer(w3_w1_weight, w3_w1_weight_scale, w2_weight, w2_weight_scale)`
-once per MoE layer; likewise `K3MoeWideState(device, i_tp, num_local)` and its layers. Not collective. Eager:
-`K3MoeState()` and `K3MoeState.layer()` raise `RuntimeError` under CUDA-graph capture (certified);
-`K3MoeWideState()` and `K3MoeWideState.layer()` do not check (*Notes*). The kernel compiles on the first call of each
+once per MoE layer; likewise `K3MoeWideState(device, i_tp, num_local)` and its layers. Not collective. Eager: the
+four constructors (`K3MoeState()`, `K3MoeState.layer()`, `K3MoeWideState()`, `K3MoeWideState.layer()`) raise
+`RuntimeError` under CUDA-graph capture (certified). The kernel compiles on the first call of each
 state object (seconds), which must be eager: under capture that call raises `RuntimeError` before the `k3_moe` launch
 and leaves the state uncompiled (certified for both builds). `config` (kernel options for tests and A/B runs) stays
 `None`. No environment variable selects anything here except PDL (*Metadata consumed*).
@@ -265,17 +265,14 @@ Besides the state objects (explicit arguments):
   rank layout (experts TP4 x EP4: 224 local experts of 896, intermediate 768), with random checkpoint-format MXFP4
   experts put through TRT-LLM's own loader. `k3_moe_fused_front`: 4 ranks of one GB200 tray in
   `tests/unittest/_torch/modeling_v2/comm/_k3_moe_front_op_matrix.py` (entry point
-  `moe/test_modeling_v2_k3_moe_front_op_matrix.py`); its 16-rank receipt (A2) is pending with `moe/k3_moe_front`'s.
+  `moe/test_modeling_v2_k3_moe_front_op_matrix.py`); its 16-rank receipt is pending with `moe/k3_moe_front`'s.
 - References: an fp64 reference over the dequantized experts (from the checkpoint-format tensors) and the stock path.
   The kernel tests (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_fused_moe.py`, `test_k3_moe_wide.py`,
   `test_k3_route_quant.py`) remain the exhaustive numerics; this entry's test copies their references.
-- Gaps against A1 (the ops are unchanged by this entry):
-  - `K3MoeWideState()` and `K3MoeWideState.layer()` do not refuse CUDA-graph capture. Built under capture, their
-    allocations come from the graph's pool and the slab's arming fills and the counters' zeroing are captured instead
-    of run, so the first eager call would find the slab unarmed and the counters undefined.
+- Gaps (the kernels are unchanged by this entry):
   - The `k3_moe` launch is not a torch op, so nothing declares what it writes: the state's slab and partial rows, the
-    layer's counters, and with head_flags the head workspace's `flags[2]` and ready words (A1: `mutates_args` names
-    every written buffer). `trtllm::k3_route_quant` writes only its new outputs (`mutates_args=()`).
+    layer's counters, and with head_flags the head workspace's `flags[2]` and ready words (a torch op would name them
+    in `mutates_args`). `trtllm::k3_route_quant` writes only its new outputs (`mutates_args=()`).
   - A layer does not record `local_expert_offset`, and nothing ties a state to a stream or checks the inputs' device.
   - The compiled kernel is per state object, not per configuration: a second state of the same configuration
     compiles again.

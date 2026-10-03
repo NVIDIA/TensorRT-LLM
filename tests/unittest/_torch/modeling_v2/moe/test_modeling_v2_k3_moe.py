@@ -791,10 +791,9 @@ def test_unsupported_calls_refused_before_launch():
 def test_construction_and_first_call_refuse_capture():
     """Under CUDA-graph capture the states refuse to allocate, and a new state refuses its first (compiling) call.
 
-    K3MoeState() and K3MoeState.layer() raise RuntimeError; the first call on a new K3MoeState and on a new
-    K3MoeWideState raises RuntimeError before the k3_moe launch (k3_route_quant, compiled eagerly first, is captured
-    and discarded with the graph); neither state is compiled afterwards. K3MoeWideState() and K3MoeWideState.layer()
-    do not check for capture (see the contract's Notes), so they are built eagerly here.
+    K3MoeState(), K3MoeState.layer(), K3MoeWideState() and K3MoeWideState.layer() raise RuntimeError; the first call
+    on a new K3MoeState and on a new K3MoeWideState raises RuntimeError before the k3_moe launch (k3_route_quant,
+    compiled eagerly first, is captured and discarded with the graph); neither state is compiled afterwards.
     """
     proc, _, bias = _experts()
     fresh = K3MoeState(_device(), I_TP, E_LOCAL)
@@ -815,6 +814,10 @@ def test_construction_and_first_call_refuse_capture():
             K3MoeState(_device(), I_TP, E_LOCAL)
         with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
             fresh.layer(*_weights(proc))
+        with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
+            K3MoeWideState(_device(), I_TP, E_LOCAL)
+        with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
+            fresh_wide.layer(*_weights(proc))
         with pytest.raises(RuntimeError, match="compiles on its first call"):
             _decode_call(fresh_layer, lg4, x4)
         with pytest.raises(RuntimeError, match="compiles on its first call"):

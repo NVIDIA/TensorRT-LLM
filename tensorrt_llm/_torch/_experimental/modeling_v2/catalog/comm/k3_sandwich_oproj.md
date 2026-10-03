@@ -113,7 +113,7 @@ alternating between two workspaces in an irregular pattern, so that their counte
 same number of calls, the `k`-th with the same op and `M` — across layers and decode steps, eager calls and graph
 replays alike; and on one stream the same order of calls across objects: each call spins until its peers' rows of
 the same call arrive, so two ranks issuing calls on two objects in different orders on one stream deadlock (measured
-for `mnnvl_allreduce_attn_res`, `runs/drafter/u4-mnnvl-srun-2`; this kernel waits the same way). On each rank the
+for `comm/mnnvl_allreduce_attn_res`, see its contract; this kernel waits the same way). On each rank the
 calls on one workspace run one after another: a call reads the counters after its grid-dependency wait, which covers
 the previous call because every kernel between two calls waits for its predecessor (the kernel's statement) — a
 kernel launched under PDL that skips that wait must not sit between two calls.
@@ -129,7 +129,7 @@ kernel's statement), so no separate clear and no record of the previous call's s
 `k3_spec_accept` failure (a re-arm sized by the current call) cannot occur. The test still drives the sequence that
 exposed it (below).
 
-**Why the test drives call sequences.** See `mnnvl_allreduce_attn_res.md` (*State*): Phase 0's `k3_spec_accept`
+**Why the test drives call sequences.** See `mnnvl_allreduce_attn_res.md` (*State*): Kimi K3's `k3_spec_accept` once
 re-armed its Lamport buffer for the current call's rows only, every single-call test passed, and a call sequence
 whose row count dipped and grew back caught it; in serving it hung the ranks. This entry's test runs 11 decode steps
 of 12 chained layers at `M` = 8, 8, 8, 2, 7, 8, 1, 1, 8, 3, 8, a random rank 5 ms late at every call, each call
@@ -172,13 +172,13 @@ it changes scheduling, not results.
   three sandwich entries in `_k3_sandwich_common.py` beside it. The reference is native torch: `core` and `o_weight`
   are small multiples of 1/8 and 1/16, so every partial sum is exact in fp32 and `updated` is compared bit for bit;
   `normed` against an fp32 reference within 2e-2 of its largest magnitude.
-- A2: the matrix takes `--world-size` and `--launcher` (`mpirun` on one tray, `srun` across trays). The kernel sums
-  ranks in chunks of 8, so a run at `W` <= 8 exercises one chunk; Kimi K3 runs `W` = 16 over four trays. This
-  entry's 16-rank receipt is pending. The op's kernel test
-  (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py`), in its B7 form — this op bit for bit
-  against `o_proj` and the MNNVL one-shot — passed 180 / 180 at 16 ranks
-  (`runs/session-7594608/pre/test_k3_sandwich.log`): the kernel's record, not this entry's receipt.
-- A1: `mutates_args` names `ws_uc`, `ws_mc` and `ws_flags` — every call pushes through `ws_mc` into every rank's
+- World sizes: the matrix takes `--world-size` and `--launcher` (`mpirun` on one tray, `srun` across trays). The
+  kernel sums ranks in chunks of 8, so a run at `W` <= 8 exercises one chunk; Kimi K3 runs `W` = 16 over four trays.
+  This entry's 16-rank receipt is pending. The op's kernel test
+  (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py`; this op bit for bit against `o_proj` and
+  the MNNVL one-shot) passed every case at 16 ranks on four trays in a recorded run: the kernel's record, not this
+  entry's receipt.
+- State: `mutates_args` names `ws_uc`, `ws_mc` and `ws_flags` — every call pushes through `ws_mc` into every rank's
   `ws_uc`, empties the words it read in `ws_uc` and advances `ws_flags` — and `x_slab`. The op module keeps no
   workspace registry: the caller passes the object it created. The compile cache is the documented process-wide cache
   above. The published / polled slabs (`x_slab`, `src_slab`) are cross-call state without a state object, so they

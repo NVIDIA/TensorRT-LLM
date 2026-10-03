@@ -318,6 +318,11 @@ l0_b200:
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_field_completeness
   # ------------- Prefix-aware scheduling E2E tests ---------------
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
+  # ------------- Kimi K3 decode MoE kernels and their catalog entry (sm_100) ---------------
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_fused_moe.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_wide.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_route_quant.py
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_k3_moe.py
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/cute_dsl_kernels/test_nvfp4_conv3d.py
   - unittest/_torch/visual_gen/test_media_decode.py

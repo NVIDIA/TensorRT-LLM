@@ -216,7 +216,7 @@ Besides `workspace` (an explicit argument):
 - Certified path: 4 ranks of one GB200 tray (sm_100), one rank per GPU, the head sharded over those 4 ranks (1120
   rows per rank, 128-row tiles), the shared activation at TP16's per-rank width (384). Kimi K3 TP16 shards the head
   over 16 ranks on four trays (280 rows per rank), which runs the half-tile geometry and which only a 16-rank run
-  reaches; the matrix takes `--world-size` and `--launcher` (A2) and that receipt is pending.
+  reaches; the matrix takes `--world-size` and `--launcher`, and that receipt is pending.
 - Test: `tests/unittest/_torch/modeling_v2/comm/_k3_moe_front_op_matrix.py` (rank body), collected by
   `tests/unittest/_torch/modeling_v2/moe/test_modeling_v2_k3_moe_front_op_matrix.py`. It also certifies
   `moe/k3_moe`'s `k3_moe_fused_front` cells.
@@ -228,8 +228,8 @@ Besides `workspace` (an explicit argument):
   reference for `y` the stock TRTLLM-Gen runner. The kernel test
   (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_front.py`) covers Gaussian payloads and races the
   publishing front's epoch read against `k3_moe`'s epoch advance (`check_publish_order`); neither is repeated here.
-- `mutates_args` names every buffer the op writes (`ag_uc`, `ag_mc`, `ag_flags`, `ag_ready`). Gaps against A1 (the op
-  is unchanged by this entry): the compile cache is a module-level dict (result-neutral, documented above); the slots'
+- `mutates_args` names every buffer the op writes (`ag_uc`, `ag_mc`, `ag_flags`, `ag_ready`). Gaps (the op is
+  unchanged by this entry): the compile cache is a module-level dict (result-neutral, documented above); the slots'
   logit vectors are dead space for this kernel; `ring` is not exposed.
-- In the model the head workspace was `head_workspace(mapping)`, a module dict created on the first eager call; this
-  entry takes the explicit object instead (A1).
+- Before this entry the head workspace was `head_workspace(mapping)`, a module dict created on the first eager call;
+  this entry takes the explicit object instead.

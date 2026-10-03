@@ -192,10 +192,10 @@ outside CUDA-graph capture first". `updated_out` is not part of the key. The cac
   within 2e-2 of an fp32 reference; the tapped `updated` bit for bit with the returned one; every output bitwise
   across the ranks. The negative control's wrong pairing puts more than half the elements outside the 8e-3 bound,
   the largest error over 10 times it.
-- A2: as for `k3_sandwich_oproj`; this entry's 16-rank receipt is pending. The op's kernel test
-  (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py`), in its B7 form, passed 180 / 180 at 16
-  ranks (`runs/session-7594608/pre/test_k3_sandwich.log`): the kernel's record, not this entry's receipt.
-- A1: `mutates_args` names every buffer the op can write: `ws_uc`, `ws_mc`, `ws_flags`, `x_slab`, `lat_uc`,
+- World sizes: as for `k3_sandwich_oproj`; this entry's 16-rank receipt is pending. The op's kernel test
+  (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py`) passed every case at 16 ranks on four
+  trays in a recorded run: the kernel's record, not this entry's receipt.
+- State: `mutates_args` names every buffer the op can write: `ws_uc`, `ws_mc`, `ws_flags`, `x_slab`, `lat_uc`,
   `lat_flags`, `tap` and `updated_out`. The compile cache is the documented process-wide cache above.
 - Not certified (an op option the wrapper does not expose): the folded latent all-reduce. With `lat_uc` / `lat_flags`
   of a `K3SandwichLatentExchange` — its own collective `create(mapping, fabric_handle=None)`; two halves of

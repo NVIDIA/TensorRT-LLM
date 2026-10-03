@@ -123,8 +123,8 @@ latent all-reduce] at Kimi K3's ceilings, `T` = 8, 2, 16, 64, 1, 7, 32, 8, 3, 16
 two independent rotations: 20 calls of mixed shapes and paths alternating irregularly between two workspaces are all
 correct, and each workspace's flags move with its own calls only (certified). They are not independent orders: on one
 stream every rank must issue its collectives in the same order, whatever object each belongs to (measured for
-`mnnvl_allreduce_attn_res`: ranks issuing B-then-A against A-then-B deadlocked, `runs/drafter/u4-mnnvl-srun-2`; this
-op waits for its peers the same way).
+`comm/mnnvl_allreduce_attn_res`: ranks issuing B-then-A against A-then-B deadlocked; this op waits for its peers
+the same way).
 
 **Call-order invariant.** Every rank of the group makes the same sequence of calls on one workspace — the same
 number, the `k`-th with the same op, `T`, `H`, fusion and path — across layers and decode steps, eager calls and
@@ -146,7 +146,7 @@ attention-residual all-reduce the first stage, whichever path the clearing call 
 grid (every shape one-shot and then two-shot back to back on one workspace, then the next shape) and by the
 sequences below.
 
-**Why the test drives call sequences.** See `mnnvl_allreduce_attn_res.md` (*State*): Phase 0's `k3_spec_accept`
+**Why the test drives call sequences.** See `mnnvl_allreduce_attn_res.md` (*State*): Kimi K3's `k3_spec_accept` once
 re-armed its Lamport buffer for the current call's rows only; every single-call test passed, and a sequence whose row
 count dipped and grew back caught it; in serving it made the ranks disagree and hang. This entry's test runs 16 decode
 steps of 8 layers, each layer the latent all-reduce `[T, 3584]` and the fused all-reduce `[T, 7168]` chained through
@@ -201,15 +201,15 @@ device's SM count, and in the fused form it sets the order in which the squares 
   bf16 and the residual add is one bf16 rounding of an exact fp32 value in the op and in the reference; the sum and
   `updated` are compared bit for bit, `normed` against the fp32 RMSNorm of `updated` within 1e-2 of its largest
   magnitude (the bf16 squares cost at most 2^-9 on `rcp`, the bf16 output 2^-8).
-- Design choices this entry follows (U4U5_PLAN §1): A1, "a typed state object per stateful op ..., built by an
-  explicit, collective, eager `create()` ... Tests drive real-state call sequences (layers x steps, capture + replay,
-  two objects interleaved) plus a negative control. `mutates_args` names every written buffer" (the op falls short of
-  the last, see the gaps below); A2, the matrix takes `--world-size` and `--launcher` (`mpirun` on one node, `srun`
-  across trays), CI runs it at 4 ranks on one GB200 tray; A4, "one caller-owned `MnnvlWorkspace` ..., shared by" every
-  MNNVL entry of the TP group, "`one_shot_max_bytes` per call".
+- State and test design: a typed state object built by an explicit, collective, eager `create()`; a test that drives
+  call sequences on real state (layers x steps, capture + replay, two objects interleaved) plus a negative control;
+  every written buffer named in the schema (the op falls short there, see the gaps below); the matrix takes
+  `--world-size` and `--launcher` (`mpirun` on one node, `srun` across trays) and CI runs it at 4 ranks on one GB200
+  tray; one caller-owned `MnnvlWorkspace` shared by every MNNVL entry of the TP group, and
+  `one_shot_max_bytes` per call.
 - At `W` = 16 the one-shot kernel adds the ranks in two chunks of 8, a branch a 4-rank run never reaches. The 16-rank
   receipt is pending.
-- Kimi K3's calls (B7 82a110a92a, its code, not this test): the model sets every `MNNVLAllReduce` of the target, its
+- Kimi K3's calls (its decode path, not this test): the model sets every `MNNVLAllReduce` of the target, its
   LM head and a drafter to `one_shot_max_bytes` = 4 MiB (`DECODE_AR_ONE_SHOT_MAX_BYTES`, against main's 1 MiB), and
   a wide decode step (9 to 64 tokens) passes 1 MiB per call (`WIDE_AR_ONE_SHOT_MAX_BYTES`). Plain: the routed-latent
   all-reduce `[T, 3584]` (decode steps where the latent exchange push is not used; wide steps) and a wide step's
@@ -217,8 +217,8 @@ device's SM count, and in the fused form it sets the order in which the squares 
   `k3_sandwich_plain` does not take the call. At 4 MiB a `[T, 7168]` call goes one-shot up to `T` = 18 at `W` = 16
   (73 at `W` = 4) and a `[T, 3584]` one up to 36 (146); at 1 MiB `[T, 7168]` up to 4 (18) and `[T, 3584]` up to 9
   (36).
-- Gaps against A1 (the op is unchanged by this entry): the schema marks `comm_buffer` mutable `(a!)` but not
-  `buffer_flags`, which every call advances (A1 item 4); the op does not check that the call fits `comm_buffer` (the
+- Gaps (the op is unchanged by this entry): the schema marks `comm_buffer` mutable `(a!)` but not `buffer_flags`,
+  which every call advances; the op does not check that the call fits `comm_buffer` (the
   attention-residual and all-gather ops do), so a direct op call over one buffer writes past it — the wrapper's
   `required_buffer_bytes` check is the guard; `MnnvlWorkspace.create` accepts any multiple of 16 bytes, but the
   two-shot broadcast stage starts at `buffer_bytes / 2` and is accessed in 16-byte vectors, so a two-shot call needs

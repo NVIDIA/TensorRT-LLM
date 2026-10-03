@@ -26,7 +26,7 @@ rounded), exact midpoints between two bf16 values in every fourth of them (ties 
 fourth column of each part, and in the fp32 part infinities, a NaN, signed denormals and the largest float, which
 arrive unchanged. The result is bitwise the same on every rank (certified, every call of the test).
 
-Kimi K3's use (B7 82a110a92a, its code): the row-sharded MoE head of a wide decode step (9 to 64 tokens), and of a
+Kimi K3's use: the row-sharded MoE head of a wide decode step (9 to 64 tokens), and of a
 decode step of at most 8 tokens where the fused MoE front kernel does not run. Rank `r`'s GEMV gives fp32
 `[T, 3584/W + 896/W]`: the latent down projection's columns `[r * 3584/W, (r+1) * 3584/W)`, then the router logits of
 experts `[r * 896/W, (r+1) * 896/W)`. This call assembles the bf16 latent `[T, 3584]` (`bf16_out`) and the fp32
@@ -96,9 +96,8 @@ all-reduce] at Kimi K3's one-shot ceilings, `T` = 8, 2, 16, 64, 1, 7, 32, 8, 3, 
 follow one-shot and two-shot all-reduces. Two objects are two independent rotations: 20 all-gathers of mixed token
 counts and splits alternating irregularly between two workspaces are all correct, and each workspace's flags move
 with its own calls only (certified). They are not independent orders: on one stream every rank must issue its
-collectives in the same order, whatever object each belongs to (measured for `mnnvl_allreduce_attn_res`: ranks
-issuing B-then-A against A-then-B deadlocked, `runs/drafter/u4-mnnvl-srun-2`; this op waits for its peers the same
-way).
+collectives in the same order, whatever object each belongs to (measured for `comm/mnnvl_allreduce_attn_res`:
+ranks issuing B-then-A against A-then-B deadlocked; this op waits for its peers the same way).
 
 **Call-order invariant.** Every rank of the group makes the same sequence of calls on one workspace — the same
 number, the `k`-th with the same op, `T`, `B` and `F` — across layers and decode steps, eager calls and graph replays
@@ -115,7 +114,7 @@ recorded and in the previous call's stage layout (`cpp/tensorrt_llm/common/lampo
 `LamportFlags::clearDirtyLamportBuf`): after a two-shot all-reduce both of its stages, after any other call the first.
 Certified by the split grid (55 calls of different sizes back to back on one workspace) and by the sequences below.
 
-**Why the test drives call sequences.** See `mnnvl_allreduce_attn_res.md` (*State*): Phase 0's `k3_spec_accept`
+**Why the test drives call sequences.** See `mnnvl_allreduce_attn_res.md` (*State*): Kimi K3's `k3_spec_accept` once
 re-armed its Lamport buffer for the current call's rows only; every single-call test passed, and a sequence whose row
 count dipped and grew back caught it. This entry's test runs 16 decode steps of 6 layers, one head all-gather per
 layer at Kimi K3's split, at `T` = 8, 8, 8, 2, 7, 8, 1, 1, 64, 3, 32, 8, 16, 1, 64, 8, a random rank 5 ms late at
@@ -158,18 +157,17 @@ depend on it.
   Test: `tests/unittest/_torch/modeling_v2/comm/_mnnvl_allgather_split_op_matrix.py`. The reference is native torch
   and exact; this op's outputs are compared bit for bit. The all-reduce and attention-residual calls of its sequences
   are checked as in their own matrices (sums bit for bit, normed outputs within a tolerance).
-- Design choices this entry follows (U4U5_PLAN §1): A1, "a typed state object per stateful op ..., built by an
-  explicit, collective, eager `create()` ... Tests drive real-state call sequences (layers x steps, capture + replay,
-  two objects interleaved) plus a negative control. `mutates_args` names every written buffer" (the op falls short of
-  the last, see the gaps below); A2, the matrix takes `--world-size` and `--launcher` (`mpirun` on one node, `srun`
-  across trays), CI runs it at 4 ranks on one GB200 tray; A4, one `MnnvlWorkspace` shared by every MNNVL entry of the
-  TP group. The 16-rank receipt is pending.
+- State and test design: a typed state object built by an explicit, collective, eager `create()`; a test that drives
+  call sequences on real state (layers x steps, capture + replay, two objects interleaved) plus a negative control;
+  every written buffer named in the schema (the op falls short there, see the gaps below); the matrix takes
+  `--world-size` and `--launcher` (`mpirun` on one node, `srun` across trays) and CI runs it at 4 ranks on one GB200
+  tray; one `MnnvlWorkspace` shared by every MNNVL entry of the TP group. The 16-rank receipt is pending.
 - Not exercised: `B` = 0 or `F` = 0 (the op accepts both), denormal and non-finite values in the bf16 columns, an
   accepted call of more than 64 tokens.
-- Gaps against A1 (the op is unchanged by this entry): the schema marks `comm_buffer` mutable `(a!)` but not
-  `buffer_flags`, which every call advances (A1 item 4); the op has no `register_fake`
+- Gaps (the op is unchanged by this entry): the schema marks `comm_buffer` mutable `(a!)` but not `buffer_flags`,
+  which every call advances; the op has no `register_fake`
   (`tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py` registers one for the other two MNNVL ops), so fake-tensor
   tracing, e.g. `torch.compile`, cannot run it.
 - In the model today the call is `MNNVLAllReduce.allgather_split(input, bf16_columns)` on `MNNVLAllReduce`'s workspace
   (a dict keyed by `Mapping`, grown to the call's footprint by the first eager call that needs more). This entry takes
-  the explicit object instead (A4), sized at construction.
+  the explicit object instead, sized at construction.

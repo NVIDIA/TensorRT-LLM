@@ -277,3 +277,38 @@ entries:
   - path: comm/mnnvl_allreduce_attn_res.py
     impl: torch.ops.trtllm.mnnvl_allreduce_attn_res
     summary: "One-shot MNNVL all-reduce with Kimi K3's residual update as its epilogue (updated = prefix + sum over ranks, normed = RMSNorm of the attention-residual selection over the snapshot bank and updated), over a caller-owned MnnvlWorkspace: three Lamport buffers rotated by every call of every MNNVL op that shares the object, so every rank makes the same calls on it in the same order; a swapped pair of same-shaped calls is silently wrong on every rank, two ranks ordering calls on two workspaces differently on one stream deadlock"
+
+  # Kimi K3 decode collectives and MoE: stateful entries with a ## State section and caller-owned state objects
+  # (K3SandwichWorkspace, MnnvlWorkspace, K3LatentExchange, K3MoeHeadWorkspace, K3MoeState / K3MoeWideState and their
+  # layers). The state types are not entries: they launch nothing per call.
+  - path: comm/k3_sandwich_oproj.py
+    impl: torch.ops.trtllm.k3_sandwich_oproj
+    summary: "Kimi K3's post-attention sandwich for at most 8 decode tokens in one kernel: the row-parallel attention output projection, its TP all-reduce and the residual update (attention-residual selection + RMSNorm), bit-identical to o_proj followed by the MNNVL one-shot attention-residual all-reduce, over a caller-owned K3SandwichWorkspace: two buffer halves selected by per-CTA call-count parity, shared by every sandwich op of the group, so every rank makes the same calls on it in the same order; a swapped pair of same-shaped calls is silently wrong on every rank"
+
+  - path: comm/k3_sandwich_tail.py
+    impl: torch.ops.trtllm.k3_sandwich_tail
+    summary: "Kimi K3's pre-attention sandwich for at most 8 decode tokens in one kernel: the row-parallel MoE tail ([rmsnorm(latent)[:, lo:lo+224] | act] @ tail_weight^T, the latent RMS on the fp32 accumulator), its TP all-reduce and the next layer's residual update, optionally storing the pre-norm mixture or updated into a capture tap and updated into a snapshot-bank row, over the same caller-owned K3SandwichWorkspace as the other sandwiches and in one call sequence with them"
+
+  - path: comm/k3_sandwich_plain.py
+    impl: torch.ops.trtllm.k3_sandwich_plain
+    summary: "A row-parallel projection (Kimi K3 drafter's o_proj, or with swiglu its MLP's SiLU-and-mul and down projection), its TP all-reduce, the residual add and RMSNorm in one kernel for at most 8 decode tokens, in the MNNVL one-shot RESIDUAL_RMS_NORM all-reduce's arithmetic, over the same caller-owned K3SandwichWorkspace as the target's sandwiches and in one call sequence with them"
+
+  - path: comm/mnnvl_fusion_allreduce.py
+    impl: torch.ops.trtllm.mnnvl_fusion_allreduce
+    summary: "MNNVL all-reduce over a caller-owned MnnvlWorkspace: the sum over the TP group, or with a residual the residual add + RMSNorm; one-shot up to the call's one_shot_max_bytes, two-shot above, both deterministic; one turn of the workspace's three-buffer Lamport rotation per call, shared with every other MNNVL entry on the object, so every rank makes the same MNNVL calls on it in the same order and a swapped pair of same-shaped calls is silently wrong"
+
+  - path: comm/mnnvl_allgather_split.py
+    impl: torch.ops.trtllm.mnnvl_allgather_split
+    summary: "One-shot MNNVL all-gather over a caller-owned MnnvlWorkspace of fp32 rows whose leading columns travel and are gathered as bf16 (round to nearest even, -0.0 as +0.0) and the rest as fp32, in rank order (Kimi K3's sharded MoE head: the latent in bf16, the router logits in fp32); one turn of the workspace's Lamport rotation, in one call order with the MNNVL all-reduces on the object"
+
+  - path: comm/k3_latent_reduce.py
+    impl: torch.ops.trtllm.k3_latent_reduce
+    summary: "Kimi K3's latent all-reduce at decode size as the consumer of pushed partials: the sum over the TP group of the routed partial rows every rank's producer stored into a caller-owned K3LatentExchange, bit-identical to the MNNVL one-shot all-reduce of the partials; halves selected by the consumer's call parity, each push followed by exactly one reduce of the same token count on every rank in the same order"
+
+  - path: moe/k3_moe_front.py
+    impl: torch.ops.trtllm.k3_moe_front
+    summary: "Kimi K3's MoE front at decode size in one kernel: the row-sharded MoE head GEMV, its all-gather over a caller-owned K3MoeHeadWorkspace (two alternating Lamport buffers rotated by every front call), the top-16 routing and MXFP8 latent as trtllm::k3_route_quant returns them for the gathered head, and the shared experts' gate_up + SiTU-and-mul; optionally publishing per-token ready words that a head_flags build of k3_moe acquires"
+
+  - path: moe/k3_moe.py
+    impl: tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.op.K3MoeLayer
+    summary: "Kimi K3's routed experts at decode size: this rank's routed partial from the persistent CuTe DSL kernel k3_moe (FC1 + SiTU + FC2 with the routing-weighted combine over the TRTLLM-Gen W4A8_MXFP4_MXFP8 buffers, read in place) after k3_route_quant or the MoE front, on caller-owned per-rank state: a K3MoeState and one K3MoeLayer per MoE layer for up to 8 tokens, a K3MoeWideState and one K3MoeWideLayer per layer for up to 64; a state's layers share its scratch (left armed by every call) and run in one stream order, each layer's counters are left zero"
