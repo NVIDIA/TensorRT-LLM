@@ -865,6 +865,9 @@ class DSparkWorker(DFlashWorker):
     :class:`DSv4DSparkWorker`.
     """
 
+    # Whether this step's block logits are the Kimi K3 decode path's vocabulary shard (see ``_draft_block_logits``).
+    _k3_sharded_block_logits = False
+
     def set_draft_model(self, draft_model) -> None:
         """Reject an unsupported vocab mapping here rather than mid-decode.
 
@@ -942,9 +945,10 @@ class DSparkWorker(DFlashWorker):
         sampled chain; the rejection-sampling path samples from the same
         biased distributions (proposal conditioned on the greedy chain).
 
-        Handles a TP vocab-sharded draft lm_head by slicing markov_w2's rows
-        to this rank's contiguous shard and chaining through the TP-aware
-        global argmax.
+        Block logits the Kimi K3 decode path kept vocab-sharded (see ``_draft_block_logits``) run the
+        whole chain as ``trtllm::k3_markov``, which also returns the greedy draft tokens and
+        next_new_tokens. Other TP-sharded logits slice markov_w2's rows to this rank's contiguous
+        shard and chain through the TP-aware global argmax.
         """
         # The d2t guard lives in set_draft_model: it is model-static, so raising
         # it here would surface a load-time config error per decode step.
@@ -953,6 +957,8 @@ class DSparkWorker(DFlashWorker):
         # duplicate the draft head's sharding rules. A standalone drafter
         # borrows the target lm_head, whose gather_output defaults to True, so
         # the logits normally arrive full-vocab and this branch is skipped.
+        self._k3_markov = None
+        k3_sharded, self._k3_sharded_block_logits = self._k3_sharded_block_logits, False
         full_vocab = draft_model.markov_w2.shape[0]
         shard = gen_logits.shape[-1]
         vocab_slice = None
@@ -969,6 +975,10 @@ class DSparkWorker(DFlashWorker):
                     "TP column shard of it."
                 )
             vocab_slice = slice(mapping.tp_rank * shard, (mapping.tp_rank + 1) * shard)
+            if k3_sharded:
+                return self._k3_markov_chain(
+                    draft_model, gen_logits, first_prev_tokens, vocab_slice
+                )
 
         def argmax_fn(step_logits):
             # Full-vocab token ids (TP-aware when sharded); tokens stay in
@@ -980,4 +990,211 @@ class DSparkWorker(DFlashWorker):
             first_prev_tokens,
             argmax_fn=argmax_fn,
             vocab_slice=vocab_slice,
+        )
+
+    def _keep_draft_logits_sharded(self, draft_model, spec_metadata, num_gens: int) -> bool:
+        """Keep the draft logits vocab-sharded: ``trtllm::k3_markov`` reduces across the ranks itself.
+
+        The chain's global argmaxes are the greedy draft tokens, so the lm_head's all-gather of the
+        full logits and the draft sampler's gather are both skipped. Needs a Kimi K3 target running its
+        decode kernels (``k3_decode``), plain TP, greedy drafting (rejection sampling reads
+        full-vocabulary probabilities), an unquantized bias-free column-parallel bf16 lm_head whose
+        shards tile the Markov vocabulary, bf16 Markov weights of the kernel's rank, MNNVL (the model's
+        all-reduces own an MNNVL workspace for this mapping), and a block, shard and batch of
+        ``num_gens`` requests the kernel can split.
+        """
+        if not self.k3_decode:
+            return False
+        from ..cute_dsl_kernels.k3_markov import op as k3_markov_op
+        from ..distributed.ops import MNNVLAllReduce
+        from ..modules.linear import TensorParallelMode
+
+        mapping = self.mapping
+        lm_head = getattr(draft_model, "lm_head", None)
+        if (
+            lm_head is None
+            or not getattr(draft_model, "has_markov_head", False)
+            or mapping is None
+            or mapping.tp_size <= 1
+            or mapping.enable_attention_dp
+            or spec_metadata.wants_advanced_draft_sampling
+            or getattr(lm_head, "tp_mode", None) != TensorParallelMode.COLUMN
+            or not getattr(lm_head, "gather_output", False)
+            or getattr(lm_head, "bias", None) is not None
+            or lm_head.weight.dtype != torch.bfloat16
+            or draft_model.markov_w1.dtype != torch.bfloat16
+            or draft_model.markov_w2.dtype != torch.bfloat16
+            or lm_head.weight.shape[0] * mapping.tp_size != draft_model.markov_w2.shape[0]
+            or MNNVLAllReduce.allreduce_mnnvl_workspaces.get(mapping) is None
+        ):
+            return False
+        shard = lm_head.weight.shape[0]
+        block = spec_metadata.runtime_draft_len
+        rank = k3_markov_op._kernel_module().MARKOV_RANK
+        if (
+            not 0 < block <= k3_markov_op.WORKSPACE_MAX_BLOCK
+            or draft_model.markov_w1.dim() != 2
+            or draft_model.markov_w1.shape[1] != rank
+            or tuple(draft_model.markov_w2.shape[1:]) != (rank,)
+        ):
+            return False
+        if k3_markov_op.pick_grid(shard, block, num_gens) == 0:
+            logger.warning_once(
+                f"DSpark Markov head: trtllm::k3_markov cannot split a {shard}-row vocab shard for "
+                f"{num_gens} requests; the draft logits are all-gathered and the chain runs unfused.",
+                key=f"dspark_k3_markov_shard_{num_gens}",
+            )
+            return False
+        return True
+
+    def _draft_block_logits(
+        self,
+        draft_model,
+        gen_hidden_states: torch.Tensor,
+        attn_metadata,
+        spec_metadata,
+    ) -> torch.Tensor:
+        """This rank's bf16 shard of the block logits when ``k3_markov`` takes them (it converts them to fp32
+        exactly, as ``.float()`` would), from the drafter's logits processor's head kernel where it takes the rows,
+        else the head's own GEMM (``_k3_head_shard``); otherwise the base class' fp32 logits."""
+        num_gens = gen_hidden_states.shape[0] // max(spec_metadata.runtime_draft_len, 1)
+        self._k3_sharded_block_logits = self._keep_draft_logits_sharded(
+            draft_model, spec_metadata, num_gens
+        )
+        if self._k3_sharded_block_logits:
+            return self._k3_head_shard(
+                draft_model.logits_processor, draft_model.lm_head, gen_hidden_states
+            )
+        return super()._draft_block_logits(
+            draft_model, gen_hidden_states, attn_metadata, spec_metadata
+        )
+
+    def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
+        """The base acceptance; under ``k3_decode`` its outputs are kept for ``k3_markov``'s next_new_tokens."""
+        accepted_tokens, num_accepted_tokens = super().sample_and_accept_draft_tokens(
+            logits, attn_metadata, spec_metadata
+        )
+        if self.k3_decode:
+            self._on_acceptance(accepted_tokens, num_accepted_tokens, attn_metadata, spec_metadata)
+        return accepted_tokens, num_accepted_tokens
+
+    def _on_acceptance(
+        self, accepted_tokens, num_accepted_tokens, attn_metadata, spec_metadata
+    ) -> None:
+        """Keeps this step's acceptance for ``k3_markov``'s next_new_tokens (and the metadata whose KV lengths it
+        rewinds)."""
+        self._k3_acceptance = (
+            accepted_tokens, num_accepted_tokens, attn_metadata.num_contexts, spec_metadata, attn_metadata
+        )  # fmt: skip
+
+    def _k3_markov_chain(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        vocab_slice: slice,
+    ) -> torch.Tensor:
+        """The Markov chain as ``trtllm::k3_markov`` on this rank's shard of the block logits.
+
+        Returns the corrected logits (fp32); keeps the kernel's greedy tokens for
+        ``sample_draft_tokens`` and its next_new_tokens (built from this step's acceptance) for
+        ``_prepare_next_new_tokens``.
+        """
+        from ..cute_dsl_kernels.k3_markov import op as k3_markov_op
+
+        acceptance = getattr(self, "_k3_acceptance", None)
+        if acceptance is None:
+            raise RuntimeError("DSpark Markov head: k3_markov needs this step's acceptance first")
+        accepted_tokens, num_accepted_tokens, num_contexts, spec_metadata, attn_metadata = (
+            acceptance
+        )
+        num_gens = gen_logits.shape[0]
+        # The draft forward's pending KV-length rewind (see _apply_kv_rewind_after_draft) runs in the kernel: every
+        # reader of kv_lens_cuda in the draft forward precedes it. In warmup the restore of kv_lens_cuda that
+        # follows overwrites it, as it would the Python rewind.
+        rewind = getattr(self, "_kv_rewind_amount", None)
+        fold = (
+            getattr(self, "_kv_rewind_pending", False)
+            and rewind is not None
+            and getattr(attn_metadata, "kv_lens_cuda", None) is not None
+            and rewind.dtype == torch.int32
+            and self._kv_rewind_bs - self._kv_rewind_nc == rewind.numel() <= num_gens
+        )
+        corrected, tokens, next_new = k3_markov_op.markov_chain(
+            self.mapping,
+            gen_logits.contiguous(),
+            first_prev_tokens.long(),
+            draft_model.markov_w1,
+            draft_model.markov_w2[vocab_slice],
+            vocab_slice.start,
+            accepted_tokens,
+            num_accepted_tokens[num_contexts : num_contexts + num_gens],
+            spec_metadata.batch_indices_cuda[num_contexts : num_contexts + num_gens],
+            kv_lens=attn_metadata.kv_lens_cuda if fold else None,
+            rewind=rewind if fold else None,
+            rewind_first=self._kv_rewind_nc if fold else 0,
+        )
+        if fold:
+            self._kv_rewind_amount = None
+            self._kv_rewind_pending = False
+        self._k3_markov = (corrected, tokens, next_new, accepted_tokens, num_accepted_tokens)
+        return corrected
+
+    def sample_draft_tokens(
+        self,
+        logits,
+        spec_metadata,
+        batch_size,
+        *,
+        num_contexts=0,
+        draft_step=None,
+        mapping_lm_head_tp=None,
+    ):
+        """Greedy block drafts straight from ``k3_markov``.
+
+        When ``logits`` are the corrected logits the kernel just returned, its per-position global
+        argmax (first maximum, lowest vocabulary index among equal values) is the token the
+        TP-gathered greedy sampler would pick. Anything else goes to the base sampler.
+        """
+        chain = getattr(self, "_k3_markov", None)
+        if (
+            chain is not None
+            and chain[0] is logits
+            and mapping_lm_head_tp is None
+            and not spec_metadata.wants_advanced_draft_sampling
+        ):
+            self._k3_markov_next = (chain[1], chain[2], chain[3], chain[4])
+            return chain[1]
+        self._k3_markov_next = None
+        return super().sample_draft_tokens(
+            logits,
+            spec_metadata,
+            batch_size,
+            num_contexts=num_contexts,
+            draft_step=draft_step,
+            mapping_lm_head_tp=mapping_lm_head_tp,
+        )
+
+    def _prepare_next_new_tokens(
+        self,
+        accepted_tokens,
+        next_draft_tokens,
+        batch_indices_cuda,
+        batch_size,
+        num_accepted_tokens,
+    ):
+        """``k3_markov``'s next_new_tokens when the drafts are its tokens for the whole batch (no context
+        requests); otherwise the base assembly."""
+        chain = getattr(self, "_k3_markov_next", None)
+        self._k3_markov_next = None
+        if (
+            chain is not None
+            and chain[0] is next_draft_tokens
+            and chain[2] is accepted_tokens
+            and chain[3] is num_accepted_tokens
+            and next_draft_tokens.shape[0] == batch_size
+        ):
+            return chain[1]
+        return super()._prepare_next_new_tokens(
+            accepted_tokens, next_draft_tokens, batch_indices_cuda, batch_size, num_accepted_tokens
         )
