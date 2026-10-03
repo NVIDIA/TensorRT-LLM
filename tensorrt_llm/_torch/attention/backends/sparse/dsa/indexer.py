@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention.backends.interface import MLAParams, Position
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.distributed.ops import allgather
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import (
@@ -39,6 +40,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..params import use_self_sampling_gvr
+from .kernels import dsa_indexer_prologue_fused, prologue_heads_per_prog
 from .params import DSAParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
@@ -619,6 +621,7 @@ class Indexer(nn.Module):
         self.index_topk = sparse_params.index_topk  # 2048
         self.layer_idx = layer_idx
         self.compress_ratio = compress_ratio
+        self.dtype = dtype
 
         self.wq_b = Linear(
             self.q_lora_rank,
@@ -687,6 +690,31 @@ class Indexer(nn.Module):
             sparse_params.use_cute_dsl_paged_mqa_logits and IS_CUTLASS_DSL_AVAILABLE
         )
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
+        # TRTLLM_DSA_INDEXER_FUSED_PROLOGUE (default on; "0" = per-kernel chain):
+        # k_norm + RoPE + FP8 Q/K quantization + weight scaling as one Triton
+        # launch (kernels.dsa_indexer_prologue_fused), bit-identical to the
+        # chain. The kernel mirrors the FP8 indexer on the flashinfer RoPE path
+        # (head_dim 128, bf16 model dtype); the FP4 indexer and subclasses that
+        # restructure the Q/K projection keep the per-kernel chain.
+        self._use_fused_prologue = (
+            os.environ.get("TRTLLM_DSA_INDEXER_FUSED_PROLOGUE", "1") != "0"
+            and IS_FLASHINFER_AVAILABLE
+            and not self.use_fp4
+            and self.head_dim == 128
+            and dtype == torch.bfloat16
+            and self.rope_dim % 2 == 0
+            and self.rope_dim <= self.head_dim
+            and isinstance(self.rotary_emb.rotary_cos_sin, torch.Tensor)
+            and type(self)._qk_projection_and_rope is Indexer._qk_projection_and_rope
+        )
+        # Launch constants: Q heads per program and the [max_positions, rope_dim]
+        # view of the rope table (flashinfer [cos | sin] layout).
+        self._heads_per_prog = prologue_heads_per_prog(self.n_heads)
+        self._rope_cos_sin_2d = (
+            self.rotary_emb.rotary_cos_sin.view(self.rotary_emb.max_positions, -1)
+            if self._use_fused_prologue
+            else None
+        )
 
         self._enable_heuristic_topk = (
             sparse_params.enable_heuristic_topk and get_sm_version() >= 100
@@ -1978,6 +2006,10 @@ class Indexer(nn.Module):
     ):
         """Project Q/K and apply RoPE"""
         q = self.wq_b(qr)
+        # fused_cat_fp8 / fused_cat_fp4 read the token rows at stride
+        # n_heads * head_dim: densify a column-sliced Q.
+        if not q.is_contiguous():
+            q = q.contiguous()
         k = self.k_norm(indexer_k)
         q = q.view(-1, self.n_heads, self.head_dim)
         q_pe, q_nope = q.split([self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
@@ -2004,9 +2036,12 @@ class Indexer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Pure token-wise projections (CUDA-graph-capturable).
 
-        Runs cublas_mm, qk_projection_and_rope, FP8/FP4 quantize, and weight
-        scaling.  Does NOT touch the k cache or any batch-specific metadata,
-        so this can safely run inside a captured CUDA graph partition.
+        Runs the fused wk | weights_proj GEMM, the wq_b projection, k_norm, RoPE,
+        the FP8/FP4 quantization of Q and K and the weight scaling. With
+        ``_use_fused_prologue`` (TRTLLM_DSA_INDEXER_FUSED_PROLOGUE, FP8 indexer)
+        everything after the GEMMs is one Triton launch, otherwise the
+        per-kernel chain runs. Does NOT touch the k cache or any batch-specific
+        metadata, so this can safely run inside a captured CUDA graph partition.
 
         Returns (q_fp_bytes, k_fp_bytes, k_scale, weights, q_scale). The last
         tensor is only consumed by the FP4 kernel dispatch; the FP8 path
@@ -2041,9 +2076,50 @@ class Indexer(nn.Module):
                 # which uses its own handle and always falls back to CUDA-core SGEMM.
                 fused_out = F.linear(_to_float(hidden_states_bf), self._fused_wk_wp_weight)
         indexer_k, weights = fused_out.split([self.head_dim, self.n_heads], dim=-1)
+        if self._use_fused_prologue:
+            # Q is the same wq_b projection _qk_projection_and_rope runs.
+            return self._prologue_fused(indexer_k, weights, self.wq_b(qr), position_ids)
+        return self._prologue_unfused(indexer_k, weights, qr, position_ids)
+
+    def _prologue_fused(
+        self,
+        indexer_k: torch.Tensor,
+        weights: torch.Tensor,
+        q: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """k_norm + RoPE + FP8 quantization (Q, K) + weight scaling in one launch.
+
+        ``q`` is the wq_b output, [num_tokens, n_heads * head_dim] in the model dtype.
+        """
+        n_rows = indexer_k.shape[0]
+        return dsa_indexer_prologue_fused(
+            indexer_k,
+            weights,
+            q.view(n_rows, self.n_heads, self.head_dim),
+            position_ids.view(-1),
+            self._rope_cos_sin_2d,
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.k_norm.variance_epsilon,
+            self.weight_scale_factor,
+            self.rope_dim,
+            interleave=not self.rotary_emb.is_neox,
+            use_ue8m0=self.scale_fmt == "ue8m0",
+            heads_per_prog=self._heads_per_prog,
+        )
+
+    def _prologue_unfused(
+        self,
+        indexer_k: torch.Tensor,
+        weights: torch.Tensor,
+        qr: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-kernel reference chain (gate off or ineligible)."""
         # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE,
         # FP8 quantize); a no-op when the projection already ran in the model dtype.
-        indexer_k = indexer_k.to(hidden_states_bf.dtype)
+        indexer_k = indexer_k.to(self.dtype)
 
         q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(qr, indexer_k, position_ids)
         q, k = maybe_execute_in_parallel(

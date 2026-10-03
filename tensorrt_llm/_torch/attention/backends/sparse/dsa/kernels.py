@@ -3,9 +3,14 @@
 
 from __future__ import annotations
 
+from typing import Optional, Tuple
+
 import torch
 import triton
 import triton.language as tl
+
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+from tensorrt_llm._torch.modules.fused_ops.gelu_tanh_mul_fp4_quant import _rcp_approx
 
 ########################################################
 # Index gather kernel
@@ -468,3 +473,246 @@ def fused_dsa_decode_metadata(
         BLOCK_S=block_s,
         BLOCK_T=block_t,
     )
+
+
+########################################################
+# Fused DSA indexer prologue (TRTLLM_DSA_INDEXER_FUSED_PROLOGUE)
+########################################################
+#
+# ``dsa_indexer_prologue_fused`` runs the FP8 indexer's per-token prologue -- the
+# work between the fused ``wk | weights_proj`` GEMM and the paged MQA-logits
+# kernel -- as one launch:
+#
+#   1. ``k_norm`` LayerNorm over the indexer head dim
+#   2. RoPE on the Q and K rope slices (flashinfer cos/sin cache layout)
+#   3. [pe | nope] FP8 E4M3 quantization of Q and K, one scale per row
+#   4. ``weights * q_scale * softmax_scale * n_heads**-0.5``
+#
+# Numerics contract (bit-identical to the per-kernel chain,
+# ``Indexer._prologue_unfused``): fp32 math on bf16-rounded intermediates -- the
+# LayerNorm output and the RoPE output are rounded to bf16 exactly where the
+# chain materializes bf16 tensors; the flashinfer RoPE expression
+# ``fma(x, cos, (+-partner) * sin)``; fused_cat_fp8's per-row scale rule (amax
+# clamped at 1e-12, / 448, UE8M0 power-of-two round-up when requested), its
+# ``rcp.approx.ftz`` reciprocal and the RN-satfinite E4M3 conversion.
+#
+# The indexer K-cache scatter is not part of this kernel: it needs the batch's
+# slot mappings and stays in ``Indexer._update_k_cache``.
+
+_PDL_ENABLED = get_env_enable_pdl()
+
+
+@triton.jit
+def _fp8_row_scale(amax, UE8M0: tl.constexpr):
+    """fused_cat_fp8 per-row scale: amax clamped at 1e-12, / 448, optional UE8M0 round-up."""
+    amax = tl.maximum(amax, 1.0e-12)
+    ratio = amax * 0.002232142857142857  # 1.0f / 448.0f
+    if UE8M0:
+        bits = ratio.to(tl.uint32, bitcast=True)
+        mant = bits & 0x007FFFFF
+        exp_bits = bits & 0x7F800000
+        exp_bits = tl.where(mant != 0, exp_bits + 0x00800000, exp_bits)
+        scale = exp_bits.to(tl.float32, bitcast=True)
+    else:
+        scale = ratio
+    return scale
+
+
+@triton.jit
+def _rope_terms(d, ROPE_DIM: tl.constexpr, INTERLEAVE: tl.constexpr):
+    """Partner column, cos/sin column and sign for column ``d`` (flashinfer layout)."""
+    HALF: tl.constexpr = ROPE_DIM // 2
+    is_rope = d < ROPE_DIM
+    if INTERLEAVE:
+        # GPT-J style: pairs (2i, 2i + 1) share cos/sin column i; even lanes subtract.
+        partner = tl.where(is_rope, d ^ 1, d)
+        cs_col = d // 2
+        neg = (d % 2) == 0
+    else:
+        # NeoX style: halves [0, HALF) and [HALF, ROPE_DIM); the first half subtracts.
+        partner = tl.where(d < HALF, d + HALF, tl.where(is_rope, d - HALF, d))
+        cs_col = d % HALF
+        neg = d < HALF
+    cs_col = tl.where(is_rope, cs_col, 0)
+    return is_rope, partner, cs_col, neg
+
+
+@triton.jit
+def _apply_rope(x, xp, c, s, neg):
+    # flashinfer: vec[i] = vec[i] * cos[i] + (neg ? -perm[i] : perm[i]) * sin[i];
+    # nvcc contracts this to fma(vec, cos, (+-perm) * sin).
+    t = tl.where(neg, -xp, xp) * s
+    return tl.fma(x, c, t)
+
+
+@triton.jit
+def _dsa_indexer_prologue_fused_kernel(
+    # inputs
+    k_ptr,  # [N, D] pre-norm indexer K (bf16 or fp32; rounded to bf16 first)
+    k_stride,
+    ln_w_ptr,  # [D] LayerNorm weight
+    ln_b_ptr,  # [D] LayerNorm bias
+    q_ptr,  # [N, H, D] bf16 indexer Q (unit inner stride)
+    q_stride_tok,
+    q_stride_head,
+    w_ptr,  # [N, H] weights_proj output (bf16 or fp32)
+    w_stride,
+    pos_ptr,  # [N] positions
+    cos_sin_ptr,  # [max_pos, ROPE_DIM] fp32: [cos(0..HALF) | sin(0..HALF)]
+    cos_sin_stride,
+    # outputs
+    q_fp8_ptr,  # [N, H, D] fp8 e4m3 (contiguous)
+    q_scale_ptr,  # [N, H] fp32
+    k_fp8_ptr,  # [N, D] fp8 e4m3 (contiguous)
+    k_scale_ptr,  # [N] fp32
+    w_out_ptr,  # [N, H] fp32
+    # scalars
+    eps,
+    weight_scale,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    HEADS_PER_PROG: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    UE8M0: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    tok = tl.program_id(0)
+    hblk = tl.program_id(1)
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    tok64 = tok.to(tl.int64)
+    d = tl.arange(0, D)
+    is_rope, partner, cs_col, neg = _rope_terms(d, ROPE_DIM, INTERLEAVE)
+    HALF: tl.constexpr = ROPE_DIM // 2
+
+    pos = tl.load(pos_ptr + tok).to(tl.int64)
+    cs_row = cos_sin_ptr + pos * cos_sin_stride
+    cos_v = tl.load(cs_row + cs_col, mask=is_rope, other=1.0)
+    sin_v = tl.load(cs_row + HALF + cs_col, mask=is_rope, other=0.0)
+
+    # ---------------- Q: HEADS_PER_PROG heads of this token ----------------
+    h = hblk * HEADS_PER_PROG + tl.arange(0, HEADS_PER_PROG)
+    q_row = q_ptr + tok64 * q_stride_tok + h[:, None].to(tl.int64) * q_stride_head
+    qx = tl.load(q_row + d[None, :]).to(tl.float32)
+    qp = tl.load(q_row + partner[None, :]).to(tl.float32)
+    q_rot = _apply_rope(qx, qp, cos_v[None, :], sin_v[None, :], neg[None, :])
+    qv = tl.where(is_rope[None, :], q_rot, qx).to(tl.bfloat16).to(tl.float32)
+    q_amax = tl.max(tl.abs(qv), axis=1)
+    q_scale = _fp8_row_scale(q_amax, UE8M0)
+    q_inv = _rcp_approx(q_scale)
+    q8 = (qv * q_inv[:, None]).to(tl.float8e4nv)
+    qo = (tok64 * H + h[:, None]) * D + d[None, :]
+    tl.store(q_fp8_ptr + qo, q8)
+    tl.store(q_scale_ptr + tok64 * H + h, q_scale)
+
+    # weights * q_scale * (softmax_scale * n_heads^-0.5), same op order as _scale().
+    w = tl.load(w_ptr + tok64 * w_stride + h).to(tl.float32)
+    tl.store(w_out_ptr + tok64 * H + h, (w * q_scale) * weight_scale)
+
+    # ---------------- K: once per token ----------------
+    if hblk == 0:
+        k_row = k_ptr + tok64 * k_stride
+        kx = tl.load(k_row + d).to(tl.bfloat16).to(tl.float32)
+        kxp = tl.load(k_row + partner).to(tl.bfloat16).to(tl.float32)
+        mean = tl.sum(kx, axis=0) / D
+        kc = kx - mean
+        var = tl.sum(kc * kc, axis=0) / D
+        rstd = tl.math.rsqrt(var + eps)
+        lw = tl.load(ln_w_ptr + d).to(tl.float32)
+        lb = tl.load(ln_b_ptr + d).to(tl.float32)
+        lwp = tl.load(ln_w_ptr + partner).to(tl.float32)
+        lbp = tl.load(ln_b_ptr + partner).to(tl.float32)
+        kn = (kc * rstd * lw + lb).to(tl.bfloat16).to(tl.float32)
+        knp = ((kxp - mean) * rstd * lwp + lbp).to(tl.bfloat16).to(tl.float32)
+        k_rot = _apply_rope(kn, knp, cos_v, sin_v, neg)
+        kv = tl.where(is_rope, k_rot, kn).to(tl.bfloat16).to(tl.float32)
+        k_amax = tl.max(tl.abs(kv), axis=0)
+        k_scale = _fp8_row_scale(k_amax, UE8M0)
+        # inline asm needs a block operand: broadcast the row scale over D.
+        k_inv = _rcp_approx(k_scale + tl.zeros([D], dtype=tl.float32))
+        k8 = (kv * k_inv).to(tl.float8e4nv)
+        tl.store(k_fp8_ptr + tok64 * D + d, k8)
+        tl.store(k_scale_ptr + tok64, k_scale)
+
+
+def prologue_heads_per_prog(n_heads: int) -> int:
+    """Q heads per program: 8 when it divides ``n_heads``, else the largest power of two that does."""
+    return 8 if n_heads % 8 == 0 else (n_heads & -n_heads)
+
+
+def dsa_indexer_prologue_fused(
+    indexer_k: torch.Tensor,
+    weights: torch.Tensor,
+    q: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+    ln_weight: torch.Tensor,
+    ln_bias: torch.Tensor,
+    eps: float,
+    weight_scale: float,
+    rope_dim: int,
+    interleave: bool,
+    use_ue8m0: bool,
+    heads_per_prog: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One-launch FP8 indexer prologue: k_norm + RoPE + FP8 Q/K quantization + weight scale.
+
+    Args:
+        indexer_k: [N, D] pre-norm indexer K (bf16, or fp32 which is rounded to bf16).
+        weights: [N, H] weights_proj output (bf16 or fp32), unit inner stride.
+        q: [N, H, D] bf16 indexer Q, unit inner stride (token/head strides are honored).
+        positions: [N] (any int dtype) rope positions.
+        cos_sin: [max_pos, rope_dim] fp32 flashinfer cos/sin cache ([cos | sin]).
+        heads_per_prog: Q heads per program; ``prologue_heads_per_prog(H)`` when None.
+
+    Returns (q_fp8 [N, H, D], k_fp8 [N, D], k_scale [N, 1], weights [N, H] fp32,
+    q_scale [N, H, 1]) -- the ``pre_indexer_proj`` FP8 contract.
+    """
+    n_tok, n_heads, head_dim = q.shape
+    assert head_dim == 128 and indexer_k.shape == (n_tok, head_dim)
+    assert q.stride(-1) == 1 and indexer_k.stride(-1) == 1 and weights.stride(-1) == 1
+    assert cos_sin.dtype == torch.float32 and cos_sin.stride(-1) == 1
+    dev = q.device
+    q_fp8 = torch.empty((n_tok, n_heads, head_dim), dtype=torch.float8_e4m3fn, device=dev)
+    q_scale = torch.empty((n_tok, n_heads, 1), dtype=torch.float32, device=dev)
+    k_fp8 = torch.empty((n_tok, head_dim), dtype=torch.float8_e4m3fn, device=dev)
+    k_scale = torch.empty((n_tok, 1), dtype=torch.float32, device=dev)
+    w_out = torch.empty((n_tok, n_heads), dtype=torch.float32, device=dev)
+    if n_tok == 0:
+        return q_fp8, k_fp8, k_scale, w_out, q_scale
+
+    hp = prologue_heads_per_prog(n_heads) if heads_per_prog is None else heads_per_prog
+    grid = (n_tok, n_heads // hp)
+    _dsa_indexer_prologue_fused_kernel[grid](
+        indexer_k,
+        indexer_k.stride(0),
+        ln_weight,
+        ln_bias,
+        q,
+        q.stride(0),
+        q.stride(1),
+        weights,
+        weights.stride(0),
+        positions,
+        cos_sin,
+        cos_sin.stride(0),
+        q_fp8,
+        q_scale,
+        k_fp8,
+        k_scale,
+        w_out,
+        float(eps),
+        float(weight_scale),
+        H=n_heads,
+        D=head_dim,
+        ROPE_DIM=rope_dim,
+        HEADS_PER_PROG=hp,
+        INTERLEAVE=bool(interleave),
+        UE8M0=bool(use_ue8m0),
+        USE_PDL=_PDL_ENABLED,
+        num_warps=4,
+        launch_pdl=_PDL_ENABLED,
+    )
+    return q_fp8, k_fp8, k_scale, w_out, q_scale
