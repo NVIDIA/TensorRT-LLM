@@ -2872,7 +2872,7 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
         attention all-reduce runs over MNNVL, the TP group's collective state (``K3DecodeComm``, collective: every
         rank builds it here) handed to every layer, with whether its sandwich takes the layer's o_proj, the decode
         path's one-shot ceiling on every stock MNNVL all-reduce (``use_decode_one_shot``), and the MoE decode path
-        (``_build_decode_moe``)."""
+        (``_build_decode_moe``); then the speculative worker's decode kernels (``_gate_spec_worker_kernels``)."""
         super().post_load_weights()
         kda = [layer.linear_attn for layer in self.model.layers if layer.is_kda]
         mla = [layer.self_attn.mixer for layer in self.model.layers if not layer.is_kda]
@@ -2915,6 +2915,7 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
             )
             + f"; MoE on k3_moe_front, k3_moe and the row-parallel tail ({moe_layers} layers)"
         )
+        self._gate_spec_worker_kernels(comm)
 
     def _build_decode_moe(self, comm: _decode_comm.K3DecodeComm) -> int:
         """The MoE decode path (``decode_moe.py``) on every MoE layer it takes: the shared state (collective: the
@@ -2955,6 +2956,29 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
         first.warm_up(takes[0])
         comm.compile_tail(takes[0].moe_hidden_size, first.shared_cols, first.tail_weight)
         return len(takes)
+
+    def _gate_spec_worker_kernels(self, comm: Optional[_decode_comm.K3DecodeComm]) -> bool:
+        """Turn the DFlash / DSpark worker's Kimi K3 decode kernels (its ``k3_decode``: ``trtllm::k3_spec_accept``,
+        ``k3_ctx_kv`` and ``k3_markov``, on target and draft logits kept vocabulary-sharded) on where this target's
+        decode path runs, off elsewhere. On needs the TP group's collective state over MNNVL (``comm``) and the LM
+        head on ``gemm/k3_head_gemv``; the worker still checks each step's own conditions. Returns the setting (False
+        without such a worker)."""
+        worker = getattr(self, "spec_worker", None)
+        if not hasattr(worker, "k3_decode"):
+            return False
+        gemvs = self.model.decode_gemvs
+        worker.k3_decode = (
+            comm is not None and gemvs is not None and gemvs.head_workspace is not None
+        )
+        logger.info(
+            f"Kimi K3 decode kernels: {type(worker).__name__} k3_spec_accept, k3_ctx_kv and k3_markov "
+            + (
+                "on"
+                if worker.k3_decode
+                else "off (no MNNVL decode state or no k3_head_gemv LM head)"
+            )
+        )
+        return worker.k3_decode
 
     def _check_step_contract(self, attn_metadata: AttentionMetadata) -> None:
         """First-forward checks of the engine surface and the per-engine settings."""
