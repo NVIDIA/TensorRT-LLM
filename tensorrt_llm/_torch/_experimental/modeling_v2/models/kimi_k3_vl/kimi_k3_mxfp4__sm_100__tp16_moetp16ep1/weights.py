@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# >>> route B: this target's expert slice
 """Weight loading: Kimi K3 (MXFP4) / sm_100 / tp16_moetp16ep1.
 
 The checkpoint is the vision-language wrapper's. `language_model.*` holds the language model; `vision_tower.*` and
@@ -11,6 +12,7 @@ The checkpoint is the vision-language wrapper's. `language_model.*` holds the la
 * The vision tower and the projector are a predicted non-load: listed here, never read.
 * Any other key fails the load, naming it, rather than being dropped.
 """
+# <<< route B
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
