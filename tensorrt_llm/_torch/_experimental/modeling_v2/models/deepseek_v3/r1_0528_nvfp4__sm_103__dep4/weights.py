@@ -131,7 +131,8 @@ def _swizzle(x: torch.Tensor) -> torch.Tensor:
 
 def _reorder_kv_b(t: torch.Tensor, core) -> torch.Tensor:
     """`[H*(nope+v), C]` per-head-interleaved -> `[H*nope ; H*v]` blocks."""
-    h, n, v, c = core.heads, core.nope, core.v_dim, core.kv_lora
+    cfg = core.model_config.pretrained_config
+    h, n, v, c = cfg.num_attention_heads, cfg.qk_nope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank
     t3 = t.reshape(h, n + v, c)
     return torch.cat(
         [t3[:, :n, :].reshape(h * n, c), t3[:, n:, :].reshape(h * v, c)], dim=0
@@ -194,7 +195,7 @@ def _mtp_rows(rows: dict, core) -> None:
     Everything here is bf16 and stored HF `[out, in]`, so the only transforms
     are the same `kv_b_proj` row regroup the trunk's attention needs and two
     plain row concatenations."""
-    p = f"model.layers.{core.num_layers}"
+    p = f"model.layers.{core.model_config.pretrained_config.num_hidden_layers}"
     rows["mtp_enorm"] = [(f"{p}.enorm.weight", None, None)]
     rows["mtp_hnorm"] = [(f"{p}.hnorm.weight", None, None)]
     rows["mtp_eh"] = [(f"{p}.eh_proj.weight", None, None)]
@@ -258,8 +259,9 @@ def _materialize(entry) -> torch.Tensor:
 def _manifest(core) -> dict:
     """target param key -> list of (ckpt key or key tuple, index into the
     param | None, source transform | None)."""
+    cfg = core.model_config.pretrained_config
     rows: dict = {}
-    for i in range(core.num_layers):
+    for i in range(cfg.num_hidden_layers):
         p = f"model.layers.{i}"
         rows[f"l{i}_norm1"] = [(f"{p}.input_layernorm.weight", None, None)]
         rows[f"l{i}_qa"] = [(f"{p}.self_attn.q_a_proj.weight", None, None)]
@@ -274,7 +276,7 @@ def _manifest(core) -> dict:
         rows[f"l{i}_k_scale"] = [(f"{p}.self_attn.k_proj.k_scale", (0,), None)]
         rows[f"l{i}_v_scale"] = [(f"{p}.self_attn.v_proj.v_scale", (0,), None)]
         rows[f"l{i}_norm2"] = [(f"{p}.post_attention_layernorm.weight", None, None)]
-        if i < core.dense_layers:
+        if i < cfg.first_k_dense_replace:
             _dense_mlp_rows(rows, f"l{i}_mlp", f"{p}.mlp")
             continue
         _dense_mlp_rows(rows, f"l{i}_mlp", f"{p}.mlp.shared_experts")
@@ -307,7 +309,7 @@ def _manifest(core) -> dict:
         # not windowed: derive_after_load asserts the shared-expert
         # activation scale against the max over all 256 routed experts.
         isc1, isc1_up, ws2_1, ws2_1_up, isc2, ws2_2 = [], [], [], [], [], []
-        for e in range(core.num_experts):
+        for e in range(cfg.n_routed_experts):
             q = f"{p}.mlp.experts.{e}"
             isc1.append((f"{q}.gate_proj.input_scale", (e,), None))
             isc1_up.append((f"{q}.up_proj.input_scale", (e,), None))
@@ -336,14 +338,16 @@ def _offwindow_expert_keys(core) -> set:
     The trunk's MoE layers store six such tensors per expert (NVFP4 data plus
     block scales); the MTP module's are bf16, so its off-window experts leave
     three each and no `weight_scale` at all."""
+    cfg = core.model_config.pretrained_config
+    num_layers = cfg.num_hidden_layers
     lo, hi = core.expert_offset, core.expert_offset + core.local_experts
-    layers = list(range(core.dense_layers, core.num_layers))
+    layers = list(range(cfg.first_k_dense_replace, num_layers))
     if core.mtp_enabled:
-        layers += list(range(core.num_layers, core.num_layers + core.mtp_layers))
+        layers += list(range(num_layers, num_layers + core.mtp_layers))
     keys = set()
     for i in layers:
-        quantized = i < core.num_layers
-        for e in range(core.num_experts):
+        quantized = i < num_layers
+        for e in range(cfg.n_routed_experts):
             if lo <= e < hi:
                 continue
             q = f"model.layers.{i}.mlp.experts.{e}"
@@ -367,9 +371,8 @@ def _mtp_keys(core, weights) -> set:
     `lm_head`, which the draft-model container points at instead of loading
     them twice. (The off-window experts are left over too, but they belong to
     the family above and are named there.)"""
-    prefixes = tuple(
-        f"model.layers.{i}." for i in range(core.num_layers, core.num_layers + core.mtp_layers)
-    )
+    num_layers = core.model_config.pretrained_config.num_hidden_layers
+    prefixes = tuple(f"model.layers.{i}." for i in range(num_layers, num_layers + core.mtp_layers))
     if not prefixes:
         return set()
     keys = {k for k in weights if k.startswith(prefixes)}
@@ -427,9 +430,11 @@ def load(model, weights) -> None:
     # shard could not be completed by a collective over rows no other rank
     # computed. Asserted rather than adapted — a shape change is a different
     # logits path.
-    assert tuple(model.lm_head.weight.shape) == (core.vocab, core.hidden), (
+    cfg = core.model_config.pretrained_config
+    expected_lm_head_shape = (cfg.vocab_size, cfg.hidden_size)
+    assert tuple(model.lm_head.weight.shape) == expected_lm_head_shape, (
         f"attention DP replicates lm_head; the shell built "
-        f"{tuple(model.lm_head.weight.shape)} instead of {(core.vocab, core.hidden)}"
+        f"{tuple(model.lm_head.weight.shape)} instead of {expected_lm_head_shape}"
     )
     fill(model.lm_head.weight, "lm_head.weight", None, None)
     # Parameter-side coverage, the other direction: the shell's construction
