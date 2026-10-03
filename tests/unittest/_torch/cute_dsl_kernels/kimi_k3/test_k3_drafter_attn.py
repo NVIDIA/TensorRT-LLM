@@ -16,10 +16,10 @@
 requests of T tokens, at the in-model TP16 group (6 query heads, 1 KV head; TP4 24 / 4 for a few splits), head dim 64,
 HND pages of 64.
 
-Every split R x T (R T <= 8, and R x 8 for R <= 8) with mixed per-request context lengths (blocks crossing a page, a
-128-row tile and the cluster's 16-tile round, no context, several tiles per CTA), page tables as strided row views
-and as dense rows, against an fp32 reference and the model's production path (flashinfer append_paged_kv_cache +
-trtllm-gen batch_context_with_kv_cache, non-causal), plus: no NaN (the pool's unused rows are NaN), the pool left
+Every split R x T (R T <= 8, and R x 8 and R x 7 for R <= 8) with mixed per-request context lengths (blocks crossing a
+page, a 128-row tile and the cluster's 16-tile round, no context, several tiles per CTA), page tables as strided row
+views and as dense rows, against an fp32 reference and the model's production path (flashinfer append_paged_kv_cache
++ trtllm-gen batch_context_with_kv_cache, non-causal), plus: no NaN (the pool's unused rows are NaN), the pool left
 untouched, reruns bit-identical, requests isolated (a change in one request's context or block changes only its
 rows), CUDA-graph replays with rewritten inputs.
 
@@ -37,10 +37,13 @@ EPS = 1e-5
 THETA = 10000.0
 TOL = 1e-2  # max |err| / max |ref|; bf16 P and output roundings are ~4e-3
 
-# Every split the engine schedules for the drafter: R requests x T tokens with R T <= 8, and DSpark's R x 8.
-SPLITS = [(1, 8), (2, 4), (4, 2), (8, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1)] + [
-    (r, 8) for r in range(2, 9)
-]
+# Every split the engine schedules for the drafter: R requests x T tokens with R T <= 8, R x 8, and DSpark's R x 7
+# (its block under shift_label is max_draft_len tokens).
+SPLITS = (
+    [(1, 8), (2, 4), (4, 2), (8, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
+    + [(r, 8) for r in range(2, 9)]
+    + [(r, 7) for r in range(1, 9)]
+)
 # Context lengths, cycled over the requests: blocks crossing a page (60, 121), a 128-row tile (124, 127), the
 # cluster's 16-tile round (2040, 2041); starting a page / tile (0, 64, 128, 1024, 2048); several tiles per CTA.
 LENGTHS = [60, 2040, 5, 124, 1000, 0, 2041, 64, 3000, 127, 1024, 121, 128, 4000, 2048, 1500]
