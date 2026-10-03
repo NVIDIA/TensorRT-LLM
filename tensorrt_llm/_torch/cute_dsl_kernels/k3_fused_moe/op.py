@@ -25,7 +25,9 @@ tensor the TRTLLM-Gen W4A8_MXFP4_MXFP8 op returns, so the routed-latent all-redu
 unchanged.
 
 Two builds: up to 8 tokens (:class:`K3MoeState`, optionally acquiring the front's outputs through the head
-workspace's ready words) and up to 64 (:class:`K3MoeWideState`). The caller owns all state: the scratch a state's
+workspace's ready words) and up to 64 (:class:`K3MoeWideState`). Given a ``K3LatentExchange``, the 8-token build
+pushes the partial into every rank's exchange for ``trtllm::k3_latent_reduce`` instead of returning it
+(:meth:`K3MoeLayer.push`). The caller owns all state: the scratch a state's
 layers share (the intermediate slab, left armed by every call, and the FC2 partial rows), each layer's counters
 (:class:`K3MoeLayer`, left zero by every call), and the head all-gather buffers of the front
 (:class:`K3MoeHeadWorkspace`, collective over the TP group). Build them before CUDA-graph capture; each build
@@ -224,7 +226,8 @@ WIDE_MAX_TOKENS = 64
 
 # The kernel's tensor arguments after the 18 it always reads: the fused all-reduce's buffers (3), the fold's inputs
 # (5), the head flags build's ready words and head flags (2), the latent slab (1). The builds this module compiles
-# read only the ready words and head flags (head_flags), so the others are given a stand-in they never touch.
+# read only the ready words and head flags (head_flags) and the fused all-reduce's buffers in its push-only mode (the
+# push build), so the others are given a stand-in they never touch.
 _OPTIONAL_ARGS = 11
 # int32 words of one slot of a K3LatentExchange: two halves of 8 tokens' bf16 [3584] rows.
 _EXCHANGE_SLOT_WORDS = 2 * _TOKEN_SLOTS * (HIDDEN_SIZE // 2)
@@ -243,10 +246,17 @@ def _part_rows(mod) -> int:
 
 
 def _config(
-    i_tp: int, num_ctas: int, num_local: int, m_max: int, use_pdl: bool, head_flags: bool
+    i_tp: int,
+    num_ctas: int,
+    num_local: int,
+    m_max: int,
+    use_pdl: bool,
+    head_flags: bool,
+    push_world: int = 0,
 ) -> dict:
-    """The kernel options of one build (trace-time constants)."""
-    return {
+    """The kernel options of one build (trace-time constants). ``push_world``: the push build for a latent exchange of
+    that many slots (the fused all-reduce's push-only mode)."""
+    config = {
         "i_tp": i_tp,
         "num_ctas": num_ctas,
         "num_local": num_local,
@@ -255,6 +265,9 @@ def _config(
         "head_flags": int(head_flags),
         "lat_slab": 0,
     }
+    if push_world:
+        config.update(ar_world=push_world, ar_push_only=1)
+    return config
 
 
 class _K3MoeScratch:
@@ -399,6 +412,33 @@ class K3MoeLayer:
         )  # fmt: skip
         return y if out is None else out[: topk_ids.shape[0]]
 
+    def push(
+        self,
+        x_fp8: torch.Tensor,
+        x_sf: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        local_expert_offset: int,
+        exchange,
+        slot: Optional[int] = None,
+        head_ready: Optional[torch.Tensor] = None,
+        head_flags: Optional[torch.Tensor] = None,
+    ) -> None:
+        """``trtllm::k3_moe``'s push build on this layer: the routed partial goes into slot ``slot`` (default
+        ``exchange.rank``) of every rank's ``exchange`` (a ``K3LatentExchange``) instead of a returned tensor, for
+        ``trtllm::k3_latent_reduce``. See the op. ``head_ready`` and ``head_flags`` are given for, and only for, the
+        layers of a ``head_flags`` state."""
+        st = self.state
+        if (head_ready is not None) != st.head_flags:
+            raise ValueError(
+                "K3MoeLayer: head_ready / head_flags are given for, and only for, a head_flags state's layers"
+            )
+        torch.ops.trtllm.k3_moe(
+            x_fp8, x_sf, topk_ids, topk_weights, *self.weights, st.c, st.cs, st.part, self.counters,
+            local_expert_offset, st.num_local, st.num_ctas, st.m_max, st.use_pdl, head_ready, head_flags, None,
+            exchange.uc, exchange.mc, exchange.flags, exchange.rank if slot is None else slot,
+        )  # fmt: skip
+
 
 def _compile_key(device: torch.device, config: dict) -> tuple:
     index = device.index if device.index is not None else torch.cuda.current_device()
@@ -422,8 +462,10 @@ def _compile(mod, args, scalars):
 
 @torch.library.custom_op(
     "trtllm::k3_moe",
-    mutates_args=("c", "cs", "part", "counters", "head_ready", "head_flags", "out"),
-)
+    mutates_args=(
+        "c", "cs", "part", "counters", "head_ready", "head_flags", "out", "exchange_uc", "exchange_mc",
+    ),
+)  # fmt: skip
 def k3_moe(
     x_fp8: torch.Tensor,
     x_sf: torch.Tensor,
@@ -445,6 +487,10 @@ def k3_moe(
     head_ready: Optional[torch.Tensor] = None,
     head_flags: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    exchange_uc: Optional[torch.Tensor] = None,
+    exchange_mc: Optional[torch.Tensor] = None,
+    exchange_flags: Optional[torch.Tensor] = None,
+    exchange_slot: int = 0,
 ) -> torch.Tensor:
     """This rank's routed partial ``[M, 3584]`` bf16 from the persistent ``k3_moe`` kernel: FC1 + SiTU + FC2 with the
     routing-weighted, deterministic combine over this rank's experts.
@@ -457,11 +503,43 @@ def k3_moe(
     build (``num_ctas``, ``use_pdl``); every call leaves the slab armed. ``counters``: the layer's, left zero.
     ``head_ready`` / ``head_flags``: a ``head_flags`` build's ready words and head flags (a ``K3MoeHeadWorkspace``'s
     ``ready`` and ``flags``), whose epoch the call advances. ``out``: bf16, contiguous, at least ``[M, 3584]``; the
-    call writes its first M rows and returns an empty ``[0, 3584]`` instead of a new tensor. 1 <= M <= ``m_max``."""
+    call writes its first M rows and returns an empty ``[0, 3584]`` instead of a new tensor. 1 <= M <= ``m_max``.
+
+    ``exchange_uc`` / ``exchange_mc`` / ``exchange_flags``: a ``K3LatentExchange``'s words (this rank's, and the same
+    words through the multicast mapping) and flags. With them the call is the push build (``m_max`` 8, no ``out``):
+    the partial goes into slot ``exchange_slot`` of half ``exchange_flags[0] & 1`` of every rank's exchange through
+    the multicast mapping (bf16 pairs, -0.0 stored as +0.0, zero rows when nothing is routed here) and the call returns
+    an empty ``[0, 3584]``. Nothing reduces the slots and the flags are not written: ``trtllm::k3_latent_reduce`` sums
+    the slots, empties the half it read and advances the flags. Each push of M tokens is followed by one reduce of M
+    tokens on that exchange before the next push."""
     num_tokens = topk_ids.shape[0]
     head = head_ready is not None
     if head != (head_flags is not None):
         raise ValueError("k3_moe: head_ready and head_flags go together")
+    push = exchange_uc is not None
+    if push != (exchange_mc is not None) or push != (exchange_flags is not None):
+        raise ValueError("k3_moe: exchange_uc, exchange_mc and exchange_flags go together")
+    push_world = 0
+    if push:
+        push_world = exchange_uc.numel() // _EXCHANGE_SLOT_WORDS
+        if (
+            exchange_uc.dtype != torch.int32
+            or exchange_mc.dtype != torch.int32
+            or push_world == 0
+            or exchange_uc.numel() != push_world * _EXCHANGE_SLOT_WORDS
+            or exchange_mc.numel() != exchange_uc.numel()
+            or exchange_flags.dtype != torch.int32
+            or exchange_flags.numel() < 1
+        ):
+            raise ValueError(
+                "k3_moe: the exchange is int32 words [2][8][slots][1792] (this rank's and multicast) and int32 flags"
+            )
+        if not 0 <= exchange_slot < push_world:
+            raise ValueError(
+                f"k3_moe: slot {exchange_slot} outside the exchange's {push_world} slots"
+            )
+        if m_max != MAX_TOKENS or out is not None:
+            raise ValueError("k3_moe: the push build is the m_max 8 build and takes no out")
     if m_max not in (MAX_TOKENS, WIDE_MAX_TOKENS) or (head and m_max != MAX_TOKENS):
         raise ValueError(
             f"k3_moe: m_max is {MAX_TOKENS} (head flags possible) or {WIDE_MAX_TOKENS}, got {m_max}"
@@ -485,7 +563,7 @@ def k3_moe(
         raise ValueError(f"k3_moe: {why}")
     e, two_i, _ = w3_w1_weight.shape
     i_tp = two_i // 2
-    config = _config(i_tp, num_ctas, num_local, m_max, use_pdl, head)
+    config = _config(i_tp, num_ctas, num_local, m_max, use_pdl, head, push_world)
     mod = _kernel_module(config)
     g_cap = mod.G_CAP
     if (
@@ -528,10 +606,15 @@ def k3_moe(
         .reshape(g_cap, _TOKEN_SLOTS, mod.K2_TILES, mod.SFB_GROUP_BYTES)
         .permute(3, 2, 1, 0)
     )
-    # Stand-in for the options this build does not have (fused all-reduce, fold, latent slab, and the head flags
-    # without head_flags): the kernel never touches it.
+    # Stand-in for the options this build does not have (fused all-reduce without a push, fold, latent slab, and the
+    # head flags without head_flags): the kernel never touches it. The push build writes no y.
     unused = counters
     flag_args = (head_ready.view(-1), head_flags.view(-1)) if head else (unused, unused)
+    ar_args = (
+        (exchange_uc.view(-1), exchange_mc.view(-1), exchange_flags.view(-1))
+        if push
+        else (unused,) * 3
+    )
     args = (
         w3_w1_weight.view(torch.int8).permute(2, 1, 0),
         x_fp8.view(torch.uint8).permute(1, 0),
@@ -542,13 +625,14 @@ def k3_moe(
         c.view(torch.uint8).permute(2, 1, 0),
         w2_weight_scale.view(e, HIDDEN_SIZE // 128, i_tp // 128, 512).permute(3, 2, 1, 0),
         sfb2, y, y.view(torch.int32), part, topk_ids, topk_weights, counters,
-        unused, unused, unused,  # the fused all-reduce's buffers
+        *ar_args,  # the fused all-reduce's buffers: the exchange's words and flags (push build)
         unused, unused, unused, unused, unused,  # the fold's inputs
         *flag_args,  # the ready words and the head flags
         unused,  # the latent slab
     )  # fmt: skip
-    # (tokens, local offset, local experts, all-reduce rank, routed scaling factor (fold only), slab buffer, re-arm 0)
-    scalars = (num_tokens, local_expert_offset, num_local, 0, 1.0, 0, 0)
+    # (tokens, local offset, local experts, all-reduce rank (the push's slot), routed scaling factor (fold only), slab
+    # buffer, re-arm 0)
+    scalars = (num_tokens, local_expert_offset, num_local, exchange_slot if push else 0, 1.0, 0, 0)
     key = _compile_key(x_fp8.device, config)
     fn = _compiled.get(key)
     if fn is None:
@@ -558,7 +642,7 @@ def k3_moe(
             )
         fn = _compiled[key] = _compile(mod, args, scalars)
     fn(*args, *scalars, torch.cuda.current_stream(x_fp8.device).cuda_stream)
-    if out is not None:
+    if out is not None or push:
         return y.new_empty((0, HIDDEN_SIZE))
     return y
 
@@ -566,9 +650,10 @@ def k3_moe(
 @k3_moe.register_fake
 def _(x_fp8, x_sf, topk_ids, topk_weights, w3_w1_weight, w3_w1_weight_scale, w2_weight, w2_weight_scale, c, cs,
       part, counters, local_expert_offset, num_local, num_ctas, m_max, use_pdl, head_ready=None, head_flags=None,
-      out=None):  # fmt: skip
-    rows = 0 if out is not None else topk_ids.shape[0]
+      out=None, exchange_uc=None, exchange_mc=None, exchange_flags=None, exchange_slot=0):  # fmt: skip
+    rows = 0 if out is not None or exchange_uc is not None else topk_ids.shape[0]
     return x_fp8.new_empty((rows, HIDDEN_SIZE), dtype=torch.bfloat16)
+
 
 # ---------------------------------------------------------------------------------------------------------------------
 # trtllm::k3_moe_m1 / trtllm::k3_moe_m2: the routed experts of one or two decode tokens as weight-stream kernels
