@@ -23,6 +23,9 @@ k3_moe_push  trtllm::k3_moe's push build at 1, 3 and 8 tokens, after trtllm::k3_
              trtllm::k3_moe_front: K3MoeLayer.push into the run's exchange, the moe/k3_moe entry's k3_moe_push into
              the 16-slot one. The front's head and shared experts are sharded over the run's ranks; its shared
              activation must be the same bits in every call of a set.
+k3_moe_push_route_a
+             the same on route A's experts (tp16_moetp4ep4): a 768-wide intermediate slice of 224 local experts at
+             offset (rank % 4) x 224, so the ranks of one tray hold 4 different expert sets.
 
 Per op, token count and routing set, against the plain call (Layer.__call__, K3MoeLayer.__call__ after the same
 producer), whose partial must be nonzero:
@@ -38,6 +41,7 @@ Run under pytest (a pool of 4 MPI workers) or directly, one process per GPU:
   srun -N1 -n4 --mpi=pmix python3 test_k3_moe_push.py [push k3_moe_push]
 """
 
+import functools
 import hashlib
 import math
 import os
@@ -75,6 +79,8 @@ WORLD = 4
 H, NUM_EXPERTS, SV = 3584, 896, 32
 # TP16: a rank's 192-wide intermediate slice, zero-padded to whole tiles (256) by the loader.
 I_TP, I_PAD, MOE_TP = 192, 256, 16
+# Route A (tp16_moetp4ep4): a rank's 768-wide slice (whole tiles) of 224 local experts.
+I_TP_A, E_LOCAL_A, MOE_TP_A = 768, 224, 4
 HIDDEN, SHARED_INTER = 7168, 6144  # the front's input width; two shared experts of 3072
 GATE_CAP, LINEAR_CAP = 4.0, 25.0  # the SiTU caps
 RSF = 2.827
@@ -123,39 +129,44 @@ def _rand_mxfp4(rows, k, k_full, gen):
     return (codes[:, 0::2] | (codes[:, 1::2] << 4)).contiguous(), exps
 
 
-# _experts' buffers per seed. A dict, not functools.lru_cache: the pool's workers would get an lru_cache wrapper by
-# reference, from a module they cannot import.
+# _experts' buffers per seed and layout. A dict, not functools.lru_cache: the pool's workers would get an lru_cache
+# wrapper by reference, from a module they cannot import.
 _EXPERTS = {}
 
 
-def _experts(seed: int):
-    """This rank's TP16 experts through W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod's loader: the buffers the engines read,
-    the 192-wide shard generated as rank 0 of tensors that hold exactly it (the loader slices it, then pads it to 256).
-    Built once per seed."""
-    if seed in _EXPERTS:
-        return _EXPERTS[seed]
+def _experts(seed: int, route_a: bool = False):
+    """This rank's experts through W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod's loader: the buffers the engines read, the
+    rank's intermediate slice generated alone. TP16: all 896 experts, the 192-wide slice as rank 0 of tensors that
+    hold exactly it (the loader slices it, then pads it to 256); route A: 224 experts, the 768-wide slice whole tiles,
+    which the loader takes as one shard. Built once per seed and layout."""
+    if (seed, route_a) in _EXPERTS:
+        return _EXPERTS[seed, route_a]
     from tensorrt_llm._torch.moe.fused_moe.quantization import W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod
 
+    if route_a:
+        i_tp, i_pad, shards, moe_tp, experts = I_TP_A, I_TP_A, 1, MOE_TP_A, E_LOCAL_A
+    else:
+        i_tp, i_pad, shards, moe_tp, experts = I_TP, I_PAD, MOE_TP, MOE_TP, NUM_EXPERTS
     method = W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod()
-    module = SimpleNamespace(tp_size=MOE_TP, tp_rank=0, scaling_vector_size=SV, intermediate_size=I_TP * MOE_TP,
-                             intermediate_size_per_partition=I_TP, hidden_size=H)  # fmt: skip
+    module = SimpleNamespace(tp_size=shards, tp_rank=0, scaling_vector_size=SV, intermediate_size=i_tp * shards,
+                             intermediate_size_per_partition=i_tp, hidden_size=H)  # fmt: skip
     kw = dict(dtype=torch.uint8, device="cuda")
-    w31 = torch.zeros(NUM_EXPERTS, 2 * I_PAD, H // 2, **kw)
-    w31s = torch.zeros(NUM_EXPERTS, 2 * I_PAD, H // SV, **kw)
-    w2 = torch.zeros(NUM_EXPERTS, H, I_PAD // 2, **kw)
-    w2s = torch.zeros(NUM_EXPERTS, H, I_PAD // SV, **kw)
+    w31 = torch.zeros(experts, 2 * i_pad, H // 2, **kw)
+    w31s = torch.zeros(experts, 2 * i_pad, H // SV, **kw)
+    w2 = torch.zeros(experts, H, i_pad // 2, **kw)
+    w2s = torch.zeros(experts, H, i_pad // SV, **kw)
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    for e in range(NUM_EXPERTS):
-        gate, gate_s = _rand_mxfp4(I_TP, H, H, gen)
-        up, up_s = _rand_mxfp4(I_TP, H, H, gen)
-        down, down_s = _rand_mxfp4(H, I_TP, I_TP * MOE_TP, gen)
+    for e in range(experts):
+        gate, gate_s = _rand_mxfp4(i_tp, H, H, gen)
+        up, up_s = _rand_mxfp4(i_tp, H, H, gen)
+        down, down_s = _rand_mxfp4(H, i_tp, i_tp * moe_tp, gen)
         method.load_expert_w3_w1_weight(module, gate, up, w31[e])
         method.load_expert_w2_weight(module, down, w2[e])
         method.load_expert_w3_w1_weight_scale_mxfp4(module, gate_s, up_s, w31s[e])
         method.load_expert_w2_weight_scale_mxfp4(module, down_s, w2s[e])
     torch.cuda.synchronize()
-    _EXPERTS[seed] = w31, w31s, w2, w2s
-    return _EXPERTS[seed]
+    _EXPERTS[seed, route_a] = w31, w31s, w2, w2s
+    return _EXPERTS[seed, route_a]
 
 
 def _tokens(m: int, seed: int):
@@ -321,11 +332,13 @@ def _front(ctx):
                            head=K3MoeHeadWorkspace.create(ctx.mapping, fabric_handle=fabric))  # fmt: skip
 
 
-def _k3_moe_layer(weights):
+def _k3_moe_layer(weights, route_a: bool = False):
     """This rank's experts as a K3MoeLayer of the 8-token build; a call with an exchange takes its push build."""
     from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.op import K3MoeState
 
     device = torch.device("cuda", torch.cuda.current_device())
+    if route_a:
+        return K3MoeState(device, I_TP_A, E_LOCAL_A).layer(*weights)
     return K3MoeState(device, I_PAD, NUM_EXPERTS).layer(*weights)
 
 
@@ -356,12 +369,16 @@ def _k3_moe_routed(producer, inputs, front):
     return x_fp8, x_sf, ids, weights, shared
 
 
-def check_k3_moe_push(ctx):
+def check_k3_moe_push(ctx, route_a: bool = False):
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe import k3_moe_push
 
     results = []
     front = _front(ctx)
-    layer = _k3_moe_layer(_experts(20260928 + ctx.rank))
+    seed = 20260928 + ctx.rank
+    layer = _k3_moe_layer(_experts(seed, route_a), route_a)
+    # Route A's experts of this rank: global ids [offset, offset + 224), the rank's EP index being rank % 4.
+    offset = ctx.rank * E_LOCAL_A % NUM_EXPERTS if route_a else 0
+    layout = ", route A" if route_a else ""
     copies16 = 16 // ctx.world
     for start in COUNT_STARTS:
         ex, ex16 = _Exchange(ctx, ctx.world, start), _Exchange(ctx, 16, start)
@@ -370,12 +387,12 @@ def check_k3_moe_push(ctx):
                 for si in range(K3_MOE_SETS):
                     inputs = _k3_moe_inputs(producer, m, 2000 + 10 * si + m)
                     *routed, shared = _k3_moe_routed(producer, inputs, front)
-                    y = layer(*routed, 0)
+                    y = layer(*routed, offset)
                     ref = _allreduce(ctx, y)
                     got, pushed_shared = [], []
                     for _ in range(3):
                         *routed, pushed = _k3_moe_routed(producer, inputs, front)
-                        layer.push(*routed, 0, ex, ctx.rank)
+                        layer.push(*routed, offset, ex, ctx.rank)
                         pushed_shared.append(pushed)
                         got.append(ex.reduce(m))
                     state = ex.state_ok(ctx)
@@ -383,13 +400,14 @@ def check_k3_moe_push(ctx):
                     # TP16's receive side: this rank's partial in slots 4 r .. 4 r + 3, one push each.
                     for c in range(copies16):
                         *routed, pushed = _k3_moe_routed(producer, inputs, front)
-                        k3_moe_push(*routed, 0, layer, ex16, ctx.rank * copies16 + c)
+                        k3_moe_push(*routed, offset, layer, ex16, ctx.rank * copies16 + c)
                         pushed_shared.append(pushed)
                     got16 = ex16.reduce(m)
                     state16 = ex16.state_ok(ctx)
                     shared_eq = shared is None or all(_same(s, shared) for s in pushed_shared)
-                    results.append(_row(ctx, f"K3MoeLayer.push after {producer}", f"set{si}_count{start}", m, y, ref,
-                                        got, state, rows, copies16, got16, state16, shared_eq=shared_eq))  # fmt: skip
+                    results.append(_row(ctx, f"K3MoeLayer.push after {producer}{layout}", f"set{si}_count{start}", m,
+                                        y, ref, got, state, rows, copies16, got16, state16,
+                                        shared_eq=shared_eq))  # fmt: skip
     return results
 
 
@@ -475,7 +493,12 @@ def check_sequences(ctx):
     return results
 
 
-CHECKS = {"push": check_push, "k3_moe_push": check_k3_moe_push, "sequences": check_sequences}
+CHECKS = {
+    "push": check_push,
+    "k3_moe_push": check_k3_moe_push,
+    "k3_moe_push_route_a": functools.partial(check_k3_moe_push, route_a=True),
+    "sequences": check_sequences,
+}
 
 
 def _run_checks(names):
