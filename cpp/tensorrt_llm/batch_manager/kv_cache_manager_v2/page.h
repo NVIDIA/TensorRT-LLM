@@ -176,6 +176,17 @@ public:
     WeakPtr<UniqPageLock> uniqLock; // non-null → LOCKED
 };
 
+//! Identifies one live SharedPageLock independently of the lock object's address.
+struct LockOwner
+{
+    KvCache* kvCache;
+    BeamIndex beamIndex;
+    BlockOrdinal ordinal;
+    LifeCycleId lifeCycle;
+
+    bool operator==(LockOwner const&) const = default;
+};
+
 // ---------------------------------------------------------------------------
 // UniqPageLock — locks a page to prevent eviction (LOCKED status).
 // Owns finish events from all SharedPageLocks it issued.
@@ -199,19 +210,28 @@ public:
     // Append a finish event, merging when count exceeds 32 to prevent unbounded growth.
     void notifyFinish(CachedCudaEvent event);
 
+    //! Validate complete sparse history for every owner and prepare non-allocating completion updates.
+    void prepareSparseOffload(KvCache const& requestingCache);
+
+    //! Record a copy ordered after page readiness, finished readers, and all live owners' prior work.
+    void recordOffloadEvent(CachedCudaEvent const& event);
+
+    //! Publish the host slot to every owner and return the fenced GPU slot. Caller holds the API lock.
+    [[nodiscard]] Slot moveToSparseHistory(Slot&& hostSlot);
+
+    std::vector<LockOwner> const& owners() const noexcept
+    {
+        return mOwners;
+    }
+
     SharedPtr<PageHolder> holder;
     std::vector<CachedCudaEvent> finishEvents;
-};
 
-// ---------------------------------------------------------------------------
-// LockOwner — identifies who holds a SharedPageLock.
-// ---------------------------------------------------------------------------
-struct LockOwner
-{
-    KvCache* kvCache;
-    BeamIndex beamIndex;
-    BlockOrdinal ordinal;
-    LifeCycleId lifeCycle;
+private:
+    friend class SharedPageLock;
+    void removeOwner(LockOwner const& owner);
+
+    std::vector<LockOwner> mOwners;
 };
 
 // ---------------------------------------------------------------------------

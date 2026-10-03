@@ -192,6 +192,11 @@ public:
     void batchedMigrate(
         CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages, MigrationRecorder const& migrationRecorder);
 
+    //! Demote complete locked sparse pages on the requesting owner's stream, updating every live owner.
+    //! Caller holds the manager's exclusive lock. Allocation/copy failure preserves GPU ownership.
+    void offloadSparsePages(KvCache& requestingCache, std::vector<SharedPtr<Page>> const& pages,
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
+
     // Best-effort migration of grouped pages to a destination cache level. Returns how many pages
     // it moved off the disk tier, counted per migrated batch rather than per page. A throw reports
     // nothing, which in practice means slot preparation failed before anything moved.
