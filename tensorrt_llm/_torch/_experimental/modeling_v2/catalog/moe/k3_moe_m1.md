@@ -160,4 +160,5 @@ cached per configuration in the process (code only, no state).
   TP4 x EP4 shapes, M 1); the push form at 4 ranks in `test_k3_moe_push.py` (bit-exact against `MNNVLAllReduce`,
   a 16-slot exchange filled 4 slots per rank, the exchange's count across the int32 wrap).
 - Kimi K3 runs the push form over 16 ranks; a 4-rank run fills a 16-slot exchange only by repeating each rank's
-  partial.
+  partial. At 16 ranks (four GB200 trays of one rack, one distinct partial per slot) `test_k3_moe_push.py` passes in
+  a recorded run.
