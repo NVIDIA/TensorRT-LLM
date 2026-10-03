@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import math
 from dataclasses import dataclass
@@ -60,6 +72,7 @@ class GuidedRequest:
     is_draft: bool = False
     draft_tokens: Optional[List[int]] = None
     num_accepted_draft_tokens: Optional[int] = None
+    committed_output: tuple[int, ...] = ()
 
     def require_matcher_init(self) -> bool:
         if self.guided_decoding_params is None:
@@ -83,7 +96,7 @@ class GuidedRequest:
 
     @classmethod
     def from_llm_request(cls, request: LlmRequest):
-        return cls(
+        snapshot = cls(
             guided_decoding_params=request.guided_decoding_params,
             request_id=request.py_request_id,
             seq_slot=(request.py_target_seq_slot
@@ -103,6 +116,17 @@ class GuidedRequest:
             is_draft=request.py_is_draft,
             draft_tokens=request.py_draft_tokens,
             num_accepted_draft_tokens=request.py_num_accepted_draft_tokens)
+        if snapshot.require_matcher_init():
+            if hasattr(request, "get_tokens_range") and hasattr(
+                    request, "get_num_tokens"):
+                snapshot.committed_output = tuple(
+                    request.get_tokens_range(0, request.orig_prompt_len,
+                                             request.get_num_tokens(0)))
+            elif hasattr(request, "get_tokens"):
+                tokens = request.get_tokens(0)
+                orig_len = getattr(request, "orig_prompt_len", len(tokens))
+                snapshot.committed_output = tuple(tokens[orig_len:])
+        return snapshot
 
     def cast_to_draft(self) -> None:
         self.is_draft = True
@@ -258,6 +282,13 @@ class GuidedDecoder:
                 if matcher_init:
                     matcher = self.grammar_matcher_factory.create(
                         req.guided_decoding_params)
+                    # Recomputed context includes output already committed to the grammar.
+                    for token in req.committed_output:
+                        if not matcher.accept_token(token):
+                            raise ValueError(
+                                f"Request {req.request_id} at slot {slot} "
+                                f"failed to accept committed output token: {token}."
+                            )
                     self.grammar_matchers[slot] = matcher
 
                 if matcher_advance:
