@@ -183,7 +183,11 @@ alternate-stream call returns the same result).
     is not characterized by this entry — do not use it.
   - `topk_group == n_group` keeps every group and is bitwise identical to
     `n_group = 1`.
-- `num_tokens == 0` is accepted and returns empty `[0, topk]` tensors.
+- `num_tokens == 0` is accepted and returns empty `[0, topk]` tensors, but
+  the call launches an empty grid and leaves `cudaErrorInvalidValue` pending:
+  the next CUDA launch check in the process raises it ("invalid argument";
+  measured on sm_100, with and without PDL). Skip the call for an empty
+  batch.
 
 A caller violating none of the above gets the result described under
 *Semantics*.
@@ -191,9 +195,10 @@ A caller violating none of the above gets the result described under
 ## Notes
 
 - **Certified surface.** Passing: `num_tokens`
-  in `{0, 1, 2, 4, 7, 8, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192}`;
+  in `{1, 2, 4, 7, 8, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192}` (and
+  `0`, with the pending launch error above);
   `num_experts` in `{1, 2, 7, 8, 16, 32, 64, 72, 100, 128, 256, 257, 512,
-  1024}`; `topk` in `{0, 1, 2, 3, 4, 6, 8, 16, 31, 32}`; all eight accepted
+  896, 1024}`; `topk` in `{0, 1, 2, 3, 4, 6, 8, 16, 31, 32}`; all eight accepted
   (logits, bias) dtype pairs; `routed_scaling_factor` in `{-1, 0, 0.5, 1, 2,
   2.5, 3, 1000}`; ungrouped and the grouped configurations `(num_experts,
   n_group, topk_group, topk)` = `(256,8,4,8)`, `(128,4,2,6)`, `(72,8,2,6)`,
@@ -241,3 +246,5 @@ A caller violating none of the above gets the result described under
   and the block-scale MoE runners' built-in `routing_method_type = 2`
   (DeepSeekV3) path, which is a different code path from this op. Catalog
   membership is `index.yaml`'s fact alone.
+- Kimi K3's routed experts route through it above 64 tokens: 896 experts, top-16, one group, `routed_scaling_factor`
+  1.0, fp32 logits and bias, at 1 to 8192 tokens: `test_kimi_k3_config`.

@@ -127,7 +127,11 @@ None. Stateless — no runtime, attention metadata, or workspace.
   saturated to +-448, and **every exact-zero lane turned into NaN**. Real
   bf16 hidden states never reach this range; a block of scaled-down
   denormals does.
-- `M == 0` (zero rows) is accepted and returns empty `data` and `sf`.
+- `M == 0` (zero rows) is accepted and returns empty `data` and `sf`, but
+  the call launches an empty grid and leaves `cudaErrorInvalidValue` pending:
+  the next CUDA launch check in the process raises it ("invalid argument";
+  measured on sm_100, with and without PDL). Skip the call for an empty
+  batch.
 - The caller owns both returned buffers; nothing else writes them.
 
 ## Notes
@@ -167,3 +171,5 @@ None. Stateless — no runtime, attention metadata, or workspace.
   block-scaled fp8); this entry covers the fixed-32-block mxfp8 path only.
 - The op allocates both outputs itself: it is functional, with no `out=`
   parameter and no in-place mode.
+- Kimi K3's routed experts quantize their latent hidden through it above 64 tokens: K 3584 (7 x 512, no padding),
+  linear scales, alignment 512, at 1 to 8192 rows: `test_kimi_k3_routed_hidden`.

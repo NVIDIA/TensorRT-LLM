@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the noaux_tc_op catalog entry."""
 
+import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
@@ -115,6 +116,31 @@ def test_deepseek_v3_lite_config() -> None:
             weights.float().sum(-1),
             torch.full((num_tokens,), 2.0, device="cuda"),
             rtol=8e-3,  # 6 bf16 addends, each rounded to 8 mantissa bits
+            atol=0.0,
+        )
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_config() -> None:
+    # Kimi K3's routed experts: 896 experts, top-16, n_group=1, topk_group=1,
+    # routed_scaling_factor 1.0, fp32 router logits (the router GEMM's fp32
+    # output) and an fp32 [896] correction bias. Above 64 tokens Kimi K3 routes
+    # through this op; at 1-64 it uses moe/kimi_k3_noaux_tc_mxfp8_quant, whose
+    # test takes this op as its reference.
+    torch.manual_seed(12)
+    bias = torch.randn(896, dtype=torch.float32, device="cuda") * 0.1
+    for num_tokens in [1, 8, 64, 65, 512, 2048, 8192]:
+        logits = torch.randn(num_tokens, 896, dtype=torch.float32, device="cuda") * 2.5
+        weights, ids = _check(logits, bias, 1, 1, 16, 1.0)
+        assert int(ids.min()) >= 0 and int(ids.max()) < 896
+        # 16 distinct experts per token
+        assert (torch.sort(ids, dim=-1).values.diff(dim=-1) > 0).all()
+        torch.testing.assert_close(
+            weights.sum(-1),
+            torch.ones(num_tokens, device="cuda"),
+            rtol=16 * torch.finfo(torch.float32).eps,  # 16 fp32 addends
             atol=0.0,
         )
 

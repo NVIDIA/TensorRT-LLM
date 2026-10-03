@@ -4,6 +4,7 @@
 
 import math
 
+import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (
@@ -357,6 +358,7 @@ def _ref_moe(
     num_local: int | None = None,
     swap_gate_up: bool = False,
     quantize_intermediate: bool = True,
+    act: str = "swiglu",
 ):
     """Native-torch MoE over dequantized mxfp4 weights, fp32 throughout.
 
@@ -364,6 +366,11 @@ def _ref_moe(
     `[offset, offset + num_local)`. `scales[t, j]` multiplies slot `j`'s
     expert output; nothing is renormalized. The FC1 activation is requantized
     to MXFP8 before FC2, which is what the kernel does.
+
+    `act="swiglu"` (act_type 0) is the clamped GLU `(up + beta) * gate *
+    sigmoid(alpha * gate)`; `act="situ"` (act_type 3) is Kimi K3's SiTu,
+    `beta * tanh(up / beta) * alpha * tanh(gate / alpha) * sigmoid(gate)`,
+    with `alpha` the gate's cap and `beta` the linear half's.
     """
     num_tokens, hidden = x_valid.shape
     up_c, up_s, up_b = ref["up"]
@@ -388,10 +395,13 @@ def _ref_moe(
             up = up.clamp(-lim, lim)
         a = 1.0 if alpha is None else float(alpha[local_e])
         b = 0.0 if beta is None else float(beta[local_e])
-        act = (up + b) * gate * torch.sigmoid(a * gate)
+        if act == "situ":
+            h = b * torch.tanh(up / b) * (a * torch.tanh(gate / a) * torch.sigmoid(gate))
+        else:
+            h = (up + b) * gate * torch.sigmoid(a * gate)
         if quantize_intermediate:
-            act = _q_intermediate(act)
-        y = act @ _dequant(dn_c[local_e], dn_s[local_e]).t() + dn_b[local_e]
+            h = _q_intermediate(h)
+        y = h @ _dequant(dn_c[local_e], dn_s[local_e]).t() + dn_b[local_e]
         out.index_add_(0, tok, y * scales[tok, slot].float().unsqueeze(1))
     return out
 
@@ -518,6 +528,55 @@ def test_gpt_oss_pre_routed():
         exp = _ref_moe(xv, ids, wts, ref, alpha, beta, limit).to(torch.bfloat16)
         _assert_moe_close(out, exp)
     print("  test_gpt_oss_pre_routed OK")
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_situ_expert_window():
+    """Kimi K3's routed experts as one rank of its TP16-attention / TP4 x EP4
+    expert layout runs them: 224 of 896 experts (the window at global id 448),
+    hidden 3584, intermediate 768 per rank, top-16 pre-routed ids over all 896
+    experts, SiTu (act_type 3) with Kimi K3's caps on every local expert (gate
+    4.0 in gemm1_alpha, linear 25.0 in gemm1_beta), no biases, no clamp, and
+    the routing arguments its model passes (routing_method_type 2, one group).
+    Slots routed outside the window contribute nothing."""
+    num_experts, num_local, offset, top_k = 896, 224, 448, 16
+    args, ref = _build(num_local, 3584, 768, seed=300)
+    gen = ref["gen"]
+    no_bias = dict(args, gemm1_bias=None, gemm2_bias=None)
+    zero_bias_ref = dict(ref)
+    for role in ("up", "gate", "down"):
+        codes, scales, bias = ref[role]
+        zero_bias_ref[role] = (codes, scales, torch.zeros_like(bias))
+    alpha = torch.full((num_local,), 4.0, dtype=torch.float32, device=DEV)
+    beta = torch.full((num_local,), 25.0, dtype=torch.float32, device=DEV)
+    for num_tokens in (1, 8, 64, 65, 512):
+        data, sf, xv = _rand_mxfp8(num_tokens, 3584, ref["h1_pad"], gen)
+        ids, wts = _routing(num_tokens, num_experts, top_k, gen)
+        out = _call(
+            data,
+            sf,
+            no_bias,
+            num_experts,
+            top_k,
+            topk_ids=ids,
+            topk_weights=wts,
+            n_group=1,
+            topk_group=1,
+            local_expert_offset=offset,
+            local_num_experts=num_local,
+            routing_method_type=2,
+            act_type=3,
+            gemm1_alpha=alpha,
+            gemm1_beta=beta,
+        )
+        assert out.shape == (num_tokens, 3584), out.shape
+        exp = _ref_moe(
+            xv, ids, wts, zero_bias_ref, alpha, beta, offset=offset, num_local=num_local, act="situ"
+        ).to(torch.bfloat16)
+        _assert_moe_close(out, exp)
+    print("  test_kimi_k3_situ_expert_window OK")
 
 
 def test_gpt_oss_router_entry_point():

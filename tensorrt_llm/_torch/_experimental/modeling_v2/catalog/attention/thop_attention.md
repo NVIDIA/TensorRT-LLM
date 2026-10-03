@@ -1942,3 +1942,6 @@ plays for the registered-layer entry points.)
   context flow), and the split-phase trtllm-gen bindings
   `thop.trtllm_gen_context_preprocess` / `thop.trtllm_gen_generation_preprocess`
   / `thop.trtllm_gen_context_postprocess`.
+- Kimi K3's MLA prefill calls it: bf16 latent pool, page 64, heads 6 / 12 / 24 / 96, `q_lora_rank` 1536, `q_scaling`
+  1.0, `position_embedding_type` 2 and its NoPE table (every (cos, sin) pair (1, 0)), in the fresh-prefill and the
+  cached-KV (no-append) context flavors: `test_kimi_k3_mla_context_bf16_page64`.

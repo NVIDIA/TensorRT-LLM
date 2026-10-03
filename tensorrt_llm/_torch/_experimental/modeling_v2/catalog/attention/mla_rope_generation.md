@@ -423,3 +423,6 @@ matches what the in-tree caller passes on the same path.
 | `precomputed_fmha_scheduler` | `False` | The scheduler counter and the two bmm scales come from this call, not from a sparse index kernel. |
 | `kv_only` / `kv_done_elsewhere` | `False` / `False` | Both halves run in this one call. |
 | `quant_scale_qkv` | `None` | `q_nope` in `quant_q_buffer` is not pre-quantized. |
+- Kimi K3's MLA decode preprocessing: bf16 latent pool (`quant_mode` 0, every fp8 buffer None), page 64, heads 6 / 12
+  / 24 / 96, `q_lora_rank` 1536, a strided `q_pe`, its NoPE table, P = 1, a leading context sequence; the outputs and
+  the appended rows are bit-exact copies: `test_kimi_k3_bf16_page64_identity_rope`.
