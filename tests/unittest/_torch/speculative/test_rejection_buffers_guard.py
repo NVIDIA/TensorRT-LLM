@@ -64,7 +64,7 @@ def test_prepare_buffers_allocates_full_draft_probs_on_vocab_mismatch():
     # Distinct draft vocab: full_draft_probs (d2t-expanded) is allocated.
     m = _alloc_meta(draft_vocab_size=V - 1)
     SpecMetadata.prepare_rejection_sampling_buffers(m)
-    assert m.full_draft_probs is not None and tuple(m.full_draft_probs.shape) == (R + 1, K, V)
+    assert m.full_draft_probs is not None and tuple(m.full_draft_probs.shape) == (R, K, V)
 
 
 def test_prepare_buffers_span_seq_slot_pool():
