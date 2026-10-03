@@ -337,6 +337,9 @@ struct MnnvlAllReduceKernelParams
     uint32_t* bufferFlags;
     bool waitForResults;
     QuantizationSFLayout layout;
+    // One-shot kernel: trigger the dependent launch at the start instead of after the reduction,
+    // so a dependent GEMV streams its weights while this kernel waits on the other ranks.
+    bool earlyTrigger;
 };
 
 template <typename PackedType, typename T>
@@ -510,7 +513,6 @@ inline __device__ PackedVec<PackedType, T> reduceOneshotDeterministicFastPath(
     return reduceOneshotDeterministic<WorldSize, LocalRank, T, PackedType, kELTS_PER_THREAD>(remoteValues, localValue);
 }
 
-// The one-shot Lamport reduction of oneshotAllreduceFusionKernel as a function, for oneshotAllreduceAttnResKernel.
 // Fully deterministic: every rank uses the exact same reduction order. For WorldSize <= 8, specialize the local
 // slot so the fast path reuses `val` from registers without a dynamic `remoteValues[rank]` store. Larger world sizes
 // use the compact fallback because the benefit is thin but specializing every rank significantly increases compile
@@ -625,7 +627,6 @@ using detail::copyF4;
 using detail::MnnvlAllReduceKernelParams;
 using detail::sanitizeLamportPayload;
 using detail::accumulateLamportRanksChunked;
-using detail::reduceOneshotDeterministicFastPath;
 using detail::reduceOneshotLamport;
 using detail::writeEpilogueOutput;
 
@@ -644,6 +645,13 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
     int threadOffset = token * params.tokenDim + packedIdx * kELTS_PER_THREAD;
 
     cudaGridDependencySynchronize();
+    if (params.earlyTrigger)
+    {
+        // Dependents read our output and the Lamport flags only after their own
+        // griddepcontrol.wait, i.e. after this grid completes; launching them now only lets
+        // them start streaming weights.
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #else
     int packedIdx = blockIdx.y * blockDim.x + threadIdx.x;
     int token = blockIdx.x;
@@ -681,50 +689,8 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
     }
 
     // ======================= Reduction =============================
-    // Fully deterministic: every rank uses the exact same reduction order. For WorldSize <= 8, specialize the local
-    // slot so the fast path reuses `val` from registers without a dynamic `remoteValues[params.rank]` store. Larger
-    // world sizes use the compact fallback because the benefit is thin but specializing every rank significantly
-    // increases compile time.
-    PackedVec<PackedType, T> packedAccum;
-    if constexpr (WorldSize <= 8)
-    {
-        packedAccum = val;
-#define RUN_ONESHOT_LOCAL_RANK(LOCAL_RANK)                                                                             \
-    case LOCAL_RANK:                                                                                                   \
-        if constexpr (WorldSize > LOCAL_RANK)                                                                          \
-        {                                                                                                              \
-            packedAccum = reduceOneshotDeterministicFastPath<WorldSize, LOCAL_RANK, T, PackedType, kELTS_PER_THREAD>(  \
-                val, stagePtrLocal, token, params.tokenDim, packedIdx);                                                \
-        }                                                                                                              \
-        break
-
-        switch (params.rank)
-        {
-            RUN_ONESHOT_LOCAL_RANK(0);
-            RUN_ONESHOT_LOCAL_RANK(1);
-            RUN_ONESHOT_LOCAL_RANK(2);
-            RUN_ONESHOT_LOCAL_RANK(3);
-            RUN_ONESHOT_LOCAL_RANK(4);
-            RUN_ONESHOT_LOCAL_RANK(5);
-            RUN_ONESHOT_LOCAL_RANK(6);
-            RUN_ONESHOT_LOCAL_RANK(7);
-        }
-#undef RUN_ONESHOT_LOCAL_RANK
-    }
-    else
-    {
-        // Chunk Lamport polling so only a bounded rank set is live at once, avoiding register spills for large
-        // world sizes.
-        constexpr int kRankChunk = 8;
-        float accum[kELTS_PER_THREAD];
-        accumulateLamportRanksChunked<WorldSize, kRankChunk, T, PackedType, kELTS_PER_THREAD>(
-            accum, stagePtrLocal, token, params.tokenDim, packedIdx);
-#pragma unroll
-        for (int i = 0; i < kELTS_PER_THREAD; i++)
-        {
-            packedAccum.elements[i] = cuda_cast<T, float>(accum[i]);
-        }
-    }
+    PackedVec<PackedType, T> packedAccum = reduceOneshotLamport<WorldSize, T, PackedType, kELTS_PER_THREAD>(
+        val, stagePtrLocal, token, params.tokenDim, packedIdx, params.rank);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -834,6 +800,8 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         .attrs = attrs,
         .numAttrs = 2U,
     };
+    // See MnnvlAllReduceKernelParams::earlyTrigger.
+    constexpr bool kEarlyTrigger = true;
 
 #define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, PATTERN)                                                                \
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, &oneshotAllreduceFusionKernel<WORLD_SIZE, T, PATTERN>, kernelParams));
@@ -898,7 +866,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         MnnvlAllReduceKernelParams<T> kernelParams{output, residualOut, input, residualIn, gamma, ucPtrs,
             reinterpret_cast<T*>(params.bufferPtrLocal), mcPtr, params.quantOut, params.scaleOut, params.scaleFactor,
             numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
-            false, params.layout};
+            false, params.layout, kEarlyTrigger};
 
         switch (params.nRanks)
         {

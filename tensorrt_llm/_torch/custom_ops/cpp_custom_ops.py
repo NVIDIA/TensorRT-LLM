@@ -137,7 +137,8 @@ def _register_fake():
           buffer_flags,
           rmsnorm_fusion,
           scale=None,
-          fusion_op: int = 0):
+          fusion_op: int = 0,
+          one_shot_max_bytes: int = 1048576):
         from tensorrt_llm.functional import AllReduceFusionOp
         op = AllReduceFusionOp(fusion_op)
         if op == AllReduceFusionOp.NONE and rmsnorm_fusion:
