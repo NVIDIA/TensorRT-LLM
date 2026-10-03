@@ -33,8 +33,7 @@ def kda_prefill(
     """Run the gated delta rule over each sequence from `state_pool[state_indices[b]]`; return `o`.
 
     The final state of sequence b is written back to `state_pool[state_indices[b]]` (fp32, V-first
-    `[slots, H, V, K]`). Returns `o` shaped like `v`, a view of the runner's scratch for this batch
-    shape: the next call with the same shape overwrites it.
+    `[slots, H, V, K]`). Returns a new `o` shaped like `v`.
     """
     return torch.ops.trtllm.kda_prefill(
         q,

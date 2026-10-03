@@ -91,24 +91,17 @@ def kda_prefill(
 | `A_log` | `[H]` | fp32 | contiguous | CUDA |
 | `dt_bias` | `[H * 128]` | fp32 | contiguous | CUDA |
 | `varlen_is_aligned`, `single_sequence_length` | optional host metadata (Kimi K3's layer passes both: every length a chunk multiple; the length of a lone sequence) | Python bool / int | — | — |
-| returns `o` | `v.shape` | `v.dtype` | a view of the runner's scratch for this batch shape (see State) | same device |
+| returns `o` | `v.shape` | `v.dtype` | newly allocated | same device |
 
 Schema mutation: `state_pool` (`mutates_args=("state_pool",)`).
 
 ## State
 
 **Object.** None of its own (stateful kind P): the op replaces the caller's
-recurrent state rows in place. The runner keeps compiled kernels and scratch
-per batch shape in a process-wide cache (an A1 gap, noted below), and **the
-returned `o` lives in that scratch**. The scratch is keyed by device, batch
-rows, token count (an equal-length single-row batch is first padded to a
-multiple of 256 tokens), heads, `K`, `V`, chunk count, sequence count and the
-batch form: the next call with the same key writes its own `o` into the same
-storage, while a call with another key leaves it alone (pinned by
-`test_output_is_runner_scratch`). A caller consumes or copies `o` before its
-next call with the same key. Kimi K3's layer does: its gated output norm
-reads `o` right away, before the next layer's prefill. (The op's fake
-registration describes `o` as a fresh tensor.)
+recurrent state rows in place. The runner keeps compiled kernels and
+intermediate scratch per batch shape in a process-wide cache (an A1 gap,
+noted below); the returned `o` is not part of it: every call allocates a new
+one, which later calls leave alone (pinned by `test_output_is_a_new_tensor`).
 
 **The pool.** The cache manager's per-layer SSM states (the V2 hybrid
 manager's fp32 V-first pool for a KDA layer), slots possibly strided wider
@@ -149,17 +142,16 @@ per batch. No attention metadata.
   batches of lengths 100, 64, 300, 37 mixing fresh sequences (zeroed rows) and
   continuations (random states) over scattered slots of a padded pool; a
   256 + 256 continuation against one 512-token call and its negative
-  control; an equal-length batch of two 256-token sequences; the output's
-  storage reuse; five of the pool and index checks above, each raising.
+  control; an equal-length batch of two 256-token sequences; a new output on
+  every call; five of the pool and index checks above, each raising.
   Varlen calls pass int64 `cu_seqlens` and `chunk_indices` and the host
   metadata, as the layer does, plus one int32 batch.
 - **Numerics.** Against an fp64 token-by-token reference, `o` is within
   `2e-2` of each sequence's largest output and the final state within `1e-2`
   of its largest entry (measured: at most 5.5e-3 for `o` and 5e-3 for the
   state, over sequences of 37 to 1024 tokens).
-- The A1 gaps: the runner's compiled kernels and scratch live in a
-  module-level cache, not a caller-owned object, and `o` is returned in that
-  scratch rather than as a fresh tensor.
+- The A1 gap: the runner's compiled kernels and intermediate scratch live in
+  a module-level cache, not a caller-owned object.
 - Kimi K3's layer runs a batch of fewer than 4 chunks on FLA's `chunk_kda`
   instead (`ssm/chunk_kda`, which agrees with this entry on a batch either can
   take); a bf16 pool it stages through dense fp32 rows and keeps here.

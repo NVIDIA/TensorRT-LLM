@@ -235,4 +235,4 @@ entries:
 
   - path: ssm/kda_prefill.py
     impl: torch.ops.trtllm.kda_prefill
-    summary: "Chunked KDA (gated delta rule with a per-key decay) prefill of varlen or equal-length sequences from each slot's fp32 V-first recurrent state, the gate and beta activations in the kernel, the final state written back to the slot; the returned o is the runner's scratch for the batch's shape key, overwritten by the next call with the same key"
+    summary: "Chunked KDA (gated delta rule with a per-key decay) prefill of varlen or equal-length sequences from each slot's fp32 V-first recurrent state, the gate and beta activations in the kernel, the final state written back to the slot"

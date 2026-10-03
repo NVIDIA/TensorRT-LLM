@@ -134,7 +134,7 @@ def test_continuation_equals_one_call() -> None:
     one = _Inputs(heads, [512], seed=2)
     one.q, one.k, one.v, one.g, one.beta = whole.q, whole.k, whole.v, whole.g, whole.beta
     one.A_log, one.dt_bias = whole.A_log, whole.dt_bias
-    o_one = one.call([3], [True]).clone()  # o is runner scratch: copy it before the next call
+    o_one = one.call([3], [True])
     state_one = one.pool[3].clone()
     first = _Inputs(heads, [256], seed=2)
     second = _Inputs(heads, [256], seed=2)
@@ -147,8 +147,8 @@ def test_continuation_equals_one_call() -> None:
         part.g, part.beta = whole.g[:, sl].contiguous(), whole.beta[:, sl].contiguous()
         part.A_log, part.dt_bias = whole.A_log, whole.dt_bias
     second.storage, second.pool = first.storage, first.pool
-    o_first = first.call([3], [True]).clone()
-    o_second = second.call([3], [False]).clone()
+    o_first = first.call([3], [True])
+    o_second = second.call([3], [False])
     # Each chunk boundary falls on a 64-token chunk boundary, so the halves give the one call's
     # outputs and state up to the evaluation order of the fp32 state hand-off.
     kr.assert_scaled_close(torch.cat([o_first, o_second], dim=1), o_one, atol=2e-3)
@@ -188,20 +188,17 @@ def test_equal_length_batch() -> None:
         _assert_state_close(inp.pool[slot], ref_s)
 
 
-def test_output_is_runner_scratch() -> None:
-    # The returned o is a view of the runner's scratch for that batch shape: the next call with the
-    # same shapes writes its own o into the same storage, so a caller consumes (or copies) o before
-    # its next call. A call with other shapes leaves it alone.
+def test_output_is_a_new_tensor() -> None:
+    # Every call returns a new o: later calls, with the same shapes or others, share no storage with
+    # it and leave it unchanged.
     heads = 6
     a = _Inputs(heads, [512], seed=5)
     o_a = a.call([3], [True])
     kept = o_a.clone()
-    other = _Inputs(heads, [256], seed=6).call([1], [True])
-    assert other.untyped_storage().data_ptr() != o_a.untyped_storage().data_ptr()
+    for lens, seed in (([256], 6), ([512], 7)):
+        o_b = _Inputs(heads, lens, seed=seed).call([1], [True])
+        assert o_b.untyped_storage().data_ptr() != o_a.untyped_storage().data_ptr()
     assert torch.equal(o_a, kept)
-    same = _Inputs(heads, [512], seed=7).call([1], [True])
-    assert same.untyped_storage().data_ptr() == o_a.untyped_storage().data_ptr()
-    assert not torch.equal(o_a, kept)
 
 
 def test_rejects_out_of_contract() -> None:
