@@ -676,10 +676,13 @@ def check_create_and_first_compile_refuse_capture() -> None:
     K3MoeHeadWorkspace.create has the ranks agree before allocating that each of them can (not capturing, enough free
     memory): with every rank capturing, and with the last rank capturing while its peers call it eagerly, every rank
     raises RuntimeError at that agreement ("not every rank can allocate", a capturing rank's message naming the
-    capture), so none allocates. Every rank must call it: a rank calling it alone would wait for its peers. A front
-    call of a configuration not yet compiled (other SiTU caps) raises RuntimeError under capture before any launch.
-    The workspace keeps its bits and the next call returns the bits of the same call made alone.
+    capture), so none allocates, and each frees the communicator it split for the call. Every rank must call it: a
+    rank calling it alone would wait for its peers. A front call of a configuration not yet compiled (other SiTU caps)
+    raises RuntimeError under capture before any launch. The workspace keeps its bits and the next call returns the
+    bits of the same call made alone.
     """
+    from tensorrt_llm._torch.distributed import ops
+
     nxt = Call(7500, 4, layer=1, kind="front")
     want = alone_results([nxt], WS_A, "before the capture refusals")[0]
     before = workspace_snapshot(WS_A)
@@ -687,10 +690,21 @@ def check_create_and_first_compile_refuse_capture() -> None:
     def create():
         OPS.workspace.create(R.mapping, fabric_handle=R.fabric)
 
-    every = raised_under_capture(create)
-    R.barrier()
+    split = ops._get_mnnvl_workspace_comm
+    comms = []
+
+    def recording_split(mapping):
+        comms.append(split(mapping))
+        return comms[-1]
+
     capturing = R.world - 1
-    one = raised_under_capture(create) if R.rank == capturing else raised_eagerly(create)
+    ops._get_mnnvl_workspace_comm = recording_split
+    try:
+        every = raised_under_capture(create)
+        R.barrier()
+        one = raised_under_capture(create) if R.rank == capturing else raised_eagerly(create)
+    finally:
+        ops._get_mnnvl_workspace_comm = split
     R.barrier()
     first = raised_under_capture(
         lambda: OPS.front(
@@ -708,6 +722,8 @@ def check_create_and_first_compile_refuse_capture() -> None:
         f"rank {R.rank}: every rank capturing {every!r}; rank {capturing} capturing {one!r}; "
         f"uncompiled front {first!r}"
     )
+    freed = len(comms) == 2 and all(c == R.MPI.COMM_NULL for c in comms)
+    assert R.all_true(freed), "a refused create kept the communicator it split"
     after = workspace_snapshot(WS_A)
     assert all(same(a, b) for a, b in zip(before, after)), (
         "a refused call touched the head workspace"

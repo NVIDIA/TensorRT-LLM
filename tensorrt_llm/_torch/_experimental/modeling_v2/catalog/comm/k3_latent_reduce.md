@@ -85,10 +85,11 @@ of up to 8 tokens fits.
   the TP group's communicator, so a rank that calls it while its peers do not waits for them there;
 - failure model (`k3_fused_moe.op.create_mcast_state`, the same as `MnnvlWorkspace.create`'s):
   - before allocating, the ranks agree that each of them can (not capturing, the buffer within that rank's free
-    device memory). If one cannot, every rank raises `RuntimeError` and none allocates (certified: every rank
-    capturing, and one rank capturing while its peers call it eagerly at the same point; every rank raises at that
-    agreement, the capturing rank's message naming the capture, and the next call is correct);
-  - a failure that returns from the allocation is agreed the same way;
+    device memory). If one cannot, every rank raises `RuntimeError`, none allocates, and under MPI each frees the
+    communicator it split for the call (certified: every rank capturing, and one rank capturing while its peers
+    call it eagerly at the same point; every rank raises at that agreement and frees its split, the capturing
+    rank's message naming the capture, and the next call is correct);
+  - a failure that returns from the allocation is agreed and handled the same way;
   - a rank that fails inside the allocation's handle exchange can leave its peers waiting in that exchange; this
     is not turned into an error on the other ranks;
 - eager: it allocates and exchanges handles, so it refuses to run under CUDA-graph capture (every rank raises);

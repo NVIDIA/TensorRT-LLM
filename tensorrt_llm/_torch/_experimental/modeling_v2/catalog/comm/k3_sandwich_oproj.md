@@ -91,10 +91,11 @@ every word empty, every counter zero.
 - collective over `mapping`'s TP group: every rank calls it at the same point;
 - failure model:
   - before allocating, the ranks agree that each of them can (not capturing, the buffer within that rank's free
-    device memory). If one cannot, every rank raises `RuntimeError` and none allocates (certified: one rank
-    capturing while its peers call it eagerly, every rank raises, the capturing rank naming the capture and its
-    peers another rank; no rank reaches the allocation, and the next call is correct);
-  - a failure that returns from the allocation is agreed the same way;
+    device memory). If one cannot, every rank raises `RuntimeError`, none allocates, and under MPI each frees the
+    communicator it split for the call (certified: one rank capturing while its peers call it eagerly, every rank
+    raises, the capturing rank naming the capture and its peers another rank; no rank reaches the allocation,
+    every rank frees its split, and the next call is correct);
+  - a failure that returns from the allocation is agreed and handled the same way;
   - a rank that fails inside the allocation's handle exchange can leave its peers waiting in that exchange; this
     is not turned into an error on the other ranks;
 - eager: it allocates and exchanges handles, so it refuses to run under CUDA-graph capture (certified: every rank

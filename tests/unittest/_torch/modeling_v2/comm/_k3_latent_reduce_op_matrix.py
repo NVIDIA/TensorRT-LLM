@@ -249,12 +249,13 @@ def check_exchange_is_armed_and_sized() -> None:
 
 def check_capture_refusals() -> None:
     """``K3LatentExchange.create`` is collective: every rank joins the TP group's communicator, and before allocating
-    the ranks agree that each of them can. With every rank capturing a CUDA graph, and with one rank capturing while
-    its peers call it eagerly at the same point, every rank raises RuntimeError, and a capturing rank's message names
-    the capture. Every rank raises at that agreement ("not every rank can allocate"; a failure after allocating reads
-    "allocation failed"), so nothing is allocated. The op's first call, which would compile the kernel, is refused per
-    rank: under capture it raises on every rank before it launches anything. The exchange is untouched and the next
-    call is correct. Runs before every eager call of the op: the compile cache must still be cold."""
+    the ranks agree that each of them can. With every rank capturing a CUDA graph, and with one rank capturing while its
+    peers call it eagerly at the same point, every rank raises RuntimeError, and a capturing rank's message names the
+    capture. Every rank raises at that agreement ("not every rank can allocate"; a failure after allocating reads
+    "allocation failed"), so nothing is allocated, and each frees the communicator it split. The op's first call, which
+    would compile the kernel, is refused per rank: under capture it raises on every rank before it launches anything.
+    The exchange is untouched and the next call is correct. Runs before every eager call of the op: the compile cache
+    must still be cold."""
     # Imported by the op's first call; imported here so that nothing is imported inside the capture.
     import cutlass.cute.runtime  # noqa: F401
 
@@ -273,14 +274,29 @@ def check_capture_refusals() -> None:
             return str(exc)
         return ""
 
-    for case, capturing in (("every rank", True), ("one rank", R.rank == R.world - 1)):
-        R.barrier()
-        message = refusal(capturing)
-        refused = "not every rank can allocate" in message
-        named = "outside CUDA-graph capture" in message or not capturing
-        assert R.all_true(refused and named), (
-            f"{case} capturing: rank {R.rank} (capturing {capturing}) got {message!r}"
-        )
+    from tensorrt_llm._torch.distributed import ops
+
+    split = ops._get_mnnvl_workspace_comm
+    comms = []
+
+    def recording_split(mapping):
+        comms.append(split(mapping))
+        return comms[-1]
+
+    ops._get_mnnvl_workspace_comm = recording_split
+    try:
+        for case, capturing in (("every rank", True), ("one rank", R.rank == R.world - 1)):
+            R.barrier()
+            message = refusal(capturing)
+            refused = "not every rank can allocate" in message
+            named = "outside CUDA-graph capture" in message or not capturing
+            assert R.all_true(refused and named), (
+                f"{case} capturing: rank {R.rank} (capturing {capturing}) got {message!r}"
+            )
+    finally:
+        ops._get_mnnvl_workspace_comm = split
+    freed = len(comms) == 2 and all(c == R.MPI.COMM_NULL for c in comms)
+    assert R.all_true(freed), "a refused create kept the communicator it split"
     R.barrier()
     first = raised_under_capture(lambda: entry(MAX_TOKENS, EX_A.state))
     assert R.all_true("outside CUDA-graph capture first" in first), f"first call: {first!r}"

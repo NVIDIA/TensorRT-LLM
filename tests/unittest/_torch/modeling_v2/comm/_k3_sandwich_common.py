@@ -520,19 +520,34 @@ def create_refuses_capture(workspace_type, ws, next_call: Call) -> None:
     rank raise RuntimeError. (a) Every rank captures: every rank raises, naming the capture. (b) The last rank captures
     while its peers call ``create`` eagerly at the same point: every rank raises, the capturing rank naming the
     capture, its peers saying another rank cannot. No rank reaches the allocation in either case (the counted
-    multicast allocation, which the workspaces in use went through), no stream is left capturing, and the workspace
-    in use is untouched: the next call is correct."""
+    multicast allocation, which the workspaces in use went through), each rank frees the communicator it split, no
+    stream is left capturing, and the workspace in use is untouched: the next call is correct."""
+    from tensorrt_llm._torch.distributed import ops
+
     assert ALLOCATIONS[0] > 0, "the counter did not see the workspaces in use being created"
     before = ALLOCATIONS[0]
-    every = _create(workspace_type, capture=True)
-    every_ok = CAPTURE_REFUSED in every
-    R.barrier()
+    split = ops._get_mnnvl_workspace_comm
+    comms = []
+
+    def recording_split(mapping):
+        comms.append(split(mapping))
+        return comms[-1]
+
     capturing = R.world - 1
-    one = _create(workspace_type, capture=R.rank == capturing)
+    ops._get_mnnvl_workspace_comm = recording_split
+    try:
+        every = _create(workspace_type, capture=True)
+        R.barrier()
+        one = _create(workspace_type, capture=R.rank == capturing)
+    finally:
+        ops._get_mnnvl_workspace_comm = split
+    every_ok = CAPTURE_REFUSED in every
     one_ok = (CAPTURE_REFUSED if R.rank == capturing else PEER_REFUSED) in one
     allocated = ALLOCATIONS[0] - before
-    assert R.all_true(every_ok and one_ok and allocated == 0), (
-        f"every rank capturing: {every!r}; rank {capturing} capturing: {one!r}; allocations reached {allocated}"
+    freed = len(comms) == 2 and all(c == R.MPI.COMM_NULL for c in comms)
+    assert R.all_true(every_ok and one_ok and allocated == 0 and freed), (
+        f"every rank capturing: {every!r}; rank {capturing} capturing: {one!r}; allocations reached {allocated}; "
+        f"communicator splits freed {freed}"
     )
     next_call.verify(next_call.run(ws), "after the refused creates")
 
