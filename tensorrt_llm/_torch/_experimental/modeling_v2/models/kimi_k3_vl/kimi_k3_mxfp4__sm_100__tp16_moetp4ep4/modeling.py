@@ -71,8 +71,10 @@ weights are a predicted non-load, `weights.py`), and a step carrying multimodal 
 **Speculative decoding** goes through the stock one-engine shell: DSpark or DFlash with an external drafter
 checkpoint, and SA. The DSpark drafter is this target's `K3DSparkDrafter`, the stock GQA drafter with a decode step's
 block on the drafter entries (`attention/k3_drafter_attn_qknorm` and the drafter's decode GEMV sites); the shell
-builds it through `_build_draft_model`. The worker and its kernels stay upstream code; this target does not own a
-worker.
+builds it through `_build_draft_model`. Where every attention all-reduce runs over MNNVL, the drafter also runs on the
+TP group's collective state: its context projection's `fc` is split by input feature over the group, `hidden_norm`
+applied in the all-reduce of the partial products (`comm/mnnvl_fusion_allreduce`). The worker and its kernels stay
+upstream code; this target does not own a worker.
 """
 
 from __future__ import annotations
@@ -188,10 +190,12 @@ REQUIRED_TRTLLM_OPS = (
     "k3_moe",
     "k3_route_quant",
     "mnnvl_allgather_split",
-    # The DSpark drafter's decode path (K3DSparkDrafter): its GEMV sites and its block attention.
+    # The DSpark drafter's decode path (K3DSparkDrafter): its GEMV sites, its block attention and the all-reduce of
+    # its split context projection with hidden_norm.
     "k3_ctm_gemv",
     "k3_ctm_gemv_swiglu",
     "k3_drafter_attn_qknorm",
+    "mnnvl_fusion_allreduce",
 )
 
 #: The engine surface the first forward checks before this target relies on it: per object, the attributes read.
@@ -233,8 +237,8 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.distributed.AllReduce",
     "tensorrt_llm._torch.modules.multi_stream_utils.maybe_execute_in_parallel",
     # The DSpark drafter: the stock GQA drafter K3DSparkDrafter extends (its block forward where the drafter entries
-    # do not take a block, its context projection and context k / v, its heads and its weight load), and the stock
-    # builder's checks for which drafter a checkpoint gets.
+    # do not take a block, its context projection without the TP group's collective state, its context k / v, its
+    # heads and its weight load), and the stock builder's checks for which drafter a checkpoint gets.
     "tensorrt_llm._torch.models.modeling_dspark.GQADSparkForCausalLM",
     "tensorrt_llm._torch.models.modeling_dspark.draft_is_embedded_in_target",
     "tensorrt_llm._torch.models.modeling_dflash.DFlashForCausalLM",
@@ -2401,6 +2405,42 @@ _DRAFTER_EPS = 1e-5
 _DRAFTER_ROPE_BASE = 10000.0
 
 
+def fc_columns(in_features: int, tp_size: int, tp_rank: int) -> Optional[Tuple[int, int]]:
+    """Rank ``tp_rank``'s input columns ``[start, end)`` of the drafter's context projection ``fc`` split by input
+    feature over ``tp_size`` ranks: equal contiguous blocks in rank order. None where they do not split evenly."""
+    if tp_size < 1 or not 0 <= tp_rank < tp_size or in_features <= 0 or in_features % tp_size:
+        return None
+    width = in_features // tp_size
+    return tp_rank * width, (tp_rank + 1) * width
+
+
+class K3FcSlice(nn.Module):
+    """This rank's block of the DSpark drafter's context projection ``fc`` (`fc_columns`): ``weight`` is
+    ``fc.weight[:, start:end]``, contiguous. Its output is this rank's partial product; the sum over the TP group's
+    ranks is ``fc``'s output."""
+
+    def __init__(self, weight: torch.Tensor, start: int, end: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.start = start
+        self.end = end
+
+    @classmethod
+    def of(cls, fc_weight: torch.Tensor, tp_size: int, tp_rank: int) -> Optional["K3FcSlice"]:
+        """Rank ``tp_rank``'s block of the full ``fc_weight`` ``[out_features, in_features]``: a copy of its columns
+        (on one rank, the weight itself); None where the input columns do not split evenly over ``tp_size`` ranks."""
+        columns = fc_columns(fc_weight.shape[1], tp_size, tp_rank)
+        if columns is None:
+            return None
+        start, end = columns
+        return cls(fc_weight.detach()[:, start:end].contiguous(), start, end)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``hidden_states[:, start:end] @ weight.T`` for the full features ``hidden_states`` ``[N, in_features]``: the
+        GEMM reads the column block in place, through the rows' stride."""
+        return torch.nn.functional.linear(hidden_states[:, self.start : self.end], self.weight)
+
+
 class K3DSparkDrafter(GQADSparkForCausalLM):
     """Kimi K3's DSpark drafter: the stock GQA drafter, with a decode step's block forward on the drafter entries.
 
@@ -2417,8 +2457,13 @@ class K3DSparkDrafter(GQADSparkForCausalLM):
     The norms and the residual adds are the stock modules'; a projection whose site does not take its rows runs its
     module. Every other block runs the stock ``dflash_forward``: a split `DRAFTER_ATTN_SPLITS` does not list, another
     attention backend, head layout, RoPE or normalization, a cache the kernel does not read, or a compile key of the
-    attention that has not run eagerly, under CUDA-graph capture. The worker that calls it (the stock
-    ``DSparkWorker``), the context projection, the context k / v and the Markov head stay upstream code.
+    attention that has not run eagerly, under CUDA-graph capture.
+
+    Where the target hands the drafter the TP group's collective state (``use_decode_comm``), the context projection's
+    ``fc`` holds only this rank's block of input columns (`K3FcSlice`), and ``project_target_hidden`` sums the ranks'
+    partial products with ``hidden_norm`` in one all-reduce; otherwise the context projection is the stock one, with
+    ``fc`` replicated. The worker that calls the drafter (the stock ``DSparkWorker``), the context k / v and the Markov
+    head stay upstream code.
     """
 
     def __init__(
@@ -2432,6 +2477,88 @@ class K3DSparkDrafter(GQADSparkForCausalLM):
         # The attention's compile keys that ran eagerly ((more than one request, page stride)); a capture takes
         # only these.
         self._k3_attn_ran: set = set()
+        # The TP group's collective state (decode_comm.py), set by the target where it builds one (use_decode_comm).
+        self.decode_comm: Optional[_decode_comm.K3DecodeComm] = None
+        # The zero residual of the split context projection's all-reduce, up to a decode step's rows.
+        self._k3_zero_rows: Optional[torch.Tensor] = None
+
+    def use_decode_comm(self, comm: _decode_comm.K3DecodeComm) -> None:
+        """Run the drafter's collectives on ``comm``, the TP group's decode state (``decode_comm.K3DecodeComm``) the
+        target builds where every attention all-reduce runs over MNNVL. The target calls it on every rank once the
+        weights are loaded, before any CUDA-graph capture.
+
+        The context projection's ``fc`` then keeps only this rank's block of input columns (`K3FcSlice`), where they
+        split evenly over the group and the drafter's layers have their TP all-reduce: ``project_target_hidden`` sums
+        the ranks' partial products and applies ``hidden_norm`` in one ``comm/mnnvl_fusion_allreduce`` call."""
+        self.decode_comm = comm
+        self._k3_split_fc()
+
+    def _k3_tp_all_reduce(self) -> Optional[nn.Module]:
+        """The drafter's own TP all-reduce (its first output projection's row-parallel all-reduce module), or None."""
+        o_proj = self.model.layers[0].self_attn.o_proj
+        if getattr(getattr(o_proj, "tp_mode", None), "name", None) != "ROW":
+            return None
+        return getattr(o_proj, "all_reduce", None)
+
+    def _k3_split_fc(self) -> None:
+        """Replace the replicated ``fc`` with this rank's block of its input columns (`K3FcSlice`) and size the zero
+        residual of the projection's all-reduce, where the drafter runs on the TP group's collective state, ``fc`` is
+        a bias-free bf16 projection whose input columns split evenly over the group, and the drafter has its TP
+        all-reduce (for rows the MNNVL workspace does not hold). Otherwise ``fc`` stays replicated."""
+        fc = getattr(self, "fc", None)
+        if self.decode_comm is None or fc is None or isinstance(fc, K3FcSlice):
+            return
+        mapping = self.model_config.mapping
+        weight = getattr(fc, "weight", None)
+        sliced = None
+        if (
+            isinstance(weight, torch.Tensor)
+            and weight.dim() == 2
+            and weight.dtype == torch.bfloat16
+            and getattr(fc, "bias", None) is None
+            and self._k3_tp_all_reduce() is not None
+        ):
+            sliced = K3FcSlice.of(weight, mapping.tp_size, mapping.tp_rank)
+        if sliced is None:
+            logger.info(
+                "Kimi K3 DSpark drafter: fc stays replicated (it is not a bias-free bf16 projection whose input "
+                f"columns split evenly over TP{mapping.tp_size}, or the layers have no TP all-reduce)"
+            )
+            return
+        self.fc = sliced
+        self._k3_zero_rows = weight.new_zeros(
+            MAX_REQUESTS * MAX_TOKENS_PER_REQUEST, weight.shape[0]
+        )
+        logger.info(
+            f"Kimi K3 DSpark drafter: fc split by input feature over TP{mapping.tp_size}: rank {mapping.tp_rank} "
+            f"holds columns [{sliced.start}, {sliced.end}), hidden_norm in the all-reduce"
+        )
+
+    def load_weights(self, weights, weight_mapper=None, **kwargs):
+        """The stock load; on the TP group's collective state, ``fc`` is split again (`_k3_split_fc`)."""
+        result = super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
+        self._k3_split_fc()
+        return result
+
+    def project_target_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``hidden_norm(fc(hidden_states))`` of the captured target features ``[N, in_features]``.
+
+        With ``fc`` split (`K3FcSlice`): this rank's partial product of its columns, then the sum over the TP group
+        with ``hidden_norm`` applied in one ``comm/mnnvl_fusion_allreduce`` call (a zero residual) up to a decode
+        step's rows the MNNVL workspace holds; more rows (a prefill) go through the drafter's TP all-reduce, then
+        ``hidden_norm``. Otherwise the stock projection."""
+        fc = self.fc
+        if not isinstance(fc, K3FcSlice):
+            return super().project_target_hidden(hidden_states)
+        partial = fc(hidden_states.to(fc.weight.dtype))
+        rows = partial.shape[0]
+        zeros = self._k3_zero_rows
+        if rows <= zeros.shape[0] and self.decode_comm.takes_allreduce_norm(rows, partial.shape[1]):
+            normed, _ = self.decode_comm.allreduce_norm(partial, zeros[:rows], self.hidden_norm)
+            return normed
+        if rows == 0:
+            return self.hidden_norm(partial)
+        return self.hidden_norm(self._k3_tp_all_reduce()(partial))
 
     def dflash_forward(
         self,
@@ -2872,7 +2999,8 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
         attention all-reduce runs over MNNVL, the TP group's collective state (``K3DecodeComm``, collective: every
         rank builds it here) handed to every layer, with whether its sandwich takes the layer's o_proj, the decode
         path's one-shot ceiling on every stock MNNVL all-reduce (``use_decode_one_shot``), and the MoE decode path
-        (``_build_decode_moe``); then the speculative worker's decode kernels (``_gate_spec_worker_kernels``)."""
+        (``_build_decode_moe``); then the speculative worker's decode kernels (``_gate_spec_worker_kernels``) and the
+        DSpark drafter's collectives (``_gate_drafter_comm``)."""
         super().post_load_weights()
         kda = [layer.linear_attn for layer in self.model.layers if layer.is_kda]
         mla = [layer.self_attn.mixer for layer in self.model.layers if not layer.is_kda]
@@ -2916,6 +3044,7 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
             + f"; MoE on k3_moe_front, k3_moe and the row-parallel tail ({moe_layers} layers)"
         )
         self._gate_spec_worker_kernels(comm)
+        self._gate_drafter_comm(comm)
 
     def _build_decode_moe(self, comm: _decode_comm.K3DecodeComm) -> int:
         """The MoE decode path (``decode_moe.py``) on every MoE layer it takes: the shared state (collective: the
@@ -2980,6 +3109,18 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
             )
         )
         return worker.k3_decode
+
+    def _gate_drafter_comm(self, comm: Optional[_decode_comm.K3DecodeComm]) -> bool:
+        """Hand the DSpark drafter (`K3DSparkDrafter`) the TP group's collective state ``comm`` where this target built
+        it (every attention all-reduce over MNNVL; TP16 is a construction assert): the drafter then runs its context
+        projection split over the group, ``hidden_norm`` in the all-reduce (``K3DSparkDrafter.use_decode_comm``).
+        Without ``comm`` it keeps the stock replicated ``fc``. Returns whether the drafter took the state (False
+        without such a drafter)."""
+        drafter = getattr(self, "draft_model", None)
+        if comm is None or not isinstance(drafter, K3DSparkDrafter):
+            return False
+        drafter.use_decode_comm(comm)
+        return True
 
     def _check_step_contract(self, attn_metadata: AttentionMetadata) -> None:
         """First-forward checks of the engine surface and the per-engine settings."""

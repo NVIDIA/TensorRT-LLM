@@ -11,15 +11,24 @@ at one TP16 rank's drafter shapes: 6 query heads and 1 KV head of 64, hidden 716
 * A split the entry does not certify runs the stock forward, bit for bit, without the entry.
 * Under CUDA-graph capture, the entries take a block only once its attention compile key has run eagerly.
 * Negative control: a weight changed between the two forwards fails the comparison.
+
+On the TP group's collective state (``use_decode_comm``), here a group of one rank whose collectives are torch
+stand-ins counted per call (the ops themselves are certified by their multi-GPU op matrices):
+
+* The context projection runs on the split ``fc`` (on one rank, the whole weight): up to a decode step's rows through
+  ``comm/mnnvl_fusion_allreduce`` with ``hidden_norm``, more rows through the drafter's TP all-reduce, and matches the
+  replicated projection.
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 from transformers import Qwen3Config
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+    decode_comm,
     decode_gemv,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
@@ -100,13 +109,74 @@ def _weights(seed=11):
     return w
 
 
-@pytest.fixture(scope="module")
-def drafter():
+def _load_drafter():
     model_config = ModelConfig(pretrained_config=_config(), attn_backend="TRTLLM")
     module = target.K3DSparkDrafter(model_config, dflash_attention_backend="TRTLLM").to("cuda")
     module.load_weights(_weights())
     assert module._k3_layers_take(), "the test drafter must be one the drafter entries take"
     return module
+
+
+@pytest.fixture(scope="module")
+def drafter():
+    return _load_drafter()
+
+
+# The TP group's collective state for a group of one rank: the workspaces' sizes are what the drafter reads; their
+# collectives are the stand-ins below.
+ONE_RANK_COMM = decode_comm.K3DecodeComm(
+    mnnvl=SimpleNamespace(world_size=1, buffer_bytes=decode_comm.MNNVL_BUFFER_BYTES),
+    sandwich=SimpleNamespace(world_size=1),
+)
+DECODE_ROWS = target.MAX_REQUESTS * target.MAX_TOKENS_PER_REQUEST
+
+
+def _rms_norm(x, weight, eps):
+    """``RMSNorm(x) * weight`` in fp32, rounded once to bf16."""
+    x = x.float()
+    return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight.float()).to(
+        torch.bfloat16
+    )
+
+
+def _fusion_allreduce_one_rank(
+    input, workspace, one_shot_max_bytes, residual=None, norm_weight=None, eps=None
+):
+    """``comm/mnnvl_fusion_allreduce`` over one rank: the sum is the input, then the residual add and the RMSNorm."""
+    assert workspace is ONE_RANK_COMM.mnnvl
+    assert one_shot_max_bytes == decode_comm.DECODE_AR_ONE_SHOT_MAX_BYTES
+    assert input.dtype == residual.dtype == norm_weight.dtype == torch.bfloat16
+    assert input.is_contiguous() and residual.is_contiguous() and input.shape == residual.shape
+    updated = (input.float() + residual.float()).to(torch.bfloat16)
+    return _rms_norm(updated, norm_weight, eps), updated
+
+
+def _one_rank_collectives(monkeypatch, calls):
+    """The drafter's collectives replaced by their one-rank stand-ins, each call recorded as (op, rows)."""
+
+    def fusion(input, *args, **kwargs):
+        calls.append(("mnnvl_fusion_allreduce", input.shape[0]))
+        return _fusion_allreduce_one_rank(input, *args, **kwargs)
+
+    monkeypatch.setattr(decode_comm, "mnnvl_fusion_allreduce", fusion)
+
+
+@pytest.fixture(scope="module")
+def fused_drafter():
+    """The drafter on the one-rank collective state: its fc split over one rank."""
+    with pytest.MonkeyPatch.context() as mp:
+        _one_rank_collectives(mp, [])
+        module = _load_drafter()
+        module.use_decode_comm(ONE_RANK_COMM)
+    return module
+
+
+@pytest.fixture
+def collectives(monkeypatch):
+    """The one-rank stand-ins of the drafter's collectives, counted: the list of (op, rows) calls."""
+    calls = []
+    _one_rank_collectives(monkeypatch, calls)
+    return calls
 
 
 @pytest.fixture(scope="module")
@@ -245,3 +315,21 @@ def test_negative_control_a_changed_weight_fails(drafter):
             weight.copy_(saved)
     ref = DFlashForCausalLM.dflash_forward(drafter, **stock_inputs)
     assert _rel_l2(out, ref) > REL_L2
+
+
+@pytest.mark.parametrize("rows", [1, 8, DECODE_ROWS, 200])
+def test_split_fc_matches_the_replicated_projection(drafter, fused_drafter, collectives, rows):
+    """On one rank the block is the whole fc. Up to a decode step's rows the projection's all-reduce applies
+    hidden_norm; above, the drafter's TP all-reduce (the identity on one rank) runs and then hidden_norm."""
+    fc = fused_drafter.fc
+    assert isinstance(fc, target.K3FcSlice) and (fc.start, fc.end) == (0, 2 * HIDDEN)
+    assert torch.equal(fc.weight, drafter.fc.weight)
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    features = torch.randn(rows, 2 * HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
+    out = fused_drafter.project_target_hidden(features)
+    ref = drafter.project_target_hidden(features)
+    torch.cuda.synchronize()
+    assert out.shape == ref.shape == (rows, HIDDEN)
+    err = _rel_l2(out, ref)
+    assert err <= REL_L2, err
+    assert collectives == ([("mnnvl_fusion_allreduce", rows)] if rows <= DECODE_ROWS else [])

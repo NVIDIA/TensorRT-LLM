@@ -17,6 +17,11 @@ The pre-attention step after a MoE layer whose row-parallel tail was handed on (
 the same kind of collective: `K3DecodeComm.sandwich_tail`, `comm/k3_sandwich_tail`, runs the tail GEMV, its
 all-reduce and the next layer's residual update (the final norm's, after the last layer) in one kernel.
 
+The DSpark drafter (`K3DSparkDrafter`) runs its collectives with a plain residual add and RMSNorm on the same state:
+`K3DecodeComm.allreduce_norm`, `comm/mnnvl_fusion_allreduce`, all-reduces an unreduced projection output of any token
+count the MNNVL workspace holds, with the residual add and the RMSNorm in its epilogue (the context projection's,
+with a zero residual).
+
 The state is one `MnnvlWorkspace` and one `K3SandwichWorkspace` of the TP group (`K3DecodeComm.create`): collective
 over the group and eager, built by the target in `post_load_weights` before any CUDA-graph capture. Every rank must
 make the same calls on each in the same order. Which call a step takes is decided from its token count and kind and
@@ -43,6 +48,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_tail
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allreduce_attn_res import (
     mnnvl_allreduce_attn_res,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_fusion_allreduce import (
+    mnnvl_fusion_allreduce,
+    required_buffer_bytes,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace import (
     MnnvlWorkspace,
@@ -104,8 +113,10 @@ class PendingTail(NamedTuple):
 
 
 def _eps(norm: nn.Module) -> float:
-    """The epsilon of a KimiK3RMSNorm (``eps``) or a stock RMSNorm (``variance_epsilon``)."""
-    return float(norm.eps if hasattr(norm, "eps") else norm.variance_epsilon)
+    """The epsilon of a KimiK3RMSNorm or ``torch.nn.RMSNorm`` (``eps``; for torch's None, its default: the machine
+    epsilon of the weight's dtype) or a stock RMSNorm (``variance_epsilon``)."""
+    eps = norm.eps if hasattr(norm, "eps") else norm.variance_epsilon
+    return float(torch.finfo(norm.weight.dtype).eps if eps is None else eps)
 
 
 def _res_args(res_proj: nn.Module, res_norm: nn.Module, out_norm: nn.Module) -> tuple:
@@ -290,4 +301,32 @@ class K3DecodeComm:
             block_residual,
             *_res_args(res_proj, res_norm, out_norm),
             self.sandwich,
+        )
+
+    def takes_allreduce_norm(self, rows: int, hidden: int) -> bool:
+        """Whether ``allreduce_norm`` takes ``rows`` bf16 rows of ``hidden`` columns: the MNNVL workspace holds the
+        call at the decode path's one-shot ceiling (`DECODE_AR_ONE_SHOT_MAX_BYTES`, two-shot above it)."""
+        if rows <= 0 or hidden <= 0 or hidden % 8:
+            return False
+        world, buffer_bytes = self.mnnvl.world_size, self.mnnvl.buffer_bytes
+        need = required_buffer_bytes(
+            rows, hidden, world, torch.bfloat16, DECODE_AR_ONE_SHOT_MAX_BYTES
+        )
+        two_shot = rows * hidden * world * 2 > DECODE_AR_ONE_SHOT_MAX_BYTES
+        return need <= buffer_bytes and not (two_shot and buffer_bytes % 32)
+
+    def allreduce_norm(
+        self, partial: torch.Tensor, residual: torch.Tensor, norm: nn.Module
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(normed, updated)`` in one ``comm/mnnvl_fusion_allreduce`` call: ``updated = residual +
+        allreduce(partial)``, ``normed = norm(updated)`` for a plain RMSNorm ``norm``, sent one-shot up to
+        `DECODE_AR_ONE_SHOT_MAX_BYTES`. ``partial`` is this rank's unreduced ``[rows, hidden]`` bf16 output of a
+        row-parallel projection, of a shape ``takes_allreduce_norm`` holds for."""
+        return mnnvl_fusion_allreduce(
+            partial.contiguous(),
+            self.mnnvl,
+            DECODE_AR_ONE_SHOT_MAX_BYTES,
+            residual.contiguous(),
+            norm.weight,
+            _eps(norm),
         )
