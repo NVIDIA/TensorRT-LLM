@@ -213,8 +213,7 @@ class K3MoeState:
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("K3MoeState allocates its scratch: build it outside CUDA-graph capture")
-        # One persistent CTA per SM (config "num_ctas" caps it, e.g. for a grid-size A/B). head_flags always explicit:
-        # its environment fallback must not reach the plain build.
+        # One persistent CTA per SM (config "num_ctas" caps it, e.g. for a grid-size A/B).
         num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
         cfg = {
             "i_tp": i_tp,
@@ -427,6 +426,8 @@ class K3MoeWideState:
     may read once that grid has completed)."""
 
     def __init__(self, device: torch.device, i_tp: int, num_local: int, use_pdl: bool = True):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("K3MoeWideState allocates its scratch: build it outside CUDA-graph capture")
         num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
         config = {
             "i_tp": i_tp,
@@ -506,6 +507,8 @@ class K3MoeWideLayer:
         w2_weight: torch.Tensor,
         w2_weight_scale: torch.Tensor,
     ):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("K3MoeWideLayer allocates its counters: build it outside CUDA-graph capture")
         ok, why = is_supported(
             w3_w1_weight, w3_w1_weight_scale, w2_weight, w2_weight_scale, state.num_local
         )

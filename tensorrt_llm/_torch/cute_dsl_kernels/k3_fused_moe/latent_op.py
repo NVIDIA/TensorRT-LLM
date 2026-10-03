@@ -56,16 +56,17 @@ def default_ctas(world: int) -> int:
 @dataclass(eq=False)
 class K3LatentExchange:
     """The latent all-reduce buffers of a TP group: int32 ``[2][8][world][1792]`` per rank behind one multicast
-    mapping, every word ``0x80000000`` (empty), and ``flags`` (int32 ``[4]``: the consumer's call count, whose parity
-    selects the half, and its CTA arrivals). Separate from the MNNVL all-reduce workspace. Pass ``uc`` and ``flags``
-    as ``trtllm::k3_latent_reduce``'s ``lat_uc`` and ``lat_flags``; :meth:`push_args` gives the producers' arguments."""
+    mapping, every word ``0x80000000`` (empty), and ``flags`` (int32 ``[4]``: [0] the consumer's call count, whose
+    parity selects the half, [2] the CTAs of its running call that have counted in). Separate from the MNNVL all-reduce
+    workspace. Pass ``uc`` and ``flags`` as ``trtllm::k3_latent_reduce``'s ``lat_uc`` and ``lat_flags``;
+    :meth:`push_args` gives the producers' arguments."""
 
     uc: torch.Tensor
     """int32 [2 * 8 * world * 1792]: this rank's words."""
     mc: torch.Tensor
     """The same words through the multicast mapping (where the producers push)."""
     flags: torch.Tensor
-    """int32 [4]: [0] the consumer's call count, then its CTA arrivals."""
+    """int32 [4]: [0] the consumer's call count, [2] its CTA arrivals; [1] and [3] unused."""
     rank: int
     world_size: int
     handle: Any
