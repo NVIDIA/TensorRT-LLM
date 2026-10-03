@@ -241,6 +241,7 @@ def load_internal_apis():
     )
     from tensorrt_llm._torch.distributed import Distributed
     from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+    from tensorrt_llm._torch.pyexecutor.config_utils import resolve_cache_transceiver_config
     from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -288,6 +289,7 @@ def load_internal_apis():
         TorchLlmArgs=TorchLlmArgs,
         resolve_kv_cache_manager_v2_auto=_resolve_kv_cache_manager_v2_auto,
         resolve_transceiver_runtime_auto=_resolve_transceiver_runtime_auto,
+        resolve_cache_transceiver_config=resolve_cache_transceiver_config,
         Mapping=Mapping,
         SamplingParams=SamplingParams,
     )
@@ -390,11 +392,16 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
 
     api = load_internal_apis()
     model_cls, hf_view = _lookup_model_cls(model_dir)
+    declared = side.get("architecture")
+    if model_dir is None and declared:
+        model_cls = api.get_registered_model_class(declared)
     setting = side["use_kv_cache_manager_v2"]
     if setting == "auto" and model_cls is None:
         raise RuntimeError(
             "use_kv_cache_manager_v2 is 'auto', but the precheck could not resolve "
-            f"a registered model class from model_dir={model_dir!r}; refusing to assume V1"
+            f"a registered model class from model_dir={model_dir!r} or "
+            f"metadata.architecture={declared!r}; refusing to assume V1. "
+            "Check LLM_MODELS_ROOT/checkpoint staging or declare the model architecture."
         )
 
     # Runtime BEFORE V2, like serving: the V2 resolver's disagg gating reads
@@ -413,7 +420,7 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
         try:
             parallel = side["parallel"]
             llm_args_kwargs = {
-                "model": model_dir,
+                "model": model_dir or "",
                 "tensor_parallel_size": parallel["tp"],
                 "pipeline_parallel_size": parallel["pp"],
                 "context_parallel_size": parallel["cp"],
@@ -445,10 +452,9 @@ def build_kv_cache_manager(kv_shape, plan, side, mapping, max_req_len, use_v2):
         "bf16": api.DataType.BF16,
     }
     dtype_str = side["kv_dtype"].lower()
-    dtype = dtype_map.get(dtype_str)
-    if dtype is None:
+    dtype = dtype_map[pcfg.normalized_kv_dtype(dtype_str)]
+    if dtype_str not in dtype_map:
         print(f"[precheck] kv dtype {dtype_str!r} not mapped, using BF16", flush=True)
-        dtype = api.DataType.BF16
 
     spec_config = None
     if side["num_nextn_predict_layers"] > 0:
@@ -760,11 +766,12 @@ class StatusRecorder:
     cases + the in-flight failure on disk.
     """
 
-    def __init__(self, work_dir, role, server_idx, is_leader):
+    def __init__(self, work_dir, role, server_idx, is_leader, metadata=None):
         self.role = role
         self.server_idx = server_idx
         self.is_leader = is_leader
         self.cases = []
+        self.metadata = dict(metadata or {})
         status_dir = os.path.join(work_dir, "status")
         if is_leader:
             os.makedirs(status_dir, exist_ok=True)
@@ -800,6 +807,7 @@ class StatusRecorder:
             "overall": overall,
             "cases": self.cases,
             "env": self.env,
+            **self.metadata,
         }
         if extra:
             doc.update(extra)
@@ -922,13 +930,29 @@ class PrecheckRunner:
         self.rank = comm.Get_rank()
         self.is_leader = self.rank == 0
         self.work_dir = args.work_dir
-        self.recorder = StatusRecorder(self.work_dir, self.role, self.server_idx, self.is_leader)
+        model_dir_resolved = plan.get("_model_dir") is not None
+        kv_shape = plan.get("_kv_shape", {})
+        self.recorder = StatusRecorder(
+            self.work_dir,
+            self.role,
+            self.server_idx,
+            self.is_leader,
+            metadata={
+                "model_dir_resolved": model_dir_resolved,
+                "synthetic_kv_shape": (
+                    not model_dir_resolved
+                    or bool(kv_shape.get("simplified"))
+                    or kv_shape.get("source") == "fallback"
+                ),
+            },
+        )
         self.zmq_ctx = None
         self.kvm = None
         self.xcvr = None
         self.runtime = "CPP"
         # Resolved in setup(): "auto" needs the model preference hook.
         self.use_v2 = False
+        self.transfer_contract = {}
         self.mapping = None
         self.llm_request_state = None
         self.csv_dir = os.path.join(self.work_dir, "csv", f"{self.role}_{self.server_idx}")
@@ -944,9 +968,74 @@ class PrecheckRunner:
         return f"rank(s) {ranks}: {bad[0][1]}"
 
     # ---- setup -------------------------------------------------------------
-    def setup(self, kv_shape, max_req_len):
-        api = load_internal_apis()
+    def _resolve_transfer_config(self, kv_shape: dict) -> object:
+        """Resolve local settings without constructing GPU or distributed resources.
 
+        Args:
+            kv_shape: Global synthetic cache dimensions resolved on this rank.
+
+        Returns:
+            The resolved CacheTransceiverConfig consumed by setup.
+
+        Raises:
+            RuntimeError: If preferences cannot be resolved or V2 requires Python.
+        """
+        api = load_internal_apis()
+        role_configs = {}
+        contracts = {}
+        # Both role resolutions are compared, preserving supported asymmetry
+        # (e.g. a V1 sender and V2 receiver) while detecting local model drift.
+        for role in ("ctx", "gen"):
+            side = pcfg.side_plan(self.plan, role)
+            cache_cfg = api.CacheTransceiverConfig(**side["cache_transceiver_config"])
+            use_v2 = resolve_model_prefs(self.plan.get("_model_dir"), side, cache_cfg)
+            api.resolve_cache_transceiver_config(cache_cfg)
+            runtime = cache_cfg.transceiver_runtime or "CPP"
+            if use_v2 and runtime != "PYTHON":
+                raise RuntimeError(
+                    "KVCacheManagerV2 requires cache_transceiver_config."
+                    f"transceiver_runtime: PYTHON, got {runtime!r}"
+                )
+            role_configs[role] = cache_cfg
+            contracts[role] = {
+                "use_v2": use_v2,
+                "runtime": runtime,
+                "backend": cache_cfg._resolve_default_backend()[0],
+                "kv_dtype": pcfg.normalized_kv_dtype(side["kv_dtype"]),
+            }
+        self.use_v2 = contracts[self.role]["use_v2"]
+        self.transfer_contract = {
+            **contracts,
+            "tokens_per_block": self.plan["tokens_per_block"],
+            "kv_shape": {
+                key: kv_shape[key] for key in ("num_layers", "num_kv_heads", "head_dim", "is_mla")
+            },
+        }
+        if self.is_leader and (kv_shape.get("simplified") or self.plan.get("_model_dir") is None):
+            print(
+                f"[precheck {self.role}_{self.server_idx}] synthetic KV pool; "
+                f"model_dir={self.plan.get('_model_dir')!r}, "
+                f"architecture={self.plan['architecture']!r}. "
+                "This checks cache transport; serving still requires a staged checkpoint.",
+                flush=True,
+            )
+        return role_configs[self.role]
+
+    def setup(self, kv_shape, max_req_len):
+        cache_cfg = None
+        local_err = None
+        try:
+            cache_cfg = self._resolve_transfer_config(kv_shape)
+        except Exception as exc:  # noqa: BLE001 - every rank must reach consensus
+            local_err = exc
+        reason = self._consensus_error(local_err)
+        if reason is not None:
+            raise RuntimeError(f"model/cache configuration resolution failed: {reason}")
+        contracts = self.comm.allgather(self.transfer_contract)
+        if any(contract != contracts[0] for contract in contracts[1:]):
+            raise RuntimeError(f"resolved transfer contract mismatch within instance: {contracts}")
+
+        api = load_internal_apis()
         self.llm_request_state = api.LlmRequestState
         par = self.side["parallel"]
         self.mapping = api.Mapping(
@@ -965,30 +1054,6 @@ class PrecheckRunner:
         # as "<instanceUuid>_<rank>.csv" (KVSendTask throughput on the ctx
         # side).
         os.environ["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = self.csv_dir
-
-        # Built VERBATIM from the disagg yaml's cache_transceiver_config so
-        # backend/max_tokens_in_buffer/timeouts match the real test exactly.
-        cache_cfg = api.CacheTransceiverConfig(**self.side["cache_transceiver_config"])
-        # Yaml-absent settings resolve against the model's preferences, like
-        # serving does (kv manager version + transceiver runtime) -- this holds
-        # even for the simplified stand-in pool: only the KV SHAPE is generic;
-        # the V1/V2 manager version and the transceiver runtime must still
-        # match what the real model runs (e.g. V4 -> V2 + Python).
-        self.use_v2 = resolve_model_prefs(self.plan.get("_model_dir"), self.side, cache_cfg)
-        if kv_shape.get("simplified") and self.is_leader:
-            print(
-                f"[precheck {self.role}_{self.server_idx}] SIMPLIFIED: {kv_shape['simplified']}",
-                flush=True,
-            )
-        # KVCacheManagerV2 only works with the Python transceiver (see
-        # cache_transceiver_test/report.py); reject the pairing up front with
-        # a clear INIT_ERROR instead of a C++ binding type error.
-        if self.use_v2 and cache_cfg.transceiver_runtime != "PYTHON":
-            raise RuntimeError(
-                "KVCacheManagerV2 requires cache_transceiver_config."
-                f"transceiver_runtime: PYTHON, got {cache_cfg.transceiver_runtime!r} "
-                "(the C++ transceiver only supports the V1 manager)"
-            )
 
         manager_cls = api.KVCacheManagerV2 if self.use_v2 else api.KVCacheManager
         api.maybe_enable_fabric_memory_for_python_transceiver(cache_cfg, manager_cls)
@@ -1480,7 +1545,7 @@ def _recv_ctx_control(
 # test, never over ZMQ):
 #
 #   gen leader                                ctx leader
-#    | -- hello {fingerprint} --------------> |  yaml mismatch -> abort
+#    | -- hello {fingerprint, contract} ----> |  config mismatch -> abort
 #    | <---------------- welcome ------------ |
 #    | -- go {li, rep, wave} --------------> |  every rank posts its sends
 #    | <----- params {pair: ctx_phase} ------ |  (from the owning dp ranks)
@@ -1515,7 +1580,19 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
     if msg[0] != "hello" or msg[1].get("fingerprint") != plan["fingerprint"]:
         leader_reply(("abort", "plan fingerprint mismatch (ctx/gen yaml disagree)"))
         raise _TransferError(f"handshake with gen_{peer_idx} failed: {msg[:1]}")
-    leader_reply(("welcome", {"fingerprint": plan["fingerprint"]}))
+    if msg[1].get("transfer_contract") != runner.transfer_contract:
+        reason = (
+            "resolved transfer contract mismatch: "
+            f"ctx={runner.transfer_contract}, gen={msg[1].get('transfer_contract')}"
+        )
+        leader_reply(("abort", reason))
+        raise _TransferError(reason)
+    leader_reply(
+        (
+            "welcome",
+            {"fingerprint": plan["fingerprint"], "transfer_contract": runner.transfer_contract},
+        )
+    )
 
     for li, req_len, rep, wave in _schedule(plan):
         msg = _recv_ctx_control(
@@ -1634,7 +1711,14 @@ def _gen_open_session(runner, peer_idx, arm):
     try:
         reply = runner._leader_send_recv_with_progress(
             sock,
-            ("hello", {"gen_idx": runner.server_idx, "fingerprint": plan["fingerprint"]}),
+            (
+                "hello",
+                {
+                    "gen_idx": runner.server_idx,
+                    "fingerprint": plan["fingerprint"],
+                    "transfer_contract": runner.transfer_contract,
+                },
+            ),
             key,
             peer_role="ctx",
             peer_idx=peer_idx,
@@ -1646,6 +1730,13 @@ def _gen_open_session(runner, peer_idx, arm):
             raise _TransferError(f"ctx_{peer_idx} aborted handshake: {reply[1]}")
         if reply[0] != "welcome":
             raise _TransferError(f"unexpected handshake reply from ctx_{peer_idx}: {reply[:1]}")
+        if (
+            reply[1].get("fingerprint") != plan["fingerprint"]
+            or reply[1].get("transfer_contract") != runner.transfer_contract
+        ):
+            reason = f"ctx_{peer_idx} handshake contract mismatch: {reply[1]}"
+            runner._leader_send_recv(sock, ("abort", reason), key)
+            raise _TransferError(reason)
         if runner.is_leader:
             zmq, _ = runner._zmq()
             sock.setsockopt(zmq.RCVTIMEO, hello_s * 1000)
