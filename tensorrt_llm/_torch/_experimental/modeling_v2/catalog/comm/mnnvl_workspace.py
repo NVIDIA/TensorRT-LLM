@@ -58,9 +58,10 @@ class MnnvlWorkspace:
 
         Failure model: before allocating, the ranks agree that each of them can (not capturing, a valid
         ``buffer_bytes``, the three buffers within its device's free memory); if one cannot, every rank raises
-        ``RuntimeError`` and none allocates. A failure that returns from the allocation is agreed the same way. A
-        rank that fails inside the allocation's handle exchange can leave its peers waiting in that exchange: that
-        failure is not turned into an error on the other ranks.
+        ``RuntimeError``, none allocates, and under MPI each frees the communicator it split for the call. A failure
+        that returns from the allocation is agreed and handled the same way. A rank that fails inside the
+        allocation's handle exchange can leave its peers waiting in that exchange: that failure is not turned into
+        an error on the other ranks.
 
         ``fabric_handle``: share the memory by fabric handle (required across nodes) rather than POSIX file
         descriptor; default ``mapping.is_multi_node()``."""
@@ -71,6 +72,7 @@ class MnnvlWorkspace:
             _mnnvl_device_index,
             _mnnvl_workspace_all_succeeded,
         )
+        from tensorrt_llm._utils import mpi_disabled
 
         use_fabric = mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
         total = NUM_LAMPORT_BUFFERS * buffer_bytes
@@ -87,6 +89,9 @@ class MnnvlWorkspace:
             if free_bytes < total:
                 problem = f"its {total} bytes exceed the {free_bytes} free on this rank's device"
         if not _mnnvl_workspace_all_succeeded(comm, problem is None):
+            # Every rank takes this path: free the MPI communicator split above (a ProcessGroup is c10d's).
+            if not mpi_disabled():
+                comm.Free()
             raise RuntimeError(
                 f"MnnvlWorkspace.create: not every rank can allocate ({problem or 'another rank cannot'})"
             )
@@ -108,6 +113,10 @@ class MnnvlWorkspace:
         except Exception as exc:  # noqa: BLE001 -- reported to every rank below, then re-raised
             error = exc
         if not _mnnvl_workspace_all_succeeded(comm, error is None):
+            # Every rank takes this path too. A handle only borrows the communicator and makes no MPI call when
+            # destroyed, so it may outlive the communicator.
+            if not mpi_disabled():
+                comm.Free()
             raise RuntimeError("MnnvlWorkspace: allocation failed on at least one rank") from error
         # Arms every buffer word and the flags; also the barrier after which a peer may push into this rank.
         _initialize_allreduce_mnnvl_protocol(

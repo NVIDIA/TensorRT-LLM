@@ -101,14 +101,23 @@ def check_workspace_is_armed_and_sized() -> None:
 
 
 def check_create_refuses_on_every_rank() -> None:
-    """One rank asks for three buffers past its device's free memory: every rank raises before any allocates, and the
-    workspaces in use stay correct."""
+    """One rank asks for three buffers past its device's free memory: every rank raises before any allocates and frees
+    the communicator it split, and the workspaces in use stay correct."""
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace import (
         MnnvlWorkspace,
     )
+    from tensorrt_llm._torch.distributed import ops
+
+    split = ops._get_mnnvl_workspace_comm
+    comms = []
+
+    def recording_split(mapping):
+        comms.append(split(mapping))
+        return comms[-1]
 
     free_bytes, _ = torch.cuda.mem_get_info()
     too_big = (free_bytes // 3 // 16 + (64 << 20) // 16) * 16
+    ops._get_mnnvl_workspace_comm = recording_split
     try:
         MnnvlWorkspace.create(
             R.mapping, too_big if R.rank == 0 else BUFFER_BYTES, fabric_handle=R.fabric
@@ -116,7 +125,11 @@ def check_create_refuses_on_every_rank() -> None:
         raised = False
     except RuntimeError as exc:
         raised = "not every rank can allocate" in str(exc)
+    finally:
+        ops._get_mnnvl_workspace_comm = split
     assert R.all_true(raised), "a rank short of memory did not make every rank raise"
+    freed = len(comms) == 1 and comms[0] == R.MPI.COMM_NULL
+    assert R.all_true(freed), "a refused create kept the communicator it split"
     call = Call(2100, 8, 3)
     verify(call, call.run(WS_A), "after the refused create")
 
