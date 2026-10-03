@@ -2959,10 +2959,11 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
 
     def _gate_spec_worker_kernels(self, comm: Optional[_decode_comm.K3DecodeComm]) -> bool:
         """Turn the DFlash / DSpark worker's Kimi K3 decode kernels (its ``k3_decode``: ``trtllm::k3_spec_accept``,
-        ``k3_ctx_kv`` and ``k3_markov``, on target and draft logits kept vocabulary-sharded) on where this target's
-        decode path runs, off elsewhere. On needs the TP group's collective state over MNNVL (``comm``) and the LM
-        head on ``gemm/k3_head_gemv``; the worker still checks each step's own conditions. Returns the setting (False
-        without such a worker)."""
+        ``k3_ctx_kv`` and ``k3_markov``, on target and draft logits kept vocabulary-sharded) on only when every input
+        that path needs exists: the TP group's collective state over MNNVL (``comm``) and the LM head's
+        ``gemm/k3_head_gemv`` workspace. ``K3LogitsProcessor.lm_head_shard`` needs that workspace to produce the
+        vocabulary shard, so the workspace is a precondition of the path, not a policy choice. The worker still checks
+        each step's own conditions. Returns the setting (False without such a worker)."""
         worker = getattr(self, "spec_worker", None)
         if not hasattr(worker, "k3_decode"):
             return False
