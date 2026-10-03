@@ -191,6 +191,11 @@ class BaseMultimodalInputProcessor(ABC):
     # inputs to `call_with_token_ids` instead of detokenizing upstream.
     supports_token_id_mm_expansion: ClassVar[bool] = False
 
+    # Whether the subclass takes `enable_tokenization_cache` in `__init__` and
+    # serves text-only prompts from the prefix-tokenization cache. Only such
+    # subclasses receive the flag from `create_input_processor`.
+    supports_tokenization_cache: ClassVar[bool] = False
+
     def __init__(self,
                  model_path,
                  config,

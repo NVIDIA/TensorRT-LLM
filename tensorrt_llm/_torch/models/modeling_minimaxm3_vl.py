@@ -1737,10 +1737,10 @@ class MiniMaxM3VLInputProcessor:
     ``MINIMAX_M3_VL_VISION_END_TOKEN`` above, resolved via the tokenizer).
 
     With ``enable_tokenization_cache``, text-only prompts are tokenized through
-    the prefix-tokenization cache instead of the HF processor.
+    the prefix-tokenization cache instead of the HF processor, under the same
+    rules as ``DefaultInputProcessor``.
     """
 
-    # Makes create_input_processor pass enable_tokenization_cache.
     supports_tokenization_cache = True
 
     def __init__(
@@ -2071,7 +2071,12 @@ class MiniMaxM3VLInputProcessor:
                 templated_text = "\n".join(explicit)
         else:
             templated_text = text_prompt or ""
-            if self._prefix_token_cache is not None:
+            if (
+                self._prefix_token_cache is not None
+                and sampling_params is not None
+                and not sampling_params.add_special_tokens
+                and sampling_params.truncate_prompt_tokens is None
+            ):
                 ids = self._prefix_token_cache.encode(self._processor.tokenizer, templated_text)
                 return ids, {"multimodal_data": {}}
 
