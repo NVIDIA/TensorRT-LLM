@@ -121,6 +121,12 @@ def _register_fake():
         return allreduce(input, residual, norm_weight, scale, bias, workspace,
                          group, strategy, op, eps, trigger_completion_at_end)
 
+    @torch.library.register_fake("trtllm::mnnvl_allreduce_attn_res")
+    def _(input, prefix_sum, block_residual, res_weight, rms_weight,
+          output_rms_weight, rms_eps, output_rms_eps, comm_buffer,
+          buffer_flags):
+        return [torch.empty_like(input), torch.empty_like(input)]
+
     # MNNVL Allreduce
     @torch.library.register_fake("trtllm::mnnvl_fusion_allreduce")
     def _(input,

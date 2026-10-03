@@ -2215,6 +2215,80 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     return {};
 }
 
+// Kimi K3 pre-MoE residual update in the MNNVL one-shot all-reduce epilogue; see
+// tensorrt_llm::kernels::mnnvl::oneshotAllreduceAttnResOp. Returns {normed, updated_prefix_sum}.
+std::vector<torch::Tensor> mnnvlAllReduceAttnRes(torch::Tensor const& input,
+    torch::optional<torch::Tensor> const& prefix_sum, torch::Tensor const& block_residual,
+    torch::Tensor const& res_weight, torch::Tensor const& rms_weight, torch::Tensor const& output_rms_weight,
+    double rms_eps, double output_rms_eps, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags)
+{
+    auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    TORCH_CHECK(
+        mcast_mem != nullptr, "[mnnvlAllReduceAttnRes] comm_buffer must be obtained from a mcastBuffer instance.");
+    TORCH_CHECK(mcast_mem->isMapped(), "[mnnvlAllReduceAttnRes] MNNVL workspace handles are not attached.");
+    auto const checkBf16 = [](torch::Tensor const& tensor, char const* name)
+    {
+        TORCH_CHECK(tensor.is_cuda() && tensor.scalar_type() == torch::kBFloat16 && tensor.is_contiguous(),
+            "[mnnvlAllReduceAttnRes] ", name, " must be a contiguous CUDA bfloat16 tensor");
+    };
+    checkBf16(input, "input");
+    checkBf16(block_residual, "block_residual");
+    checkBf16(res_weight, "res_weight");
+    checkBf16(rms_weight, "rms_weight");
+    checkBf16(output_rms_weight, "output_rms_weight");
+    TORCH_CHECK(input.dim() == 2, "[mnnvlAllReduceAttnRes] input must be [num_tokens, hidden]");
+    int64_t const numTokens = input.size(0);
+    int64_t const hiddenDim = input.size(1);
+    if (prefix_sum.has_value())
+    {
+        checkBf16(prefix_sum.value(), "prefix_sum");
+        TORCH_CHECK(prefix_sum.value().sizes() == input.sizes(),
+            "[mnnvlAllReduceAttnRes] prefix_sum must have the shape of input");
+    }
+    TORCH_CHECK(block_residual.dim() == 3 && block_residual.size(1) == numTokens && block_residual.size(2) == hiddenDim,
+        "[mnnvlAllReduceAttnRes] block_residual must be [num_snapshots, num_tokens, hidden]");
+    for (auto const* weight : {&res_weight, &rms_weight, &output_rms_weight})
+    {
+        TORCH_CHECK(weight->dim() == 1 && weight->size(0) == hiddenDim,
+            "[mnnvlAllReduceAttnRes] res_weight, rms_weight and output_rms_weight must be [hidden]");
+    }
+    int64_t const nRanks = mcast_mem->getWorldSize();
+    TORCH_CHECK(numTokens * hiddenDim * nRanks <= comm_buffer.size(-1),
+        "[mnnvlAllReduceAttnRes] the one-shot footprint of ", numTokens * hiddenDim * nRanks,
+        " elements exceeds one Lamport buffer of ", comm_buffer.size(-1), " elements");
+
+    torch::Tensor normOut = torch::empty_like(input);
+    torch::Tensor prefixOut = torch::empty_like(input);
+
+    auto params = tensorrt_llm::kernels::mnnvl::AllReduceFusionParams();
+    params.nRanks = static_cast<int>(nRanks);
+    params.rank = mcast_mem->getRank();
+    params.dType = tensorrt_llm::DataType::kBF16;
+    params.numTokens = static_cast<int>(numTokens);
+    params.tokenDim = static_cast<int>(hiddenDim);
+    params.bufferPtrsDev = reinterpret_cast<void**>(mcast_mem->getBufferPtrsDev());
+    params.bufferPtrLocal = comm_buffer.mutable_data_ptr();
+    params.multicastPtr = mcast_mem->getMulticastPtr();
+    params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
+    params.input = input.const_data_ptr();
+    params.residualIn = prefix_sum.has_value() ? prefix_sum.value().const_data_ptr() : nullptr;
+    params.residualOut = prefixOut.mutable_data_ptr();
+    params.output = normOut.mutable_data_ptr();
+    params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+    tensorrt_llm::kernels::mnnvl::AttnResEpilogueParams epilogue{};
+    epilogue.blockResidual = block_residual.const_data_ptr();
+    epilogue.resWeight = res_weight.const_data_ptr();
+    epilogue.rmsWeight = rms_weight.const_data_ptr();
+    epilogue.outputRmsWeight = output_rms_weight.const_data_ptr();
+    epilogue.rmsEps = static_cast<float>(rms_eps);
+    epilogue.outputRmsEps = static_cast<float>(output_rms_eps);
+    epilogue.numCandidates = static_cast<int>(block_residual.size(0)) + 1;
+
+    tensorrt_llm::kernels::mnnvl::oneshotAllreduceAttnResOp(params, epilogue);
+    return {normOut, prefixOut};
+}
+
 torch::Tensor minimax_allreduce_rms(torch::Tensor const& input, torch::Tensor const& norm_weight,
     torch::Tensor workspace, int64_t const rank, int64_t const nranks, double const eps,
     bool const trigger_completion_at_end_)
@@ -2317,6 +2391,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? scale=None, int fusion_op=0) -> "
         "Tensor[]");
     m.def(
+        "mnnvl_allreduce_attn_res(Tensor input, Tensor? prefix_sum, Tensor block_residual, Tensor res_weight, "
+        "Tensor rms_weight, Tensor output_rms_weight, float rms_eps, float output_rms_eps, Tensor(a!) comm_buffer, "
+        "Tensor(b!) buffer_flags) -> Tensor[]");
+    m.def(
         "allreduce("
         "Tensor input,"
         "Tensor? residual,"
@@ -2414,6 +2492,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("mnnvl_fusion_allreduce", &tensorrt_llm::torch_ext::mnnvlFusionAllReduce);
+    m.impl("mnnvl_allreduce_attn_res", &tensorrt_llm::torch_ext::mnnvlAllReduceAttnRes);
     m.impl("allreduce", &tensorrt_llm::torch_ext::allreduce_raw);
     m.impl("autotuned_allreduce", &tensorrt_llm::torch_ext::autotunedAllreduce);
     m.impl("register_allreduce_tactic", &tensorrt_llm::torch_ext::registerAllReduceTactic);
