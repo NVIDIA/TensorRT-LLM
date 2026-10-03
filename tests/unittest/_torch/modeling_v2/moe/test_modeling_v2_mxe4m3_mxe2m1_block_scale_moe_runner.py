@@ -288,22 +288,23 @@ def _call(data, sf, args, num_experts, top_k, **kw):
 # ── reference ─────────────────────────────────────────────────────────────
 
 
-# The FC1 epilogue's block-scale recipe is architecture-specific, and the
-# difference is bit-exact rather than a tolerance: trtllm-gen ships one cubin
-# per architecture. Measured on each, with an identity down-projection reading
-# the intermediate out element by element (test_intermediate_is_mxfp8_quantized):
+# The FC1 epilogue's block-scale recipe is a property of each architecture's
+# trtllm-gen cubin (one cubin per architecture), and the two candidates differ
+# bit-exactly rather than by a tolerance:
 #
-#   sm_100   e8m0 = floor(log2(amax)) - 8      "OCP scale"
-#   sm_103   e8m0 = ceil(log2(amax / 448))     "round-up scale"
+#   "round_up"   e8m0 = ceil(log2(amax / 448))
+#   "ocp"        e8m0 = floor(log2(amax)) - 8
 #
-# The round-up form is the one `torch.ops.trtllm.mxfp8_quantize` has always
-# used, so sm_103 makes the MoE epilogue and the standalone quantizer agree.
-# Both are named here, and each architecture's test refutes the other's recipe,
-# so a future cubin that switches back cannot pass silently.
+# Measured on each architecture with an identity down-projection reading the
+# intermediate out element by element (test_intermediate_is_mxfp8_quantized),
+# both sm_100 and sm_103 use the round-up scale, the one
+# `torch.ops.trtllm.mxfp8_quantize` applies, so the MoE epilogue and the
+# standalone quantizer agree. That test also refutes the recipe not in force,
+# so a cubin that switches recipe fails there instead of drifting quietly.
 _OCP_SCALE, _ROUND_UP_SCALE = "ocp", "round_up"
 
 _SCALE_RECIPE_BY_SM = {
-    (10, 0): _OCP_SCALE,
+    (10, 0): _ROUND_UP_SCALE,
     (10, 3): _ROUND_UP_SCALE,
 }
 
@@ -626,7 +627,7 @@ def test_mxfp8_quantize_pairing():
 
 
 def test_intermediate_is_mxfp8_quantized():
-    """The FC1 activation reaches FC2 as MXFP8, on the OCP scale, bit-exactly.
+    """The FC1 activation reaches FC2 as MXFP8, on the architecture's block scale, bit-exactly.
 
     A down projection set to the identity turns the returned rows into the
     kernel's own post-activation intermediate, so the requantization can be
@@ -698,7 +699,7 @@ def test_intermediate_is_mxfp8_quantized():
             "differ bit-exactly and every other cell's reference depends on "
             "which one is in force"
         )
-        # The other architecture's recipe must NOT also fit, or this case does
+        # The other recipe must NOT also fit, or this case does
         # not actually separate them and the bit-exact claim is vacuous.
         other = _OCP_SCALE if recipe == _ROUND_UP_SCALE else _ROUND_UP_SCALE
         assert not torch.equal(out, _q_intermediate(act, other)), (

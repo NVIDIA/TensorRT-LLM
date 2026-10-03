@@ -79,28 +79,26 @@ out[t] += topk_weights[t, j] * y            # fp32 accumulation
 and `out` is stored as bf16. The gpt-oss clamped GLU is exactly
 `alpha = 1.702`, `beta = 1.0`, `limit = 7.0`.
 
-**The intermediate is MXFP8, on the OCP scale.** FC2 is an MXFP8 x MXFP4 GEMM,
-so the FC1 epilogue quantizes its post-activation output before FC2 reads it.
-Per token row and per **32 consecutive intermediate columns** (natural column
-order, blocks starting at column 0 of the padded intermediate):
+**The intermediate is MXFP8, on the round-up scale.** FC2 is an MXFP8 x MXFP4
+GEMM, so the FC1 epilogue quantizes its post-activation output before FC2 reads
+it. Per token row and per **32 consecutive intermediate columns** (natural
+column order, blocks starting at column 0 of the padded intermediate):
 
 ```
 amax  = max |act| over the 32-element block
-e     = floor(log2(amax)) - 8               # E8M0 byte = e + 127; e = -127 if amax == 0
+e     = ceil(log2(amax / 448))              # E8M0 byte = e + 127; e = -127 if amax == 0
 act'  = round_to_nearest_even(clamp(act / 2^e, -448, +448)) * 2^e
 ```
 
-This is the OCP MX scale — `floor` of the block max's exponent, with the block
-max itself **saturating** to `448 * 2^e` whenever its mantissa exceeds 1.75
-(18–21% of blocks measured, clipping that one element by up to 12.5%). It is
-**not** the round-up scale `torch.ops.trtllm.mxfp8_quantize` applies to
-activations, and modelling it as such is wrong for exactly those blocks. An
-intermediate element below roughly `2^-18` of its block's largest magnitude
-rounds to zero. This entry's test reads the requantized values straight out of
-the kernel (a down projection set to the identity) and matches the formula
-above bit-exactly on all 16384 + 46080 elements of two geometries
-(`H = I = 512` and `H = I = 2880`); on the same data the round-up scale
-matches 99.2% of elements and the *un*quantized activation 6%.
+This is the scale `torch.ops.trtllm.mxfp8_quantize` applies to activations, on
+sm_100 and sm_103 alike (the recipe is a property of each architecture's cubin;
+see *The FC1 epilogue's block-scale recipe* below). An intermediate element
+below roughly `2^-18` of its block's largest magnitude rounds to zero. This
+entry's test reads the requantized values straight out of the kernel (a down
+projection set to the identity) and matches the formula above bit-exactly on
+all 16384 + 46080 elements of two geometries (`H = I = 512` and
+`H = I = 2880`), while the OCP scale (`floor(log2(amax)) - 8`, which saturates
+a block max whose mantissa exceeds 1.75) does not fit.
 
 **FC1 half order is `[up | gate]`.** Before the kernel's row interleave (§
 *Preconditions*) the first `I_pad` rows of the FC1 operand are the up
@@ -483,29 +481,30 @@ A caller violating none of the above gets the result described under
   `index.yaml`'s fact alone.
 
 
-## The FC1 epilogue's block-scale recipe is architecture-specific
+## The FC1 epilogue's block-scale recipe
 
-trtllm-gen ships one cubin per architecture, and the two differ **bit-exactly**
-in how the FC1 epilogue picks the e8m0 scale when it requantizes its activation
-output to MXFP8 for FC2. Measured with an identity down-projection, which reads
-the intermediate out element by element rather than inferring it from output
-noise (`test_intermediate_is_mxfp8_quantized`):
+trtllm-gen ships one cubin per architecture, and a cubin's FC1 epilogue picks
+the e8m0 scale by one of two recipes, which differ **bit-exactly**, when it
+requantizes its activation output to MXFP8 for FC2. Measured with an identity
+down-projection, which reads the intermediate out element by element rather
+than inferring it from output noise (`test_intermediate_is_mxfp8_quantized`):
 
 | Arch | e8m0 exponent | Name |
 |---|---|---|
-| sm_100 | `floor(log2(amax)) - 8` | OCP scale |
+| sm_100 | `ceil(log2(amax / 448))` | round-up scale |
 | sm_103 | `ceil(log2(amax / 448))` | round-up scale |
 
-Both were verified bit-exact on their own architecture (0 mismatched elements)
-and each *refutes* the other's, so the cases genuinely separate the recipes.
-The round-up form is what `torch.ops.trtllm.mxfp8_quantize` has always used, so
-sm_103 brings the MoE epilogue into agreement with the standalone quantizer.
+Each is bit-exact on its architecture (0 mismatched elements), and the test
+*refutes* the other recipe, the OCP scale `floor(log2(amax)) - 8`, so its cases
+genuinely separate the two. The round-up form is what
+`torch.ops.trtllm.mxfp8_quantize` uses, so the MoE epilogue and the standalone
+quantizer agree.
 
-This is the whole of the sm_100 -> sm_103 numerical difference for this entry.
-Before the reference was made architecture-aware, 10 of 19 cells failed --
-relative RMS ~5.5 ulp against a 4 ulp gate, max abs ~0.07 against 0.031. With
-the correct recipe in force all 19 pass **at the original tolerances**, which
-is what identifies the recipe as the sole cause rather than one contributor.
+The recipe is the whole of this entry's numerical dependence on the cubin. On
+sm_100, a reference under the OCP scale fails 10 of the 18 cells (relative RMS
+~5.5 ulp against a 4 ulp gate, max abs ~0.07 against 0.031); under the
+round-up scale all 18 pass **at the original tolerances**, which is what
+identifies the recipe as the sole cause rather than one contributor.
 
 A future cubin that changes recipe again will fail the bit-exact test rather
 than drift quietly; record the new recipe in `_SCALE_RECIPE_BY_SM`, and do not
