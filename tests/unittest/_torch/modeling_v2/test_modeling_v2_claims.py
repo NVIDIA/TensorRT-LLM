@@ -219,7 +219,8 @@ def test_targets_do_not_share_files():
 
 
 #: tensorrt_llm imports that compute nothing, so a target's generic path need not declare them: types and configs
-#: it reads, enums it passes, the metadata it is handed, its registration and its logger.
+#: it reads, enums it passes, the metadata it is handed and the views it takes of it, the graph-capture context it
+#: asks about, its registration and its logger.
 _NON_COMPUTE_IMPORTS = frozenset(
     {
         "AllReduceStrategy",
@@ -232,6 +233,8 @@ _NON_COMPUTE_IMPORTS = frozenset(
         "QuantAlgo",
         "QuantConfig",
         "SiTuActivation",
+        "is_in_breakable_cuda_graph",
+        "k3_mla_decode_view",
         "logger",
         "register_auto_model",
     }
