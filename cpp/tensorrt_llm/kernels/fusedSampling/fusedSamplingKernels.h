@@ -58,7 +58,11 @@ struct FusedSamplingParams
     //! call is legal inside a captured CUDA graph.
     uint64_t const* seed{nullptr};
     uint64_t const* offset{nullptr};
-    //! Whether seed/offset carry one entry per row rather than a single shared entry.
+    //! Whether seed/offset carry one entry per row rather than a single shared entry. A
+    //! shared entry makes the row index the Philox subsequence, so rows still draw
+    //! independent streams. Per-row entries use subsequence 0: a row's draws then depend
+    //! only on its own seed/offset, not on its position in the batch, and rows must be
+    //! given non-overlapping offsets. A row draws at most kMaxRejectRounds (32) values.
     bool perRowRng{false};
 
     //! Output [numRows], optional. Sampled token ids.

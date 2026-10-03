@@ -100,6 +100,7 @@ class _Sampler(TorchSampler):
         self._fast_temperatures = None
         self._fast_top_ks = None
         self._fast_top_ps = None
+        self._fast_min_ps = None
         self._fast_seeds = None
         self._fast_offsets = None
         self._fast_num_rows = 0
@@ -268,7 +269,7 @@ class TestStaging:
         # batch simply did not schedule. Advancing its Philox offset would make
         # that request's stream depend on concurrent load, which is exactly what
         # _SeedManager exists to prevent.
-        live = make_request(py_request_id=1, py_seq_slot=0)
+        live = make_request(sampling={**FAST_PARAMS, "seed": 7}, py_request_id=1, py_seq_slot=0)
         dummy = make_request(py_request_id=99, py_seq_slot=None, is_dummy=True)
         before = sampler._seed_manager._offsets.clone()
 
