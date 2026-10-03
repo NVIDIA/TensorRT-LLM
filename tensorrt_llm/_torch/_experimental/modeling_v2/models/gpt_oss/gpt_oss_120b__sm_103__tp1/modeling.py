@@ -397,13 +397,20 @@ class ModelingV2Core(DecoderModel):
             Phase.DECODE: DecodeTarget(self),
         }
 
-    def _check_step_contract(self, md, position_ids) -> None:
+    def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE
         asks for it: the metadata fields this target consumes must exist (they
         are private trtllm surface). Everything checked is fixed at
         engine construction — once per model instance is sound, and off in a
         served engine, where the only thing this could still do is fail.
+
+        Called unconditionally every forward; the early return below is the
+        gate. That costs one Python call per forward, not per layer, against
+        a decode step measured in milliseconds -- accepted in exchange for
+        not scattering the `_contract_pending` check across every call site.
         """
+        if not self._contract_pending:
+            return
         # Calling the projection is the check: it reads every metadata field
         # this target consumes, so a rename or removal upstream surfaces
         # here rather than mid-forward. Deriving it this way is the point --
@@ -428,8 +435,12 @@ class ModelingV2Core(DecoderModel):
         the dispatcher is equivalent to duplicating it into both
         `PrefillTarget` and `DecodeTarget` and checks nothing they would not.
         """
-        if self._contract_pending:
-            self._check_step_contract(attn_metadata, kwargs.get("position_ids"))
+        # "A new engine step has begun" is the dispatcher's knowledge, not a
+        # target's: this runs once per engine forward, before either target
+        # binds per-step state, so validating() catches a target that forgot
+        # to rebind.
+        advance_step_generation()
+        self._check_step_contract(attn_metadata)
         return self._targets[phase_of(attn_metadata)].forward(attn_metadata, *args, **kwargs)
 
 
@@ -614,10 +625,6 @@ class PrefillTarget(Target):
         core = self.core
         cfg = core.model_config.pretrained_config
 
-        # advance_step_generation must run before any bind_const this forward
-        # makes: it is what lets validating() catch a target that forgot to
-        # rebind and is running an op against last step's metadata.
-        advance_step_generation()
         self._attn.bind_const(**self.step_args(attn_metadata))
 
         # attention_window_size is per-layer, and rebound every forward
@@ -860,10 +867,6 @@ class DecodeTarget(Target):
         core = self.core
         cfg = core.model_config.pretrained_config
 
-        # advance_step_generation must run before any bind_const this forward
-        # makes: it is what lets validating() catch a target that forgot to
-        # rebind and is running an op against last step's metadata.
-        advance_step_generation()
         self._attn.bind_const(**self.step_args(attn_metadata))
 
         # attention_window_size is per-layer, and rebound every forward
