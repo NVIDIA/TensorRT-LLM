@@ -1,5 +1,6 @@
 ---
-receipts: {}
+receipts:
+  sm_100: {status: passed, tests: 4}
 ---
 
 # k3_ctm_gemv_wide
