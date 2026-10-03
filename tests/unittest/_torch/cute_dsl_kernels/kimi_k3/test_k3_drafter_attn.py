@@ -16,7 +16,7 @@
 requests of T tokens, at the in-model TP16 group (6 query heads, 1 KV head; TP4 24 / 4 for a few splits), head dim 64,
 HND pages of 64.
 
-Every split R x T (R T <= 8, and R x 8 and R x 7 for R <= 8) with mixed per-request context lengths (blocks crossing a
+The splits R x T (R T <= 8, and R x 8 and R x 7 for R <= 8) with mixed per-request context lengths (blocks crossing a
 page, a 128-row tile and the cluster's 16-tile round, no context, several tiles per CTA), page tables as strided row
 views and as dense rows, against an fp32 reference and the model's production path (flashinfer append_paged_kv_cache
 + trtllm-gen batch_context_with_kv_cache, non-causal), plus: no NaN (the pool's unused rows are NaN), the pool left
@@ -37,8 +37,8 @@ EPS = 1e-5
 THETA = 10000.0
 TOL = 1e-2  # max |err| / max |ref|; bf16 P and output roundings are ~4e-3
 
-# Every split the engine schedules for the drafter: R requests x T tokens with R T <= 8, R x 8, and DSpark's R x 7
-# (its block under shift_label is max_draft_len tokens).
+# The splits tested, R requests x T tokens: R T <= 8 (short blocks), R x 8 (DFlash's block at max_draft_len 7:
+# max_draft_len + 1 tokens) and R x 7 (DSpark's block at max_draft_len 7: max_draft_len tokens under shift_label).
 SPLITS = (
     [(1, 8), (2, 4), (4, 2), (8, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
     + [(r, 8) for r in range(2, 9)]

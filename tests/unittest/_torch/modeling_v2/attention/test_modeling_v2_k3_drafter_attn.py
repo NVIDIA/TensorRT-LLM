@@ -28,9 +28,10 @@ TOL = 1e-2
 # Context lengths, cycled over the requests: none, a block crossing a page, page and 128-row tile boundaries, the
 # cluster's 16-tile round, several tiles per CTA.
 LENGTHS = (60, 2041, 0, 127, 1000, 64, 128, 5)
+# R x 7: DSpark's block at max_draft_len 7 (max_draft_len tokens under shift_label).
 SPLITS = ((1, 1), (1, 8), (2, 4), (4, 2), (8, 1), (3, 1), (2, 8), (8, 8)) + tuple(
     (r, 7) for r in range(1, 9)
-)  # R x 7: DSpark's block under shift_label (max_draft_len 7)
+)
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
