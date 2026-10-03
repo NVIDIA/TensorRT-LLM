@@ -19,7 +19,18 @@ import sys
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
-from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -84,7 +95,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     gen_multimodal_cache_key_tokens,
     typed_range,
 )
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BACKEND as KV_CACHE_MANAGER_V2_BACKEND
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfMemoryError as KVCacheOutOfMemoryError
@@ -256,6 +266,30 @@ class BlockReusePolicy(StrEnum):
     ALL_REUSABLE = "all_reusable"
     PER_REQUEST = "per_request"
     PER_CONVERSATION = "per_conversation"
+
+
+def _swa_endpoint_priority(
+    prompt_length: int, tokens_per_block: int, rewind_tokens: int
+) -> Callable[[int, object], int]:
+    """Assign page priorities around a fixed reusable prompt endpoint.
+
+    ``prompt_length`` excludes the final prompt token that is recomputed.
+    The callback applies to newly created pages; reused pages keep their priority.
+    Intermediate pages remain reusable until evicted.
+    """
+
+    def priority(ordinal: int, life_cycle: object) -> int:
+        if not isinstance(life_cycle, AttnLifeCycle) or life_cycle.window_size is None:
+            return 35
+        first_protected_token = max(0, prompt_length - rewind_tokens - life_cycle.window_size)
+        block_start = ordinal * tokens_per_block
+        if ordinal < life_cycle.num_sink_blocks or (
+            block_start < prompt_length and block_start + tokens_per_block > first_protected_token
+        ):
+            return 70
+        return 0
+
+    return priority
 
 
 def _request_conversation_id(request: LlmRequest) -> Optional[str]:
@@ -1180,6 +1214,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         block_reuse_config = kv_cache_config.block_reuse_config
         self.block_reuse_policy = BlockReusePolicy(block_reuse_config.policy)
+        self._swa_endpoint_rewind = block_reuse_config.swa_endpoint_rewind_tokens
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {idx: offset for offset, idx in enumerate(self.pp_layers)}
         self.max_beam_width = max_beam_width
@@ -1285,16 +1320,9 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_events_config is not None and kv_events_config.enable_kv_cache_events
         )
         if streaming_events_enabled:
-            if self.event_buffer_max_size > 0:
-                logger.warning(
-                    "Both kv_cache_config.event_buffer_max_size and streaming "
-                    "kv_events_config are enabled; streaming publishing takes "
-                    "precedence and the buffered get_kv_cache_events() poll path "
-                    "will return no events."
-                )
             assert kv_events_config is not None
-            # Rejects unsupported parallelism, a non-Python V2 backend and colliding
-            # publish/replay port ranges, all before any socket is bound.
+            # Rejects unsupported parallelism and streaming itself, before any socket is
+            # bound and before any claim is made about which event path is in use.
             validate_streaming_support(
                 kv_events_config,
                 pp_size=mapping.pp_size,
@@ -1302,8 +1330,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Ranks bind by global rank; only those sharing a host can collide.
                 ranks_per_host=min(mapping.dp_size, mapping.gpus_per_node),
                 data_parallel_size=mapping.dp_size,
-                backend=KV_CACHE_MANAGER_V2_BACKEND,
             )
+            if self.event_buffer_max_size > 0:
+                logger.warning(
+                    "Both kv_cache_config.event_buffer_max_size and streaming "
+                    "kv_events_config are enabled; streaming publishing takes "
+                    "precedence and the buffered get_kv_cache_events() poll path "
+                    "will return no events."
+                )
             if mapping.enable_attention_dp or mpi_rank() == 0:
                 # Constructing it is side-effect free; start() below binds the socket
                 # and starts the publisher thread once every other check has passed.
@@ -3409,6 +3443,11 @@ class KVCacheManagerV2(BaseResourceManager):
         """Undo this iteration's context resize. False means the cache was dropped,
         not shrunk (history outran pre-resize capacity); the caller drops any draft pool.
         """
+        if self._connector_reservations_enabled():
+            if self.kv_connector_manager.get_prefix_reservation(req) is not None:
+                self.free_resources(req)
+                rewind_context_after_cache_drop(req, self.tokens_per_block)
+                return False
         pre_cap = getattr(req, "py_ctx_pre_resize_cap", None)
         if pre_cap is None:
             return True
@@ -3567,11 +3606,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 # scratch blocks are only valid for local prefill chunks.
                 kv_cache.enable_swa_scratch_reuse = False
             elif self._connector_may_serve(req):
-                # Same reason, one step earlier: a connector writes real cache
-                # content into these blocks. Whether it will is not known until
-                # `prepare_resources` asks, and the flag has to be off before
-                # `resize_context` can take scratch slots, so it is cleared for
-                # every servable request rather than only the served ones.
+                # Connector loads need persistent destination pages; scratch
+                # slots are reserved for local prefill.
                 kv_cache.enable_swa_scratch_reuse = False
             if not self._resume_and_restore(req.py_request_id, kv_cache):
                 return None
@@ -3588,7 +3624,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return kv_cache.num_committed_tokens
 
     def prepare_context(self, req: LlmRequest) -> bool:
-        """Create _KVCache, handle block reuse, and resume. Does NOT resize."""
+        """Create/resume the cache and expose local or reserved reuse before budgeting."""
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
         )
@@ -3599,6 +3635,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # until context end, so reapplying later would rewind the cursor.
         if req.is_first_context_chunk and self.enable_block_reuse:
             _settle_context_cursor(req, reused, self.tokens_per_block)
+        self._prepare_connector_prefix_reservation(req)
         return True
 
     def _disagg_transfer_overwrites_whole_cached_prefix(self) -> bool:
@@ -3612,8 +3649,8 @@ class KVCacheManagerV2(BaseResourceManager):
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
 
-        Returns True on success, False if resize failed (first chunk is
-        suspended on failure).
+        Return False on allocation failure. Unstarted connector reservations
+        are released with their tentative allocations.
         """
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
@@ -3633,7 +3670,15 @@ class KVCacheManagerV2(BaseResourceManager):
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
-        success = kv_cache.resize(capacity)
+        reservation = (
+            self.kv_connector_manager.get_prefix_reservation(req)
+            if self._connector_reservations_enabled()
+            else None
+        )
+        history = reservation.end if reservation is not None else None
+        success = (
+            kv_cache.resize(capacity, history) if history is not None else kv_cache.resize(capacity)
+        )
         if not success:
             logger.debug(
                 f"[KVCacheManagerV2] request {req.py_request_id} failed to resize KV cache "
@@ -3641,7 +3686,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"(context_current_position={req.context_current_position}, "
                 f"num_tokens={num_tokens})"
             )
-            if req.is_first_context_chunk:
+            if reservation is not None:
+                self.free_resources(req)
+                rewind_context_after_cache_drop(req, self.tokens_per_block)
+            elif req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
         self._fill_fresh_kv_pages(req.py_request_id)
@@ -3763,6 +3811,45 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
         return self._resume_and_restore(req.py_request_id, kv_cache)
 
+    # ---- preemption ----
+    #
+    # Suspension only unpins pages; the eviction controller then migrates them
+    # one cache level down. With GPU as the last level a suspended page stays
+    # `HELD`, which `CacheLevelManager.is_evictable` refuses to evict, so
+    # suspension frees nothing and the scheduler has no way out of a full pool.
+    #
+    # Preemption is the fallback for that case. It gives the pages up instead
+    # of parking them, which costs a re-prefill but always works.
+
+    @property
+    def has_cache_tier_below_gpu(self) -> bool:
+        """True when a suspended page has somewhere to be evicted to."""
+        return len(self.impl.cache_tier_list) > 1
+
+    def preempt_request(self, req: LlmRequest) -> bool:
+        """Give up *req*'s KV cache so its pages can be reclaimed.
+
+        Unlike :meth:`suspend_request` this does not keep the pages. Closing
+        the request's `_KVCache` returns its committed blocks to the radix tree
+        as reusable prefix and leaves their pages `DROPPABLE`, which is
+        evictable at every level, unlike `HELD`. The data is not thrown away:
+        it stays resident and locally matchable until something else needs the
+        space.
+
+        The request is reset to context state by the caller and re-prefills
+        whatever it can no longer match.
+
+        Returns whether the pages were released. Callers must check: pages
+        still being read out of, such as by a connector save in flight, are
+        not released until that completes.
+        """
+        self._release_preempted(req)
+        return True
+
+    def _release_preempted(self, req: LlmRequest) -> None:
+        self.free_resources(req)
+        req.py_num_connector_matched_tokens = 0
+
     # ---- prepare_resources ----
 
     def _life_cycle_by_layer_group(self) -> List[AttnLifeCycle]:
@@ -3855,11 +3942,9 @@ class KVCacheManagerV2(BaseResourceManager):
             self._run_kv_connector_hooks(scheduled_batch)
 
     def _run_kv_connector_hooks(self, scheduled_batch: ScheduledRequests) -> None:
-        """Serve the connector prefix, then report the pages it may write into.
-
-        Runs on the batch the forward pass will actually execute; see
-        ``_apply_connector_matched_prefix`` for why that placement is load-bearing.
-        """
+        """Serve final-batch queries for connectors without source reservations."""
+        if self._connector_reservations_enabled():
+            return
         served_any = False
         for request in scheduled_batch.context_requests:
             # An allocation is asked about and reported exactly once, and it
@@ -3893,27 +3978,99 @@ class KVCacheManagerV2(BaseResourceManager):
             # those two lists, so the split has to be rebuilt before it runs.
             scheduled_batch.reset_context_requests()
 
-    def report_batch_to_connector(self, scheduled_batch: ScheduledRequests) -> None:
+    def report_batch_to_connector(
+        self, scheduled_batch: ScheduledRequests, *, finalize_prefix_reservations: bool = True
+    ) -> None:
         """Report the batch to the KV connector.
 
         ``RequestData.num_scheduled_tokens`` describes the upcoming forward
         pass, so this may only run once every resource manager has. That is why
         ``ResourceManager.prepare_resources`` drives it rather than
         ``prepare_resources`` here, which also gives the disagg-generation-init
-        mini-batch the same hook.
+        mini-batch the same hook. Such mini-batches must pass
+        ``finalize_prefix_reservations=False`` to preserve the compute batch's
+        pending reservations.
         """
         if self.kv_connector_manager is not None and not self.is_draft:
+            if finalize_prefix_reservations and self._connector_reservations_enabled():
+                self._accept_connector_prefix_reservations(scheduled_batch)
             self.kv_connector_manager.build_scheduler_output(scheduled_batch, self)
 
     # ---- KV connector prefix ----
-    #
-    # The connector is asked from `prepare_resources`, downstream of every stage
-    # that can still drop a request (`_can_queue`, batch waiting, attention-DP
-    # balancing, the mamba-hybrid filter, the fp8 context-MLA cap). The
-    # connector ABC has no `cancel_load`, so that placement is required: an
-    # asked request must always reach `request_finished`. Moving the ask into
-    # the scheduling pass would buy the scheduler a budget that accounts for the
-    # served prefix and break the guarantee.
+
+    def _connector_reservations_enabled(self) -> bool:
+        return (
+            self.kv_connector_manager is not None
+            and not self.is_draft
+            and self.kv_connector_manager.prefix_reservations_enabled
+        )
+
+    def _prepare_connector_prefix_reservation(self, req: LlmRequest) -> None:
+        """Reserve source KV and expose its prefix to the scheduler's token budget."""
+        if (
+            not self._connector_reservations_enabled()
+            or not self._connector_may_serve(req)
+            or not req.is_first_context_chunk
+            or req.py_connector_allocation_reported
+            or not self.kv_connector_manager.should_add_sequence(req)
+        ):
+            return
+        local_end = self.kv_cache_map[req.py_request_id].num_committed_tokens
+        reservation = self.kv_connector_manager.reserve_prefix(req, local_end)
+        if reservation is None:
+            return
+        # Loads end at full blocks and leave the final prompt token for logits.
+        end = min(reservation.end, req.prompt_len - 1)
+        end = end // self.tokens_per_block * self.tokens_per_block
+        if end <= local_end:
+            self.kv_connector_manager.release_prefix_reservation(req)
+            return
+        reservation = self.kv_connector_manager.trim_prefix_reservation(req, local_end, end)
+        if reservation is not None:
+            _settle_context_cursor(req, reservation.end, self.tokens_per_block)
+
+    def release_unused_connector_reservations(self, accepted_request_ids: set[int]) -> None:
+        """Release unstarted promises and tentative allocations excluded from the batch."""
+        if not self._connector_reservations_enabled():
+            return
+        for req in self.kv_connector_manager.pending_prefix_requests():
+            if req.request_id in accepted_request_ids:
+                continue
+            # Drop unfilled history even when capacity did not grow.
+            self.free_resources(req)
+            rewind_context_after_cache_drop(req, self.tokens_per_block)
+
+    def _accept_connector_prefix_reservations(self, scheduled_batch: ScheduledRequests) -> None:
+        requests = scheduled_batch.context_requests
+        self.release_unused_connector_reservations({req.request_id for req in requests})
+        for req in requests:
+            if (
+                not req.is_first_context_chunk
+                or req.py_connector_allocation_reported
+                or not self.kv_connector_manager.should_add_sequence(req)
+            ):
+                continue
+            reservation = self.kv_connector_manager.get_prefix_reservation(req)
+            by_group = self.get_page_indices_by_layer_group(req)
+            flat = by_group[0] if len(by_group) == 1 else []
+            if reservation is not None:
+                kv_cache = self.kv_cache_map[req.py_request_id]
+                allocation_valid = (
+                    kv_cache.is_active
+                    and kv_cache.history_length >= reservation.end
+                    and req.context_current_position == reservation.end
+                    and kv_cache.capacity >= reservation.end + req.context_chunk_size
+                )
+                if not allocation_valid:
+                    raise RuntimeError(
+                        f"Request {req.request_id} has no allocation for its reserved KV prefix"
+                    )
+                self.kv_connector_manager.accept_prefix_load(
+                    req, reservation.start, reservation.end, by_group
+                )
+                req.py_connector_served_position = reservation.end
+            self.kv_connector_manager.update_state_after_alloc(req, flat, by_group)
+            req.py_connector_allocation_reported = True
 
     def _connector_may_serve(self, req: LlmRequest) -> bool:
         """Whether the connector is allowed to serve a prefix for ``req``."""
@@ -5098,9 +5255,14 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.add(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        # The promise to the connector is one ask per allocation, not one per
-        # request, so a replay of this request after a destructive pause may be
-        # asked and reported again.
+        if self.kv_connector_manager is not None and not self.is_draft:
+            self.kv_connector_manager.release_unstarted_prefix_loads(request)
+            if self.kv_connector_manager.has_pending_load(request):
+                raise RuntimeError(
+                    f"Cannot release KV cache while request {request.request_id} is loading"
+                )
+            self.kv_connector_manager.release_prefix_reservation(request)
+        # Replay obtains fresh connector metadata for its new destination pages.
         request.py_connector_allocation_reported = False
         # Same allocation, same lifetime. The pages the served position vouches
         # for are gone, so a replay recomputes from its own reuse match.
@@ -5671,12 +5833,25 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         salt_int = self._derive_reuse_salt(cache_salt)
         enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
+        priority_kwargs = {}
+        if (
+            self._swa_endpoint_rewind > 0
+            and self.enable_block_reuse
+            and self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
+            and not is_dummy
+            and not self.is_draft
+            and expected_prompt_length is not None
+        ):
+            priority_kwargs["custom_priority_callback"] = _swa_endpoint_priority(
+                expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind
+            )
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=salt_int),
             input_tokens,
             id=request_id,
             enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
+            **priority_kwargs,
         )
         self.kv_cache_map[request_id] = kv_cache
         if enable_request_stats and not self.enable_stats:

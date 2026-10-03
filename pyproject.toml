@@ -737,7 +737,6 @@ exclude = [
     "tests/unittest/llmapi/apps/_test_openai_responses.py",
     "tests/unittest/llmapi/apps/_test_openai_tool_call.py",
     "tests/unittest/llmapi/apps/_test_trtllm_serve_benchmark.py",
-    "tests/unittest/llmapi/apps/_test_trtllm_serve_duplicated_args.py",
     "tests/unittest/llmapi/apps/_test_trtllm_serve_example.py",
     "tests/unittest/llmapi/apps/_test_trtllm_serve_lora.py",
     "tests/unittest/llmapi/apps/_test_trtllm_serve_multimodal_benchmark.py",
@@ -898,10 +897,6 @@ files = [
 #   tests/unittest   -> 'utils'
 #   tests/unittest/_torch/sampler   -> for 'test_beam_search_util'
 mypy_path = ".:tests/unittest:tests/unittest/_torch/sampler"
-
-[[tool.mypy.overrides]]
-module = ["tensorrt_llm.runtime.kv_cache_manager_v2.*"]
-disallow_any_generics = false
 
 [[tool.mypy.overrides]]
 module = ["tensorrt_llm.bindings.*"]

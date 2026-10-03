@@ -56,7 +56,8 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
-from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
+from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
+                       TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TORCH_LLMARGS_REMOVED_ARGS, TorchLlmArgs,
                        validate_token_encoder_bucket_config)
 from .llm_utils import CachedModelLoader, KvCacheRetentionConfig, ModelLoader
@@ -521,9 +522,20 @@ class BaseLLM:
                     == _usage.UsageContext.UNKNOWN):
                 telemetry_config = telemetry_config.model_copy(
                     update={"usage_context": _usage.UsageContext.LLM_CLASS})
+            pretrained_config = self._hf_model_config
+            if getattr(self, "_encoder_executor", None) is not None:
+                try:
+                    runtime_pretrained_config = (
+                        self._encoder_executor.model_engine.model.model_config.
+                        pretrained_config)
+                    if runtime_pretrained_config is not None:
+                        pretrained_config = runtime_pretrained_config
+                except AttributeError:
+                    # Missing runtime metadata must not suppress usage reporting.
+                    pass
             _usage.report_usage(
                 llm_args=self.args,
-                pretrained_config=self._hf_model_config,
+                pretrained_config=pretrained_config,
                 telemetry_config=telemetry_config,
             )
         except Exception as exc:
@@ -1163,8 +1175,11 @@ class BaseLLM:
             batch_indexed_model_output (bool): If specified, assume batched model output indexed by request index, as opposed to token index. Defaults to True.
             copy_logits_to_host (bool): If set, copy logits from device to host. Otherwise, return a view into the on-device logits tensor. Defaults to True.
             return_raw_logits (bool): Whether to return the raw CPU logits tensor for the whole input batch. Defaults to False.
-            model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples: token_type_ids (BERT),
-                inputs_embeds (reward models).
+            model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples:
+                token_type_ids (BERT), inputs_embeds (reward models). Pass tensors where they already live (host or device).
+                With encoder CUDA graphs enabled, every tensor kwarg must be declared in
+                `cuda_graph_config.extra_model_inputs`: an undeclared tensor raises, and a non-tensor
+                value runs that call eagerly.
 
         Returns:
             Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]:
@@ -1253,16 +1268,10 @@ class BaseLLM:
         # Build inputs dict — common + model-specific kwargs.
         # Filter keys that are supplied by EncoderRunner itself to avoid
         # "multiple values for keyword argument" errors.
-        _RESERVED_KEYS = {
-            'input_ids',
-            'seq_lens',
-            'multi_item_part_lens',
-            'attn_metadata',
-            'return_context_logits',
-        }
         filtered_kwargs = {
             k: v
-            for k, v in model_kwargs.items() if k not in _RESERVED_KEYS
+            for k, v in model_kwargs.items()
+            if k not in ENCODER_RUNNER_MANAGED_INPUTS
         }
 
         forward_inputs = {

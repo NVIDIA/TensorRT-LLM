@@ -29,16 +29,14 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
     validate_streaming_support,
 )
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
-    Block,
-    BlockRadixTree,
-    ReuseScope,
+
+# Streaming KV cache events have no implementation: StreamingKVCacheEventManager
+# construction and validate_streaming_support() both raise. The supported route for KV
+# cache events is the buffered one, via kv_cache_config.event_buffer_max_size.
+streaming_unsupported = pytest.mark.skip(
+    reason="streaming KV cache events have no implementation; "
+    "use the buffered path via kv_cache_config.event_buffer_max_size"
 )
-from tensorrt_llm.runtime.kv_cache_manager_v2._config import (
-    GpuCacheTierConfig,
-    KVCacheManagerConfig,
-)
-from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry
 
 _ZMQ_SETUP_ATTEMPTS = 4
 _RECEIVE_TIMEOUT_MS = 2_000
@@ -93,52 +91,7 @@ def _run_on_fresh_port(scenario: Callable[[int], None]) -> None:
     pytest.fail(f"ZeroMQ setup failed after {_ZMQ_SETUP_ATTEMPTS} attempts")
 
 
-def test_streaming_sink_supports_real_radix_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Real radix construction must accept the streaming sink's capability hooks."""
-    manager = StreamingKVCacheEventManager(
-        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
-        data_parallel_rank=0,
-        block_size=4,
-        max_window_size=128,
-    )
-    life_cycles = LifeCycleRegistry(
-        KVCacheManagerConfig(
-            tokens_per_block=4,
-            cache_tiers=[GpuCacheTierConfig(quota=4096)],
-            layers=[],
-        )
-    )
-    tree = BlockRadixTree(life_cycles, tokens_per_block=4, event_manager=manager)
-    published: list[KVEventBatch] = []
-    monkeypatch.setattr(
-        manager._publisher, "publish", lambda batch: published.append(batch) or True
-    )
-    try:
-        root = tree.add_or_get_existing(ReuseScope())
-        first = Block([1, 2, 3, 4], root)
-        second = Block([5, 6, 7, 8], first)
-
-        # Exercise wire event production after the page-coverage gate without
-        # allocating GPU pages; the radix blocks and sink are real objects.
-        manager._add_full_block(first)
-        manager._add_full_block(second)
-        manager.flush_iteration_events()
-
-        assert len(published) == 1
-        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]))
-        assert len(decoded[1]) == 1
-        stored = decoded[1][0]
-        assert stored["type"] == "BlockStored"
-        assert stored["token_ids"] == [1, 2, 3, 4, 5, 6, 7, 8]
-        assert stored["parent_block_hash"] is None
-        assert stored["block_size"] == 4
-        assert len(stored["block_hashes"]) == 2
-        assert manager.stored_blocks == 2
-    finally:
-        tree.clear()
-        manager.shutdown()
-
-
+@streaming_unsupported
 def test_streaming_fast_path_publishes_only_full_max_window_blocks() -> None:
     """Protect radix hash reuse, filtering, wire format, and shutdown."""
     topic = "kv-events"
@@ -261,6 +214,7 @@ def test_streaming_fast_path_publishes_only_full_max_window_blocks() -> None:
     _run_on_fresh_port(scenario)
 
 
+@streaming_unsupported
 def test_streaming_removals_are_never_dropped_by_the_entry_cap() -> None:
     """Removals must survive the per-iteration cap or the consumer desyncs."""
     manager = StreamingKVCacheEventManager(
@@ -339,6 +293,7 @@ def test_dropped_batches_leave_a_sequence_gap() -> None:
         publisher.shutdown()
 
 
+@streaming_unsupported
 def test_construction_binds_nothing_until_start() -> None:
     """A constructed-but-unstarted publisher must hold no socket and no thread."""
     port = _unused_tcp_port()
@@ -363,6 +318,7 @@ def test_construction_binds_nothing_until_start() -> None:
         manager.shutdown()
 
 
+@streaming_unsupported
 def test_shutdown_without_start_is_safe() -> None:
     """Tearing down a manager that never started must not raise."""
     manager = StreamingKVCacheEventManager(
@@ -378,19 +334,15 @@ def test_shutdown_without_start_is_safe() -> None:
 
 def test_validate_streaming_support_rejects_unsupported_setups() -> None:
     config = KVEventsConfig(enable_kv_cache_events=True, endpoint="tcp://*:5557")
-    supported = dict(pp_size=1, cp_size=1, ranks_per_host=1, data_parallel_size=1, backend="python")
-
-    # The supported baseline must not raise, or the negative cases prove nothing.
-    validate_streaming_support(config, **supported)
+    supported = dict(pp_size=1, cp_size=1, ranks_per_host=1, data_parallel_size=1)
 
     with pytest.raises(ValueError, match="pipeline parallelism"):
         validate_streaming_support(config, **{**supported, "pp_size": 2})
     with pytest.raises(ValueError, match="context parallelism"):
         validate_streaming_support(config, **{**supported, "cp_size": 2})
-    # The default backend is "cpp", whose nanobind KVCacheManager cannot accept a
-    # duck-typed Python event sink; the error must name the env var that fixes it.
-    with pytest.raises(ValueError, match="TLLM_KV_CACHE_MANAGER_V2_BACKEND=python"):
-        validate_streaming_support(config, **{**supported, "backend": "cpp"})
+    # Streaming has no implementation, so even an otherwise supported setup is rejected.
+    with pytest.raises(ValueError, match="event_buffer_max_size"):
+        validate_streaming_support(config, **supported)
 
 
 @pytest.mark.parametrize(
@@ -427,6 +379,7 @@ def test_validate_endpoint_ranges(endpoint, replay_endpoint, ranks_per_host, ove
         validate_endpoint_ranges(config, ranks_per_host, ranks_per_host)
 
 
+@streaming_unsupported
 def test_partial_target_page_coverage_is_suppressed_until_fully_covered() -> None:
     """A page adopted from a shorter sibling must not be published as a full block."""
     manager = StreamingKVCacheEventManager(
@@ -471,6 +424,7 @@ def test_partial_target_page_coverage_is_suppressed_until_fully_covered() -> Non
         manager.shutdown()
 
 
+@streaming_unsupported
 def test_life_cycle_hooks_ignore_none_ids() -> None:
     """A None life-cycle id must not reach int() before the target is configured."""
     manager = StreamingKVCacheEventManager(
@@ -523,6 +477,7 @@ def test_validate_endpoint_ranges_rejects_port_overflow(
         validate_endpoint_ranges(config, 1, dp_size)
 
 
+@streaming_unsupported
 def test_validate_streaming_support_rejects_overflowing_port_span() -> None:
     """Every rank must reject the span, so none reaches the following collective."""
     config = KVEventsConfig(enable_kv_cache_events=True, endpoint="tcp://*:65535")

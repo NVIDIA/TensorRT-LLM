@@ -50,7 +50,7 @@ if IS_FLASHINFER_AVAILABLE:
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
-                     fp4_scale_infer_shape,
+                     deep_gemm_jit_warmup_buckets, fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      get_power_of_2_num_tokens_buckets,
                      is_nvfp4_marlin_supported_sm, last_positive_power_of_2,
@@ -280,6 +280,7 @@ def fused_moe(
     gated_slot_lora_ranks: Optional[torch.Tensor] = None,
     gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
     token_to_slot: Optional[torch.Tensor] = None,
+    swiglu_clamp_after_silu: bool = False,
 ) -> List[torch.Tensor]:
     tuner = AutoTuner.get()
     # Only the non-alltoall case is considered for profiling in the warmup phase.
@@ -380,6 +381,7 @@ def fused_moe(
             fc2_slot_lora_ranks, fc2_slot_lora_weight_ptrs,
             gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot
         ]
+    run_moe_args.append(swiglu_clamp_after_silu)
     try:
         output = run_moe(*run_moe_args)
     except RuntimeError as e:
@@ -453,7 +455,8 @@ def _(input: torch.Tensor,
       fc2_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
       gated_slot_lora_ranks: Optional[torch.Tensor] = None,
       gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
-      token_to_slot: Optional[torch.Tensor] = None):
+      token_to_slot: Optional[torch.Tensor] = None,
+      swiglu_clamp_after_silu: bool = False):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:
         # Note: The weight shape for INT8 weight only quantization is different, i.e.,
@@ -2074,8 +2077,6 @@ def _(
     return input.new_empty((M, N), dtype=output_dtype)
 
 
-# deep_gemm_gen_tuning_buckets is imported from ..utils
-
 _USE_FUSED_FP8_QUANT_PACK = os.environ.get("TRTLLM_FUSED_FP8_QUANT_PACK",
                                            "1") == "1"
 
@@ -2147,7 +2148,7 @@ class fp8SwapABGemmRunner(TunableRunner):
     # every process startup.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
+            0, 0, deep_gemm_jit_warmup_buckets), ),
         exclude_from_cache=True,
     )
 
@@ -2340,12 +2341,17 @@ def _(
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 
 
-# The runner is used to trigger deepgemm jit during autotune.
+# The runner is used to trigger deepgemm jit during autotune. Only Hopper has
+# work to do: on SM100 this GEMM dispatches to TrtllmGenGemmRunner's prebuilt
+# cubins and compiles nothing.
 class Fp8BlockScalingGemmRunner(TunableRunner):
+    # Without exclude_from_cache, a warm disk cache short-circuits tuning and
+    # the JIT warmup never runs.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
+            0, 0, deep_gemm_jit_warmup_buckets), ),
         tune_max_num_tokens=4096,
+        exclude_from_cache=True,
     )
 
     def get_valid_tactics(
