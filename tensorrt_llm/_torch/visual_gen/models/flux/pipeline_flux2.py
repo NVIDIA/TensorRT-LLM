@@ -23,7 +23,7 @@ import os
 import time
 from contextlib import contextmanager
 from io import BytesIO
-from typing import Any, Iterator, List, Optional, Tuple, Union
+from typing import Any, Iterator, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import PIL.Image
@@ -199,19 +199,64 @@ class Flux2Pipeline(BasePipeline):
     def default_warmup_num_frames(self):
         return [1]
 
-    def warmup_cache_key(self, height: int, width: int, **kwargs) -> tuple:
-        return (height, width)
+    def warmup_cache_key(
+        self,
+        height: int,
+        width: int,
+        reference_shapes: Tuple[Tuple[int, int], ...] = (),
+        **kwargs,
+    ) -> tuple:
+        """Build the compiled-shape key for FLUX.2.
+
+        A reference image is not resized to the output shape: it keeps its own
+        size and its packed latents are concatenated along the sequence
+        dimension, so the reference count and each reference's size are part of
+        the compiled shape. Both the warmup side and
+        :meth:`request_warmup_cache_key` go through here so the two can never
+        disagree on the key's arity.
+        """
+        if not reference_shapes:
+            return (height, width)
+        return (height, width, len(reference_shapes), reference_shapes)
 
     def request_warmup_cache_key(self, req: Any) -> tuple:
-        cache_key = super().request_warmup_cache_key(req)
-        condition_images = req.prepared_inputs.get("condition_images")
-        if condition_images is None:
-            return cache_key
-
-        reference_shapes = tuple(
-            (int(image.shape[-2]), int(image.shape[-1])) for image in condition_images
+        condition_images = req.prepared_inputs.get("condition_images") or ()
+        return self.warmup_cache_key(
+            req.params.height,
+            req.params.width,
+            reference_shapes=tuple(
+                (int(image.shape[-2]), int(image.shape[-1])) for image in condition_images
+            ),
+            num_frames=req.params.num_frames,
         )
-        return (*cache_key, len(condition_images), reference_shapes)
+
+    def warmup_cache_keys(self, shapes: List[Tuple[int, int, int]]) -> Set[tuple]:
+        keys = super().warmup_cache_keys(shapes)
+        keys.update(
+            self.warmup_cache_key(
+                h,
+                w,
+                reference_shapes=(self._warmup_reference_shape(h, w),),
+                num_frames=f,
+            )
+            for h, w, f in shapes
+        )
+        return keys
+
+    def _warmup_reference_shape(self, height: int, width: int) -> Tuple[int, int]:
+        """Reference size the warmup pass conditions on for an output shape.
+
+        A client that posts a reference without an explicit output size gets the
+        output shape from the reference itself (``_resolve_target_dimensions``),
+        so a reference at the output shape is the canonical /v1/images/edits
+        case. Floored the same way ``_preprocess_reference_images`` floors a real
+        client image, so the warmed key matches what a request produces.
+        """
+        multiple_of = self.vae_scale_factor * 2
+        return (
+            max(height // multiple_of, 1) * multiple_of,
+            max(width // multiple_of, 1) * multiple_of,
+        )
 
     def _init_transformer(self) -> None:
         """Initialize FLUX.2 transformer with quantization support."""
@@ -221,15 +266,33 @@ class Flux2Pipeline(BasePipeline):
         )
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        forward_kwargs = dict(
+            prompt="warmup",
+            height=height,
+            width=width,
+            num_inference_steps=steps,
+            guidance_scale=3.5,
+            seed=42,
+            max_sequence_length=512,
+        )
+        reference_height, reference_width = self._warmup_reference_shape(height, width)
         with torch.no_grad():
+            self.forward(**forward_kwargs)
+            # A reference lengthens the transformer sequence, so the text-only
+            # pass above leaves that graph uncompiled; without this the compile
+            # would land inside the first measured /v1/images/edits request.
             self.forward(
-                prompt="warmup",
-                height=height,
-                width=width,
-                num_inference_steps=steps,
-                guidance_scale=3.5,
-                seed=42,
-                max_sequence_length=512,
+                **forward_kwargs,
+                _condition_images=[
+                    torch.zeros(
+                        1,
+                        3,
+                        reference_height,
+                        reference_width,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                ],
             )
 
     def _detect_text_encoder_type(self, checkpoint_dir: str) -> str:

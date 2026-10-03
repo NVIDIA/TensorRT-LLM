@@ -289,6 +289,23 @@ class TestWarmupExecution:
         pipe.warmup()
         assert pipe._warmed_up_shapes == {(480, 832, 33)}
 
+    def test_warmup_records_subclass_extra_keys(self):
+        """warmup() records what warmup_cache_keys() reports, not the raw plan.
+
+        A pipeline that compiles more than one graph per planned shape (FLUX.2
+        also warms a reference-carrying pass) overrides warmup_cache_keys(), and
+        every key it reports must land in _warmed_up_shapes.
+        """
+        cfg = CompilationConfig(resolutions=[(480, 832)], num_frames=[33])
+        pipe = _make_stub_pipeline(cfg)
+        pipe.warmup_cache_keys = lambda shapes: {(h, w, f) for h, w, f in shapes} | {
+            (h, w, f, "extra") for h, w, f in shapes
+        }
+
+        pipe.warmup()
+
+        assert pipe._warmed_up_shapes == {(480, 832, 33), (480, 832, 33, "extra")}
+
 
 class TestWarmupPhasing:
     """warmup() tune/merge/capture phasing: number of warmup passes per config.
