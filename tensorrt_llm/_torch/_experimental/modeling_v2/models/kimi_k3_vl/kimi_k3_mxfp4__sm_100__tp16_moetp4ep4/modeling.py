@@ -73,8 +73,9 @@ checkpoint, and SA. The DSpark drafter is this target's `K3DSparkDrafter`, the s
 block on the drafter entries (`attention/k3_drafter_attn_qknorm` and the drafter's decode GEMV sites); the shell
 builds it through `_build_draft_model`. Where every attention all-reduce runs over MNNVL, the drafter also runs on the
 TP group's collective state: its context projection's `fc` is split by input feature over the group, `hidden_norm`
-applied in the all-reduce of the partial products (`comm/mnnvl_fusion_allreduce`). The worker and its kernels stay
-upstream code; this target does not own a worker.
+applied in the all-reduce of the partial products (`comm/mnnvl_fusion_allreduce`), and a block's residual adds and
+RMSNorms run in its all-reduces (`comm/k3_sandwich_plain` with the projection up to 8 rows, else
+`comm/mnnvl_fusion_allreduce`). The worker and its kernels stay upstream code; this target does not own a worker.
 """
 
 from __future__ import annotations
@@ -190,11 +191,12 @@ REQUIRED_TRTLLM_OPS = (
     "k3_moe",
     "k3_route_quant",
     "mnnvl_allgather_split",
-    # The DSpark drafter's decode path (K3DSparkDrafter): its GEMV sites, its block attention and the all-reduce of
-    # its split context projection with hidden_norm.
+    # The DSpark drafter's decode path (K3DSparkDrafter): its GEMV sites, its block attention, and its all-reduces
+    # with the residual add and RMSNorm (the split context projection's with hidden_norm).
     "k3_ctm_gemv",
     "k3_ctm_gemv_swiglu",
     "k3_drafter_attn_qknorm",
+    "k3_sandwich_plain",
     "mnnvl_fusion_allreduce",
 )
 
@@ -2454,15 +2456,26 @@ class K3DSparkDrafter(GQADSparkForCausalLM):
     * gate / up on ``drafter_gate_up`` and the down projection with the SiLU-and-mul on ``drafter_down``, then the
       module's all-reduce.
 
-    The norms and the residual adds are the stock modules'; a projection whose site does not take its rows runs its
-    module. Every other block runs the stock ``dflash_forward``: a split `DRAFTER_ATTN_SPLITS` does not list, another
-    attention backend, head layout, RoPE or normalization, a cache the kernel does not read, or a compile key of the
-    attention that has not run eagerly, under CUDA-graph capture.
+    The norms and the residual adds are the stock modules' unless the drafter runs on the TP group's collective state
+    (below); a projection whose site does not take its rows runs its module. Every other block runs the stock
+    ``dflash_forward``: a split `DRAFTER_ATTN_SPLITS` does not list, another attention backend, head layout, RoPE or
+    normalization, a cache the kernel does not read, or a compile key of the attention that has not run eagerly, under
+    CUDA-graph capture.
 
-    Where the target hands the drafter the TP group's collective state (``use_decode_comm``), the context projection's
-    ``fc`` holds only this rank's block of input columns (`K3FcSlice`), and ``project_target_hidden`` sums the ranks'
-    partial products with ``hidden_norm`` in one all-reduce; otherwise the context projection is the stock one, with
-    ``fc`` replicated. The worker that calls the drafter (the stock ``DSparkWorker``), the context k / v and the Markov
+    Where the target hands the drafter the TP group's collective state (``use_decode_comm``):
+
+    * the context projection's ``fc`` holds only this rank's block of input columns (`K3FcSlice`), and
+      ``project_target_hidden`` sums the ranks' partial products with ``hidden_norm`` in one all-reduce;
+    * a block the entries take runs each residual add and RMSNorm in the all-reduce before it (o_proj's with the
+      post-attention norm, the MLP's with the next layer's input norm, the last one's with the final norm), the
+      block's input serving as the first residual, uncopied. Up to 8 rows ``comm/k3_sandwich_plain`` runs the
+      projection, its all-reduce and the norm in one launch (o_proj, and with the SiLU-and-mul the down projection
+      after ``drafter_gate_up``); otherwise the projection (its site, or its module without the all-reduce) is
+      followed by ``comm/mnnvl_fusion_allreduce``. A block whose rows the MNNVL workspace does not hold, or layers
+      whose norms or projections the fused all-reduces do not reproduce, keep the stock all-reduces and norms.
+
+    Otherwise ``fc`` stays replicated, with the stock context projection, and the norms and residual adds are the
+    stock modules'. The worker that calls the drafter (the stock ``DSparkWorker``), the context k / v and the Markov
     head stay upstream code.
     """
 
@@ -2481,17 +2494,80 @@ class K3DSparkDrafter(GQADSparkForCausalLM):
         self.decode_comm: Optional[_decode_comm.K3DecodeComm] = None
         # The zero residual of the split context projection's all-reduce, up to a decode step's rows.
         self._k3_zero_rows: Optional[torch.Tensor] = None
+        # Whether a block's residual adds and RMSNorms run in its all-reduces, and the comm/k3_sandwich_plain forms
+        # ("o_proj", "down") compiled for the layers' shapes; set with the collective state.
+        self._k3_norms_fuse = False
+        self._k3_sandwich_forms: frozenset = frozenset()
 
     def use_decode_comm(self, comm: _decode_comm.K3DecodeComm) -> None:
         """Run the drafter's collectives on ``comm``, the TP group's decode state (``decode_comm.K3DecodeComm``) the
-        target builds where every attention all-reduce runs over MNNVL. The target calls it on every rank once the
-        weights are loaded, before any CUDA-graph capture.
+        target builds where every attention all-reduce runs over MNNVL. The target calls it once the weights are
+        loaded, before any CUDA-graph capture. Collective: every rank of the group calls it at the same point.
 
-        The context projection's ``fc`` then keeps only this rank's block of input columns (`K3FcSlice`), where they
-        split evenly over the group and the drafter's layers have their TP all-reduce: ``project_target_hidden`` sums
-        the ranks' partial products and applies ``hidden_norm`` in one ``comm/mnnvl_fusion_allreduce`` call."""
+        * The context projection's ``fc`` keeps only this rank's block of input columns (`K3FcSlice`), where they
+          split evenly over the group and the drafter's layers have their TP all-reduce: ``project_target_hidden``
+          sums the ranks' partial products and applies ``hidden_norm`` in one ``comm/mnnvl_fusion_allreduce`` call.
+        * Where the layers' norms and projections take it (`_k3_norms_take_comm`), a block's residual adds and
+          RMSNorms run in its all-reduces (``_k3_block_forward``). Each form of ``comm/k3_sandwich_plain`` whose
+          shape every layer shares compiles here, with one call on a zero row of a zero weight; a form that does not
+          compile is not used."""
         self.decode_comm = comm
         self._k3_split_fc()
+        self._k3_norms_fuse = self._k3_norms_take_comm()
+        forms = set()
+        if self._k3_norms_fuse:
+            layers = self.model.layers
+            for form, swiglu, weights in (
+                ("o_proj", False, [layer.self_attn.o_proj.weight for layer in layers]),
+                ("down", True, [layer.mlp.down_proj.weight for layer in layers]),
+            ):
+                if len({tuple(w.shape) for w in weights}) == 1 and comm.compile_plain(
+                    weights[0], swiglu=swiglu
+                ):
+                    forms.add(form)
+        self._k3_sandwich_forms = frozenset(forms)
+        logger.info(
+            "Kimi K3 DSpark drafter: residual adds and RMSNorms "
+            + (
+                f"in the all-reduces (k3_sandwich_plain: {sorted(forms) or 'none'}, else "
+                "mnnvl_fusion_allreduce)"
+                if self._k3_norms_fuse
+                else "on the stock modules (a layer norm or projection the fused all-reduces do not reproduce)"
+            )
+        )
+
+    def _k3_norms_take_comm(self) -> bool:
+        """Whether a block's residual adds and RMSNorms can run in its all-reduces: every layer's input and
+        post-attention norms and the final norm are plain bf16 RMSNorms of the hidden width (no Gemma offset, no
+        quantized output), and every output and down projection is row parallel with its all-reduce."""
+        hidden = self.config.hidden_size
+
+        def plain(norm: nn.Module) -> bool:
+            weight = getattr(norm, "weight", None)
+            return (
+                isinstance(weight, torch.Tensor)
+                and weight.dtype == torch.bfloat16
+                and tuple(weight.shape) == (hidden,)
+                and hasattr(norm, "variance_epsilon")
+                and not getattr(norm, "use_gemma", True)
+                and not getattr(norm, "is_nvfp4", True)
+                and not getattr(norm, "return_hp_output", True)
+            )
+
+        def reduces(linear: nn.Module) -> bool:
+            return (
+                getattr(getattr(linear, "tp_mode", None), "name", None) == "ROW"
+                and getattr(linear, "reduce_output", False)
+                and getattr(linear, "all_reduce", None) is not None
+            )
+
+        return plain(self.model.norm) and all(
+            plain(layer.input_layernorm)
+            and plain(layer.post_attention_layernorm)
+            and reduces(layer.self_attn.o_proj)
+            and reduces(layer.mlp.down_proj)
+            for layer in self.model.layers
+        )
 
     def _k3_tp_all_reduce(self) -> Optional[nn.Module]:
         """The drafter's own TP all-reduce (its first output projection's row-parallel all-reduce module), or None."""
@@ -2705,14 +2781,22 @@ class K3DSparkDrafter(GQADSparkForCausalLM):
         page_table = ctx_page_table.index_select(0, ctx_cache_batch_idx.to(torch.long))
         positions = query_positions.reshape(-1).contiguous()
         hidden = noise_embedding.reshape(rows, -1)
+        layers = self.model.layers
+        comm = self._k3_fused_comm(hidden)
         residual = None
-        for layer_idx, layer in enumerate(self.model.layers):
+        if comm is not None:
+            # The fused all-reduces read the residual and return the updated one: the block's input serves as the
+            # first residual, uncopied.
+            residual = hidden
+            normed = layers[0].input_layernorm(hidden)
+        for layer_idx, layer in enumerate(layers):
             attn = layer.self_attn
-            if residual is None:
-                residual = hidden.clone()
-                normed = layer.input_layernorm(hidden)
-            else:
-                normed, residual = layer.input_layernorm(hidden, residual)
+            if comm is None:
+                if residual is None:
+                    residual = hidden.clone()
+                    normed = layer.input_layernorm(hidden)
+                else:
+                    normed, residual = layer.input_layernorm(hidden, residual)
             qkv = self._k3_project("drafter_qkv", normed, attn.qkv_proj)
             out = torch.empty(rows, attn.q_size, dtype=torch.bfloat16, device=qkv.device)
             k3_drafter_attn_qknorm(
@@ -2729,11 +2813,87 @@ class K3DSparkDrafter(GQADSparkForCausalLM):
                 attn.num_key_value_heads,
                 out,
             )
+            if comm is not None:
+                # o_proj's all-reduce applies the post-attention norm; the MLP's the next layer's input norm, after
+                # the last layer the final norm.
+                next_norm = (
+                    layers[layer_idx + 1].input_layernorm
+                    if layer_idx + 1 < len(layers)
+                    else self.model.norm
+                )
+                normed, residual = self._k3_project_norm(
+                    comm, out, attn.o_proj, residual, layer.post_attention_layernorm
+                )
+                normed, residual = self._k3_mlp_norm(comm, layer.mlp, normed, residual, next_norm)
+                continue
             hidden = self._k3_project("drafter_o", out, attn.o_proj)
             hidden, residual = layer.post_attention_layernorm(hidden, residual)
             hidden = self._k3_mlp(layer.mlp, hidden)
+        if comm is not None:
+            return normed
         out, _ = self.model.norm(hidden, residual)
         return out
+
+    def _k3_fused_comm(self, hidden: torch.Tensor) -> Optional[_decode_comm.K3DecodeComm]:
+        """The TP group's collective state where a block of rows ``hidden`` runs its residual adds and RMSNorms in its
+        all-reduces: the drafter runs on it (``use_decode_comm``) with layers that take it, and its MNNVL workspace
+        holds an all-reduce of the block's rows; else None (the stock all-reduces and norms)."""
+        comm = self.decode_comm
+        if comm is None or not self._k3_norms_fuse or not comm.takes_allreduce_norm(*hidden.shape):
+            return None
+        return comm
+
+    def _k3_project_norm(
+        self,
+        comm: _decode_comm.K3DecodeComm,
+        x: torch.Tensor,
+        linear: nn.Module,
+        residual: torch.Tensor,
+        norm: nn.Module,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(norm(updated), updated)``, ``updated = residual + linear(x)`` for the row-parallel output projection,
+        the residual add and ``norm`` in its all-reduce: ``comm/k3_sandwich_plain`` where it takes the rows (the
+        projection in the ``drafter_o`` site's arithmetic, in the same launch), else the projection on ``drafter_o``
+        where that takes the rows, or the module without its all-reduce, then ``comm/mnnvl_fusion_allreduce``."""
+        if "o_proj" in self._k3_sandwich_forms and comm.takes_plain(
+            x, linear.weight, residual, norm
+        ):
+            return comm.sandwich_plain(x, linear.weight, residual, norm)
+        gemvs = self.decode_gemvs
+        partial = None if gemvs is None else gemvs.project("drafter_o", x, linear.weight)
+        if partial is None:
+            partial = linear(x, all_reduce_params=_decode_comm.skip_all_reduce())
+        return comm.allreduce_norm(partial, residual, norm)
+
+    def _k3_mlp_norm(
+        self,
+        comm: _decode_comm.K3DecodeComm,
+        mlp: nn.Module,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        norm: nn.Module,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(norm(updated), updated)``, ``updated = residual + mlp(x)``, the residual add and ``norm`` in the down
+        projection's all-reduce: gate / up on ``drafter_gate_up``, then ``comm/k3_sandwich_plain``'s SiLU-and-mul
+        form where it takes the rows (the ``drafter_down`` site's arithmetic), else the SiLU-and-mul and down
+        projection on ``drafter_down``; where those sites do not take the rows, the module without its all-reduce;
+        then ``comm/mnnvl_fusion_allreduce``."""
+        gemvs = self.decode_gemvs
+        gate_up = (
+            None if gemvs is None else gemvs.project("drafter_gate_up", x, mlp.gate_up_proj.weight)
+        )
+        partial = None
+        if gate_up is not None:
+            if "down" in self._k3_sandwich_forms and comm.takes_plain(
+                gate_up, mlp.down_proj.weight, residual, norm, swiglu=True
+            ):
+                return comm.sandwich_plain(
+                    gate_up, mlp.down_proj.weight, residual, norm, swiglu=True
+                )
+            partial = gemvs.project("drafter_down", gate_up, mlp.down_proj.weight)
+        if partial is None:
+            partial = mlp(x, final_all_reduce_params=_decode_comm.skip_all_reduce())
+        return comm.allreduce_norm(partial, residual, norm)
 
     def _k3_project(self, site: str, x: torch.Tensor, linear: nn.Module) -> torch.Tensor:
         """``linear(x)``, its GEMM on the ``site`` decode GEMV where that takes the rows, then a row-parallel
@@ -3113,9 +3273,10 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
     def _gate_drafter_comm(self, comm: Optional[_decode_comm.K3DecodeComm]) -> bool:
         """Hand the DSpark drafter (`K3DSparkDrafter`) the TP group's collective state ``comm`` where this target built
         it (every attention all-reduce over MNNVL; TP16 is a construction assert): the drafter then runs its context
-        projection split over the group, ``hidden_norm`` in the all-reduce (``K3DSparkDrafter.use_decode_comm``).
-        Without ``comm`` it keeps the stock replicated ``fc``. Returns whether the drafter took the state (False
-        without such a drafter)."""
+        projection split over the group, ``hidden_norm`` in the all-reduce, and its blocks' residual adds and RMSNorms
+        in their all-reduces (``K3DSparkDrafter.use_decode_comm``, collective: it compiles the drafter's sandwich on
+        the group's workspace). Without ``comm`` it keeps the stock replicated ``fc``, all-reduces and norms. Returns
+        whether the drafter took the state (False without such a drafter)."""
         drafter = getattr(self, "draft_model", None)
         if comm is None or not isinstance(drafter, K3DSparkDrafter):
             return False

@@ -18,6 +18,14 @@ stand-ins counted per call (the ops themselves are certified by their multi-GPU 
 * The context projection runs on the split ``fc`` (on one rank, the whole weight): up to a decode step's rows through
   ``comm/mnnvl_fusion_allreduce`` with ``hidden_norm``, more rows through the drafter's TP all-reduce, and matches the
   replicated projection.
+* A decode block of every certified split runs its residual adds and RMSNorms in its all-reduces and matches the
+  stock block forward: up to 8 rows ``comm/k3_sandwich_plain`` for o_proj (and, on the decode GEMV sites, its
+  SiLU-and-mul form for the down projection), else ``comm/mnnvl_fusion_allreduce``, two per layer, the last with the
+  final norm. Both sandwich forms compiled with the state.
+* The stock all-reduces and norms run without the collective state, where the workspace does not hold the block's
+  rows, or where the layers' norms do not take the fused form; a sandwich form that did not compile gives way to
+  ``comm/mnnvl_fusion_allreduce``.
+* A fused block captured in a CUDA graph makes the same collective calls and replays the eager result.
 """
 
 import math
@@ -151,19 +159,44 @@ def _fusion_allreduce_one_rank(
     return _rms_norm(updated, norm_weight, eps), updated
 
 
+def _sandwich_plain_one_rank(x, weight, residual, norm_weight, eps, workspace, swiglu=False):
+    """``comm/k3_sandwich_plain`` over one rank: the projection (of ``silu(gate) * up`` with ``swiglu``), then the
+    residual add and the RMSNorm."""
+    assert workspace is ONE_RANK_COMM.sandwich
+    k = weight.shape[1]
+    assert (
+        x.shape == (residual.shape[0], 2 * k if swiglu else k)
+        and residual.shape[1] == weight.shape[0]
+    )
+    assert x.is_contiguous() and residual.is_contiguous() and isinstance(eps, float)
+    a = x.float()
+    if swiglu:
+        a = (torch.nn.functional.silu(a[:, :k]) * a[:, k:]).to(torch.bfloat16).float()
+    partial = (a @ weight.float().T).to(torch.bfloat16)
+    updated = (residual.float() + partial.float()).to(torch.bfloat16)
+    return _rms_norm(updated, norm_weight, eps), updated
+
+
 def _one_rank_collectives(monkeypatch, calls):
-    """The drafter's collectives replaced by their one-rank stand-ins, each call recorded as (op, rows)."""
+    """The drafter's collectives replaced by their one-rank stand-ins, each call recorded as (op, rows) or, for the
+    sandwich, (op, rows, swiglu)."""
 
     def fusion(input, *args, **kwargs):
         calls.append(("mnnvl_fusion_allreduce", input.shape[0]))
         return _fusion_allreduce_one_rank(input, *args, **kwargs)
 
+    def sandwich(x, *args, swiglu=False):
+        calls.append(("k3_sandwich_plain", x.shape[0], swiglu))
+        return _sandwich_plain_one_rank(x, *args, swiglu=swiglu)
+
     monkeypatch.setattr(decode_comm, "mnnvl_fusion_allreduce", fusion)
+    monkeypatch.setattr(decode_comm, "k3_sandwich_plain", sandwich)
 
 
 @pytest.fixture(scope="module")
 def fused_drafter():
-    """The drafter on the one-rank collective state: its fc split over one rank."""
+    """The drafter on the one-rank collective state: its fc split over one rank, both sandwich forms compiled (their
+    compile calls run on the stand-in)."""
     with pytest.MonkeyPatch.context() as mp:
         _one_rank_collectives(mp, [])
         module = _load_drafter()
@@ -238,7 +271,9 @@ def attn_calls(monkeypatch):
 
 @pytest.mark.parametrize("use_gemvs", [False, True], ids=["torch", "gemv"])
 @pytest.mark.parametrize("split", sorted(target.DRAFTER_ATTN_SPLITS))
-def test_block_matches_the_stock_forward(drafter, gemvs, attn_calls, monkeypatch, use_gemvs, split):
+def test_block_matches_the_stock_forward(
+    drafter, gemvs, attn_calls, collectives, monkeypatch, use_gemvs, split
+):
     batch, block = split
     projected = []
     project = gemvs.project
@@ -261,6 +296,8 @@ def test_block_matches_the_stock_forward(drafter, gemvs, attn_calls, monkeypatch
     err = _rel_l2(out, ref)
     assert err <= REL_L2, err
     assert all(torch.equal(c, b) for c, b in zip(inputs["ctx_kv_cache"], before))
+    # Without the TP group's collective state the module all-reduces and the stock norms run.
+    assert collectives == []
     if use_gemvs:
         # At most 8 rows every site takes its projection; above, each declines and its module runs (the down
         # projection's site is not asked once gate / up's declined).
@@ -333,3 +370,108 @@ def test_split_fc_matches_the_replicated_projection(drafter, fused_drafter, coll
     err = _rel_l2(out, ref)
     assert err <= REL_L2, err
     assert collectives == ([("mnnvl_fusion_allreduce", rows)] if rows <= DECODE_ROWS else [])
+
+
+def test_fused_drafter_compiled_both_sandwich_forms(fused_drafter):
+    assert fused_drafter.decode_comm is ONE_RANK_COMM
+    assert fused_drafter._k3_norms_fuse
+    assert fused_drafter._k3_sandwich_forms == {"o_proj", "down"}
+
+
+def _fused_calls(rows, use_gemvs):
+    """One layer's collective calls on the fused path: up to 8 rows the o_proj sandwich, and the down projection's
+    sandwich where the gate / up site produced its input; else the projection then the fused all-reduce."""
+    if rows > decode_gemv.MAX_ROWS:
+        return [("mnnvl_fusion_allreduce", rows)] * 2
+    down = ("k3_sandwich_plain", rows, True) if use_gemvs else ("mnnvl_fusion_allreduce", rows)
+    return [("k3_sandwich_plain", rows, False), down]
+
+
+@pytest.mark.parametrize("use_gemvs", [False, True], ids=["torch", "gemv"])
+@pytest.mark.parametrize("split", sorted(target.DRAFTER_ATTN_SPLITS))
+def test_fused_block_matches_the_stock_forward(
+    fused_drafter, gemvs, attn_calls, collectives, use_gemvs, split
+):
+    batch, block = split
+    rows = batch * block
+    fused_drafter.decode_gemvs = gemvs if use_gemvs else None
+    inputs = _block(batch, block, seed=batch * 10 + block + 1)
+    stock_inputs = _copy(inputs)
+    before = [c.clone() for c in inputs["ctx_kv_cache"]]
+    noise = inputs["noise_embedding"].clone()
+    out = fused_drafter.dflash_forward(**inputs)
+    calls = list(collectives)
+    ref = DFlashForCausalLM.dflash_forward(fused_drafter, **stock_inputs)
+    torch.cuda.synchronize()
+    assert attn_calls == [rows] * LAYERS
+    assert calls == _fused_calls(rows, use_gemvs) * LAYERS
+    assert out.shape == ref.shape == (rows, HIDDEN)
+    err = _rel_l2(out, ref)
+    assert err <= REL_L2, err
+    # The block's input served as the first residual, read only; the cache is untouched.
+    assert torch.equal(inputs["noise_embedding"], noise)
+    assert all(torch.equal(c, b) for c, b in zip(inputs["ctx_kv_cache"], before))
+
+
+def _stock_norms_case(fused_drafter, monkeypatch, case):
+    if case == "workspace":
+        small = decode_comm.K3DecodeComm(
+            mnnvl=SimpleNamespace(world_size=1, buffer_bytes=1024),
+            sandwich=ONE_RANK_COMM.sandwich,
+        )
+        monkeypatch.setattr(fused_drafter, "decode_comm", small)
+    else:
+        monkeypatch.setattr(fused_drafter, "_k3_norms_fuse", False)
+
+
+@pytest.mark.parametrize("case", ["workspace", "norms"])
+def test_fused_norms_fall_back_to_the_stock_norms(
+    fused_drafter, gemvs, attn_calls, collectives, monkeypatch, case
+):
+    """A block whose rows the MNNVL workspace does not hold, or layers whose norms the fused all-reduces do not
+    reproduce, keep the module all-reduces and the stock norms."""
+    _stock_norms_case(fused_drafter, monkeypatch, case)
+    fused_drafter.decode_gemvs = gemvs
+    inputs = _block(1, 7, seed=17)
+    stock_inputs = _copy(inputs)
+    out = fused_drafter.dflash_forward(**inputs)
+    ref = DFlashForCausalLM.dflash_forward(fused_drafter, **stock_inputs)
+    torch.cuda.synchronize()
+    assert collectives == []
+    assert attn_calls == [7] * LAYERS
+    err = _rel_l2(out, ref)
+    assert err <= REL_L2, err
+
+
+def test_uncompiled_sandwich_gives_way_to_the_fused_all_reduce(
+    fused_drafter, gemvs, collectives, monkeypatch
+):
+    monkeypatch.setattr(fused_drafter, "_k3_sandwich_forms", frozenset({"down"}))
+    fused_drafter.decode_gemvs = gemvs
+    inputs = _block(1, 8, seed=88)
+    stock_inputs = _copy(inputs)
+    out = fused_drafter.dflash_forward(**inputs)
+    ref = DFlashForCausalLM.dflash_forward(fused_drafter, **stock_inputs)
+    torch.cuda.synchronize()
+    assert collectives == [("mnnvl_fusion_allreduce", 8), ("k3_sandwich_plain", 8, True)] * LAYERS
+    err = _rel_l2(out, ref)
+    assert err <= REL_L2, err
+
+
+@pytest.mark.parametrize("split", [(1, 7), (2, 7)])
+def test_fused_block_replays_under_capture(fused_drafter, gemvs, collectives, split):
+    """Eager first (the attention compiles for the block's key), then captured and replayed."""
+    fused_drafter.decode_gemvs = gemvs
+    inputs = _block(*split, seed=70 + split[0])
+    eager = fused_drafter.dflash_forward(**_copy(inputs))
+    torch.cuda.synchronize()
+    eager_calls = list(collectives)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = fused_drafter.dflash_forward(**inputs)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert eager_calls == _fused_calls(split[0] * split[1], True) * LAYERS
+    assert collectives[len(eager_calls) :] == eager_calls
+    err = _rel_l2(captured, eager)
+    assert err <= 1e-3, err

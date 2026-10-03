@@ -18,9 +18,13 @@ the same kind of collective: `K3DecodeComm.sandwich_tail`, `comm/k3_sandwich_tai
 all-reduce and the next layer's residual update (the final norm's, after the last layer) in one kernel.
 
 The DSpark drafter (`K3DSparkDrafter`) runs its collectives with a plain residual add and RMSNorm on the same state:
-`K3DecodeComm.allreduce_norm`, `comm/mnnvl_fusion_allreduce`, all-reduces an unreduced projection output of any token
-count the MNNVL workspace holds, with the residual add and the RMSNorm in its epilogue (the context projection's,
-with a zero residual).
+
+* `K3DecodeComm.sandwich_plain`, `comm/k3_sandwich_plain`: a row-parallel projection of at most `SANDWICH_MAX_TOKENS`
+  tokens (a layer's attention output projection, or its MLP's SiLU-and-mul and down projection), its all-reduce, the
+  residual add and the RMSNorm in one kernel.
+* `K3DecodeComm.allreduce_norm`, `comm/mnnvl_fusion_allreduce`: the all-reduce of an unreduced projection output of
+  any token count the MNNVL workspace holds, with the residual add and the RMSNorm in its epilogue (the context
+  projection's with a zero residual).
 
 The state is one `MnnvlWorkspace` and one `K3SandwichWorkspace` of the TP group (`K3DecodeComm.create`): collective
 over the group and eager, built by the target in `post_load_weights` before any CUDA-graph capture. Every rank must
@@ -42,6 +46,9 @@ from torch import nn
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_oproj import (
     K3SandwichWorkspace,
     k3_sandwich_oproj,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_plain import (
+    k3_sandwich_plain,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_tail import (
     k3_sandwich_tail,
@@ -85,6 +92,12 @@ def use_decode_one_shot(model: nn.Module) -> None:
         mnnvl = getattr(module, "mnnvl_allreduce", None)
         if mnnvl is not None:
             mnnvl.one_shot_max_bytes = DECODE_AR_ONE_SHOT_MAX_BYTES
+
+
+def skip_all_reduce() -> AllReduceParams:
+    """All-reduce parameters under which a row-parallel module returns this rank's unreduced output (its projection
+    without its all-reduce): a ``Linear``'s ``all_reduce_params``, a ``GatedMLP``'s ``final_all_reduce_params``."""
+    return AllReduceParams(enable_allreduce=False)
 
 
 def wide_all_reduce(all_reduce: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -301,6 +314,57 @@ class K3DecodeComm:
             block_residual,
             *_res_args(res_proj, res_norm, out_norm),
             self.sandwich,
+        )
+
+    def compile_plain(self, weight: torch.Tensor, swiglu: bool = False) -> bool:
+        """Compile the plain sandwich (``sandwich_plain``) for a projection of ``weight``'s shape (with ``swiglu``, a
+        down projection after the SiLU-and-mul) with one call on a zero row of a zero weight, before any capture;
+        False, with nothing launched, where the kernel does not take that shape. Collective: every rank of the group
+        makes the call; it advances the sandwich workspace on every rank alike."""
+        zero = torch.zeros_like(weight)
+        hidden, k_in = zero.shape
+        x = zero.new_zeros(1, 2 * k_in if swiglu else k_in)
+        residual = zero.new_zeros(1, hidden)
+        ones = zero.new_ones(hidden)
+        if not _sandwich_op.supports_plain(x, zero, residual, ones, swiglu):
+            return False
+        k3_sandwich_plain(x, zero, residual, ones, 1e-6, self.sandwich, swiglu=swiglu)
+        torch.cuda.synchronize(zero.device)
+        return True
+
+    @staticmethod
+    def takes_plain(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        residual: torch.Tensor,
+        norm: nn.Module,
+        swiglu: bool = False,
+    ) -> bool:
+        """Whether ``sandwich_plain`` takes the call: at most `SANDWICH_MAX_TOKENS` contiguous bf16 rows ``x`` of a
+        row-parallel slice ``weight`` [7168, K] (K a multiple of 128 up to 896; with ``swiglu`` K 896 and ``x`` the
+        ``[gate | up]`` rows, 2 K wide), ``residual`` [rows, 7168], and ``norm``'s bf16 [7168] weight."""
+        return _sandwich_op.supports_plain(x, weight, residual, norm.weight, swiglu)
+
+    def sandwich_plain(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        residual: torch.Tensor,
+        norm: nn.Module,
+        swiglu: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(normed, updated)`` in one ``comm/k3_sandwich_plain`` call: ``updated = residual + allreduce(x @
+        weight.T)`` (with ``swiglu``, of ``silu_and_mul(x) @ weight.T``), ``normed = norm(updated)`` for a plain
+        RMSNorm ``norm``. Bit for bit, by the kernel's statement, the projection on ``k3_ctm_gemv`` at split 1 (with
+        ``swiglu``, ``k3_ctm_gemv_swiglu`` at split 2) followed by ``allreduce_norm``'s one-shot call."""
+        return k3_sandwich_plain(
+            x.contiguous(),
+            weight,
+            residual.contiguous(),
+            norm.weight,
+            _eps(norm),
+            self.sandwich,
+            swiglu=swiglu,
         )
 
     def takes_allreduce_norm(self, rows: int, hidden: int) -> bool:
