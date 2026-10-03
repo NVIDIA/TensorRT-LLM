@@ -368,8 +368,8 @@ class DynamicResolutionImageTiler:
         patches = closest_patch_height * closest_patch_width
 
         factor = min(math.sqrt(num_tokens_available / patches), self._factor_max)
-        target_patch_height = math.floor(factor * closest_patch_height)
-        target_patch_width = math.floor(factor * closest_patch_width)
+        target_patch_height = max(1, math.floor(factor * closest_patch_height))
+        target_patch_width = max(1, math.floor(factor * closest_patch_width))
 
         # Enforce min_num_patches.
         if (
@@ -391,6 +391,11 @@ class DynamicResolutionImageTiler:
                 target_patch_height += inc_h
             else:
                 target_patch_height = max(required_divisor, target_patch_height - rem_h)
+                if target_patch_height * target_patch_width > num_tokens_available:
+                    target_patch_width = max(
+                        required_divisor,
+                        (num_tokens_available // target_patch_height) // required_divisor * required_divisor,
+                    )
 
         rem_w = target_patch_width % required_divisor
         if rem_w != 0:
@@ -399,6 +404,11 @@ class DynamicResolutionImageTiler:
                 target_patch_width += inc_w
             else:
                 target_patch_width = max(required_divisor, target_patch_width - rem_w)
+                if target_patch_height * target_patch_width > num_tokens_available:
+                    target_patch_height = max(
+                        required_divisor,
+                        (num_tokens_available // target_patch_width) // required_divisor * required_divisor,
+                    )
 
         num_embeddings = self._get_num_embeddings(target_patch_width, target_patch_height)
         token_count = target_patch_width * target_patch_height
