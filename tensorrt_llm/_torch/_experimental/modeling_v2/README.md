@@ -181,8 +181,9 @@ Perf is measured, never gated.
 
 ## Status of every record in this tree
 
-**The catalog is fully certified on sm_103. The targets construct but have
-never executed.**
+**The catalog is certified: 19 entries on sm_103, and 6 on sm_100 (B200 /
+GB200): the 6 Kimi K3 entries, where their first caller runs. The targets
+construct but have never executed.**
 
 Two things voided every receipt in the move: each catalog test file was
 rewritten, and the targets moved from sm_100 (B200) to sm_103 (GB300), where

@@ -3048,6 +3048,14 @@ def _create_kv_cache_manager(
             if is_kda_mtp_verify_available():
                 kda_extra_kwargs["kda_replay_num_spec"] = (
                     spec_config.tokens_per_gen_step - 1)
+                # A model whose KDA verify starts from the state after the
+                # accepted drafts (instead of replaying them) asks for the
+                # state after every draft with `kda_token_states`.
+                backbone = getattr(getattr(model_engine, "model", None),
+                                   "model", None)
+                if (issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
+                        and getattr(backbone, "kda_token_states", False)):
+                    kda_extra_kwargs["kda_token_states"] = True
         if is_glm5_next:
             # The manager places an indexer buffer on every attention layer.
             from ..attention.backends.sparse.glm_kpool import \
