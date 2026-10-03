@@ -58,14 +58,16 @@ over the W ranks only) and of k3_markov on the bf16 logits.
 
 W = 2 or 4 GPUs of one NVLink domain, every GPU of the node visible to every rank (rank r runs on GPU r % count).
 Without a mode the checks run, then the timing (unless ``--skip-perf``); the exit code is nonzero when a check fails.
-The checks also run under pytest on W >= 2 ranks (``srun -n W --mpi=pmix python3 -m pytest -p no:cacheprovider
-test_k3_markov.py``); with fewer ranks the module is skipped.
+Under pytest (``python3 -m pytest test_k3_markov.py``, 4 GPUs visible) one test runs the checks on 4 ranks: this
+file under a local ``mpirun -n 4``, started from a fresh interpreter, under a deadline; with fewer GPUs the module is
+skipped.
 """
 
 import argparse
-import contextlib
 import os
+import signal
 import statistics
+import subprocess
 import sys
 import traceback
 import zlib
@@ -118,12 +120,14 @@ def _world_size() -> int:
     return MPI.COMM_WORLD.Get_size()
 
 
-pytestmark = [
-    pytest.mark.skipif(not _sm100(), reason="needs SM100 (MNNVL multicast, TMA bulk copies, PDL)"),
-    pytest.mark.skipif(
-        _world_size() < 2, reason="needs >= 2 MPI ranks: srun -n W --mpi=pmix python3 -m pytest"
-    ),
-]
+# The ranks of the pytest run (one GB200 tray) and its deadline: a broken collective hangs rather than raising.
+WORLD = 4
+DEADLINE_S = 3600
+
+pytestmark = pytest.mark.skipif(
+    not _sm100() or torch.cuda.device_count() < WORLD,
+    reason=f"needs {WORLD} SM100 GPUs (MNNVL multicast, TMA bulk copies, PDL)",
+)
 
 
 def case_seed(*key) -> int:
@@ -867,93 +871,45 @@ def timing(g: Group, rounds: int = 10) -> None:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# pytest (srun -n W --mpi=pmix python3 -m pytest -p no:cacheprovider test_k3_markov.py): every rank runs the same
-# tests in the same order, and every collective of a test happens before its assert.
+# pytest (python3 -m pytest test_k3_markov.py): the checks on WORLD ranks of this node.
 # ----------------------------------------------------------------------------------------------------------------
 
-_state = {}
+
+@pytest.mark.no_xdist
+def test_k3_markov():
+    """``report`` on WORLD ranks: ``launch`` in a fresh interpreter, which starts this file under ``mpirun`` (a
+    process that has initialized MPI, as pytest's has, cannot start mpirun)."""
+    visible = [d for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d.strip()]
+    devices = (visible or [str(i) for i in range(torch.cuda.device_count())])[:WORLD]
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(devices))
+    done = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "launch"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=DEADLINE_S + 300,
+    )
+    print(done.stdout, flush=True)
+    assert done.returncode == 0 and "ALL PASS" in done.stdout, (
+        done.stdout[-20000:] + done.stderr[-20000:]
+    )
 
 
-def group() -> Group:
-    """This process' rank of the group, built by the first test (its workspaces are allocated collectively)."""
-    if "group" not in _state:
-        _state["group"] = Group()
-    return _state["group"]
-
-
-@contextlib.contextmanager
-def collective():
-    """Inference mode; an exception on one rank aborts the job (its peers would wait for it in a collective)."""
-    with torch.inference_mode():
-        try:
-            yield
-        except Exception:
-            traceback.print_exc()
-            from mpi4py import MPI
-
-            MPI.COMM_WORLD.Abort(1)
-            raise
-
-
-def test_shard_support():
-    with collective():
-        g = group()
-        results = [(shard, *shard_support(g, shard, copies)) for shard, copies in g.shards()]
-    for shard, rejected, consistent, line in results:
-        assert consistent, line
-        assert not (shard == TP16_SHARD and rejected), line
-
-
-@pytest.mark.parametrize("dtype", DTYPES, ids=[DTYPE_NAMES[d] for d in DTYPES])
-@pytest.mark.parametrize("block", BLOCKS)
-@pytest.mark.parametrize("batch", BATCHES)
-@pytest.mark.parametrize("shard_kind", ["tp16", "full"])
-def test_split(shard_kind, batch, block, dtype):
-    with collective():
-        g = group()
-        shard, copies = g.shard(shard_kind)
-        if g.op.pick_grid(shard, block, batch) == 0:
-            pytest.skip(f"pick_grid rejects S = {shard} (see test_shard_support)")
-        row = random_case(g, shard, copies, batch, block, dtype)
-    assert row["ok"], row
-
-
-@pytest.mark.parametrize(
-    "index", range(len(CRAFTED_SPLITS)), ids=[f"{b}x{k}" for b, k in CRAFTED_SPLITS]
-)
-@pytest.mark.parametrize("kind", list(CRAFTED))
-@pytest.mark.parametrize("shard_kind", ["tp16", "full"])
-def test_crafted(shard_kind, kind, index):
-    batch, block = CRAFTED_SPLITS[index]
-    with collective():
-        g = group()
-        shard, copies = g.shard(shard_kind)
-        if g.op.pick_grid(shard, block, batch) == 0:
-            pytest.skip(f"pick_grid rejects S = {shard} (see test_shard_support)")
-        row = crafted_case(g, kind, shard, copies, batch, block, DTYPES[index % len(DTYPES)])
-    assert row["ok"], row
-
-
-@pytest.mark.parametrize("batch", MIXED_GENS)
-@pytest.mark.parametrize("contexts", MIXED_CONTEXTS)
-def test_mixed_step(contexts, batch):
-    with collective():
-        row = mixed_step_case(group(), contexts, batch)
-    assert row["ok"], row
-
-
-def test_eager_interleave():
-    with collective():
-        row = eager_interleave(group())
-    assert row["ok"], row
-
-
-@pytest.mark.parametrize("dtype", DTYPES, ids=[DTYPE_NAMES[d] for d in DTYPES])
-@pytest.mark.parametrize("batch,block", GRAPH_SPLITS, ids=[f"{b}x{k}" for b, k in GRAPH_SPLITS])
-def test_graph_replay(batch, block, dtype):
-    with collective():
-        row = graph_replays(group(), batch, block, dtype)
-    assert row["ok"], row
+def launch() -> int:
+    """This file's ``report`` under ``mpirun -n WORLD`` (one rank per visible device), killed with its process
+    group at the deadline."""
+    command = ["mpirun", "-n", str(WORLD), sys.executable, os.path.abspath(__file__), "report"]
+    print(f"[launch] {' '.join(command)}", flush=True)
+    process = subprocess.Popen(command, start_new_session=True)
+    try:
+        return process.wait(timeout=DEADLINE_S)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        print(
+            f"[launch] the {WORLD}-rank run did not finish in {DEADLINE_S} s (wedged)", flush=True
+        )
+        return 1
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -968,8 +924,9 @@ def main() -> int:
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=("report", "time"),
-        help="the checks only, or the timing only (default: the checks, then the timing)",
+        choices=("report", "time", "launch"),
+        help="the checks only, the timing only, or the checks on WORLD ranks under a local mpirun (launch; "
+        "the pytest form) (default: the checks, then the timing)",
     )
     parser.add_argument(
         "--copies",
@@ -982,6 +939,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.copies is not None and args.copies < 1:
         parser.error("--copies must be >= 1")
+    if args.mode == "launch":
+        return launch()
     if not _sm100() or _world_size() < 2:
         print(
             "needs SM100 GPUs and >= 2 MPI ranks: srun -n W --mpi=pmix python3 test_k3_markov.py",
