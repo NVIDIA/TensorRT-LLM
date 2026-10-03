@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""ModelingV2 target: Kimi K3 (MXFP4) / sm_100 / tp16 attention, routed experts moe_tp 4 x moe_ep 4.
+# >>> route B: this target's layout, and decoding without speculation
+"""ModelingV2 target: Kimi K3 (MXFP4) / sm_100 / tp16 attention, routed experts moe_tp 16 x moe_ep 1.
 
 Kimi K3's language model: 93 layers, hidden 7168. Every fourth layer (3, 7, ..., 91) is MLA attention with 96
 query heads; the others are Kimi Delta Attention (KDA), a gated linear-attention recurrence with per-request state.
@@ -8,9 +9,16 @@ Layer 0's MLP is dense. Every other layer's MLP is a latent MoE: 896 routed expe
 Attention residuals mix each sublayer's input from a bank of earlier outputs. The routed experts are MXFP4 (the
 checkpoint's compressed-tensors default, read as W4A8_MXFP4_MXFP8); everything else is bf16, and so is the KV pool.
 
-`tp16_moetp4ep4` is `tensor_parallel_size: 16` with `moe_tensor_parallel_size: 4` and
-`moe_expert_parallel_size: 4`, no attention data parallelism, all 16 GPUs in one NVLink domain. Attention is
-head-split (6 MLA query heads per rank), and every rank holds a quarter of the width of a quarter of the experts.
+`tp16_moetp16ep1` is `tensor_parallel_size: 16` with `moe_tensor_parallel_size: 16` and
+`moe_expert_parallel_size: 1`, both set explicitly, no attention data parallelism, all 16 GPUs in one NVLink domain.
+Attention is head-split (6 MLA query heads per rank), and every rank holds all 896 experts at a sixteenth of their
+intermediate width (192 of 3072 values, zero-padded to 256 when they load). With the expert split left unset the
+engine resolves the same sizes, but Kimi K3 then runs the experts expert-parallel over the 16 ranks, a layout no
+target serves. This is Kimi K3's layout for decoding without speculation; `tp16_moetp4ep4` serves speculative
+decoding.
+
+**This module is `tp16_moetp4ep4`'s, copied** (targets share no files) and changed only inside its marked route B
+blocks; test_modeling_v2_kimi_k3_drift.py checks that the two modules match everywhere else.
 
 **Each step is classified once, on the host, from its shape** (`decode_step`, a `DecodeStep` or None), and the
 classification decides which kernels each module runs:
@@ -18,11 +26,8 @@ classification decides which kernels each module runs:
 * **small**: at most 8 tokens (`DECODE_MAX_TOKENS`, one token tile), context requests included. The token-count
   kernels take it: decode GEMVs, the MoE front and routed experts, the sandwiches, the embedding and residual
   epilogues.
-* **decode**: a pure decode step of R <= 8 generation requests with the same T <= 8 tokens each (one token without
-  speculation, 1 + 7 drafts with DSpark) and no context request, so at most 64 tokens. The request-aware kernels
-  take it: MLA attention and its KV store, the KDA verify, the drafter's attention.
-* **wide**: a decode step of more than one token tile (DSpark verify of several requests). It keeps the decode
-  layout's MoE head and tail, on M-general ops.
+* **decode**: a pure decode step of R <= 8 generation requests and no context request; without speculation each
+  request has one token. The request-aware kernels take it: MLA attention and its KV store.
 
 Every other step (prefill, mixed steps, decode steps above those bounds) runs the **generic path**: this target's
 text model (`KimiLinearModel` below: decoder layers, attention residuals, the MLA / KDA / MoE runtimes), computed
@@ -33,33 +38,35 @@ The text model hands each step's classification to its attention modules, which 
 decode kernels' catalog entries:
 
 * KDA (`K3DecodeKDA`): one token per request, the fused input projection and the plain decode in one
-  `ssm/k3_kda_decode_attn` launch. Verify tokens (DFlash / DSpark at an even verify width up to 8): the cache manager
-  then keeps the KDA state after every verify token, and every verify of the layer, on any step, runs the kernels
-  that keep it: `ssm/k3_kda_attn` for one request of 8 tokens (the projection fused in), else `ssm/k3_kda_verify`.
+  `ssm/k3_kda_decode_attn` launch.
 * MLA (`K3DecodeMLA`): `attention/k3_mla_qkv` (the query path and the step's latent KV rows into the paged cache),
   then `attention/k3_mla_attn_vb_out` (the attention, v_b and the output gate in one launch).
 
-The projections around them run on the decode GEMV sites of `decode_gemv.py` (the [W_a; W_g] and KDA verify-row
-projections, `o_proj` on every classified step), as do the LM head, the embedding and layer 0's dense MLP. The state
-those kernels share (the KDA projection's Lamport buffers, the MLA attention workspace, the decode GEMVs' state)
-lives in typed objects this target creates in `post_load_weights`, before any graph capture. The MoE front and routed
-experts, the sandwiches and the residual epilogues come with their own entries; until then they run the generic path
-on every step.
+The projections around them run on the decode GEMV sites of `decode_gemv.py` (the [W_a; W_g] projection, `o_proj`
+on every classified step), as do the LM head, the embedding and layer 0's dense MLP. The state those kernels share
+(the KDA projection's Lamport buffers, the MLA attention workspace, the decode GEMVs' state) lives in typed objects
+this target creates in `post_load_weights`, before any graph capture. The MoE front and routed experts, the
+sandwiches and the residual epilogues come with their own entries; until then they run the generic path on every
+step.
 
-**What this target asserts rather than adapts**: SM 10.0; the topology above; the MXFP4 checkpoint's quantization
-(W4A16_MXFP4 with no per-layer declarations, so the routed experts run the W4A8_MXFP4_MXFP8 default and the excluded
-modules stay bf16); bf16 weights and a bf16 KV pool;
+**What this target asserts rather than adapts**: SM 10.0; the topology above, with the expert split set explicitly;
+no speculative decoding; the MXFP4 checkpoint's quantization (W4A16_MXFP4 with no per-layer declarations, so the
+routed experts run the W4A8_MXFP4_MXFP8 default and the excluded modules stay bf16); bf16 weights and a bf16 KV pool;
 tokens_per_block 64 (the MLA generation kernels K3's 96 heads reach exist only at 64); the V2 hybrid KV / state
 manager, which holds the KDA states, with block reuse off and fp32 recurrent states; an all-reduce strategy of AUTO or
-MNNVL. The construction-time ones fail in `__init__`, the per-engine ones on the first forward, each naming the
-setting. A layer the decode kernels do not take fails the weight load.
+MNNVL. The construction-time ones fail in `__init__`, the
+per-engine ones on the first forward, each naming the setting. A layer the decode kernels do not take fails the
+weight load.
 
 **Text only.** The checkpoint is the vision-language wrapper. This target builds and loads no vision tower (its
 weights are a predicted non-load, `weights.py`), and a step carrying multimodal input raises.
 
-**Speculative decoding** goes through the stock one-engine shell: DSpark or DFlash with an external drafter
-checkpoint, and SA. The worker and its kernels stay upstream code; this target does not own a worker.
+**No speculative decoding.** A speculative decoding config fails construction, naming `tp16_moetp4ep4`'s expert
+split. The causal LM is still the stock one-engine shell the built-in model builds on, which without that config
+builds no drafter and no worker. This target drops `tp16_moetp4ep4`'s KDA verify kernels and the per-token verify
+states they keep; the text model's speculative hidden-state taps stay as `tp16_moetp4ep4` has them and never fire.
 """
+# <<< route B
 
 from __future__ import annotations
 
@@ -79,17 +86,16 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_mla_attn
     K3MlaAttnWorkspace,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_mla_qkv import k3_mla_qkv
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_attn import k3_kda_attn
+
+# >>> route B: no KDA verify kernels, and no trtllm::kda_mtp_decode (the built-in KDA verify's)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_buffers import K3KdaBuffers
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_decode_attn import (
     k3_kda_decode_attn,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_verify import k3_kda_verify
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import k3_mla_decode_view
 
-# Registers trtllm::kda_mtp_decode (REQUIRED_TRTLLM_OPS), which the built-in KDA module loads on its first verify.
-from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_kda_mtp_ops  # noqa: F401
+# <<< route B
 from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
@@ -138,12 +144,11 @@ REQUIRED_TRTLLM_OPS = (
     "attn_res_add_rmsnorm_persistent_fwd",
     "kda_prefill",
     "kda_decode",
-    "kda_mtp_decode",
+    # >>> route B: no KDA verify (kda_mtp_decode, k3_kda_attn, k3_kda_verify)
     "dsv3_router_gemm_op",
     "dsv3_fused_a_gemm_op",
     "k3_kda_decode_attn",
-    "k3_kda_attn",
-    "k3_kda_verify",
+    # <<< route B
     "k3_mla_qkv",
     "k3_mla_attn_vb_out",
     # The decode path's GEMVs, LM head and embedding (decode_gemv.py).
@@ -180,7 +185,8 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.models.modeling_utils.DecoderModel",
     # The text model's stock modules.
     "tensorrt_llm._torch.modules.kimi_kda.KimiKDALinearAttention",
-    "tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops",
+    # >>> route B: no trtllm::kda_mtp_decode registration (the built-in KDA verify's)
+    # <<< route B
     "tensorrt_llm._torch.modules.kimi_k3_mla.KimiK3MLAAttention",
     "tensorrt_llm._torch.moe.fused_moe.create_moe",
     "tensorrt_llm._torch.moe.fused_moe.ConfigurableMoE",
@@ -945,9 +951,11 @@ class KimiK3MoERuntime(nn.Module):
 
     @staticmethod
     def _select_moe_tp_ep(mapping: Mapping) -> Tuple[int, int]:
+        # >>> route B: this target's split
         """The routed-expert ``(moe_tp, moe_ep)`` split: the user config's explicit
-        ``moe_tensor_parallel_size`` / ``moe_expert_parallel_size`` (4 x 4, asserted at
+        ``moe_tensor_parallel_size`` / ``moe_expert_parallel_size`` (16 x 1, asserted at
         construction)."""
+        # <<< route B
         return mapping.moe_tp_size, mapping.moe_ep_size
 
     @staticmethod
@@ -1560,19 +1568,8 @@ class KimiLinearModel(DecoderModel):
             key="kimi_k3_aux_capture_mode",
         )
 
-    @property
-    def kda_token_states(self) -> bool:
-        """Whether the hybrid cache manager keeps the KDA state after every verify token, the protocol of
-        ``ssm/k3_kda_verify`` and ``ssm/k3_kda_attn``. The engine reads it once the weights are loaded, to build the
-        manager: DFlash / DSpark drafts of an even verify width up to 8, every KDA layer taking the K3 kernels.
-        Otherwise the KDA verify replays the accepted drafts (the built-in verify)."""
-        spec_config = getattr(self.model_config, "spec_config", None)
-        return bool(
-            spec_config is not None
-            and (spec_config.spec_dec_mode.is_dflash() or spec_config.spec_dec_mode.is_dspark())
-            and spec_config.tokens_per_gen_step in (2, 4, 6, 8)
-            and all(layer.linear_attn.takes_k3_kernels for layer in self.layers if layer.is_kda)
-        )
+    # >>> route B: no per-token KDA verify states (kda_token_states): no speculative decoding
+    # <<< route B
 
     def forward(
         self,
@@ -1682,15 +1679,11 @@ class KimiLinearModel(DecoderModel):
 
 
 class K3DecodeKDA(KimiKDALinearAttention):
+    # >>> route B: no verify kernels
     """Kimi K3's KDA attention: the built-in module, with the decode kernels on the steps they take.
 
     * A decode step of one token per request runs the fused input projection and the plain decode in one
       ``ssm/k3_kda_decode_attn`` launch.
-    * With the cache manager's per-token states (``KimiLinearModel.kda_token_states``), every verify of the layer, on
-      any step, runs the kernels that keep them: ``ssm/k3_kda_attn`` for one request of 8 tokens (the projection fused
-      in), else ``ssm/k3_kda_verify`` on the projection's rows (the ``kda_proj`` decode GEMV site where it takes
-      them). The built-in verify replays drafts from caches these kernels do not fill, so the two never run on one
-      manager.
     * On every step ``decode_step`` classifies, ``o_proj`` runs on the ``o_proj`` decode GEMV site where it takes the
       rows, then the module's all-reduce.
 
@@ -1698,6 +1691,8 @@ class K3DecodeKDA(KimiKDALinearAttention):
     checkpoint load from the module's own, and the device's ``K3KdaBuffers`` and decode GEMVs' state, which the
     target sets in ``post_load_weights``.
     """
+
+    # <<< route B
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -1801,85 +1796,8 @@ class K3DecodeKDA(KimiKDALinearAttention):
         self._sync_kda_replay_conv_window(layer_cache, slots, layer_cache.conv)
         return core
 
-    def forward_verify(
-        self,
-        x2d,
-        num_steps,
-        layer_cache,
-        conv_pool,
-        ssm_pool,
-        slot_indices,
-        output: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """The built-in verify, unless the cache manager keeps the per-token states; then the decode kernels'."""
-        if not (layer_cache.has_kda_replay_caches and layer_cache.kda_state_tok is not None):
-            return super().forward_verify(
-                x2d, num_steps, layer_cache, conv_pool, ssm_pool, slot_indices, output=output
-            )
-        assert self.takes_k3_kernels and self.k3_buffers is not None, (
-            f"Kimi K3 KDA layer {self.layer_idx}: the cache manager keeps the per-token verify states, which only "
-            "the decode kernels write, and this layer has no fused projection weight or buffers"
-        )
-        core = self._k3_verify(x2d, num_steps, layer_cache, ssm_pool, slot_indices)
-        return self._store_core(core, output)
-
-    def _k3_verify(self, x, num_steps, layer_cache, ssm_pool, slot_indices) -> torch.Tensor:
-        """The core output ``[N T, H, 128]`` of N requests of T verify tokens: ``ssm/k3_kda_attn`` for one request of
-        8 tokens, else ``ssm/k3_kda_verify`` on the projection's rows (the ``kda_proj`` decode GEMV site where it
-        takes them). Each slot's state after the golden token, its drafts' states and its conv window are written in
-        place."""
-        num_requests = x.shape[0] // num_steps
-        slots = slot_indices[:num_requests]
-        w_q, w_k, w_v = self._get_mtp_conv_weights()
-        constants = (float(self.gate_lower_bound), self.head_k_dim**-0.5, float(self.o_norm.eps))
-        if num_requests == 1 and num_steps == 8:
-            out = k3_kda_attn(
-                x.contiguous(),
-                self.k3_proj_weight,
-                self.f_b_proj.weight,
-                w_q,
-                w_k,
-                w_v,
-                self._A_log_f32,
-                self._dt_bias_f32,
-                self._onorm_w_f32,
-                layer_cache.kda_conv_q,
-                layer_cache.kda_conv_k,
-                layer_cache.kda_conv_v,
-                ssm_pool,
-                layer_cache.kda_state_tok,
-                slots,
-                layer_cache.prev_num_accepted_tokens,
-                self.k3_buffers,
-                num_steps - 1,
-                *constants,
-            )
-        else:
-            rows = None
-            if self.decode_gemvs is not None:
-                rows = self.decode_gemvs.project("kda_proj", x, self.k3_proj_weight)
-            if rows is None:
-                rows = torch.nn.functional.linear(x, self.k3_proj_weight)
-            out = k3_kda_verify(
-                rows,
-                self.f_b_proj.weight,
-                w_q,
-                w_k,
-                w_v,
-                self._A_log_f32,
-                self._dt_bias_f32,
-                self._onorm_w_f32,
-                layer_cache.kda_conv_q,
-                layer_cache.kda_conv_k,
-                layer_cache.kda_conv_v,
-                ssm_pool,
-                layer_cache.kda_state_tok,
-                slots,
-                layer_cache.prev_num_accepted_tokens,
-                num_steps - 1,
-                *constants,
-            )
-        return out.view(-1, self.num_heads, self.head_dim)
+    # >>> route B: no verify kernels (a verify step needs speculative decoding)
+    # <<< route B
 
 
 class K3DecodeMLA(KimiK3MLAAttention):
@@ -2146,11 +2064,22 @@ def _check_construction(model_config: ModelConfig) -> None:
         mapping.moe_ep_size,
         mapping.enable_attention_dp,
     )
-    assert topology == (16, 16, 1, 4, 4, False), (
-        "the tp16_moetp4ep4 target needs world_size 16, tensor_parallel_size 16, pipeline_parallel_size 1, "
-        "moe_tensor_parallel_size 4, moe_expert_parallel_size 4 and enable_attention_dp false; the engine built "
+    # >>> route B: this target's topology, its expert split set explicitly, and no speculative decoding
+    assert topology == (16, 16, 1, 16, 1, False), (
+        "the tp16_moetp16ep1 target needs world_size 16, tensor_parallel_size 16, pipeline_parallel_size 1, "
+        "moe_tensor_parallel_size 16, moe_expert_parallel_size 1 and enable_attention_dp false; the engine built "
         f"(world, tp, pp, moe_tp, moe_ep, attention_dp) = {topology}"
     )
+    assert mapping.moe_tp_ep_user_specified, (
+        "the tp16_moetp16ep1 target needs moe_tensor_parallel_size 16 and moe_expert_parallel_size 1 set "
+        "explicitly; with the split unset the engine resolves the same sizes, but Kimi K3 then runs the experts "
+        "expert-parallel over the 16 ranks"
+    )
+    assert getattr(model_config, "spec_config", None) is None, (
+        "the tp16_moetp16ep1 target decodes without speculation; for DSpark, DFlash or SA set "
+        "moe_tensor_parallel_size 4 and moe_expert_parallel_size 4 (the tp16_moetp4ep4 target)"
+    )
+    # <<< route B
     assert model_config.torch_dtype == torch.bfloat16, (
         f"this target computes in bf16; the engine resolved dtype {model_config.torch_dtype}"
     )
@@ -2170,8 +2099,10 @@ def _check_construction(model_config: ModelConfig) -> None:
     )
 
 
-@register_auto_model("ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4")
-class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
+# >>> route B: this target's name
+@register_auto_model("ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1")
+class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
+    # <<< route B
     """The registration shell: this target's text model (`KimiLinearModel` above) behind its checks.
 
     It inherits the built-in Kimi K3 causal LM for the checkpoint load and the engine hooks (`load_weights` through
@@ -2192,13 +2123,8 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
         )
         _check_construction(model_config)
         text = _text_model_config(model_config)
-        spec_config = getattr(text, "spec_config", None)
-        assert (
-            spec_config is None
-            or spec_config.spec_dec_mode.is_sa()
-            or spec_config.spec_dec_mode.is_dflash()
-            or spec_config.spec_dec_mode.is_dspark()
-        ), "Kimi K3 supports speculative decoding only with SA, DFlash or DSpark"
+        # >>> route B: no speculative decoding (_check_construction), so the one-engine shell builds no drafter
+        # <<< route B
         # The inherited loader reads these: this target has neither helix context parallelism nor the fp8
         # weight-read conversion of the shared / latent MLPs.
         self._fp8_weight_read_moe_mlp = False
@@ -2213,13 +2139,10 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
             vocab_size=cfg.vocab_size,
         )
         self._step_checked = False
-        # The LM head on gemm/k3_head_gemv at decode size, once cache_derived_state has built its state. It is the
-        # processor the speculative worker's target logits and a parallel drafter's logits call too.
-        stock_logits_processor = self.logits_processor
-        self.logits_processor = _decode_gemv.K3LogitsProcessor(stock_logits_processor)
-        draft_model = getattr(self, "draft_model", None)
-        if getattr(draft_model, "logits_processor", None) is stock_logits_processor:
-            draft_model.logits_processor = self.logits_processor
+        # >>> route B: no drafter to hand the LM head to
+        # The LM head on gemm/k3_head_gemv at decode size, once cache_derived_state has built its state.
+        self.logits_processor = _decode_gemv.K3LogitsProcessor(self.logits_processor)
+        # <<< route B
         # The executor reads generation settings (eos_token_id, ...) off the model config the engine holds, which
         # must therefore be the text config, as the built-in wrapper leaves it.
         model_config._frozen = False
@@ -2262,7 +2185,9 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
         for module in kda + mla:
             module.decode_gemvs = self.model.decode_gemvs
         logger.info(
-            "Kimi K3 decode kernels: KDA on k3_kda_decode_attn, k3_kda_attn and k3_kda_verify "
+            # >>> route B: no verify kernels
+            "Kimi K3 decode kernels: KDA on k3_kda_decode_attn "
+            # <<< route B
             f"({sum(m.takes_k3_kernels for m in kda)} / {len(kda)} layers take them), MLA on k3_mla_qkv and "
             f"k3_mla_attn_vb_out ({len(mla)} layers)"
         )
