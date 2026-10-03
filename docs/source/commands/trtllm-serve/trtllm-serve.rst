@@ -214,6 +214,36 @@ model.
          {"type": "audio_url", "audio_url": {"url": "https://example.com/audio.mp3"}}
      ]}
 
+Multimodal CPU Memory Limits
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Decoded media can need far more CPU memory than the request that carried it.
+Two prototype options bound this memory in each serving frontend process; both
+are disabled by default:
+
+* ``--max_multimodal_cpu_bytes_per_request`` caps one request. Request bodies
+  above the cap on ``/v1/chat/completions``, ``/v1/messages``, and
+  ``/v1/responses`` are rejected before they are parsed, including text-only
+  requests. For chat and Messages requests, the raw body plus the decoded media
+  and processed multimodal tensors must also stay under the cap; media decoding
+  stops as soon as it is exceeded. Rejected requests get HTTP 413.
+* ``--max_multimodal_cpu_bytes`` caps the requests with media that are decoded
+  and preprocessed at the same time. Each one reserves the per-request cap, so
+  at most ``max_multimodal_cpu_bytes // max_multimodal_cpu_bytes_per_request``
+  run concurrently and the rest wait. Text-only requests do not wait. If
+  ``--max_multimodal_cpu_bytes_per_request`` is not set, it defaults to
+  ``--max_multimodal_cpu_bytes``, so only one request with media is decoded and
+  preprocessed at a time.
+
+.. code-block:: bash
+
+   trtllm-serve Qwen/Qwen2-VL-7B-Instruct \
+       --max_multimodal_cpu_bytes 8GiB \
+       --max_multimodal_cpu_bytes_per_request 1GiB
+
+The limits count tensor, array, and image storage, not process RSS. Leave
+headroom for decoder temporaries and allocator overhead.
+
 
 
 Visual Generation Serving
