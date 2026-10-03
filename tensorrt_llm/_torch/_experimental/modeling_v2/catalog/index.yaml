@@ -28,7 +28,7 @@
 # limits, e.g. no float8 arithmetic, are noted in the entry docstring).
 # Entries wrapping trtllm ops carry all three.
 #
-# ── RECEIPT STATUS: all 19 entries certified on sm_103 ────────────────────
+# ── RECEIPT STATUS: 19 entries certified on sm_103, 6 on sm_100 ───────────
 #
 # A receipt says this entry's test passed on a stated GPU architecture. The
 # architecture is the whole key: it is a real axis -- see the
@@ -66,6 +66,10 @@
 # exactly as written. They are true records of what was observed on another
 # device, and rewriting them would manufacture GB300 evidence that does not
 # exist. Read them as provenance; the frontmatter is the certification.
+#
+# The Kimi K3 entries (k3_* and ssm/kda_decode) are certified on sm_100 (B200 /
+# GB200), where their first caller runs, and their tests skip on any other
+# architecture.
 # ──────────────────────────────────────────────────────────────────────────
 #
 # 30 of the source catalog's 43 entries are here — the union of what the two
