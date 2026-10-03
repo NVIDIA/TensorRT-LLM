@@ -372,7 +372,89 @@ def check_k3_moe_push(ctx):
     return results
 
 
-CHECKS = {"push": check_push, "k3_moe_push": check_k3_moe_push}
+def check_sequences(ctx):
+    """The push form of the moe/k3_moe_m1 entry (catalog wrappers, one token) on one created state and one exchange,
+    each push followed by one reduce, against MNNVLAllReduce's one-shot of the plain partials:
+      steps     12 steps of 3 layers (the experts in 3 orders), the tokens changing every step, a random rank 5 ms
+                late at every call;
+      replay    one step captured and replayed 4 times with rewritten inputs, an eager push + reduce between replays;
+      swapped   the negative control: rank 0 pushes two token sets in the other order. Nothing raises or hangs, but
+                every rank's two sums are wrong (each reduce sums rank 0's partial of the other set); the next pair,
+                in the same order on every rank, is right again."""
+    import random
+    import time
+
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe_m1 import (
+        k3_moe_m1,
+        k3_moe_m1_push,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    base = _experts(20260928 + ctx.rank)
+    weights = [
+        tuple(t.roll(li, dims=0).contiguous() for t in base) if li else base for li in range(3)
+    ]
+    state = op.K3MoeM1State.create(
+        device, I_TP, I_PAD, NUM_EXPERTS, num_tokens=1, push=((ctx.world, 1),)
+    )
+    plain_state = op.K3MoeM1State.create(device, I_TP, I_PAD, NUM_EXPERTS, num_tokens=1)
+    layers = [state.layer(*w) for w in weights]
+    plain_layers = [plain_state.layer(*w) for w in weights]
+    sets = [_tokens(1, 3000 + s) for s in range(5)]
+    refs = {(li, si): _allreduce(ctx, k3_moe_m1(*sets[si], 0, plain_layers[li]))
+            for li in range(3) for si in range(5)}  # fmt: skip
+    ex = _Exchange(ctx, ctx.world, 0)
+    late = random.Random(7)  # the same draws on every rank
+    results = []
+
+    def push_reduce(li, tokens):
+        k3_moe_m1_push(*tokens, 0, layers[li], ex)
+        return ex.reduce(1)
+
+    good = True
+    for step in range(12):
+        for li in range(3):
+            if late.randrange(ctx.world) == ctx.rank:
+                time.sleep(0.005)
+            good &= _same(push_reduce(li, sets[step % 4]), refs[li, step % 4])
+    results.append(dict(op="k3_moe_m1_push", case="steps", M=1, exact=good, state=ex.state_ok(ctx)))
+
+    static = [tuple(t.clone() for t in sets[0]) for _ in range(3)]
+    graph = torch.cuda.CUDAGraph()
+    ctx.comm.Barrier()
+    with torch.cuda.graph(graph):
+        outs = [push_reduce(li, static[li]) for li in range(3)]
+    ex.count = (ex.count - 3 + 2**31) % 2**32 - 2**31  # capture launched nothing
+    good = True
+    for rep in range(4):
+        for li in range(3):
+            for dst, src in zip(static[li], sets[(rep + li) % 4]):
+                dst.copy_(src)
+        ctx.comm.Barrier()
+        graph.replay()
+        ex.count = (ex.count + 3 + 2**31) % 2**32 - 2**31
+        good &= all(_same(outs[li], refs[li, (rep + li) % 4]) for li in range(3))
+        good &= _same(push_reduce(rep % 3, sets[4]), refs[rep % 3, 4])
+    results.append(
+        dict(op="k3_moe_m1_push", case="replay", M=1, exact=good, state=ex.state_ok(ctx))
+    )
+    del graph
+
+    first, second = (sets[1], sets[0]) if ctx.rank == 0 else (sets[0], sets[1])
+    got0, got1 = push_reduce(0, first), push_reduce(0, second)
+    wrong = [(got0 != refs[0, 0]).float().mean().item(), (got1 != refs[0, 1]).float().mean().item()]
+    after = _same(push_reduce(0, sets[2]), refs[0, 2])
+    results.append(dict(op="k3_moe_m1_push", case="swapped", M=1, detected=min(wrong) > 0.5, after=after,
+                        state=ex.state_ok(ctx)))  # fmt: skip
+    for row in results:
+        row["ok"] = all(
+            ctx.comm.allgather(all(v for k, v in row.items() if k not in ("op", "case", "M")))
+        )
+    return results
+
+
+CHECKS = {"push": check_push, "k3_moe_push": check_k3_moe_push, "sequences": check_sequences}
 
 
 def _run_checks(names):

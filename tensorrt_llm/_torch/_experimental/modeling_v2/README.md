@@ -186,8 +186,8 @@ Perf is measured, never gated.
 
 ## Status of every record in this tree
 
-**The catalog is certified: 19 entries on sm_103, and 23 on sm_100 (B200 /
-GB200): the 20 Kimi K3 entries (the MNNVL ones among them), where their
+**The catalog is certified: 19 entries on sm_103, and 25 on sm_100 (B200 /
+GB200): the 22 Kimi K3 entries (the MNNVL ones among them), where their
 first caller runs, and `cublas_mm`, `flashinfer_rmsnorm` and `allgather`.
 The targets construct but have never executed.**
 
