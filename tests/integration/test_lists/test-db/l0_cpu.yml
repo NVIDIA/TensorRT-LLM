@@ -48,6 +48,8 @@ l0_cpu:
   - unittest/_torch/peft
   - unittest/_torch/memory
   - unittest/_torch/modeling
+  # l0_b300 selects unittest/_torch/modeling_v2 with -m "not cpu_only", so this entry is what runs it.
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_step.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
