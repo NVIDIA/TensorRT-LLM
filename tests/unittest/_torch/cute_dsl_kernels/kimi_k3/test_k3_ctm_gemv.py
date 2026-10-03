@@ -46,20 +46,41 @@ PLAIN = {
 }
 # k3_ctm_gemv_long: (N, K, sig_col0, split, ring, push), as each call site passes them.
 LONG = {
-    "mla_qkv_a_gate": (2880, 7168, 2112, 6, 6, True),  # [W_a; W_g], the gate columns as bf16(sigmoid)
+    "mla_qkv_a_gate": (
+        2880,
+        7168,
+        2112,
+        6,
+        6,
+        True,
+    ),  # [W_a; W_g], the gate columns as bf16(sigmoid)
     "dense_gate_up": (4224, 7168, -1, 4, 5, False),
     "dense_down": (7168, 2112, -1, 2, 6, False),  # K 2112 ends in a half k-tile
     "drafter_qkv": (512, 7168, -1, 8, 6, True),
     "drafter_gate_up": (1792, 7168, -1, 8, 6, True),
     "drafter_gate_up_dummy": (1536, 7168, -1, 8, 6, True),
-    "kda_qkvg": (3208, 7168, -1, 5, 6, True),  # KDA q/k/v/g/f_a/b: 25 whole tiles and an 8-row last one
+    "kda_qkvg": (
+        3208,
+        7168,
+        -1,
+        5,
+        6,
+        True,
+    ),  # KDA q/k/v/g/f_a/b: 25 whole tiles and an 8-row last one
 }
 # k3_ctm_gemv_swiglu: (N, K, split, push), the drafter down projection (tuned and synthetic).
 SWIGLU = {"drafter_down": (7168, 896, 2, True), "drafter_down_dummy": (7168, 768, 2, True)}
-AG_COLS, G_COL0, K_O = 2880, 2112, 768  # MLA: [q_a 1536 | kv_a 576 | gate 768] rows of the fused projection
+AG_COLS, G_COL0, K_O = (
+    2880,
+    2112,
+    768,
+)  # MLA: [q_a 1536 | kv_a 576 | gate 768] rows of the fused projection
 HIDDEN, LATENT, WIDTH, PAD, ACT = 7168, 3584, 224, 256, 384
 EPS = 1e-6
-SITU = {"k3": (4.0, 25.0), "plain": (1.0, None)}  # (beta, linear_beta): the K3 checkpoint's, and the defaults
+SITU = {
+    "k3": (4.0, 25.0),
+    "plain": (1.0, None),
+}  # (beta, linear_beta): the K3 checkpoint's, and the defaults
 
 
 def _ops():
@@ -88,7 +109,9 @@ def _report(op, case, m, y, ref, stock=None, **flags):
     extra = "" if stock is None else f" vs_stock={_rel(y, stock):.2e}"
     marks = " ".join(f"{k}={v}" for k, v in flags.items())
     abs_err = (y.double() - ref.double()).abs().max().item()
-    print(f"OPCHECK op={op} case={case} M={m} abs={abs_err:.3e} rel={_rel(y, ref):.3e}{extra} {marks}")
+    print(
+        f"OPCHECK op={op} case={case} M={m} abs={abs_err:.3e} rel={_rel(y, ref):.3e}{extra} {marks}"
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -119,11 +142,23 @@ def test_k3_ctm_gemv(name, m):
     n, k, split, push = PLAIN[name]
     w = _weight(n, k, 1, 0.03)
     assert _ctm().supports(_rows(k, 2)[:m], w, split)
-    (x,), y, det, minv = _checks(lambda x_: ops.k3_ctm_gemv(x_, w, True, split, push), [_rows(k, 2)], m)
+    (x,), y, det, minv = _checks(
+        lambda x_: ops.k3_ctm_gemv(x_, w, True, split, push), [_rows(k, 2)], m
+    )
     ref = x.double() @ w.double().t()
     decode = ops.k3_decode_gemv(x, w, True)
     same_decode = torch.equal(_bits(y), _bits(decode))
-    _report("k3_ctm_gemv", name, m, y, ref, F.linear(x, w), det=det, rows_as_m8=minv, eq_k3_decode_gemv=same_decode)
+    _report(
+        "k3_ctm_gemv",
+        name,
+        m,
+        y,
+        ref,
+        F.linear(x, w),
+        det=det,
+        rows_as_m8=minv,
+        eq_k3_decode_gemv=same_decode,
+    )
     assert _rel(y, ref) <= TOL and _rel(y, F.linear(x, w)) <= TOL
     assert det and minv
     if split == 1:
@@ -177,7 +212,9 @@ def test_k3_ctm_gemv_swiglu(name, m):
     w = _weight(n, k, 7)
     gu8 = _rows(2 * k, 8, 2.0)
     assert _ctm().supports_swiglu(gu8, w, split)
-    (gu,), y, det, minv = _checks(lambda g_: ops.k3_ctm_gemv_swiglu(g_, w, True, split, push), [gu8], m)
+    (gu,), y, det, minv = _checks(
+        lambda g_: ops.k3_ctm_gemv_swiglu(g_, w, True, split, push), [gu8], m
+    )
     act = _silu_and_mul(gu)
     ref = act.double() @ w.double().t()
     _report("k3_ctm_gemv_swiglu", name, m, y, ref, F.linear(act, w), det=det, rows_as_m8=minv)
@@ -228,12 +265,22 @@ def test_k3_ctm_gemv_tail(rank, m):
     (lat, act), y, det, minv = _checks(call, [_rows(LATENT, 12, 0.8), _rows(ACT, 13, 0.5)], m)
     lat64 = lat.double()
     normed = lat64 * torch.rsqrt(lat64.pow(2).mean(dim=1, keepdim=True) + EPS)
-    ref = torch.cat([normed[:, lo : lo + WIDTH], act.double()], dim=1) @ torch.cat(
-        [w[:, :WIDTH], w[:, PAD:]], dim=1
-    ).double().t()
+    ref = (
+        torch.cat([normed[:, lo : lo + WIDTH], act.double()], dim=1)
+        @ torch.cat([w[:, :WIDTH], w[:, PAD:]], dim=1).double().t()
+    )
     decode = ops.k3_decode_gemv_tail(lat, act, w, lo, WIDTH, EPS, True)
     same_decode = torch.equal(_bits(y), _bits(decode))
-    _report("k3_ctm_gemv_tail", f"rank{rank}", m, y, ref, det=det, rows_as_m8=minv, eq_k3_decode_gemv_tail=same_decode)
+    _report(
+        "k3_ctm_gemv_tail",
+        f"rank{rank}",
+        m,
+        y,
+        ref,
+        det=det,
+        rows_as_m8=minv,
+        eq_k3_decode_gemv_tail=same_decode,
+    )
     assert _rel(y, ref) <= TOL
     assert det and minv and same_decode
 
@@ -261,7 +308,17 @@ def test_k3_situ_mul(situ, m):
     stock = SituAndMul(beta=beta, linear_beta=linear_beta, use_fused_activation=True)(gu)
     ref = _situ_ref(gu, beta, linear_beta)
     identical = (_bits(y) == _bits(stock)).float().mean().item()
-    _report("k3_situ_mul", situ, m, y, ref, stock, det=det, rows_as_m8=minv, frac_eq_triton=f"{identical:.4f}")
+    _report(
+        "k3_situ_mul",
+        situ,
+        m,
+        y,
+        ref,
+        stock,
+        det=det,
+        rows_as_m8=minv,
+        frac_eq_triton=f"{identical:.4f}",
+    )
     assert y.shape == (m, 2112)
     assert _rel(y, ref) <= TOL and _rel(y, stock) <= TOL
     assert det and minv
@@ -273,9 +330,15 @@ def test_token_limit(m):
     _ops()
     x = torch.zeros(m, 7168, dtype=torch.bfloat16, device="cuda")
     for n, k, _, split, ring, _ in LONG.values():
-        assert not op.supports_long(torch.zeros(m, k, dtype=torch.bfloat16, device="cuda"), _weight(n, k, 9), split, ring)
+        assert not op.supports_long(
+            torch.zeros(m, k, dtype=torch.bfloat16, device="cuda"), _weight(n, k, 9), split, ring
+        )
     with pytest.raises(ValueError):
         torch.ops.trtllm.k3_ctm_gemv_long(x, _weight(2880, 7168, 9), 2112, 6, 6, True, True)
-    assert not op.supports(torch.zeros(m, 768, dtype=torch.bfloat16, device="cuda"), _weight(7168, 768, 1, 0.03), 1)
+    assert not op.supports(
+        torch.zeros(m, 768, dtype=torch.bfloat16, device="cuda"), _weight(7168, 768, 1, 0.03), 1
+    )
     assert not op.supports_situ_mul(torch.zeros(m, 4224, dtype=torch.bfloat16, device="cuda"))
-    assert not op.supports_swiglu(torch.zeros(m, 1792, dtype=torch.bfloat16, device="cuda"), _weight(7168, 896, 7), 2)
+    assert not op.supports_swiglu(
+        torch.zeros(m, 1792, dtype=torch.bfloat16, device="cuda"), _weight(7168, 896, 7), 2
+    )

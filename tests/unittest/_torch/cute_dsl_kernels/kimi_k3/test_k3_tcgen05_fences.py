@@ -45,6 +45,7 @@ BEFORE = "Tcgen05Fence.BEFORE_THREAD_SYNC"
 LOAD_WAIT = "Tcgen05Wait.LOAD"
 SYNC = re.compile(r"mbarrier_arrive\(|barrier_cta_sync\(|cute\.arch\.barrier\(")
 
+
 def violations(lines):
     """(line number, rule) of every tcgen05 operation reached from a wait without the after-fence, and every arrive /
     barrier reached from a TMEM load wait without the before-fence (scanning back within the function)."""

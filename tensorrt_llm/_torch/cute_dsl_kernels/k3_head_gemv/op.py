@@ -253,5 +253,16 @@ def k3_head_gemv(
 
 
 @k3_head_gemv.register_fake
-def _(x, weight, partials, flags, claim, keep_tiles=0, chunk_tiles=0, ring=6, schedule="streamk", prefetch=16):
+def _(
+    x,
+    weight,
+    partials,
+    flags,
+    claim,
+    keep_tiles=0,
+    chunk_tiles=0,
+    ring=6,
+    schedule="streamk",
+    prefetch=16,
+):
     return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.bfloat16)

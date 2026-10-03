@@ -106,7 +106,7 @@ def _call(x, w, ws):
 
 @pytest.mark.parametrize("m", M_ALL)
 def test_k3_head_gemv(m):
-    ops = _ops()
+    _ops()
     from tensorrt_llm._torch.cute_dsl_kernels.k3_head_gemv import op
 
     w, x8 = _inputs()
@@ -151,7 +151,9 @@ def test_k3_head_gemv_two_workspaces_interleaved():
     single = {(m, i): _call(x8[:m].contiguous(), (w, w2)[i], wa) for m in (1, 4, 8) for i in (0, 1)}
     for m in (8, 1, 4, 1, 8):
         for i, ws in ((0, wa), (1, wb)):
-            assert torch.equal(_bits(_call(x8[:m].contiguous(), (w, w2)[i], ws)), _bits(single[(m, i)]))
+            assert torch.equal(
+                _bits(_call(x8[:m].contiguous(), (w, w2)[i], ws)), _bits(single[(m, i)])
+            )
     assert not wa.flags.any() and not wb.flags.any()
 
 

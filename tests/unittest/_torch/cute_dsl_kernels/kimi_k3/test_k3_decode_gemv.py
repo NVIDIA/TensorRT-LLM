@@ -61,7 +61,9 @@ def _report(op, case, m, y, ref, stock=None, **flags):
     extra = "" if stock is None else f" vs_stock={_rel(y, stock):.2e}"
     marks = " ".join(f"{k}={v}" for k, v in flags.items())
     abs_err = (y.double() - ref.double()).abs().max().item()
-    print(f"OPCHECK op={op} case={case} M={m} abs={abs_err:.3e} rel={_rel(y, ref):.3e}{extra} {marks}")
+    print(
+        f"OPCHECK op={op} case={case} M={m} abs={abs_err:.3e} rel={_rel(y, ref):.3e}{extra} {marks}"
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -90,7 +92,9 @@ def test_k3_decode_gemv(name, m):
     ref = x.double() @ w.double().t()
     deterministic = torch.equal(_bits(y), _bits(again))
     m_invariant = torch.equal(_bits(y), _bits(y8[:m]))
-    _report("k3_decode_gemv", name, m, y, ref, F.linear(x, w), det=deterministic, rows_as_m8=m_invariant)
+    _report(
+        "k3_decode_gemv", name, m, y, ref, F.linear(x, w), det=deterministic, rows_as_m8=m_invariant
+    )
     assert y.shape == (m, n)
     assert _rel(y, ref) <= TOL and _rel(y, F.linear(x, w)) <= TOL
     assert deterministic and m_invariant
