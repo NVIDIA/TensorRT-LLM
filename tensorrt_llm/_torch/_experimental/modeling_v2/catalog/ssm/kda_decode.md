@@ -18,12 +18,14 @@ For request b (slot `s = ssm_state_indices[b]`), head h, with `x_q`, `x_k`, `x_v
 ```
 q, k, v = SiLU(conv4(window[s], new raw) + bias)   # taps w_*_t[j], oldest input first; bias_* added before SiLU
 q = q / sqrt(sum(q^2) + 1e-6) * scale;  k = k / sqrt(sum(k^2) + 1e-6)
-beta = sigmoid(beta) if apply_beta_sigmoid else beta
-decay = exp(lower_bound * sigmoid(exp(a_log) * (g + dt_bias)))   if use_lower_bound
-        exp(-exp(a_log) * softplus(g + dt_bias))                 otherwise
+beta = sigmoid(beta)
+decay = exp(lower_bound * sigmoid(exp(a_log) * (g + dt_bias)))
 S = state[s] * decay (per key);  S += beta (v - S k) k^T;  state[s] = S;  o = S q
-output = o * rsqrt(mean(o^2) + onorm_eps) * onorm_weight * sigmoid(onorm_g)   if apply_onorm, else o
+output = o * rsqrt(mean(o^2) + onorm_eps) * onorm_weight * sigmoid(onorm_g)
 ```
+
+`apply_onorm`, `use_lower_bound` and `apply_beta_sigmoid` must all be True: the op supports only that combination
+(*Preconditions*), which is the one above and Kimi K3's.
 
 With `update_conv_cache` the conv windows at the slot shift by one (the last two raw inputs, then the new one). The
 float64 reference of the test is this arithmetic; the op matches it within fp32 tolerance (outputs 2e-2 relative,
@@ -122,9 +124,10 @@ TBD(tray: test_modeling_v2_kda_decode.py::test_swapped_steps_are_silently_wrong,
 - Every check in the table is the op's (`TORCH_CHECK`): a violation raises `RuntimeError` before the launch, with the
   pools unchanged. Among them: the state base must be 16-byte aligned and its slot stride a multiple of 4 floats (the
   kernels move state with 16-byte accesses at `slot * stride(0)`); `ssm_state_indices` must be int32.
-- On sm_100 and sm_103, the optimized kernels the dispatcher picks for small and large workloads require
-  `apply_onorm`, `use_lower_bound` and `apply_beta_sigmoid`; with any of them off such a call raises `RuntimeError`
-  ("Optimized KDA decode requires ...") before the launch. Certified with the lower bound off at B = 2, H = 6.
+- `apply_onorm`, `use_lower_bound` and `apply_beta_sigmoid` must all be True, on every architecture and batch size:
+  the op checks them first and otherwise raises `RuntimeError` ("KDA decode only supports apply_onorm=true,
+  use_lower_bound=true, and apply_beta_sigmoid=true") before the launch. Certified with the lower bound off at B = 2,
+  H = 6, the pools unchanged.
 - The conv inputs, gates and outputs are bf16 and the state fp32; K = V = 128 and conv width 4 only.
 
 ## Notes

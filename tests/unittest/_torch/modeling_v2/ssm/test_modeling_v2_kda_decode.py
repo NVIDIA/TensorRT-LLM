@@ -172,8 +172,9 @@ def test_swapped_steps_are_silently_wrong(mgr, slots) -> None:
 
 
 def test_rejects_out_of_contract(mgr, slots) -> None:
-    """A state view that is not 16-byte aligned, int64 slot indices, and (on sm_100 / sm_103, where small batches
-    run the optimized kernels) the gate without its lower bound: each raises before the pools are written."""
+    """A state view that is not 16-byte aligned, int64 slot indices, and the gate without its lower bound (the op
+    supports only apply_onorm, use_lower_bound and apply_beta_sigmoid all on): each raises before the pools are
+    written."""
     used = slots[:2]
     p = kc.layer_pools(mgr, 0)
     with torch.inference_mode():
@@ -187,8 +188,9 @@ def test_rejects_out_of_contract(mgr, slots) -> None:
             _call(wt, shifted, inp, used)
         with pytest.raises(RuntimeError, match="int32"):
             _call(wt, p, inp, used.long())
-        if torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
-            with pytest.raises(RuntimeError, match="lower-bound gate"):
-                _call(wt, p, inp, used, use_lower_bound=False)
+        with pytest.raises(
+            RuntimeError, match="only supports apply_onorm=true, use_lower_bound=true"
+        ):
+            _call(wt, p, inp, used, use_lower_bound=False)
         torch.cuda.synchronize()
     assert all(torch.equal(p[n], before[n]) for n in ("conv", "ssm"))
