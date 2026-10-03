@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Optional
 from unittest import mock
 
@@ -47,6 +48,7 @@ from ..conftest import (check_device_contain, get_device_count,
                         skip_no_mxfp4_swizzle, skip_no_rubin, skip_no_sm120,
                         skip_post_blackwell, skip_post_hopper, skip_pre_ada,
                         skip_pre_blackwell, skip_pre_hopper, skip_ray, skip_x86)
+from ..deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT, evaluate_gsm8k
 
 # isort: off
 from .accuracy_core import (
@@ -2126,6 +2128,74 @@ def _make_deepseekv4_eplb_config(model_path, layer_updates_per_iter, ep_size=8):
 
 DEEPSEEKV4_TEST_MAX_BATCH_SIZE = 128
 
+
+@skip_pre_blackwell
+@pytest.mark.skip_device_not_contain(["GB300"])
+@pytest.mark.timeout(GSM8K_TEST_TIMEOUT)
+class TestDeepSeekV41(LlmapiAccuracyTestHarness):
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4.1-Flash"
+
+    @pytest.mark.parametrize(
+        "tp_size,attention_dp,nvfp4", [(4, False, False), (4, False, True),
+                                       (4, True, True), (8, False, True),
+                                       (8, True, True)],
+        ids=["mxfp4-tp4", "nvfp4-tp4", "nvfp4-dp4", "nvfp4-tp8", "nvfp4-dp8"])
+    def test_gsm8k_dspark(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                          tp_size: int, attention_dp: bool,
+                          nvfp4: bool) -> None:
+        world_size = get_mpi_world_size()
+        available_gpus = get_device_count() if world_size == 1 else world_size
+        if available_gpus < tp_size:
+            pytest.skip(f"Requires at least {tp_size} GPUs")
+
+        for name in tuple(os.environ):
+            if name.startswith("TRTLLM_V41_"):
+                monkeypatch.delenv(name)
+
+        with LLM(
+                self.MODEL_PATH + ("-NVFP4" if nvfp4 else ""),
+                tensor_parallel_size=tp_size,
+                moe_expert_parallel_size=tp_size,
+                gpus_per_node=4,
+                enable_attention_dp=attention_dp,
+                custom_tokenizer="deepseek_v41",
+                trust_remote_code=True,
+                max_seq_len=8192,
+                max_num_tokens=8192,
+                max_batch_size=64,
+                enable_chunked_prefill=True,
+                disable_overlap_scheduler=False,
+                enable_iter_perf_stats=True,
+                cuda_graph_config=CudaGraphConfig(
+                    batch_sizes=[1, 2, 4, 8, 16, 32, 64], enable_padding=True),
+                moe_config=MoeConfig(backend="TRTLLM"),
+                allreduce_strategy="NCCL",
+                kv_cache_config=KvCacheConfig(dtype="fp8",
+                                              enable_block_reuse=True,
+                                              enable_swa_scratch_reuse=False,
+                                              tokens_per_block=128,
+                                              max_tokens=262144,
+                                              free_gpu_memory_fraction=0.5),
+                sparse_attention_config={"algorithm": "csa2"},
+                speculative_config=DSparkDecodingConfig(max_draft_len=5),
+        ) as llm:
+            request_outputs = []
+            evaluate_gsm8k(llm, tmp_path, request_outputs=request_outputs)
+            assert request_outputs
+            for output in request_outputs:
+                assert output.finished
+                assert output.decoding_iter > 0
+            # Request metrics include every attention-DP rank.
+            acceptance_length = sum(
+                output.avg_decoded_tokens_per_iter * output.decoding_iter
+                for output in request_outputs) / sum(
+                    output.decoding_iter for output in request_outputs)
+            print(f"[AL] DS-V4.1 tp={tp_size} attention_dp={attention_dp} "
+                  f"nvfp4={nvfp4}: {acceptance_length:.3f}")
+            assert acceptance_length >= 3.0, (
+                f"DSpark acceptance length {acceptance_length:.3f} < 3.0")
+
+
 _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
     "Solve the problem carefully. End your response with a final line exactly "
     "in the form #### <answer>, using the simplest numeric form without units "
@@ -2454,6 +2524,100 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
             assert_acceptance_length(
                 "TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm",
                 acceptance_length)
+
+
+@pytest.mark.timeout(14400)
+@pytest.mark.skip_less_device_memory(140000)
+@skip_pre_blackwell
+class TestDeepSeekV41FlashDSpark(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4.1-Flash"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4.1-Flash"
+
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @parametrize_with_ids("attention_dp", [False, True])
+    @parametrize_with_ids("bounded_replay", [False, True])
+    def test_gsm8k_tp4(self, bounded_replay: bool, attention_dp: bool,
+                       monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Full GSM8K with DSpark, block reuse and concurrent requests."""
+        env = {
+            "TRTLLM_V41_ENCODER_REPLAY": str(int(bounded_replay)),
+            "TRTLLM_V41_DECODER_BOUNDED_REPLAY": str(int(bounded_replay)),
+            "TLLM_KV_CACHE_MANAGER_V2_BACKEND": "cpp",
+            "TLLM_EVAL_MAX_IN_FLIGHT": "128",
+            "TLLM_EVAL_PARTIAL_SCORES_EVERY": "64",
+        }
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        # Keep the full accuracy gate instead of the one-sample smoke mode.
+        monkeypatch.setenv("INTEGRATION_TEST", "0")
+
+        with LLM(self.MODEL_PATH,
+                 env_overrides=env,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 gpus_per_node=4,
+                 enable_attention_dp=attention_dp,
+                 custom_tokenizer="deepseek_v41",
+                 trust_remote_code=True,
+                 max_seq_len=8192,
+                 max_num_tokens=8192,
+                 max_batch_size=64,
+                 enable_chunked_prefill=True,
+                 disable_overlap_scheduler=False,
+                 enable_iter_perf_stats=True,
+                 cuda_graph_config=CudaGraphConfig(
+                     batch_sizes=[1, 2, 4, 8, 16, 32, 64], enable_padding=True),
+                 kv_cache_config=KvCacheConfig(dtype="fp8",
+                                               enable_block_reuse=True,
+                                               enable_swa_scratch_reuse=False,
+                                               tokens_per_block=128,
+                                               max_tokens=262144,
+                                               free_gpu_memory_fraction=0.5),
+                 sparse_attention_config={"algorithm": "csa2"},
+                 speculative_config=DSparkDecodingConfig(
+                     max_draft_len=5,
+                     speculative_model=self.MODEL_PATH)) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=llm.args.speculative_config.decoding_type)
+            assert acc_params.num_samples == 1319
+            task.EVALUATE_KWARGS = dict(
+                task.EVALUATE_KWARGS,
+                sampling_override=True,
+                scores_filter="exact_match,flexible-extract")
+            evaluator_kwargs = dict(
+                num_fewshot=5,
+                random_seed=0,
+                apply_chat_template=True,
+                chat_template_kwargs={"thinking": False},
+                system_prompt=_DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT,
+                log_samples=True,
+                output_path=str(tmp_path / "results"),
+                output_dir=str(tmp_path / "outputs"))
+            score = task.evaluate(llm,
+                                  extra_evaluator_kwargs=evaluator_kwargs,
+                                  sampling_params=SamplingParams(
+                                      max_tokens=256,
+                                      truncate_prompt_tokens=4096,
+                                      temperature=0,
+                                      seed=0))
+
+        with (tmp_path / "results" / "samples_gsm8k.json").open() as stream:
+            results = json.load(stream)
+        assert results["n-samples"]["gsm8k"]["effective"] == 1319
+        for filter_name in ("strict-match", "flexible-extract"):
+            rows = [
+                row for row in results["samples"]["gsm8k"]
+                if row["filter"] == filter_name
+            ]
+            assert len(rows) == 1319
+            assert len({row["doc_id"] for row in rows}) == 1319
+        assert score > 91.0, (
+            f"GSM8K flexible exact match {score:.4f}% must exceed 91%; "
+            f"bounded_replay={bounded_replay}, results={tmp_path}")
 
 
 @pytest.mark.timeout(14400)

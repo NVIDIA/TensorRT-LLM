@@ -22,8 +22,10 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay, encoder_replay_tokens
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BlockReusePolicy
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import BudgetTracker, ScheduleAction
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 
 pytestmark = pytest.mark.cpu_only
@@ -49,6 +51,7 @@ def make_gen_request(
     request_id, beam_width=1, num_draft_tokens=0, lora_task_id=None, is_first_context_chunk=False
 ):
     req = Mock()
+    req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
     req.state_value = GEN_IN_PROGRESS
@@ -77,6 +80,7 @@ def make_ctx_request(
     encoder_output_len: int | None = None,
 ) -> Mock:
     req = Mock()
+    req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
     req.state_value = CONTEXT_INIT
@@ -102,6 +106,7 @@ def make_ctx_request(
 
 def make_encoder_request(request_id, encoder_output_len, lora_task_id=None):
     req = Mock()
+    req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
     req.state_value = ENCODER_INIT
@@ -121,6 +126,7 @@ def make_disagg_request(
     prompt_len=None,
 ):
     req = Mock()
+    req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
     req.state_value = DISAGG_GEN_INIT
@@ -138,6 +144,7 @@ def make_disagg_request(
 
 def make_filtered_request(request_id, state_value=0):
     req = Mock()
+    req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
     req.state_value = state_value
@@ -146,6 +153,145 @@ def make_filtered_request(request_id, state_value=0):
     req.is_first_context_chunk = True
     req.py_draft_tokens = None
     return req
+
+
+def make_replay_request(new_tokens=1000, **kwargs):
+    req = make_ctx_request(7, new_tokens, **kwargs)
+    req.py_multimodal_data = None
+    req.py_ced_replay = EncoderReplay(7, 123, 4000, 3872)
+    return req
+
+
+class TestEncoderReplayBudget:
+    @pytest.mark.parametrize("prefix_aware", [False, True])
+    @pytest.mark.parametrize(
+        "suffix,replay_rows,budget,expected_rows",
+        [(128, 0, 128, 128), (127, 128, 255, 255), (256, 0, 128, 128)],
+    )
+    def test_budget_uses_manager_reported_replay_rows(
+        self, prefix_aware, suffix, replay_rows, budget, expected_rows
+    ):
+        req = make_replay_request(suffix, prompt_len=4000 + suffix)
+        mgr = make_kv_cache_manager()
+        mgr.context_replay_tokens.side_effect = None
+        mgr.context_replay_tokens.return_value = replay_rows
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=budget,
+            ctx_chunk_config=(None, 128),
+            enable_prefix_aware_scheduling=prefix_aware,
+        )
+        action, cost, _ = sched._try_schedule_context_chunked(
+            req, BudgetTracker(budget, 1), preempt_for_pages=lambda _req: False
+        )
+        assert action is ScheduleAction.SCHEDULED
+        expected_chunk = min(suffix, budget - replay_rows)
+        assert req.context_chunk_size == expected_chunk
+        assert cost == expected_rows
+        mgr.resize_context.assert_called_once_with(req, expected_chunk)
+
+    @pytest.mark.parametrize(
+        "budget,new_tokens,expected",
+        [(1128, 1000, 1000), (1024, 1000, 896), (129, 1, 1)],
+    )
+    @pytest.mark.parametrize("prefix_aware", [False, True])
+    def test_claim_reserves_physical_replay_rows(self, budget, new_tokens, expected, prefix_aware):
+        req = make_ctx_request(7, 4000 + new_tokens)
+        req.py_multimodal_data = None
+        req.py_ced_replay = None
+        mgr = make_kv_cache_manager()
+
+        def claim(request):
+            request.context_current_position = 4000
+            request.context_remaining_length = new_tokens
+            request.py_ced_replay = EncoderReplay(7, 123, 4000, 3872)
+            return True
+
+        mgr.prepare_context.side_effect = claim
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=budget,
+            ctx_chunk_config=(None, 128),
+            enable_prefix_aware_scheduling=prefix_aware,
+        )
+        action, cost, _ = sched._try_schedule_context_chunked(
+            req, BudgetTracker(budget, 1), preempt_for_pages=lambda _req: False
+        )
+        assert req.context_current_position == 4000
+        assert not req.py_ced_replay.consumed
+        assert action is ScheduleAction.SCHEDULED
+        assert req.context_chunk_size == expected
+        assert cost == expected + 128
+        mgr.resize_context.assert_called_once_with(req, expected)
+
+    @pytest.mark.parametrize("budget", [128, 129, 255])
+    def test_long_suffix_rejects_budget_that_can_never_make_progress(self, budget):
+        req = make_replay_request()
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=budget, ctx_chunk_config=(None, 128))
+        with pytest.raises(ValueError, match="Encoder replay cannot make progress"):
+            sched._try_schedule_context_chunked(
+                req, BudgetTracker(budget, 1), preempt_for_pages=lambda _req: False
+            )
+        mgr.resize_context.assert_not_called()
+
+    def test_busy_batch_defers_replay_until_budget_is_available(self):
+        req = make_replay_request()
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 128))
+        action, cost, _ = sched._try_schedule_context_chunked(
+            req, BudgetTracker(128, 1), preempt_for_pages=lambda _req: False
+        )
+        assert action is ScheduleAction.SKIP
+        assert cost == 0
+        mgr.resize_context.assert_not_called()
+
+    @pytest.mark.parametrize("snapshot_offset", [1, 100])
+    def test_forced_snapshot_boundary_controls_minimum_replay_budget(self, snapshot_offset):
+        req = make_replay_request(prompt_len=5000)
+        req.context_current_position = 4000
+        req.expect_snapshot_points = [4000 + snapshot_offset]
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(
+            mgr, max_num_tokens=129, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 128)
+        )
+        if snapshot_offset == 1:
+            action, cost, _ = sched._try_schedule_context_chunked(
+                req, BudgetTracker(129, 1), preempt_for_pages=lambda _req: False
+            )
+            assert action is ScheduleAction.SCHEDULED
+            assert cost == 129
+            assert req.context_chunk_size == 1
+        else:
+            with pytest.raises(ValueError, match="Encoder replay cannot make progress"):
+                sched._try_schedule_context_chunked(
+                    req, BudgetTracker(129, 1), preempt_for_pages=lambda _req: False
+                )
+            mgr.resize_context.assert_not_called()
+
+    def test_consumed_replay_does_not_charge_later_chunk(self):
+        req = make_ctx_request(7, 1000, is_first_context_chunk=False)
+        req.py_multimodal_data = None
+        req.context_current_position = 4896
+        req.py_ced_replay = EncoderReplay(7, 123, 4000, 3872, consumed=True)
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 128))
+        action, cost, _ = sched._try_schedule_context_chunked(
+            req, BudgetTracker(1024, 1), preempt_for_pages=lambda _req: False
+        )
+        assert action is ScheduleAction.SCHEDULED
+        assert cost == 1000
+        assert req.context_chunk_size == 1000
+
+    def test_full_context_admission_includes_replay(self):
+        req = make_replay_request(1)
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=128)
+        action, _, _ = sched._try_schedule_context_full(
+            req, BudgetTracker(128, 1), preempt_for_pages=lambda _req: False
+        )
+        assert action is ScheduleAction.STOP
+        mgr.resize_context.assert_not_called()
 
 
 class _KVCacheMap(dict):
@@ -187,6 +333,9 @@ def make_kv_cache_manager(
     mgr.enable_joint_kv_cache_reuse = enable_joint_kv_cache_reuse
     mgr.enable_block_reuse = enable_block_reuse
     mgr.num_extra_kv_tokens = 0
+    mgr.context_replay_tokens.side_effect = lambda req: (
+        encoder_replay_tokens(req) if isinstance(req.py_ced_replay, EncoderReplay) else None
+    )
     mgr.can_evict = can_evict
     mgr._has_cp_helix = False
     mgr.is_vswa = is_vswa
@@ -2378,6 +2527,30 @@ class TestChunkedContext:
         mgr.resize_context.assert_called_once_with(req, 256)
         draft_mgr.try_allocate_draft_context.assert_called_once_with(req, 256)
 
+    def test_remote_tail_source_larger_than_budget_is_chunked(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=200, ctx_chunk_config=(None, 64))
+        req = make_ctx_request(0, context_remaining_length=1000)
+        req.py_csa2_remote_tail_mode = "source"
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 192
+
+    def test_remote_tail_destination_requires_whole_tail_budget(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=200, ctx_chunk_config=(None, 64))
+        first = make_ctx_request(0, context_remaining_length=128)
+        first.py_csa2_remote_tail_mode = "destination"
+        pending = make_ctx_request(1, context_remaining_length=100)
+        pending.py_csa2_remote_tail_mode = "destination"
+
+        out = sched.schedule_request([first, pending], set())
+
+        assert ids(out.context_requests) == [0]
+        assert pending.context_chunk_size == 0
+
     def test_min_budget_check(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)
         sched = make_scheduler(mgr, max_num_tokens=50, ctx_chunk_config=(None, 64))
@@ -4056,3 +4229,32 @@ def test_parked_connector_load_keeps_kv_pressure_retryable() -> None:
     output = scheduler.schedule_request([loading, generation], set())
     assert output.generation_requests == []
     assert output.recompute_paused_requests == []
+
+
+@pytest.mark.parametrize("remote_mode", [None, "source", "destination"])
+def test_replay_only_batch_clears_deferred_generation_overlap_state(
+    remote_mode: str | None,
+) -> None:
+    """A resumed decode must not compensate for a token already harvested on CPU."""
+    manager = make_kv_cache_manager()
+    scheduler = make_scheduler(manager, max_num_tokens=256)
+    decoding = make_gen_request(0)
+    decoding.py_batch_idx = 7
+    replay = make_ctx_request(1, context_remaining_length=128)
+    replay.py_csa2_remote_tail_mode = remote_mode
+
+    first = scheduler.schedule_request([decoding, replay], set())
+    assert ids(first.context_requests) == [1]
+    if remote_mode is None:
+        assert ids(first.generation_requests) == [0]
+        assert decoding.py_batch_idx == 7
+    else:
+        assert not first.generation_requests
+        assert decoding.py_batch_idx is None
+        manager.try_allocate_generation.assert_not_called()
+        manager.suspend_request.assert_not_called()
+
+    # After replay finishes, the deferred request resumes without losing KV.
+    resumed = scheduler.schedule_request([decoding], set())
+    assert ids(resumed.generation_requests) == [0]
+    manager.try_allocate_generation.assert_called_with(decoding)

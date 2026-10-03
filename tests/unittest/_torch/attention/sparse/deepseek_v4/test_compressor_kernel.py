@@ -377,6 +377,13 @@ PREFILL_CONFIGS = [
     # Basic mode (ratio=128)
     pytest.param(1, 128, 128, 128, False, id="basic_hd128_eq_ratio"),
     pytest.param(1, 256, 128, 512, False, id="basic_hd512_2chunks"),
+    # Basic mode, ratio=2: DeepSeek-V4.1's pooled long-range layers. The kernels
+    # are ratio-generic, so these exercise the same code path as ratio 128 with
+    # the smallest possible group -- where an off-by-one in the group walk shows
+    # up as a wrong answer rather than a wrong tail.
+    pytest.param(1, 64, 2, 512, False, id="v41_ratio2_hd512_32chunks"),
+    pytest.param(4, 64, 2, 128, False, id="v41_ratio2_hd128_batch4"),
+    pytest.param(1, 65, 2, 512, False, id="v41_ratio2_hd512_remainder"),
 ]
 
 
@@ -459,6 +466,10 @@ DECODE_CONFIGS = [
     pytest.param(1, 4, 512, True, 8, id="overlap_hd512"),
     pytest.param(1, 128, 128, False, 256, id="basic_hd128_2compressions"),
     pytest.param(1, 128, 512, False, 256, id="basic_hd512_2compressions"),
+    # ratio=2 decode: a group completes every other step, so this is the densest
+    # possible interleaving of "hold the partial group" and "flush it".
+    pytest.param(1, 2, 512, False, 16, id="v41_ratio2_hd512_8compressions"),
+    pytest.param(2, 2, 128, False, 9, id="v41_ratio2_hd128_odd_steps"),
 ]
 
 
@@ -1306,6 +1317,7 @@ PREFILL_DECODE_CONFIGS = [
     pytest.param(1, 256, 128, 128, False, 128, id="basic_hd128_prefill256_decode128"),
     pytest.param(1, 20, 4, 512, True, 12, id="overlap_hd512_prefill20_decode12"),
     pytest.param(1, 256, 128, 512, False, 128, id="basic_hd512_prefill256_decode128"),
+    pytest.param(1, 31, 2, 512, False, 9, id="v41_ratio2_prefill31_decode9"),
 ]
 
 
@@ -1676,6 +1688,10 @@ CHUNKED_PREFILL_CONFIGS = [
     pytest.param(4, 512, True, 1, 3, 9, id="overlap_sp3_seq9_unaligned"),
     # overlap=False, aligned start_pos
     pytest.param(128, 128, False, 1, 128, 128, id="nonoverlap_sp128_seq128"),
+    # ratio=2 chunked prefill: `start_pos % ratio` is either 0 or 1, so the two
+    # entries below are the whole alignment space for V4.1's pooled layers.
+    pytest.param(2, 512, False, 1, 16, 16, id="v41_ratio2_sp16_seq16"),
+    pytest.param(2, 512, False, 1, 15, 17, id="v41_ratio2_sp15_seq17_unaligned"),
     # overlap=False, unaligned start_pos
     pytest.param(128, 128, False, 1, 50, 206, id="nonoverlap_sp50_seq206_unaligned"),
     pytest.param(128, 128, False, 1, 5, 251, id="nonoverlap_sp5_seq251_2windows"),

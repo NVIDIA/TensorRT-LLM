@@ -359,6 +359,16 @@ class DeepSeekV4ReasoningParser(BaseReasoningParser):
         return self._parser.finish()
 
 
+@register_reasoning_parser("deepseek_v41")
+class DeepSeekV41ReasoningParser(DeepSeekV4ReasoningParser):
+    """DeepSeek-V4.1 reasoning adapter.
+
+    V4.1 keeps V4's ``<think>...</think>`` reasoning protocol and thinking
+    controls.  The dedicated adapter makes the model-version pairing explicit
+    while intentionally inheriting the shared wire-format implementation.
+    """
+
+
 @register_reasoning_parser("poolside_v1", "laguna")
 class PoolsideV1ReasoningParser(DeepSeekV4ReasoningParser):
     """Poolside Laguna models, which prefill the marker the same way.
@@ -444,6 +454,8 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "deepseek_v32": "deepseek-r1",
     "laguna": "poolside_v1",
     "deepseek_v4": "deepseek_v4",
+    "deepseek_v41": "deepseek_v41",
+    "deepseek_v41_text": "deepseek_v41",
     "nemotron_h": "nemotron-v3",
     "nemotron_h_puzzle": "nemotron-v3",
     "nemotron_h_omni": "nemotron-v3",

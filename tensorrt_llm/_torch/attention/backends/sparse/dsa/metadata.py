@@ -92,7 +92,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     max_draft_tokens: int = 0
     # Indexer head dimension
     indexer_head_dim: int = 128
-    # Indexer quant block size
+    # Elements per four-byte scale word, matching Indexer.prepare().
     indexer_quant_block_size: int = 128
     # Enable indexer skip for short sequences
     enable_indexer_skip: bool = False
@@ -526,6 +526,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.seq_lens_cuda[: self.num_seqs], self.num_tokens
             ).to(self.req_idx_per_token.dtype)
 
+        # Uncached DSA prefill aliases these scatter maps as gather maps.
         if self.kv_cache_manager is not None and self.num_tokens > 0 and not fused_eligible:
             seq_lens = self.seq_lens_cuda[: self.num_seqs]
             # Runtime cached lengths after overlap/spec-dec correction.
@@ -552,7 +553,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 req_indices,
                 index_head_dim,
                 self._tokens_per_block,
-                self.kv_cache_manager.quant_block_size,
+                self.indexer_quant_block_size,
                 data_bytes_per_token=data_bytes_per_token,
             )
             self.slot_mapping_fp8[: self.num_tokens] = fp8_indices
@@ -671,7 +672,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             max_query_len=1 + self.max_draft_tokens,
             tokens_per_block=self._tokens_per_block,
             index_head_dim=index_head_dim,
-            quant_block_size=self.kv_cache_manager.quant_block_size,
+            quant_block_size=self.indexer_quant_block_size,
             data_bytes_per_token=data_bytes_per_token,
         )
 

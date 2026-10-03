@@ -54,6 +54,7 @@ _cpp = _load_cpp_module()
 
 AggregatedPageDesc = _cpp.AggregatedPageDesc
 AttentionLayerConfig = _cpp.AttentionLayerConfig
+AttentionReusePolicy = _cpp.AttentionReusePolicy
 AttnLifeCycle = _cpp.AttnLifeCycle
 BatchDesc = _cpp.BatchDesc
 # BatchDesc is also consumed via dataclasses.replace(): MambaCacheManager's
@@ -142,6 +143,7 @@ PlannedDropHandle = _cpp.PlannedDropHandle
 PoolDesc = _cpp.PoolDesc
 PoolGroupDesc = _cpp.PoolGroupDesc
 PoolGroupPeakBlockStats = _cpp.PoolGroupPeakBlockStats
+ReuseGroupStatus = _cpp.ReuseGroupStatus
 ReuseScope = _cpp.ReuseScope
 ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
 ScratchDesc = _cpp.ScratchDesc
@@ -197,6 +199,7 @@ def typed_range(*args: int) -> range:
 __all__ = [
     "AggregatedPageDesc",
     "AttentionLayerConfig",
+    "AttentionReusePolicy",
     "BAD_PAGE_INDEX",
     "CACHE_LEVEL1",
     "BatchDesc",
@@ -245,6 +248,7 @@ __all__ = [
     "PoolGroupIndex",
     "PoolIndex",
     "Priority",
+    "ReuseGroupStatus",
     "ReuseScope",
     "ScratchDesc",
     "KVCacheIterationStatsDelta",

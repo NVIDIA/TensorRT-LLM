@@ -181,6 +181,14 @@ def _is_forced_context_chunk_boundary(req: LlmRequest, chunk_size: int) -> bool:
     return next_position >= req.prompt_len or next_position in req.expect_snapshot_points
 
 
+class RemoteTailPhase(Enum):
+    """Fleet-wide GEN phase for conditional disaggregation with attention DP."""
+
+    NONE = "none"
+    CONTEXT = "context"
+    DECODE = "decode"
+
+
 class ScheduledRequests:
     """Scheduled requests separated into disjoint sets.
 
@@ -219,6 +227,8 @@ class ScheduledRequests:
     outputs are still missing). ``None`` when no items were scheduled."""
 
     def __init__(self):
+        self.attention_dp_phase: RemoteTailPhase | None = None
+        self.is_attention_dp_phase_idle = False
         self.encoder_requests: RequestList = []
         self.context_requests_chunking: RequestList = []
         self.context_requests_last_chunk: RequestList = []
@@ -236,7 +246,10 @@ class ScheduledRequests:
 
     @property
     def can_run_cuda_graph(self) -> bool:
-        return self.num_context_requests == 0
+        return (
+            self.num_context_requests == 0
+            and self.attention_dp_phase is not RemoteTailPhase.CONTEXT
+        )
 
     @property
     def batch_size(self) -> int:

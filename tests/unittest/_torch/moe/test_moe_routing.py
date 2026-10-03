@@ -1,6 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import pickle
 import sys
+from unittest.mock import Mock
 
 import cloudpickle
 import pytest
@@ -433,6 +437,80 @@ def _make_v4_routing(top_k, n_group, topk_group, num_experts, is_hashed):
         callable_tid2eid=lambda: torch.zeros(0, dtype=torch.int32),
         is_hashed=is_hashed,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("num_experts", [256, 384])
+def test_deepseek_v41_image_routing_native_graph(
+        num_experts: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Native image routing preserves FP32 weights and replay-time masks."""
+    num_tokens, top_k, route_scale = 17, 6, 2.5
+    logits = torch.randn(num_tokens,
+                         num_experts,
+                         generator=torch.Generator().manual_seed(17))
+    logits[0] += 100
+    logits[1] = -200
+    logits = logits.to(device="cuda", dtype=torch.bfloat16)
+    text_bias = torch.zeros(num_experts, device="cuda")
+    vision_bias = torch.zeros_like(text_bias)
+    selected_bias = torch.arange(5,
+                                 5 + top_k,
+                                 device="cuda",
+                                 dtype=torch.float32)
+    text_bias[[3, 18, 67, 100, 131, 173]] = selected_bias
+    vision_bias[[7, 34, 89, 143, 205, num_experts - 1]] = selected_bias
+    image_mask = torch.arange(num_tokens, device="cuda") % 3 == 1
+    routing = DeepSeekV4MoeRoutingMethod(
+        top_k=top_k,
+        n_group=8,
+        topk_group=4,
+        routed_scaling_factor=route_scale,
+        callable_e_score_correction_bias=lambda: text_bias,
+        callable_tid2eid=lambda: None,
+        is_hashed=False,
+        callable_e_score_correction_bias_vl=lambda: vision_bias,
+    )
+    native_gate = Mock(wraps=torch.ops.trtllm.gate_forward)
+    monkeypatch.setattr(torch.ops.trtllm, "gate_forward", native_gate)
+
+    def check(outputs: tuple[torch.Tensor, torch.Tensor],
+              mask: torch.Tensor) -> None:
+        indices, weights = outputs
+        assert indices.dtype == torch.int32
+        assert weights.dtype == torch.float32
+        assert torch.isfinite(weights).all()
+        scores = F.softplus(logits.float()).sqrt()
+        bias = torch.where(mask[:, None], vision_bias, text_bias)
+        expected_indices = (scores + bias).topk(top_k, dim=-1).indices
+        expected_weights = scores.gather(1, expected_indices)
+        expected_weights /= expected_weights.sum(dim=-1, keepdim=True) + 1e-20
+        expected_weights *= route_scale
+        sorted_indices, order = indices.sort(dim=-1)
+        sorted_expected, expected_order = expected_indices.sort(dim=-1)
+        torch.testing.assert_close(sorted_indices,
+                                   sorted_expected.to(torch.int32),
+                                   rtol=0,
+                                   atol=0)
+        torch.testing.assert_close(weights.gather(1, order),
+                                   expected_weights.gather(1, expected_order),
+                                   rtol=2e-6,
+                                   atol=1e-6)
+
+    check(routing.apply_with_aux(logits, None, image_mask), image_mask)
+    native_gate.assert_called_once()
+    check(routing.apply(logits), torch.zeros_like(image_mask))
+    torch.cuda.synchronize()
+
+    native_gate.reset_mock()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs = routing.apply_with_aux(logits, None, image_mask)
+    native_gate.assert_called_once()
+    for next_mask in (~image_mask, torch.zeros_like(image_mask),
+                      torch.ones_like(image_mask)):
+        image_mask.copy_(next_mask)
+        graph.replay()
+        check(graph_outputs, image_mask)
 
 
 # DSv4-Pro production: num_experts_per_tok=6, n_routed_experts=384, n_group=8,

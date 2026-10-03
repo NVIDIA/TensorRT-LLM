@@ -802,7 +802,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
 
 template <uint32_t SHAPE_N, uint32_t HIDDEN, uint32_t HC_MULT, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
     uint32_t kSwizzleCDMode, uint32_t N_B_STAGES, uint32_t N_INPUT_STAGES, uint32_t kNumMMAThreads,
-    uint32_t kNumPmapThreads, uint32_t kNumSplits = 1, bool kFuseNorm = false>
+    uint32_t kNumPmapThreads, uint32_t kNumSplits = 1, bool kFuseNorm = false, bool kLaggedPre = false>
 __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     fused_allinone_tf32_pmap_gemm_atomic_impl(const uint32_t shape_m,
         const __grid_constant__ cute::TmaDescriptor tensor_map_residual,     // residual_prev, bf16
@@ -825,7 +825,11 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         // norm_weight must be bf16 [HIDDEN]; norm_eps is the RMSNorm epsilon.
         // When kFuseNorm is false, norm_weight/norm_eps are ignored.
         __nv_bfloat16 const* __restrict__ norm_weight, float norm_eps, float rms_eps, float hc_pre_eps,
-        float hc_sinkhorn_eps, float hc_post_mult_value, uint32_t sinkhorn_repeat)
+        float hc_sinkhorn_eps, float hc_post_mult_value, uint32_t sinkhorn_repeat,
+        // kLaggedPre (DeepSeek-V4.1 wiring): layer_input is collapsed with the previous sublayer's
+        // gate pre_mix_ext [M, HC_MULT] and this token's own gate is written to pre_mix_out [M, HC_MULT].
+        // Both are ignored when kLaggedPre is false (V4).
+        float const* __restrict__ pre_mix_ext = nullptr, float* __restrict__ pre_mix_out = nullptr)
 {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000) and (__CUDA_ARCH__ < 1100)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -1417,6 +1421,11 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
 
             float v = y_row[lane_bf] * rstd * s0 + hc_base[lane_bf];
             pre_mix_local = 1.0f / (1.0f + __expf(-v)) + hc_pre_eps;
+            if constexpr (kLaggedPre)
+            {
+                if (warp_in_team == 0)
+                    pre_mix_out[static_cast<long long>(tok) * HC_MULT + lane_bf] = pre_mix_local;
+            }
 
             if (warp_in_team == 0)
             {
@@ -1477,7 +1486,12 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         float pm[HC_MULT];
 #pragma unroll
         for (uint32_t j = 0; j < HC_MULT; ++j)
-            pm[j] = __shfl_sync(0xffffffff, pre_mix_local, j);
+        {
+            if constexpr (kLaggedPre)
+                pm[j] = pre_mix_ext[static_cast<long long>(tok) * HC_MULT + j];
+            else
+                pm[j] = __shfl_sync(0xffffffff, pre_mix_local, j);
+        }
 
         // Layer_input[tok, h] = sum_j pm[j] * residual_cur[tok, j, h].
         // When WARPS_PER_TOK>1, warp_in_team 0..WARPS_PER_TOK-1 together cover

@@ -28,16 +28,18 @@ def get_all_rank_num_tokens(
 ) -> list[int] | None:
     if enable_attention_dp:
         assert dist is not None, "attention DP requires a distributed communicator"
-        num_tokens = attn_metadata.num_tokens
+        counts = attn_metadata.get_adp_token_counts()
         if mapping.has_cp_helix():
             # With CP, attention uses reduce-scatter to divide tokens
             # among CP ranks. Report the post-RS token count.
             # Use tp_cp_allgather so MoE (which sees the repurposed
             # mapping where tp_size = original tp * cp) can index
             # with its tp_rank.
-            num_tokens = math.ceil(num_tokens / mapping.cp_size)
-            return dist.tp_cp_allgather_int64([num_tokens])[:, 0].tolist()
-        return dist.tp_allgather_int64([num_tokens])[:, 0].tolist()
+            counts = [math.ceil(count / mapping.cp_size) for count in counts]
+            gathered = dist.tp_cp_allgather_int64(counts)
+        else:
+            gathered = dist.tp_allgather_int64(counts)
+        return attn_metadata.set_adp_token_counts(gathered.T.tolist())
     return None
 
 

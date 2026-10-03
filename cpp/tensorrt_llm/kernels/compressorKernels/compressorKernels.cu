@@ -205,9 +205,10 @@ struct VecType<16>
 
 // Cache scale / pre-store quantization type for postProcessScatterKernel.
 // The store dtype is implied: kNone keeps the input dtype (elem_bytes
-// controls bf16 vs fp32), kFP8* writes one byte per element, and
-// kMXFP4Blockwise writes packed FP4 (two values per byte) plus per-32
-// UE8M0 scale bytes.
+// controls bf16 vs fp32), kFP8* writes one byte per element, and the FP4
+// types write packed FP4 (two values per byte) plus one scale byte per
+// block -- per-32 UE8M0 for kMXFP4Blockwise, per-16 E4M3 for
+// kNVFP4Blockwise.
 enum class CacheScaleType
 {
     kNone = 0,
@@ -307,8 +308,13 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 {
     using KvScoreElemT = typename std::conditional<KV_SCORE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
     using StateElemT = typename std::conditional<STATE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
-    // DeepSeek-V4 model configures compress_ratio to be 4 or 128.
-    static_assert(COMPRESS_RATIO == 4 || COMPRESS_RATIO == 128, "Unsupported COMPRESS_RATIO");
+    // DeepSeek-V4 configures compress_ratio to 4 or 128; DeepSeek-V4.1 uses 2.
+    // (V4.1's other ratio, 1, needs no reduction at all and never reaches here.)
+    static_assert(COMPRESS_RATIO == 2 || COMPRESS_RATIO == 4 || COMPRESS_RATIO == 128, "Unsupported COMPRESS_RATIO");
+    // Overlapping pooling windows are a V4 ratio-4 property, not a property of
+    // small ratios: V4.1's ratio-2 compressor keeps one window in flight and
+    // sizes its state (max_batch, ratio, head_dim) with no overlap half
+    // (model.py:451-456), so CR=2 takes the non-overlap path like CR=128.
     constexpr bool IS_OVERLAP = (COMPRESS_RATIO == 4);
     constexpr int ELEM_BYTES_FOR_VEC
         = (KV_SCORE_ELEM_BYTES > STATE_ELEM_BYTES) ? KV_SCORE_ELEM_BYTES : STATE_ELEM_BYTES;
@@ -658,9 +664,9 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 //   HD       — HEAD_DIM in {128, 512}
 //   KV_EB    — kv_score element bytes in {2 (bf16), 4 (fp32)}
 //   STATE_EB — paged state element bytes in {2 (bf16), 4 (fp32)}
-//   CR       — COMPRESS_RATIO in {4, 128}
+//   CR       — COMPRESS_RATIO in {2 (V4.1), 4, 128}
 //   NRW      — NUM_RED_WARPS — 4 when CR=128 (multi-warp Phase 3 reduction
-//              hides DRAM latency for the heavier R=128 chunk); 1 when CR=4.
+//              hides DRAM latency for the heavier R=128 chunk); 1 when CR=2 or 4.
 //
 // Multi-warp SMEM budget (per block): 3 * NRW * ELEM_PER_BLOCK * sizeof(float).
 //   HD=128:        ELEM_PER_BLOCK=128 → 6 KB
@@ -675,6 +681,8 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 // Master list. Order does not matter; the dispatcher walks linearly.
 // clang-format off
 #define FOREACH_DECODE_CONFIG(F)                                                                                       \
+    /* CR=2 (DeepSeek-V4.1): single-warp, same reason as CR=4 and half the loop. */                                     \
+    FOREACH_DECODE_DTYPE(F, 128, 2, 1) FOREACH_DECODE_DTYPE(F, 512, 2, 1)                                              \
     /* CR=4: single-warp only (small reduction; multi-warp would over-subscribe). */                                    \
     FOREACH_DECODE_DTYPE(F, 128, 4, 1) FOREACH_DECODE_DTYPE(F, 512, 4, 1)                                              \
     /* CR=128: multi-warp Phase 3 reduction for every supported next_n. */                                              \
@@ -713,8 +721,8 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
     int compress_ratio, int next_n, int kv_score_elem_bytes, int state_elem_bytes, int out_elem_bytes,
     cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(
-        compress_ratio == 4 || compress_ratio == 128, "pagedKvCompressLaunch only supports compress_ratio 4 or 128");
+    TLLM_CHECK_WITH_INFO(compress_ratio == 2 || compress_ratio == 4 || compress_ratio == 128,
+        "pagedKvCompressLaunch only supports compress_ratio 2 (V4.1), 4 or 128, got %d", compress_ratio);
     TLLM_CHECK_WITH_INFO(
         (kv_score_elem_bytes == 2 || kv_score_elem_bytes == 4) && (state_elem_bytes == 2 || state_elem_bytes == 4),
         "pagedKvCompressLaunch only supports bf16/fp32 kv_score and paged state");
@@ -855,7 +863,8 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
 {
     using KvScoreElemT = typename std::conditional<KV_SCORE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
     using StateElemT = typename std::conditional<STATE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
-    static_assert(COMPRESS_RATIO == 4 || COMPRESS_RATIO == 128, "Unsupported COMPRESS_RATIO");
+    // See pagedKvCompressKernel: V4.1 adds CR=2, which is non-overlapping.
+    static_assert(COMPRESS_RATIO == 2 || COMPRESS_RATIO == 4 || COMPRESS_RATIO == 128, "Unsupported COMPRESS_RATIO");
     constexpr bool IS_OVERLAP = (COMPRESS_RATIO == 4);
 
     constexpr int ELEM_BYTES_FOR_VEC
@@ -1210,8 +1219,10 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     INST_PREFILL(HD, 2, 2, CR, NRW)                                                                                    \
     INST_PREFILL(HD, 2, 4, CR, NRW) INST_PREFILL(HD, 4, 2, CR, NRW) INST_PREFILL(HD, 4, 4, CR, NRW)
 
+INST_PREFILL_DTYPES(128, 2, 1)
 INST_PREFILL_DTYPES(128, 4, 1)
 INST_PREFILL_DTYPES(128, 128, 4)
+INST_PREFILL_DTYPES(512, 2, 1)
 INST_PREFILL_DTYPES(512, 4, 1)
 INST_PREFILL_DTYPES(512, 128, 4)
 #undef INST_PREFILL_DTYPES
@@ -1238,8 +1249,8 @@ void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_
     int out_elem_bytes, cudaStream_t stream)
 {
     bool const overlap = (compress_ratio == 4);
-    TLLM_CHECK_WITH_INFO(
-        compress_ratio == 4 || compress_ratio == 128, "prefillReductionLaunch only supports compress_ratio 4 or 128");
+    TLLM_CHECK_WITH_INFO(compress_ratio == 2 || compress_ratio == 4 || compress_ratio == 128,
+        "prefillReductionLaunch only supports compress_ratio 2 (V4.1), 4 or 128, got %d", compress_ratio);
     TLLM_CHECK_WITH_INFO(
         (kv_score_elem_bytes == 2 || kv_score_elem_bytes == 4) && (state_elem_bytes == 2 || state_elem_bytes == 4),
         "prefillReductionLaunch only supports bf16/fp32 kv_score and paged state");
@@ -1286,14 +1297,18 @@ void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_
 
     if (head_dim == 512)
     {
-        if (compress_ratio == 4)
+        if (compress_ratio == 2)
+            DISPATCH_PREFILL_DTYPE(512, 2, 1);
+        else if (compress_ratio == 4)
             DISPATCH_PREFILL_DTYPE(512, 4, 1);
         else
             DISPATCH_PREFILL_DTYPE(512, 128, 4);
     }
     else
     {
-        if (compress_ratio == 4)
+        if (compress_ratio == 2)
+            DISPATCH_PREFILL_DTYPE(128, 2, 1);
+        else if (compress_ratio == 4)
             DISPATCH_PREFILL_DTYPE(128, 4, 1);
         else
             DISPATCH_PREFILL_DTYPE(128, 128, 4);
@@ -1322,6 +1337,8 @@ void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_
 //   - kFP8Blockwise:      one fp8 byte per value + one fp32 scale per 128 values.
 //   - kMXFP4Blockwise:    packed fp4 (two values per byte) + one ue8m0 byte
 //                         per 32 values.
+//   - kNVFP4Blockwise:    packed fp4 (two values per byte) + one e4m3 byte
+//                         per 16 values (V4.1 tech report §2.4.4).
 //
 // Pipeline (10 steps, all in fp32 registers):
 //   1. Vectorized load compressed token from kv_comp

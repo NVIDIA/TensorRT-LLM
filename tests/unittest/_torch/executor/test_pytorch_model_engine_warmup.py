@@ -324,7 +324,10 @@ def test_compiled_mxfp8_warmup_backend_selection(
     inputs = torch.zeros(2, 4)
     output = torch.zeros(2, 3)
     layer = SimpleNamespace(
-        weight=torch.zeros(3, 4), weight_scale=torch.ones(4), dtype=torch.float32
+        weight=torch.zeros(3, 4),
+        weight_scale=torch.ones(4),
+        _mxfp8_alpha=torch.ones(1, dtype=torch.float32),
+        dtype=torch.float32,
     )
     native_gemm = Mock(return_value=output)
     flashinfer_gemm = Mock(return_value=output)
@@ -343,12 +346,12 @@ def test_compiled_mxfp8_warmup_backend_selection(
     monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=flashinfer_tune))
     method = MXFP8LinearMethod()
     engine = SimpleNamespace(
+        _warmup_timer=_WarmupTimer(rank=0),
         llm_args=SimpleNamespace(enable_autotuner=True),
         _torch_compile_enabled=compile_enabled,
         _torch_compile_prefill_only=prefill_only,
         _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
-        _warmup_timer=_WarmupTimer(rank=0),
         is_warmup=True,
         cuda_graph_runner=SimpleNamespace(enabled=True),
         model=SimpleNamespace(
@@ -608,6 +611,12 @@ def _run_warmup_tracked(
     (call_order_list, log_records_or_None).
     """
     tracker = _Tracker()
+    # Observe this module's explicit cleanup without counting unrelated
+    # destructors triggered by gc.collect() or lazy imports.
+    tracked_cuda = SimpleNamespace(**vars(torch.cuda))
+    tracked_cuda.empty_cache = tracker("empty_cache")
+    tracked_torch = SimpleNamespace(**vars(torch))
+    tracked_torch.cuda = tracked_cuda
     helix_ctx = (
         patch.object(model_engine.mapping, "has_cp_helix", return_value=True)
         if force_helix_cp
@@ -637,7 +646,7 @@ def _run_warmup_tracked(
             "tensorrt_llm._torch.pyexecutor.model_engine.warmup_sampling_module",
             side_effect=tracker("sampling_warmup"),
         ),
-        patch("torch.cuda.empty_cache", side_effect=tracker("empty_cache")),
+        patch.object(model_engine_module, "torch", tracked_torch),
         patch(
             "tensorrt_llm._torch.custom_ops.torch_custom_ops.MoERunner.clear_all_workspaces",
             side_effect=tracker("moe_clear"),
@@ -845,7 +854,8 @@ class TestWarmupCleanup(unittest.TestCase):
         )
         model_engine.prefill_cuda_graph_backend = PrefillCudaGraphBackend.PIECEWISE
         model_engine._metrics = {}
-        resource_manager = object()
+        model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        resource_manager = ResourceManager({})
         events = []
 
         @contextlib.contextmanager

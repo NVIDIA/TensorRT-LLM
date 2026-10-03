@@ -20,7 +20,7 @@
 # ``DSv4DSparkDraftModel.forward`` rather than via mask-token cross-attention.
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -71,6 +71,16 @@ class DSparkSpecMetadata(SpecMetadata):
 
     batch_indices_cuda: Optional[torch.Tensor] = None
 
+    # The engine sets this only for the duration of a target forward. Its
+    # return_context_logits flag also serves sparse speculative gather and is
+    # not itself evidence that every context row is needed. None means the
+    # caller has not supplied that distinction; pruning must stay conservative.
+    _requires_all_context_logits: bool | None = field(default=None, init=False, repr=False)
+
+    # Valid suffix rows per context in the original target batch. None keeps
+    # the ordinary full-capture contract; zero means this chunk has no capture.
+    context_capture_lens: tuple[int, ...] | None = field(default=None, init=False, repr=False)
+
     # Hidden state capture fields
     layers_to_capture: Optional[List[int]] = None
     hidden_size: int = 0
@@ -117,6 +127,7 @@ class DSparkSpecMetadata(SpecMetadata):
             self._layer_to_idx = {}
 
     def prepare(self):
+        self.context_capture_lens = None
         assert self.request_ids is not None
         num_seqs = len(self.request_ids)
         batch_indices = torch.arange(
@@ -184,7 +195,12 @@ class DSparkSpecMetadata(SpecMetadata):
         return layer_id in self._capture_layer_set
 
     def maybe_capture_hidden_states(
-        self, layer_id: int, hidden_states: torch.Tensor, residual: Optional[torch.Tensor] = None
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        *,
+        row_indices: Optional[torch.Tensor] = None,
     ) -> None:
         """Capture hidden states from a target model layer into the buffer.
 
@@ -193,7 +209,10 @@ class DSparkSpecMetadata(SpecMetadata):
         streams* (reference ``h.mean(dim=2)`` with ``h`` shaped
         ``[*, hc_mult, hidden]``). We reduce here so the V4 decoder layer's
         existing capture call is unchanged. A ``[num_tokens, hidden]`` input
-        (already reduced / non-mHC) is stored as-is.
+        (already reduced / non-mHC) is stored as-is. During CED replay,
+        ``row_indices`` maps compacted query rows back into the original target
+        batch. The draft worker seeds its rolling window using those original
+        offsets, including when context and generation requests are mixed.
         """
         if self.captured_hidden_states is None:
             return
@@ -205,9 +224,15 @@ class DSparkSpecMetadata(SpecMetadata):
             if to_save.shape[-1] != self.hidden_size:
                 hc_mult = to_save.shape[-1] // self.hidden_size
                 to_save = to_save.reshape(num_tokens, hc_mult, self.hidden_size).mean(dim=1)
-            self.captured_hidden_states[
-                :num_tokens, i * self.hidden_size : (i + 1) * self.hidden_size
-            ].copy_(to_save, non_blocking=True)
+            destination = self.captured_hidden_states[
+                :, i * self.hidden_size : (i + 1) * self.hidden_size
+            ]
+            if row_indices is None:
+                destination[:num_tokens].copy_(to_save, non_blocking=True)
+            else:
+                if row_indices.ndim != 1 or row_indices.shape[0] != num_tokens:
+                    raise ValueError("DSpark capture row_indices must map every replay query row")
+                destination.index_copy_(0, row_indices, to_save)
 
     def get_hidden_states(self, num_tokens: int) -> Optional[torch.Tensor]:
         """Get captured hidden states (all layers concatenated)."""
@@ -466,10 +491,16 @@ class DSv4DSparkWorker(SpecWorkerBase):
         continuation chunks append to the same request slot.
         """
         captured = spec_metadata.get_hidden_states(total_target_tokens)
+        capture_lens = getattr(spec_metadata, "context_capture_lens", None)
+        if capture_lens is not None and len(capture_lens) != attn_metadata.num_contexts:
+            raise ValueError("DSpark capture lengths must match the context requests")
         flat_position_ids = position_ids.reshape(-1)
         context_offset = 0
         for i in range(attn_metadata.num_contexts):
             chunk_len = int(attn_metadata._seq_lens[i])
+            capture_len = chunk_len if capture_lens is None else capture_lens[i]
+            if not 0 <= capture_len <= chunk_len:
+                raise ValueError("DSpark capture length must be a suffix of its context chunk")
             chunk_positions = flat_position_ids[context_offset : context_offset + chunk_len].long()
             if chunk_len == 0:
                 context_offset += chunk_len
@@ -481,11 +512,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._ctx_len[slot] = chunk_positions[-1] + 1
             self._position_initialized[slot] = True
 
-            if captured is not None:
+            if captured is not None and capture_len:
                 self._valid_len[slot] = torch.clamp(
-                    self._valid_len[slot] + chunk_len, max=self._win
+                    self._valid_len[slot] + capture_len, max=self._win
                 )
-                keep = min(self._win, chunk_len)
+                keep = min(self._win, capture_len)
                 hidden = captured[context_offset + chunk_len - keep : context_offset + chunk_len]
                 # A prompt token at absolute position p is stored in frame p+1,
                 # matching the generation path's start_pos convention.
@@ -557,7 +588,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
             return None
         captured = spec_metadata.get_hidden_states(total_target_tokens)
         if captured is None:
-            return None
+            raise RuntimeError(
+                "DSpark generation requires captured target hidden states; "
+                "check target_layer_ids and the target model's capture hooks. "
+                "Refusing to substitute zero draft tokens for a missing capture buffer."
+            )
 
         # gen-only graph batches have num_ctx_tokens == 0; mixed eager batches put
         # the gen tokens after the context tokens.

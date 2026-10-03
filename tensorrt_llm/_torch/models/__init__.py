@@ -34,6 +34,8 @@ __all__ = [
     "Cohere2ForCausalLM",
     "Cosmos3Model",
     "DeepseekV3ForCausalLM",
+    "DeepseekV41ForCausalLM",
+    "DeepseekV41ForConditionalGeneration",
     "DeepseekV4ForCausalLM",
     "Exaone4ForCausalLM",
     "Exaone4_5_ForConditionalGeneration",

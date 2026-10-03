@@ -13,6 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tensorrt_llm._torch.modules.engram.engram import Engram, EngramConfig, EngramHashProvider
+from tensorrt_llm._torch.modules.engram.engram import (
+    Engram,
+    EngramConfig,
+    EngramHashProvider,
+    MultiHeadEmbedding,
+    ShardedFp8MultiHeadEmbedding,
+)
+from tensorrt_llm._torch.modules.engram.functional import engram_gate
 
-__all__ = ["Engram", "EngramConfig", "EngramHashProvider"]
+__all__ = [
+    "Engram",
+    "EngramConfig",
+    "EngramHashProvider",
+    "MultiHeadEmbedding",
+    "ShardedFp8MultiHeadEmbedding",
+    "engram_gate",
+]

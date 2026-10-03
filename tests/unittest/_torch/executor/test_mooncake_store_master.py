@@ -449,9 +449,13 @@ def test_a_published_address_is_read_from_the_file_that_names_it(tmp_path):
 def test_an_address_not_published_yet_is_waited_for(tmp_path):
     """Master and workers are started together; neither one orders the other."""
     published = tmp_path / "master.addr"
-    threading.Timer(0.5, published.write_text, ["10.0.0.9:50051\n"]).start()
-
-    assert resolve_master_address(f"file://{published}", timeout=10.0) == "10.0.0.9:50051"
+    publisher = threading.Timer(0.5, published.write_text, ["10.0.0.9:50051\n"])
+    publisher.start()
+    try:
+        assert resolve_master_address(f"file://{published}", timeout=10.0) == "10.0.0.9:50051"
+    finally:
+        publisher.cancel()
+        publisher.join()
 
 
 def test_an_empty_address_file_is_not_taken_for_an_address(tmp_path):

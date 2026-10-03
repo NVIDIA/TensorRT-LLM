@@ -93,6 +93,7 @@ def test_to_disaggregated_params():
         first_gen_tokens=[1, 2],
         ctx_dp_rank=5,
         ctx_info_endpoint="tcp://10.0.0.1:5000",
+        remote_tail_start=128,
         ctx_usage={
             "prompt_tokens": 10,
             "completion_tokens": 0,
@@ -109,6 +110,7 @@ def test_to_disaggregated_params():
     assert openai_params.first_gen_tokens == [1, 2]
     assert openai_params.ctx_dp_rank == 5
     assert openai_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
+    assert openai_params.remote_tail_start == 128
     assert openai_params.ctx_usage.prompt_tokens == 10
     assert openai_params.ctx_usage.prompt_tokens_details.cached_tokens == 4
 
@@ -125,6 +127,7 @@ def test_to_llm_disaggregated_params():
         request_type="generation_only",
         ctx_dp_rank=2,
         ctx_info_endpoint="tcp://10.0.0.1:5000",
+        remote_tail_start=256,
         ctx_usage=UsageInfo(
             prompt_tokens=10,
             completion_tokens=0,
@@ -138,6 +141,7 @@ def test_to_llm_disaggregated_params():
     assert llm_params.request_type == "generation_only"
     assert llm_params.ctx_dp_rank == 2
     assert llm_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
+    assert llm_params.remote_tail_start == 256
     assert llm_params.ctx_usage["prompt_tokens"] == 10
     assert llm_params.ctx_usage["prompt_tokens_details"]["cached_tokens"] == 4
 
@@ -153,6 +157,26 @@ def test_opaque_state_round_trips_through_openai_protocol():
     )
     assert openai_params.encoded_opaque_state == "b3BhcXVl"
     assert to_llm_disaggregated_params(openai_params).opaque_state == b"opaque"
+
+
+def test_multimodal_spans_round_trip_through_openai_json():
+    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
+    from tensorrt_llm.serve.openai_protocol import (
+        to_disaggregated_params,
+        to_llm_disaggregated_params,
+    )
+
+    original = DisaggregatedParams(
+        request_type="context_only",
+        first_gen_tokens=[17],
+        opaque_state=b"opaque",
+        remote_tail_start=128,
+        multimodal_positions=[1, 5],
+        multimodal_lengths=[2, 1],
+    )
+    encoded = to_disaggregated_params(original).model_dump_json()
+    restored = to_llm_disaggregated_params(OpenAIDisaggregatedParams.model_validate_json(encoded))
+    assert restored == original
 
 
 @patch("tensorrt_llm.disaggregated_params.tllme")

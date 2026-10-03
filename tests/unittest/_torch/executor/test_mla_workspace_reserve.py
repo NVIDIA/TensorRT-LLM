@@ -218,6 +218,8 @@ def _fp8_mla_model_config(sparse_algorithm):
         # Absorption path, TRTLLM-gen SM, fallback off -> K/V read from the paged cache, nothing staged.
         ("dsa", 100, "0", True),
         ("deepseek_v4", 103, "0", True),
+        # CSA2 always passes selected indices to C++ and has no short-seq MHA fallback.
+        ("csa2", 100, "1024", True),
         # Short-seq MHA fallback sends short contexts down the dense path -> buffer is staged.
         ("dsa", 100, "1024", False),
         # Skip-softmax is a sparse config but passes no sparse indices to C++, so MLA stays dense.

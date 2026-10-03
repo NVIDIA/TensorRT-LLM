@@ -147,17 +147,22 @@ def _build_transceiver_for_kv_slice(
     # first-token over-hang. `block_ids` here is the stale-stripped chain, so
     # prepend the -1 holes. (V1 masks its full chain to this shape; V2 reports
     # it directly via valid_only=False.)
-    stale_end = 0
-    if sliding_window_size is not None:
-        stale_end = max(0, (prompt_len + 1 - sliding_window_size) // tokens_per_block)
-    ordinals = np.concatenate([np.full(stale_end, -1, dtype=np.int64), block_ids])
+    def get_block_ordinals(req, idx, lg):
+        transfer_len = getattr(req, "py_csa2_remote_tail_start", None)
+        if transfer_len is None:
+            transfer_len = prompt_len
+        stale_end = 0
+        if sliding_window_size is not None:
+            stale_end = max(0, (transfer_len + 1 - sliding_window_size) // tokens_per_block)
+        return np.concatenate([np.full(stale_end, -1, dtype=np.int64), block_ids])
 
     reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
-        get_cached_token_count_per_layer_group=lambda req, layer_groups: [cached_tokens]
-        * len(layer_groups),
+        get_cached_token_count_per_layer_group=lambda req, layer_groups: (
+            [cached_tokens] * len(layer_groups)
+        ),
         get_block_ids=lambda req, idx, lg: block_ids,
-        get_block_ordinals=lambda req, idx, lg: ordinals,
+        get_block_ordinals=get_block_ordinals,
     )
     page_table = SimpleNamespace(layer_groups=[layer_group])
     cache_manager = SimpleNamespace(num_extra_kv_tokens=num_extra_kv_tokens)
@@ -176,6 +181,58 @@ def _build_transceiver_for_kv_slice(
         py_draft_tokens=[0 for _ in range(num_extra_kv_tokens + 1)],
     )
     return transceiver, req
+
+
+@pytest.mark.parametrize("encoder_hit", [False, True])
+def test_v2_receive_uses_each_resumed_group(encoder_hit):
+    transceiver, req = _build_transceiver_for_kv_slice(
+        0, 257, tokens_per_block=128, is_generation_only=True
+    )
+    # Native lifecycle IDs, not physical pool IDs, index reuse_status. Two
+    # distinct window groups can share a physical pool without sharing reuse.
+    groups = [
+        AttentionLayerGroup(pool_group_idx=0, kv_head_num_per_rank=1),
+        AttentionLayerGroup(pool_group_idx=1, kv_head_num_per_rank=1, sliding_window_size=128),
+        AttentionLayerGroup(pool_group_idx=1, kv_head_num_per_rank=1, sliding_window_size=128),
+    ]
+    pages = [[10, 11, 12], [-1, 21, 22], [-1, 31, 32]]
+    cache = SimpleNamespace(
+        num_committed_tokens=256,
+        reuse_status=[
+            SimpleNamespace(endpoint=256, complete=True),
+            SimpleNamespace(endpoint=256, complete=encoder_hit),
+            SimpleNamespace(endpoint=256, complete=False),
+        ],
+        get_aggregated_page_indices=lambda group, valid_only: iter(pages[group]),
+    )
+    manager = SimpleNamespace(
+        enable_block_reuse=True, tokens_per_block=128, kv_cache_map={0: cache}
+    )
+    adapter = _CacheReuseAdapterV2(manager)
+    transceiver._reuse_adapter = adapter
+    transceiver._page_table.layer_groups = groups
+    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [
+        256,
+        256 if encoder_hit else 0,
+        0,
+    ]
+    received = transceiver._create_chunk(req).block_ids_per_layer_groups
+    for actual, expected in zip(
+        received, [[-1, -1, 12], [-1, -1, 22] if encoder_hit else [-1, 21, 22], [-1, 31, 32]]
+    ):
+        np.testing.assert_array_equal(actual, expected)
+
+    # A later commit must not make newly allocated, unreceived pages look like
+    # an admission-time prefix hit.
+    cache.num_committed_tokens = 384
+    assert adapter.get_cached_token_count_per_layer_group(req, groups)[0] == 256
+    cache.reuse_status[1].complete = False  # manager declined an available OPTIONAL group
+    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [256, 0, 0]
+    manager.enable_block_reuse = False
+    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [0, 0, 0]
+    manager.enable_block_reuse = True
+    manager.kv_cache_map.clear()
+    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [0, 0, 0]
 
 
 class TestCreateKvSliceBlockSpan:
@@ -384,6 +441,68 @@ class TestKvSliceProperty:
                 f"window_slots={window_slots} spec={spec_slots}"
             )
             np.testing.assert_array_equal(got, expected, err_msg=ctx)
+
+    @pytest.mark.parametrize(
+        "prompt_len,remote_tail_start,source_pages,destination_pages",
+        (
+            pytest.param(129, 1, [100], [200, 201], id="partial-prefix"),
+            pytest.param(1024, 896, [106], [206, 207], id="evicted-prefix"),
+        ),
+    )
+    def test_remote_tail_preserves_source_swa_prefix(
+        self,
+        prompt_len: int,
+        remote_tail_start: int,
+        source_pages: list[int],
+        destination_pages: list[int],
+    ) -> None:
+        slices = []
+        for mode, block_ids in (("source", source_pages), ("destination", destination_pages)):
+            transceiver, req = _build_transceiver_for_kv_slice(
+                num_extra_kv_tokens=0,
+                prompt_len=prompt_len,
+                tokens_per_block=128,
+                block_ids=block_ids,
+                sliding_window_size=128,
+                is_generation_only=mode == "destination",
+            )
+            req.py_csa2_remote_tail_mode = mode
+            req.py_csa2_remote_tail_start = remote_tail_start
+            req.py_draft_tokens = []
+            slices.append(transceiver._create_chunk(req).block_ids_per_layer_groups[0])
+
+        # CTX owns only the computed prefix. GEN also reserves the replay tail,
+        # whose uninitialized page must not replace the prefix's receive target.
+        prefix_blocks = (remote_tail_start + 127) // 128
+        stale = max(0, (remote_tail_start + 1 - 128) // 128)
+        np.testing.assert_array_equal(
+            slices[0], [-1] * stale + source_pages[: prefix_blocks - stale]
+        )
+        np.testing.assert_array_equal(
+            slices[1], [-1] * stale + destination_pages[: prefix_blocks - stale]
+        )
+
+    @pytest.mark.parametrize("mode", ("source", "destination"))
+    @pytest.mark.parametrize("prompt_len", (64, 128))
+    @pytest.mark.parametrize("window", (None, 128))
+    def test_remote_tail_zero_prefix_transfers_no_pages(
+        self, mode: str, prompt_len: int, window: int | None
+    ) -> None:
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=0,
+            prompt_len=prompt_len,
+            tokens_per_block=128,
+            block_ids=[100],
+            sliding_window_size=window,
+            is_generation_only=mode == "destination",
+        )
+        req.py_csa2_remote_tail_mode = mode
+        req.py_csa2_remote_tail_start = 0
+        req.py_draft_tokens = []
+
+        kv_slice = transceiver._create_chunk(req)
+
+        assert kv_slice.block_ids_per_layer_groups[0].size == 0
 
 
 # ---------------------------------------------------------------------------

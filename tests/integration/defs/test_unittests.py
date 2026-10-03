@@ -434,3 +434,59 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     if not passed:
         _fail_unittests("failure reported in unittests", output_xml, output_dir,
                         case)
+
+
+def test_csa2_tensor_parallel(llm_root, llm_venv, output_dir):
+    """Launch the existing TP cases on two ranks instead of skipping in serial pytest."""
+    import xml.etree.ElementTree as ET
+
+    from defs.common import venv_mpi_check_call
+
+    cases = [
+        "_torch/attention/sparse/csa2/test_module.py::test_two_rank_module_projection_parity",
+        "_torch/attention/sparse/csa2/test_module.py::test_tp_output_projection_uses_requested_allreduce_strategy",
+        "_torch/attention/sparse/csa2/test_indexer.py::test_multi_rank_candidate_publication_and_reindex",
+        "_torch/modeling/test_modeling_deepseekv41.py::test_attention_adapter_preserves_model_allreduce_strategy",
+    ]
+    test_root = os.path.join(llm_root, "tests", "unittest")
+    output_dir = os.path.abspath(output_dir)
+    pythonpath_dir = os.path.join(output_dir, "csa2-tp-pythonpath")
+    os.makedirs(pythonpath_dir, exist_ok=True)
+    triton_source = os.path.join(llm_root, "triton_kernels")
+    triton_link = os.path.join(pythonpath_dir, "triton_kernels")
+    if os.path.lexists(triton_link):
+        if not os.path.islink(triton_link) or os.readlink(
+                triton_link) != triton_source:
+            raise RuntimeError(f"Unexpected triton_kernels path: {triton_link}")
+    else:
+        os.symlink(triton_source, triton_link)
+    # Each MPI rank must own its GPU and JUnit file. Preserve child exit codes.
+    launcher = (
+        "import sys, torch, pytest; from mpi4py import MPI; "
+        "rank = MPI.COMM_WORLD.Get_rank(); torch.cuda.set_device(rank); "
+        "output = sys.argv[1]; "
+        "raise SystemExit(pytest.main(sys.argv[2:] + ['-v', '--tb=short', "
+        "'--timeout=1200', f'--junitxml={output}/results-csa2-tp-rank{rank}.xml']))"
+    )
+    venv_mpi_check_call(
+        llm_venv,
+        ["mpirun", "--allow-run-as-root", "-n", "2"],
+        ["-c", launcher, output_dir] +
+        [os.path.join(test_root, case) for case in cases],
+        env={
+            "PYTHONPATH":
+            os.pathsep.join([
+                pythonpath_dir,
+                test_root,
+                os.environ.get("PYTHONPATH", ""),
+            ]),
+        },
+        timeout=1800,
+    )
+    for rank in range(2):
+        report = ET.parse(
+            os.path.join(output_dir, f"results-csa2-tp-rank{rank}.xml"))
+        testcases = report.findall(".//testcase")
+        assert testcases, f"MPI rank {rank} collected no tests"
+        assert all(case.find("skipped") is None for case in testcases), (
+            f"MPI rank {rank} skipped a required TP case")

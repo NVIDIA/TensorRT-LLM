@@ -41,6 +41,22 @@ struct AttnLifeCycle
     std::optional<int> windowSize; // nullopt = no sliding window
     int numSinkBlocks = 0;         // divUp(numSinkTokens, tokensPerBlock)
     bool isSparse = false;
+    AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
+
+    bool isPrivate() const noexcept
+    {
+        return reusePolicy == AttentionReusePolicy::PRIVATE;
+    }
+
+    bool requiresPrefixCoverage() const noexcept
+    {
+        return reusePolicy == AttentionReusePolicy::REQUIRED;
+    }
+
+    bool allowsCheckpoint() const noexcept
+    {
+        return reusePolicy == AttentionReusePolicy::OPTIONAL;
+    }
 
     HalfOpenRange<BlockOrdinal> getStaleRange(int historyLength, int tokensPerBlock) const
     {
@@ -57,7 +73,8 @@ struct AttnLifeCycle
 
     bool operator==(AttnLifeCycle const& o) const noexcept
     {
-        return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks && isSparse == o.isSparse;
+        return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks && isSparse == o.isSparse
+            && reusePolicy == o.reusePolicy;
     }
 
     bool operator<(AttnLifeCycle const& o) const noexcept
@@ -70,18 +87,22 @@ struct AttnLifeCycle
         {
             return numSinkBlocks < o.numSinkBlocks;
         }
-        return isSparse < o.isSparse;
+        if (isSparse != o.isSparse)
+        {
+            return isSparse < o.isSparse;
+        }
+        return reusePolicy < o.reusePolicy;
     }
 
-    static AttnLifeCycle make(
-        std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock, bool isSparse = false)
+    static AttnLifeCycle make(std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock,
+        bool isSparse = false, AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED)
     {
         TLLM_CHECK_DEBUG(tokensPerBlock > 0);
         TLLM_CHECK_DEBUG(!ws.has_value() || *ws > 0);
         TLLM_CHECK_DEBUG(!numSinkTokens.has_value() || *numSinkTokens >= 0);
         TLLM_CHECK_DEBUG((!numSinkTokens.has_value() || *numSinkTokens == 0) || ws.has_value());
         int sinkBlocks = divUp(numSinkTokens.value_or(0), tokensPerBlock);
-        return AttnLifeCycle{ws, sinkBlocks, isSparse};
+        return AttnLifeCycle{ws, sinkBlocks, isSparse, reusePolicy};
     }
 };
 
@@ -112,6 +133,18 @@ struct SsmLifeCycle
 // LifeCycle — variant of attention or SSM lifecycle.
 // ---------------------------------------------------------------------------
 using LifeCycle = std::variant<AttnLifeCycle, SsmLifeCycle>;
+
+inline bool isPrivateLifeCycle(LifeCycle const& lc)
+{
+    auto const* attn = std::get_if<AttnLifeCycle>(&lc);
+    return attn && attn->isPrivate();
+}
+
+inline bool requiresPrefixCoverage(LifeCycle const& lc)
+{
+    auto const* attn = std::get_if<AttnLifeCycle>(&lc);
+    return !attn || attn->requiresPrefixCoverage();
+}
 
 // Free function: compute stale range via std::visit.
 inline HalfOpenRange<BlockOrdinal> getStaleRange(LifeCycle const& lc, int historyLength, int tokensPerBlock)

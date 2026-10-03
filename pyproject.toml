@@ -902,6 +902,12 @@ mypy_path = ".:tests/unittest:tests/unittest/_torch/sampler"
 module = ["tensorrt_llm.bindings.*"]
 ignore_errors = true
 
+# Generated pybind11 stub; DeepGEMM returns a bare py::dict from
+# get_bf16_mega_gate_config, which stubgen renders without type parameters.
+[[tool.mypy.overrides]]
+module = ["tensorrt_llm.deep_gemm_cpp_tllm", "deep_gemm_cpp_tllm"]
+disallow_any_generics = false
+
 [[tool.mypy.overrides]]
 module = [
     "tensorrt_llm._torch.pyexecutor.sampler",

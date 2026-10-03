@@ -848,6 +848,8 @@ class LlmResult:
         # Context-worker usage for gen-first disagg, delivered via the
         # KV-transfer aux buffer (see _maybe_attach_ctx_usage).
         self.ctx_usage = None
+        # Explicit context-to-generation remote-tail replay boundary.
+        self.remote_tail_start: Optional[int] = None
         # Time breakdown metrics for performance analysis
         # Contains: step_metrics (list), ctx_gpu_forward_time (float), ctx_gpu_sample_time (float)
         self.time_breakdown_metrics = time_breakdown_metrics
@@ -1175,6 +1177,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # state instead).
         self.py_draft_tokens_effective_len = None
         self.py_last_context_chunk = (None, None)
+        # Established only after the Global cache claim succeeds. The physical
+        # replay prefix is additional compute, never logical context progress.
+        self.py_ced_replay = None
         self.py_last_draft_tokens = None
         self.py_num_accepted_draft_tokens = 0
         # Denominator paired with py_num_accepted_draft_tokens: the number of
@@ -1194,6 +1199,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_rewind_draft_token_separate_adjustment = 0
         self.py_decoding_iter = 0
         self.py_ctx_pre_resize_cap = None
+        self.py_csa2_remote_tail_mode = None
+        self.py_csa2_remote_tail_start = None
+        self.py_csa2_remote_tail_split = None
         self._cached_tokens = 0
         self._cached_tokens_set = False
 
@@ -1211,6 +1219,31 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # here shadows it with something always-truthy for any caller that
         # reads it as an attribute.
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+
+    @property
+    def context_remaining_length(self):
+        """Context rows left on this worker, accounting for remote-tail handoff."""
+        if getattr(self, "py_csa2_remote_tail_mode", None) == "source":
+            end = self.py_csa2_remote_tail_start
+            if end is not None:
+                # An empty transferred prefix still needs a schedulable source
+                # step. Run the prompt through the encoder only; the generation
+                # worker replays the full prompt from position zero.
+                if end == 0:
+                    end = self.prompt_len
+                return max(0, end - self.context_current_position)
+        return super().context_remaining_length
+
+    @property
+    def is_last_context_chunk(self):
+        """Whether this chunk reaches this worker's effective context end."""
+        if getattr(self, "py_csa2_remote_tail_mode", None) == "source":
+            end = self.py_csa2_remote_tail_start
+            if end is not None:
+                if end == 0:
+                    end = self.prompt_len
+                return self.context_current_position + self.context_chunk_size == end
+        return super().is_last_context_chunk
 
     def create_response(self,
                         use_fast_logits=False,
@@ -1299,17 +1332,23 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if not time_breakdown_metrics:
                 time_breakdown_metrics = None
 
-        response = LlmResponse(
+        if len(result) == 0:
+            return None
+        llm_result = LlmResult(
+            result,
+            py_result,
+            is_final,
+            time_breakdown_metrics=time_breakdown_metrics,
+        )
+        if getattr(self, "py_csa2_remote_tail_mode", None) == "source":
+            llm_result.remote_tail_start = self.py_csa2_remote_tail_start
+        llm_result.cached_tokens = self.cached_tokens
+        return LlmResponse(
             request_id=self.py_request_id
             if not self.is_child else self.parent_request_id,
-            result=LlmResult(result,
-                             py_result,
-                             is_final,
-                             time_breakdown_metrics=time_breakdown_metrics),
-            client_id=self.py_client_id) if len(result) > 0 else None
-        if response is not None:
-            response.result.cached_tokens = self.cached_tokens
-        return response
+            result=llm_result,
+            client_id=self.py_client_id,
+        )
 
     @property
     def is_dummy(self):
