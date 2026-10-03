@@ -222,8 +222,38 @@ def make_kv_cache_manager(
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
     # The default here has a cache tier below GPU, which leaves preemption off.
     mgr.has_cache_tier_below_gpu = has_cache_tier_below_gpu
-    mgr.preempt_request.side_effect = lambda req: True
+
+    def preempt_request(req):
+        """Release the pages now, as the real one does with no connector.
+
+        Going through `free_resources` is what makes the release observable.
+        """
+        mgr.free_resources(req)
+        return True
+
+    mgr.preempt_request.side_effect = preempt_request
+    # A bare Mock would answer truthily and suppress every stall check.
+    mgr.has_pending_preemption.return_value = False
     return mgr
+
+
+def defer_preemption(mgr, *request_ids):
+    """Make *mgr* hold back the preemption of each id, as a connector save does.
+
+    Nothing is released, and `has_pending_preemption` stays true until the
+    returned set is cleared, which stands in for the executor completing it.
+    """
+    deferred = set(request_ids)
+
+    def preempt_request(req):
+        if req.py_request_id in deferred:
+            return False
+        mgr.free_resources(req)
+        return True
+
+    mgr.preempt_request.side_effect = preempt_request
+    mgr.has_pending_preemption.side_effect = lambda: bool(deferred)
+    return deferred
 
 
 def make_peft_cache_manager(max_device_pages, pages_per_task=1):
@@ -1567,6 +1597,146 @@ class TestContextPreemption:
 # ===========================================================================
 # Deadlock detection
 # ===========================================================================
+
+
+class TestPreemptionDefersToConnectorSaves:
+    """No page is freed while a connector save is still reading it.
+
+    A freed page is allocated by the next request and overwritten, and a save
+    reading it mid-transfer publishes those bytes under the victim's hash, so
+    an unrelated request's KV is served as a prefix hit. Both allocation paths
+    therefore release through `KVCacheManagerV2.preempt_request`, which parks
+    the victim until the save retires.
+    """
+
+    @staticmethod
+    def _blocked_by_a_suspended_victim(victim_id=1):
+        """A generation request that only fits once *victim_id* gives up its pages."""
+        freed = set()
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: victim_id in freed)
+        mgr.free_resources.side_effect = lambda req: freed.add(req.py_request_id)
+        return mgr
+
+    def test_generation_path_holds_the_pages_a_save_is_reading(self):
+        mgr = self._blocked_by_a_suspended_victim()
+        defer_preemption(mgr, 1)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        current = make_gen_request(0)
+        victim = make_gen_request(1)
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+
+        out = sched.schedule_request([current, victim], set())
+
+        mgr.preempt_request.assert_called_once_with(victim)
+        mgr.free_resources.assert_not_called()
+        # Parked, so it belongs to no output list.
+        assert out.recompute_paused_requests == []
+        assert victim not in out.paused_requests
+        assert out.generation_requests == []
+
+    def test_context_path_holds_the_pages_a_save_is_reading(self):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        defer_preemption(mgr, 99)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([make_ctx_request(0, 100), victim], set())
+
+        mgr.preempt_request.assert_called_once_with(victim)
+        mgr.free_resources.assert_not_called()
+        assert out.recompute_paused_requests == []
+        assert victim not in out.paused_requests
+
+    def test_a_deferred_victim_leaves_the_evicted_list(self):
+        """`pause` would overwrite the state that parks it.
+
+        A victim suspended earlier in the pass sits on `evicted`, which the
+        executor pauses. A parked request keeps the state `preempt_request`
+        left it in until the release completes, so it goes on no list at all.
+        """
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import _RecomputePauseState
+
+        victim = make_gen_request(0)
+        current = make_gen_request(1)
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: True, can_evict=True)
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+        defer_preemption(mgr, 0)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        evicted = [victim]
+        recompute_paused = []
+
+        req_it_end, success = sched._try_recompute_pause_for_gen(
+            current,
+            [victim, current],
+            req_it=1,
+            req_it_end=1,
+            recompute_pause_state=_RecomputePauseState(frontier=1),
+            evicted=evicted,
+            recompute_paused=recompute_paused,
+            inflight_request_ids=set(),
+        )
+
+        assert not success
+        assert req_it_end == 1
+        assert evicted == []
+        assert recompute_paused == []
+        mgr.free_resources.assert_not_called()
+
+    def test_one_victim_drains_at_a_time(self):
+        """A deferral stops the search rather than taking a second victim.
+
+        Giving up another request's cache buys nothing while the first
+        victim's pages are already promised to this allocation.
+        """
+        mgr = self._blocked_by_a_suspended_victim(victim_id=2)
+        defer_preemption(mgr, 1, 2)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        current = make_gen_request(0)
+        first = make_gen_request(1)
+        second = make_gen_request(2)
+        for victim in (first, second):
+            mgr.kv_cache_map[victim.py_request_id].is_active = False
+
+        sched.schedule_request([current, first, second], set())
+
+        assert [call.args[0].py_request_id for call in mgr.preempt_request.call_args_list] == [2]
+
+    def test_the_pages_are_released_once_the_save_retires(self):
+        """The victim is a victim again next pass, and this time it gives them up."""
+        mgr = self._blocked_by_a_suspended_victim()
+        deferred = defer_preemption(mgr, 1)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        current = make_gen_request(0)
+        victim = make_gen_request(1)
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+
+        sched.schedule_request([current, victim], set())
+        mgr.free_resources.assert_not_called()
+
+        # The connector reports the save retired, which is what
+        # PyExecutor._resume_preempted_request acts on.
+        deferred.clear()
+        out = sched.schedule_request([current, victim], set())
+
+        mgr.free_resources.assert_called_once_with(victim)
+        assert ids(out.recompute_paused_requests) == [1]
+        assert ids(out.generation_requests) == [0]
+
+    def test_a_deferred_preemption_is_not_a_stall(self):
+        """Those pages are coming, so the pass that waits for them is progress."""
+        mgr = self._blocked_by_a_suspended_victim()
+        defer_preemption(mgr, 1)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        sched._DEADLOCK_STALL_ITERS = 3
+        victim = make_gen_request(1)
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+        reqs = [make_gen_request(0), victim]
+
+        for _ in range(10):
+            sched.schedule_request(reqs, set())
 
 
 class TestDeadlockDetection:

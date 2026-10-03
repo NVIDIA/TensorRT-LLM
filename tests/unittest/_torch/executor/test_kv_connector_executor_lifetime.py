@@ -17,6 +17,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
 from tensorrt_llm.bindings.executor import FinishReason
@@ -33,6 +34,10 @@ def _executor() -> PyExecutor:
     executor.kv_connector_manager.get_finished.return_value = []
     executor.kv_connector_manager.take_finished_load_terminations.return_value = []
     executor.kv_cache_manager = Mock()
+    # A bare Mock answers both of these truthily, which would route every
+    # finished request through the deferred-preemption path.
+    executor.kv_cache_manager.try_complete_preemption.return_value = False
+    executor.kv_cache_manager.is_preemption_pending.return_value = False
     executor._is_kv_manager_v2 = True
     executor.kv_cache_transceiver = None
     executor.active_requests = []
@@ -428,3 +433,156 @@ def test_completion_envelope_reaches_every_rank_without_a_compute_batch() -> Non
         executor.kv_connector_manager.finish_prefix_loads.assert_called_once_with([17])
         waiting_queue.add_requests.assert_called_once_with([])
     executors[1].kv_connector_manager.take_finished_prefix_loads.assert_not_called()
+
+
+# ---- deferred preemption ----
+
+
+class _PreemptionBookkeeping:
+    """The victim ledger `KVCacheManagerV2.preempt_request` keeps.
+
+    Borrows the manager's own methods so the deferral contract under test is
+    the shipped one, and supplies only what they reach for. Constructing a real
+    manager needs a GPU; `test_kvcm2_integration.py` covers it there.
+    """
+
+    preempt_request = KVCacheManagerV2.preempt_request
+    try_complete_preemption = KVCacheManagerV2.try_complete_preemption
+    is_preemption_pending = KVCacheManagerV2.is_preemption_pending
+    has_pending_preemption = KVCacheManagerV2.has_pending_preemption
+    _release_preempted = KVCacheManagerV2._release_preempted
+
+    def __init__(self, connector_manager) -> None:
+        self.kv_connector_manager = connector_manager
+        self.is_draft = False
+        self._pending_preemption = {}
+        self.released = []
+
+    def get_page_indices_by_layer_group(self, req):
+        return [[1, 2, 3]]
+
+    def free_resources(self, req):
+        self.released.append(req.py_request_id)
+
+
+def _preemption_executor() -> PyExecutor:
+    """An executor with the pieces `_handle_responses` reads."""
+    executor = _executor()
+    executor.kv_cache_manager = _PreemptionBookkeeping(executor.kv_connector_manager)
+    executor.perf_manager = Mock()
+    executor.disagg = Mock()
+    executor.model_engine = None
+    executor.iter_counter = 1
+    executor._free_request_resources = Mock()
+    executor._terminate_request = Mock()
+    executor.force_terminate_ctx_for_partial_reuse = False
+    # Wide enough that a mid-stream request emits nothing of its own, so any
+    # response seen below came from the finish path rather than from streaming.
+    executor.stream_interval = 100
+    return executor
+
+
+def _preemption_victim(request_id: int = 1) -> SimpleNamespace:
+    """A generation request the scheduler is about to preempt."""
+    request = _request(request_id)
+    request.py_decoding_iter = 5
+    request.py_draft_tokens = []
+    request.py_per_pos_drafted = None
+    request.py_per_pos_accepted = None
+    request.py_total_draft_tokens = 0
+    request.py_kv_transfer_timed_out = False
+    request.is_attention_dp_dummy = False
+    request.is_generation_only_request = False
+    request.is_disagg_context_complete_state = False
+    request.is_disagg_context_transmission_state = True
+    request.return_perf_metrics = False
+    request.py_num_connector_matched_tokens = 8
+    request.py_connector_prefix_start = 0
+    request.py_connector_prefix_end = 8
+    request.py_connector_load_async = False
+    request.py_connector_delivered = True
+
+    def reset_for_recompute(_max_input_len):
+        # The real teardown puts the request back in context state, which is
+        # what makes it schedulable again.
+        request.is_finished = False
+        request.is_disagg_context_transmission_state = False
+
+    request.reset_for_recompute = Mock(side_effect=reset_for_recompute)
+    return request
+
+
+def test_deferred_preemption_is_not_reported_to_the_client_as_finished() -> None:
+    """A parked victim must survive the response pass that runs before its saves retire.
+
+    `preempt_request` hands the victim to the connector the way a finished
+    request is handed over, which leaves it in the state `LlmRequest.isFinished`
+    reports as finished. `_handle_responses` runs before `get_finished` in the
+    same iteration, so reading that state as "done generating" would send the
+    client a final response for a request that is about to re-prefill and drop
+    it from `active_requests`, where the resume path would find nothing to put
+    back.
+    """
+    executor = _preemption_executor()
+    victim = _preemption_victim()
+    executor.active_requests = [victim]
+    connector = executor.kv_connector_manager
+    connector.request_finished.return_value = True
+
+    assert executor.kv_cache_manager.preempt_request(victim) is False
+    assert executor.kv_cache_manager.has_pending_preemption()
+    # The state the connector handshake leaves behind is exactly the one that
+    # makes this bug reachable, so assert the test is standing in it.
+    victim.is_finished = True
+    assert executor._is_preemption_pending(victim)
+
+    executor._handle_responses()
+
+    assert executor.active_requests == [victim]
+    victim.create_response.assert_not_called()
+    executor._enqueue_responses.assert_called_once_with([])
+    executor._terminate_request.assert_not_called()
+
+
+def test_a_victim_whose_saves_retired_goes_back_to_being_schedulable() -> None:
+    """The round trip: deferral, a response pass, then completion."""
+    executor = _preemption_executor()
+    victim = _preemption_victim()
+    executor.active_requests = [victim]
+    connector = executor.kv_connector_manager
+    connector.request_finished.return_value = True
+
+    assert executor.kv_cache_manager.preempt_request(victim) is False
+    victim.is_finished = True
+    executor._handle_responses()
+
+    connector.get_finished.return_value = [victim]
+    executor._kv_connector_terminate_requests()
+
+    # Preempted, not finished: the transfer release belongs to the other kind.
+    executor._release_transfer.assert_not_called()
+    assert executor.kv_cache_manager.released == [victim.py_request_id]
+    assert not executor.kv_cache_manager.has_pending_preemption()
+    executor._free_request_resources.assert_called_once_with(victim)
+    victim.reset_for_recompute.assert_called_once()
+    assert victim.py_num_connector_matched_tokens == 0
+
+    # And the next response pass leaves it alone, so the scheduler sees it.
+    connector.get_finished.return_value = []
+    executor._handle_responses()
+    assert executor.active_requests == [victim]
+    victim.create_response.assert_not_called()
+
+
+def test_a_finished_request_still_takes_the_transfer_release() -> None:
+    """Only a preemption victim is resumed; everything else retires as before."""
+    executor = _preemption_executor()
+    request = _preemption_victim()
+    request.is_finished = True
+    executor.kv_connector_manager.get_finished.return_value = [request]
+
+    executor._kv_connector_terminate_requests()
+
+    executor._release_transfer.assert_called_once_with(request)
+    executor._free_request_resources.assert_not_called()
+    request.reset_for_recompute.assert_not_called()

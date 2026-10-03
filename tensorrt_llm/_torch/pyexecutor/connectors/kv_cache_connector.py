@@ -188,6 +188,18 @@ class KvCacheConnectorWorker(ABC):
             {"register_kv_caches": "register_kv_cache_layout"},
         )
 
+    @property
+    def capacity_only(self) -> bool:
+        """Whether this worker contributes resources but transfers no KV.
+
+        Several executor guards exist to protect the page addresses a
+        connector registers: the capacity scheduler is restricted, cache tiers
+        below GPU are refused, and per-layer hooks are installed. A worker that
+        registers nothing needs none of them, so overriding this leaves its
+        engine alone. It still participates in construction and shutdown.
+        """
+        return False
+
     def bind_connector_meta(self, metadata: object):
         self._metadata = metadata
 
@@ -436,6 +448,19 @@ class KvCacheConnectorScheduler(ABC):
                 "indices cannot share one list."
             )
         return self.request_finished(request, cache_block_ids_by_layer_group[0])
+
+    def request_reset(self, request: LlmRequest) -> None:
+        """
+        Called when a request's allocation is released for it to run again.
+
+        Rollback and failed admission take this path, where request_finished
+        ends a request instead. Another request may own the released pages
+        before this one is readmitted, so state the connector recorded in page
+        indices has to be dropped or rebuilt here. Defaults to a no-op.
+
+        Args:
+            request: The request whose allocation was released.
+        """
 
     @abstractmethod
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
@@ -712,6 +737,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         self.worker = worker
         self.scheduler = scheduler
+        #: Whether the attached connector moves KV at all; see
+        #: `KvCacheConnectorWorker.capacity_only`.
+        self.capacity_only = bool(worker.capacity_only)
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -1136,6 +1164,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.scheduler_output_manager.reset_request(request.request_id)
         self.finished_async_loading_requests.pop(request.request_id, None)
         self._deferred_load_terminations.pop(request.request_id, None)
+        # The connector's own per-request state is keyed to the allocation too.
+        if self.scheduler is not None:
+            self.scheduler.request_reset(request)
 
     def should_add_sequence(self, request: LlmRequest) -> bool:
         req_id = request.request_id
@@ -1144,6 +1175,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def build_scheduler_output(
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
     ):
+        if self.capacity_only:
+            # The output would describe no loads and no saves, and both KV
+            # cache managers build one per iteration from `prepare_resources`,
+            # which on a generation server is inter-token latency.
+            # `handle_metadata` returns early when none was built.
+            return
         async_requests = AsyncRequests(
             {},
             {

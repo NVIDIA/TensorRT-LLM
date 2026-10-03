@@ -2502,6 +2502,106 @@ class DecodingBaseConfig(StrictBaseModel):
         return 0
 
 
+class MooncakeStoreConfig(StrictBaseModel):
+    """How this server joins a Mooncake store pool.
+
+    The pool itself is described by the master that owns it, in the manifest
+    `pool` names. What is left here belongs to this server alone: how much
+    memory each of its ranks lends, and what it then does with the pool.
+
+    Setting this makes `trtllm-serve` render the Mooncake client config and
+    export `MOONCAKE_CONFIG_PATH` itself. An inherited `MOONCAKE_CONFIG_PATH`
+    wins, so an externally managed pool stays reachable.
+    """
+    pool: str = Field(
+        ...,
+        description="The pool to join: file://<path> naming the manifest a "
+        "'trtllm-serve mooncake_master --pool_file' published, or a master's "
+        "host:port. The manifest form is how to reach a master whose host a "
+        "scheduler chose, and it carries the settings every participant has "
+        "to agree on, so they are stated once rather than per server.")
+    role: Literal["both", "producer", "consumer", "capacity"] = Field(
+        "both",
+        description="What this server does with the pool. 'both' reads and "
+        "writes, and is what a context server wants. 'capacity' does neither: "
+        "the ranks lend their memory and never touch the pool, which is what a "
+        "generation server wants, since prompt KV reaches it over the cache "
+        "transceiver instead. A capacity-only server registers no KV cache "
+        "with Mooncake, so it needs no GPUDirect RDMA.")
+    segment_size: Union[int, str] = Field(
+        "16GiB",
+        description="Host memory each of this server's ranks contributes to "
+        "the pool. Capacity is the sum over every participating rank, so keep "
+        "it the same on every server; the run's summary reports the distinct "
+        "values seen. A node's demand is ranks_on_node x segment_size, "
+        "checked against available memory at startup. Write binary sizes "
+        "('16GiB') or byte counts: 'GB' means a power of 1000 here and a "
+        "power of 1024 to vLLM, so it is refused in a file both engines may "
+        "read. Zero lends nothing: the server joins the pool and uses capacity "
+        "its peers hold, so a pool whose every participant lends nothing has "
+        "nowhere to put a page.")
+    transfer_batch_size: PositiveInt = Field(
+        64, telemetry=False, description="Page keys per store call.")
+    namespace: Optional[str] = Field(
+        None,
+        description="Key namespace, isolating this deployment's cache from "
+        "others on the same pool. Bump it after any change to page layout or "
+        "contents. Defaults to the pool manifest's.")
+    model_key: str = Field(
+        ...,
+        telemetry=False,
+        description="What the pool keys identify this checkpoint by. Two "
+        "engines share cache only when they agree on it, and two that "
+        "disagree read each other's pages as their own, so it has no default. "
+        "A model path is a poor choice, since 'org-a/model' and 'org-b/model' "
+        "share a directory name while meaning different weights.")
+    stage_through_host: bool = Field(
+        False,
+        telemetry=False,
+        description="Copy pages through a pinned host buffer instead of "
+        "registering the KV pools with Mooncake. An escape hatch for a host "
+        "whose HCA cannot pin GPU pages; costs a copy each way. Ignored when "
+        "role is 'capacity', which registers no pages at all.")
+    run_dir: Optional[str] = Field(
+        None,
+        telemetry=False,
+        description="Where this server keeps the Mooncake client config it "
+        "renders and the record each of its ranks writes of the segment it "
+        "mounted. Required when a launcher starts one task per rank, as "
+        "trtllm-llmapi-launch does, since those ranks cannot inherit the path "
+        "from the process that rendered it. Give each server its own: two "
+        "sharing a directory render one client config between them. Defaults "
+        "to a temporary directory removed at shutdown, which loses the "
+        "records the pool report reads.")
+    master_timeout: float = Field(
+        60.0,
+        telemetry=False,
+        description="Seconds to wait for the pool manifest to appear and the "
+        "master to accept connections. Raise it when the wait spans container "
+        "start on another node. Expiring fails the server at startup, which "
+        "is the intent: an unreachable master otherwise fails inside every "
+        "rank after the model has loaded, as a bare status code.")
+
+    @field_validator("segment_size", mode="after")
+    @classmethod
+    def _check_segment_size(cls, value):
+        """Reject a size here rather than in every rank after bringup.
+
+        The connector parses it, so a typo would otherwise surface as a
+        per-rank failure with the model already loading.
+        """
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        try:
+            parsed = parse_size(value, strict_units=True)
+        except ValueError as exc:
+            raise ValueError(f"mooncake_store.segment_size: {exc}")
+        if parsed < 0:
+            raise ValueError(f"mooncake_store.segment_size: {value!r} is "
+                             f"{parsed} bytes; it cannot be negative.")
+        return value
+
+
 class KvCacheConnectorConfig(StrictBaseModel):
     """Configuration for the KV Cache Connector.
 
@@ -2516,7 +2616,8 @@ class KvCacheConnectorConfig(StrictBaseModel):
         description="Named connector preset (e.g. 'lmcache'). "
         "When set, connector_module/scheduler_class/worker_class are "
         "auto-populated from the preset registry.",
-        telemetry=TelemetryField.categorical('lmcache', 'lmcache-mp', 'kvbm'))
+        telemetry=TelemetryField.categorical('lmcache', 'lmcache-mp', 'kvbm',
+                                             'mooncake-store'))
     connector_module: Optional[str] = Field(
         None,
         description=
@@ -2531,11 +2632,16 @@ class KvCacheConnectorConfig(StrictBaseModel):
         description="URL for an external connector server "
         "(e.g. 'tcp://localhost:5555'). Connectors that run in "
         "multi-process mode use this to reach the cache server.")
+    mooncake_store: Optional[MooncakeStoreConfig] = Field(
+        None,
+        description="Pool topology for the 'mooncake-store' connector. When "
+        "set, trtllm-serve provisions the pool during bringup instead of "
+        "requiring MOONCAKE_CONFIG_PATH from an external script.")
 
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":
-        from tensorrt_llm._torch.pyexecutor.connectors.registry import \
-            CONNECTOR_REGISTRY
+        from tensorrt_llm._torch.pyexecutor.connectors.registry import (
+            CONNECTOR_REGISTRY, uses_connector)
         if self.connector is not None:
             preset = CONNECTOR_REGISTRY.get(self.connector)
             if preset is None:
@@ -2553,6 +2659,12 @@ class KvCacheConnectorConfig(StrictBaseModel):
             raise ValueError("connector_scheduler_class is required")
         if self.connector_worker_class is None:
             raise ValueError("connector_worker_class is required")
+        if self.mooncake_store is not None and not uses_connector(
+                self, "mooncake-store"):
+            raise ValueError(
+                "mooncake_store describes a Mooncake pool, but this config "
+                f"resolves to connector_module={self.connector_module!r}. "
+                "Set connector: mooncake-store, or drop mooncake_store.")
         return self
 
 
