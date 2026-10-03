@@ -54,7 +54,12 @@ Example from `l0_a30.yml`:
 
 ## Unit tests
 
-Unit tests live under `tests/unittest/` and run during the merge-request pipeline. They are invoked from `jenkins/L0_MergeRequest.groovy` and do not require mapping to specific hardware stages.
+Unit tests live under `tests/unittest/`, but CI does not collect them directly. Entries with the
+`unittest/` prefix in the `test-db` lists act as bridges: each one generates a `test_unittests_v2`
+instance that runs `pytest` in `tests/unittest` with the rest of the line as arguments. A unit test
+that no entry covers — directly or through a listed parent directory — is never collected, so it
+reports nothing and a regression in it merges unnoticed. See [tests/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/README.md)
+for how to add one.
 
 ## Jenkins stage names
 
