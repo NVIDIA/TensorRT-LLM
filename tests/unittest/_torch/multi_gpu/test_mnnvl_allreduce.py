@@ -337,8 +337,8 @@ def mnnvl_checkpoint_worker_env(_: int):
 
 def mnnvl_growth_graph_forward(tensor_parallel_size: int,
                                tensor_parallel_rank: int) -> bool:
-    """A graph captured on the MNNVL workspace replays correctly after an eager call grew the workspace, and growth
-    during capture is refused."""
+    """A graph captured on the MNNVL workspace replays correctly after an eager call grew the workspace, a replaced
+    workspace that no capture used is not kept, and growth during capture is refused."""
     env_names = ("TLLM_TEST_MNNVL", "TRTLLM_FORCE_MNNVL_AR")
     previous_env = {
         name: (name in os.environ, os.environ.get(name))
@@ -401,6 +401,23 @@ def mnnvl_growth_graph_forward(tensor_parallel_size: int,
                     output,
                     torch.full_like(
                         output, expected + tensor_parallel_size * (1 + step)))
+
+            # No capture used `after`: growing past it keeps only `before`, which the graph still launches on.
+            wider = torch.ones((6144, 7168),
+                               dtype=torch.bfloat16,
+                               device="cuda")
+            torch.testing.assert_close(
+                allreduce(wider), torch.full_like(wider, tensor_parallel_size))
+            assert MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping][
+                "buffer_size_bytes"] > after["buffer_size_bytes"]
+            assert MNNVLAllReduce.allreduce_mnnvl_retired_workspaces[
+                mapping] == [before]
+            del wider, after
+            input_.fill_(tensor_parallel_rank + 1)
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(output,
+                                       torch.full_like(output, expected))
 
             huge = torch.ones((8192, 7168), dtype=torch.bfloat16, device="cuda")
             with pytest.raises(RuntimeError, match="during CUDA graph capture"):
