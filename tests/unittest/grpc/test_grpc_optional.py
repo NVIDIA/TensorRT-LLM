@@ -70,18 +70,50 @@ def test_protobuf_warning_in_fresh_process(implementation: str) -> None:
 
 @pytest.mark.cpu_only
 def test_cpp_protobuf_does_not_warn(monkeypatch) -> None:
+    from google.protobuf.internal import api_implementation
+
     from tensorrt_llm.grpc import _protobuf
 
     warning = MagicMock()
-    monkeypatch.setattr(_protobuf.api_implementation, "Type", lambda: "cpp")
+    monkeypatch.setattr(api_implementation, "Type", lambda: "cpp")
     monkeypatch.setattr(_protobuf.logger, "warning", warning)
     _protobuf._warn_if_python_protobuf()
     warning.assert_not_called()
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("missing_api", ["import", "Type"])
+def test_protobuf_warning_skips_unavailable_api(monkeypatch, missing_api: str) -> None:
+    """An unavailable diagnostic API must not prevent import or startup."""
+    from google.protobuf.internal import api_implementation
+
+    from tensorrt_llm.grpc import _protobuf
+
+    warning = MagicMock()
+    monkeypatch.setattr(_protobuf.logger, "warning", warning)
+    if missing_api == "import":
+        real_import = builtins.__import__
+
+        def import_without_implementation(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "google.protobuf.internal" and "api_implementation" in fromlist:
+                raise ImportError("protobuf implementation API unavailable")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", import_without_implementation)
+    else:
+        monkeypatch.delattr(api_implementation, "Type")
+
+    importlib.reload(_protobuf)
+    _protobuf._warn_if_python_protobuf()
+    warning.assert_not_called()
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("protocol", ["smg", "openengine"])
-def test_python_protobuf_warns_before_model_startup(monkeypatch, protocol: str) -> None:
+@pytest.mark.parametrize("implementation_available", [True, False])
+def test_protobuf_warning_does_not_block_model_startup(
+    monkeypatch, protocol: str, implementation_available: bool
+) -> None:
     from google.protobuf.internal import api_implementation
 
     if protocol == "smg":
@@ -90,14 +122,20 @@ def test_python_protobuf_warns_before_model_startup(monkeypatch, protocol: str) 
     warning = MagicMock()
 
     def initialize_model(**kwargs):
-        warning.assert_called_once()
+        if implementation_available:
+            warning.assert_called_once()
+        else:
+            warning.assert_not_called()
         raise RuntimeError("model startup reached")
 
     llm_factory = MagicMock(side_effect=initialize_model)
     monkeypatch.setattr(server_module, "PyTorchLLM", llm_factory)
     monkeypatch.setattr(server_module.logger, "warning", warning)
     monkeypatch.setattr(server_module.uvloop, "run", asyncio.run)
-    monkeypatch.setattr(api_implementation, "Type", lambda: "python")
+    if implementation_available:
+        monkeypatch.setattr(api_implementation, "Type", lambda: "python")
+    else:
+        monkeypatch.delattr(api_implementation, "Type")
     launch = server_module.launch_smg_server if protocol == "smg" else server_module.launch_server
     with pytest.raises(RuntimeError, match="model startup reached"):
         launch("127.0.0.1", 50051, {"backend": "pytorch", "model": "test-model"})

@@ -3,14 +3,18 @@
 
 """Protobuf performance guidance shared by the gRPC launchers."""
 
-from google.protobuf.internal import api_implementation
-
 from tensorrt_llm.logger import logger
 
 
 def _warn_if_python_protobuf() -> None:
-    """Warn when the active protobuf implementation is pure Python."""
-    implementation = api_implementation.Type()
+    """Warn for Python protobuf if its implementation can be detected."""
+    try:
+        from google.protobuf.internal import api_implementation
+
+        implementation = api_implementation.Type()
+    except (ImportError, AttributeError):
+        return
+
     if implementation == "python":
         logger.warning(
             "TensorRT-LLM gRPC is using Python protobuf, which can reduce throughput. Set "
