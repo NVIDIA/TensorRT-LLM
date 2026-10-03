@@ -236,9 +236,12 @@ def reference_block_scale_moe_torch(
     return results.view_as(x)
 
 
-def create_mock_cuda_graph_runner(batch_size: int,
-                                  use_mrope: bool = False,
-                                  max_num_tokens: int = 1):
+def create_mock_cuda_graph_runner(
+        batch_size: int,
+        use_mrope: bool = False,
+        max_num_tokens: int = 1,
+        static_input_ids: Optional[torch.Tensor] = None,
+        static_position_ids: Optional[torch.Tensor] = None):
     config = CUDAGraphRunnerConfig(
         use_cuda_graph=True,
         cuda_graph_padding_enabled=False,
@@ -256,7 +259,9 @@ def create_mock_cuda_graph_runner(batch_size: int,
         is_encoder_decoder=False,
         mapping=Mapping(),
         dist=None,
-        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER)
+        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
+        static_input_ids=static_input_ids,
+        static_position_ids=static_position_ids)
     return CUDAGraphRunner(config)
 
 

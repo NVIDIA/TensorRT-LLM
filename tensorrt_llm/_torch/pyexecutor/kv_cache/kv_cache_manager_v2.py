@@ -5762,6 +5762,38 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             self._allocated_draft_lens.pop(req.py_request_id, None)
 
+    def stage_batch_block_offsets(
+        self,
+        stage,
+        dst_tensor: torch.Tensor,
+        request_ids: List[int],
+        beam_width: int,
+        num_contexts: int,
+        num_seqs: int,
+    ) -> bool:
+        """Stage ``copy_batch_block_offsets`` on a StepInputStage instead of launching its kernel.
+
+        Returns False, staging nothing, where that copy is not this class's single-table copy on the current
+        stream: the per-layer page-table layout, a subclass that overrides ``copy_batch_block_offsets``, a manager
+        whose stream is not the current one, or a copy the stage does not cover. The caller then copies as usual.
+        """
+        if (
+            self._use_per_layer_page_tables
+            or type(self).copy_batch_block_offsets is not KVCacheManagerV2.copy_batch_block_offsets
+            or self._stream != torch.cuda.current_stream()
+        ):
+            return False
+        assert beam_width == 1, "beam_width must be 1 for KVCacheManagerV2"
+        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
+        assert copy_idx.shape[0] == num_seqs
+        return stage.block_copy(
+            dst_tensor,
+            self.host_kv_cache_block_offsets,
+            copy_idx,
+            self.index_scales,
+            self.kv_offset,
+        )
+
     def copy_batch_block_offsets(
         self,
         dst_tensor: torch.Tensor,

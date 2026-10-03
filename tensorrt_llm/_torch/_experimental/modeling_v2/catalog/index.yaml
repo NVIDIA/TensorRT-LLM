@@ -28,7 +28,7 @@
 # limits, e.g. no float8 arithmetic, are noted in the entry docstring).
 # Entries wrapping trtllm ops carry all three.
 #
-# ── RECEIPT STATUS: 19 entries certified on sm_103, 13 on sm_100 ──────────
+# ── RECEIPT STATUS: 19 entries certified on sm_103, 22 on sm_100 ──────────
 #
 # A receipt says this entry's test passed on a stated GPU architecture. The
 # architecture is the whole key: it is a real axis -- see the
@@ -68,10 +68,13 @@
 # exist. Read them as provenance; the frontmatter is the certification.
 #
 # An entry first called by a GB200 (sm_100) target is certified there: its
-# receipt key is sm_100 (comm/mnnvl_allreduce_attn_res). An entry already
-# certified elsewhere gains its sm_100 key in the change that adds its first
-# sm_100 caller. A collective's receipt records the world size its matrix ran
-# at.
+# receipt key is sm_100 (comm/mnnvl_allreduce_attn_res,
+# attention/k3_drafter_attn, attention/k3_drafter_attn_qknorm). An entry
+# already certified elsewhere gains its sm_100 key in the change that adds its
+# first sm_100 caller and keeps the key it had, noting that the new cells
+# post-date it (attention/fused_qk_norm_rope). Those cells skip off SM 10.0,
+# so CI on the other architecture keeps re-certifying the existing ones. A
+# collective's receipt records the world size its matrix ran at.
 #
 # The Kimi K3 entries (k3_*, attn_res_*) are certified on sm_100 (B200 /
 # GB200), where their first caller runs, and their tests skip on any other
@@ -246,6 +249,14 @@ entries:
   - path: attention/k3_mla_attn_vb_out.py
     impl: torch.ops.trtllm.k3_mla_attn_vb_out
     summary: "Kimi K3's MLA decode attention of at most 8 requests of at most 8 tokens over the paged latent cache (heads a multiple of 6, causal bottom-right, a request's rows exactly those of its own R = 1 call) with v_b and the optional sigmoid output gate in the same launch, over a caller-owned K3MlaAttnWorkspace: per-CTA partials and the no-cluster mode's arrival counters, one workspace per device and head-group count shared by every layer, its calls one at a time in stream order; siblings: k3_mla_attn_out (the attention output itself) and k3_mla_attn"
+
+  - path: attention/k3_drafter_attn.py
+    impl: torch.ops.trtllm.k3_drafter_attn
+    summary: "Kimi K3 DSpark drafter block attention (CuTe DSL, sm_100): R <= 8 requests' draft blocks of T <= 8 tokens, each attending densely (non-causal within the block) to its request's paged context (HND pages of 64, rows 0 .. ctx_len[r] - 1, page-table rows at any row stride) and to the block's own K / V taken from qkv, not written to the cache; GQA with 6 query heads per KV head, head dim 64, bf16; compiles on its first call outside capture, then replays under CUDA graphs with lengths, page tables and qkv rewritten in place"
+
+  - path: attention/k3_drafter_attn_qknorm.py
+    impl: torch.ops.trtllm.k3_drafter_attn_qknorm
+    summary: "k3_drafter_attn on the raw QKV projection: per-head q / k RMSNorm and NeoX RoPE (fused_qk_norm_rope's arithmetic, positions int32 or int64) applied inside the kernel, qkv left unmodified"
 
   # ─── ssm ───────────────────────────────────────────────────────
   # KDA (Kimi Delta Attention) decode. The state type ssm/k3_kda_buffers.py is not an entry: it launches nothing per

@@ -551,6 +551,10 @@ class DFlashSpecMetadata(SpecMetadata):
                     evicted[slot] = 0
                     worker._req_ctx_pos.pop(rid, None)
                     worker._free_slots.append(slot)
+            # The dummy slot starts every step empty. Its rows (CUDA-graph padding, warmup dummies) add their accepted
+            # tokens to its length like any request, and their table rows are the padding request's pages, the rest
+            # mapped to page 0 (another request's). Left growing, a padding row's context K / V would land there.
+            evicted[worker._dummy_slot] = 0
             worker._write_ctx_len(evicted)
 
             # A disagg generation worker receives prompt KV instead of

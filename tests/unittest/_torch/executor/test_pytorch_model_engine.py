@@ -1575,6 +1575,134 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             [generation.py_seq_slot], 0)
         kv_cache_manager.shutdown()
 
+    def _check_staged_spec_decode_graph_step(
+            self, use_kv_cache_manager_v2: bool) -> None:
+        """A CUDA graph decode step of a speculative engine whose step inputs
+        are staged on the StepInputStage (one launch after the attention
+        metadata's prepare) writes what the torch path writes."""
+        from tensorrt_llm._torch.attention.backends.trtllm import \
+            TrtllmAttentionMetadata
+        from tensorrt_llm._torch.cute_dsl_kernels.spec_step_copies import \
+            op as spec_step_copies
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+            KVCacheManagerV2
+        from tensorrt_llm.llmapi.llm_args import \
+            KvCacheConfig as LlmKvCacheConfig
+        if not spec_step_copies.is_supported():
+            self.skipTest("the step-copy kernels run on SM 100")
+        max_draft_len = 3
+        tokens_per_step = max_draft_len + 1
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(
+            spec_config=SADecodingConfig(max_draft_len=max_draft_len))
+        if use_kv_cache_manager_v2:
+            kv_cache_manager.shutdown()
+            kv_cache_manager = KVCacheManagerV2(
+                LlmKvCacheConfig(max_tokens=512, enable_block_reuse=False),
+                tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+                num_layers=1,
+                num_kv_heads=model_engine.model.config.num_key_value_heads,
+                head_dim=model_engine.model.config.head_dim,
+                tokens_per_block=4,
+                max_seq_len=256,
+                max_batch_size=8,
+                mapping=Mapping(world_size=1, tp_size=1, rank=0),
+                dtype=tensorrt_llm.bindings.DataType.HALF)
+        model_engine.runtime_draft_len = max_draft_len
+        stage = model_engine._step_input_stage
+        self.assertIsNotNone(stage)
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        # Three requests that ran in the previous step, in slots out of order.
+        slots = [5, 2, 7]
+        requests = kv_cache_manager.add_dummy_requests(
+            [1, 2, 3],
+            token_nums=[10, 17, 33],
+            is_gen=True,
+            max_num_draft_tokens=max_draft_len)
+        for request, slot in zip(requests, slots):
+            request.is_dummy_request = False
+            request.py_seq_slot = slot
+        batch = ScheduledRequests()
+        batch.generation_requests = requests
+        attn_metadata = model_engine._set_up_attn_metadata(kv_cache_manager)
+        self.assertIs(type(attn_metadata), TrtllmAttentionMetadata)
+        graph_metadata = attn_metadata.create_cuda_graph_metadata(
+            len(requests), False, max_draft_len)
+        spec_metadata = Mock(
+            _force_non_greedy_for_capture=False,
+            context_prompt_lookahead_tokens=None,
+        )
+
+        # The sampler's slot stores as the previous step left them.
+        num_slots = 8
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        previous = SampleStateTensorsSpec(
+            new_tokens=torch.randint(0,
+                                     1000, (tokens_per_step, num_slots, 1),
+                                     generator=generator,
+                                     dtype=torch.int32,
+                                     device="cuda"),
+            new_tokens_lens=torch.randint(1,
+                                          tokens_per_step + 1, (num_slots, ),
+                                          generator=generator,
+                                          dtype=torch.int32,
+                                          device="cuda"),
+            next_draft_tokens=torch.randint(0,
+                                            1000, (num_slots, max_draft_len),
+                                            generator=generator,
+                                            dtype=torch.int32,
+                                            device="cuda"),
+        )
+
+        def step_inputs(step_input_stage):
+            """The buffers one step writes, from a filler they all start at."""
+            model_engine._step_input_stage = step_input_stage
+            for request, slot in zip(requests, slots):
+                request.py_batch_idx = slot
+            written = (model_engine.input_ids_cuda,
+                       model_engine.position_ids_cuda,
+                       model_engine.draft_tokens_cuda,
+                       model_engine.previous_pos_id_offsets_cuda,
+                       model_engine.previous_kv_lens_offsets_cuda,
+                       graph_metadata.prompt_lens_cuda,
+                       graph_metadata.kv_lens_cuda,
+                       graph_metadata.kv_cache_block_offsets)
+            for buffer in written:
+                buffer.fill_(-3)
+            model_engine._prepare_tp_inputs(scheduled_requests=batch,
+                                            kv_cache_manager=kv_cache_manager,
+                                            attn_metadata=graph_metadata,
+                                            spec_metadata=spec_metadata,
+                                            new_tensors_device=previous,
+                                            resource_manager=resource_manager)
+            torch.cuda.synchronize()
+            return [buffer.clone() for buffer in written]
+
+        torch_path = step_inputs(None)
+        with patch.object(stage, "commit", wraps=stage.commit) as commit, \
+                patch.object(stage, "block_copy",
+                             wraps=stage.block_copy) as block_copy:
+            staged = step_inputs(stage)
+        commit.assert_called_once()
+        self.assertEqual(block_copy.call_count,
+                         1 if use_kv_cache_manager_v2 else 0)
+        for expected, actual in zip(torch_path, staged):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        # The previous rows' input ids came from the stores, by slot.
+        num_tokens = len(requests) * tokens_per_step
+        expected_input_ids = previous.new_tokens[:, slots, 0].t().reshape(-1)
+        self.assertEqual(staged[0][:num_tokens].tolist(),
+                         expected_input_ids.tolist())
+        kv_cache_manager.shutdown()
+
+    def test_staged_spec_decode_graph_step_matches_torch_path(self) -> None:
+        self._check_staged_spec_decode_graph_step(use_kv_cache_manager_v2=False)
+
+    def test_staged_spec_decode_graph_step_matches_torch_path_kv_v2(
+            self) -> None:
+        self._check_staged_spec_decode_graph_step(use_kv_cache_manager_v2=True)
+
     def test_multimodal_encoder_max_seq_len(self) -> None:
 
         class CapturingEncoder(torch.nn.Module, MultimodalEncoderMixin):
