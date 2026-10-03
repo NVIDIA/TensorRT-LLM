@@ -45,10 +45,11 @@ classified step's attention-residual epilogues (the selection and the RMSNorm af
 one token tile, 32 tokens on a wide decode step. On any step of at most 16 tokens but a wide one, the post-attention
 all-reduce carries the residual update (`decode_comm.py`): at most 8 tokens on an attention decode branch, o_proj, the
 all-reduce and the update are one `comm/k3_sandwich_oproj` kernel; otherwise the attention's unreduced o_proj output
-goes through `comm/mnnvl_allreduce_attn_res`. The state those kernels share (the KDA projection's Lamport buffers, the
-MLA attention workspace, the decode GEMVs' state, the TP group's MNNVL and sandwich workspaces) lives in typed objects
-this target creates in `post_load_weights`, before any graph capture. The MoE front and routed experts come with
-their own entries; until then they run the generic path on every step.
+goes through `comm/mnnvl_allreduce_attn_res`. The stock MNNVL all-reduces send one-shot up to 4 MiB, a wide decode
+step's up to the stock 1 MiB. The state those kernels share (the KDA projection's Lamport buffers, the MLA attention
+workspace, the decode GEMVs' state, the TP group's MNNVL and sandwich workspaces) lives in typed objects this target
+creates in `post_load_weights`, before any graph capture. The MoE front and routed experts come with their own
+entries; until then they run the generic path on every step.
 
 **What this target asserts rather than adapts**: SM 10.0; the topology above; the MXFP4 checkpoint's quantization
 (W4A16_MXFP4 with no per-layer declarations, so the routed experts run the W4A8_MXFP4_MXFP8 default and the excluded
@@ -1536,26 +1537,32 @@ class KimiLinearDecoderLayer(nn.Module):
                     self.mlp_res_norm,
                     self.post_attention_layernorm,
                 )
-        elif prefix_sum is None:
-            prefix_sum = attention(hidden_states, attn_metadata, step=step)
-            hidden_states = _apply_attn_res_and_rmsnorm(
-                prefix_sum,
-                valid_block_residual,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                self.post_attention_layernorm,
-                attn_res_max_tokens,
-            )
         else:
-            prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
-                prefix_sum,
-                attention(hidden_states, attn_metadata, step=step),
-                valid_block_residual,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                self.post_attention_layernorm,
-                attn_res_max_tokens,
-            )
+            if comm is not None and step is not None and step.wide:
+                partial = attention(hidden_states, attn_metadata, step=step, reduce_output=False)
+                attention_output = _decode_comm.wide_all_reduce(attention._o_allreduce, partial)
+            else:
+                attention_output = attention(hidden_states, attn_metadata, step=step)
+            if prefix_sum is None:
+                prefix_sum = attention_output
+                hidden_states = _apply_attn_res_and_rmsnorm(
+                    prefix_sum,
+                    valid_block_residual,
+                    self.mlp_res_proj,
+                    self.mlp_res_norm,
+                    self.post_attention_layernorm,
+                    attn_res_max_tokens,
+                )
+            else:
+                prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
+                    prefix_sum,
+                    attention_output,
+                    valid_block_residual,
+                    self.mlp_res_proj,
+                    self.mlp_res_norm,
+                    self.post_attention_layernorm,
+                    attn_res_max_tokens,
+                )
         if self.is_moe:
             hidden_states = self.block_sparse_moe(
                 hidden_states, getattr(attn_metadata, "all_rank_num_tokens", None)
@@ -2398,7 +2405,8 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
         every layer of its kind: the KDA projection's Lamport buffers and the MLA decode attention's workspace; the
         decode GEMVs' state (built by ``cache_derived_state``) handed to every attention module; and, where every
         attention all-reduce runs over MNNVL, the TP group's collective state (``K3DecodeComm``, collective: every
-        rank builds it here) handed to every layer, with whether its sandwich takes the layer's o_proj."""
+        rank builds it here) handed to every layer, with whether its sandwich takes the layer's o_proj, and the
+        decode path's one-shot ceiling on every stock MNNVL all-reduce (``use_decode_one_shot``)."""
         super().post_load_weights()
         kda = [layer.linear_attn for layer in self.model.layers if layer.is_kda]
         mla = [layer.self_attn.mixer for layer in self.model.layers if not layer.is_kda]
@@ -2424,6 +2432,7 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
             comm = _decode_comm.K3DecodeComm.create(self.model_config.mapping, oproj)
             for layer in layers:
                 layer.decode_comm = comm
+            _decode_comm.use_decode_one_shot(self)
         logger.info(
             "Kimi K3 decode kernels: KDA on k3_kda_decode_attn, k3_kda_attn and k3_kda_verify "
             f"({sum(m.takes_k3_kernels for m in kda)} / {len(kda)} layers take them), MLA on k3_mla_qkv and "

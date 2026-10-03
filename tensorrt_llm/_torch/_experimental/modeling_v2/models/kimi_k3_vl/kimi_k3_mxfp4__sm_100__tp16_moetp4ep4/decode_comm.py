@@ -17,6 +17,9 @@ The state is one `MnnvlWorkspace` and one `K3SandwichWorkspace` of the TP group 
 over the group and eager, built by the target in `post_load_weights` before any CUDA-graph capture. Every rank must
 make the same calls on each in the same order. Which call a step takes is decided from its token count and kind and
 from the load-time layout alone, which every rank of the group shares.
+
+The plain MNNVL all-reduces the decode path keeps (the stock modules') send one-shot up to
+`DECODE_AR_ONE_SHOT_MAX_BYTES` (`use_decode_one_shot`), except a wide decode step's (`wide_all_reduce`).
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace 
 
 # The kernel's support predicate: metadata reads only.
 from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich import op as _sandwich_op
+from tensorrt_llm._torch.distributed import AllReduceParams
 
 # The most tokens of a step whose post-attention all-reduce runs one-shot with the residual update in its epilogue.
 AR_ATTN_RES_MAX_TOKENS = 16
@@ -49,6 +53,35 @@ SANDWICH_MAX_TOKENS = _sandwich_op.MAX_TOKENS
 
 # The MNNVL workspace's buffer size: a one-shot call pushes T x 7168 bf16 from each of 16 ranks, 3.5 MiB at T = 16.
 MNNVL_BUFFER_BYTES = 4 << 20
+
+# The one-shot ceiling of the stock MNNVL all-reduces on the decode path: 8 tokens x 7168 x 16 ranks x 2 B is
+# 1.75 MiB, which the stock 1 MiB ceiling would send two-shot.
+DECODE_AR_ONE_SHOT_MAX_BYTES = 4 << 20
+
+# A wide decode step's ceiling: the stock 1 MiB. At 16 ranks two-shot is faster for every wide step's rows.
+WIDE_AR_ONE_SHOT_MAX_BYTES = 1 << 20
+
+
+def use_decode_one_shot(model: nn.Module) -> None:
+    """Every stock MNNVL all-reduce of ``model`` sends one-shot up to `DECODE_AR_ONE_SHOT_MAX_BYTES`. Each grows its
+    workspace on its first eager call of a larger size, before the capture of that size."""
+    for module in model.modules():
+        mnnvl = getattr(module, "mnnvl_allreduce", None)
+        if mnnvl is not None:
+            mnnvl.one_shot_max_bytes = DECODE_AR_ONE_SHOT_MAX_BYTES
+
+
+def wide_all_reduce(all_reduce: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """``all_reduce(x)`` of a wide decode step (a stock ``AllReduce`` module, no fusion): its MNNVL all-reduce with
+    the `WIDE_AR_ONE_SHOT_MAX_BYTES` ceiling, else the module itself."""
+    mnnvl = getattr(all_reduce, "mnnvl_allreduce", None)
+    if mnnvl is not None:
+        out = mnnvl(
+            x.contiguous(), AllReduceParams(), one_shot_max_bytes=WIDE_AR_ONE_SHOT_MAX_BYTES
+        )
+        if out is not None:
+            return out
+    return all_reduce(x)
 
 
 def _eps(norm: nn.Module) -> float:
