@@ -25,9 +25,10 @@ classification decides which kernels each module runs:
   layout's MoE head and tail, on M-general ops.
 
 Every other step (prefill, mixed steps, decode steps above those bounds) runs the **generic path**: this target's
-text model (`KimiLinearModel` below: decoder layers, attention residuals, the MLA / KDA / MoE runtimes), computed
-exactly as the built-in Kimi K3 text model computes it, on stock modules and ops that have no catalog entries yet.
-`UNCERTIFIED_GENERIC_CALLS` names them.
+text model (`KimiLinearModel` below: decoder layers, attention residuals, the MLA / KDA / MoE runtimes), computed as
+the built-in Kimi K3 text model computes it, on stock modules and ops that have no catalog entries yet. One weight
+differs: where the MoE decode path takes a layer, its latent norm's weight is folded into the latent up projection
+(the same function, rounded differently). `UNCERTIFIED_GENERIC_CALLS` names the stock code.
 
 The text model hands each step's classification to its attention modules, which run a **decode step** on the K3
 decode kernels' catalog entries:
@@ -47,9 +48,14 @@ all-reduce carries the residual update (`decode_comm.py`): at most 8 tokens on a
 all-reduce and the update are one `comm/k3_sandwich_oproj` kernel; otherwise the attention's unreduced o_proj output
 goes through `comm/mnnvl_allreduce_attn_res`. The stock MNNVL all-reduces send one-shot up to 4 MiB, a wide decode
 step's up to the stock 1 MiB. The state those kernels share (the KDA projection's Lamport buffers, the MLA attention
-workspace, the decode GEMVs' state, the TP group's MNNVL and sandwich workspaces) lives in typed objects this target
-creates in `post_load_weights`, before any graph capture. The MoE front and routed experts come with their own
-entries; until then they run the generic path on every step.
+workspace, the decode GEMVs' state, the TP group's MNNVL and sandwich workspaces, the MoE path's) lives in typed
+objects this target creates in `post_load_weights`, before any graph capture.
+
+A MoE layer on a step of at most 8 tokens runs `decode_moe.py`: `moe/k3_moe_front` (this rank's head slice, its
+all-gather, the routing, the MXFP8 latent and the shared experts' gate_up + SiTU in one kernel), `moe/k3_moe`, the
+latent all-reduce, then the row-parallel tail, which the next layer's pre-attention step (the final norm's, after the
+last layer) runs with its all-reduce and residual update as one `comm/k3_sandwich_tail` kernel. A wide decode step's
+MoE keeps the sharded head and the row-parallel tail, on `moe/k3_route_quant`, `moe/k3_moe` and M-general ops.
 
 **What this target asserts rather than adapts**: SM 10.0; the topology above; the MXFP4 checkpoint's quantization
 (W4A16_MXFP4 with no per-layer declarations, so the routed experts run the W4A8_MXFP4_MXFP8 default and the excluded
@@ -72,7 +78,7 @@ import copy
 import math
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, NamedTuple, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -125,6 +131,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 from . import decode_comm as _decode_comm
 from . import decode_gemv as _decode_gemv
+from . import decode_moe as _decode_moe
 from . import weights as _weights
 
 if TYPE_CHECKING:
@@ -161,9 +168,14 @@ REQUIRED_TRTLLM_OPS = (
     "k3_head_gemv",
     "k3_embed_norm",
     "allgather",
-    # The decode path's collectives (decode_comm.py).
+    # The decode path's collectives (decode_comm.py) and MoE (decode_moe.py).
     "mnnvl_allreduce_attn_res",
     "k3_sandwich_oproj",
+    "k3_sandwich_tail",
+    "k3_moe_front",
+    "k3_moe",
+    "k3_route_quant",
+    "mnnvl_allgather_split",
 )
 
 #: The engine surface the first forward checks before this target relies on it: per object, the attributes read.
@@ -851,6 +863,7 @@ class KimiK3MoERuntime(nn.Module):
             raise ValueError("Kimi K3 runtime expects latent_moe_use_norm=True")
 
         situ_beta, situ_linear_beta = _resolve_kimi_situ_betas(cfg)
+        self._situ_betas = (situ_beta, situ_linear_beta)
         dtype = torch.bfloat16
 
         # Routing scores stay fp32; the gate GEMM runs bf16xbf16 with fp32
@@ -975,6 +988,9 @@ class KimiK3MoERuntime(nn.Module):
         self.routed_expert_norm = RMSNorm(
             hidden_size=self.moe_hidden_size, eps=cfg.rms_norm_eps, dtype=dtype
         )
+        # The decode path (decode_moe.py) and the decode GEMVs' state, set by the target's post_load_weights.
+        self.decode_moe: Optional[_decode_moe.K3DecodeMoeLayer] = None
+        self.decode_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
 
     @staticmethod
     def _routed_projection(hidden_states: torch.Tensor, projection: nn.Module) -> torch.Tensor:
@@ -1136,8 +1152,27 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = True
         return routed_model_config
 
-    def forward(self, hidden_states: torch.Tensor, all_rank_num_tokens=None) -> torch.Tensor:
-        """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
+    def tail_rp_eligible(self, hidden_states: torch.Tensor, step: Optional[DecodeStep]) -> bool:
+        """Whether this layer's forward on ``step`` can hand its output on as this rank's unreduced row-parallel
+        share (``partial_tail``): the decode path takes the step with that tail."""
+        return self.decode_moe is not None and self.decode_moe.takes(hidden_states, step, True)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        all_rank_num_tokens=None,
+        partial_tail: bool = False,
+        step: Optional[DecodeStep] = None,
+    ) -> Union[torch.Tensor, _decode_comm.PendingTail]:
+        """``hidden_states``: ``[num_tokens, hidden_size]`` bf16. ``step``: the step's classification
+        (``decode_step``); the decode path (``decode_moe.py``) runs the steps it takes. ``partial_tail`` (only where
+        ``tail_rp_eligible`` holds): return this rank's unreduced share of the output instead, a ``PendingTail`` at
+        most 8 tokens, a tensor on a wide decode step."""
+        decode = self.decode_moe
+        if decode is not None and decode.takes(hidden_states, step, partial_tail):
+            return decode.forward(self, hidden_states, self.decode_gemvs, partial_tail)
+        if partial_tail:
+            raise RuntimeError("the row-parallel MoE tail needs the decode path to take the step")
         identity = hidden_states
         router_logits = self.gate.compute_logits(hidden_states)
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
@@ -1439,7 +1474,9 @@ class KimiLinearDecoderLayer(nn.Module):
         capture: Optional[Tuple[Any, int]] = None,
         step: Optional[DecodeStep] = None,
         prenormed: bool = False,
-    ) -> Tuple[torch.Tensor, int]:
+        pending_moe_partial: Optional[Union[torch.Tensor, _decode_comm.PendingTail]] = None,
+        defer_moe_tail: bool = False,
+    ) -> Union[Tuple[torch.Tensor, int], Tuple[torch.Tensor, int, Any]]:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
 
         ``block_residual`` is a preallocated snapshot bank in kernel-native
@@ -1466,13 +1503,55 @@ class KimiLinearDecoderLayer(nn.Module):
         (``K3DecodeComm.sandwich_oproj``) where the sandwich takes the layer,
         the step and the attention's decode branch, else on the attention's
         unreduced o_proj output (``K3DecodeComm.allreduce_attn_res``).
+
+        ``pending_moe_partial`` (only where ``accepts_moe_partial`` held): the
+        previous layer's MoE output, unreduced (``defer_moe_tail``); then
+        ``hidden_states`` is the prefix sum without it, and this layer's
+        pre-attention step reduces and adds it: a ``PendingTail`` in one
+        ``K3DecodeComm.sandwich_tail`` call, a wide decode step's tensor by its
+        all-reduce and the fused add + attn_res + RMSNorm.
+
+        ``defer_moe_tail``: return ``(prefix_sum, num_snapshots, partial)``
+        instead, ``partial`` this layer's MoE output unreduced, for the next
+        consumer to reduce.
         """
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
         attn_res_max_tokens = _attn_res_max_tokens(step)
+        tail = (
+            pending_moe_partial
+            if isinstance(pending_moe_partial, _decode_comm.PendingTail)
+            else None
+        )
+        # A snapshot layer whose pre-attention step is the sandwich tail has the kernel store the running prefix sum
+        # straight into the bank row it snapshots.
+        snapshot_row = None
+        if tail is not None and self.layer_idx % self.attn_res_block_size == 0:
+            snapshot_row = block_residual[num_snapshots]
 
         if prenormed:
             assert num_snapshots == 0 and self.layer_idx % self.attn_res_block_size == 0
+            assert pending_moe_partial is None and capture is None
+        elif tail is not None:
+            hidden_states, prefix_sum = self.decode_comm.sandwich_tail(
+                tail,
+                prefix_sum,
+                valid_block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+                updated_out=snapshot_row,
+            )
+        elif pending_moe_partial is not None:
+            prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
+                prefix_sum,
+                _decode_comm.wide_all_reduce(self._o_allreduce(), pending_moe_partial),
+                valid_block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+                attn_res_max_tokens,
+            )
         elif capture is not None:
             # The mixture tap needs the PRE-norm value, which the fused
             # attn-res + RMSNorm kernel does not expose. Keep the two steps
@@ -1502,8 +1581,23 @@ class KimiLinearDecoderLayer(nn.Module):
         else:
             hidden_states = self.input_layernorm(hidden_states)
 
+        if capture is not None and pending_moe_partial is not None:
+            # The tapped layer handed its MoE output on: the step above reduced it into prefix_sum. Tap that value's
+            # pre-norm attn_res mixture, what the split path captures.
+            tapped = (
+                _apply_attn_res(
+                    prefix_sum,
+                    valid_block_residual,
+                    self.self_attention_res_proj,
+                    self.self_attention_res_norm,
+                )
+                if _AUX_ATTN_RES_STREAM_ENABLED
+                else prefix_sum
+            )
+            capture[0].maybe_capture_hidden_states(capture[1], tapped, None)
+
         if self.layer_idx % self.attn_res_block_size == 0:
-            if not prenormed:
+            if not prenormed and snapshot_row is None:
                 block_residual[num_snapshots].copy_(prefix_sum)
             num_snapshots += 1
             valid_block_residual = block_residual[:num_snapshots]
@@ -1540,7 +1634,7 @@ class KimiLinearDecoderLayer(nn.Module):
         else:
             if comm is not None and step is not None and step.wide:
                 partial = attention(hidden_states, attn_metadata, step=step, reduce_output=False)
-                attention_output = _decode_comm.wide_all_reduce(attention._o_allreduce, partial)
+                attention_output = _decode_comm.wide_all_reduce(self._o_allreduce(), partial)
             else:
                 attention_output = attention(hidden_states, attn_metadata, step=step)
             if prefix_sum is None:
@@ -1563,10 +1657,14 @@ class KimiLinearDecoderLayer(nn.Module):
                     self.post_attention_layernorm,
                     attn_res_max_tokens,
                 )
-        if self.is_moe:
-            hidden_states = self.block_sparse_moe(
-                hidden_states, getattr(attn_metadata, "all_rank_num_tokens", None)
+        all_rank_num_tokens = getattr(attn_metadata, "all_rank_num_tokens", None)
+        if self.is_moe and defer_moe_tail:
+            partial = self.block_sparse_moe(
+                hidden_states, all_rank_num_tokens, partial_tail=True, step=step
             )
+            return prefix_sum, num_snapshots, partial
+        if self.is_moe:
+            hidden_states = self.block_sparse_moe(hidden_states, all_rank_num_tokens, step=step)
         else:
             hidden_states = self._dense_mlp(hidden_states, step)
 
@@ -1596,6 +1694,15 @@ class KimiLinearDecoderLayer(nn.Module):
     def _o_proj(self) -> nn.Module:
         """This layer's attention output projection (row parallel)."""
         return self.linear_attn.o_proj if self.is_kda else self.self_attn.mixer.o_proj
+
+    def _o_allreduce(self) -> AllReduce:
+        """The all-reduce module of this layer's attention output; it also reduces a wide step's MoE partial."""
+        return (self.linear_attn if self.is_kda else self.self_attn)._o_allreduce
+
+    def accepts_moe_partial(self, num_snapshots: int) -> bool:
+        """Whether this layer's pre-attention step can reduce the previous layer's unreduced MoE output: the target
+        built its collective state, and the snapshot bank is not empty."""
+        return num_snapshots > 0 and self.decode_comm is not None
 
     def skip_forward(
         self,
@@ -1676,6 +1783,29 @@ class KimiLinearModel(DecoderModel):
             and all(layer.linear_attn.takes_k3_kernels for layer in self.layers if layer.is_kda)
         )
 
+    def _defer_moe_tail(
+        self,
+        i: int,
+        hidden_states: torch.Tensor,
+        num_snapshots: int,
+        spec_metadata,
+        capture_set,
+        step: Optional[DecodeStep],
+    ) -> bool:
+        """Whether layer ``i`` hands its MoE output on unreduced (the row-parallel tail, ``decode_moe.py``): its MoE
+        takes the step with that tail, and its consumer, the next layer's pre-attention step or the final norm after
+        the last layer, accepts it. A layer DSpark taps defers too: the next layer's step reduces the output, then taps
+        its pre-norm mixture. An unknown capture set (every layer tapped) and a tapped last layer keep the replicated
+        tail."""
+        layer = self.layers[i]
+        if not (layer.is_moe and layer.block_sparse_moe.tail_rp_eligible(hidden_states, step)):
+            return False
+        if spec_metadata is not None and (
+            capture_set is None or (layer.layer_idx in capture_set and i == len(self.layers) - 1)
+        ):
+            return False
+        return self.layers[min(i + 1, len(self.layers) - 1)].accepts_moe_partial(num_snapshots)
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1721,6 +1851,9 @@ class KimiLinearModel(DecoderModel):
             if spec_metadata is not None
             else None
         )
+        # A MoE layer's output handed on unreduced, which the next layer's pre-attention step (or the final norm)
+        # reduces: a decode_comm.PendingTail, or a wide decode step's tensor.
+        pending_moe_partial = None
         for i, layer in enumerate(self.layers):
             # DFlash/DSpark hidden-state capture. The drafter is distilled on
             # the aggregated stream value -- the pre-norm softmax mixture its
@@ -1739,7 +1872,10 @@ class KimiLinearModel(DecoderModel):
                 and (capture_set is None or self.layers[i - 1].layer_idx in capture_set)
             ):
                 capture = (spec_metadata, self.layers[i - 1].layer_idx)
-            hidden_states, num_snapshots = layer(
+            defer_moe_tail = self._defer_moe_tail(
+                i, hidden_states, num_snapshots, spec_metadata, capture_set, step
+            )
+            outputs = layer(
                 hidden_states,
                 block_residual,
                 num_snapshots,
@@ -1747,7 +1883,35 @@ class KimiLinearModel(DecoderModel):
                 capture=capture,
                 step=step,
                 prenormed=i == 0 and prenormed is not None,
+                pending_moe_partial=pending_moe_partial,
+                defer_moe_tail=defer_moe_tail,
             )
+            if defer_moe_tail:
+                hidden_states, num_snapshots, pending_moe_partial = outputs
+            else:
+                (hidden_states, num_snapshots), pending_moe_partial = outputs, None
+
+        if isinstance(pending_moe_partial, _decode_comm.PendingTail):
+            normed, _ = self.layers[-1].decode_comm.sandwich_tail(
+                pending_moe_partial,
+                hidden_states,
+                block_residual[:num_snapshots],
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                self.norm,
+            )
+            return normed
+        if pending_moe_partial is not None:
+            _, normed = _apply_attn_res_add_and_rmsnorm(
+                hidden_states,
+                _decode_comm.wide_all_reduce(self.layers[-1]._o_allreduce(), pending_moe_partial),
+                block_residual[:num_snapshots],
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                self.norm,
+                _attn_res_max_tokens(step),
+            )
+            return normed
 
         # The last layer has no successor, so this one recompute is
         # unavoidable -- output-side score weights, matching SGLang's
@@ -2405,8 +2569,9 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
         every layer of its kind: the KDA projection's Lamport buffers and the MLA decode attention's workspace; the
         decode GEMVs' state (built by ``cache_derived_state``) handed to every attention module; and, where every
         attention all-reduce runs over MNNVL, the TP group's collective state (``K3DecodeComm``, collective: every
-        rank builds it here) handed to every layer, with whether its sandwich takes the layer's o_proj, and the
-        decode path's one-shot ceiling on every stock MNNVL all-reduce (``use_decode_one_shot``)."""
+        rank builds it here) handed to every layer, with whether its sandwich takes the layer's o_proj, the decode
+        path's one-shot ceiling on every stock MNNVL all-reduce (``use_decode_one_shot``), and the MoE decode path
+        (``_build_decode_moe``)."""
         super().post_load_weights()
         kda = [layer.linear_attn for layer in self.model.layers if layer.is_kda]
         mla = [layer.self_attn.mixer for layer in self.model.layers if not layer.is_kda]
@@ -2433,6 +2598,7 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
             for layer in layers:
                 layer.decode_comm = comm
             _decode_comm.use_decode_one_shot(self)
+        moe_layers = 0 if comm is None else self._build_decode_moe(comm)
         logger.info(
             "Kimi K3 decode kernels: KDA on k3_kda_decode_attn, k3_kda_attn and k3_kda_verify "
             f"({sum(m.takes_k3_kernels for m in kda)} / {len(kda)} layers take them), MLA on k3_mla_qkv and "
@@ -2446,7 +2612,48 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
                 if comm is not None
                 else "unfused (an attention all-reduce does not run over MNNVL)"
             )
+            + f"; MoE on k3_moe_front, k3_moe and the row-parallel tail ({moe_layers} layers)"
         )
+
+    def _build_decode_moe(self, comm: _decode_comm.K3DecodeComm) -> int:
+        """The MoE decode path (``decode_moe.py``) on every MoE layer it takes: the shared state (collective: the
+        front's head workspace), each layer's decode weights with its latent norm folded into the latent up
+        projection, the decode GEMVs' state; then one call of every kernel of the path (collective: the front and
+        the sandwich tail). Every rank builds it here. Returns the number of MoE layers it takes."""
+        mapping = self.model_config.mapping
+        moes = [layer.block_sparse_moe for layer in self.model.layers if layer.is_moe]
+        gaps = {
+            id(moe): _decode_moe.layout_gaps(
+                moe, mapping.tp_size, self.model.num_attn_res_snapshots
+            )
+            for moe in moes
+        }
+        takes = [moe for moe in moes if not gaps[id(moe)]]
+        for reason in sorted({gap for moe in moes for gap in gaps[id(moe)]}):
+            logger.info_once(
+                f"Kimi K3 MoE decode path off on some layers: {reason}",
+                key=f"k3_decode_moe_off_{reason}",
+            )
+        if not takes:
+            return 0
+        backend = takes[0].routed_experts.backend
+        state = _decode_moe.K3DecodeMoe.create(
+            mapping,
+            backend.w3_w1_weight.device,
+            backend.w3_w1_weight.shape[1] // 2,
+            backend.expert_size_per_partition,
+            comm.mnnvl,
+        )
+        for moe in takes:
+            _decode_moe.fold_latent_norm(moe)
+            moe.decode_moe = _decode_moe.K3DecodeMoeLayer.create(
+                moe, state, mapping.tp_rank, mapping.tp_size
+            )
+            moe.decode_gemvs = self.model.decode_gemvs
+        first = takes[0].decode_moe
+        first.warm_up(takes[0])
+        comm.compile_tail(takes[0].moe_hidden_size, first.shared_cols, first.tail_weight)
+        return len(takes)
 
     def _check_step_contract(self, attn_metadata: AttentionMetadata) -> None:
         """First-forward checks of the engine surface and the per-engine settings."""

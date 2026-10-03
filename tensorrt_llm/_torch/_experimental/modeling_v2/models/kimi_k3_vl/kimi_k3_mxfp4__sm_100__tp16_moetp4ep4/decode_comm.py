@@ -13,6 +13,10 @@ aside) one collective runs both:
 * `K3DecodeComm.allreduce_attn_res`, `comm/mnnvl_allreduce_attn_res`, everywhere else: the one-shot MNNVL all-reduce
   of the attention's unreduced o_proj partial, with the residual update as its epilogue.
 
+The pre-attention step after a MoE layer whose row-parallel tail was handed on (a `PendingTail`, `decode_moe.py`) is
+the same kind of collective: `K3DecodeComm.sandwich_tail`, `comm/k3_sandwich_tail`, runs the tail GEMV, its
+all-reduce and the next layer's residual update (the final norm's, after the last layer) in one kernel.
+
 The state is one `MnnvlWorkspace` and one `K3SandwichWorkspace` of the TP group (`K3DecodeComm.create`): collective
 over the group and eager, built by the target in `post_load_weights` before any CUDA-graph capture. Every rank must
 make the same calls on each in the same order. Which call a step takes is decided from its token count and kind and
@@ -25,7 +29,7 @@ The plain MNNVL all-reduces the decode path keeps (the stock modules') send one-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 from torch import nn
@@ -33,6 +37,9 @@ from torch import nn
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_oproj import (
     K3SandwichWorkspace,
     k3_sandwich_oproj,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_tail import (
+    k3_sandwich_tail,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allreduce_attn_res import (
     mnnvl_allreduce_attn_res,
@@ -82,6 +89,18 @@ def wide_all_reduce(all_reduce: nn.Module, x: torch.Tensor) -> torch.Tensor:
         if out is not None:
             return out
     return all_reduce(x)
+
+
+class PendingTail(NamedTuple):
+    """A MoE layer's row-parallel tail left to its consumer's fused pre-attention step (``K3DecodeComm.sandwich_tail``):
+    the reduced latent ``[T, 3584]``, the shared experts' activation, the tail weight ``[latent up columns | padding |
+    shared down]``, this rank's first latent column and the latent norm's epsilon."""
+
+    latent: torch.Tensor
+    act: torch.Tensor
+    weight: torch.Tensor
+    lo: int
+    lat_eps: float
 
 
 def _eps(norm: nn.Module) -> float:
@@ -139,6 +158,30 @@ class K3DecodeComm:
             torch.cuda.synchronize(weight.device)
         return state
 
+    def compile_tail(self, latent_size: int, act_size: int, tail_weight: torch.Tensor) -> None:
+        """Compile the sandwich tail kernel for a MoE tail of ``latent_size`` latent and ``act_size`` shared columns
+        and ``tail_weight``'s shape, with one call on a zero row of a zero weight, before any capture. Collective: every
+        rank of the group makes the call; it advances the sandwich workspace on every rank alike."""
+        weight = torch.zeros_like(tail_weight)
+        hidden = weight.shape[0]
+        ones = weight.new_ones(hidden)
+        k3_sandwich_tail(
+            weight.new_zeros(1, latent_size),
+            weight.new_zeros(1, act_size),
+            weight,
+            0,
+            1e-6,
+            None,
+            weight.new_zeros(0, 1, hidden),
+            weight.new_zeros(hidden),
+            ones,
+            ones,
+            1e-6,
+            1e-6,
+            self.sandwich,
+        )
+        torch.cuda.synchronize(weight.device)
+
     def takes_post_attention(self, hidden_states: torch.Tensor, step) -> bool:
         """Whether one of this state's collectives runs the post-attention step of a layer whose attention input is
         ``hidden_states``: at most `AR_ATTN_RES_MAX_TOKENS` bf16 rows of a hidden size the MNNVL entry takes, on any
@@ -170,6 +213,15 @@ class K3DecodeComm:
             and _sandwich_op.supports(weight.new_empty((1, weight.shape[1])), weight, max_snapshots)
         )
 
+    @staticmethod
+    def takes_tail(
+        latent: torch.Tensor, act: torch.Tensor, tail_weight: torch.Tensor, max_snapshots: int
+    ) -> bool:
+        """Whether ``sandwich_tail`` takes a MoE tail of these tensors' shapes (rows of ``latent`` and ``act``, at most
+        `SANDWICH_MAX_TOKENS`; ``tail_weight``) with a snapshot bank of at most ``max_snapshots`` rows: the TP16
+        per-rank shapes."""
+        return _sandwich_op.supports_tail(latent, act, tail_weight, max_snapshots)
+
     def allreduce_attn_res(
         self,
         partial: torch.Tensor,
@@ -189,6 +241,33 @@ class K3DecodeComm:
             block_residual,
             *_res_args(res_proj, res_norm, out_norm),
             self.mnnvl,
+        )
+
+    def sandwich_tail(
+        self,
+        pending: PendingTail,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+        res_proj: nn.Module,
+        res_norm: nn.Module,
+        out_norm: nn.Module,
+        updated_out: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(normed, updated)`` as ``allreduce_attn_res`` of a MoE layer's row-parallel tail ``pending``
+        (``[RMSNorm(latent)[:, lo:lo + 224] | act] @ weight.T``), in one ``comm/k3_sandwich_tail`` call.
+        ``updated_out``: a bf16 ``[T, H]`` tensor the call stores ``updated`` into (the consumer's snapshot bank row),
+        returned as ``updated``."""
+        return k3_sandwich_tail(
+            pending.latent,
+            pending.act,
+            pending.weight,
+            pending.lo,
+            pending.lat_eps,
+            prefix_sum,
+            block_residual,
+            *_res_args(res_proj, res_norm, out_norm),
+            self.sandwich,
+            updated_out=updated_out,
         )
 
     def sandwich_oproj(
