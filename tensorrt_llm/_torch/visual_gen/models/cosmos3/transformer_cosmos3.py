@@ -92,6 +92,20 @@ def _noop_offload_context(_tower_name: str) -> ContextManager:
     return nullcontext()
 
 
+def _add_action_timestep_embedding(
+    hidden_action: torch.Tensor,
+    time_embed: torch.Tensor,
+    noisy_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    time_embed = time_embed.unsqueeze(1).expand_as(hidden_action)
+    if noisy_mask is not None:
+        time_embed = time_embed * noisy_mask.to(hidden_action.dtype)
+    indexes = torch.arange(hidden_action.shape[1], device=hidden_action.device)
+    indexes = indexes.view(1, -1, 1).expand_as(hidden_action)
+    # Match Framework's BF16 store before timestep scatter-add under torch.compile.
+    return hidden_action.scatter_add(1, indexes, time_embed)
+
+
 COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
 
 
@@ -474,6 +488,19 @@ class DomainAwareLinear(nn.Module):
         )
 
 
+def _project_video_tokens(tokens: torch.Tensor, projection: nn.Linear) -> torch.Tensor:
+    if tokens.is_contiguous():
+        return projection(tokens)
+    # Extra modality tokens leave gaps between video batches. nn.Linear then
+    # rounds the matmul to BF16 before adding bias; keep bias in the GEMM instead.
+    output = tokens.new_empty((*tokens.shape[:-1], projection.out_features))
+    for batch_idx in range(tokens.shape[0]):
+        torch.addmm(
+            projection.bias, tokens[batch_idx], projection.weight.t(), out=output[batch_idx]
+        )
+    return output
+
+
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -484,7 +511,6 @@ class TimestepEmbedder(nn.Module):
         hidden_size,
         frequency_embedding_size=256,
         max_period=10000,
-        target_dtype=torch.bfloat16,
     ):
         super().__init__()
         self.mlp = TimestepEmbedding(
@@ -495,7 +521,7 @@ class TimestepEmbedder(nn.Module):
 
         half = frequency_embedding_size // 2
         freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=target_dtype) / half
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
         )
         self.register_buffer("freqs", freqs, persistent=False)
 
@@ -507,7 +533,6 @@ class TimestepEmbedder(nn.Module):
         torch.nn.init.trunc_normal_(self.mlp.linear_2.weight, std=std, a=-3 * std, b=3 * std)
 
     def forward(self, t):
-        # use .float() here if acc loss
         args = t[:, None] * self.freqs[None]
         t_freq = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         t_emb = self.mlp(t_freq)
@@ -1285,8 +1310,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             self.llm2audio = nn.Linear(self.hidden_size, self.audio_dim)
             self.audio_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
 
-        # try timestep embedder in float32 if acc loss
-        self.time_embedder = TimestepEmbedder(self.hidden_size, target_dtype=torch.bfloat16)
+        self.time_embedder = TimestepEmbedder(self.hidden_size)
 
         self.gen_layers = nn.ModuleList(
             [
@@ -1590,6 +1614,18 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             "action_start_frame_offset", _int_key("action_start_frame_offset")
         )
 
+    @staticmethod
+    def _conditional_rows(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Trim a cached [2*B, ...] CFG tensor down to its conditional rows.
+
+        Returns ``tensor`` untouched unless its batch is exactly twice the requested
+        one, which only happens when a denoising step dropped the unconditional
+        branch after the cache was populated at the doubled batch.
+        """
+        if tensor.shape[0] != 2 * batch_size:
+            return tensor
+        return tensor[batch_size:]
+
     def reset_cache(self):
         self.cached_kv = None
         self.cached_real_text_lens = None
@@ -1800,12 +1836,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 self.pack_action(action_latents), action_domain_ids_tensor
             )
             hidden_action = hidden_action + self.action_modality_embed.to(hidden_action.dtype)
-            if action_noisy_mask is None:
-                hidden_action = hidden_action + time_embed.unsqueeze(1)
-            else:
-                hidden_action = hidden_action + time_embed.unsqueeze(1) * action_noisy_mask.to(
-                    hidden_action.dtype
-                )
+            hidden_action = _add_action_timestep_embedding(
+                hidden_action, time_embed, action_noisy_mask
+            )
             hidden_gen = torch.cat([hidden_gen, hidden_action], dim=1)
             # The rotary table is request-invariant: chunk size, prompt lengths,
             # fps and the frame offset are all fixed once the request starts.
@@ -1873,6 +1906,16 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         S_gen = hidden_gen.shape[1]
         hidden_gen = self.sharder.shard(hidden_gen, dim=1, pad_to_multiple=True)
         cos, sin = freqs_gen_combined
+        # The understanding K/V and the generation RoPE frequencies are both cached on
+        # the first denoising step, at whatever batch that step used. A later step may
+        # drop the unconditional branch once guidance reaches 1.0 (see
+        # ``BasePipeline.denoise``'s ``skip_uncond_at_scale_one``), which halves the
+        # generation batch. The cached rows are laid out as [unconditional,
+        # conditional], so the conditional half is the tail. A no-op when the batch is
+        # unchanged, which is every other configuration.
+        gen_batch = hidden_gen.shape[0]
+        cos = self._conditional_rows(cos, gen_batch)
+        sin = self._conditional_rows(sin, gen_batch)
         cos = self.sharder.shard(cos, dim=1, pad_to_multiple=True)
         sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
         freqs_gen = (cos, sin)
@@ -1880,6 +1923,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         with offload_context("generator"):
             for i, layer in enumerate(self.gen_layers):
                 k_und, v_und = self.cached_kv[i]
+                k_und = self._conditional_rows(k_und, gen_batch)
+                v_und = self._conditional_rows(v_und, gen_batch)
                 if not self.sharder.is_active:
                     hidden_gen = layer(
                         hidden_gen,
@@ -1906,7 +1951,12 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         # --- Decode video velocity ------------------------------------------------
         video_vel = self.unpatchify(
-            self.llm2vae(hidden_gen[:, T_control : T_control + T_vid_tokens]), T, H, W
+            _project_video_tokens(
+                hidden_gen[:, T_control : T_control + T_vid_tokens], self.llm2vae
+            ),
+            T,
+            H,
+            W,
         )
 
         # --- Decode extra-modality velocity (action XOR audio; follows video) ---

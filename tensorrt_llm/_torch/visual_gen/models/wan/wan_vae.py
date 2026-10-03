@@ -1095,9 +1095,9 @@ class WanRMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         norm_dim = 1 if self.channel_first else -1
-        # Normalize in fp32 for low-precision dtypes, then cast back, to avoid
-        # eps underflow producing NaNs (matches diffusers AutoencoderKLWan >=0.38.0).
-        needs_fp32_normalize = x.dtype in (torch.float16, torch.bfloat16) or any(
+        # Temporarily preserve Cosmos Framework's BF16 normalization rounding.
+        # Retain the FP16 and smaller-dtype underflow guard.
+        needs_fp32_normalize = x.dtype == torch.float16 or any(
             t in str(x.dtype) for t in ("float4_", "float8_")
         )
         normalized = F.normalize(x.float() if needs_fp32_normalize else x, dim=norm_dim).to(x.dtype)
