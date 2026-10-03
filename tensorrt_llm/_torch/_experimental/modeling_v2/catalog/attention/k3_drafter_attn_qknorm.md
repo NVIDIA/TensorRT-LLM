@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, tests: 8}
+  sm_100: {status: passed, tests: 16}
 ---
 
 # k3_drafter_attn_qknorm
@@ -55,7 +55,8 @@ def k3_drafter_attn_qknorm(
 | `cache`, `page_table`, `ctx_len`, `out` | as `k3_drafter_attn` | | | |
 | `num_heads`, `num_kv_heads` | 6 / 1 certified | Python int | — | — |
 
-Certified splits `R x T`: 1x1, 1x8, 2x4, 4x2, 8x1, 3x1, 2x8, 8x8, context lengths 0 to 2041.
+Certified splits `R x T`: 1x1, 1x8, 2x4, 4x2, 8x1, 3x1, 2x8, 8x8, and 1x7 to 8x7 (DSpark's block at
+`max_draft_len` 7), context lengths 0 to 2041.
 
 ## Metadata consumed
 

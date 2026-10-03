@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, tests: 20}
+  sm_100: {status: passed, tests: 36}
 ---
 
 # k3_drafter_attn
@@ -53,8 +53,9 @@ def k3_drafter_attn(
 | `num_heads`, `num_kv_heads` | 6 / 1 (Kimi K3 at TP16) and 24 / 4 (TP4) certified; `num_heads` = 6 `num_kv_heads` | Python int | — | — |
 | `out` | `[M, num_heads * 64]` | bf16 | contiguous | CUDA |
 
-Certified splits `R x T`: 1x1, 1x8, 2x4, 4x2, 8x1, 3x1, 2x8, 8x8, with context lengths 0 to 2041 (blocks crossing a
-page, 64- and 128-row boundaries, 2041 rows spanning the kernel's 16-tile round), at both head layouts.
+Certified splits `R x T`: 1x1, 1x8, 2x4, 4x2, 8x1, 3x1, 2x8, 8x8, and 1x7 to 8x7 (DSpark's block at
+`max_draft_len` 7), with context lengths 0 to 2041 (blocks crossing a page, 64- and 128-row boundaries, 2041 rows
+spanning the kernel's 16-tile round), at both head layouts.
 
 ## Metadata consumed
 
