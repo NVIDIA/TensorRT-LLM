@@ -1,6 +1,7 @@
 ---
 receipts:
   sm_103: {status: passed, tests: 47}
+  sm_100: {status: passed, tests: 49}
 ---
 
 # thop_attention
@@ -1949,5 +1950,5 @@ plays for the registered-layer entry points.)
   plus 7 drafts), at 6 heads per rank (TP16 attention, both Kimi K3 targets) and 96 (one rank):
   `test_kimi_k3_mla_generation_bf16_page64`. At 24 heads per rank (TP4) the trtllm-gen FMHA kernel selection
   raises `RuntimeError: Internal error numHeadsQ=24, numHeadsPerCta=16, numCtasForAllHeads=1` for these calls, so
-  the cell does not take that head count. The sm_103 receipt predates the two Kimi K3 cells and covers the other
-  47.
+  the cell does not take that head count. The sm_100 receipt covers the whole file (49 tests); the sm_103 receipt
+  predates the two Kimi K3 cells and covers the other 47.
