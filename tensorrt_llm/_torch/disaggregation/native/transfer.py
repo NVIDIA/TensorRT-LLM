@@ -56,6 +56,21 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TxSessionBase,
     WaitResult,
 )
+from tensorrt_llm._torch.disaggregation.lifecycle.ownership import (
+    PhysicalOperationState as _PhysicalOperationState,  # noqa: F401 -- native diagnostic alias
+)
+from tensorrt_llm._torch.disaggregation.lifecycle.ownership import (
+    ReceiveOperationOwner as _ReceiveOperationOwner,
+)
+from tensorrt_llm._torch.disaggregation.lifecycle.ownership import SendOperationOwner
+from tensorrt_llm._torch.disaggregation.lifecycle.ownership import (
+    TransferNotSubmittedError as _TransferNotSubmittedError,
+)
+from tensorrt_llm._torch.disaggregation.lifecycle.retirement import (
+    QuiescenceFatalEvent,
+    RetirementDeadline,
+    RetirementWatchdog,
+)
 from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBuffer,
     build_aux_transfer_layout,
@@ -70,11 +85,6 @@ from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.native.retirement import (
-    QuiescenceFatalEvent,
-    RetirementDeadline,
-    RetirementWatchdog,
-)
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
@@ -86,6 +96,8 @@ from tensorrt_llm._utils import CUASSERT, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.disaggregation.base.agent import TransferStatus
+
     from .bounce import Config
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
@@ -101,10 +113,6 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 # an overall deadline. KvCacheTransceiverV2 requires a configured transfer
 # timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
-
-
-class _TransferNotSubmittedError(RuntimeError):
-    """The sender rejected an operation before the backend could access memory."""
 
 
 @dataclass
@@ -329,251 +337,6 @@ class _LogicalTask:
         return self._logical_outcomes.get(self._logical_index)
 
 
-class _ReceiveOperationOwner:
-    """Track destination access independently from a task's logical result."""
-
-    def __init__(self, retirement: Optional[RetirementDeadline] = None) -> None:
-        self._retirement = retirement
-        self._lock = threading.Lock() if retirement is None else retirement.lock
-        self._publication_pending = False
-        self._cancelled_unpublished = False
-        self._expected_writers: Optional[int] = None
-        self._writer_cohort: Optional[frozenset[int]] = None
-        self._writer_candidates: Optional[frozenset[int]] = None
-        self._published_writers: Optional[frozenset[int]] = None
-        self._quiesced_sessions: set[int] = set()
-        self._writer_results: dict[int, bool] = {}
-        self._in_doubt_writers: set[int] = set()
-        self._settled_writers: set[int] = set()
-        self._publication_failed = False
-        self._local_completion_pending = False
-        self._invalid_evidence = False
-
-    def _settle_if_drained_locked(self) -> None:
-        """Remove this claim only after the complete cohort and local work settle."""
-        if self._retirement is not None and self._resources_drained_locked():
-            self._retirement.settle(self)
-
-    def _invalidate_evidence_locked(self) -> None:
-        """Quarantine conflicting proof, including proof disputed after settlement."""
-        self._invalid_evidence = True
-        if self._retirement is not None:
-            self._retirement.retain_unproven(self, "invalid receive ownership evidence")
-
-    def begin_publication(self) -> None:
-        with self._lock:
-            if self._publication_pending or self._expected_writers is not None:
-                raise RuntimeError("destination publication was already started")
-            self._publication_pending = True
-
-    def seal_writer_cohort(
-        self,
-        expected_writers: int,
-        writer_cohort: Optional[set[int]] = None,
-        *,
-        published_writers: Optional[set[int]] = None,
-    ) -> None:
-        if expected_writers < 0:
-            raise ValueError(f"expected_writers must be non-negative, got {expected_writers}")
-        cohort = None if writer_cohort is None else frozenset(writer_cohort)
-        candidates = cohort if published_writers is None else frozenset(published_writers)
-        if cohort is not None and len(cohort) != expected_writers:
-            raise ValueError(
-                f"writer cohort has {len(cohort)} member(s), expected {expected_writers}"
-            )
-        if candidates is not None and (
-            len(candidates) < expected_writers or (cohort is not None and not cohort <= candidates)
-        ):
-            raise ValueError("published candidates must cover every eligible writer")
-        with self._lock:
-            if self._expected_writers is not None:
-                if (
-                    self._expected_writers != expected_writers
-                    or self._writer_cohort != cohort
-                    or self._writer_candidates != candidates
-                ):
-                    raise RuntimeError("writer cohort was already sealed differently")
-                return
-            self._expected_writers = expected_writers
-            self._writer_cohort = cohort
-            self._writer_candidates = candidates
-            self._published_writers = candidates
-
-    def finish_publication(self) -> None:
-        """Record that every authorized REQUEST_DATA message was sent."""
-        with self._lock:
-            self._publication_pending = False
-            self._settle_if_drained_locked()
-
-    def abort_publication(self, published_writers: set[int]) -> None:
-        """Close a failed fan-out around the writers whose sends succeeded."""
-        with self._lock:
-            published = frozenset(published_writers)
-            if self._writer_cohort is not None and not published.issubset(self._writer_cohort):
-                self._invalidate_evidence_locked()
-                raise RuntimeError("publication recorded a writer outside the sealed cohort")
-            if not (self._writer_results.keys() | self._in_doubt_writers) <= published:
-                self._invalidate_evidence_locked()
-                raise RuntimeError("terminal evidence came from an unpublished writer")
-            self._expected_writers = len(published)
-            self._writer_cohort = frozenset(published)
-            self._published_writers = published
-            self._publication_failed = True
-            self._cancelled_unpublished = not published
-            self._publication_pending = False
-            self._settle_if_drained_locked()
-
-    def cancel_unpublished(self) -> bool:
-        """Close a publication that did not authorize a remote writer."""
-        with self._lock:
-            if self._invalid_evidence:
-                return False
-            if self._expected_writers is not None:
-                return self._cancelled_unpublished
-            self._cancelled_unpublished = True
-            self._expected_writers = 0
-            self._writer_cohort = frozenset()
-            self._published_writers = frozenset()
-            self._publication_pending = False
-            self._settle_if_drained_locked()
-            return True
-
-    def record_session_quiesced(self, peer_rank: int) -> None:
-        """Record no-future-access proof without inventing a per-piece result."""
-        with self._lock:
-            if self._writer_candidates is None or peer_rank not in self._writer_candidates:
-                self._invalidate_evidence_locked()
-                raise RuntimeError(f"session acknowledgment from unknown writer {peer_rank}")
-            if self._published_writers is not None and peer_rank in self._published_writers:
-                self._quiesced_sessions.add(peer_rank)
-                self._settle_if_drained_locked()
-
-    def record_writer_in_doubt(self, peer_rank: int) -> bool:
-        """Retain ownership after a writer reports no safe terminal evidence."""
-        with self._lock:
-            if self._expected_writers is None:
-                self._invalidate_evidence_locked()
-                raise RuntimeError(
-                    f"writer {peer_rank} reported ambiguous evidence before publication"
-                )
-            if self._writer_cohort is not None and peer_rank not in self._writer_cohort:
-                self._invalidate_evidence_locked()
-                raise RuntimeError(f"writer {peer_rank} is outside the sealed cohort")
-            if peer_rank in self._in_doubt_writers or peer_rank in self._settled_writers:
-                return False
-            self._in_doubt_writers.add(peer_rank)
-            if self._retirement is not None:
-                self._retirement.retain_unproven(self, "receive ownership is in doubt")
-            return True
-
-    def record_writer_settlement(self, peer_rank: int) -> bool:
-        """Accept physical DONE for a writer that previously reported IN_DOUBT.
-
-        Ordinary FAILED is not this proof: it may describe a later, unsubmitted
-        chunk while the earlier ambiguous write is still touching the destination.
-        """
-        with self._lock:
-            if self._expected_writers is None or (
-                self._writer_cohort is not None and peer_rank not in self._writer_cohort
-            ):
-                self._invalidate_evidence_locked()
-                raise RuntimeError(f"writer {peer_rank} settled outside the published cohort")
-            if peer_rank in self._settled_writers:
-                return False
-            if peer_rank not in self._in_doubt_writers:
-                self._invalidate_evidence_locked()
-                raise RuntimeError(f"writer {peer_rank} settled without prior ambiguous evidence")
-            if self._writer_results.get(peer_rank) is True:
-                self._invalidate_evidence_locked()
-                raise RuntimeError(f"writer {peer_rank} settled after contradictory success")
-            self._writer_results[peer_rank] = False
-            self._in_doubt_writers.remove(peer_rank)
-            self._settled_writers.add(peer_rank)
-            self._settle_if_drained_locked()
-            return True
-
-    def record_writer_result(
-        self,
-        peer_rank: int,
-        succeeded: bool,
-        *,
-        wait_for_local_completion: bool,
-    ) -> tuple[bool, bool]:
-        """Record one writer and return ``(accepted, all_succeeded)``."""
-        with self._lock:
-            if self._expected_writers is None:
-                self._invalidate_evidence_locked()
-                raise RuntimeError(
-                    f"writer {peer_rank} reported terminal evidence before publication"
-                )
-            if self._writer_cohort is not None and peer_rank not in self._writer_cohort:
-                self._invalidate_evidence_locked()
-                raise RuntimeError(f"writer {peer_rank} is outside the sealed cohort")
-            if peer_rank in self._in_doubt_writers:
-                if succeeded:
-                    self._invalidate_evidence_locked()
-                    raise RuntimeError(f"writer {peer_rank} reported success while in doubt")
-                return False, False
-            previous = self._writer_results.get(peer_rank)
-            if previous is not None:
-                if previous != succeeded:
-                    self._invalidate_evidence_locked()
-                    raise RuntimeError(
-                        f"writer {peer_rank} reported contradictory terminal evidence"
-                    )
-                return False, False
-            if len(self._writer_results) >= self._expected_writers:
-                return False, False
-            self._writer_results[peer_rank] = succeeded
-            all_reported = len(self._writer_results) == self._expected_writers
-            all_succeeded = (
-                all_reported and not self._publication_failed and all(self._writer_results.values())
-            )
-            if all_succeeded and wait_for_local_completion:
-                self._local_completion_pending = True
-            self._settle_if_drained_locked()
-            return True, all_succeeded
-
-    def finish_local_completion(self) -> None:
-        with self._lock:
-            self._local_completion_pending = False
-            self._settle_if_drained_locked()
-
-    @property
-    def all_writers_reported(self) -> bool:
-        """Whether every writer of the sealed cohort has reported a terminal result."""
-        with self._lock:
-            return (
-                self._expected_writers is not None
-                and len(self._writer_results) == self._expected_writers
-                and not self._in_doubt_writers
-            )
-
-    @property
-    def resources_drained(self) -> bool:
-        with self._lock:
-            return self._resources_drained_locked() and (
-                self._retirement is None or self._retirement.can_retire()
-            )
-
-    def _resources_drained_locked(self) -> bool:
-        """Check physical evidence without consulting the session's other owners."""
-        return (
-            self._expected_writers is not None
-            and (
-                len(self._writer_results) == self._expected_writers
-                or (
-                    self._published_writers is not None
-                    and self._published_writers <= self._quiesced_sessions
-                )
-            )
-            and not self._publication_pending
-            and not self._local_completion_pending
-            and not self._in_doubt_writers
-            and not self._invalid_evidence
-        )
-
-
 class AgentResult(Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
@@ -630,44 +393,6 @@ def _make_aux_result_msg(instance_rank: int, unique_rid: int, result: AgentResul
     ]
 
 
-class _PhysicalOperationState(Enum):
-    """Sender-side evidence for one peer's access to a task's source memory.
-
-    The legal forward paths are::
-
-        ADMITTED -> NOT_SUBMITTED
-        ADMITTED -> SUBMITTING -> SUBMITTED -> BACKEND_DONE
-        SUBMITTING -> IN_DOUBT
-        SUBMITTED -> IN_DOUBT -> BACKEND_DONE (same retained status reports DONE)
-
-    Only NOT_SUBMITTED and BACKEND_DONE prove that the operation can no longer
-    access the source. An IN_DOUBT operation without a retained backend status
-    cannot retire. Repeating a terminal transition is idempotent, and repeating
-    IN_DOUBT preserves the retained backend evidence.
-    """
-
-    ADMITTED = "ADMITTED"
-    SUBMITTING = "SUBMITTING"
-    SUBMITTED = "SUBMITTED"
-    NOT_SUBMITTED = "NOT_SUBMITTED"
-    BACKEND_DONE = "BACKEND_DONE"
-    IN_DOUBT = "IN_DOUBT"
-
-
-_DRAINED_PHYSICAL_OPERATION_STATES = frozenset(
-    (_PhysicalOperationState.NOT_SUBMITTED, _PhysicalOperationState.BACKEND_DONE)
-)
-
-
-@dataclass
-class _PhysicalOperation:
-    """State plus strong backend roots retained until physical quiescence."""
-
-    state: _PhysicalOperationState
-    request: Optional[TransferRequest] = None
-    status: Optional[object] = None
-
-
 @dataclass
 class _PendingSettlement:
     write_meta: WriteMeta
@@ -687,8 +412,9 @@ class SendTaskBase(_LogicalTask):
         self._params = params
         self._unique_rid: Optional[int] = params.disagg_request_id
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
-        self._physical_lock = threading.Lock()
-        self._physical_operations: dict[int, _PhysicalOperation] = {}
+        self._physical_owner = SendOperationOwner()
+        # Preserve the native diagnostic view of the shared owner's exact roots.
+        self._physical_operations = self._physical_owner._physical_operations
 
     def bind_logical_outcomes(self, outcomes: _LogicalOutcomes) -> None:
         """Bind session outcome and deadline before exposing the task to workers.
@@ -697,8 +423,7 @@ class SendTaskBase(_LogicalTask):
             outcomes: The session's stable logical-result arbiter.
         """
         super().bind_logical_outcomes(outcomes)
-        if self._retirement is not None:
-            self._physical_lock = self._retirement.lock
+        self._physical_owner.bind_retirement(self._retirement)
 
     def fail(self, exc: Exception) -> None:
         self._logical_outcomes.fail(exc)
@@ -720,142 +445,41 @@ class SendTaskBase(_LogicalTask):
         return self._event.is_set()
 
     def begin_physical_operation(self, peer_rank: int) -> bool:
-        with self._physical_lock:
-            if peer_rank in self._physical_operations:
-                return False
-            self._physical_operations[peer_rank] = _PhysicalOperation(
-                _PhysicalOperationState.ADMITTED
-            )
-            return True
+        """Admit a participant once in the shared physical owner."""
+        return self._physical_owner.begin_physical_operation(peer_rank)
 
-    def _require_physical_operation_locked(
-        self,
-        peer_rank: int,
-        expected_states: tuple[_PhysicalOperationState, ...],
-    ) -> _PhysicalOperation:
-        operation = self._physical_operations.get(peer_rank)
-        if operation is None:
-            raise RuntimeError(f"physical operation {peer_rank} was not admitted")
-        if operation.state not in expected_states:
-            expected = ", ".join(state.value for state in expected_states)
-            raise RuntimeError(
-                f"physical operation {peer_rank} is {operation.state.value}, expected {expected}"
-            )
-        return operation
+    def begin_backend_submission(self, peer_rank: int, request: TransferRequest) -> None:
+        """Root the request before the native backend submission escapes."""
+        self._physical_owner.begin_backend_submission(peer_rank, request)
 
-    def begin_backend_submission(
-        self,
-        peer_rank: int,
-        request: TransferRequest,
-    ) -> None:
-        with self._physical_lock:
-            operation = self._require_physical_operation_locked(
-                peer_rank, (_PhysicalOperationState.ADMITTED,)
-            )
-            if self._retirement is not None and not self._retirement.expose(operation):
-                operation.state = _PhysicalOperationState.NOT_SUBMITTED
-                raise _TransferNotSubmittedError("source retirement admission is closed")
-            operation.request = request
-            operation.state = _PhysicalOperationState.SUBMITTING
-
-    def record_backend_submission(self, peer_rank: int, status: object) -> None:
-        with self._physical_lock:
-            operation = self._require_physical_operation_locked(
-                peer_rank, (_PhysicalOperationState.SUBMITTING,)
-            )
-            operation.status = status
-            operation.state = _PhysicalOperationState.SUBMITTED
+    def record_backend_submission(self, peer_rank: int, status: TransferStatus) -> None:
+        """Retain the exact status returned by the native backend."""
+        self._physical_owner.record_backend_submission(peer_rank, status)
 
     def mark_physical_operation_in_doubt(self, peer_rank: int) -> None:
-        with self._physical_lock:
-            operation = self._require_physical_operation_locked(
-                peer_rank,
-                (
-                    _PhysicalOperationState.SUBMITTING,
-                    _PhysicalOperationState.SUBMITTED,
-                    _PhysicalOperationState.IN_DOUBT,
-                ),
-            )
-            operation.state = _PhysicalOperationState.IN_DOUBT
-            if self._retirement is not None:
-                self._retirement.request_drain("backend quiescence unproven")
+        """Retain ambiguous access independently of the logical outcome."""
+        self._physical_owner.mark_physical_operation_in_doubt(peer_rank)
 
     def retire_unsubmitted_physical_operation(self, peer_rank: int) -> None:
-        with self._physical_lock:
-            operation = self._require_physical_operation_locked(
-                peer_rank,
-                (
-                    _PhysicalOperationState.ADMITTED,
-                    _PhysicalOperationState.NOT_SUBMITTED,
-                ),
-            )
-            operation.state = _PhysicalOperationState.NOT_SUBMITTED
+        """Record that a participant never submitted a backend operation."""
+        self._physical_owner.retire_unsubmitted_physical_operation(peer_rank)
 
     def retire_backend_done_physical_operation(self, peer_rank: int) -> bool:
-        with self._physical_lock:
-            operation = self._require_physical_operation_locked(
-                peer_rank,
-                (
-                    _PhysicalOperationState.SUBMITTED,
-                    _PhysicalOperationState.BACKEND_DONE,
-                ),
-            )
-            if operation.state is _PhysicalOperationState.BACKEND_DONE:
-                return True
-            if self._retirement is not None and not self._retirement.settle(operation):
-                operation.state = _PhysicalOperationState.IN_DOUBT
-                return False
-            operation.request = None
-            operation.status = None
-            operation.state = _PhysicalOperationState.BACKEND_DONE
-            return True
+        """Settle backend-defined completion through the common deadline arbiter."""
+        return self._physical_owner.retire_backend_done_physical_operation(peer_rank)
 
     def poll_in_doubt_physical_operation(self, peer_rank: int) -> bool:
-        """Retire once, only after a fresh DONE query on the retained status.
-
-        Polling does not change the task's logical outcome. Keep strong local
-        roots across the query, and reject a result if its operation changed.
-        """
-        with self._physical_lock:
-            operation = self._physical_operations.get(peer_rank)
-            if operation is None or operation.state is not _PhysicalOperationState.IN_DOUBT:
-                return False
-            request, status = operation.request, operation.status
-        if status is None:
-            return False
-        try:
-            completed = status.is_completed()
-        except Exception:
-            # A backend query failure is not evidence that its accessors stopped.
-            return False
-        if completed is not True:
-            return False
-        with self._physical_lock:
-            if (
-                self._physical_operations.get(peer_rank) is not operation
-                or operation.state is not _PhysicalOperationState.IN_DOUBT
-                or operation.request is not request
-                or operation.status is not status
-            ):
-                return False
-            if self._retirement is not None and not self._retirement.settle(operation):
-                return False
-            operation.request = None
-            operation.status = None
-            operation.state = _PhysicalOperationState.BACKEND_DONE
-            return True
+        """Query and settle only the exact retained ambiguous operation."""
+        return self._physical_owner.poll_in_doubt_physical_operation(peer_rank)
 
     def has_started_physical_operation(self, peer_rank: int) -> bool:
-        with self._physical_lock:
-            return peer_rank in self._physical_operations
+        """Whether this task has admitted the participant."""
+        return self._physical_owner.has_started_physical_operation(peer_rank)
 
     @property
     def resources_drained(self) -> bool:
-        with self._physical_lock:
-            return (self._retirement is None or self._retirement.can_retire()) and all(
-                operation.state in _DRAINED_PHYSICAL_OPERATION_STATES
-                for operation in self._physical_operations.values()
-            )
+        """Whether operation evidence and the session deadline permit retirement."""
+        return self._physical_owner.resources_drained
 
     def print_perf_info(self, peer_rank: int, instance_name: str, instance_rank: int):
         if self._perf_timer is None:
