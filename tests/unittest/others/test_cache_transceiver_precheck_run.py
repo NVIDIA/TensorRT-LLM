@@ -1322,23 +1322,21 @@ class TestInternalApiContract:
 
     @pytest.mark.parametrize("role", ["ctx", "gen"])
     @pytest.mark.parametrize(
-        "topology",
+        "config_path",
         [
-            "con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3",
-            "con1456_ctx3_dep8_gen1_dep16_eplb0_dspark5",
+            pytest.param(path, id=f"{suite}/{path.stem}")
+            for suite in ("perf", "perf-sanity")
+            for path in sorted(
+                (Path(rp.__file__).parents[2] / suite / "disaggregated").glob("*deepseek-v4*.yaml")
+            )
         ],
     )
     def test_deepseek_v4_declared_architecture_without_checkpoint(
-        self, api: object, tmp_path: Path, role: str, topology: str
+        self, api: object, tmp_path: Path, role: str, config_path: Path
     ) -> None:
-        """Both failing configurations resolve V2/PYTHON without model weights."""
+        """All DeepSeek V4 disagg configurations resolve V2/PYTHON without weights."""
         import yaml
 
-        config_path = (
-            Path(rp.__file__).parent.parent
-            / "disaggregated"
-            / (f"gb300_deepseek-v4-pro-dspark_agentx_{topology}_ccb-NIXL.yaml")
-        )
         cfg = yaml.safe_load(config_path.read_text())
         assert rp.pcfg.resolve_model_dir(cfg, llm_models_root=str(tmp_path)) is None
         side = rp.pcfg.side_plan(rp.pcfg.resolve_plan(cfg), role)
