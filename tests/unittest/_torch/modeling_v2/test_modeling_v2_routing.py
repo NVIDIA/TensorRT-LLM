@@ -235,3 +235,102 @@ def test_an_unknown_mode_raises_rather_than_falling_back(monkeypatch):
     monkeypatch.setenv(MODELING_V2_ENV, "yes")
     with pytest.raises(ValueError, match="not a modeling_v2 mode"):
         ModelingV2Mode.from_env()
+
+
+_SM100 = (10, 0)
+_TP16_MOETP4EP4 = dict(world_size=16, tp_size=16, moe_tp_size=4, moe_ep_size=4)
+_K3_TARGET = "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4"
+
+
+def _k3_config(text_as_dict=False, **text_overrides):
+    """The shape Kimi K3's own config.json declares: a vision-language wrapper
+    whose language model is ``text_config``."""
+    text = dict(
+        model_type="kimi_linear",
+        num_hidden_layers=93,
+        hidden_size=7168,
+        num_experts=896,
+        routed_expert_hidden_size=3584,
+    )
+    text.update(text_overrides)
+    return PretrainedConfig(
+        architectures=["KimiK3ForConditionalGeneration"],
+        model_type="kimi_k3",
+        text_config=text if text_as_dict else PretrainedConfig(**text),
+    )
+
+
+@pytest.fixture
+def _on_sm100(monkeypatch):
+    """Route as if this were a GB200."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: _SM100)
+
+
+@pytest.mark.usefixtures("_on_sm100")
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("text_as_dict", [False, True], ids=["text-config", "text-dict"])
+def test_kimi_k3_tp16_moetp4ep4_matches(monkeypatch, mode, text_as_dict):
+    _set_mode(monkeypatch, mode)
+    config = _model_config(_k3_config(text_as_dict=text_as_dict), **_TP16_MOETP4EP4)
+    assert modeling_v2_resolve(config) == _K3_TARGET
+
+
+@pytest.mark.usefixtures("_on_sm100")
+def test_kimi_k3_target_registers_and_counts_as_external():
+    config = _model_config(_k3_config(), **_TP16_MOETP4EP4)
+    cls = get_registered_model_class(modeling_v2_resolve(config))
+    assert cls is not None and cls.__name__ == _K3_TARGET
+    assert not _is_builtin_model_class(cls)
+
+
+@pytest.mark.usefixtures("_on_sm100")
+def test_kimi_k3_nvfp4_requant_does_not_match(monkeypatch):
+    """The NVFP4 requant has the MXFP4 checkpoint's shape; its quantization
+    is what keeps it out of a target whose loader reads packed MXFP4 experts."""
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    config = ModelConfig(
+        pretrained_config=_k3_config(),
+        mapping=Mapping(**_TP16_MOETP4EP4),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
+    )
+    assert modeling_v2_resolve(config) is None
+
+    _set_mode(monkeypatch, "require")
+    with pytest.raises(ValueError, match="quant"):
+        modeling_v2_resolve(config)
+
+
+@pytest.mark.usefixtures("_on_sm100")
+@pytest.mark.parametrize(
+    "text_overrides, mapping_kwargs, missed",
+    [
+        # a Kimi-family checkpoint of another depth
+        (dict(num_hidden_layers=61), _TP16_MOETP4EP4, "shape"),
+        # route B's expert split: experts tensor-parallel 16 ways, no target yet
+        (dict(), dict(world_size=16, tp_size=16, moe_tp_size=16, moe_ep_size=1), "parallel"),
+        # attention data parallelism splits the requests, not the heads
+        (dict(), dict(_TP16_MOETP4EP4, enable_attention_dp=True), "parallel"),
+        # one tray instead of four
+        (dict(), dict(world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4), "parallel"),
+    ],
+)
+def test_kimi_k3_near_misses_do_not_match(monkeypatch, text_overrides, mapping_kwargs, missed):
+    config = _model_config(_k3_config(**text_overrides), **mapping_kwargs)
+    assert modeling_v2_resolve(config) is None
+
+    _set_mode(monkeypatch, "require")
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config)
+
+
+def test_kimi_k3_on_another_sm_does_not_match(monkeypatch):
+    """The autouse fixture routes as a GB300 (sm 10.3); the K3 target is sm 10.0 only."""
+    config = _model_config(_k3_config(), **_TP16_MOETP4EP4)
+    assert modeling_v2_resolve(config) is None
+
+    _set_mode(monkeypatch, "require")
+    with pytest.raises(ValueError) as excinfo:
+        modeling_v2_resolve(config)
+    assert "sm" in str(excinfo.value) and "(10, 3)" in str(excinfo.value)
