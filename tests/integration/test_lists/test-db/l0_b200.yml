@@ -286,6 +286,10 @@ l0_b200:
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_drafter_attn.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_drafter_attn_qknorm.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_fused_qk_norm_rope.py
+  # Kimi K3 DSpark decode kernels (CuTe DSL, SM 100), one GPU: the acceptance against vocabulary-sharded target
+  # logits and the drafter's context K / V. Their multi-rank tests are in l0_gb200_multi_gpus.yml.
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_spec_accept.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_ctx_kv.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial

@@ -58,6 +58,9 @@ l0_gb200_multi_gpus:
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_front.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_latent_reduce.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_push.py
+  # Kimi K3 DSpark decode kernels' cross-rank exchanges (sm_100): the sharded acceptance and the Markov chain, 4 ranks
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_spec_accept_sharded.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_markov.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_oproj_op_matrix.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_tail_op_matrix.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_plain_op_matrix.py
