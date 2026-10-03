@@ -2387,8 +2387,11 @@ class K3DecodeMLA(KimiK3MLAAttention):
 # The DSpark drafter: the stock GQA drafter, with a decode step's block on the drafter entries.
 # ----------------------------------------------------------------------------------------------------------------------
 
-#: The (requests, block tokens) splits attention/k3_drafter_attn_qknorm certifies.
-DRAFTER_ATTN_SPLITS = frozenset({(1, 1), (1, 8), (2, 4), (4, 2), (8, 1), (3, 1), (2, 8), (8, 8)})
+#: The (requests, block tokens) splits attention/k3_drafter_attn_qknorm certifies; R x 7 is DSpark's block at
+#: max_draft_len 7.
+DRAFTER_ATTN_SPLITS = frozenset(
+    {(1, 1), (1, 8), (2, 4), (4, 2), (8, 1), (3, 1), (2, 8), (8, 8)} | {(r, 7) for r in range(1, 9)}
+)
 # The drafter layout it certifies: 6 query heads and 1 KV head of 64 per rank, context pages of 64 rows, the q / k
 # RMSNorm's epsilon and the NeoX RoPE's base.
 _DRAFTER_HEADS = (6, 1)

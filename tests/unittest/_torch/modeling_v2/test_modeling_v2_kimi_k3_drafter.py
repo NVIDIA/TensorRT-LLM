@@ -205,9 +205,9 @@ def test_block_matches_the_stock_forward(drafter, gemvs, attn_calls, monkeypatch
 
 def test_an_uncertified_split_runs_the_stock_forward(drafter, attn_calls):
     drafter.decode_gemvs = None
-    batch, block = 2, 7
+    batch, block = 4, 4
     assert (batch, block) not in target.DRAFTER_ATTN_SPLITS
-    inputs = _block(batch, block, seed=27)
+    inputs = _block(batch, block, seed=44)
     stock_inputs = _copy(inputs)
     out = drafter.dflash_forward(**inputs)
     ref = DFlashForCausalLM.dflash_forward(drafter, **stock_inputs)
