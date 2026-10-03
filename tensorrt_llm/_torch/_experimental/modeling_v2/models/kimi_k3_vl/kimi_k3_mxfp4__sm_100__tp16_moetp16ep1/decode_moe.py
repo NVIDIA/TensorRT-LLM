@@ -341,6 +341,9 @@ class K3DecodeMoeLayer:
             args = [t.expand(rows, -1).contiguous() for t in (x_fp8, x_sf, ids, weights)]
             self._routed(*args, offset)
             if exchange is not None:
+                # Two calls on one layer must not run back to back (moe/k3_moe): the push build starts once the
+                # call above has ended.
+                torch.cuda.synchronize(device)
                 self._routed(*args, offset, push=True)
                 k3_latent_reduce(rows, exchange)
         # <<< route B

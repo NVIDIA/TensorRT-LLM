@@ -52,7 +52,11 @@ def k3_moe(
     acquires the front's outputs through the workspace's ready words and advances its epoch, so the front call before
     it must have published them (``moe/k3_moe_front`` with ``publish=True``). ``out``: bf16, contiguous, at
     least ``[M, 3584]``; the call writes its first M rows and returns an empty ``[0, 3584]`` tensor. Writes the state's
-    slab (left armed) and partial rows, and the layer's counters (left zero)."""
+    slab (left armed) and partial rows, and the layer's counters (left zero).
+
+    Two calls on one layer, in either form, must not run back to back: a call claims its first tile from the layer's
+    counters before its grid-dependency wait. Between the two, some kernel must wait for its predecessor before it
+    triggers its dependents (``griddepcontrol.wait``, then ``launch_dependents``), or the stream is synchronized."""
     state = layer.state
     if (head is not None) != state.head_flags:
         raise ValueError(
@@ -80,7 +84,8 @@ def k3_moe_push(
     (default ``exchange.rank``) of every rank's ``exchange`` (a TP group's ``K3LatentExchange``) instead of returned.
     One ``comm/k3_latent_reduce`` of the M tokens on that exchange must follow before the next push, on every rank in
     the same order. ``head`` as in :func:`k3_moe`. Writes the state's slab (left armed) and partial rows, the layer's
-    counters (left zero), and every rank's exchange."""
+    counters (left zero), and every rank's exchange. As for :func:`k3_moe`, two calls on one layer must not run back to
+    back."""
     state = layer.state
     if (head is not None) != state.head_flags:
         raise ValueError(

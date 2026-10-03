@@ -275,6 +275,9 @@ class K3DecodeMoeLayer:
         k3_moe(x_fp8, x_sf, ids, weights, offset, self.small)
         exchange = self.state.exchange
         if exchange is not None:
+            # Two calls on one layer must not run back to back (moe/k3_moe): the push build starts once the call
+            # above has ended.
+            torch.cuda.synchronize(device)
             k3_moe_push(x_fp8, x_sf, ids, weights, offset, self.small, exchange)
             k3_latent_reduce(1, exchange)
         logits = torch.zeros(1, moe.num_experts, dtype=torch.float32, device=device)
