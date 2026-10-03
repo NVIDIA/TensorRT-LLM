@@ -14,10 +14,20 @@ from ..test_llm import get_model_path
 from .openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
 from .utils import expand_slurm_nodelist, wait_for_endpoint_down, wait_for_endpoint_ready
 
-RANK = int(os.environ.get("SLURM_PROCID", 0))
-NODE_RANK = int(os.environ.get("SLURM_NODEID", 0))
-NODE_LIST = expand_slurm_nodelist(os.environ.get("SLURM_NODELIST", ""))
-SLURM_NTASKS_PER_NODE = int(os.environ.get("SLURM_NTASKS_PER_NODE", 1))
+
+def _slurm_topology_env(name: str, default: str) -> str:
+    # trtllm-llmapi-launch, which CI wraps this test in for multi-node stages,
+    # unsets every SLURM_* variable before running the task child and republishes
+    # the topology as TLLM_SLURM_*. Without that fallback the node identity
+    # silently collapses to the defaults: every node believes it is node 0 and
+    # the node list comes back empty.
+    return os.environ.get(f"SLURM_{name}") or os.environ.get(f"TLLM_SLURM_{name}") or default
+
+
+RANK = int(_slurm_topology_env("PROCID", "0"))
+NODE_RANK = int(_slurm_topology_env("NODEID", "0"))
+NODE_LIST = expand_slurm_nodelist(_slurm_topology_env("NODELIST", ""))
+SLURM_NTASKS_PER_NODE = int(_slurm_topology_env("NTASKS_PER_NODE", "1"))
 
 # This a multi-node QA test, use a fixed port instead of finding a free port
 # so that all nodes can have the same disagg server config
@@ -51,7 +61,12 @@ def env():
         k: v
         for k, v in os.environ.items()
         if not ("PMI_" in k or "OMPI_" in k or "PMIX_" in k or "SLURM_" in k)
-        and k not in ["UCX_TLS", "UCX_NET_DEVICES"]
+        # UCX_TLS is dropped to avoid UCX failure on oci. UCX_NET_DEVICES is
+        # deliberately kept: cluster images pin it to a working interface (e.g.
+        # eth0), and without the pin UCX tries every interface and dies on
+        # unbindable ones (GB300 NVL72 rdma_vf_rail0 IPv6 bind failure), taking
+        # the worker's NIXL UCX backend down with it.
+        and k != "UCX_TLS"
     }
 
 
