@@ -599,6 +599,74 @@ def test_kda_prefill_op_rejects_misaligned_state_indices() -> None:
 
 
 @torch.no_grad()
+@pytest.mark.parametrize(
+    "sequence_lengths",
+    [[100, 200], None],
+    ids=["varlen", "equal-length-padded"],
+)
+def test_kda_prefill_op_output_survives_the_next_call(sequence_lengths) -> None:
+    """The op's output belongs to the caller, as its fake (a new tensor) declares.
+
+    A second call with the same shapes and other inputs must leave the first
+    call's output as it was. ``None`` runs one 300-token row without
+    cu_seqlens, which the op pads to a chunk multiple and slices back.
+    """
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_custom_ops  # noqa: F401
+    from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
+
+    heads = 2
+    tokens = sum(sequence_lengths) if sequence_lengths else 300
+    rows = len(sequence_lengths) if sequence_lengths else 1
+    state_pool = torch.zeros(rows, heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device="cuda")
+    state_indices = torch.arange(rows, dtype=torch.int32, device="cuda")
+    cu_seqlens = None
+    chunk_indices = None
+    if sequence_lengths:
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+            dtype=torch.long,
+            device="cuda",
+        )
+        chunk_indices = prepare_chunk_indices(cu_seqlens, 64)
+
+    def call(seed: int) -> torch.Tensor:
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        shape = (1, tokens, heads, HEAD_DIM)
+
+        def unit() -> torch.Tensor:
+            t = torch.randn(*shape, generator=gen, device="cuda")
+            return (t / t.norm(dim=-1, keepdim=True)).to(torch.bfloat16)
+
+        state_pool.zero_()
+        return torch.ops.trtllm.kda_prefill(
+            q=unit(),
+            k=unit(),
+            v=(torch.randn(*shape, generator=gen, device="cuda") * 0.5).to(torch.bfloat16),
+            g=torch.randn(*shape, generator=gen, device="cuda").to(torch.bfloat16),
+            beta=torch.randn(1, tokens, heads, generator=gen, device="cuda"),
+            state_pool=state_pool,
+            state_indices=state_indices,
+            scale=HEAD_DIM**-0.5,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            safe_gate=True,
+            lower_bound=-5.0,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            A_log=torch.zeros(heads, device="cuda"),
+            dt_bias=torch.zeros(heads * HEAD_DIM, device="cuda"),
+        )
+
+    first = call(seed=0)
+    kept = first.clone()
+    second = call(seed=1)
+    torch.cuda.synchronize()
+    assert first.shape == second.shape == (1, tokens, heads, HEAD_DIM)
+    assert not torch.equal(second, kept), "the two calls must compute different outputs"
+    assert torch.equal(first, kept), "a later call wrote an earlier call's output"
+
+
+@torch.no_grad()
 def test_kda_prefill_op_partial_final_chunk_large_batch():
     """Regression: varlen batches whose FINAL chunk is partial.
 
