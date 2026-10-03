@@ -213,17 +213,21 @@ def uniform_subpages_per_slot(kv_cache_manager) -> int:
     for the whole pool and prepare() can expand the block table without naming
     a layer (see subpage_block_table). A manager with no sub-page pool, or one
     whose groups disagree, reports 0 rather than a guess.
+
+    NVFP4 sparse layers and the shared draft layer of a hybrid NVFP4 cache are
+    skipped: this decode path reads neither, and they can sit in pools with a
+    different factor from the dense FP8 target layers.
     """
     get_pool = getattr(kv_cache_manager, "get_kv_subpage_pool", None)
     layer_offsets = getattr(kv_cache_manager, "layer_offsets", None)
     if get_pool is None or not layer_offsets:
         return 0
     is_nvfp4 = getattr(kv_cache_manager, "is_nvfp4_layer", lambda _: False)
-    is_subpaged = getattr(kv_cache_manager, "is_fp8_subpaged_layer", lambda _: False)
+    is_hybrid_draft = getattr(kv_cache_manager, "is_hybrid_draft_layer", lambda _: False)
     factors = {
         int(get_pool(layer_idx, "HND")[1])
         for layer_idx in layer_offsets
-        if not is_nvfp4(layer_idx) and not is_subpaged(layer_idx)
+        if not is_nvfp4(layer_idx) and not is_hybrid_draft(layer_idx)
     }
     return factors.pop() if len(factors) == 1 else 0
 

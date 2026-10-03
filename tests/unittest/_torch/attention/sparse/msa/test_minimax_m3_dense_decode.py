@@ -158,6 +158,20 @@ def test_uniform_subpages_per_slot(factors, expected):
     assert uniform_subpages_per_slot(_PerLayerFactors(factors)) == expected
 
 
+def test_uniform_subpages_per_slot_skips_nvfp4_and_hybrid_draft_layers():
+    """A hybrid NVFP4 cache stages the dense FP8 target layers' factor only;
+    its sparse NVFP4 layers and shared draft layer may sit in other pools."""
+
+    class _Hybrid(_PerLayerFactors):
+        def is_nvfp4_layer(self, layer_idx: int) -> bool:
+            return layer_idx == 1
+
+        def is_hybrid_draft_layer(self, layer_idx: int) -> bool:
+            return layer_idx == 3
+
+    assert uniform_subpages_per_slot(_Hybrid({0: 8, 1: 3, 2: 8, 3: 5})) == 8
+
+
 def test_uniform_subpages_per_slot_reports_zero_without_a_pool():
     """A manager with no sub-page pool leaves each dense layer to expand its
     own table, rather than being staged against a guessed factor."""
