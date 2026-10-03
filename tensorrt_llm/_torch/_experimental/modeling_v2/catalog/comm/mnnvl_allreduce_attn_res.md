@@ -55,7 +55,7 @@ def mnnvl_allreduce_attn_res(
 |---|---|---|---|---|
 | `input` | `[T, H]`; `H` = 7168 certified (the op takes a multiple of 1024 up to 8192); `T` 1-8 and 16 certified, at most `workspace.max_one_shot_tokens(H)` | bf16 | contiguous | CUDA, this rank's device |
 | `prefix_sum` | `None`, or `[T, H]` | bf16 | contiguous | CUDA |
-| `block_residual` | `[S, T, H]`, `S` = 0..11 (certified at 0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11) | bf16 | contiguous | CUDA |
+| `block_residual` | `[S, T, H]`, `S` = 0..11 (all certified) | bf16 | contiguous | CUDA |
 | `res_weight`, `rms_weight`, `output_rms_weight` | `[H]` | bf16 | contiguous | CUDA |
 | `rms_eps`, `output_rms_eps` | scalar | Python float | — | — |
 | `workspace` | an `MnnvlWorkspace` of this rank's TP group (see *State*) | — | — | — |
