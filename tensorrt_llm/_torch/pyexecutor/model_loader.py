@@ -1922,6 +1922,8 @@ class ModelLoader:
             multimodal_config=self.llm_args.multimodal_config,
             use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
             use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
+            lm_head_dtype=(torch.float32 if self.llm_args.lm_head_dtype
+                           == "float32" else None),
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)

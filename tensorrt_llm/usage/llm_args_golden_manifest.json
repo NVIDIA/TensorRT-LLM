@@ -828,6 +828,15 @@
     {
       "allowed_values": [
         "auto",
+        "float32"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "lm_head_dtype"
+    },
+    {
+      "allowed_values": [
+        "auto",
         "dummy",
         "vision_only",
         "gms",

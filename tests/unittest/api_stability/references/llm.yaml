@@ -171,6 +171,10 @@ methods:
         annotation: bool
         default: False
         status: beta
+      lm_head_dtype:
+        annotation: Literal['auto', 'float32']
+        default: auto
+        status: prototype
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         status: beta
