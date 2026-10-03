@@ -158,6 +158,9 @@ def test_cuda_graph_replay_matches_eager() -> None:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = attn_res_fwd(*inputs, RMS_EPS)
+        # One replay before the poison: under cudaMallocAsync the captured outputs are graph allocations, backed by
+        # memory only once the graph has run.
+        graph.replay()
         for tensor in captured:
             tensor.fill_(float("nan"))
         graph.replay()
@@ -166,3 +169,5 @@ def test_cuda_graph_replay_matches_eager() -> None:
             assert torch.equal(_bits(actual), _bits(expected)), (
                 f"T={num_tokens} N={num_candidates}: replayed {name} differs from eager"
             )
+        # Freed here rather than inside the next capture, where cudaMallocAsync's free would be part of it.
+        del captured
