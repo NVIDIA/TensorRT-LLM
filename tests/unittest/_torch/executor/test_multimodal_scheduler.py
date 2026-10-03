@@ -18,6 +18,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
 )
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     MultimodalEncoderProgress,
     MultimodalEncoderRequestError,
@@ -32,6 +33,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     MultimodalScheduler,
     ScheduledRequests,
 )
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -39,6 +41,7 @@ from tensorrt_llm.inputs.multimodal import (
     strip_mm_encoder_inputs,
 )
 from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 
 
 class _CapacityScheduler:
@@ -758,3 +761,182 @@ def test_mm_encoder_state_publishes_the_buffer_without_copying():
     assert state.progress is MultimodalEncoderProgress.READY
     assert state.pending_item_indices() == []
     assert state.resident_output_bytes(4) == (2 + 3) * 4
+
+
+# MultimodalScheduler over a combined KVCacheV2Scheduler, the default for
+# item-scheduled models on KV cache manager V2, with FCFS chunked prefill. The
+# KV cache manager is a mock whose contexts draw tokens from one pool;
+# everything else is real. Each stall scenario admits all of its requests in
+# the first pass, as under attention DP, which skips the executor's MM
+# admission gate. With the gate, the newer requests would wait in the queue
+# and the same inputs finish on main.
+_BYTES_PER_ROW = 4
+
+
+def _make_v2_multimodal_scheduler(
+    *, kv_capacity, max_num_tokens, encoder_max_num_tokens, encoder_batch_size
+):
+    kv_allocated = {}
+    manager = Mock(spec=KVCacheManagerV2)
+    manager.tokens_per_block = 10
+    manager.enable_block_reuse = False
+    manager.enable_joint_kv_cache_reuse = False
+    manager._has_cp_helix = False
+    manager.kv_cache_map = {}
+
+    def prepare_context(request):
+        manager.kv_cache_map.setdefault(request.py_request_id, Mock())
+        kv_allocated.setdefault(request.py_request_id, 0)
+        return True
+
+    def resize_context(request, num_tokens):
+        growth = request.context_current_position + num_tokens - kv_allocated[request.py_request_id]
+        if growth > kv_capacity - sum(kv_allocated.values()):
+            return False
+        kv_allocated[request.py_request_id] += max(growth, 0)
+        return True
+
+    def free_resources(request):
+        manager.kv_cache_map.pop(request.py_request_id, None)
+        kv_allocated.pop(request.py_request_id, None)
+
+    manager.prepare_context.side_effect = prepare_context
+    manager.resize_context.side_effect = resize_context
+    manager.free_resources.side_effect = free_resources
+    v2_scheduler = KVCacheV2Scheduler(
+        max_batch_size=8,
+        max_num_tokens=max_num_tokens,
+        kv_cache_manager=manager,
+        scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 10),
+    )
+    scheduler = MultimodalScheduler(
+        v2_scheduler,
+        max_batch_size=encoder_batch_size,
+        max_num_tokens=encoder_max_num_tokens,
+        # Item-scheduled models emit one embedding row per 4 encoder tokens.
+        output_budget_bytes=encoder_max_num_tokens // 4 * _BYTES_PER_ROW,
+        bytes_per_encoder_embedding=_BYTES_PER_ROW,
+    )
+    return scheduler, kv_allocated
+
+
+def _make_v2_request(request_id, prompt_len, item_rows=()):
+    if not item_rows:
+        return make_llm_request(request_id, prompt_len=prompt_len)
+    return make_mm_request(
+        request_id,
+        [4 * rows for rows in item_rows],
+        embedding_lengths=item_rows,
+        prompt_len=prompt_len,
+    )
+
+
+def _run_prefill(scheduler, requests, *, arrivals=None, before_pass=None, max_passes=8):
+    """Encode the selected items and run the scheduled chunks each pass, like the executor.
+
+    Requests in ``arrivals`` join at the start of their pass. Returns the pass
+    in which each request finished prefill.
+    """
+    active, finished = list(requests), {}
+    for pass_idx in range(1, max_passes + 1):
+        active.extend((arrivals or {}).get(pass_idx, ()))
+        if before_pass is not None:
+            before_pass(pass_idx)
+        output = scheduler.schedule_request(active, set())
+        requests_by_id = {request.request_id: request for request in active}
+        for request_id, item_indices in (output.scheduled_mm_encoder_items or {}).items():
+            for item_idx in item_indices:
+                record_output(requests_by_id[request_id].py_mm_encoder_state, item_idx)
+        for request in output.context_requests:
+            assert is_multimodal_encoder_ready(request)
+            request.context_current_position += request.context_chunk_size
+            if request.context_remaining_length == 0:
+                # Prefill consumed the encoder outputs.
+                request.py_mm_encoder_state = None
+                scheduler.scheduler.kv_cache_manager.free_resources(request)
+                active.remove(request)
+                finished[request.request_id] = pass_idx
+    return finished
+
+
+def test_v2_chunked_prefill_spends_encoder_budget_in_admission_order():
+    # Two encoder slots; the 12 B output budget holds 3 embedding rows.
+    scheduler, _ = _make_v2_multimodal_scheduler(
+        kv_capacity=80, max_num_tokens=60, encoder_max_num_tokens=12, encoder_batch_size=2
+    )
+    first = _make_v2_request(1, 10, [1])
+    second = _make_v2_request(2, 40, [2, 1])
+    third = _make_v2_request(3, 80, [1, 1])
+
+    # V2 returns the third request's non-last chunk first, but the encoder
+    # budget must still go to the oldest request first. The second request's
+    # outputs cannot fit beside the others', and while it waits it must not
+    # hold KV cache: the third request needs all 80 tokens to finish.
+    assert _run_prefill(scheduler, [first, second, third]) == {1: 1, 3: 3, 2: 4}
+
+
+def test_v2_partially_encoded_request_is_not_starved_by_older_context():
+    # One encoder slot; the 32 B output budget holds 8 embedding rows.
+    scheduler, kv_allocated = _make_v2_multimodal_scheduler(
+        kv_capacity=100, max_num_tokens=50, encoder_max_num_tokens=32, encoder_batch_size=1
+    )
+    older = _make_v2_request(1, 80, [1])
+    partial = _make_v2_request(2, 20, [4, 4])
+    text = _make_v2_request(3, 70)
+
+    def decodes_hold_kv_in_first_pass(pass_idx):
+        kv_allocated["decodes"] = 60 if pass_idx == 1 else 0
+
+    # In pass 1 the older request's chunk does not fit beside the decodes, so
+    # the second request starts encoding first and fills the output budget.
+    # The older request must then not take the token budget the second one
+    # needs to finish. It still goes before the text request: V2 never
+    # preempts one context for another, so if the text request started first,
+    # the two would split the KV cache and deadlock.
+    finished = _run_prefill(
+        scheduler, [older, partial, text], before_pass=decodes_hold_kv_in_first_pass
+    )
+
+    assert finished == {2: 2, 1: 4, 3: 5}
+
+
+def test_v2_output_budget_wait_does_not_hold_back_newer_requests():
+    # One encoder slot; the 32 B output budget holds 8 embedding rows, which
+    # the first request fills while it encodes one item per pass.
+    scheduler, _ = _make_v2_multimodal_scheduler(
+        kv_capacity=1000, max_num_tokens=60, encoder_max_num_tokens=32, encoder_batch_size=1
+    )
+    holder = _make_v2_request(1, 30, [2, 2, 2, 2])
+    waiting = _make_v2_request(2, 10, [1])
+    text = _make_v2_request(3, 10)
+
+    # The second request cannot start encoding until the first one prefills,
+    # but a newer request that is ready runs meanwhile.
+    finished = _run_prefill(scheduler, [holder, waiting], arrivals={2: [text]})
+
+    assert finished == {1: 4, 2: 5, 3: 2}
+
+
+def test_v2_context_that_lost_the_encoder_slot_keeps_its_kv_cache():
+    # One encoder slot; the 12 B output budget holds 3 embedding rows, enough
+    # for both requests, so only the slot keeps the second one waiting.
+    scheduler, kv_allocated = _make_v2_multimodal_scheduler(
+        kv_capacity=100, max_num_tokens=60, encoder_max_num_tokens=12, encoder_batch_size=1
+    )
+    first = _make_v2_request(1, 30, [1, 1])
+    second = _make_v2_request(2, 10, [1])
+
+    def decodes_take_free_kv_in_passes_2_to_4(pass_idx):
+        kv_allocated.pop("decodes", None)
+        if 2 <= pass_idx <= 4:
+            kv_allocated["decodes"] = 100 - sum(kv_allocated.values())
+
+    # The first request takes the slot for two passes. The second request is
+    # served next and must keep its KV cache while it waits for the slot;
+    # without it, growing decodes would take that space and delay it.
+    finished = _run_prefill(
+        scheduler, [first, second], before_pass=decodes_take_free_kv_in_passes_2_to_4
+    )
+
+    assert finished == {1: 2, 2: 3}

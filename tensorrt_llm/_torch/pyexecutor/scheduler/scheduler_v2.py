@@ -775,16 +775,23 @@ class KVCacheV2Scheduler(RequestScheduler):
         if first_chunk and result[0] is not ScheduleAction.SCHEDULED:
             # Failed admission must not retain prefix-reuse holds. Suspension
             # alone cannot release them when the last cache tier is full.
-            for manager in (
-                self.kv_cache_manager,
-                self.draft_kv_cache_manager,
-                self.cross_kv_cache_manager,
-            ):
-                if manager is not None and req.py_request_id in manager.kv_cache_map:
-                    manager.free_resources(req)
-            rewind_context_after_cache_drop(req, self.tokens_per_block)
+            self.release_context_admission(req)
 
         return result
+
+    def release_context_admission(self, req: LlmRequest) -> None:
+        """Free a first-chunk context's caches in every pool and rewind its cursor.
+
+        Its next admission then starts from a fresh prefix match.
+        """
+        for manager in (
+            self.kv_cache_manager,
+            self.draft_kv_cache_manager,
+            self.cross_kv_cache_manager,
+        ):
+            if manager is not None and req.py_request_id in manager.kv_cache_map:
+                manager.free_resources(req)
+        rewind_context_after_cache_drop(req, self.tokens_per_block)
 
     def _try_schedule_context_full(
         self,
