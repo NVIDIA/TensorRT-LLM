@@ -98,6 +98,7 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModel, register_aut
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.kimi_k3_mla import KimiK3MLAAttention
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
+from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import maybe_bcg_kda_core_inplace
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.situ import SituAndMul
@@ -182,6 +183,7 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.models.modeling_utils.DecoderModel",
     # The text model's stock modules.
     "tensorrt_llm._torch.modules.kimi_kda.KimiKDALinearAttention",
+    "tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer.maybe_bcg_kda_core_inplace",
     "tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops",
     "tensorrt_llm._torch.modules.kimi_k3_mla.KimiK3MLAAttention",
     "tensorrt_llm._torch.moe.fused_moe.create_moe",
@@ -1252,15 +1254,27 @@ class KimiMLARuntime(nn.Module):
             aux_stream_dict=aux_stream_dict,
         )
 
+    def will_run_decode_branch(
+        self, attn_metadata: AttentionMetadata, step: Optional[DecodeStep]
+    ) -> bool:
+        """Whether the mixer runs ``step`` on the decode kernels (``K3DecodeMLA.will_run_decode_branch``)."""
+        return self.mixer.will_run_decode_branch(attn_metadata, step)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         step: Optional[DecodeStep] = None,
+        reduce_output: bool = True,
+        project_output: bool = True,
     ) -> torch.Tensor:
+        """``reduce_output=False`` returns ``o_proj``'s TP partial (no all-reduce); ``project_output=False`` the
+        mixer's gated attention output before ``o_proj``, only where ``will_run_decode_branch`` holds."""
         # MLA.forward takes position_ids first; K3 is NoPE, so pass None.
-        out = self.mixer(None, hidden_states, attn_metadata, step=step)
-        if self._o_allreduce is not None:
+        out = self.mixer(
+            None, hidden_states, attn_metadata, step=step, project_output=project_output
+        )
+        if project_output and reduce_output and self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.
             out = self._o_allreduce(out)
@@ -1738,17 +1752,32 @@ class K3DecodeKDA(KimiKDALinearAttention):
         self.k3_proj_weight = fused
         self._qkvg_proj_weight, self._bfa_proj_weight = fused[:rows], fused[rows:]
 
+    def will_run_decode_branch(
+        self, attn_metadata: AttentionMetadata, step: Optional[DecodeStep]
+    ) -> bool:
+        """Whether ``forward`` runs ``step`` on the decode branch: a step ``decode_step`` classifies, outside a
+        breakable CUDA graph."""
+        return step is not None and not is_in_breakable_cuda_graph()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         step: Optional[DecodeStep] = None,
+        reduce_output: bool = True,
+        project_output: bool = True,
     ) -> torch.Tensor:
-        """The built-in forward on a step ``decode_step`` does not classify, and under a breakable CUDA graph. On the
-        others: the plain decode on ``ssm/k3_kda_decode_attn`` on a decode step of one token per request, else the
-        built-in dispatch; then ``o_proj`` on its decode GEMV site."""
-        if step is None or is_in_breakable_cuda_graph():
-            return super().forward(hidden_states, attn_metadata)
+        """The built-in forward where ``will_run_decode_branch`` does not hold. On the decode branch: the plain decode
+        on ``ssm/k3_kda_decode_attn`` on a decode step of one token per request, else the built-in dispatch; then
+        ``o_proj`` on its decode GEMV site and the TP all-reduce.
+
+        On every path, ``reduce_output=False`` returns ``o_proj``'s TP partial (no all-reduce), and
+        ``project_output=False`` the post-o_norm core ``[N, H * 128]`` (no ``o_proj``)."""
+        if not self.will_run_decode_branch(attn_metadata, step):
+            if reduce_output and project_output:
+                return super().forward(hidden_states, attn_metadata)
+            core = self._builtin_core(hidden_states, attn_metadata).reshape(-1, self.proj_size)
+            return self.o_proj(core) if project_output else core
         if (
             step.decode
             and step.tokens_per_request == 1
@@ -1758,19 +1787,37 @@ class K3DecodeKDA(KimiKDALinearAttention):
             core = self._k3_decode(hidden_states[: step.num_tokens], attn_metadata)
         else:
             core = self._forward_impl(hidden_states, attn_metadata)
-        return self._k3_project_output(core)
+        if not project_output:
+            return core.reshape(-1, self.proj_size)
+        return self._k3_project_output(core, reduce_output)
 
-    def _k3_project_output(self, core: torch.Tensor) -> torch.Tensor:
-        """``o_proj`` on the ``o_proj`` decode GEMV site where it takes the rows (else the module), then the TP
-        all-reduce."""
+    def _builtin_core(
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> torch.Tensor:
+        """The built-in forward's core ``[N, H, 128]``: inside a breakable CUDA graph from the eager
+        ``maybe_bcg_kda_core_inplace``, else from ``_forward_impl``."""
+        if self.register_to_config and is_in_breakable_cuda_graph():
+            core = hidden_states.new_empty(
+                (hidden_states.shape[0], self.num_heads, self.head_dim), dtype=torch.bfloat16
+            )
+            maybe_bcg_kda_core_inplace(hidden_states, self.layer_idx_str, core)
+            return core
+        return self._forward_impl(hidden_states, attn_metadata)
+
+    def _k3_project_output(self, core: torch.Tensor, reduce_output: bool = True) -> torch.Tensor:
+        """``o_proj`` on the ``o_proj`` decode GEMV site where it takes the rows (else the module), then, with
+        ``reduce_output``, the TP all-reduce."""
+        core2d = core.reshape(-1, self.proj_size)
         out = None
         if self.decode_gemvs is not None:
-            out = self.decode_gemvs.project(
-                "o_proj", core.reshape(-1, self.proj_size), self.o_proj.weight
-            )
+            out = self.decode_gemvs.project("o_proj", core2d, self.o_proj.weight)
         if out is None:
-            return self._project_output(core)
-        return out if self._o_allreduce is None else self._o_allreduce(out)
+            if reduce_output:
+                return self._project_output(core)
+            out = self.o_proj(core2d)
+        if reduce_output and self._o_allreduce is not None:
+            out = self._o_allreduce(out)
+        return out
 
     def _k3_decode(self, x: torch.Tensor, attn_metadata: AttentionMetadata) -> torch.Tensor:
         """``ssm/k3_kda_decode_attn``: the core output ``[R, H, 128]`` of one token of each of the step's R requests;
@@ -1961,6 +2008,29 @@ class K3DecodeMLA(KimiK3MLAAttention):
         )
         return [why for ok, why in checks if not ok]
 
+    def will_run_decode_branch(
+        self, attn_metadata: AttentionMetadata, step: Optional[DecodeStep]
+    ) -> bool:
+        """Whether ``forward`` runs ``step`` on the decode kernels (see ``_k3_step_view``). Only there does it return
+        the gated attention output before ``o_proj``; the KV writes forbid running the attention twice, so a caller
+        that needs it asks first."""
+        return self._k3_step_view(attn_metadata, step) is not None
+
+    def _k3_step_view(
+        self, attn_metadata: AttentionMetadata, step: Optional[DecodeStep]
+    ) -> Optional[dict]:
+        """The paged-cache view the decode kernels read on ``step``: a decode step, this layer's ``[W_a; W_g]`` and
+        workspace built, outside a breakable CUDA graph, and a cache ``k3_mla_decode_view`` takes. Else None."""
+        if not (
+            step is not None
+            and step.decode
+            and self.k3_ag_weight is not None
+            and self.k3_workspace is not None
+            and not is_in_breakable_cuda_graph()
+        ):
+            return None
+        return self._k3_decode_view(attn_metadata, step.num_tokens)
+
     def forward(
         self,
         position_ids: Optional[torch.Tensor],
@@ -1969,19 +2039,15 @@ class K3DecodeMLA(KimiK3MLAAttention):
         all_reduce_params=None,
         latent_cache_gen: Optional[torch.Tensor] = None,
         step: Optional[DecodeStep] = None,
+        project_output: bool = True,
     ) -> torch.Tensor:
-        """The built-in forward, except on a decode step whose cache the decode kernels read."""
-        view = None
-        if (
-            step is not None
-            and step.decode
-            and latent_cache_gen is None
-            and self.k3_ag_weight is not None
-            and self.k3_workspace is not None
-            and not is_in_breakable_cuda_graph()
-        ):
-            view = self._k3_decode_view(attn_metadata, step.num_tokens)
+        """The built-in forward, except on a decode step whose cache the decode kernels read
+        (``will_run_decode_branch``). There only, ``project_output=False`` returns the gated attention output
+        ``[M, H * 128]``, the input of ``o_proj``."""
+        view = None if latent_cache_gen is not None else self._k3_step_view(attn_metadata, step)
         if view is None:
+            if not project_output:
+                raise ValueError("project_output=False needs a step will_run_decode_branch takes")
             return super().forward(
                 position_ids, hidden_states, attn_metadata, all_reduce_params, latent_cache_gen
             )
@@ -2021,6 +2087,8 @@ class K3DecodeMLA(KimiK3MLAAttention):
             gate=ag,
             gate_col0=rows,
         )
+        if not project_output:
+            return attn_output
         out = None if gemvs is None else gemvs.project("o_proj", attn_output, self.o_proj.weight)
         if out is None:
             out = self._project_output(
