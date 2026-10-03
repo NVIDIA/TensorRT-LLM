@@ -41,12 +41,22 @@ Checks:
     With the metadata's ``capture_view`` the sandwich tail stores the tap into the capture slot and the layer captures
     nothing more; without it the layer captures the split path's tap (``_apply_attn_res``). The two taps within TOL,
     every other output of the chain bit for bit the same.
+  * decode MoE push: the MoE decode path with random MXFP4 routed experts (route A's layout: 224 local experts of
+    intermediate 768, every rank its own EP shard) on the TP group's latent exchange, its latent all-reduce as the
+    routed experts' push form plus comm/k3_latent_reduce (``push=True``) against the routed experts' all-reduce
+    (``push=False``), bit for bit: one call at every M 1..8, both tails; 3 layers x 12 steps with M dipping and growing
+    back, wide steps and one step without the push in between, a random rank late on every pushing call; a 2-layer step
+    captured in a CUDA graph and replayed with rewritten inputs; and, at every M 1..8, a 3-layer step captured and
+    replayed 16 times (48 push + reduce calls, the exchange's two halves rotating at every layer position). After all
+    of it the exchange is empty and its call count has advanced by one per pushing call.
   * Every output bitwise equal across the ranks.
 
 Every rank draws the replicated tensors (prefix sum, snapshot bank, norms) from one seed and its own o_proj, core and
 tail from a rank seed.
 """
 
+import math
+import random
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -774,6 +784,184 @@ def check_decode_moe_from_model_parameters():
         assert R.same_on_ranks(y), (rows, "ranks differ")
 
 
+PUSH_LAYERS = 3
+PUSH_STEPS = (8, 3, 1, 8, 16, 5, 2, 8, 1, 16, 7, 8)  # tokens per step; 16: a wide step
+ONE_SHOT_STEP = 5  # the sequence's step that keeps the routed experts' all-reduce
+RING_REPLAYS = 16
+EXCHANGE_EMPTY = -(2**31)  # an exchange word no push has written
+
+
+def _rand_mxfp4(rows, k, gen):
+    """Random checkpoint-format MXFP4 (packed [rows, k / 2], one E8M0 per 32 k), as test_modeling_v2_k3_moe.py draws
+    it."""
+    codes = torch.randint(0, 16, (rows, k), dtype=torch.uint8, device="cuda", generator=gen)
+    base = 127 + round(0.5 * math.log2(0.01057 / k))
+    exps = torch.randint(
+        base, base + 6, (rows, k // 32), dtype=torch.uint8, device="cuda", generator=gen
+    )
+    return (codes[:, 0::2] | (codes[:, 1::2] << 4)).contiguous(), exps
+
+
+def _load_experts(backend, seed):
+    """Random MXFP4 routed experts through the TRTLLM-Gen W4A8_MXFP4_MXFP8 loader into ``backend``'s buffers, at
+    route A's layout: intermediate 768 per rank (moe_tp 4), 224 local experts."""
+    from tensorrt_llm._torch.moe.fused_moe.quantization import W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod
+
+    method = W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod()
+    i_full = I_TP * 4
+    module = SimpleNamespace(
+        tp_size=4,
+        tp_rank=0,
+        scaling_vector_size=32,
+        intermediate_size=i_full,
+        intermediate_size_per_partition=I_TP,
+        hidden_size=LATENT,
+    )
+    gen = _gen(seed)
+    with torch.no_grad():
+        for e in range(E_LOCAL):
+            w1, w1s = _rand_mxfp4(i_full, LATENT, gen)  # gate
+            w3, w3s = _rand_mxfp4(i_full, LATENT, gen)  # up
+            w2, w2s = _rand_mxfp4(LATENT, i_full, gen)  # down
+            method.load_expert_w3_w1_weight(module, w1, w3, backend.w3_w1_weight[e])
+            method.load_expert_w2_weight(module, w2, backend.w2_weight[e])
+            method.load_expert_w3_w1_weight_scale_mxfp4(
+                module, w1s, w3s, backend.w3_w1_weight_scale[e]
+            )
+            method.load_expert_w2_weight_scale_mxfp4(module, w2s, backend.w2_weight_scale[e])
+    torch.cuda.synchronize()
+
+
+def _outs(out):
+    """A decode MoE call's tensors: a PendingTail's latent and shared activation, else the output."""
+    return (out.latent, out.act) if isinstance(out, T._decode_comm.PendingTail) else (out,)
+
+
+def _same_bits(got, want) -> bool:
+    return all(
+        g.shape == w.shape
+        and torch.equal(g.contiguous().view(torch.int16), w.contiguous().view(torch.int16))
+        for g, w in zip(got, want)
+    )
+
+
+def check_decode_moe_push():
+    """The decode MoE's latent all-reduce as the routed experts' push form plus comm/k3_latent_reduce, against the
+    routed experts' all-reduce, bit for bit (see the module docstring)."""
+    if R.world not in (4, 8, 16):
+        if R.rank == 0:
+            print(f"[rank 0] decode MoE push skipped at world {R.world}", flush=True)
+        return
+    dm = T._decode_moe
+    moe = _decode_moe_layer()
+    _load_experts(moe.routed_experts.backend, 6000 + R.rank)
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = dm.K3DecodeMoe.create(R.mapping, device, I_TP, E_LOCAL, COMM.mnnvl)
+    ex = state.exchange
+    assert ex is not None, "no latent exchange at a TP size it takes"
+    dm.fold_latent_norm(moe)
+    layers = [dm.K3DecodeMoeLayer.create(moe, state, R.rank, R.world) for _ in range(PUSH_LAYERS)]
+    layers[0].warm_up(moe)
+    R.barrier()
+    count0 = int(ex.flags[0].item())
+    pushes = 0
+
+    def call(layer, x, push, tail):
+        nonlocal pushes
+        out = _outs(layer.forward(moe, x, None, partial_tail=tail, push=push))
+        pushes += int(push and x.shape[0] <= dm.MAX_TOKENS)
+        return out
+
+    # One call at every M, both tails.
+    for m in range(1, dm.MAX_TOKENS + 1):
+        x = _normal(_gen(6100 + m), (m, H), 0.5)
+        for tail in (False, True):
+            want = call(layers[0], x, False, tail)
+            got = call(layers[0], x, True, tail)
+            torch.cuda.synchronize()
+            assert _same_bits(got, want), (m, tail, "push != one-shot")
+            assert got[0].float().abs().sum().item() > 0, (m, tail, "a zero output proves nothing")
+            # The latent and the replicated output are the same on every rank; the shared activation is the rank's.
+            assert R.same_on_ranks(got[0]), (m, tail, "ranks differ")
+
+    # A sequence of steps over every layer, both paths; a random rank late on every pushing call.
+    late = random.Random(11)
+    runs = {}
+    for push in (False, True):
+        outs = []
+        for i, m in enumerate(PUSH_STEPS):
+            x = _normal(_gen(6200 + i), (m, H), 0.5)
+            for j, layer in enumerate(layers):
+                pushing = push and i != ONE_SHOT_STEP
+                R.late(late.randrange(R.world) if pushing else None)
+                outs.append(call(layer, x, pushing, tail=j % 2 == 0))
+        torch.cuda.synchronize()
+        runs[push] = outs
+    assert all(_same_bits(g, w) for g, w in zip(runs[True], runs[False])), (
+        "sequence: push != one-shot"
+    )
+
+    # A 2-layer step at 8 tokens in a CUDA graph, replayed with rewritten inputs, against eager calls without the push.
+    x_static = _normal(_gen(6300), (dm.MAX_TOKENS, H), 0.5)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = [
+            _outs(layer.forward(moe, x_static, None, partial_tail=j == 0, push=True))
+            for j, layer in enumerate(layers[:2])
+        ]
+    for rep in range(3):
+        x_static.copy_(_normal(_gen(6400 + rep), (dm.MAX_TOKENS, H), 0.5))
+        graph.replay()
+        pushes += 2
+        torch.cuda.synchronize()
+        got = [tuple(t.clone() for t in outs) for outs in captured]
+        want = [call(layer, x_static, False, j == 0) for j, layer in enumerate(layers[:2])]
+        torch.cuda.synchronize()
+        assert all(_same_bits(g, w) for g, w in zip(got, want)), (
+            rep,
+            "graph replay != eager one-shot",
+        )
+    del graph, captured
+
+    # Ring reuse: at every M, a 3-layer step captured once and replayed RING_REPLAYS times.
+    for m in range(1, dm.MAX_TOKENS + 1):
+        x_static = _normal(_gen(6500 + m), (m, H), 0.5)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = [
+                _outs(layer.forward(moe, x_static, None, partial_tail=j == 1, push=True))
+                for j, layer in enumerate(layers)
+            ]
+        for rep in range(RING_REPLAYS):
+            x_static.copy_(_normal(_gen(6600 + 64 * m + rep), (m, H), 0.5))
+            R.late(late.randrange(R.world))
+            graph.replay()
+            pushes += PUSH_LAYERS
+            torch.cuda.synchronize()
+            got = [tuple(t.clone() for t in outs) for outs in captured]
+            want = [call(layer, x_static, False, j == 1) for j, layer in enumerate(layers)]
+            torch.cuda.synchronize()
+            assert all(_same_bits(g, w) for g, w in zip(got, want)), (
+                m,
+                rep,
+                "ring replay != eager one-shot",
+            )
+        del graph, captured
+
+    # The exchange is empty, and its count advanced by one per pushing call since the warm-up.
+    R.barrier()
+    assert bool((ex.uc == EXCHANGE_EMPTY).all().item()), "exchange words left after the last reduce"
+    assert int(ex.flags[2].item()) == 0, "arrival word not cleared"
+    assert int(ex.flags[0].item()) == count0 + pushes, (int(ex.flags[0].item()), count0, pushes)
+    if R.rank == 0:
+        print(
+            f"[rank 0] decode MoE push: {pushes} push + reduce calls, all equal to the one-shot",
+            flush=True,
+        )
+
+
 CHECKS = [
     check_takes_oproj,
     check_decode_one_shot,
@@ -783,6 +971,7 @@ CHECKS = [
     check_moe_tail_deferral,
     check_moe_tail_tap,
     check_moe_tail_graph,
+    check_decode_moe_push,
 ]
 
 LAYERS_BUILT = None

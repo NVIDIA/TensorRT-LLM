@@ -12,6 +12,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxf
     DecodeStep,
     _attn_res_max_tokens,
     decode_step,
+    latent_push,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -85,3 +86,47 @@ def test_attn_res_epilogue_ceiling(step, ceiling):
     """The fused attn_res kernels take a classified step up to one token tile and a wide decode step up to 32 tokens;
     any other step keeps the generic path's ceiling."""
     assert _attn_res_max_tokens(step) == ceiling
+
+
+@pytest.mark.parametrize(
+    "step,given,pushes",
+    [
+        (DecodeStep(1, 1, 1), {}, True),  # one token per request on the KDA decode kernels
+        (DecodeStep(8, 8, 1), {}, True),
+        (
+            DecodeStep(8, 1, 8),
+            {"kda_token_states": True},
+            True,
+        ),  # a DSpark verify with per-token states
+        (DecodeStep(4, 2, 2), {"kda_token_states": True}, True),
+        (DecodeStep(8, 1, 8), {}, False),  # the built-in KDA verify
+        (DecodeStep(5), {}, False),  # a context request, or rows that are not the step's tokens
+        (
+            DecodeStep(16, 2, 8),
+            {"kda_token_states": True},
+            False,
+        ),  # wide: the routed experts' all-reduce
+        (DecodeStep(1, 1, 1), {"capturing": False}, False),  # an eager step
+        (DecodeStep(1, 1, 1), {"breakable": True}, False),
+        (
+            DecodeStep(1, 1, 1),
+            {"kda_decode_kernels": False},
+            False,
+        ),  # a KDA layer on the built-in kernels
+        (DecodeStep(1, 1, 1), {"mla_decode_branch": False}, False),  # MLA on the built-in path
+        (None, {}, False),
+    ],
+)
+def test_latent_push(step, given, pushes):
+    """Which steps the MoE layers push on (``latent_push``): a pure decode step of at most 8 tokens, captured into a
+    CUDA graph, whose attention layers all run the decode kernels; every other step keeps the routed experts'
+    all-reduce."""
+    flags = dict(
+        capturing=True,
+        breakable=False,
+        kda_token_states=False,
+        kda_decode_kernels=True,
+        mla_decode_branch=True,
+    )
+    flags.update(given)
+    assert latent_push(step, **flags) == pushes
