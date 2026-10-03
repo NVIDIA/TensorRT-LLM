@@ -322,6 +322,7 @@ l0_b200:
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_fused_moe.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_wide.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_route_quant.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_front_geometry.py
   - unittest/_torch/modeling_v2/moe/test_modeling_v2_k3_moe.py
   - unittest/_torch/modeling_v2/moe/test_modeling_v2_k3_route_quant.py
   # ------------- Visual Gen tests ---------------
