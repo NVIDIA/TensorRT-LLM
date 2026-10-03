@@ -28,7 +28,7 @@
 # limits, e.g. no float8 arithmetic, are noted in the entry docstring).
 # Entries wrapping trtllm ops carry all three.
 #
-# ── RECEIPT STATUS: all 19 entries certified on sm_103 ────────────────────
+# ── RECEIPT STATUS: 19 entries certified on sm_103, 1 on sm_100 ───────────
 #
 # A receipt says this entry's test passed on a stated GPU architecture. The
 # architecture is the whole key: it is a real axis -- see the
@@ -66,7 +66,27 @@
 # exactly as written. They are true records of what was observed on another
 # device, and rewriting them would manufacture GB300 evidence that does not
 # exist. Read them as provenance; the frontmatter is the certification.
+#
+# An entry first called by a GB200 (sm_100) target is certified there: its
+# receipt key is sm_100 (comm/mnnvl_allreduce_attn_res). An entry already
+# certified elsewhere gains its sm_100 key in the change that adds its first
+# sm_100 caller. A collective's receipt records the world size its matrix ran
+# at.
 # ──────────────────────────────────────────────────────────────────────────
+#
+# STATEFUL ENTRIES. When an op's result depends on state that outlives the
+# call (a workspace, Lamport buffers, counters, a record one launch writes and
+# a later one reads), that state is a typed object the caller owns and passes
+# as an argument: created once by an explicit constructor (collective where
+# the op is, eager, before any CUDA-graph capture), never a module-level dict
+# or an environment switch. The object's type sits beside the entries that
+# take it (comm/mnnvl_workspace.py) and is not an entry: it launches nothing
+# per call. The contract gains a `## State` section: the object's contents and
+# size; who creates it and when; which ops may share one object; the call
+# order every rank must keep across layers and steps; what a later launch
+# reads; how it is re-armed. Its test drives call sequences (chained calls
+# across steps, capture and replay, two objects interleaved) and a negative
+# control that breaks the call order, not only single calls.
 #
 # 30 of the source catalog's 43 entries are here — the union of what the two
 # migrated targets call. The 13 left behind (silu_and_mul, attn_custom_op_inplace,
@@ -206,3 +226,9 @@ entries:
   - path: comm/reducescatter.py
     impl: torch.ops.trtllm.reducescatter
     summary: "Summing reduce-scatter over a group of MPI-session ranks into a fresh tensor: every rank's tensor summed elementwise, then split along dim 0 in ascending rank order so each rank keeps its own rows, even (sizes=None) or uneven (per-rank row counts in `sizes`, as attention data parallelism produces); the sum is accumulated in the input dtype in a destination-dependent ring order — deterministic and replay-reproducible, but not the correctly rounded fp32 sum — and float8_e4m3fn is summed as raw bytes rather than as floats; calls pair by position on the communicator whichever `sizes` form they take, and because this one computes, ranks that disagree on call order make every rank wrong nearly everywhere rather than a quarter of the way — silently, and bitwise reproducibly, whenever the mispaired calls move the same number of bytes, hanging only when they do not"
+
+  # Stateful (a `## State` section and a caller-owned state object; the state type comm/mnnvl_workspace.py is not
+  # an entry: it launches nothing per call).
+  - path: comm/mnnvl_allreduce_attn_res.py
+    impl: torch.ops.trtllm.mnnvl_allreduce_attn_res
+    summary: "One-shot MNNVL all-reduce with Kimi K3's residual update as its epilogue (updated = prefix + sum over ranks, normed = RMSNorm of the attention-residual selection over the snapshot bank and updated), over a caller-owned MnnvlWorkspace: three Lamport buffers rotated by every call of every MNNVL op that shares the object, so every rank makes the same calls on it in the same order; a swapped pair of same-shaped calls is silently wrong on every rank, two ranks ordering calls on two workspaces differently on one stream deadlock"
