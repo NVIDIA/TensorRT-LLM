@@ -37,6 +37,14 @@ using kv_cache_manager::BlockKeyHasher;
 namespace
 {
 
+/// Feature-driven encoders (e.g. Whisper) carry no encoder token ids, so the request has no
+/// encoder unique tokens to key cross-KV blocks on and cross prefix reuse cannot apply to it.
+bool hasEncoderUniqueTokens(LlmRequest const& req)
+{
+    auto const& encoderUniqueTokens = req.getEncoderUniqueTokens();
+    return encoderUniqueTokens.has_value() && encoderUniqueTokens.value() != nullptr;
+}
+
 std::tuple<std::unordered_set<BlockKey, BlockKeyHasher>, std::unordered_set<BlockKey, BlockKeyHasher>>
 prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
     kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
@@ -59,7 +67,7 @@ prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
                     newlyContributedContextBlocks.insert(summary.firstNewBlock.value());
                 }
             }
-            if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse())
+            if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse() && hasEncoderUniqueTokens(*req))
             {
                 auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
                 auto summary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
@@ -344,12 +352,20 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                         if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
                             && !crossKvCacheManager->getBlockManager().isVariableWindow())
                         {
-                            auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
-                            crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
+                            if (hasEncoderUniqueTokens(*req))
+                            {
+                                auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
+                                crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
+                            }
+                            else
+                            {
+                                // Nothing to look up: an empty summary means "no reusable cross blocks".
+                                crossSummary = kv_cache_manager::PrefixReuseSummary{};
+                            }
                         }
                     }
                     else if (isEncoderInit && crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
-                        && !crossKvCacheManager->getBlockManager().isVariableWindow())
+                        && !crossKvCacheManager->getBlockManager().isVariableWindow() && hasEncoderUniqueTokens(*req))
                     {
                         // Encoder admission only needs the cross summary for reuse ordering.
                         auto uniqueTokens = *(req->getEncoderUniqueTokens().value());

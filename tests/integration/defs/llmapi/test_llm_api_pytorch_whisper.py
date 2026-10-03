@@ -29,6 +29,7 @@ import pytest
 import soundfile
 
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
@@ -116,6 +117,8 @@ def _make_llm(
     cuda_graph_batch_sizes: list[int] | None = None,
     tensor_parallel_size: int = 1,
     encoder_graphs: bool = False,
+    enable_block_reuse: bool = False,
+    use_python_scheduler: bool = True,
 ) -> LLM:
     """Build a Whisper LLM for the test matrix, optionally with encoder CUDA graphs."""
     # CudaGraphConfig captures the decode step; the enc-dec encoder step opts in
@@ -154,7 +157,7 @@ def _make_llm(
         disable_overlap_scheduler=True,  # overlap scheduler unsupported
         enable_chunked_prefill=False,
         kv_cache_config=KvCacheConfig(
-            enable_block_reuse=False,
+            enable_block_reuse=enable_block_reuse,
             free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
             cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
             use_kv_cache_manager_v2=use_kv_cache_manager_v2,
@@ -165,7 +168,7 @@ def _make_llm(
         # 1500 encoder positions every Whisper request produces.
         max_input_len=_ENCODER_OUTPUT_LEN,
         max_num_tokens=2 * _ENCODER_OUTPUT_LEN,
-        scheduler_config=SchedulerConfig(use_python_scheduler=True),
+        scheduler_config=SchedulerConfig(use_python_scheduler=use_python_scheduler),
         tensor_parallel_size=tensor_parallel_size,
         **encoder_kwargs,
         **dtype_kwargs,
@@ -246,6 +249,67 @@ _BEAM_SEARCH_CASES = [
     pytest.param(None, None, False, id="fp32-kv-v1-graphs-off-beam2"),
     pytest.param("bfloat16", [1, 2], True, id="bf16-kv-v1-decoder-graphs-on-beam2"),
 ]
+
+
+def test_whisper_pytorch_block_reuse_requested(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Greedy transcription when KV block reuse is requested.
+
+    Whisper requests carry encoder features, not encoder token ids, so the
+    executor disables reuse for both KV pools and must still admit and run
+    them (https://nvbugs/6713231). This checks the Python reuse override;
+    the C++ scheduler's missing-token guards are covered by its unit test.
+    Distinct audio clips sharing the decoder prompt must match their
+    reuse-disabled results, both sequentially and in a mixed batch.
+    """
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+
+    model_path = _get_whisper_model_path()
+    wave, sample_rate = soundfile.read(_get_audio_path())
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=_MAX_NEW_TOKENS)
+    # Derive a distinct speech clip from the existing CI fixture, keeping the
+    # sample rate and decoder prompt identical. No extra model-share asset is needed.
+    cropped_wave = wave[: len(wave) // 2].copy()
+    batches = ([wave], [cropped_wave], [wave, cropped_wave])
+    results = {}
+
+    for enable_block_reuse in (False, True):
+        batch_results = []
+        with _make_llm(
+            model_path,
+            enable_block_reuse=enable_block_reuse,
+            use_python_scheduler=False,
+        ) as llm:
+            executor = llm._executor.engine
+            for resource_type in (
+                ResourceManagerType.KV_CACHE_MANAGER,
+                ResourceManagerType.CROSS_KV_CACHE_MANAGER,
+            ):
+                manager = executor.resource_manager.get_resource_manager(resource_type)
+                assert manager is not None
+                assert manager.enable_block_reuse is False
+            assert executor.model_engine.attn_runtime_features.cache_reuse is False
+            for batch in batches:
+                outputs = llm.generate(
+                    [_audio_prompt(clip, sample_rate) for clip in batch],
+                    sampling_params,
+                )
+                assert len(outputs) == len(batch)
+                batch_results.append(
+                    [
+                        (list(output.outputs[0].token_ids), output.outputs[0].text)
+                        for output in outputs
+                    ]
+                )
+        results[enable_block_reuse] = batch_results
+
+    baseline = results[False]
+    assert baseline[0][0][0] == _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
+    assert _EXPECTED_TRANSCRIPT_FRAGMENT in baseline[0][0][1].lower()
+    assert baseline[1][0][1].strip()
+    # Ensure the second input actually distinguishes feature-conditioned caches.
+    assert baseline[0][0][0] != baseline[1][0][0]
+    assert baseline[2] == [baseline[0][0], baseline[1][0]]
+    assert results[True] == baseline
 
 
 @pytest.mark.parametrize("torch_dtype,cuda_graph_batch_sizes,graphs_captured", _BEAM_SEARCH_CASES)
