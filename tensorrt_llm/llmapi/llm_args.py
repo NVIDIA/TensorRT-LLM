@@ -3172,6 +3172,22 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "for cross-attention in the draft model. If None, read from the draft "
         "model config (dflash_config.target_layer_ids).")
 
+    context_recompute_tail: Optional[int] = Field(
+        default=None,
+        description=
+        "Number of prompt-tail tokens to recompute through the target forward "
+        "when a request takes a KV-cache prefix hit, so the drafter's "
+        "hidden-state context covers them (reused tokens never pass a target "
+        "forward, which otherwise degrades acceptance length exactly when "
+        "prefix caching helps most). None resolves from the draft model "
+        "config: dflash_config.swa_window_size when the drafter's context "
+        "attention is windowed (a tail of the window size reproduces the "
+        "no-reuse drafter inputs exactly), else -1. -1 forces a full "
+        "re-prefill on a hit; 0 disables the recompute. Blocks stay reused "
+        "either way, so the allocation/dedup win is kept. Enable chunked "
+        "prefill with this: the scheduler admits on estimated reuse, and "
+        "chunking absorbs batches whose recompute exceeds the token budget.")
+
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
 
     attention_backend: Literal["VANILLA", "TRTLLM", "FA4"] = Field(
@@ -3222,6 +3238,18 @@ class DFlashDecodingConfig(DecodingBaseConfig):
             mask_id = dflash_cfg.get("mask_token_id")
             if mask_id is not None:
                 self.mask_token_id = mask_id
+        if self.context_recompute_tail is None:
+            # A windowed drafter can never attend to prompt context beyond
+            # the most recent swa_window_size tokens (context K/V come
+            # straight from projected target hidden states, so the receptive
+            # field does not grow with drafter depth): recomputing that tail
+            # reproduces the no-reuse drafter inputs exactly. A non-windowed
+            # drafter needs the whole prompt, hence full re-prefill.
+            swa_window = dflash_cfg.get("swa_window_size")
+            if dflash_cfg.get("use_swa") and swa_window:
+                self.context_recompute_tail = int(swa_window)
+            else:
+                self.context_recompute_tail = -1
 
         # The drafter is trained for one block size. Another size still runs,
         # but acceptance length drops, so warn rather than silently serving a

@@ -2021,6 +2021,7 @@ def _make_admission_manager(
     manager.is_draft = False
     manager.kv_cache_type = CacheType.SELF
     manager.is_estimating_kv_cache = is_estimating_kv_cache
+    manager._spec_recompute_tail = 0
     manager._disagg_transfer_overwrites_whole_cached_prefix = lambda: overwrites_whole_cached_prefix
     manager._resume_and_restore = lambda _req_id, _kv_cache: True
     kv_cache = SimpleNamespace(

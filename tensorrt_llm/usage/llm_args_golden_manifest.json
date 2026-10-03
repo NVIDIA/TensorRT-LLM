@@ -1574,6 +1574,11 @@
       "path": "speculative_config.block_size"
     },
     {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.context_recompute_tail"
+    },
+    {
       "allowed_values": [
         "AUTO",
         "DFlash",

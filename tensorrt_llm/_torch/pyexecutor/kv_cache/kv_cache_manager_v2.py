@@ -90,6 +90,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     SwaScratchReuseConfig,
     TokenIdExt,
     _cpp_introspection,
+    _introspection,
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
@@ -1139,10 +1140,67 @@ def _settle_context_cursor(req: LlmRequest, reuse: int, tokens_per_block: int) -
     req.context_chunk_size = req.context_remaining_length
 
 
+def _spec_recompute_target(
+    req: LlmRequest,
+    committed: int,
+    *,
+    tail: int,
+    tokens_per_block: int,
+    is_draft: bool,
+) -> int:
+    """Cap the reuse start position so a prompt tail is recomputed.
+
+    Hidden-state-conditioned drafters (DFlash/DSpark) capture target
+    hidden states only for tokens that physically pass through a target
+    forward. A prefix-cache hit skips the reused tokens, so the drafter's
+    cross-attention context never sees them and acceptance length drops
+    (measured -15% AL at a 100% prefix-hit rate). Rewinding the context
+    position keeps the blocks reused (the allocation/dedup win stays, and
+    the recompute rewrites them with identical values; try_commit_blocks
+    skips re-commit below the committed watermark) while restoring the
+    drafter's inputs.
+
+    ``tail`` is the manager's ``_spec_recompute_tail``, resolved at
+    construction from the spec config's ``context_recompute_tail`` (which the
+    draft model config fills when unset): each cache-hit request starts its
+    context at a block-aligned position leaving at least that many prompt
+    tokens to recompute. For a drafter whose context attention
+    is windowed (e.g. DFlash2 ``swa_window_size``), a tail of the window
+    size reproduces the no-reuse drafter inputs exactly; ``-1`` forces a
+    full re-prefill for non-windowed drafters. The scheduler reads
+    ``context_remaining_length`` after ``prepare_context``, so budget and
+    chunk sizing account for the recomputed tail natively.
+
+    A module-level function taking the manager scalars explicitly, like the
+    cursor helpers above: no-op cases (nothing committed, draft pool, dummy
+    request) are decided from the request alone, before ``tail`` is read.
+    """
+    if committed <= 0 or is_draft or req.is_dummy or not tail:
+        return committed
+    prompt_len = req.prompt_len
+    if tail < 0:
+        target = 0
+    else:
+        if prompt_len - committed >= tail:
+            return committed  # already recomputing at least the tail
+        target = max(
+            0,
+            (prompt_len - tail) // tokens_per_block * tokens_per_block,
+        )
+    if target >= committed:
+        return committed
+    return target
+
+
 class KVCacheManagerV2(BaseResourceManager):
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
+    # Declared on the class for the same reason: prepare_context and the
+    # connector-reservation cap read it on instances tests build without
+    # running __init__ (which overwrites it from the spec config). Zero
+    # disables the spec recompute tail.
+    _spec_recompute_tail: int = 0
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -1215,6 +1273,15 @@ class KVCacheManagerV2(BaseResourceManager):
         block_reuse_config = kv_cache_config.block_reuse_config
         self.block_reuse_policy = BlockReusePolicy(block_reuse_config.policy)
         self._swa_endpoint_rewind = block_reuse_config.swa_endpoint_rewind_tokens
+        # Recompute tail for hidden-state-conditioned drafters with block
+        # reuse: rewind cache-hit context requests so at least this many
+        # prompt tokens pass through the target forward. Resolved from the
+        # draft model config (or set explicitly) on the spec config; see
+        # _spec_recompute_target for why drafters need it. None means the
+        # auto value never resolved; recompute everything rather than
+        # silently serving a degraded drafter.
+        tail = getattr(spec_config, "context_recompute_tail", 0)
+        self._spec_recompute_tail = -1 if tail is None else int(tail)
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {idx: offset for offset, idx in enumerate(self.pp_layers)}
         self.max_beam_width = max_beam_width
@@ -3634,6 +3701,15 @@ class KVCacheManagerV2(BaseResourceManager):
         # First chunk only: num_committed_tokens holds at the initial prefix
         # until context end, so reapplying later would rewind the cursor.
         if req.is_first_context_chunk and self.enable_block_reuse:
+            # Hidden-state drafters need a recomputed prompt tail; cap the
+            # reuse start (blocks stay reused, the cursor rewinds further).
+            reused = _spec_recompute_target(
+                req,
+                reused,
+                tail=self._spec_recompute_tail,
+                tokens_per_block=self.tokens_per_block,
+                is_draft=self.is_draft,
+            )
             _settle_context_cursor(req, reused, self.tokens_per_block)
         self._prepare_connector_prefix_reservation(req)
         return True
@@ -3720,6 +3796,13 @@ class KVCacheManagerV2(BaseResourceManager):
         reused = self.prepare_context_cache(req)
         if reused is None:
             return False
+        # Deliberately NO _spec_recompute_target here: the context-recompute
+        # tail applies at local prefill only. A disagg generation-init request
+        # receives its prompt KV from the context worker and never runs a
+        # target prefill forward on this engine, so there are no drafter
+        # hidden states to recover by rewinding. Speculative decoding on a
+        # disaggregated engine is guard-refused anyway (disagg_dflash_error),
+        # making this site unreachable for hidden-state drafters.
         if self.enable_block_reuse:
             _settle_context_cursor(req, reused, self.tokens_per_block)
 
@@ -3849,6 +3932,77 @@ class KVCacheManagerV2(BaseResourceManager):
     def _release_preempted(self, req: LlmRequest) -> None:
         self.free_resources(req)
         req.py_num_connector_matched_tokens = 0
+
+    def admit_mirror(self, req: LlmRequest) -> bool:
+        """Create *req*'s draft mirror if it has none, then resume it.
+
+        Creating is half the job, not a precondition of it: a fresh ``_KVCache``
+        starts SUSPENDED (``_KVCache.__init__`` sets the status and
+        ``_never_resumed``), so its FIRST resume goes through the same
+        ``max_util_for_resume`` gate as any later one and can be refused under
+        pool pressure. Treating "no mirror yet" as nothing-to-do therefore
+        leaves the whole first-sight case unadmitted, and the refusal lands
+        instead inside ``_prepare_draft_resources``, where the request is
+        already in the batch and the only remaining answer is to raise.
+        Measured: a c=256 run died on the first request whose mirror was born
+        while the draft pool was above the gate.
+
+        Returns False when the mirror cannot be created (IndexMapper saturated)
+        or cannot be resumed, so the caller defers the request instead of
+        forwarding it.
+        """
+        kv_cache = self._mirror_draft_kv_cache(req)
+        if kv_cache is None:
+            return False
+        return self._resume_and_restore(req.py_request_id, kv_cache)
+
+    def has_active_cache(self, req: LlmRequest) -> bool:
+        """Whether *req* already holds an ACTIVE cache in this pool.
+
+        Cheap and side-effect-free. The scheduler uses it to prove that
+        re-running ``prepare_context`` for *req* would be a no-op (no fresh
+        reuse claim, no resume), which is one precondition for skipping the
+        request's per-iteration admission work entirely.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        return kv_cache is not None and kv_cache.is_active
+
+    def _resume_gate_refuses(self) -> bool:
+        """Side-effect-free preview of ``_KVCache.resume``'s utilization gate.
+
+        The exact first check ``resume`` makes on BOTH backends: the maximum
+        GPU-level pool-group utilization compared against
+        ``max_util_for_resume`` (python ``_core/_kv_cache.py::resume`` and C++
+        ``kvCache.cpp::KvCache::resume`` implement the same refusal).
+        ``storage_utilization`` dispatches to whichever backend is loaded, and
+        the threshold is read from the impl's own config so the comparison
+        uses the very value the gate compares against. Empty utilization (no
+        pool groups) mirrors the C++ treatment: not refused.
+        """
+        utilization = _introspection.storage_utilization(self.impl, GPU_LEVEL)
+        if not utilization:
+            return False
+        return max(utilization) > self.impl.init_config.max_util_for_resume
+
+    def mirror_admission_certainly_blocked(self, req: LlmRequest) -> bool:
+        """Whether ``admit_mirror(req)`` would certainly be refused right now.
+
+        A cheap O(1), side-effect-free preview for the scheduler: True only
+        when *req* already has a SUSPENDED mirror whose resume the
+        ``max_util_for_resume`` gate would refuse (``_resume_gate_refuses``).
+        False in every other case — no mirror yet (creating one is a side
+        effect the real admission must keep), mirror already active (admission
+        is a no-op success), or utilization at/below the gate (the resume
+        could succeed).
+
+        One-sided by construction: True implies ``admit_mirror`` would return
+        False, so a caller acting on it can never change a scheduling
+        decision — only skip work whose outcome is already determined.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None or kv_cache.is_active:
+            return False
+        return self._resume_gate_refuses()
 
     # ---- prepare_resources ----
 
@@ -4022,6 +4176,20 @@ class KVCacheManagerV2(BaseResourceManager):
         # Loads end at full blocks and leave the final prompt token for logits.
         end = min(reservation.end, req.prompt_len - 1)
         end = end // self.tokens_per_block * self.tokens_per_block
+        # A connector-served prefix starves a hidden-state drafter exactly like
+        # local reuse does -- served tokens never pass a target forward -- and
+        # the cursor cannot rewind below py_connector_served_position once the
+        # load is accepted (_settle_context_cursor floors on it). Cap the
+        # reservation at the same recomputed-tail boundary as local reuse, so
+        # the tail stays local by construction; a full-re-prefill tail (-1)
+        # caps to zero and releases the reservation below.
+        end = _spec_recompute_target(
+            req,
+            end,
+            tail=self._spec_recompute_tail,
+            tokens_per_block=self.tokens_per_block,
+            is_draft=self.is_draft,
+        )
         if end <= local_end:
             self.kv_connector_manager.release_prefix_reservation(req)
             return
@@ -4311,6 +4479,25 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                     continue
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
+                    # RAISE, deliberately, even though this is a transient
+                    # pressure refusal and not corruption.
+                    #
+                    # Skipping it here looks like the mirror-shortage branch
+                    # above and is NOT the same: that one has no cache at all,
+                    # so the request id stays unmapped and copy_batch_block_offsets
+                    # asserts in C++ before anything reads it. A cache that
+                    # merely failed to RESUME is still in kv_cache_map, so the
+                    # offsets copy succeeds, the forward proceeds, and the
+                    # drafter writes context K/V through the inactive cache's
+                    # stale page table -- a crash traded for silent corruption.
+                    # An earlier iteration deferred the resume here and hit
+                    # exactly that corruption; the deferral was reverted.
+                    #
+                    # Deferring it safely means not forwarding the request this
+                    # iteration, which is an admission decision and belongs to
+                    # the scheduler, not to this method: by the time draft
+                    # preparation runs, the target manager has already prepared
+                    # the same request.
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
