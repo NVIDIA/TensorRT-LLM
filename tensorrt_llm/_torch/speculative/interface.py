@@ -31,10 +31,13 @@ from ..._utils import get_sm_version, prefer_pinned
 from ..attention.backends.interface import AttentionMetadata
 from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
+from ..distributed.ops import allgather
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
+    from tensorrt_llm.mapping import Mapping
+
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
 
@@ -47,6 +50,7 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from .draft_argmax import DraftArgmaxExchange, gather_argmax_pairs_allgather
 
 
 def rejection_sampling_one_model(
@@ -1594,6 +1598,9 @@ class SpecWorkerBase(nn.Module, ABC):
         self._force_accept_rng_counter: Optional[torch.Tensor] = None
         self._auxiliary_state_handlers: list[
             AuxiliarySpeculativeStateHandler] = []
+        # Per-TP-group argmax-pair exchange of a vocab-sharded draft head
+        # (speculative/draft_argmax.py); workers register one at __init__.
+        self._draft_argmax_by_mapping: dict[Mapping, DraftArgmaxExchange] = {}
 
     def register_auxiliary_state_handler(
             self, handler: AuxiliarySpeculativeStateHandler) -> None:
@@ -2149,7 +2156,6 @@ class SpecWorkerBase(nn.Module, ABC):
         # Only plain TP (no attention DP) reaches here -- ADP variants return
         # early via _draft_logits_are_sharded, since their ranks are
         # data-parallel and must not gather draft logits across ranks.
-        from ..distributed.ops import allgather
         return allgather(logits, self.mapping, dim=-1)
 
     @staticmethod
@@ -2624,27 +2630,19 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return draft_tokens.type(torch.int32)
 
-    def _get_local_max_and_combined(self, logits, mapping_lm_tp=None):
-        """Pack each rank's local (global_argmax_index, max_value) for a
-        distributed argmax over a vocab-sharded draft LM head.
-        """
-        local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
-        vocab_per_rank = logits.shape[-1]
-        mapping_lm_tp = mapping_lm_tp if mapping_lm_tp is not None else self.mapping
-        max_index_per_rank = local_argmax.type(
-            torch.int32) + (mapping_lm_tp.tp_rank * vocab_per_rank)
-        max_index_per_rank_float = max_index_per_rank.float()
-        local_max_values_float32 = local_max_values.float()
-        # Interleaved layout: [idx0, val0, idx1, val1, ...] after all-gather.
-        combined = torch.stack(
-            [max_index_per_rank_float, local_max_values_float32],
-            dim=-1).flatten(-2)
-        return combined
+    def _gather_draft_argmax_pairs(self, logits, mapping):
+        """``[rows, 2 * tp_size]`` fp32 rank-major (global argmax index, max
+        value) pairs of ``logits`` over ``mapping``'s TP group: the group's
+        registered exchange, else the allgather producer (draft_argmax.py)."""
+        exchange = self._draft_argmax_by_mapping.get(mapping)
+        if exchange is not None:
+            return exchange(logits)
+        return gather_argmax_pairs_allgather(logits, mapping)
 
     @torch.compile(options={"max-autotune": True})
     def _get_draft_tokens_from_gathered(self, gathered):
         """Pick the global-argmax token id from the all-gathered per-rank
-        (index, value) pairs produced by ``_get_local_max_and_combined``.
+        (index, value) pairs produced by ``_gather_draft_argmax_pairs``.
         """
         gathered_indices_float = gathered[..., 0::2]
         gathered_values_float = gathered[..., 1::2]
@@ -2677,10 +2675,8 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         if (mapping_lm_head_tp is not None
                 and getattr(mapping_lm_head_tp, "tp_size", 1) > 1):
-            from ..distributed.ops import allgather
-            combined = self._get_local_max_and_combined(logits,
-                                                        mapping_lm_head_tp)
-            gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
+            gathered = self._gather_draft_argmax_pairs(logits,
+                                                       mapping_lm_head_tp)
             group_size = mapping_lm_head_tp.tp_size
             local_rows = logits.shape[0] // group_size
             own_segment = gathered.view(group_size, local_rows,
@@ -2691,9 +2687,7 @@ class SpecWorkerBase(nn.Module, ABC):
         if (sharded and mapping is not None
                 and getattr(mapping, "tp_size", 1) > 1
                 and not mapping.enable_attention_dp):
-            from ..distributed.ops import allgather
-            combined = self._get_local_max_and_combined(logits)
-            gathered = allgather(combined, mapping, dim=-1)
+            gathered = self._gather_draft_argmax_pairs(logits, mapping)
             return self._get_draft_tokens_from_gathered(gathered)
         # No cross-rank gather for plain attention-DP: each rank owns its own
         # requests with replicated full-vocab logits, so a per-rank argmax is

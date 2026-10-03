@@ -1895,7 +1895,7 @@ class DFlashWorker(SpecWorkerBase):
 
         local_values, local_ids = torch.topk(gen_logits, top_k, dim=-1)
         local_ids = local_ids + mapping.tp_rank * shard
-        # Interleaved (id, value) pairs, matching _get_local_max_and_combined.
+        # Interleaved (id, value) pairs, matching draft_argmax.local_argmax_pairs.
         combined = torch.stack([local_ids.float(), local_values.float()], dim=-1).flatten(-2)
         gathered = allgather(combined, mapping, dim=-1)
         unary_logits, selected = torch.topk(gathered[..., 1::2], top_k, dim=-1)

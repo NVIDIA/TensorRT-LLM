@@ -45,6 +45,11 @@ from tensorrt_llm.mapping import Mapping
 _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
     "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
 
+# In case that AutoTuner brings potential perf regression; read once like the
+# flag above. TODO: Remove this if no perf regression is observed.
+_DISABLE_ALLREDUCE_AUTOTUNE: bool = (os.environ.get(
+    "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1")
+
 _MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
 
 _thread_local = threading.local()
@@ -99,6 +104,13 @@ class _MnnvlWorkspace(TypedDict):
     # An MPI communicator under MPI, the TP ProcessGroup under a non-MPI orchestrator (Ray).
     # None between checkpoint_prepare() and a successful checkpoint_restore().
     comm: Optional[Union[_MpiCommProtocol, "torch.distributed.ProcessGroup"]]
+
+
+# Registry key of an MNNVL all-reduce workspace (MNNVLAllReduce.workspace_key):
+# the mapping itself for its default workspace, (mapping, tag) for a tagged one
+# on the same TP group, so launches on one tag never dirty another tag's
+# Lamport buffers.
+_MnnvlWorkspaceKey = Union[Mapping, Tuple[Mapping, str]]
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -244,70 +256,80 @@ def _mnnvl_workspace_all_succeeded(comm, local_success: bool) -> bool:
 def get_or_scale_allreduce_mnnvl_workspace(
         mapping: Mapping,
         dtype: torch.dtype,
-        buffer_size_bytes: Optional[int] = None) -> _MnnvlWorkspace:
+        buffer_size_bytes: Optional[int] = None,
+        workspace_key: Optional[_MnnvlWorkspaceKey] = None) -> _MnnvlWorkspace:
     """
     WORKSPACE is a entire memory allocation used for allreduce, while BUFFER refers to single lamport buffer.
     Each WORKSPACE contains NUM_LAMPORT_BUFFERS buffers.
+
+    ``buffer_size_bytes`` is the Lamport buffer size this call needs (``None``: any size); a
+    workspace this call creates starts at that size, or at the model-sized default
+    (1024 tokens x 8192 hidden) when ``None``. ``workspace_key`` is the registry key
+    (``MNNVLAllReduce.workspace_key``); ``None`` is ``mapping``'s default workspace.
     """
 
+    key = mapping if workspace_key is None else workspace_key
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
-    if mapping in allreduce_mnnvl_workspaces:
-        workspace = allreduce_mnnvl_workspaces[mapping]
+    if key in allreduce_mnnvl_workspaces:
+        workspace = allreduce_mnnvl_workspaces[key]
         if not workspace["handle"].is_mapped():
             raise RuntimeError("MNNVL workspace handles are not attached")
         if workspace["buffer_size_bytes"] >= (buffer_size_bytes or 0):
             return workspace
 
-    workspace_lock = MNNVLAllReduce._get_allreduce_mnnvl_workspace_lock(mapping)
+    workspace_lock = MNNVLAllReduce._get_allreduce_mnnvl_workspace_lock(key)
     with workspace_lock:
         return _get_or_scale_allreduce_mnnvl_workspace(mapping, dtype,
-                                                       buffer_size_bytes)
+                                                       buffer_size_bytes, key)
 
 
 def _get_or_scale_allreduce_mnnvl_workspace(
         mapping: Mapping,
         dtype: torch.dtype,
-        buffer_size_bytes: Optional[int] = None) -> _MnnvlWorkspace:
+        buffer_size_bytes: Optional[int] = None,
+        workspace_key: Optional[_MnnvlWorkspaceKey] = None) -> _MnnvlWorkspace:
 
     NUM_LAMPORT_BUFFERS = 3
+
+    key = mapping if workspace_key is None else workspace_key
+    tag_desc = f", tag {key[1]}" if isinstance(key, tuple) else ""
 
     # Use MNNVLAllReduce class to share across threads
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
     pending_comms = MNNVLAllReduce.allreduce_mnnvl_pending_comms
 
-    if mapping in allreduce_mnnvl_workspaces:
-        workspace = allreduce_mnnvl_workspaces[mapping]
+    if key in allreduce_mnnvl_workspaces:
+        workspace = allreduce_mnnvl_workspaces[key]
         if not workspace["handle"].is_mapped():
             raise RuntimeError("MNNVL workspace handles are not attached")
 
-    # A safe method to get the element size of the dtype
-    elem_size = torch.tensor([], dtype=dtype).element_size()
+    elem_size = dtype.itemsize
     force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
     use_fabric_handle = force_mn or mapping.is_multi_node()
 
-    if mapping not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[
-            mapping]["buffer_size_bytes"] < (buffer_size_bytes or 0):
+    if key not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[key][
+            "buffer_size_bytes"] < (buffer_size_bytes or 0):
         # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
         init_buffer_size_bytes = max(1024 * 8192 * elem_size, buffer_size_bytes
                                      or 0)
         # Creating the workspace if it doesn't exist
-        if mapping not in allreduce_mnnvl_workspaces:
+        if key not in allreduce_mnnvl_workspaces:
             # A construction attempt that failed before publishing a workspace
             # left its communicator valid (McastDeviceMemory only borrows it),
             # so reuse it instead of leaking one world-wide split per module.
-            comm = pending_comms.get(mapping)
+            comm = pending_comms.get(key)
             if comm is None:
                 comm = _get_mnnvl_workspace_comm(mapping)
-                pending_comms[mapping] = comm
+                pending_comms[key] = comm
             # Use the predefined buffer size if no buffer size is provided
             buffer_size_bytes = buffer_size_bytes or init_buffer_size_bytes
             if mapping.tp_rank == 0:
                 logger.debug(
-                    f"[MNNVL] Creating workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} with {buffer_size_bytes} bytes"
+                    f"[MNNVL] Creating workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size}{tag_desc} with {buffer_size_bytes} bytes"
                 )
 
         else:
-            comm = allreduce_mnnvl_workspaces[mapping]["comm"]
+            comm = allreduce_mnnvl_workspaces[key]["comm"]
             assert comm is not None
             # Safeguard against when buffer_size_bytes is None
             req_buffer_size_bytes = buffer_size_bytes or init_buffer_size_bytes
@@ -315,7 +337,7 @@ def _get_or_scale_allreduce_mnnvl_workspace(
             buffer_size_bytes = math.ceil(req_buffer_size_bytes /
                                           (8 * 1024 * 1024)) * (8 * 1024 * 1024)
             logger.debug(
-                f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
+                f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size}{tag_desc} from {allreduce_mnnvl_workspaces[key]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
             )
         candidate_workspace: Optional[_MnnvlWorkspace] = None
         candidate_error: Optional[Exception] = None
@@ -362,9 +384,9 @@ def _get_or_scale_allreduce_mnnvl_workspace(
         # their buffers, so nobody signals through memory another rank has not initialised.
         _initialize_allreduce_mnnvl_protocol(candidate_workspace)
         # Hand ownership of the communicator to the workspace.
-        pending_comms.pop(mapping, None)
-        allreduce_mnnvl_workspaces[mapping] = candidate_workspace
-    return allreduce_mnnvl_workspaces[mapping]
+        pending_comms.pop(key, None)
+        allreduce_mnnvl_workspaces[key] = candidate_workspace
+    return allreduce_mnnvl_workspaces[key]
 
 
 def userbuffers_allreduce_finalize(
@@ -751,19 +773,22 @@ class MNNVLAllReduce(nn.Module):
     establish global quiescence before invoking them. Multi-node MPI, NCCL, and
     RDMA process-restore semantics are not yet supported by such a coordinator.
     """
-    allreduce_mnnvl_workspaces: typing.ClassVar[dict[Mapping,
+    # Keyed by workspace_key: the mapping for its default workspace,
+    # (mapping, tag) for a tagged one on the same TP group, so launches on one
+    # tag never dirty another tag's Lamport buffers.
+    allreduce_mnnvl_workspaces: typing.ClassVar[dict[_MnnvlWorkspaceKey,
                                                      _MnnvlWorkspace]] = {}
 
     # Communicators split for a mapping whose workspace construction has not
     # succeeded yet. Ownership moves to the workspace once it is published, so
     # an entry here is never reachable from allreduce_mnnvl_workspaces.
-    allreduce_mnnvl_pending_comms: typing.ClassVar[dict[Mapping,
+    allreduce_mnnvl_pending_comms: typing.ClassVar[dict[_MnnvlWorkspaceKey,
                                                         _MpiCommProtocol]] = {}
 
-    # The guard makes lock creation atomic, while each mapping lock serializes
-    # its complete workspace construction and publication lifecycle.
+    # The guard makes lock creation atomic, while each workspace lock serializes
+    # its complete construction and publication lifecycle.
     _allreduce_mnnvl_workspace_locks: typing.ClassVar[dict[
-        Mapping, threading.Lock]] = {}
+        _MnnvlWorkspaceKey, threading.Lock]] = {}
     _allreduce_mnnvl_workspace_locks_guard: typing.ClassVar[
         threading.Lock] = threading.Lock()
 
@@ -776,16 +801,37 @@ class MNNVLAllReduce(nn.Module):
     })
 
     @classmethod
-    def _get_allreduce_mnnvl_workspace_lock(cls,
-                                            mapping: Mapping) -> threading.Lock:
+    def _get_allreduce_mnnvl_workspace_lock(
+            cls, workspace_key: _MnnvlWorkspaceKey) -> threading.Lock:
         with cls._allreduce_mnnvl_workspace_locks_guard:
             return cls._allreduce_mnnvl_workspace_locks.setdefault(
-                mapping, threading.Lock())
+                workspace_key, threading.Lock())
 
-    def __init__(self, mapping: Mapping, dtype: torch.dtype):
+    def __init__(self,
+                 mapping: Mapping,
+                 dtype: torch.dtype,
+                 workspace_tag: Optional[str] = None,
+                 initial_buffer_size_bytes: Optional[int] = None):
+        """
+        Args:
+            mapping (Mapping): The TP group this all-reduce runs over.
+            dtype (torch.dtype): Element type of the tensors to reduce.
+            workspace_tag (Optional[str]): ``None`` shares ``mapping``'s default workspace;
+                a tag names a separate workspace on the same TP group (``workspace_key`` is
+                then ``(mapping, tag)``), so launches on one tag never dirty another tag's
+                Lamport buffers.
+            initial_buffer_size_bytes (Optional[int]): Lamport buffer size a workspace this
+                instance creates starts with (``get_required_workspace_size`` units);
+                ``None`` keeps the model-sized default.
+        """
         super().__init__()
         self.mapping = mapping
         self.dtype = dtype
+        # Registry key: the mapping itself when untagged, so every existing
+        # allreduce_mnnvl_workspaces[mapping] access stays valid.
+        self.workspace_key: _MnnvlWorkspaceKey = mapping
+        if workspace_tag is not None:
+            self.workspace_key = (mapping, workspace_tag)
         if dtype not in MNNVLAllReduce.get_supported_dtypes() or (
                 mapping.has_cp()):
             # This is safe as we always capture the exception when create this object
@@ -794,7 +840,11 @@ class MNNVLAllReduce(nn.Module):
             )
 
         # Initialize the workspace
-        get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype)
+        get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping,
+            self.dtype,
+            buffer_size_bytes=initial_buffer_size_bytes,
+            workspace_key=self.workspace_key)
 
     @staticmethod
     def get_supported_dtypes():
@@ -827,9 +877,18 @@ class MNNVLAllReduce(nn.Module):
         return supported and (explicitly_requested or mapping.is_multi_node())
 
     @staticmethod
+    def max_one_shot_tokens(hidden_dim: int, group_size: int,
+                            dtype: torch.dtype) -> int:
+        """Largest token count of ``hidden_dim``-wide ``dtype`` rows over
+        ``group_size`` ranks that the allreduceOp.cpp heuristic still routes to
+        the one-shot kernel (see get_required_workspace_size)."""
+        return _MNNVL_ONE_SHOT_THRESHOLD_BYTES // (hidden_dim * group_size *
+                                                   dtype.itemsize)
+
+    @staticmethod
     def get_required_workspace_size(num_tokens: int, hidden_dim: int,
                                     group_size: int, dtype: torch.dtype) -> int:
-        elem_size = torch.tensor([], dtype=dtype).element_size()
+        elem_size = dtype.itemsize
         # This should match the heuristic in allreduceOp.cpp.
         is_one_shot = (num_tokens * hidden_dim * group_size * elem_size
                        <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES)
@@ -852,7 +911,7 @@ class MNNVLAllReduce(nn.Module):
         current MPI runtime is still valid. It is not sufficient for live-serving
         checkpointing.
         """
-        workspace = self.allreduce_mnnvl_workspaces[self.mapping]
+        workspace = self.allreduce_mnnvl_workspaces[self.workspace_key]
         workspace["handle"].checkpoint_prepare()
         comm = workspace["comm"]
         if comm is not None:
@@ -876,7 +935,7 @@ class MNNVLAllReduce(nn.Module):
                 retains its own duplicate, so the caller may release this object
                 after the method returns.
         """
-        workspace = self.allreduce_mnnvl_workspaces[self.mapping]
+        workspace = self.allreduce_mnnvl_workspaces[self.workspace_key]
         if mpi_disabled():
             restore_pending = workspace["handle"].checkpoint_restore(
                 process_group=comm, pybind11_abi=torch_pybind11_abi())
@@ -945,6 +1004,7 @@ class MNNVLAllReduce(nn.Module):
             self.mapping,
             self.dtype,
             buffer_size_bytes=workspace_size_bytes,
+            workspace_key=self.workspace_key,
         )
 
         # We don't expect the buffer to be directly used in this level. The tensor is only used for passing the pointer to the kernel
@@ -975,7 +1035,9 @@ class AllReduce(nn.Module):
     def __init__(self,
                  mapping: Mapping,
                  strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
-                 dtype: Optional[torch.dtype] = None):
+                 dtype: Optional[torch.dtype] = None,
+                 workspace_tag: Optional[str] = None,
+                 mnnvl_initial_workspace_bytes: Optional[int] = None):
         super().__init__()
         """
         AllReduce is a module that performs an all-reduce operation on a tensor.
@@ -1001,6 +1063,16 @@ class AllReduce(nn.Module):
                   Should only be used on topologies with PCIe switches and without NVLink.
                   This strategy may result in some precision loss but can improve performance
                   on specific hardware configurations.
+
+            dtype (Optional[torch.dtype]): Element type of the tensors to reduce; required for
+                the MNNVL kernels to be considered.
+            workspace_tag (Optional[str]): names a separate workspace on the same TP group;
+                today only the MNNVL registry honours it (see ``MNNVLAllReduce``) -- the
+                custom Lamport one-shot workspace is still per-mapping.
+            mnnvl_initial_workspace_bytes (Optional[int]): Lamport buffer size an MNNVL
+                workspace this instance creates starts with
+                (``MNNVLAllReduce.get_required_workspace_size`` units); ``None`` keeps the
+                model-sized default.
 
             All strategies support the following operations:
                 - NONE (AllReduce only)
@@ -1097,7 +1169,8 @@ class AllReduce(nn.Module):
                     # ALWAYS capture the exception when creating this instance
                     try:
                         self.mnnvl_allreduce = MNNVLAllReduce(
-                            self.mapping, dtype) if dtype else None
+                            self.mapping, dtype, workspace_tag,
+                            mnnvl_initial_workspace_bytes) if dtype else None
                     except Exception as e:
                         logger.debug(
                             f"MNNVL AllReduce can't be enabled due to {e}.")
@@ -1214,12 +1287,7 @@ class AllReduce(nn.Module):
                 "pg": pg.boxed(),
             }
 
-        # In case that AutoTuner brings potential perf regression
-        # TODO: Remove this if no perf regression is observed.
-        disable_allreduce_autotune = os.environ.get(
-            "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
-
-        if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
+        if allreduce_strategy == AllReduceStrategy.AUTO and not _DISABLE_ALLREDUCE_AUTOTUNE and not self._disable_mpi:
             # Use native lookup after tuning unless its Python/C++ contract
             # failed; then retain the existing Python cache and selection path.
             if _ALLREDUCE_AUTOTUNER_TUNING_MODE or not _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED:
