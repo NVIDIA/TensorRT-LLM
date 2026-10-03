@@ -15,6 +15,36 @@ from tensorrt_llm._torch.modules.fla.utils import is_nvidia_hopper
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 
+# Under USE_INDEXED_STATE the kernel aliases ``ht`` onto ``h0`` and
+# read-modify-writes the persistent GDN state pool in place. Autotuning
+# benchmarks each config by re-running the kernel, so without rolling the pool
+# back between trials every replay compounds onto already-advanced state and the
+# surviving values are wrong for the first call of each new autotune key.
+#
+# ``restore_value=["h0"]`` cannot be used here: it clones unconditionally, while
+# the AutoDeploy delta-rule caller legitimately passes ``initial_state=None``.
+# Triton drives these hooks as a pre/post pair around a single benchmarked
+# launch, so one snapshot slot is enough.
+_h0_snapshot = None
+
+
+def _save_h0(kwargs, reset_only=False):
+    global _h0_snapshot
+    h0 = kwargs.get("h0")
+    # Only the indexed-state path writes through h0; otherwise it is read-only.
+    # reset_only=True comes from Autotuner.run() with no post-hook to pair with.
+    if reset_only or h0 is None or kwargs.get("h0_i") is None:
+        _h0_snapshot = None
+        return
+    _h0_snapshot = h0.clone()
+
+
+def _restore_h0(kwargs, exception=None):
+    global _h0_snapshot
+    if _h0_snapshot is not None:
+        kwargs["h0"].copy_(_h0_snapshot)
+        _h0_snapshot = None
+
 
 @triton.heuristics({
     "USE_G": lambda args: args["g"] is not None,
@@ -30,6 +60,8 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
         for nw in NUM_WARPS for ns in [2, 3, 4] for BV in [32, 64]
     ],
     key=["H", "K", "V", "BT", "USE_G"],
+    pre_hook=_save_h0,
+    post_hook=_restore_h0,
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
