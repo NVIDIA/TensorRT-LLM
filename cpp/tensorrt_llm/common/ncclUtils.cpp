@@ -410,6 +410,38 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
     TLLM_CHECK_WITH_INFO(size > 0, "Buffer size must be greater than 0");
 
+    // Do not hand out a window buffer while a CUDA graph is capturing.
+    //
+    // A captured collective writes its window buffer on every replay, for as
+    // long as the graph lives. But the tensor wrapping that buffer dies at the
+    // end of the capture -- for an all-reduce whose output is an intermediate
+    // activation, that is immediate, and deliberately so: CUDAGraphRunner runs
+    // graph outputs through make_weak_ref() precisely so intermediates can be
+    // freed. releaseBuffer() then puts the buffer back on the free list, the
+    // next requester is given it, and every subsequent replay overwrites
+    // whatever that requester wrote.
+    //
+    // Restricting reuse rather than refusing outright does not work. The
+    // natural rule -- allow reuse on the same stream, since the previous
+    // holder's tensor is dead at that point in the recorded sequence and
+    // kernels are stream-ordered -- is the reason the eager path may recycle,
+    // and it does not carry over: this buffer is written by the collective,
+    // that is, by the peer ranks. Stream order sequences local kernels; it does
+    // not order a remote rank's writes into this rank's window. Measured on a
+    // 4-rank run, a same-stream reuse rule worked exactly as designed (7
+    // buffers serving 72 requests, 65 reuse hits, zero pool-exhaustion
+    // fallbacks) and still produced wrong output on 3/3 prompts.
+    //
+    // Refusing costs the zero-copy path under graphs; callers fall back to a
+    // plain ncclAllReduce, which is correct by construction and needs no
+    // assumption about ordering. Eager collectives keep using windows.
+    if (common::isCapturing(at::cuda::getCurrentCUDAStream().stream()))
+    {
+        ++mCaptureRefusals;
+        TLLM_LOG_TRACE("[NCCLUtil] Refusing an NCCL window buffer of %zu bytes during CUDA graph capture", size);
+        return NCCLWindowBuffer();
+    }
+
     std::lock_guard<std::mutex> lock(mMutex);
 
     // Register cleanup callback for this communicator if not already registered
