@@ -173,6 +173,9 @@ l0_b200:
   - unittest/_torch/modeling/test_kimi_linear_checkpoint.py
   # CPU self-test of the Kimi K3 disagg parity harness comparison logic.
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
+  # ------------- distributed ---------------
+  # One process: the MNNVL workspace's capture guard raises before any MNNVL call.
+  - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_creation_refuses_graph_capture
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
