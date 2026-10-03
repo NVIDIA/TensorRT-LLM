@@ -35,6 +35,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      per_request_spec_decode_stats:
+        annotation: bool
+        default: False
+        status: prototype
       perf_metrics_output_dir:
         annotation: Optional[str]
         default: null
