@@ -13,6 +13,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.attention.backends.interface import idempotent_kv_lens_hook
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import maybe_compile
@@ -61,6 +62,19 @@ def _fused_dsa_meta_enabled() -> bool:
     return os.environ.get("TRTLLM_DISABLE_FUSED_DSA_METADATA", "0") == "0"
 
 
+@functools.lru_cache(maxsize=1)
+def dsa_mtp_schedule_skip_enabled() -> bool:
+    """Read the TRTLLM_DSA_MTP_SCHEDULE_SKIP env gate (once, process-constant).
+
+    Enabled by default. Set it to "0" for the original path: the indexer
+    schedule is rebuilt on every kv-lens update of the MTP draft loop and the
+    model engine keeps its duplicate on_update_kv_lens() call at the step
+    boundary. Cached for the same reason as _fused_dsa_meta_enabled: the
+    choice is fixed before CUDA-graph capture.
+    """
+    return os.environ.get("TRTLLM_DSA_MTP_SCHEDULE_SKIP", "1") != "0"
+
+
 def build_req_idx_per_token(seq_lens: torch.Tensor, num_tokens: int) -> torch.Tensor:
     """Map each flattened-batch token to its request index."""
     cu_seq_lens = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
@@ -100,6 +114,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer_skip_topk: bool = False
     in_mtp_draft_loop: bool = False
     mtp_num_accepted: Optional[torch.Tensor] = None
+    # Set by on_update_kv_lens(skip_indexer_schedule=True): the DeepGEMM MQA-logits schedule, the
+    # 2D/expanded indexer KV lengths and the GVR row order were left untouched. Legal only if no
+    # MQA-logits + TopK pass runs before the next full rebuild; the indexer asserts via this marker.
+    indexer_schedule_stale: bool = False
     # Whether skip the indexer for context requests
     skip_indexer_for_ctx_reqs: bool = False
     # Whether skip the indexer for generation requests
@@ -482,7 +500,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 "will JIT-compile lazily on first touch instead."
             )
 
-    def on_update_kv_lens(self) -> None:
+    def on_update_kv_lens(self, skip_indexer_schedule: bool = False) -> None:
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         #
@@ -491,6 +509,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # (inside _preprocess_inputs) to account for variable accepted tokens. The indexer
         # slot_mapping_* buffers also depend on these effective cached lengths. If we do not
         # refresh slot mappings here, indexer K-cache updates can be written with stale offsets.
+        #
+        # skip_indexer_schedule leaves the indexer's MQA-logits schedule as is; see
+        # indexer_schedule_stale for what that covers and when it is legal.
+        self.indexer_schedule_stale = skip_indexer_schedule
 
         super().on_update_kv_lens()
 
@@ -577,54 +599,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     dtype=torch.int64,
                     out=self.gen_cached_token_indptr[1 : self.num_generations + 1],
                 )
-            gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
-            gen_indexer_kv_lens = self.get_indexer_kv_lens(gen_kv_lens)
-            self.gen_indexer_kv_lens_cuda_runtime = gen_indexer_kv_lens
-            next_n_cap = self.kv_lens_cuda_2d.shape[1]
-            self.kv_lens_cuda_2d[: self.num_generations, :next_n_cap].copy_(
-                gen_indexer_kv_lens.unsqueeze(-1).expand(-1, next_n_cap)
-            )
-            scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, self.num_sms
-            )
-            self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
-            if self.max_draft_tokens > 0 and not self.use_expanded_buffers_for_mtp:
-                scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
-                    self.kv_lens_cuda_2d[: self.num_generations, :next_n_cap],
-                    _DG_SCHEDULE_BLOCK_KV,
-                    self.num_sms,
-                )
-                self.scheduler_metadata_buffer_full_next_n.copy_(
-                    scheduler_metadata_buffer_full_next_n, non_blocking=True
-                )
-            if self.use_expanded_buffers_for_mtp:
-                num_draft_tokens = 1 + self.max_draft_tokens
-                num_tokens = self.num_generations * num_draft_tokens
-                kv_lens_expanded = torch.stack([gen_indexer_kv_lens] * num_draft_tokens, dim=0)
-                self.kv_lens_expanded_cuda[:num_tokens] = (
-                    kv_lens_expanded.transpose(0, 1).contiguous().flatten()
-                )
-                scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                    self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
-                    _DG_SCHEDULE_BLOCK_KV,
-                    self.num_sms,
-                )
-                self.scheduler_metadata_buffer_expanded.copy_(
-                    scheduler_metadata_buffer_expanded, non_blocking=True
-                )
-            if self.expand_for_dsl and self.dsl_expand_factor > 1:
-                expand_factor = self.dsl_expand_factor
-                num_tokens = self.num_generations * expand_factor
-                gen_kv_lens_expanded = gen_indexer_kv_lens.repeat_interleave(expand_factor)
-                self.kv_lens_expanded_cuda[:num_tokens].copy_(gen_kv_lens_expanded)
-                scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                    self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
-                    _DG_SCHEDULE_BLOCK_KV,
-                    self.num_sms,
-                )
-                self.scheduler_metadata_buffer_expanded.copy_(
-                    scheduler_metadata_buffer_expanded, non_blocking=True
-                )
+        if self.num_generations > 0 and not skip_indexer_schedule:
+            self._rebuild_indexer_schedule()
 
         if fused_eligible:
             if not getattr(self, "_fused_dsa_meta_armed", False):
@@ -636,8 +612,68 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self._fused_dsa_meta_armed = True
             self._run_fused_dsa_decode_metadata()
 
-        self._compute_kv_lens_row_reorder()
+        if not skip_indexer_schedule:
+            self._compute_kv_lens_row_reorder()
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
+
+    # The kill switch also restores the engine's duplicate call at the step boundary.
+    on_update_kv_lens = (
+        idempotent_kv_lens_hook(on_update_kv_lens)
+        if dsa_mtp_schedule_skip_enabled()
+        else on_update_kv_lens
+    )
+
+    def _rebuild_indexer_schedule(self) -> None:
+        """Rebuild what the indexer's MQA-logits + TopK pass reads from the gen KV lengths:
+        the DeepGEMM schedule(s), the 2D/expanded indexer KV lengths and their runtime copy."""
+        gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
+        gen_indexer_kv_lens = self.get_indexer_kv_lens(gen_kv_lens)
+        self.gen_indexer_kv_lens_cuda_runtime = gen_indexer_kv_lens
+        next_n_cap = self.kv_lens_cuda_2d.shape[1]
+        self.kv_lens_cuda_2d[: self.num_generations, :next_n_cap].copy_(
+            gen_indexer_kv_lens.unsqueeze(-1).expand(-1, next_n_cap)
+        )
+        scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
+            gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, self.num_sms
+        )
+        self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
+        if self.max_draft_tokens > 0 and not self.use_expanded_buffers_for_mtp:
+            scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
+                self.kv_lens_cuda_2d[: self.num_generations, :next_n_cap],
+                _DG_SCHEDULE_BLOCK_KV,
+                self.num_sms,
+            )
+            self.scheduler_metadata_buffer_full_next_n.copy_(
+                scheduler_metadata_buffer_full_next_n, non_blocking=True
+            )
+        if self.use_expanded_buffers_for_mtp:
+            num_draft_tokens = 1 + self.max_draft_tokens
+            num_tokens = self.num_generations * num_draft_tokens
+            kv_lens_expanded = torch.stack([gen_indexer_kv_lens] * num_draft_tokens, dim=0)
+            self.kv_lens_expanded_cuda[:num_tokens] = (
+                kv_lens_expanded.transpose(0, 1).contiguous().flatten()
+            )
+            scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
+                _DG_SCHEDULE_BLOCK_KV,
+                self.num_sms,
+            )
+            self.scheduler_metadata_buffer_expanded.copy_(
+                scheduler_metadata_buffer_expanded, non_blocking=True
+            )
+        if self.expand_for_dsl and self.dsl_expand_factor > 1:
+            expand_factor = self.dsl_expand_factor
+            num_tokens = self.num_generations * expand_factor
+            gen_kv_lens_expanded = gen_indexer_kv_lens.repeat_interleave(expand_factor)
+            self.kv_lens_expanded_cuda[:num_tokens].copy_(gen_kv_lens_expanded)
+            scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
+                _DG_SCHEDULE_BLOCK_KV,
+                self.num_sms,
+            )
+            self.scheduler_metadata_buffer_expanded.copy_(
+                scheduler_metadata_buffer_expanded, non_blocking=True
+            )
 
     def _run_fused_dsa_decode_metadata(self):
         """Fill req_idx_per_token + slot mappings + gen indptrs via one Triton
@@ -693,8 +729,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.num_ctx_cached_tokens = 0
         self.max_gen_seq_len = 1
 
-        # device
-        self.on_update_kv_lens()
+        # device. Inside an index-sharing draft loop every call here prepares either a
+        # TopK-reuse draft step or the post-loop target forward, which rebuilds in
+        # _preprocess_inputs: the indexer schedule is never read before its next full rebuild.
+        skip_indexer_schedule = (
+            dsa_mtp_schedule_skip_enabled()
+            and self.in_mtp_draft_loop
+            and self.sparse_metadata_params.mtp_index_share
+        )
+        self.on_update_kv_lens(skip_indexer_schedule=skip_indexer_schedule)
 
     # Create buffers for mla_rope_append_paged_kv_assign_q
     def create_buffers_for_mla_rope_append(self, capture_graph=False):
@@ -835,6 +878,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.indexer_skip_topk = False
         self.in_mtp_draft_loop = False
         self.mtp_num_accepted = None
+        self.indexer_schedule_stale = False
 
         # Indexer metadata
         # Separate slot mappings for non-interleaved layout (flat byte indices)
