@@ -86,7 +86,7 @@ def _build_step_args(
     are per-capture constants (host-derived class). attention_window_size is
     absent here on purpose: it is per-layer, not per-step, and is rebound
     every forward with `bind_layered` instead -- see the comment in
-    `_GptOssTarget.forward`.
+    `PrefillTarget.forward` and `DecodeTarget.forward`.
 
     `num_contexts` and `num_ctx_tokens` are passed rather than read off `md`
     because they are the two values a decode target knows by its routing --
@@ -253,11 +253,12 @@ class ModelingV2Core(DecoderModel):
         # so both shapes are resolved here and every scalar the ramp
         # depends on is asserted rather than defaulted.
         #
-        # Unlike the block above, nothing but `_GptOssTarget.__init__` (via
-        # `build_layer_views`) reads `theta` or the four `yarn_*` once this
-        # method returns -- they exist solely to bind `fused_qk_norm_rope`.
-        # They stay attributes anyway, rather than becoming a second copy of
-        # this derivation inside the target: the ramp has real failure modes
+        # Unlike the block above, nothing but `PrefillTarget.__init__` and
+        # `DecodeTarget.__init__` (via `build_layer_views`) reads `theta` or
+        # the four `yarn_*` once this method returns -- they exist solely to
+        # bind `fused_qk_norm_rope`. They stay attributes anyway, rather than
+        # becoming a second copy of this derivation inside the target: the
+        # ramp has real failure modes
         # (a missing rope key raises KeyError; `math.log` of a non-positive
         # `theta` or `orig_max` raises ValueError), and catching those here,
         # before the weight load, is cheaper than catching them afterward or
@@ -304,8 +305,9 @@ class ModelingV2Core(DecoderModel):
         # and `inter` are locals for the same reason as the five above.
         # `topk` and `swiglu_limit` never even get that far: weights.py
         # doesn't read them either, so (like `eps`, this checkpoint's
-        # `rms_norm_eps`) the target reads each straight off `cfg` at its one
-        # call site instead -- see `_GptOssTarget.__init__`.
+        # `rms_norm_eps`) each target reads it straight off `cfg` at its own
+        # one call site instead -- see `PrefillTarget.__init__` and
+        # `DecodeTarget.__init__`.
         num_experts = cfg.num_local_experts
         inter = cfg.intermediate_size
 
@@ -379,12 +381,13 @@ class ModelingV2Core(DecoderModel):
         Used to also derive per-layer GEMM views and the MoE/RoPE call
         tensors itself, holding them in two attributes (a per-layer tuple
         and a call-tensor dict) that this class no longer declares. Both are
-        deleted outright, not just unused: each target's `__init__` (via
-        `Target.__init__` -> the shared `_GptOssTarget`) now binds its own
-        per-layer weight tables and op-owned fixtures straight into the
-        catalog-entry instances it holds, so there is no longer a parallel
-        copy here for a call site to read out of -- and nothing else reads
-        `self.w` through this method.
+        deleted outright, not just unused: each target's own `__init__` now
+        binds its own per-layer weight tables and op-owned fixtures straight
+        into the catalog-entry instances it holds, so there is no longer a
+        parallel copy here for a call site to read out of -- and nothing else
+        reads `self.w` through this method. `PrefillTarget` and `DecodeTarget`
+        each do this independently; the two bindings are identical in
+        content, not shared in code.
 
         Meta is over by the time this runs, so real tensors may be built and
         `.t()`'d; never called from `__init__`, where the shell's containers
@@ -430,13 +433,19 @@ class ModelingV2Core(DecoderModel):
         return self._targets[phase_of(attn_metadata)].forward(attn_metadata, *args, **kwargs)
 
 
-class _GptOssTarget(Target):
-    """The shared step body.
+class PrefillTarget(Target):
+    """The general case: context rows, and possibly generation rows beside them.
+
+    In-flight batching puts both in one step, and that mixed batch routes here
+    rather than to decode -- so this target reads both counts off the metadata
+    and may not assume either is zero.
 
     gpt_oss is not MLA, so `TrtllmAttention` accepts `mixed` and the
     context/generation split stays inside the C++ dispatcher: this forward has
-    no phase branch to divide. The two concrete targets below therefore differ
-    only in `step_args`. A model whose phases run different computations --
+    no phase branch to divide. `DecodeTarget`, below, runs the identical body
+    -- the two differ only in `step_args` -- as a separate, independent class:
+    targets in this tree do not share code with each other, even when sharing
+    would be free. A model whose phases run different computations --
     deepseek's MLA, where generation works in latent space and context
     materializes K and V -- overrides `forward` itself instead.
     """
@@ -590,6 +599,9 @@ class _GptOssTarget(Target):
             self._norm_next.bind_layered(i, weight=next_w)
         self._norm_next.bind_const(eps=cfg.rms_norm_eps)
 
+    def step_args(self, md: TrtllmAttentionMetadata) -> dict:
+        return _build_step_args(md, num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -612,7 +624,7 @@ class _GptOssTarget(Target):
         # rather than once: its full-attention value is
         # attn_metadata.max_seq_len, which reads the KV cache manager's
         # *resolved* max_seq_len, not known until the cache is sized --
-        # well after `_GptOssTarget.__init__` runs at post-load. The value
+        # well after `PrefillTarget.__init__` runs at post-load. The value
         # itself never changes between forwards once the cache exists (no
         # attention backend reassigns `max_seq_len` per step -- see
         # `AttentionMetadata` in interface.py -- and the only writes to it
@@ -666,29 +678,250 @@ class _GptOssTarget(Target):
         return x
 
 
-class PrefillTarget(_GptOssTarget):
-    """The general case: context rows, and possibly generation rows beside them.
-
-    In-flight batching puts both in one step, and that mixed batch routes here
-    rather than to decode -- so this target reads both counts off the metadata
-    and may not assume either is zero.
-    """
-
-    def step_args(self, md: TrtllmAttentionMetadata) -> dict:
-        return _build_step_args(md, num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
-
-
-class DecodeTarget(_GptOssTarget):
+class DecodeTarget(Target):
     """The specialization: routed to only when there are no context rows.
 
     It states the two counts rather than reading them. Not an optimization --
     they are per-capture host constants either way -- but it is what makes the
     invariant checkable: a decode target that reads the phase back has stopped
     being one, and the source gate in test_modeling_v2_claims.py can see that.
+
+    gpt_oss is not MLA, so `TrtllmAttention` accepts `mixed` and the
+    context/generation split stays inside the C++ dispatcher: this forward has
+    no phase branch to divide. `PrefillTarget`, above, runs the identical body
+    -- the two differ only in `step_args` -- as a separate, independent class:
+    targets in this tree do not share code with each other, even when sharing
+    would be free. A model whose phases run different computations --
+    deepseek's MLA, where generation works in latent space and context
+    materializes K and V -- overrides `forward` itself instead.
     """
+
+    def __init__(self, core: ModelingV2Core) -> None:
+        """Bind every op this target calls, once, against the real weights.
+
+        `Target.__init__` only stores `self.core`; everything below is this
+        target's own addition, and is why gpt_oss needed one. Per-layer
+        weight tables go into each catalog entry's `bind_layered`, one layer
+        at a time, built straight from `core.w` and keeping the `.t()` views
+        the hot-path GEMMs already used (zero-copy). Configuration comes
+        from `cfg` throughout: `core` carries none of it past what is
+        genuinely derived (`inter_pad`, `fc1_k_pad`, `fc2_rows_pad`, `theta`,
+        the `yarn_*` quantities) or read per layer by the forward
+        (`sliding`, `window`) -- see `ModelingV2Core.__init__` for which is
+        which. The one op-owned fixture built here -- `fused_qk_norm_rope`'s
+        inert q/k norm weight -- is an input that op needs to satisfy its
+        own signature, not state the model computes; the MoE runner's
+        per-expert activation vectors are the same kind of fixture, but the
+        op builds those itself now, via `bind_glu`.
+        """
+        super().__init__(core)
+        cfg = core.model_config.pretrained_config
+        w = core.w
+        device = w["final_norm"].device
+        dtype = w["final_norm"].dtype
+        n = cfg.num_hidden_layers
+
+        self._norm0 = FlashinferRmsnorm()
+        self._norm0.bind_const(weight=w["l0_norm1"], eps=cfg.rms_norm_eps)
+
+        self._qkv = CublasMm()
+        for i in range(n):
+            self._qkv.bind_layered(i, mat_b=w[f"l{i}_qkv"].t(), bias=w[f"l{i}_qkv_bias"])
+
+        # fused_qk_norm_rope requires valid q/k norm weight tensors even with
+        # is_qk_norm=False, where their values are unused; built from the
+        # scalars the op needs (head_dim, dtype, device) rather than copied
+        # off a reference tensor, which would tie this fixture to whichever
+        # tensor happened to be handy when it was written. rotary_dim is
+        # cfg.head_dim directly -- equal for this checkpoint, and not worth
+        # a third name for the same value (see `ModelingV2Core.__init__`).
+        no_qk_norm = torch.zeros(cfg.head_dim, dtype=dtype, device=device)
+        self._qk_rope = FusedQkNormRope()
+        self._qk_rope.bind_const(
+            num_heads_q=cfg.num_attention_heads,
+            num_heads_k=cfg.num_key_value_heads,
+            num_heads_v=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            rotary_dim=cfg.head_dim,
+            eps=cfg.rms_norm_eps,
+            q_weight=no_qk_norm,
+            k_weight=no_qk_norm,
+            base=core.theta,
+            is_neox=True,
+            factor=core.yarn_factor,
+            low=core.yarn_low,
+            high=core.yarn_high,
+            attention_factor=core.yarn_attn_factor,
+            is_qk_norm=False,
+        )
+
+        # attention_window_size is absent here -- it is not knowable until a
+        # forward is underway (its full-attention value is
+        # attn_metadata.max_seq_len, the KV cache manager's *resolved* size,
+        # not known until after this target's __init__ runs at post-load),
+        # so every forward binds it fresh instead -- see the comment in
+        # `forward`. local_layer_idx is layered rather than passed at the
+        # call site even though it is exactly `layer`'s own value: it is a
+        # genuine op argument (the row thop_attention reads out of the pool
+        # mapping), not the binding mechanism's own index, and layering it
+        # here means the call site states `layer=i` once instead of the same
+        # `i` under two names.
+        self._attn = ThopAttention()
+        for i in range(n):
+            self._attn.bind_layered(i, attention_sinks=w[f"l{i}_sinks"], local_layer_idx=i)
+        self._attn.bind_const(
+            num_heads=cfg.num_attention_heads,
+            num_kv_heads=cfg.num_key_value_heads,
+            head_size=cfg.head_dim,
+            **_CALL_CONSTANTS,
+        )
+
+        self._o_proj = CublasMm()
+        for i in range(n):
+            self._o_proj.bind_layered(i, mat_b=w[f"l{i}_o"].t(), bias=w[f"l{i}_o_bias"])
+
+        self._norm2 = FlashinferFusedAddRmsnorm()
+        for i in range(n):
+            self._norm2.bind_layered(i, weight=w[f"l{i}_norm2"])
+        self._norm2.bind_const(eps=cfg.rms_norm_eps)
+
+        self._router = CublasMm()
+        for i in range(n):
+            self._router.bind_layered(i, mat_b=w[f"l{i}_router"].t(), bias=w[f"l{i}_router_bias"])
+
+        self._quant = Mxfp8Quantize()
+        # swizzled_layout=False: the MoE op reads the activation scales as a
+        # linear (row-major) buffer. The 128x4 swizzled order has the same
+        # byte count whenever num_tokens is a multiple of 128 -- which every
+        # decode CUDA-graph batch of 128 or 256 is -- and is then accepted
+        # silently as a wrong answer, so this is spelled out rather than
+        # left to the quantizer's default.
+        self._quant.bind_const(swizzled_layout=False, alignment=_FC1_K_ALIGN)
+
+        self._moe = Mxe4m3Mxe2m1BlockScaleMoeRunner()
+        for i in range(n):
+            self._moe.bind_layered(
+                i,
+                gemm1_weights=w[f"l{i}_fc1_w"],
+                gemm1_weights_scale=w[f"l{i}_fc1_s"],
+                gemm1_bias=w[f"l{i}_fc1_b"],
+                gemm2_weights=w[f"l{i}_fc2_w"],
+                gemm2_weights_scale=w[f"l{i}_fc2_s"],
+                gemm2_bias=w[f"l{i}_fc2_b"],
+            )
+        # alpha, beta and the clamp limit: the op builds its own per-expert
+        # vectors from a count and a scalar -- see `bind_glu`. This target
+        # runs tp1, so every expert is local and `cfg.num_local_experts` is
+        # the whole count, not a per-layer table: every layer shares the
+        # same checkpoint constants (alpha, beta) and config scalar
+        # (swiglu_limit).
+        self._moe.bind_glu(cfg.num_local_experts, cfg.swiglu_limit, device)
+        self._moe.bind_const(
+            # The router bias rides the router GEMM's own epilogue instead
+            # (see the call site): routing_bias is bound to None here so a
+            # reader never has to find a bare positional None at the call and
+            # wonder what it is.
+            routing_bias=None,
+            num_experts=cfg.num_local_experts,
+            top_k=cfg.num_experts_per_tok,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=core.inter_pad,
+            valid_hidden_size=cfg.hidden_size,
+            valid_intermediate_size=cfg.intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=cfg.num_local_experts,
+            routed_scaling_factor=None,
+            # Renormalize routing (top-k first, then fp32 softmax over the
+            # selected logits) and the only gated-activation kernel in this
+            # dtype family.
+            routing_method_type=1,
+            act_type=0,
+        )
+
+        self._norm_next = FlashinferFusedAddRmsnorm()
+        for i in range(n):
+            next_w = w[f"l{i + 1}_norm1"] if i + 1 < n else w["final_norm"]
+            self._norm_next.bind_layered(i, weight=next_w)
+        self._norm_next.bind_const(eps=cfg.rms_norm_eps)
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         return _build_step_args(md, num_contexts=0, num_ctx_tokens=0)
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.IntTensor | None = None,
+        position_ids: torch.IntTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        lora_params: dict | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        core = self.core
+        cfg = core.model_config.pretrained_config
+
+        # advance_step_generation must run before any bind_const this forward
+        # makes: it is what lets validating() catch a target that forgot to
+        # rebind and is running an op against last step's metadata.
+        advance_step_generation()
+        self._attn.bind_const(**self.step_args(attn_metadata))
+
+        # attention_window_size is per-layer, and rebound every forward
+        # rather than once: its full-attention value is
+        # attn_metadata.max_seq_len, which reads the KV cache manager's
+        # *resolved* max_seq_len, not known until the cache is sized --
+        # well after `DecodeTarget.__init__` runs at post-load. The value
+        # itself never changes between forwards once the cache exists (no
+        # attention backend reassigns `max_seq_len` per step -- see
+        # `AttentionMetadata` in interface.py -- and the only writes to it
+        # happen in `KVCacheManager.__init__` and engine construction, both
+        # long done by the time a forward reaches this target), so this
+        # recomputes the same 36-entry table every step. That cost is
+        # accepted in exchange for not carrying a one-shot flag and the
+        # branch that read it.
+        full_window = attn_metadata.max_seq_len
+        for i, sliding in enumerate(core.sliding):
+            self._attn.bind_layered(
+                i, attention_window_size=core.window if sliding else full_window
+            )
+
+        pos = torch.reshape(position_ids, [-1])
+
+        if inputs_embeds is None:
+            h = nn.functional.embedding(input_ids, core.w["embed"])
+        else:
+            h = inputs_embeds
+        num_tokens = h.shape[0]
+        dt = h.dtype
+        attn_out = torch.empty(
+            [num_tokens, cfg.num_attention_heads * cfg.head_dim], dtype=dt, device=h.device
+        )
+
+        x = self._norm0(h)
+        residual = h
+        for i in range(cfg.num_hidden_layers):
+            qkv = self._qkv(x, layer=i)
+            qkv = self._qk_rope(qkv, position_ids=pos)
+            attn_out = self._attn(q=qkv, output=attn_out, layer=i)
+            o = self._o_proj(attn_out, layer=i)
+            o, residual = self._norm2(o, residual, layer=i)
+            # The router bias rides the GEMM epilogue: the MoE op silently
+            # ignores routing_bias on this routing method -- routing_bias
+            # itself is bound to None on self._moe (see __init__).
+            router_logits = self._router(o, layer=i)
+            # The quantizer owns the hidden widening 2880 -> fc1_k_pad: it
+            # zero-fills the padded columns and their scale bytes, which
+            # multiply zero-valued padded weights.
+            hidden_fp8, hidden_sf = self._quant(o)
+            moe = self._moe(
+                routing_logits=router_logits,
+                hidden_states=hidden_fp8,
+                hidden_states_scale=hidden_sf,
+                layer=i,
+            )
+            moe, residual = self._norm_next(moe, residual, layer=i)
+            x = moe
+        return x
 
 
 @register_auto_model("ModelingV2GptOss120bSm103Tp1")
