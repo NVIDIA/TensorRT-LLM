@@ -23,8 +23,10 @@ intermediate 768), as in the TP16 deployment.
           trtllm::kimi_k3_noaux_tc_mxfp8_quant; shared: cuBLAS gate_up -> trtllm::situ_and_mul): top-16 ids per
           token (a mismatch only at a reference
           16th / 17th key margin below 1e-4: the split-K head sums in another order), routing weights, MXFP8 codes and
-          scales (> 99.9 % equal, dequantized within one block-scale unit), the shared activation within 2e-2; the same
-          routing and latent bits on every rank; the head buffers empty and the buffer index flipped after each call;
+          scales (> 99.9 % equal; for the same reason a code may differ only at a reference rounding tie: the
+          adjacent E4M3 value under the same block scale, the reference latent within two bf16 ulps of the two
+          values' midpoint), the shared activation within 2e-2; the same routing and latent bits on every rank; the
+          head buffers empty and the buffer index flipped after each call;
   fused : y against the TRTLLM-Gen W4A8_MXFP4_MXFP8 runner on the front's own routing and MXFP8 latent (op-catalog
           gates), the shared activation the front's bits, k3_moe's scratch re-armed;
   head_flags : fused with the ready-word handoff (k3_moe built with head_flags) across the head epoch's int32 wrap:
@@ -210,7 +212,25 @@ def _reference(ctx, x):
     shared = torch.ops.trtllm.situ_and_mul(F.linear(x, ctx.gate_up), GATE_CAP, LINEAR_CAP)
     key = torch.sigmoid(logits) + ctx.bias
     top = key.sort(dim=1, descending=True).values
-    return ids, w, q, s, shared, top[:, TOP_K - 1] - top[:, TOP_K]
+    return ids, w, q, s, shared, top[:, TOP_K - 1] - top[:, TOP_K], latent
+
+
+def _latent_mismatch_not_near_tie(q, s, r_q, r_s, r_latent) -> int:
+    """MXFP8 latent codes that differ from the reference's anywhere but at a reference rounding tie. The front sums
+    the head in its own split-K order, so its bf16 latent can sit one bf16 ulp from the reference's; where that ulp
+    straddles an E4M3 rounding midpoint the code moves to the adjacent value. A difference is allowed only there:
+    the same block scale, adjacent codes, and the reference latent within two bf16 ulps of their midpoint."""
+    qb, rb = _bits(q).int(), _bits(r_q).int()
+    mismatch = qb != rb
+    same_scale = (_bits(s) == _bits(r_s)).repeat_interleave(SV, dim=1)
+    # E4M3 codes of one sign are ordered by magnitude: adjacent values differ by one in the 7 magnitude bits.
+    adjacent = ((qb & 0x80) == (rb & 0x80)) & (((qb & 0x7F) - (rb & 0x7F)).abs() == 1)
+    scale = torch.pow(2.0, r_s.float() - 127.0).repeat_interleave(SV, dim=1)
+    mid = (q.float() + r_q.float()) * 0.5 * scale
+    lat = r_latent.float()
+    bf16_ulp = torch.pow(2.0, torch.floor(torch.log2(lat.abs().clamp_min(2.0**-126))) - 7)
+    near_tie = (lat - mid).abs() <= 2 * bf16_ulp
+    return int((mismatch & ~(same_scale & adjacent & near_tie)).sum())
 
 
 def _dequant(q, s):
@@ -232,7 +252,7 @@ def check_front(ctx):
         torch.cuda.synchronize()
         flag1 = int(ctx.ws.flags[0].item())
         empty = _quiet_check(ctx, lambda: _buffers_empty(ctx))
-        r_ids, r_w, r_q, r_s, r_shared, margin = _reference(ctx, x)
+        r_ids, r_w, r_q, r_s, r_shared, margin, r_latent = _reference(ctx, x)
         # The selected experts per token (their order inside the top 16 may differ at near-equal keys) and each
         # selected expert's weight.
         sets_equal = (ids.sort(dim=1).values == r_ids.sort(dim=1).values).all(dim=1)
@@ -251,6 +271,7 @@ def check_front(ctx):
             weight_max_err=(dense[same_tok] - r_dense[same_tok]).abs().max().item() if same_tok.numel() else 0.0,
             codes_equal=(_bits(q) == _bits(r_q)).float().mean().item(), scales_equal=(s == r_s).float().mean().item(),
             latent_err_scale_units=((dq - rdq).abs() / torch.maximum(scale, rscale)).max().item(),
+            latent_mismatch_not_near_tie=_latent_mismatch_not_near_tie(q, s, r_q, r_s, r_latent),
             shared_rel=((shared.float() - r_shared.float()).abs().max() / r_shared.float().abs().max()).item(),
             det=all(all(_same(a, b) for a, b in zip(r, out)) for r in again),
             rows_as_m8=all(_same(a, b[:m]) for a, b in zip(out, out8)),
@@ -258,7 +279,8 @@ def check_front(ctx):
             buffers_empty=empty and _quiet_check(ctx, lambda: _buffers_empty(ctx)), flag_flipped=flag1 != flag0,
         )  # fmt: skip
         good = (row["mismatch_not_near_tie"] == 0 and row["weight_max_err"] <= 0.01 * RSF and row["codes_equal"] > 0.999
-                and row["scales_equal"] > 0.999 and row["latent_err_scale_units"] <= 1.0 and row["shared_rel"] <= 2e-2
+                and row["scales_equal"] > 0.999 and row["latent_mismatch_not_near_tie"] == 0
+                and row["shared_rel"] <= 2e-2
                 and row["det"] and row["rows_as_m8"] and row["ranks_agree"] and row["buffers_empty"]
                 and row["flag_flipped"])  # fmt: skip
         row["rank"], row["good"] = ctx.rank, bool(good)
