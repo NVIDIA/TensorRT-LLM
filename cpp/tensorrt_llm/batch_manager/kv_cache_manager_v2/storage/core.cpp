@@ -34,6 +34,23 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
+size_t tierAllocationGranularity(CacheTier tier, size_t quota)
+{
+    switch (tier)
+    {
+    case CacheTier::GPU_MEM:
+    case CacheTier::HOST_MEM:
+    {
+        constexpr size_t kPageSize = 2ULL << 20;
+        size_t const ratio = quota / (kPageSize * 512);
+        int const exponent = ratio == 0 ? 0 : std::min(4, static_cast<int>(std::log2(ratio)));
+        return kPageSize << exponent;
+    }
+    case CacheTier::DISK: return kDiskPoolSizeGranularity;
+    default: throw std::invalid_argument("Invalid cache tier");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SlotAllocator
 // ---------------------------------------------------------------------------
@@ -354,15 +371,27 @@ Address GpuSlotPool::slotAddress(SlotId slot) const
 // HostSlotPool
 // ---------------------------------------------------------------------------
 
-HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots)
+HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options)
     : SlotPoolBase(slotSize)
-    , mHostMem(alignedSize(numSlots))
+    , mCommitUnit(options.commitUnit)
+    // The pool does not wait for the fill: HostPoolGroup blocks per allocation
+    // on only the range it hands out, so serving can start before the whole
+    // tier is committed.
+    , mHostMem(std::max(vmSize, alignedSize(numSlots)), alignedSize(numSlots), options, /*waitForFill=*/false)
 {
+}
+
+void HostSlotPool::waitSlotUsable(SlotId slot) const
+{
+    mHostMem.waitUsable(mSlotSize * (toSizeT(slot) + 1));
 }
 
 size_t HostSlotPool::alignedSize(SlotCount numSlots) const noexcept
 {
-    return roundUp(slotCountToSizeT(numSlots) * mSlotSize, HostMem::kAlignment);
+    // Rounded to the unit memory is allocated and released in, which is what
+    // every size handed to HostMem must be a multiple of. Deliberately not the
+    // fill chunk: the last fill step is simply short.
+    return roundUp(slotCountToSizeT(numSlots) * mSlotSize, mCommitUnit);
 }
 
 SlotCount HostSlotPool::numSlots() const noexcept
@@ -583,18 +612,74 @@ GpuPoolGroup::GpuPoolGroup(
 // HostPoolGroup
 // ---------------------------------------------------------------------------
 
-HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList)
+HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t groupVmSize,
+    HostMemBackingOptions const& options)
     : PoolGroupBase(numSlots)
 {
+    TLLM_CHECK_WITH_INFO(!slotSizeList.empty(), "HostPoolGroup: slotSizeList must not be empty");
+    // Each pool reserves address space proportional to its slot size, so that
+    // the pools can grow together up to the bound. Mirrors GpuPoolGroup, which
+    // divides the device's memory the same way.
+    size_t const maxSlotSize = *std::max_element(slotSizeList.begin(), slotSizeList.end());
     for (size_t sz : slotSizeList)
     {
-        mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots));
+        double const sizeRatio = static_cast<double>(sz) / static_cast<double>(maxSlotSize);
+        auto const poolVmSize = static_cast<size_t>(static_cast<double>(groupVmSize) * sizeRatio);
+        mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots, poolVmSize, options));
     }
 }
 
-HostMem const* HostPoolGroup::hostMem(PoolIndex poolIndex) const
+void HostPoolGroup::waitSlotUsable(SlotId slot) const
 {
-    return static_cast<HostSlotPool const&>(*mPools.at(poolIndex)).hostMem();
+    for (auto const& pool : mPools)
+    {
+        static_cast<HostSlotPool const&>(*pool).waitSlotUsable(slot);
+    }
+}
+
+// A failed fill surfaces out of waitSlotUsable, after the slots are already
+// taken, so they are returned to the allocator before the error propagates.
+Slot HostPoolGroup::allocate()
+{
+    Slot slot = PoolGroupBase::allocate();
+    try
+    {
+        waitSlotUsable(slot.slotId());
+    }
+    catch (...)
+    {
+        release(std::move(slot));
+        throw;
+    }
+    return slot;
+}
+
+std::vector<Slot> HostPoolGroup::allocateMultiple(SlotCount numSlots)
+{
+    std::vector<Slot> slots = PoolGroupBase::allocateMultiple(numSlots);
+    if (slots.empty())
+    {
+        return slots;
+    }
+    // Slot ids are not returned in order, so the highest one bounds them all.
+    SlotId highest = slots.front().slotId();
+    for (auto const& slot : slots)
+    {
+        highest = std::max(highest, slot.slotId());
+    }
+    try
+    {
+        waitSlotUsable(highest);
+    }
+    catch (...)
+    {
+        for (auto& slot : slots)
+        {
+            release(std::move(slot));
+        }
+        throw;
+    }
+    return slots;
 }
 
 // ---------------------------------------------------------------------------
@@ -656,15 +741,20 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
 // HostCacheLevelStorage
 // ---------------------------------------------------------------------------
 
-HostCacheLevelStorage::HostCacheLevelStorage(
-    TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList)
+HostCacheLevelStorage::HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::optional<size_t> maxQuota,
+    HostMemBackingOptions const& options)
+    : mOptions(options)
+    // Resolved once here so the bound the pools reserve against is the same one
+    // a later resize is checked against.
+    , mMaxQuota(maxQuota.value_or(hostTotalMemory()))
 {
     TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "HostCacheLevelStorage: slotCountList and slotDescList must have the same length");
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
-        mPoolGroups.push_back(
-            std::make_unique<HostPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList()));
+        mPoolGroups.push_back(std::make_unique<HostPoolGroup>(
+            slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mMaxQuota, mOptions));
     }
 }
 
@@ -691,7 +781,7 @@ DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
 
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-    PooledPhysMemAllocator* gpuPhysMemAllocator)
+    PooledPhysMemAllocator* gpuPhysMemAllocator, HostMemBackingOptions const& options)
 {
     TLLM_CHECK((cacheTierOf(tierCfg) == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
     return std::visit(
@@ -704,7 +794,7 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const
             }
             else if constexpr (std::is_same_v<T, HostCacheTierConfig>)
             {
-                return std::make_unique<HostCacheLevelStorage>(slotDescList, slotCountList);
+                return std::make_unique<HostCacheLevelStorage>(slotDescList, slotCountList, cfg.maxQuota, options);
             }
             else
             {

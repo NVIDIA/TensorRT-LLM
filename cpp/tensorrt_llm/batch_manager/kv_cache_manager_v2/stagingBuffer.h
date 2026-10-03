@@ -125,11 +125,6 @@ public:
 
     [[nodiscard]] StagingBufferMemory memory() const noexcept;
 
-    [[nodiscard]] HostMem const* hostMem() const noexcept
-    {
-        return std::get_if<HostMem>(&mMemoryOwner);
-    }
-
 private:
     friend class StagingBuffer;
 

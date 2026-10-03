@@ -21,11 +21,12 @@
 #include <filesystem>
 #include <set>
 #include <stdexcept>
+#include <variant>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-void DiskCacheTierConfig::assertValid() const
+void DiskCacheTierConfig::validate() const
 {
     if (quota == 0)
     {
@@ -57,6 +58,11 @@ void KVCacheManagerConfig::validate() const
     if (cacheTiers.empty() || cacheTierOf(cacheTiers[0]) != CacheTier::GPU_MEM)
     {
         throw AssertionError("KVCacheManagerConfig: first cache tier must be GPU memory");
+    }
+
+    for (auto const& tier : cacheTiers)
+    {
+        std::visit([](auto const& cfg) { cfg.validate(); }, tier);
     }
 
     // Check for duplicate layer ids.

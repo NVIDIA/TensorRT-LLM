@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/funcGuard.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.h"
 #include "tensorrt_llm/common/tllmException.h"
 
 #include <cuda_runtime_api.h>
@@ -33,6 +34,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -63,7 +65,11 @@ KVCacheManagerConfig makeSplitColdGroupingConfig()
     KVCacheManagerConfig config;
     config.tokensPerBlock = 4;
     config.cacheTiers.emplace_back(GpuCacheTierConfig{4 << 20});
-    config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
+    // The host tier is distributed in units of HostMem::kAlignment, so a quota
+    // of only a few multiples of it cannot express a pool ratio: every group
+    // rounds to the same single unit. Sized here to leave enough units for the
+    // ratios these tests assert on.
+    config.cacheTiers.emplace_back(HostCacheTierConfig{256 << 20});
 
     AttentionLayerConfig first;
     first.layerId = 0;
@@ -76,6 +82,26 @@ KVCacheManagerConfig makeSplitColdGroupingConfig()
     second.slidingWindowSize = 256;
     second.buffers.push_back(BufferConfig{"key", 4096, std::nullopt});
     config.layers.emplace_back(std::move(second));
+    return config;
+}
+
+//! A config whose cold tier holds exactly one page.
+//!
+//! The host tier is allocated in whole multiples of HostMem::kAlignment, so a
+//! pool contains a single slot only when one page fills that unit. Tests that
+//! need two pages to contend for one cold slot size the page accordingly rather
+//! than shrinking the quota, which cannot go below one unit.
+KVCacheManagerConfig makeSingleColdSlotConfig()
+{
+    KVCacheManagerConfig config = makeSplitColdGroupingConfig();
+    for (auto& layer : config.layers)
+    {
+        std::get<AttentionLayerConfig>(layer).buffers[0].size = HostMem::kAlignment;
+    }
+    // The hot tier holds pages of the same size, so it is sized in the same
+    // unit to leave room for the slots these tests allocate up front.
+    config.cacheTiers[0] = GpuCacheTierConfig{8 * HostMem::kAlignment};
+    config.cacheTiers[1] = HostCacheTierConfig{HostMem::kAlignment};
     return config;
 }
 
@@ -652,11 +678,48 @@ TEST(KvCacheManagerV2ColdPageTest, EvictionRoutesLifecycleQueuesToDifferentColdP
     EXPECT_TRUE(secondPage->scheduledForEviction());
 }
 
+//! A max_quota below quota is a config that can never be satisfied: the initial
+//! size would not fit the reservation. Rejecting it here names the field,
+//! whereas letting it through fails later inside HostMem.
+TEST(KvCacheManagerV2ColdPageTest, HostTierConfigRejectsMaxQuotaBelowQuota)
+{
+    HostCacheTierConfig config{size_t{256} << 20, size_t{128} << 20};
+    EXPECT_THROW(config.validate(), std::invalid_argument);
+
+    config.maxQuota = config.quota; // equal is the tightest valid bound
+    EXPECT_NO_THROW(config.validate());
+
+    config.maxQuota = std::nullopt; // unset means the host memory the OS reports
+    EXPECT_NO_THROW(config.validate());
+}
+
+//! A resize past the tier's reserved maximum must be refused up front. The
+//! address space was reserved once so the base address never moves, so growing
+//! past it is not serviceable -- and discovering that inside a pool would leave
+//! earlier pool groups already resized.
+TEST(KvCacheManagerV2ColdPageTest, ResizeBeyondMaxQuotaIsRefused)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    constexpr size_t kQuota = size_t{128} << 20;
+    constexpr size_t kMaxQuota = size_t{256} << 20;
+
+    auto config = makeSplitColdGroupingConfig();
+    config.cacheTiers[1] = HostCacheTierConfig{kQuota, kMaxQuota};
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    CacheLevel const coldLevel{1};
+
+    EXPECT_TRUE(manager->resize(coldLevel, kMaxQuota, /*bestEfforts=*/false)) << "growing to the bound must work";
+    auto const quotaBefore = manager->getQuota(coldLevel);
+    EXPECT_FALSE(manager->resize(coldLevel, kMaxQuota * 2, /*bestEfforts=*/false)) << "growing past it must not";
+    // Equality, not a bound: a refusal that had already resized some pool groups
+    // would still satisfy <= kMaxQuota and go unnoticed.
+    EXPECT_EQ(manager->getQuota(coldLevel), quotaBefore) << "the refused resize must not have taken effect";
+}
+
 TEST(KvCacheManagerV2ColdPageTest, FallenPagesRetainHighestPriorityAcrossLifecycleQueues)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    auto config = makeSplitColdGroupingConfig();
-    config.cacheTiers[1] = HostCacheTierConfig{4096};
+    auto config = makeSingleColdSlotConfig();
     auto manager = std::make_shared<KvCacheManager>(std::move(config));
     auto& storage = manager->storage();
     CacheLevel const coldLevel{1};
@@ -681,9 +744,8 @@ TEST(KvCacheManagerV2ColdPageTest, FallenPagesRetainHighestPriorityAcrossLifecyc
 TEST(KvCacheManagerV2ColdPageTest, RecursiveFallenPageMergeResortsByPriority)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    auto config = makeSplitColdGroupingConfig();
-    config.cacheTiers[1] = HostCacheTierConfig{4096};
-    config.cacheTiers.emplace_back(HostCacheTierConfig{4096});
+    auto config = makeSingleColdSlotConfig();
+    config.cacheTiers.emplace_back(HostCacheTierConfig{HostMem::kAlignment});
     auto manager = std::make_shared<KvCacheManager>(std::move(config));
     auto& storage = manager->storage();
     CacheLevel const firstColdLevel{1};

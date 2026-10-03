@@ -26,7 +26,7 @@ treat this as internal API rather than test-only scaffolding.
 from __future__ import annotations
 
 import sys
-from typing import Any
+from typing import Any, NamedTuple
 
 
 def _cpp_introspection_module() -> Any | None:
@@ -121,6 +121,35 @@ def committed_page_is_linked(kv_cache: Any, ordinal: int, lc_id: int) -> bool | 
     build catches the fault itself.
     """
     return _cpp().committed_page_is_linked(kv_cache, ordinal, lc_id)
+
+
+class HostMemPlacement(NamedTuple):
+    """Where a host-tier allocation's pages landed, and under which NUMA policy."""
+
+    gpu_numa_node: int
+    #: None where the policy could not be read back, which also means mbind did
+    #: not apply and the placement came from first touch.
+    strict_binding: bool | None
+    #: Resident pages per NUMA node.
+    node_page_counts: dict[int, int]
+
+
+def probe_host_mem_placement(
+    size: int, allow_remote_numa_fallback: bool
+) -> HostMemPlacement | None:
+    """Allocate host-tier memory the way the host tier would and report its placement.
+
+    None where the question does not apply: a platform whose selected backing is
+    not mmap, no libnuma, or a single NUMA node.
+    """
+    placement = _cpp().probe_host_mem_placement(size, allow_remote_numa_fallback)
+    if placement is None:
+        return None
+    return HostMemPlacement(
+        gpu_numa_node=placement.gpu_numa_node,
+        strict_binding=placement.strict_binding,
+        node_page_counts=dict(placement.node_page_counts),
+    )
 
 
 def all_tree_pages_droppable(manager: Any) -> bool:

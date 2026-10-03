@@ -25,9 +25,28 @@
 #include <cstdint>
 #include <optional>
 #include <tuple>
+#include <utility>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+//! Where a host-tier allocation's pages ended up, and under which policy.
+struct HostMemPlacement
+{
+    //! NUMA node of the GPU current at the time of the probe.
+    int gpuNumaNode;
+    //! True when the range carries MPOL_BIND rather than MPOL_PREFERRED, read
+    //! back from the kernel so it reports what took effect rather than what was
+    //! asked. Absent where the policy cannot be queried: get_mempolicy sits
+    //! behind CAP_SYS_NICE in a container's default seccomp profile, which also
+    //! means mbind did not apply and the placement below came from first touch.
+    std::optional<bool> strictBinding;
+    //! Resident pages per NUMA node, as reported by /proc/self/numa_maps. That
+    //! is an ordinary proc read rather than a gated syscall, so placement stays
+    //! observable even where the policy is not.
+    std::vector<std::pair<int, size_t>> nodePageCounts;
+};
 
 class KvCacheIntrospection
 {
@@ -52,6 +71,25 @@ public:
     static void setNumSampledKvCaches(KvCacheManager& manager, int value);
     static void setLastAdjustmentTime(KvCacheManager& manager, double value);
     static void setTargetRatioListGpu(KvCacheManager& manager, TypedVec<PoolGroupIndex, float> value);
+
+    //! Allocates `size` bytes of host-tier memory the way the host tier would
+    //! and reports where its pages landed.
+    //!
+    //! The commit runs on a worker bound to the GPU's node, as HostMem's fill
+    //! does, so the result reflects the arrangement in production rather than
+    //! mbind in isolation: placement holds through first touch when mbind is
+    //! unavailable, and through the range policy when it is.
+    //!
+    //! Returns nullopt only where the question does not apply -- no libnuma, a
+    //! single NUMA node, or a platform whose selected backing is not mmap. The
+    //! VMM backing names its node to the driver, so there is no range policy to
+    //! inspect there.
+    //!
+    //! Uses the current device, so the caller selects which GPU the placement is
+    //! relative to. A CUDA context must already exist on it: the backing
+    //! selection queries device attributes and will not create one.
+    [[nodiscard]] static std::optional<HostMemPlacement> probeHostMemPlacement(
+        size_t size, bool allowRemoteNumaFallback);
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

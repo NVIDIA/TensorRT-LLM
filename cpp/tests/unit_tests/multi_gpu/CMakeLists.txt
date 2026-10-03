@@ -18,6 +18,16 @@ add_subdirectory(kernels)
 add_gtest(cacheTransceiverTest cacheTransceiverTest.cpp)
 target_link_libraries(cacheTransceiverTest PRIVATE ${Python3_LIBRARIES})
 
+add_gtest(
+  kvCacheManagerV2HostMemNumaTest
+  "kvCacheManagerV2HostMemNumaTest.cpp;../batch_manager/kvCacheManagerV2PoisonCheck.cpp"
+)
+target_include_directories(
+  kvCacheManagerV2HostMemNumaTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+# Queries libnuma and get_mempolicy directly to see where pages landed.
+target_link_libraries(kvCacheManagerV2HostMemNumaTest PRIVATE numa)
+
 add_gtest(mpiUtilsTest mpiUtilsTest.cpp)
 add_gtest(userBufferTest userBufferTest.cpp)
 add_gtest(ncclUtilsTest ncclUtilsTest.cpp)

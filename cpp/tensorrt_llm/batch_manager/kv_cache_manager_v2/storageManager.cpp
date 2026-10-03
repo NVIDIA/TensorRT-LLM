@@ -102,30 +102,14 @@ PoolGroupIndex LifeCyclePoolGroupMapping::numPoolGroups() const noexcept
 
 CacheLevelManager::CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cl,
     CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator)
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator,
+    HostMemBackingOptions const& options)
     : cacheLevel(cl)
     , cacheTier(CacheTier(tierConfig.index()))
     , controller(lifeCycleGrouping, cl)
 {
     TLLM_CHECK((cacheTier == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
-    storage = createCacheLevelStorage(tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator);
-}
-
-size_t CacheLevelManager::cacheTierGranularity(CacheTier tier, size_t quota)
-{
-    switch (tier)
-    {
-    case CacheTier::GPU_MEM:
-    {
-        constexpr size_t kPageSize = 2ULL << 20;
-        size_t const ratio = quota / (kPageSize * 512);
-        int const exponent = ratio == 0 ? 0 : std::min(4, static_cast<int>(std::log2(ratio)));
-        return kPageSize << exponent;
-    }
-    case CacheTier::HOST_MEM: return HostMem::kAlignment; // 4 KiB
-    case CacheTier::DISK: return size_t{2} << 20;         // DiskCacheLevelStorage::POOL_SIZE_GRANULARITY
-    default: throw std::invalid_argument("Invalid cache tier");
-    }
+    storage = createCacheLevelStorage(tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator, options);
 }
 
 // ---------------------------------------------------------------------------
@@ -280,8 +264,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     }
 
     size_t const gpuQuota = cacheTierQuota(config.cacheTiers[kHotLevel]);
-    mGpuPhysMemAllocator = std::make_unique<PooledPhysMemAllocator>(
-        CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota));
+    mGpuPhysMemAllocator
+        = std::make_unique<PooledPhysMemAllocator>(tierAllocationGranularity(CacheTier::GPU_MEM, gpuQuota));
     size_t const gpuGranularity = mGpuPhysMemAllocator->physMemSize();
 
     // Constraints are hot-level feasibility floors. They are scaled by
@@ -337,7 +321,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots);
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
-        gpuSlotCounts, mGpuPhysMemAllocator.get());
+        gpuSlotCounts, mGpuPhysMemAllocator.get(), tierBackingOptions(config.cacheTiers[kHotLevel]));
 
     auto const gpuDescs = poolGroupDescs();
     TLLM_CHECK_WITH_INFO(
@@ -438,7 +422,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         auto* gpuPhysMemAllocator
             = cacheTierOf(config.cacheTiers[level]) == CacheTier::GPU_MEM ? mGpuPhysMemAllocator.get() : nullptr;
         mLevels.emplace_back(lifeCycleGrouping(level), level, config.cacheTiers[level], slotDescList(level), slotCounts,
-            gpuPhysMemAllocator);
+            gpuPhysMemAllocator, tierBackingOptions(config.cacheTiers[level]));
     }
 
     for (CacheLevel level{0}; level < mLevels.size(); ++level)
@@ -1622,6 +1606,14 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
         throw std::invalid_argument("Quota " + std::to_string(quota)
             + " is insufficient for min_slots constraints (requires at least " + std::to_string(minQuota) + ")");
     }
+    // Rejected here rather than deeper down: a level whose address space was
+    // reserved up front cannot grow past it without moving the base address,
+    // and by the time a pool discovers that, some groups may already be resized.
+    if (auto const maxQuota = lvlStorage.maxQuota(); maxQuota.has_value() && quota > *maxQuota)
+    {
+        throw std::invalid_argument("Quota " + std::to_string(quota) + " exceeds the reserved maximum of "
+            + std::to_string(*maxQuota) + " for this cache level (raise the tier's max_quota)");
+    }
     auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, minSlots, quota);
 
     TLLM_CHECK_DEBUG(isLastLevel(level) || persistentPages == nullptr);
@@ -1921,12 +1913,32 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(Cac
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
     TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
 {
-    CacheTier tier = cacheTierOf(tierConfig);
     size_t quota = cacheTierQuota(tierConfig);
-    size_t granularity = tier == CacheTier::GPU_MEM ? mGpuPhysMemAllocator->physMemSize()
-                                                    : CacheLevelManager::cacheTierGranularity(tier, quota);
+    size_t const granularity = tierCommitUnit(tierConfig);
     quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots), roundUp(quota, granularity));
     return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots);
+}
+
+size_t StorageManager::tierCommitUnit(CacheTierConfig const& tierConfig) const
+{
+    // Every GPU level shares one allocator, whose unit was derived from the hot
+    // level's quota. A cold GPU level must report that unit rather than one
+    // recomputed from its own quota, which is smaller and would not match the
+    // chunks the allocator actually hands out.
+    return cacheTierOf(tierConfig) == CacheTier::GPU_MEM
+        ? mGpuPhysMemAllocator->physMemSize()
+        : tierAllocationGranularity(cacheTierOf(tierConfig), cacheTierQuota(tierConfig));
+}
+
+HostMemBackingOptions StorageManager::tierBackingOptions(CacheTierConfig const& tierConfig) const
+{
+    HostMemBackingOptions options;
+    options.commitUnit = tierCommitUnit(tierConfig);
+    if (auto const* host = std::get_if<HostCacheTierConfig>(&tierConfig))
+    {
+        options.allowRemoteNumaFallback = host->allowRemoteNumaFallback;
+    }
+    return options;
 }
 
 // ---------------------------------------------------------------------------
