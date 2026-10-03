@@ -124,9 +124,10 @@ def route(
         raise RuntimeError(f"route requires b >= 1, got {b}")
     if num_sms < 1:
         raise RuntimeError(f"route requires num_sms >= 1, got {num_sms}")
-    # Only the register-resident rungs scale with the available SM count. The
-    # streaming and clustered-register paths below retain their independently
-    # tuned 148/296 constants.
+    # Every SM-count envelope below -- the one-wave (num_sms) and two-wave
+    # (2 * num_sms) batch bounds and the per-row CTA split -- scales with the
+    # device SM count. The kernel-plan constants (register plans, slab
+    # capacities, cluster sizes and their GPC-packing vetoes) do not.
     wide = b <= num_sms
 
     # ======================= register-resident block ========================
@@ -206,7 +207,7 @@ def route(
 
     # ---- clustered register-resident path ----
     if n4 > 4096 and n4 <= 8 * BLKC * 4 and k <= BLKC:
-        av = 148 // (b if b > 0 else 1)  # truncating
+        av = num_sms // b  # CTAs per row that fit one wave (truncating)
         amax = 1
         while (amax << 1) <= av and amax < 8:
             amax <<= 1
@@ -262,7 +263,7 @@ def route(
     # ====================== streaming / collect path ========================
     R = 1
     if b <= 32:
-        r1 = 148 // b
+        r1 = num_sms // b  # CTAs per row that fit one wave
         if r1 < 1:
             r1 = 1
         r2 = ((n >> 2) + 1023) // 1024
@@ -272,6 +273,9 @@ def route(
         if R < 1:
             R = 1
     elif b <= 74 and (n >> 2) >= 16384 and k <= 1024:  # shallow R=2 split
+        # The shallow band stays at b <= 74: every SPLIT row owns a workspace
+        # slab and the slab count is the fixed _MAXC (160), so this band is
+        # bounded by the workspace, not by the SM count.
         R = 2
 
     useclus = False
@@ -286,7 +290,8 @@ def route(
         R = p2
         useclus = True
 
-    big = b * R <= 148
+    # big: the whole (R x b) grid is one wave at one CTA per SM.
+    big = b * R <= num_sms
     SCAP = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
     CMP = (4096 if k > 1024 else 2048) if big else 1024
 
@@ -392,7 +397,10 @@ def route(
             "ws": False,
         }
 
-    smem_main = (SCAP + 4) * (8 if (R > 1 or b <= 296) else 4) + (CMP + 1) * 8
+    # Mirrors the kernel constexpr (SCPB+4)*(VSTG?8:4) with VSTG = SPLIT ||
+    # BLK >= 512: the 4-byte staging form belongs to the BLK=256 plan picked
+    # past the two-wave bound below, so the two conditions must move together.
+    smem_main = (SCAP + 4) * (8 if (R > 1 or b <= 2 * num_sms) else 4) + (CMP + 1) * 8
 
     def _main(BLK, MINB, U, SPLIT):
         # KPT ladder 1/2/4/8; grid = (R, b).
@@ -431,7 +439,7 @@ def route(
         per = Q >> 10
         U = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
         return _main(1024, 1, U, R > 1)  # SPLIT iff R>1
-    if b <= 296:
+    if b <= 2 * num_sms:  # two BLK=512 CTAs per SM form one wave
         return _main(512, 2, 8, False)
     return _main(256, 4, 8, False)
 
@@ -507,10 +515,13 @@ def route_static(
     return st
 
 
-def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object], int]:
+def route_dynamic(
+    static: dict[str, object], n: int, num_sms: int = 148
+) -> tuple[dict[str, object], int]:
     """Recompute the redacted n-continuous scalars from (static, n).
     Returns (rt_updates, smem). Must stay equivalent to route(); the
-    device-side per-row engine mirrors exactly these formulas."""
+    device-side per-row engine mirrors exactly these formulas. ``num_sms``
+    must be the SM count the static plan was routed with."""
     fam = static["kernel"]
     k = static["rt"]["k"]
     if fam in ("reg", "regimg"):
@@ -534,7 +545,7 @@ def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object],
     else:
         R = static["rt"]["R"]
         scap = static["rt"]["SCAP_"]
-    big = b * R <= 148
+    big = b * R <= num_sms
     aim = (
         ((4 * k if k >= 1024 else 2 * k) if R == 1 else 2 * k)
         if big
@@ -595,7 +606,7 @@ def route_split(
     """route_static + route_dynamic recombined — must equal route() exactly
     (the factorization fuzz in the unit tests asserts this)."""
     st = route_static(b, n, npad, k, num_sms, sm_version)
-    dyn, smem = route_dynamic(st, n)
+    dyn, smem = route_dynamic(st, n, num_sms)
     plan = {key: (dict(val) if isinstance(val, dict) else val) for key, val in st.items()}
     plan["rt"].update(dyn)
     plan["smem"] = smem
@@ -603,24 +614,26 @@ def route_split(
 
 
 def route_streaming(
-    b: int, n: int, npad: int, k: int, force_main: bool = False
+    b: int, n: int, npad: int, k: int, force_main: bool = False, num_sms: int = 148
 ) -> dict[str, object]:
     """route() restricted to its STREAMING half (main / clus) — the varlen
     capture policy: per-row kernels must be picked from the families that are
     correct for ANY row length, so the register-resident specialists are
     skipped even when the envelope n would normally land on them.  Where
-    route() itself lands on main/clus this is IDENTICAL to route().
-    force_main additionally skips the clus rounding, so the raw
-    min(r1, r2) R matches the CUDA else-branch exactly."""
+    route() itself lands on main/clus this is IDENTICAL to route() for the
+    same ``num_sms``.  force_main additionally skips the clus rounding, so the
+    raw min(r1, r2) R matches the CUDA else-branch exactly."""
     if b < 1:
         raise RuntimeError(f"route_streaming requires b >= 1, got {b}")
+    if num_sms < 1:
+        raise RuntimeError(f"route_streaming requires num_sms >= 1, got {num_sms}")
     R = 1
     if b <= 32:
-        r1 = max(148 // b, 1)
+        r1 = max(num_sms // b, 1)
         r2 = max(((n >> 2) + 1023) // 1024, 1)
         R = max(min(r1, r2), 1)
     elif b <= 74 and (n >> 2) >= 16384 and k <= 1024:
-        R = 2
+        R = 2  # workspace-bounded shallow band, see route()
     useclus = False
     if not force_main and 2 <= R <= 8 and k <= 1024:
         p2 = 1
@@ -630,7 +643,7 @@ def route_streaming(
             p2 = 4
         R = p2
         useclus = True
-    big = b * R <= 148
+    big = b * R <= num_sms
     scap = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
     cmp_ = (4096 if k > 1024 else 2048) if big else 1024
     aim = (
@@ -695,7 +708,7 @@ def route_streaming(
             "smem": smc,
             "ws": False,
         }
-    smem_main = (scap + 4) * (8 if (R > 1 or b <= 296) else 4) + (cmp_ + 1) * 8
+    smem_main = (scap + 4) * (8 if (R > 1 or b <= 2 * num_sms) else 4) + (cmp_ + 1) * 8
 
     def _main(blk_, minb_, u_, split_):
         kpt = 1 if k <= blk_ else (2 if k <= 2 * blk_ else (4 if k <= 4 * blk_ else 8))
@@ -727,7 +740,7 @@ def route_streaming(
         per = q_ >> 10
         u_ = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
         return _main(1024, 1, u_, R > 1)
-    if b <= 296:
+    if b <= 2 * num_sms:
         return _main(512, 2, 8, False)
     return _main(256, 4, 8, False)
 
@@ -741,11 +754,10 @@ _VARLEN_CACHE = {}
 # exact row count or npad — so the cache stays bounded on a long-running server.
 _PREFILL_CACHE = {}
 _PREFILL_ROW_SLAB = 32768  # gridDim.y <= 65535; slab so keys stay bounded
-_PREFILL_TIER_ROWS = (75, 149, 297)  # (rows<=148, 149..296, >296) band reps
 # The tier-0 plan is the BLK=1024 non-split slab, whose compile-time pair-sample
 # gate is n > 16384, so under an envelope <= 16384 every row runs the unsampled
 # path. The tier-1 BLK=512 plan samples above its own gate (4096 for k <= 1024,
-# 8192 for k > 1024); <= 148-row launches take it when the envelope is above
+# 8192 for k > 1024); <= num_sms-row launches take it when the envelope is above
 # that gate by a margin (just above the gate the freshly sampling BLK=512 plan
 # is slower than the unsampled BLK=1024 plan for b >= 32) and at most 16384
 # (above that the BLK=1024 plan samples too and is the better slab).
@@ -753,12 +765,21 @@ _PREFILL_T1_MARGIN = 256
 _PREFILL_T1_MAX = 16384
 
 
+def _prefill_tier_rows(num_sms: int) -> tuple[int, int, int]:
+    """Representative row counts of the three prefill tiers (rows <= num_sms,
+    num_sms < rows <= 2 * num_sms, rows > 2 * num_sms). The tier-0
+    representative must sit above the shallow R=2 band (b <= 74) so the plan
+    is the R == 1 BLK=1024 slab; every supported device has more SMs than
+    that."""
+    return (75, num_sms + 1, 2 * num_sms + 1)
+
+
 def _prefill_scpb_tier1(k: int) -> int:
     return 8192 if k > 1024 else 4096
 
 
-def _prefill_tier(rows: int, n_env: int, k: int) -> int:
-    tier = 0 if rows <= 148 else 1 if rows <= 296 else 2
+def _prefill_tier(rows: int, n_env: int, k: int, num_sms: int = 148) -> int:
+    tier = 0 if rows <= num_sms else 1 if rows <= 2 * num_sms else 2
     if tier == 0 and _prefill_scpb_tier1(k) + _PREFILL_T1_MARGIN < n_env <= _PREFILL_T1_MAX:
         tier = 1
     return tier
@@ -776,17 +797,19 @@ def _prefill_cache_key(tier: int, k: int, n_bucket: int):
     return (tier, k, n_bucket if tier == 0 else 0)
 
 
-def _prefill_launcher(tier: int, k: int, n_bucket: int) -> tuple:
+def _prefill_launcher(tier: int, k: int, n_bucket: int, num_sms: int = 148) -> tuple:
     """Prefill plan + compiled launcher: ``_varlen_launcher``'s main branch with
     r_const=1, split=False and the prefill compile flag. SCAP_/CMP_ are envelope
-    upper bounds; npad is filled per call in ``run_prefill``."""
+    upper bounds; npad is filled per call in ``run_prefill``. The plan is a
+    function of the tier alone (the representative row is in-band for every
+    ``num_sms``), so the cache key does not carry the SM count."""
     key = _prefill_cache_key(tier, k, n_bucket)
     hit = _PREFILL_CACHE.get(key)
     if hit is not None:
         return hit
-    b_route = _PREFILL_TIER_ROWS[tier]
+    b_route = _prefill_tier_rows(num_sms)[tier]
     n_route = max(n_bucket, k + 1)
-    plan = route_streaming(b_route, n_route, n_route, k, force_main=True)
+    plan = route_streaming(b_route, n_route, n_route, k, force_main=True, num_sms=num_sms)
     if plan["kernel"] != "main":
         raise RuntimeError(f"prefill route did not land on gvr_main: {plan['kernel']}")
     rt = plan["rt"]
@@ -901,7 +924,7 @@ def _varlen_launcher(
         )
         _VARLEN_CACHE[key] = lc
         return lc
-    plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
+    plan = route_streaming(num_rows, n_route, npad, k, force_main=True, num_sms=num_sms)
     tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
     rt = plan["rt"]
     r_const = rt["R"]
@@ -909,7 +932,7 @@ def _varlen_launcher(
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
     fn = dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const), hint_free=True)
-    big = num_rows * r_const <= 148
+    big = num_rows * r_const <= num_sms
     aim_base = (
         ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
         if big
@@ -1177,9 +1200,15 @@ def _device_profile_key(dev_index: int) -> int:
     return profile
 
 
+def device_route_profile(dev_index: int) -> tuple[int, int]:
+    """Return ``(SM count, SM version)`` of a CUDA device for ``route()``,
+    cached per device (host-only; safe under CUDA-graph capture)."""
+    return _unpack_device_profile(_device_profile_key(dev_index))
+
+
 def _device_num_sms(dev_index: int) -> int:
     """Return the cached CUDA runtime-reported SM count."""
-    return _unpack_device_profile(_device_profile_key(dev_index))[0]
+    return device_route_profile(dev_index)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1694,9 +1723,10 @@ def run_prefill(
     n_env = _index(max_row_len) if max_row_len is not None else logits.shape[1]
     n_env = min(max(n_env, 1), npad)
     n_bucket = _prefill_bucket(n_env)
+    num_sms = _device_num_sms(d)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
-        tier = _prefill_tier(r1 - r0, n_env, k)
+        tier = _prefill_tier(r1 - r0, n_env, k, num_sms)
         lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket))
         if lc is None:
             if _is_capturing():
@@ -1704,7 +1734,7 @@ def run_prefill(
                     "prefill launcher not compiled for this shape — warm up "
                     "before CUDA graph capture"
                 )
-            lc = _prefill_launcher(tier, k, n_bucket)
+            lc = _prefill_launcher(tier, k, n_bucket, num_sms)
         _, fn, (scap, cmp_), tail = lc
         # varlen main ABI: pre_idx slot = row_ends, kv_lens slot = row_starts;
         # only npad / k / SCAP_ / CMP_ matter (R=1), the other scalars are dead.
@@ -1729,8 +1759,9 @@ def prefill_ready(
     n_env = _index(max_row_len) if max_row_len is not None else logits.shape[1]
     n_env = min(max(n_env, 1), max(npad, 1))
     n_bucket = _prefill_bucket(n_env)
+    num_sms = _device_num_sms(logits.get_device())
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
-        tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k)
+        tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k, num_sms)
         if _prefill_cache_key(tier, k, n_bucket) not in _PREFILL_CACHE:
             return False
     return True
@@ -1742,6 +1773,7 @@ __all__ = [
     "route_dynamic",
     "route_split",
     "route_bands",
+    "device_route_profile",
     "run",
     "run_ws",
     "run_varlen",
@@ -1831,6 +1863,7 @@ def warmup_varlen(
                 npad_c,
                 int(top_k),
                 force_main=True,
+                num_sms=num_sms,
             )
             ekey = ("main", tuple(p["tpl"][:6]), p["rt"]["R"])
         if ekey not in seen_keys:
@@ -1912,15 +1945,19 @@ _PREFILL_WARMUP_LOCK = threading.Lock()
 def warmup_prefill(
     top_k: int,
     max_cols: int,
-    num_rows_list: Sequence[int] = (1, 149, 297),
+    num_rows_list: Sequence[int] | None = None,
     row_stride: int | None = None,
 ) -> None:
     """Compile every prefill engine ``run_prefill`` can request before serving:
-    the tier-0 arm per pow2 envelope bucket where a <= 148-row launch keeps it
-    (``_prefill_tier`` is evaluated at both edges of every bucket), tiers 1/2
-    one launch each. ``max_cols`` is the compressed max column count;
-    idempotent per done-key."""
+    the tier-0 arm per pow2 envelope bucket where a <= num_sms-row launch keeps
+    it (``_prefill_tier`` is evaluated at both edges of every bucket), tiers 1/2
+    one launch each. ``num_rows_list`` defaults to one row count per tier of
+    the current device (1, num_sms + 1, 2 * num_sms + 1). ``max_cols`` is the
+    compressed max column count; idempotent per done-key."""
     dev = torch.cuda.current_device()
+    num_sms = _device_num_sms(dev)
+    if num_rows_list is None:
+        num_rows_list = (1, num_sms + 1, 2 * num_sms + 1)
     k = int(top_k)
     max_cols = int(max_cols)
     lo = _prefill_bucket(k + 1)
@@ -1936,14 +1973,14 @@ def warmup_prefill(
     for rows in num_rows_list:
         for bk in buckets:
             for n_env in (bk // 2 + 1, bk):  # the tier can change inside a bucket
-                tier = _prefill_tier(int(rows), n_env, k)
+                tier = _prefill_tier(int(rows), n_env, k, num_sms)
                 keys.setdefault(_prefill_cache_key(tier, k, bk), (tier, bk, n_env))
     done_key = (dev, k, max_cols, tuple(sorted(int(r) for r in num_rows_list)), row_stride)
     with _PREFILL_WARMUP_LOCK:
         if done_key in _PREFILL_WARMUP_DONE:
             return
     for tier, bk, n_env in keys.values():
-        rows = _PREFILL_TIER_ROWS[tier]
+        rows = _prefill_tier_rows(num_sms)[tier]
         stride = row_stride if row_stride is not None else ((bk + 256 + 255) // 256 * 256)
         if stride < bk or stride % 4:
             stride = (max(stride, bk) + 256 + 255) // 256 * 256
