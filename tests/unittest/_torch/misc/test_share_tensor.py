@@ -1,7 +1,12 @@
 import multiprocessing as mp
+import threading
 import unittest
+from unittest import mock
 
 import torch
+from torch.multiprocessing import (get_all_sharing_strategies,
+                                   get_sharing_strategy, set_sharing_strategy)
+from torch.multiprocessing.reductions import reduce_storage
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 
@@ -87,6 +92,97 @@ class TestShareTensor(unittest.TestCase):
             # Explicit cleanup to prevent QueueFeederThread leak
             queue.close()
             queue.join_thread()
+
+    def test_share_cpu_tensor_restores_strategy_on_error(self):
+        """The process-wide sharing strategy is restored if serialization fails."""
+        if "file_descriptor" not in get_all_sharing_strategies():
+            self.skipTest("file_descriptor sharing is not available")
+
+        original_strategy = get_sharing_strategy()
+        set_sharing_strategy("file_descriptor")
+        try:
+            container = SharedTensorContainer.from_tensor(self.ref_tensor)
+
+            def fail_serialization(_storage):
+                self.assertEqual(get_sharing_strategy(), "file_system")
+                raise RuntimeError("serialization failed")
+
+            with mock.patch(
+                    "tensorrt_llm._torch.shared_tensor.shared_tensor.reduce_storage",
+                    side_effect=fail_serialization):
+                with self.assertRaisesRegex(RuntimeError,
+                                            "serialization failed"):
+                    container.dump_to_dict()
+            self.assertEqual(get_sharing_strategy(), "file_descriptor")
+        finally:
+            set_sharing_strategy(original_strategy)
+
+    def test_share_cpu_tensor_serialization_is_serialized(self):
+        """Concurrent CPU serialization cannot overlap the strategy window."""
+        if "file_descriptor" not in get_all_sharing_strategies():
+            self.skipTest("file_descriptor sharing is not available")
+
+        original_strategy = get_sharing_strategy()
+        first_reducer_entered = threading.Event()
+        release_first_reducer = threading.Event()
+        second_call_started = threading.Event()
+        second_reducer_entered = threading.Event()
+        call_count = 0
+        call_count_lock = threading.Lock()
+        errors = []
+
+        def blocking_reduce(storage):
+            nonlocal call_count
+            with call_count_lock:
+                call_count += 1
+                call_number = call_count
+            if call_number == 1:
+                first_reducer_entered.set()
+                if not release_first_reducer.wait(timeout=5):
+                    raise TimeoutError("first reducer was not released")
+            else:
+                second_reducer_entered.set()
+            return reduce_storage(storage)
+
+        def serialize(container, started=None):
+            if started is not None:
+                started.set()
+            try:
+                container.dump_to_dict()
+            except BaseException as error:
+                errors.append(error)
+
+        set_sharing_strategy("file_descriptor")
+        first_thread = threading.Thread(target=serialize,
+                                        args=(SharedTensorContainer.from_tensor(
+                                            self.ref_tensor), ))
+        second_thread = threading.Thread(
+            target=serialize,
+            args=(SharedTensorContainer.from_tensor(self.ref_tensor),
+                  second_call_started))
+        try:
+            with mock.patch(
+                    "tensorrt_llm._torch.shared_tensor.shared_tensor.reduce_storage",
+                    side_effect=blocking_reduce):
+                first_thread.start()
+                self.assertTrue(first_reducer_entered.wait(timeout=5))
+                second_thread.start()
+                self.assertTrue(second_call_started.wait(timeout=5))
+                self.assertFalse(second_reducer_entered.wait(timeout=0.2))
+                release_first_reducer.set()
+                first_thread.join(timeout=5)
+                second_thread.join(timeout=5)
+
+            self.assertFalse(first_thread.is_alive())
+            self.assertFalse(second_thread.is_alive())
+            self.assertTrue(second_reducer_entered.is_set())
+            self.assertEqual(errors, [])
+            self.assertEqual(get_sharing_strategy(), "file_descriptor")
+        finally:
+            release_first_reducer.set()
+            first_thread.join(timeout=5)
+            second_thread.join(timeout=5)
+            set_sharing_strategy(original_strategy)
 
     def test_share_tensor_different_shapes(self):
         """Test CPU tensor sharing with different tensor shapes."""
