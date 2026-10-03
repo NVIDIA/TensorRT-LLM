@@ -15,6 +15,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxf
     modeling as route_b,
 )
 from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 def _config(moe_tp, moe_ep, split_set=True, spec_config=None, attention_dp=False):
@@ -32,7 +33,10 @@ def _config(moe_tp, moe_ep, split_set=True, spec_config=None, attention_dp=False
         mapping=mapping,
         spec_config=spec_config,
         torch_dtype=torch.bfloat16,
-        quant_config=types.SimpleNamespace(quant_algo=None, kv_cache_quant_algo=None),
+        # The MXFP4 checkpoint's quantization, as the model config reads it.
+        quant_config=types.SimpleNamespace(
+            quant_algo=QuantAlgo.W4A16_MXFP4, kv_cache_quant_algo=None
+        ),
         quant_config_dict=None,
         allreduce_strategy=AllReduceStrategy.AUTO,
     )

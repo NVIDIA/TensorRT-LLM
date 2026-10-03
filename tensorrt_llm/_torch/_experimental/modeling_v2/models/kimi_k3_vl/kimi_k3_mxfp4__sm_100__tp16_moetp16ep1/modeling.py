@@ -50,9 +50,11 @@ sandwiches and the residual epilogues come with their own entries; until then th
 step.
 
 **What this target asserts rather than adapts**: SM 10.0; the topology above, with the expert split set explicitly;
-no speculative decoding; bf16 weights and a bf16 KV pool; tokens_per_block 64 (the MLA generation kernels K3's 96
-heads reach exist only at 64); the V2 hybrid KV / state manager, which holds the KDA states, with block reuse off and
-fp32 recurrent states; an all-reduce strategy of AUTO or MNNVL. The construction-time ones fail in `__init__`, the
+no speculative decoding; the MXFP4 checkpoint's quantization (W4A16_MXFP4 with no per-layer declarations, so the
+routed experts run the W4A8_MXFP4_MXFP8 default and the excluded modules stay bf16); bf16 weights and a bf16 KV pool;
+tokens_per_block 64 (the MLA generation kernels K3's 96 heads reach exist only at 64); the V2 hybrid KV / state
+manager, which holds the KDA states, with block reuse off and fp32 recurrent states; an all-reduce strategy of AUTO or
+MNNVL. The construction-time ones fail in `__init__`, the
 per-engine ones on the first forward, each naming the setting. A layer the decode kernels do not take fails the
 weight load.
 
@@ -717,19 +719,12 @@ def _apply_attn_res_add_and_rmsnorm(
     )
 
 
-# Routed-expert key spellings that ModelOpt emits for Kimi K3. The NVFP4
-# checkpoint (``nvidia/Kimi-K3-NVFP4``) lists every prefix x module-name
-# combination in ``quantized_layers``, so a lookup over this product finds it
-# without needing the MiniMax-M3-style prefix normalization in ``ModelConfig``.
-_K3_ROUTED_EXPERT_KEY_PREFIXES = ("language_model.model.", "model.", "")
-
-
 _K3_ROUTED_EXPERT_KEY_SUFFIXES = ("block_sparse_moe.experts", "mlp.experts")
 
 
-# The subset of the above that can be a real module path. ``exclude_modules``
-# matches with wildcards and walks ancestor prefixes, so an empty prefix would
-# widen what matches instead of just missing, as it does in the dict lookup.
+# The routed experts' module path prefixes. ``exclude_modules`` matches with
+# wildcards and walks ancestor prefixes, so an empty prefix would widen what
+# matches instead of just missing.
 _K3_ROUTED_EXPERT_MODULE_PREFIXES = ("language_model.model.", "model.")
 
 
@@ -754,19 +749,6 @@ def _load_packed_mxfp4_expert(backend, base, expert_idx, local_slot_id, get_tens
     )
 
 
-def _load_nvfp4_expert(backend, base, expert_idx, local_slot_id, get_tensor) -> None:
-    backend.quant_method.load_streaming_nvfp4_expert(
-        backend,
-        global_expert_id=expert_idx,
-        local_slot_id=local_slot_id,
-        **{
-            f"{w}_{kind}": get_tensor(f"{base}.{expert_idx}.{w}.{kind}")
-            for w in ("w1", "w2", "w3")
-            for kind in ("weight", "weight_scale", "weight_scale_2", "input_scale")
-        },
-    )
-
-
 class _K3ExpertCkptSpec(NamedTuple):
     """How one routed-expert quantization is spelled and loaded."""
 
@@ -775,8 +757,7 @@ class _K3ExpertCkptSpec(NamedTuple):
     loader: Callable[..., None]
     # Set of filled slots the loader maintains, checked after the load.
     loaded_slots_attr: str
-    # NVFP4 defers cat/pad/interleave and the alpha computation to
-    # ``process_weights_after_loading``; the MXFP4 loaders write through.
+    # Whether the layer is finalized after its experts load (the MXFP4 loaders write through).
     needs_layer_finalize: bool
 
 
@@ -786,12 +767,6 @@ _K3_EXPERT_CKPT_SPECS = {
         loader=_load_packed_mxfp4_expert,
         loaded_slots_attr="_packed_mxfp4_loaded_slots",
         needs_layer_finalize=False,
-    ),
-    QuantAlgo.NVFP4: _K3ExpertCkptSpec(
-        kinds=("weight", "weight_scale", "weight_scale_2", "input_scale"),
-        loader=_load_nvfp4_expert,
-        loaded_slots_attr="_streamed_expert_slots",
-        needs_layer_finalize=True,
     ),
 }
 
@@ -843,20 +818,12 @@ class KimiK3MoERuntime(nn.Module):
         situ_beta, situ_linear_beta = _resolve_kimi_situ_betas(cfg)
         dtype = torch.bfloat16
 
-        # Routing scores stay fp32; with attention-DP off the gate GEMM runs
-        # bf16xbf16 with fp32 accumulate/output (checkpoint stores the gate
-        # weight in bf16; saves a per-layer input cast + fp32 splitK pair on
-        # the bs1 decode path). Under attention-DP the legacy upcast-to-fp32
-        # GEMM is kept: the bf16-input min-latency GEMM's different reduction
-        # order flips borderline top-16 picks (GSM8K 96.7 -> 96.1/96.4,
-        # 3-run bisect on 62b20dd868), and the bs1-latency win is irrelevant
-        # at DEP batch sizes. KIMI_K3_ROUTER_BF16=1/0 forces either path.
+        # Routing scores stay fp32; the gate GEMM runs bf16xbf16 with fp32
+        # accumulate/output (checkpoint stores the gate weight in bf16; saves a
+        # per-layer input cast + fp32 splitK pair on the bs1 decode path).
+        # KIMI_K3_ROUTER_BF16=0 forces the upcast-to-fp32 GEMM.
         _router_bf16_env = os.environ.get("KIMI_K3_ROUTER_BF16")
-        _router_bf16 = (
-            _router_bf16_env == "1"
-            if _router_bf16_env is not None
-            else not model_config.mapping.enable_attention_dp
-        )
+        _router_bf16 = _router_bf16_env == "1" if _router_bf16_env is not None else True
         self.gate = KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16 if _router_bf16 else None)
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)
@@ -926,14 +893,11 @@ class KimiK3MoERuntime(nn.Module):
         self.expert_hi = self.expert_lo + self.experts_per_rank
 
         shared_intermediate = cfg.moe_intermediate_size * cfg.num_shared_experts
-        attention_dp = model_config.mapping.enable_attention_dp
         shared_model_config = copy.copy(model_config)
         shared_model_config.quant_config = QuantConfig()
-        # Under attention DP each rank owns different tokens, so the shared
-        # expert is replicated (TP size 1) and must not reduce across ranks.
         # Direct MoE-TP leaves both branches as partials for one concatenated
         # all-reduce.
-        use_shared_tp = not attention_dp and model_config.mapping.tp_size > 1
+        use_shared_tp = model_config.mapping.tp_size > 1
         self._reduce_routed_output = (
             use_shared_tp
             and self.routed_experts.backend.scheduler_kind != MoESchedulerKind.FUSED_COMM
@@ -954,7 +918,6 @@ class KimiK3MoERuntime(nn.Module):
             ),
             dtype=dtype,
             config=shared_model_config,
-            overridden_tp_size=1 if attention_dp else None,
             reduce_output=use_shared_tp,
             layer_idx=layer_idx,
             is_shared_expert=True,
@@ -988,38 +951,23 @@ class KimiK3MoERuntime(nn.Module):
 
     @staticmethod
     def _select_moe_tp_ep(mapping: Mapping) -> Tuple[int, int]:
-        """Resolve the routed-expert ``(moe_tp, moe_ep)`` split.
-
-        Precedence:
-
-        1. Explicit ``moe_tensor_parallel_size`` / ``moe_expert_parallel_size``
-           from the user config. Detected via
-           ``mapping.moe_tp_ep_user_specified`` so the auto-resolved mapping
-           default (``moe_tp=tp_size, moe_ep=1``) is NOT mistaken for a TP
-           request.
-        2. Default: EP-only (``moe_tp=1, moe_ep=tp_size``), the historical
-           K3 layout.
-        """
-        tp_size = mapping.tp_size
-        if getattr(mapping, "moe_tp_ep_user_specified", False):
-            return mapping.moe_tp_size, mapping.moe_ep_size
-        return 1, tp_size
+        # >>> route B: this target's split
+        """The routed-expert ``(moe_tp, moe_ep)`` split: the user config's explicit
+        ``moe_tensor_parallel_size`` / ``moe_expert_parallel_size`` (16 x 1, asserted at
+        construction)."""
+        # <<< route B
+        return mapping.moe_tp_size, mapping.moe_ep_size
 
     @staticmethod
     def _resolve_routed_quant_config(model_config: ModelConfig, layer_idx: int) -> QuantConfig:
-        """Routed-expert quantization for ``layer_idx``, taken from the checkpoint.
+        """Routed-expert quantization for ``layer_idx``: the MXFP4 checkpoint declares nothing per layer (asserted at
+        construction), so the experts keep the ``W4A8_MXFP4_MXFP8`` default.
 
-        ``nvidia/Kimi-K3-NVFP4`` declares the routed experts per layer as
-        ``NVFP4`` with ``group_size=16``; the original ``moonshotai/Kimi-K3``
-        declares nothing per layer and keeps the historical
-        ``W4A8_MXFP4_MXFP8`` default. Reading the checkpoint instead of
-        hardcoding is what lets one code path serve both.
-
-        An exclusion outranks the per-layer entry and the default below:
-        ``create_weights`` treats an override as authoritative over anything
-        ``__post_init__`` wrote, so this return value stands in for both
-        quantization passes and exclusion is the one that runs second. It is
-        matched as a pattern, so it is asked only about real module names.
+        An exclusion outranks the default: ``create_weights`` treats an override
+        as authoritative over anything ``__post_init__`` wrote, so this return
+        value stands in for both quantization passes and exclusion is the one
+        that runs second. It is matched as a pattern, so it is asked only about
+        real module names.
         """
         quant_config = model_config.quant_config
         if quant_config is not None and any(
@@ -1036,22 +984,6 @@ class KimiK3MoERuntime(nn.Module):
             )
             return QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
 
-        per_layer = getattr(model_config, "quant_config_dict", None)
-        if per_layer:
-            for prefix in _K3_ROUTED_EXPERT_KEY_PREFIXES:
-                for suffix in _K3_ROUTED_EXPERT_KEY_SUFFIXES:
-                    cfg = per_layer.get(f"{prefix}layers.{layer_idx}.{suffix}")
-                    if cfg is not None and cfg.quant_algo is not None:
-                        # Logged once per layer: the routed-expert format decides
-                        # which MoE backends can serve this checkpoint at all.
-                        logger.debug(
-                            "Kimi K3 layer %d routed experts: %s (group_size=%s) "
-                            "from the checkpoint",
-                            layer_idx,
-                            cfg.quant_algo,
-                            cfg.group_size,
-                        )
-                        return cfg
         logger.debug(
             "Kimi K3 layer %d routed experts: no per-layer quant config in the "
             "checkpoint, defaulting to %s",
@@ -1101,7 +1033,7 @@ class KimiK3MoERuntime(nn.Module):
     @staticmethod
     def _routed_moe_model_config(model_config: ModelConfig) -> ModelConfig:
         """Build a private routed-expert mapping without mutating the shared
-        config. Default split is EP-only; see ``_select_moe_tp_ep``."""
+        config, with the split of ``_select_moe_tp_ep``."""
         # Every backend here declares ``ActivationType.SiTu`` in its
         # ``activation_support``; the list is not a preference order. CUTEDSL
         # joined once its act-fusion kernel grew the SiTU epilogue.
@@ -1124,21 +1056,8 @@ class KimiK3MoERuntime(nn.Module):
                 "EPLB or replicated expert slots."
             )
         mapping = model_config.mapping
-        if getattr(mapping, "_dwdp_size", 0) > 1:
-            raise NotImplementedError("Kimi K3 packed-checkpoint streaming does not support DWDP.")
 
         moe_tp, moe_ep = KimiK3MoERuntime._select_moe_tp_ep(mapping)
-        if moe_tp < 1 or moe_ep < 1 or moe_tp * moe_ep != mapping.tp_size:
-            raise ValueError(
-                f"Kimi K3 routed MoE split moe_tp={moe_tp} x moe_ep={moe_ep} "
-                f"must multiply to tp_size={mapping.tp_size}."
-            )
-        if moe_tp > 1 and mapping.enable_attention_dp:
-            raise NotImplementedError(
-                "Kimi K3 MoE tensor parallelism requires "
-                "enable_attention_dp=false (the attention-DP dispatch/combine "
-                "path is validated for EP-only splits)."
-            )
         logger.info_once(
             f"Kimi K3 routed MoE parallelism: moe_tp={moe_tp}, "
             f"moe_ep={moe_ep} (tp_size={mapping.tp_size})",
@@ -1279,7 +1198,6 @@ class KimiMLARuntime(nn.Module):
         layer_idx: int,
         model_config: ModelConfig,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-        mapping_with_cp: Optional[Mapping] = None,
     ) -> None:
         super().__init__()
 
@@ -1293,11 +1211,8 @@ class KimiMLARuntime(nn.Module):
         # KimiK3MLAAttention owns MLA projection/head sharding. Keep only the
         # final output reduction in this wrapper so the output gate remains
         # between attention and the row-parallel o_proj.
-        # Helix: mapping_with_cp (the CP original) activates the base MLA's
-        # helix machinery; this wrapper's allreduce over the repurposed
-        # mapping sums the base o_proj's tp*cp partials.
         mapping = model_config.mapping
-        reduce_output = not mapping.enable_attention_dp and mapping.tp_size > 1
+        reduce_output = mapping.tp_size > 1
         self._o_allreduce = (
             AllReduce(
                 mapping=mapping,
@@ -1341,7 +1256,6 @@ class KimiMLARuntime(nn.Module):
             max_position_embeddings=max_positions,
             model_config=attention_config,
             aux_stream_dict=aux_stream_dict,
-            mapping_with_cp=mapping_with_cp,
         )
 
     def forward(
@@ -1400,8 +1314,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 layer_idx,
                 model_config=model_config,
                 aux_stream_dict=aux_stream_dict,
-                # CP original stashed by _setup_helix_mappings; None outside helix.
-                mapping_with_cp=getattr(model_config, "_helix_mapping_with_cp", None),
             )
 
         self.is_moe = (
@@ -1414,24 +1326,17 @@ class KimiLinearDecoderLayer(nn.Module):
         else:
             situ_beta = getattr(cfg, "activation_situ_beta", None) or 1.0
             situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)
-            attention_dp = model_config.mapping.enable_attention_dp
-            if attention_dp:
-                self.mlp_tp_size = 1
-            else:
-                self.mlp_tp_size = math.gcd(cfg.intermediate_size, model_config.mapping.tp_size)
-                # Over MNNVL (one NVLink domain across the nodes, where a cross-node all-reduce costs what a node's
-                # does) the MLP stays split over the whole TP group, the per-rank shapes its decode GEMVs take
-                # (decode_gemv.SITES); otherwise it stays within one node.
-                spans_nodes = self._mnnvl_allreduce() is not None
-                if self.mlp_tp_size > model_config.mapping.gpus_per_node and not spans_nodes:
-                    self.mlp_tp_size = math.gcd(
-                        self.mlp_tp_size, model_config.mapping.gpus_per_node
-                    )
+            self.mlp_tp_size = math.gcd(cfg.intermediate_size, model_config.mapping.tp_size)
+            # Over MNNVL (one NVLink domain across the nodes, where a cross-node all-reduce costs what a node's
+            # does) the MLP stays split over the whole TP group, the per-rank shapes its decode GEMVs take
+            # (decode_gemv.SITES); otherwise it stays within one node.
+            spans_nodes = self._mnnvl_allreduce() is not None
+            if self.mlp_tp_size > model_config.mapping.gpus_per_node and not spans_nodes:
+                self.mlp_tp_size = math.gcd(self.mlp_tp_size, model_config.mapping.gpus_per_node)
             mlp_model_config = copy.copy(model_config)
             mlp_model_config.quant_config = QuantConfig()
             # K3's dense layer is BF16, so a unit block size gives the same
-            # subgroup selection as DeepSeek-V3. Attention DP replicates the
-            # MLP because ranks own different tokens.
+            # subgroup selection as DeepSeek-V3.
             self.mlp = GatedMLP(
                 hidden_size=cfg.hidden_size,
                 intermediate_size=cfg.intermediate_size,
@@ -2181,6 +2086,12 @@ def _check_construction(model_config: ModelConfig) -> None:
     kv_algo = model_config.quant_config.kv_cache_quant_algo
     assert kv_algo is None, (
         f"this target's MLA kernels read a bf16 KV pool; kv_cache_config.dtype resolved to {kv_algo}"
+    )
+    quant_algo = model_config.quant_config.quant_algo
+    assert quant_algo == QuantAlgo.W4A16_MXFP4 and not model_config.quant_config_dict, (
+        "this target loads the MXFP4 checkpoint, whose compressed-tensors config the model config reads as "
+        "W4A16_MXFP4 with no per-layer declarations (its routed experts run the W4A8_MXFP4_MXFP8 default); the "
+        f"engine read {quant_algo} with {len(model_config.quant_config_dict or {})} per-layer declarations"
     )
     strategy = model_config.allreduce_strategy
     assert strategy in (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL), (
