@@ -43,6 +43,7 @@ class DSAMetadataParams(SparseMetadataParams):
     mtp_index_share: bool = False
     use_self_sampling_topk: bool = True
     use_gvr_emission: bool = False
+    use_gvr_block_skip: bool = True
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,13 @@ class DSAParams(SparseParams):
     # Emission block-skip for the temporal-hint engine; only meaningful with
     # enable_heuristic_topk=True and use_self_sampling_topk=False on FP4.
     use_gvr_emission: bool = False
+    # Block-max skip for the self-sampling engine: the FP4 indexer epilogue
+    # emits per-32-position maxima and the single-CTA streaming top-k skips
+    # the blocks below its sampled line (exactness unaffected). Armed only for
+    # large decode batches at >= 512k-token envelopes; only meaningful with
+    # enable_heuristic_topk=True and use_self_sampling_topk=True on FP4 with
+    # the DSL paged-MQA scorer.
+    use_gvr_block_skip: bool = True
     indexer_k_dtype: Literal["fp8", "fp4"] = "fp8"
     # Shared layers reuse the preceding full layer's top-k.
     is_full_indexer_layer: bool = True

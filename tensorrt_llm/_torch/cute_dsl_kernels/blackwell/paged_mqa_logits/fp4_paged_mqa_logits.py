@@ -60,6 +60,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
+
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
 # form is also accepted by older wrappers, so keep it version-independent.
 _RND_RN = "rn"
@@ -74,6 +76,41 @@ _META_NEG_FLT_MAX = -3.4028235e38
 # fp32 min/max use the order-preserving int encoding
 # enc(f) = bits(f) >= 0 ? bits(f) : bits(f) ^ 0x7FFFFFFF (an involution)
 # with red.global.{min,max}.s32; sum uses red.global.add.f32.
+@dsl_user_op
+def _fabs_f32(x, *, loc=None, ip=None):
+    """abs.f32 as inline PTX so ptxas folds it into the FADD2 |R| operand modifier
+    (relu(x) = (x + |x|) * 0.5, the 0.5 pre-folded into the cached weights)."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [x.ir_value(loc=loc, ip=ip)],
+            "abs.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_global_f32(addr_i64, fval, *, loc=None, ip=None):
+    """st.global.f32 [addr], val (block_max record store by precomputed byte address)."""
+    llvm.inline_asm(
+        None,
+        [addr_i64.ir_value(loc=loc, ip=ip), fval.ir_value(loc=loc, ip=ip)],
+        "st.global.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @dsl_user_op
 def _red_global_fmin_ordered(addr_i64, fval, *, loc=None, ip=None):
     llvm.inline_asm(
@@ -155,6 +192,54 @@ def _red_global_add_f32(addr_i64, fval, *, loc=None, ip=None):
         [addr_i64.ir_value(loc=loc, ip=ip), fval.ir_value(loc=loc, ip=ip)],
         "red.global.add.f32 [$0], $1;",
         "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _ld_relaxed_gpu_s32(addr_i64, *, loc=None, ip=None):
+    """L1-bypassing load of a word other CTAs mutate (claim counters)."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [addr_i64.ir_value(loc=loc, ip=ip)],
+            "ld.relaxed.gpu.global.b32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _trap(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [],
+        "trap;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_global_s32(addr_i64, ival, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [addr_i64.ir_value(loc=loc, ip=ip), ival.ir_value(loc=loc, ip=ip)],
+        "st.global.b32 [$0], $1;",
+        "l,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -469,6 +554,12 @@ class FP4MQALogitsKernel:
         cand_cap: int = 5120,
         emit_cand_bucketed: bool = False,
         accept_cap: int = 8192,
+        dynamic_sched: bool = False,
+        ring_depth: int = 128,
+        b_cap: int = 1024,
+        pdl: bool | None = None,
+        pdl_trigger: int = 2,
+        num_kv_stages: int = 6,
     ):
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
@@ -538,6 +629,17 @@ class FP4MQALogitsKernel:
         # False emits block_max ONLY (no bitmap read, no hit aggregate).
         self.emit_block_meta = emit_block_meta
         self.emit_hit_stats = emit_hit_stats
+        # Deferred block_max emission: with only block_max requested, a
+        # tile's warp fmax + record store are issued under the NEXT tile's
+        # TMEM load instead of at the end of its epilogue chain. The
+        # sub-knobs below consume r_bmax in place, so they keep the in-place
+        # path.
+        self.emit_block_meta_deferred = (
+            emit_block_meta and not emit_hit_stats and not emit_seed_counts
+        )
+        # plain build: each tile's logits store is deferred into the next
+        # tile's TMEM-load shadow (emitting builds place block_max there)
+        self.defer_logits = not emit_block_meta
         # emit_seed_counts (requires emit_block_meta): per row, count
         # stored logits >= each of the T=3 caller-provided thresholds.
         # Counts are computed on the POST-conversion value over valid
@@ -578,6 +680,44 @@ class FP4MQALogitsKernel:
         # q-transition/loop end, so `claimed` over-approximates the true
         # count (counts[r][0] exact).
         self.CAND_WIN = 8
+        # dynamic_sched: tail-only work stealing over the DG ranges. Every
+        # CTA walks the head of its range unchanged; the last
+        # (range >> tail_shift) pairs form its donation region, split into
+        # C-pair chunks claimed through one global counter per range (owner
+        # first, just in time, then any CTA that ran out of work). TMA warp 0
+        # publishes row segments {row|flag<<16, kv0, n_pairs, ctx} into a
+        # smem ring every role consumes in order. The regime is decided per
+        # launch from the inputs (total_pairs >= nmin * num_ctas); below it
+        # every CTA walks exactly its DG range. A thief scans every range's
+        # claim counter and takes a chunk of a range that still holds many
+        # (one atomic per probe). Global state lives in a caller-owned int32
+        # buffer [0]=arrival, [64..64+NC)=per-range claim counters, restored
+        # to zero by the last arriving CTA; launches sharing a buffer must be
+        # stream-ordered.
+        # Under PDL the kernel-entry griddepcontrol.wait orders the first
+        # claim after the previous grid's reset of these words.
+        self.dynamic_sched = dynamic_sched
+        # pdl: launch with the programmatic-dependent-launch attribute and
+        # wait at kernel entry before any role's first input read; default
+        # follows TRTLLM_ENABLE_PDL. pdl_trigger: release the dependent top-k
+        # 0 never, 1 at kernel entry, 2 at each CTA's tile-loop exit (the
+        # dependent still waits for this grid's completion before reading)
+        self.pdl = TRTLLM_ENABLE_PDL if pdl is None else bool(pdl)
+        self.pdl_trigger = int(pdl_trigger)
+        if self.pdl_trigger not in (0, 1, 2):
+            raise ValueError("pdl_trigger must be 0, 1 or 2")
+        self.ring_depth = ring_depth
+        self.b_cap = b_cap
+        # setmaxnreg split (producer warps, math WGs) of the 168 x 384 pool;
+        # the fetcher and ring pops need 56 producer registers
+        self.prod_regs, self.math_regs = (56, 224) if dynamic_sched else (24, 240)
+        assert ring_depth >= 16 and ring_depth % 2 == 0
+        assert b_cap % 32 == 0 and b_cap <= 1024
+        assert num_sms <= 256, "dynamic scheduler encodes CTA ids in 8 bits"
+        assert not (dynamic_sched and (emit_cand or emit_cand_bucketed)), (
+            "dynamic_sched is incompatible with candidate emission (per-segment "
+            "CAND_WIN flushes inflate `claimed` against cand_cap)"
+        )
         # epi_bytes covers fp16 and bf16 (FP8 only handled fp16).
         self.epi_bytes = 2 if epi_dtype in (cutlass.Float16, cutlass.BFloat16) else 4
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
@@ -602,13 +742,17 @@ class FP4MQALogitsKernel:
         self.umma_warp_base = 10
 
         self.num_q_stages = 3
-        # Note, when next_n=1, num_umma_stages could be 2. But test on silicon shows,
-        # num_umma_stages=2 don't improve perf much, so we use num_umma_stages=1 now.
-        # This parameter could be tuned when needed.
-        # self.num_umma_stages = 2 if next_n == 1 else 1
-        self.num_umma_stages = 1
-        # KV pipeline depth
-        self.num_kv_stages = 6
+        # next_n == 1: two accumulator stages per math warpgroup so the next
+        # tile's MMA overlaps this tile's epilogue; next_n > 1 keeps one (TMEM).
+        self.num_umma_stages = 2 if next_n == 1 else 1
+        # KV pipeline depth (op knob TRTLLM_DSL_FP4_KV_STAGES): 6 = 117 KB dynamic
+        # SMEM, each stage adds 17 KB (8 KB KV + 512 B SF per group), 10 = 185 KB
+        assert 2 <= num_kv_stages <= 10, f"num_kv_stages={num_kv_stages} must be in [2, 10]"
+        self.num_kv_stages = num_kv_stages
+        # the fetcher throttles the work ring at D - ring_slack unpopped entries;
+        # the laggard roles trail it by at most kv + umma stages
+        self.ring_slack = max(8, self.num_kv_stages + self.num_umma_stages)
+        assert self.ring_slack <= ring_depth // 2 - 4
         # Step 5.11: smem_pad_bytes (FP8 sub-partition opt knob) dropped.
 
         # acc_dtype is locked to fp32 for FP4 MXF4 SS (cannot be exposed).
@@ -810,6 +954,9 @@ class FP4MQALogitsKernel:
         cand_ctl: cute.Tensor = None,  # [num_rows, 2] int32 {claimed, void}, zeroed
         cand_idx_t: cute.Tensor = None,  # bucketed: [num_rows, 2*segA+capC] int32 SoA
         cand_cur: cute.Tensor = None,  # bucketed: [num_rows, 4] int32 cursors, zeroed
+        dyn_state: cute.Tensor = None,  # dynamic_sched: int32 [>= 64 + roundup32(num_sms)]
+        dyn_chunk: cutlass.Int32 = 16,  # bits 0-7 pairs per chunk (<= ring_depth/2 - 4), bits 8-15 tail shift
+        dyn_nmin: cutlass.Int32 = 64,  # dynamic regime iff total_pairs >= nmin * num_ctas
     ):
         # Derive KV data and SF views from the fused uint8 buffer.
         # Fused layout per phys block: [data half_head_dim*phys_block_kv bytes]
@@ -981,6 +1128,9 @@ class FP4MQALogitsKernel:
         self.num_q_tma_bytes = b_copy_size * atom_thr_size + sf_q_tma_bytes + w_copy_size
 
         num_ctas = self.num_sms
+        ring_d = self.ring_depth if self.dynamic_sched else 1
+        b_cap = self.b_cap if self.dynamic_sched else 1
+        nc_d = (self.num_sms + 31) // 32 * 32 if self.dynamic_sched else 0
 
         @cute.struct
         class SharedStorage:
@@ -989,7 +1139,17 @@ class FP4MQALogitsKernel:
             q_mbar: cute.struct.MemRange[cutlass.Int64, self.num_q_stages * 2]
             umma_mbar_0: cute.struct.MemRange[cutlass.Int64, self.num_umma_stages * 2]
             umma_mbar_1: cute.struct.MemRange[cutlass.Int64, self.num_umma_stages * 2]
+            ring_mbar: cute.struct.MemRange[cutlass.Int64, ring_d * 2]
             tmem_holding_buf: cutlass.Int32
+            # scheduler words re-read per warp role after setmaxnreg (a prologue
+            # value carried across the role split is spilled function-wide)
+            sched_state: cute.struct.MemRange[cutlass.Int32, 4]
+            # dynamic_sched: ring entries, pair-prefix / ctx tables, fetcher state
+            # (64 words) + per-range donation table (2 words per range)
+            ring_ent: cute.struct.MemRange[cutlass.Int32, ring_d * 4]
+            sched_P: cute.struct.MemRange[cutlass.Int32, b_cap + 1]
+            sched_ctx: cute.struct.MemRange[cutlass.Int32, b_cap]
+            sched_ctl: cute.struct.MemRange[cutlass.Int32, 64 + 2 * nc_d]
 
         self.kernel(
             tiled_mma,
@@ -1017,6 +1177,9 @@ class FP4MQALogitsKernel:
             cand_ctl,
             cand_idx_t,
             cand_cur,
+            dyn_state,
+            dyn_chunk,
+            dyn_nmin,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -1037,6 +1200,7 @@ class FP4MQALogitsKernel:
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
+            use_pdl=self.pdl,
         )
 
     @cute.jit
@@ -1187,6 +1351,356 @@ class FP4MQALogitsKernel:
             cwbase[t] = cutlass.Int32(0)
             cwleft[t] = cutlass.Int32(0)
 
+    # ---- dynamic_sched helpers (warp-collective; all lanes of one warp call) ----
+    # sched_ctl words: 0 mode (0 own, 1 steal, 2 finished, 3 static-tail),
+    # 1/2 own donation region [t, e) flat pairs, 3 own chunk limit,
+    # 6/7 pending segment [pf0, pf1), 8 pending first-of-chunk flag,
+    # 9 chunks published (incl. terminal), 10 chunks popped by the fetcher,
+    # 12 donation table built, 13/14 scan reductions, 16..18 ring producer
+    # (count, index, phase), 32..63 strip totals (prologue scratch).
+
+    @cute.jit
+    def _ring_pop(self, ring, ring_cons, ring_ent, lane_idx):
+        ring.consumer_wait(ring_cons)
+        eb = ring_cons.index * 4
+        re0 = ring_ent[eb]
+        re1 = ring_ent[eb + 1]
+        re2 = ring_ent[eb + 2]
+        re3 = ring_ent[eb + 3]
+        cute.arch.sync_warp()
+        if lane_idx == cutlass.Int32(0):
+            ring.consumer_release(ring_cons)
+        return re0, re1, re2, re3
+
+    @cute.jit
+    def _ring_publish(self, ring, ring_ent, s_ctl, lane_idx, w0, w1, w2, w3):
+        st = pipeline.PipelineState(self.ring_depth, s_ctl[16], s_ctl[17], s_ctl[18])
+        ring.producer_acquire(st)
+        if lane_idx == cutlass.Int32(0):
+            eb = st.index * 4
+            ring_ent[eb] = w0
+            ring_ent[eb + 1] = w1
+            ring_ent[eb + 2] = w2
+            ring_ent[eb + 3] = w3
+            ring.producer_commit(st)
+        st.advance()
+        if lane_idx == cutlass.Int32(0):
+            s_ctl[16] = st.count
+            s_ctl[17] = st.index
+            s_ctl[18] = st.phase
+        cute.arch.sync_warp()
+
+    @cute.jit
+    def _row_of(self, s_P, batch_size, lane_idx, f):
+        """row r with P[r] <= f < P[r+1] (two 32-way ballot rounds; f < P[B])."""
+        i1 = min(cutlass.Int32(32) * (lane_idx + cutlass.Int32(1)), batch_size)
+        c1 = cutlass.Int32(cute.arch.popc(cute.arch.vote_ballot_sync(s_P[i1] <= f)))
+        i2 = min(cutlass.Int32(32) * c1 + lane_idx + cutlass.Int32(1), batch_size)
+        c2 = cutlass.Int32(cute.arch.popc(cute.arch.vote_ballot_sync(s_P[i2] <= f)))
+        return cutlass.Int32(32) * c1 + c2
+
+    @cute.jit
+    def _dyn_drain(self, ring, ring_ent, s_P, s_ctx, s_ctl, batch_size, lane_idx, cons_count):
+        """Publish up to 8 row segments of the pending range while the ring
+        holds fewer than ring_depth - ring_slack entries past the fetcher's own pop."""
+        D = cutlass.const_expr(self.ring_depth)
+        SL = cutlass.const_expr(self.ring_slack)
+        pf0 = s_ctl[6]
+        pf1 = s_ctl[7]
+        flag = s_ctl[8]
+        k_it = cutlass.Int32(0)
+        go = cutlass.Int32(1)
+        while go == cutlass.Int32(1):
+            pc = s_ctl[16]
+            if pf0 < pf1 and pc - cons_count < cutlass.Int32(D - SL) and k_it < cutlass.Int32(8):
+                row = self._row_of(s_P, batch_size, lane_idx, pf0)
+                pb = s_P[row]
+                pn = s_P[row + cutlass.Int32(1)]
+                n = min(pf1, pn) - pf0
+                self._ring_publish(
+                    ring,
+                    ring_ent,
+                    s_ctl,
+                    lane_idx,
+                    row | (flag << 16),
+                    (pf0 - pb) * cutlass.Int32(2),
+                    n,
+                    s_ctx[row],
+                )
+                pf0 = pf0 + n
+                flag = cutlass.Int32(0)
+                k_it = k_it + cutlass.Int32(1)
+            else:
+                go = cutlass.Int32(0)
+        if lane_idx == cutlass.Int32(0):
+            s_ctl[6] = pf0
+            s_ctl[8] = flag
+        cute.arch.sync_warp()
+
+    @cute.jit
+    def _dyn_claim(
+        self,
+        ring,
+        ring_ent,
+        s_P,
+        s_rng,
+        s_ctl,
+        mScheduleMeta,
+        dyn_base,
+        sm_idx,
+        lane_idx,
+        chunk,
+        tail_sh,
+    ):
+        """One claim probe (at most one global atomic): the next own donation
+        chunk (mode 0), else a chunk of a rich range (mode 1: the first range
+        in ring order after sm_idx among those holding at least half of the
+        maximum unclaimed chunks; a lost race leaves that counter past its
+        limit, so the range drops out of later scans). With nothing left
+        anywhere: arrive (the last arriver restores the zeros) and publish
+        the terminal entry."""
+        num_ctas = cutlass.const_expr(self.num_sms)
+        NW = cutlass.const_expr((self.num_sms + 31) // 32)
+        mode = s_ctl[0]
+        if s_ctl[12] == cutlass.Int32(0) and mode != cutlass.Int32(3):
+            # donation table [end, size) per range, built at this CTA's first
+            # claim (its own range still has two chunks of work queued); own
+            # and out-of-range entries get size 0
+            qs_v = cute.make_rmem_tensor(NW, cutlass.Int32)
+            ks_v = cute.make_rmem_tensor(NW, cutlass.Int32)
+            qe_v = cute.make_rmem_tensor(NW, cutlass.Int32)
+            ke_v = cute.make_rmem_tensor(NW, cutlass.Int32)
+            for i in cutlass.range_constexpr(NW):
+                vc = min(lane_idx + cutlass.Int32(32 * i), cutlass.Int32(num_ctas - 1))
+                qs_v[i] = mScheduleMeta[(vc, 0)]
+                ks_v[i] = mScheduleMeta[(vc, 1)]
+                qe_v[i] = mScheduleMeta[(vc + cutlass.Int32(1), 0)]
+                ke_v[i] = mScheduleMeta[(vc + cutlass.Int32(1), 1)]
+            for i in cutlass.range_constexpr(NW):
+                v = lane_idx + cutlass.Int32(32 * i)
+                e_v = s_P[qe_v[i]] + ke_v[i]
+                d_v = (e_v - s_P[qs_v[i]] - ks_v[i]) >> tail_sh
+                if v >= cutlass.Int32(num_ctas) or v == sm_idx:
+                    d_v = cutlass.Int32(0)
+                s_rng[v * 2] = e_v
+                s_rng[v * 2 + 1] = d_v
+            cute.arch.sync_warp()
+            if lane_idx == cutlass.Int32(0):
+                s_ctl[12] = cutlass.Int32(1)
+        got = cutlass.Int32(0)
+        pf0 = cutlass.Int32(0)
+        pf1 = cutlass.Int32(0)
+        if mode == cutlass.Int32(0):
+            lim = s_ctl[3]
+            s0 = s_ctl[1]
+            e0 = s_ctl[2]
+            old = cutlass.Int32(0)
+            if lane_idx == cutlass.Int32(0):
+                old = _atom_global_add_s32(
+                    dyn_base + cutlass.Int64(64 + sm_idx) * cutlass.Int64(4), cutlass.Int32(1)
+                )
+            old = cute.arch.shuffle_sync(old, cutlass.Int32(0))
+            k = old + cutlass.Int32(1)
+            if k < lim:
+                pf0 = s0 + k * chunk
+                pf1 = min(pf0 + chunk, e0)
+                got = cutlass.Int32(1)
+            else:
+                mode = cutlass.Int32(1)
+        go_done = cutlass.Int32(0)
+        if mode == cutlass.Int32(1) and got == cutlass.Int32(0):
+            # lane l scans ranges v = l + 32 i
+            cnt = cute.make_rmem_tensor(NW, cutlass.Int32)
+            for i in cutlass.range_constexpr(NW):
+                vc = min(lane_idx + cutlass.Int32(32 * i), cutlass.Int32(num_ctas - 1))
+                cnt[i] = _ld_relaxed_gpu_s32(dyn_base + cutlass.Int64(64 + vc) * cutlass.Int64(4))
+            rem_max = cutlass.Int32(0)
+            for i in cutlass.range_constexpr(NW):
+                v = lane_idx + cutlass.Int32(32 * i)
+                rem = (
+                    (s_rng[v * 2 + 1] + chunk - cutlass.Int32(1)) // chunk
+                    - cutlass.Int32(1)
+                    - cnt[i]
+                )
+                rem_max = max(rem_max, rem)
+            for k in cutlass.range_constexpr(5):
+                rem_max = max(rem_max, cute.arch.shuffle_sync_bfly(rem_max, 1 << k))
+            if lane_idx == cutlass.Int32(0):
+                s_ctl[13] = rem_max
+            cute.arch.sync_warp()
+            rem_max = s_ctl[13]
+            if rem_max <= cutlass.Int32(0):
+                go_done = cutlass.Int32(1)
+            else:
+                thr = (rem_max + cutlass.Int32(1)) >> 1
+                pick = cutlass.Int32(0x7FFFFFFF)
+                for i in cutlass.range_constexpr(NW):
+                    v = lane_idx + cutlass.Int32(32 * i)
+                    rem = (
+                        (s_rng[v * 2 + 1] + chunk - cutlass.Int32(1)) // chunk
+                        - cutlass.Int32(1)
+                        - cnt[i]
+                    )
+                    if rem >= thr:
+                        dist = (v - sm_idx - cutlass.Int32(1)) & cutlass.Int32(0xFF)
+                        pick = min(pick, (dist << 8) | v)
+                for k in cutlass.range_constexpr(5):
+                    pick = min(pick, cute.arch.shuffle_sync_bfly(pick, 1 << k))
+                if lane_idx == cutlass.Int32(0):
+                    s_ctl[14] = pick
+                cute.arch.sync_warp()
+                v = s_ctl[14] & cutlass.Int32(0xFF)
+                old = cutlass.Int32(0)
+                if lane_idx == cutlass.Int32(0):
+                    old = _atom_global_add_s32(
+                        dyn_base + cutlass.Int64(64 + v) * cutlass.Int64(4), cutlass.Int32(1)
+                    )
+                e_v = s_rng[v * 2]
+                d_v = s_rng[v * 2 + 1]
+                lim_v = (d_v + chunk - cutlass.Int32(1)) // chunk
+                old = cute.arch.shuffle_sync(old, cutlass.Int32(0))
+                k = old + cutlass.Int32(1)
+                if k < lim_v:
+                    pf0 = e_v - d_v + k * chunk
+                    pf1 = min(pf0 + chunk, e_v)
+                    got = cutlass.Int32(1)
+        if got == cutlass.Int32(1):
+            if lane_idx == cutlass.Int32(0):
+                s_ctl[0] = mode
+                s_ctl[6] = pf0
+                s_ctl[7] = pf1
+                s_ctl[8] = cutlass.Int32(1)
+                s_ctl[9] = s_ctl[9] + cutlass.Int32(1)
+        if go_done == cutlass.Int32(1):
+            # one arrival per CTA; the last arriver restores the zeros
+            a = cutlass.Int32(0)
+            if lane_idx == cutlass.Int32(0):
+                cute.arch.fence_acq_rel_gpu()
+                a = _atom_global_add_s32(dyn_base, cutlass.Int32(1))
+            a = cute.arch.shuffle_sync(a, cutlass.Int32(0))
+            if a == cutlass.Int32(num_ctas - 1):
+                cute.arch.fence_acq_rel_gpu()
+                if lane_idx == cutlass.Int32(0):
+                    _st_global_s32(dyn_base, cutlass.Int32(0))
+                for _j in cutlass.range_constexpr(NW):
+                    _st_global_s32(
+                        dyn_base + cutlass.Int64(64 + 32 * _j + lane_idx) * cutlass.Int64(4),
+                        cutlass.Int32(0),
+                    )
+        if go_done == cutlass.Int32(1) or mode == cutlass.Int32(3):
+            self._ring_publish(
+                ring,
+                ring_ent,
+                s_ctl,
+                lane_idx,
+                cutlass.Int32(1 << 16),
+                cutlass.Int32(0),
+                cutlass.Int32(0),
+                cutlass.Int32(0),
+            )
+            if lane_idx == cutlass.Int32(0):
+                s_ctl[0] = cutlass.Int32(2)
+                s_ctl[9] = s_ctl[9] + cutlass.Int32(1)
+        cute.arch.sync_warp()
+
+    @cute.jit
+    def _fetch_step(
+        self,
+        ring,
+        ring_ent,
+        s_P,
+        s_ctx,
+        s_rng,
+        s_ctl,
+        mScheduleMeta,
+        dyn_base,
+        batch_size,
+        sm_idx,
+        lane_idx,
+        cons_count,
+        chunk,
+        tail_sh,
+    ):
+        """Claim the next chunk when the pending range is drained and fewer
+        than two chunks are claimed ahead of the fetcher's pops; then drain.
+        Returns 1 while a further step can make progress."""
+        mode = s_ctl[0]
+        pf0 = s_ctl[6]
+        pf1 = s_ctl[7]
+        ahead = s_ctl[9] - s_ctl[10]
+        if pf0 == pf1 and mode != cutlass.Int32(2) and ahead < cutlass.Int32(2):
+            self._dyn_claim(
+                ring,
+                ring_ent,
+                s_P,
+                s_rng,
+                s_ctl,
+                mScheduleMeta,
+                dyn_base,
+                sm_idx,
+                lane_idx,
+                chunk,
+                tail_sh,
+            )
+        self._dyn_drain(ring, ring_ent, s_P, s_ctx, s_ctl, batch_size, lane_idx, cons_count)
+        need = cutlass.Int32(0)
+        if s_ctl[6] < s_ctl[7]:
+            need = cutlass.Int32(1)
+        if s_ctl[0] != cutlass.Int32(2) and s_ctl[9] - s_ctl[10] < cutlass.Int32(2):
+            need = cutlass.Int32(1)
+        return need
+
+    @cute.jit
+    def _issue_q(
+        self,
+        q_pipeline,
+        q_prod_state,
+        tma_atom_b,
+        tBgB,
+        tBsB,
+        b_mcast_mask,
+        tma_atom_sf_q,
+        tSF_Q_gSF_Q,
+        tSF_Q_sSF_Q,
+        tma_atom_w,
+        tWgW,
+        tWsW,
+        row,
+    ):
+        q_pipeline.producer_acquire(q_prod_state)
+        q_bar = q_pipeline.producer_get_barrier(q_prod_state)
+        cute.copy(
+            tma_atom_b,
+            tBgB[(None, 0, row)],
+            tBsB[(None, q_prod_state.index)],
+            tma_bar_ptr=q_bar,
+            mcast_mask=b_mcast_mask,
+        )
+        cute.copy(
+            tma_atom_sf_q,
+            tSF_Q_gSF_Q[(None, row)],
+            tSF_Q_sSF_Q[(None, q_prod_state.index)],
+            tma_bar_ptr=q_bar,
+        )
+        cute.copy(
+            tma_atom_w,
+            tWgW[(None, row)],
+            tWsW[(None, q_prod_state.index)],
+            tma_bar_ptr=q_bar,
+        )
+
+    @cute.jit
+    def _load_schedule_row(self, mScheduleMeta, s_sched, sm_idx, num_math_wg):
+        # s_sched = [start tile, start row, end tile, end row] (tiles = half-units x num_math_wg)
+        start_q = mScheduleMeta[(sm_idx, 0)]
+        start_kv_half = mScheduleMeta[(sm_idx, 1)]
+        end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
+        end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
+        s_sched[0] = start_kv_half * num_math_wg
+        s_sched[1] = start_q
+        s_sched[2] = end_kv_half * num_math_wg
+        s_sched[3] = end_q_idx
+
     @cute.kernel
     def kernel(
         self,
@@ -1215,6 +1729,9 @@ class FP4MQALogitsKernel:
         mCandCtl: cute.Tensor,  # [num_rows, 2] int32 {claimed, void} (or None)
         mCandIdx: cute.Tensor,  # bucketed: [num_rows, 2*segA+capC] int32 SoA (or None)
         mCandCur: cute.Tensor,  # bucketed: [num_rows, 4] int32 cursors (or None)
+        mDynState: cute.Tensor,  # dynamic_sched state words (or None)
+        dyn_chunk: cutlass.Int32,
+        dyn_nmin: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -1257,17 +1774,13 @@ class FP4MQALogitsKernel:
         NUM_MATH_WG = 2  # kNumMathWarpGroups
         NUM_BLOCKS_PER_MMA = self.num_blocks_per_mma
         sm_idx = bidz
-        start_q = mScheduleMeta[(sm_idx, 0)]
-        start_kv_half = mScheduleMeta[(sm_idx, 1)]
-        end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
-        end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
-        # Early mContextLens load: overlap ~200-cycle L2 latency with the
-        # entire prologue setup (pipelines, SMEM alloc, TMA partition, etc.)
-        # Clamp to avoid OOB when start_q == batch_size (zero-work CTA sentinel).
-        # Note: zero-work CTAs get a stale current_num_kv (from the last batch
-        # element), but it is never used because has_work will be False.
-        start_q_clamped = min(start_q, batch_size - 1)
-        current_num_kv = (mContextLens[start_q_clamped] + self.block_kv - 1) // self.block_kv
+        if cutlass.const_expr(self.pdl):
+            # every warp waits here, before the role split: the reads below
+            # (schedule_meta, context_lens, block table, q / K / weights via
+            # TMA, the dynamic scheduler's state words) all follow it
+            griddepcontrol_wait()
+            if cutlass.const_expr(self.pdl_trigger == 1):
+                griddepcontrol_launch_dependents()
 
         if is_tma_warp:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -1278,6 +1791,82 @@ class FP4MQALogitsKernel:
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
+
+        lane_idx = tidx % 32
+        left = cutlass.Int32(0)
+        trig = cutlass.Int32(-1)
+        ring = None
+        ring_cons = None
+        ring_ent = None
+        s_P = None
+        s_ctx = None
+        s_ctl = None
+        s_rng = None
+        if cutlass.const_expr(self.dynamic_sched):
+            D_RING = self.ring_depth
+            B_CAP = self.b_cap
+            NSTRIP = B_CAP // 32
+            ring_ent = cute.make_tensor(
+                storage.ring_ent.data_ptr(), cute.make_layout((4 * D_RING,))
+            )
+            s_P = cute.make_tensor(storage.sched_P.data_ptr(), cute.make_layout((B_CAP + 1,)))
+            s_ctx = cute.make_tensor(storage.sched_ctx.data_ptr(), cute.make_layout((B_CAP,)))
+            s_ctl = cute.make_tensor(storage.sched_ctl.data_ptr(), cute.make_layout((64,)))
+            s_rng = cute.make_tensor(
+                storage.sched_ctl.data_ptr() + 64,
+                cute.make_layout((2 * ((self.num_sms + 31) // 32 * 32),)),
+            )
+            if batch_size > cutlass.Int32(B_CAP):
+                _trap()
+            # P[r] = pairs of rows < r: warp w scans strips w, w+12, w+24 of 32 rows
+            strip_incl = cute.make_rmem_tensor(3, cutlass.Int32)
+            for s_i in cutlass.range_constexpr(3):
+                strip = warp_idx + 12 * s_i
+                strip_incl[s_i] = cutlass.Int32(0)
+                if strip < NSTRIP:
+                    p = cutlass.Int32(0)
+                    if strip * 32 < batch_size:
+                        row = strip * 32 + lane_idx
+                        if row < batch_size:
+                            c = mContextLens[row]
+                            s_ctx[row] = c
+                            # a zero-tile row still costs one pair (static visits it once)
+                            p = max(
+                                (((c + cutlass.Int32(127)) >> 7) + cutlass.Int32(1)) >> 1,
+                                cutlass.Int32(1),
+                            )
+                        for k in cutlass.range_constexpr(5):
+                            o = cute.arch.shuffle_sync_up(p, 1 << k, mask_and_clamp=0)
+                            if lane_idx >= cutlass.Int32(1 << k):
+                                p = p + o
+                    strip_incl[s_i] = p
+                    if lane_idx == cutlass.Int32(31):
+                        s_ctl[32 + strip] = p
+            cute.arch.barrier()
+            tot_l = s_ctl[32 + lane_idx]
+            incl_t = tot_l
+            for k in cutlass.range_constexpr(5):
+                o = cute.arch.shuffle_sync_up(incl_t, 1 << k, mask_and_clamp=0)
+                if lane_idx >= cutlass.Int32(1 << k):
+                    incl_t = incl_t + o
+            for s_i in cutlass.range_constexpr(3):
+                strip = warp_idx + 12 * s_i
+                if strip < NSTRIP:
+                    base = cute.arch.shuffle_sync(incl_t, strip) - cute.arch.shuffle_sync(
+                        tot_l, strip
+                    )
+                    row = strip * 32 + lane_idx
+                    if row < batch_size:
+                        s_P[row + 1] = base + strip_incl[s_i]
+            if tidx == cutlass.Int32(0):
+                s_P[0] = cutlass.Int32(0)
+
+        # Schedule row: one thread loads it and broadcasts it through smem, so
+        # no other warp consumes a global load before the block barrier (warp 0's
+        # mbarrier init overlaps the load). Every role reads s_sched after it.
+        s_sched = cute.make_tensor(storage.sched_state.data_ptr(), cute.make_layout((4,)))
+        if tidx == cutlass.Int32(11 * 32):
+            self._load_schedule_row(mScheduleMeta, s_sched, sm_idx, NUM_MATH_WG)
 
         block_kv_val = self.block_kv
         num_heads = self.num_heads
@@ -1393,6 +1982,26 @@ class FP4MQALogitsKernel:
             pipeline.PipelineUserType.Consumer, self.num_umma_stages
         )
 
+        if cutlass.const_expr(self.dynamic_sched):
+            # work ring: fetcher lane 0 produces, lane 0 of all 12 warps releases
+            ring = pipeline.PipelineAsync.create(
+                barrier_storage=storage.ring_mbar.data_ptr(),
+                num_stages=self.ring_depth,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 12),
+                defer_sync=True,
+            )
+            ring_cons = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.ring_depth
+            )
+            ring_prod_init = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.ring_depth
+            )
+            if tidx == cutlass.Int32(0):
+                s_ctl[16] = ring_prod_init.count
+                s_ctl[17] = ring_prod_init.index
+                s_ctl[18] = ring_prod_init.phase
+
         # TMEM — only Math warps (8×32=256) + UMMA warps (2×32=64) = 320 threads
         # TMA warps do NOT participate, so they can start TMA loads earlier.
         # Math warp 0 is the allocator (like fp16_gemm_3's epilogue warp 0),
@@ -1417,6 +2026,9 @@ class FP4MQALogitsKernel:
         )
 
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
+        # tcgen05.alloc by math warp 0; the 320-thread retrieve barrier stays
+        # in the math / UMMA branches.
+        tmem.allocate(self.num_tmem_alloc_cols_total)
 
         # SMEM allocation: per-group KV + shared Q
         sKV_0 = smem.allocate_tensor(
@@ -1590,7 +2202,6 @@ class FP4MQALogitsKernel:
 
         # TMEM layout info (allocation deferred to UMMA/Math warp branches)
         cols_per_group = cols * us * (32 // self.acc_dtype.width)
-        num_tmem_alloc_cols_total = self.num_tmem_alloc_cols_total
 
         # Epilogue setup
         c_layout = utils.LayoutEnum.ROW_MAJOR
@@ -1604,25 +2215,10 @@ class FP4MQALogitsKernel:
             use_2cta_instrs,
         )
 
-        # ===== SCHEDULER: derive values from early-loaded schedule metadata =====
-        end_kv_idx = end_kv_half * NUM_MATH_WG
-
-        # Convert start to KV block units
-        current_q_idx = start_q
-        current_kv_idx = start_kv_half * NUM_MATH_WG
-
-        # ===== COMMON SCHEDULER STATE (before warp branches) =====
-        # Each warp role independently maintains its own copy of these
-        # variables (like DeepGEMM where each role creates its own scheduler).
-        # Pre-fetch first task (current_num_kv loaded early above for latency hiding)
-        next_q_idx = current_q_idx
-        next_kv_idx = current_kv_idx
-        next_num_kv = current_num_kv
+        # Scheduler state is derived per role from s_sched after the barrier
+        # (a prologue value carried across setmaxnreg is spilled function-wide).
         # Sentinel: no previous batch (q_idx = batch_size)
         q_idx = batch_size
-        # While-loop termination flag (fetch_next_task pattern).
-        # True if this CTA has work assigned (start != end in schedule_meta).
-        has_work = (current_q_idx != end_q_idx) | (current_kv_idx != end_kv_idx)
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
@@ -1630,39 +2226,145 @@ class FP4MQALogitsKernel:
 
         if is_tma_warp_0:
             # TMA warp 0: loads Q (prefetch) + KV for group 0
-            cute.arch.warpgroup_reg_dealloc(24)
+            cute.arch.warpgroup_reg_dealloc(self.prod_regs)
+            next_kv_idx = s_sched[0]
+            next_q_idx = s_sched[1]
+            end_kv_idx = s_sched[2]
+            end_q_idx = s_sched[3]
             lane_idx = tidx % 32
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+            blk_row = min(next_q_idx, batch_size - 1)
+            # num_kv of the first tile is derived in the advance step, after its
+            # KV burst (a load here would be consumed before the first TMA issue).
+            next_num_kv = cutlass.Int32(0)
 
             # Block table prefetch: 32 lanes cache block indices,
             # distributed via shuffle. Each lane holds num_blocks_per_mma
             # physical block indices per compute tile.
             cached_blks = [cutlass.Int32(0) for _ in range(NUM_BLOCKS_PER_MMA)]
             kv_blk_ptr = cutlass.Int32(32)  # force prefetch on first use
+            q_row = cutlass.Int32(-1)
+            dyn_base = cutlass.Int64(0)
+            chunk_c = cutlass.Int32(1)
+            tail_sh = cutlass.Int32(0)
 
-            # Prefetch first Q before loop
-            q_pipeline.producer_acquire(q_prod_state)
-            q_bar = q_pipeline.producer_get_barrier(q_prod_state)
-            cute.copy(
-                tma_atom_b,
-                tBgB[(None, 0, next_q_idx)],
-                tBsB[(None, q_prod_state.index)],
-                tma_bar_ptr=q_bar,
-                mcast_mask=b_mcast_mask,
-            )
-            # Step 5.4: SF_Q TMA load — under same q_bar as Q + W.
-            cute.copy(
-                tma_atom_sf_q,
-                tSF_Q_gSF_Q[(None, next_q_idx)],
-                tSF_Q_sSF_Q[(None, q_prod_state.index)],
-                tma_bar_ptr=q_bar,
-            )
-            cute.copy(
-                tma_atom_w,
-                tWgW[(None, next_q_idx)],
-                tWsW[(None, q_prod_state.index)],
-                tma_bar_ptr=q_bar,
-            )
-            q_prod_state.advance()
+            if cutlass.const_expr(self.dynamic_sched):
+                dyn_base = mDynState.iterator.toint()
+                chunk_c = dyn_chunk & cutlass.Int32(0xFF)
+                tail_sh = dyn_chunk >> 8
+                own_s = s_P[next_q_idx] + (next_kv_idx >> 1)
+                own_e = s_P[end_q_idx] + (end_kv_idx >> 1)
+                total_pairs = s_P[batch_size]
+                # donation region [own_t, own_e); the head [own_s, own_t) plus
+                # chunk 0 is this CTA's initial pending segment
+                own_t = own_e - ((own_e - own_s) >> tail_sh)
+                lim_i = (own_e - own_t + chunk_c - cutlass.Int32(1)) // chunk_c
+                dyn_on = total_pairs >= dyn_nmin * cutlass.Int32(self.num_sms)
+                if lane_idx == cutlass.Int32(0):
+                    s_ctl[1] = own_t
+                    s_ctl[2] = own_e
+                    s_ctl[3] = lim_i
+                    mode0 = cutlass.Int32(3)
+                    pf1_0 = own_e
+                    if dyn_on:
+                        mode0 = cutlass.Int32(0)
+                        pf1_0 = min(own_t + chunk_c, own_e)
+                    s_ctl[0] = mode0
+                    s_ctl[6] = own_s
+                    s_ctl[7] = pf1_0
+                    s_ctl[8] = cutlass.Int32(1)
+                    cpub0 = cutlass.Int32(1)
+                    if own_e == own_s:
+                        cpub0 = cutlass.Int32(0)
+                    s_ctl[9] = cpub0
+                    s_ctl[10] = cutlass.Int32(0)
+                    s_ctl[12] = cutlass.Int32(0)
+                cute.arch.sync_warp()
+                need_first = s_ctl[16] == ring_cons.count
+                while need_first:
+                    self._fetch_step(
+                        ring,
+                        ring_ent,
+                        s_P,
+                        s_ctx,
+                        s_rng,
+                        s_ctl,
+                        mScheduleMeta,
+                        dyn_base,
+                        batch_size,
+                        sm_idx,
+                        lane_idx,
+                        ring_cons.count,
+                        chunk_c,
+                        tail_sh,
+                    )
+                    need_first = s_ctl[16] == ring_cons.count
+                re0, re1, re2, re3 = self._ring_pop(ring, ring_cons, ring_ent, lane_idx)
+                ring_cons.advance()
+                next_q_idx = re0 & cutlass.Int32(0xFFFF)
+                next_kv_idx = re1
+                left = re2
+                next_num_kv = (re3 + cutlass.Int32(127)) >> 7
+                has_work = re2 > cutlass.Int32(0)
+                # one scheduler step per segment, two chunks (or half the
+                # segment) before its end
+                trig = left - (chunk_c + chunk_c)
+                if trig < (left >> 1):
+                    trig = left >> 1
+                if lane_idx == cutlass.Int32(0):
+                    s_ctl[10] = s_ctl[10] + (re0 >> 16)
+                cute.arch.sync_warp()
+                if has_work:
+                    self._issue_q(
+                        q_pipeline,
+                        q_prod_state,
+                        tma_atom_b,
+                        tBgB,
+                        tBsB,
+                        b_mcast_mask,
+                        tma_atom_sf_q,
+                        tSF_Q_gSF_Q,
+                        tSF_Q_sSF_Q,
+                        tma_atom_w,
+                        tWgW,
+                        tWsW,
+                        next_q_idx,
+                    )
+                    q_prod_state.advance()
+                    q_row = next_q_idx
+            else:
+                # First tile pair's page indices: issued before the Q TMA so the
+                # load overlaps the TMA issue and the KV producer_acquire.
+                kv_blk_ptr = cutlass.Int32(0)
+                # Lanes past the row read in-bounds entries that are never consumed.
+                pf_base = (next_kv_idx + lane_idx * NUM_MATH_WG) * NUM_BLOCKS_PER_MMA
+                pf_last = cute.size(mBlockTable, mode=[1]) - 1
+                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                    cached_blks[i] = mBlockTable[(blk_row, min(pf_base + i, pf_last))]
+                # Prefetch first Q before loop
+                q_pipeline.producer_acquire(q_prod_state)
+                q_bar = q_pipeline.producer_get_barrier(q_prod_state)
+                cute.copy(
+                    tma_atom_b,
+                    tBgB[(None, 0, next_q_idx)],
+                    tBsB[(None, q_prod_state.index)],
+                    tma_bar_ptr=q_bar,
+                    mcast_mask=b_mcast_mask,
+                )
+                # Step 5.4: SF_Q TMA load — under same q_bar as Q + W.
+                cute.copy(
+                    tma_atom_sf_q,
+                    tSF_Q_gSF_Q[(None, next_q_idx)],
+                    tSF_Q_sSF_Q[(None, q_prod_state.index)],
+                    tma_bar_ptr=q_bar,
+                )
+                cute.copy(
+                    tma_atom_w,
+                    tWgW[(None, next_q_idx)],
+                    tWsW[(None, q_prod_state.index)],
+                    tma_bar_ptr=q_bar,
+                )
+                q_prod_state.advance()
 
             while has_work:
                 # fetch_next_task: commit next → current
@@ -1670,60 +2372,6 @@ class FP4MQALogitsKernel:
                 q_idx = next_q_idx
                 kv_idx = next_kv_idx
                 num_kv = next_num_kv
-
-                # Q prefetch: when batch changes, load Q for NEXT batch
-                if q_idx != q_idx_old:
-                    kv_blk_ptr = cutlass.Int32(32)  # force re-prefetch
-                    prefetch_next = q_idx + 1
-                    if prefetch_next < end_q_idx:
-                        q_pipeline.producer_acquire(q_prod_state)
-                        q_bar = q_pipeline.producer_get_barrier(q_prod_state)
-                        cute.copy(
-                            tma_atom_b,
-                            tBgB[(None, 0, prefetch_next)],
-                            tBsB[(None, q_prod_state.index)],
-                            tma_bar_ptr=q_bar,
-                            mcast_mask=b_mcast_mask,
-                        )
-                        # Step 5.4: SF_Q TMA load — under same q_bar.
-                        cute.copy(
-                            tma_atom_sf_q,
-                            tSF_Q_gSF_Q[(None, prefetch_next)],
-                            tSF_Q_sSF_Q[(None, q_prod_state.index)],
-                            tma_bar_ptr=q_bar,
-                        )
-                        cute.copy(
-                            tma_atom_w,
-                            tWgW[(None, prefetch_next)],
-                            tWsW[(None, q_prod_state.index)],
-                            tma_bar_ptr=q_bar,
-                        )
-                        q_prod_state.advance()
-                    elif prefetch_next == end_q_idx:
-                        if end_kv_idx > 0:
-                            q_pipeline.producer_acquire(q_prod_state)
-                            q_bar = q_pipeline.producer_get_barrier(q_prod_state)
-                            cute.copy(
-                                tma_atom_b,
-                                tBgB[(None, 0, prefetch_next)],
-                                tBsB[(None, q_prod_state.index)],
-                                tma_bar_ptr=q_bar,
-                                mcast_mask=b_mcast_mask,
-                            )
-                            # Step 5.4: SF_Q TMA load — under same q_bar.
-                            cute.copy(
-                                tma_atom_sf_q,
-                                tSF_Q_gSF_Q[(None, prefetch_next)],
-                                tSF_Q_sSF_Q[(None, q_prod_state.index)],
-                                tma_bar_ptr=q_bar,
-                            )
-                            cute.copy(
-                                tma_atom_w,
-                                tWgW[(None, prefetch_next)],
-                                tWsW[(None, q_prod_state.index)],
-                                tma_bar_ptr=q_bar,
-                            )
-                            q_prod_state.advance()
 
                 # Block table prefetch for group 0.
                 # Each lane loads num_blocks_per_mma physical block indices
@@ -1765,24 +2413,237 @@ class FP4MQALogitsKernel:
                     )
                 kv_prod_state_0.advance()
 
-                # Advance: inline fetch_next_task
-                next_kv_idx = kv_idx + NUM_MATH_WG
-                if next_kv_idx >= num_kv:
-                    next_q_idx = q_idx + 1
-                    next_kv_idx = 0
-                    if next_q_idx < batch_size:
-                        next_num_kv = (mContextLens[next_q_idx] + block_kv_val - 1) // block_kv_val
-                # Update while-loop condition
-                has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+                # Q prefetch for the next row, after this tile's KV burst.
+                if cutlass.const_expr(not self.dynamic_sched):
+                    if q_idx != q_idx_old:
+                        prefetch_next = q_idx + 1
+                        if prefetch_next < end_q_idx:
+                            q_pipeline.producer_acquire(q_prod_state)
+                            q_bar = q_pipeline.producer_get_barrier(q_prod_state)
+                            cute.copy(
+                                tma_atom_b,
+                                tBgB[(None, 0, prefetch_next)],
+                                tBsB[(None, q_prod_state.index)],
+                                tma_bar_ptr=q_bar,
+                                mcast_mask=b_mcast_mask,
+                            )
+                            # Step 5.4: SF_Q TMA load — under same q_bar.
+                            cute.copy(
+                                tma_atom_sf_q,
+                                tSF_Q_gSF_Q[(None, prefetch_next)],
+                                tSF_Q_sSF_Q[(None, q_prod_state.index)],
+                                tma_bar_ptr=q_bar,
+                            )
+                            cute.copy(
+                                tma_atom_w,
+                                tWgW[(None, prefetch_next)],
+                                tWsW[(None, q_prod_state.index)],
+                                tma_bar_ptr=q_bar,
+                            )
+                            q_prod_state.advance()
+                        elif prefetch_next == end_q_idx:
+                            if end_kv_idx > 0:
+                                q_pipeline.producer_acquire(q_prod_state)
+                                q_bar = q_pipeline.producer_get_barrier(q_prod_state)
+                                cute.copy(
+                                    tma_atom_b,
+                                    tBgB[(None, 0, prefetch_next)],
+                                    tBsB[(None, q_prod_state.index)],
+                                    tma_bar_ptr=q_bar,
+                                    mcast_mask=b_mcast_mask,
+                                )
+                                # Step 5.4: SF_Q TMA load — under same q_bar.
+                                cute.copy(
+                                    tma_atom_sf_q,
+                                    tSF_Q_gSF_Q[(None, prefetch_next)],
+                                    tSF_Q_sSF_Q[(None, q_prod_state.index)],
+                                    tma_bar_ptr=q_bar,
+                                )
+                                cute.copy(
+                                    tma_atom_w,
+                                    tWgW[(None, prefetch_next)],
+                                    tWsW[(None, q_prod_state.index)],
+                                    tma_bar_ptr=q_bar,
+                                )
+                                q_prod_state.advance()
+
+                if cutlass.const_expr(self.dynamic_sched):
+                    left = left - cutlass.Int32(1)
+                    if left == trig:
+                        # claim ahead (at most two probes) and publish; then Q
+                        # for the entry after the current one if it is visible
+                        k_it = cutlass.Int32(0)
+                        go = cutlass.Int32(1)
+                        while go == cutlass.Int32(1):
+                            need = self._fetch_step(
+                                ring,
+                                ring_ent,
+                                s_P,
+                                s_ctx,
+                                s_rng,
+                                s_ctl,
+                                mScheduleMeta,
+                                dyn_base,
+                                batch_size,
+                                sm_idx,
+                                lane_idx,
+                                ring_cons.count,
+                                chunk_c,
+                                tail_sh,
+                            )
+                            k_it = k_it + cutlass.Int32(1)
+                            go = cutlass.Int32(0)
+                            if need == cutlass.Int32(1) and k_it < cutlass.Int32(2):
+                                go = cutlass.Int32(1)
+                        if s_ctl[16] > ring_cons.count:
+                            nb_e = ring_cons.index * 4
+                            n_row = ring_ent[nb_e] & cutlass.Int32(0xFFFF)
+                            n_cnt = ring_ent[nb_e + 2]
+                            if n_cnt > cutlass.Int32(0) and n_row != q_row:
+                                self._issue_q(
+                                    q_pipeline,
+                                    q_prod_state,
+                                    tma_atom_b,
+                                    tBgB,
+                                    tBsB,
+                                    b_mcast_mask,
+                                    tma_atom_sf_q,
+                                    tSF_Q_gSF_Q,
+                                    tSF_Q_sSF_Q,
+                                    tma_atom_w,
+                                    tWgW,
+                                    tWsW,
+                                    n_row,
+                                )
+                                q_prod_state.advance()
+                                q_row = n_row
+                    if left > cutlass.Int32(0):
+                        next_kv_idx = kv_idx + NUM_MATH_WG
+                    else:
+                        # segment end: publish (claim or terminal) until an entry is visible, then pop it
+                        empty = s_ctl[16] == ring_cons.count
+                        while empty:
+                            self._fetch_step(
+                                ring,
+                                ring_ent,
+                                s_P,
+                                s_ctx,
+                                s_rng,
+                                s_ctl,
+                                mScheduleMeta,
+                                dyn_base,
+                                batch_size,
+                                sm_idx,
+                                lane_idx,
+                                ring_cons.count,
+                                chunk_c,
+                                tail_sh,
+                            )
+                            empty = s_ctl[16] == ring_cons.count
+                        re0, re1, re2, re3 = self._ring_pop(ring, ring_cons, ring_ent, lane_idx)
+                        ring_cons.advance()
+                        next_q_idx = re0 & cutlass.Int32(0xFFFF)
+                        next_kv_idx = re1
+                        left = re2
+                        next_num_kv = (re3 + cutlass.Int32(127)) >> 7
+                        has_work = re2 > cutlass.Int32(0)
+                        kv_blk_ptr = cutlass.Int32(32)
+                        trig = left - (chunk_c + chunk_c)
+                        if trig < (left >> 1):
+                            trig = left >> 1
+                        if lane_idx == cutlass.Int32(0):
+                            s_ctl[10] = s_ctl[10] + (re0 >> 16)
+                        cute.arch.sync_warp()
+                        if has_work and next_q_idx != q_row:
+                            self._issue_q(
+                                q_pipeline,
+                                q_prod_state,
+                                tma_atom_b,
+                                tBgB,
+                                tBsB,
+                                b_mcast_mask,
+                                tma_atom_sf_q,
+                                tSF_Q_gSF_Q,
+                                tSF_Q_sSF_Q,
+                                tma_atom_w,
+                                tWgW,
+                                tWsW,
+                                next_q_idx,
+                            )
+                            q_prod_state.advance()
+                            q_row = next_q_idx
+                        if has_work and s_ctl[16] > ring_cons.count:
+                            nb_e = ring_cons.index * 4
+                            n_row = ring_ent[nb_e] & cutlass.Int32(0xFFFF)
+                            n_cnt = ring_ent[nb_e + 2]
+                            if n_cnt > cutlass.Int32(0) and n_row != q_row:
+                                self._issue_q(
+                                    q_pipeline,
+                                    q_prod_state,
+                                    tma_atom_b,
+                                    tBgB,
+                                    tBsB,
+                                    b_mcast_mask,
+                                    tma_atom_sf_q,
+                                    tSF_Q_gSF_Q,
+                                    tSF_Q_sSF_Q,
+                                    tma_atom_w,
+                                    tWgW,
+                                    tWsW,
+                                    n_row,
+                                )
+                                q_prod_state.advance()
+                                q_row = n_row
+                else:
+                    # Advance: inline fetch_next_task
+                    if q_idx_old == batch_size:
+                        num_kv = (mContextLens[q_idx] + block_kv_val - 1) // block_kv_val
+                        next_num_kv = num_kv
+                    next_kv_idx = kv_idx + NUM_MATH_WG
+                    if next_kv_idx >= num_kv:
+                        next_q_idx = q_idx + 1
+                        next_kv_idx = 0
+                        kv_blk_ptr = cutlass.Int32(32)
+                        if next_q_idx < batch_size:
+                            next_num_kv = (
+                                mContextLens[next_q_idx] + block_kv_val - 1
+                            ) // block_kv_val
+                    # Update while-loop condition
+                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
         elif is_tma_warp_1:
             # TMA warp 1: loads KV + Scale for group 1 only
-            cute.arch.warpgroup_reg_dealloc(24)
+            cute.arch.warpgroup_reg_dealloc(self.prod_regs)
+            next_kv_idx = s_sched[0]
+            next_q_idx = s_sched[1]
+            end_kv_idx = s_sched[2]
+            end_q_idx = s_sched[3]
             lane_idx = tidx % 32
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+            blk_row = min(next_q_idx, batch_size - 1)
+            # num_kv of the first tile is derived in the advance step, after its
+            # KV burst (a load here would be consumed before the first TMA issue).
+            next_num_kv = cutlass.Int32(0)
 
             # Block table prefetch for group 1
             cached_blks = [cutlass.Int32(0) for _ in range(NUM_BLOCKS_PER_MMA)]
             kv_blk_ptr = cutlass.Int32(32)  # force prefetch on first use
+
+            if cutlass.const_expr(self.dynamic_sched):
+                re0, re1, re2, re3 = self._ring_pop(ring, ring_cons, ring_ent, lane_idx)
+                ring_cons.advance()
+                next_q_idx = re0 & cutlass.Int32(0xFFFF)
+                next_kv_idx = re1
+                left = re2
+                next_num_kv = (re3 + cutlass.Int32(127)) >> 7
+                has_work = re2 > cutlass.Int32(0)
+            else:
+                # First tile pair's page indices, issued at role entry.
+                kv_blk_ptr = cutlass.Int32(0)
+                pf_base = (next_kv_idx + 1 + lane_idx * NUM_MATH_WG) * NUM_BLOCKS_PER_MMA
+                pf_last = cute.size(mBlockTable, mode=[1]) - 1
+                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                    cached_blks[i] = mBlockTable[(blk_row, min(pf_base + i, pf_last))]
 
             while has_work:
                 # fetch_next_task: commit next → current
@@ -1791,9 +2652,10 @@ class FP4MQALogitsKernel:
                 kv_idx = next_kv_idx
                 num_kv = next_num_kv
 
-                # New q_idx → force block table re-prefetch
-                if q_idx != q_idx_old:
-                    kv_blk_ptr = cutlass.Int32(32)
+                if cutlass.const_expr(self.dynamic_sched):
+                    # New q_idx → force block table re-prefetch
+                    if q_idx != q_idx_old:
+                        kv_blk_ptr = cutlass.Int32(32)
 
                 # Block table prefetch for group 1
                 if kv_blk_ptr == 32:
@@ -1833,15 +2695,35 @@ class FP4MQALogitsKernel:
                     )
                 kv_prod_state_1.advance()
 
-                # Advance: inline fetch_next_task
-                next_kv_idx = kv_idx + NUM_MATH_WG
-                if next_kv_idx >= num_kv:
-                    next_q_idx = q_idx + 1
-                    next_kv_idx = 0
-                    if next_q_idx < batch_size:
-                        next_num_kv = (mContextLens[next_q_idx] + block_kv_val - 1) // block_kv_val
-                # Update while-loop condition
-                has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+                if cutlass.const_expr(self.dynamic_sched):
+                    left = left - cutlass.Int32(1)
+                    if left > cutlass.Int32(0):
+                        next_kv_idx = kv_idx + NUM_MATH_WG
+                    else:
+                        re0, re1, re2, re3 = self._ring_pop(ring, ring_cons, ring_ent, lane_idx)
+                        ring_cons.advance()
+                        next_q_idx = re0 & cutlass.Int32(0xFFFF)
+                        next_kv_idx = re1
+                        left = re2
+                        next_num_kv = (re3 + cutlass.Int32(127)) >> 7
+                        has_work = re2 > cutlass.Int32(0)
+                        kv_blk_ptr = cutlass.Int32(32)
+                else:
+                    # Advance: inline fetch_next_task
+                    if q_idx_old == batch_size:
+                        num_kv = (mContextLens[q_idx] + block_kv_val - 1) // block_kv_val
+                        next_num_kv = num_kv
+                    next_kv_idx = kv_idx + NUM_MATH_WG
+                    if next_kv_idx >= num_kv:
+                        next_q_idx = q_idx + 1
+                        next_kv_idx = 0
+                        kv_blk_ptr = cutlass.Int32(32)
+                        if next_q_idx < batch_size:
+                            next_num_kv = (
+                                mContextLens[next_q_idx] + block_kv_val - 1
+                            ) // block_kv_val
+                    # Update while-loop condition
+                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
         elif is_umma_warp_0:
             # UMMA warp for group 0
@@ -1849,7 +2731,16 @@ class FP4MQALogitsKernel:
             # barriers are NOT visibility-ordered even within the same
             # warp. KV0 barrier arriving does not guarantee Q SMEM
             # writes are visible.
-            cute.arch.warpgroup_reg_dealloc(24)
+            cute.arch.warpgroup_reg_dealloc(self.prod_regs)
+            next_kv_idx = s_sched[0]
+            next_q_idx = s_sched[1]
+            end_kv_idx = s_sched[2]
+            end_q_idx = s_sched[3]
+            lane_idx = tidx % 32
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+            next_num_kv = (
+                mContextLens[min(next_q_idx, batch_size - 1)] + block_kv_val - 1
+            ) // block_kv_val
 
             # TMEM: wait for math warp 0's allocation, retrieve pointer
             tmem.wait_for_alloc()
@@ -1872,6 +2763,15 @@ class FP4MQALogitsKernel:
             if is_leader_cta:
                 num_k_blocks = cute.size(tCrA_0.shape[2])
                 q_stage_0 = cutlass.Int32(0)
+
+                if cutlass.const_expr(self.dynamic_sched):
+                    re0, re1, re2, re3 = self._ring_pop(ring, ring_cons, ring_ent, lane_idx)
+                    ring_cons.advance()
+                    next_q_idx = re0 & cutlass.Int32(0xFFFF)
+                    next_kv_idx = re1
+                    left = re2
+                    next_num_kv = (re3 + cutlass.Int32(127)) >> 7
+                    has_work = re2 > cutlass.Int32(0)
 
                 while has_work:
                     # fetch_next_task: commit next → current
@@ -2001,23 +2901,45 @@ class FP4MQALogitsKernel:
                     # land before warp 1's previous MMA has committed.
                     sfb_sync_barrier.arrive_and_wait()
 
-                    # Advance: inline fetch_next_task
-                    next_kv_idx = kv_idx + NUM_MATH_WG
-                    if next_kv_idx >= num_kv:
-                        next_q_idx = q_idx + 1
-                        next_kv_idx = 0
-                        if next_q_idx < batch_size:
-                            next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
-                            ) // block_kv_val
-                    # Update while-loop condition
-                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+                    if cutlass.const_expr(self.dynamic_sched):
+                        left = left - cutlass.Int32(1)
+                        if left > cutlass.Int32(0):
+                            next_kv_idx = kv_idx + NUM_MATH_WG
+                        else:
+                            re0, re1, re2, re3 = self._ring_pop(ring, ring_cons, ring_ent, lane_idx)
+                            ring_cons.advance()
+                            next_q_idx = re0 & cutlass.Int32(0xFFFF)
+                            next_kv_idx = re1
+                            left = re2
+                            next_num_kv = (re3 + cutlass.Int32(127)) >> 7
+                            has_work = re2 > cutlass.Int32(0)
+                    else:
+                        # Advance: inline fetch_next_task
+                        next_kv_idx = kv_idx + NUM_MATH_WG
+                        if next_kv_idx >= num_kv:
+                            next_q_idx = q_idx + 1
+                            next_kv_idx = 0
+                            if next_q_idx < batch_size:
+                                next_num_kv = (
+                                    mContextLens[next_q_idx] + block_kv_val - 1
+                                ) // block_kv_val
+                        # Update while-loop condition
+                        has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
         elif is_umma_warp_1:
             # UMMA warp for group 1
             # Explicitly waits on Q pipeline — critical because TMA warp 1
             # only loads KV1, not Q. Without this wait, UMMA warp 1 can
             # start GEMM before TMA warp 0 finishes loading Q into SMEM.
-            cute.arch.warpgroup_reg_dealloc(24)
+            cute.arch.warpgroup_reg_dealloc(self.prod_regs)
+            next_kv_idx = s_sched[0]
+            next_q_idx = s_sched[1]
+            end_kv_idx = s_sched[2]
+            end_q_idx = s_sched[3]
+            lane_idx = tidx % 32
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+            next_num_kv = (
+                mContextLens[min(next_q_idx, batch_size - 1)] + block_kv_val - 1
+            ) // block_kv_val
 
             # TMEM: wait for umma_warp_0's allocation, retrieve pointer
             tmem.wait_for_alloc()
@@ -2044,6 +2966,15 @@ class FP4MQALogitsKernel:
             if is_leader_cta:
                 num_k_blocks_1 = cute.size(tCrA_1.shape[2])
                 q_stage_1 = cutlass.Int32(0)
+
+                if cutlass.const_expr(self.dynamic_sched):
+                    re0, re1, re2, re3 = self._ring_pop(ring, ring_cons, ring_ent, lane_idx)
+                    ring_cons.advance()
+                    next_q_idx = re0 & cutlass.Int32(0xFFFF)
+                    next_kv_idx = re1
+                    left = re2
+                    next_num_kv = (re3 + cutlass.Int32(127)) >> 7
+                    has_work = re2 > cutlass.Int32(0)
 
                 while has_work:
                     # fetch_next_task: commit next → current
@@ -2133,22 +3064,43 @@ class FP4MQALogitsKernel:
                     # reading it.
                     sfb_sync_barrier.arrive_and_wait()
 
-                    # Advance: inline fetch_next_task
-                    next_kv_idx = kv_idx + NUM_MATH_WG
-                    if next_kv_idx >= num_kv:
-                        next_q_idx = q_idx + 1
-                        next_kv_idx = 0
-                        if next_q_idx < batch_size:
-                            next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
-                            ) // block_kv_val
-                    # Update while-loop condition
-                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+                    if cutlass.const_expr(self.dynamic_sched):
+                        left = left - cutlass.Int32(1)
+                        if left > cutlass.Int32(0):
+                            next_kv_idx = kv_idx + NUM_MATH_WG
+                        else:
+                            re0, re1, re2, re3 = self._ring_pop(ring, ring_cons, ring_ent, lane_idx)
+                            ring_cons.advance()
+                            next_q_idx = re0 & cutlass.Int32(0xFFFF)
+                            next_kv_idx = re1
+                            left = re2
+                            next_num_kv = (re3 + cutlass.Int32(127)) >> 7
+                            has_work = re2 > cutlass.Int32(0)
+                    else:
+                        # Advance: inline fetch_next_task
+                        next_kv_idx = kv_idx + NUM_MATH_WG
+                        if next_kv_idx >= num_kv:
+                            next_q_idx = q_idx + 1
+                            next_kv_idx = 0
+                            if next_q_idx < batch_size:
+                                next_num_kv = (
+                                    mContextLens[next_q_idx] + block_kv_val - 1
+                                ) // block_kv_val
+                        # Update while-loop condition
+                        has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
         elif is_math_warp:
-            cute.arch.warpgroup_reg_alloc(240)
+            cute.arch.warpgroup_reg_alloc(self.math_regs)
+            lane_idx = tidx % 32
+            next_kv_idx = s_sched[0]
+            next_q_idx = s_sched[1]
+            end_kv_idx = s_sched[2]
+            end_q_idx = s_sched[3]
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+            next_num_kv = (
+                mContextLens[min(next_q_idx, batch_size - 1)] + block_kv_val - 1
+            ) // block_kv_val
 
-            # TMEM: math warp 0 is the allocator; all math warps wait + retrieve
-            tmem.allocate(num_tmem_alloc_cols_total)
+            # TMEM: allocated by math warp 0 in the prologue; wait + retrieve
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake_staged.layout)
@@ -2187,9 +3139,11 @@ class FP4MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 64
                 else:  # fp32, 4-byte weights
                     MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
-                if cutlass.const_expr(self.emit_block_meta):
+                if cutlass.const_expr(self.emit_block_meta and next_n > 1):
                     # Free ~8 registers for the meta accumulators/fragments;
-                    # the epilogue's weight cache sits at the spill edge.
+                    # the epilogue's weight cache sits at the spill edge for
+                    # next_n >= 2. next_n == 1 has the headroom and keeps the
+                    # full cache.
                     MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                     if cutlass.const_expr(self.emit_hit_stats):
                         # Hit accumulators + bitmap word add ~6 more live
@@ -2206,10 +3160,37 @@ class FP4MQALogitsKernel:
                 else:
                     result_arr = None
                 q_stage_local = cutlass.Int32(0)
+                # loop-carried: the deferred logits / block_max flushes read
+                # the last tile's position after the loop
+                kv_pos = cutlass.Int32(0)
+                # deferred logits store (plain build): the previous tile's
+                # values are stored under the next tile's first TMEM load
+                lg_pend = cute.make_rmem_tensor(next_n, self.output_dtype)
+                lg_row = cutlass.Int32(0)
+                lg_pos = cutlass.Int32(0)
+                lg_on = cutlass.Int32(0)
                 if cutlass.const_expr(self.emit_block_meta):
                     ctx_cur = cutlass.Int32(0)
                     meta_warp = local_tidx // 32
                     meta_lane = local_tidx % 32
+                    # block_max row base (bytes) + record pitch: hoisted per q so
+                    # the per-tile store is one address add instead of a full
+                    # tensor-index chain (LDC + 64-bit IMAD/LEA) on the
+                    # epilogue's critical path
+                    bm_base = cutlass.Int64(0)
+                    bm_nrec = cutlass.Int32(mBlockMax.shape[1])
+                    if cutlass.const_expr(self.emit_block_meta_deferred):
+                        # pending emission of the previous tile: per-lane
+                        # values (masked only at the row's last tile) and the
+                        # record address (row base + warp*4 + tile*16)
+                        pend_v = cute.make_rmem_tensor(next_n, cutlass.Float32)
+                        for _i in cutlass.range_constexpr(next_n):
+                            pend_v[_i] = cutlass.Float32(_META_NEG_FLT_MAX)
+                        pend_addr = cutlass.Int64(0)
+                        bm_base_w = cutlass.Int64(0)
+                        # 16 B tile pitch kept opaque to the compiler (bm_nrec
+                        # >= 0) so the arm lowers to one wide multiply-add
+                        bm_pitch = cutlass.Int32(16) + (bm_nrec >> cutlass.Int32(31))
                     if cutlass.const_expr(self.emit_seed_counts):
                         sthr = cute.make_rmem_tensor(next_n * 3, cutlass.Float32)
                         scnt = cute.make_rmem_tensor(next_n * 3, cutlass.Int32)
@@ -2245,6 +3226,27 @@ class FP4MQALogitsKernel:
                         meta_j = cutlass.Int32(0)
                         hitw_batch = cutlass.Int32(0)
 
+                if cutlass.const_expr(self.dynamic_sched):
+                    re0, re1, re2, re3 = self._ring_pop(ring, ring_cons, ring_ent, lane_idx)
+                    ring_cons.advance()
+                    next_q_idx = re0 & cutlass.Int32(0xFFFF)
+                    next_kv_idx = re1
+                    left = re2
+                    next_num_kv = (re3 + cutlass.Int32(127)) >> 7
+                    has_work = re2 > cutlass.Int32(0)
+                if cutlass.const_expr(self.emit_block_meta_deferred):
+                    # pre-arm to this warp's first record: the first flush
+                    # stores -FLT_MAX there and the same lanes overwrite it
+                    # with the true value one tile later (no armed flag)
+                    pend_addr = (
+                        mBlockMax.iterator.toint()
+                        + cutlass.Int64(next_q_idx * next_n)
+                        * cutlass.Int64(bm_nrec)
+                        * cutlass.Int64(4)
+                        + cutlass.Int64((next_kv_idx) * cutlass.Int32(4) + meta_warp)
+                        * cutlass.Int64(4)
+                    )
+
                 while has_work:
                     # fetch_next_task: commit next → current
                     q_idx_old = q_idx
@@ -2262,9 +3264,15 @@ class FP4MQALogitsKernel:
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
                             for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
-                                w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
-                                    (t_i * num_heads + w_j, q_stage_local)
-                                ]
+                                if cutlass.const_expr(self.epi_dtype == cutlass.Float32):
+                                    # cached weights carry the 0.5 of (x + |x|) / 2
+                                    w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
+                                        (t_i * num_heads + w_j, q_stage_local)
+                                    ] * cutlass.Float32(0.5)
+                                else:
+                                    w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
+                                        (t_i * num_heads + w_j, q_stage_local)
+                                    ]
                         if cutlass.const_expr(self.emit_block_meta):
                             # Flush the PREVIOUS request's hit accumulators
                             # before switching context.
@@ -2313,6 +3321,11 @@ class FP4MQALogitsKernel:
                                         mCand, mCandIdx, q_idx_old, cwbase, cwleft, meta_lane
                                     )
                             ctx_cur = mContextLens[q_idx]
+                            bm_base = mBlockMax.iterator.toint() + cutlass.Int64(
+                                q_idx * next_n
+                            ) * cutlass.Int64(bm_nrec) * cutlass.Int64(4)
+                            if cutlass.const_expr(self.emit_block_meta_deferred):
+                                bm_base_w = bm_base + cutlass.Int64(meta_warp * cutlass.Int32(4))
 
                     # Process KV block for group 0 (kv_idx + 0)
                     # Unconditional Math: OOB results
@@ -2320,7 +3333,8 @@ class FP4MQALogitsKernel:
                     kv_pos = kv_idx * block_kv_val + m_coord
                     if cutlass.const_expr(self.emit_block_meta):
                         meta_kv_tile = kv_idx
-                        meta_valid = kv_pos < ctx_cur
+                        if cutlass.const_expr(not self.emit_block_meta_deferred):
+                            meta_valid = kv_pos < ctx_cur
                         if cutlass.const_expr(self.emit_hit_stats):
                             # Warp-uniform reload once per 32 tiles: this
                             # WG's tile at counter j+l is kv_tile + 2*l,
@@ -2355,6 +3369,26 @@ class FP4MQALogitsKernel:
 
                     # --- First sub-tile LDTM ---
                     cute.copy(tc_0, tTR_0[(None, None, None, 0, 0)], tTR_rAcc)
+                    if cutlass.const_expr(self.defer_logits):
+                        if lg_on != cutlass.Int32(0):
+                            for _t in cutlass.range_constexpr(next_n):
+                                mLogits[(lg_row + _t, lg_pos)] = lg_pend[_t]
+                    if cutlass.const_expr(self.emit_block_meta_deferred):
+                        # previous tile's block_max under this tile's TMEM
+                        # load; all 32 lanes store the warp-uniform value
+                        for _t in cutlass.range_constexpr(next_n):
+                            r_pend = cute.arch.warp_redux_sync(pend_v[_t], "fmax")
+                            _st_global_f32(
+                                pend_addr
+                                + cutlass.Int64(_t) * cutlass.Int64(bm_nrec) * cutlass.Int64(4),
+                                r_pend,
+                            )
+                        # arm this tile: record = tile*4 + warp -> 16 B per tile
+                        pend_addr = cutlass.Int64(
+                            cutlass.Uint64(bm_base_w)
+                            + cutlass.Uint64(cutlass.Uint32(meta_kv_tile))
+                            * cutlass.Uint64(cutlass.Uint32(bm_pitch))
+                        )
                     cute.arch.fence_view_async_tmem_load()
 
                     # --- Sub-tile compute loop ---
@@ -2430,10 +3464,17 @@ class FP4MQALogitsKernel:
                                         ps0 = fma_bf16x2(pa01, pw01, ps0)
                                         ps1 = fma_bf16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    # relu(x) * w == (x + |x|) * (w / 2), bit-exact in fp32
+                                    x0 = acc_vec[n0]
+                                    x1 = acc_vec[n0 + 1]
+                                    x2 = acc_vec[n0 + 2]
+                                    x3 = acc_vec[n0 + 3]
+                                    a0, a1 = cute.arch.add_packed_f32x2(
+                                        (x0, x1), (_fabs_f32(x0), _fabs_f32(x1))
+                                    )
+                                    a2, a3 = cute.arch.add_packed_f32x2(
+                                        (x2, x3), (_fabs_f32(x2), _fabs_f32(x3))
+                                    )
                                     r0 = t * NUM_W_IN_REG + h_g
                                     w0 = w_cache[r0]
                                     w1 = w_cache[r0 + 1]
@@ -2520,6 +3561,8 @@ class FP4MQALogitsKernel:
                         stored_t = self.output_dtype(result_t)
                         if cutlass.const_expr(self.use_batched_store):
                             result_arr[t] = stored_t
+                        elif cutlass.const_expr(self.defer_logits):
+                            lg_pend[t] = stored_t
                         else:
                             out_row = q_idx * next_n + t
                             mLogits[(out_row, kv_pos)] = stored_t
@@ -2527,17 +3570,28 @@ class FP4MQALogitsKernel:
                             # Meta reduction on the POST-conversion value so
                             # block_max bounds what GVR reads back bit-exactly.
                             f32_t = cutlass.Float32(stored_t)
-                            bmax_v = cutlass.Float32(_META_NEG_FLT_MAX)
-                            if meta_valid:
-                                bmax_v = f32_t
-                            r_bmax = cute.arch.warp_redux_sync(bmax_v, "fmax")
-                            # Warp-autonomous store: record index =
-                            # tile*4 + warp; the GVR consumer folds the
-                            # 4 warp-partials per block.
-                            if meta_lane == cutlass.Int32(0):
-                                out_row_m = q_idx * next_n + t
-                                rec_m = meta_kv_tile * cutlass.Int32(4) + meta_warp
-                                mBlockMax[(out_row_m, rec_m)] = r_bmax
+                            if cutlass.const_expr(self.emit_block_meta_deferred):
+                                # unmasked here: only the row's last tile pair
+                                # can straddle ctx and it is always the last
+                                # tile of a static row / dynamic run
+                                pend_v[t] = f32_t
+                            else:
+                                bmax_v = cutlass.Float32(_META_NEG_FLT_MAX)
+                                if meta_valid:
+                                    bmax_v = f32_t
+                                r_bmax = cute.arch.warp_redux_sync(bmax_v, "fmax")
+                                # Warp-autonomous store: record index =
+                                # tile*4 + warp; the GVR consumer folds the
+                                # 4 warp-partials per block.
+                                if meta_lane == cutlass.Int32(0):
+                                    rec_m = (
+                                        cutlass.Int32(t) * bm_nrec
+                                        + meta_kv_tile * cutlass.Int32(4)
+                                        + meta_warp
+                                    )
+                                    _st_global_f32(
+                                        bm_base + cutlass.Int64(rec_m) * cutlass.Int64(4), r_bmax
+                                    )
                             if cutlass.const_expr(self.emit_seed_counts):
                                 # Seed-count accumulation: branchless 0/1
                                 # adds on the post-conversion value; the
@@ -2900,24 +3954,77 @@ class FP4MQALogitsKernel:
                                 hacc_sum[t] = hacc_sum[t] + seladd
                                 hacc_cnt[t] = hacc_cnt[t] + meta_hit
 
-                    if cutlass.const_expr(self.use_batched_store):
+                    if cutlass.const_expr(self.use_batched_store and self.defer_logits):
+                        for t in cutlass.range_constexpr(next_n):
+                            lg_pend[t] = result_arr[t]
+                    elif cutlass.const_expr(self.use_batched_store):
                         # Batched STG: all result_arr[t] → mLogits in one pass.
                         for t in cutlass.range_constexpr(next_n):
                             out_row = q_idx * next_n + t
                             mLogits[(out_row, kv_pos)] = result_arr[t]
+                    if cutlass.const_expr(self.defer_logits):
+                        lg_row = q_idx * next_n
+                        lg_pos = kv_pos
+                        lg_on = cutlass.Int32(1)
 
-                    # Advance: inline fetch_next_task
-                    next_kv_idx = kv_idx + NUM_MATH_WG
-                    if next_kv_idx >= num_kv:
-                        next_q_idx = q_idx + 1
-                        next_kv_idx = 0
-                        if next_q_idx < batch_size:
-                            next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
-                            ) // block_kv_val
-                    # Update while-loop condition
-                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+                    if cutlass.const_expr(self.dynamic_sched):
+                        left = left - cutlass.Int32(1)
+                        if left > cutlass.Int32(0):
+                            next_kv_idx = kv_idx + NUM_MATH_WG
+                        else:
+                            if cutlass.const_expr(self.emit_block_meta_deferred):
+                                # run end: the row's last tile (or WG1's OOB
+                                # tile) may hold lanes >= ctx; mask before flush
+                                for _t in cutlass.range_constexpr(next_n):
+                                    if kv_pos >= ctx_cur:
+                                        pend_v[_t] = cutlass.Float32(_META_NEG_FLT_MAX)
+                            re0, re1, re2, re3 = self._ring_pop(ring, ring_cons, ring_ent, lane_idx)
+                            ring_cons.advance()
+                            next_q_idx = re0 & cutlass.Int32(0xFFFF)
+                            next_kv_idx = re1
+                            left = re2
+                            next_num_kv = (re3 + cutlass.Int32(127)) >> 7
+                            has_work = re2 > cutlass.Int32(0)
+                            if cutlass.const_expr(self.emit_block_meta and self.emit_hit_stats):
+                                meta_j = cutlass.Int32(0)
+                    else:
+                        # Advance: inline fetch_next_task
+                        next_kv_idx = kv_idx + NUM_MATH_WG
+                        if next_kv_idx >= num_kv:
+                            if cutlass.const_expr(self.emit_block_meta_deferred):
+                                # row end: see the dynamic branch
+                                for _t in cutlass.range_constexpr(next_n):
+                                    if kv_pos >= ctx_cur:
+                                        pend_v[_t] = cutlass.Float32(_META_NEG_FLT_MAX)
+                            next_q_idx = q_idx + 1
+                            next_kv_idx = 0
+                            if next_q_idx < batch_size:
+                                next_num_kv = (
+                                    mContextLens[next_q_idx] + block_kv_val - 1
+                                ) // block_kv_val
+                        # Update while-loop condition
+                        has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
+                if cutlass.const_expr(self.pdl and self.pdl_trigger == 2):
+                    # past this CTA's last work tile
+                    griddepcontrol_launch_dependents()
+                if cutlass.const_expr(self.defer_logits):
+                    if lg_on != cutlass.Int32(0):
+                        for _t in cutlass.range_constexpr(next_n):
+                            mLogits[(lg_row + _t, lg_pos)] = lg_pend[_t]
+                if cutlass.const_expr(self.emit_block_meta_deferred):
+                    # flush the last tile's pending block_max (WG 0); a
+                    # segment ending mid-row skipped the tail mask, so mask here
+                    if q_idx < batch_size:
+                        for _t in cutlass.range_constexpr(next_n):
+                            if kv_pos >= ctx_cur:
+                                pend_v[_t] = cutlass.Float32(_META_NEG_FLT_MAX)
+                            r_pend = cute.arch.warp_redux_sync(pend_v[_t], "fmax")
+                            _st_global_f32(
+                                pend_addr
+                                + cutlass.Int64(_t) * cutlass.Int64(bm_nrec) * cutlass.Int64(4),
+                                r_pend,
+                            )
                 # Flush the final request's hit accumulators (WG 0).
                 if cutlass.const_expr(self.emit_block_meta and self.emit_hit_stats):
                     if q_idx < batch_size:
@@ -2961,9 +4068,11 @@ class FP4MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 64
                 else:
                     MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
-                if cutlass.const_expr(self.emit_block_meta):
+                if cutlass.const_expr(self.emit_block_meta and next_n > 1):
                     # Free ~8 registers for the meta accumulators/fragments;
-                    # the epilogue's weight cache sits at the spill edge.
+                    # the epilogue's weight cache sits at the spill edge for
+                    # next_n >= 2. next_n == 1 has the headroom and keeps the
+                    # full cache.
                     MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                     if cutlass.const_expr(self.emit_hit_stats):
                         # Hit accumulators + bitmap word add ~6 more live
@@ -2980,10 +4089,37 @@ class FP4MQALogitsKernel:
                 else:
                     result_arr = None
                 q_stage_local = cutlass.Int32(0)
+                # loop-carried: the deferred logits / block_max flushes read
+                # the last tile's position after the loop
+                kv_pos = cutlass.Int32(0)
+                # deferred logits store (plain build): the previous tile's
+                # values are stored under the next tile's first TMEM load
+                lg_pend = cute.make_rmem_tensor(next_n, self.output_dtype)
+                lg_row = cutlass.Int32(0)
+                lg_pos = cutlass.Int32(0)
+                lg_on = cutlass.Int32(0)
                 if cutlass.const_expr(self.emit_block_meta):
                     ctx_cur = cutlass.Int32(0)
                     meta_warp = local_tidx // 32
                     meta_lane = local_tidx % 32
+                    # block_max row base (bytes) + record pitch: hoisted per q so
+                    # the per-tile store is one address add instead of a full
+                    # tensor-index chain (LDC + 64-bit IMAD/LEA) on the
+                    # epilogue's critical path
+                    bm_base = cutlass.Int64(0)
+                    bm_nrec = cutlass.Int32(mBlockMax.shape[1])
+                    if cutlass.const_expr(self.emit_block_meta_deferred):
+                        # pending emission of the previous tile: per-lane
+                        # values (masked only at the row's last tile) and the
+                        # record address (row base + warp*4 + tile*16)
+                        pend_v = cute.make_rmem_tensor(next_n, cutlass.Float32)
+                        for _i in cutlass.range_constexpr(next_n):
+                            pend_v[_i] = cutlass.Float32(_META_NEG_FLT_MAX)
+                        pend_addr = cutlass.Int64(0)
+                        bm_base_w = cutlass.Int64(0)
+                        # 16 B tile pitch kept opaque to the compiler (bm_nrec
+                        # >= 0) so the arm lowers to one wide multiply-add
+                        bm_pitch = cutlass.Int32(16) + (bm_nrec >> cutlass.Int32(31))
                     if cutlass.const_expr(self.emit_seed_counts):
                         sthr = cute.make_rmem_tensor(next_n * 3, cutlass.Float32)
                         scnt = cute.make_rmem_tensor(next_n * 3, cutlass.Int32)
@@ -3019,6 +4155,29 @@ class FP4MQALogitsKernel:
                         meta_j = cutlass.Int32(0)
                         hitw_batch = cutlass.Int32(0)
 
+                if cutlass.const_expr(self.dynamic_sched):
+                    re0, re1, re2, re3 = self._ring_pop(ring, ring_cons, ring_ent, lane_idx)
+                    ring_cons.advance()
+                    next_q_idx = re0 & cutlass.Int32(0xFFFF)
+                    next_kv_idx = re1
+                    left = re2
+                    next_num_kv = (re3 + cutlass.Int32(127)) >> 7
+                    has_work = re2 > cutlass.Int32(0)
+                if cutlass.const_expr(self.emit_block_meta_deferred):
+                    # pre-arm to this warp's first record: the first flush
+                    # stores -FLT_MAX there and the same lanes overwrite it
+                    # with the true value one tile later (no armed flag)
+                    pend_addr = (
+                        mBlockMax.iterator.toint()
+                        + cutlass.Int64(next_q_idx * next_n)
+                        * cutlass.Int64(bm_nrec)
+                        * cutlass.Int64(4)
+                        + cutlass.Int64(
+                            (next_kv_idx + cutlass.Int32(1)) * cutlass.Int32(4) + meta_warp
+                        )
+                        * cutlass.Int64(4)
+                    )
+
                 while has_work:
                     # fetch_next_task: commit next → current
                     q_idx_old = q_idx
@@ -3036,9 +4195,15 @@ class FP4MQALogitsKernel:
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
                             for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
-                                w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
-                                    (t_i * num_heads + w_j, q_stage_local)
-                                ]
+                                if cutlass.const_expr(self.epi_dtype == cutlass.Float32):
+                                    # cached weights carry the 0.5 of (x + |x|) / 2
+                                    w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
+                                        (t_i * num_heads + w_j, q_stage_local)
+                                    ] * cutlass.Float32(0.5)
+                                else:
+                                    w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
+                                        (t_i * num_heads + w_j, q_stage_local)
+                                    ]
                         if cutlass.const_expr(self.emit_block_meta):
                             # Flush the PREVIOUS request's hit accumulators
                             # before switching context.
@@ -3086,6 +4251,11 @@ class FP4MQALogitsKernel:
                                         mCand, mCandIdx, q_idx_old, cwbase, cwleft, meta_lane
                                     )
                             ctx_cur = mContextLens[q_idx]
+                            bm_base = mBlockMax.iterator.toint() + cutlass.Int64(
+                                q_idx * next_n
+                            ) * cutlass.Int64(bm_nrec) * cutlass.Int64(4)
+                            if cutlass.const_expr(self.emit_block_meta_deferred):
+                                bm_base_w = bm_base + cutlass.Int64(meta_warp * cutlass.Int32(4))
 
                     # Process KV block for group 1 (kv_idx + 1)
                     # Unconditional Math
@@ -3098,7 +4268,8 @@ class FP4MQALogitsKernel:
                         # (kv_idx_1 == num_kv) every lane has
                         # kv_pos >= ctx_cur, so identities land in the
                         # nb_pad padding slot — never read by GVR.
-                        meta_valid = kv_pos < ctx_cur
+                        if cutlass.const_expr(not self.emit_block_meta_deferred):
+                            meta_valid = kv_pos < ctx_cur
                         if cutlass.const_expr(self.emit_hit_stats):
                             # Warp-uniform reload once per 32 tiles: this
                             # WG's tile at counter j+l is kv_tile + 2*l,
@@ -3130,6 +4301,26 @@ class FP4MQALogitsKernel:
 
                     # --- First sub-tile LDTM (WG1) ---
                     cute.copy(tc_1, tTR_1[(None, None, None, 0, 0)], tTR_rAcc)
+                    if cutlass.const_expr(self.defer_logits):
+                        if lg_on != cutlass.Int32(0):
+                            for _t in cutlass.range_constexpr(next_n):
+                                mLogits[(lg_row + _t, lg_pos)] = lg_pend[_t]
+                    if cutlass.const_expr(self.emit_block_meta_deferred):
+                        # previous tile's block_max under this tile's TMEM
+                        # load; all 32 lanes store the warp-uniform value
+                        for _t in cutlass.range_constexpr(next_n):
+                            r_pend = cute.arch.warp_redux_sync(pend_v[_t], "fmax")
+                            _st_global_f32(
+                                pend_addr
+                                + cutlass.Int64(_t) * cutlass.Int64(bm_nrec) * cutlass.Int64(4),
+                                r_pend,
+                            )
+                        # arm this tile: record = tile*4 + warp -> 16 B per tile
+                        pend_addr = cutlass.Int64(
+                            cutlass.Uint64(bm_base_w)
+                            + cutlass.Uint64(cutlass.Uint32(meta_kv_tile))
+                            * cutlass.Uint64(cutlass.Uint32(bm_pitch))
+                        )
                     cute.arch.fence_view_async_tmem_load()
 
                     # --- Sub-tile compute loop (WG1) ---
@@ -3197,10 +4388,17 @@ class FP4MQALogitsKernel:
                                         ps0 = fma_bf16x2(pa01, pw01, ps0)
                                         ps1 = fma_bf16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    # relu(x) * w == (x + |x|) * (w / 2), bit-exact in fp32
+                                    x0 = acc_vec[n0]
+                                    x1 = acc_vec[n0 + 1]
+                                    x2 = acc_vec[n0 + 2]
+                                    x3 = acc_vec[n0 + 3]
+                                    a0, a1 = cute.arch.add_packed_f32x2(
+                                        (x0, x1), (_fabs_f32(x0), _fabs_f32(x1))
+                                    )
+                                    a2, a3 = cute.arch.add_packed_f32x2(
+                                        (x2, x3), (_fabs_f32(x2), _fabs_f32(x3))
+                                    )
                                     r0 = t * NUM_W_IN_REG + h_g
                                     w0 = w_cache[r0]
                                     w1 = w_cache[r0 + 1]
@@ -3287,6 +4485,8 @@ class FP4MQALogitsKernel:
                         stored_t = self.output_dtype(result_t)
                         if cutlass.const_expr(self.use_batched_store):
                             result_arr[t] = stored_t
+                        elif cutlass.const_expr(self.defer_logits):
+                            lg_pend[t] = stored_t
                         else:
                             out_row = q_idx * next_n + t
                             mLogits[(out_row, kv_pos)] = stored_t
@@ -3294,17 +4494,28 @@ class FP4MQALogitsKernel:
                             # Meta reduction on the POST-conversion value so
                             # block_max bounds what GVR reads back bit-exactly.
                             f32_t = cutlass.Float32(stored_t)
-                            bmax_v = cutlass.Float32(_META_NEG_FLT_MAX)
-                            if meta_valid:
-                                bmax_v = f32_t
-                            r_bmax = cute.arch.warp_redux_sync(bmax_v, "fmax")
-                            # Warp-autonomous store: record index =
-                            # tile*4 + warp; the GVR consumer folds the
-                            # 4 warp-partials per block.
-                            if meta_lane == cutlass.Int32(0):
-                                out_row_m = q_idx * next_n + t
-                                rec_m = meta_kv_tile * cutlass.Int32(4) + meta_warp
-                                mBlockMax[(out_row_m, rec_m)] = r_bmax
+                            if cutlass.const_expr(self.emit_block_meta_deferred):
+                                # unmasked here: only the row's last tile pair
+                                # can straddle ctx and it is always the last
+                                # tile of a static row / dynamic run
+                                pend_v[t] = f32_t
+                            else:
+                                bmax_v = cutlass.Float32(_META_NEG_FLT_MAX)
+                                if meta_valid:
+                                    bmax_v = f32_t
+                                r_bmax = cute.arch.warp_redux_sync(bmax_v, "fmax")
+                                # Warp-autonomous store: record index =
+                                # tile*4 + warp; the GVR consumer folds the
+                                # 4 warp-partials per block.
+                                if meta_lane == cutlass.Int32(0):
+                                    rec_m = (
+                                        cutlass.Int32(t) * bm_nrec
+                                        + meta_kv_tile * cutlass.Int32(4)
+                                        + meta_warp
+                                    )
+                                    _st_global_f32(
+                                        bm_base + cutlass.Int64(rec_m) * cutlass.Int64(4), r_bmax
+                                    )
                             if cutlass.const_expr(self.emit_seed_counts):
                                 # Seed-count accumulation: branchless 0/1
                                 # adds on the post-conversion value; the
@@ -3667,24 +4878,77 @@ class FP4MQALogitsKernel:
                                 hacc_sum[t] = hacc_sum[t] + seladd
                                 hacc_cnt[t] = hacc_cnt[t] + meta_hit
 
-                    if cutlass.const_expr(self.use_batched_store):
+                    if cutlass.const_expr(self.use_batched_store and self.defer_logits):
+                        for t in cutlass.range_constexpr(next_n):
+                            lg_pend[t] = result_arr[t]
+                    elif cutlass.const_expr(self.use_batched_store):
                         # Batched STG: all result_arr[t] → mLogits in one pass.
                         for t in cutlass.range_constexpr(next_n):
                             out_row = q_idx * next_n + t
                             mLogits[(out_row, kv_pos)] = result_arr[t]
+                    if cutlass.const_expr(self.defer_logits):
+                        lg_row = q_idx * next_n
+                        lg_pos = kv_pos
+                        lg_on = cutlass.Int32(1)
 
-                    # Advance: inline fetch_next_task
-                    next_kv_idx = kv_idx + NUM_MATH_WG
-                    if next_kv_idx >= num_kv:
-                        next_q_idx = q_idx + 1
-                        next_kv_idx = 0
-                        if next_q_idx < batch_size:
-                            next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
-                            ) // block_kv_val
-                    # Update while-loop condition
-                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+                    if cutlass.const_expr(self.dynamic_sched):
+                        left = left - cutlass.Int32(1)
+                        if left > cutlass.Int32(0):
+                            next_kv_idx = kv_idx + NUM_MATH_WG
+                        else:
+                            if cutlass.const_expr(self.emit_block_meta_deferred):
+                                # run end: the row's last tile (or WG1's OOB
+                                # tile) may hold lanes >= ctx; mask before flush
+                                for _t in cutlass.range_constexpr(next_n):
+                                    if kv_pos >= ctx_cur:
+                                        pend_v[_t] = cutlass.Float32(_META_NEG_FLT_MAX)
+                            re0, re1, re2, re3 = self._ring_pop(ring, ring_cons, ring_ent, lane_idx)
+                            ring_cons.advance()
+                            next_q_idx = re0 & cutlass.Int32(0xFFFF)
+                            next_kv_idx = re1
+                            left = re2
+                            next_num_kv = (re3 + cutlass.Int32(127)) >> 7
+                            has_work = re2 > cutlass.Int32(0)
+                            if cutlass.const_expr(self.emit_block_meta and self.emit_hit_stats):
+                                meta_j = cutlass.Int32(0)
+                    else:
+                        # Advance: inline fetch_next_task
+                        next_kv_idx = kv_idx + NUM_MATH_WG
+                        if next_kv_idx >= num_kv:
+                            if cutlass.const_expr(self.emit_block_meta_deferred):
+                                # row end: see the dynamic branch
+                                for _t in cutlass.range_constexpr(next_n):
+                                    if kv_pos >= ctx_cur:
+                                        pend_v[_t] = cutlass.Float32(_META_NEG_FLT_MAX)
+                            next_q_idx = q_idx + 1
+                            next_kv_idx = 0
+                            if next_q_idx < batch_size:
+                                next_num_kv = (
+                                    mContextLens[next_q_idx] + block_kv_val - 1
+                                ) // block_kv_val
+                        # Update while-loop condition
+                        has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
+                if cutlass.const_expr(self.pdl and self.pdl_trigger == 2):
+                    # past this CTA's last work tile
+                    griddepcontrol_launch_dependents()
+                if cutlass.const_expr(self.defer_logits):
+                    if lg_on != cutlass.Int32(0):
+                        for _t in cutlass.range_constexpr(next_n):
+                            mLogits[(lg_row + _t, lg_pos)] = lg_pend[_t]
+                if cutlass.const_expr(self.emit_block_meta_deferred):
+                    # flush the last tile's pending block_max (WG 1); a
+                    # segment ending mid-row skipped the tail mask, so mask here
+                    if q_idx < batch_size:
+                        for _t in cutlass.range_constexpr(next_n):
+                            if kv_pos >= ctx_cur:
+                                pend_v[_t] = cutlass.Float32(_META_NEG_FLT_MAX)
+                            r_pend = cute.arch.warp_redux_sync(pend_v[_t], "fmax")
+                            _st_global_f32(
+                                pend_addr
+                                + cutlass.Int64(_t) * cutlass.Int64(bm_nrec) * cutlass.Int64(4),
+                                r_pend,
+                            )
                 # Flush the final request's hit accumulators (WG 1).
                 if cutlass.const_expr(self.emit_block_meta and self.emit_hit_stats):
                     if q_idx < batch_size:
@@ -3715,4 +4979,4 @@ class FP4MQALogitsKernel:
             tmem.free(tmem_ptr)
 
         else:
-            cute.arch.warpgroup_reg_dealloc(24)
+            cute.arch.warpgroup_reg_dealloc(self.prod_regs)

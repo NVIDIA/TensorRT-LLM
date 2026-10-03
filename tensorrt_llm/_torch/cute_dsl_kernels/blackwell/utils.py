@@ -57,6 +57,18 @@ from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 TRTLLM_ENABLE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+# Shape gate for the FP4 scorer -> GVR top-k PDL pair (rows = B * next_n,
+# npad = logits width in compressed positions): PDL-launch the pair only when
+# either dimension is small. At long rows x large batch the dependent top-k
+# CTAs park in griddepcontrol.wait on SMs the scorer frees early and the
+# scorer itself slows.
+GVR_PDL_MAX_B = int(os.environ.get("TRTLLM_GVR_PDL_MAX_B", "16"))
+GVR_PDL_MAX_NPAD = int(os.environ.get("TRTLLM_GVR_PDL_MAX_NPAD", "16384"))
+
+
+def gvr_pdl_enabled(rows: int, npad: int) -> bool:
+    return TRTLLM_ENABLE_PDL and (int(rows) <= GVR_PDL_MAX_B
+                                  or int(npad) <= GVR_PDL_MAX_NPAD)
 
 
 # WAR for CuTeDSL make_ptr implementation
