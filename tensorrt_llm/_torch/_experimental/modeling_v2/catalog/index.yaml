@@ -28,7 +28,7 @@
 # limits, e.g. no float8 arithmetic, are noted in the entry docstring).
 # Entries wrapping trtllm ops carry all three.
 #
-# ── RECEIPT STATUS: all 19 entries certified on sm_103 ────────────────────
+# ── RECEIPT STATUS: 19 entries certified on sm_103, 34 on sm_100 ──────────
 #
 # A receipt says this entry's test passed on a stated GPU architecture. The
 # architecture is the whole key: it is a real axis -- see the
@@ -66,7 +66,36 @@
 # exactly as written. They are true records of what was observed on another
 # device, and rewriting them would manufacture GB300 evidence that does not
 # exist. Read them as provenance; the frontmatter is the certification.
+#
+# An entry first called by a GB200 (sm_100) target is certified there: its
+# receipt key is sm_100 (comm/mnnvl_allreduce_attn_res,
+# attention/k3_drafter_attn, attention/k3_drafter_attn_qknorm). An entry
+# already certified elsewhere gains its sm_100 key in the change that adds its
+# first sm_100 caller and keeps the key it had, noting that the new cells
+# post-date it (attention/fused_qk_norm_rope). Those cells skip off SM 10.0,
+# so CI on the other architecture keeps re-certifying the existing ones. A
+# collective's receipt records the world size its matrix ran at.
+#
+# The Kimi K3 entries (k3_*, attn_res_*, ssm/kda_decode and the comm/mnnvl_*
+# ones) are certified on sm_100 (B200 / GB200), where their first caller
+# runs, and their tests skip on any other architecture. cublas_mm,
+# flashinfer_rmsnorm and allgather, which that caller also uses, keep their
+# sm_103 receipts and add sm_100 ones.
 # ──────────────────────────────────────────────────────────────────────────
+#
+# STATEFUL ENTRIES. When an op's result depends on state that outlives the
+# call (a workspace, Lamport buffers, counters, a record one launch writes and
+# a later one reads), that state is a typed object the caller owns and passes
+# as an argument: created once by an explicit constructor (collective where
+# the op is, eager, before any CUDA-graph capture), never a module-level dict
+# or an environment switch. The object's type sits beside the entries that
+# take it (comm/mnnvl_workspace.py) and is not an entry: it launches nothing
+# per call. The contract gains a `## State` section: the object's contents and
+# size; who creates it and when; which ops may share one object; the call
+# order every rank must keep across layers and steps; what a later launch
+# reads; how it is re-armed. Its test drives call sequences (chained calls
+# across steps, capture and replay, two objects interleaved) and a negative
+# control that breaks the call order, not only single calls.
 #
 # 30 of the source catalog's 43 entries are here — the union of what the two
 # migrated targets call. The 13 left behind (silu_and_mul, attn_custom_op_inplace,
@@ -133,10 +162,26 @@ entries:
     impl: torch.ops.trtllm.flashinfer_fused_add_rmsnorm
     summary: "In-place fused residual add + RMS norm: residual += x; x = rmsnorm(residual) * weight"
 
+  - path: norm/k3_embed_norm.py
+    impl: torch.ops.trtllm.k3_embed_norm
+    summary: "Kimi K3 decode-step embedding + layer 0's input RMSNorm in one CuTe DSL launch: raw[:] = table[ids] (int32 or int64 ids, N <= 64; zero rows for ids outside [0, V)) written bit for bit into the caller's bf16 [N,H] buffer (the model passes slot 0 of its attention-residual snapshot bank), and a fresh bf16 [N,H] raw * rsqrt(mean(raw^2) + eps) * weight with fp32 statistics, an approximate rsqrt and one rounding, H in (6144, 16384] a multiple of 1024; rows independent of N and bit-reproducible run to run; the op states bit-identity with the gather followed by flashinfer's CuTe DSL RMSNorm (the kernel behind norm/flashinfer_rmsnorm); compiles per (N, V, H, ids dtype, PDL) on its first, eager, call; under PDL it releases its dependents at entry, so a dependent waits on the grid dependency before reading raw or the output"
+
+  - path: norm/attn_res_fwd.py
+    impl: torch.ops.trtllm.attn_res_fwd
+    summary: "Kimi K3 attention-residual selection: per token (B == 1), a softmax over N = K+1 candidates (the K bf16 [K,T,1,H] snapshots in order, then the bf16 [T,1,H] layer residual) of fp32 logits rsqrt(mean(v^2) + rms_eps) * <v, rms_weight * res_weight>, mixing the raw candidates into a fresh bf16 [T,1,H] output (one rounding) and returning the fp32 [N,T,1] rsigma / probs / logits too; N <= 12, T <= 16384, H a multiple of 1024 in [4096, 8192], sm_100 family only; kernel chosen by (T, N) -- a single-CTA or 8-CTA-cluster decode kernel at T == 1 for N in {1,2,4} / {8,12}, else a persistent TMEM online-softmax kernel -- each bit-reproducible run to run"
+
+  - path: norm/attn_res_rmsnorm_fwd.py
+    impl: torch.ops.trtllm.attn_res_rmsnorm_fwd
+    summary: "Kimi K3 attention-residual selection fused with the RMSNorm that consumes it: attn_res_fwd's bf16 mixture (that rounding kept), normalized in fp32 with output_rms_eps, rounded to bf16, times the bf16 output_rms_weight and rounded again (KimiK3RMSNorm order), into a fresh bf16 [T,1,7168] tensor; H == 7168 only, N <= 12, T <= 16384, one CTA (N <= 4) or one 8-CTA cluster (N >= 5) per token so rows do not depend on T; with TRTLLM_ENABLE_PDL on, each CTA waits on its grid dependency and then releases its dependents before writing, so a PDL dependent must wait on the grid dependency before reading the output"
+
   # ─── activation ────────────────────────────────────────────────
   - path: activation/flashinfer_silu_and_mul.py
     impl: torch.ops.trtllm.flashinfer_silu_and_mul
     summary: "SwiGLU activation: silu(x[..., :d]) * x[..., d:] over a packed gate/up last dim"
+
+  - path: activation/k3_situ_mul.py
+    impl: torch.ops.trtllm.k3_situ_mul
+    summary: "SiTU-gated multiply (SituAndMul) of a packed [gate | up] bf16 gate_up output for M <= 8 tokens on a CuTe DSL kernel: bf16(beta*tanh(g/beta)*sigmoid(g) * v), v = linear_beta*tanh(u/linear_beta) or u, in fp32 with one rounding; launches its PDL dependents at once and reads gu after the grid wait; linear_beta=0.0 refused by the wrapper (the op would run it as 1.0)"
 
   # ─── gemm ──────────────────────────────────────────────────────
   - path: gemm/cublas_mm.py
@@ -150,6 +195,30 @@ entries:
   - path: gemm/nvfp4_gemm.py
     impl: torch.ops.trtllm.nvfp4_gemm
     summary: "NVFP4 x NVFP4 dense GEMM in nn.Linear layout with in-kernel block-scale dequantization: alpha * ([M,K/2] e2m1 + 128x4-swizzled e4m3 scales) @ ([N,K/2] e2m1 + swizzled scales)^T (+ per-column bias) -> fresh [M,N] bf16/fp16/fp32 buffer, fp32 accumulation, backend auto-selected (cutlass/cublaslt/cuda_core/cutedsl)"
+
+  - path: gemm/k3_ctm_gemv.py
+    impl: torch.ops.trtllm.k3_ctm_gemv
+    summary: "Kimi K3 decode GEMV for M <= 8 bf16 tokens on the CTM CuTe DSL kernel (SM 10.x): bf16(x @ W^T) for an [N, K] weight with N % 128 == 0 and at most 6 128-column k-tiles per CTA, fp32 tcgen05 accumulation with one rounding, one CTA or a 2- or 4-CTA split-K cluster per 128 rows (partials summed in rank order); the weight is read before the PDL grid wait"
+
+  - path: gemm/k3_ctm_gemv_swiglu.py
+    impl: torch.ops.trtllm.k3_ctm_gemv_swiglu
+    summary: "SwiGLU down projection for M <= 8 tokens on the CTM CuTe DSL kernel (SM 10.x): bf16(bf16(silu(gate) * up) @ W^T) from a packed [gate | up] bf16 gate_up output, the activation computed in fp32 in the GEMV's shared memory and never stored, fp32 accumulation, 1/2/4-CTA split-K summed in rank order"
+
+  - path: gemm/k3_ctm_gemv_long.py
+    impl: torch.ops.trtllm.k3_ctm_gemv_long
+    summary: "Long-K decode GEMV for M <= 8 bf16 tokens on the CTM CuTe DSL kernel (SM 10.x): bf16(x @ W^T) with each 128-row block split over a cluster of 2 or 4-8 CTAs, its weight streamed through a shared-memory ring filled before the PDL grid wait, partials summed in rank order; columns >= sig_col0 as bf16(sigmoid(bf16(.))) (torch.sigmoid of the plain output, bitwise); any N, K % 64 == 0"
+
+  - path: gemm/k3_ctm_gemv_wide.py
+    impl: torch.ops.trtllm.k3_ctm_gemv_wide
+    summary: "Wide decode GEMV for M <= 64 bf16 tokens on the long CTM kernel (SM 10.x): one MMA of 16/32/64 token columns, split and ring picked from the shape and the SM count (one wave), each token's row bit-identical to k3_ctm_gemv_long's at the same split; bf16 output with optional sigmoid columns from sig_col0, or unrounded fp32; N % 8 == 0, K % 64 == 0"
+
+  - path: gemm/k3_decode_gemv.py
+    impl: torch.ops.trtllm.k3_decode_gemv
+    summary: "Kimi K3 decode GEMV for at most 8 rows: bf16 x [M,K] @ weight [N,K]^T into a fresh bf16 [M,N], fp32 accumulation (tcgen05 into TMEM) and one rounding, on a CuTe DSL kernel the weight's shape selects -- short K (K <= 768, N a multiple of 128: one CTA per 128-row tile with the whole weight slice in shared memory) or split K (K a multiple of 512 above 768: 4-CTA clusters, the partials added in rank order); rows independent of M and bit-reproducible run to run, not bit-identical to cuBLAS; SM 10.x; compiles per (N, K, trigger_early, PDL) on its first, eager, call; under PDL the weight is loaded before the grid-dependency wait, so it must not be written by the preceding kernel"
+
+  - path: gemm/k3_head_gemv.py
+    impl: torch.ops.trtllm.k3_head_gemv
+    summary: "Kimi K3 vocabulary-shard head GEMV for at most 8 rows: bf16 x [M,K] @ weight [N,K]^T (N, K multiples of 128) into bf16 [M,N] (the first M rows of a fresh [8,N]) on a persistent stream-K CuTe DSL kernel of min(SMs, tiles x k-tiles) CTAs, a split tile's fp32 piece partials added in k order before one rounding -- rows independent of M, bit-reproducible run to run on one GPU; over a caller-owned K3HeadGemvWorkspace (fp32 partials and one flag word per (tile, piece); created eagerly, before any capture, for one weight shape and schedule; one that does not fit the call is refused with ValueError) that every completed launch leaves at zero, so the calls sharing one are ordered on one stream, eager calls and graph replays alike; weight tiles past keep_tiles streamed EVICT_FIRST; the dynamic schedule accepted, not certified; SM 10.x; compiles per shape on its first, eager, call"
 
   # ─── attention ─────────────────────────────────────────────────
   - path: attention/fused_qk_norm_rope.py
@@ -172,6 +241,43 @@ entries:
     impl: tensorrt_llm.bindings.internal.thop.attention
     summary: "Full attention core with fully explicit state (pybind binding, approved exception): paged KV-cache append + causal/padding-masked GQA FMHA over a caller-owned pool (bf16, or fp8-e4m3 with per-tensor kv scales) and explicit length/offset tensors, written into a caller buffer, on either context execution path (use_paged_context_fmha selects packed-QKV context FMHA, or paged-KV context FMHA so a context call may run over a cached prefix — KV-cache reuse and chunked prefill), with optional per-query-head attention sinks (one extra softmax-denominator logit, dropped from the output) and an optional per-call sliding window (attention_window_size keys ending at the query's absolute position; a pure mask — the append stays at absolute positions, so cyclic pool reuse is the caller's page mapping); MLA mode runs context prefill (in-kernel RoPE + latent append), no-append context over explicit K/V (latent_cache=None: cached-KV prefixes and chunked partial passes with softmax-stats output), and generation latent-MQA decode as separate calls over a paged latent pool (bf16 or fp8-e4m3)"
 
+  # Kimi K3 MLA decode (sm_100). The state type attention/k3_mla_attn_workspace.py is not an entry: it launches nothing
+  # per call.
+  - path: attention/k3_mla_qkv.py
+    impl: torch.ops.trtllm.k3_mla_qkv
+    summary: "Kimi K3's MLA decode query path for at most 64 tokens in one launch (q_a RMSNorm, q_b projection and k_b absorption into fused_q [M, heads x 576]) plus the step's latent KV rows (kv_a RMSNorm, rope columns) stored into the paged latent cache at each token's row; the page table is read before the grid-dependency wait, so under CUDA graphs it must be written before the graph runs; siblings: k3_mla_q (the query path alone) and k3_mla_qkv_out (the cache rows into a dense buffer)"
+
+  - path: attention/k3_mla_attn_vb_out.py
+    impl: torch.ops.trtllm.k3_mla_attn_vb_out
+    summary: "Kimi K3's MLA decode attention of at most 8 requests of at most 8 tokens over the paged latent cache (heads a multiple of 6, causal bottom-right, a request's rows exactly those of its own R = 1 call) with v_b and the optional sigmoid output gate in the same launch, over a caller-owned K3MlaAttnWorkspace: per-CTA partials and the no-cluster mode's arrival counters, one workspace per device and head-group count shared by every layer, its calls one at a time in stream order; siblings: k3_mla_attn_out (the attention output itself) and k3_mla_attn"
+
+  - path: attention/k3_drafter_attn.py
+    impl: torch.ops.trtllm.k3_drafter_attn
+    summary: "Kimi K3 DSpark drafter block attention (CuTe DSL, sm_100): R <= 8 requests' draft blocks of T <= 8 tokens, each attending densely (non-causal within the block) to its request's paged context (HND pages of 64, rows 0 .. ctx_len[r] - 1, page-table rows at any row stride) and to the block's own K / V taken from qkv, not written to the cache; GQA with 6 query heads per KV head, head dim 64, bf16; compiles on its first call outside capture, then replays under CUDA graphs with lengths, page tables and qkv rewritten in place"
+
+  - path: attention/k3_drafter_attn_qknorm.py
+    impl: torch.ops.trtllm.k3_drafter_attn_qknorm
+    summary: "k3_drafter_attn on the raw QKV projection: per-head q / k RMSNorm and NeoX RoPE (fused_qk_norm_rope's arithmetic, positions int32 or int64) applied inside the kernel, qkv left unmodified"
+
+  # ─── ssm ───────────────────────────────────────────────────────
+  # KDA (Kimi Delta Attention) decode. The state type ssm/k3_kda_buffers.py is not an entry: it launches nothing per
+  # call. The pools every entry here updates belong to the cache manager (the V2 hybrid manager's per-layer views).
+  - path: ssm/kda_decode.py
+    impl: torch.ops.trtllm.kda_decode
+    summary: "One-token KDA decode of B requests: the causal depthwise conv over each request's conv window, the gated delta rule on its fp32 recurrent state and the gated RMS norm, the state (and the conv window) updated in place at each request's slot of the cache manager's pools; at Kimi K3's rank slice (6 heads, K = V = 128, conv width 4) B <= 5 runs the cluster kernel and 6 <= B <= 24 the legacy compact-heads kernel"
+
+  - path: ssm/k3_kda_attn.py
+    impl: torch.ops.trtllm.k3_kda_attn
+    summary: "Kimi K3's KDA layer for one speculative-decoding request in one launch: the fused input projection of its golden token and 7 drafts and the KDA verify of ssm/k3_kda_verify on it, bit for bit the unfused pair, writing the slot's state, per-draft states and conv window in place, over a caller-owned K3KdaBuffers (three Lamport buffers and per-CTA indices, one set per device shared with ssm/k3_kda_decode_attn, its launches one at a time in stream order); the head CTAs read the slot's pools before the grid-dependency wait, so a launch must not directly follow another on the same pools; sibling: k3_kda_qkvg (the projection stream alone, a 104-CTA set of its own)"
+
+  - path: ssm/k3_kda_decode_attn.py
+    impl: torch.ops.trtllm.k3_kda_decode_attn
+    summary: "Kimi K3's KDA layer for plain decode of R <= 8 requests in one launch: the fused input projection of one token per request and the one-token KDA decode of ssm/kda_decode on it, the state and conv window updated in place at each request's slot, over the same caller-owned K3KdaBuffers as ssm/k3_kda_attn (either may follow the other on one set); the head CTAs read the slots' pools before the grid-dependency wait"
+
+  - path: ssm/k3_kda_verify.py
+    impl: torch.ops.trtllm.k3_kda_verify
+    summary: "Kimi K3's KDA speculative verify of N requests of 1 + num_spec tokens from the fused projection rows to the gated-norm core output, starting each request from the state after the drafts the sampler accepted last round (the per-token states of the V2 hybrid manager, selected by prev_num_accepted_tokens, read before the grid-dependency wait) and committing the state after every verify token, so the next round needs no replay"
+
   # ─── moe ───────────────────────────────────────────────────────
   - path: moe/noaux_tc_op.py
     impl: torch.ops.trtllm.noaux_tc_op
@@ -188,6 +294,10 @@ entries:
   - path: moe/fp4_block_scale_moe_runner.py
     impl: torch.ops.trtllm.fp4_block_scale_moe_runner
     summary: "Full NVFP4-weight / NVFP4-activation MoE layer (trtllm-gen W4A4): caller-supplied top-k ids/weights + grouped FC1 GEMM over pre-shuffled block-scaled [up; gate] expert weights + SwiGLU + NVFP4 requantization of that activation + grouped FC2 GEMM + routing-weighted fp32 combine, into a fresh or caller-provided [tokens, hidden] bf16 buffer; the checkpoint's per-tensor global scales enter as three per-expert fp32 scalars, hidden must be a multiple of 256, expert-parallel window selected by local_expert_offset/local_num_experts, do_finalize=False returns the per-slot rows plus their permuted-row map instead of the combine"
+
+  - path: moe/k3_route_quant.py
+    impl: torch.ops.trtllm.k3_route_quant
+    summary: "Kimi K3's top-16 routing (sigmoid + bias-corrected selection, the unbiased weights renormalized and scaled) and the MXFP8 quantization of the routed latent for 1-64 decode tokens in one CuTe DSL kernel, bit-identical to trtllm::kimi_k3_noaux_tc_mxfp8_quant; stateless (a compile cache only); early_trigger lets a programmatic-dependent k3_moe launch before the outputs are written"
 
   # ─── quantization ──────────────────────────────────────────────
   - path: quantization/mxfp8_quantize.py
@@ -206,3 +316,50 @@ entries:
   - path: comm/reducescatter.py
     impl: torch.ops.trtllm.reducescatter
     summary: "Summing reduce-scatter over a group of MPI-session ranks into a fresh tensor: every rank's tensor summed elementwise, then split along dim 0 in ascending rank order so each rank keeps its own rows, even (sizes=None) or uneven (per-rank row counts in `sizes`, as attention data parallelism produces); the sum is accumulated in the input dtype in a destination-dependent ring order — deterministic and replay-reproducible, but not the correctly rounded fp32 sum — and float8_e4m3fn is summed as raw bytes rather than as floats; calls pair by position on the communicator whichever `sizes` form they take, and because this one computes, ranks that disagree on call order make every rank wrong nearly everywhere rather than a quarter of the way — silently, and bitwise reproducibly, whenever the mispaired calls move the same number of bytes, hanging only when they do not"
+
+  # Stateful (a `## State` section and a caller-owned state object; the state type comm/mnnvl_workspace.py is not
+  # an entry: it launches nothing per call).
+  - path: comm/mnnvl_allreduce_attn_res.py
+    impl: torch.ops.trtllm.mnnvl_allreduce_attn_res
+    summary: "One-shot MNNVL all-reduce with Kimi K3's residual update as its epilogue (updated = prefix + sum over ranks, normed = RMSNorm of the attention-residual selection over the snapshot bank and updated), over a caller-owned MnnvlWorkspace: three Lamport buffers rotated by every call of every MNNVL op that shares the object, so every rank makes the same calls on it in the same order; a swapped pair of same-shaped calls is silently wrong on every rank, two ranks ordering calls on two workspaces differently on one stream deadlock"
+
+  # Kimi K3 decode collectives and MoE: stateful entries with a ## State section and caller-owned state objects
+  # (K3SandwichWorkspace, MnnvlWorkspace, K3LatentExchange, K3MoeHeadWorkspace, K3MoeState / K3MoeWideState and their
+  # layers). The state types are not entries: they launch nothing per call.
+  - path: comm/k3_sandwich_oproj.py
+    impl: torch.ops.trtllm.k3_sandwich_oproj
+    summary: "Kimi K3's post-attention sandwich for at most 8 decode tokens in one kernel: the row-parallel attention output projection, its TP all-reduce and the residual update (attention-residual selection + RMSNorm), bit-identical to o_proj followed by the MNNVL one-shot attention-residual all-reduce, over a caller-owned K3SandwichWorkspace: two buffer halves selected by per-CTA call-count parity, shared by every sandwich op of the group, so every rank makes the same calls on it in the same order; a swapped pair of same-shaped calls is silently wrong on every rank"
+
+  - path: comm/k3_sandwich_tail.py
+    impl: torch.ops.trtllm.k3_sandwich_tail
+    summary: "Kimi K3's pre-attention sandwich for at most 8 decode tokens in one kernel: the row-parallel MoE tail ([rmsnorm(latent)[:, lo:lo+224] | act] @ tail_weight^T, the latent RMS on the fp32 accumulator), its TP all-reduce and the next layer's residual update, optionally storing the pre-norm mixture or updated into a capture tap and updated into a snapshot-bank row, over the same caller-owned K3SandwichWorkspace as the other sandwiches and in one call sequence with them"
+
+  - path: comm/k3_sandwich_plain.py
+    impl: torch.ops.trtllm.k3_sandwich_plain
+    summary: "A row-parallel projection (Kimi K3 drafter's o_proj, or with swiglu its MLP's SiLU-and-mul and down projection), its TP all-reduce, the residual add and RMSNorm in one kernel for at most 8 decode tokens, in the MNNVL one-shot RESIDUAL_RMS_NORM all-reduce's arithmetic, over the same caller-owned K3SandwichWorkspace as the target's sandwiches and in one call sequence with them"
+
+  - path: comm/mnnvl_fusion_allreduce.py
+    impl: torch.ops.trtllm.mnnvl_fusion_allreduce
+    summary: "MNNVL all-reduce over a caller-owned MnnvlWorkspace: the sum over the TP group, or with a residual the residual add + RMSNorm; one-shot up to the call's one_shot_max_bytes, two-shot above, both deterministic; one turn of the workspace's three-buffer Lamport rotation per call, shared with every other MNNVL entry on the object, so every rank makes the same MNNVL calls on it in the same order and a swapped pair of same-shaped calls is silently wrong"
+
+  - path: comm/mnnvl_allgather_split.py
+    impl: torch.ops.trtllm.mnnvl_allgather_split
+    summary: "One-shot MNNVL all-gather over a caller-owned MnnvlWorkspace of fp32 rows whose leading columns travel and are gathered as bf16 (round to nearest even, -0.0 as +0.0) and the rest as fp32, in rank order (Kimi K3's sharded MoE head: the latent in bf16, the router logits in fp32); one turn of the workspace's Lamport rotation, in one call order with the MNNVL all-reduces on the object"
+
+  - path: comm/k3_latent_reduce.py
+    impl: torch.ops.trtllm.k3_latent_reduce
+    summary: "Kimi K3's latent all-reduce at decode size as the consumer of pushed partials: the sum over the TP group of the routed partial rows every rank's producer stored into a caller-owned K3LatentExchange, bit-identical to the MNNVL one-shot all-reduce of the partials; halves selected by the consumer's call parity, each push followed by exactly one reduce of the same token count on every rank in the same order"
+
+  - path: moe/k3_moe_front.py
+    impl: torch.ops.trtllm.k3_moe_front
+    summary: "Kimi K3's MoE front at decode size in one kernel: the row-sharded MoE head GEMV, its all-gather over a caller-owned K3MoeHeadWorkspace (two alternating Lamport buffers rotated by every front call), the top-16 routing and MXFP8 latent as trtllm::k3_route_quant returns them for the gathered head, and the shared experts' gate_up + SiTU-and-mul; optionally publishing per-token ready words that a head_flags build of k3_moe acquires"
+
+  - path: moe/k3_moe.py
+    impl: torch.ops.trtllm.k3_moe
+    summary: "Kimi K3's routed experts at decode size: this rank's routed partial from the persistent CuTe DSL kernel k3_moe (FC1 + SiTU + FC2 with the routing-weighted combine over the TRTLLM-Gen W4A8_MXFP4_MXFP8 buffers, read in place) on the routing and MXFP8 latent of k3_route_quant or the MoE front, over caller-owned per-rank state: a K3MoeState (up to 8 tokens; its head_flags build acquires a publishing front's ready words on the group's K3MoeHeadWorkspace) or a K3MoeWideState (up to 64), and one K3MoeLayer per MoE layer; a state's layers share its scratch (left armed by every call) and run in one stream order, each layer's counters are left zero"
+  - path: moe/k3_moe_m1.py
+    impl: torch.ops.trtllm.k3_moe_m1
+    summary: "Kimi K3's routed experts of one or two decode tokens with every expert on the rank (moe TP16 x EP1) as one weight-stream CuTe DSL kernel (trtllm::k3_moe_m1): FC1 (MXFP4 x MXFP8), SiTU, the MXFP8 intermediate, FC2 and the routing-weighted combine in trtllm::k3_moe's order, returned as this rank's routed partial or pushed into every rank's latent exchange for trtllm::k3_latent_reduce (bit-exact against MNNVLAllReduce's one-shot); over a caller-owned K3MoeM1State, created eagerly with its builds compiled before capture, whose workspace every layer shares in one stream order and every call re-arms for the next"
+  - path: moe/k3_moe_m2.py
+    impl: torch.ops.trtllm.k3_moe_m2
+    summary: "Kimi K3's routed experts of two decode tokens with every expert on the rank and an intermediate of at most 256 (moe TP16 x EP1) as one weight-stream CuTe DSL kernel (trtllm::k3_moe_m2), k3_moe_m1's function with per-group FC1 -> FC2 hand-offs: returned as this rank's routed partial or pushed into every rank's latent exchange for trtllm::k3_latent_reduce; over a caller-owned K3MoeM2State, created eagerly with its builds compiled before capture, whose workspace every layer shares in one stream order and every call re-arms for the next"

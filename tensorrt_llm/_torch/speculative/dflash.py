@@ -432,6 +432,32 @@ def dflash_draft_slot_ids(
     return (request_bases.unsqueeze(1) + first_slot + offsets.unsqueeze(0)).flatten()
 
 
+def dflash_noise_block_embedding(
+    embed_tokens: nn.Module,
+    bonus: torch.Tensor,
+    mask_token_id: int,
+    block_size: int,
+    trained_mask_embedding: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The drafter's input block per request, [len(bonus), block_size, hidden]: slot 0 the bonus token's embedding,
+    every other slot the mask token's.
+
+    The mask row is the drafter's own trained one when it has one (``trained_mask_embedding``); otherwise the shared
+    lookup's. Both rows go through ``embed_tokens.forward`` (NOT ``.weight[...]``) so TP-sharded vocabs mask out
+    ranks that don't own the token id and all-reduce, the mask row included, so every rank makes the same call.
+    """
+    num_gens = bonus.shape[0]
+    mask_tok = torch.full((1,), int(mask_token_id), dtype=torch.long, device=bonus.device)
+    combined_embed = embed_tokens(torch.cat([bonus, mask_tok], dim=0))
+    embed_bonus = combined_embed[:num_gens]
+    embed_mask = combined_embed[num_gens]
+    if trained_mask_embedding is not None:
+        embed_mask = trained_mask_embedding.to(embed_mask.dtype)
+    noise_embed_2d = embed_mask.expand(num_gens, block_size, -1).clone()
+    noise_embed_2d[:, 0, :] = embed_bonus
+    return noise_embed_2d
+
+
 def dflash_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -> int:
     """Positions a drafter that indexes absolute positions must be able to encode.
 
@@ -551,6 +577,10 @@ class DFlashSpecMetadata(SpecMetadata):
                     evicted[slot] = 0
                     worker._req_ctx_pos.pop(rid, None)
                     worker._free_slots.append(slot)
+            # The dummy slot starts every step empty. Its rows (CUDA-graph padding, warmup dummies) add their accepted
+            # tokens to its length like any request, and their table rows are the padding request's pages, the rest
+            # mapped to page 0 (another request's). Left growing, a padding row's context K / V would land there.
+            evicted[worker._dummy_slot] = 0
             worker._write_ctx_len(evicted)
 
             # A disagg generation worker receives prompt KV instead of
@@ -1995,14 +2025,15 @@ class DFlashWorker(SpecWorkerBase):
             query_position_ids = ctx_len_now.unsqueeze(1) + j_block.unsqueeze(0)
             ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
 
-            # Go through embed_tokens.forward (NOT .weight[...]) so TP-sharded
-            # vocabs mask out ranks that don't own the token id and all-reduce.
-            mask_tok = torch.full((1,), int(mask_token_id), dtype=torch.long, device="cuda")
-            combined_embed = embed_tokens(torch.cat([bonus, mask_tok], dim=0))
-            embed_bonus = combined_embed[:num_gens]
-            embed_mask = combined_embed[num_gens]
-            noise_embed_2d = embed_mask.expand(num_gens, query_tokens_per_req, -1).clone()
-            noise_embed_2d[:, 0, :] = embed_bonus
+            # The drafter's own trained mask row, if it kept one for the mask id in use.
+            trained_mask_embedding = (
+                getattr(draft_model, "mask_token_embedding", None)
+                if mask_token_id == getattr(draft_model, "mask_token_id", None)
+                else None
+            )
+            noise_embed_2d = dflash_noise_block_embedding(
+                embed_tokens, bonus, mask_token_id, query_tokens_per_req, trained_mask_embedding
+            )
 
             # Accumulate new accepted features into context buffers
             if has_target_features:

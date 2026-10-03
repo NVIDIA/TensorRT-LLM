@@ -27,7 +27,9 @@ from typing import Optional
 
 import torch
 
+from ..._utils import copy_to_device_if_changed
 from ...sampling_params import SamplingParams
+from ..cute_dsl_kernels.spec_step_copies import op as spec_step_copies
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
@@ -301,6 +303,16 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # tree (K=6, T=60), MTP dynamic tree, PARD (T=2K-1) and the linear
         # modes -- none exceed it.
         self.max_accepted_path_len = args.max_draft_len + 1
+        # Where the step-copy kernels run, one kernel moves a step's outputs
+        # into the stores below, reading each row's slot from _slot_table.
+        self._store_scatter: Optional[spec_step_copies.SlotScatter] = None
+        self._slot_table: Optional[torch.Tensor] = None
+        if spec_step_copies.is_supported():
+            self._store_scatter = spec_step_copies.SlotScatter()
+            self._slot_table = torch.zeros((seq_slots,), dtype=torch.int32, device="cuda")
+        # Recorded after the last step's host copies of the stores, which read
+        # them on the D2H side stream.
+        self._store_copies_done: Optional[torch.cuda.Event] = None
         self.store = self.Store(
             new_tokens=int_tensor((self.max_accepted_path_len, seq_slots, self.max_beam_width)),
             next_new_tokens=int_tensor(
@@ -371,50 +383,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
-    def sample_async(
-        self,
-        scheduled_requests: ScheduledRequests,
-        outputs: dict[str, torch.Tensor],
-        num_context_logits_prefix_sum: list[int],
-    ) -> SampleStateSpec:
-        """
-        Async sampling - schedules GPU->CPU copy.
-        Called after CUDA graph replay.
-
-        Args:
-            scheduled_requests: Batch of scheduled requests
-            outputs: Dict from worker forward() containing:
-                - new_tokens: [batch, max_draft_len + 1] accepted tokens
-                - new_tokens_lens: [batch] number of accepted tokens
-                - next_draft_tokens: [batch, max_draft_len] draft tokens for next iter
-                - next_new_tokens: [batch, max_draft_len + 1] input for next iter
-            num_context_logits_prefix_sum: Prefix sum of context logits (unused)
-
-        Returns:
-            SampleStateSpec with device and host tensors
-        """
-        num_skip = len(scheduled_requests.context_requests_chunking)
-        finished_context_requests = scheduled_requests.context_requests_last_chunk
-        sampling_requests = finished_context_requests + scheduled_requests.generation_requests
-        num_sampling_requests = len(sampling_requests)
-
-        # Snapshot each request's draft count for THIS step before
-        # _add_dummy_draft_tokens below installs placeholder drafts on
-        # finished-context requests; update_requests pairs these with the
-        # acceptance counts (see SampleStateSpec.draft_lens). Drafter-fed
-        # flows (NGram, SA) pad py_draft_tokens to the static max for CUDA
-        # graphs before the forward, so prefer the pre-padding count the
-        # drafter recorded; min() guards against a stale count when the
-        # buffer was since cleared (e.g. speculation dynamically disabled).
-        draft_lens = [
-            min(r.py_draft_tokens_effective_len, get_draft_token_length(r))
-            if r.py_draft_tokens_effective_len is not None
-            else get_draft_token_length(r)
-            for r in sampling_requests
-        ]
-
-        slots = torch.as_tensor([r.py_seq_slot for r in sampling_requests], dtype=torch.long)
-        slots = slots.to(device="cuda", non_blocking=True)
+    def _scatter_to_stores(
+        self, outputs: dict[str, torch.Tensor], num_skip: int, slots: list[int]
+    ) -> None:
+        """Move rows ``num_skip`` onward of the forward's outputs into the stores at ``slots``."""
+        num_sampling_requests = len(slots)
+        slots_device = torch.as_tensor(slots, dtype=torch.long)
+        slots_device = slots_device.to(device="cuda", non_blocking=True)
 
         o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
         o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
@@ -422,7 +397,6 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             num_skip : num_skip + num_sampling_requests
         ]
         o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
-        runtime_draft_len = o_next_draft_tokens.shape[1]
 
         # Pad or truncate to match fixed-size store buffers for index_copy_.
         # The worker output width tracks runtime_draft_len, which dynamic draft
@@ -450,10 +424,73 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
 
         # Use index_copy_ for efficient copying (slots are unique)
-        self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
-        self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
-        self.store.new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
-        self.store.next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
+        self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_new_tokens)
+        self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_next_new_tokens)
+        self.store.new_tokens_lens.index_copy_(0, slots_device, o_new_tokens_lens)
+        self.store.next_draft_tokens.index_copy_(0, slots_device, o_next_draft_tokens)
+
+    def sample_async(
+        self,
+        scheduled_requests: ScheduledRequests,
+        outputs: dict[str, torch.Tensor],
+        num_context_logits_prefix_sum: list[int],
+    ) -> SampleStateSpec:
+        """
+        Async sampling - schedules GPU->CPU copy.
+        Called after CUDA graph replay.
+
+        Args:
+            scheduled_requests: Batch of scheduled requests
+            outputs: Dict from worker forward() containing:
+                - new_tokens: [batch, max_draft_len + 1] accepted tokens
+                - new_tokens_lens: [batch] number of accepted tokens
+                - next_draft_tokens: [batch, max_draft_len] draft tokens for next iter
+                - next_new_tokens: [batch, max_draft_len + 1] input for next iter
+            num_context_logits_prefix_sum: Prefix sum of context logits (unused)
+
+        Returns:
+            SampleStateSpec with device and host tensors
+        """
+        num_skip = len(scheduled_requests.context_requests_chunking)
+        finished_context_requests = scheduled_requests.context_requests_last_chunk
+        sampling_requests = finished_context_requests + scheduled_requests.generation_requests
+
+        # Snapshot each request's draft count for THIS step before
+        # _add_dummy_draft_tokens below installs placeholder drafts on
+        # finished-context requests; update_requests pairs these with the
+        # acceptance counts (see SampleStateSpec.draft_lens). Drafter-fed
+        # flows (NGram, SA) pad py_draft_tokens to the static max for CUDA
+        # graphs before the forward, so prefer the pre-padding count the
+        # drafter recorded; min() guards against a stale count when the
+        # buffer was since cleared (e.g. speculation dynamically disabled).
+        draft_lens = [
+            min(r.py_draft_tokens_effective_len, get_draft_token_length(r))
+            if r.py_draft_tokens_effective_len is not None
+            else get_draft_token_length(r)
+            for r in sampling_requests
+        ]
+
+        runtime_draft_len = outputs["next_draft_tokens"].shape[1]
+        if self._store_copies_done is not None:
+            # The previous step's host copies may still be reading the stores.
+            torch.cuda.current_stream().wait_event(self._store_copies_done)
+        slots = [r.py_seq_slot for r in sampling_requests]
+        scattered = False
+        if self._store_scatter is not None:
+            # A step whose batch is unchanged leaves the slot table as it is.
+            copy_to_device_if_changed(self._slot_table, torch.tensor(slots, dtype=torch.int32))
+            scattered = self._store_scatter.scatter(
+                outputs,
+                num_skip,
+                len(slots),
+                self._slot_table,
+                self.store.new_tokens,
+                self.store.next_new_tokens,
+                self.store.new_tokens_lens,
+                self.store.next_draft_tokens,
+            )
+        if not scattered:
+            self._scatter_to_stores(outputs, num_skip, slots)
 
         # Create sample state with async D2H copy
         device_tensors = SampleStateTensorsSpec(
@@ -462,12 +499,26 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=self.store.next_draft_tokens,
         )
 
-        host_tensors = SampleStateTensorsSpec(
-            new_tokens=self._copy_to_host(self.store.new_tokens),
-            new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
-            next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
-        )
-        sampler_event = self._record_sampler_event()
+        if self._async_worker_active():
+            host_tensors = SampleStateTensorsSpec(
+                new_tokens=self._copy_to_host(self.store.new_tokens),
+                new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
+                next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
+            )
+            sampler_event = self._record_sampler_event()
+        else:
+            # The next step's input preparation waits on this stream and only
+            # needs the stores, so the host copies run on the side stream.
+            # update_requests syncs their event before reading them, and the
+            # next step's store update waits for it on this stream.
+            with self._make_side_stream_copier() as copier:
+                host_tensors = SampleStateTensorsSpec(
+                    new_tokens=copier.stage_copy_to_host(self.store.new_tokens),
+                    new_tokens_lens=copier.stage_copy_to_host(self.store.new_tokens_lens),
+                    next_draft_tokens=copier.stage_copy_to_host(self.store.next_draft_tokens),
+                )
+            self._store_copies_done = copier.event
+            sampler_event = self._record_sampler_event(side_stream_event=copier.event)
 
         # Add dummy draft tokens to context requests for KV cache preparation
         for request in finished_context_requests:

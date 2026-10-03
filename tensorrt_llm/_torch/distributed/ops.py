@@ -183,6 +183,24 @@ def _get_mnnvl_workspace_comm(mapping: Mapping):
         mapping.tp_rank)
 
 
+def _get_mnnvl_tp_group_comm(mapping: Mapping):
+    """A new communicator of exactly mapping.tp_group (its rank i = TP rank i) for a caller-owned
+    MNNVL state's create(); only the group's ranks take part (MPI_Comm_create_group). The caller
+    frees it. Under Ray the TP ProcessGroup (c10d's).
+    """
+    if mpi_disabled():
+        pg = mapping.tp_group_pg
+        assert pg is not None, "TP ProcessGroup not initialised"
+        return pg
+    session = mpi_comm()
+    session_group = session.Get_group()
+    group = session_group.Incl(mapping.tp_group)
+    session_group.Free()
+    comm = session.Create_group(group)
+    group.Free()
+    return comm
+
+
 def _mnnvl_device_index(mapping: Mapping) -> int:
     """CUDA device index backing this rank's MNNVL buffers.
 
@@ -287,6 +305,10 @@ def _get_or_scale_allreduce_mnnvl_workspace(
 
     if mapping not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[
             mapping]["buffer_size_bytes"] < (buffer_size_bytes or 0):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "MNNVL all-reduce workspace creation or growth during CUDA graph capture: run each shape once "
+                "outside capture first")
         # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
         init_buffer_size_bytes = max(1024 * 8192 * elem_size, buffer_size_bytes
                                      or 0)
@@ -363,6 +385,11 @@ def _get_or_scale_allreduce_mnnvl_workspace(
         _initialize_allreduce_mnnvl_protocol(candidate_workspace)
         # Hand ownership of the communicator to the workspace.
         pending_comms.pop(mapping, None)
+        previous_workspace = allreduce_mnnvl_workspaces.get(mapping)
+        if previous_workspace is not None:
+            # CUDA graphs captured before this growth keep launching on the previous buffers and flags.
+            MNNVLAllReduce.allreduce_mnnvl_retired_workspaces.setdefault(
+                mapping, []).append(previous_workspace)
         allreduce_mnnvl_workspaces[mapping] = candidate_workspace
     return allreduce_mnnvl_workspaces[mapping]
 
@@ -754,6 +781,11 @@ class MNNVLAllReduce(nn.Module):
     allreduce_mnnvl_workspaces: typing.ClassVar[dict[Mapping,
                                                      _MnnvlWorkspace]] = {}
 
+    # Workspaces a larger one replaced. CUDA graphs captured before the growth still launch on their buffers and
+    # flags, so they stay alive with the process. The checkpoint hooks cover only the current workspace.
+    allreduce_mnnvl_retired_workspaces: typing.ClassVar[dict[
+        Mapping, list[_MnnvlWorkspace]]] = {}
+
     # Communicators split for a mapping whose workspace construction has not
     # succeeded yet. Ownership moves to the workspace once it is published, so
     # an entry here is never reachable from allreduce_mnnvl_workspaces.
@@ -786,6 +818,9 @@ class MNNVLAllReduce(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.dtype = dtype
+        # Largest num_tokens * hidden * ranks * element size this all-reduce sends one-shot when a call does not
+        # say; a model may raise it on its own all-reduces.
+        self.one_shot_max_bytes = _MNNVL_ONE_SHOT_THRESHOLD_BYTES
         if dtype not in MNNVLAllReduce.get_supported_dtypes() or (
                 mapping.has_cp()):
             # This is safe as we always capture the exception when create this object
@@ -827,12 +862,16 @@ class MNNVLAllReduce(nn.Module):
         return supported and (explicitly_requested or mapping.is_multi_node())
 
     @staticmethod
-    def get_required_workspace_size(num_tokens: int, hidden_dim: int,
-                                    group_size: int, dtype: torch.dtype) -> int:
+    def get_required_workspace_size(
+            num_tokens: int,
+            hidden_dim: int,
+            group_size: int,
+            dtype: torch.dtype,
+            one_shot_max_bytes: int = _MNNVL_ONE_SHOT_THRESHOLD_BYTES) -> int:
         elem_size = torch.tensor([], dtype=dtype).element_size()
         # This should match the heuristic in allreduceOp.cpp.
         is_one_shot = (num_tokens * hidden_dim * group_size * elem_size
-                       <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES)
+                       <= one_shot_max_bytes)
         if is_one_shot:
             # For one-shot, each rank needs to store num_tokens * group_size tokens
             workspace_size = num_tokens * hidden_dim * group_size * elem_size
@@ -913,12 +952,15 @@ class MNNVLAllReduce(nn.Module):
         self,
         input: torch.Tensor,
         all_reduce_params: AllReduceParams,
+        one_shot_max_bytes: Optional[int] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """Forward pass for MNNVL AllReduce.
 
         Args:
             input (torch.Tensor): Input tensor to be reduced; last dim is the hidden dimension.
             all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations.
+            one_shot_max_bytes (Optional[int]): Largest num_tokens * hidden * ranks * element size
+                sent one-shot (larger messages go two-shot); default ``self.one_shot_max_bytes``.
 
         Returns:
             Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s). Output tensors
@@ -926,12 +968,15 @@ class MNNVLAllReduce(nn.Module):
             NVFP4 scale-factor output is 1-D).
         """
 
+        if one_shot_max_bytes is None:
+            one_shot_max_bytes = self.one_shot_max_bytes
         fusion_op = all_reduce_params.fusion_op
         hidden_dim = input.shape[-1]
         num_tokens = input.numel() // hidden_dim
 
         workspace_size_bytes = self.get_required_workspace_size(
-            num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
+            num_tokens, hidden_dim, self.mapping.tp_size, self.dtype,
+            one_shot_max_bytes)
 
         # We use uint32_t to store workspace size related info. Safeguard against overflow.
         if workspace_size_bytes >= 2**32 - 1:
@@ -966,8 +1011,75 @@ class MNNVLAllReduce(nn.Module):
             is_fusion,  # rmsnorm_fusion
             all_reduce_params.scale,  # scale
             int(fusion_op),
+            one_shot_max_bytes,
         )
         return tuple(outputs) if is_fusion else outputs[0]
+
+    def allreduce_attn_res_rmsnorm(
+        self,
+        input: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+        res_weight: torch.Tensor,
+        rms_weight: torch.Tensor,
+        output_rms_weight: torch.Tensor,
+        rms_eps: float,
+        output_rms_eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One-shot all-reduce of ``input`` with Kimi K3's residual update as its epilogue.
+
+        Computes ``updated = prefix_sum + allreduce(input)`` (``allreduce(input)`` when
+        ``prefix_sum`` is None), then the attention-residual selection over
+        ``block_residual`` ``[num_snapshots, num_tokens, hidden]`` and ``updated``, then an
+        RMSNorm with ``output_rms_weight``. Returns ``(normed, updated)``, rounded like the
+        unfused all-reduce followed by ``trtllm::attn_res_add_rmsnorm_fwd``.
+
+        The workspace is grown to the one-shot footprint when needed, so the first call for a
+        shape must happen outside CUDA graph capture (warmup does this).
+        """
+        num_tokens, hidden_dim = input.shape
+        one_shot_bytes = (num_tokens * hidden_dim * self.mapping.tp_size *
+                          input.element_size())
+        workspace = get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping, self.dtype, buffer_size_bytes=one_shot_bytes)
+        normed, updated = torch.ops.trtllm.mnnvl_allreduce_attn_res(
+            input,
+            prefix_sum,
+            block_residual,
+            res_weight,
+            rms_weight,
+            output_rms_weight,
+            rms_eps,
+            output_rms_eps,
+            workspace["uc_buffer"].view(self.dtype).view(3, -1),
+            workspace["buffer_flags"],
+        )
+        return normed, updated
+
+    def allgather_split(self, input: torch.Tensor,
+                        bf16_columns: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One-shot all-gather of this rank's fp32 rows over the MNNVL workspace.
+
+        ``input`` is ``[num_tokens, columns]`` fp32. Returns ``(bf16_out, fp32_out)``: the
+        first ``bf16_columns`` columns of every rank, rounded to bf16, as ``[num_tokens, tp *
+        bf16_columns]`` in rank order, and the remaining columns as fp32 ``[num_tokens, tp *
+        (columns - bf16_columns)]``. It takes a turn of the one-shot all-reduce's Lamport
+        rotation, so it must run in the same stream order as the other MNNVL collectives of
+        this workspace. The first call for a shape must happen outside CUDA graph capture.
+        """
+        num_tokens, columns = input.shape
+        footprint = num_tokens * self.mapping.tp_size * (
+            bf16_columns * 2 + (columns - bf16_columns) * 4)
+        workspace = get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping, self.dtype, buffer_size_bytes=footprint)
+        bf16_out, fp32_out = torch.ops.trtllm.mnnvl_allgather_split(
+            input,
+            bf16_columns,
+            self.mapping.tp_size,
+            workspace["uc_buffer"].view(self.dtype).view(3, -1),
+            workspace["buffer_flags"],
+        )
+        return bf16_out, fp32_out
 
 
 class AllReduce(nn.Module):

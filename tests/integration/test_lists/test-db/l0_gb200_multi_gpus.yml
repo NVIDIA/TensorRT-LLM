@@ -50,6 +50,24 @@ l0_gb200_multi_gpus:
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_checkpoint_preserves_cuda_graph_addresses
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_checkpoint_rejects_wrong_group_membership
+  - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_growth_keeps_captured_graphs
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_mnnvl_allreduce_attn_res_op_matrix.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mnnvl_comm.py
+  # Kimi K3 collective kernels (sm_100) and the catalog entries over caller-owned state, 4 ranks
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_front.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_latent_reduce.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_push.py
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_oproj_op_matrix.py
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_tail_op_matrix.py
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_plain_op_matrix.py
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_mnnvl_fusion_allreduce_op_matrix.py
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_mnnvl_allgather_split_op_matrix.py
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_latent_reduce_op_matrix.py
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_allgather_op_matrix.py
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_k3_moe_front_op_matrix.py
+  # The Kimi K3 target's decode-path collectives over those entries, 4 ranks
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_kimi_k3_decode_comm_op_matrix.py
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_checkpoint_preserves_moe_graph_addresses
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_engine_checkpoint_coordination
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_checkpoint_failure_is_collective_and_bounded

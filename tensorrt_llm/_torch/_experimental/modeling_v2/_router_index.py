@@ -59,6 +59,7 @@ MODELING_V2_ENV = "TRTLLM_MODELING_V2"
 MODELING_V2_ROUTERS = {
     "GptOssForCausalLM": "models.gpt_oss.routing",
     "DeepseekV3ForCausalLM": "models.deepseek_v3.routing",
+    "KimiK3ForConditionalGeneration": "models.kimi_k3_vl.routing",
 }
 
 #: Backends whose model construction reaches ``modeling_v2_resolve``. The

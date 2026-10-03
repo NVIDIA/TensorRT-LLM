@@ -115,8 +115,9 @@ tests/unittest/_torch/modeling_v2/
   test_modeling_v2_claims.py     routing tables vs the targets they name (no GPU)
   test_modeling_v2_routing.py    what modeling_v2_resolve does (no GPU)
   <category>/test_modeling_v2_<entry>.py
-  comm/_<entry>_op_matrix.py   the two collectives' 4-rank rank bodies
-  comm/_rank_job.py            starts one of those and asserts on its exit code
+  comm/_<entry>_op_matrix.py   each collective's rank bodies
+  comm/_lockstep.py            the stateful matrices' launcher and shared reference
+  comm/_rank_job.py            starts one at a world size and asserts on its exit code
 ```
 
 That split is not a preference; it is where this repo's CI collects from, and
@@ -124,13 +125,17 @@ an in-package test is on no list. It costs one thing worth stating: a receipt
 is valid only if it post-dates the last write to *every* file of its entry, so
 that check now has to look in both trees.
 
-The two collectives' rank bodies sit in the tests tree with everything else
+The collectives' rank bodies sit in the tests tree with everything else
 that only tests run. Both halves are started by file path -- the launcher must
 not import `tensorrt_llm`, because that calls `MPI_Init` and an
 MPI-initialized process cannot start `mpirun`, and the ranks reach the catalog
 by absolute import -- so neither needs a package to live in. Neither those
 file names nor their `check_*` bodies match pytest's collection patterns:
-each is one fixed 4-rank sequence that cannot run as independent cases.
+each is one fixed sequence over one job's ranks that cannot run as
+independent cases. CI runs them at 4 ranks on one node. A stateful entry's
+launcher also takes `--world-size N --launcher srun`, which runs the same
+body as one of N ranks started across nodes: that is how its multi-node
+receipt is recorded.
 
 Identity is the directory name, and it carries all three segments:
 `gpt_oss_120b__sm_103__tp1`. They were three nested directories once, which
@@ -181,8 +186,12 @@ Perf is measured, never gated.
 
 ## Status of every record in this tree
 
-**The catalog is fully certified on sm_103. The targets construct but have
-never executed.**
+**The catalog is certified: 19 entries on sm_103, and 34 on sm_100 (B200 /
+GB200): the 30 Kimi K3 entries (the MNNVL ones, `attention/k3_drafter_attn` and
+`attention/k3_drafter_attn_qknorm` among them), where their first caller runs,
+and `cublas_mm`, `flashinfer_rmsnorm`, `allgather` and
+`attention/fused_qk_norm_rope`. The targets construct but have never
+executed.**
 
 Two things voided every receipt in the move: each catalog test file was
 rewritten, and the targets moved from sm_100 (B200) to sm_103 (GB300), where

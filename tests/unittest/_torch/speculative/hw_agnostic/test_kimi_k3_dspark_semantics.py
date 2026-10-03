@@ -455,6 +455,50 @@ def test_dspark_drafter_loads_head_weights_and_parses_config():
 
 
 @needs_gpu
+def test_gqa_dspark_keeps_its_trained_mask_row_over_the_target_embedding():
+    """The GQA drafter takes the target's embedding (load_weights_from_target_model), but a checkpoint that ships its
+    own embedding trained the mask token's row, which the target's embedding does not have. The drafter keeps that row
+    as ``mask_token_embedding``, and the worker's noise block puts it in every masked slot; slot 0 stays the bonus
+    token's embedding from the shared lookup.
+    """
+    h = TINY["hidden_size"]
+    weights = _tiny_weights()
+    g = torch.Generator().manual_seed(23)
+    weights["embed_tokens.weight"] = (torch.randn(VOCAB, h, generator=g) * 0.05).to(torch.bfloat16)
+    drafter = _build_drafter(True, weights)
+    target_embed = torch.nn.Embedding(VOCAB, h).to("cuda", torch.bfloat16)
+    target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=target_embed),
+        lm_head=torch.nn.Linear(h, VOCAB, bias=False),
+    )
+    drafter.load_weights_from_target_model(target)
+
+    mask_id = drafter.mask_token_id
+    trained = weights["embed_tokens.weight"][mask_id]
+    assert not torch.equal(target_embed.weight[mask_id].detach().cpu(), trained)
+    torch.testing.assert_close(drafter.mask_token_embedding.cpu(), trained, rtol=0, atol=0)
+
+    from tensorrt_llm._torch.speculative.dflash import dflash_noise_block_embedding
+
+    bonus = torch.tensor([3, 5], dtype=torch.long, device="cuda")
+    block = 4
+    with torch.no_grad():
+        noise = dflash_noise_block_embedding(
+            drafter.draft_model_full.model.embed_tokens,
+            bonus,
+            mask_id,
+            block,
+            drafter.mask_token_embedding,
+        )
+    assert tuple(noise.shape) == (2, block, h)
+    torch.testing.assert_close(
+        noise[:, 0].cpu(), target_embed.weight[bonus].detach().cpu(), rtol=0, atol=0
+    )
+    for j in range(1, block):
+        torch.testing.assert_close(noise[:, j].cpu(), trained.expand(2, -1), rtol=0, atol=0)
+
+
+@needs_gpu
 def test_published_drafter_spelling_activates_the_heads():
     """Both public K3 DSpark checkpoints load with their heads live.
 

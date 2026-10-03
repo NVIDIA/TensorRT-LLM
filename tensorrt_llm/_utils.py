@@ -1336,6 +1336,34 @@ def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def copy_to_device_if_changed(dst: torch.Tensor, host: torch.Tensor) -> None:
+    """Copy ``host`` into the leading elements of the device buffer ``dst``
+    unless they already hold it.
+
+    ``dst`` is the whole buffer (not a slice), and the values it last received
+    are kept on it, so a reallocated buffer starts over. Only for per-step
+    metadata buffers that nothing else writes: a decode step whose batch is
+    unchanged then enqueues no copy. "Nothing else" includes other tensor
+    objects over the same memory, such as the views a shared buffer pool hands
+    to each metadata object. The copy itself goes through fresh pinned staging,
+    so ``host`` may be reused right away.
+    """
+    flat = host.reshape(-1)
+    n = flat.numel()
+    last = getattr(dst, "_last_host_values", None)
+    if last is not None and last.numel() >= n and torch.equal(last[:n], flat):
+        return
+    staging = torch.empty_like(flat, device="cpu", pin_memory=prefer_pinned())
+    staging.copy_(flat)
+    dst.view(-1)[:n].copy_(staging, non_blocking=True)
+    if last is None or last.numel() <= n:
+        dst._last_host_values = flat.clone()
+    else:
+        last = last.clone()
+        last[:n] = flat
+        dst._last_host_values = last
+
+
 def async_tensor_h2d(data, dtype: torch.dtype,
                      device: Union[str, torch.device]) -> torch.Tensor:
     """Build a CPU tensor from `data` and ship it to `device` with a

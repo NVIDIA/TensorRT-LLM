@@ -135,6 +135,41 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
+  # Kimi K3 decode kernels (CuTe DSL): the GEMVs, the head GEMV and the
+  # embedding, and the cluster-wait and tcgen05-fence lints over them.
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_embed.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_ctm_gemv.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_ctm_gemv_wide.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_decode_gemv.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_head_gemv.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_cluster_waits.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_tcgen05_fences.py
+  # The Kimi K3 targets' routing and the claims check of their stock imports. l0_b300's modeling_v2
+  # entry, the only other one that collects them, is waived (nvbugs/6853741).
+  - unittest/_torch/modeling_v2/test_modeling_v2_routing.py -k "kimi_k3"
+  - unittest/_torch/modeling_v2/test_modeling_v2_claims.py::test_uncertified_generic_calls_name_every_stock_import
+  # modeling_v2 catalog entries with sm_100 receipts (the K3 ones skip on
+  # other architectures).
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_k3_embed_norm.py
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_attn_res_fwd.py
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_attn_res_rmsnorm_fwd.py
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_flashinfer_rmsnorm.py
+  - unittest/_torch/modeling_v2/activation/test_modeling_v2_k3_situ_mul.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_cublas_mm.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_ctm_gemv.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_ctm_gemv_swiglu.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_ctm_gemv_long.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_ctm_gemv_wide.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_decode_gemv.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_head_gemv.py
+  # The Kimi K3 target's decode GEMVs, LM head and embedding on those entries.
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_gemv.py
+  # The Kimi K3 target's DSpark drafter on the drafter entries, against the stock block forward.
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_drafter.py
+  # The Kimi K3 targets' construction checks and the drift check of tp16_moetp16ep1's copied modules.
+  # l0_b300's modeling_v2 entry, the only other one that collects them, is waived (nvbugs/6853741).
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_construction.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_drift.py
   # KDA runtime: host-derived prefill metadata and the bf16 state pool
   # round-trip. Both are single-device cases that use GPU 0 only.
   - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
@@ -148,6 +183,9 @@ l0_b200:
   - unittest/_torch/modeling/test_kimi_linear_checkpoint.py
   # CPU self-test of the Kimi K3 disagg parity harness comparison logic.
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
+  # ------------- distributed ---------------
+  # One process: the MNNVL workspace's capture guard raises before any MNNVL call.
+  - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_creation_refuses_graph_capture
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
@@ -238,6 +276,16 @@ l0_b200:
   # accuracy deviation found so far is Blackwell-only), so it is not
   # hw-agnostic and needs its own Blackwell run.
   - unittest/_torch/speculative/test_fused_sampling_op.py
+  # One-model speculative decoding step-copy kernels and the engine's staged
+  # decode-step inputs (SM 100 only; they skip on every other list).
+  - unittest/_torch/cute_dsl_kernels/test_spec_step_copies.py
+  - unittest/_torch/executor/test_pytorch_model_engine.py -k "test_staged_spec_decode_graph_step"
+  # Kimi K3 DSpark drafter attention (CuTe DSL, SM 100) and its modeling_v2 catalog entries, plus the sm_100 cells of
+  # fused_qk_norm_rope, which the drafter calls.
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_drafter_attn.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_drafter_attn.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_drafter_attn_qknorm.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_fused_qk_norm_rope.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
@@ -292,6 +340,17 @@ l0_b200:
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_field_completeness
   # ------------- Prefix-aware scheduling E2E tests ---------------
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
+  # ------------- Kimi K3 decode MoE kernels and their catalog entries (sm_100) ---------------
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_fused_moe.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_wide.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_route_quant.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_front_geometry.py
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_k3_moe.py
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_k3_route_quant.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_m1.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_m2.py
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_k3_moe_m1.py
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_k3_moe_m2.py
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/cute_dsl_kernels/test_nvfp4_conv3d.py
   - unittest/_torch/visual_gen/test_media_decode.py
@@ -375,6 +434,16 @@ l0_b200:
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_public_visual_gen_api_smoke TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (30)
+  # ------------- Kimi K3 KDA / MLA decode kernels (sm_100) and their modeling_v2 entries ---------------
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_kda_attn.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_kda_decode_attn.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_kda_pools_past_2g.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_kda_verify.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_attn.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_q.py
+  - unittest/_torch/modeling_v2/ssm
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_mla_qkv.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_mla_attn_vb_out.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
