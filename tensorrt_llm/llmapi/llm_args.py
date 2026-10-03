@@ -2361,7 +2361,9 @@ class MooncakeStoreConfig(StrictBaseModel):
         "checked against available memory at startup. Write binary sizes "
         "('16GiB') or byte counts: 'GB' means a power of 1000 here and a "
         "power of 1024 to vLLM, so it is refused in a file both engines may "
-        "read.")
+        "read. Zero lends nothing: the server joins the pool and uses capacity "
+        "its peers hold, so a pool whose every participant lends nothing has "
+        "nowhere to put a page.")
     transfer_batch_size: PositiveInt = Field(
         64, telemetry=False, description="Page keys per store call.")
     namespace: Optional[str] = Field(
@@ -2409,8 +2411,8 @@ class MooncakeStoreConfig(StrictBaseModel):
     def _check_segment_size(cls, value):
         """Reject a size here rather than in every rank after bringup.
 
-        The connector parses it, so a typo or a zero would otherwise surface
-        as a per-rank failure with the model already loading.
+        The connector parses it, so a typo would otherwise surface as a
+        per-rank failure with the model already loading.
         """
         from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
             parse_size
@@ -2418,9 +2420,9 @@ class MooncakeStoreConfig(StrictBaseModel):
             parsed = parse_size(value, strict_units=True)
         except ValueError as exc:
             raise ValueError(f"mooncake_store.segment_size: {exc}")
-        if parsed <= 0:
+        if parsed < 0:
             raise ValueError(f"mooncake_store.segment_size: {value!r} is "
-                             f"{parsed} bytes; it has to be positive.")
+                             f"{parsed} bytes; it cannot be negative.")
         return value
 
 

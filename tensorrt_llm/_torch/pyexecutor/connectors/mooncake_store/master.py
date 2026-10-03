@@ -612,6 +612,14 @@ def _log_contribution(segment_size: int, role: str, run_dir: str) -> None:
     """
     from tensorrt_llm._utils import local_mpi_size
 
+    if segment_size <= 0:
+        logger.warning(
+            "mooncake-store: this server lends no host memory to the pool, so "
+            "its pages live in capacity its peers hold and leave when those "
+            "peers do."
+        )
+        return
+
     gib = segment_size / (1 << 30)
     try:
         ranks_here = max(1, local_mpi_size())

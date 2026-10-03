@@ -44,7 +44,11 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     KvCacheRegion,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import worker as worker_module
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import CONFIG_PATH_ENV
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
+    CONFIG_PATH_ENV,
+    MooncakeStoreConnectorConfig,
+    StoreRole,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
     POOL_MANIFEST_NAME,
     provision_pool,
@@ -57,6 +61,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
     MooncakeStoreConnectorWorker,
+    _open_store,
 )
 from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig
 
@@ -75,8 +80,12 @@ REGION_BYTES = 4096
 BUFFER_BYTES = NUM_GROUPS * len(REGION_ROLES) * NUM_SLOTS * REGION_BYTES
 
 MODEL_KEY = "mooncake-real-pool-test"
+#: The pool's whole capacity, held by the keeper the fixture leaves running.
 #: Small enough to pass the node budget check on any machine that can run this.
-SEGMENT_SIZE = "1GiB"
+KEEPER_SEGMENT_SIZE = 1 << 30
+#: The workers lend nothing, so the keeper's segment is the only place a page
+#: can land and no worker takes part of a block down with it at shutdown.
+WORKER_SEGMENT_SIZE = 0
 #: Stands in for a `BlockHashChain` digest, which the connector treats as
 #: opaque content identity. Fixed so separate workers agree on it.
 BLOCK_HASH = hashlib.sha256(b"mooncake-real-pool-test/block-0").digest()
@@ -177,7 +186,10 @@ def _llm_args(store_config: MooncakeStoreConfig) -> SimpleNamespace:
 
 @pytest.fixture
 def mooncake_pool(tmp_path, monkeypatch):
-    """A live master with a published manifest, shut down with the test.
+    """A live master and the capacity behind it, shut down with the test.
+
+    The master stores nothing: a page lives in the memory of the participant
+    it was allocated in, so the keeper is what lets the pool outlive a worker.
 
     The master publishes into its own directory and clients claim another, so
     neither claims a run directory the other owns.
@@ -198,11 +210,22 @@ def mooncake_pool(tmp_path, monkeypatch):
         rpc_port=_free_port(),
         metrics_port=_free_port(),
         protocol="tcp",
-    ):
-        yield SimpleNamespace(
-            run_dir=str(client_dir),
-            pool=f"file://{master_dir / POOL_MANIFEST_NAME}",
+    ) as master:
+        keeper, _ = _open_store(
+            MooncakeStoreConnectorConfig(
+                master_server_address=master.address,
+                protocol="tcp",
+                global_segment_size=KEEPER_SEGMENT_SIZE,
+                role=StoreRole.CAPACITY,
+            )
         )
+        try:
+            yield SimpleNamespace(
+                run_dir=str(client_dir),
+                pool=f"file://{master_dir / POOL_MANIFEST_NAME}",
+            )
+        finally:
+            keeper.close()
 
 
 @contextlib.contextmanager
@@ -222,7 +245,7 @@ def open_worker(
     store_config = MooncakeStoreConfig(
         pool=pool.pool,
         model_key=model_key,
-        segment_size=SEGMENT_SIZE,
+        segment_size=WORKER_SEGMENT_SIZE,
         stage_through_host=stage_through_host,
         run_dir=pool.run_dir,
     )
@@ -383,18 +406,14 @@ def test_a_different_model_key_shares_nothing(mooncake_pool):
     from the key prefix. A collision would serve one model's KV to another,
     which produces plausible-looking nonsense rather than an error.
 
-    The writer checks its own block first, so the miss below cannot be the
-    store declining to answer at all.
+    The block is asked for under both keys, so the miss is the model key
+    rather than a page the pool lost: the `model-a` hit would fail first.
     """
     buffer = _device_buffer(filled=True)
     with open_worker(
         mooncake_pool, buffer=buffer, stage_through_host=True, model_key="model-a"
     ) as writer:
         save_page(writer, request_id=1, page_index=0)
-        assert writer.count_prefix_hit([BLOCK_HASH]) == 1, (
-            "The writer cannot see the block it just saved, so the miss asserted "
-            "below would say nothing about model keys."
-        )
 
     other_buffer = _device_buffer(filled=False)
     with open_worker(
@@ -402,4 +421,12 @@ def test_a_different_model_key_shares_nothing(mooncake_pool):
     ) as reader:
         assert reader.count_prefix_hit([BLOCK_HASH]) == 0, (
             "A block saved under one model key was offered to a different model."
+        )
+
+    with open_worker(
+        mooncake_pool, buffer=other_buffer, stage_through_host=True, model_key="model-a"
+    ) as same_model:
+        assert same_model.count_prefix_hit([BLOCK_HASH]) == 1, (
+            "The block is gone from the pool under the key it was saved with, "
+            "so the miss asserted above says nothing about model keys."
         )
