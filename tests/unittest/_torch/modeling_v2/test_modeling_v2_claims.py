@@ -276,42 +276,25 @@ def _core_modules() -> list[Path]:
     return modules
 
 
-def _phase_field_offenders(path: Path) -> list[str]:
-    """Attribute reads of `_PHASE_FIELDS` anywhere in `path`, outside the two
-    exempt regions computed from this module's own AST."""
-    tree = ast.parse(path.read_text())
-    allowed_ranges = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == "PrefillTarget":
-            allowed_ranges.append((node.lineno, node.end_lineno))
-        elif isinstance(node, ast.FunctionDef) and node.name == "_check_step_contract":
-            allowed_ranges.append((node.lineno, node.end_lineno))
-    offenders = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Attribute) or node.attr not in _PHASE_FIELDS:
-            continue
-        if any(lo <= node.lineno <= hi for lo, hi in allowed_ranges):
-            continue
-        offenders.append(f"{path.relative_to(_ROOT)}:{node.lineno} .{node.attr}")
-    return offenders
-
-
 def test_a_decode_target_never_reads_the_phase_back():
-    """An attribute read of `num_contexts` or `num_ctx_tokens` anywhere in a
-    core's module is a violation of the phase split, with exactly two named
-    exemptions:
+    """Decode is routed to only when there are no context rows. Reading the
+    count back inside it is not a redundancy, it is the design being violated:
+    the value is a per-capture constant, so a branch on it inside a captured
+    graph is frozen at whatever the capturing batch happened to carry.
 
-    `PrefillTarget` -- it holds the mixed batch and genuinely needs
-    `num_ctx_tokens` to split it; and `_check_step_contract` -- it
-    legitimately mirrors the same projection, once, phase-independently,
-    to validate it before either target runs.
+    Prefill is deliberately exempt -- it holds the mixed batch and genuinely
+    needs `num_ctx_tokens` to split it. The asymmetry is the design, not an
+    oversight.
 
-    The rule is inverted rather than enumerating class names, because
-    enumeration goes stale: `DecodeTarget` inherits its forward from
-    `_GptOssTarget` (where decode actually executes) and its `step_args`
-    delegates to the module-level `_build_step_args`. A gate keyed on the
-    `DecodeTarget` class name alone sees neither and only guards the one
-    call site that states the literals.
+    Scoped to the `DecodeTarget` class node rather than inverted over the
+    whole module: that inversion existed only while a decode body could be
+    inherited from a shared base, where `DecodeTarget`'s own node held just
+    the literal-args `step_args` call and a gate keyed on the class name saw
+    nothing of the forward that actually ran. Every target in this tree is
+    now a complete, independent class -- `DecodeTarget.forward` is not
+    inherited from anywhere -- so the class node is once again the target's
+    whole body, and the direct form catches a violation planted anywhere in
+    it.
 
     Read by parsing rather than by importing, like everything else in this
     file: no GPU, no built extensions.
@@ -320,7 +303,13 @@ def test_a_decode_target_never_reads_the_phase_back():
     for path in _core_modules():
         if not path.is_file():
             continue
-        offenders.extend(_phase_field_offenders(path))
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef) or node.name != "DecodeTarget":
+                continue
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Attribute) and inner.attr in _PHASE_FIELDS:
+                    offenders.append(f"{path.relative_to(_ROOT)}:{inner.lineno} .{inner.attr}")
     assert not offenders, "a decode target reads the phase it was routed on: " + ", ".join(
         offenders
     )
