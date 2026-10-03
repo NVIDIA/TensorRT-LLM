@@ -2254,8 +2254,11 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
 
     def cache_derived_state(self) -> None:
         """Build the decode GEMVs' state once the weights are final: the LM head's workspace, and one eager call of
-        every decode GEMV kernel at its site's shape (decode_gemv.SITES), so none compiles under capture."""
+        every decode GEMV kernel at its site's shape (decode_gemv.SITES), so none compiles under capture. Built once:
+        a later call keeps it, since CUDA graphs captured in between hold its workspace."""
         super().cache_derived_state()
+        if self.model.decode_gemvs is not None:
+            return
         gemvs = _decode_gemv.K3DecodeGemvs.create(self.lm_head)
         self.model.decode_gemvs = gemvs
         self.logits_processor.gemvs = gemvs
