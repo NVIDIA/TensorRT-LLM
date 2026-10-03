@@ -52,7 +52,11 @@ class GatedMLP(nn.Module):
         self.activation = activation
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         # Opt-in BF16 gate/up GEMM with SwiGLU in the epilogue (QuACK, SM100/SM103).
-        self.use_quack_swiglu_epilogue = use_quack_swiglu_epilogue
+        # Availability (GPU family, import and a probe compile) is resolved once
+        # here so that forward, which may run under torch.compile, only reads
+        # a plain attribute.
+        self.use_quack_swiglu_epilogue = (use_quack_swiglu_epilogue
+                                          and gate_up_swiglu_quack_available())
         self.swiglu_limit = float(
             swiglu_limit) if swiglu_limit is not None else None
         # SwiGLU-OAI shape parameters, left None for plain SwiGLU, where the
@@ -254,11 +258,12 @@ class GatedMLP(nn.Module):
         Requires ``use_quack_swiglu_epilogue=True`` at construction, plain
         SwiGLU (no limit, alpha or beta), an unquantized BF16 ``gate_up_proj``
         without bias and without tensor parallelism, K a multiple of 8 and an
-        intermediate size that is a multiple of 128 (QuACK tile alignment), no
-        other GEMM provider selected on the projection, on an SM100/SM103 GPU
-        with QuACK importable. Evaluated in forward, after the weights exist.
+        intermediate size that is a multiple of 128 (QuACK tile alignment) and no
+        other GEMM provider selected on the projection. GPU family and QuACK
+        availability were resolved at construction. Evaluated in forward, after
+        the weights exist.
         """
-        if not self.use_quack_swiglu_epilogue:
+        if not self.use_quack_swiglu_epilogue:  # opt-in and QuACK usable (resolved at construction)
             return False
         if not (self.activation == F.silu and self._is_plain_swiglu()):
             return False
@@ -277,7 +282,7 @@ class GatedMLP(nn.Module):
         if (getattr(proj, "use_cute_dsl_bf16_gemm", False)
                 or getattr(proj, "use_custom_cublas_mm", False)):
             return False
-        return gate_up_swiglu_quack_available()
+        return True
 
     def _can_fuse_swiglu_fp8_quant(self) -> bool:
         """Check whether down projection can consume fused SwiGLU FP8 output."""

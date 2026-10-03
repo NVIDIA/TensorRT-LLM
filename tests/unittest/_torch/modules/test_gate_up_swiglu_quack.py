@@ -103,7 +103,7 @@ def test_gated_mlp_dispatches_bf16_epilogue(monkeypatch):
     monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_bf16", tracked)
     with torch.inference_mode():
         fused_out = mlp(x)
-        monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_available", lambda: False)
+        monkeypatch.setattr(mlp, "use_quack_swiglu_epilogue", False)
         assert not mlp._can_fuse_gate_up_swiglu_bf16()
         unfused_out = mlp(x)
     assert calls == [True]
@@ -139,6 +139,13 @@ def test_gated_mlp_bf16_epilogue_is_opt_in_and_excludes_bias_quant_and_tp(monkey
     assert not mlp._can_fuse_gate_up_swiglu_bf16()  # quantized projection
     monkeypatch.undo()
     monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_available", lambda: True)
+    mlp = GatedMLP(
+        hidden_size=16,
+        intermediate_size=128,
+        bias=False,
+        dtype=torch.bfloat16,
+        use_quack_swiglu_epilogue=True,
+    )
     assert mlp._can_fuse_gate_up_swiglu_bf16()
     monkeypatch.setattr(mlp.gate_up_proj, "tp_size", 2)
     assert not mlp._can_fuse_gate_up_swiglu_bf16()  # tensor parallel
@@ -206,3 +213,24 @@ def test_gated_mlp_bf16_epilogue_replays_under_cuda_graph(monkeypatch):
             torch.cuda.synchronize()
             eager = mlp(x)
             assert torch.equal(static_out, eager)
+
+
+def test_availability_falls_back_when_the_probe_fails(monkeypatch):
+    """A QuACK/CUTLASS DSL mismatch shows up at kernel compile time; availability must report False."""
+    import types
+
+    fused._quack_gemm_act.cache_clear()
+    broken = types.ModuleType("quack.gemm_interface")
+
+    def gemm_act(*args, **kwargs):
+        raise ValueError("too many values to unpack (expected 3)")
+
+    broken.gemm_act = gemm_act
+    monkeypatch.setitem(__import__("sys").modules, "quack.gemm_interface", broken)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(fused, "get_sm_version", lambda: 100)
+    try:
+        assert fused._quack_gemm_act() is None
+        assert not fused.gate_up_swiglu_quack_available()
+    finally:
+        fused._quack_gemm_act.cache_clear()
