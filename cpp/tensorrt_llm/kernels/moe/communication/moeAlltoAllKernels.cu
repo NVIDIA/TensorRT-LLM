@@ -1617,8 +1617,10 @@ __device__ __forceinline__ void vec_convert(
         out[j] = DstT(static_cast<float>(in[j]));
 }
 
-// BF16 → FP8 e4m3: paired PTX cvt.rn.satfinite.e4m3x2.bf16x2 (SM100+, Blackwell).
-#if TLLM_MOE_A2A_COMPILE_SM100
+// Paired BF16 -> FP8 conversion requires PTX 9.1 (CUDA 13.1) and an
+// architecture- or family-specific Blackwell target.
+#if TLLM_MOE_A2A_COMPILE_SM100 && (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 130100)                \
+    && (TLLM_CUDA_HOST_PASS || defined(__CUDA_ARCH_SPECIFIC__) || defined(__CUDA_ARCH_FAMILY_SPECIFIC__))
 template <size_t VEC_SIZE, std::enable_if_t<(VEC_SIZE % 2 == 0), int> = 0>
 __device__ __forceinline__ void vec_convert(
     flashinfer::vec_t<__nv_fp8_e4m3, VEC_SIZE>& out, flashinfer::vec_t<__nv_bfloat16, VEC_SIZE> const& in)
