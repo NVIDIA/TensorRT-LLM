@@ -1347,6 +1347,25 @@ class KVCacheManager(BaseResourceManager):
                 _populate_dummy_mrope_config(req, token_num, is_gen)
             requests.append(req)
 
+        # Beam search allocates most blocks once per beam, so the single-block
+        # check above does not guarantee the dummy requests fit. Skip padding
+        # instead of failing inside the block manager. VSWA pools are sized
+        # per window, which this full-attention count does not model.
+        if beam_width > 1 and batch_request_infos and not self.is_vswa:
+            num_appended_tokens = self.num_extra_kv_tokens + (_kv_draft
+                                                              if is_gen else 0)
+            num_required_blocks = sum(
+                self._get_num_blocks_for_dummy_request(
+                    token_num, num_appended_tokens, beam_width)
+                for _, token_num, _ in batch_request_infos)
+            if num_required_blocks > available_blocks:
+                logger.debug(
+                    f"[add_dummy_requests] {len(batch_request_infos)} dummy "
+                    f"requests with beam_width={beam_width} need "
+                    f"{num_required_blocks} blocks, only {available_blocks} "
+                    f"free; skipping.")
+                return None
+
         try:
             # Use add_sequence_batch for all dummy requests, then add extra tokens.
             # This must happen before is_gen state modifications below, which may
@@ -1839,17 +1858,61 @@ class KVCacheManager(BaseResourceManager):
     def get_num_available_tokens(self,
                                  token_num_upper_bound: int,
                                  max_num_draft_tokens: int = 0,
+                                 max_beam_width: int = 1,
                                  **kwargs) -> int:
+        """Return a token count such that one sequence of any length up to it
+        fits in the free blocks.
+
+        Args:
+            token_num_upper_bound: Upper bound on the returned token count.
+            max_num_draft_tokens: Draft tokens appended after the sequence.
+            max_beam_width: Beam width of the sequence. With beam search, only
+                blocks fully covered by the prompt are shared among beams; the
+                rest are allocated once per beam.
+        """
         free_blocks = self.get_num_free_blocks()
-        result = min(
-            token_num_upper_bound, free_blocks * self.tokens_per_block -
-            self.num_extra_kv_tokens - max_num_draft_tokens)
+        num_appended_tokens = self.num_extra_kv_tokens + max_num_draft_tokens
+        if max_beam_width > 1 and self.kv_cache_type != CacheTypeCpp.CROSS:
+            # Block usage is not monotonic in the sequence length (a
+            # block-aligned prompt shares all of its blocks), so bound it by
+            # the worst case: a partially filled last prompt block followed by
+            # the appended tokens, all allocated per beam.
+            max_blocks_per_beam = math.ceil(
+                (self.tokens_per_block - 1 + num_appended_tokens) /
+                self.tokens_per_block)
+            num_shared_blocks = free_blocks - max_beam_width * max_blocks_per_beam
+            capacity = (num_shared_blocks + 1) * self.tokens_per_block - 1
+        else:
+            capacity = free_blocks * self.tokens_per_block - num_appended_tokens
+        result = min(token_num_upper_bound, capacity)
         logger.debug(
             f"[get_num_available_tokens] free_blocks={free_blocks}, "
             f"tokens_per_block={self.tokens_per_block}, "
             f"num_extra_kv_tokens={self.num_extra_kv_tokens}, "
+            f"max_beam_width={max_beam_width}, "
             f"token_num_upper_bound={token_num_upper_bound}, result={result}")
         return result
+
+    def _get_num_blocks_for_dummy_request(self, token_num: int,
+                                          num_appended_tokens: int,
+                                          beam_width: int) -> int:
+        """Number of blocks ``add_dummy_requests`` allocates for one sequence
+        of ``token_num`` prompt tokens followed by ``num_appended_tokens``
+        tokens added one at a time.
+
+        Blocks fully covered by the prompt are shared among beams (for cross
+        KV, the partial last prompt block is shared too); every other block is
+        allocated once per beam.
+        """
+        num_blocks = math.ceil(
+            (token_num + num_appended_tokens) / self.tokens_per_block)
+        if beam_width == 1:
+            return num_blocks
+        if self.kv_cache_type == CacheTypeCpp.CROSS:
+            num_shared_blocks = math.ceil(token_num / self.tokens_per_block)
+        else:
+            num_shared_blocks = token_num // self.tokens_per_block
+        return num_shared_blocks + beam_width * (num_blocks - num_shared_blocks)
 
     def get_buffers(self,
                     layer_idx: int,
