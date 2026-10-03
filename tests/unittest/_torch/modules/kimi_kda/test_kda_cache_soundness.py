@@ -247,6 +247,43 @@ def test_recycled_cu_seqlens_id_matches_fla(
 
 
 @torch.no_grad()
+def test_evicted_prefill_scratch_is_released(
+    dispatch_pair: tuple[KDAKernelDispatch, KDAKernelDispatch],
+    gate_params: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """Scratch that leaves the LRU buffer cache keeps no pinned cute wrapper.
+
+    A serving process sees a new prefill length on almost every call. The
+    buffer cache holds the scratch of the last few lengths only, so the
+    scratch of every older length must be freed.
+    """
+    optimized, _ = dispatch_pair
+    module = _op_module()
+
+    def scratch_ids() -> set[int]:
+        return {
+            id(tensor)
+            for entry in module._buf_cache.values()
+            for tensor in entry
+            if isinstance(tensor, torch.Tensor)
+        }
+
+    seen: set[int] = set()
+    for step in range(module._BUF_CACHE_MAX_ENTRIES + 4):
+        total_tokens = 256 + 64 * step
+        inputs = _make_inputs(total_tokens, seed=100 + step)
+        run_indexed_prefill(optimized, gate_params, inputs, _make_cu_seqlens([total_tokens]))
+        torch.cuda.synchronize()
+        seen |= scratch_ids()
+
+    assert len(module._buf_cache) <= module._BUF_CACHE_MAX_ENTRIES
+    evicted = seen - scratch_ids()
+    assert evicted, "the run must evict at least one buffer-cache entry"
+    pinned = {key[0] for key in module._input_wrap_cache} & evicted
+    assert not pinned, f"{len(pinned)} evicted scratch tensors are still pinned by cached wrappers"
+
+
+@torch.no_grad()
 def test_repeated_single_sequence_metadata_matches_fla(
     dispatch_pair: tuple[KDAKernelDispatch, KDAKernelDispatch],
     gate_params: tuple[torch.Tensor, torch.Tensor],
