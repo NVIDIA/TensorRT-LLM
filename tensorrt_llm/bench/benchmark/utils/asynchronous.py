@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import tqdm
 from transformers import PreTrainedTokenizer
-from zmq import PUSH
+from zmq import LINGER, PUSH
 from zmq.asyncio import Context
 
 from tensorrt_llm import LLM, SamplingParams
@@ -33,6 +33,12 @@ from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
+
+_ITERATION_STATS_TIMEOUT_SEC = 2.0
+# Shutdown may finish one in-flight stats read and then perform a final read.
+# RPC-backed reads can spend the timeout in both fetch and iteration.
+_ITERATION_LOG_DRAIN_TIMEOUT_SEC = 2 * 2 * _ITERATION_STATS_TIMEOUT_SEC + 1.0
+_ITERATION_LOG_LINGER_MS = 1000
 
 
 class LlmManager:
@@ -324,8 +330,9 @@ class LlmManager:
 
         try:
             # Create a ZMQ context and socket for sending data
-            context = Context.instance(io_threads=1)
+            context = Context(io_threads=1)
             socket = context.socket(PUSH)
+            socket.setsockopt(LINGER, _ITERATION_LOG_LINGER_MS)
             socket.connect(iteration_addr)
 
             # Wait until a request is seen before proceeding
@@ -335,7 +342,8 @@ class LlmManager:
 
             # Continuously send statistics data while the stop signal is not set
             while not self._stop.is_set():
-                async for stats in self.llm.get_stats_async(2):
+                async for stats in self.llm.get_stats_async(
+                        _ITERATION_STATS_TIMEOUT_SEC):
                     await socket.send_json(stats)
                 # NOTE: This is a WAR to force this loop to relinquish control
                 # that was preventing other async tasks from holding the event
@@ -344,24 +352,19 @@ class LlmManager:
 
             # Wrap up by sending any remaining statistics data
             logger.debug("Iteration log worker wrapping up...")
-            async for stats in self.llm.get_stats_async(2):
+            async for stats in self.llm.get_stats_async(
+                    _ITERATION_STATS_TIMEOUT_SEC):
                 await socket.send_json(stats)
+            await socket.send_json({"end": True})
         except asyncio.CancelledError:
-            # Handle task cancellation
             logger.debug("Iteration log worker cancelled.")
-        except Exception as e:
-            # Raise any other exceptions encountered
-            raise e
+            raise
         finally:
-            # Ensure the socket sends a termination message and is properly closed
-            logger.debug("Iteration log worker sending None...")
-            socket.send_json({"end": True})
             if socket is not None:
-                logger.debug("Closing socket...")
                 socket.close()
             if context is not None:
-                logger.debug("Terminating context...")
-                context.term()
+                # Even finite linger can block; keep the event loop responsive.
+                await asyncio.to_thread(context.term)
 
         logger.info("Iteration log worker exiting.")
 
@@ -369,7 +372,12 @@ class LlmManager:
         logger.info("Stopping LLM backend.")
         self._stop.set()
         if self._iteration_log_task:
-            await self._iteration_log_task
+            try:
+                await asyncio.wait_for(self._iteration_log_task,
+                                       timeout=_ITERATION_LOG_DRAIN_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                logger.warning("Iteration logging timed out; the iteration log "
+                               "may be incomplete.")
         assert self._backend_task is not None
         await self._backend_task
         logger.info("LLM Backend stopped.")

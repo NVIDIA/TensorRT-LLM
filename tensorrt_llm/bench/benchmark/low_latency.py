@@ -272,6 +272,7 @@ def latency_command(
     exec_settings["performance_options"]["multi_block_mode"] = True
 
     exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
+    exec_settings["iteration_log"] = options.iteration_log
     exec_settings["explicit_cli_keys"] = collect_explicit_cli_keys()
 
     # Construct the runtime configuration dataclass.
