@@ -171,8 +171,8 @@ forms are two kernels, each compiled (seconds) on its first call, which must be 
   is compared bit for bit in both forms. `normed` is compared with torch's fp32 RMSNorm within 2e-2 of its largest
   magnitude (the one-shot rounds the squares to bf16 and sums them in its own tree). SiLU-and-mul's rounding on
   general inputs is the kernel test's to certify (bit for bit against `k3_ctm_gemv_swiglu`), not this matrix's.
-- World sizes: as for `k3_sandwich_oproj`; this entry's 16-rank receipt is pending. The op's kernel test
-  (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py`) passed every case at 16 ranks on four
+- World sizes: as for `k3_sandwich_oproj`; at 16 ranks this entry's matrix passes in a recorded run. The op's kernel
+  test (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py`) passed every case at 16 ranks on four
   trays in a recorded run: the kernel's record, not this entry's receipt.
 - State: `mutates_args` names `ws_uc`, `ws_mc` and `ws_flags`, every buffer the op writes. The compile cache is the
   documented process-wide cache above.

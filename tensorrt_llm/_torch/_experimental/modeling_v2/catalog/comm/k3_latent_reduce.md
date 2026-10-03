@@ -224,6 +224,7 @@ scheduling, not results (the op's statement; the test runs the default).
   time.
 - World size: the matrix takes `--world-size` and `--launcher` (`mpirun` on one node, `srun` across nodes). Kimi K3
   runs the op over 16 ranks on four trays, where the kernel sums the ranks in two chunks of 8 and uses 14 CTAs per
-  token row; a 4-rank run reaches neither. The 16-rank receipt is pending; `W` = 8 is not run.
+  token row; a 4-rank run reaches neither. At 16 ranks (four GB200 trays of one rack, fabric handles) the matrix
+  passes, every check on every rank, in a recorded run; `W` = 8 is not run.
 - The op writes `lat_uc` (it empties words) and `lat_flags`, and its schema declares both mutable; the producers'
   writes through `mc` are theirs to declare. The compile cache is a module-level dict (result-neutral, above).
