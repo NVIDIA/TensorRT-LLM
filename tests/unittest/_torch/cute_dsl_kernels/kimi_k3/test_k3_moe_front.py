@@ -14,9 +14,10 @@
 # limitations under the License.
 """trtllm::k3_moe_front and K3MoeLayer.front (the Kimi K3 MoE front: sharded head GEMV, head all-gather, top-16
 routing, MXFP8 latent, shared gate_up + SiTU; then k3_moe on its grid), one process per GPU over the TP group of this
-run, at every M in 1..8, over one K3MoeHeadWorkspace. The head is sharded over the group (TP W: 3584 / W latent + 896 / W router rows and
-2 x 6144 / W shared rows per rank; W = 4 on one GB200 tray, the model's TP16 shapes with 16 processes); the routed
-experts are one rank of experts TP4 x EP4 (224 local experts, intermediate 768), as in the TP16 deployment.
+run, at every M in 1..8, over one K3MoeHeadWorkspace. The head is sharded over the group (TP W: 3584 / W latent +
+896 / W router rows and 2 x 6144 / W shared rows per rank; W = 4 on one GB200 tray, the model's TP16 shapes with 16
+processes); the routed experts are one rank of experts TP4 x EP4 (224 local experts, intermediate 768), as in the TP16
+deployment.
   front : against the unfused chain (the head GEMV in fp32 torch -> the gather ->
           trtllm::kimi_k3_noaux_tc_mxfp8_quant; shared: cuBLAS gate_up -> trtllm::situ_and_mul): top-16 ids per
           token (a mismatch only at a reference

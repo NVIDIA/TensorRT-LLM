@@ -424,7 +424,7 @@ def check_wrap(ctx):
     ctx.comm.Barrier()
     wrapped = run()
     after = int(flags[0].item())
-    same = all(_same(a, b) for fo, wo in zip(fresh, wrapped) for a, b in zip(fo, wo))
+    same = all(_same(a, b) for f_out, w_out in zip(fresh, wrapped) for a, b in zip(f_out, w_out))
     row = dict(op="k3_sandwich_wrap", case="int32_wrap", M=8, eq_fresh=same, crossed=after < 0, calls=len(calls))
     row["ok"] = _all_ranks(ctx, same and row["crossed"])
     return [row]
@@ -469,7 +469,7 @@ def check_fold_wrap(ctx):
     flags[0] = 2**31 - 4 + (count & 1)
     torch.cuda.synchronize()
     wrapped, wrapped_kept = run()
-    same = all(_same(a, b) for fo, wo in zip(fresh, wrapped) for a, b in zip(fo, wo))
+    same = all(_same(a, b) for f_out, w_out in zip(fresh, wrapped) for a, b in zip(f_out, w_out))
     kept = all(fresh_kept) and all(wrapped_kept)
     row = dict(op="k3_sandwich_tail_fold", case="count_wrap", M=8, eq_fresh=same, other_words_kept=kept,
                count_after=int(flags[0].item()))  # fmt: skip

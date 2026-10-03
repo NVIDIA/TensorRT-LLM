@@ -150,7 +150,8 @@ def _reference(raw, x_deq, ids, weights):
             xe = x_deq[tok].double()
             up = (xe @ _deq_w(raw["up"][e], raw["up_s"][e]).double().t()).float()
             gate = (xe @ _deq_w(raw["gate"][e], raw["gate_s"][e]).double().t()).float()
-            act = GATE_CAP * torch.tanh(gate / GATE_CAP) * torch.sigmoid(gate) * (LINEAR_CAP * torch.tanh(up / LINEAR_CAP))
+            act = GATE_CAP * torch.tanh(gate / GATE_CAP) * torch.sigmoid(gate)
+            act = act * (LINEAR_CAP * torch.tanh(up / LINEAR_CAP))
             y = (_requant(act).double() @ _deq_w(raw["down"][e], raw["down_s"][e]).double().t()).float()
             out.index_add_(0, tok, y * weights[tok, slot].float().unsqueeze(1))
         return out

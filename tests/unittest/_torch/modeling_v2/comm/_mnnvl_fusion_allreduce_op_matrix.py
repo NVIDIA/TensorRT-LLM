@@ -561,10 +561,10 @@ def check_graph_capture_and_replay() -> None:
         AR(6004, 32, H_MODEL, path="two"),
         AR(6005, 16, H_MODEL, residual=True, path="two"),
     ]
-    statics = [c.static() for c in calls]
+    static_bufs = [c.static() for c in calls]
 
     def step():
-        return [c.run(WS_B, **s) for c, s in zip(calls, statics)]
+        return [c.run(WS_B, **s) for c, s in zip(calls, static_bufs)]
 
     outs = step()  # every call once eagerly, outside capture
     for i, (c, got) in enumerate(zip(calls, outs)):
@@ -585,7 +585,7 @@ def check_graph_capture_and_replay() -> None:
         lambda seed: AR(seed, 64, H_LATENT, path="one"),
     )
     for rep in range(8):
-        for i, (c, s) in enumerate(zip(calls, statics)):
+        for i, (c, s) in enumerate(zip(calls, static_bufs)):
             c.refill(c.fresh(7000 + 100 * rep + i), s)
         R.barrier()
         graph.replay()

@@ -544,9 +544,9 @@ def check_graph_capture_and_replay() -> None:
     buffers are empty, WS_B's epoch advanced once per head_flags call, replayed or eager, with every ready word at it,
     and both states armed.
     """
-    statics = [torch.zeros(8, HIDDEN, dtype=torch.bfloat16, device="cuda") for _ in range(LAYERS)]
+    static_bufs = [torch.zeros(8, HIDDEN, dtype=torch.bfloat16, device="cuda") for _ in range(LAYERS)]
     shells = [
-        Call(0, 0, layer=layer, kind=KINDS[layer], x=statics[layer]) for layer in range(LAYERS)
+        Call(0, 0, layer=layer, kind=KINDS[layer], x=static_bufs[layer]) for layer in range(LAYERS)
     ]
 
     def step():
@@ -564,7 +564,7 @@ def check_graph_capture_and_replay() -> None:
     alone_eager = alone_results(eagers, WS_A, "eager between replays")
 
     epoch0 = epoch_and_words(WS_B)[0]
-    for static, c in zip(statics, warm):
+    for static, c in zip(static_bufs, warm):
         static.copy_(c.x)
     R.barrier()
     step()  # every first call of this step eager
@@ -577,7 +577,7 @@ def check_graph_capture_and_replay() -> None:
     R.barrier()
     flag_calls = 1  # the warm-up step's
     for r in range(REPLAYS):
-        for static, c in zip(statics, reps[r]):
+        for static, c in zip(static_bufs, reps[r]):
             static.copy_(c.x)
         R.barrier()
         graph.replay()
