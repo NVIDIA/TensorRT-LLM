@@ -18,7 +18,7 @@ import time
 import uuid
 from collections import Counter, defaultdict
 from itertools import chain
-from typing import Any, Callable, Dict, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, cast
 
 import numpy as np
 import torch
@@ -45,16 +45,19 @@ from tensorrt_llm._torch.disaggregation.native.bounce import (
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.publish import PeerPublish
-from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
+from tensorrt_llm._torch.disaggregation.native.retirement import QuiescenceFatalEvent
+from tensorrt_llm._torch.disaggregation.native.transfer import (
+    RxSession,
+    TransferWorker,
+    TransferWorkerConfig,
+)
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
-from tensorrt_llm._torch.disaggregation.resource.utils import (
-    get_physical_pool,
-    get_pool_view_num_layers,
-)
+from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_slot_bytes
 from tensorrt_llm._torch.distributed.communicator import Distributed
+from tensorrt_llm._torch.pyexecutor import hang_detector
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
@@ -65,14 +68,115 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, nvtx_range
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
+if TYPE_CHECKING:
+    from mpi4py import MPI
+
 _FP4_MLA_OWNERSHIP_BRIDGE_ENV = "TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE"
+_FATAL_LOG_JOIN_TIMEOUT_S = 0.5
+
+
+def _log_unproven_kv_transfer(event: QuiescenceFatalEvent) -> None:
+    """Emit best-effort fatal diagnostics on a dedicated thread.
+
+    Args:
+        event: The sticky expiry event retained by the watchdog.
+    """
+    try:
+        logger.critical(
+            "UNPROVEN_FATAL: hard-stopping through MPI/launcher; termination may include "
+            "other executors in the same job. Retaining KV "
+            f"and transport roots until process teardown. request_id={event.request_id}, "
+            f"direction={event.direction}, reason={event.reason}, "
+            f"deadline={event.deadline}, expired_at={event.expired_at}"
+        )
+    except Exception:  # noqa: BLE001 - diagnostics cannot alter containment
+        pass
+
+
+def _fail_unproven_kv_transfer(
+    event: QuiescenceFatalEvent, communicator: Optional["MPI.Comm"] = None
+) -> None:
+    """Terminate the executor world without running ordinary resource cleanup.
+
+    Called by the independent retirement watchdog after fatal expiry is sticky
+    and transfer admission is closed. The existing MPI/launcher crash path
+    makes the endpoint unhealthy; request failure is not memory-release proof.
+    The communicator identifies the executor, not an isolated failure domain:
+    Open MPI aborts the entire job, including other executors in split worlds.
+    Launcher-driven termination can likewise extend beyond this executor.
+    A supervisor may replace the world only after qualified platform teardown,
+    not merely after this function requests termination.
+
+    Args:
+        event: The first unproven physical owner whose drain deadline expired.
+        communicator: Validated executor world captured before the watchdog starts.
+    """
+    try:
+        log_thread = threading.Thread(
+            target=_log_unproven_kv_transfer,
+            args=(event,),
+            name="kv-retirement-fatal-log",
+            daemon=True,
+        )
+        log_thread.start()
+        # Allow a fast diagnostic to finish without waiting indefinitely for
+        # a blocked handler. Admission and unresolved roots remain fenced.
+        log_thread.join(timeout=_FATAL_LOG_JOIN_TIMEOUT_S)
+    finally:
+        # Do not call PyExecutor._handle_errors(), request termination, or
+        # transceiver.shutdown(): their normal cleanup may recycle KV pages.
+        hang_detector.propagate_hard_kill(diagnostics=False, communicator=communicator)
+
+
+def _retirement_executor_comm(mapping: Mapping) -> "MPI.Comm":
+    """Capture the MPI executor world that the deadline watchdog may abort.
+
+    Rank/size validation does not isolate termination. Shared MPI launches can
+    lose every executor when one executor reaches fatal expiry.
+
+    Args:
+        mapping: The executor's expected worker rank and world size.
+
+    Returns:
+        The exact communicator, retained rather than resolved on another thread.
+
+    Raises:
+        ValueError: MPI cannot safely terminate the complete executor world.
+    """
+    message = (
+        "KV retirement fail-stop requires an initialized MPI executor world with "
+        "MPI_THREAD_MULTIPLE and communicator rank/size matching Mapping; "
+        "non-MPI launchers are not qualified"
+    )
+    if not ENABLE_MULTI_DEVICE or mpi_disabled():
+        raise ValueError(message)
+    from mpi4py import MPI
+
+    if not MPI.Is_initialized() or MPI.Is_finalized() or MPI.Query_thread() != MPI.THREAD_MULTIPLE:
+        raise ValueError(message)
+    communicator = mpi_comm()
+    if (
+        communicator == MPI.COMM_NULL
+        or communicator.Is_inter()
+        or communicator.Get_size() != mapping.world_size
+        or communicator.Get_rank() != mapping.rank
+    ):
+        raise ValueError(message)
+    if mapping.rank == 0:
+        logger.warning(
+            "KV retirement fail-stop may terminate the entire MPI job, including other "
+            "CTX/GEN executors sharing the launch. A split communicator does not isolate "
+            "MPI_Abort. Use separate launcher jobs when independent availability is required, "
+            "and qualify their termination boundaries."
+        )
+    return communicator
 
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
@@ -161,6 +265,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             mapping, kv_cache_manager, cache_transceiver_config
         )
         self._fp4_mla_bridge_enabled = enforce_physical_ownership
+        self._retirement_mpi_comm = (
+            _retirement_executor_comm(mapping) if enforce_physical_ownership else None
+        )
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
 
         self._device_id = torch.cuda.current_device()
@@ -190,6 +297,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 tx_overall_timeout_s=transfer_timeout_s,
                 rx_timeout_s=transfer_timeout_s,
                 enforce_physical_ownership=enforce_physical_ownership,
+                quiescence_fatal_callback=(
+                    self._fail_unproven_transfer if enforce_physical_ownership else None
+                ),
                 # kv_cache_bounce_size_mb is the shared bounce capacity; agent_bounce_buffer_enable
                 # routes it to exactly one implementation: the Python bounce below (per-region,
                 # size 0 = off; the per-transfer size gates are internal, tuned via env:
@@ -215,6 +325,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"rank={rank}/{mapping.world_size}, backend=NIXL, runtime=PYTHON, "
                 "request_schedule_required=GENERATION_FIRST, attention_dp=True, pp=1, cp=1, "
                 "retry=False, async=True, layerwise=False, bounce_mb=0, "
+                "unproven_retirement=fail_stop, termination_scope=mpi_job_or_launcher, "
                 f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}"
             )
         logger.info(
@@ -254,6 +365,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # per-iter tp_allgather when this transceiver never sends/receives.
         self._ever_had_send_session: bool = False
         self._ever_had_recv_session: bool = False
+
+    def _fail_unproven_transfer(self, event: QuiescenceFatalEvent) -> None:
+        """Fail-stop while the watchdog retains this transceiver's resource roots.
+
+        The bound callback keeps request maps, KV manager, transfer worker and
+        agent alive through the watchdog's persistent fatal thread even if the
+        termination call raises or unexpectedly returns.
+
+        Args:
+            event: The sticky physical-retirement deadline expiry.
+        """
+        _fail_unproven_kv_transfer(event, self._retirement_mpi_comm)
 
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
@@ -346,6 +469,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _shutdown_once(self) -> None:
         if getattr(self, "_shutdown_complete", False):
             return
+        # Preflight may refuse closure while DMA remains active. Start the
+        # bounded drain before that refusal, not only in worker.shutdown().
+        self._transfer_worker.request_shutdown()
         # This flag records completed teardown, not an attempted shutdown. If
         # an active owner refuses closure, leave it false so shutdown can be
         # retried after the physical operation drains.
@@ -353,6 +479,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # separate drain snapshot would not be sufficient: late evidence can make an
         # owner unretirable before close() acquires its lock.
         for rid, session in list(self._recv_sessions.items()):
+            if getattr(session, "_retirement", None) is not None:
+                # Close unpublished admission before inspecting drain state.
+                # Published accessors remain retained; do not notify peers here.
+                session.cancel_local()
             self._close_session_or_raise(session, rid, "shutdown")
         for rid, session in list(self._send_sessions.items()):
             self._close_session_or_raise(session, rid, "shutdown")
@@ -454,8 +584,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return window
 
     def _chunk_num_bytes(self, chunk: Chunk) -> int:
-        """Local-rank KV bytes covered by a chunk (sum of num_valid_blocks * pool.slot_bytes), enough to populate
-        kv_cache_size and unblock the perf-metric timestamps that gate on it.
+        """Local-rank KV bytes covered by a chunk: per view, the valid block count times the view's
+        transferable slot region. Populates kv_cache_size (and the perf-metric timestamps that gate
+        on it) and is the exact expected-write total the verified-reuse admission checks attested
+        sender bytes against, so it must count what the mappers move, never physical slot bytes: a
+        coalesced pool carries one view per role class (summing slot_bytes per view would double
+        count the slot) and ignored-role buffers occupy slot offsets no view transfers.
 
         Counterpart accounting: the bounce reserve sizing (bounce/impl.py block_bytes_per_group)
         computes per-block bytes for the same layer groups but reads pool 0 only, while this sums
@@ -474,16 +608,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 continue
             lg = pt.layer_groups[lg_id]
             for pv in lg.pool_views:
-                pool = get_physical_pool(pt, lg_id, pv.pool_idx)
+                # The view's byte regions within one slot (all of its layers).
+                view_bytes = get_pool_view_slot_bytes(pv)
                 if lg.kind == CacheKind.STATE:
-                    # STATE: n=1 (one slot), but transfer covers all layers of
-                    # the view. The physical slot may hold several roles, so
-                    # size by the view's per-layer bytes, not the pool's slot.
-                    num_layers = get_pool_view_num_layers(pv)
-                    total += num_layers * pv.bytes_per_layer
+                    # STATE: one slot per request; the transfer covers each
+                    # view region once regardless of the block count.
+                    total += view_bytes
                 else:
-                    # Attention: n blocks, each slot covers all layers.
-                    total += n * pool.slot_bytes
+                    # Attention: n blocks, each covering the view's regions.
+                    total += n * view_bytes
         return total
 
     @staticmethod
@@ -565,13 +698,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         allgather: Callable,
         need_sync: bool,
         locally_quiesced=None,
+        locally_verified=None,
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
-        # Quiescence, when requested, also requires agreement from every rank.
+        # Quiescence and write-verification, when requested, also require
+        # agreement from every rank.
         # Batch the id lists into one allgather to cut the per-step collective count.
         local_outcome = [list(cancelled), list(failed), list(completed)]
         if locally_quiesced is not None:
             local_outcome.append(list(locally_quiesced))
+        if locally_verified is not None:
+            local_outcome.append(list(locally_verified))
         if not need_sync:
             packed = [local_outcome]
         else:
@@ -590,14 +727,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         new_completed = [
             rid for rid in to_process if rid in global_completed and rid not in terminal
         ]
+        result = [new_cancelled, new_failed, new_completed]
+        idx = 3
         if locally_quiesced is not None:
-            all_quiesced = [p[3] for p in packed]
+            all_quiesced = [p[idx] for p in packed]
+            idx += 1
             global_quiesced = self._intersection(all_quiesced, n)
-            new_quiesced = [rid for rid in to_process if rid in global_quiesced]
-            return new_cancelled, new_failed, new_completed, new_quiesced
-        return new_cancelled, new_failed, new_completed
+            result.append([rid for rid in to_process if rid in global_quiesced])
+        if locally_verified is not None:
+            # Per-rank reuse trees stay consistent only if every rank admits
+            # the same tokens, so a request counts as write-verified only
+            # when EVERY rank verified its local shard.
+            all_verified = [p[idx] for p in packed]
+            global_verified = self._intersection(all_verified, n)
+            result.append({rid for rid in to_process if rid in global_verified})
+        return tuple(result)
 
-    def _gen_consensus_outcome(self, to_process, cancelled, failed, completed):
+    def _gen_consensus_outcome(self, to_process, cancelled, failed, completed, locally_verified):
         # A failure/cancellation may be global, but reuse is safe only after
         # every participating rank has drained its local physical accessor.
         locally_retirable = []
@@ -605,20 +751,24 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._recv_sessions[rid]
             if not self._ownership_blocks_retirement(session):
                 locally_retirable.append(rid)
-        new_cancelled, new_failed, new_completed, globally_retirable = self._consensus_outcome(
-            to_process,
-            cancelled,
-            failed,
-            completed,
-            self._gen_allgather,
-            self._gen_need_sync,
-            locally_retirable,
+        new_cancelled, new_failed, new_completed, globally_retirable, verified = (
+            self._consensus_outcome(
+                to_process,
+                cancelled,
+                failed,
+                completed,
+                self._gen_allgather,
+                self._gen_need_sync,
+                locally_retirable,
+                locally_verified,
+            )
         )
         retirable = set(globally_retirable)
         return (
             [rid for rid in new_cancelled if rid in retirable],
             [rid for rid in new_failed if rid in retirable],
             new_completed,
+            verified,
         )
 
     def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed, locally_quiesced):
@@ -697,6 +847,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 completed.append(rid)
             elif session.has_failed():
                 if self._ownership_blocks_retirement(session):
+                    if isinstance(session, RxSession):
+                        session.notify_cancel()
                     continue
                 failed.append(rid)
         return completed, failed
@@ -913,7 +1065,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
             # A remote cancellation can win before the local TxSession is
             # created. Sender.setup_session() records that terminal state and
-            # reports safe pre-submission failures to every known receiver;
+            # acknowledges the fenced session to every known receiver;
             # leave retirement to the normal status path without attempting
             # to publish KV or auxiliary memory afterward.
             if session.has_failed():
@@ -960,13 +1112,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             fetches = self._open_peer_source(req)
             # Same submission the asynchronous entry makes; what differs is who waits. The session
             # underneath is read back for the blocking wait, the auxiliary buffer and the close.
-            fetches.fetch(extent)
+            fetches.fetch(extent, expected_write_bytes=self._chunk_num_bytes(extent.local))
             session = self._legacy_session(fetches)
             self._recv_sessions[rid] = session
             self._recv_reqs[rid] = req
             result = session.wait_complete(blocking=True)
 
             if result == WaitResult.COMPLETED:
+                # Verified-range reuse admission (local verdict; this
+                # blocking path has no cross-rank outcome consensus).
+                req.py_kv_transfer_verified = session.kv_write_verified()
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
                 req.set_kv_cache_size(
                     self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
@@ -1032,7 +1187,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
             return
         extent = self._create_cache_extent(req)
-        req.py_kv_cache_xfer_bytes = self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
+        chunk_bytes = self._chunk_num_bytes(extent.local)
+        req.py_kv_cache_xfer_bytes = chunk_bytes * self._kv_size_rank_factor
         fetches = self._open_peer_source(req)
         # Claimed to be transferring only once there is something to transfer: a builder that
         # raises above leaves the request where it was, not in a state nothing advances.
@@ -1043,7 +1199,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         try:
             # The handle that comes back is the contract's answer about this piece. What retires
             # the request is the sweep over the session tables, as it was before.
-            fetches.fetch(extent)
+            fetches.fetch(extent, expected_write_bytes=chunk_bytes)
         except Exception:
             # No session means no publication and nothing the sweep could ever pair the request
             # with, so the registration made here is undone here and the request goes terminal.
@@ -1193,9 +1349,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 failed.append(rid)
             # else: None — KV done but aux still in flight; re-poll next cycle
 
+        # Verified-range reuse admission: a rid qualifies only when this
+        # rank's session attests full write coverage of the published
+        # destination bytes (see RxSession.kv_write_verified).
+        locally_verified = [
+            rid for rid in completed if self._recv_sessions[rid].kv_write_verified()
+        ]
+
         # All ranks must agree on per-rid outcome to avoid req.state divergence.
-        cancelled, failed, completed = self._gen_consensus_outcome(
-            to_process, cancelled, failed, completed
+        cancelled, failed, completed, verified = self._gen_consensus_outcome(
+            to_process, cancelled, failed, completed, locally_verified
         )
 
         cancelled_reqs = []
@@ -1223,6 +1386,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid in completed:
             session = self._recv_sessions[rid]
             req = self._recv_reqs[rid]
+            # Stamp the write-verification verdict on the request before the
+            # session is closed and dropped: commit_blocks_for_reuse runs
+            # later (batch preparation) and gates reuse admission on it.
+            req.py_kv_transfer_verified = rid in verified
             # transfer_end already stamped at completion detection above.
             req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
             if self._need_aux_transfer(req):
@@ -1454,6 +1621,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return True
 
     def commit_blocks_for_reuse(self, req) -> None:
+        # Verified-range admission (fail-closed): commit the received range
+        # to the reuse tree only when every published destination byte has
+        # attested write coverage on every rank. Transfer SUCCESS alone is
+        # not proof the destination pages were written — a false-success
+        # would otherwise admit never-written pages under the prompt's token
+        # hashes and reuse would re-serve the poisoned prefix. Skipping the
+        # commit never affects the request itself: generation proceeds
+        # normally, the blocks just stay out of the reuse tree.
+        if not getattr(req, "py_kv_transfer_verified", False):
+            logger.warning(
+                "Skipping KV block reuse admission for request "
+                f"{req.py_request_id}: the received range is not verified as "
+                "written (attested bytes did not cover the published "
+                "destination on every rank)"
+            )
+            return
         self._reuse_adapter.commit_blocks_for_reuse(req)
 
     def get_context_state(self):

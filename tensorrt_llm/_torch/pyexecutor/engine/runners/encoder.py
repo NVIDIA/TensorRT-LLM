@@ -8,7 +8,7 @@ from __future__ import annotations
 import gc
 import os
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, cast
 
@@ -21,9 +21,14 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionMetadata,
     AttentionRuntimeFeatures,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.memory_buffer_utils import with_shared_pool
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancerIterContext
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
+    MoeLoadBalancer,
+    MoeLoadBalancerIterContext,
+)
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     EncoderCUDAGraphRunner,
     EncoderCUDAGraphRunnerConfig,
@@ -31,7 +36,13 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
 )
 from tensorrt_llm._torch.utils import torch_multi_arange, with_model_extra_attrs
 from tensorrt_llm._utils import maybe_pin_memory, nvtx_range, prefer_pinned
-from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, validate_token_encoder_bucket_config
+from tensorrt_llm.llmapi.llm_args import (
+    ENCODER_RESERVED_INPUT_NAMES,
+    ENCODER_RUNNER_MANAGED_INPUTS,
+    EncodeCudaGraphConfig,
+    EncodeExtraInputSpec,
+    validate_token_encoder_bucket_config,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -42,8 +53,10 @@ from ..cuda_graph import (
     filter_cuda_graph_num_tokens,
     filter_cuda_graph_seq_lens,
 )
+from ..input_buffers import InputBuffers
 from ..metadata import build_attention_metadata
-from .interface import PackedEncoderBatch, PreparedInputs, RunnerConfig, RunnerDeps
+from ..model_call import ModelCaller
+from .interface import PackedInputs, PackedModelRunner, PreparedInputs, RunnerConfig
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -63,6 +76,9 @@ class EncoderConfigMixin:
     feature_shape: tuple[int, ...] | None = None
     feature_dtype: torch.dtype | None = None
     fixed_seq_len: int | None = None
+    # Tensor kwargs the caller declared via EncodeCudaGraphConfig.extra_model_inputs
+    # and will pass to LLM.encode(**model_kwargs).
+    extra_model_inputs: list[EncodeExtraInputSpec] = field(default_factory=list)
 
     @classmethod
     def create(
@@ -80,7 +96,6 @@ class EncoderConfigMixin:
         attention_runtime_features: AttentionRuntimeFeatures,
         enable_autotuner: bool,
         is_encoder_decoder: bool,
-        draft_model: bool,
     ) -> Self:
         """Resolve encoder settings and construct the concrete runner config."""
         batch_sizes = list(graph_config.batch_sizes or []) if graph_config is not None else []
@@ -107,12 +122,7 @@ class EncoderConfigMixin:
         feature_shape = None
         feature_dtype = None
         fixed_seq_len = None
-        if (
-            graph_config is not None
-            and not draft_model
-            and is_encoder_decoder
-            and model_graph_spec is not None
-        ):
+        if graph_config is not None and is_encoder_decoder and model_graph_spec is not None:
             if mapping.tp_size > 1:
                 logger.warning(
                     "Feature-mode encoder CUDA graphs require TP=1; the encoder phase stays eager."
@@ -204,6 +214,9 @@ class EncoderConfigMixin:
             feature_shape=feature_shape,
             feature_dtype=feature_dtype,
             fixed_seq_len=fixed_seq_len,
+            extra_model_inputs=(
+                list(graph_config.extra_model_inputs) if graph_config is not None else []
+            ),
         )
 
 
@@ -226,7 +239,6 @@ class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
         attention_backend: type[AttentionBackend],
         attention_runtime_features: AttentionRuntimeFeatures,
         enable_autotuner: bool,
-        draft_model: bool,
     ) -> Self:
         return super().create(
             model=model,
@@ -241,7 +253,6 @@ class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
             attention_runtime_features=attention_runtime_features,
             enable_autotuner=enable_autotuner,
             is_encoder_decoder=False,
-            draft_model=draft_model,
         )
 
 
@@ -264,11 +275,16 @@ class EncoderMixin:
     def _initialize_encoder(
         self,
         model: nn.Module,
-        deps: RunnerDeps,
         config: EncoderConfigMixin,
+        *,
+        mapping: Mapping,
+        dist: Distributed | None,
+        moe_load_balancer: MoeLoadBalancer | None,
     ) -> None:
         self._model = model
-        self._deps = deps
+        self._mapping = mapping
+        self._dist = dist
+        self._moe_load_balancer = moe_load_balancer
         self._config = cast(RunnerConfig, config)
         self._encoder_config = config
         self._initialize_encoder_cuda_graph()
@@ -293,6 +309,7 @@ class EncoderMixin:
                 feature_shape=config.feature_shape,
                 feature_dtype=config.feature_dtype,
                 fixed_seq_len=config.fixed_seq_len,
+                cuda_graph_extra_inputs=config.extra_model_inputs,
             )
         )
         if config.feature_shape is not None:
@@ -321,6 +338,7 @@ class EncoderMixin:
     def _create_attention_metadata(
         self,
         *,
+        cache_indirection: torch.Tensor | None = None,
         enable_context_mla_with_cached_kv: bool | None = None,
         num_heads_per_kv: int | None = None,
     ) -> AttentionMetadata:
@@ -331,10 +349,8 @@ class EncoderMixin:
             max_beam_width=self._config.max_beam_width,
             attention_backend=self._config.attention_backend,
             attention_runtime_features=self._config.attention_runtime_features,
-            mapping=self._deps.mapping,
-            cache_indirection=(
-                None if self._encoder_config.is_encoder_decoder else self._deps.cache_indirection
-            ),
+            mapping=self._mapping,
+            cache_indirection=cache_indirection,
             kv_cache_manager=None,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             num_heads_per_kv=num_heads_per_kv,
@@ -344,10 +360,10 @@ class EncoderMixin:
         return metadata
 
     def _is_distributed_forward(self) -> bool:
-        dist = self._deps.dist
+        dist = self._dist
         if dist is None:
             return False
-        return dist.world_size > 1 or self._deps.mapping.dwdp_enabled
+        return dist.world_size > 1 or self._mapping.dwdp_enabled
 
     def _prepare_encoder_graph_inputs(
         self,
@@ -523,7 +539,7 @@ class EncoderMixin:
         key = prepared.graph_key
         assert key is not None
         # Only token encoder graphs participate in MoE load-balancer iterations.
-        moe_load_balancer = None if runner.feature_mode else self._deps.moe_load_balancer
+        moe_load_balancer = None if runner.feature_mode else self._moe_load_balancer
         capture_outputs = None
         if runner.needs_capture(key):
 
@@ -537,11 +553,11 @@ class EncoderMixin:
         with MoeLoadBalancerIterContext(moe_load_balancer):
             return runner.replay(key, prepared.kwargs)
 
-    def cleanup(self) -> None:
+    def release_graphs(self) -> None:
         self._encoder_cuda_graph_runner.clear()
 
 
-class EncoderRunner(EncoderMixin):
+class EncoderRunner(EncoderMixin, PackedModelRunner):
     """Run the direct EncodeOnly model contract.
 
     This runner deliberately knows nothing about ``LlmRequest``, decoder
@@ -551,18 +567,52 @@ class EncoderRunner(EncoderMixin):
     def __init__(
         self,
         model: nn.Module,
-        deps: RunnerDeps,
         config: EncoderRunnerConfig,
+        *,
+        mapping: Mapping,
+        dist: Distributed | None,
+        moe_load_balancer: MoeLoadBalancer | None,
+        model_caller: ModelCaller,
     ) -> None:
+        self._model_caller = model_caller
         if config.is_encoder_decoder:
             raise ValueError("EncoderRunner cannot run an encoder-decoder model.")
-        self._initialize_encoder(model, deps, config)
+        self._buffers = InputBuffers.allocate(
+            max_num_tokens=config.max_num_tokens,
+            max_batch_size=config.max_batch_size,
+            max_beam_width=config.max_beam_width,
+            max_seq_len=config.max_seq_len,
+            use_cache_indirection=config.attention_backend.Metadata is TrtllmAttentionMetadata,
+        )
+        self._initialize_encoder(
+            model, config, mapping=mapping, dist=dist, moe_load_balancer=moe_load_balancer
+        )
         self._attn_metadata: AttentionMetadata | None = None
 
     def _setup_attention_metadata(self) -> AttentionMetadata:
         if self._attn_metadata is None:
-            self._attn_metadata = self._create_attention_metadata()
+            self._attn_metadata = self._create_attention_metadata(
+                cache_indirection=self._buffers.cache_indirection
+            )
         return self._attn_metadata
+
+    def _model_inputs_to_device(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Move host tensor model inputs of an encode-only inputs dict to the device.
+
+        Only the eager path needs this, since it hands them straight to
+        `forward()`. The graph path copies into static buffers instead, so
+        callers should not have to pick a device based on whether a graph
+        happened to be captured.
+        """
+        device = self._buffers.input_ids_cuda.device
+        moved = {
+            name: value.to(device=device, non_blocking=True)
+            for name, value in inputs.items()
+            if name not in ENCODER_RESERVED_INPUT_NAMES
+            and isinstance(value, torch.Tensor)
+            and value.device != device
+        }
+        return {**inputs, **moved} if moved else inputs
 
     def _prepare_encoder_inputs(
         self,
@@ -611,37 +661,151 @@ class EncoderRunner(EncoderMixin):
         metadata.multi_item_part_lens = multi_item_part_lens
         metadata.prepare_encoder_only()
 
-        self._deps.input_ids_cuda[:actual_num_tokens].copy_(input_ids_cpu, non_blocking=True)
-        self._deps.position_ids_cuda[:actual_num_tokens].copy_(position_ids_cpu, non_blocking=True)
+        self._buffers.input_ids_cuda[:actual_num_tokens].copy_(input_ids_cpu, non_blocking=True)
+        self._buffers.position_ids_cuda[:actual_num_tokens].copy_(
+            position_ids_cpu, non_blocking=True
+        )
         return PreparedInputs(
             {
-                **model_inputs,
+                **self._model_inputs_to_device(model_inputs),
                 "attn_metadata": metadata,
-                "input_ids": self._deps.input_ids_cuda[:actual_num_tokens],
-                "position_ids": self._deps.position_ids_cuda[:actual_num_tokens].unsqueeze(0),
+                "input_ids": self._buffers.input_ids_cuda[:actual_num_tokens],
+                "position_ids": self._buffers.position_ids_cuda[:actual_num_tokens].unsqueeze(0),
             }
         )
 
     def _reject_unsupported_model_inputs(self, model_inputs: dict[str, Any]) -> None:
-        reserved_inputs = model_inputs.keys() & {
-            "input_ids",
-            "seq_lens",
-            "multi_item_part_lens",
-            "attn_metadata",
-            "return_context_logits",
-        }
+        reserved_inputs = model_inputs.keys() & ENCODER_RUNNER_MANAGED_INPUTS
         if reserved_inputs:
             raise ValueError(
                 f"Model inputs cannot override runner-managed fields: {sorted(reserved_inputs)}"
             )
-        if model_inputs and self._encoder_cuda_graph_runner.enabled:
-            raise NotImplementedError(
-                "Model-specific encoder inputs are not supported when encoder "
-                "CUDA graphs are enabled. Disable encoder CUDA graphs or omit "
-                f"the inputs. Unsupported keys: {sorted(model_inputs)}"
+
+    def _call_can_use_cuda_graph(self, multi_item_part_lens: list[list[int]] | None) -> bool:
+        """Whether this call could replay an encoder CUDA graph at all.
+
+        Multi-item batches and attention backends that cannot replay encoder
+        graphs always run eagerly, so their model inputs are not checked
+        against the declared specs. Shape only decides which bucket is used,
+        not whether the specs apply.
+        """
+        runner = self._encoder_cuda_graph_runner
+        if not runner.enabled or multi_item_part_lens is not None:
+            return False
+        if not runner.supports_metadata_type(self._config.attention_backend.Metadata):
+            logger.warning_once(
+                "Encoder CUDA graph only supports TrtllmAttentionMetadata; falling back to eager.",
+                key="encoder_cuda_graph_backend_warning",
+            )
+            return False
+        return True
+
+    def _check_cuda_graph_model_inputs(
+        self,
+        model_inputs: dict[str, Any],
+        *,
+        num_packed_tokens: int,
+        batch_size: int,
+    ) -> bool:
+        """Validate model inputs against the declared CUDA-graph extra inputs.
+
+        Each declared `EncodeExtraInputSpec` is backed by a static buffer the
+        runner copies into at replay, so every declared input must be present
+        and be a tensor matching its spec.
+
+        An undeclared *tensor* raises rather than falling back to eager, which
+        would hide the lost speedup; an undeclared *non-tensor* cannot be
+        captured at all -- a graph would freeze it to its capture-time value --
+        so it forces this call eager.
+
+        Returns:
+            bool: whether the encoder CUDA graph can be used for this call.
+        """
+        runner = self._encoder_cuda_graph_runner
+        specs_by_name = {spec.name: spec for spec in runner.extra_input_specs}
+        declared_names = set(specs_by_name)
+        provided_names = set(model_inputs)
+        undeclared_names = provided_names - declared_names
+
+        undeclared_tensor = sorted(
+            name for name in undeclared_names if isinstance(model_inputs[name], torch.Tensor)
+        )
+        if undeclared_tensor:
+            raise ValueError(
+                "Encoder received tensor model_kwargs not declared in "
+                f"cuda_graph_config.extra_model_inputs: {undeclared_tensor}. "
+                "Add them to the spec or disable encoder CUDA graphs. "
+                f"Declared inputs: {sorted(declared_names)}"
             )
 
-    def prepare_inputs(self, batch: PackedEncoderBatch) -> EncoderPreparedInputs:
+        missing = sorted(declared_names - provided_names)
+        if missing:
+            raise ValueError(
+                "Encoder is missing model_kwargs that were declared in "
+                f"cuda_graph_config.extra_model_inputs: {missing}. "
+                "Pass them as keyword arguments to encode()."
+            )
+
+        # Declared specs form a tensor contract that is enforced regardless of
+        # whether this particular call ends up using the graph.
+        for name, spec in specs_by_name.items():
+            value = model_inputs[name]
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(
+                    f"Encoder model_kwarg {name!r} must be a torch.Tensor when "
+                    f"encoder CUDA graphs are enabled, got {type(value).__name__}."
+                )
+            expected_dtype = spec.torch_dtype()
+            if value.dtype != expected_dtype:
+                raise ValueError(
+                    f"Encoder model_kwarg {name!r} dtype mismatch: expected "
+                    f"{expected_dtype} per EncodeExtraInputSpec.dtype={spec.dtype!r}, "
+                    f"got {value.dtype}."
+                )
+            if value.dim() != len(spec.shape):
+                raise ValueError(
+                    f"Encoder model_kwarg {name!r} rank mismatch: expected "
+                    f"{len(spec.shape)} dims per EncodeExtraInputSpec.shape={spec.shape}, "
+                    f"got shape={tuple(value.shape)}."
+                )
+            for axis, dim in enumerate(spec.shape):
+                if dim == "num_tokens":
+                    # Symbolic axis: must equal this batch's packed token count.
+                    # The bucket range is checked at replay time.
+                    if value.shape[axis] != num_packed_tokens:
+                        raise ValueError(
+                            f"Encoder model_kwarg {name!r} length {value.shape[axis]} "
+                            f"along symbolic 'num_tokens' axis {axis} disagrees with "
+                            f"the packed token count {num_packed_tokens}."
+                        )
+                elif dim == "batch_size":
+                    # Symbolic axis: must equal the request count (one row per
+                    # request). Padding to the bucket batch size happens in the runner.
+                    if value.shape[axis] != batch_size:
+                        raise ValueError(
+                            f"Encoder model_kwarg {name!r} length {value.shape[axis]} "
+                            f"along symbolic 'batch_size' axis {axis} disagrees with "
+                            f"the request count {batch_size}."
+                        )
+                elif value.shape[axis] != int(dim):
+                    raise ValueError(
+                        f"Encoder model_kwarg {name!r} shape mismatch at axis {axis}: "
+                        f"expected {int(dim)} per spec, got {value.shape[axis]}."
+                    )
+
+        undeclared_non_tensor = sorted(undeclared_names - set(undeclared_tensor))
+        if undeclared_non_tensor:
+            logger.warning_once(
+                f"Encoder received non-tensor model_kwargs {undeclared_non_tensor}, "
+                "which encoder CUDA graphs cannot capture; running this call "
+                "eagerly. Declared tensor inputs still use the graph on "
+                "tensor-only calls.",
+                key="encode_non_tensor_model_kwargs_eager_fallback",
+            )
+            return False
+        return True
+
+    def prepare_inputs(self, batch: PackedInputs) -> EncoderPreparedInputs:
         """Prepare a batch the caller already packed."""
         model_inputs = batch.model_inputs
         self._reject_unsupported_model_inputs(model_inputs)
@@ -661,11 +825,22 @@ class EncoderRunner(EncoderMixin):
                 )
             if any(not part_lens for part_lens in multi_item_part_lens):
                 raise ValueError('"multi_item_part_lens" entries must not be empty.')
+        # Calls that can never use a graph skip spec validation. For the rest,
+        # declared tensor inputs are validated against their specs, and a
+        # non-tensor input, which cannot be captured, keeps the call eager.
+        allow_cuda_graph = self._call_can_use_cuda_graph(
+            multi_item_part_lens
+        ) and self._check_cuda_graph_model_inputs(
+            model_inputs,
+            num_packed_tokens=len(input_ids),
+            batch_size=len(sequence_lengths),
+        )
         return self._prepare_encoder_batch(
             input_ids,
             sequence_lengths,
             multi_item_part_lens=multi_item_part_lens,
             model_inputs=model_inputs,
+            allow_cuda_graph=allow_cuda_graph,
         )
 
     def _prepare_encoder_batch(
@@ -675,6 +850,7 @@ class EncoderRunner(EncoderMixin):
         *,
         multi_item_part_lens: list[list[int]] | None = None,
         model_inputs: dict[str, Any] | None = None,
+        allow_cuda_graph: bool = True,
     ) -> EncoderPreparedInputs:
         inputs = {
             **(model_inputs or {}),
@@ -683,7 +859,11 @@ class EncoderRunner(EncoderMixin):
         }
         if multi_item_part_lens is not None:
             inputs["multi_item_part_lens"] = multi_item_part_lens
-        graph_inputs = self._prepare_encoder_graph_inputs(inputs, self._setup_attention_metadata())
+        graph_inputs = (
+            self._prepare_encoder_graph_inputs(inputs, self._setup_attention_metadata())
+            if allow_cuda_graph
+            else None
+        )
         if graph_inputs is not None:
             return graph_inputs
         prepared = self._prepare_encoder_inputs(
@@ -722,7 +902,7 @@ class EncoderRunner(EncoderMixin):
             ],
             pin_memory=prefer_pinned(),
             dtype=torch.int32,
-        ).to(device=self._deps.position_ids_cuda.device, non_blocking=True)
+        ).to(device=self._buffers.position_ids_cuda.device, non_blocking=True)
         ends = torch.tensor(
             [
                 end + 1
@@ -732,7 +912,7 @@ class EncoderRunner(EncoderMixin):
             ],
             pin_memory=prefer_pinned(),
             dtype=torch.int32,
-        ).to(device=self._deps.position_ids_cuda.device, non_blocking=True)
+        ).to(device=self._buffers.position_ids_cuda.device, non_blocking=True)
         return torch_multi_arange(
             starts=starts,
             ends=ends,
@@ -761,10 +941,6 @@ class EncoderRunner(EncoderMixin):
         gc.collect()
         torch.cuda.empty_cache()
         self._run_autotuner_warmup()
-
-    @torch.inference_mode()
-    @with_model_extra_attrs(lambda self: self._model.extra_attrs)
-    def capture_graphs(self) -> None:
         self._capture_encoder_cuda_graphs(
             self._prepare_capture_inputs,
             self._execute_prepared,
@@ -780,7 +956,22 @@ class EncoderRunner(EncoderMixin):
         )
 
     def _prepare_capture_inputs(self, sequence_lengths: list[int]) -> EncoderPreparedInputs:
-        return self._prepare_encoder_batch([0] * sum(sequence_lengths), sequence_lengths)
+        num_tokens = sum(sequence_lengths)
+        # Zero-filled stand-ins so each bucket captures the full forward
+        # signature; capture depends only on shape and dtype, and real values
+        # arrive via the replay copy.
+        model_inputs = {
+            spec.name: torch.zeros(
+                spec.resolve_shape(num_tokens=num_tokens, batch_size=len(sequence_lengths)),
+                dtype=spec.torch_dtype(),
+            )
+            for spec in self._encoder_cuda_graph_runner.extra_input_specs
+        }
+        return self._prepare_encoder_batch(
+            [0] * num_tokens,
+            sequence_lengths,
+            model_inputs=model_inputs or None,
+        )
 
     def _run_warmup_shapes(self, shapes: list[tuple[int, int, int]]) -> None:
         with cuda_graph_disabled(self._encoder_cuda_graph_runner):
@@ -811,7 +1002,7 @@ class EncoderRunner(EncoderMixin):
     def _run_autotuner_warmup(self) -> None:
         if not self._encoder_config.enable_autotuner:
             return
-        AutoTuner.get().setup_distributed_state(self._deps.mapping, self._deps.dist)
+        AutoTuner.get().setup_distributed_state(self._mapping, self._dist)
         logger.info("Running encoder autotuner warmup...")
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")
@@ -846,7 +1037,7 @@ class EncoderRunner(EncoderMixin):
         graph_runner = self._encoder_cuda_graph_runner
         with with_shared_pool(graph_runner.get_graph_pool()):
             if prepared.graph_key is None:
-                with MoeLoadBalancerIterContext(self._deps.moe_load_balancer):
+                with MoeLoadBalancerIterContext(self._moe_load_balancer):
                     return forward(prepared.kwargs)
             graph_outputs = self._execute_encoder_cuda_graph(prepared, forward)
         if not isinstance(graph_outputs, dict):
@@ -865,15 +1056,13 @@ class EncoderRunner(EncoderMixin):
     @with_model_extra_attrs(lambda self: self._model.extra_attrs)
     def forward(
         self,
-        batch: PackedEncoderBatch,
-        *,
-        gather_context_logits: bool = False,
+        inputs: PackedInputs,
     ) -> dict[str, Any]:
-        """Execute a batch the caller already packed."""
-        prepared = self.prepare_inputs(batch)
+        """Execute packed inputs with their requested output options."""
+        prepared = self.prepare_inputs(inputs)
         return self._execute_prepared(
             prepared,
-            gather_context_logits=gather_context_logits,
+            gather_context_logits=inputs.gather_context_logits,
         )
 
     def _forward_step(
@@ -887,7 +1076,7 @@ class EncoderRunner(EncoderMixin):
         if metadata is not None:
             metadata.on_update_kv_lens()
 
-        outputs = self._deps.model_forward(
+        outputs = self._model_caller(
             **inputs,
             return_context_logits=(gather_ids is not None or gather_context_logits),
         )
