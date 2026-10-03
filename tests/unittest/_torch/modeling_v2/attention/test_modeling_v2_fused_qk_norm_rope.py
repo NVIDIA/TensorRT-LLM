@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the fused_qk_norm_rope catalog entry."""
 
+import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
@@ -149,6 +150,21 @@ def test_bf16_neox_head_dims() -> None:
             2, 8, 2, head_dim=head_dim, rotary_dim=head_dim, eps=1e-6,
             base=10000.0, is_neox=True,
         )  # fmt: skip
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_bf16_neox_kimi_k3_drafter() -> None:
+    torch.manual_seed(9)
+    # Kimi K3's DSpark drafter: head_dim 64, 6 query heads per KV head (TP16: 6 / 1, TP4: 24 / 4), draft blocks of
+    # up to 8 requests x 8 tokens
+    for num_heads_q, num_heads_kv in ((6, 1), (24, 4)):
+        for num_tokens in (1, 8, 64):
+            _check(
+                num_tokens, num_heads_q, num_heads_kv, head_dim=64, rotary_dim=64, eps=1e-5,
+                base=10000.0, is_neox=True,
+            )  # fmt: skip
 
 
 def test_bf16_neox_prefill() -> None:

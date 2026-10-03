@@ -28,7 +28,7 @@
 # limits, e.g. no float8 arithmetic, are noted in the entry docstring).
 # Entries wrapping trtllm ops carry all three.
 #
-# ── RECEIPT STATUS: 19 entries certified on sm_103, 1 on sm_100 ───────────
+# ── RECEIPT STATUS: 19 entries certified on sm_103, 3 on sm_100 ───────────
 #
 # A receipt says this entry's test passed on a stated GPU architecture. The
 # architecture is the whole key: it is a real axis -- see the
@@ -68,10 +68,13 @@
 # exist. Read them as provenance; the frontmatter is the certification.
 #
 # An entry first called by a GB200 (sm_100) target is certified there: its
-# receipt key is sm_100 (comm/mnnvl_allreduce_attn_res). An entry already
-# certified elsewhere gains its sm_100 key in the change that adds its first
-# sm_100 caller. A collective's receipt records the world size its matrix ran
-# at.
+# receipt key is sm_100 (comm/mnnvl_allreduce_attn_res,
+# attention/k3_drafter_attn, attention/k3_drafter_attn_qknorm). An entry
+# already certified elsewhere gains its sm_100 key in the change that adds its
+# first sm_100 caller and keeps the key it had, noting that the new cells
+# post-date it (attention/fused_qk_norm_rope). Those cells skip off SM 10.0,
+# so CI on the other architecture keeps re-certifying the existing ones. A
+# collective's receipt records the world size its matrix ran at.
 # ──────────────────────────────────────────────────────────────────────────
 #
 # STATEFUL ENTRIES. When an op's result depends on state that outlives the
@@ -191,6 +194,14 @@ entries:
   - path: attention/thop_attention.py
     impl: tensorrt_llm.bindings.internal.thop.attention
     summary: "Full attention core with fully explicit state (pybind binding, approved exception): paged KV-cache append + causal/padding-masked GQA FMHA over a caller-owned pool (bf16, or fp8-e4m3 with per-tensor kv scales) and explicit length/offset tensors, written into a caller buffer, on either context execution path (use_paged_context_fmha selects packed-QKV context FMHA, or paged-KV context FMHA so a context call may run over a cached prefix — KV-cache reuse and chunked prefill), with optional per-query-head attention sinks (one extra softmax-denominator logit, dropped from the output) and an optional per-call sliding window (attention_window_size keys ending at the query's absolute position; a pure mask — the append stays at absolute positions, so cyclic pool reuse is the caller's page mapping); MLA mode runs context prefill (in-kernel RoPE + latent append), no-append context over explicit K/V (latent_cache=None: cached-KV prefixes and chunked partial passes with softmax-stats output), and generation latent-MQA decode as separate calls over a paged latent pool (bf16 or fp8-e4m3)"
+
+  - path: attention/k3_drafter_attn.py
+    impl: torch.ops.trtllm.k3_drafter_attn
+    summary: "Kimi K3 DSpark drafter block attention (CuTe DSL, sm_100): R <= 8 requests' draft blocks of T <= 8 tokens, each attending densely (non-causal within the block) to its request's paged context (HND pages of 64, rows 0 .. ctx_len[r] - 1, page-table rows at any row stride) and to the block's own K / V taken from qkv, not written to the cache; GQA with 6 query heads per KV head, head dim 64, bf16; compiles on its first call outside capture, then replays under CUDA graphs with lengths, page tables and qkv rewritten in place"
+
+  - path: attention/k3_drafter_attn_qknorm.py
+    impl: torch.ops.trtllm.k3_drafter_attn_qknorm
+    summary: "k3_drafter_attn on the raw QKV projection: per-head q / k RMSNorm and NeoX RoPE (fused_qk_norm_rope's arithmetic, positions int32 or int64) applied inside the kernel, qkv left unmodified"
 
   # ─── moe ───────────────────────────────────────────────────────
   - path: moe/noaux_tc_op.py

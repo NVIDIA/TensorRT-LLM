@@ -187,8 +187,9 @@ Perf is measured, never gated.
 ## Status of every record in this tree
 
 **The catalog is certified: 19 entries on sm_103, and
-`comm/mnnvl_allreduce_attn_res` on sm_100 (GB200), where its first caller
-runs. The targets construct but have never executed.**
+`comm/mnnvl_allreduce_attn_res`, `attention/k3_drafter_attn` and
+`attention/k3_drafter_attn_qknorm` on sm_100 (GB200), where their first
+caller runs. The targets construct but have never executed.**
 
 Two things voided every receipt in the move: each catalog test file was
 rewritten, and the targets moved from sm_100 (B200) to sm_103 (GB300), where

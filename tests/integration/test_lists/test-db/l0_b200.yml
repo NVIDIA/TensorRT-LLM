@@ -245,8 +245,12 @@ l0_b200:
   # decode-step inputs (SM 100 only; they skip on every other list).
   - unittest/_torch/cute_dsl_kernels/test_spec_step_copies.py
   - unittest/_torch/executor/test_pytorch_model_engine.py -k "test_staged_spec_decode_graph_step"
-  # Kimi K3 DSpark drafter attention (CuTe DSL, SM 100).
+  # Kimi K3 DSpark drafter attention (CuTe DSL, SM 100) and its modeling_v2 catalog entries, plus the sm_100 cells of
+  # fused_qk_norm_rope, which the drafter calls.
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_drafter_attn.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_drafter_attn.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_drafter_attn_qknorm.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_fused_qk_norm_rope.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
