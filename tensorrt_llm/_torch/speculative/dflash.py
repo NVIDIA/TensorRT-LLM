@@ -2192,13 +2192,9 @@ class DFlashWorker(SpecWorkerBase):
                 # Which block slots carry them is a drafter-family convention,
                 # resolved through _draft_slot_ids.
                 block_size = self._compute_block_size
-                gen_gather_ids = self._draft_slot_ids(draft_model, num_gens, block_size, K)
-                # Shields only the last request: at block_size == K with
-                # shift_label off, slots run 1..K, so every request reads the
-                # next one's slot 0 and the last overruns. Degrades, never raises.
-                gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
-
-                gen_hidden_states = hidden_states_out[gen_gather_ids]
+                gen_hidden_states = self._draft_block_hidden_states(
+                    draft_model, hidden_states_out, num_gens, block_size, K
+                )
                 gen_logits = self._draft_block_logits(
                     draft_model, gen_hidden_states, attn_metadata, spec_metadata
                 )
@@ -2308,6 +2304,43 @@ class DFlashWorker(SpecWorkerBase):
         the width bounds the slots the gather is allowed to name.
         """
         return self.max_draft_len + 1
+
+    def _draft_block_hidden_states(
+        self,
+        draft_model,
+        hidden_states_out: torch.Tensor,
+        num_gens: int,
+        block_size: int,
+        num_draft_tokens: int,
+    ) -> torch.Tensor:
+        """The block-output rows that produce the K draft logits per gen request (``_draft_slot_ids``).
+
+        The slot ids depend only on the shapes, so they are built once per shape, outside CUDA-graph
+        capture, and cached. When they are one contiguous run of rows (a single request, or the
+        shift_label convention with a block of K slots, whose requests' slots follow each other) the
+        rows are returned as a view, without a gather; otherwise they are gathered.
+        """
+        rows = hidden_states_out.shape[0]
+        key = (num_gens, block_size, num_draft_tokens, rows)
+        cache = self.__dict__.setdefault("_draft_block_rows", {})
+        entry = cache.get(key)
+        if entry is None:
+            ids = self._draft_slot_ids(draft_model, num_gens, block_size, num_draft_tokens)
+            # Shields only the last request: at block_size == K with
+            # shift_label off, slots run 1..K, so every request reads the
+            # next one's slot 0 and the last overruns. Degrades, never raises.
+            ids = ids.clamp(max=rows - 1)
+            if torch.cuda.is_current_stream_capturing():
+                return hidden_states_out[ids]
+            host = ids.tolist()
+            if host and host == list(range(host[0], host[0] + len(host))):
+                entry = host[0]
+            else:
+                entry = ids
+            cache[key] = entry
+        if isinstance(entry, int):
+            return hidden_states_out[entry : entry + num_gens * num_draft_tokens]
+        return hidden_states_out[entry]
 
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
