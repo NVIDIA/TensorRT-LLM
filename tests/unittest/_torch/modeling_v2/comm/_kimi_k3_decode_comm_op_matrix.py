@@ -653,9 +653,8 @@ def check_moe_tail_graph():
 
 
 # The MoE decode path at this check's TP: a moetp4ep4 rank's routed experts (intermediate columns, experts), and a
-# shared expert whose rank slice at TP 4 is a TP16 rank's (384 activation columns).
+# shared expert whose rank slice is a TP16 rank's (TAIL_ACT = 384 activation columns) at every world.
 I_TP, E_LOCAL, NUM_EXPERTS = 768, 224, 896
-SHARED = 384 * 4
 SITU_CAPS = (4.0, 25.0)
 MOE_TOL = 3e-2  # the front's fused shared gate_up + SiTU against the shared expert's own GEMMs
 
@@ -689,7 +688,7 @@ def _decode_moe_layer():
         norm = RMSNorm(hidden_size=LATENT, eps=1e-5, dtype=torch.bfloat16)
         shared = GatedMLP(
             hidden_size=H,
-            intermediate_size=SHARED,
+            intermediate_size=TAIL_ACT * R.world,
             bias=False,
             activation=SituAndMul(
                 beta=SITU_CAPS[0], linear_beta=SITU_CAPS[1], use_fused_activation=True
