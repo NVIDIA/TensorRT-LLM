@@ -83,6 +83,21 @@ def get_ucx_tls():
     return "^ib,gdr_copy"
 
 
+def apply_pre_hopper_nccl_workaround(env: dict) -> None:
+    """Keep NCCL off PCIe peer-to-peer on pre-Hopper CI nodes.
+
+    The 8xL40S CI nodes run with the AMD IOMMU in DMA translation mode, so
+    PCIe P2P writes across the host bridge fault (``AMD-Vi IO_PAGE_FAULT``)
+    and never land. NCCL still picks its P2P/CUMEM transport there, and the
+    first PP send/recv or TP collective in the warmup forward hangs the
+    worker before it can register with the disagg server
+    (https://nvbugs/6728119). Restricting P2P to PCIe-switch peers makes NCCL
+    fall back to SHM on those nodes; NVLink platforms are unaffected.
+    """
+    if get_sm_version() < 90:
+        env.setdefault("NCCL_P2P_LEVEL", "PXB")
+
+
 def cleanup_output_files():
     """Clean up output files from previous runs."""
     for file in ['output.json', 'output_streaming.json']:
@@ -1037,6 +1052,7 @@ def run_disaggregated_test(example_dir,
 
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    apply_pre_hopper_nccl_workaround(run_env)
     ctx_run_env = run_env.copy()
     if ctx_env:
         ctx_run_env.update(ctx_env)
