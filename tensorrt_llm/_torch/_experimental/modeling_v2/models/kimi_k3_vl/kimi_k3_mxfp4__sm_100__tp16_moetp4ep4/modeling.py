@@ -3284,8 +3284,10 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
         it (every attention all-reduce over MNNVL; TP16 is a construction assert): the drafter then runs its context
         projection split over the group, ``hidden_norm`` in the all-reduce, and its blocks' residual adds and RMSNorms
         in their all-reduces (``K3DSparkDrafter.use_decode_comm``, collective: it compiles the drafter's sandwich on
-        the group's workspace). Without ``comm`` it keeps the stock replicated ``fc``, all-reduces and norms. Returns
-        whether the drafter took the state (False without such a drafter)."""
+        the group's workspace). Without ``comm`` it keeps the stock replicated ``fc``, all-reduces and norms. The gate
+        requires exactly what this path uses: ``comm`` and nothing else, so not the LM head's ``k3_head_gemv``
+        workspace, which only the speculative worker's path (`_gate_spec_worker_kernels`) reads. Returns whether the
+        drafter took the state (False without such a drafter)."""
         drafter = getattr(self, "draft_model", None)
         if comm is None or not isinstance(drafter, K3DSparkDrafter):
             return False
