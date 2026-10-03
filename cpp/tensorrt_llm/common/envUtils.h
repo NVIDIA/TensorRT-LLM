@@ -170,12 +170,6 @@ bool getEnvDisaggBenchmarkGenOnly();
 // Whether to disable the chunked-attention in the generation phase.
 bool getEnvDisableChunkedAttentionInGenPhase();
 
-// TODO: For DEV purpose temporarily.
-// Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)
-int getEnvMoeA2ADispatchBlockSize();
-// Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
-int getEnvMoeA2ACombineBlockSize();
-
 bool getEnvKVCacheTransferAllBlocksForWindow();
 
 bool getEnvEplbForceGdrcopy();

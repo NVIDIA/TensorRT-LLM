@@ -76,7 +76,7 @@ from .vmm import (
 # to dup an FD from a sibling DWDP MPI worker into the local fd table so
 # ``cuMemImportFromShareableHandle(fd, POSIX_FILE_DESCRIPTOR)`` accepts it.
 # Mirrors ``MnnvlMemory.open_mnnvl_memory`` in
-# ``tensorrt_llm/_mnnvl_utils.py``.
+# ``tensorrt_llm/_torch/distributed/mnnvl_memory.py``.
 _SYS_pidfd_open = 434
 _SYS_pidfd_getfd = 438
 

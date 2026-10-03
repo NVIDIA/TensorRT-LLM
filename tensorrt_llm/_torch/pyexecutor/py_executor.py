@@ -1080,6 +1080,8 @@ class PyExecutor:
 
         self.dwdp_manager = dwdp_manager
 
+        self._validate_moe_a2a_checkpoint_support()
+
         if start_worker:
             self.start_worker()
 
@@ -1439,6 +1441,31 @@ class PyExecutor:
         self.model_engine.is_warmup = value
         if self.draft_model_engine is not None:
             self.draft_model_engine.is_warmup = value
+
+    def _validate_moe_a2a_checkpoint_support(self) -> None:
+        """Reject sleep/wakeup up front when a MoE resource cannot checkpoint.
+
+        The MNNVL all-reduce workspaces checkpoint through their own path in
+        distributed/ops.py and are not covered here. Without this the conflict
+        only surfaces at the first sleep request, once the engine is already
+        serving.
+        """
+        if getattr(self.llm_args, "sleep_config", None) is None:
+            return
+
+        blockers = []
+        for resource in self._mnnvl_checkpoint_resources(
+                list(ExecutorMemoryType)):
+            reason = resource.checkpoint_blocked_reason()
+            if reason is not None:
+                blockers.append(reason)
+
+        if blockers:
+            raise ValueError(
+                "sleep_config was requested, but the engine holds a resource that "
+                "cannot be checkpointed: " + "; ".join(sorted(set(blockers))) +
+                ". "
+                "Remove sleep_config to keep the current configuration.")
 
     def start_worker(self):
         with self.worker_lock:

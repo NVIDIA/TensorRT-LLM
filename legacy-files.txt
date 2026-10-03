@@ -160,7 +160,6 @@ tensorrt_llm/_torch/device_mesh.py
 tensorrt_llm/_torch/disaggregation/kv_cache_transceiver.py
 tensorrt_llm/_torch/distributed/__init__.py
 tensorrt_llm/_torch/distributed/communicator.py
-tensorrt_llm/_torch/moe/fused_moe/communication/moe_alltoall.py
 tensorrt_llm/_torch/distributed/ops.py
 tensorrt_llm/_torch/distributed/pg_utils.py
 tensorrt_llm/_torch/moe/expert_statistic.py
@@ -586,7 +585,6 @@ tests/unittest/_torch/multi_gpu/test_linear.py
 tests/unittest/_torch/multi_gpu/test_lowprecision_allreduce.py
 tests/unittest/_torch/multi_gpu/test_mnnvl_allreduce.py
 tests/unittest/_torch/multi_gpu/test_mnnvl_memory.py
-tests/unittest/_torch/moe/multi_gpu/test_moe_a2a.py
 tests/unittest/_torch/multi_gpu/test_user_buffers.py
 tests/unittest/_torch/multi_gpu_modeling/test_deepseek.py
 tests/unittest/_torch/multimodal/test_external_embedding.py

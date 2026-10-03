@@ -22,9 +22,10 @@ from typing import Dict, List, Optional, Protocol, Tuple, TypedDict, Union
 import torch
 from torch import nn
 
-from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
+from tensorrt_llm._torch.distributed.mnnvl_memory import (HelixCpMnnvlMemory,
+                                                          MnnvlMemory)
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._torch.utils import get_model_extra_attrs
@@ -813,7 +814,7 @@ class MNNVLAllReduce(nn.Module):
                 where MNNVL is the clear win; an explicit request is honoured on a single node too,
                 as long as the hardware supports it.
         """
-        from tensorrt_llm._mnnvl_utils import MnnvlMemory
+        from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 
         arch = platform.machine().lower()
         is_on_aarch64 = "aarch64" in arch

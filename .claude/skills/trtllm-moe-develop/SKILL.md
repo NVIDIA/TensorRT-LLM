@@ -673,7 +673,7 @@ Prefer the unified MoE tests:
 - Communication changes: `pytest tests/unittest/_torch/moe/test_moe_comm.py -k '<strategy>'`.
 - Routing changes: `pytest tests/unittest/_torch/moe/test_moe_routing.py -k '<routing>'`.
 - Load balancer changes: `pytest tests/unittest/_torch/moe/test_moe_load_balancer.py -k '<case>'`.
-- Multi-GPU EP/all-to-all behavior: `pytest tests/unittest/_torch/moe/multi_gpu/test_moe_a2a.py -k '<case>'`.
+- Multi-GPU EP/all-to-all behavior: `pytest tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py -k '<case>'`.
 
 When GPU resources are required, use the TRT-LLM GPU allocation/test-runner
 skills first and record skipped tests with reasons.

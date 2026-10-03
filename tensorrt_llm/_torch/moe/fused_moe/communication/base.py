@@ -44,6 +44,11 @@ class CheckpointableCommunication(Protocol):
         """Return the identity shared by wrappers using one checkpoint resource."""
         ...
 
+    def checkpoint_blocked_reason(self) -> Optional[str]:
+        """Return why this instance's current configuration blocks
+        checkpointing, or None when it can proceed."""
+        ...
+
     def checkpoint_prepare(self) -> None:
         """Detach checkpoint-backed resources after global quiescence."""
         ...
@@ -79,6 +84,18 @@ class Communication(ABC):
                 f"is not supported on this platform."
             )
         self._is_platform_supported = True
+
+    def checkpoint_blocked_reason(self) -> Optional[str]:
+        """Return why this instance's current configuration blocks
+        checkpointing, or None when it can proceed.
+
+        Implementing the checkpoint methods is a property of the class;
+        whether a given instance can use them is a property of how it was
+        configured. Defined here so every strategy satisfies
+        CheckpointableCommunication structurally, and only those with a
+        blocking configuration need to override it.
+        """
+        return None
 
     @staticmethod
     @abstractmethod
