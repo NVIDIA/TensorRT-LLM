@@ -1047,12 +1047,18 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_single_cta_kernel(bf16
     bf16_t const* __restrict__ layer_res, bf16_t const* __restrict__ layer_res_add, bf16_t const* __restrict__ res_w,
     bf16_t const* __restrict__ rms_w, bf16_t const* __restrict__ output_rms_w, bf16_t* __restrict__ updated_layer_res,
     bf16_t* __restrict__ output, float* __restrict__ rsigma_out, float* __restrict__ probs_out,
-    float* __restrict__ logits_out, float rms_eps, float output_rms_eps, int num_tokens)
+    float* __restrict__ logits_out, float rms_eps, float output_rms_eps, int num_tokens, bool early_trigger)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     if constexpr (ENABLE_PDL)
     {
         cudaGridDependencySynchronize();
+        // The dependent grid still waits for this one to complete before reading its
+        // output; triggering here lets it launch and stream its weights while this kernel runs.
+        if (early_trigger)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
     }
 
     constexpr int H = 7168;
@@ -1322,7 +1328,10 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_single_cta_kernel(bf16
 
     if constexpr (ENABLE_PDL)
     {
-        cudaTriggerProgrammaticLaunchCompletion();
+        if (!early_trigger)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
     }
 #else
     if (cute::thread0())
@@ -1332,11 +1341,17 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_single_cta_kernel(bf16
 #endif
 }
 
+// Decode handoff options for the s1 kernels (see AttnResFwdParams).
+struct S1Handoff
+{
+    bool early_trigger = false;
+};
+
 template <int N, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LAYER_ADD = false>
 static void launch_s1_single_cta(bf16_t const* block_residual, bf16_t const* layer_residual,
     bf16_t const* layer_residual_add, bf16_t const* res_weight, bf16_t const* rms_weight,
     bf16_t const* output_rms_weight, bf16_t* updated_layer_residual, bf16_t* output, float* rsigma, float* probs,
-    float* logits, float rms_eps, float output_rms_eps, int num_tokens, cudaStream_t stream)
+    float* logits, float rms_eps, float output_rms_eps, int num_tokens, cudaStream_t stream, S1Handoff handoff = {})
 {
     if (tensorrt_llm::common::getEnvEnablePDL())
     {
@@ -1352,14 +1367,14 @@ static void launch_s1_single_cta(bf16_t const* block_residual, bf16_t const* lay
         config.numAttrs = 1;
         cudaLaunchKernelEx(&config, kernel, block_residual, layer_residual, layer_residual_add, res_weight, rms_weight,
             output_rms_weight, updated_layer_residual, output, rsigma, probs, logits, rms_eps, output_rms_eps,
-            num_tokens);
+            num_tokens, handoff.early_trigger);
     }
     else
     {
         attn_res_fwd_s1_single_cta_kernel<N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, false>
             <<<num_tokens, 256, 0, stream>>>(block_residual, layer_residual, layer_residual_add, res_weight, rms_weight,
                 output_rms_weight, updated_layer_residual, output, rsigma, probs, logits, rms_eps, output_rms_eps,
-                num_tokens);
+                num_tokens, false);
     }
 }
 
@@ -1381,13 +1396,22 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_splitk_kernel(bf16_t c
     bf16_t const* __restrict__ layer_res, bf16_t const* __restrict__ layer_res_add, bf16_t const* __restrict__ res_w,
     bf16_t const* __restrict__ rms_w, bf16_t const* __restrict__ output_rms_w, bf16_t* __restrict__ updated_layer_res,
     bf16_t* __restrict__ output, float* __restrict__ rsigma_out, float* __restrict__ probs_out,
-    float* __restrict__ logits_out, float rms_eps, float output_rms_eps, int num_tokens)
+    float* __restrict__ logits_out, float rms_eps, float output_rms_eps, int num_tokens, bool early_trigger)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-    if constexpr (ENABLE_PDL)
+    auto const wait_for_previous_grid = [&]
     {
-        cudaGridDependencySynchronize();
-    }
+        if constexpr (ENABLE_PDL)
+        {
+            cudaGridDependencySynchronize();
+            // See attn_res_fwd_s1_single_cta_kernel.
+            if (early_trigger)
+            {
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+        }
+    };
+    wait_for_previous_grid();
 
     namespace cg = cooperative_groups;
     constexpr int H = 7168;
@@ -1440,6 +1464,7 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_splitk_kernel(bf16_t c
 
     float sq[N] = {};
     float dot[N] = {};
+    // Every candidate in one pass, so all loads are in flight together.
 #pragma unroll
     for (int ki = tid; ki < K_PER_CTA; ki += THREADS)
     {
@@ -1639,7 +1664,10 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_splitk_kernel(bf16_t c
 
     if constexpr (ENABLE_PDL)
     {
-        cudaTriggerProgrammaticLaunchCompletion();
+        if (!early_trigger)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
     }
 #else
     if (cute::thread0())
@@ -1653,13 +1681,14 @@ template <int N, int GROUPS = 8, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LA
 static void launch_s1_splitk(bf16_t const* block_residual, bf16_t const* layer_residual,
     bf16_t const* layer_residual_add, bf16_t const* res_weight, bf16_t const* rms_weight,
     bf16_t const* output_rms_weight, bf16_t* updated_layer_residual, bf16_t* output, float* rsigma, float* probs,
-    float* logits, float rms_eps, float output_rms_eps, int num_tokens, cudaStream_t stream)
+    float* logits, float rms_eps, float output_rms_eps, int num_tokens, cudaStream_t stream, S1Handoff handoff = {})
 {
     constexpr int K_PER_CTA = 7168 / GROUPS;
     constexpr int WARPS = 8;
     constexpr size_t smem_size
         = (size_t) N * K_PER_CTA * sizeof(float) + (size_t) WARPS * N * sizeof(float2) + (size_t) N * sizeof(float);
     bool const enable_pdl = tensorrt_llm::common::getEnvEnablePDL();
+    bool early_trigger = enable_pdl && handoff.early_trigger;
     auto kernel = enable_pdl ? &attn_res_fwd_s1_splitk_kernel<N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, true>
                              : &attn_res_fwd_s1_splitk_kernel<N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, false>;
     static std::once_flag attrs_set[2][64];
@@ -1679,7 +1708,7 @@ static void launch_s1_splitk(bf16_t const* block_residual, bf16_t const* layer_r
     void* args[] = {const_cast<bf16_t**>(&block_residual), const_cast<bf16_t**>(&layer_residual),
         const_cast<bf16_t**>(&layer_residual_add), const_cast<bf16_t**>(&res_weight), const_cast<bf16_t**>(&rms_weight),
         const_cast<bf16_t**>(&output_rms_weight), &updated_layer_residual, &output, &rsigma, &probs, &logits, &rms_eps,
-        &output_rms_eps, &num_tokens};
+        &output_rms_eps, &num_tokens, &early_trigger};
     cudaLaunchConfig_t config{};
     // One cluster per token. clusterDim stays GROUPS, so clusters are contiguous
     // spans of the grid and each token's DSM exchange stays within its own.
@@ -1888,18 +1917,22 @@ static void launchAttnResDecodeRmsNorm(AttnResFwdParams const& params, cudaStrea
 
     auto const* layer_residual_add = FUSE_LAYER_ADD ? params.layerResidualAdd : nullptr;
     auto* updated_layer_residual = FUSE_LAYER_ADD ? params.updatedLayerResidual : nullptr;
+    // The dependent kernel launches (and streams its weights) while this one runs: it waits for
+    // this grid before reading the output.
+    constexpr bool early_trigger = true;
+    S1Handoff const handoff{early_trigger};
 
     if constexpr (N <= 4)
     {
         launch_s1_single_cta<N, true, FUSE_LAYER_ADD>(params.blockResidual, params.layerResidual, layer_residual_add,
             params.resWeight, params.rmsWeight, params.outputRmsWeight, updated_layer_residual, params.output, nullptr,
-            nullptr, nullptr, params.rmsEps, params.outputRmsEps, params.seqLen, stream);
+            nullptr, nullptr, params.rmsEps, params.outputRmsEps, params.seqLen, stream, handoff);
     }
     else
     {
         launch_s1_splitk<N, 8, true, FUSE_LAYER_ADD>(params.blockResidual, params.layerResidual, layer_residual_add,
             params.resWeight, params.rmsWeight, params.outputRmsWeight, updated_layer_residual, params.output, nullptr,
-            nullptr, nullptr, params.rmsEps, params.outputRmsEps, params.seqLen, stream);
+            nullptr, nullptr, params.rmsEps, params.outputRmsEps, params.seqLen, stream, handoff);
     }
 }
 
