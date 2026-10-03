@@ -1840,12 +1840,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
         if self.spec_worker is not None:
-            # get logits
-            logits = self.logits_processor.forward(
+            # The target logits, in the layout the worker's acceptance reads.
+            logits = self.spec_worker.target_logits(
                 hidden_states[spec_metadata.gather_ids],
                 self.lm_head,
+                self.logits_processor,
                 attn_metadata,
-                True,
+                spec_metadata,
+                self.draft_model,
             )
 
             # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with
