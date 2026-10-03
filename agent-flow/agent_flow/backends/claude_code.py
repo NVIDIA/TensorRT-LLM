@@ -10,6 +10,7 @@ from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+import anyio
 import claude_agent_sdk
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -222,6 +223,62 @@ def _assistant_error_detail(message: AssistantMessage) -> str:
     return f" ({'; '.join(parts)})" if parts else ""
 
 
+# How long a turn may receive nothing at all before we call the session hung.
+#
+# Nothing below this bounds a stalled stream on a self-hosted gateway. The CLI
+# decides BOTH whether to arm its own byte-idle watchdog AND whether to disable
+# the runtime's generic fetch timeout from one check on the endpoint host, so
+# against any base URL other than Anthropic's the good watchdog is not armed and
+# the blunt timeout is left on. Disabling the blunt one (API_FORCE_IDLE_TIMEOUT)
+# does not arm the other: it leaves the stream with no bound at all.
+#
+# Measured on a campaign that hung at the reporter: 40+ minutes with zero bytes
+# read on an ESTABLISHED socket, main thread parked in epoll_wait, no child
+# process, and CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS, CLAUDE_STREAM_IDLE_TIMEOUT_MS
+# and API_FORCE_IDLE_TIMEOUT all set with not one of them firing. A campaign in
+# that state never fails and never finishes, which is worse than failing --
+# nothing reports it and nothing reclaims it.
+#
+# 15 minutes clears the longest real turn observed here by enough margin that
+# this fires on hangs rather than on slow work.
+STREAM_IDLE_TIMEOUT_S = float(os.environ.get("AGENT_FLOW_STREAM_IDLE_TIMEOUT_S") or 900.0)
+
+
+class StreamIdleError(RuntimeError):
+    """Nothing arrived for ``STREAM_IDLE_TIMEOUT_S``, so the session is hung.
+
+    Worth its own type because the recovery is not a resend. The CLI subprocess
+    is still sitting on the dead request, so sending again on the same client
+    queues behind it and hangs too -- the session has to be torn down and
+    replaced.
+    """
+
+
+async def _each_before_idle(stream, seconds: float):
+    """Yield from ``stream``, raising :class:`StreamIdleError` on a silent gap.
+
+    The deadline is per message, not per turn: a turn that keeps producing is
+    never interrupted however long it runs, and only silence is cut. A per-turn
+    deadline would kill real work -- which is the mistake this replaces rather
+    than repeats.
+
+    The cancel scope opens and closes inside a single ``__anext__``, with the
+    ``yield`` outside it, so the generator is never suspended holding a scope.
+    """
+    iterator = stream.__aiter__()
+    while True:
+        with anyio.move_on_after(seconds) as scope:
+            try:
+                item = await iterator.__anext__()
+            except StopAsyncIteration:
+                return
+        if scope.cancelled_caught:
+            raise StreamIdleError(
+                f"no message from the backend for {seconds:.0f}s; treating the session as hung"
+            )
+        yield item
+
+
 class ClaudeCodeClient(BackendClient):
     def __init__(self, sdk_client) -> None:
         self._client = sdk_client
@@ -241,7 +298,9 @@ class ClaudeCodeClient(BackendClient):
         pending_result: ResultEvent | None = None
         try:
             await self._client.query(message)
-            async for sdk_message in self._client.receive_response():
+            async for sdk_message in _each_before_idle(
+                self._client.receive_response(), STREAM_IDLE_TIMEOUT_S
+            ):
                 if isinstance(sdk_message, SystemMessage):
                     if sdk_message.subtype == "init":
                         yield _session_init_event_from_data(sdk_message.data)
