@@ -4,11 +4,12 @@
 
 * **Per-site GEMVs** (`K3DecodeGemvs.project`): a projection of a decode step runs on the kernel measured fastest
   at its call site's weight shape (`SITES`): at most `MAX_ROWS` rows on `gemm/k3_decode_gemv`,
-  `gemm/k3_ctm_gemv_wide` or `gemm/k3_ctm_gemv_long`, and, where the site lists it, more rows (up to `WIDE_ROWS`)
-  on `gemm/k3_ctm_gemv_wide`. The sites are the decode kernels' fused projections (MLA's [W_a; W_g] with the gate
-  rows through a sigmoid, KDA's [q | k | v | g | f_a | b]), the attention output projection, the built-in MLA path's
-  q_a / kv_a, q_b and gate projections, and the MoE decode path's projections (`decode_moe.py`), two of them with
-  fp32 outputs.
+  `gemm/k3_ctm_gemv_wide`, `gemm/k3_ctm_gemv_long`, `gemm/k3_ctm_gemv` or `gemm/k3_ctm_gemv_swiglu`, and, where the
+  site lists it, more rows (up to `WIDE_ROWS`) on `gemm/k3_ctm_gemv_wide`. The sites are the decode kernels' fused
+  projections (MLA's [W_a; W_g] with the gate rows through a sigmoid, KDA's [q | k | v | g | f_a | b]), the attention
+  output projection, the built-in MLA path's q_a / kv_a, q_b and gate projections, the MoE decode path's projections
+  (`decode_moe.py`), two of them with fp32 outputs, and the DSpark drafter's q / k / v, output, gate / up and down
+  projections (`K3DSparkDrafter`).
 * **LM head** (`K3LogitsProcessor`): at most `MAX_ROWS` rows of this rank's vocabulary shard on
   `gemm/k3_head_gemv` over the target's `K3HeadGemvWorkspace`, then the shards gathered (`comm/allgather`) as the
   stock head gathers them. It is the shell's logits processor, so the speculative worker's target logits and the
@@ -41,8 +42,12 @@ from torch import nn
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.k3_situ_mul import k3_situ_mul
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import allgather
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv import k3_ctm_gemv
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_long import (
     k3_ctm_gemv_long,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_swiglu import (
+    k3_ctm_gemv_swiglu,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_wide import (
     k3_ctm_gemv_wide,
@@ -73,10 +78,11 @@ WIDE_ROWS = 64
 @dataclass(frozen=True)
 class Site:
     """A call site's weight shape (this target's per-rank shapes) and its kernels: ``small`` at 1..MAX_ROWS rows
-    ("decode", "wide" or "long"), and k3_ctm_gemv_wide at MAX_ROWS+1..``wide_rows`` rows where ``wide``. Output columns
-    from ``sig_col0`` on are stored through a sigmoid; ``out_fp32``: an fp32 output (k3_ctm_gemv_wide only).
-    ``split`` / ``ring`` / ``push``: k3_ctm_gemv_long's CTAs per 128-row weight tile, weight-ring stages, and whether
-    the partial sums are pushed to each row's owner."""
+    ("decode", "wide", "long", "ctm" for k3_ctm_gemv, or "swiglu" for k3_ctm_gemv_swiglu, whose rows are the
+    ``[gate | up]`` input of the SiLU-and-mul, 2 ``k`` wide), and k3_ctm_gemv_wide at MAX_ROWS+1..``wide_rows`` rows
+    where ``wide``. Output columns from ``sig_col0`` on are stored through a sigmoid; ``out_fp32``: an fp32 output
+    (k3_ctm_gemv_wide only). ``split`` / ``ring`` / ``push``: the CTM kernels' CTAs per 128-row weight tile,
+    k3_ctm_gemv_long's weight-ring stages, and whether the partial sums are pushed to each row's owner."""
 
     n: int
     k: int
@@ -113,7 +119,19 @@ SITES: Dict[str, Site] = {
     "moe_shared_gate_up": Site(768, 7168, "wide", wide=True),
     "moe_tail": Site(7168, 640, "wide", wide=True, wide_rows=32),
     "moe_up": Site(7168, 3584, "wide", out_fp32=True),
+    # The DSpark drafter's projections (K3DSparkDrafter; 6 query heads, 1 KV head of 64, MLP width 896): the fused
+    # q / k / v, the output projection (row parallel), gate_up [gate 896 | up 896], and the down projection with the
+    # SiLU-and-mul (row parallel).
+    "drafter_qkv": Site(512, 7168, "long", split=8, ring=6, push=True),
+    "drafter_o": Site(7168, 384, "ctm", split=1, push=True),
+    "drafter_gate_up": Site(1792, 7168, "long", split=8, ring=6, push=True),
+    "drafter_down": Site(7168, 896, "swiglu", split=2, push=True),
 }
+
+
+def _width(spec: Site) -> int:
+    """The row width a site's kernel reads: ``k``, or the ``[gate | up]`` input of a SiLU-and-mul site, 2 ``k``."""
+    return 2 * spec.k if spec.small == "swiglu" else spec.k
 
 
 def _wide_tile(rows: int) -> int:
@@ -136,6 +154,14 @@ def _run(
         return k3_ctm_gemv_wide(x2d, weight, sig_col0=spec.sig_col0, out_fp32=spec.out_fp32)
     if spec.out_fp32:
         return None
+    if kernel == "ctm":
+        if spec.sig_col0 >= 0 or not _ctm_op.supports(x2d, weight, spec.split):
+            return None
+        return k3_ctm_gemv(x2d, weight, trigger_early=True, split=spec.split, push=spec.push)
+    if kernel == "swiglu":
+        if spec.sig_col0 >= 0 or not _ctm_op.supports_swiglu(x2d, weight, spec.split):
+            return None
+        return k3_ctm_gemv_swiglu(x2d, weight, trigger_early=True, split=spec.split, push=spec.push)
     # One wave of the GPU's SMs: beyond it the long GEMV loses to the others.
     sms = torch.cuda.get_device_properties(x2d.device).multi_processor_count
     if math.ceil(spec.n / 128) * spec.split > sms or not _ctm_op.supports_long(
@@ -240,7 +266,7 @@ class K3DecodeGemvs:
             for rows in (1, 16, 32, 64) if spec.wide else (1,):
                 if rows > spec.wide_rows:
                     continue
-                state._project(site, weight.new_zeros(rows, spec.k), weight, warm=True)
+                state._project(site, weight.new_zeros(rows, _width(spec)), weight, warm=True)
             del weight
         if "dense_gate_up" in sites:
             gu = torch.zeros(1, SITES["dense_gate_up"].n, dtype=torch.bfloat16, device=device)
@@ -262,25 +288,27 @@ class K3DecodeGemvs:
 
     def project(self, site: str, x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
         """``x @ weight.T`` (``[..., N]``: bf16, the site's sigmoid columns through the sigmoid; fp32 at an
-        ``out_fp32`` site) for ``site``'s weight on its decode kernel, or None where none takes the call: more rows
-        than the site's kernels take, another shape or dtype, or, under capture, a kernel that has not run eagerly.
-        The caller then runs its GEMM."""
+        ``out_fp32`` site; on a SiLU-and-mul site, ``silu(gate) * up`` of ``x = [gate | up]`` first) for ``site``'s
+        weight on its decode kernel, or None where none takes the call: more rows than the site's kernels take,
+        another shape or dtype, or, under capture, a kernel that has not run eagerly. The caller then runs its
+        module."""
         return self._project(site, x, weight, warm=False)
 
     def _project(
         self, site: str, x: torch.Tensor, weight: torch.Tensor, warm: bool
     ) -> Optional[torch.Tensor]:
         spec = SITES[site]
+        width = _width(spec)
         if (
             weight.dtype != torch.bfloat16
             or tuple(weight.shape) != (spec.n, spec.k)
             or not weight.is_contiguous()
             or x.dtype != torch.bfloat16
             or x.dim() < 1
-            or x.shape[-1] != spec.k
+            or x.shape[-1] != width
         ):
             return None
-        rows = x.numel() // spec.k
+        rows = x.numel() // width
         if 0 < rows <= MAX_ROWS:
             kernel = spec.small
         elif spec.wide and MAX_ROWS < rows <= spec.wide_rows:
@@ -291,7 +319,7 @@ class K3DecodeGemvs:
         capturing = _capturing()
         if capturing and not warm and key not in self._ran:
             return None
-        y = _run(spec, kernel, _dense_rows(x.reshape(rows, spec.k)), weight)
+        y = _run(spec, kernel, _dense_rows(x.reshape(rows, width)), weight)
         if y is None:
             return None
         if not capturing:

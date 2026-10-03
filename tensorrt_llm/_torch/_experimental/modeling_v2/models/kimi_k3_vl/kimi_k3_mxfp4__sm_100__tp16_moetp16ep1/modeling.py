@@ -72,6 +72,8 @@ weights are a predicted non-load, `weights.py`), and a step carrying multimodal 
 split. The causal LM is still the stock one-engine shell the built-in model builds on, which without that config
 builds no drafter and no worker. This target drops `tp16_moetp4ep4`'s KDA verify kernels and the per-token verify
 states they keep; the text model's speculative hidden-state taps stay as `tp16_moetp4ep4` has them and never fire.
+The DSpark drafter (`K3DSparkDrafter`, which `_build_draft_model` builds) also stays as `tp16_moetp4ep4` has it
+and is never built here; its decode GEMV sites are warmed with the others and never called.
 """
 # <<< route B
 
@@ -86,6 +88,9 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, NamedTuple, Opti
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_drafter_attn_qknorm import (
+    k3_drafter_attn_qknorm,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_mla_attn_vb_out import (
     k3_mla_attn_vb_out,
 )
@@ -105,6 +110,11 @@ from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import k3_mla_deco
 # <<< route B
 from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
+from tensorrt_llm._torch.models.modeling_dspark import (
+    GQADSparkForCausalLM,
+    draft_is_embedded_in_target,
+)
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, register_auto_model
@@ -124,6 +134,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
+from tensorrt_llm._torch.pyexecutor.config_utils import is_mla
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.functional import AllReduceStrategy
@@ -177,6 +188,10 @@ REQUIRED_TRTLLM_OPS = (
     "k3_moe",
     "k3_route_quant",
     "mnnvl_allgather_split",
+    # The DSpark drafter's decode path (K3DSparkDrafter): its GEMV sites and its block attention.
+    "k3_ctm_gemv",
+    "k3_ctm_gemv_swiglu",
+    "k3_drafter_attn_qknorm",
 )
 
 #: The engine surface the first forward checks before this target relies on it: per object, the attributes read.
@@ -218,6 +233,13 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.modules.rms_norm.RMSNorm",
     "tensorrt_llm._torch.distributed.AllReduce",
     "tensorrt_llm._torch.modules.multi_stream_utils.maybe_execute_in_parallel",
+    # The DSpark drafter: the stock GQA drafter K3DSparkDrafter extends (its block forward where the drafter entries
+    # do not take a block, its context projection and context k / v, its heads and its weight load), and the stock
+    # builder's checks for which drafter a checkpoint gets.
+    "tensorrt_llm._torch.models.modeling_dspark.GQADSparkForCausalLM",
+    "tensorrt_llm._torch.models.modeling_dspark.draft_is_embedded_in_target",
+    "tensorrt_llm._torch.models.modeling_dflash.DFlashForCausalLM",
+    "tensorrt_llm._torch.pyexecutor.config_utils.is_mla",
 )
 
 # The K3 decode kernels' bounds: the token-count kernels take one tile of DECODE_MAX_TOKENS rows; the request-aware
@@ -2275,6 +2297,264 @@ class K3DecodeMLA(KimiK3MLAAttention):
 
 
 # ----------------------------------------------------------------------------------------------------------------------
+# The DSpark drafter: the stock GQA drafter, with a decode step's block on the drafter entries.
+# ----------------------------------------------------------------------------------------------------------------------
+
+#: The (requests, block tokens) splits attention/k3_drafter_attn_qknorm certifies; R x 7 is DSpark's block at
+#: max_draft_len 7.
+DRAFTER_ATTN_SPLITS = frozenset(
+    {(1, 1), (1, 8), (2, 4), (4, 2), (8, 1), (3, 1), (2, 8), (8, 8)} | {(r, 7) for r in range(1, 9)}
+)
+# The drafter layout it certifies: 6 query heads and 1 KV head of 64 per rank, context pages of 64 rows, the q / k
+# RMSNorm's epsilon and the NeoX RoPE's base.
+_DRAFTER_HEADS = (6, 1)
+_DRAFTER_HEAD_DIM = 64
+_DRAFTER_PAGE = 64
+_DRAFTER_EPS = 1e-5
+_DRAFTER_ROPE_BASE = 10000.0
+
+
+class K3DSparkDrafter(GQADSparkForCausalLM):
+    """Kimi K3's DSpark drafter: the stock GQA drafter, with a decode step's block forward on the drafter entries.
+
+    A block the entries take runs, per layer:
+
+    * the fused q / k / v projection on the ``drafter_qkv`` decode GEMV site;
+    * ``attention/k3_drafter_attn_qknorm``: the q / k RMSNorm, the NeoX RoPE, and each request's block attending to
+      its paged context and to its own k / v, in one launch. The block's k / v are not stored in the cache: the
+      worker writes the accepted rows' context k / v before a block reads them;
+    * the output projection on ``drafter_o``, then the module's all-reduce;
+    * gate / up on ``drafter_gate_up`` and the down projection with the SiLU-and-mul on ``drafter_down``, then the
+      module's all-reduce.
+
+    The norms and the residual adds are the stock modules'; a projection whose site does not take its rows runs its
+    module. Every other block runs the stock ``dflash_forward``: a split `DRAFTER_ATTN_SPLITS` does not list, another
+    attention backend, head layout, RoPE or normalization, a cache the kernel does not read, or a compile key of the
+    attention that has not run eagerly, under CUDA-graph capture. The worker that calls it (the stock
+    ``DSparkWorker``), the context projection, the context k / v and the Markov head stay upstream code.
+    """
+
+    def __init__(
+        self, draft_config: ModelConfig, *, dflash_attention_backend: str = "AUTO"
+    ) -> None:
+        super().__init__(draft_config, dflash_attention_backend=dflash_attention_backend)
+        # The decode GEMVs' state (decode_gemv.py), shared by the target's layers; set by the target once built.
+        self.decode_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
+        # Whether every layer is one the drafter entries take; decided on the first block, the weights loaded.
+        self._k3_take: Optional[bool] = None
+        # The attention's compile keys that ran eagerly ((more than one request, page stride)); a capture takes
+        # only these.
+        self._k3_attn_ran: set = set()
+
+    def dflash_forward(
+        self,
+        noise_embedding: torch.Tensor,
+        query_positions: torch.Tensor,
+        num_ctx_per_req: torch.Tensor,
+        ctx_k_cache: torch.Tensor,
+        ctx_v_cache: torch.Tensor,
+        ctx_cache_batch_idx: torch.Tensor,
+        ctx_kv_cache: Optional[torch.Tensor] = None,
+        ctx_page_table: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """The block's hidden states ``[B * block, hidden]``: on the drafter entries where they take it (the class
+        docstring), else the stock forward."""
+        keys = self._k3_block_keys(noise_embedding, ctx_kv_cache, ctx_page_table)
+        if keys is None:
+            return super().dflash_forward(
+                noise_embedding,
+                query_positions,
+                num_ctx_per_req,
+                ctx_k_cache,
+                ctx_v_cache,
+                ctx_cache_batch_idx,
+                ctx_kv_cache,
+                ctx_page_table,
+            )
+        out = self._k3_block_forward(
+            noise_embedding,
+            query_positions,
+            num_ctx_per_req,
+            ctx_cache_batch_idx,
+            ctx_kv_cache,
+            ctx_page_table,
+        )
+        if not torch.cuda.is_current_stream_capturing():
+            self._k3_attn_ran |= keys
+        return out
+
+    def _k3_layers_take(self) -> bool:
+        """Whether every layer is one the drafter entries take: plain NeoX RoPE with the q / k RMSNorm at the head
+        layout, epsilon and RoPE base the attention certifies, bias-free projections, a plain SiLU-and-mul MLP,
+        non-causal unwindowed block attention, and no block convolution or post-attention gate."""
+        if self._k3_take is None:
+            if self._fused_kv_weight is None:
+                self._build_fused_kv_buffers()
+            take = (
+                self._use_fused_qk_norm_rope
+                and not self.has_block_conv
+                and type(self)._post_attention_gate is DFlashForCausalLM._post_attention_gate
+            )
+            for layer_idx, layer in enumerate(self.model.layers):
+                attn, mlp = layer.self_attn, layer.mlp
+                pos = getattr(attn, "pos_embd_params", None)
+                rope = getattr(pos, "rope", None)
+                norms = (attn.q_norm, attn.k_norm)
+                take = take and (
+                    (attn.num_heads, attn.num_key_value_heads) == _DRAFTER_HEADS
+                    and attn.head_dim == _DRAFTER_HEAD_DIM
+                    and getattr(attn, "is_qk_norm", False)
+                    and not getattr(attn, "use_gemma_rms_norm", True)
+                    and rope is not None
+                    and pos.is_neox
+                    and getattr(pos, "mrope_section", None) is None
+                    and rope.theta == _DRAFTER_ROPE_BASE
+                    and all(
+                        norm.variance_epsilon == _DRAFTER_EPS
+                        and norm.weight.dtype == torch.bfloat16
+                        and tuple(norm.weight.shape) == (_DRAFTER_HEAD_DIM,)
+                        for norm in norms
+                    )
+                    and attn.qkv_proj.bias is None
+                    and attn.o_proj.bias is None
+                    and mlp.activation is torch.nn.functional.silu
+                    and mlp.swiglu_limit is None
+                    and mlp.swiglu_alpha in (None, 1.0)
+                    and mlp.swiglu_beta in (None, 0.0)
+                    and mlp.gate_up_proj.bias is None
+                    and mlp.down_proj.bias is None
+                    and self._resolve_block_attention(layer_idx) == (False, (-1, -1))
+                )
+            self._k3_take = bool(take)
+            logger.info(
+                f"Kimi K3 DSpark drafter: {len(self.model.layers)} layers, decode blocks "
+                + (
+                    "on k3_drafter_attn_qknorm and the drafter GEMV sites"
+                    if self._k3_take
+                    else "on the stock block forward (a layer the drafter entries do not take)"
+                )
+            )
+        return self._k3_take
+
+    def _k3_block_keys(
+        self,
+        noise_embedding: torch.Tensor,
+        ctx_kv_cache: Optional[torch.Tensor],
+        ctx_page_table: Optional[torch.Tensor],
+    ) -> Optional[frozenset]:
+        """The attention's compile keys for this block when the drafter entries take it, else None."""
+        if (
+            self.dflash_attention_backend != "TRTLLM"
+            or ctx_kv_cache is None
+            or ctx_page_table is None
+            or noise_embedding.dtype != torch.bfloat16
+            or tuple(noise_embedding.shape[:2]) not in DRAFTER_ATTN_SPLITS
+            or is_in_breakable_cuda_graph()
+            or not self._k3_layers_take()
+        ):
+            return None
+        num_kv_heads = self.model.layers[0].self_attn.num_key_value_heads
+        page = (2, num_kv_heads, _DRAFTER_PAGE, _DRAFTER_HEAD_DIM)
+        dense = (
+            num_kv_heads * _DRAFTER_PAGE * _DRAFTER_HEAD_DIM,
+            _DRAFTER_PAGE * _DRAFTER_HEAD_DIM,
+        )
+        strides = set()
+        for layer_idx in range(len(self.model.layers)):
+            cache = ctx_kv_cache[layer_idx]
+            if (
+                cache.dtype != torch.bfloat16
+                or cache.dim() != 5
+                or tuple(cache.shape[1:]) != page
+                or cache.stride()[1:] != (*dense, _DRAFTER_HEAD_DIM, 1)
+                or cache.stride(0) % 8
+            ):
+                return None
+            strides.add(cache.stride(0))
+        keys = frozenset((noise_embedding.shape[0] > 1, stride) for stride in strides)
+        if torch.cuda.is_current_stream_capturing() and not keys <= self._k3_attn_ran:
+            return None
+        return keys
+
+    def _k3_block_forward(
+        self,
+        noise_embedding: torch.Tensor,
+        query_positions: torch.Tensor,
+        num_ctx_per_req: torch.Tensor,
+        ctx_cache_batch_idx: torch.Tensor,
+        ctx_kv_cache: torch.Tensor,
+        ctx_page_table: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, block = noise_embedding.shape[:2]
+        rows = batch * block
+        ctx_len = num_ctx_per_req[:batch].to(torch.int32)
+        page_table = ctx_page_table.index_select(0, ctx_cache_batch_idx.to(torch.long))
+        positions = query_positions.reshape(-1).contiguous()
+        hidden = noise_embedding.reshape(rows, -1)
+        residual = None
+        for layer_idx, layer in enumerate(self.model.layers):
+            attn = layer.self_attn
+            if residual is None:
+                residual = hidden.clone()
+                normed = layer.input_layernorm(hidden)
+            else:
+                normed, residual = layer.input_layernorm(hidden, residual)
+            qkv = self._k3_project("drafter_qkv", normed, attn.qkv_proj)
+            out = torch.empty(rows, attn.q_size, dtype=torch.bfloat16, device=qkv.device)
+            k3_drafter_attn_qknorm(
+                qkv,
+                attn.q_norm.weight,
+                attn.k_norm.weight,
+                positions,
+                attn.q_norm.variance_epsilon,
+                attn.pos_embd_params.rope.theta,
+                ctx_kv_cache[layer_idx],
+                page_table,
+                ctx_len,
+                attn.num_heads,
+                attn.num_key_value_heads,
+                out,
+            )
+            hidden = self._k3_project("drafter_o", out, attn.o_proj)
+            hidden, residual = layer.post_attention_layernorm(hidden, residual)
+            hidden = self._k3_mlp(layer.mlp, hidden)
+        out, _ = self.model.norm(hidden, residual)
+        return out
+
+    def _k3_project(self, site: str, x: torch.Tensor, linear: nn.Module) -> torch.Tensor:
+        """``linear(x)``, its GEMM on the ``site`` decode GEMV where that takes the rows, then a row-parallel
+        projection's all-reduce."""
+        y = None if self.decode_gemvs is None else self.decode_gemvs.project(site, x, linear.weight)
+        if y is None:
+            return linear(x)
+        return _row_parallel_reduce(linear, y)
+
+    def _k3_mlp(self, mlp: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """``mlp(x)``: gate / up on ``drafter_gate_up`` and the SiLU-and-mul with the down projection on
+        ``drafter_down`` where both take the rows, then the down projection's all-reduce."""
+        gemvs = self.decode_gemvs
+        gate_up = (
+            None if gemvs is None else gemvs.project("drafter_gate_up", x, mlp.gate_up_proj.weight)
+        )
+        down = (
+            None
+            if gate_up is None
+            else gemvs.project("drafter_down", gate_up, mlp.down_proj.weight)
+        )
+        if down is None:
+            return mlp(x)
+        return _row_parallel_reduce(mlp.down_proj, down)
+
+
+def _row_parallel_reduce(linear: nn.Module, partial: torch.Tensor) -> torch.Tensor:
+    """``partial`` all-reduced as ``linear`` reduces its output: a row-parallel projection's all-reduce, if any."""
+    all_reduce = getattr(linear, "all_reduce", None)
+    if getattr(getattr(linear, "tp_mode", None), "name", None) == "ROW" and all_reduce is not None:
+        return all_reduce(partial)
+    return partial
+
+
+# ----------------------------------------------------------------------------------------------------------------------
 # The target: step classification, the construction checks and the registration shell.
 # ----------------------------------------------------------------------------------------------------------------------
 
@@ -2466,13 +2746,31 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
         model_config.pretrained_config = self.config
         model_config._frozen = True
 
+    def _build_draft_model(
+        self, model_config: ModelConfig, draft_config: Optional[ModelConfig]
+    ) -> Optional[nn.Module]:
+        """DSpark's drafter from a standalone GQA checkpoint is this target's `K3DSparkDrafter`; any other drafter
+        is the mode registry's."""
+        spec_config = model_config.spec_config
+        if (
+            spec_config.spec_dec_mode.is_dspark()
+            and draft_config is not None
+            and not draft_is_embedded_in_target(model_config)
+            and not is_mla(draft_config.pretrained_config)
+        ):
+            return K3DSparkDrafter(
+                draft_config, dflash_attention_backend=spec_config.attention_backend
+            )
+        return super()._build_draft_model(model_config, draft_config)
+
     def load_weights(self, weights, *args, **kwargs):
         _weights.load(self, weights)
 
     def cache_derived_state(self) -> None:
         """Build the decode GEMVs' state once the weights are final: the LM head's workspace, and one eager call of
         every decode GEMV kernel at its site's shape (decode_gemv.SITES), so none compiles under capture. Built once:
-        a later call keeps it, since CUDA graphs captured in between hold its workspace."""
+        a later call keeps it, since CUDA graphs captured in between hold its workspace. The DSpark drafter's sites
+        are among them, and the drafter gets the state too."""
         super().cache_derived_state()
         if self.model.decode_gemvs is not None:
             return
@@ -2482,6 +2780,8 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
         for layer in self.model.layers:
             if not layer.is_moe:
                 layer.decode_gemvs = gemvs
+        if isinstance(self.draft_model, K3DSparkDrafter):
+            self.draft_model.decode_gemvs = gemvs
 
     def post_load_weights(self) -> None:
         """The state the decode kernels share, built once per device before any CUDA-graph capture and handed to
