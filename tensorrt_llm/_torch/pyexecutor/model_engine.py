@@ -362,6 +362,23 @@ def _set_moe_a2a_warmup(in_warmup: bool) -> None:
             f"budget was not switched: {type(e).__name__}: {e}")
 
 
+def uses_full_generation_page_table(enable_spec_decode: bool,
+                                    disable_overlap_scheduler: bool,
+                                    spec_config: Optional[DecodingBaseConfig],
+                                    attn_metadata) -> bool:
+    """Return whether overlap decode needs every reserved generation page.
+
+    ``attn_metadata`` may be an ``AttentionMetadata`` instance or its class:
+    only the presence of the correction hook is read, so the executor creator
+    can evaluate this before any metadata exists.
+    """
+    # FlashInfer metadata owns the optional device-side KV-length correction used with this
+    # wider page table.
+    return (enable_spec_decode and not disable_overlap_scheduler
+            and getattr(spec_config, '_use_shared_kv_cache', False)
+            and hasattr(attn_metadata, 'apply_spec_decode_kv_lens_offsets'))
+
+
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(
@@ -3920,11 +3937,9 @@ class PyTorchModelEngine(ModelEngine):
             self, spec_config: Optional[DecodingBaseConfig],
             attn_metadata: AttentionMetadata) -> bool:
         """Return whether overlap decode needs every reserved generation page."""
-        # FlashInfer metadata owns the optional device-side KV-length correction used with this
-        # wider page table.
-        return (self.enable_spec_decode and not self._disable_overlap_scheduler
-                and getattr(spec_config, '_use_shared_kv_cache', False)
-                and hasattr(attn_metadata, 'apply_spec_decode_kv_lens_offsets'))
+        return uses_full_generation_page_table(self.enable_spec_decode,
+                                               self._disable_overlap_scheduler,
+                                               spec_config, attn_metadata)
 
     def _preprocess_inputs(self, inputs: Dict[str, Any]):
         """
