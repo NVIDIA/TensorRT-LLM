@@ -47,6 +47,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         CacheLevel,
         CudaStream,
         KVCacheManager,
+        MmItemContext,
         ReuseScope,
         TokenId,
         _introspection,
@@ -57,6 +58,7 @@ else:
         CacheLevel,
         CudaStream,
         KVCacheManager,
+        MmItemContext,
         ReuseScope,
         TokenId,
         _introspection,
@@ -274,7 +276,11 @@ def test_event_data_pickle_round_trip_preserves_value_semantics():
         [token],
         cache_level=1,
         priority=35,
-        mm_keys=[(b"short-mm-key", 3), (b"another-key", 5, "uuid")],
+        mm_keys=[
+            (b"short-mm-key", 3),
+            (b"another-key", 5, "uuid"),
+            (b"digest-key", 7, "routing-identity", True),
+        ],
         cache_salt="salt",
     )
     diff = KVCacheEventDiff(0, 1)
@@ -955,7 +961,8 @@ def test_v2_kv_cache_event_manager_derives_mm_keys_across_blocks(
     make_block = real_block_factory(event_manager)
     digest_a = bytes(range(32))
     digest_b = bytes(reversed(range(32)))
-    first = make_block([1, digest_a, 1001, 1002], [ancestor_coverage])
+    uuid_a = "frontend-h-a"
+    first = make_block([1, MmItemContext(digest_a, uuid_a), 1001, 1002], [ancestor_coverage])
     gap = make_block([2, 3, 4, 5], [ancestor_coverage], parent=first)
     continued = make_block([1003, 7, 1004, 1005], [4], parent=gap)
     last = make_block([1006, digest_b, 1001, 9], [4], parent=continued)
@@ -972,17 +979,37 @@ def test_v2_kv_cache_event_manager_derives_mm_keys_across_blocks(
     }
     expected = {
         _block_key(continued).hex(): [
-            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 3},
-            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 4},
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 3,
+            },
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 4,
+            },
         ],
         _block_key(last).hex(): [
-            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 6},
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 6,
+            },
             {"type": "mm_key", "hash": digest_b.hex(), "start_offset": 0},
         ],
     }
     if ancestor_coverage == 4:
         expected[_block_key(first).hex()] = [
-            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 0}
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 0,
+            }
         ]
         expected[_block_key(gap).hex()] = []
     assert mm_keys_by_hash == expected
@@ -994,7 +1021,9 @@ def test_v2_kv_cache_event_manager_preserves_mm_keys_after_life_cycle_removal(re
     )
     make_block = real_block_factory(event_manager, num_life_cycles=2)
     mm_hash = bytes(range(32))
-    block = make_block([mm_hash, 1001], [2, 2])
+    uuid = "frontend-routing-identity-" + "x" * 1024
+    assert uuid != mm_hash.hex()[:16]
+    block = make_block([MmItemContext(mm_hash, uuid), 1001], [2, 2])
     block_key = _block_key(block)
 
     _add_stored_block(event_manager, block)
@@ -1004,6 +1033,7 @@ def test_v2_kv_cache_event_manager_preserves_mm_keys_after_life_cycle_removal(re
         {
             "type": "mm_key",
             "hash": mm_hash.hex(),
+            "uuid": uuid,
             "start_offset": 0,
         }
     ]

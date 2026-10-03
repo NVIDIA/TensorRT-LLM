@@ -1342,8 +1342,9 @@ def create_input_processor_with_hash(
         positions, and masks on top.
 
         Supports optional user-provided UUIDs via 'multi_modal_uuids' in inputs.
-        When a UUID is provided for a multimodal item, it will be used as the
-        cache identifier and returned in KV cache events instead of the content hash.
+        When a UUID is provided for a multimodal item, it contributes to the
+        derived cache digest and is preserved as the external identity in KV
+        cache events.
         """
         assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
         mm_data = inputs['multi_modal_data']
