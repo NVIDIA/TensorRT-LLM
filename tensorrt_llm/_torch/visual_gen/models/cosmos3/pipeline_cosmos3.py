@@ -755,7 +755,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     "Please run the following installation commands or "
                     "explicitly disable guardrails by setting TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1 "
                     "(user is responsible for deploying the model without guardrails). "
-                    "- `pip install cosmos_guardrail==0.3.0 && pip uninstall opencv-python`"
+                    "- `pip install cosmos_guardrail==0.3.2 && pip uninstall opencv-python "
+                    "&& pip install opencv-python-headless`"
                 )
             # Guardrails are only evaluated on rank 0; load them only there to avoid
             # dead model weights occupying GPU memory on every other rank.
@@ -2742,7 +2743,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     ) -> torch.Tensor:
         """Run Cosmos3 transfer denoising with sequential control/text CFG branches."""
 
-        branch_caches: dict[str, tuple[Any, Any]] = {}
+        branch_caches: dict[
+            str,
+            tuple[Any, Any, torch.Tensor | None, list[int] | None, bool | None],
+        ] = {}
 
         def run_branch(
             cache_key: str,
@@ -2752,10 +2756,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             branch_control_latents: list[torch.Tensor] | None,
             timestep: torch.Tensor,
         ) -> torch.Tensor:
-            self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches.get(
-                cache_key,
-                (None, None),
-            )
+            (
+                self.transformer.cached_kv,
+                self.transformer.cached_freqs_gen,
+                self.transformer.cached_real_text_lens,
+                self.transformer.cached_real_text_lens_host,
+                self.transformer.cached_text_lengths_uniform,
+            ) = branch_caches.get(cache_key, (None, None, None, None, None))
             result = self.transformer(
                 hidden_states=latents,
                 timestep=timestep / self.scheduler.config.num_train_timesteps,
@@ -2769,6 +2776,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             branch_caches[cache_key] = (
                 self.transformer.cached_kv,
                 self.transformer.cached_freqs_gen,
+                self.transformer.cached_real_text_lens,
+                self.transformer.cached_real_text_lens_host,
+                self.transformer.cached_text_lengths_uniform,
             )
             if result.video is None:
                 raise ValueError("Cosmos3 transfer diffusion expects video predictions.")

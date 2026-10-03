@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import queue
 import subprocess
@@ -209,6 +224,51 @@ def check_mixed_prompt_batch(client,
                 f"[{label}] empty response — request did not complete"
         print_info(f"[{label}] reasoning: {reasoning!r}")
         print_info(f"[{label}] content:   {content!r}")
+
+
+def test_config_override_precedence(llm_root, llm_venv, tmp_path) -> None:
+    """Verify YAML < dedicated CLI < --set with a single-GPU serving request."""
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(llm_root, "examples", "serve", "requirements.txt")
+    ])
+    model_path = os.environ.get("LLM_ENGINE_DIR") or os.path.join(
+        llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({
+        "tensor_parallel_size": 99,
+        "max_num_tokens": 16384,
+    }),
+                           encoding="utf-8")
+    port = get_free_port_in_ci()
+    # TP=99 or PP=2 would fail on one GPU, so startup checks both boundaries.
+    cmd = [
+        "trtllm-serve",
+        model_path,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--tp_size",
+        "1",
+        "--pp_size",
+        "2",
+        "--config",
+        str(config_path),
+        "--set",
+        "pipeline_parallel_size=1",
+    ]
+    with popen(cmd) as proc:
+        _wait_for_server_ready(proc, http_port=port)
+        with OpenAI(base_url=f"http://localhost:{port}/v1",
+                    api_key="tensorrt_llm",
+                    timeout=600) as client:
+            response = client.completions.create(
+                model="TinyLlama-1.1B-Chat-v1.0",
+                prompt="Where is New York?",
+                max_tokens=20,
+            )
+            assert response.choices, "Server returned no completion choices"
 
 
 @pytest.mark.parametrize("config_flag", ["--extra_llm_api_options", "--config"])

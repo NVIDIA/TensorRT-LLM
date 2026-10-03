@@ -424,14 +424,10 @@ class CachedModelLoader:
                                        DFlashDecodingConfig)):
                     self.llm_args._validate_dflash_ctx_budget()
 
-        # AutoDeploy doesn't use ModelLoader
-        if self.llm_args.backend == "_autodeploy":
-            return None
-
         self._hf_model_dir = None
         self.model_loader = ModelLoader(self.llm_args)
 
-        if self.llm_args.backend not in ["pytorch", "_autodeploy"]:
+        if self.llm_args.backend != "pytorch":
             raise ValueError(
                 f'backend {self.llm_args.backend} is not supported.')
 
@@ -612,6 +608,12 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
                 "falling back to V1.", runtime, effective_backend)
             use_v2 = False
 
+    if (not use_v2 and llm_args.kv_cache_config.block_reuse_config.
+            swa_endpoint_rewind_tokens > 0):
+        raise ValueError(
+            "block_reuse_config.swa_endpoint_rewind_tokens requires KV cache "
+            "manager v2, but use_kv_cache_manager_v2='auto' resolved to V1. "
+            "Set kv_cache_config.use_kv_cache_manager_v2=True explicitly.")
     llm_args.kv_cache_config.use_kv_cache_manager_v2 = use_v2
     return use_v2
 

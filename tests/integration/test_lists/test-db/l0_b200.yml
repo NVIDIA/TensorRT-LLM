@@ -32,9 +32,12 @@ l0_b200:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_horizontal_producer.py
+  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_nvfp4_horizontal_producer.py
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_indexer.py
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_unfused_index_projection_tp_construction
+  - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_explicit_caches_match_manager
+  - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage[cuda]
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
@@ -113,6 +116,7 @@ l0_b200:
   - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_tf32.py TIMEOUT (15)
   - unittest/_torch/attention/sparse/test_sparse_mla_forward.py TIMEOUT (60)
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
+  - unittest/_torch/modeling/test_glm5_next_contracts.py
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
@@ -252,7 +256,6 @@ l0_b200:
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e4b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_multimodal_26b_dummy
-  - unittest/auto_deploy/standalone/test_standalone_package.py::TestStandalonePackage::test_run_unit_tests
   - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
@@ -300,12 +303,18 @@ l0_b200:
   - unittest/_torch/visual_gen/test_pertoken_adaln.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
   - unittest/_torch/visual_gen/test_fa4_cutlass_compatibility.py
-  - unittest/_torch/visual_gen/test_attention_cute_dsl_vsa.py
-  - unittest/_torch/visual_gen/test_attention_cute_dsl_sol_attn.py
+  - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_attention.py
+  - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_kernels.py
+  - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_parity.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_attention.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_parity.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_predictor.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_predictor_kernels.py
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_attention_cudnn.py
   - unittest/_torch/visual_gen/test_attention_integration.py
+  - unittest/_torch/visual_gen/test_trtllm_attention_metadata.py
   - unittest/_torch/visual_gen/test_attention_fa4.py
   - unittest/_torch/visual_gen/test_attention_perf.py
   - unittest/_torch/visual_gen/test_qwen_image_layered_registry.py

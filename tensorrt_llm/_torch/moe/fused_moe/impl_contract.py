@@ -121,6 +121,9 @@ class MoEProblem:
     activation_constants: frozenset[str] = frozenset()
     #: ``RoutingMethodType`` member name; None means the call site did not say.
     routing: Optional[str] = None
+    #: True when a clamped SwiGLU must clamp its activated gate rather than
+    #: preserving the historical raw-gate clamp order.
+    clamp_after_silu: bool = False
 
     @property
     def routing_method_type(self) -> Optional["RoutingMethodType"]:
@@ -503,6 +506,7 @@ class MoEResolutionReport:
                 "bias": self.problem.bias,
                 "activation": self.problem.activation,
                 "activation_constants": sorted(self.problem.activation_constants),
+                "clamp_after_silu": self.problem.clamp_after_silu,
                 "routing": self.problem.routing,
             },
             "deployment": {
