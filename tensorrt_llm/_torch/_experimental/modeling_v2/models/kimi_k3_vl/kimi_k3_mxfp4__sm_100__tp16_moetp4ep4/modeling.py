@@ -877,7 +877,7 @@ class KimiK3MoERuntime(nn.Module):
             # as if it were the backend that was asked for, and the decline is
             # easy to trigger: MegaMoE has its own token / top-k limits and is
             # EP-only, and CuteDSL declines on activation shape, SM version and
-            # the CuTe DSL dependency. Measured 2026-09-08: a CUTEDSL request
+            # the CuTe DSL dependency. As measured once: a CUTEDSL request
             # was turned down on every one of the 92 MoE layers, on all 16
             # ranks, and still produced correct text and a zero exit -- the
             # only trace was a warning line per layer. Fail in the resolver
