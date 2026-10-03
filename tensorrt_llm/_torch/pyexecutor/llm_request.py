@@ -639,15 +639,24 @@ class PyResult:
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
 
-    def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
-                             mm_embedding_lengths: List[int]):
+    def append_mm_embeddings(
+        self,
+        mm_embeddings: torch.Tensor,
+        mm_embedding_lengths: List[int],
+        mm_embedding_metadata: list[dict[str, list[int]]]
+        | None = None) -> None:
         """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:
             mm_embeddings: Concatenated multimodal embeddings tensor of shape
                 [total_tokens, hidden_dim].
             mm_embedding_lengths: Per-item encoder-output embedding lengths.
+            mm_embedding_metadata: Optional per-item layout data for prefill.
         """
+        if mm_embedding_metadata is not None and len(
+                mm_embedding_metadata) != len(mm_embedding_lengths):
+            raise ValueError(
+                "Embedding metadata must have one entry per multimodal item")
         split_embeddings = torch.split(mm_embeddings,
                                        mm_embedding_lengths,
                                        dim=0)
@@ -656,6 +665,11 @@ class PyResult:
             SharedTensorContainer.from_tensor(emb).dump_to_dict()
             for emb in split_embeddings
         ]
+        if mm_embedding_metadata is not None:
+            for handle, metadata in zip(self._mm_embeddings,
+                                        mm_embedding_metadata,
+                                        strict=True):
+                handle["metadata"] = metadata
         self.diff.mm_embeddings = self._mm_embeddings
 
     def set_mrope_position(
@@ -1053,16 +1067,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_num_connector_matched_tokens = 0
 
-        # Whether the KV connector has been asked about, and told about, this
-        # request's current KV allocation. The promise is at most once per
-        # allocation, not once per request, so this is cleared in
-        # `free_resources` -- the one place an allocation dies.
+        # Destination pages are reported once per allocation. Destroying the
+        # allocation clears this flag so replay can report its new pages.
         self.py_connector_allocation_reported = False
 
-        # End of the prefix a KV connector populated for the current allocation,
-        # or 0. The cache holds those tokens but never commits them, so a context
-        # request that re-enters cannot recover the end from the cache's own
-        # reuse depth.
+        # End of the connector prefix retained by this allocation, or 0. This
+        # depth survives async parking; local reuse cannot reconstruct it.
         self.py_connector_served_position = 0
 
         self.py_result = PyResult(

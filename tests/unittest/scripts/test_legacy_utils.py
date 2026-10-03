@@ -290,12 +290,6 @@ def rendered_toml():
     return template.render(paths=["dummy/file.py"])
 
 
-class TestNoAutoDeployPerFileIgnore:
-    def test_no_auto_deploy_in_template(self, rendered_toml):
-        """Rendered ruff-legacy.toml should not contain auto_deploy per-file-ignore."""
-        assert "auto_deploy" not in rendered_toml
-
-
 class TestNoPylintMaxArgs:
     def test_no_max_args_in_template(self, rendered_toml):
         """Rendered ruff-legacy.toml should not contain max-args config."""
