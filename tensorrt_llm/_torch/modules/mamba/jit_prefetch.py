@@ -107,16 +107,31 @@ class MambaSSDProvider:
         return 1 if v == 1 else (16 if v % 16 == 0 else 0)
 
     def batch_key(self, ctx_lens: List[int], any_cached: bool) -> tuple:
+        """Coarse dedup key: re-plan only when a planned launch could differ.
+
+        Covers every batch-dependent int that reaches a kernel signature:
+        token count, sequence count, and the chunk counts derived from them
+        (``nchunks`` and the chunk-index length ``N``, which adds one chunk per
+        sequence boundary that is not chunk-aligned). Planning itself is exact;
+        this only decides whether to plan. A miss here costs one extra plan
+        (tens of ms), never a wrong key.
+        """
+        from .mamba2_metadata import compute_extra_chunks_cpu
+
         n = len(ctx_lens)
         tokens = sum(ctx_lens)
-        # Everything below that reaches a kernel signature as an int arg or a
-        # constexpr; plus the multi-seq flag that gates the chunk-index kernel.
+        classes = []
+        for s in self.shapes:
+            nchunks = -(-tokens // s.chunk_size)
+            extra = compute_extra_chunks_cpu(ctx_lens, n, s.chunk_size)
+            classes.append((self._int_class(nchunks), self._int_class(nchunks + extra)))
         return (
             min(n, 2),
             any_cached,
             self._int_class(tokens),
             self._int_class(n),
             self._int_class(n + 1),
+            tuple(classes),
         )
 
     def __call__(self, batch_ctx: Any) -> List[KernelCall]:
@@ -148,7 +163,10 @@ class MambaSSDProvider:
         dt = zxbcdt[:, s.d_inner + s.conv_dim :].unsqueeze(0)
         bc = s.ngroups * s.d_state
         if s.token_major_conv:
-            xbc = torch.empty(s.conv_dim, T, dtype=s.io_dtype, device=meta).t()
+            # Mamba2Mixer.forward_core: empty(T, conv_dim).t() is the conv's
+            # channel-last output, and .t() again gives the token-major
+            # [T, conv_dim] view that x/B/C are sliced from.
+            xbc = torch.empty(T, s.conv_dim, dtype=s.io_dtype, device=meta)
             x = xbc[:, : s.d_inner].view(T, s.nheads, s.head_dim).unsqueeze(0)
             B = xbc[:, s.d_inner : s.d_inner + bc].view(T, s.ngroups, s.d_state).unsqueeze(0)
             C = xbc[:, s.d_inner + bc :].view(T, s.ngroups, s.d_state).unsqueeze(0)
