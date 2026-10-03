@@ -170,6 +170,8 @@ l0_b200:
   # l0_b300's modeling_v2 entry, the only other one that collects them, is waived (nvbugs/6853741).
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_construction.py
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_drift.py
+  # tp16_moetp16ep1's MoE decode path: the layers and steps it takes (its kernels: l0_gb200_multi_gpus.yml).
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_route_b_moe.py
   # KDA runtime: host-derived prefill metadata and the bf16 state pool
   # round-trip. Both are single-device cases that use GPU 0 only.
   - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py

@@ -51,10 +51,14 @@ all-reduces send one-shot up to 4 MiB. The state those kernels share (the KDA pr
 attention workspace, the decode GEMVs' state, the TP group's MNNVL and sandwich workspaces) lives in typed objects this
 target creates in `post_load_weights`, before any graph capture.
 
-The MoE layers run the generic path on every step. `decode_moe.py` is `tp16_moetp4ep4`'s MoE decode path, which this
-target does not build (its wide `k3_moe` build does not fit 896 local experts); this layout's own MoE engines
-(`moe/k3_moe_m1` and `moe/k3_moe_m2` at one and two tokens, `moe/k3_moe` over all 896 experts up to 8) come with their
-wiring as route B blocks.
+A MoE layer on a step of at most 8 tokens runs `decode_moe.py` with every expert on each rank: `moe/k3_moe_front`
+(this rank's head slice, its all-gather, the top-16 routing, the MXFP8 latent and the shared experts' gate_up + SiTU),
+then the routed experts as `moe/k3_moe_m1` at one token, `moe/k3_moe_m2` at two and `moe/k3_moe` over all 896 experts
+up to 8, the latent all-reduce and the row-parallel tail. On a pushing step (`DecodeStep.latent_push`) the engines
+push their partials into the TP group's `K3LatentExchange` and `comm/k3_latent_reduce` sums them; other steps use the
+routed experts' all-reduce, which sums in the same order. Its routing is the front's (the noaux_tc arithmetic), not
+the generic path's TRTLLM-Gen routing. Wider steps, and every step of a checkpoint whose SiTU caps differ from the ones
+the engines compile in, run the generic path: `k3_moe`'s wide build does not fit 896 local experts.
 
 **What this target asserts rather than adapts**: SM 10.0; the topology above, with the expert split set explicitly;
 no speculative decoding; the MXFP4 checkpoint's quantization (W4A16_MXFP4 with no per-layer declarations, so the
@@ -189,6 +193,10 @@ REQUIRED_TRTLLM_OPS = (
     "k3_latent_reduce",
     "k3_route_quant",
     "mnnvl_allgather_split",
+    # >>> route B: the MoE engines of one and two tokens
+    "k3_moe_m1",
+    "k3_moe_m2",
+    # <<< route B
     # The DSpark drafter's decode path (K3DSparkDrafter): its GEMV sites, its block attention, and its all-reduces
     # with the residual add and RMSNorm (the split context projection's with hidden_norm).
     "k3_ctm_gemv",
@@ -3177,10 +3185,7 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
             for layer in layers:
                 layer.decode_comm = comm
             _decode_comm.use_decode_one_shot(self)
-        # >>> route B: no MoE decode path yet (its build is tp16_moetp4ep4's; k3_moe's wide build does not fit 896
-        # local experts). The MoE layers run the generic path until route B's own engines are wired.
-        moe_layers = 0
-        # <<< route B
+        moe_layers = 0 if comm is None else self._build_decode_moe(comm)
         logger.info(
             # >>> route B: no verify kernels
             "Kimi K3 decode kernels: KDA on k3_kda_decode_attn "
@@ -3196,7 +3201,9 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
                 if comm is not None
                 else "unfused (an attention all-reduce does not run over MNNVL)"
             )
-            + f"; MoE on k3_moe_front, k3_moe and the row-parallel tail ({moe_layers} layers)"
+            # >>> route B: this target's MoE engines
+            + f"; MoE on k3_moe_front, k3_moe_m1 / k3_moe_m2 / k3_moe and the row-parallel tail ({moe_layers} layers)"
+            # <<< route B
         )
         self._gate_spec_worker_kernels(comm)
         self._gate_drafter_comm(comm)
@@ -3229,6 +3236,12 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
             backend.w3_w1_weight.shape[1] // 2,
             backend.expert_size_per_partition,
             comm.mnnvl,
+            # >>> route B: the experts' logical slice (192 of the loader's 256), which k3_moe_m1 / k3_moe_m2 stream
+            i_logical=(
+                getattr(backend.quant_method, "intermediate_size_per_partition_lean", None)
+                or backend.intermediate_size_per_partition
+            ),
+            # <<< route B
         )
         for moe in takes:
             _decode_moe.fold_latent_norm(moe)

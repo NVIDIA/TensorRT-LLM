@@ -1,18 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The decode path's latent MoE on the catalog's Kimi K3 MoE entries.
+# >>> route B: this target's MoE engines (every expert on each rank)
+"""The decode path's latent MoE on the catalog's Kimi K3 MoE entries, with every expert on each rank (moe TP16 x EP1).
 
 **At most 8 tokens** (`MAX_TOKENS`), a MoE layer runs:
 
 * `moe/k3_moe_front`, one kernel: this rank's slice of the MoE head (its latent-down rows and its router rows) as one
   GEMV, the slices' all-gather over the TP group's `K3MoeHeadWorkspace`, the top-16 routing, the MXFP8 latent, and
-  the shared experts' gate_up + SiTU;
-* `moe/k3_moe`: this rank's routed partial over its experts (on a `K3MoeState`);
+  the shared experts' gate_up + SiTU. The routing is the noaux_tc arithmetic of `moe/kimi_k3_noaux_tc_mxfp8_quant`;
+  the generic path's TRTLLM-Gen MoE routes inside its own kernel, so a near-tie can select another expert there;
+* the routed experts of all 896 experts over this rank's intermediate slice: `moe/k3_moe_m1` at one token,
+  `moe/k3_moe_m2` at two, `moe/k3_moe` (on a `K3MoeState`) at three to eight;
 * the latent all-reduce. On a pushing step (`DecodeStep.latent_push`: a pure decode step captured into a CUDA graph
-  whose attention layers all run the decode kernels) the routed experts run as `moe/k3_moe`'s push form, which stores
-  this rank's partial into every rank's `K3LatentExchange`, and `comm/k3_latent_reduce` sums the partials in the MNNVL
-  one-shot's order, so with the same bits, while the experts' grid completes. On every other step it is the routed
-  experts' all-reduce (one-shot, as `decode_comm.use_decode_one_shot` sets);
+  whose attention layers all run the decode kernels) the engine runs its push form, which stores this rank's partial
+  into every rank's `K3LatentExchange`, and `comm/k3_latent_reduce` sums the partials in the MNNVL one-shot's order,
+  so with the same bits, while the experts' grid completes. On every other step it is the routed experts' all-reduce
+  (one-shot, as `decode_comm.use_decode_one_shot` sets);
 * the tail. The latent norm's weight is folded into the latent up projection at load, so
   `[RMSNorm(latent) slice | shared activation] @ [latent up columns | shared down]` is this rank's share of the MoE
   output. Where the next layer's pre-attention step (or the final norm) reduces it, the layer hands it on unreduced
@@ -20,18 +23,17 @@
   kernel (`decode_comm.py`). Elsewhere the replicated tail runs: the latent RMS applied to the fp32 output of one
   GEMV with the folded latent up weight, plus the shared experts' down projection and its all-reduce.
 
-**A wide decode step** (9 to 64 tokens, `WIDE_MAX_TOKENS`) keeps the sharded head and the row-parallel tail on
-M-general ops: the head GEMV, `comm/mnnvl_allgather_split`, then `moe/k3_route_quant` and `moe/k3_moe` (on a
-`K3MoeWideState`) beside the shared gate_up + SiTU, the latent all-reduce, and one GEMV of
-`[RMSNorm(latent) slice | padding | shared activation]` with the tail weight. That is this rank's unreduced share,
-which the consumer reduces with a plain all-reduce.
+**More than 8 tokens** run the generic path: `k3_moe`'s wide build does not fit 896 local experts, so the wide step
+below (`_wide`, `tp16_moetp4ep4`'s) never runs here. The engines compile the SiTU caps 4 and 25 in
+(`ENGINE_SITU_CAPS`): a checkpoint with other caps keeps the generic path (`layout_gaps`).
 
 The GEMVs run on the decode GEMV sites of `decode_gemv.py` where they take the call, else on the stock GEMM ops.
 
-`K3DecodeMoe` holds what every MoE layer shares: the head workspace and the latent exchange (both collective over
-the TP group), the two `k3_moe` builds' scratch, and the TP group's MNNVL workspace (`decode_comm.K3DecodeComm`'s).
-`K3DecodeMoeLayer` holds one layer's decode weights and its `k3_moe` counters. The target builds both in
-`post_load_weights`, before any CUDA-graph capture, and runs every kernel once there so none compiles under a capture.
+`K3DecodeMoe` holds what every MoE layer shares: the head workspace and the latent exchange (both collective over the
+TP group), the engines' workspaces (`K3MoeM1State`, `K3MoeM2State` and the `k3_moe` build's scratch), and the TP
+group's MNNVL workspace (`decode_comm.K3DecodeComm`'s). `K3DecodeMoeLayer` holds one layer's decode weights and its
+engine handles. The target builds both in `post_load_weights`, before any CUDA-graph capture, and runs every kernel
+once there so none compiles under a capture.
 
 Every MoE layer's push and reduce go to the one exchange, in the stream's order: each push is followed by exactly one
 reduce of the same token count before the next push, on every rank in the same order (the exchange's call-order
@@ -39,6 +41,7 @@ invariant, `comm/k3_latent_reduce`). Every kernel between a reduce and the next 
 launches without programmatic dependent launch), which the decode kernels a pushing step runs do; pushes run only in
 CUDA-graph replays, so no other step's kernels sit between two pushes.
 """
+# <<< route B
 
 from __future__ import annotations
 
@@ -72,6 +75,22 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe_front impo
     k3_moe_front,
     weight_supported,
 )
+
+# >>> route B: the one- and two-token engines
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe_m1 import (
+    K3MoeM1Layer,
+    K3MoeM1State,
+    k3_moe_m1,
+    k3_moe_m1_push,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe_m2 import (
+    K3MoeM2Layer,
+    K3MoeM2State,
+    k3_moe_m2,
+    k3_moe_m2_push,
+)
+
+# <<< route B
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_route_quant import k3_route_quant
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 
@@ -85,29 +104,53 @@ WIDE_MAX_TOKENS = 64
 # (comm/k3_sandwich_tail takes the TP16 tail weight [7168, 256 + 384]).
 TAIL_K_TILE = 256
 
+# >>> route B: the routed experts' SiTU caps (activation_situ_beta, activation_situ_linear_beta) that k3_moe_m1,
+# k3_moe_m2 and k3_moe compile in (their kernels' SITU_GATE_CAP and SITU_LINEAR_CAP)
+ENGINE_SITU_CAPS = (4.0, 25.0)
+# <<< route B
+
 
 @dataclass(eq=False)
 class K3DecodeMoe:
+    # >>> route B: the engines' workspaces; no wide build
     """What every MoE layer's decode path shares on one device: the TP group's ``K3MoeHeadWorkspace`` (the front's
-    all-gather), the ``k3_moe`` builds for up to 8 and up to 64 tokens (their scratch; the layers run one at a time on
-    one stream), the TP group's ``MnnvlWorkspace`` for a wide step's head all-gather, and the TP group's
+    all-gather), the engines' workspaces (``k3_moe_m1``, ``k3_moe_m2`` and the ``k3_moe`` build for up to 8 tokens;
+    the layers run one at a time on one stream), the TP group's ``MnnvlWorkspace``, and the TP group's
     ``K3LatentExchange`` for a pushing step's latent all-reduce (None: every step keeps the routed experts'
-    all-reduce). Built by `create`."""
+    all-reduce). ``wide`` is None: ``k3_moe``'s wide build does not fit 896 local experts. Built by `create`."""
+
+    # <<< route B
 
     head: K3MoeHeadWorkspace
     small: K3MoeState
     wide: K3MoeWideState
     mnnvl: MnnvlWorkspace
     exchange: Optional[K3LatentExchange] = None
+    # >>> route B: the one- and two-token engines' workspaces (``create`` builds both)
+    m1: Optional[K3MoeM1State] = None
+    m2: Optional[K3MoeM2State] = None
+    # <<< route B
 
+    # >>> route B: every expert on each rank: the engines with their push builds for the exchange and the k3_moe build
+    # for up to 8 tokens; no wide build
     @classmethod
     def create(
-        cls, mapping, device, i_tp: int, num_local: int, mnnvl: MnnvlWorkspace, push: bool = True
+        cls,
+        mapping,
+        device,
+        i_tp: int,
+        num_local: int,
+        mnnvl: MnnvlWorkspace,
+        push: bool = True,
+        *,
+        i_logical: int,
     ) -> "K3DecodeMoe":
-        """The state for ``mapping``'s TP group on ``device``, for experts of ``i_tp`` intermediate columns per rank,
-        ``num_local`` of them on this rank. Collective (the head workspace and the latent exchange): every rank of the
-        group calls it at the same point, eagerly, before any CUDA-graph capture. ``push``: build the latent exchange
-        (where it takes the TP size: 4, 8 or 16 ranks); without it every step keeps the routed experts' all-reduce."""
+        """The state for ``mapping``'s TP group on ``device``, for experts of ``i_tp`` intermediate columns per rank
+        (the loader's zero-padded width; ``i_logical`` of them hold the checkpoint's slice, which k3_moe_m1 and
+        k3_moe_m2 stream), ``num_local`` of them on this rank. Collective (the head workspace and the latent
+        exchange): every rank of the group calls it at the same point, eagerly, before any CUDA-graph capture.
+        ``push``: build the latent exchange (where it takes the TP size: 4, 8 or 16 ranks) and the engines' push builds
+        for it; without it every step keeps the routed experts' all-reduce."""
         head = K3MoeHeadWorkspace.create(mapping)
         exchange = None
         if push:
@@ -116,13 +159,18 @@ class K3DecodeMoe:
             # Raised before any collective step, on every rank of the group alike: a TP size the exchange does not take.
             except ValueError:
                 exchange = None
+        builds = () if exchange is None else ((mapping.tp_size, 1),)
         return cls(
             head,
             K3MoeState(device, i_tp, num_local),
-            K3MoeWideState(device, i_tp, num_local),
+            None,
             mnnvl,
             exchange,
+            K3MoeM1State.create(device, i_logical, i_tp, num_local, push=builds),
+            K3MoeM2State.create(device, i_logical, i_tp, num_local, push=builds),
         )
+
+    # <<< route B
 
 
 def _experts(moe: nn.Module) -> tuple:
@@ -145,6 +193,10 @@ def layout_gaps(moe: nn.Module, tp_size: int, max_snapshots: int) -> list:
     gate_up, down = shared.gate_up_proj.weight, shared.down_proj.weight
     if not moe._reduce_routed_output:
         return ["a routed output the model does not reduce"]
+    # >>> route B: k3_moe_m1, k3_moe_m2 and k3_moe compile the SiTU caps in
+    if tuple(moe._situ_betas) != ENGINE_SITU_CAPS:
+        return [f"SiTU caps {tuple(moe._situ_betas)}; the MoE engines compile {ENGINE_SITU_CAPS}"]
+    # <<< route B
     if (moe.num_experts, moe.top_k, moe.moe_hidden_size, moe.hidden_size) != (896, 16, 3584, 7168):
         return [
             f"experts / top-k / latent / hidden {(moe.num_experts, moe.top_k, moe.moe_hidden_size)}"
@@ -222,6 +274,10 @@ class K3DecodeMoeLayer:
     shared_cols: int
     small: K3MoeLayer
     wide: K3MoeLayer
+    # >>> route B: the one- and two-token engines' handles
+    m1: K3MoeM1Layer
+    m2: K3MoeM2Layer
+    # <<< route B
 
     @classmethod
     def create(
@@ -259,30 +315,35 @@ class K3DecodeMoeLayer:
             lo=lo,
             width=width,
             shared_cols=gate_up.shape[0] // 2,
+            # >>> route B: the engines' handles; no wide build
             small=state.small.layer(*weights),
-            wide=state.wide.layer(*weights),
+            wide=None,
+            m1=state.m1.layer(*weights),
+            m2=state.m2.layer(*weights),
+            # <<< route B
         )
 
     def warm_up(self, moe: nn.Module) -> None:
-        """One call of every kernel of the decode path on zero inputs (M = 1), so none compiles under a capture: the
-        front (collective: every rank makes the same call), both ``k3_moe`` builds, ``k3_route_quant`` and, with the
-        latent exchange, the push build and the reduce (one push + reduce pair, collective). Once per model: every
+        # >>> route B: the engines; no wide build
+        """One call of every kernel of the decode path on zero inputs, so none compiles under a capture: the front
+        (collective: every rank makes the same call), each engine (``k3_moe_m1``, ``k3_moe_m2``, ``k3_moe``) and, with
+        the latent exchange, its push build, each push followed by the reduce (collective). Once per model: every
         layer's calls compile the same builds."""
+        # <<< route B
         device = self.front_weight.device
         x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
         ids, weights, x_fp8, x_sf, _ = self._front(moe, x)
         offset = moe.routed_experts.backend.slot_start
-        k3_moe(x_fp8, x_sf, ids, weights, offset, self.small)
+        # >>> route B: every engine returning and, with the latent exchange, pushing (k3_moe's builds compile here),
+        # each push followed by the reduce; no wide build
         exchange = self.state.exchange
-        if exchange is not None:
-            k3_moe_push(x_fp8, x_sf, ids, weights, offset, self.small, exchange)
-            k3_latent_reduce(1, exchange)
-        logits = torch.zeros(1, moe.num_experts, dtype=torch.float32, device=device)
-        latent = torch.zeros(1, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
-        ids, weights, x_fp8, x_sf = k3_route_quant(
-            logits, self.bias, latent, float(moe.gate.routed_scaling_factor), early_trigger=True
-        )
-        k3_moe(x_fp8, x_sf, ids, weights, offset, self.wide)
+        for rows in (1, 2, 3):
+            args = [t.expand(rows, -1).contiguous() for t in (x_fp8, x_sf, ids, weights)]
+            self._routed(*args, offset)
+            if exchange is not None:
+                self._routed(*args, offset, push=True)
+                k3_latent_reduce(rows, exchange)
+        # <<< route B
         torch.cuda.synchronize(device)
 
     def _front(self, moe: nn.Module, x: torch.Tensor):
@@ -297,12 +358,16 @@ class K3DecodeMoeLayer:
         )
 
     def takes(self, hidden_states: torch.Tensor, step, partial_tail: bool) -> bool:
+        # >>> route B: no wide step
         """Whether this decode path runs the layer on ``step`` (bf16 rows ``hidden_states``): any step of at most
-        `MAX_TOKENS` tokens; with ``partial_tail``, also a wide decode step."""
+        `MAX_TOKENS` tokens, with or without ``partial_tail``."""
+        # <<< route B
         rows = hidden_states.shape[0]
         if hidden_states.dtype != torch.bfloat16 or step is None:
             return False
-        return 0 < rows <= MAX_TOKENS or (partial_tail and step.wide and rows <= WIDE_MAX_TOKENS)
+        # >>> route B: no wide step (k3_moe's wide build does not fit 896 local experts)
+        return 0 < rows <= MAX_TOKENS
+        # <<< route B
 
     def forward(
         self,
@@ -322,12 +387,13 @@ class K3DecodeMoeLayer:
         ids, weights, x_fp8, x_sf, shared_act = self._front(moe, hidden_states)
         offset = moe.routed_experts.backend.slot_start
         exchange = self.state.exchange
+        # >>> route B: the engine of the token count
         if push and exchange is not None:
-            k3_moe_push(x_fp8, x_sf, ids, weights, offset, self.small, exchange)
+            self._routed(x_fp8, x_sf, ids, weights, offset, push=True)
             latent = k3_latent_reduce(hidden_states.shape[0], exchange)
         else:
-            routed = k3_moe(x_fp8, x_sf, ids, weights, offset, self.small)
-            latent = moe.routed_experts.all_reduce(routed)
+            latent = moe.routed_experts.all_reduce(self._routed(x_fp8, x_sf, ids, weights, offset))
+        # <<< route B
         if partial_tail:
             return PendingTail(
                 latent.contiguous(),
@@ -346,6 +412,27 @@ class K3DecodeMoeLayer:
         )
         return (up * scale + shared_out.float()).bfloat16()
 
+    # >>> route B: the engine of a token count
+    def _routed(self, x_fp8, x_sf, ids, weights, offset: int, push: bool = False):
+        """This rank's routed partial of the front's outputs on ``k3_moe_m1`` at one token, ``k3_moe_m2`` at two, else
+        ``k3_moe`` (up to `MAX_TOKENS`); with ``push``, stored into every rank's latent exchange instead (None)."""
+        rows = x_fp8.shape[0]
+        if push:
+            exchange = self.state.exchange
+            if rows == 1:
+                k3_moe_m1_push(x_fp8, x_sf, ids, weights, offset, self.m1, exchange)
+            elif rows == 2:
+                k3_moe_m2_push(x_fp8, x_sf, ids, weights, offset, self.m2, exchange)
+            else:
+                k3_moe_push(x_fp8, x_sf, ids, weights, offset, self.small, exchange)
+            return None
+        if rows == 1:
+            return k3_moe_m1(x_fp8, x_sf, ids, weights, offset, self.m1)
+        if rows == 2:
+            return k3_moe_m2(x_fp8, x_sf, ids, weights, offset, self.m2)
+        return k3_moe(x_fp8, x_sf, ids, weights, offset, self.small)
+
+    # <<< route B
     def _wide(self, moe: nn.Module, hidden_states: torch.Tensor, gemvs) -> torch.Tensor:
         """A wide decode step's MoE: this rank's unreduced share of the output, ``[M, hidden]`` bf16."""
         x = hidden_states.contiguous()

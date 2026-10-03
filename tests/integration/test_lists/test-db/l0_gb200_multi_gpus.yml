@@ -71,6 +71,8 @@ l0_gb200_multi_gpus:
   - unittest/_torch/modeling_v2/moe/test_modeling_v2_k3_moe_front_op_matrix.py
   # The Kimi K3 target's decode-path collectives over those entries, 4 ranks
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_kimi_k3_decode_comm_op_matrix.py
+  # tp16_moetp16ep1's MoE decode path: the engines pushing into the latent exchange, 4 ranks
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_kimi_k3_route_b_decode_moe_op_matrix.py
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_checkpoint_preserves_moe_graph_addresses
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_engine_checkpoint_coordination
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_checkpoint_failure_is_collective_and_bounded
