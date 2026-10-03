@@ -23,7 +23,7 @@ from tensorrt_llm._torch.models.checkpoints.auto_mapper import AutoCheckpointMap
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_qwen3_5 import (
-    _lm_head_nvfp4_enabled,
+    _lm_head_quant_enabled,
     _normalize_qwen35_quant_config_dict,
     _normalize_qwen35_vl_config,
 )
@@ -262,7 +262,7 @@ def test_qwen35_dense_vl_keeps_w4a16_nvfp4_for_32_element_blocks(sm_version: int
         "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
         return_value=sm_version,
     ):
-        keep_lm_head_quant = _lm_head_nvfp4_enabled(model_config)
+        keep_lm_head_quant = _lm_head_quant_enabled(model_config)
         assert not keep_lm_head_quant
         _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep_lm_head_quant)
 
@@ -287,7 +287,7 @@ def test_qwen35_lm_head_requires_native_nvfp4_blocks(sm_version: int, group_size
     with patch(
         "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version", return_value=sm_version
     ):
-        keep = _lm_head_nvfp4_enabled(model_config)
+        keep = _lm_head_quant_enabled(model_config)
         assert keep is (group_size == 16)
         _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep)
     assert ("lm_head" in model_config.quant_config_dict) is keep
