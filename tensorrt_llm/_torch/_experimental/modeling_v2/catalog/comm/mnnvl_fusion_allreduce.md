@@ -247,9 +247,9 @@ follows `T`, `H` and the device's SM count, and in the fused form it sets the or
 - Gaps: the op does not check that the call fits `comm_buffer` (the attention-residual and all-gather ops do), so a
   direct op call over one buffer writes past it — the wrapper's `required_buffer_bytes` check is the guard;
   `MnnvlWorkspace.create` accepts any multiple of 16 bytes, but the two-shot broadcast stage starts at
-  `buffer_bytes / 2` and is accessed in 16-byte vectors, so a two-shot call needs `buffer_bytes` to be a multiple of
-  32 (code; every buffer in the test is); the schema's default `one_shot_max_bytes=1048576` applies to a direct op
-  call (the wrapper always passes one).
+  `buffer_bytes / 2` and is accessed in 16-byte vectors, so the wrapper raises `ValueError` before a two-shot call
+  on a workspace whose `buffer_bytes` is not a multiple of 32 (code; every buffer in the test is a multiple); the
+  schema's default `one_shot_max_bytes=1048576` applies to a direct op call (the wrapper always passes one).
 - In the model today the workspace is `MNNVLAllReduce`'s (a dict keyed by `Mapping`, grown on demand by the first
   eager call that needs more, in 8 MiB steps) and the one-shot ceiling is a module attribute with a per-call override.
   This entry takes both explicitly: the workspace sized at construction, the ceiling per call.

@@ -93,6 +93,10 @@ class K3LatentExchange:
                 comm=comm,
             )
 
+        if mapping.tp_size not in (4, 8, 16):
+            raise ValueError(
+                f"K3LatentExchange.create: TP size {mapping.tp_size}; the exchange supports 4, 8 and 16"
+            )
         words = _kernel().buffer_words(mapping.tp_size)
         return create_mcast_state("K3LatentExchange", mapping, words, fabric_handle, build)
 

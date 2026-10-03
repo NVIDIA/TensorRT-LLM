@@ -521,8 +521,7 @@ def check_two_workspaces_interleaved() -> None:
     """Two workspaces are two rotations: calls of mixed shapes and paths alternate between them in an irregular
     pattern (A A B A B B ...), every call is correct and each workspace's flags move with its own calls only. The
     pattern is the same on every rank: calls on one stream are serialized and each waits for its peers, so ranks
-    issuing calls on two workspaces in different orders deadlock (measured for mnnvl_allreduce_attn_res,
-    runs/drafter/u4-mnnvl-srun-2)."""
+    issuing calls on two workspaces in different orders deadlock (seen with mnnvl_allreduce_attn_res)."""
     pattern = "AABABBAAAB" * 2
     for i, which in enumerate(pattern):
         t, hidden, fused, path = INTERLEAVED[i % len(INTERLEAVED)]

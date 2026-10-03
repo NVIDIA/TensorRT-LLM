@@ -54,6 +54,15 @@ def mnnvl_fusion_allreduce(
             f"mnnvl_fusion_allreduce: the call needs {need} bytes per Lamport buffer, the workspace has "
             f"{workspace.buffer_bytes}"
         )
+    two_shot = (
+        num_tokens * hidden * workspace.world_size * input.element_size() > one_shot_max_bytes
+    )
+    if two_shot and workspace.buffer_bytes % 32:
+        # The two-shot broadcast stage starts at buffer_bytes / 2 and is accessed in 16-byte vectors.
+        raise ValueError(
+            "mnnvl_fusion_allreduce: a two-shot call needs the workspace's buffer_bytes to be a multiple of 32, "
+            f"not {workspace.buffer_bytes}"
+        )
     fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM if fused else AllReduceFusionOp.NONE
     outputs = torch.ops.trtllm.mnnvl_fusion_allreduce(
         input,

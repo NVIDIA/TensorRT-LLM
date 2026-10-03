@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kimi K3 fused routed-expert decode path (``trtllm::k3_fused_moe``).
+"""Kimi K3 MoE decode kernels: the routed experts (``trtllm::k3_moe``, :mod:`.op`), the MoE front
+(``trtllm::k3_moe_front``, :mod:`.front_op`) and the latent reduce (``trtllm::k3_latent_reduce``, :mod:`.latent_op`).
 
-Importing :mod:`.op` registers the torch op; nothing is imported eagerly here so that
-the CuTe DSL dependency stays optional for every other model.
+Importing a module registers its torch op; nothing is imported eagerly here so that the CuTe DSL dependency stays
+optional for every other model.
 """

@@ -98,8 +98,8 @@ of up to 8 tokens fits.
 - `fabric_handle`: share the memory by fabric handle (required across nodes) or POSIX file descriptor; default
   `mapping.is_multi_node()`. No environment variable is read.
 
-`create` does not check `W`: it builds an exchange for any TP size, and the op then raises `ValueError` at every
-call unless `W` is 4, 8 or 16 (the op's code).
+`create` raises `ValueError` for a TP size other than 4, 8 or 16, on every rank and before any collective step (the
+size is the same on every rank of the group; code).
 
 **Which ops may share one object.** One call's producers and this op. The producers are the push-only builds of the
 routed experts (`k3_moe_m1` / `k3_moe_m2` push, `trtllm::k3_fused_moe_push`, `trtllm::k3_fused_moe_front_push`;
