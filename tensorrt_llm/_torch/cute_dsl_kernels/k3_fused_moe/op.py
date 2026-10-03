@@ -162,10 +162,10 @@ def create_mcast_state(name: str, mapping, words: int, fabric_handle: Optional[b
 
 @dataclass(eq=False)
 class K3MoeHeadWorkspace:
-    """One TP group's MoE head all-gather buffers, read and written by ``trtllm::k3_moe_front`` (alone, or as the
-    producer of :meth:`K3MoeLayer.front`): two alternating Lamport buffers of every rank's head slice per token behind
-    one multicast mapping, then the front's router partials; the flag words that rotate them; and the per-token ready
-    words a ``head_flags`` build of k3_moe acquires. Every front call on it takes the next buffer, so all of a group's
+    """One TP group's MoE head all-gather buffers, read and written by ``trtllm::k3_moe_front``: two alternating Lamport
+    buffers of every rank's head slice per token behind one multicast mapping, then the front's router partials; the
+    flag words that rotate them; and the per-token ready words a publishing front releases and the ``head_flags``
+    build of ``trtllm::k3_moe`` after it acquires. Every front call on it takes the next buffer, so all of a group's
     ranks make the same front calls on it in the same order. Pass ``uc``, ``mc``, ``flags``, ``rank`` and
     ``world_size`` as the front's ``ag_uc``, ``ag_mc``, ``ag_flags``, ``ag_rank`` and ``ag_world``, and ``ready`` as
     its ``ag_ready``. Separate from the MNNVL all-reduce workspace."""
@@ -217,8 +217,10 @@ WIDE_MAX_TOKENS = 64
 # read only the ready words and head flags (head_flags), so the others are given a stand-in they never touch.
 _OPTIONAL_ARGS = 11
 # (alignment, leading dim) of every tensor argument, in the kernel's order.
-_ALIGNS = [16, 16, 16, 16, 16, 4, 16, 16, 16, 16, 16, 16, 16, 16, 16, 4, 4, 4] + [16] * _OPTIONAL_ARGS
-_LEADING = [0, 0, 0, 1, 2, 2, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0] + [0] * _OPTIONAL_ARGS
+_ALIGNS = [16, 16, 16, 16, 16, 4, 16, 16, 16, 16, 16, 16, 16, 16, 16, 4, 4, 4]
+_ALIGNS += [16] * _OPTIONAL_ARGS
+_LEADING = [0, 0, 0, 1, 2, 2, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0]
+_LEADING += [0] * _OPTIONAL_ARGS
 _compiled: Dict[tuple, object] = {}
 
 
@@ -228,7 +230,9 @@ def _part_rows(mod) -> int:
     return mod.PART_ROWS if mod.WIDE else mod.G_CAP * _TOKEN_SLOTS
 
 
-def _config(i_tp: int, num_ctas: int, num_local: int, m_max: int, use_pdl: bool, head_flags: bool) -> dict:
+def _config(
+    i_tp: int, num_ctas: int, num_local: int, m_max: int, use_pdl: bool, head_flags: bool
+) -> dict:
     """The kernel options of one build (trace-time constants)."""
     return {
         "i_tp": i_tp,
@@ -370,8 +374,13 @@ class K3MoeLayer:
         head_flags: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """``trtllm::k3_moe`` on this layer's experts, counters and its state's scratch: see the op."""
+        """``trtllm::k3_moe`` on this layer's experts, counters and its state's scratch: see the op. ``head_ready`` and
+        ``head_flags`` are given for, and only for, the layers of a ``head_flags`` state."""
         st = self.state
+        if (head_ready is not None) != st.head_flags:
+            raise ValueError(
+                "K3MoeLayer: head_ready / head_flags are given for, and only for, a head_flags state's layers"
+            )
         y = torch.ops.trtllm.k3_moe(
             x_fp8, x_sf, topk_ids, topk_weights, *self.weights, st.c, st.cs, st.part, self.counters,
             local_expert_offset, st.num_local, st.num_ctas, st.m_max, st.use_pdl, head_ready, head_flags, out,
@@ -478,14 +487,18 @@ def k3_moe(
         or tuple(counters.shape) != (mod.NUM_STATE,)
         or not all(t.is_contiguous() for t in (c, cs, part, counters))
     ):
-        raise ValueError("k3_moe: c / cs / part / counters are not this build's scratch and layer counters")
+        raise ValueError(
+            "k3_moe: c / cs / part / counters are not this build's scratch and layer counters"
+        )
     if head and (
         head_ready.dtype != torch.int32
         or head_ready.numel() < 2 * MAX_TOKENS
         or head_flags.dtype != torch.int32
         or head_flags.numel() < 3
     ):
-        raise ValueError("k3_moe: head_ready / head_flags must be a K3MoeHeadWorkspace's ready and flags")
+        raise ValueError(
+            "k3_moe: head_ready / head_flags must be a K3MoeHeadWorkspace's ready and flags"
+        )
     if out is None:
         y = torch.empty(num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device=x_fp8.device)
     else:

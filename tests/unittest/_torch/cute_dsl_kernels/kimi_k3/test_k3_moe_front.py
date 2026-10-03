@@ -12,12 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""trtllm::k3_moe_front and K3MoeLayer.front (the Kimi K3 MoE front: sharded head GEMV, head all-gather, top-16
-routing, MXFP8 latent, shared gate_up + SiTU; then k3_moe on its grid), one process per GPU over the TP group of this
-run, at every M in 1..8, over one K3MoeHeadWorkspace. The head is sharded over the group (TP W: 3584 / W latent +
-896 / W router rows and 2 x 6144 / W shared rows per rank; W = 4 on one GB200 tray, the model's TP16 shapes with 16
-processes); the routed experts are one rank of experts TP4 x EP4 (224 local experts, intermediate 768), as in the TP16
-deployment.
+"""trtllm::k3_moe_front (the Kimi K3 MoE front: sharded head GEMV, head all-gather, top-16 routing, MXFP8 latent,
+shared gate_up + SiTU), alone and followed by trtllm::k3_moe through a K3MoeLayer (the plain build waits for the
+front's grid; the head_flags build acquires the ready words the front publishes with ag_ready), one process per GPU
+over the TP group of this run, at every M in 1..8, over one K3MoeHeadWorkspace. The head is sharded over the group
+(TP W: 3584 / W latent + 896 / W router rows and 2 x 6144 / W shared rows per rank; W = 4 on one GB200 tray, the
+model's TP16 shapes with 16 processes); the routed experts are one rank of experts TP4 x EP4 (224 local experts,
+intermediate 768), as in the TP16 deployment.
   front : against the unfused chain (the head GEMV in fp32 torch -> the gather ->
           trtllm::kimi_k3_noaux_tc_mxfp8_quant; shared: cuBLAS gate_up -> trtllm::situ_and_mul): top-16 ids per
           token (a mismatch only at a reference
@@ -169,13 +170,14 @@ def _context(with_experts):
     return ctx
 
 
-def _layer(ctx, head_flags=False, config=None):
-    """This rank's experts as a layer of a new K3MoeState: the plain build, or the head_flags build."""
+def _layer(ctx, head_flags=False, num_ctas=None):
+    """This rank's experts as a layer of a new K3MoeState: the plain build, or the head_flags build; ``num_ctas`` caps
+    k3_moe's persistent grid (default one CTA per SM)."""
     from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op as moe_op
 
     p = ctx.experts
     state = moe_op.K3MoeState(torch.device("cuda", torch.cuda.current_device()), I_TP, E_LOCAL, head_flags=head_flags,
-                              config=config)  # fmt: skip
+                              num_ctas=num_ctas)  # fmt: skip
     return state.layer(p["w31"], p["w31s"], p["w2"], p["w2s"])
 
 
@@ -266,10 +268,18 @@ def check_front(ctx):
 
 
 def _fused(ctx, x, layer=None, bias=None):
-    """K3MoeLayer.front on ``layer`` (default: the plain build's ``ctx.layer``)."""
+    """trtllm::k3_moe_front, then trtllm::k3_moe on ``layer`` (default: the plain build's ``ctx.layer``); returns
+    (y, shared). A head_flags layer's front publishes the ready words (``ag_ready``) and its k3_moe acquires them."""
     layer = layer or ctx.layer
-    return layer.front(x, ctx.front, ctx.bias if bias is None else bias, ctx.offset, RSF, ctx.inter, GATE_CAP,
-                       LINEAR_CAP, ctx.ws)  # fmt: skip
+    head = layer.state.head_flags
+    ids, w, q, s, shared = torch.ops.trtllm.k3_moe_front(
+        x, ctx.front, ctx.bias if bias is None else bias, RSF, ctx.inter, GATE_CAP, LINEAR_CAP, *ctx.ag, ctx.world,
+        ag_ready=ctx.ws.ready if head else None,
+    )  # fmt: skip
+    if not head:
+        return layer(q, s, ids, w, ctx.offset), shared
+    y = layer(q, s, ids, w, ctx.offset, head_ready=ctx.ws.ready, head_flags=ctx.ws.flags)
+    return y, shared
 
 
 def _runner(ctx, ids, w, q, s):
@@ -349,8 +359,8 @@ def _i32(v: int) -> int:
 
 
 def check_head_flags(ctx):
-    """K3MoeLayer.front with the ready-word handoff (``ag_ready``: k3_moe built with head_flags acquires the front's
-    ready words, ready[t] / ready[8 + t] = the head epoch flags[2] + 1 for token t, instead of waiting for its grid)
+    """The front, then k3_moe with the ready-word handoff (``ag_ready``: k3_moe built with head_flags acquires the
+    front's ready words, ready[t] / ready[8 + t] = the head epoch flags[2] + 1 for token t, instead of its grid)
     across the epoch's int32 wrap. From a new workspace's state (epoch 0, ready words 0), two calls at M 1, then the
     epoch preset to -2, then calls at M 1, 8, 3, 8: the M 8 call at epoch -1 waits for 0, the value of the words that
     no call has published. Per call: no word the call polls already holds its epoch + 1 (such a word would let k3_moe
@@ -457,7 +467,7 @@ def check_publish_order(ctx, num_ctas=None):
         ctas = num_ctas or ctas // 2
     saved_kernel, saved_compiled = front_op._kernel, dict(front_op._compiled)
     tmp_dir = tempfile.mkdtemp(prefix="k3_moe_front_")
-    held_layer = _layer(ctx, head_flags=True, config={"num_ctas": ctas})
+    held_layer = _layer(ctx, head_flags=True, num_ctas=ctas)
 
     def fused(x):
         return _fused(ctx, x, held_layer, bias)

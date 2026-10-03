@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU certification matrix for the ``moe/k3_moe_front`` catalog entry and its ``K3MoeHeadWorkspace``, with the
-fused-front cells of ``moe/k3_moe`` (``k3_moe_fused_front`` on a plain and on a head_flags ``K3MoeState``).
+"""GPU certification matrix for the ``moe/k3_moe_front`` catalog entry and its ``K3MoeHeadWorkspace``, with the cells
+of ``moe/k3_moe`` behind the front: ``trtllm::k3_moe_front``, then the ``k3_moe`` entry on a plain and on a head_flags
+``K3MoeState`` (the head_flags pair: the front with ``publish=True`` releasing the workspace's ready words, k3_moe
+acquiring them).
 
 The front's correctness depends on state that outlives a call: the head workspace's two alternating Lamport buffers
 (flags[0] says which one a call uses; every call flips it), the readers' re-arm of every word they read, and, with a
@@ -32,9 +34,9 @@ rounded to bf16), gathered, and the stock trtllm::kimi_k3_noaux_tc_mxfp8_quant o
 weights, MXFP8 codes and scales must equal it bit for bit (the front routes with k3_route_quant's selection, weights
 and quantization: the kernel's statement), and be bit for bit the same on every rank. The shared activation: this
 rank's gate_up in fp64 (exact) rounded to bf16, SiTU in fp32, within 2e-2 of its largest magnitude (the kernel's tanh
-and sigmoid are fast approximations). k3_moe_fused_front's routed partial against the stock TRTLLM-Gen
+and sigmoid are fast approximations). The routed partial of the front + k3_moe pair against the stock TRTLLM-Gen
 W4A8_MXFP4_MXFP8 runner on the front's own routing and latent (op-catalog gates: 8 bf16 ulp of the row's max per
-element, 4 ulp relative RMS); the head_flags build bit for bit against the plain one. Call sequences compare every
+element, 4 ulp relative RMS); the head_flags pair bit for bit against the plain one. Call sequences compare every
 call bit for bit with the same call made alone (itself checked against the references first).
 """
 
@@ -72,7 +74,8 @@ ULP = 2.0**-8
 SHARED_TOL = 2e-2
 TOKENS = (1, 2, 3, 4, 5, 6, 7, 8)
 LAYERS = 3
-# Layer l of a step: k3_moe_fused_front on the plain state, on the head_flags state, and k3_moe_front alone.
+# Layer l of a step: the front then k3_moe on the plain state, the publishing front then k3_moe on the head_flags state,
+# and the front alone.
 KINDS = ("fused", "flags", "front")
 DIP_STEPS = (8, 8, 8, 2, 7, 8, 1, 1, 8, 3, 8)
 REPLAYS = 6
@@ -134,8 +137,9 @@ def max_ulp(a: torch.Tensor, b: torch.Tensor) -> int:
 class Call:
     """One call: the MoE input ``x`` (the same on every rank), the layer whose weights it uses, and its kind.
 
-    Kinds: "front" (k3_moe_front), "fused" (k3_moe_fused_front on the plain K3MoeState's layer), "flags"
-    (k3_moe_fused_front on the head_flags K3MoeState's layer).
+    Kinds: "front" (the k3_moe_front entry, five outputs), "fused" (the entry, then the k3_moe entry on the plain
+    K3MoeState's layer: ``(y, shared)``), "flags" (the publishing front, then the k3_moe entry on the head_flags
+    K3MoeState's layer with ``head=ws``: ``(y, shared)``).
     """
 
     def __init__(self, seed: int, tokens: int, layer: int = 0, kind: str = "front", x=None):
@@ -154,12 +158,16 @@ class Call:
     def run(self, ws, x=None):
         x = self.x if x is None else x
         lw = LAYER_WEIGHTS[self.layer]
+        if self.kind == "flags":
+            ids, w, q, s, shared = OPS.front(
+                x, lw.front, BIAS, RSF, SHARED_COLS, GATE_CAP, LINEAR_CAP, ws, publish=True
+            )
+            return OPS.k3_moe(q, s, ids, w, OFFSET, FLAGS.layers[self.layer], head=ws), shared
+        out = OPS.front(x, lw.front, BIAS, RSF, SHARED_COLS, GATE_CAP, LINEAR_CAP, ws)
         if self.kind == "front":
-            return OPS.front(x, lw.front, BIAS, RSF, SHARED_COLS, GATE_CAP, LINEAR_CAP, ws)
-        layer = (PLAIN if self.kind == "fused" else FLAGS).layers[self.layer]
-        return OPS.fused(
-            x, lw.front, BIAS, OFFSET, RSF, SHARED_COLS, GATE_CAP, LINEAR_CAP, ws, layer
-        )
+            return out
+        ids, w, q, s, shared = out
+        return OPS.k3_moe(q, s, ids, w, OFFSET, PLAIN.layers[self.layer]), shared
 
 
 # ── references ────────────────────────────────────────────────────────────
@@ -235,7 +243,7 @@ def compare(y, ref):
 
 
 def verify_fused(got, call: Call, ws, where: str) -> None:
-    """k3_moe_fused_front's (y, shared) for ``call``.
+    """The (y, shared) of a front + k3_moe pair for ``call``.
 
     The front alone on the same input (made here, on ``ws``, by every rank) gives the routing and MXFP8 latent k3_moe
     consumed: y within the op-catalog gates of the stock runner on them (all zeros on a rank no token routes to), and
@@ -405,12 +413,12 @@ def check_front_single_calls() -> None:
         )
 
 
-def check_fused_front_single_calls() -> None:
-    """k3_moe_fused_front at every M 1-8 on the plain K3MoeState and on the head_flags one.
+def check_front_and_k3_moe_single_calls() -> None:
+    """The front then the k3_moe entry at every M 1-8, on the plain K3MoeState and on the head_flags one.
 
     Layer 0's weights, the first M tokens of one batch. The plain y within the op-catalog gates of the stock runner
     on the front's own routing and latent (all zeros on a rank no token routes to), the shared activation the front's
-    bits; the head_flags build's y and shared the plain build's bits, its handoff checked before and after
+    bits; the head_flags pair's y and shared the plain pair's bits, its handoff checked before and after
     (flags_call_checked); the plain y's rows within one bf16 ulp of the same rows of the 8-token call (k3_moe's slice
     FC2 groups a token's expert terms by the step's group count; bit-identity counted) and the shared rows their bits;
     run-to-run identical bits; afterwards both states armed with every counter zero and the head buffers empty.
@@ -477,8 +485,9 @@ def check_head_flags_epoch_wraps() -> None:
 def check_dip_and_regrow_sequence() -> None:
     """Decode steps of three layers on one workspace, the token count dipping and growing back, a random rank late.
 
-    Each step: k3_moe_fused_front on the plain state (layer 0's weights), on the head_flags state (layer 1's) and the
-    front alone (layer 2's), at M 8, 8, 8, 2, 7, 8, 1, 1, 8, 3, 8 with new inputs every call, the layers back to back
+    Each step: the front then k3_moe on the plain state (layer 0's weights), the publishing front then k3_moe on the
+    head_flags state (layer 1's), and the front alone (layer 2's), at M 8, 8, 8, 2, 7, 8, 1, 1, 8, 3, 8 with new inputs
+    every call, the layers back to back
     with a random rank 5 ms late before every call. Every call returns the bits of the same call made alone (each
     checked first). Afterwards the head buffers are empty, the epoch advanced once per head_flags call with every
     ready word at it, and both states armed: a call after a smaller one reads nothing an older, larger call left.
@@ -538,8 +547,8 @@ def check_two_workspaces_interleaved() -> None:
 def check_graph_capture_and_replay() -> None:
     """A captured step replayed with rewritten inputs, eager calls of other token counts between replays.
 
-    The step: the three layers at M 8 on WS_B (k3_moe_fused_front plain and head_flags, the front alone), captured
-    once and replayed 6 times with new inputs copied into its static buffers; between replays an eager call of
+    The step: the three layers at M 8 on WS_B (the front + k3_moe pairs, plain and head_flags, and the front alone),
+    captured once and replayed 6 times with new inputs copied into its static buffers; between replays an eager call of
     another M on WS_B. Every replayed and eager call returns the bits of the same call alone; afterwards the head
     buffers are empty, WS_B's epoch advanced once per head_flags call, replayed or eager, with every ready word at it,
     and both states armed.
@@ -603,8 +612,9 @@ def check_graph_capture_and_replay() -> None:
 def check_unsupported_shape_raises_on_every_rank() -> None:
     """M 0 and 9 raise ValueError on every rank before touching anything, and the next call is correct.
 
-    The front alone and k3_moe_fused_front (plain and head_flags) at M 0 and 9: the head workspace's words, flags and
-    ready words keep their bits; the next call returns the bits of the same call made alone.
+    The front alone and the two front + k3_moe pairs (plain, and head_flags with the publishing front) at M 0 and 9:
+    the front refuses them before touching the workspace (its words, flags and ready words keep their bits); the next
+    call returns the bits of the same call made alone.
     """
     nxt = Call(7000, 8, layer=0, kind="fused")
     want = alone_results([nxt], WS_A, "before the unsupported calls")[0]
@@ -632,41 +642,72 @@ def check_unsupported_shape_raises_on_every_rank() -> None:
     )
 
 
-def check_create_and_first_compile_refuse_capture() -> None:
-    """Under CUDA-graph capture on every rank, create() and a not yet compiled front configuration raise.
+def raised_under_capture(fn) -> str:
+    """Run ``fn`` under CUDA-graph capture; the message of the RuntimeError it raised, or '' if it raised none."""
+    graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+    resting = torch.cuda.current_stream()
+    stream.wait_stream(resting)
+    message = ""
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            try:
+                fn()
+            except RuntimeError as exc:
+                message = str(exc)
+    finally:
+        # A capture that fails when it ends leaves its own stream current; put the resting one back.
+        torch.cuda.set_stream(resting)
+    del graph
+    return message
 
-    K3MoeHeadWorkspace.create raises RuntimeError before entering the collective (no rank waits for another), and a
-    front call of a configuration not yet compiled (other SiTU caps) raises RuntimeError before any launch. The
-    workspace keeps its bits and the next call returns the bits of the same call made alone.
+
+def raised_eagerly(fn) -> str:
+    """Run ``fn``; the message of the RuntimeError it raised, or '' if it raised none."""
+    try:
+        fn()
+    except RuntimeError as exc:
+        return str(exc)
+    return ""
+
+
+def check_create_and_first_compile_refuse_capture() -> None:
+    """Under CUDA-graph capture, create() is refused on every rank, and a not yet compiled front configuration raises.
+
+    K3MoeHeadWorkspace.create has the ranks agree before allocating that each of them can (not capturing, enough free
+    memory): with every rank capturing, and with the last rank capturing while its peers call it eagerly, every rank
+    raises RuntimeError at that agreement ("not every rank can allocate", a capturing rank's message naming the
+    capture), so none allocates. Every rank must call it: a rank calling it alone would wait for its peers. A front
+    call of a configuration not yet compiled (other SiTU caps) raises RuntimeError under capture before any launch.
+    The workspace keeps its bits and the next call returns the bits of the same call made alone.
     """
     nxt = Call(7500, 4, layer=1, kind="front")
     want = alone_results([nxt], WS_A, "before the capture refusals")[0]
     before = workspace_snapshot(WS_A)
-    messages = []
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        try:
-            OPS.workspace.create(R.mapping, fabric_handle=R.fabric)
-        except RuntimeError as exc:
-            messages.append(str(exc))
-        try:
-            OPS.front(
-                nxt.x,
-                LAYER_WEIGHTS[1].front,
-                BIAS,
-                RSF,
-                SHARED_COLS,
-                GATE_CAP + 1.0,
-                LINEAR_CAP,
-                WS_A,
-            )
-        except RuntimeError as exc:
-            messages.append(str(exc))
-    del graph
-    refused = len(messages) == 2 and all("outside CUDA-graph capture" in msg for msg in messages)
-    assert R.all_true(refused), f"under capture: {messages}"
+
+    def create():
+        OPS.workspace.create(R.mapping, fabric_handle=R.fabric)
+
+    every = raised_under_capture(create)
+    R.barrier()
+    capturing = R.world - 1
+    one = raised_under_capture(create) if R.rank == capturing else raised_eagerly(create)
+    R.barrier()
+    first = raised_under_capture(
+        lambda: OPS.front(
+            nxt.x, LAYER_WEIGHTS[1].front, BIAS, RSF, SHARED_COLS, GATE_CAP + 1.0, LINEAR_CAP, WS_A
+        )
+    )
+    refused = (
+        "not every rank can allocate" in every
+        and "outside CUDA-graph capture" in every
+        and "not every rank can allocate" in one
+        and (R.rank != capturing or "outside CUDA-graph capture" in one)
+        and "outside CUDA-graph capture" in first
+    )
+    assert R.all_true(refused), (
+        f"rank {R.rank}: every rank capturing {every!r}; rank {capturing} capturing {one!r}; "
+        f"uncompiled front {first!r}"
+    )
     after = workspace_snapshot(WS_A)
     assert all(same(a, b) for a, b in zip(before, after)), (
         "a refused call touched the head workspace"
@@ -742,7 +783,7 @@ def check_wrong_call_order_is_detected() -> None:
 CHECKS = [
     check_workspace_is_armed_and_sized,
     check_front_single_calls,
-    check_fused_front_single_calls,
+    check_front_and_k3_moe_single_calls,
     check_head_flags_epoch_wraps,
     check_dip_and_regrow_sequence,
     check_two_workspaces_interleaved,
@@ -836,7 +877,7 @@ def _run_one_rank(args) -> int:
 
     OPS = SimpleNamespace(
         front=front.k3_moe_front,
-        fused=moe.k3_moe_fused_front,
+        k3_moe=moe.k3_moe,
         workspace=front.K3MoeHeadWorkspace,
         K3MoeState=moe.K3MoeState,
     )

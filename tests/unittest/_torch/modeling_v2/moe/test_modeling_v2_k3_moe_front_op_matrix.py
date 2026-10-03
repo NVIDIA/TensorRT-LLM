@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Collected entry point for the k3_moe_front op's certification matrix.
 
-The matrix also certifies moe/k3_moe's fused-front cells (k3_moe_fused_front on a plain and a head_flags
-K3MoeState). It is ``comm/_k3_moe_front_op_matrix.py``: rank bodies live beside ``_lockstep`` and ``_rank_job`` in
-``comm/``, and it is its own W-rank launcher (call sequences over caller-owned workspaces and states, so one job, not
-independent cases); see ``_rank_job`` for why that is left intact. This file puts ``comm/`` on the import path to
-reach ``_rank_job``.
+The matrix also certifies moe/k3_moe's cells behind the front (trtllm::k3_moe_front, then the k3_moe entry on a plain
+and on a head_flags K3MoeState). It is ``comm/_k3_moe_front_op_matrix.py``: rank bodies live beside ``_lockstep`` and
+``_rank_job`` in ``comm/``, and it is its own W-rank launcher (call sequences over caller-owned workspaces and states,
+so one job, not independent cases); see ``_rank_job`` for why that is left intact. This file puts ``comm/`` on the
+import path to reach ``_rank_job``.
 """
 
 import sys

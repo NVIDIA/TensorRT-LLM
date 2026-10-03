@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""K3MoeLayer (trtllm::k3_route_quant + the persistent k3_moe kernel, M <= 8) on one GPU, at the Kimi K3 TP16
-deployment's routed-expert rank layout (experts TP4 x EP4: 224 local experts, intermediate 768 per rank), at every M
+"""trtllm::k3_route_quant, then trtllm::k3_moe through a K3MoeLayer (the persistent k3_moe kernel, M <= 8) on one GPU,
+at the Kimi K3 TP16 deployment's routed-expert rank layout (experts TP4 x EP4: 224 local experts, intermediate 768
+per rank), at every M
 in 1..8 with random routing, with 0, 4 and 16 of each token's experts local, and with 16 local experts per token none
 shared (16 M groups: the kernel's group capacity at M = 8): against the stock path
 (trtllm::kimi_k3_noaux_tc_mxfp8_quant then the TRTLLM-Gen W4A8_MXFP4_MXFP8 MoE runner with those ids) and an fp32
@@ -54,6 +55,7 @@ M_ALL = list(range(1, 9))
 def _ops():
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op  # noqa: F401
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_route_quant import op as _rq  # noqa: F401
 
     return torch.ops.trtllm
 
@@ -207,7 +209,10 @@ def _layer():
 
 
 def _fused(proc, bias, x, logits):
-    return _layer()(x, logits, bias, OFFSET, RSF)
+    """trtllm::k3_route_quant (its dependents launched early: k3_moe is its programmatic dependent), then
+    trtllm::k3_moe on _layer()."""
+    ids, w, x_fp8, x_sf = _ops().k3_route_quant(logits, bias, x, RSF, early_trigger=True)
+    return _layer()(x_fp8, x_sf, ids, w, OFFSET)
 
 
 def _scratch_rearmed():
@@ -350,8 +355,8 @@ def test_token_limit():
 
 def test_collective_workspaces_refuse_graph_capture():
     """The head all-gather's buffers (the front's) are created collectively (an MNNVL multicast allocation over the TP
-    group): creating them under CUDA-graph capture raises instead of entering the collective. The per-rank state and
-    a layer's counters refuse capture too (they allocate)."""
+    group): under CUDA-graph capture create() raises (the group's ranks agree first that each can allocate; a group of
+    one here) instead of allocating. The per-rank state and a layer's counters refuse capture too (they allocate)."""
     from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op
     from tensorrt_llm.mapping import Mapping
 

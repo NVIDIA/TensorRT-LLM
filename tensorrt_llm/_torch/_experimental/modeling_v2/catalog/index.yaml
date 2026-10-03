@@ -254,6 +254,10 @@ entries:
     impl: torch.ops.trtllm.fp4_block_scale_moe_runner
     summary: "Full NVFP4-weight / NVFP4-activation MoE layer (trtllm-gen W4A4): caller-supplied top-k ids/weights + grouped FC1 GEMM over pre-shuffled block-scaled [up; gate] expert weights + SwiGLU + NVFP4 requantization of that activation + grouped FC2 GEMM + routing-weighted fp32 combine, into a fresh or caller-provided [tokens, hidden] bf16 buffer; the checkpoint's per-tensor global scales enter as three per-expert fp32 scalars, hidden must be a multiple of 256, expert-parallel window selected by local_expert_offset/local_num_experts, do_finalize=False returns the per-slot rows plus their permuted-row map instead of the combine"
 
+  - path: moe/k3_route_quant.py
+    impl: torch.ops.trtllm.k3_route_quant
+    summary: "Kimi K3's top-16 routing (sigmoid + bias-corrected selection, the unbiased weights renormalized and scaled) and the MXFP8 quantization of the routed latent for 1-64 decode tokens in one CuTe DSL kernel, bit-identical to trtllm::kimi_k3_noaux_tc_mxfp8_quant; stateless (a compile cache only); early_trigger lets a programmatic-dependent k3_moe launch before the outputs are written"
+
   # ─── quantization ──────────────────────────────────────────────
   - path: quantization/mxfp8_quantize.py
     impl: torch.ops.trtllm.mxfp8_quantize
@@ -310,5 +314,5 @@ entries:
     summary: "Kimi K3's MoE front at decode size in one kernel: the row-sharded MoE head GEMV, its all-gather over a caller-owned K3MoeHeadWorkspace (two alternating Lamport buffers rotated by every front call), the top-16 routing and MXFP8 latent as trtllm::k3_route_quant returns them for the gathered head, and the shared experts' gate_up + SiTU-and-mul; optionally publishing per-token ready words that a head_flags build of k3_moe acquires"
 
   - path: moe/k3_moe.py
-    impl: tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.op.K3MoeLayer
-    summary: "Kimi K3's routed experts at decode size: this rank's routed partial from the persistent CuTe DSL kernel k3_moe (FC1 + SiTU + FC2 with the routing-weighted combine over the TRTLLM-Gen W4A8_MXFP4_MXFP8 buffers, read in place) after k3_route_quant or the MoE front, on caller-owned per-rank state: a K3MoeState and one K3MoeLayer per MoE layer for up to 8 tokens, a K3MoeWideState and one K3MoeWideLayer per layer for up to 64; a state's layers share its scratch (left armed by every call) and run in one stream order, each layer's counters are left zero"
+    impl: torch.ops.trtllm.k3_moe
+    summary: "Kimi K3's routed experts at decode size: this rank's routed partial from the persistent CuTe DSL kernel k3_moe (FC1 + SiTU + FC2 with the routing-weighted combine over the TRTLLM-Gen W4A8_MXFP4_MXFP8 buffers, read in place) on the routing and MXFP8 latent of k3_route_quant or the MoE front, over caller-owned per-rank state: a K3MoeState (up to 8 tokens; its head_flags build acquires a publishing front's ready words on the group's K3MoeHeadWorkspace) or a K3MoeWideState (up to 64), and one K3MoeLayer per MoE layer; a state's layers share its scratch (left armed by every call) and run in one stream order, each layer's counters are left zero"

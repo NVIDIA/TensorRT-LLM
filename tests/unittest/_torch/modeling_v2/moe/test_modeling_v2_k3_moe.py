@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the moe/k3_moe catalog entry: k3_moe and k3_moe_wide on their caller-owned state.
+"""GPU test for the moe/k3_moe catalog entry: trtllm::k3_moe on its caller-owned state, both builds.
 
 One GPU (sm_100), one rank of the Kimi K3 TP16 deployment's routed experts: experts TP4 x EP4, so 224 of the 896
 experts are local (global ids [224, 448)) with intermediate 768 per rank. The experts are random checkpoint-format
 MXFP4 tensors put through TRT-LLM's own W4A8_MXFP4_MXFP8 TRTLLM-Gen loader, which writes the buffers that both k3_moe
-and the stock runner read.
+and the stock runner read. Every call routes with moe/k3_route_quant first (its early trigger on when the state
+launches k3_moe as a programmatic dependent), as a target does.
 
 References: the stock path (trtllm::kimi_k3_noaux_tc_mxfp8_quant, then the TRTLLM-Gen W4A8_MXFP4_MXFP8 MoE runner on
 those ids) and an fp64 reference over the dequantized MXFP4 experts (SiTU, the MXFP8 intermediate with the round-up
@@ -17,10 +18,11 @@ experts, B over other experts), a second K3MoeState, a K3MoeWideState with layer
 first (compiling) call eagerly where it needs one, so it also runs alone (-k). The kernel tests under
 tests/unittest/_torch/cute_dsl_kernels/kimi_k3/ remain the exhaustive numerics; this file copies what it needs.
 
-k3_moe_fused_front needs the TP group's head workspace: its cells run in moe/k3_moe_front's 4-rank matrix,
-tests/unittest/_torch/modeling_v2/comm/_k3_moe_front_op_matrix.py.
+The head_flags build needs the TP group's head workspace and the MoE front: its cells run in moe/k3_moe_front's
+4-rank matrix, tests/unittest/_torch/modeling_v2/comm/_k3_moe_front_op_matrix.py.
 """
 
+import contextlib
 import functools
 import math
 from types import SimpleNamespace
@@ -34,8 +36,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe import (
     K3MoeWideState,
     is_supported,
     k3_moe,
-    k3_moe_wide,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_route_quant import k3_route_quant
 
 H, TOP_K, NUM_EXPERTS, SV = 3584, 16, 896, 32
 I_TP, E_LOCAL, MOE_TP, TP_RANK, EP_RANK = 768, 224, 4, 1, 1  # one rank of experts TP4 x EP4
@@ -50,7 +52,6 @@ DEV = "cuda"
 DECODE_CASES = ("random", "16_local_disjoint", "none_local")
 WIDE_CASES = ("random", "group_cap", "none_local")
 WIDE_M = (1, 2, 7, 8, 9, 16, 33, 40, 64)
-ROUTE_M = (1, 2, 3, 4, 5, 6, 7, 8, 16, 33, 64)
 DIP_STEPS = (8, 8, 8, 2, 7, 8, 1, 1, 8, 3, 8)
 WIDE_DIP_STEPS = (64, 64, 16, 1, 40, 64, 8, 23, 64, 9, 64)
 REPLAYS = 6
@@ -224,10 +225,13 @@ def _draw(seed: int, rows: int):
     return logits, torch.randn(rows, H, generator=gen, device=DEV).bfloat16()
 
 
-def _zeros(rows: int):
+def _routed_zeros(rows: int):
+    """k3_moe's inputs for ``rows`` tokens, all zero: (x_fp8, x_sf, topk_ids, topk_weights)."""
     return (
-        torch.zeros(rows, NUM_EXPERTS, device=DEV),
-        torch.zeros(rows, H, dtype=torch.bfloat16, device=DEV),
+        torch.zeros(rows, H, dtype=torch.float8_e4m3fn, device=DEV),
+        torch.zeros(rows, H // SV, dtype=torch.uint8, device=DEV),
+        torch.zeros(rows, TOP_K, dtype=torch.int32, device=DEV),
+        torch.zeros(rows, TOP_K, dtype=torch.bfloat16, device=DEV),
     )
 
 
@@ -262,12 +266,16 @@ def _experts_of(i: int):
     return (_experts()[0], _rolled(), _experts()[0])[i]
 
 
-def _decode_call(layer, logits, x):
-    return k3_moe(x, logits, _bias(), OFFSET, RSF, layer)
+def _route(layer, logits, x):
+    """moe/k3_route_quant for a call on ``layer``: its dependents launched early when the layer's state launches
+    k3_moe as a programmatic dependent."""
+    return k3_route_quant(logits, _bias(), x, RSF, early_trigger=layer.state.use_pdl)
 
 
-def _wide_call(layer, logits, x, out=None):
-    return k3_moe_wide(x, logits, _bias(), OFFSET, RSF, layer, out=out)
+def _call(layer, logits, x, out=None):
+    """moe/k3_route_quant, then the moe/k3_moe entry on ``layer`` (either build)."""
+    ids, weights, x_fp8, x_sf = _route(layer, logits, x)
+    return k3_moe(x_fp8, x_sf, ids, weights, OFFSET, layer, out=out)
 
 
 def _armed(state, layers) -> bool:
@@ -290,6 +298,21 @@ def _snapshot(state, layers):
     return [
         t.clone() for t in (state.c, state.cs, state.part, *(layer.counters for layer in layers))
     ]
+
+
+@contextlib.contextmanager
+def _cold_k3_moe_cache():
+    """trtllm::k3_moe's compile cache emptied for the duration (and restored after): the next call of every build is
+    a first call."""
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op
+
+    saved = dict(op._compiled)
+    op._compiled.clear()
+    try:
+        yield
+    finally:
+        op._compiled.clear()
+        op._compiled.update(saved)
 
 
 # ── references ────────────────────────────────────────────────────────────
@@ -429,10 +452,10 @@ def _check_vs_stock(y, experts, logits, x, where: str) -> None:
     assert c["ok"], f"{where}: against the stock path {c}"
 
 
-def _alone(fn, layer, logits, x, experts, where: str):
+def _alone(layer, logits, x, experts, where: str):
     """One call made alone (synchronized before and after), checked against the stock path."""
     torch.cuda.synchronize()
-    y = fn(layer, logits, x)
+    y = _call(layer, logits, x)
     torch.cuda.synchronize()
     _check_vs_stock(y, experts, logits, x, where)
     return y
@@ -444,55 +467,47 @@ def _alone(fn, layer, logits, x, experts, where: str):
 def test_state_armed_and_sized():
     """New state objects are armed and sized as the contract states for 224 local experts and intermediate 768.
 
-    K3MoeState: slab [128, 8, 768] FP8 codes and [128, 8, 96] scale bytes armed, FC2 partial rows fp32 [1024, 3584]
-    zero, not compiled; a layer's counters int32 [288] zero. K3MoeWideState: slab [324, 8, 768] and [324, 8, 96]
-    armed, partials fp32 [1024, 3584]; a layer's counters int32 [680] zero. The loader's buffers fit the kernels.
+    K3MoeState: the M <= 8 build (m_max 8, one CTA per SM), slab [128, 8, 768] FP8 codes and [128, 8, 96] scale bytes
+    armed, FC2 partial rows fp32 [1024, 3584] zero; a layer's counters int32 [288] zero and its weights the tensors
+    it was built over. K3MoeWideState: m_max 64, slab [324, 8, 768] and [324, 8, 96] armed, partials fp32
+    [1024, 3584] zero; a layer's counters int32 [680] zero. The loader's buffers fit the kernels.
     """
     proc, _, _ = _experts()
     ok, why = is_supported(*_weights(proc), E_LOCAL)
     assert ok, why
+    sms = torch.cuda.get_device_properties(_device()).multi_processor_count
     state = K3MoeState(_device(), I_TP, E_LOCAL)
     layer = state.layer(*_weights(proc))
     g = min(E_LOCAL, DECODE_MAX * TOP_K)
     assert state.mod.G_CAP == g == 128
+    assert state.m_max == DECODE_MAX and state.num_ctas == sms and not state.head_flags
+    assert state.num_local == E_LOCAL and state.i_tp == I_TP
     assert state.c.dtype == state.cs.dtype == torch.int8
     assert tuple(state.c.shape) == (g, 8, I_TP) and tuple(state.cs.shape) == (g, 8, I_TP // 8)
     assert state.part.dtype == torch.float32 and tuple(state.part.shape) == (8 * g, H)
     assert bool((state.part == 0).all())
     assert layer.counters.dtype == torch.int32 and tuple(layer.counters.shape) == (32 + 2 * g,)
-    assert _armed(state, [layer]) and not state.head_flags and state.compiled is None
-    assert K3MoeState(_device(), I_TP, E_LOCAL, head_flags=True).head_flags
+    assert all(a is b for a, b in zip(layer.weights, _weights(proc)))
+    assert _armed(state, [layer])
+    flags_state = K3MoeState(_device(), I_TP, E_LOCAL, head_flags=True)
+    assert flags_state.head_flags and flags_state.m_max == DECODE_MAX
 
     wide = K3MoeWideState(_device(), I_TP, E_LOCAL)
     wide_layer = wide.layer(*_weights(proc))
     gw = E_LOCAL + (WIDE_MAX * TOP_K - E_LOCAL) // 8
     assert wide.mod.G_CAP == gw == 324
+    assert wide.m_max == WIDE_MAX and wide.num_ctas == sms and wide.use_pdl and not wide.head_flags
     assert tuple(wide.c.shape) == (gw, 8, I_TP) and tuple(wide.cs.shape) == (gw, 8, I_TP // 8)
     assert wide.part.dtype == torch.float32 and tuple(wide.part.shape) == (16 * WIDE_MAX, H)
+    assert bool((wide.part == 0).all())
     assert tuple(wide_layer.counters.shape) == (32 + 2 * gw,)
-    assert _armed(wide, [wide_layer]) and wide.compiled is None
-
-
-@pytest.mark.parametrize("m", ROUTE_M)
-def test_k3_route_quant_is_the_stock_routing(m):
-    """k3_route_quant (inside k3_moe and k3_moe_wide) returns kimi_k3_noaux_tc_mxfp8_quant's four outputs, bit for bit.
-
-    Top-16 ids, routing weights, MXFP8 codes and scales, with and without the early dependent trigger.
-    """
-    logits64, x64 = _tokens("random", WIDE_MAX)
-    logits, x = logits64[:m].contiguous(), x64[:m].contiguous()
-    want = torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(logits, _bias(), x, RSF)
-    for early in (False, True):
-        got = torch.ops.trtllm.k3_route_quant(logits, _bias(), x, RSF, early_trigger=early)
-        same = [_same(a, b) for a, b in zip(got, want)]
-        print(f"OPCHECK op=k3_route_quant M={m} early_trigger={early} same(ids,w,q,sf)={same}")
-        assert all(same), f"M {m} early_trigger {early}: {same}"
+    assert _armed(wide, [wide_layer])
 
 
 @pytest.mark.parametrize("m", range(1, DECODE_MAX + 1))
 @pytest.mark.parametrize("case", DECODE_CASES)
 def test_k3_moe_single_call(case, m):
-    """One k3_moe call of M tokens on layer A against the fp64 reference and the stock path.
+    """One call of M tokens on the K3MoeState's layer A against the fp64 reference and the stock path.
 
     Also: run-to-run identical bits; each row within one bf16 ulp of the same row of the 8-token call (the slice FC2
     adds a token's expert terms in slices whose bounds follow the step's group count; bit-identity is reported); the
@@ -502,7 +517,7 @@ def test_k3_moe_single_call(case, m):
     state, layers = _decode()
     logits8, x8 = _tokens(case, DECODE_MAX)
     logits, x = logits8[:m].contiguous(), x8[:m].contiguous()
-    y = _decode_call(layers[0], logits, x)
+    y = _call(layers[0], logits, x)
     torch.cuda.synchronize()
     rearmed = _armed(state, layers)
     assert (
@@ -511,8 +526,8 @@ def test_k3_moe_single_call(case, m):
         and y.is_contiguous()
         and y.device == x.device
     )
-    det = all(_same(_decode_call(layers[0], logits, x), y) for _ in range(2))
-    y8 = _decode_call(layers[0], logits8, x8)
+    det = all(_same(_call(layers[0], logits, x), y) for _ in range(2))
+    y8 = _call(layers[0], logits8, x8)
     ulp_m8 = _max_ulp(y, y8[:m])
     y_stock, ids, w, x_fp8, x_sf = _stock(proc, bias, x, logits)
     local = _local_pairs(ids)
@@ -524,7 +539,7 @@ def test_k3_moe_single_call(case, m):
     if local == 0:
         zeros = bool((y == 0).all())
         print(
-            f"OPCHECK op=k3_moe case={case} M={m} zeros={zeros} det={det} "
+            f"OPCHECK op=k3_moe build=m8 case={case} M={m} zeros={zeros} det={det} "
             f"rows_as_m8={_same(y, y8[:m])} scratch_rearmed={rearmed}"
         )
         assert zeros and det and ulp_m8 == 0 and rearmed
@@ -532,7 +547,7 @@ def test_k3_moe_single_call(case, m):
     ref = _reference(raw, _deq_x(x_fp8, x_sf), ids, w).bfloat16()
     c_ref, c_stock, c_stock_ref = _compare(y, ref), _compare(y, y_stock), _compare(y_stock, ref)
     print(
-        f"OPCHECK op=k3_moe case={case} M={m} local_pairs={local} groups={groups} "
+        f"OPCHECK op=k3_moe build=m8 case={case} M={m} local_pairs={local} groups={groups} "
         f"vs_ref_elt_ulp={c_ref['elt_ulp']:.2f} vs_ref_rms_ulp={c_ref['rms_ulp']:.2f} "
         f"vs_stock_elt_ulp={c_stock['elt_ulp']:.2f} vs_stock_rms_ulp={c_stock['rms_ulp']:.2f} "
         f"stock_vs_ref_elt_ulp={c_stock_ref['elt_ulp']:.2f} det={det} "
@@ -545,36 +560,37 @@ def test_k3_moe_single_call(case, m):
 @pytest.mark.parametrize("m", WIDE_M)
 @pytest.mark.parametrize("case", WIDE_CASES)
 def test_k3_moe_wide_single_call(case, m):
-    """One k3_moe_wide call of M tokens on its layer A against the fp64 reference and the stock path.
+    """One call of M tokens on the K3MoeWideState's layer A against the fp64 reference and the stock path.
 
     Also: run-to-run identical bits; the slab armed and every counter zero after the call; at M <= 8 within one bf16
-    ulp of k3_moe on the same experts (bit-identity reported); at group_cap M 64 the group count at the capacity, 324.
+    ulp of the M <= 8 build on the same experts (bit-identity reported); at group_cap M 64 the group count at the
+    capacity, 324.
     """
     proc, raw, bias = _experts()
     state, layers = _wide()
     _, decode_layers = _decode()
     logits64, x64 = _tokens(case, WIDE_MAX)
     logits, x = logits64[:m].contiguous(), x64[:m].contiguous()
-    y = _wide_call(layers[0], logits, x)
+    y = _call(layers[0], logits, x)
     torch.cuda.synchronize()
     rearmed = _armed(state, layers)
     assert y.shape == (m, H) and y.dtype == torch.bfloat16 and y.is_contiguous()
-    det = all(_same(_wide_call(layers[0], logits, x), y) for _ in range(2))
+    det = all(_same(_call(layers[0], logits, x), y) for _ in range(2))
     y_stock, ids, w, x_fp8, x_sf = _stock(proc, bias, x, logits)
     groups = _groups_wide(ids)
     if case == "group_cap" and m == WIDE_MAX:
         assert groups == state.mod.G_CAP == 324
     decode = ""
     if m <= DECODE_MAX:
-        y_dec = _decode_call(decode_layers[0], logits, x)
+        y_dec = _call(decode_layers[0], logits, x)
         ulp_dec = _max_ulp(y, y_dec)
-        decode = f" max_ulp_vs_k3_moe={ulp_dec} bits_as_k3_moe={_same(y, y_dec)}"
+        decode = f" max_ulp_vs_m8_build={ulp_dec} bits_as_m8_build={_same(y, y_dec)}"
         assert ulp_dec <= 1
     local = _local_pairs(ids)
     if local == 0:
         zeros = bool((y == 0).all())
         print(
-            f"OPCHECK op=k3_moe_wide case={case} M={m} zeros={zeros} det={det} "
+            f"OPCHECK op=k3_moe build=m64 case={case} M={m} zeros={zeros} det={det} "
             f"scratch_rearmed={rearmed}{decode}"
         )
         assert zeros and det and rearmed
@@ -582,7 +598,7 @@ def test_k3_moe_wide_single_call(case, m):
     ref = _reference(raw, _deq_x(x_fp8, x_sf), ids, w).bfloat16()
     c_ref, c_stock, c_stock_ref = _compare(y, ref), _compare(y, y_stock), _compare(y_stock, ref)
     print(
-        f"OPCHECK op=k3_moe_wide case={case} M={m} local_pairs={local} groups={groups} "
+        f"OPCHECK op=k3_moe build=m64 case={case} M={m} local_pairs={local} groups={groups} "
         f"vs_ref_elt_ulp={c_ref['elt_ulp']:.2f} vs_ref_rms_ulp={c_ref['rms_ulp']:.2f} "
         f"vs_stock_elt_ulp={c_stock['elt_ulp']:.2f} vs_stock_rms_ulp={c_stock['rms_ulp']:.2f} "
         f"stock_vs_ref_elt_ulp={c_stock_ref['elt_ulp']:.2f} det={det} scratch_rearmed={rearmed}{decode}"
@@ -591,74 +607,62 @@ def test_k3_moe_wide_single_call(case, m):
     assert det and rearmed
 
 
-@pytest.mark.parametrize("m", [9, WIDE_MAX])
-def test_k3_moe_wide_out_buffer(m):
-    """k3_moe_wide with ``out``: the result is out[:M] (the same storage), the bits of the call without ``out``.
+@pytest.mark.parametrize("build,m", [("m8", 3), ("m8", 8), ("m64", 9), ("m64", 64)])
+def test_k3_moe_out_buffer(build, m):
+    """``out``: the call writes out[:M], the bits of the call without ``out``, and returns an empty [0, 3584] tensor.
 
     The rows of ``out`` past M keep their bits.
     """
-    _, layers = _wide()
+    layer = (_decode() if build == "m8" else _wide())[1][0]
     logits, x = _draw(900 + m, m)
-    want = _wide_call(layers[0], logits, x)
+    want = _call(layer, logits, x)
     out = torch.full((WIDE_MAX + 3, H), -3.0, dtype=torch.bfloat16, device=DEV)
     tail = out[m:].clone()
-    got = _wide_call(layers[0], logits, x, out=out)
+    got = _call(layer, logits, x, out=out)
     torch.cuda.synchronize()
-    assert got.data_ptr() == out.data_ptr() and got.shape == (m, H)
-    assert _same(got, want) and _same(out[m:], tail)
+    assert got.dtype == torch.bfloat16 and tuple(got.shape) == (0, H)
+    assert _same(out[:m], want) and _same(out[m:], tail)
 
 
 def test_layers_by_steps_dip_and_regrow():
     """Decode steps of several layers on one state, the token count dipping and growing back, back to back.
 
-    Steps of three k3_moe calls (layers A, B, C of one state) at M 8, 8, 8, 2, 7, 8, 1, 1, 8, 3, 8, then steps of two
-    k3_moe_wide calls (layers A, B of the wide state) at M 64, 64, 16, 1, 40, 64, 8, 23, 64, 9, 64, with new inputs
-    every call. Each call is first made alone (synchronized, checked against the stock path); in the sequence, back to
-    back on one stream, each returns the bits of its call alone, and afterwards both slabs are armed and every counter
-    is zero: a call after a smaller one reads nothing an older, larger call left.
+    Steps of three calls (layers A, B, C of the K3MoeState) at M 8, 8, 8, 2, 7, 8, 1, 1, 8, 3, 8, then steps of two
+    calls (layers A, B of the K3MoeWideState) at M 64, 64, 16, 1, 40, 64, 8, 23, 64, 9, 64, with new inputs every call.
+    Each call is first made alone (synchronized, checked against the stock path); in the sequence, back to back on one
+    stream, each returns the bits of its call alone, and afterwards both slabs are armed and every counter is zero: a
+    call after a smaller one reads nothing an older, larger call left.
     """
-    state, layers = _decode()
-    calls = [(i, *_draw(1000 + 10 * s + i, m)) for s, m in enumerate(DIP_STEPS) for i in range(3)]
-    alone = [
-        _alone(
-            _decode_call, layers[i], lg, x, _experts_of(i), f"k3_moe layer {i} M {x.shape[0]} alone"
+    for state, layers, steps, seed in (
+        (*_decode(), DIP_STEPS, 1000),
+        (*_wide(), WIDE_DIP_STEPS, 2000),
+    ):
+        calls = [
+            (i, *_draw(seed + 10 * s + i, m))
+            for s, m in enumerate(steps)
+            for i in range(len(layers))
+        ]
+        alone = [
+            _alone(
+                layers[i], lg, x, _experts_of(i), f"m{state.m_max} layer {i} M {x.shape[0]} alone"
+            )
+            for i, lg, x in calls
+        ]
+        seq = [_call(layers[i], lg, x) for i, lg, x in calls]
+        torch.cuda.synchronize()
+        bad = [k for k, (y, a) in enumerate(zip(seq, alone)) if not _same(y, a)]
+        assert not bad, (
+            f"m{state.m_max}: calls {bad} of the sequence differ from the same calls alone"
         )
-        for i, lg, x in calls
-    ]
-    seq = [_decode_call(layers[i], lg, x) for i, lg, x in calls]
-    torch.cuda.synchronize()
-    bad = [k for k, (y, a) in enumerate(zip(seq, alone)) if not _same(y, a)]
-    assert not bad, f"k3_moe calls {bad} of the sequence differ from the same calls alone"
-    assert _armed(state, layers)
-
-    wide, wide_layers = _wide()
-    wide_calls = [
-        (i, *_draw(2000 + 10 * s + i, m)) for s, m in enumerate(WIDE_DIP_STEPS) for i in range(2)
-    ]
-    alone = [
-        _alone(
-            _wide_call,
-            wide_layers[i],
-            lg,
-            x,
-            _experts_of(i),
-            f"k3_moe_wide layer {i} M {x.shape[0]} alone",
-        )
-        for i, lg, x in wide_calls
-    ]
-    seq = [_wide_call(wide_layers[i], lg, x) for i, lg, x in wide_calls]
-    torch.cuda.synchronize()
-    bad = [k for k, (y, a) in enumerate(zip(seq, alone)) if not _same(y, a)]
-    assert not bad, f"k3_moe_wide calls {bad} of the sequence differ from the same calls alone"
-    assert _armed(wide, wide_layers)
+        assert _armed(state, layers)
 
 
 def test_two_states_interleaved():
-    """Two K3MoeStates (each its own scratch) and the wide state, calls interleaved in an irregular pattern.
+    """Two K3MoeStates (each its own scratch) and the K3MoeWideState, calls interleaved in an irregular pattern.
 
-    A A B A B B A A A B, twice, with a k3_moe_wide call after every third, M varying, back to back on one stream: every
-    call returns the bits of the same call alone (checked against the stock path), and every slab is armed and every
-    counter zero afterwards.
+    A A B A B B A A A B, twice, with a call on the wide state after every third, M varying, back to back on one
+    stream: every call returns the bits of the same call alone (checked against the stock path), and every slab is
+    armed and every counter zero afterwards.
     """
     state_a, layers_a = _decode()
     state_b, layer_b = _decode_b()
@@ -667,17 +671,17 @@ def test_two_states_interleaved():
     for i, which in enumerate("AABABBAAAB" * 2):
         m = (3, 8, 1, 8, 5)[i % 5]
         if which == "A":
-            plan.append((_decode_call, layers_a[i % 3], _experts_of(i % 3), *_draw(3000 + i, m)))
+            plan.append((layers_a[i % 3], _experts_of(i % 3), *_draw(3000 + i, m)))
         else:
-            plan.append((_decode_call, layer_b, _experts()[0], *_draw(3000 + i, m)))
+            plan.append((layer_b, _experts()[0], *_draw(3000 + i, m)))
         if i % 3 == 2:
             mw = (40, 64, 9)[(i // 3) % 3]
-            plan.append((_wide_call, wide_layers[i % 2], _experts_of(i % 2), *_draw(3500 + i, mw)))
+            plan.append((wide_layers[i % 2], _experts_of(i % 2), *_draw(3500 + i, mw)))
     alone = [
-        _alone(fn, layer, lg, x, ex, f"interleaved call {k} alone")
-        for k, (fn, layer, ex, lg, x) in enumerate(plan)
+        _alone(layer, lg, x, ex, f"interleaved call {k} alone")
+        for k, (layer, ex, lg, x) in enumerate(plan)
     ]
-    seq = [fn(layer, lg, x) for fn, layer, _, lg, x in plan]
+    seq = [_call(layer, lg, x) for layer, _, lg, x in plan]
     torch.cuda.synchronize()
     bad = [k for k, (y, a) in enumerate(zip(seq, alone)) if not _same(y, a)]
     assert not bad, f"interleaved calls {bad} differ from the same calls alone"
@@ -687,19 +691,20 @@ def test_two_states_interleaved():
 def test_graph_capture_and_replay():
     """A captured step replayed with rewritten inputs, eager calls of other token counts between replays.
 
-    The step: k3_moe on layers A, B, C at M 8, then k3_moe_wide on its layer A at M 64, captured once and replayed six
-    times with new inputs copied into its static buffers; between replays an eager k3_moe call (M 3, 1, 6, 5, 2, 7)
-    and an eager k3_moe_wide call (M 23, 9, 40, 1, 64, 16) on the same states. Every replayed and eager call returns
-    the bits of the same call alone (checked against the stock path), and the slabs are armed and every counter zero
-    afterwards.
+    The step: layers A, B, C of the K3MoeState at M 8, then layer A of the K3MoeWideState at M 64 (each routed by
+    k3_route_quant inside the step), captured once and replayed six times with new inputs copied into its static
+    buffers; between replays an eager call of another M on each state (M 3, 1, 6, 5, 2, 7 and 23, 9, 40, 1, 64, 16).
+    Every replayed and eager call returns the bits of the same call alone (checked against the stock path), and the
+    slabs are armed and every counter zero afterwards.
     """
     state, layers = _decode()
     wide, wide_layers = _wide()
+    step_layers = [layers[0], layers[1], layers[2], wide_layers[0]]
+    step_experts = [_experts_of(0), _experts_of(1), _experts_of(2), _experts_of(0)]
     static = [_draw(4000 + i, DECODE_MAX) for i in range(3)] + [_draw(4003, WIDE_MAX)]
 
     def step():
-        outs = [_decode_call(layers[i], *static[i]) for i in range(3)]
-        return outs + [_wide_call(wide_layers[0], *static[3])]
+        return [_call(layer, lg, x) for layer, (lg, x) in zip(step_layers, static)]
 
     step()  # every first call eager: k3_route_quant and both k3_moe builds compile here if nothing has yet
     torch.cuda.synchronize()
@@ -709,37 +714,21 @@ def test_graph_capture_and_replay():
     with torch.cuda.graph(graph, stream=stream):
         outs = step()
     for rep in range(REPLAYS):
-        inputs = [_draw(5000 + 10 * rep + i, DECODE_MAX) for i in range(3)] + [
-            _draw(5003 + 10 * rep, WIDE_MAX)
-        ]
+        inputs = [_draw(5000 + 10 * rep + i, DECODE_MAX) for i in range(3)]
+        inputs.append(_draw(5003 + 10 * rep, WIDE_MAX))
         alone = [
-            _alone(
-                _decode_call, layers[i], *inputs[i], _experts_of(i), f"replay {rep} layer {i} alone"
-            )
-            for i in range(3)
+            _alone(layer, lg, x, ex, f"replay {rep} call {i} alone")
+            for i, (layer, ex, (lg, x)) in enumerate(zip(step_layers, step_experts, inputs))
         ]
-        alone.append(
-            _alone(
-                _wide_call, wide_layers[0], *inputs[3], _experts_of(0), f"replay {rep} wide alone"
-            )
-        )
-        eager = (
-            _draw(6000 + rep, (3, 1, 6, 5, 2, 7)[rep]),
-            _draw(6100 + rep, (23, 9, 40, 1, 64, 16)[rep]),
-        )
-        eager_layers = (layers[rep % 3], wide_layers[rep % 2])
-        eager_alone = (
-            _alone(
-                _decode_call, eager_layers[0], *eager[0], _experts_of(rep % 3), f"eager {rep} alone"
-            ),
-            _alone(
-                _wide_call,
-                eager_layers[1],
-                *eager[1],
+        eager = [
+            (layers[rep % 3], _experts_of(rep % 3), *_draw(6000 + rep, (3, 1, 6, 5, 2, 7)[rep])),
+            (
+                wide_layers[rep % 2],
                 _experts_of(rep % 2),
-                f"eager wide {rep} alone",
+                *_draw(6100 + rep, (23, 9, 40, 1, 64, 16)[rep]),
             ),
-        )
+        ]
+        eager_alone = [_alone(layer, lg, x, ex, f"eager {rep} alone") for layer, ex, lg, x in eager]
         for (lg, x), (new_lg, new_x) in zip(static, inputs):
             lg.copy_(new_lg)
             x.copy_(new_x)
@@ -747,7 +736,7 @@ def test_graph_capture_and_replay():
         torch.cuda.synchronize()
         bad = [i for i, (y, a) in enumerate(zip(outs, alone)) if not _same(y, a)]
         assert not bad, f"replay {rep}: calls {bad} differ from the same calls alone"
-        got = (_decode_call(eager_layers[0], *eager[0]), _wide_call(eager_layers[1], *eager[1]))
+        got = [_call(layer, lg, x) for layer, _, lg, x in eager]
         torch.cuda.synchronize()
         assert all(_same(g, a) for g, a in zip(got, eager_alone)), f"eager calls after replay {rep}"
     del graph
@@ -757,43 +746,56 @@ def test_graph_capture_and_replay():
 def test_unsupported_calls_refused_before_launch():
     """Unsupported calls raise ValueError before any launch, and the next call is correct.
 
-    k3_moe at M 0 and 9, k3_moe_wide at M 0 and 65, and k3_moe on a head_flags state's layer (that build takes the
-    front's ready words: k3_moe_fused_front only). The slabs, the FC2 partial rows and every counter keep their bits;
-    the next calls return the bits of the same calls made before.
+    M 0 and 9 on the K3MoeState, M 0 and 65 on the K3MoeWideState; a head_flags state's layer without ``head`` and a
+    plain state's layer with one; int64 ids; an ``out`` with too few rows. The slabs, the FC2 partial rows and every
+    counter keep their bits; the next calls return the bits of the same calls made before.
     """
     state, layers = _decode()
     wide, wide_layers = _wide()
     lg8, x8 = _draw(7000, DECODE_MAX)
     lg40, x40 = _draw(7001, 40)
-    want = _decode_call(layers[0], lg8, x8)
-    want_wide = _wide_call(wide_layers[0], lg40, x40)
+    want = _call(layers[0], lg8, x8)
+    want_wide = _call(wide_layers[0], lg40, x40)
     flags_state = K3MoeState(_device(), I_TP, E_LOCAL, head_flags=True)
     flags_layer = flags_state.layer(*_weights(_experts()[0]))
+    ids, weights, x_fp8, x_sf = _route(layers[0], lg8, x8)
+    # Never touched: the entry refuses a head for a plain state's layer before reading it.
+    head = SimpleNamespace(
+        ready=torch.zeros(32, dtype=torch.int32, device=DEV),
+        flags=torch.zeros(4, dtype=torch.int32, device=DEV),
+    )
     torch.cuda.synchronize()
     objects = ((state, layers), (wide, wide_layers), (flags_state, [flags_layer]))
     before = [_snapshot(st, lyrs) for st, lyrs in objects]
     for m in (0, DECODE_MAX + 1):
         with pytest.raises(ValueError):
-            _decode_call(layers[0], *_zeros(m))
+            k3_moe(*_routed_zeros(m), OFFSET, layers[0])
     for m in (0, WIDE_MAX + 1):
         with pytest.raises(ValueError):
-            _wide_call(wide_layers[0], *_zeros(m))
-    with pytest.raises(ValueError, match="head_flags"):
-        _decode_call(flags_layer, lg8, x8)
+            k3_moe(*_routed_zeros(m), OFFSET, wide_layers[0])
+    with pytest.raises(ValueError, match="head"):
+        k3_moe(x_fp8, x_sf, ids, weights, OFFSET, flags_layer)
+    with pytest.raises(ValueError, match="head"):
+        k3_moe(x_fp8, x_sf, ids, weights, OFFSET, layers[0], head=head)
+    with pytest.raises(ValueError):
+        k3_moe(x_fp8, x_sf, ids.long(), weights, OFFSET, layers[0])
+    with pytest.raises(ValueError):
+        short = torch.empty(DECODE_MAX - 1, H, dtype=torch.bfloat16, device=DEV)
+        k3_moe(x_fp8, x_sf, ids, weights, OFFSET, layers[0], out=short)
     torch.cuda.synchronize()
     after = [_snapshot(st, lyrs) for st, lyrs in objects]
     assert all(_same(a, b) for snap_a, snap_b in zip(before, after) for a, b in zip(snap_a, snap_b))
-    assert flags_state.compiled is None
-    assert _same(_decode_call(layers[0], lg8, x8), want)
-    assert _same(_wide_call(wide_layers[0], lg40, x40), want_wide)
+    assert _same(_call(layers[0], lg8, x8), want)
+    assert _same(_call(wide_layers[0], lg40, x40), want_wide)
 
 
 def test_construction_and_first_call_refuse_capture():
-    """Under CUDA-graph capture the states refuse to allocate, and a new state refuses its first (compiling) call.
+    """Under CUDA-graph capture the states refuse to allocate, and a build refuses its first (compiling) call.
 
-    K3MoeState(), K3MoeState.layer(), K3MoeWideState() and K3MoeWideState.layer() raise RuntimeError; the first call
-    on a new K3MoeState and on a new K3MoeWideState raises RuntimeError before the k3_moe launch (k3_route_quant,
-    compiled eagerly first, is captured and discarded with the graph); neither state is compiled afterwards.
+    K3MoeState(), K3MoeState.layer(), K3MoeWideState() and K3MoeWideState.layer() raise RuntimeError. With
+    trtllm::k3_moe's compile cache cold, the first call of either build raises RuntimeError before the k3_moe launch
+    (k3_route_quant, compiled eagerly first, is captured and discarded with the graph), and the build stays
+    uncompiled.
     """
     proc, _, bias = _experts()
     fresh = K3MoeState(_device(), I_TP, E_LOCAL)
@@ -802,28 +804,29 @@ def test_construction_and_first_call_refuse_capture():
     fresh_wide_layer = fresh_wide.layer(*_weights(proc))
     lg4, x4 = _draw(7100, 4)
     lg16, x16 = _draw(7101, 16)
-    # Both k3_route_quant builds compiled, whichever PDL setting the layers use.
+    # Both k3_route_quant builds compiled, whichever PDL setting the states use.
     for early in (False, True):
-        torch.ops.trtllm.k3_route_quant(lg4, bias, x4, RSF, early_trigger=early)
+        k3_route_quant(lg4, bias, x4, RSF, early_trigger=early)
     torch.cuda.synchronize()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
-            K3MoeState(_device(), I_TP, E_LOCAL)
-        with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
-            fresh.layer(*_weights(proc))
-        with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
-            K3MoeWideState(_device(), I_TP, E_LOCAL)
-        with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
-            fresh_wide.layer(*_weights(proc))
-        with pytest.raises(RuntimeError, match="compiles on its first call"):
-            _decode_call(fresh_layer, lg4, x4)
-        with pytest.raises(RuntimeError, match="compiles on its first call"):
-            _wide_call(fresh_wide_layer, lg16, x16)
+    with _cold_k3_moe_cache():
+        with torch.cuda.graph(graph, stream=stream):
+            with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
+                K3MoeState(_device(), I_TP, E_LOCAL)
+            with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
+                fresh.layer(*_weights(proc))
+            with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
+                K3MoeWideState(_device(), I_TP, E_LOCAL)
+            with pytest.raises(RuntimeError, match="outside CUDA-graph capture"):
+                fresh_wide.layer(*_weights(proc))
+            with pytest.raises(RuntimeError, match="compiles on its first call"):
+                _call(fresh_layer, lg4, x4)
+            with pytest.raises(RuntimeError, match="compiles on its first call"):
+                _call(fresh_wide_layer, lg16, x16)
+        assert not fresh.compiled and not fresh_wide.compiled
     del graph
-    assert fresh.compiled is None and fresh_wide.compiled is None
 
 
 def test_negative_control_weights_rebound_after_layer():
@@ -843,14 +846,14 @@ def test_negative_control_weights_rebound_after_layer():
     stale_wide = wide.layer(*_weights(e1))
     lg8, x8 = _tokens("random", DECODE_MAX)
     lg40, x40 = _draw(8000, 40)
-    y_e1 = _decode_call(stale, lg8, x8)
-    yw_e1 = _wide_call(stale_wide, lg40, x40)
+    y_e1 = _call(stale, lg8, x8)
+    yw_e1 = _call(stale_wide, lg40, x40)
     torch.cuda.synchronize()
 
     # The reload: the caller's weights are now these new tensors; E1's buffers stay as they were.
     e2 = _rolled()
-    y_stale = _decode_call(stale, lg8, x8)
-    yw_stale = _wide_call(stale_wide, lg40, x40)
+    y_stale = _call(stale, lg8, x8)
+    yw_stale = _call(stale_wide, lg40, x40)
     stock_e2 = _stock(e2, bias, x8, lg8)[0]
     stock_wide_e2 = _stock(e2, bias, x40, lg40)[0]
     c, cw = _compare(y_stale, stock_e2), _compare(yw_stale, stock_wide_e2)
@@ -864,10 +867,10 @@ def test_negative_control_weights_rebound_after_layer():
 
     fresh = state.layer(*_weights(e2))
     fresh_wide = wide.layer(*_weights(e2))
-    y_e2 = _decode_call(fresh, lg8, x8)
-    yw_e2 = _wide_call(fresh_wide, lg40, x40)
+    y_e2 = _call(fresh, lg8, x8)
+    yw_e2 = _call(fresh_wide, lg40, x40)
     assert _compare(y_e2, stock_e2)["ok"] and _compare(yw_e2, stock_wide_e2)["ok"]
     for name, t in e1.items():
         t.copy_(e2[name])  # in place: the buffers the stale layers read now hold E2
-    assert _same(_decode_call(stale, lg8, x8), y_e2)
-    assert _same(_wide_call(stale_wide, lg40, x40), yw_e2)
+    assert _same(_call(stale, lg8, x8), y_e2)
+    assert _same(_call(stale_wide, lg40, x40), yw_e2)

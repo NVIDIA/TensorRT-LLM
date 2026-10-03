@@ -26,11 +26,11 @@ shared  = bf16(gate_cap * tanh(g / gate_cap) * sigmoid(g) * linear_cap * tanh(u 
 ```
 
 `head_weight_r` is rank `r`'s `[WL + WE, K]` head slice and `gate`, `up` this rank's `[shared_cols, K]` shared rows,
-all inside the ranks' `w_front`. `k3_route_quant` is the routing and quantization of `moe/k3_moe` (top-16 of the
-sigmoid plus the bias, ties to the lower id, weights renormalized times `routed_scaling_factor`; MXFP8 with one UE8M0
-scale per 32 columns): the front selects with all warps of a CTA but returns `top16_warp`'s experts, order and weight
-bits, and quantizes with the same device code (the kernel's statement). Every head and shared value is an fp32 sum
-over `K` split across the 8 CTAs of a cluster, the 8 partials added in cluster-rank order from +0.0 (the kernel's
+all inside the ranks' `w_front`. `k3_route_quant` is the routing and quantization of `moe/k3_route_quant` (top-16 of
+the sigmoid plus the bias, ties to the lower id, weights renormalized times `routed_scaling_factor`; MXFP8 with one
+UE8M0 scale per 32 columns): the front selects with all warps of a CTA but returns `top16_warp`'s experts, order and
+weight bits, and quantizes with the same device code (the kernel's statement). Every head and shared value is an fp32
+sum over `K` split across the 8 CTAs of a cluster, the 8 partials added in cluster-rank order from +0.0 (the kernel's
 statement): deterministic, but not the summation order of another GEMM.
 
 Certified at every `M` 1-8 and for every front call the matrix makes alone, with payloads whose head and shared sums
@@ -48,9 +48,9 @@ another GEMM's in the last bit; the kernel test (`test_k3_moe_front.py`) bounds 
 the 16th and 17th selection keys are within 1e-4, more than 99.9 % of the MXFP8 codes and scales equal.
 
 Fusion boundary. Inside: the head GEMV, the head all-gather, the routing, the MXFP8 latent, the shared gate_up and
-its SiTU. Outside: the producer of the MoE input `x`; the routed experts (`moe/k3_moe`'s `k3_moe_fused_front` runs
-`k3_moe` on this op's outputs within the same call); the shared experts' down projection and its all-reduce; the
-routed partials' all-reduce and the latent-up projection.
+its SiTU. Outside: the producer of the MoE input `x`; the routed experts (`moe/k3_moe`, called on this op's routing
+and MXFP8 latent right after it); the shared experts' down projection and its all-reduce; the routed partials'
+all-reduce and the latent-up projection.
 
 ## Signature
 
@@ -64,6 +64,7 @@ def k3_moe_front(
     gate_cap: float,
     linear_cap: float,
     workspace: K3MoeHeadWorkspace,
+    publish: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 ```
 
@@ -83,11 +84,12 @@ The wrapper module also exports the load-time helpers `front_weight(head_weight,
 | `shared_cols` | 384 (Kimi K3 TP16's per-rank width: two shared experts of 3072 over 16 ranks) | Python int | — | — |
 | `gate_cap`, `linear_cap` | 4.0, 25.0 (Kimi K3's SiTU caps) | Python float | — | — |
 | `workspace` | the `K3MoeHeadWorkspace` of this rank's TP group, `W` = 4 certified (see *State*) | — | — | — |
+| `publish` | `True`: also release the workspace's per-token ready words for the head_flags `moe/k3_moe` call that follows (*State*); `False` (default): leave them and the epoch untouched | Python bool | — | — |
 | returns | `topk_ids [M, 16]` int32, `topk_weights [M, 16]` bf16, `quantized [M, 3584]` float8_e4m3fn, `scales [M, 112]` uint8 (linear: one byte per 32 columns), `shared [M, shared_cols]` bf16 | — | contiguous, newly allocated | `x.device` |
 
-Inert (not exposed by the wrapper): `ring` (4, the weight ring's stages) and `ag_ready` (`None`: the standalone front
-publishes no ready words; `K3MoeLayer.front` on a head_flags state passes the workspace's `ready`, see *State*).
-`gate_cap` and `linear_cap` are compile-time constants of the kernel: each pair compiles once (*Metadata consumed*).
+Inert (not exposed by the wrapper): `ring` (4, the weight ring's stages). `publish` passes the workspace's ready
+words as the op's `ag_ready`. `gate_cap` and `linear_cap` are compile-time constants of the kernel: each pair
+compiles once (*Metadata consumed*).
 
 ## State
 
@@ -108,29 +110,38 @@ at `W` 4, 8 and 16 (certified at 4):
   advanced only by a head_flags build of `k3_moe` (`moe/k3_moe`); `[3]` the sign-ins of the CTAs that read `[0]` in
   the current call.
 - `ready`, int32 `[32]`: `[t]` token `t`'s routing and `[8 + t]` its MXFP8 row, released as `epoch + 1` by a
-  publishing front (`K3MoeLayer.front` on a head_flags state); `[16, 32)` unused.
+  publishing front (this entry with `publish=True`); `[16, 32)` unused.
 - `rank`, `world_size`; `handle`, the `McastGPUBuffer` that owns the memory (the workspace is valid while this object
   lives); `comm`, the TP-group communicator the handles were exchanged over.
 
 The size depends on `W` only, not on `M`: every call fits.
 
 **Who creates it, and when.** The target, in `post_load_weights`, with `K3MoeHeadWorkspace.create(mapping,
-fabric_handle=None)`: collective over `mapping`'s TP group (every rank calls it at the same point; it returns on every
-rank or raises on every rank, the agreement also being the barrier that keeps any rank from pushing into a peer's
-buffer before the peer has emptied it); eager: under CUDA-graph capture it raises `RuntimeError` before entering the
-collective (certified, on every rank). It empties every word and zeroes `flags` and `ready` (certified, both of the
-matrix's workspaces). `fabric_handle`: share the memory by fabric handle (required across nodes) or POSIX file
-descriptor; default `mapping.is_multi_node()`. No environment variable is read.
+fabric_handle=None)`: collective over `mapping`'s TP group and eager, every rank of the group calling it at the same
+point. Under MPI each call first splits the group's communicator off the session's, a collective of every rank of the
+session (`_get_mnnvl_workspace_comm`). Before allocating, the ranks agree that each of them can: not capturing a CUDA
+graph, the buffer within its device's free memory. If one cannot, every rank raises `RuntimeError` ("not every rank
+can allocate") and none allocates. A failure returned by the allocation is agreed the same way, and that second
+agreement is also the barrier that keeps any rank from pushing into a peer's buffer before the peer has emptied it; a
+rank that fails inside the allocation's handle exchange can leave its peers waiting there (the op module's
+statements). Certified: with every rank capturing, and with the last rank capturing while its peers call it eagerly,
+every rank raises `RuntimeError` (the capturing ranks' messages naming the capture) and the existing workspace keeps
+its bits. So even a refusal needs every rank to call `create()`: a rank calling it alone waits for its peers. It
+empties every word and zeroes `flags` and `ready` (certified, both of the matrix's workspaces). `fabric_handle`: share
+the memory by fabric handle (required across nodes) or POSIX file descriptor; default `mapping.is_multi_node()`. No
+environment variable is read.
 
-**Which ops may share one object.** Every MoE front call of the TP group: this entry and `moe/k3_moe`'s
-`k3_moe_fused_front`, on a plain or a head_flags `K3MoeState`. They form one sequence on the workspace: mixed in one
-step (the fused front on each state, then the front alone) they all stay correct (certified, below). Separate from the
-MNNVL all-reduce workspace and the sandwich workspace: a front call advances neither. Two workspaces are two
-independent rotations and two independent epochs: 20 calls alternating between two workspaces in an irregular
-pattern, kinds mixed, each return the bits of the same call made alone, and each workspace's epoch advances by its
-own head_flags calls only (certified). They are not independent orders: each call spins until its peers' pushes of
-the same call arrive and the calls of one stream run one after the other, so ranks that order calls on two
-workspaces differently on one stream would deadlock (the kernel's design; not exercised).
+**Which ops may share one object.** Every MoE front call of the TP group: this entry, plain or publishing
+(`publish=True`, the front a head_flags `k3_moe` pairs with). The head_flags calls of `moe/k3_moe` (`head=workspace`)
+read and advance its epoch `flags[2]` and its ready words (the kernel's statement). They form one sequence on the
+workspace: mixed in one step (the front then `k3_moe` on a plain state, the publishing front then `k3_moe` on a
+head_flags state, the front alone) they all stay correct (certified, below). Separate from the MNNVL all-reduce
+workspace and the sandwich workspace: a front call advances neither. Two workspaces are two independent rotations and
+two independent epochs: 20 calls alternating between two workspaces in an irregular pattern, kinds mixed, each return
+the bits of the same call made alone, and each workspace's epoch advances by its own head_flags calls only
+(certified). They are not independent orders: each call spins until its peers' pushes of the same call arrive and the
+calls of one stream run one after the other, so ranks that order calls on two workspaces differently on one stream
+would deadlock (the kernel's design; not exercised).
 
 **Call-order invariant.** Every rank of the group makes the same sequence of front calls on one workspace (the same
 number of calls, the `k`-th with the same `M`), eager calls and graph replays alike, with the same `x`; and on one
@@ -139,7 +150,8 @@ pushes its latent slice and router partials into that buffer on every rank, poll
 pushes of this call are there, and empties what it read. Every CTA that reads `flags[0]` signs in on `flags[3]` right
 after the read; the CTA that flips `flags[0]` for the next call waits for all of them and zeroes `flags[3]` (the
 kernel's statement; certified: `flags[0]` flips once per call, and `flags[3]` is zero after each single call and
-each sequence).
+each sequence). Each publishing front call is followed by exactly one head_flags `k3_moe` call on the same workspace
+(`moe/k3_moe`, *Preconditions*).
 
 **What a later launch reads.** `flags[0]`, and its buffer's words, which must be empty except for this call's pushes;
 `flags[3]` at zero. A publishing front also reads the epoch `flags[2]`, before it lets its dependent launch (the
@@ -150,10 +162,10 @@ words of the same call's tokens. The next push into a buffer comes from a call t
 after this call has ended on this rank (the kernel's statement, from the stream order and the grid-dependency waits).
 So no separate clear and no record of the previous call's size is needed, and a call after a smaller one finds no
 word of an older, larger one. Certified: every word of this rank's buffers empty and `flags[1]`, `flags[3]` zero
-after each single call and after each sequence below; decode steps of three layers (the fused front on the plain
-state, the fused front on the head_flags state, the front alone) at `M` 8, 8, 8, 2, 7, 8, 1, 1, 8, 3, 8 with new
-inputs every call, back to back, a random rank 5 ms late before every call: every call the bits of the same call made
-alone (itself checked against the references).
+after each single call and after each sequence below; decode steps of three layers (the front then `k3_moe` on the
+plain state, the publishing front then `k3_moe` on the head_flags state, the front alone) at `M` 8, 8, 8, 2, 7, 8, 1,
+1, 8, 3, 8 with new inputs every call, back to back, a random rank 5 ms late before every call: every call the bits of
+the same call made alone (itself checked against the references).
 
 The ready words are re-armed by the head_flags `k3_moe` (`moe/k3_moe`, *State*): at its last tile claim it writes
 `epoch + 1` into the words of the tokens past its `M` and into `flags[2]`, so after every head_flags call `flags[2]`
@@ -163,9 +175,9 @@ at it; after every back-to-back sequence and every replayed step, the epoch adva
 calls with all 16 words at it; across -1 -> 0 (from zeroed words and epoch 0, calls at `M` 1, 1, then the epoch
 preset to -2 and calls at `M` 1, 8, 3, 8: the `M` 8 call at epoch -1 waits for 0, the value a word past an earlier
 call's tokens would still hold without that re-arm) and across 2^31 - 1 -> -2^31 (epoch preset to 2^31 - 2, calls at
-`M` 8, 1, 8), each call's outputs the plain build's bits. The standalone front leaves `flags[2]` and the ready words
-untouched (certified). Nothing else may write them: a caller that resets `flags[2]` while the words hold
-`epoch + 1` would let the next head_flags `k3_moe` read the front's outputs before the front writes them (not
+`M` 8, 1, 8), each call's outputs the plain build's bits. A front call without `publish` leaves `flags[2]` and
+the ready words untouched (certified). Nothing else may write them: a caller that resets `flags[2]` while the words
+hold `epoch + 1` would let the next head_flags `k3_moe` read the front's outputs before the front writes them (not
 exercised).
 
 **What a wrong order does.** Certified at `W` = 4 (the negative control): rank 0 issues two same-shaped front calls
@@ -190,9 +202,16 @@ Besides `workspace` (an explicit argument):
 - `TRTLLM_ENABLE_PDL` (default on), read on every call and part of the key; it changes scheduling, not results (the
   op's statement).
 - The device's cluster capacity (`max_clusters`, cached per device), which sizes the grid and picks the head's
-  geometry: 128-row tiles, or one round of 64-row half-tiles when they fit next to the shared tiles
-  (`half_geometry`; the op's statement: TP16). At `W` 4 the head (1120 rows per rank, 18 half-tiles) does not fit in
-  one round, so the 4-rank run uses 128-row tiles.
+  geometry (the kernel module's `geometry` and `half_geometry`): one round of 64-row half-tiles, every head k-tile of
+  a CTA on chip before the grid-dependency wait, when they fit beside the shared tiles in the clusters left next to
+  the two role clusters; else 128-row tiles. A GB200 holds 15 clusters of 8 CTAs (the kernel's statement), so with
+  384 shared columns (6 tiles) the half-tile path runs at `W` 16 only: 280 head rows per rank make 5 half-tiles, 11
+  GEMV clusters of the 13 left. At `W` 8 (560 rows, 9 half-tiles) and `W` 4 (1120 rows, 18) they do not fit, and the
+  head runs as 5 and 9 tiles of 128 rows. The CPU test
+  `tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_front_geometry.py` checks this choice and that
+  `front_weight`'s rows are the rows each plan reads. So this entry's 4-rank matrix runs 128-row tiles only; the
+  half-tile path's 16-rank record is the kernel test `test_k3_moe_front.py` run as 16 processes (the model's TP16
+  shapes), not this matrix.
 
 ## Preconditions
 
@@ -206,26 +225,26 @@ Besides `workspace` (an explicit argument):
   invariant. Nothing checks that `x` agrees across ranks: a rank with another `x` mixes its slice into every rank's
   result (the negative control shows that effect).
 - `workspace` was created, and the kernel compiled (one eager call per configuration), before any capture. Calls may
-  be captured: certified with a captured step of three calls at `M` 8 (the fused front on the plain and on the
-  head_flags state, the front alone) replayed 6 times with rewritten inputs, an eager call of another `M` on the same
-  workspace between replays, every replayed and eager call the bits of the same call made alone, the epoch advanced
-  once per head_flags call, replayed or eager.
+  be captured: certified with a captured step of three calls at `M` 8 (the front then `k3_moe` on the plain state,
+  the publishing front then `k3_moe` on the head_flags state, the front alone) replayed 6 times with rewritten
+  inputs, an eager call of another `M` on the same workspace between replays, every replayed and eager call the bits
+  of the same call made alone, the epoch advanced once per head_flags call, replayed or eager.
 
 ## Notes
 
 - Certified path: 4 ranks of one GB200 tray (sm_100), one rank per GPU, the head sharded over those 4 ranks (1120
   rows per rank, 128-row tiles), the shared activation at TP16's per-rank width (384). Kimi K3 TP16 shards the head
-  over 16 ranks on four trays (280 rows per rank), which runs the half-tile geometry and which only a 16-rank run
-  reaches; the matrix takes `--world-size` and `--launcher`, and that receipt is pending.
+  over 16 ranks on four trays (280 rows per rank, the half-tile geometry: *Metadata consumed*); the matrix takes
+  `--world-size` and `--launcher`, and its 16-rank receipt is pending.
 - Test: `tests/unittest/_torch/modeling_v2/comm/_k3_moe_front_op_matrix.py` (rank body), collected by
   `tests/unittest/_torch/modeling_v2/moe/test_modeling_v2_k3_moe_front_op_matrix.py`. It also certifies
-  `moe/k3_moe`'s `k3_moe_fused_front` cells.
+  `moe/k3_moe` behind the front, on a plain and on a head_flags `K3MoeState`.
 - Reference: native torch for the head (every rank's slice in fp64, exact for the payloads, then fp32; the latent
   columns rounded to bf16) and the shared gate_up (fp64, exact, rounded to bf16) with SiTU in fp32; the stock
   `trtllm::kimi_k3_noaux_tc_mxfp8_quant` for the routing and quantization of the gathered head. Every rank draws every
-  rank's head slice from one seed, so each holds the whole reference. The routed experts of the fused cells are
-  random checkpoint-format MXFP4 (224 per rank, rank `r` at global ids `[224 (r % 4), 224 (r % 4) + 224)`), the
-  reference for `y` the stock TRTLLM-Gen runner. The kernel test
+  rank's head slice from one seed, so each holds the whole reference. The routed experts behind the front are random
+  checkpoint-format MXFP4 (224 per rank, rank `r` at global ids `[224 (r % 4), 224 (r % 4) + 224)`), the reference
+  for `y` the stock TRTLLM-Gen runner. The kernel test
   (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_front.py`) covers Gaussian payloads and races the
   publishing front's epoch read against `k3_moe`'s epoch advance (`check_publish_order`); neither is repeated here.
 - `mutates_args` names every buffer the op writes (`ag_uc`, `ag_mc`, `ag_flags`, `ag_ready`). Gaps (the op is
