@@ -652,6 +652,18 @@ class DFlashSpecMetadata(SpecMetadata):
                 (i + 1) * self.hidden_size,
             )
 
+    def capture_view(self, layer_id: int, num_tokens: int) -> Optional[torch.Tensor]:
+        """``layer_id``'s slot of the capture buffer for ``num_tokens`` rows (a strided view a kernel can write the
+        tap into), or None when the layer is not captured."""
+        if self.captured_hidden_states is None:
+            return None
+        i = self._layer_to_idx.get(layer_id)
+        if i is None:
+            return None
+        return self.captured_hidden_states[
+            :num_tokens, i * self.hidden_size : (i + 1) * self.hidden_size
+        ]
+
     def get_hidden_states(self, num_tokens: int) -> Optional[torch.Tensor]:
         """Get captured hidden states (all layers concatenated)."""
         if self.captured_hidden_states is None:
