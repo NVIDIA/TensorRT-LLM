@@ -212,7 +212,11 @@ class MultimodalEncoderGraphRunner:
         `enable_padding=True` captures the with-dummy-context variant for each bucket;
         `enable_padding=False` captures the exact-fit variant.
         """
-        for bucket in self._buckets:
+        # Capture larger workloads first. Attention backends may share a graph workspace across
+        # metadata variants; warming up a later, larger workload can resize that workspace and
+        # invalidate pointers captured by an earlier graph. This matches the ordering used by the
+        # LLM CUDA-graph runners and also lets smaller graphs reuse the larger graph's memory pool.
+        for bucket in reversed(self._buckets):
             key = self._padded_key_for_bucket(bucket)
             if key in self._captured:
                 continue
