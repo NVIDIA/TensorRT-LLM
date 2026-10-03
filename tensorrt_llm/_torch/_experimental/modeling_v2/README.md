@@ -186,9 +186,10 @@ Perf is measured, never gated.
 
 ## Status of every record in this tree
 
-**The catalog is certified: 19 entries on sm_103, and
-`comm/mnnvl_allreduce_attn_res` on sm_100 (GB200), where its first caller
-runs. The targets construct but have never executed.**
+**The catalog is certified: 19 entries on sm_103, and 13 on sm_100 (B200 /
+GB200): the 11 Kimi K3 entries (`comm/mnnvl_allreduce_attn_res` among them),
+where their first caller runs, and `cublas_mm` and `flashinfer_rmsnorm`. The
+targets construct but have never executed.**
 
 Two things voided every receipt in the move: each catalog test file was
 rewritten, and the targets moved from sm_100 (B200) to sm_103 (GB300), where

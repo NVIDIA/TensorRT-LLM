@@ -1,6 +1,8 @@
 ---
 receipts:
+  # sm_103 was certified before the sm_100 key was added, on the same test file.
   sm_103: {status: passed, tests: 4}
+  sm_100: {status: passed, tests: 4}
 ---
 
 # flashinfer_rmsnorm
