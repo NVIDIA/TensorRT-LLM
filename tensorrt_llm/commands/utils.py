@@ -103,6 +103,42 @@ def has_registered_llm_architecture(model_path: str) -> bool:
     )
 
 
+# The files `--reasoning_parser auto` / `--tool_parser auto` read: the model
+# type, plus the chat template in whichever of the three layouts ships it.
+_PARSER_DETECTION_FILES = [
+    "config.json",
+    "chat_template.jinja",
+    "tokenizer_config.json",
+    "chat_template.json",
+]
+
+
+def resolve_parser_detection_dir(model: str) -> str:
+    """Return a local directory holding the files parser auto-detection reads.
+
+    The model may be given as a Hugging Face id rather than a path, and
+    detection only knows how to read a directory. Fetching those few small
+    files makes `auto` behave the same either way; the full checkpoint
+    download follows moments later anyway.
+
+    On failure the original value is returned, so an unreachable hub degrades
+    into the ordinary "cannot auto-detect" message instead of a stack trace.
+    """
+    if os.path.exists(model):
+        return model
+
+    try:
+        return str(download_hf_partial(model=model, allow_patterns=_PARSER_DETECTION_FILES))
+    except (OSError, ValueError) as e:
+        # Every huggingface_hub download error derives from one of these two.
+        logger.warning(
+            "Could not fetch the metadata needed to auto-detect parsers for '%s': %s",
+            model,
+            e,
+        )
+        return model
+
+
 def get_is_diffusion_only_model(model_path: str):
     model_path = _maybe_download_model(model_path)
     if not is_diffusers_model_path(model_path):
