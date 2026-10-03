@@ -178,14 +178,17 @@ def fold_latent_norm(moe: nn.Module) -> None:
 class K3DecodeMoeLayer:
     """One MoE layer's decode path: the front weight (this rank's head slice padded to whole tiles, then the shared
     gate_up re-ordered), the head slice (a view of it), the row-parallel tail weight
-    ``[latent up columns lo:lo+width | padding | shared down]``, and its ``k3_moe`` handles on the shared builds.
-    Built by `create` once the weights are final (and the latent norm folded)."""
+    ``[latent up columns lo:lo+width | padding | shared down]``, the routing bias, and its ``k3_moe`` handles on the
+    shared builds. Built by `create` once the weights are final (and the latent norm folded)."""
 
     state: K3DecodeMoe
     front_weight: torch.Tensor
     head_weight: torch.Tensor
     tail_weight: torch.Tensor
     tail_pad: Optional[torch.Tensor]
+    # The gate's routing bias detached (a view of the parameter): an op given a tensor that requires grad while
+    # autograd records, as in post_load_weights, returns outputs that require grad, which k3_moe cannot take.
+    bias: torch.Tensor
     lo: int
     width: int
     shared_cols: int
@@ -224,6 +227,7 @@ class K3DecodeMoeLayer:
             head_weight=front[: head.shape[0]],
             tail_weight=tail,
             tail_pad=up.new_zeros(WIDE_MAX_TOKENS, pad) if pad else None,
+            bias=moe.gate.e_score_correction_bias.detach(),
             lo=lo,
             width=width,
             shared_cols=gate_up.shape[0] // 2,
@@ -242,9 +246,8 @@ class K3DecodeMoeLayer:
         logits = torch.zeros(1, moe.num_experts, dtype=torch.float32, device=device)
         latent = torch.zeros(1, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
         ids, weights, x_fp8, x_sf = k3_route_quant(
-            logits, moe.gate.e_score_correction_bias, latent, float(moe.gate.routed_scaling_factor),
-            early_trigger=True,
-        )  # fmt: skip
+            logits, self.bias, latent, float(moe.gate.routed_scaling_factor), early_trigger=True
+        )
         k3_moe(x_fp8, x_sf, ids, weights, offset, self.wide)
         torch.cuda.synchronize(device)
 
@@ -252,7 +255,7 @@ class K3DecodeMoeLayer:
         return k3_moe_front(
             x.contiguous(),
             self.front_weight,
-            moe.gate.e_score_correction_bias,
+            self.bias,
             float(moe.gate.routed_scaling_factor),
             self.shared_cols,
             *moe._situ_betas,
@@ -307,7 +310,7 @@ class K3DecodeMoeLayer:
 
         def _routed_partial():
             ids, weights, x_fp8, x_sf = k3_route_quant(
-                router_logits, moe.gate.e_score_correction_bias, routed_in.contiguous(),
+                router_logits, self.bias, routed_in.contiguous(),
                 float(moe.gate.routed_scaling_factor), early_trigger=True,
             )  # fmt: skip
             return k3_moe(

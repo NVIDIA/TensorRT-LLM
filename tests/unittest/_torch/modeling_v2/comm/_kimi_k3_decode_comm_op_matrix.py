@@ -20,6 +20,10 @@ on a PendingTail of the TP16 per-rank shapes (latent [T, 3584], shared activatio
 [7168, 256 + 384]), or returns that tail reduced in torch and the stock all-reduce.
 
 Checks:
+  * decode MoE (first, outside inference mode with autograd on, as post_load_weights runs): the MoE decode path built
+    from a MoE layer's own modules (the target's gate, whose parameters require grad, the latent projections, the
+    stock RMSNorm and shared GatedMLP; zeroed routed experts) at this TP, every kernel warmed up, then a 3-token step
+    and a wide 16-token step against the shared expert's forward.
   * takes_oproj: the TP16 o_proj shape only, bias-free, within the kernel's candidate count.
   * use_decode_one_shot: every stock MNNVL all-reduce takes the decode ceiling.
   * fused vs built-in: for each dense layer and step (decode of 1 / 3 / 8 tokens, DSpark 1 x 6, a 5-token prefill,
@@ -572,6 +576,138 @@ def check_moe_tail_graph():
     del graph
 
 
+# The MoE decode path at this check's TP: a moetp4ep4 rank's routed experts (intermediate columns, experts), and a
+# shared expert whose rank slice at TP 4 is a TP16 rank's (384 activation columns).
+I_TP, E_LOCAL, NUM_EXPERTS = 768, 224, 896
+SHARED = 384 * 4
+SITU_CAPS = (4.0, 25.0)
+MOE_TOL = 3e-2  # the front's fused shared gate_up + SiTU against the shared expert's own GEMMs
+
+
+def _decode_moe_layer():
+    """A MoE layer with the parts the decode path reads, from the modules KimiK3MoERuntime builds: the target's
+    KimiK3MoEGate, nn.Linear latent projections, the stock RMSNorm and GatedMLP (at this check's TP), each with its
+    own parameters (the gate's and the latent projections' require grad, as in the model), and zeroed routed-expert
+    buffers in TRTLLM-Gen's W4A8_MXFP4_MXFP8 layout, so the routed experts add nothing."""
+    from tensorrt_llm._torch.distributed import AllReduce
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+    from tensorrt_llm._torch.modules.situ import SituAndMul
+    from tensorrt_llm.functional import AllReduceStrategy
+
+    cfg = SimpleNamespace(
+        num_experts_per_token=16,
+        num_experts=NUM_EXPERTS,
+        routed_scaling_factor=2.827,
+        moe_router_activation_func="sigmoid",
+        num_expert_group=1,
+        topk_group=1,
+        moe_renormalize=True,
+        hidden_size=H,
+    )
+    with torch.device("cuda"):
+        gate = T.KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16)
+        down = nn.Linear(H, LATENT, bias=False, dtype=torch.bfloat16)
+        up = nn.Linear(LATENT, H, bias=False, dtype=torch.bfloat16)
+        norm = RMSNorm(hidden_size=LATENT, eps=1e-5, dtype=torch.bfloat16)
+        shared = GatedMLP(
+            hidden_size=H,
+            intermediate_size=SHARED,
+            bias=False,
+            activation=SituAndMul(
+                beta=SITU_CAPS[0], linear_beta=SITU_CAPS[1], use_fused_activation=True
+            ),
+            dtype=torch.bfloat16,
+            config=ModelConfig(mapping=R.mapping, allreduce_strategy=AllReduceStrategy.MNNVL),
+            reduce_output=True,
+            layer_idx=MOE_LAYERS[0],
+            is_shared_expert=True,
+        )
+    g = _gen(5000)  # replicated
+    gr = _gen(5100 + R.rank)  # this rank's shared expert slices
+    with torch.no_grad():
+        gate.weight.copy_(_normal(g, gate.weight.shape, 0.02))
+        gate.e_score_correction_bias.copy_(
+            0.05 * torch.randn(NUM_EXPERTS, generator=g, device="cuda")
+        )
+        down.weight.copy_(_normal(g, down.weight.shape, 0.02))
+        up.weight.copy_(_normal(g, up.weight.shape, 0.02))
+        norm.weight.copy_(_normal(g, norm.weight.shape, 0.1, 1.0))
+        shared.gate_up_proj.weight.copy_(_normal(gr, shared.gate_up_proj.weight.shape, 0.02))
+        shared.down_proj.weight.copy_(_normal(gr, shared.down_proj.weight.shape, 0.02))
+
+    def zeros(*shape):
+        return nn.Parameter(
+            torch.zeros(shape, dtype=torch.uint8, device="cuda"), requires_grad=False
+        )
+
+    backend = SimpleNamespace(
+        w3_w1_weight=zeros(E_LOCAL, 2 * I_TP, LATENT // 2),
+        w3_w1_weight_scale=zeros(E_LOCAL, 2 * I_TP, LATENT // 32),
+        w2_weight=zeros(E_LOCAL, LATENT, I_TP // 2),
+        w2_weight_scale=zeros(E_LOCAL, LATENT, I_TP // 32),
+        expert_size_per_partition=E_LOCAL,
+        slot_start=R.rank * E_LOCAL % NUM_EXPERTS,
+    )
+    all_reduce = AllReduce(
+        mapping=R.mapping, strategy=AllReduceStrategy.MNNVL, dtype=torch.bfloat16
+    )
+    return SimpleNamespace(
+        num_experts=NUM_EXPERTS,
+        top_k=cfg.num_experts_per_token,
+        moe_hidden_size=LATENT,
+        hidden_size=H,
+        gate=gate,
+        routed_expert_down_proj=down,
+        routed_expert_up_proj=up,
+        routed_expert_norm=norm,
+        shared_experts=shared,
+        routed_experts=SimpleNamespace(backend=backend, all_reduce=all_reduce),
+        _situ_betas=SITU_CAPS,
+        moe_main_event=torch.cuda.Event(),
+        moe_shared_event=torch.cuda.Event(),
+        shared_expert_stream=torch.cuda.Stream(),
+    )
+
+
+def check_decode_moe_from_model_parameters():
+    """The MoE decode path built as post_load_weights builds it, outside inference mode with autograd on, from a MoE
+    layer's own modules (_decode_moe_layer): the shared state, the folded latent norm, the layer's decode weights and
+    one call of every kernel (the front, both k3_moe builds, k3_route_quant). Then a step of 3 tokens (the replicated
+    tail) and a wide step of 16 (this rank's share, reduced here) against the shared expert's forward: the routed
+    experts are zeros, so the two agree."""
+    if R.world not in (4, 8, 16):
+        if R.rank == 0:
+            print(
+                f"[rank 0] decode MoE skipped at world {R.world}: the front runs 4, 8 or 16 ranks",
+                flush=True,
+            )
+        return
+    assert torch.is_grad_enabled() and not torch.is_inference_mode_enabled()
+    dm = T._decode_moe
+    moe = _decode_moe_layer()
+    assert moe.gate.e_score_correction_bias.requires_grad
+    mnnvl = T._decode_comm.MnnvlWorkspace.create(R.mapping, T._decode_comm.MNNVL_BUFFER_BYTES)
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = dm.K3DecodeMoe.create(R.mapping, device, I_TP, E_LOCAL, mnnvl)
+    dm.fold_latent_norm(moe)
+    layer = dm.K3DecodeMoeLayer.create(moe, state, R.rank, R.world)
+    layer.warm_up(moe)
+    for rows in (3, 16):
+        x = _normal(_gen(5200 + rows), (rows, H), 0.5)
+        y = layer.forward(moe, x, None, partial_tail=False)
+        if rows > dm.MAX_TOKENS:  # a wide step returns this rank's share
+            y = moe.routed_experts.all_reduce(y)
+        want = moe.shared_experts(x)
+        torch.cuda.synchronize()
+        err = ls.rel_err(y, want)
+        if R.rank == 0:
+            print(f"[rank 0] decode MoE, {rows} tokens: vs the shared expert {err:.2e}", flush=True)
+        assert torch.isfinite(y.float()).all() and err <= MOE_TOL, (rows, err)
+        assert R.same_on_ranks(y), (rows, "ranks differ")
+
+
 CHECKS = [
     check_takes_oproj,
     check_decode_one_shot,
@@ -595,10 +731,12 @@ def _run_one_rank(args) -> int:
         "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
         "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling"
     )
+    # First, before anything exists as an inference tensor: the decode MoE as post_load_weights builds it.
+    code = ls.run_checks(R, [check_decode_moe_from_model_parameters])
     with torch.inference_mode():
         LAYERS_BUILT = build_layers()
         COMM = make_comm(LAYERS_BUILT)
-        code = ls.run_checks(R, CHECKS)
+        code = ls.run_checks(R, CHECKS) or code
     if R.rank == 0:
         print(f"[rank 0] world {R.world}; {STATS}", flush=True)
     return code
