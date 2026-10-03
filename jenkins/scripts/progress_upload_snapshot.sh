@@ -26,19 +26,36 @@
 #   PROGRESS_HASH_FILE  path to store the content hash of the last successful upload
 #                       (default: ${WORKSPACE}/${PROGRESS_TAR}.last_hash)
 #                       Set to empty string to disable dedup.
-#   TIMEOUT_XML_SCRIPT  path to generate_timeout_xml.py; when set, regenerates
-#                       results-timeout.xml from unfinished_test.txt before each upload.
+#   TIMEOUT_XML_SCRIPT  path to generate_timeout_xml.py; when set, the final
+#                       snapshot merges unfinished lists and timeout JSONL files.
 
 set +e
 
-# --- Generate timeout XML from unfinished_test.txt (final snapshot only) ---
-# Skipped during periodic snapshots so incomplete unfinished_test.txt does not produce premature timeout reports.
+# --- Generate timeout XML from unfinished lists and timeout data (final snapshot only) ---
+# Skipped during periodic snapshots so incomplete unfinished_test.txt does not
+# produce premature timeout reports. A stage can have the original list plus
+# rerun lists, and a Slurm invocation can have one JSONL file per rank.
 if [ -n "$FINAL_SNAPSHOT" ] && \
-        [ -n "$TIMEOUT_XML_SCRIPT" ] && [ -f "${WORKSPACE}/${STAGE_NAME}/unfinished_test.txt" ]; then
-    ( cd "$WORKSPACE" && python3 "$TIMEOUT_XML_SCRIPT" \
-        --stage-name "$STAGE_NAME" \
-        --test-file-path "unfinished_test.txt" \
-        --output-file "${WORKSPACE}/${STAGE_NAME}/results-timeout.xml" ) 2>/dev/null || true
+        [ -n "$TIMEOUT_XML_SCRIPT" ] && [ -d "${WORKSPACE}/${STAGE_NAME}" ]; then
+    test_file_args=()
+    while IFS= read -r path; do
+        test_file_args+=(--test-file-path "$path")
+    done < <(find "${WORKSPACE}/${STAGE_NAME}" -type f \
+        -name unfinished_test.txt -print | sort)
+
+    timeout_data_args=()
+    while IFS= read -r path; do
+        timeout_data_args+=(--timeout-data-file "$path")
+    done < <(find "${WORKSPACE}/${STAGE_NAME}" -maxdepth 1 -type f \
+        -name 'timeout_data*.jsonl' -print | sort)
+
+    if [ "${#test_file_args[@]}" -gt 0 ]; then
+        python3 "$TIMEOUT_XML_SCRIPT" \
+            --stage-name "$STAGE_NAME" \
+            "${test_file_args[@]}" \
+            --output-file "${WORKSPACE}/${STAGE_NAME}/results-timeout.xml" \
+            "${timeout_data_args[@]}" 2>/dev/null || true
+    fi
 fi
 
 # --- Fix testsuite name in XML files (pytest default -> stage name) ---
@@ -48,7 +65,8 @@ find "${WORKSPACE}/${STAGE_NAME}" -name "*.xml" -exec \
 # --- Content-based dedup: skip upload when stage directory is unchanged ---
 HASH_FILE="${PROGRESS_HASH_FILE-${WORKSPACE}/${PROGRESS_TAR}.last_hash}"
 if [ -n "$HASH_FILE" ]; then
-    current_hash=$(find "${WORKSPACE}/${STAGE_NAME}" -type f | sort \
+    current_hash=$(find "${WORKSPACE}/${STAGE_NAME}" -type f \
+                   ! -name 'timeout_data*.jsonl' | sort \
                    | xargs sha256sum 2>/dev/null | sha256sum | awk '{print $1}')
     last_hash=$(cat "$HASH_FILE" 2>/dev/null || echo "")
     if [ -n "$current_hash" ] && [ "$current_hash" = "$last_hash" ]; then
@@ -61,13 +79,16 @@ fi
 # without touching the on-disk files (SCP overwrites them cleanly next iteration).
 if [ -n "$POST_TAG" ]; then
     ( cd "$WORKSPACE" && tar -czf "$PROGRESS_TAR" \
+        --exclude="${STAGE_NAME}/timeout_data*.jsonl" \
         --transform "s|^\(${STAGE_NAME}/results[^/]*\)\.xml$|\1${POST_TAG}.xml|" \
         "${STAGE_NAME}/" ) || {
         echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: ${LABEL} tar failed"
         exit 1
     }
 else
-    ( cd "$WORKSPACE" && tar -czf "$PROGRESS_TAR" "${STAGE_NAME}/" ) || {
+    ( cd "$WORKSPACE" && tar -czf "$PROGRESS_TAR" \
+        --exclude="${STAGE_NAME}/timeout_data*.jsonl" \
+        "${STAGE_NAME}/" ) || {
         echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: ${LABEL} tar failed"
         exit 1
     }
