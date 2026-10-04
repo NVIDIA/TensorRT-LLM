@@ -15,7 +15,8 @@ at one TP16 rank's drafter shapes: 6 query heads and 1 KV head of 64, hidden 716
   rows from the first gen request on), not a gathered copy, and give the gather's result bit for bit.
 
 On the TP group's collective state (``use_decode_comm``), here a group of one rank whose collectives are torch
-stand-ins counted per call (the ops themselves are certified by their multi-GPU op matrices):
+stand-ins counted per call (the ops themselves are certified by their multi-GPU op matrices). The layers' o_proj gets
+the group's TP all-reduce, the identity on one rank, which a one-rank Qwen3 layer does not build:
 
 * The context projection runs on the split ``fc`` (on one rank, the whole weight): up to a decode step's rows through
   ``comm/mnnvl_fusion_allreduce`` with ``hidden_norm``, more rows through the drafter's TP all-reduce, and matches the
@@ -195,6 +196,26 @@ def _one_rank_collectives(monkeypatch, calls):
     monkeypatch.setattr(decode_comm, "k3_sandwich_plain", sandwich)
 
 
+class _OneRankTPAllReduce(torch.nn.Module):
+    """The TP all-reduce of a group of one rank: the identity."""
+
+    def forward(self, input, all_reduce_params=None):
+        return input
+
+    def uses_nccl_symmetric_memory_window(self) -> bool:
+        return False
+
+
+def _one_rank_tp_all_reduce(module):
+    """Every layer's o_proj reduces over the one-rank group, as it reduces over the TP group on more ranks
+    (``Qwen3DecoderLayer`` builds o_proj without an all-reduce when tp_size is 1). The drafter's fused path keys on that
+    all-reduce; the stock forward through o_proj keeps its bits."""
+    for layer in module.model.layers:
+        o_proj = layer.self_attn.o_proj
+        o_proj.reduce_output = True
+        o_proj.all_reduce = _OneRankTPAllReduce()
+
+
 @pytest.fixture(scope="module")
 def fused_drafter():
     """The drafter on the one-rank collective state: its fc split over one rank, both sandwich forms compiled (their
@@ -202,6 +223,7 @@ def fused_drafter():
     with pytest.MonkeyPatch.context() as mp:
         _one_rank_collectives(mp, [])
         module = _load_drafter()
+        _one_rank_tp_all_reduce(module)
         module.use_decode_comm(ONE_RANK_COMM)
     return module
 
