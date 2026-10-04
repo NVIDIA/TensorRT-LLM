@@ -196,6 +196,18 @@ def test_kolibri_causal_lm_load_weights_hook():
             assert call_kwargs["params_map"] == mapper.params_map
 
 
+@pytest.mark.cpu_only
+def test_kolibri_auto_checkpoint_mapper():
+    """Test AutoCheckpointMapper resolves Kolibri1HfWeightMapper."""
+    import tensorrt_llm._torch.models.checkpoints as checkpoints
+    from tensorrt_llm._torch.models.checkpoints.auto_mapper import (
+        AutoCheckpointMapper,
+    )
+
+    mapper = AutoCheckpointMapper.get("HF", "Kolibri1ForCausalLM")
+    assert isinstance(mapper, checkpoints.Kolibri1HfWeightMapper)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA GPU")
 def test_kolibri_e2e_dummy_forward(tiny_kolibri_config):
     """Test full Kolibri 1 model forward pass on GPU with dummy weights (QA / local smoke test)."""
