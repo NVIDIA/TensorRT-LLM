@@ -3460,6 +3460,10 @@ class KVCacheManagerV2(BaseResourceManager):
             "window_size": self.draft_window_size,
         }
 
+    def _draft_history_uses_kv_history(self) -> bool:
+        """Embedded DSpark writes the complete live suffix of target history."""
+        return getattr(self, "draft_attention_backend", None) == "DSv4"
+
     def get_draft_block_table(
         self,
         request_ids: List[int],
@@ -3486,11 +3490,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 raise ValueError("Standalone draft cache has an incomplete or oversized page table")
             first_required_block = 0
             if self.draft_window_size is not None:
-                history = (
-                    histories[row]
-                    if histories is not None
-                    else self.get_draft_history(request_ids[row])
-                )
+                history = None
+                if not self._draft_history_uses_kv_history():
+                    history = (
+                        histories[row]
+                        if histories is not None
+                        else self.get_draft_history(request_ids[row])
+                    )
                 history_start = (
                     history.position - history.valid_length
                     if history is not None
@@ -3523,6 +3529,15 @@ class KVCacheManagerV2(BaseResourceManager):
     def export_draft_history(self, request_id: int) -> Optional[dict]:
         if not self.draft_layer_ids:
             return None
+        if self._draft_history_uses_kv_history():
+            cache = self.kv_cache_map[request_id]
+            if not cache.is_active:
+                raise ValueError("Embedded DSpark transfer requires an active cache")
+            return {
+                "valid_length": min(cache.history_length, self.draft_window_size),
+                "position": cache.history_length,
+                "layout": self.get_draft_transfer_identity(),
+            }
         history = self.get_draft_history(request_id)
         if history is None:
             raise ValueError(
@@ -3539,6 +3554,19 @@ class KVCacheManagerV2(BaseResourceManager):
             raise ValueError("Standalone draft transfer layout does not match the receiving worker")
         valid_length = metadata.get("valid_length")
         position = metadata.get("position")
+        if self._draft_history_uses_kv_history():
+            cache = self.kv_cache_map[request_id]
+            # Receive admission establishes the global prompt watermark; the
+            # transfer completion path validates that the received KV covers it.
+            if (
+                type(position) is not int
+                or type(valid_length) is not int
+                or position != cache.history_length
+                or valid_length != min(position, self.draft_window_size)
+            ):
+                raise ValueError("Embedded DSpark transfer does not match the admitted KV history")
+            self.get_draft_block_table([request_id])
+            return
         history = StandaloneDraftHistory(valid_length, position)
         # Validate receiver-local allocation before publishing history.
         self.get_draft_block_table([request_id], [history])
@@ -4090,7 +4118,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.enable_swa_scratch_reuse = False
             if not self._resume_and_restore(req.py_request_id, kv_cache):
                 return None
-            if self.draft_layer_ids and req.py_request_id not in self.draft_history:
+            if (
+                self.draft_layer_ids
+                and not self._draft_history_uses_kv_history()
+                and req.py_request_id not in self.draft_history
+            ):
                 # The reuse match covers every cache domain. Initialize once,
                 # after resume succeeds, so overlap/chunk retries cannot rewind
                 # draft history that has already advanced on the device.
@@ -6282,7 +6314,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - rewind_len
             )
-            if self.draft_layer_ids and new_capacity is not None:
+            embedded_draft = KVCacheManagerV2._draft_history_uses_kv_history(self)
+            if self.draft_layer_ids and not embedded_draft and new_capacity is not None:
                 draft_history = self.get_draft_history(req.py_request_id)
                 if draft_history is not None:
                     # Rejected target verification slots do not revoke draft
@@ -6297,6 +6330,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 if self.kv_compression_manages_history or self._has_cp_helix
                 else req.max_beam_num_tokens - 1
             )
+            if embedded_draft and self._has_cp_helix:
+                # HELIX stores rank-local prompt tokens but generated tokens
+                # are replicated. The cache ledger uses global positions.
+                history_length = (
+                    req.total_input_len_cp + req.max_beam_num_tokens - req.py_prompt_len - 1
+                )
+            if embedded_draft and new_capacity is not None and history_length is not None:
+                new_capacity = max(new_capacity, history_length)
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(

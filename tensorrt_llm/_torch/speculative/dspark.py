@@ -29,7 +29,6 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..pyexecutor.kv_cache.standalone_draft_cache import DraftHistoryUpdate, StandaloneDraftHistory
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.resource_manager import ResourceManagerType
 from .dflash import DFlashWorker, dflash_draft_slot_ids
@@ -218,7 +217,6 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._draft_block_tables = None
         self._draft_capacities = None
         self._managed_residency = {}
-        self._prepared_managed_request_ids = ()
         # Set in _lazy_init from the RoPE table the drafter will build; None
         # leaves positions unbounded (direct construction in tests).
         self._position_cap: Optional[int] = None
@@ -401,21 +399,6 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._bind_managed_history(resource_manager)
         self._prepare_managed_history(spec_metadata.request_ids, attn_metadata.num_contexts)
 
-    def snapshot_managed_draft_history(self):
-        """Copy this iteration's history before another batch can reuse its slots."""
-        if self._draft_kv_manager is None:
-            return None
-        request_ids = tuple(self._prepared_managed_request_ids)
-        if not request_ids:
-            return None
-        slots = torch.tensor(
-            [self._req_to_slot[request_id] for request_id in request_ids],
-            dtype=torch.long,
-            device=self._ctx_len.device,
-        )
-        values = torch.stack((self._valid_len[slots], self._ctx_len[slots]), dim=1)
-        return DraftHistoryUpdate.capture(self._draft_kv_manager, request_ids, values)
-
     def _prepare_managed_history(self, request_ids: list[int], num_contexts: int) -> None:
         """Bind live page tables and initialize progress for newly resident histories."""
         # Startup probes and graph/ADP padding never publish synthetic history.
@@ -426,17 +409,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         ]
         real_ids = [request_ids[row] for row in real_rows]
         self._release_inactive_slots(real_ids)
-        validation_histories = []
-        for request_id in real_ids:
-            cache = self._draft_kv_manager.kv_cache_map[request_id]
-            history = self._draft_kv_manager.get_draft_history(request_id)
-            if self._managed_residency.get(request_id) is cache:
-                # Device progress can precede the host history readback. The
-                # manager's history_length bounds the pages retained meanwhile.
-                position = max(history.position if history is not None else 0, cache.history_length)
-                history = StandaloneDraftHistory(min(self._win, position), position)
-            validation_histories.append(history or StandaloneDraftHistory(0, 0))
-        table = self._draft_kv_manager.get_draft_block_table(real_ids, validation_histories)
+        table = self._draft_kv_manager.get_draft_block_table(real_ids)
         tables_host = torch.zeros_like(self._draft_block_tables, device="cpu")
         tables_host[real_rows] = table
         self._draft_block_tables.copy_(tables_host, non_blocking=True)
@@ -456,19 +429,18 @@ class DSv4DSparkWorker(SpecWorkerBase):
             batch_slots[row] = slot
             if self._managed_residency.get(request_id) is cache:
                 continue
-            history = self._draft_kv_manager.get_draft_history(request_id)
-            if row >= num_contexts and history is None:
+            position = cache.history_length
+            if row >= num_contexts and position == 0:
                 raise ValueError(
-                    f"Embedded DSpark generation request {request_id} has no committed draft history"
+                    f"Embedded DSpark generation request {request_id} has no committed KV history"
                 )
-            self._ctx_len[slot] = history.position if history is not None else 0
-            self._valid_len[slot] = history.valid_length if history is not None else 0
+            self._ctx_len[slot] = position
+            self._valid_len[slot] = min(self._win, position)
             self._managed_residency[request_id] = cache
         self._batch_to_slot.fill_(self._scratch_slot)
         self._batch_to_slot[: len(request_ids)].copy_(
             torch.tensor(batch_slots, dtype=torch.long, device=self._batch_to_slot.device)
         )
-        self._prepared_managed_request_ids = tuple(real_ids)
 
     def _seed_context_pages(
         self,
@@ -495,6 +467,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
             req_id = spec_metadata.request_ids[i]
             slot = self._req_to_slot.get(req_id, self._scratch_slot)
+            if captured is None and slot != self._scratch_slot:
+                raise RuntimeError(
+                    "Embedded DSpark requires captured context to initialize KV history"
+                )
             if captured is not None:
                 keep = min(self._win, chunk_len)
                 # Prefix reuse can publish any complete page in this chunk.
@@ -571,7 +547,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             return None
         captured = spec_metadata.get_hidden_states(total_target_tokens)
         if captured is None:
-            return None
+            raise RuntimeError("Embedded DSpark requires captured context to advance KV history")
 
         # gen-only graph batches have num_ctx_tokens == 0; mixed eager batches put
         # the gen tokens after the context tokens.
