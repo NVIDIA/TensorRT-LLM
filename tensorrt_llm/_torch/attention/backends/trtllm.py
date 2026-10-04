@@ -25,6 +25,7 @@ import torch
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
+    from ...cute_dsl_kernels.spec_step_copies.op import StepInputStage
     from ...model_config import ModelConfig
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
@@ -123,6 +124,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
     workspace_reclaimable: bool = field(default=True, init=False)
+    # Set by the model engine around prepare() on a CUDA graph decode step:
+    # the per-step host-to-device copies are staged on it (a StepInputStage)
+    # and written by its commit, instead of being copied here.
+    h2d_stage: Optional["StepInputStage"] = field(default=None, init=False)
 
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
@@ -873,6 +878,29 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """Restore backend state modified for draft-forward execution."""
         return None
 
+    def _copy_block_offsets(self, manager, dst: torch.Tensor,
+                            max_blocks: Optional[int]) -> None:
+        """``manager``'s block-offset copy for this batch, staged on
+        ``h2d_stage`` when the engine set one and the manager can stage it
+        (``stage_batch_block_offsets``)."""
+        stage_copy = getattr(manager, "stage_batch_block_offsets", None)
+        if self.h2d_stage is not None and stage_copy is not None and stage_copy(
+                self.h2d_stage, dst, self.request_ids, self.beam_width,
+                self.num_contexts, self.num_seqs):
+            return
+        manager.copy_batch_block_offsets(dst,
+                                         self.request_ids,
+                                         self.beam_width,
+                                         self.num_contexts,
+                                         self.num_seqs,
+                                         max_blocks=max_blocks)
+
+    def _copy_step_input(self, dst: torch.Tensor, src: torch.Tensor) -> None:
+        """``dst.copy_(src)`` for a per-step input, staged on ``h2d_stage``
+        when the engine set one."""
+        if self.h2d_stage is None or not self.h2d_stage.copy(dst, src):
+            dst.copy_(maybe_pin_memory(src), non_blocking=True)
+
     def prepare(self) -> None:
         super().prepare()
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
@@ -901,8 +929,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        self.prompt_lens_cuda[:self.num_seqs].copy_(
-            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+        self._copy_step_input(self.prompt_lens_cuda[:self.num_seqs],
+                              self.prompt_lens_cpu[:self.num_seqs])
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -955,9 +983,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
-            kv_lens[:self.num_seqs]),
-                                                non_blocking=True)
+        self._copy_step_input(self.kv_lens_cuda[:self.num_seqs],
+                              kv_lens[:self.num_seqs])
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -995,24 +1022,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             if not spec_active and self.kv_cache_manager.tokens_per_block:
                 max_blocks = ceil_div(max_kv_len,
                                       self.kv_cache_manager.tokens_per_block)
-            self.kv_cache_manager.copy_batch_block_offsets(
-                self.kv_cache_block_offsets,
-                self.request_ids,
-                self.beam_width,
-                self.num_contexts,
-                self.num_seqs,
-                max_blocks=max_blocks)
+            self._copy_block_offsets(self.kv_cache_manager,
+                                     self.kv_cache_block_offsets, max_blocks)
 
             # Also prepare draft KV cache block offsets if draft_kv_cache_manager exists
             if self.draft_kv_cache_manager is not None:
-                # Use the wrapper method which works for both V1 and V2
-                self.draft_kv_cache_manager.copy_batch_block_offsets(
-                    self.draft_kv_cache_block_offsets,
-                    self.request_ids,
-                    self.beam_width,
-                    self.num_contexts,
-                    self.num_seqs,
-                    max_blocks=max_blocks)
+                self._copy_block_offsets(self.draft_kv_cache_manager,
+                                         self.draft_kv_cache_block_offsets,
+                                         max_blocks)
 
         # Don't pass self.kv_lens as kv_lens here because it includes extra
         # tokens. Use the actual KV length (without extra tokens) for
@@ -1319,6 +1336,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.max_ctx_cached_token_len = 0
             self.max_ctx_kv_len = 0
             self.max_ctx_seq_len = 0
+            # The indptrs below are read only by the context MLA kernels, and
+            # every batch with context requests rewrites them.
+            return
         torch.cumsum(cached_token_lens[:self.num_contexts],
                      dim=0,
                      dtype=torch.int64,

@@ -24,7 +24,7 @@ import triton.language as tl
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import copy_to_device_if_changed, prefer_pinned
 
 REPLAY_WORK_POSITION_IN_DECODE_BATCH = 0
 REPLAY_WORK_CACHE_SLOT = 1
@@ -505,8 +505,8 @@ class Mamba2Metadata:
                 self.state_indices_cpu[:batch_size].copy_(
                     torch.as_tensor(indices,
                                     dtype=self.state_indices_cpu.dtype))
-                self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+                copy_to_device_if_changed(self.state_indices,
+                                          self.state_indices_cpu[:batch_size])
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)

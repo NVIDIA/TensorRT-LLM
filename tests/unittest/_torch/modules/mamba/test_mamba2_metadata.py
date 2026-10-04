@@ -138,6 +138,44 @@ class TestMamba2Metadata:
         assert metadata.chunk_indices is not None
         assert metadata.chunk_offsets is not None
 
+    def test_prepare_skips_an_unchanged_state_index_upload(self):
+        """A decode step whose state indices (a list from the cache manager) did not change enqueues no upload: the
+        device buffer keeps values the host never sent. A changed step uploads again."""
+
+        class ListCacheManager:
+            def __init__(self):
+                self.state_indices = [3, 1]
+
+            def get_state_indices(self, request_ids, is_padding):
+                return self.state_indices[: len(request_ids)]
+
+        manager = ListCacheManager()
+        metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
+        seq_lens = torch.tensor([1, 1], dtype=torch.int)
+        attn_metadata = SimpleNamespace(
+            seq_lens=seq_lens,
+            seq_lens_cuda=seq_lens.cuda(),
+            num_contexts=0,
+            num_ctx_tokens=0,
+            kv_cache_manager=manager,
+            request_ids=[10, 11],
+            kv_cache_params=None,
+        )
+
+        metadata.prepare(attn_metadata)
+        torch.cuda.synchronize()
+        assert metadata.state_indices[:2].tolist() == [3, 1]
+
+        metadata.state_indices.fill_(-1)
+        metadata.prepare(attn_metadata)
+        torch.cuda.synchronize()
+        assert metadata.state_indices[:2].tolist() == [-1, -1]
+
+        manager.state_indices = [3, 2]
+        metadata.prepare(attn_metadata)
+        torch.cuda.synchronize()
+        assert metadata.state_indices[:2].tolist() == [3, 2]
+
     def test_prepare_replay_work_items_write_first(self):
         class ReplayCacheManager:
             use_replay_state_update = True

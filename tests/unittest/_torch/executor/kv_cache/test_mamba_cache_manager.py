@@ -3840,6 +3840,54 @@ def test_v2_kda_state_index_setup_relocates_generation_history():
         mgr.shutdown()
 
 
+@skip_no_cuda
+def test_v2_state_index_setup_skips_unchanged_uploads():
+    """A step whose state indices and dummy flags did not change enqueues no upload of either: the device buffers
+    keep values the host never sent. A changed step uploads both again."""
+
+    class StateCache:
+        def __init__(self, slot: int) -> None:
+            self.slot = slot
+
+        def get_ssm_block_base_index(self, _layer_group_id) -> int:
+            return self.slot
+
+        def close(self) -> None:
+            pass
+
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        conv_state_layout="q_k_v",
+        mamba_n_groups=4,
+        mamba_ssm_cache_dtype=torch.float32,
+        kda_replay_num_spec=2,
+    )
+    live = SimpleNamespace(py_request_id=101, is_dummy=False)
+    padding = SimpleNamespace(py_request_id=202, is_dummy=True)
+    mgr.kv_cache_map.update({101: StateCache(0), 202: StateCache(1)})
+    try:
+        mgr._setup_state_indices([live, padding])
+        torch.cuda.synchronize()
+        assert mgr.cuda_state_indices[:2].tolist() == [0, 1]
+        assert mgr._dummy_request_mask[:2].tolist() == [False, True]
+
+        mgr.cuda_state_indices.fill_(-1)
+        mgr._dummy_request_mask.fill_(True)
+        mgr._setup_state_indices([live, padding])
+        torch.cuda.synchronize()
+        assert mgr.cuda_state_indices[:2].tolist() == [-1, -1]
+        assert mgr._dummy_request_mask[:2].tolist() == [True, True]
+
+        mgr.kv_cache_map[202].slot = 2
+        padding.is_dummy = False
+        mgr._setup_state_indices([live, padding])
+        torch.cuda.synchronize()
+        assert mgr.cuda_state_indices[:2].tolist() == [0, 2]
+        assert mgr._dummy_request_mask[:2].tolist() == [False, False]
+    finally:
+        mgr.shutdown()
+
+
 def test_v2_kda_replay_seeds_disaggregated_generation_slots():
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr._use_kda_replay_update = True

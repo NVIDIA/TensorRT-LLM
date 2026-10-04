@@ -137,6 +137,13 @@ class CUDAGraphRunnerConfig:
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
     enable_encoder_decoder_mixed_cuda_graph: bool = False
     enable_in_graph_sampling: bool = False
+    static_input_ids: Optional[torch.Tensor] = None
+    """The engine's own int32 input-id buffer. When given (with
+    ``static_position_ids``), the graphs' static inputs are views of the
+    engine's buffers: every write the engine makes is already the graphs'
+    input, and replay copies nothing. For engines that rewrite every token's
+    input each step."""
+    static_position_ids: Optional[torch.Tensor] = None
 
 
 class CUDAGraphRunner:
@@ -204,6 +211,25 @@ class CUDAGraphRunner:
             max_total_tokens = self.config.max_num_tokens
         max_total_tokens = min(max_total_tokens, self.config.max_num_tokens)
 
+        if self.config.static_input_ids is not None:
+            input_ids = self.config.static_input_ids
+            position_ids = self.config.static_position_ids
+            if (self.config.use_mrope or position_ids is None
+                    or input_ids.dtype != torch.int32
+                    or position_ids.dtype != torch.int32 or input_ids.dim() != 1
+                    or position_ids.dim() != 1 or not input_ids.is_contiguous()
+                    or not position_ids.is_contiguous()
+                    or min(input_ids.numel(),
+                           position_ids.numel()) < max_total_tokens):
+                raise ValueError(
+                    "CUDA graph static inputs from the engine's buffers need "
+                    "two contiguous 1-D int32 buffers of at least "
+                    f"{max_total_tokens} tokens and no MRoPE.")
+            self.shared_static_tensors = {
+                "input_ids": input_ids[:max_total_tokens],
+                "position_ids": position_ids[:max_total_tokens].unsqueeze(0),
+            }
+            return
         self.shared_static_tensors = {
             "input_ids":
             torch.ones((max_total_tokens, ), device="cuda", dtype=torch.int32),
@@ -733,10 +759,12 @@ class CUDAGraphRunner:
             # Do not keep the eager result live from this runner across graph
             # setup/capture; release its reference before entering.
             output = None
+            # A captured forward does not run, so there is no in-place input
+            # change to undo (postprocess_fn is for the warmup forwards above).
+            # Undoing one here would shift the static inputs, which are the
+            # engine's own buffers when static_input_ids is set.
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = forward_fn(capture_inputs)
-            if postprocess_fn is not None:
-                postprocess_fn(capture_inputs)
             _restore_spec_decode_capture_state(attn_metadata,
                                                saved_kv_lens_cuda)
 
@@ -766,7 +794,11 @@ class CUDAGraphRunner:
                 f"replay() got {seqlen} tokens for key {key}, but the graph "
                 f"was captured for {expected_num_tokens} tokens. A shorter "
                 "input_ids leaves the tail of the static input buffer stale.")
-        static_tensors["input_ids"][:seqlen].copy_(input_ids)
+        # With the engine's buffers as the static inputs (static_input_ids)
+        # the source is the static view itself, and there is nothing to copy.
+        static_input_ids = static_tensors["input_ids"][:seqlen]
+        if input_ids.data_ptr() != static_input_ids.data_ptr():
+            static_input_ids.copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope:
@@ -813,7 +845,9 @@ class CUDAGraphRunner:
                     f"for key {key}, but expected {expected_position_ids_shape}. "
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
-            static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
+            static_position_ids = static_tensors["position_ids"][:, :seqlen]
+            if position_ids.data_ptr() != static_position_ids.data_ptr():
+                static_position_ids.copy_(position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
         if num_encoder_tokens:

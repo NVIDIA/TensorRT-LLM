@@ -20,7 +20,9 @@ CUDA buffers the latter also fills.
 import types
 from typing import Optional
 
-from tensorrt_llm._torch.speculative.interface import SpecMetadata
+import torch
+
+from tensorrt_llm._torch.speculative.interface import DEFAULT_SAMPLING_SEED, SpecMetadata
 
 MAX_DRAFT_LEN = 3
 WINDOW = MAX_DRAFT_LEN + 1
@@ -180,3 +182,37 @@ def test_graph_copy_shares_the_counters() -> None:
     assert _offsets(meta, [_request(1)]) == [0]
     assert _offsets(graph_meta, [_request(1)]) == [WINDOW]
     assert _offsets(meta, [_request(1)]) == [2 * WINDOW]
+
+
+# --- all-greedy batches ------------------------------------------------------
+
+
+def _populated(meta: SpecMetadata, requests: list[types.SimpleNamespace]) -> list[int]:
+    """Run _populate_request_rng_state on CPU buffers and return request_offsets."""
+    for request in requests:
+        request.sampling_config = types.SimpleNamespace(seed=request.seed)
+    normalized = [(0.0, 0, 1.0, 0.0, WINDOW) for _ in requests]
+    meta._populate_request_rng_state(requests, normalized)
+    return meta.request_offsets[: len(requests)].tolist()
+
+
+def test_all_greedy_batch_skips_the_copies_but_advances_the_windows() -> None:
+    # The argmax graph reads none of the Philox buffers, so an all-greedy batch
+    # leaves them as they are; its windows are still taken, so the next sampled
+    # batch gets the same offsets it would have had.
+    meta = _meta()
+    sentinel = -5
+    meta.temperatures = torch.ones(8 * WINDOW)
+    meta.request_seeds = torch.full((8,), sentinel, dtype=torch.int64)
+    meta.request_offsets = torch.full((8,), sentinel, dtype=torch.int64)
+    meta.seeds = torch.full((8 * WINDOW,), sentinel, dtype=torch.int64)
+    meta.offsets = torch.full((8 * WINDOW,), sentinel, dtype=torch.int64)
+
+    meta.is_all_greedy_sample = True
+    assert _populated(meta, [_request(0, seed=7), _request(1)]) == [sentinel, sentinel]
+    assert meta.seeds.eq(sentinel).all() and meta.offsets.eq(sentinel).all()
+
+    meta.is_all_greedy_sample = False
+    assert _populated(meta, [_request(0, seed=7), _request(1)]) == [WINDOW, WINDOW]
+    assert meta.request_seeds[:2].tolist() == [7, DEFAULT_SAMPLING_SEED]
+    assert meta.offsets[: 2 * WINDOW].tolist() == [WINDOW] * (2 * WINDOW)

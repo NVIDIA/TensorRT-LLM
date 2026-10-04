@@ -244,6 +244,10 @@ l0_b200:
   # accuracy deviation found so far is Blackwell-only), so it is not
   # hw-agnostic and needs its own Blackwell run.
   - unittest/_torch/speculative/test_fused_sampling_op.py
+  # One-model speculative decoding step-copy kernels and the engine's staged
+  # decode-step inputs (SM 100 only; they skip on every other list).
+  - unittest/_torch/cute_dsl_kernels/test_spec_step_copies.py
+  - unittest/_torch/executor/test_pytorch_model_engine.py -k "test_staged_spec_decode_graph_step"
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial

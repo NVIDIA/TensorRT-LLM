@@ -22,7 +22,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import copy_to_device_if_changed, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -561,10 +561,7 @@ class DFlashSpecMetadata(SpecMetadata):
         assert self.request_ids is not None
 
         num_seqs = len(self.request_ids)
-        batch_indices = torch.arange(
-            num_seqs, dtype=torch.int, device="cpu", pin_memory=prefer_pinned()
-        )
-        self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
+        copy_to_device_if_changed(self.batch_indices_cuda, torch.arange(num_seqs, dtype=torch.int))
 
         # Update slot mapping for DFlash context buffers
         worker = getattr(self, "_dflash_worker", None)
@@ -602,10 +599,8 @@ class DFlashSpecMetadata(SpecMetadata):
             mapping = torch.tensor(
                 [worker._req_to_slot.get(rid, worker._dummy_slot) for rid in self.request_ids],
                 dtype=torch.long,
-                device="cpu",
-                pin_memory=prefer_pinned(),
             )
-            worker._batch_to_slot[:num_seqs].copy_(mapping, non_blocking=True)
+            copy_to_device_if_changed(worker._batch_to_slot, mapping)
 
     def is_layer_capture(self, layer_id: int) -> bool:
         return layer_id in self._capture_layer_set
@@ -1367,6 +1362,16 @@ class DFlashWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
             attn_metadata.kv_lens_cuda[nc:bs].clamp_(min=0)
 
+    def _rebuild_batch_to_slot(self, request_ids: List[int]) -> None:
+        """Point _batch_to_slot at each request's slot after prefill assigned new ones.
+
+        Like DFlashSpecMetadata.prepare, this writes through copy_to_device_if_changed,
+        which keeps the values it last copied on the buffer: every write of the buffer
+        must go through it, or a later unchanged batch skips its copy over other values.
+        """
+        mapping = [self._req_to_slot.get(rid, self._dummy_slot) for rid in request_ids]
+        copy_to_device_if_changed(self._batch_to_slot, torch.tensor(mapping, dtype=torch.long))
+
     def _write_ctx_len(self, updates: dict[int, int]) -> None:
         """Apply a slot-to-length mapping to _ctx_len in one async scatter."""
         if not updates:
@@ -1662,17 +1667,7 @@ class DFlashWorker(SpecWorkerBase):
             )
             # Rebuild batch_to_slot after prefill assigns new slots
             if self._ctx_buf_inited and spec_metadata.request_ids:
-                num_seqs = len(spec_metadata.request_ids)
-                mapping = [
-                    self._req_to_slot.get(rid, self._dummy_slot)
-                    for rid in spec_metadata.request_ids
-                ]
-                self._batch_to_slot[:num_seqs].copy_(
-                    torch.tensor(
-                        mapping, dtype=torch.long, device="cpu", pin_memory=prefer_pinned()
-                    ),
-                    non_blocking=True,
-                )
+                self._rebuild_batch_to_slot(spec_metadata.request_ids)
 
         inputs = self.prepare_1st_drafter_inputs(
             input_ids=input_ids,
