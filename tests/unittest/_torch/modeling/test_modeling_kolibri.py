@@ -89,7 +89,9 @@ def test_kolibri_gate_load_bias():
     )
 
     gate = Kolibri1Gate(in_features=64, out_features=8)
-    bias = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], dtype=torch.float32)
+    # Bias that flips selection: expert 0 has low logit but huge bias
+    bias = torch.zeros(8, dtype=torch.float32)
+    bias[0] = 100.0
     weight = torch.randn(8, 64)
 
     gate.load_weights([{"weight": weight, "e_score_correction_bias": bias}])
@@ -101,6 +103,19 @@ def test_kolibri_gate_load_bias():
         callable_e_score_correction_bias=lambda: gate.e_score_correction_bias,
     )
     assert torch.allclose(routing.e_score_correction_bias, bias)
+
+    # Verify that the loaded bias actively affects expert selection in apply()
+    logits = torch.tensor([[1.0, 5.0, 4.0, 2.0, 0.0, -1.0, -2.0, -3.0]])
+    topk_ids, topk_weights = routing.apply(logits)
+
+    selected = set(topk_ids[0].tolist())
+    assert 0 in selected
+    assert 1 in selected
+
+    # Verify weights are based on uncorrected sigmoid of raw logits
+    for idx, weight_val in zip(topk_ids[0].tolist(), topk_weights[0].tolist()):
+        expected_weight = torch.sigmoid(logits[0, idx]).item()
+        assert abs(weight_val - expected_weight) < 1e-5
 
 
 @pytest.mark.cpu_only
@@ -128,7 +143,7 @@ def test_kolibri_weight_mapper():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA GPU")
 def test_kolibri_e2e_dummy_forward(tiny_kolibri_config):
-    """Test full Kolibri 1 model forward pass on GPU with dummy weights."""
+    """Test full Kolibri 1 model forward pass on GPU with dummy weights (QA / local smoke test)."""
     import json
     import tempfile
 
