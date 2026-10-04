@@ -221,7 +221,7 @@ def _yarn_mscale(factor: float, mscale: float) -> float:
     return 0.1 * mscale * math.log(factor) + 1.0
 
 
-class DeepseekV3ModelingV2(DecoderModel):
+class DeepseekV3Dep4ModelingV2(DecoderModel):
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
         cfg = model_config.pretrained_config
@@ -521,7 +521,7 @@ class DeepseekV3ModelingV2(DecoderModel):
 class PrefillTarget(Target):
     """The general case: context rows, and possibly generation rows beside them."""
 
-    def __init__(self, core: "DeepseekV3ModelingV2") -> None:
+    def __init__(self, core: "DeepseekV3Dep4ModelingV2") -> None:
         """Bind every op this target calls, once, against the real weights."""
         super().__init__(core)
         cfg = core.model_config.pretrained_config
@@ -1067,7 +1067,7 @@ class DecodeTarget(Target):
     guarantees never runs.
     """
 
-    def __init__(self, core: "DeepseekV3ModelingV2") -> None:
+    def __init__(self, core: "DeepseekV3Dep4ModelingV2") -> None:
         """Bind every op this target calls, once, against the real weights."""
         super().__init__(core)
         cfg = core.model_config.pretrained_config
@@ -1505,7 +1505,7 @@ class MTPLayer:
     output returned **un-normalized** — `shared_head` applies the module's own norm, and the
     runtime feeds the un-normalized tensor back in as the next step's `h`."""
 
-    def __init__(self, core: DeepseekV3ModelingV2, logits_processor) -> None:
+    def __init__(self, core: DeepseekV3Dep4ModelingV2, logits_processor) -> None:
         self.core = core
         self.logits_processor = logits_processor
 
@@ -1837,7 +1837,7 @@ class DraftModel:
     every parameter is still a meta tensor, and the engine materializes the registry by
     replacing the tensor objects, so a reference snapshotted here stays on meta."""
 
-    def __init__(self, core: DeepseekV3ModelingV2, lm_head, logits_processor) -> None:
+    def __init__(self, core: DeepseekV3Dep4ModelingV2, lm_head, logits_processor) -> None:
         self.core = core
         self.mtp_layers = [MTPLayer(core, logits_processor)]
         self.lm_head = lm_head
@@ -1849,12 +1849,12 @@ class DraftModel:
 
 @register_auto_model("ModelingV2DeepseekR10528Nvfp4Sm103Dep4")
 class ModelingV2DeepseekR10528Nvfp4Sm103Dep4(
-    DecoderModelForCausalLM[DeepseekV3ModelingV2, PretrainedConfig]
+    DecoderModelForCausalLM[DeepseekV3Dep4ModelingV2, PretrainedConfig]
 ):
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config
         super().__init__(
-            DeepseekV3ModelingV2(model_config),
+            DeepseekV3Dep4ModelingV2(model_config),
             config=model_config,
             hidden_size=cfg.hidden_size,
             vocab_size=cfg.vocab_size,
