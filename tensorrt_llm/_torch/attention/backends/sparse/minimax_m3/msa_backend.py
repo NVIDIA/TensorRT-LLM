@@ -165,7 +165,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # plan, so both forms are staged rather than derived at the call site.
     msa_block_table: Optional[torch.Tensor] = None
     msa_seq_lens_cuda: Optional[torch.Tensor] = None
-    msa_qo_lens_dev: Optional[torch.Tensor] = None
+    msa_qo_lens_cuda: Optional[torch.Tensor] = None
     msa_cu_q_lens: Optional[torch.Tensor] = None
     msa_cu_kv_lens: Optional[torch.Tensor] = None
     # msa_block_table with each slot expanded into the K and V sub-pages the
@@ -452,10 +452,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
         if getattr(kv_cache_manager, "dtype", None) == DataType.NVFP4:
-            self.msa_qo_lens_dev = self.get_empty(
+            self.msa_qo_lens_cuda = self.get_empty(
                 buffers,
                 (max_num_sequences,),
-                cache_name="msa_qo_lens_dev",
+                cache_name="msa_qo_lens_cuda",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
@@ -1097,10 +1097,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self._msa_live_batch = batch_size
             self.msa_cu_q_lens[0].zero_()
             self.msa_cu_kv_lens[0].zero_()
-            qo_lens_dev = self.msa_qo_lens_dev[:batch_size]
-            qo_lens_dev.copy_(qo_lens_cpu, non_blocking=True)
+            qo_lens_cuda = self.msa_qo_lens_cuda[:batch_size]
+            qo_lens_cuda.copy_(qo_lens_cpu, non_blocking=True)
             torch.cumsum(
-                qo_lens_dev,
+                qo_lens_cuda,
                 0,
                 out=self.msa_cu_q_lens[1 : batch_size + 1],
             )
