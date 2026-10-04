@@ -39,8 +39,6 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import prov
 from tensorrt_llm.commands import mooncake as mooncake_commands
 from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig
 
-pytestmark = pytest.mark.cpu_only
-
 HANDLED_SIGNALS = [signal.SIGINT, signal.SIGTERM]
 
 

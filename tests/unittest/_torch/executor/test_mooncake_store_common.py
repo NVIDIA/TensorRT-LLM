@@ -45,8 +45,6 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.staging import (
     unstage_batch_after_get,
 )
 
-pytestmark = pytest.mark.cpu_only
-
 TOKENS_PER_BLOCK = 4
 
 #: Device addresses the staging tests gather from and scatter back to. Never

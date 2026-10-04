@@ -27,9 +27,11 @@ Each test gets a key namespace of its own; see `mooncake_pool`.
 """
 
 import contextlib
+import importlib.util
 import json
 import math
 import os
+import shutil
 import socket
 from types import SimpleNamespace
 
@@ -42,6 +44,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ledger import read_segments
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
+    DEFAULT_MASTER_BINARY,
     POOL_MANIFEST_NAME,
     provision_pool,
     running_master,
@@ -53,6 +56,30 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig, 
 
 from ..conftest import llm_models_root
 from .test_llm_api_connector import E2E_MIN_TOKEN_AGREEMENT
+
+
+def _missing_mooncake_runtime() -> str:
+    """Why no pool can be stood up here, or an empty string when one can.
+
+    The master binary and the store bindings both come from the Mooncake
+    runtime `docker/common/install_mooncake.sh` installs. An image built
+    before that script grew its wheel step carries neither, and the module
+    fixture below would otherwise error out of setup rather than skip.
+    """
+    if shutil.which(DEFAULT_MASTER_BINARY) is None:
+        return f"{DEFAULT_MASTER_BINARY} is not on PATH, so no Mooncake master can be started."
+    try:
+        found = importlib.util.find_spec("mooncake.store") is not None
+    except ImportError:
+        found = False
+    if not found:
+        return "The Mooncake store bindings are not installed."
+    return ""
+
+
+_MISSING_MOONCAKE_RUNTIME = _missing_mooncake_runtime()
+
+pytestmark = pytest.mark.skipif(bool(_MISSING_MOONCAKE_RUNTIME), reason=_MISSING_MOONCAKE_RUNTIME)
 
 MODEL_PATH = "Qwen3/Qwen3-0.6B"
 #: What the fixture lends the pool. Small enough to pass the node budget check

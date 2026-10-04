@@ -64,8 +64,6 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
-pytestmark = pytest.mark.cpu_only
-
 TOKENS_PER_BLOCK = 4
 
 

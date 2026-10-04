@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import importlib.util
+import shutil
 import socket
 import time
 from collections.abc import Iterator
@@ -50,6 +52,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     StoreRole,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
+    DEFAULT_MASTER_BINARY,
     POOL_MANIFEST_NAME,
     provision_pool,
     running_master,
@@ -65,10 +68,38 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
 )
 from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="The connector transfers KV out of device memory.",
-)
+
+def _missing_mooncake_runtime() -> str | None:
+    """Why no pool can be stood up here, or None when one can.
+
+    The master binary and the store bindings both come from the Mooncake
+    runtime `docker/common/install_mooncake.sh` installs. An image built
+    before that script grew its wheel step carries neither, and the fixture
+    below would otherwise error out of setup rather than skip.
+    """
+    if shutil.which(DEFAULT_MASTER_BINARY) is None:
+        return f"{DEFAULT_MASTER_BINARY} is not on PATH, so no Mooncake master can be started."
+    try:
+        found = importlib.util.find_spec("mooncake.store") is not None
+    except ImportError:
+        found = False
+    if not found:
+        return "The Mooncake store bindings are not installed."
+    return None
+
+
+_MISSING_MOONCAKE_RUNTIME = _missing_mooncake_runtime()
+
+pytestmark = [
+    pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason="The connector transfers KV out of device memory.",
+    ),
+    pytest.mark.skipif(
+        _MISSING_MOONCAKE_RUNTIME is not None,
+        reason=_MISSING_MOONCAKE_RUNTIME or "",
+    ),
+]
 
 TOKENS_PER_BLOCK = 32
 #: Two layer groups of a key and a value region each, the smallest shape that

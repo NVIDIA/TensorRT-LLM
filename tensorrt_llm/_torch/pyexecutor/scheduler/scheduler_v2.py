@@ -1084,6 +1084,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # The executor completes the release once the connector
                 # reports the saves retired; see
                 # `PyExecutor._resume_preempted_request`.
+                #
+                # It counts as preempted for the rest of this pass all the
+                # same. `pending_ctx` was collected before the parking, so
+                # without this the victim is re-admitted and runs a forward
+                # pass over the pages its own saves are still reading.
+                preempted_ids.add(victim.py_request_id)
                 logger.debug(
                     f"[V2Scheduler] Preemption of request {victim.py_request_id} "
                     "deferred until its connector saves retire"
