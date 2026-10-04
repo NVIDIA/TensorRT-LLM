@@ -124,6 +124,7 @@ def test_create_kv_cache_swa_endpoint_priority(
     manager.max_beam_width = 1
     manager.num_pools = 0
     manager.impl = Mock()
+    manager.impl.create_kv_cache.return_value.beam_width = 1
 
     manager._create_kv_cache(0, None, None, is_dummy=is_dummy, expected_prompt_length=prompt)
 
