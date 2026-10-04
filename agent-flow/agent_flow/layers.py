@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import replace
 from typing import Any, AsyncIterator, Callable
 
 import anyio
@@ -40,40 +39,10 @@ from .types import (
     ThinkingEvent,
     ToolCallEvent,
     UsageInfo,
+    merge_turn_usage,
 )
 
 PromptBuilder = Callable[[str], AgentRequest]
-
-
-def _merge_turn_usage(previous: UsageInfo | None, current: UsageInfo | None) -> UsageInfo | None:
-    """Sum per-SDK-turn accounting and keep the final context snapshot.
-
-    Backends normalize cumulative upstream counters to turn deltas before
-    yielding ResultEvent. Context occupancy is a snapshot, not an expense,
-    and must not be summed across the initial and corrective turns.
-    """
-    if previous is None:
-        return current
-    if current is None:
-        return previous
-    additive = (
-        "input_tokens",
-        "output_tokens",
-        "cache_creation_tokens",
-        "cache_read_tokens",
-        "total_tokens",
-        "cost_usd",
-        "num_turns",
-        "duration_ms",
-    )
-    totals = {}
-    for field in additive:
-        before, after = getattr(previous, field), getattr(current, field)
-        totals[field] = None if before is None and after is None else (before or 0) + (after or 0)
-    estimate = current.estimated_thread_cost_usd
-    if estimate is None:
-        estimate = previous.estimated_thread_cost_usd
-    return replace(current, **totals, estimated_thread_cost_usd=estimate)
 
 
 def _read_stdin(prompt: str = "> ") -> str:
@@ -455,7 +424,7 @@ class AgentLayer(Module):
                         print_compact_boundary(self.layer_name, event, sink)
                 else:
                     raise TypeError(f"Unexpected backend event: {type(event).__name__}")
-            usage = _merge_turn_usage(usage, turn_usage)
+            usage = merge_turn_usage(usage, turn_usage)
             if not policy.missing:
                 break
             if attempt:
