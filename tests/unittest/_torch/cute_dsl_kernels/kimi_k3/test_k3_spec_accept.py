@@ -548,6 +548,31 @@ def test_force_mode():
         assert op.force_mode(force_value(drafts, "over"), drafts) == want, drafts
 
 
+def test_arrival_counter_at_rest_after_back_to_back_calls():
+    """Calls of several splits and block widths launched back to back on one stream, the state carried and no host
+    synchronization between them, as consecutive decode steps run: each grid's arrival counter (``CTAs arrived``,
+    which the last CTA of every call zeroes) is zero once the device is idle."""
+    op = _op()
+    gen = torch.Generator(device="cuda").manual_seed(20261003)
+    with torch.inference_mode():
+        calls = []
+        for batch, tokens, block_delta in [(1, 8, 0), (8, 8, 0), (4, 2, 1), (8, 4, 1), (2, 8, 1)]:
+            drafts = tokens - 1
+            st = make_state(gen, batch)
+            for step in range(3):
+                logits, draft = step_inputs(gen, batch, drafts, "plain", step)
+                calls.append((st, logits, draft, drafts + block_delta))
+        torch.cuda.synchronize()
+        for st, logits, draft, block in calls:
+            fused(st, logits, draft, 0.0, block)
+        torch.cuda.synchronize()
+    device = torch.cuda.current_device()
+    counters = [scratch[1] for (dev, _), scratch in op._scratch.items() if dev.index == device]
+    assert counters and all(int(c.item()) == 0 for c in counters), (
+        "an arrival counter is not at rest"
+    )
+
+
 def test_supports():
     """Every split the engine runs is supported (block K .. 8, the whole vocabulary or a TP shard); the limits are
     rejected, and unsupported calls raise before launching."""

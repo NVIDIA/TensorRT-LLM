@@ -796,7 +796,15 @@ def report(g: Group) -> int:
     not_run = [f"S = {shard}: {len(rejected)} splits" for shard, _, rejected in runs if rejected]
     if not_run:
         g.say("Not run (rejected by pick_grid, see above): " + ", ".join(not_run))
-    ok = g.all_ranks(ok and all(row["ok"] for row in rows))
+    # The last CTA of every call zeroes its workspace's arrival word (flags[1]): at rest once the device is idle.
+    torch.cuda.synchronize()
+    workspaces = list(g.op._workspaces.values())
+    at_rest = g.all_ranks(bool(workspaces) and all(int(ws["flags"][1]) == 0 for ws in workspaces))
+    g.say(
+        f"Arrival words of the {len(workspaces)} k3_markov workspaces at rest after the run: "
+        f"{'yes' if at_rest else 'NO'}"
+    )
+    ok = g.all_ranks(ok and at_rest and all(row["ok"] for row in rows))
     g.say("ALL PASS" if ok else "FAIL")
     return 0 if ok else 1
 
