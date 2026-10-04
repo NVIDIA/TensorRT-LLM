@@ -323,6 +323,56 @@ def test_split_tp4(batch, k1):
     assert res["ok"], res
 
 
+BACK_TO_BACK_SPLITS = [(1, 8), (8, 8), (2, 4), (8, 1), (4, 8), (3, 4), (8, 7)]
+
+
+def test_back_to_back_calls_share_the_arrival_counter():
+    """Calls of different splits (different grids) launched back to back on one stream, two of each, with no host
+    synchronization between them, as consecutive decode steps run: they share the device's arrival counter, which
+    each call's last arrival resets. Every call's pool, ctx_len and num_ctx equal the same call made alone, and the
+    counter is zero once the device is idle."""
+    op = _op()
+    with torch.inference_mode():
+        steps = []
+        for i, (batch, k1) in enumerate(BACK_TO_BACK_SPLITS):
+            gen = torch.Generator(device="cuda").manual_seed(20261003 + 10 * i)
+            steps.append(Step(gen, 1, batch, k1, seed=i))
+        alone = []
+        for st in steps:
+            buf, ctx, num_ctx, _ = st.run_kernel()
+            torch.cuda.synchronize()
+            alone.append((buf, ctx, num_ctx))
+        # Inputs, pools and pool views first, so that nothing between the calls waits on the device.
+        calls = []
+        for st in steps:
+            for _ in range(2):
+                buf, ctx = st.buf.clone(), st.ctx0.clone()
+                calls.append((st, buf, ctx, pool_view(views_of(buf, st.layers, st.style))))
+        torch.cuda.synchronize()
+        outs = []
+        for st, buf, ctx, (flat, layer_off, ps, kvs, hs) in calls:
+            num_ctx = torch.ops.trtllm.k3_ctx_kv(
+                st.x, st.w, st.k_norm, st.cs, st.cpos, st.num_acc, ctx, st.slots, st.rows, st.table, st.counts,
+                flat, layer_off, ps, kvs, hs, EPS, MAX_CTX, PAGE, BLOCK, st.nkv,
+            )  # fmt: skip
+            outs.append((buf, ctx, num_ctx.long()))
+        torch.cuda.synchronize()
+    for i, (buf, ctx, num_ctx) in enumerate(outs):
+        want = alone[i // 2]
+        split = BACK_TO_BACK_SPLITS[i // 2]
+        assert torch.equal(buf.view(torch.int16), want[0].view(torch.int16)), (
+            f"pool, {split} call {i % 2}"
+        )
+        assert torch.equal(ctx, want[1]) and torch.equal(num_ctx, want[2]), (
+            f"ctx_len / num_ctx, {split}"
+        )
+    device = torch.cuda.current_device()
+    counters = [c for d, c in op._counters.items() if d.index == device]
+    assert counters and all(int(c.item()) == 0 for c in counters), (
+        "the arrival counter is not at rest"
+    )
+
+
 def test_supported_shapes():
     """TP16 takes every step up to 8 x 8; TP4 (shared memory for the resident tokens) up to 32 tokens."""
     op = _op()
