@@ -306,6 +306,19 @@ class KvCacheConnectorScheduler(ABC):
             (determined by ``get_finished`` on the workers).
         """
 
+    def request_reset(self, request: LlmRequest) -> None:
+        """
+        Called when a request's allocation is released for it to run again.
+
+        Rollback and failed admission take this path, where request_finished
+        ends a request instead. Another request may own the released pages
+        before this one is readmitted, so state the connector recorded in page
+        indices has to be dropped or rebuilt here. The default is a no-op.
+
+        Args:
+            request: The request whose allocation was released.
+        """
+
     @abstractmethod
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
         """
@@ -785,6 +798,28 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
         return saving_async
+
+    def reset_request_state(self, req: LlmRequest) -> None:
+        """
+        Retire the bookkeeping keyed to an allocation released for replay.
+
+        The scheduler-output deltas describe the pages the request held: left
+        behind, the replay lands in `cached_requests` carrying a block-id delta
+        against pages that no longer exist. Needs no collective, since it
+        decides nothing the ranks have to agree on.
+
+        Args:
+            req: The request whose allocation was released.
+        """
+        if req.is_dummy_request:
+            return
+
+        self.scheduler_output_manager.requests.pop(req.request_id, None)
+        self.scheduler_output_manager.external_loads.pop(req.request_id, None)
+        self.finished_async_loading_requests.pop(req.request_id, None)
+        # The connector's own per-request state is keyed to the allocation too.
+        if self.scheduler is not None:
+            self.scheduler.request_reset(req)
 
     def get_finished(self) -> List[LlmRequest]:
         """

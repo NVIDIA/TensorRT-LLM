@@ -538,11 +538,15 @@ def test_config_metadata_server_falls_back_to_the_handshake(tmp_path, monkeypatc
     assert resolve_config().metadata_server == "P2PHANDSHAKE"
 
 
-def test_config_model_key_defaults_to_basename(store_config, tmp_path, monkeypatch):
+def test_config_without_a_model_key_is_refused_rather_than_guessed(tmp_path, monkeypatch):
+    """A key derived from the model path would let two checkpoints that share a
+    directory name read each other's pages as their own.
+    """
     path = tmp_path / "no_model_key.json"
     path.write_text(json.dumps({"master_server_address": "127.0.0.1:50051"}))
     monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(path))
-    assert resolve_config().resolve_model_key("/models/MiniMax-M3/") == "MiniMax-M3"
+    with pytest.raises(ValueError, match="needs a model key"):
+        resolve_config().resolve_model_key("/models/MiniMax-M3/")
 
 
 # ---- validation ----
@@ -1456,6 +1460,30 @@ def test_scheduler_request_finished_is_false_without_saves(store_config):
     request = make_request(1, list(range(TOKENS_PER_BLOCK - 1)))
     scheduler.get_num_new_matched_tokens(request, 0)
     assert scheduler.request_finished(request, []) is False
+
+
+def test_scheduler_saves_a_replayed_request_from_its_new_pages(store_config):
+    """Rollback frees the pages the first attempt recorded, and another request
+    may own them by the time the replay saves.
+    """
+    scheduler = make_scheduler(store_config, hit_blocks=0)
+    tokens = list(range(2 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+
+    scheduler.get_num_new_matched_tokens(request, 0)
+    first = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, [4, 5])])
+    )
+    assert [page.page_index for page in first.saves[0].pages] == [4, 5]
+
+    scheduler.request_reset(request)
+
+    # The replay is admitted to different pages and must save from those.
+    scheduler.get_num_new_matched_tokens(request, 0)
+    replay = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, [9, 10])])
+    )
+    assert [page.page_index for page in replay.saves[0].pages] == [9, 10]
 
 
 def test_scheduler_isolates_requests_by_cache_salt(store_config):

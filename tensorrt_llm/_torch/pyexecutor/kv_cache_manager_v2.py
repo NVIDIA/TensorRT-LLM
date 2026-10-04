@@ -3528,6 +3528,12 @@ class KVCacheManagerV2(BaseResourceManager):
         # blocking every later preemption through has_pending_preemption.
         self._pending_preemption.pop(request.py_request_id, None)
         self._release_undelivered_connector_prefix(request)
+        if self.kv_connector_manager is not None and not self.is_draft:
+            # A replay allocates different pages, so state the connector keyed
+            # to these ones has to go. Rollback and failed admission release an
+            # allocation here for a request that will run again, where
+            # `request_finished` ends one.
+            self.kv_connector_manager.reset_request_state(request)
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)

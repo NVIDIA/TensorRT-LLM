@@ -40,6 +40,11 @@ These methods run on the leader process for TP, or on each request-owning rank f
   * **Description**: Called when a request completes generation.
   * **Returns**: A boolean indicating if an asynchronous save operation is underway. If `True`, the system waits for the operation to complete before releasing the KV cache blocks.
 
+* **`request_reset(self, request: LlmRequest)`**
+  * **Description**: Optional, with a no-op default. Tells the connector that the request's allocation has been released and the request will run again from the start, unlike `request_finished`, which ends it. Any per-request state the connector keeps in page indices describes pages that are now free for another request to own, so it has to be dropped or rebuilt here.
+  * **When it fires**: on `KVCacheManagerV2`, from `free_resources`, which is the path a rollback or a failed admission takes. Direct preemption calls `request_finished` instead, so a connector that keys state by request id sees exactly one of the two.
+  * **Why it matters**: without it a replayed request's new pages are appended to the record of the pages it held before, so the block ordinals a later save reads from point at slots a different request now owns, and the connector writes that request's KV into the store under this one's keys.
+
 * **`update_state_after_alloc(self, request: LlmRequest, block_ids: list[int])`**
   * **Description**: a callback to update internal state after KV cache blocks have been allocated for the prefill.
   * **Note**: on `KVCacheManagerV2` with chunked prefill, `block_ids` covers only the blocks allocated for the first chunk, because V2 allocates per chunk rather than for the whole prompt. The remaining blocks arrive as append-deltas in `RequestData.new_block_ids` on subsequent chunks. A connector that treats this callback as its only source of block ids will under-plan; drive off `build_connector_meta` instead.
@@ -203,11 +208,14 @@ kv_connector_config:
     pool: file:///shared/pool.json
     role: both            # both | producer | consumer | capacity
     segment_size: 160GiB  # per rank
+    model_key: minimax-m3-fp4
 ```
 
 `trtllm-serve` then reads the manifest, adds this server's settings and this node's detected RDMA devices, renders the Mooncake client config, and exports `MOONCAKE_CONFIG_PATH` before the ranks that open store handles are spawned.
 
-Only `pool` is required. `pool` also accepts a bare `host:port` for joining a master run without this CLI, in which case the pool-wide settings take their defaults and keeping them consistent is the deployment's problem.
+`pool` and `model_key` are required. `pool` also accepts a bare `host:port` for joining a master run without this CLI, in which case the pool-wide settings take their defaults and keeping them consistent is the deployment's problem.
+
+`model_key` is what the pool's keys identify this checkpoint by. Two engines share cache only when they agree on it, and two that disagree about which checkpoint it names would read each other's pages as their own, so it has no default. Give it a value that separates this checkpoint from any other an engine on the same pool might load; a model path is a poor choice, since `org-a/model` and `org-b/model` share a directory name while disagreeing on what the pages mean. Every role needs it, `capacity` included, because each rank resolves it while starting up.
 
 Sizes are written as binary units (`160GiB`) or byte counts. `GB` and friends are **refused** in anything both engines may read: this parser scales them by 1000 and vLLM's Mooncake parser by 1024, so `80GB` would name two different segments. The rendered client config always holds resolved integers for the same reason.
 
@@ -224,6 +232,7 @@ Setting `run_dir` covers that case: the rendered config is read back from `<run_
 ```yaml
 mooncake_store:
   pool: file:///shared/run/pool.json
+  model_key: minimax-m3-fp4
   run_dir: /shared/run/ctx0
 ```
 
@@ -251,6 +260,7 @@ kv_connector_config:
     pool: file:///shared/pool.json
     role: capacity
     segment_size: 160GiB   # the same per-rank figure as the context servers
+    model_key: minimax-m3-fp4
 ```
 
 Such a rank opens its handle, mounts its segment, and stops. It runs no prefix lookup, issues no load or save, starts no background save thread, and **registers no KV cache with Mooncake** — which also means it needs no GPUDirect RDMA, so a host whose HCA cannot pin GPU pages can still lend memory.

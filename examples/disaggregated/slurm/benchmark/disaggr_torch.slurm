@@ -187,7 +187,17 @@ if [ "${mooncake_enabled}" = "true" ]; then
     sed -i "s|__LOG_DIR__|${full_logdir}|g" \
         "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"
 
-    mooncake_pool_file="${full_logdir}/pool.json"
+    # Read from the worker configs so the master publishes where the workers
+    # look. A fixed path lets a config that names a different manifest wait out
+    # the timeout below on one that is never written.
+    mooncake_pool_file=$(sed -n \
+        's|^[[:space:]]*pool:[[:space:]]*file://\([^[:space:]]*\).*$|\1|p' \
+        "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml" \
+        | sort -u)
+    if [ "$(printf '%s' "${mooncake_pool_file}" | grep -c '^')" -ne 1 ]; then
+        cleanup_on_failure "The worker configs must name one shared manifest as mooncake_store.pool for the single master this job starts, but they name: $(echo ${mooncake_pool_file} | tr '\n' ' '). A host:port pool is for joining a master run outside this script, which this path does not support"
+    fi
+    echo "Mooncake manifest: ${mooncake_pool_file}"
     # A manifest left by an earlier attempt would be read as this run's and
     # send every worker to a master that is gone.
     rm -f "${mooncake_pool_file}"

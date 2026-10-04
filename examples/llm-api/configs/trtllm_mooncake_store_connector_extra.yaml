@@ -62,6 +62,11 @@ kv_connector_config:
     # budget is checked at startup, since ranks_on_node x segment_size is what
     # this actually claims from host memory.
     segment_size: 32GiB
+    # What the pool's keys identify this checkpoint by, spelled the same way on
+    # every server on the pool. Two that disagree read each other's pages as
+    # their own, so there is no default. A model path is a poor choice:
+    # 'org-a/model' and 'org-b/model' share a directory name.
+    model_key: minimax-m3-fp4
     # Where this server keeps the client config it renders and the record each
     # of its ranks writes. Needed whenever a launcher starts one task per rank,
     # since those ranks cannot inherit the path, and one directory per server:

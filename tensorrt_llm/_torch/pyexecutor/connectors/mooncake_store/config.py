@@ -231,10 +231,8 @@ class MooncakeStoreConnectorConfig:
     #: set different values; bump it after any change to page layout or
     #: contents.
     namespace: str = DEFAULT_NAMESPACE
-    #: Identity the keys are namespaced by. Two engines only share cache when
-    #: they agree on this, so it defaults to the model directory's basename
-    #: rather than its full path: the same checkpoint is routinely mounted
-    #: somewhere else on another host, which is exactly the case sharing is for.
+    #: Checkpoint identity the keys are namespaced by; see
+    #: :meth:`resolve_model_key`.
     model_key: Optional[str] = None
     #: How many page keys go into one store call. Bounds the size of a single
     #: RPC without bounding how much a request may transfer.
@@ -321,7 +319,20 @@ class MooncakeStoreConnectorConfig:
         return MooncakeStoreConnectorConfig.from_file(path)
 
     def resolve_model_key(self, model: Any) -> str:
-        """The model identity to namespace keys by, given the configured model."""
+        """The model identity to namespace keys by.
+
+        Deliberately has no default. Deriving one from the model path would
+        make two checkpoints that happen to share a directory name, such as
+        `org-a/model` and `org-b/model` or two revisions mounted alike, agree
+        on a namespace while disagreeing on what the pages mean, and each would
+        read the other's KV as its own.
+        """
         if self.model_key:
             return self.model_key
-        return os.path.basename(str(model).rstrip("/")) or str(model)
+        raise ValueError(
+            f"The mooncake-store connector needs a model key to namespace its "
+            f"pool keys by, and there is no safe default: set the model_key "
+            f"field of the Mooncake JSON config. Give it a value that "
+            f"separates this checkpoint from any other an engine sharing the "
+            f"pool might load, rather than one derived from {model!r}."
+        )
