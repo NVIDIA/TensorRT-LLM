@@ -5,8 +5,14 @@
 One weight's shape, dtype, checkpoint source and load-time transform used to
 live in three files. The table merges them, which is only safe if it declares
 exactly what the hand-written block declared -- same keys, same shapes, same
-dtypes. This test is that proof, and it runs while both forms still exist so
-the switchover has something to stand on.
+dtypes. This test is that proof.
+
+The block it compares against no longer exists in the model; `_reference`
+below is a transcription of it, kept deliberately. That is the point of
+having transcribed rather than imported it: the table is still held to what
+the model used to say, and an import would now have the test agreeing with
+itself. A shape that changes here is a real change to what this target
+allocates, and should be made knowingly rather than discovered.
 
 No GPU and no built extensions: the parameters are meta tensors, so only
 shape and dtype are compared, which is all the declaration ever stated.
