@@ -6,11 +6,13 @@ Flat single-entry forward assembled from catalog entries only; every call
 that creates or transforms a tensor is a catalog entry, everything else is
 tensor-metadata reads and Python control flow. Attention consumes runtime
 state fully explicitly through thop_attention: per-step arguments are
-projected from the engine-prepared TrtllmAttentionMetadata once per forward
-in _build_step_args and shared by all layers. Two attention arguments are
-per-layer here rather than per-step: the fp32 sink logits (one extra softmax
-denominator column per query head) and attention_window_size — this
-checkpoint alternates sliding_attention (window 128) and full_attention
+projected from the engine-prepared TrtllmAttentionMetadata once per forward,
+by each target's own `step_args`, and shared by all layers. The two targets'
+projections differ only in `num_contexts`/`num_ctx_tokens` -- see
+`PrefillTarget.step_args` and `DecodeTarget.step_args`. Two attention
+arguments are per-layer here rather than per-step: the fp32 sink logits (one
+extra softmax denominator column per query head) and attention_window_size —
+this checkpoint alternates sliding_attention (window 128) and full_attention
 layers, and the window is a pure mask, so one shared pool and one
 block-offset table serve both kinds.
 
@@ -73,65 +75,6 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, register_auto_model
 
 from . import weights as _weights
-
-
-def _build_step_args(
-    md: TrtllmAttentionMetadata, *, num_contexts: int, num_ctx_tokens: int
-) -> dict:
-    """Project the prepared metadata onto thop_attention's explicit batch
-    state, once per forward; every runtime-owned value passes through as
-    the engine prepared it. CUDA-graph classes: tensors are engine-owned
-    persistent buffers refreshed in place (reference class); Python ints
-    are per-capture constants (host-derived class). attention_window_size is
-    absent here on purpose: it is per-layer, not per-step, and is rebound
-    every forward with `bind_layered` instead -- see the comment in
-    `PrefillTarget.forward` and `DecodeTarget.forward`.
-
-    `num_contexts` and `num_ctx_tokens` are passed rather than read off `md`
-    because they are the two values a decode target knows by its routing --
-    it states them as 0 instead of reading back what the predicate already
-    guaranteed."""
-    return dict(
-        sequence_length=md.kv_lens_cuda_runtime,
-        host_past_key_value_lengths=md.kv_lens_runtime,
-        host_total_kv_lens=md.host_total_kv_lens,
-        context_lengths=md.prompt_lens_cuda_runtime,
-        host_context_lengths=md.prompt_lens_cpu_runtime,
-        host_request_types=md.host_request_types_runtime,
-        kv_cache_block_offsets=md.kv_cache_block_offsets,
-        host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
-        workspace_=md.effective_workspace,
-        tokens_per_block=md.tokens_per_block,
-        max_num_requests=md.max_num_requests,
-        max_context_length=md.max_context_length,
-        max_seq_len=md.max_seq_len,
-        num_contexts=num_contexts,
-        num_ctx_tokens=num_ctx_tokens,
-        trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
-        use_paged_context_fmha=md.use_paged_context_fmha,
-        beam_width=md.effective_beam_width,
-        cache_indirection=md.cache_indirection,
-        block_ids_per_seq=md.block_ids_per_seq,
-        max_context_q_len_override=md.max_context_q_len_override,
-        is_cross=md.is_cross,
-        is_spec_decoding_enabled=md.is_spec_decoding_enabled,
-        use_spec_decoding=md.use_spec_decoding,
-        is_spec_dec_tree=md.is_spec_dec_tree,
-        spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
-        spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
-        spec_decoding_packed_mask=md.spec_decoding_packed_mask,
-        spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
-        spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
-        spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
-        spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
-        num_sparse_topk=md.num_sparse_topk,
-        flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
-        flash_mla_num_splits=md.flash_mla_num_splits,
-        max_num_sequences=md.max_num_sequences,
-        force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
-    )
-
 
 # Per-call constants of this target's call shape — the values the in-tree
 # path sources from the attention module and forward args: packed-QKV
@@ -245,52 +188,25 @@ class GptOssModelingV2(ModelingV2Core):
         heads_kv = cfg.num_key_value_heads
         head_dim = cfg.head_dim
 
-        # RoPE: YaRN over the full head_dim, half-split (neox) pairs. The
+        # RoPE base: YaRN over the full head_dim, half-split (neox) pairs. The
         # engine hands this checkpoint the transformers-5.x migrated rope
         # dict (rope_theta lives inside it and cfg.rope_theta is absent);
         # a checkpoint written before that migration keeps the flat field,
-        # so both shapes are resolved here and every scalar the ramp
-        # depends on is asserted rather than defaulted.
+        # so both shapes are resolved here. `theta` stays an attribute --
+        # nothing downstream of `head_dim` needs a second name for it either
+        # (`rotary_dim` equals it exactly for this checkpoint, so the target
+        # binds `rotary_dim=cfg.head_dim` directly).
         #
-        # Unlike the block above, nothing but `PrefillTarget.__init__` and
-        # `DecodeTarget.__init__` (via `build_layer_views`) reads `theta` or
-        # the four `yarn_*` once this method returns -- they exist solely to
-        # bind `fused_qk_norm_rope`. They stay attributes anyway, rather than
-        # becoming a second copy of this derivation inside the target: the
-        # ramp has real failure modes
-        # (a missing rope key raises KeyError; `math.log` of a non-positive
-        # `theta` or `orig_max` raises ValueError), and catching those here,
-        # before the weight load, is cheaper than catching them afterward or
-        # duplicating ~20 lines of math to catch them in two places. Nothing
-        # downstream of `head_dim` has that problem -- `rotary_dim` equals it
-        # exactly for this checkpoint -- so the target binds
-        # `rotary_dim=cfg.head_dim` directly instead of reading a third name
-        # for the same value.
+        # The YaRN low/high correction-dimension ramp and its attention-factor
+        # scalar are *not* derived here. Unlike `theta`, they are read only by
+        # `PrefillTarget.__init__` and `DecodeTarget.__init__`, to bind
+        # `fused_qk_norm_rope`, and nothing between their computation and that
+        # binding would touch a core attribute -- so `build_layer_views`
+        # computes them as locals, once, and passes them straight into both
+        # constructors instead of a `self.yarn_*` a core would otherwise carry
+        # for no reason but to be bound. See the comment there.
         rope = getattr(cfg, "rope_scaling", None) or getattr(cfg, "rope_parameters", None)
         self.theta = float(rope.get("rope_theta", getattr(cfg, "rope_theta", 0.0)))
-        rotary_dim = head_dim
-        self.yarn_factor = float(rope["factor"])
-        beta_fast = float(rope["beta_fast"])
-        beta_slow = float(rope["beta_slow"])
-        orig_max = float(rope["original_max_position_embeddings"])
-        truncate = bool(rope.get("truncate", True))
-
-        def correction_dim(rotations: float) -> float:
-            return (
-                rotary_dim
-                * math.log(orig_max / (rotations * 2.0 * math.pi))
-                / (2.0 * math.log(self.theta))
-            )
-
-        low = correction_dim(beta_fast)
-        high = correction_dim(beta_slow)
-        if truncate:
-            low, high = math.floor(low), math.ceil(high)
-        self.yarn_low = max(low, 0.0)
-        self.yarn_high = min(high, rotary_dim - 1.0)
-        self.yarn_attn_factor = (
-            0.1 * math.log(self.yarn_factor) + 1.0 if self.yarn_factor > 1.0 else 1.0
-        )
 
         # Sliding window: half the layers mask to the newest `window` keys,
         # the rest are plain causal. The window is a mask only — the op
@@ -360,14 +276,56 @@ class GptOssModelingV2(ModelingV2Core):
         each do this independently; the two bindings are identical in
         content, not shared in code.
 
+        What it derives itself -- the YaRN low/high correction-dimension ramp
+        and its attention-factor scalar -- is the one thing both targets'
+        constructors need that is neither a weight nor per-layer config:
+        computed once, here, as locals, and passed straight into both calls
+        below, rather than carried as four `self.yarn_*` attributes on the
+        core that would exist for no reason but to be bound (see the comment
+        in `__init__`). `theta` and `cfg` are cheap to re-reach from here, so
+        recomputing the ramp costs nothing a `self.` copy would have saved.
+
         Meta is over by the time this runs, so real tensors may be built and
         `.t()`'d; never called from `__init__`, where the shell's containers
         are still meta."""
-        self._prefill = PrefillTarget(self)
-        self._decode = DecodeTarget(self)
+        cfg = self.model_config.pretrained_config
+        rope = getattr(cfg, "rope_scaling", None) or getattr(cfg, "rope_parameters", None)
+        rotary_dim = cfg.head_dim
+        yarn_factor = float(rope["factor"])
+        beta_fast = float(rope["beta_fast"])
+        beta_slow = float(rope["beta_slow"])
+        orig_max = float(rope["original_max_position_embeddings"])
+        truncate = bool(rope.get("truncate", True))
 
-    def _probe_step_surface(self, md) -> None:
-        _build_step_args(md, num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
+        def correction_dim(rotations: float) -> float:
+            return (
+                rotary_dim
+                * math.log(orig_max / (rotations * 2.0 * math.pi))
+                / (2.0 * math.log(self.theta))
+            )
+
+        low = correction_dim(beta_fast)
+        high = correction_dim(beta_slow)
+        if truncate:
+            low, high = math.floor(low), math.ceil(high)
+        yarn_low = max(low, 0.0)
+        yarn_high = min(high, rotary_dim - 1.0)
+        yarn_attn_factor = 0.1 * math.log(yarn_factor) + 1.0 if yarn_factor > 1.0 else 1.0
+
+        self._prefill = PrefillTarget(
+            self,
+            yarn_factor=yarn_factor,
+            yarn_low=yarn_low,
+            yarn_high=yarn_high,
+            yarn_attn_factor=yarn_attn_factor,
+        )
+        self._decode = DecodeTarget(
+            self,
+            yarn_factor=yarn_factor,
+            yarn_low=yarn_low,
+            yarn_high=yarn_high,
+            yarn_attn_factor=yarn_attn_factor,
+        )
 
     def _select_target(self, attn_metadata) -> Target:
         """Which target runs this step.
@@ -389,17 +347,16 @@ class GptOssModelingV2(ModelingV2Core):
     ) -> torch.Tensor:
         """Route the step, and nothing else.
 
-        The contract check runs here rather than inside a target because it is
-        phase-independent: it does not vary by phase, so running it once in
-        the dispatcher is equivalent to duplicating it into both
-        `PrefillTarget` and `DecodeTarget` and checks nothing they would not.
+        The contract check is no longer run here: it probes `step_args`, which
+        is a target's own projection and differs by phase, so each target runs
+        its own check on its own first forward instead -- see
+        `Target._check_step_contract` in `_target.py`.
         """
         # "A new engine step has begun" is the dispatcher's knowledge, not a
         # target's: this runs once per engine forward, before either target
         # binds per-step state, so validating() catches a target that forgot
         # to rebind.
         advance_step_generation()
-        self._check_step_contract(attn_metadata)
         return self._select_target(attn_metadata).forward(attn_metadata, *args, **kwargs)
 
 
@@ -420,7 +377,15 @@ class PrefillTarget(Target):
     materializes K and V -- overrides `forward` itself instead.
     """
 
-    def __init__(self, core: GptOssModelingV2) -> None:
+    def __init__(
+        self,
+        core: GptOssModelingV2,
+        *,
+        yarn_factor: float,
+        yarn_low: float,
+        yarn_high: float,
+        yarn_attn_factor: float,
+    ) -> None:
         """Bind every op this target calls, once, against the real weights.
 
         `Target.__init__` only stores `self.core`; everything below is this
@@ -429,10 +394,13 @@ class PrefillTarget(Target):
         at a time, built straight from `core.w` and keeping the `.t()` views
         the hot-path GEMMs already used (zero-copy). Configuration comes
         from `cfg` throughout: `core` carries none of it past what is
-        genuinely derived (`inter_pad`, `fc1_k_pad`, `fc2_rows_pad`, `theta`,
-        the `yarn_*` quantities) or read per layer by the forward
-        (`sliding`, `window`) -- see `GptOssModelingV2.__init__` for which is
-        which. The one op-owned fixture built here -- `fused_qk_norm_rope`'s
+        genuinely derived (`inter_pad`, `fc1_k_pad`, `fc2_rows_pad`, `theta`)
+        or read per layer by the forward (`sliding`, `window`) -- see
+        `GptOssModelingV2.__init__` for which is which. The four `yarn_*`
+        arguments are the YaRN ramp `build_layer_views` computes once and
+        passes to both targets' constructors, rather than a `self.yarn_*` the
+        core would carry for no reason but to be bound -- see the comment
+        there. The one op-owned fixture built here -- `fused_qk_norm_rope`'s
         inert q/k norm weight -- is an input that op needs to satisfy its
         own signature, not state the model computes; the MoE runner's
         per-expert activation vectors are the same kind of fixture, but the
@@ -472,10 +440,10 @@ class PrefillTarget(Target):
             k_weight=no_qk_norm,
             base=core.theta,
             is_neox=True,
-            factor=core.yarn_factor,
-            low=core.yarn_low,
-            high=core.yarn_high,
-            attention_factor=core.yarn_attn_factor,
+            factor=yarn_factor,
+            low=yarn_low,
+            high=yarn_high,
+            attention_factor=yarn_attn_factor,
             is_qk_norm=False,
         )
 
@@ -570,7 +538,61 @@ class PrefillTarget(Target):
         self._norm_next.bind_const(eps=cfg.rms_norm_eps)
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
-        return _build_step_args(md, num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
+        """Project the prepared metadata onto thop_attention's explicit batch
+        state, once per forward; every runtime-owned value passes through as
+        the engine prepared it. CUDA-graph classes: tensors are engine-owned
+        persistent buffers refreshed in place (reference class); Python ints
+        are per-capture constants (host-derived class). attention_window_size
+        is absent here on purpose: it is per-layer, not per-step, and is
+        rebound every forward with `bind_layered` instead -- see the comment
+        in `forward`.
+
+        This target holds the mixed batch -- context rows, and possibly
+        generation rows beside them -- so `num_contexts` and `num_ctx_tokens`
+        are read off `md` rather than assumed; it may not assume either is
+        zero. Also the probe `Target._check_step_contract` calls to validate
+        this metadata surface on the first forward.
+        """
+        return dict(
+            sequence_length=md.kv_lens_cuda_runtime,
+            host_past_key_value_lengths=md.kv_lens_runtime,
+            host_total_kv_lens=md.host_total_kv_lens,
+            context_lengths=md.prompt_lens_cuda_runtime,
+            host_context_lengths=md.prompt_lens_cpu_runtime,
+            host_request_types=md.host_request_types_runtime,
+            kv_cache_block_offsets=md.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
+            workspace_=md.effective_workspace,
+            tokens_per_block=md.tokens_per_block,
+            max_num_requests=md.max_num_requests,
+            max_context_length=md.max_context_length,
+            max_seq_len=md.max_seq_len,
+            num_contexts=md.num_contexts,
+            num_ctx_tokens=md.num_ctx_tokens,
+            trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
+            use_paged_context_fmha=md.use_paged_context_fmha,
+            beam_width=md.effective_beam_width,
+            cache_indirection=md.cache_indirection,
+            block_ids_per_seq=md.block_ids_per_seq,
+            max_context_q_len_override=md.max_context_q_len_override,
+            is_cross=md.is_cross,
+            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
+            use_spec_decoding=md.use_spec_decoding,
+            is_spec_dec_tree=md.is_spec_dec_tree,
+            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
+            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
+            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
+            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
+            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+            num_sparse_topk=md.num_sparse_topk,
+            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits=md.flash_mla_num_splits,
+            max_num_sequences=md.max_num_sequences,
+            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+        )
 
     def forward(
         self,
@@ -584,6 +606,7 @@ class PrefillTarget(Target):
         core = self.core
         cfg = core.model_config.pretrained_config
 
+        self._check_step_contract(attn_metadata)
         self._attn.bind_const(**self.step_args(attn_metadata))
 
         # attention_window_size is per-layer, and rebound every forward
@@ -662,7 +685,15 @@ class DecodeTarget(Target):
     materializes K and V -- overrides `forward` itself instead.
     """
 
-    def __init__(self, core: GptOssModelingV2) -> None:
+    def __init__(
+        self,
+        core: GptOssModelingV2,
+        *,
+        yarn_factor: float,
+        yarn_low: float,
+        yarn_high: float,
+        yarn_attn_factor: float,
+    ) -> None:
         """Bind every op this target calls, once, against the real weights.
 
         `Target.__init__` only stores `self.core`; everything below is this
@@ -671,10 +702,13 @@ class DecodeTarget(Target):
         at a time, built straight from `core.w` and keeping the `.t()` views
         the hot-path GEMMs already used (zero-copy). Configuration comes
         from `cfg` throughout: `core` carries none of it past what is
-        genuinely derived (`inter_pad`, `fc1_k_pad`, `fc2_rows_pad`, `theta`,
-        the `yarn_*` quantities) or read per layer by the forward
-        (`sliding`, `window`) -- see `GptOssModelingV2.__init__` for which is
-        which. The one op-owned fixture built here -- `fused_qk_norm_rope`'s
+        genuinely derived (`inter_pad`, `fc1_k_pad`, `fc2_rows_pad`, `theta`)
+        or read per layer by the forward (`sliding`, `window`) -- see
+        `GptOssModelingV2.__init__` for which is which. The four `yarn_*`
+        arguments are the YaRN ramp `build_layer_views` computes once and
+        passes to both targets' constructors, rather than a `self.yarn_*` the
+        core would carry for no reason but to be bound -- see the comment
+        there. The one op-owned fixture built here -- `fused_qk_norm_rope`'s
         inert q/k norm weight -- is an input that op needs to satisfy its
         own signature, not state the model computes; the MoE runner's
         per-expert activation vectors are the same kind of fixture, but the
@@ -714,10 +748,10 @@ class DecodeTarget(Target):
             k_weight=no_qk_norm,
             base=core.theta,
             is_neox=True,
-            factor=core.yarn_factor,
-            low=core.yarn_low,
-            high=core.yarn_high,
-            attention_factor=core.yarn_attn_factor,
+            factor=yarn_factor,
+            low=yarn_low,
+            high=yarn_high,
+            attention_factor=yarn_attn_factor,
             is_qk_norm=False,
         )
 
@@ -812,7 +846,65 @@ class DecodeTarget(Target):
         self._norm_next.bind_const(eps=cfg.rms_norm_eps)
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
-        return _build_step_args(md, num_contexts=0, num_ctx_tokens=0)
+        """Project the prepared metadata onto thop_attention's explicit batch
+        state, once per forward; every runtime-owned value passes through as
+        the engine prepared it. CUDA-graph classes: tensors are engine-owned
+        persistent buffers refreshed in place (reference class); Python ints
+        are per-capture constants (host-derived class). attention_window_size
+        is absent here on purpose: it is per-layer, not per-step, and is
+        rebound every forward with `bind_layered` instead -- see the comment
+        in `forward`.
+
+        `num_contexts` and `num_ctx_tokens` are the literal `0` rather than
+        read off `md`: they are the two values this target knows by its
+        routing -- it is reached only when there are no context rows -- and
+        stating them is what makes that invariant checkable by
+        `test_a_decode_target_never_reads_the_phase_back` in
+        `test_modeling_v2_claims.py`; `PrefillTarget.step_args` holds the
+        mixed batch and genuinely reads both off `md` instead. Also the probe
+        `Target._check_step_contract` calls to validate this metadata surface
+        on the first forward.
+        """
+        return dict(
+            sequence_length=md.kv_lens_cuda_runtime,
+            host_past_key_value_lengths=md.kv_lens_runtime,
+            host_total_kv_lens=md.host_total_kv_lens,
+            context_lengths=md.prompt_lens_cuda_runtime,
+            host_context_lengths=md.prompt_lens_cpu_runtime,
+            host_request_types=md.host_request_types_runtime,
+            kv_cache_block_offsets=md.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
+            workspace_=md.effective_workspace,
+            tokens_per_block=md.tokens_per_block,
+            max_num_requests=md.max_num_requests,
+            max_context_length=md.max_context_length,
+            max_seq_len=md.max_seq_len,
+            num_contexts=0,
+            num_ctx_tokens=0,
+            trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
+            use_paged_context_fmha=md.use_paged_context_fmha,
+            beam_width=md.effective_beam_width,
+            cache_indirection=md.cache_indirection,
+            block_ids_per_seq=md.block_ids_per_seq,
+            max_context_q_len_override=md.max_context_q_len_override,
+            is_cross=md.is_cross,
+            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
+            use_spec_decoding=md.use_spec_decoding,
+            is_spec_dec_tree=md.is_spec_dec_tree,
+            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
+            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
+            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
+            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
+            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+            num_sparse_topk=md.num_sparse_topk,
+            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits=md.flash_mla_num_splits,
+            max_num_sequences=md.max_num_sequences,
+            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+        )
 
     def forward(
         self,
@@ -826,6 +918,7 @@ class DecodeTarget(Target):
         core = self.core
         cfg = core.model_config.pretrained_config
 
+        self._check_step_contract(attn_metadata)
         self._attn.bind_const(**self.step_args(attn_metadata))
 
         # attention_window_size is per-layer, and rebound every forward
