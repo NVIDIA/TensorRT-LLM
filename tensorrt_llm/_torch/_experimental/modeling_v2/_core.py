@@ -29,6 +29,18 @@ class ModelingV2Core(DecoderModel):
     model's step consumes differ by model, so the check is a skeleton here
     (`_probe_step_surface`, `_after_contract_check`) that each subclass fills
     in, not a body this class runs itself.
+
+    This copy exists for deepseek's sake specifically, not every model's.
+    deepseek has no target split -- its core's `forward` is still the whole
+    body, with an internal phase branch -- so its contract check has nowhere
+    else to live and stays here. gpt_oss, once split into `PrefillTarget` and
+    `DecodeTarget` (`_target.py`), moved its own copy of this same skeleton
+    onto `Target`, where `step_args` is the probe for each target's own
+    projection. The two models are in different states during this
+    transition, deliberately: deepseek's check moves here-to-`Target` too
+    only when deepseek itself gets a target split, which is separate work.
+    Do not delete this skeleton because gpt_oss no longer calls it -- deepseek
+    still does.
     """
 
     def __init__(self, model_config: ModelConfig) -> None:
