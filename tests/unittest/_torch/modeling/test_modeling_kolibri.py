@@ -38,6 +38,7 @@ def tiny_kolibri_config():
     )
 
 
+@pytest.mark.cpu_only
 def test_kolibri_config_schedule(tiny_kolibri_config):
     """Test layer_types alternating schedule."""
     assert len(tiny_kolibri_config.layer_types) == 5
@@ -45,6 +46,7 @@ def test_kolibri_config_schedule(tiny_kolibri_config):
     assert tiny_kolibri_config.layer_types[4] == "full_attention"
 
 
+@pytest.mark.cpu_only
 def test_kolibri_routing_method():
     """Test Kolibri 1 routing method: biased selection, unbiased sigmoid weights."""
     from tensorrt_llm._torch.models.modeling_kolibri import Kolibri1RoutingMethod
@@ -78,6 +80,30 @@ def test_kolibri_routing_method():
         assert abs(weight - expected_weight) < 1e-5
 
 
+@pytest.mark.cpu_only
+def test_kolibri_gate_load_bias():
+    """Test Kolibri1Gate loads e_score_correction_bias and integrates with routing."""
+    from tensorrt_llm._torch.models.modeling_kolibri import (
+        Kolibri1Gate,
+        Kolibri1RoutingMethod,
+    )
+
+    gate = Kolibri1Gate(in_features=64, out_features=8)
+    bias = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], dtype=torch.float32)
+    weight = torch.randn(8, 64)
+
+    gate.load_weights([{"weight": weight, "e_score_correction_bias": bias}])
+    assert torch.allclose(gate.e_score_correction_bias, bias)
+
+    routing = Kolibri1RoutingMethod(
+        top_k=2,
+        num_experts=8,
+        callable_e_score_correction_bias=lambda: gate.e_score_correction_bias,
+    )
+    assert torch.allclose(routing.e_score_correction_bias, bias)
+
+
+@pytest.mark.cpu_only
 def test_kolibri_weight_mapper():
     """Test Kolibri 1 weight mapper key remapping."""
     from tensorrt_llm._torch.models.checkpoints.hf.kolibri_weight_mapper import (
@@ -119,9 +145,14 @@ def test_kolibri_e2e_dummy_forward(tiny_kolibri_config):
             model=tmp_dir,
             backend="pytorch",
             load_format="dummy",
+            skip_tokenizer_init=True,
             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
         )
 
-        outputs = llm.generate(["Hello world"], sampling_params=SamplingParams(max_tokens=4))
+        outputs = llm.generate(
+            [[1, 2, 3, 4, 5]],
+            sampling_params=SamplingParams(
+                max_tokens=4, ignore_eos=True, detokenize=False),
+        )
         assert len(outputs) == 1
-        assert len(outputs[0].outputs[0].token_ids) > 0
+        assert len(outputs[0].outputs[0].token_ids) == 4

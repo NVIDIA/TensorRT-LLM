@@ -13,20 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm._torch.configs.kolibri import Kolibri1Config
+from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, register_auto_model
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 from tensorrt_llm._torch.modules.embedding import Embedding
+from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.moe.fused_moe import BaseMoeRoutingMethod, RoutingMethodType, create_moe
@@ -45,6 +47,7 @@ class Kolibri1RoutingMethod(BaseMoeRoutingMethod):
         self,
         top_k: int,
         num_experts: int,
+        callable_e_score_correction_bias: Optional[Callable[[], torch.Tensor]] = None,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         norm_topk_prob: bool = False,
         output_dtype: torch.dtype = torch.float32,
@@ -52,9 +55,16 @@ class Kolibri1RoutingMethod(BaseMoeRoutingMethod):
         super().__init__()
         self.top_k = top_k
         self.num_experts = num_experts
-        self.e_score_correction_bias = e_score_correction_bias
+        self._e_score_correction_bias = e_score_correction_bias
+        self.callable_e_score_correction_bias = callable_e_score_correction_bias
         self.norm_topk_prob = norm_topk_prob
         self.output_dtype = output_dtype
+
+    @property
+    def e_score_correction_bias(self) -> Optional[torch.Tensor]:
+        if self.callable_e_score_correction_bias is not None:
+            return self.callable_e_score_correction_bias()
+        return self._e_score_correction_bias
 
     @property
     def requires_separated_routing(self) -> bool:
@@ -65,17 +75,19 @@ class Kolibri1RoutingMethod(BaseMoeRoutingMethod):
     def routing_method_type(self) -> RoutingMethodType:
         return RoutingMethodType.SigmoidRenorm
 
+    @property
+    def resolution_routing_method_type(self) -> RoutingMethodType:
+        # Prevent fused SigmoidRenorm routing resolution so Kolibri's separated apply() is preserved.
+        return RoutingMethodType.Unspecified
+
     def apply(
         self,
         router_logits: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         logits = router_logits.float()
-        scores = (
-            logits + self.e_score_correction_bias
-            if self.e_score_correction_bias is not None
-            else logits
-        )
+        bias = self.e_score_correction_bias
+        scores = (logits + bias) if bias is not None else logits
         _, topk_ids = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
         topk_weights = torch.sigmoid(logits.gather(dim=-1, index=topk_ids))
         if self.norm_topk_prob:
@@ -83,13 +95,13 @@ class Kolibri1RoutingMethod(BaseMoeRoutingMethod):
         return topk_ids.to(torch.int32), topk_weights.to(self.output_dtype)
 
 
-class Kolibri1Attention(Attention):
+class Kolibri1Attention(QKNormRoPEAttention):
     """Kolibri 1 Attention Layer:
 
     - Alternates SWA and Full Attention based on config.layer_types.
     - SWA layers use RoPE + sliding window.
     - Full-attention layers use RNoPE (No Positional Encoding, global window).
-    - Applies per-head QK RMSNorm.
+    - Applies per-head QK RMSNorm via QKNormRoPEAttention.
     """
 
     def __init__(
@@ -117,57 +129,19 @@ class Kolibri1Attention(Attention):
                 rope=RopeParams.from_config(config),
             )
 
-        self.q_norm = RMSNorm(
-            hidden_size=config.head_dim,
-            eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
-        )
-        self.k_norm = RMSNorm(
-            hidden_size=config.head_dim,
-            eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
-        )
-
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
-            head_dim=config.head_dim,
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
             pos_embd_params=pos_embd_params,
             skip_rope=self.is_full_attention,
+            fuse_qk_norm_rope=False,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
         )
-
-    def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply head-dim RMSNorm independently to Q and K."""
-        q = self.q_norm(q.reshape(-1, self.head_dim)).reshape(q.shape)
-        k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(k.shape)
-        return q, k
-
-    def apply_rope(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        position_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # 1. Unpack fused QKV into separate Q, K, V tensors
-        q, k, v = self.split_qkv(q, k, v)
-        assert k is not None and v is not None, "k and v must be present after split_qkv"
-
-        # 2. Normalize Q and K heads
-        q, k = self.apply_qk_norm(q, k)
-
-        # 3. Skip RoPE on full-attention layers (RNoPE)
-        if self.is_full_attention:
-            return q, k, v
-
-        # 4. Apply RoPE on SWA layers
-        return super().apply_rope(q, k, v, position_ids)
 
     def forward(
         self,
@@ -183,6 +157,44 @@ class Kolibri1Attention(Attention):
             attention_window_size=self.attention_window_size,
             **kwargs,
         )
+
+
+class Kolibri1Gate(Linear):
+    """Gate projection layer for Kolibri 1 router with e_score_correction_bias."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__(
+            in_features=in_features,
+            out_features=out_features,
+            bias=False,
+            dtype=dtype,
+        )
+        self.e_score_correction_bias = nn.Parameter(
+            torch.zeros(out_features, dtype=torch.float32),
+            requires_grad=False,
+        )
+
+    def load_weights(
+        self,
+        weights: List[dict],
+        allow_partial_loading: bool = False,
+    ):
+        super().load_weights(
+            weights=weights,
+            allow_partial_loading=allow_partial_loading,
+        )
+        bias = weights[0].get("e_score_correction_bias")
+        if not allow_partial_loading:
+            assert bias is not None, "Kolibri1Gate expects 'e_score_correction_bias'"
+        if bias is not None:
+            self.e_score_correction_bias.copy_(
+                bias[:].to(self.e_score_correction_bias.dtype)
+            )
 
 
 class Kolibri1MoE(nn.Module):
@@ -203,25 +215,21 @@ class Kolibri1MoE(nn.Module):
         self.hidden_dim = config.hidden_size
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
+        self.mapping = model_config.mapping
+        self.enable_attention_dp = self.mapping.enable_attention_dp
 
         # 1. Router Gate: model.layers.{i}.mlp.gate
-        self.gate = Linear(
-            self.hidden_dim,
-            self.num_experts,
-            bias=False,
+        self.gate = Kolibri1Gate(
+            in_features=self.hidden_dim,
+            out_features=self.num_experts,
             dtype=config.torch_dtype,
-        )
-        # model.layers.{i}.mlp.gate.e_score_correction_bias
-        self.gate.e_score_correction_bias = nn.Parameter(
-            torch.zeros(self.num_experts, dtype=torch.float32),
-            requires_grad=False,
         )
 
         # 2. Routing Strategy
         self.routing_method = Kolibri1RoutingMethod(
             top_k=self.top_k,
             num_experts=self.num_experts,
-            e_score_correction_bias=self.gate.e_score_correction_bias,
+            callable_e_score_correction_bias=lambda: self.gate.e_score_correction_bias,
             norm_topk_prob=config.norm_topk_prob,  # False from config.json!
         )
 
@@ -239,17 +247,24 @@ class Kolibri1MoE(nn.Module):
         )
 
         # 4. 1 Shared Expert (intermediate_size=512)
-        from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
-
         self.shared_experts = GatedMLP(
             hidden_size=self.hidden_dim,
             intermediate_size=config.shared_expert_intermediate_size,  # 512
             bias=False,
             dtype=config.torch_dtype,
             config=model_config,
+            overridden_tp_size=1 if self.enable_attention_dp else None,
+            reduce_output=False,
             is_shared_expert=True,
             layer_idx=layer_idx,
         )
+
+        self.all_reduce = None
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            self.all_reduce = AllReduce(
+                mapping=self.mapping,
+                strategy=model_config.allreduce_strategy,
+            )
 
     def forward(
         self,
@@ -258,24 +273,27 @@ class Kolibri1MoE(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         orig_shape = hidden_states.shape
-        hidden_states = hidden_states.view(-1, self.hidden_dim)
+        hidden_states_2d = hidden_states.view(-1, self.hidden_dim)
 
         # 1. Compute router logits [num_tokens, 384]
-        router_logits = self.gate(hidden_states)
+        router_logits = self.gate(hidden_states_2d)
 
         # 2. Run 384 routed experts (top-6 activated)
         routed_out = self.experts(
-            hidden_states,
+            hidden_states_2d,
             router_logits,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             use_dp_padding=False,
         )
 
         # 3. Run shared expert
-        shared_out = self.shared_experts(hidden_states)
+        shared_out = self.shared_experts(hidden_states_2d)
 
-        # 4. Sum outputs and restore shape
-        return (routed_out + shared_out).view(orig_shape)
+        # 4. Sum outputs and all-reduce if TP > 1
+        out = routed_out + shared_out
+        if self.all_reduce is not None:
+            out = self.all_reduce(out)
+        return out.view(orig_shape)
 
 
 class Kolibri1DecoderLayer(DecoderLayer):
