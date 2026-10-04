@@ -41,7 +41,7 @@ class Kolibri1HfWeightMapper(Qwen3MoeHfWeightMapper):
             r"(.*)moe\.router\.expert_bias(.*)": r"\1mlp.gate.e_score_correction_bias\2",
             r"(.*)mlp\.expert_bias(.*)": r"\1mlp.gate.e_score_correction_bias\2",
             r"(.*)mlp\.gate\.expert_bias(.*)": r"\1mlp.gate.e_score_correction_bias\2",
-            r"(.*)\.shared_experts\.(.*)": r"\1.mlp.shared_experts.\2",
+            r"^(?!.*\.mlp\.)(.*)\.shared_experts\.(.*)": r"\1.mlp.shared_experts.\2",
         }
 
     def init_model_and_config(self, model: nn.Module, config: ModelConfig):

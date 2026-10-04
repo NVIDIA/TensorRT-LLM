@@ -153,12 +153,17 @@ def test_kolibri_weight_mapper():
     )
     remapped_consumable = mapper.preprocess_weights(consumable)
     assert isinstance(remapped_consumable, ConsumableWeightsDict)
+    assert len(consumable) == 0
     assert "model.layers.0.mlp.gate.e_score_correction_bias" in remapped_consumable
     assert "model.layers.0.mlp.shared_experts.gate_proj.weight" in remapped_consumable
 
-    # 3. Verify params_map regex mappings
-    assert r"(.*)\.shared_experts\.(.*)" in mapper.params_map
+    # 3. Verify params_map regex mappings and idempotency across transformations
+    assert r"^(?!.*\.mlp\.)(.*)\.shared_experts\.(.*)" in mapper.params_map
     assert r"(.*)moe\.router\.expert_bias(.*)" in mapper.params_map
+    final_weights = mapper.rename_by_params_map(mapper.params_map, remapped)
+    assert "model.layers.0.mlp.shared_experts.gate_proj.weight" in final_weights
+    assert "model.layers.0.mlp.mlp.shared_experts.gate_proj.weight" not in final_weights
+
 
 
 @pytest.mark.cpu_only
