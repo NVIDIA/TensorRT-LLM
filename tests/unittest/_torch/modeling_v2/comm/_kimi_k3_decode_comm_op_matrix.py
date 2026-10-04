@@ -472,7 +472,9 @@ def check_graph_capture_and_replay():
             )
         if R.rank == 0:
             print(f"[rank 0] graph {name}: 3 replays == eager bit for bit", flush=True)
-        del graph
+        # Freed here, outside any capture: rebinding outs inside the next case's capture would free this graph's
+        # outputs there, a captured free of memory the new graph does not own.
+        del graph, outs
 
 
 def _pending(seed, tokens):
