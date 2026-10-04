@@ -1,49 +1,35 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Weight manifest and loader: gpt-oss-120b / sm_103 / tp1.
+"""Weight table: gpt-oss-120b / sm_103 / tp1.
 
-MANIFEST is a data table: target parameter -> the checkpoint keys that fill
-it, each with an optional destination index into the parameter and an
-optional source transform. tp1: no sharding — every checkpoint tensor
-reaches exactly one parameter whole.
+One `W` per weight role, carrying its shape, checkpoint source, dtype and
+load-time transform. tp1: no sharding -- every checkpoint tensor reaches
+exactly one parameter whole. Storage layout is HF [out, in] row-major, so the
+attention, router and embed copies are layout-preserving.
 
-Storage layout is HF [out, in] row-major, so every attention/router/embed
-copy is layout-preserving; the GEMM-side column-major views are derived
-after load in modeling.build_layer_views(). Two families need a transform:
-
-* **fp32 promotions.** The expert biases and the attention sink logits are
-  bf16 on disk, but the MoE op rejects a bf16 bias and thop_attention reads
-  the sink buffer as raw fp32.
-
-* **The MXFP4 expert operands.** The checkpoint stores each layer's experts
-  as `gate_up_proj_blocks` [E, 2I, H/32, 16] / `_scales` [E, 2I, H/32] and
-  `down_proj_blocks` [E, H, I/32, 16] / `_scales` [E, H, I/32] — E2M1 codes
-  two per byte (low nibble = even K index) with one E8M0 exponent per 32 K
-  elements, already in [out, in] orientation. The MoE op wants them padded,
-  row-permuted and (scales only) swizzled; `_prep_fc1` / `_prep_fc2` below
-  are that recipe, applied on device, one layer at a time.
-
-  The parity trap: this checkpoint's `2I` axis runs (gate, up, gate, up,
-  ...) — HF reads `gate = gate_up[..., ::2]`, `up = gate_up[..., 1::2]` —
-  while the kernel's interleave wants destination row `2i` = **up** `i` and
-  `2i+1` = gate `i`. The halves are therefore split by parity and
-  re-concatenated as [up ; gate] before the permutation. Getting it
-  backwards is finite, plausibly scaled and invisible to a boot check.
-
-Loading contract: `load(model, weights)` consumes the engine-provided
-per-rank checkpoint dict (safetensors lazy slices), fills every declared
-parameter exactly once, and asserts full bidirectional coverage — every
-target parameter written, every checkpoint key consumed.
+The parity trap in the MXFP4 expert operands: this checkpoint's `2I` axis
+runs (gate, up, gate, up, ...) -- HF reads `gate = gate_up[..., ::2]`, `up =
+gate_up[..., 1::2]` -- while the kernel's interleave wants destination row
+`2i` = **up** `i` and `2i+1` = gate `i`. Getting it backwards is finite,
+plausibly scaled and invisible to a boot check.
 """
 
-from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Callable
 
 import torch
-import torch.nn as nn
+
+from tensorrt_llm._torch._experimental.modeling_v2._weights import ModelWeights, W
 
 SCALE_BLOCK = 32  # mxfp4: one E8M0 exponent per 32 elements along K
+
+# FC1's K alignment for the trtllm-gen MXFP4 weight family. It sizes the
+# declared expert operands here and is the alignment mxfp8_quantize pads the
+# hidden states up to in modeling.py; the two must be the same number.
+FC1_K_ALIGN = 512
+
+
+def _pad_up(x: int, align: int) -> int:
+    return (x + align - 1) // align * align
 
 
 def _pad_rows_cols(t: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
@@ -167,36 +153,7 @@ def _to_fp32(t: torch.Tensor, core) -> torch.Tensor:
     return t.float()
 
 
-@dataclass(frozen=True)
-class W:
-    """One weight role: what it is, where its bytes come from, what happens on the way.
-
-    Three facts that used to live in three places -- the shape in the model's
-    declaration block, the checkpoint key in the manifest, the transform in a
-    function far from either. A reader who wants to know what `fc1_w` is now
-    reads one entry.
-
-    `shape` is a callable rather than a constant because every shape here is
-    derived from configuration: `fc1_k_pad` is a padded width, `q_width` is a
-    product. It takes the dimension bundle `declare` is given.
-
-    `src` is a checkpoint key template with `{p}` standing for the layer
-    prefix, or a sequence of `(template, slice_fn)` pairs when one parameter is
-    assembled from several checkpoint tensors -- `qkv` is three.
-
-    `transform` runs on the source tensor before the copy, on the destination's
-    device. `None` means the checkpoint tensor is already the declared shape.
-    """
-
-    name: str
-    shape: Callable[[Any], tuple[int, ...]]
-    src: str | tuple[tuple[str, Callable], ...]
-    dtype: torch.dtype | None = None
-    transform: Callable | None = None
-    per_layer: bool = True
-
-
-WEIGHTS: tuple[W, ...] = (
+_WEIGHTS: tuple[W, ...] = (
     W("norm1", shape=lambda d: (d.hidden,), src="{p}.input_layernorm.weight"),
     W(
         "qkv",
@@ -292,31 +249,41 @@ WEIGHTS: tuple[W, ...] = (
 )
 
 
-def declare(**dims: Any) -> nn.ParameterDict:
-    """Allocate every weight the table declares.
+class GptOssWeights(ModelWeights):
+    """gpt-oss-120b / sm_103 / tp1."""
 
-    Takes the dimensions explicitly rather than reading them off the core: the
-    core no longer carries them, having stopped forwarding configuration, and
-    passing them is what keeps it that way.
+    WEIGHTS = _WEIGHTS
+    RELEASE_AFTER = "_fc2_b"
 
-    Meta-init intercepts `torch.empty` here -- real CUDA storage arrives when
-    the engine materializes the registry.
-    """
-    d = SimpleNamespace(**dims)
-    w = nn.ParameterDict()
-    for entry in WEIGHTS:
-        dtype = entry.dtype or d.dtype
-        keys = (
-            [f"l{i}_{entry.name}" for i in range(d.num_layers)] if entry.per_layer else [entry.name]
+    def dims(self, core) -> SimpleNamespace:
+        cfg = core.model_config.pretrained_config
+        inter_pad = _pad_up(cfg.intermediate_size, 128)
+        return SimpleNamespace(
+            num_layers=cfg.num_hidden_layers,
+            hidden=cfg.hidden_size,
+            q_width=cfg.num_attention_heads * cfg.head_dim,
+            kv_width=cfg.num_key_value_heads * cfg.head_dim,
+            heads_q=cfg.num_attention_heads,
+            num_experts=cfg.num_local_experts,
+            vocab=cfg.vocab_size,
+            fc1_rows=2 * inter_pad,
+            fc1_k_pad=_pad_up(cfg.hidden_size, FC1_K_ALIGN),
+            inter_pad=inter_pad,
+            fc2_rows_pad=_pad_up(cfg.hidden_size, 128),
+            dtype=core.model_config.torch_dtype,
         )
-        for key in keys:
-            w[key] = nn.Parameter(torch.empty(*entry.shape(d), dtype=dtype), requires_grad=False)
-    return w
+
+
+MODEL_WEIGHTS = GptOssWeights()
 
 
 def _manifest(core) -> dict:
-    """target param key -> list of (ckpt key, index into the param | None,
-    source transform | None)."""
+    """The hand-written manifest `ModelWeights.manifest` replaces.
+
+    Dead code, kept for one commit so the equivalence test can compare the
+    generated manifest against the thing it is replacing rather than against a
+    transcription of it. Deleted once that test has run green.
+    """
     cfg = core.model_config.pretrained_config
     q_width = cfg.num_attention_heads * cfg.head_dim
     kv_width = cfg.num_key_value_heads * cfg.head_dim
@@ -361,41 +328,3 @@ def _manifest(core) -> dict:
     rows["final_norm"] = [("model.norm.weight", None, None)]
     rows["embed"] = [("model.embed_tokens.weight", None, None)]
     return rows
-
-
-def load(model, weights) -> None:
-    core = model.model
-    manifest = _manifest(core)
-    consumed: set = set()
-
-    def fill(param: torch.nn.Parameter, ckpt_key: str, index, transform) -> None:
-        assert ckpt_key in weights, f"checkpoint key missing: {ckpt_key}"
-        src = weights[ckpt_key][:]  # materialize the lazy slice
-        dst = param.data if index is None else param.data[index]
-        if transform is not None:
-            # The expert transforms are heavy row gathers over ~1 GB of
-            # blocks; run them where the destination lives.
-            src = transform(src.to(dst.device, non_blocking=True), core)
-        assert dst.shape == src.shape, (ckpt_key, tuple(dst.shape), tuple(src.shape))
-        assert src.dtype == dst.dtype, (ckpt_key, src.dtype, dst.dtype)
-        dst.copy_(src, non_blocking=True)
-        consumed.add(ckpt_key)
-
-    # No drift check between the manifest and the parameters: both unroll
-    # WEIGHTS, so a key present in one and absent from the other is not a
-    # state this code can reach. The assert that used to stand here existed
-    # only because the seventeen names were written out twice.
-    for param_key, sources in manifest.items():
-        for ckpt_key, index, transform in sources:
-            fill(core.w[param_key], ckpt_key, index, transform)
-        # The transforms allocate several GB of scratch per layer; release it
-        # before the next one so peak load memory stays one layer deep.
-        if param_key.endswith("_fc2_b"):
-            torch.cuda.empty_cache()
-
-    # Shell-registered exception: the base class owns lm_head (untied).
-    fill(model.lm_head.weight, "lm_head.weight", None, None)
-
-    torch.cuda.synchronize()
-    leftover = set(weights.keys()) - consumed
-    assert not leftover, f"unconsumed checkpoint keys: {sorted(leftover)[:8]}"
