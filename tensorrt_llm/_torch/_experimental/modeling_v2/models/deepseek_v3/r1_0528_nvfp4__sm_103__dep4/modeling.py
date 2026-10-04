@@ -55,7 +55,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
+from tensorrt_llm._torch._experimental.modeling_v2._core import ModelingV2Core
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import advance_step_generation
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
@@ -109,11 +109,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import (
-    DecoderModel,
-    DecoderModelForCausalLM,
-    register_auto_model,
-)
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, register_auto_model
 from tensorrt_llm._torch.speculative import get_spec_worker
 
 from . import weights as _weights
@@ -336,7 +332,7 @@ def _yarn_mscale(factor: float, mscale: float) -> float:
     return 0.1 * mscale * math.log(factor) + 1.0
 
 
-class ModelingV2Core(DecoderModel):
+class DeepseekV3ModelingV2(ModelingV2Core):
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
         cfg = model_config.pretrained_config
@@ -565,11 +561,6 @@ class ModelingV2Core(DecoderModel):
         self._rope_positions = 0
         self._side_stream: torch.cuda.Stream | None = None
         self._cached_ctx = False
-        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it: read once here
-        # rather than per forward, and False for the whole life of a served
-        # engine. "pending" rather than "enabled" because the check runs once
-        # -- everything it looks at is fixed at engine construction.
-        self._contract_pending = step_contract_enabled()
 
     def _rope_tables(self, device, positions: int) -> dict:
         """The duplicated-layout GPT-J rope table the MLA ops read: per
@@ -638,7 +629,7 @@ class ModelingV2Core(DecoderModel):
         one layer at a time, built straight from `self.w` and keeping the
         `.t()` views the hot-path GEMMs already used (zero-copy). Configuration
         comes from `cfg` throughout, read locally here rather than from a core
-        attribute -- see `ModelingV2Core.__init__`. The rope table and every
+        attribute -- see `DeepseekV3ModelingV2.__init__`. The rope table and every
         NVFP4 call scalar are derived the same way they always were, folded
         from the checkpoint's per-tensor `input_scale` / `weight_scale_2`
         pairs, the routed ones sliced to this rank's expert window, which is
@@ -970,29 +961,15 @@ class ModelingV2Core(DecoderModel):
             "head_norm": w["mtp_head_norm"],
         }
 
-    def _check_step_contract(self, md) -> None:
-        """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE
-        asks for it: the metadata fields this target consumes must exist
-        (private trtllm surface), and the rope table is grown to cover every
-        position the engine admits. Everything checked is fixed at
-        engine construction — once per model instance is sound.
+    def _probe_step_surface(self, md) -> None:
+        _build_step_args(md)
 
-        Called unconditionally every forward; the early return below is the
-        gate. That costs one Python call per forward, not per layer, against
-        a decode step measured in milliseconds -- accepted in exchange for
-        not scattering the `_contract_pending` check across every call site.
-        """
-        if not self._contract_pending:
-            return
-        # Calling the projection is the check: it reads every metadata field
-        # this target consumes, so a rename or removal upstream surfaces
-        # here rather than mid-forward. Deriving it this way is the point --
-        # a hand-kept list of the same names drifts silently the first time
-        # _build_step_args gains a field and nobody updates the copy.
-        try:
-            _build_step_args(md)
-        except AttributeError as exc:
-            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
+    def _after_contract_check(self, md) -> None:
+        """Grow the rope table to cover every position the engine admits, and
+        fix the context flavor this engine construction runs. Both are fixed
+        at engine construction -- once per model instance is sound, run after
+        `_probe_step_surface` has confirmed the metadata surface this reads
+        still exists."""
         # The rope table must cover every position the engine admits: a short
         # table is read out of bounds with no check, and `rope_max_positions`,
         # the argument that looks like it bounds this, is one of the inert
@@ -1017,7 +994,6 @@ class ModelingV2Core(DecoderModel):
         self._cached_ctx = all(hasattr(md, n) for n in _CACHED_CTX_FIELDS) and bool(
             md.enable_context_mla_with_cached_kv
         )
-        self._contract_pending = False
 
     def _dp_rows(self, md, num_tokens: int) -> int:
         """The uniform row count every rank pads its token block to before the
@@ -1435,7 +1411,7 @@ class MTPLayer:
     `spec_metadata` (the one thing the layer needs off it, the DP padding
     basis, arrives as the `all_rank_num_tokens` keyword instead)."""
 
-    def __init__(self, core: ModelingV2Core, logits_processor) -> None:
+    def __init__(self, core: DeepseekV3ModelingV2, logits_processor) -> None:
         self.core = core
         self.logits_processor = logits_processor
 
@@ -1817,7 +1793,7 @@ class DraftModel:
     registry by replacing those tensor objects. A reference captured at
     construction stays on meta and fails at the first draft step."""
 
-    def __init__(self, core: ModelingV2Core, lm_head, logits_processor) -> None:
+    def __init__(self, core: DeepseekV3ModelingV2, lm_head, logits_processor) -> None:
         self.core = core
         self.mtp_layers = [MTPLayer(core, logits_processor)]
         self.lm_head = lm_head
@@ -1829,12 +1805,12 @@ class DraftModel:
 
 @register_auto_model("ModelingV2DeepseekR10528Nvfp4Sm103Dep4")
 class ModelingV2DeepseekR10528Nvfp4Sm103Dep4(
-    DecoderModelForCausalLM[ModelingV2Core, PretrainedConfig]
+    DecoderModelForCausalLM[DeepseekV3ModelingV2, PretrainedConfig]
 ):
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config
         super().__init__(
-            ModelingV2Core(model_config),
+            DeepseekV3ModelingV2(model_config),
             config=model_config,
             hidden_size=cfg.hidden_size,
             vocab_size=cfg.vocab_size,
