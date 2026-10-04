@@ -3952,6 +3952,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _build_cache_config(
             self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         kv_cache_config = self.kv_cache_config
+        if (getattr(self, "_use_kda_replay_update", False)
+                and self.local_num_mamba_layers > 0
+                and kv_cache_config.enable_kv_pool_rebalance):
+            # The KDA replay caches and prev_num_accepted_tokens hold one
+            # entry per SSM slot the pool keeps at construction; a rebalance
+            # can grow the SSM pool past them, and the verify kernels index
+            # them by slot without a bound.
+            raise ValueError(
+                "The KDA replay caches (speculative decoding on KDA layers) "
+                "are sized once from the SSM pool's slot count, and a KV pool "
+                "rebalance can grow that pool past them: set "
+                "kv_cache_config.enable_kv_pool_rebalance=False.")
         cache_tiers = config.cache_tiers
         gpu_quota = cache_tiers[0].quota
         minimum_live_quota = self._minimum_live_gpu_quota()

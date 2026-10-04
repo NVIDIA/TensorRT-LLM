@@ -2353,6 +2353,7 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_n_groups=1,
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
+    enable_kv_pool_rebalance=False,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
@@ -2380,6 +2381,7 @@ def _build_v2_hybrid_with_mamba_layer(
             enable_branch_snapshot=enable_branch_snapshot,
         ),
         dtype=kv_cache_dtype,
+        enable_kv_pool_rebalance=enable_kv_pool_rebalance,
     )
     return MambaHybridCacheManagerV2(
         mamba_d_state=8,
@@ -3673,6 +3675,25 @@ def test_v2_kda_replay_validates_configuration(
             use_replay_state_update=use_replay_state_update,
             conv_state_layout=conv_state_layout,
             kda_replay_num_spec=num_spec,
+        )
+
+
+@pytest.mark.parametrize("kda_replay", [True, False], ids=["kda_replay", "no_replay"])
+def test_v2_kda_replay_refuses_kv_pool_rebalance(kda_replay):
+    """The KDA replay caches and prev_num_accepted_tokens hold one entry per SSM slot the pool keeps at construction,
+    and a KV pool rebalance can grow that pool past them, so the manager refuses enable_kv_pool_rebalance with them;
+    without them the rebalance stays allowed."""
+    if not kda_replay:
+        _build_v2_hybrid_with_mamba_layer(enable_kv_pool_rebalance=True).shutdown()
+        return
+    with pytest.raises(ValueError, match="enable_kv_pool_rebalance=False"):
+        _build_v2_hybrid_with_mamba_layer(
+            spec_config=MTPDecodingConfig(max_draft_len=2),
+            conv_state_layout="q_k_v",
+            mamba_n_groups=4,
+            mamba_ssm_cache_dtype=torch.float32,
+            kda_replay_num_spec=2,
+            enable_kv_pool_rebalance=True,
         )
 
 
