@@ -27,11 +27,14 @@ layout — identical for the W4A16 and W4A8 members of this kernel family — an
 the manifest loop in weights.py transforms the checkpoint's block/scale
 tensors into it at load time.
 
-Weights are target-owned: a flat ParameterDict declared here (HF [out, in]
-storage so checkpoint rows copy in unchanged), loaded by the manifest loop
-in the sibling weights.py, with column-major GEMM views derived once after
-load. The registration shell inherits DecoderModelForCausalLM for lm_head,
-packed-batch logits gathering, and the meta-init/load/post-load hooks.
+Weights are target-owned, and declared in the sibling weights.py: one table
+entry per role carries its shape, dtype, checkpoint source and load-time
+transform together, and the same table drives both the allocation and the
+manifest the loader walks. Storage is HF [out, in] row-major so checkpoint
+rows copy in unchanged; the column-major GEMM views are bound into the
+catalog entries after load. The registration shell inherits
+DecoderModelForCausalLM for lm_head, packed-batch logits gathering, and the
+meta-init/load/post-load hooks.
 
 The import-time and first-forward contract checks below fail fast on drift.
 """
@@ -325,48 +328,24 @@ class ModelingV2Core(DecoderModel):
         q_width = heads_q * head_dim
         kv_width = heads_kv * head_dim
 
-        # Weight declaration: HF [out, in] row-major storage so checkpoint
-        # rows copy in unchanged; GEMM consumes .t() column-major views
-        # built after load. The expert tensors are the exception — they are
-        # declared in the MoE op's kernel-ready layout (padded, row-permuted
-        # weights/scales/biases), which weights.py builds from the
-        # checkpoint's block/scale tensors during the load. Meta-init
-        # intercepts torch.empty here — real CUDA storage arrives when the
-        # engine materializes the registry.
-        def P(*shape, dtype=dt):
-            return nn.Parameter(torch.empty(*shape, dtype=dtype), requires_grad=False)
-
-        fc1_rows = 2 * self.inter_pad
-        w = nn.ParameterDict()
-        for i in range(num_layers):
-            w[f"l{i}_norm1"] = P(hidden)
-            w[f"l{i}_qkv"] = P(q_width + 2 * kv_width, hidden)
-            w[f"l{i}_qkv_bias"] = P(q_width + 2 * kv_width)
-            w[f"l{i}_sinks"] = P(heads_q, dtype=torch.float32)
-            w[f"l{i}_o"] = P(hidden, q_width)
-            w[f"l{i}_o_bias"] = P(hidden)
-            w[f"l{i}_norm2"] = P(hidden)
-            w[f"l{i}_router"] = P(num_experts, hidden)
-            w[f"l{i}_router_bias"] = P(num_experts)
-            w[f"l{i}_fc1_w"] = P(num_experts, fc1_rows, self.fc1_k_pad // 2, dtype=torch.uint8)
-            w[f"l{i}_fc1_s"] = P(num_experts, fc1_rows, self.fc1_k_pad // 32, dtype=torch.uint8)
-            w[f"l{i}_fc1_b"] = P(num_experts, fc1_rows, dtype=torch.float32)
-            w[f"l{i}_fc2_w"] = P(
-                num_experts,
-                self.fc2_rows_pad,
-                self.inter_pad // 2,
-                dtype=torch.uint8,
-            )
-            w[f"l{i}_fc2_s"] = P(
-                num_experts,
-                self.fc2_rows_pad,
-                self.inter_pad // 32,
-                dtype=torch.uint8,
-            )
-            w[f"l{i}_fc2_b"] = P(num_experts, self.fc2_rows_pad, dtype=torch.float32)
-        w["final_norm"] = P(hidden)
-        w["embed"] = P(cfg.vocab_size, hidden)
-        self.w = w
+        # The weight table in weights.py is the single declaration: shape,
+        # dtype, checkpoint source and load-time transform for each of the
+        # seventeen roles, stated once. Asking it for the dict is what keeps
+        # the keys from being named here as well.
+        self.w = _weights.declare(
+            num_layers=num_layers,
+            hidden=hidden,
+            q_width=q_width,
+            kv_width=kv_width,
+            heads_q=heads_q,
+            num_experts=num_experts,
+            vocab=cfg.vocab_size,
+            fc1_rows=2 * self.inter_pad,
+            fc1_k_pad=self.fc1_k_pad,
+            inter_pad=self.inter_pad,
+            fc2_rows_pad=self.fc2_rows_pad,
+            dtype=dt,
+        )
 
         self._targets: dict[Phase, Target] | None = None
         # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it: read once here
