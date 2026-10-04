@@ -120,7 +120,10 @@ def test_kolibri_gate_load_bias():
 
 @pytest.mark.cpu_only
 def test_kolibri_weight_mapper():
-    """Test Kolibri 1 weight mapper key remapping."""
+    """Test Kolibri 1 weight mapper key remapping and ConsumableWeightsDict support."""
+    from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
+        ConsumableWeightsDict,
+    )
     from tensorrt_llm._torch.models.checkpoints.hf.kolibri_weight_mapper import (
         Kolibri1HfWeightMapper,
     )
@@ -133,12 +136,59 @@ def test_kolibri_weight_mapper():
         "model.layers.0.shared_experts.gate_proj.weight": torch.zeros(512, 2560),
     }
 
+    # 1. Plain dict remapping
     remapped = mapper.preprocess_weights(raw_weights)
 
     assert "model.layers.0.mlp.gate.e_score_correction_bias" in remapped
     assert "model.layers.1.mlp.gate.e_score_correction_bias" in remapped
     assert "model.layers.2.mlp.gate.e_score_correction_bias" in remapped
     assert "model.layers.0.mlp.shared_experts.gate_proj.weight" in remapped
+
+    # 2. ConsumableWeightsDict ownership transfer
+    consumable = ConsumableWeightsDict(
+        {
+            "model.layers.0.moe.router.expert_bias": torch.zeros(384),
+            "model.layers.0.shared_experts.gate_proj.weight": torch.zeros(512, 2560),
+        }
+    )
+    remapped_consumable = mapper.preprocess_weights(consumable)
+    assert isinstance(remapped_consumable, ConsumableWeightsDict)
+    assert "model.layers.0.mlp.gate.e_score_correction_bias" in remapped_consumable
+    assert "model.layers.0.mlp.shared_experts.gate_proj.weight" in remapped_consumable
+
+    # 3. Verify params_map regex mappings
+    assert r"(.*)\.shared_experts\.(.*)" in mapper.params_map
+    assert r"(.*)moe\.router\.expert_bias(.*)" in mapper.params_map
+
+
+@pytest.mark.cpu_only
+def test_kolibri_causal_lm_load_weights_hook():
+    """Test Kolibri1ForCausalLM.load_weights invokes mapper preprocessing."""
+    from unittest.mock import MagicMock, patch
+
+    from tensorrt_llm._torch.models.checkpoints.hf.kolibri_weight_mapper import (
+        Kolibri1HfWeightMapper,
+    )
+    from tensorrt_llm._torch.models.modeling_kolibri import Kolibri1ForCausalLM
+
+    mapper = Kolibri1HfWeightMapper()
+    raw_weights = {
+        "model.layers.0.moe.router.expert_bias": torch.zeros(384),
+        "model.layers.0.shared_experts.gate_proj.weight": torch.zeros(512, 2560),
+    }
+
+    with patch.object(Kolibri1ForCausalLM, "__init__", return_value=None):
+        model = Kolibri1ForCausalLM(MagicMock())
+        with patch(
+            "tensorrt_llm._torch.models.modeling_speculative.SpecDecOneEngineForCausalLM.load_weights"
+        ) as mock_super_load:
+            model.load_weights(raw_weights, weight_mapper=mapper)
+            assert mock_super_load.called
+            call_kwargs = mock_super_load.call_args.kwargs
+            forwarded_weights = call_kwargs["weights"]
+            assert "model.layers.0.mlp.gate.e_score_correction_bias" in forwarded_weights
+            assert "model.layers.0.mlp.shared_experts.gate_proj.weight" in forwarded_weights
+            assert call_kwargs["params_map"] == mapper.params_map
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA GPU")

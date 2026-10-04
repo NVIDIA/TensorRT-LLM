@@ -13,9 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Dict, Union
+
+import torch
 from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 
@@ -37,12 +41,15 @@ class Kolibri1HfWeightMapper(Qwen3MoeHfWeightMapper):
             r"(.*)moe\.router\.expert_bias(.*)": r"\1mlp.gate.e_score_correction_bias\2",
             r"(.*)mlp\.expert_bias(.*)": r"\1mlp.gate.e_score_correction_bias\2",
             r"(.*)mlp\.gate\.expert_bias(.*)": r"\1mlp.gate.e_score_correction_bias\2",
+            r"(.*)\.shared_experts\.(.*)": r"\1.mlp.shared_experts.\2",
         }
 
     def init_model_and_config(self, model: nn.Module, config: ModelConfig):
         super().init_model_and_config(model, config)
 
-    def preprocess_weights(self, weights: dict) -> dict:
+    def preprocess_weights(
+        self, weights: Union[Dict[str, torch.Tensor], ConsumableWeightsDict]
+    ) -> Union[Dict[str, torch.Tensor], ConsumableWeightsDict]:
         remapped_weights = {}
         for k, v in weights.items():
             new_k = k
@@ -61,4 +68,5 @@ class Kolibri1HfWeightMapper(Qwen3MoeHfWeightMapper):
                 new_k = new_k.replace(".shared_experts.", ".mlp.shared_experts.")
 
             remapped_weights[new_k] = v
-        return remapped_weights
+        return ConsumableWeightsDict.take_ownership(weights, remapped_weights)
+

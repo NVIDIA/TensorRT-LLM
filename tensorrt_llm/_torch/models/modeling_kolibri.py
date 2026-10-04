@@ -24,6 +24,7 @@ from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm._torch.configs.kolibri import Kolibri1Config
 from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, register_auto_model
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
@@ -480,3 +481,24 @@ class Kolibri1ForCausalLM(SpecDecOneEngineForCausalLM[Kolibri1Model, Kolibri1Con
             model_config,
         )
         self.preload_weight_modules = self.model.preload_weight_modules
+
+    def load_weights(
+        self,
+        weights: Dict[str, torch.Tensor],
+        weight_mapper: Optional[BaseWeightMapper] = None,
+        skip_modules: List[str] = [],
+        params_map: Optional[Dict[str, str]] = None,
+        allow_partial_loading: bool = False,
+    ):
+        if weight_mapper is not None and hasattr(weight_mapper, "preprocess_weights"):
+            weights = weight_mapper.preprocess_weights(weights)
+        if params_map is None and weight_mapper is not None and hasattr(weight_mapper, "params_map"):
+            params_map = weight_mapper.params_map
+
+        super().load_weights(
+            weights=weights,
+            weight_mapper=weight_mapper,
+            skip_modules=skip_modules,
+            params_map=params_map,
+            allow_partial_loading=allow_partial_loading,
+        )
