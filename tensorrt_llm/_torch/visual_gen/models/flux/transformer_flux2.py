@@ -246,6 +246,7 @@ class Flux2TransformerBlock(nn.Module):
             config=config,
             layer_idx=layer_idx,
             module_name=f"transformer_blocks.{layer_idx}.attn",
+            supports_static_e4m3_attention=False,
         )
 
         # FFN for image stream (shared GatedMLP from _torch/modules)

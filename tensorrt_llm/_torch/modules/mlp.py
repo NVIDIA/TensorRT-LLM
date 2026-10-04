@@ -21,6 +21,68 @@ from .linear import (Linear, TensorParallelMode, UnquantizedLinearMethod,
                      is_static_nvfp4_input_eligible)
 
 
+def is_nvfp4_gemm_gelu_fusion_eligible(
+        module: Linear, activation: Callable[[torch.Tensor],
+                                             torch.Tensor]) -> bool:
+    """Return whether a static NVFP4 Linear and GELU can use the fused op."""
+    unwrapped_activation = getattr(activation, "__wrapped__", activation)
+    is_gelu_tanh = (activation is gelu_tanh
+                    or unwrapped_activation is gelu_tanh)
+    return (is_gelu_tanh and not module.gather_output
+            and get_sm_version() in (100, 103)
+            and is_static_nvfp4_input_eligible(module) and hasattr(
+                torch.ops.trtllm, "cute_dsl_nvfp4_dense_gemm_gelu_blackwell"))
+
+
+def fused_nvfp4_gemm_gelu(
+    module: Linear,
+    x: Union[torch.Tensor, tuple, Fp4QuantizedTensor],
+    output_input_scale: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Fp4QuantizedTensor]:
+    """Run an NVFP4 GEMM with a fused bias and GELU(tanh) epilogue.
+
+    Args:
+        module: NVFP4 Linear supplying the GEMM weights and input quantizer.
+        x: Plain or pre-quantized input tensor.
+        output_input_scale: Optional scale for fused FP4 output quantization.
+
+    Returns:
+        A BF16 tensor, or an Fp4QuantizedTensor when output_input_scale is set.
+    """
+    original_shape = None
+    if not isinstance(x, (tuple, Fp4QuantizedTensor)) and x.dim() > 2:
+        original_shape = x.shape
+        x = x.reshape(-1, x.shape[-1])
+    elif isinstance(x, Fp4QuantizedTensor) and x.fp4_tensor.dim() > 2:
+        # Fused GEMM needs a 2D mat1. The scaling factor is already flat-M.
+        original_shape = x.fp4_tensor.shape
+        x = Fp4QuantizedTensor(
+            fp4_tensor=x.fp4_tensor.reshape(-1, x.fp4_tensor.shape[-1]),
+            scaling_factor=x.scaling_factor,
+            is_sf_swizzled=x.is_sf_swizzled,
+        )
+
+    act_fp4, act_sf, alpha = module.quant_method._input_prepare(module, x)
+
+    if output_input_scale is not None:
+        fp4_output, out_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell(
+            act_fp4, module.weight, act_sf, module.weight_scale, alpha,
+            output_input_scale, module.bias)
+        if original_shape is not None:
+            fp4_output = fp4_output.reshape(*original_shape[:-1],
+                                            fp4_output.shape[-1])
+        return Fp4QuantizedTensor(fp4_output, out_sf)
+
+    output = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_gelu_blackwell(
+        act_fp4, module.weight, act_sf, module.weight_scale, alpha,
+        module.dtype, module.bias)
+    if output.shape[-1] > module.out_features:
+        output = output[..., :module.out_features].contiguous()
+    if original_shape is not None:
+        output = output.reshape(*original_shape[:-1], output.shape[-1])
+    return output
+
+
 class MLP(nn.Module):
 
     def __init__(
@@ -219,12 +281,8 @@ class MLP(nn.Module):
         down_proj and the nvfp4_sfc_finalize op. The runtime quant_method check
         is applied in forward (quant_method can be downgraded after this).
         """
-        if (self.activation is not gelu_tanh or self.up_proj.gather_output
-                or get_sm_version() not in (100, 103) or not getattr(
-                    self.up_proj, "has_nvfp4_activation_quantization", False)):
-            return False, False, False
-        bf16_ok = hasattr(torch.ops.trtllm,
-                          "cute_dsl_nvfp4_dense_gemm_gelu_blackwell")
+        bf16_ok = is_nvfp4_gemm_gelu_fusion_eligible(self.up_proj,
+                                                     self.activation)
         fp4_ok = (bf16_ok and hasattr(
             torch.ops.trtllm, "cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell")
                   and is_static_nvfp4_input_eligible(self.down_proj))
