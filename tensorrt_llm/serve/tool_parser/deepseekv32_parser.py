@@ -308,6 +308,37 @@ class DeepSeekV32Parser(BaseToolParser):
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=normal_text + current_text)
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release text the stream ended on while it was still withheld.
+
+        ``parse_streaming_increment`` holds the buffer back whenever its tail
+        could still grow into a DSML delimiter, and releases it as soon as the
+        next chunk resolves the ambiguity. When generation stops instead --
+        max_tokens, a stop string, an abort -- nothing resolves it, and the
+        base class's no-op ``finish`` drops whatever was held. A response
+        ending on ``<`` loses every character buffered since the last release,
+        silently: the request succeeds and the tail of the answer is missing.
+
+        Only a buffer with no tool-call section is released. Text that precedes
+        a section is already streamed by the increment path, so what remains
+        there is partial DSML markup rather than content, and surfacing that
+        raw would trade one defect for another.
+        """
+        buffer = self._buffer
+        if not buffer:
+            return StreamingParseResult()
+
+        start_tokens = [self.bot_token, self._INVOKE_HEADER_PREFIX]
+        if any(idx != -1 for idx in map(buffer.find, start_tokens)):
+            return StreamingParseResult()
+
+        self._buffer = ""
+        # The same delimiters the increment path strips before emitting, so a
+        # stream that ended just after one does not show it to the caller.
+        for token in (self.eot_token, self.invoke_end_token, self._eos_token):
+            buffer = buffer.replace(token, "")
+        return StreamingParseResult(normal_text=buffer)
+
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
             begin=f'<｜DSML｜invoke name="{name}">',
