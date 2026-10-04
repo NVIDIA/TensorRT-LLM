@@ -1651,6 +1651,25 @@ class SpecWorkerBase(nn.Module, ABC):
     def _forward_impl(self, *args, **kwargs):
         """Worker-specific forward logic, called by SpecWorkerBase.forward."""
 
+    def target_logits(self, hidden_states: torch.Tensor, lm_head,
+                      logits_processor, attn_metadata, spec_metadata,
+                      draft_model) -> torch.Tensor:
+        """The target logits of the gathered rows ``hidden_states``, which
+        the model hands to ``forward`` as ``logits``: fp32 [rows, vocab].
+
+        A worker whose acceptance reads another layout overrides this. If its
+        ``forward`` then returns this TP rank's vocabulary shard as
+        ``"logits"``, it also returns ``"logits_vocab_shard": True``, and the
+        engine gathers the logits (on every TP rank together, so not under
+        attention DP) before any logits post-processor sees them; the
+        post-processors get a read-only view, since the acceptance already
+        ran inside ``forward``. Such a worker applies a guided decoder's
+        bitmask to its shard at the shard's column offset, or rejects guided
+        decoding.
+        """
+        return logits_processor.forward(hidden_states, lm_head, attn_metadata,
+                                        True)
+
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         """Restore attn-metadata spec-dec state if a failure skipped it.
 

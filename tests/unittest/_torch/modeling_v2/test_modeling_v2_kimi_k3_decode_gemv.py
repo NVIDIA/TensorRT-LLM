@@ -3,9 +3,10 @@
 """The Kimi K3 target's decode GEMVs, LM head and embedding on the catalog's single-GPU entries (``decode_gemv.py``
 of ``kimi_k3_mxfp4__sm_100__tp16_moetp4ep4``), on one GPU.
 
-* Each GEMV site at every row count it takes (1..8, and 9..64 where k3_ctm_gemv_wide takes it): the bits of its
-  catalog entry's call, within 8e-3 of ``max |ref|`` of a float64 product (the sigmoid columns within 1e-2 of the
-  sigmoid of it); declined above its rows, at another shape or dtype, and under capture before an eager call.
+* Each GEMV site at every row count it takes (1..8, and 9..its ``wide_rows`` where k3_ctm_gemv_wide takes it): the
+  bits of its catalog entry's call (fp32 at an ``out_fp32`` site), within 8e-3 of ``max |ref|`` of a float64 product
+  (the sigmoid columns within 1e-2 of the sigmoid of it; a SiLU-and-mul site's product taken of torch's bf16
+  ``silu(gate) * up``); declined above its rows, at another shape or dtype, and under capture before an eager call.
 * The LM head through ``K3LogitsProcessor`` on a real ``LMHead`` (one rank): fp32 logits from ``k3_head_gemv``
   within the same bound, the stock processor's rows selected, the stock path above 8 rows and before the state is
   built.
@@ -22,8 +23,12 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.k3_situ_mul import k3_situ_mul
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv import k3_ctm_gemv
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_long import (
     k3_ctm_gemv_long,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_swiglu import (
+    k3_ctm_gemv_swiglu,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_wide import (
     k3_ctm_gemv_wide,
@@ -81,16 +86,30 @@ def _bits(t):
 def _entry(spec, rows, x, w):
     """The site's catalog entry called directly: what ``project`` must reproduce bit for bit."""
     if rows > decode_gemv.MAX_ROWS or spec.small == "wide":
-        return k3_ctm_gemv_wide(x, w, sig_col0=spec.sig_col0)
+        return k3_ctm_gemv_wide(x, w, sig_col0=spec.sig_col0, out_fp32=spec.out_fp32)
     if spec.small == "decode":
         return k3_decode_gemv(x, w)
+    if spec.small == "ctm":
+        return k3_ctm_gemv(x, w, split=spec.split, push=spec.push)
+    if spec.small == "swiglu":
+        return k3_ctm_gemv_swiglu(x, w, split=spec.split, push=spec.push)
     return k3_ctm_gemv_long(
         x, w, sig_col0=spec.sig_col0, split=spec.split, ring=spec.ring, push=spec.push
     )
 
 
 def _site_rows(spec):
-    return list(ROWS) + ([9, 16, 24, 40, 64] if spec.wide else [])
+    return list(ROWS) + (
+        [m for m in (9, 16, 24, 32, 40, 64) if m <= spec.wide_rows] if spec.wide else []
+    )
+
+
+def _product_input(spec, x):
+    """The rows the site's weight multiplies: ``x``, or a SiLU-and-mul site's torch bf16 ``silu(gate) * up``."""
+    if spec.small != "swiglu":
+        return x
+    gate, up = x.float().chunk(2, dim=-1)
+    return (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
 
 
 @pytest.mark.parametrize("site", list(decode_gemv.SITES))
@@ -100,21 +119,22 @@ def test_site(site):
     w = _weight(spec.n, spec.k, seed=len(site))
     gemvs = decode_gemv.K3DecodeGemvs.create(None, sites=[site])
     for m in _site_rows(spec):
-        x = _rows(m, spec.k, seed=m)
+        x = _rows(m, decode_gemv._width(spec), seed=m)
         y = gemvs.project(site, x, w)
         assert y is not None and y.shape == (m, spec.n), (site, m)
+        assert y.dtype == (torch.float32 if spec.out_fp32 else torch.bfloat16), (site, y.dtype)
         assert torch.equal(_bits(y), _bits(_entry(spec, m, x, w))), (site, m)
-        _check_product(y, x, w, spec.sig_col0)
+        _check_product(y, _product_input(spec, x), w, spec.sig_col0)
 
 
-@pytest.mark.parametrize("site", ["kv_a", "mla_ag"])
+@pytest.mark.parametrize("site", ["kv_a", "mla_ag", "moe_head"])
 def test_site_declines(site):
     """More rows than the site takes, another weight shape, a non-bf16 input, and under capture before any eager
     call: None, nothing launched."""
     spec = decode_gemv.SITES[site]
     w = _weight(spec.n, spec.k, seed=1)
     gemvs = decode_gemv.K3DecodeGemvs.create(None, sites=[site])
-    too_many = decode_gemv.WIDE_ROWS + 1 if spec.wide else decode_gemv.MAX_ROWS + 1
+    too_many = spec.wide_rows + 1 if spec.wide else decode_gemv.MAX_ROWS + 1
     assert gemvs.project(site, _rows(too_many, spec.k, seed=9), w) is None
     assert (
         gemvs.project(site, _rows(4, spec.k, seed=4), _weight(spec.n + 128, spec.k, seed=2)) is None

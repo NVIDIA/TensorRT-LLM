@@ -16,7 +16,9 @@
 sync patterns): a tcgen05 operation issued after an mbarrier wait follows ``tcgen05.fence::after_thread_sync``, and a
 thread whose TMEM loads another thread's tcgen05 work must not overtake (an mbarrier arrive or a CTA barrier after
 ``tcgen05.wait::ld``) issues ``tcgen05.fence::before_thread_sync`` first. Without them ptxas may move the TMEM access
-across the synchronization; no test of values can see it, so the kernels' sources are read.
+across the synchronization; no test of values can see it, so the kernels' sources are read. A tcgen05 operation that
+reads shared memory filled by generic-proxy writes (cp.async) also follows ``fence.proxy.async.shared::cta`` after the
+wait that orders those writes.
 
   pytest test_k3_tcgen05_fences.py
 """
@@ -29,6 +31,16 @@ import pytest
 KERNELS = [
     "tensorrt_llm._torch.cute_dsl_kernels.k3_ctm_gemv.k3_ctm_gemv_kernel",
     "tensorrt_llm._torch.cute_dsl_kernels.k3_decode_gemv.k3_decode_gemv_kernel",
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.k3_moe_front",
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.k3_moe_kernel",
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.k3_moe_m1_kernel",
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.k3_moe_m2_kernel",
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_kda_attn.k3_kda_attn_kernel",
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_kda_attn.k3_kda_decode_kernel",
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_kda_verify.k3_kda_verify_kernel",
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_mla.k3_mla_attn_kernel",
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_mla.k3_mla_q_kernel",
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich.k3_sandwich_kernel",
 ]
 
 # Thread syncs that order other threads' work before a tcgen05 operation of this thread. Waits on a barrier only TMA
@@ -44,6 +56,13 @@ AFTER = "Tcgen05Fence.AFTER_THREAD_SYNC"
 BEFORE = "Tcgen05Fence.BEFORE_THREAD_SYNC"
 LOAD_WAIT = "Tcgen05Wait.LOAD"
 SYNC = re.compile(r"mbarrier_arrive\(|barrier_cta_sync\(|cute\.arch\.barrier\(")
+
+# Kernel module -> the barriers whose stages hold shared memory that generic-proxy writes fill and a tcgen05 operation
+# reads after the wait (k3_moe: the FC1 activation scales, copied in by cp.async and read by tcgen05.cp).
+GENERIC_FED = {
+    "tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.k3_moe_kernel": ("ab_full_fc1",),
+}
+PROXY_FENCE = re.compile(r"fence_proxy\(\s*(\"async_shared\"|prims\.Proxy\.ASYNC_SHARED)")
 
 
 def violations(lines):
@@ -79,6 +98,25 @@ def violations(lines):
     return out
 
 
+def generic_reads(lines, barriers):
+    """(line number of the wait, whether it is fenced) for each wait on a listed barrier (named on the wait's line or
+    the next) that reaches a tcgen05 operation; fenced means ``fence.proxy.async`` lies between the two."""
+    code = [ln.split("#", 1)[0] for ln in lines]
+    out = []
+    for i, ln in enumerate(code):
+        window = ln + (code[i + 1] if i + 1 < len(code) else "")
+        if WAIT.search(ln) and any(re.search(rf"\b{name}\b", window) for name in barriers):
+            fenced = False
+            for later in code[i + 1 :]:
+                if later.lstrip().startswith("def "):
+                    break
+                fenced = fenced or bool(PROXY_FENCE.search(later))
+                if TCGEN05_OP.search(later):
+                    out.append((i + 1, fenced))
+                    break
+    return out
+
+
 def test_checker_catches_the_patterns():
     """The checker flags both missing fences (and accepts the fenced forms)."""
     bad = [
@@ -109,3 +147,32 @@ def test_kernel_fences(module):
     with open(path) as f:
         found = violations(f.read().split("\n"))
     assert not found, f"{path}: {found}"
+
+
+def test_checker_catches_an_unfenced_generic_read():
+    """The proxy check flags a tcgen05 read after the wait without fence.proxy.async (and accepts the fenced form)."""
+    wait = [
+        "def f():",
+        "    while not cute.arch.mbarrier_try_wait(",
+        "        ab_full_fc1.subview(stage).data_ptr(), phase",
+        "    ):",
+        "        pass",
+    ]
+    copy = ["    prims.tcgen05_cp(shape, tmem_ptr, desc)"]
+    fence = ['    prims.fence_proxy("async_shared", space=prims.SharedSpace.shared_cta)']
+    assert generic_reads(wait + copy, ("ab_full_fc1",)) == [(2, False)]
+    assert generic_reads(wait + fence + copy, ("ab_full_fc1",)) == [(2, True)]
+
+
+@pytest.mark.parametrize(
+    "module", list(GENERIC_FED), ids=[m.rsplit(".", 1)[1] for m in GENERIC_FED]
+)
+def test_generic_proxy_reads_fenced(module):
+    path = importlib.util.find_spec(module).origin
+    with open(path) as f:
+        reads = generic_reads(f.read().split("\n"), GENERIC_FED[module])
+    assert reads, f"{path}: no wait on {GENERIC_FED[module]} reaches a tcgen05 operation"
+    unfenced = [line for line, fenced in reads if not fenced]
+    assert not unfenced, (
+        f"{path}: no fence.proxy.async between the waits at lines {unfenced} and their tcgen05 reads"
+    )

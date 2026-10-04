@@ -242,7 +242,9 @@ def test_an_unknown_mode_raises_rather_than_falling_back(monkeypatch):
 
 _SM100 = (10, 0)
 _TP16_MOETP4EP4 = dict(world_size=16, tp_size=16, moe_tp_size=4, moe_ep_size=4)
+_TP16_MOETP16EP1 = dict(world_size=16, tp_size=16, moe_tp_size=16, moe_ep_size=1)
 _K3_TARGET = "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4"
+_K3_TARGET_B = "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1"
 
 
 def _k3_config(text_as_dict=False, **text_overrides):
@@ -339,10 +341,25 @@ def test_kimi_k3_tp16_moetp4ep4_matches(monkeypatch, mode, text_as_dict):
 
 
 @pytest.mark.usefixtures("_on_sm100")
-def test_kimi_k3_target_registers_and_counts_as_external():
-    config = _k3_model_config(_k3_config(), **_TP16_MOETP4EP4)
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("text_as_dict", [False, True], ids=["text-config", "text-dict"])
+def test_kimi_k3_tp16_moetp16ep1_matches(monkeypatch, mode, text_as_dict):
+    """Route B: the experts split 16 ways by tensor, set explicitly."""
+    _set_mode(monkeypatch, mode)
+    config = _k3_model_config(_k3_config(text_as_dict=text_as_dict), **_TP16_MOETP16EP1)
+    assert modeling_v2_resolve(config) == _K3_TARGET_B
+
+
+@pytest.mark.usefixtures("_on_sm100")
+@pytest.mark.parametrize(
+    "mapping_kwargs, target",
+    [(_TP16_MOETP4EP4, _K3_TARGET), (_TP16_MOETP16EP1, _K3_TARGET_B)],
+    ids=["tp16_moetp4ep4", "tp16_moetp16ep1"],
+)
+def test_kimi_k3_target_registers_and_counts_as_external(mapping_kwargs, target):
+    config = _k3_model_config(_k3_config(), **mapping_kwargs)
     cls = get_registered_model_class(modeling_v2_resolve(config))
-    assert cls is not None and cls.__name__ == _K3_TARGET
+    assert cls is not None and cls.__name__ == target
     assert not _is_builtin_model_class(cls)
 
 
@@ -369,10 +386,20 @@ def test_kimi_k3_other_quantizations_do_not_match(monkeypatch, quant_algo):
     [
         # a Kimi-family checkpoint of another depth
         (dict(num_hidden_layers=61), _TP16_MOETP4EP4, "shape"),
-        # route B's expert split: experts tensor-parallel 16 ways, no target yet
-        (dict(), dict(world_size=16, tp_size=16, moe_tp_size=16, moe_ep_size=1), "parallel"),
+        # the expert split left unset: the mapping resolves to moe_tp 16 x moe_ep 1, but the built-in model runs
+        # that default as expert parallelism over the 16 ranks, a layout no target serves
+        (dict(), dict(world_size=16, tp_size=16), "parallel"),
+        # experts split 16 ways by expert, set explicitly
+        (dict(), dict(world_size=16, tp_size=16, moe_tp_size=1, moe_ep_size=16), "parallel"),
         # attention data parallelism splits the requests, not the heads
         (dict(), dict(_TP16_MOETP4EP4, enable_attention_dp=True), "parallel"),
+        (dict(), dict(_TP16_MOETP16EP1, enable_attention_dp=True), "parallel"),
+        # pipeline parallelism over the 16 ranks
+        (
+            dict(),
+            dict(world_size=16, tp_size=8, pp_size=2, moe_tp_size=8, moe_ep_size=1),
+            "parallel",
+        ),
         # one tray instead of four
         (dict(), dict(world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4), "parallel"),
     ],

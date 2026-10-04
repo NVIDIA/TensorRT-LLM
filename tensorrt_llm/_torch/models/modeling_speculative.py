@@ -1783,9 +1783,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                     spec_config)
 
-                self.draft_model = get_draft_model(model_config,
-                                                   self.draft_config,
-                                                   self.lm_head, self.model)
+                self.draft_model = self._build_draft_model(
+                    model_config, self.draft_config)
                 if spec_config.uses_replacement_heads:
                     self.draft_config = self.draft_model.model_config
                 if self.draft_model is not None:
@@ -1807,6 +1806,18 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.spec_worker.set_draft_model(self.draft_model)
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
+
+    def _build_draft_model(
+            self, model_config: ModelConfig,
+            draft_config: Optional[ModelConfig]) -> Optional[nn.Module]:
+        """Build the draft model for ``model_config``'s speculative mode.
+
+        The default is the mode registry's builder (``get_draft_model``). A
+        model that owns its drafter overrides this; ``__init__`` calls it once,
+        after ``draft_config`` is resolved and before the worker is built.
+        """
+        return get_draft_model(model_config, draft_config, self.lm_head,
+                               self.model)
 
     def setup_aliases(self) -> None:
         if (self.draft_model is not None
@@ -1840,12 +1851,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
         if self.spec_worker is not None:
-            # get logits
-            logits = self.logits_processor.forward(
+            # The target logits, in the layout the worker's acceptance reads.
+            logits = self.spec_worker.target_logits(
                 hidden_states[spec_metadata.gather_ids],
                 self.lm_head,
+                self.logits_processor,
                 attn_metadata,
-                True,
+                spec_metadata,
+                self.draft_model,
             )
 
             # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with
