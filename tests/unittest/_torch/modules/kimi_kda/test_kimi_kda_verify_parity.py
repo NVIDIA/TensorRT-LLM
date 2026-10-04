@@ -94,7 +94,7 @@ def test_forward_preserves_native_int32_state_indices(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_forward_uses_metadata_aligned_generation_state_indices(
+def test_forward_uses_generation_state_indices_slice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     attention = KimiKDALinearAttention(_Cfg(), layer_idx=0).cuda()
@@ -112,6 +112,8 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
         conv_pool: torch.Tensor,
         ssm_pool: torch.Tensor,
         slot_indices: torch.Tensor,
+        replay_metadata=None,
+        is_dummy: torch.Tensor | None = None,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         captured["slot_indices"] = slot_indices
@@ -122,11 +124,10 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
     layer_cache = SimpleNamespace(
         conv=torch.empty(0, device="cuda"),
         temporal=torch.empty(0, device="cuda"),
+        has_kda_replay_caches=False,
     )
 
     class KdaCacheManager:
-        use_kda_replay_update = True
-
         def __init__(self) -> None:
             self.state_indices = torch.tensor([9, 4], dtype=torch.int32, device="cuda")
 
@@ -154,16 +155,13 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
     metadata.mamba_metadata = mamba_metadata
     hidden_states = torch.empty(4, _Cfg.hidden_size, dtype=torch.bfloat16, device="cuda")
     generation_slice = mamba_metadata.state_indices[1:]
-    aligned_indices = mamba_metadata.generation_state_indices
 
     assert generation_slice.data_ptr() % 16 != 0
-    assert aligned_indices.data_ptr() % 16 == 0
 
     output = attention(hidden_states, metadata)
 
     assert output.shape == hidden_states.shape
-    assert captured["slot_indices"].data_ptr() == aligned_indices.data_ptr()
-    torch.testing.assert_close(aligned_indices, generation_slice)
+    assert captured["slot_indices"].data_ptr() == generation_slice.data_ptr()
 
 
 class _LayerCache:
@@ -176,8 +174,8 @@ class _LayerCache:
         self.intermediate_ssm = torch.zeros(
             slots, t_max, h, v, k, dtype=torch.float32, device=device
         )
-        # This double drives the sequential-verify path, not the KDA
-        # fused-replay path, so it has no kda_* replay caches.
+        # This double drives the sequential-verify path, so it has no KDA
+        # replay histories.
         self.has_kda_replay_caches = False
 
 
