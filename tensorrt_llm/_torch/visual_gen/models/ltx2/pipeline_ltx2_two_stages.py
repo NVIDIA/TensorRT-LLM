@@ -1728,9 +1728,18 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # Add noise at the first sigma level using flow-matching interpolation:
         #   z_t = noise * sigma + clean * (1 - sigma)
         # This matches the reference GaussianNoiser, NOT additive noise.
+        # Draw the video noise in the un-patchified (B, C, F, H, W) layout and
+        # patchify it, as Stage 1 does for its initial latents. v_latents is a
+        # non-contiguous token-order view of that layout, so drawing directly in
+        # its shape would assign a different sample to each latent element.
         sigma_0 = sigmas[0]
-        v_noise = randn_tensor(
-            v_latents.shape, generator=generator, device=v_latents.device, dtype=v_latents.dtype
+        v_noise = self.video_patchifier.patchify(
+            randn_tensor(
+                video_latents.shape,
+                generator=generator,
+                device=v_latents.device,
+                dtype=v_latents.dtype,
+            )
         )
         v_working = v_noise * sigma_0 + v_latents * (1.0 - sigma_0)
 
