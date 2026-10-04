@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for Python, Cpp, and V2 Mamba cache managers."""
 
+import math
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -77,6 +78,7 @@ from tensorrt_llm.llmapi.llm_utils import (
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    GPU_LEVEL,
     AttentionLayerConfig,
     BatchDesc,
     BufferConfig,
@@ -300,12 +302,16 @@ def _kimi_model_config() -> SimpleNamespace:
         quant_config=None,
         sparse_attention_config=None,
         get_num_mamba_layers=lambda: 2,
+        # get_kv_cache_manager_cls reads the mapping and spec config (helix check).
+        mapping=None,
+        spec_config=None,
     )
 
 
 def _capture_kimi_v2_manager_ctor(
     monkeypatch: pytest.MonkeyPatch,
     spec_config=None,
+    model_engine=None,
 ) -> tuple[tuple, dict]:
     """Route a Kimi config through _create_kv_cache_manager with an explicit
     V2 manager and capture the constructor arguments."""
@@ -324,7 +330,7 @@ def _capture_kimi_v2_manager_ctor(
     assert get_kv_cache_manager_cls(model_config, kv_cache_config) is MambaHybridCacheManagerV2
 
     _create_kv_cache_manager(
-        model_engine=None,
+        model_engine=model_engine,
         kv_cache_manager_cls=RecordingV2Manager,
         mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
         kv_cache_config=kv_cache_config,
@@ -380,6 +386,33 @@ def test_kimi_explicit_v2_manager_enables_kda_replay(
 
     assert kwargs["kda_replay_num_spec"] == spec_config.tokens_per_gen_step - 1
     assert kwargs["conv_state_layout"] == "q_k_v"
+    assert "kda_token_states" not in kwargs
+
+
+@pytest.mark.parametrize("backbone_asks", [True, False])
+def test_kimi_explicit_v2_manager_kda_token_states_follow_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+    backbone_asks: bool,
+) -> None:
+    """The factory asks the V2 manager for per-token KDA verify states only when
+    the model's backbone sets ``kda_token_states``."""
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
+        lambda: True,
+    )
+    backbone = SimpleNamespace(kda_token_states=True) if backbone_asks else SimpleNamespace()
+    model_engine = SimpleNamespace(
+        model=SimpleNamespace(model=backbone),
+        _max_cuda_graph_batch_size=4,
+        is_multimodal=True,
+    )
+
+    _, kwargs = _capture_kimi_v2_manager_ctor(
+        monkeypatch, MTPDecodingConfig(max_draft_len=3), model_engine
+    )
+
+    assert kwargs["kda_replay_num_spec"] == 3
+    assert kwargs.get("kda_token_states", False) is backbone_asks
 
 
 def test_kimi_explicit_v2_manager_uses_qkv_convolution_layout(
@@ -2353,6 +2386,7 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_n_groups=1,
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
+    kda_token_states=False,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
@@ -2407,6 +2441,7 @@ def _build_v2_hybrid_with_mamba_layer(
         dtype=dtype,
         conv_state_layout=conv_state_layout,
         kda_replay_num_spec=kda_replay_num_spec,
+        kda_token_states=kda_token_states,
     )
 
 
@@ -3629,6 +3664,43 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
         )
         assert layer_cache.intermediate_ssm is None
         assert layer_cache.intermediate_conv_window is None
+        assert layer_cache.kda_state_tok is None
+        assert not mgr.keeps_kda_token_states
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("kda_replay_num_spec", [2, None])
+def test_v2_kda_token_states_allocated_with_the_replay_caches(kda_replay_num_spec):
+    """With the replay caches, ``kda_token_states`` adds the fp32 state after every
+    draft of each slot, per layer; without them it allocates nothing."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=4,
+        num_mamba_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        conv_state_layout="q_k_v",
+        mamba_d_conv=5,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
+        mamba_ssm_cache_dtype=torch.float32,
+        kda_replay_num_spec=kda_replay_num_spec,
+        kda_token_states=True,
+    )
+    try:
+        if kda_replay_num_spec is None:
+            assert getattr(mgr, "kda_state_tok", None) is None
+            assert not mgr.keeps_kda_token_states
+            return
+        assert mgr.keeps_kda_token_states
+        for layer_idx in range(2):
+            layer_cache = mgr.mamba_layer_cache(layer_idx)
+            cache_size = layer_cache.temporal.shape[0]
+            states = layer_cache.kda_state_tok
+            assert states.shape == (cache_size, 2, *layer_cache.temporal.shape[1:])
+            assert states.dtype is torch.float32
+            assert states.data_ptr() == mgr.kda_state_tok[layer_idx].data_ptr()
+            assert not states.any()
     finally:
         mgr.shutdown()
 
@@ -3674,6 +3746,180 @@ def test_v2_kda_replay_validates_configuration(
             conv_state_layout=conv_state_layout,
             kda_replay_num_spec=num_spec,
         )
+
+
+def _v2_kda_token_state_manager(kda_token_states, enable_block_reuse):
+    """A V2 hybrid manager stub for _build_cache_config: one KDA layer with the replay caches and one attention
+    layer."""
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._generation_kv_capacity_headroom = 1
+    mgr._has_cp_helix = False
+    mgr.kv_cache_type = CacheTypeCpp.SELF
+    mgr.head_dim_per_layer = [64, 64]
+    mgr.pp_layers = [0, 1]
+    mgr._mamba_layer_mask = [True, False]
+    # One 2 MiB grain per state slot, so the pool's slot count follows its grains (a Kimi K3 slot holds 27 MB).
+    mgr.ssm_bytes = 2 << 20
+    mgr.conv_bytes = 64 << 10
+    mgr.max_attention_window_vec = [128, 128]
+    mgr.max_batch_size = 2
+    mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+    mgr.max_seq_len = 128
+    mgr.max_num_tokens = 128
+    mgr.tokens_per_block = 32
+    mgr.num_local_layers = 2
+    mgr.local_num_mamba_layers = 1
+    mgr._num_reserved_dummy_slots = 1
+    mgr.dtype = DataType.HALF
+    mgr.enable_swa_scratch_reuse = False
+    mgr.enable_stats = False
+    mgr.num_extra_kv_tokens = 0
+    mgr.get_layer_bytes_per_token = lambda **kwargs: 8
+    # Layer 1's 256-byte pages of 32 tokens (_base_attention_layer_configs; layer 0 becomes the SSM layer).
+    mgr._attention_cache_bytes_per_token = lambda: 8
+    mgr._use_kda_replay_update = True
+    mgr._kda_token_states = kda_token_states
+    # The per-token states count in each slot's state bytes (_mamba_state_bytes_per_slot): num_spec fp32 states of
+    # the SSM state shape, 2 MiB each here.
+    mgr._kda_replay_num_spec = 2
+    mgr.ssm_state_shape = [8, 256, 256]
+    mgr.kv_cache_config = KvCacheConfig(
+        avg_seq_len=64,
+        enable_block_reuse=enable_block_reuse,
+        enable_partial_reuse=False,
+    )
+    return mgr
+
+
+@pytest.mark.parametrize(
+    ("kda_token_states", "enable_block_reuse", "at_floor"),
+    [(True, False, True), (False, False, False), (False, True, False)],
+)
+def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
+    kda_token_states, enable_block_reuse, at_floor
+):
+    """The per-token KDA states take memory per SSM slot beside the V2 pools. Without block reuse the SSM pool keeps
+    only its live floor, the states' bytes come out of the quota, and attention gets the rest; without the states
+    (replay caches only, with or without block reuse) the typical step's ratio sizes the pool."""
+    mgr = _v2_kda_token_state_manager(kda_token_states, enable_block_reuse)
+    base_config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=128 << 20)],
+        layers=_base_attention_layer_configs(2),
+    )
+    runtime_manager = RuntimeKVCacheManager(mgr._build_cache_config(base_config))
+    try:
+        slots = {}
+        for stats in runtime_manager.get_storage_statistics():
+            sizes = stats.slot_sizes if hasattr(stats, "slot_sizes") else stats.slot_size
+            role = "ssm" if mgr.ssm_bytes in [int(s) for s in sizes] else "attention"
+            slots[role] = int(stats.total)
+        pool_bytes = runtime_manager.get_quota(GPU_LEVEL)
+    finally:
+        runtime_manager.shutdown()
+
+    floor = mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots
+    if at_floor:
+        # The floor's min-slots constraint is scaled by 1 / max_util_for_resume (0.97).
+        assert floor <= slots["ssm"] <= floor + 1
+        # kda_state_tok, allocated beside the pools: (layers, SSM slots, num_spec, *ssm_state_shape) fp32.
+        token_state_bytes = (
+            mgr.local_num_mamba_layers
+            * slots["ssm"]
+            * mgr._kda_replay_num_spec
+            * math.prod(mgr.ssm_state_shape)
+            * 4
+        )
+        # The pools and the states fit in the quota, and attention takes the rest of it, to within one 2 MiB grain.
+        assert (128 << 20) - (2 << 20) < pool_bytes + token_state_bytes <= 128 << 20
+    else:
+        assert slots["ssm"] > 10 * floor
+
+
+@pytest.mark.parametrize("off_the_floor", ["block_reuse", "pool_ratio", "no_attention"])
+def test_v2_kda_token_states_refuse_a_pool_off_the_live_floor(off_the_floor):
+    """kda_state_tok is allocated for every slot the SSM pool keeps, so with block reuse, a pool_ratio, or no
+    attention layers on the rank (the SSM pool sized by its ratio, its slot count unknown before sizing) the build
+    refuses the per-token states instead of allocating them outside the quota."""
+    mgr = _v2_kda_token_state_manager(
+        kda_token_states=True, enable_block_reuse=off_the_floor == "block_reuse"
+    )
+    pool_ratio = None
+    if off_the_floor == "pool_ratio":
+        pool_ratio = [0.5, 0.5]
+    elif off_the_floor == "no_attention":
+        mgr._attention_cache_bytes_per_token = lambda: 0
+    with pytest.raises(ValueError, match="need the SSM pool at its live floor"):
+        mgr._build_cache_config(
+            KVCacheManagerConfig(
+                tokens_per_block=32,
+                cache_tiers=[GpuCacheTierConfig(quota=128 << 20)],
+                layers=_base_attention_layer_configs(2),
+                initial_pool_ratio=pool_ratio,
+            )
+        )
+
+
+def test_v2_kda_token_states_reserve_quota_before_sizing():
+    """At the live floor the token states of every slot the SSM pool keeps come out of the GPU quota before the pools
+    are sized, and the minimum quota and the quota for max_tokens count them all."""
+    mgr = _v2_kda_token_state_manager(kda_token_states=True, enable_block_reuse=False)
+    plain = _v2_kda_token_state_manager(kda_token_states=False, enable_block_reuse=False)
+    assert mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots == 3
+    # The pool keeps ceil(3 / max_util_for_resume) = 4 slots, each with 2 fp32 token states of 2 MiB; the quotas
+    # without token states differ by exactly those.
+    reserved = 4 * 2 * (2 << 20)
+    minimum = mgr._minimum_live_gpu_quota()
+    assert minimum - plain._minimum_live_gpu_quota() == reserved
+    for max_tokens in (0, 4096):
+        assert (
+            mgr._get_quota_from_max_tokens(max_tokens)
+            - plain._get_quota_from_max_tokens(max_tokens)
+            == reserved
+        )
+
+    def build(quota):
+        return mgr._build_cache_config(
+            KVCacheManagerConfig(
+                tokens_per_block=32,
+                cache_tiers=[GpuCacheTierConfig(quota=quota)],
+                layers=_base_attention_layer_configs(2),
+            )
+        )
+
+    with pytest.raises(ValueError, match="too small for live recurrent states"):
+        build(minimum - 1)
+    assert build(minimum).cache_tiers[0].quota == minimum - reserved
+    assert build(128 << 20).cache_tiers[0].quota == (128 << 20) - reserved
+
+
+def test_v2_kda_token_states_reserve_the_slots_the_runtime_keeps():
+    """The quota checks and the build count the same slots when floor / max_util_for_resume is a whole number in
+    exact arithmetic: the runtime holds the ratio as a C++ float, so 19 / 0.95 keeps 21 slots, not 20."""
+    mgr = _v2_kda_token_state_manager(kda_token_states=True, enable_block_reuse=False)
+    plain = _v2_kda_token_state_manager(kda_token_states=False, enable_block_reuse=False)
+    for m in (mgr, plain):
+        m.max_batch_size = 18
+        m.kv_cache_config = KvCacheConfig(
+            avg_seq_len=64,
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+            max_util_for_resume=0.95,
+        )
+    assert mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots == 19
+    reserved = 21 * 2 * (2 << 20)
+    minimum = mgr._minimum_live_gpu_quota()
+    assert minimum - plain._minimum_live_gpu_quota() == reserved
+    quota = minimum + (64 << 20)
+    built = mgr._build_cache_config(
+        KVCacheManagerConfig(
+            tokens_per_block=32,
+            cache_tiers=[GpuCacheTierConfig(quota=quota)],
+            layers=_base_attention_layer_configs(2),
+            max_util_for_resume=0.95,
+        )
+    )
+    assert quota - built.cache_tiers[0].quota == reserved
 
 
 def test_mamba_cache_manager_delegates_kda_replay_capability() -> None:
@@ -3783,6 +4029,60 @@ def test_v2_kda_replay_relocates_live_slot_history():
             torch.testing.assert_close(replay_buffer[:, 2], source_one)
     finally:
         mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_kda_token_states_relocate_with_their_slot():
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        conv_state_layout="q_k_v",
+        mamba_n_groups=4,
+        mamba_ssm_cache_dtype=torch.float32,
+        kda_replay_num_spec=2,
+        kda_token_states=True,
+    )
+    try:
+        states = mgr.kda_state_tok
+        assert states is not None
+        states.zero_()
+        states[:, 0].fill_(1.0)
+        states[:, 1].fill_(2.0)
+        source_zero, source_one = states[:, 0].clone(), states[:, 1].clone()
+
+        mgr._relocate_kda_replay_slots([0, 1], [1, 2])
+
+        torch.testing.assert_close(states[:, 1], source_zero, rtol=0, atol=0)
+        torch.testing.assert_close(states[:, 2], source_one, rtol=0, atol=0)
+    finally:
+        mgr.shutdown()
+    # Released with the other replay buffers.
+    assert mgr.kda_state_tok is None
+
+
+@skip_no_cuda
+def test_v2_kda_token_states_count_in_the_per_slot_budget():
+    """The capacity math sees the per-token states: a slot costs one more fp32 SSM state per draft and layer."""
+    kwargs = dict(
+        num_mamba_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        conv_state_layout="q_k_v",
+        mamba_d_conv=5,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
+        mamba_ssm_cache_dtype=torch.float32,
+        kda_replay_num_spec=2,
+    )
+    plain = _build_v2_hybrid_with_mamba_layer(**kwargs)
+    try:
+        plain_bytes = plain._mamba_state_bytes_per_slot()
+    finally:
+        plain.shutdown()
+    with_states = _build_v2_hybrid_with_mamba_layer(kda_token_states=True, **kwargs)
+    try:
+        per_token = 2 * 2 * math.prod(with_states.ssm_state_shape) * 4
+        assert with_states._mamba_state_bytes_per_slot() == plain_bytes + per_token
+    finally:
+        with_states.shutdown()
 
 
 @skip_no_cuda
