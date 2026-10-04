@@ -12,19 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Bring a server onto a Mooncake pool that something else already owns.
+"""Run a Mooncake pool's master, and join a server to the pool it owns.
 
 The connector needs two things that are not the engine's to produce: a
 reachable `mooncake_master`, and a JSON client config named by
-`MOONCAKE_CONFIG_PATH` that points every worker at it.
+`MOONCAKE_CONFIG_PATH` that points every worker at it. Both are here, and they
+are separate processes because one master serves a whole deployment: that is
+what lets a prefix one server computed be read by another, and lets the pool
+outlive a restart of any server in it.
 
-`running_master` is the first, reachable as `trtllm-serve mooncake_master`. It
-runs per deployment rather than per engine, and publishes a manifest naming the
-pool's address and the transport every participant has to agree on, so those
-settings are stated once rather than restated in every worker config.
+`running_master` is the first, run as `trtllm-serve mooncake_master`. It
+publishes a manifest naming the pool's address and the transport every
+participant has to agree on, so those settings are stated once rather than
+restated in every worker config.
 
-`provision_pool` is the second, inside each serving process. It reads the
-manifest, adds what is this server's alone, and renders the client config,
+`provision_pool` is the second, and runs inside each serving process. It reads
+the manifest, adds what is this server's alone, and renders the client config,
 exporting `MOONCAKE_CONFIG_PATH` for the ranks the LLM constructor spawns.
 """
 
@@ -198,9 +201,11 @@ class PoolManifest:
 def _wait_for_manifest(path: str, timeout: float) -> Dict[str, Any]:
     """Block until `path` holds a readable manifest, then return it.
 
-    Nothing knows which host the scheduler will give the master when the worker
-    configs are written, so the file is the rendezvous and waiting here doubles
-    as waiting for the master to exist at all.
+    A deployment that knows where its master will run can name that address
+    directly instead. The file is for the rest: a scheduler need not have
+    placed the master by the time the worker configs are written, and naming a
+    path defers the address until it has. Waiting here then doubles as waiting
+    for the master to exist at all, so the two can be started in either order.
 
     The writer renames into place, so a half-written file cannot be observed.
     An empty or unparsable one is what a reader racing a slow filesystem sees,
