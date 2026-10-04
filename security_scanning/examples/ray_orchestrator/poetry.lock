@@ -661,14 +661,14 @@ files = [
 
 [[package]]
 name = "filelock"
-version = "4.0.9"
+version = "4.0.10"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-4.0.9-py3-none-any.whl", hash = "sha256:9287fd61b99a806e5202be29a83034c0808a1b9830e820537c2f5773981f7eeb"},
-    {file = "filelock-4.0.9.tar.gz", hash = "sha256:635e7d67fa92654eed444e75e9ca18426d34e77ad9c469bf4373f75a932f7b22"},
+    {file = "filelock-4.0.10-py3-none-any.whl", hash = "sha256:698048d158dc3c9e18cc5e88b3efdd4bd0e77d76686b22adb4511cc4b2c2f0db"},
+    {file = "filelock-4.0.10.tar.gz", hash = "sha256:00d6a81f976a6332551c2c10f39e12b4abb7e01c64d4c497b81a615bc9186f1f"},
 ]
 
 [[package]]
@@ -1424,14 +1424,14 @@ files = [
 
 [[package]]
 name = "platformdirs"
-version = "4.12.2"
+version = "4.12.3"
 description = "A small Python package for determining appropriate platform-specific dirs, e.g. a `user data dir`."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "platformdirs-4.12.2-py3-none-any.whl", hash = "sha256:29dbf06d96c500bc6bdbce75fb0a14d63279c93b1842f97e72a135b33e856983"},
-    {file = "platformdirs-4.12.2.tar.gz", hash = "sha256:eab5f70271a490ef74618bb314fbb86e3c7e82fa3b9c922c2ea0e0a1a155d329"},
+    {file = "platformdirs-4.12.3-py3-none-any.whl", hash = "sha256:080f3b39423b5abfca9a23d84c4e9795f54d395cd8459867a8ded44084fcd5f8"},
+    {file = "platformdirs-4.12.3.tar.gz", hash = "sha256:427fc0bb321ae0c5b037fa03238ca74820437be162e78b4848c4d4055b9b766c"},
 ]
 
 [[package]]
