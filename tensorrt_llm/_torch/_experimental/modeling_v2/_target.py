@@ -2,9 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """What runs a step, separated from what a model statically is.
 
-A model's core -- deriving the shared `ModelingV2Core` base in `_core.py`,
-under its own model-specific name -- carries the static structure: routing
-identity, weights, parallel and quantization configuration. A `Target`
+A model's core carries the static structure: routing identity, weights,
+parallel and quantization configuration. A `Target`
 carries one way of running a forward over that structure. A core has two,
 and the runtime picks between them per call.
 
@@ -78,10 +77,8 @@ class Target(ABC):
     Also owns the opt-in step-contract check (`_check_step_contract` below):
     for a model split into targets, `step_args` is itself the probe -- the
     one projection whose content differs by phase -- so the check belongs
-    beside it, not on the core it was split out of. A core with no target
-    split (deepseek, today) keeps the equivalent skeleton on
-    `ModelingV2Core` in `_core.py` instead; see the comment there for why the
-    two models carry it in different places.
+    beside it. A core with no target split (deepseek, today) carries its own
+    copy of the same check instead.
     """
 
     def __init__(self, core: Any) -> None:

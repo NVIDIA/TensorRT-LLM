@@ -16,7 +16,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._core import ModelingV2Core
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import advance_step_generation
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
@@ -70,7 +70,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, register_auto_model
+from tensorrt_llm._torch.models.modeling_utils import (
+    DecoderModel,
+    DecoderModelForCausalLM,
+    register_auto_model,
+)
 from tensorrt_llm._torch.speculative import get_spec_worker
 
 from . import weights as _weights
@@ -217,10 +221,14 @@ def _yarn_mscale(factor: float, mscale: float) -> float:
     return 0.1 * mscale * math.log(factor) + 1.0
 
 
-class DeepseekV3ModelingV2(ModelingV2Core):
+class DeepseekV3ModelingV2(DecoderModel):
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
         cfg = model_config.pretrained_config
+        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it, and False for the
+        # whole life of a served engine: everything the check looks at is fixed
+        # at engine construction, so it runs once.
+        self._contract_pending = step_contract_enabled()
 
         mapping = model_config.mapping
         self.rank = mapping.rank
@@ -685,8 +693,22 @@ class DeepseekV3ModelingV2(ModelingV2Core):
             "head_norm": w["mtp_head_norm"],
         }
 
-    def _probe_step_surface(self, md) -> None:
-        _build_step_args(md)
+    def _check_step_contract(self, md) -> None:
+        """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE asks for it.
+
+        Calling the projection is the check: it reads every metadata field this model
+        consumes, so a rename or removal of that private trtllm surface surfaces here
+        rather than mid-forward. A hand-kept list of the same names would drift
+        silently the first time `_build_step_args` gains a field.
+        """
+        if not self._contract_pending:
+            return
+        try:
+            _build_step_args(md)
+        except AttributeError as exc:
+            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
+        self._after_contract_check(md)
+        self._contract_pending = False
 
     def _after_contract_check(self, md) -> None:
         """Grow the rope table to cover every position the engine admits, and fix the context

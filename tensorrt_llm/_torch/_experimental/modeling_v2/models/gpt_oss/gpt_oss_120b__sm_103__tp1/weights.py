@@ -153,106 +153,104 @@ def _to_fp32(t: torch.Tensor, core) -> torch.Tensor:
     return t.float()
 
 
-_WEIGHTS: tuple[W, ...] = (
-    W("norm1", shape=lambda d: (d.hidden,), src="{p}.input_layernorm.weight"),
-    W(
-        "qkv",
-        shape=lambda d: (d.q_width + 2 * d.kv_width, d.hidden),
-        src=(
-            ("{p}.self_attn.q_proj.weight", lambda d: (slice(0, d.q_width),)),
-            (
-                "{p}.self_attn.k_proj.weight",
-                lambda d: (slice(d.q_width, d.q_width + d.kv_width),),
-            ),
-            (
-                "{p}.self_attn.v_proj.weight",
-                lambda d: (slice(d.q_width + d.kv_width, d.q_width + 2 * d.kv_width),),
-            ),
-        ),
-    ),
-    W(
-        "qkv_bias",
-        shape=lambda d: (d.q_width + 2 * d.kv_width,),
-        src=(
-            ("{p}.self_attn.q_proj.bias", lambda d: (slice(0, d.q_width),)),
-            (
-                "{p}.self_attn.k_proj.bias",
-                lambda d: (slice(d.q_width, d.q_width + d.kv_width),),
-            ),
-            (
-                "{p}.self_attn.v_proj.bias",
-                lambda d: (slice(d.q_width + d.kv_width, d.q_width + 2 * d.kv_width),),
-            ),
-        ),
-    ),
-    W(
-        "sinks",
-        shape=lambda d: (d.heads_q,),
-        dtype=torch.float32,
-        src="{p}.self_attn.sinks",
-        transform=_to_fp32,
-    ),
-    W("o", shape=lambda d: (d.hidden, d.q_width), src="{p}.self_attn.o_proj.weight"),
-    W("o_bias", shape=lambda d: (d.hidden,), src="{p}.self_attn.o_proj.bias"),
-    W("norm2", shape=lambda d: (d.hidden,), src="{p}.post_attention_layernorm.weight"),
-    W("router", shape=lambda d: (d.num_experts, d.hidden), src="{p}.mlp.router.weight"),
-    W("router_bias", shape=lambda d: (d.num_experts,), src="{p}.mlp.router.bias"),
-    W(
-        "fc1_w",
-        shape=lambda d: (d.num_experts, d.fc1_rows, d.fc1_k_pad // 2),
-        dtype=torch.uint8,
-        src="{p}.mlp.experts.gate_up_proj_blocks",
-        transform=_prep_fc1_weight,
-    ),
-    W(
-        "fc1_s",
-        shape=lambda d: (d.num_experts, d.fc1_rows, d.fc1_k_pad // 32),
-        dtype=torch.uint8,
-        src="{p}.mlp.experts.gate_up_proj_scales",
-        transform=_prep_fc1_scale,
-    ),
-    W(
-        "fc1_b",
-        shape=lambda d: (d.num_experts, d.fc1_rows),
-        dtype=torch.float32,
-        src="{p}.mlp.experts.gate_up_proj_bias",
-        transform=_prep_fc1_bias,
-    ),
-    W(
-        "fc2_w",
-        shape=lambda d: (d.num_experts, d.fc2_rows_pad, d.inter_pad // 2),
-        dtype=torch.uint8,
-        src="{p}.mlp.experts.down_proj_blocks",
-        transform=_prep_fc2_weight,
-    ),
-    W(
-        "fc2_s",
-        shape=lambda d: (d.num_experts, d.fc2_rows_pad, d.inter_pad // 32),
-        dtype=torch.uint8,
-        src="{p}.mlp.experts.down_proj_scales",
-        transform=_prep_fc2_scale,
-    ),
-    W(
-        "fc2_b",
-        shape=lambda d: (d.num_experts, d.fc2_rows_pad),
-        dtype=torch.float32,
-        src="{p}.mlp.experts.down_proj_bias",
-        transform=_prep_fc2_bias,
-    ),
-    W("final_norm", shape=lambda d: (d.hidden,), src="model.norm.weight", per_layer=False),
-    W(
-        "embed",
-        shape=lambda d: (d.vocab, d.hidden),
-        src="model.embed_tokens.weight",
-        per_layer=False,
-    ),
-)
-
-
 class GptOssWeights(ModelWeights):
     """gpt-oss-120b / sm_103 / tp1."""
 
-    WEIGHTS = _WEIGHTS
+    WEIGHTS: tuple[W, ...] = (
+        W("norm1", shape=lambda d: (d.hidden,), src="{p}.input_layernorm.weight"),
+        W(
+            "qkv",
+            shape=lambda d: (d.q_width + 2 * d.kv_width, d.hidden),
+            src=(
+                ("{p}.self_attn.q_proj.weight", lambda d: (slice(0, d.q_width),)),
+                (
+                    "{p}.self_attn.k_proj.weight",
+                    lambda d: (slice(d.q_width, d.q_width + d.kv_width),),
+                ),
+                (
+                    "{p}.self_attn.v_proj.weight",
+                    lambda d: (slice(d.q_width + d.kv_width, d.q_width + 2 * d.kv_width),),
+                ),
+            ),
+        ),
+        W(
+            "qkv_bias",
+            shape=lambda d: (d.q_width + 2 * d.kv_width,),
+            src=(
+                ("{p}.self_attn.q_proj.bias", lambda d: (slice(0, d.q_width),)),
+                (
+                    "{p}.self_attn.k_proj.bias",
+                    lambda d: (slice(d.q_width, d.q_width + d.kv_width),),
+                ),
+                (
+                    "{p}.self_attn.v_proj.bias",
+                    lambda d: (slice(d.q_width + d.kv_width, d.q_width + 2 * d.kv_width),),
+                ),
+            ),
+        ),
+        W(
+            "sinks",
+            shape=lambda d: (d.heads_q,),
+            dtype=torch.float32,
+            src="{p}.self_attn.sinks",
+            transform=_to_fp32,
+        ),
+        W("o", shape=lambda d: (d.hidden, d.q_width), src="{p}.self_attn.o_proj.weight"),
+        W("o_bias", shape=lambda d: (d.hidden,), src="{p}.self_attn.o_proj.bias"),
+        W("norm2", shape=lambda d: (d.hidden,), src="{p}.post_attention_layernorm.weight"),
+        W("router", shape=lambda d: (d.num_experts, d.hidden), src="{p}.mlp.router.weight"),
+        W("router_bias", shape=lambda d: (d.num_experts,), src="{p}.mlp.router.bias"),
+        W(
+            "fc1_w",
+            shape=lambda d: (d.num_experts, d.fc1_rows, d.fc1_k_pad // 2),
+            dtype=torch.uint8,
+            src="{p}.mlp.experts.gate_up_proj_blocks",
+            transform=_prep_fc1_weight,
+        ),
+        W(
+            "fc1_s",
+            shape=lambda d: (d.num_experts, d.fc1_rows, d.fc1_k_pad // 32),
+            dtype=torch.uint8,
+            src="{p}.mlp.experts.gate_up_proj_scales",
+            transform=_prep_fc1_scale,
+        ),
+        W(
+            "fc1_b",
+            shape=lambda d: (d.num_experts, d.fc1_rows),
+            dtype=torch.float32,
+            src="{p}.mlp.experts.gate_up_proj_bias",
+            transform=_prep_fc1_bias,
+        ),
+        W(
+            "fc2_w",
+            shape=lambda d: (d.num_experts, d.fc2_rows_pad, d.inter_pad // 2),
+            dtype=torch.uint8,
+            src="{p}.mlp.experts.down_proj_blocks",
+            transform=_prep_fc2_weight,
+        ),
+        W(
+            "fc2_s",
+            shape=lambda d: (d.num_experts, d.fc2_rows_pad, d.inter_pad // 32),
+            dtype=torch.uint8,
+            src="{p}.mlp.experts.down_proj_scales",
+            transform=_prep_fc2_scale,
+        ),
+        W(
+            "fc2_b",
+            shape=lambda d: (d.num_experts, d.fc2_rows_pad),
+            dtype=torch.float32,
+            src="{p}.mlp.experts.down_proj_bias",
+            transform=_prep_fc2_bias,
+        ),
+        W("final_norm", shape=lambda d: (d.hidden,), src="model.norm.weight", per_layer=False),
+        W(
+            "embed",
+            shape=lambda d: (d.vocab, d.hidden),
+            src="model.embed_tokens.weight",
+            per_layer=False,
+        ),
+    )
+
     RELEASE_AFTER = "_fc2_b"
 
     def dims(self, core) -> SimpleNamespace:
