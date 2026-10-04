@@ -15,7 +15,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._core import ModelingV2Core
 from tensorrt_llm._torch._experimental.modeling_v2._target import Phase, Target, phase_of
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import advance_step_generation
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
@@ -40,7 +39,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_qu
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, register_auto_model
+from tensorrt_llm._torch.models.modeling_utils import (
+    DecoderModel,
+    DecoderModelForCausalLM,
+    register_auto_model,
+)
 
 from . import weights as _weights
 
@@ -102,7 +105,7 @@ _CALL_CONSTANTS = dict(
 _FC1_K_ALIGN = _weights.FC1_K_ALIGN
 
 
-class GptOssModelingV2(ModelingV2Core):
+class GptOssModelingV2(DecoderModel):
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
         cfg = model_config.pretrained_config
@@ -123,11 +126,15 @@ class GptOssModelingV2(ModelingV2Core):
         self._prefill: Target | None = None
         self._decode: Target | None = None
 
-    def build_layer_views(self) -> None:
+    def post_load_weights(self) -> None:
         """Construct the two targets, now that the weights are real.
 
         Must only be called after meta init is over, never from `__init__`, where the
         shell's containers are still meta.
+
+        Named for the shell hook that drives it. Not an override: that hook lives on
+        DecoderModelForCausalLM, and a core derives from DecoderModel, which has no
+        such method -- so there is no super() to call here.
         """
         cfg = self.model_config.pretrained_config
         rope = getattr(cfg, "rope_scaling", None) or getattr(cfg, "rope_parameters", None)
@@ -623,4 +630,4 @@ class ModelingV2GptOss120bSm103Tp1(DecoderModelForCausalLM[GptOssModelingV2, Pre
 
     def post_load_weights(self):
         super().post_load_weights()
-        self.model.build_layer_views()
+        self.model.post_load_weights()
