@@ -42,6 +42,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention.backends import get_sparse_attn_kv_cache_manager
+from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..disaggregation.kv_cache_transceiver import (
     AttentionTypeCpp, create_kv_cache_transceiver,
     maybe_enable_fabric_memory_for_python_transceiver)
@@ -3032,22 +3033,33 @@ def _create_kv_cache_manager(
         # manager's own internal gate (`tp_size = 1 if enable_attention_dp
         # else tp_size`, then num_heads / n_groups / conv_dim divide by
         # it), so the params pass through unscaled.
-        # KDA fused multi-token verify (trtllm::kda_mtp_decode): when the
-        # kernel can run here, allocate the per-slot replay caches instead
-        # of the legacy per-step intermediate verification buffers. The
-        # kernel replays accepted drafts from these caches and commits
-        # states in place, replacing the intermediate-buffer + promotion
-        # flow for KDA layers.
+        # KDA replay keeps one delayed recurrent checkpoint and a
+        # single accepted K/U/G history. It is specialized for Kimi K3 on
+        # datacenter Blackwell and uses the V2 manager for its all-layer
+        # post-sampling commit.
         kda_extra_kwargs = {}
-        kda_replay_manager_types = (MixedMambaHybridCacheManager,
-                                    MambaHybridCacheManagerV2)
-        if (spec_config is not None
-                and issubclass(kv_cache_manager_cls, kda_replay_manager_types)):
+        use_kda_replay = (
+            not is_glm5_next and spec_config is not None
+            and 2 <= spec_config.tokens_per_gen_step <= 8
+            and not getattr(spec_config, "use_dynamic_tree", False)
+            and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
+            and is_sm_100f(get_sm_version()) and IS_CUTLASS_DSL_AVAILABLE
+            and mamba_params.dtype == torch.bfloat16
+            and mamba_params.mamba_ssm_cache_dtype in (torch.bfloat16,
+                                                       torch.float32)
+            and mamba_params.state_size == 128 and mamba_params.head_dim == 128
+            and mamba_params.conv_kernel == 4
+            and text_config.linear_attn_config.get("gate_lower_bound") == -5.0)
+        if use_kda_replay:
             from ..modules.kimi_kda._kda_kernels import \
                 is_kda_mtp_verify_available
             if is_kda_mtp_verify_available():
                 kda_extra_kwargs["kda_replay_num_spec"] = (
                     spec_config.tokens_per_gen_step - 1)
+            else:
+                use_kda_replay = False
+        logger.info("KDA replay: " +
+                    ("ENABLED" if use_kda_replay else "DISABLED"))
         if is_glm5_next:
             # The manager places an indexer buffer on every attention layer.
             from ..attention.backends.sparse.glm_kpool import \

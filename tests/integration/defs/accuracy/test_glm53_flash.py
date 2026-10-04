@@ -273,7 +273,7 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_mtp(self, tp_size, ep_size):
         # The checkpoint's single MTP layer is chained for three drafts per
-        # step; KDA verification runs on the fused replay kernel.
+        # step; GLM-5 keeps the sequential KDA verification fallback.
         with LLM(
             self.MODEL_PATH,
             speculative_config=MTPDecodingConfig(max_draft_len=3),
