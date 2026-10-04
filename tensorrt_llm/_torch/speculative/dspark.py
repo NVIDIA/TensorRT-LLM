@@ -1186,7 +1186,11 @@ class DSparkWorker(DFlashWorker):
         """``k3_markov``'s next_new_tokens when the drafts are its tokens for the whole batch (no context
         requests); otherwise the base assembly."""
         chain = getattr(self, "_k3_markov_next", None)
+        # The step ends here: release its acceptance (which holds the step's attention and spec metadata) and the
+        # kernel's outputs, so they do not keep a captured graph's pool or metadata alive after the step.
         self._k3_markov_next = None
+        self._k3_acceptance = None
+        self._k3_markov = None
         if (
             chain is not None
             and chain[0] is next_draft_tokens

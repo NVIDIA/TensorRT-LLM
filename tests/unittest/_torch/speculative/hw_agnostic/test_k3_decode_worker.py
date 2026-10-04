@@ -19,9 +19,12 @@
 * Each kernel's predicate takes an eligible step and declines a step that fails one of its conditions:
   ``trtllm::k3_spec_accept`` (``_k3_accept_applies``) and its vocabulary-sharded target logits (``target_logits``),
   ``trtllm::k3_ctx_kv`` (``_k3_ctx_kv_applies``) and ``trtllm::k3_markov`` (``_keep_draft_logits_sharded``).
-* DSpark's chain: sharded block logits go to ``k3_markov``, whose tokens and next_new_tokens are the step's.
+* DSpark's chain: sharded block logits go to ``k3_markov``, whose tokens and next_new_tokens are the step's; after
+  next_new_tokens the worker holds nothing of the step.
 """
 
+import gc
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -738,6 +741,66 @@ def test_k3_markov_chain_drafts_and_next_new_tokens(monkeypatch, pending):
         accepted, drafts, spec.batch_indices_cuda, NUM_GENS, num_accepted
     )
     assert next_new is outputs[2]
+
+
+class _StepMetadata:
+    """A step's attention metadata stand-in: a plain object, so a weak reference tells when it is released."""
+
+
+@pytest.mark.parametrize(
+    "kernel_drafts", [True, False], ids=["kernel drafts", "base sampler drafts"]
+)
+def test_k3_markov_step_state_is_released_after_next_new_tokens(monkeypatch, kernel_drafts):
+    """Once ``_prepare_next_new_tokens`` has run, the worker holds nothing of the step: neither its acceptance,
+    which carries the step's attention and spec metadata, nor ``k3_markov``'s outputs. Held, they would keep a
+    captured step's graph pool and metadata alive after it."""
+    worker = _worker(DSparkWorker, k3_decode=True, mapping=TP4)
+    accepted = torch.zeros(NUM_GENS, K + 1, dtype=torch.int32)
+    num_accepted = torch.ones(NUM_GENS, dtype=torch.int32)
+    spec = SimpleNamespace(
+        batch_indices_cuda=torch.arange(4, dtype=torch.int32),
+        wants_advanced_draft_sampling=not kernel_drafts,
+    )
+    attn = _StepMetadata()
+    attn.num_contexts, attn.kv_lens_cuda = 0, None
+    outputs = (
+        torch.zeros(NUM_GENS, K, SHARD),
+        torch.zeros(NUM_GENS, K, dtype=torch.int32),
+        torch.zeros(NUM_GENS, K + 1, dtype=torch.int32),
+    )
+    sampled = torch.zeros(NUM_GENS, K, dtype=torch.int32)
+    assembled = torch.zeros(NUM_GENS, K + 1, dtype=torch.int32)
+    monkeypatch.setattr(markov_op, "markov_chain", lambda *args, **kwargs: outputs)
+    monkeypatch.setattr(
+        SpecWorkerBase, "sample_draft_tokens", lambda self, *args, **kwargs: sampled
+    )
+    monkeypatch.setattr(SpecWorkerBase, "_prepare_next_new_tokens", lambda self, *args: assembled)
+    vocab_slice = slice(RANK_IN_TP * SHARD, (RANK_IN_TP + 1) * SHARD)
+
+    worker._on_acceptance(accepted, num_accepted, attn, spec)
+    corrected = worker._k3_markov_chain(
+        _markov_drafter(),
+        torch.zeros(NUM_GENS, K, SHARD, dtype=torch.bfloat16),
+        torch.zeros(NUM_GENS, dtype=torch.long),
+        vocab_slice,
+    )
+    drafts = worker.sample_draft_tokens(corrected, spec, NUM_GENS, num_contexts=0)
+    next_new = worker._prepare_next_new_tokens(
+        accepted, drafts, spec.batch_indices_cuda, NUM_GENS, num_accepted
+    )
+    assert drafts is (outputs[1] if kernel_drafts else sampled)
+    assert next_new is (outputs[2] if kernel_drafts else assembled)
+
+    held = [
+        name
+        for name in ("_k3_acceptance", "_k3_markov", "_k3_markov_next")
+        if getattr(worker, name, None) is not None
+    ]
+    assert not held, f"the worker still holds {held} after the step"
+    step_metadata = weakref.ref(attn)
+    del attn
+    gc.collect()
+    assert step_metadata() is None, "the step's attention metadata outlives the step"
 
 
 def test_dspark_drafts_from_the_base_sampler_without_the_kernel(monkeypatch):
