@@ -16,7 +16,7 @@
 
 Instances are broadcast from rank 0 to every worker, so these carry only plain
 data: a page's identity (its block hash) and where that page currently lives on
-this rank (a layer group and a page slot index). Deliberately no store keys --
+this rank (a layer group and a page slot index). Deliberately no store keys:
 each worker prefixes its own rank namespace, so one broadcast serves all shards.
 """
 
