@@ -343,10 +343,11 @@ class GptOssModelingV2(ModelingV2Core):
             dtype=dt,
         )
 
-        self._targets: dict[Phase, Target] | None = None
+        self._prefill: Target | None = None
+        self._decode: Target | None = None
 
     def build_layer_views(self) -> None:
-        """Construct the per-phase targets, now that the weights are real.
+        """Construct the two targets, now that the weights are real.
 
         Used to also derive per-layer GEMM views and the MoE/RoPE call
         tensors itself, holding them in two attributes (a per-layer tuple
@@ -362,13 +363,23 @@ class GptOssModelingV2(ModelingV2Core):
         Meta is over by the time this runs, so real tensors may be built and
         `.t()`'d; never called from `__init__`, where the shell's containers
         are still meta."""
-        self._targets = {
-            Phase.PREFILL: PrefillTarget(self),
-            Phase.DECODE: DecodeTarget(self),
-        }
+        self._prefill = PrefillTarget(self)
+        self._decode = DecodeTarget(self)
 
     def _probe_step_surface(self, md) -> None:
         _build_step_args(md, num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
+
+    def _select_target(self, attn_metadata) -> Target:
+        """Which target runs this step.
+
+        A method rather than a lookup keyed on phase: today the phase
+        decides, but the criterion belongs in one place that can grow, not
+        in the shape of the table. Delegates to `phase_of` rather than
+        restating its predicate -- `num_contexts == 0` means decode has one
+        home, in `_target.py`, and this reads that answer instead of
+        re-deriving it.
+        """
+        return self._decode if phase_of(attn_metadata) is Phase.DECODE else self._prefill
 
     def forward(
         self,
@@ -389,7 +400,7 @@ class GptOssModelingV2(ModelingV2Core):
         # to rebind.
         advance_step_generation()
         self._check_step_contract(attn_metadata)
-        return self._targets[phase_of(attn_metadata)].forward(attn_metadata, *args, **kwargs)
+        return self._select_target(attn_metadata).forward(attn_metadata, *args, **kwargs)
 
 
 class PrefillTarget(Target):
