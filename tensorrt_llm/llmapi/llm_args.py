@@ -1980,7 +1980,9 @@ class MooncakeStoreConfig(StrictBaseModel):
         "segment_size, checked against available memory at startup. Write "
         "binary sizes ('16GiB') or byte counts: 'GB' means a power of 1000 "
         "here and a power of 1024 to vLLM, so it is refused in a file both "
-        "engines may read.")
+        "engines may read. Zero lends nothing: the server joins the pool and "
+        "uses capacity its peers hold, so a pool whose every participant "
+        "lends nothing has nowhere to put a page.")
     transfer_batch_size: int = Field(64,
                                      telemetry=False,
                                      description="Page keys per store call.")
