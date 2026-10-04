@@ -118,6 +118,9 @@ def test_cuda_graph_replay() -> None:
             eager = kimi_k3_noaux_tc_mxfp8_quant(logits, bias, hidden, 1.0)
             for replayed, expected in zip(outs, eager):
                 assert torch.equal(replayed.view(torch.uint8), expected.view(torch.uint8))
+        # Free this capture's outputs before the next capture starts: rebound inside it, they would be freed inside
+        # another graph's capture, which cudaMallocAsync turns into a captured free of this graph's memory.
+        del outs, graph
 
 
 def test_input_not_mutated_and_deterministic() -> None:
