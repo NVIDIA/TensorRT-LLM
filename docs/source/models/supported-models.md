@@ -26,6 +26,7 @@ The following is a table of supported models for the PyTorch backend:
 | `KimiK25ForConditionalGeneration`    | Kimi-K2.5                          | `moonshotai/Kimi-K2.5`                       |
 | `KimiK3ForConditionalGeneration` [^15]| Kimi-K3                            | `moonshotai/Kimi-K3`                         |
 | `KimiLinearForCausalLM` [^15]        | Kimi-K3 (text decoder)             | `moonshotai/Kimi-K3`                         |
+| `Kolibri1ForCausalLM`                | Kolibri 1                          | `aleph-alpha/kolibri-1`                      |
 | `LagunaForCausalLM`                  | Laguna-XS                          | `poolside/laguna-XS.2`                       |
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
 | `Llama4ForConditionalGeneration`     | Llama 4                            | `meta-llama/Llama-4-Scout-17B-16E-Instruct`  |
