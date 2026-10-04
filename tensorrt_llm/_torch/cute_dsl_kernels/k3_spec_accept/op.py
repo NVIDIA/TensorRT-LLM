@@ -21,6 +21,8 @@ Bit-identical to the Python path it replaces: ``_refresh_ctx_block_tables``, ``_
 With a :func:`workspace`, the target logits may stay vocabulary-sharded (this rank's bf16 columns of a TP
 column-parallel head): the ranks exchange their row maxima over a multicast Lamport buffer instead of all-gathering
 the logits, with the same argmax. Compiled on the first call per shape, which must happen outside CUDA-graph capture.
+Every call on a device with the same number of logits columns shares one arrival counter, so the calls must be ordered
+on one stream: two calls not ordered on one stream would mix their arrivals.
 """
 
 from __future__ import annotations

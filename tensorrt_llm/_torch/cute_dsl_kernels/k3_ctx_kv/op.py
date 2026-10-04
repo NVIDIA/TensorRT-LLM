@@ -18,7 +18,8 @@ For the N = B (K + 1) <= 64 context tokens of a decode step (B <= 8 requests, K 
 of every drafter layer, k_norm, NeoX RoPE, the write mask and the paged store into the drafter's context pool, then
 ``ctx_len += num_accepted`` (clamped) and the context length each request may advertise, in one launch (see
 ``k3_ctx_kv_kernel``). Compiled on the first call for its shape (B, K + 1), which must happen outside CUDA-graph
-capture.
+capture. Every call on a device shares one arrival counter, so the calls must be ordered on one stream: two calls not
+ordered on one stream would mix their arrivals.
 """
 
 from __future__ import annotations
