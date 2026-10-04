@@ -3793,14 +3793,14 @@ def _v2_kda_token_state_manager(kda_token_states, enable_block_reuse):
 
 @pytest.mark.parametrize(
     ("kda_token_states", "enable_block_reuse", "at_floor"),
-    [(True, False, True), (False, False, False), (True, True, False)],
+    [(True, False, True), (False, False, False), (False, True, False)],
 )
 def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
     kda_token_states, enable_block_reuse, at_floor
 ):
     """The per-token KDA states take memory per SSM slot beside the V2 pools. Without block reuse the SSM pool keeps
-    only its live floor, the states' bytes come out of the quota, and attention gets the rest; otherwise (replay caches
-    only, or block reuse) the typical step's ratio sizes the pool."""
+    only its live floor, the states' bytes come out of the quota, and attention gets the rest; without the states
+    (replay caches only, with or without block reuse) the typical step's ratio sizes the pool."""
     mgr = _v2_kda_token_state_manager(kda_token_states, enable_block_reuse)
     base_config = KVCacheManagerConfig(
         tokens_per_block=32,
@@ -3834,6 +3834,30 @@ def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
         assert (128 << 20) - (2 << 20) < pool_bytes + token_state_bytes <= 128 << 20
     else:
         assert slots["ssm"] > 10 * floor
+
+
+@pytest.mark.parametrize("off_the_floor", ["block_reuse", "pool_ratio", "no_attention"])
+def test_v2_kda_token_states_refuse_a_pool_off_the_live_floor(off_the_floor):
+    """kda_state_tok is allocated for every slot the SSM pool keeps, so with block reuse, a pool_ratio, or no
+    attention layers on the rank (the SSM pool sized by its ratio, its slot count unknown before sizing) the build
+    refuses the per-token states instead of allocating them outside the quota."""
+    mgr = _v2_kda_token_state_manager(
+        kda_token_states=True, enable_block_reuse=off_the_floor == "block_reuse"
+    )
+    pool_ratio = None
+    if off_the_floor == "pool_ratio":
+        pool_ratio = [0.5, 0.5]
+    elif off_the_floor == "no_attention":
+        mgr._attention_cache_bytes_per_token = lambda: 0
+    with pytest.raises(ValueError, match="need the SSM pool at its live floor"):
+        mgr._build_cache_config(
+            KVCacheManagerConfig(
+                tokens_per_block=32,
+                cache_tiers=[GpuCacheTierConfig(quota=128 << 20)],
+                layers=_base_attention_layer_configs(2),
+                initial_pool_ratio=pool_ratio,
+            )
+        )
 
 
 def test_v2_kda_token_states_reserve_quota_before_sizing():

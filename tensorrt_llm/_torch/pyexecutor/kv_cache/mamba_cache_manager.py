@@ -4054,6 +4054,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _build_cache_config(
             self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         kv_cache_config = self.kv_cache_config
+        if (getattr(self, "_kda_token_states", False)
+                and self.local_num_mamba_layers > 0
+                and (config.initial_pool_ratio is not None
+                     or not self._ssm_pool_at_live_floor(kv_cache_config))):
+            # kda_state_tok is allocated for every slot the SSM pool keeps;
+            # only at the live floor is that count known before sizing, so
+            # that its bytes can come out of the quota.
+            raise ValueError(
+                "Per-token KDA states (kda_token_states) need the SSM pool at "
+                "its live floor: kv_cache_config.enable_block_reuse off, "
+                "kv_cache_config.pool_ratio unset, and attention layers on "
+                "this rank.")
         cache_tiers = config.cache_tiers
         gpu_quota = cache_tiers[0].quota
         minimum_live_quota = self._minimum_live_gpu_quota()
