@@ -671,6 +671,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_position_offset = None
         self._managed_cache_bindings = {}
         self._managed_request_ids = ()
+        self._managed_snapshot_slots: Optional[torch.Tensor] = None
         # Host shadows of _ctx_len and of each request's prompt progress.
         self._ctx_len_host = None
         self._req_ctx_pos = {}
@@ -844,11 +845,24 @@ class DFlashWorker(SpecWorkerBase):
             torch.tensor(
                 [self._req_to_slot.get(request_id, self._dummy_slot) for request_id in request_ids],
                 dtype=torch.long,
-                device=self._batch_to_slot.device,
-            )
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            ),
+            non_blocking=True,
         )
         self._managed_request_ids = tuple(
             request_id for request_id in request_ids if request_id in real_request_ids
+        )
+        # Each upload owns fresh host storage. PyTorch's pinned allocator defers
+        # recycling it until the asynchronous copy completes.
+        self._managed_snapshot_slots[: len(self._managed_request_ids)].copy_(
+            torch.tensor(
+                [self._req_to_slot[request_id] for request_id in self._managed_request_ids],
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            ),
+            non_blocking=True,
         )
         return restore_rows
 
@@ -888,11 +902,9 @@ class DFlashWorker(SpecWorkerBase):
         """Queue iteration-owned readback; the executor publishes after completion."""
         if not self._has_unified_draft_cache() or not self._managed_request_ids:
             return None
-        slots = torch.tensor(
-            [self._req_to_slot[request_id] for request_id in self._managed_request_ids],
-            dtype=torch.long,
-            device=self._ctx_len.device,
-        )
+        # Preparation, forward, snapshot gathers and the next preparation run
+        # on the execution stream, so its next upload cannot overtake this read.
+        slots = self._managed_snapshot_slots[: len(self._managed_request_ids)]
         lengths = self._ctx_len[slots]
         positions = lengths + self._ctx_position_offset[slots]
         return DraftHistoryUpdate.capture(
@@ -1094,8 +1106,10 @@ class DFlashWorker(SpecWorkerBase):
                         for rid in request_ids[:num_seqs]
                     ],
                     dtype=torch.long,
-                    device=self._ctx_block_counts.device,
-                )
+                    device="cpu",
+                    pin_memory=prefer_pinned(),
+                ),
+                non_blocking=True,
             )
             return True
         src = getattr(attn_metadata, "draft_kv_cache_block_offsets", None)
@@ -1207,6 +1221,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_position_offset = torch.zeros_like(self._ctx_len)
         self._ctx_len_host = [0] * num_slots
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
+        self._managed_snapshot_slots = torch.empty_like(self._batch_to_slot) if unified else None
 
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
