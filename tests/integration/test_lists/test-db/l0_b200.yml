@@ -153,6 +153,35 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
+  # Kimi K3 decode kernels (CuTe DSL): the GEMVs, the head GEMV and the
+  # embedding, and the cluster-wait and tcgen05-fence lints over them.
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_embed.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_ctm_gemv.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_ctm_gemv_wide.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_decode_gemv.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_head_gemv.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_cluster_waits.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_tcgen05_fences.py
+  # The Kimi K3 targets' routing and the claims check of their stock imports. l0_b300's modeling_v2
+  # entry, the only other one that collects them, is waived (nvbugs/6853741).
+  - unittest/_torch/modeling_v2/test_modeling_v2_routing.py -k "kimi_k3"
+  - unittest/_torch/modeling_v2/test_modeling_v2_claims.py::test_uncertified_generic_calls_name_every_stock_import
+  # modeling_v2 catalog entries with sm_100 receipts (the K3 ones skip on
+  # other architectures).
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_k3_embed_norm.py
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_attn_res_fwd.py
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_attn_res_rmsnorm_fwd.py
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_flashinfer_rmsnorm.py
+  - unittest/_torch/modeling_v2/activation/test_modeling_v2_k3_situ_mul.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_cublas_mm.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_ctm_gemv.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_ctm_gemv_swiglu.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_ctm_gemv_long.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_ctm_gemv_wide.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_decode_gemv.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_head_gemv.py
+  # The Kimi K3 target's decode GEMVs, LM head and embedding on those entries.
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_gemv.py
   # KDA runtime: host-derived prefill metadata and the bf16 state pool
   # round-trip. Both are single-device cases that use GPU 0 only.
   - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
