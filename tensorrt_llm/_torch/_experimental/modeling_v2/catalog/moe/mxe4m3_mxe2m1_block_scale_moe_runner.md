@@ -1,6 +1,7 @@
 ---
 receipts:
   sm_103: {status: passed, tests: 18}
+  sm_100: {status: passed, tests: 19}
 ---
 
 # mxe4m3_mxe2m1_block_scale_moe_runner
@@ -65,11 +66,13 @@ gate = hidden[t] @ W_gate[e].T (+ gemm1_bias_gate[e])
 gate = min(gate, limit[e])
 up   = clamp(up, -limit[e], limit[e])
 
-# act_type 0 (SwiGlu) — the only kernel that exists on this path:
+# act_type 0 (SwiGlu):
 act  = (up + beta[e]) * gate * sigmoid(alpha[e] * gate)
        # alpha defaults to 1.0 when gemm1_alpha is None,
        # beta  defaults to 0.0 when gemm1_beta  is None,
        # so the default is plain SwiGLU: up * silu(gate)
+# act_type 3 (SiTu, Kimi K3's; certified with both caps given, no clamp):
+act  = beta[e] * tanh(up / beta[e]) * alpha[e] * tanh(gate / alpha[e]) * sigmoid(gate)
 
 act  = mx_requantize(act)                   # see below — the W4A8 step
 y    = act @ W_down[e].T (+ gemm2_bias[e])
@@ -79,28 +82,26 @@ out[t] += topk_weights[t, j] * y            # fp32 accumulation
 and `out` is stored as bf16. The gpt-oss clamped GLU is exactly
 `alpha = 1.702`, `beta = 1.0`, `limit = 7.0`.
 
-**The intermediate is MXFP8, on the OCP scale.** FC2 is an MXFP8 x MXFP4 GEMM,
-so the FC1 epilogue quantizes its post-activation output before FC2 reads it.
-Per token row and per **32 consecutive intermediate columns** (natural column
-order, blocks starting at column 0 of the padded intermediate):
+**The intermediate is MXFP8, on the round-up scale.** FC2 is an MXFP8 x MXFP4
+GEMM, so the FC1 epilogue quantizes its post-activation output before FC2 reads
+it. Per token row and per **32 consecutive intermediate columns** (natural
+column order, blocks starting at column 0 of the padded intermediate):
 
 ```
 amax  = max |act| over the 32-element block
-e     = floor(log2(amax)) - 8               # E8M0 byte = e + 127; e = -127 if amax == 0
+e     = ceil(log2(amax / 448))              # E8M0 byte = e + 127; e = -127 if amax == 0
 act'  = round_to_nearest_even(clamp(act / 2^e, -448, +448)) * 2^e
 ```
 
-This is the OCP MX scale — `floor` of the block max's exponent, with the block
-max itself **saturating** to `448 * 2^e` whenever its mantissa exceeds 1.75
-(18–21% of blocks measured, clipping that one element by up to 12.5%). It is
-**not** the round-up scale `torch.ops.trtllm.mxfp8_quantize` applies to
-activations, and modelling it as such is wrong for exactly those blocks. An
-intermediate element below roughly `2^-18` of its block's largest magnitude
-rounds to zero. This entry's test reads the requantized values straight out of
-the kernel (a down projection set to the identity) and matches the formula
-above bit-exactly on all 16384 + 46080 elements of two geometries
-(`H = I = 512` and `H = I = 2880`); on the same data the round-up scale
-matches 99.2% of elements and the *un*quantized activation 6%.
+This is the scale `torch.ops.trtllm.mxfp8_quantize` applies to activations, on
+sm_100 and sm_103 alike (the recipe is a property of each architecture's cubin;
+see *The FC1 epilogue's block-scale recipe* below). An intermediate element
+below roughly `2^-18` of its block's largest magnitude rounds to zero. This
+entry's test reads the requantized values straight out of the kernel (a down
+projection set to the identity) and matches the formula above bit-exactly on
+all 16384 + 46080 elements of two geometries (`H = I = 512` and
+`H = I = 2880`), while the OCP scale (`floor(log2(amax)) - 8`, which saturates
+a block max whose mantissa exceeds 1.75) does not fit.
 
 **FC1 half order is `[up | gate]`.** Before the kernel's row interleave (§
 *Preconditions*) the first `I_pad` rows of the FC1 operand are the up
@@ -200,14 +201,14 @@ For gpt-oss-120b (`H = I = 2880`): `I_pad = 2944`, `H1_pad = 3072`,
 | `gemm2_bias` | `[E, H2_pad]` or `None` | **fp32** | contiguous, pre-shuffled | CUDA |
 | `num_experts` | scalar | int, the global routing space; `> top_k` | — | — |
 | `top_k` | scalar | int, `0 < top_k < num_experts` | — | — |
-| `n_group` / `topk_group` | `None` | — | — | — |
+| `n_group` / `topk_group` | `None` (Kimi K3 passes 1 / 1 to the pre-routed entry point, where they are inert) | — | — | — |
 | `intermediate_size` | scalar | int, **must equal `I_pad`** | — | — |
 | `valid_hidden_size` | scalar (not `None`) | int, `H`; multiple of 32 with `pad_up(H, 128) == H2_pad` | — | — |
 | `valid_intermediate_size` | scalar or `None` | int, multiple of 32, `<= I_pad` | — | — |
 | `local_expert_offset` / `local_num_experts` | scalars | int, `E = local_num_experts >= 1` | — | — |
 | `routed_scaling_factor` | `None` | — | — | — |
-| `routing_method_type` | scalar | int: **0** (Default) or **1** (Renormalize) | — | — |
-| `act_type` | scalar | int: **0** (SwiGlu) only | — | — |
+| `routing_method_type` | scalar | int: **0** (Default) or **1** (Renormalize); inert on the pre-routed entry point (Kimi K3 passes 2) | — | — |
+| `act_type` | scalar | int: **0** (SwiGlu) or **3** (SiTu) | — | — |
 | `topk_weights` | `[T, top_k]` or `None` | **bf16** | contiguous | CUDA |
 | `topk_ids` | `[T, top_k]` or `None` | **int32** | contiguous | CUDA |
 | `output` | `[T, valid_hidden_size]` or `None` | bf16 | contiguous | CUDA |
@@ -289,7 +290,7 @@ produces them:
   content is inert (verified with e4m3 `400.0` under a live scale byte). A
   NaN there propagates into the output.
 - `T >= 1`; `T = 0` is rejected. Certified `T`: 1, 2, 4, 6, 8, 10, 12, 16, 17,
-  24, 32, 128, 256, 1024, 8192.
+  24, 32, 64, 65, 128, 256, 512, 1024, 8192.
 
 ### Weight preparation — the caller owns all of it
 
@@ -390,14 +391,16 @@ steps 3 and 4; this entry's test asserts that equivalence.
 ### Sizes and counts
 
 - `0 < top_k < num_experts` (`num_experts must be greater than top_k`;
-  `top_k = 0` is rejected). Certified `top_k`: 1, 2, 3, 4.
+  `top_k = 0` is rejected). Certified `top_k`: 1, 2, 3, 4, 16.
 - `num_experts` is only the routing space; it need not equal
   `local_num_experts` (certified at `num_experts = 8`,
-  `local_num_experts = 4`, `local_expert_offset = 4`). Certified
-  `num_experts`: 2, 3, 4, 5, 8, 16, 128; certified `local_num_experts`:
-  2, 3, 4, 5, 8, 16, 128.
+  `local_num_experts = 4`, `local_expert_offset = 4`, and at Kimi K3's
+  `num_experts = 896`, `local_num_experts = 224`, `local_expert_offset = 448`).
+  Certified `num_experts`: 2, 3, 4, 5, 8, 16, 128, 896; certified
+  `local_num_experts`: 2, 3, 4, 5, 8, 16, 128, 224.
 - Certified geometries `(H, I)`: (512, 128), (512, 256), (512, 512),
-  (640, 128), (1024, 512), (2048, 512), (2880, 1024), (2880, 2880). `H` and
+  (640, 128), (1024, 512), (2048, 512), (2880, 1024), (2880, 2880),
+  (3584, 768). `H` and
   `I` need not be multiples of the kernel's alignments — that is what the
   padding is for — but both must be multiples of 32, since they are passed as
   `valid_hidden_size` / `valid_intermediate_size` (a `valid_hidden_size` of
@@ -416,11 +419,12 @@ steps 3 and 4; this entry's test asserts that equivalence.
   (`hidden_states must be Float8_e4m3fn`). bf16 hidden states belong to the
   sibling op `torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner`, whose
   signature has no `hidden_states_scale` parameter at all.
-- `act_type` must be `0`. `1` (Relu2) and `2` (Silu) fail with
+- `act_type` must be `0` or `3`. `1` (Relu2) and `2` (Silu) fail with
   `No kernel found for the given options: mDtypeA: MxE4m3, mDtypeB: MxE2m1
   ...` — the non-gated activations have no cubin in this MXFP8 x MXFP4 family.
   `SwigluBias` is not a separate value: the per-expert `alpha`/`beta`/
-  `clamp_limit` tensors turn `act_type = 0` into it.
+  `clamp_limit` tensors turn `act_type = 0` into it. SiTu (`3`) takes its gate
+  cap in `gemm1_alpha` and its up cap in `gemm1_beta`.
 - `hidden_states` must be 2-D; a 3-D `[1, T, H1_pad]` view is rejected.
 - sm_100 only. The receipt covers sm_100 (B200), the only arch available
   here; the installed build carries the assertion `Only SM100f is supported
@@ -481,31 +485,38 @@ A caller violating none of the above gets the result described under
   `torch.ops.trtllm.fp4_block_scale_moe_runner` (NVFP4) and
   `torch.ops.trtllm.fp8_block_scale_moe_runner`. Catalog membership is
   `index.yaml`'s fact alone.
+- Kimi K3's routed experts run on it: 224 of 896 experts per rank (the expert window at global id 448), hidden 3584,
+  intermediate 768 per rank, top-16 pre-routed ids, SiTu (`act_type` 3) with its caps (gate 4.0 in `gemm1_alpha`,
+  linear 25.0 in `gemm1_beta`), no biases, no clamp, `routing_method_type` 2 with one group, at 1 to 512 tokens. The
+  test's reference adds SiTu (`act="situ"`): `test_kimi_k3_situ_expert_window`. The sm_100 receipt covers the whole
+  file (19 tests); the sm_103 receipt predates that cell and covers the other 18.
 
 
-## The FC1 epilogue's block-scale recipe is architecture-specific
+## The FC1 epilogue's block-scale recipe
 
-trtllm-gen ships one cubin per architecture, and the two differ **bit-exactly**
-in how the FC1 epilogue picks the e8m0 scale when it requantizes its activation
-output to MXFP8 for FC2. Measured with an identity down-projection, which reads
-the intermediate out element by element rather than inferring it from output
-noise (`test_intermediate_is_mxfp8_quantized`):
+trtllm-gen ships one cubin per architecture, and a cubin's FC1 epilogue picks
+the e8m0 scale by one of two recipes, which differ **bit-exactly**, when it
+requantizes its activation output to MXFP8 for FC2. Measured with an identity
+down-projection, which reads the intermediate out element by element rather
+than inferring it from output noise (`test_intermediate_is_mxfp8_quantized`):
 
 | Arch | e8m0 exponent | Name |
 |---|---|---|
-| sm_100 | `floor(log2(amax)) - 8` | OCP scale |
+| sm_100 | `ceil(log2(amax / 448))` | round-up scale |
 | sm_103 | `ceil(log2(amax / 448))` | round-up scale |
 
-Both were verified bit-exact on their own architecture (0 mismatched elements)
-and each *refutes* the other's, so the cases genuinely separate the recipes.
-The round-up form is what `torch.ops.trtllm.mxfp8_quantize` has always used, so
-sm_103 brings the MoE epilogue into agreement with the standalone quantizer.
+Each is bit-exact on its architecture (0 mismatched elements), and the test
+*refutes* the other recipe, the OCP scale `floor(log2(amax)) - 8`, so its cases
+genuinely separate the two. The round-up form is what
+`torch.ops.trtllm.mxfp8_quantize` uses, so the MoE epilogue and the standalone
+quantizer agree.
 
-This is the whole of the sm_100 -> sm_103 numerical difference for this entry.
-Before the reference was made architecture-aware, 10 of 19 cells failed --
-relative RMS ~5.5 ulp against a 4 ulp gate, max abs ~0.07 against 0.031. With
-the correct recipe in force all 19 pass **at the original tolerances**, which
-is what identifies the recipe as the sole cause rather than one contributor.
+The recipe is the whole of this entry's numerical dependence on the cubin. On
+sm_100, a reference under the OCP scale fails 10 of the 18 pre-existing cells
+(relative RMS ~5.5 ulp against a 4 ulp gate, max abs ~0.07 against 0.031) and
+the Kimi K3 cell; under the round-up scale all 19 pass **at the original
+tolerances**, which is what identifies the recipe as the sole cause rather than
+one contributor.
 
 A future cubin that changes recipe again will fail the bit-exact test rather
 than drift quietly; record the new recipe in `_SCALE_RECIPE_BY_SM`, and do not

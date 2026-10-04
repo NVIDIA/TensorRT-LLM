@@ -137,10 +137,18 @@ entries:
     impl: torch.ops.trtllm.flashinfer_fused_add_rmsnorm
     summary: "In-place fused residual add + RMS norm: residual += x; x = rmsnorm(residual) * weight"
 
+  - path: norm/rms_norm_gated_token_major.py
+    impl: torch.ops.trtllm.rms_norm_gated_token_major
+    summary: "Gated RMS norm of per-head rows, norm first: x [tokens * heads, N] times weight times sigmoid(z) (KDA) or z * sigmoid(z) (GDN), the gate read from a token-major [tokens, heads, N] view whose per-token block is dense (token stride free, e.g. a column slice); optional e4m3 output by a static scale; Kimi K3's KDA output gate"
+
   # ─── activation ────────────────────────────────────────────────
   - path: activation/flashinfer_silu_and_mul.py
     impl: torch.ops.trtllm.flashinfer_silu_and_mul
     summary: "SwiGLU activation: silu(x[..., :d]) * x[..., d:] over a packed gate/up last dim"
+
+  - path: activation/situ_and_mul.py
+    impl: torch.ops.trtllm.situ_and_mul
+    summary: "SiTU-gated multiply on a packed [gate | up] row (Kimi K3's MLP activation): beta * tanh(gate / beta) * sigmoid(gate) times linear_beta * tanh(up / linear_beta) (or up unchanged), fp32 inside, one rounding; 2-D input, any row stride"
 
   # ─── gemm ──────────────────────────────────────────────────────
   - path: gemm/cublas_mm.py
@@ -210,6 +218,10 @@ entries:
     impl: torch.ops.trtllm.noaux_tc_op
     summary: "DeepSeek-V3 style MoE routing (noaux_tc): in-kernel sigmoid of the router logits + per-expert bias correction for selection only + optional group-limited top-k (n_group/topk_group; identity at n_group=1) + combine weights gathered from the unbiased sigmoid, renormalized and scaled by routed_scaling_factor, returning weights in the logits' dtype and int32 expert ids"
 
+  - path: moe/kimi_k3_noaux_tc_mxfp8_quant.py
+    impl: torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant
+    summary: "Kimi K3's decode MoE input for at most 64 tokens in one launch: noaux_tc routing of 896 experts to the top 16 (one group, the bias in selection only, weights renormalized and scaled, rounded once to bf16) and the MXFP8 quantization of each [3584] hidden row with linear UE8M0 scales; returns ids first, then weights, data, scales"
+
   - path: moe/fused_moe.py
     impl: torch.ops.trtllm.fused_moe
     summary: "Full MoE layer over pre-routed tokens: expert permutation + grouped FC1 GEMM over stacked [up; gate] expert weights + gated activation (SwiGLU with optional per-expert alpha/beta/limit, or GeGLU) + grouped FC2 GEMM + routing-weighted fp32 combine, into a fresh or caller-provided [tokens, hidden] buffer (bf16/fp16 unquantized path; expert-parallel slot range selected by ep_size/ep_rank)"
@@ -239,3 +251,21 @@ entries:
   - path: comm/reducescatter.py
     impl: torch.ops.trtllm.reducescatter
     summary: "Summing reduce-scatter over a group of MPI-session ranks into a fresh tensor: every rank's tensor summed elementwise, then split along dim 0 in ascending rank order so each rank keeps its own rows, even (sizes=None) or uneven (per-rank row counts in `sizes`, as attention data parallelism produces); the sum is accumulated in the input dtype in a destination-dependent ring order — deterministic and replay-reproducible, but not the correctly rounded fp32 sum — and float8_e4m3fn is summed as raw bytes rather than as floats; calls pair by position on the communicator whichever `sizes` form they take, and because this one computes, ranks that disagree on call order make every rank wrong nearly everywhere rather than a quarter of the way — silently, and bitwise reproducibly, whenever the mispaired calls move the same number of bytes, hanging only when they do not"
+
+  # ─── ssm ───────────────────────────────────────────────────────
+  # KDA prefill. The pools these entries update belong to the cache manager (the V2 hybrid manager's per-layer views).
+  - path: ssm/causal_conv1d_fwd.py
+    impl: torch.ops.trtllm.causal_conv1d_fwd
+    summary: "Prefill causal depthwise conv1d (width 2-4) over a varlen or equal-length batch, each sequence started from its slot's conv state (or zeros) and advancing it to its last width - 1 inputs, bias and SiLU optional, in place on a channel-major x or into an explicit channel-last out; a padding-slot sequence is skipped; Kimi K3's KDA conv over its packed q | k | v"
+
+  - path: ssm/chunk_kda.py
+    impl: fla.ops.kda.chunk_kda
+    summary: "FLA's chunked KDA (gated delta rule with a per-key decay) over a varlen batch from dense fp32 V-first initial states (or zeros), the gate and beta activations in the kernel, returning o and the final states; Kimi K3's prefill path below four 64-token chunks"
+
+  - path: ssm/kda_post_conv.py
+    impl: tensorrt_llm._torch.modules.kimi_kda._kda_kernels.fused_kda_post_conv
+    summary: "KDA prefill's conv output to the delta rule's inputs in one Triton launch: a channel-major [3 * H * D, T] q | k | v tensor to three token-major [1, T, H, D] tensors, q and k L2-normalized per head (eps inside the root), v copied"
+
+  - path: ssm/kda_prefill.py
+    impl: torch.ops.trtllm.kda_prefill
+    summary: "Chunked KDA (gated delta rule with a per-key decay) prefill of varlen or equal-length sequences from each slot's fp32 V-first recurrent state, the gate and beta activations in the kernel, the final state written back to the slot"

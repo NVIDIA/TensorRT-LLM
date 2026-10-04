@@ -30,6 +30,7 @@ Two configurations are covered:
 
 from typing import List, Optional, Tuple
 
+import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.load_paged_kv_cache_for_mla import (
@@ -323,6 +324,38 @@ def _raises(fn) -> str:
 
 
 # ───────────────────────── matching-dtype pool ──────────────────────────
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_bf16_page64() -> None:
+    """Kimi K3's latent cache: bf16 pool (quant_mode=0, no scale), page 64,
+    C / R = 512 / 64 (its kv_lora_rank and qk_rope_head_dim), bf16 output,
+    layer 1 of a two-layer pool with decoy rows in layer 0. Context sequences
+    with 57 cached + 7 new tokens (across a page boundary), 64 + 64 (cached up
+    to a boundary) and 0 + 1, then two generation sequences the op must skip.
+    The gather is a bitwise copy of the pool rows, in batch order."""
+    torch.manual_seed(46)
+    env = _MlaCacheEnv(DataType.BF16, num_layers=2, tokens_per_block=TOKENS_PER_BLOCK)
+    try:
+        cached = [57, 64, 0, 100, 20]
+        new = [7, 64, 1, 1, 1]
+        rids = [0, 1, 2, 3, 4]
+        kv_lens = [c + n for c, n in zip(cached, new)]
+        env.kv_cache_manager.add_dummy_requests(rids, token_nums=kv_lens)
+        env.fill_layer(0, rids, kv_lens)
+        stored, _ = env.fill_layer(1, rids[:3], kv_lens[:3])
+        metadata = env.prepare_metadata(rids, new, 3, cached)
+        total_ctx_kv = int(metadata.num_ctx_cached_tokens + metadata.num_ctx_tokens)
+        assert total_ctx_kv == 64 + 128 + 1, total_ctx_kv
+        ckv, kpe = _call(env, metadata, 3, torch.bfloat16, None, layer_idx=1)
+        _check_outputs(ckv, kpe, total_ctx_kv, torch.bfloat16)
+        rows = torch.cat(stored, dim=0)
+        assert torch.equal(ckv, rows[:, :KV_LORA_RANK])
+        assert torch.equal(kpe, rows[:, KV_LORA_RANK:])
+    finally:
+        env.shutdown()
 
 
 # ───────────────────────── fp8-e4m3 latent pool ─────────────────────────

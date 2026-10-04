@@ -406,7 +406,6 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
         gk_last_exp = torch.empty(B, NT, H, K_dim, device=dev, dtype=torch.float32)
         A_qk = _with_slack(torch.zeros, B, T_alloc, H, BT, dtype=dtype_k)
         A_kk = _with_slack(torch.zeros, B, T_alloc, H, BT, dtype=dtype_k)
-        O_flat = _with_slack(torch.empty, B, T_alloc, H, V_dim, dtype=dtype_k)
         cu_eqlen = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=dev)
         # co_eqlen is consumed only on the eqlen path (varlen K4 derives its
         # chunk offsets from cu_seqlens). Eqlen inputs are pre-padded to a
@@ -423,7 +422,6 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
         KS_flat = k_scaled.reshape(T_total, H, K_dim)
         QS_flat = q_scaled.reshape(T_total, H, K_dim)
         KG_flat = kg.reshape(T_total, H, K_dim)
-        O_token = O_flat.reshape(T_total, H, V_dim)
         gk_flat = gk_last_exp.reshape(-1, H, K_dim)
 
         def _wrap(t, etype):
@@ -436,7 +434,6 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
         ks_ct = _wrap(KS_flat, bf16)  # raw k_scaled (beta absorbed in akk_inv)
         qs_ct = _wrap(QS_flat, bf16)
         kg_ct = _wrap(KG_flat, bf16)
-        o_ct = _wrap(O_token, bf16)
         gk_ct = _wrap(gk_flat, fp32)
         cu_eqlen_ct = from_dlpack(cu_eqlen, assumed_align=4).mark_layout_dynamic()
         cu_eqlen_ct.element_type = cutlass.Int32
@@ -458,7 +455,6 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
             ks_ct=ks_ct,
             qs_ct=qs_ct,
             kg_ct=kg_ct,
-            o_ct=o_ct,
             gk_ct=gk_ct,
             cu_eqlen_ct=cu_eqlen_ct,
             co_eqlen_ct=co_eqlen_ct,
@@ -480,7 +476,6 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
             gk_last_exp,
             A_qk,
             A_kk,
-            O_flat,
             cu_eqlen,
             co_eqlen,
             cute_wrappers,
@@ -491,8 +486,20 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
     return _buf_cache[key]
 
 
+def _new_output(dev, dtype, B, T, H, V_dim, BT, varlen=False):
+    """The prefill's output ``o`` [B, T, H, V] and K4's wrapper of it, new for every call: ``o`` belongs to the
+    caller, so no later call may write it. On the varlen path the buffer has one chunk of slack past T, like the
+    scratch."""
+    T_alloc = T + BT if varlen else T
+    o = torch.empty(B, T_alloc, H, V_dim, device=dev, dtype=dtype)[:, :T]
+    o_ct = from_dlpack(o.reshape(B * T, H, V_dim), assumed_align=16).mark_layout_dynamic()
+    o_ct.element_type = cutlass.BFloat16
+    return o, o_ct
+
+
 def _launch_k4_persistent(
     cute_wrappers,
+    o_ct,
     v_beta,
     state_pool,
     state_indices,
@@ -528,7 +535,6 @@ def _launch_k4_persistent(
     q_ct = cute_wrappers["qs_ct"]
     aqc_ct = cute_wrappers["aqc_ct"]
     kg_ct = cute_wrappers["kg_ct"]
-    o_ct = cute_wrappers["o_ct"]
     gk_ct = cute_wrappers["gk_ct"]
 
     # v is a per-call activation — wrap fresh every call (never cache; see
@@ -1020,11 +1026,11 @@ def _chunk_kda_fwd(
         gk_last_exp,
         A_qk,
         A_kk,
-        O_flat,
         cu_eqlen,
         co_eqlen,
         cute_wrappers,
     ) = _get_buffers(device, k.dtype, B, T, H, K, V_dim, NT, N_seqs, BT, varlen=is_varlen)
+    o, o_ct = _new_output(device, k.dtype, B, T, H, V_dim, BT, varlen=is_varlen)
 
     # Beta is fused entirely in akk_inv kernel epilogue (post-inv column-scale).
     # No host v*beta and no K1 k_scaled*beta any more.
@@ -1068,6 +1074,7 @@ def _chunk_kda_fwd(
 
     _launch_k4_persistent(
         cute_wrappers,
+        o_ct,
         v,
         state_pool,
         state_indices,
@@ -1078,10 +1085,9 @@ def _chunk_kda_fwd(
         V_dim=V_dim,
     )
 
-    o = O_flat
     if needs_eqlen_pad:
         # Caller called with original T = real_T; their downstream code expects
-        # outputs at that shape. Slice the padded scratch tail back off.
+        # outputs at that shape. Slice the padded tail back off.
         o = o[:, :real_T]
     return o
 
