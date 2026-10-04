@@ -14,6 +14,11 @@
 # limitations under the License.
 """Unit tests for the Mooncake store KV cache connector.
 
+Covers the three places a defect is a wrong answer rather than a slow one: the
+arithmetic that maps a store key onto KV cache memory, the host staging that
+has to leave a staged transfer byte-identical to a zero-copy one, and the
+scheduler state that decides which pages are published under which key.
+
 Runs without a Mooncake installation and without a GPU: the store handle is
 replaced by an in-process fake, and the KV cache layout is synthesized from
 plain integers, which is all the addressing arithmetic needs.
@@ -21,6 +26,7 @@ plain integers, which is all the addressing arithmetic needs.
 
 import contextlib
 import json
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -40,21 +46,12 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     KvCacheRegion,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import validation as validation_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import worker as worker_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import (
     PageAddressing,
     merge_intervals,
 )
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
-    MooncakeStoreConnectorConfig,
-    StoreRole,
-)
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
-    BlockHashChain,
-    KeyNamespace,
-)
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ledger import read_segments
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import BlockHashChain
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
     PageTransfer,
     RequestTransfers,
@@ -62,20 +59,12 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
     MooncakeStoreConnectorScheduler,
 )
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.staging import plan_slot_geometry
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.validation import (
-    NODE_BUDGET_RESERVE_BYTES,
-    validate_layout,
-    validate_llm_args,
-    validate_node_budget,
-)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
     MooncakeStoreConnectorWorker,
 )
-from tensorrt_llm._torch.pyexecutor.connectors.registry import uses_connector
-from tensorrt_llm._torch.pyexecutor.py_executor_creator import _disable_native_kv_offload
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
+pytestmark = pytest.mark.cpu_only
 
 TOKENS_PER_BLOCK = 4
 
@@ -122,7 +111,7 @@ class FakeStore:
         self.closed = True
 
 
-def make_layout(*, num_groups=1, regions_per_group=1, num_slots=8, window_size=None):
+def make_layout(*, num_groups=1, regions_per_group=1, num_slots=8):
     """A layout whose regions are laid out back to back in a fake address space."""
     groups = []
     base = 0x1000
@@ -145,7 +134,7 @@ def make_layout(*, num_groups=1, regions_per_group=1, num_slots=8, window_size=N
             KvCacheLayerGroupLayout(
                 layer_group_id=group_id,
                 layer_ids=(group_id,),
-                window_size=window_size,
+                window_size=None,
                 regions=tuple(regions),
             )
         )
@@ -199,11 +188,6 @@ def make_llm_args(
     )
 
 
-def resolve_config(run_dir: str | None = None) -> MooncakeStoreConnectorConfig:
-    """The client config a rank resolves, given what its worker config said."""
-    return MooncakeStoreConnectorConfig.resolve(make_llm_args(run_dir=run_dir))
-
-
 @pytest.fixture
 def fake_store(monkeypatch):
     """Replace the store handle, and tear down any worker a test builds."""
@@ -224,8 +208,8 @@ def make_worker(
     fake_store: FakeStore,
     *,
     layout: KvCacheLayout | None = None,
-    enable_attention_dp: bool = False,
     run_dir: str | None = None,
+    enable_attention_dp: bool = False,
 ) -> Iterator[MooncakeStoreConnectorWorker]:
     """Build a worker and shut it down before the test call phase ends.
 
@@ -234,7 +218,7 @@ def make_worker(
     fixture teardown would run too late to keep it quiet.
     """
     worker = MooncakeStoreConnectorWorker(
-        make_llm_args(enable_attention_dp=enable_attention_dp, run_dir=run_dir)
+        make_llm_args(run_dir=run_dir, enable_attention_dp=enable_attention_dp)
     )
     fake_store.workers.append(worker)
     if layout is not None:
@@ -245,84 +229,40 @@ def make_worker(
         worker.shutdown()
 
 
-def make_request(request_id, tokens, cache_salt=None):
+def make_request(
+    request_id,
+    tokens,
+    cache_salt=None,
+    lora_task_id=None,
+    multimodal_hashes=None,
+    multimodal_positions=None,
+    multimodal_lengths=None,
+):
+    """A stand-in for the fields the leader reads off an `LlmRequest`.
+
+    The multimodal three travel together on a real request, so a caller that
+    names any of them gets plausible values for the others.
+    """
+    if multimodal_positions is None and (
+        multimodal_hashes is not None or multimodal_lengths is not None
+    ):
+        multimodal_positions = [0]
+    if multimodal_lengths is None and multimodal_positions is not None:
+        multimodal_lengths = [1] * len(multimodal_positions)
     return SimpleNamespace(
         request_id=request_id,
         cache_salt=cache_salt,
+        lora_task_id=lora_task_id,
+        multimodal_hashes=multimodal_hashes,
+        multimodal_positions=multimodal_positions,
+        multimodal_lengths=multimodal_lengths,
         get_tokens=lambda _beam=0, _tokens=tuple(tokens): list(_tokens),
     )
 
 
-# ---- keys ----
-
-
-def test_hash_chain_is_deterministic_and_prefix_sensitive():
-    tokens = list(range(3 * TOKENS_PER_BLOCK))
-    first = list(BlockHashChain(TOKENS_PER_BLOCK).extend(tokens))
-    second = list(BlockHashChain(TOKENS_PER_BLOCK).extend(tokens))
-    assert first == second
-
-    # Changing a token in block 0 must change every hash after it, which is what
-    # makes a key safe to share: a hit implies the whole prefix matched.
-    altered = list(tokens)
-    altered[0] += 1
-    changed = list(BlockHashChain(TOKENS_PER_BLOCK).extend(altered))
-    assert all(a != b for a, b in zip(first, changed))
-
-
-def test_hash_chain_ignores_partial_trailing_block():
-    full = list(range(2 * TOKENS_PER_BLOCK))
-    chain = BlockHashChain(TOKENS_PER_BLOCK)
-    assert len(chain.extend(full)) == 2
-    assert len(chain.extend(full + [99])) == 2
-
-
-def test_hash_chain_extends_incrementally():
-    tokens = list(range(4 * TOKENS_PER_BLOCK))
-    incremental = BlockHashChain(TOKENS_PER_BLOCK)
-    for end in range(0, len(tokens) + 1, TOKENS_PER_BLOCK):
-        incremental.extend(tokens[:end])
-    assert list(incremental.hashes) == list(BlockHashChain(TOKENS_PER_BLOCK).extend(tokens))
-
-
-def test_hash_chain_separates_cache_salts():
-    tokens = list(range(TOKENS_PER_BLOCK))
-    unsalted = BlockHashChain(TOKENS_PER_BLOCK).extend(tokens)
-    salted = BlockHashChain(TOKENS_PER_BLOCK, cache_salt="tenant-a").extend(tokens)
-    other = BlockHashChain(TOKENS_PER_BLOCK, cache_salt="tenant-b").extend(tokens)
-    assert unsalted[0] != salted[0] != other[0]
-    assert salted[0] != other[0]
-
-
-def test_hash_chain_rejects_shrinking_token_list():
-    chain = BlockHashChain(TOKENS_PER_BLOCK)
-    chain.extend(list(range(2 * TOKENS_PER_BLOCK)))
-    with pytest.raises(ValueError, match="shrank"):
-        chain.extend(list(range(TOKENS_PER_BLOCK)))
-
-
-def test_key_namespace_separates_every_dimension():
-    base = dict(
-        namespace="trtllm",
-        model_key="m",
-        rank=0,
-        world_size=2,
-        layer_group_id=0,
-        tokens_per_block=32,
-        bytes_per_page=1024,
-    )
-    block_hash = b"\x01" * 16
-    reference = KeyNamespace(**base).key(block_hash)
-    for field, value in [
-        ("namespace", "other"),
-        ("model_key", "n"),
-        ("rank", 1),
-        ("world_size", 4),
-        ("layer_group_id", 1),
-        ("tokens_per_block", 64),
-        ("bytes_per_page", 2048),
-    ]:
-        assert KeyNamespace(**{**base, field: value}).key(block_hash) != reference
+#: One item's content hash in the form the bindings report: 8 int32 chunks.
+IMAGE_A_HASH = [1, 2, 3, 4, 5, 6, 7, 8]
+IMAGE_B_HASH = [1, 2, 3, 4, 5, 6, 7, 9]
 
 
 # ---- addressing ----
@@ -395,391 +335,7 @@ def test_page_addressing_rejects_mixed_slot_counts():
         PageAddressing(layout)
 
 
-# ---- config ----
-
-
-def test_config_reads_sizes_and_staging_from_the_json(store_config):
-    """Sizes arrive as unit strings, and staging is off until the JSON asks."""
-    config = resolve_config()
-    assert config.global_segment_size == 1024**3
-    assert config.local_buffer_size == 256 * 1024**2
-    assert config.role is StoreRole.BOTH
-    assert config.resolve_model_key("/models/ignored") == "test-model"
-    assert config.stage_through_host is False
-
-    set_pool_setting(store_config, stage_through_host=True)
-    assert resolve_config().stage_through_host is True
-
-
-@pytest.mark.parametrize("spelling", ["80GB", "4g", "2TB", "512mb"])
-def test_config_refuses_sizes_vllm_would_read_differently(store_config, spelling):
-    """This file is the one both engines open, and they disagree about 'GB'."""
-    set_pool_setting(store_config, global_segment_size=spelling)
-    with pytest.raises(ValueError, match="power of 1000"):
-        resolve_config()
-
-
-@pytest.mark.parametrize(
-    "spelling, expected",
-    [("160GiB", 160 * 1024**3), ("512MiB", 512 * 1024**2), (1024, 1024)],
-)
-def test_config_accepts_the_sizes_both_engines_agree_on(store_config, spelling, expected):
-    set_pool_setting(store_config, global_segment_size=spelling)
-    assert resolve_config().global_segment_size == expected
-
-
-@pytest.mark.parametrize(
-    "role, loads, saves",
-    [
-        ("both", True, True),
-        ("producer", False, True),
-        ("consumer", True, False),
-        ("capacity", False, False),
-    ],
-)
-def test_config_role_comes_from_the_json(store_config, role, loads, saves):
-    """Each server's own config says what it does with the pool.
-
-    There is no environment override for it. The role is a field of
-    `mooncake_store`, and the rendered config carries what that field said, so
-    a second way to set it could only disagree with the first.
-    """
-    set_pool_setting(store_config, role=role)
-    config = resolve_config()
-
-    assert config.role is StoreRole(role)
-    assert (config.role.loads, config.role.saves) == (loads, saves)
-    assert config.capacity_only is (not loads and not saves)
-
-
-def test_config_rejects_a_role_it_does_not_have(store_config):
-    set_pool_setting(store_config, role="donor")
-    with pytest.raises(ValueError, match="not one of"):
-        resolve_config()
-
-
-# ---- roles ----
-#
-# A role names the traffic an engine drives, not the memory it lends, so every
-# call site is guarded on `loads` and `saves` alone.
-
-
-@pytest.mark.parametrize(
-    "role, loads, saves",
-    [
-        (StoreRole.BOTH, True, True),
-        (StoreRole.PRODUCER, False, True),
-        (StoreRole.CONSUMER, True, False),
-        (StoreRole.CAPACITY, False, False),
-    ],
-)
-def test_each_role_drives_the_traffic_it_names(role, loads, saves):
-    assert role.loads is loads
-    assert role.saves is saves
-    assert role.transfers is (loads or saves)
-
-
-def test_exactly_one_role_transfers_nothing():
-    """Without it, contributing memory would mean also using the pool."""
-    silent = [role for role in StoreRole if not role.transfers]
-    assert silent == [StoreRole.CAPACITY]
-
-
-def test_config_needs_a_pool_described_somewhere(monkeypatch):
-    monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
-    with pytest.raises(ValueError, match="MOONCAKE_CONFIG_PATH"):
-        resolve_config()
-
-
-def test_config_falls_back_to_the_run_directory(tmp_path, monkeypatch):
-    # A rank an external launcher started was already running when its leader
-    # provisioned the pool, so it never inherited the exported path and reads
-    # the rendered config out of the run directory its own config names.
-    monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
-    (tmp_path / "mooncake.json").write_text(
-        json.dumps({"master_server_address": "10.0.0.1:50051", "global_segment_size": "8GiB"})
-    )
-
-    config = resolve_config(run_dir=str(tmp_path))
-
-    assert config.master_server_address == "10.0.0.1:50051"
-    assert config.global_segment_size == 8 * 1024**3
-
-
-def test_config_run_directory_without_a_rendered_config_still_asks(tmp_path, monkeypatch):
-    # An empty run directory means no leader provisioned anything, which is a
-    # missing pool rather than a default one.
-    monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
-    with pytest.raises(ValueError, match="MOONCAKE_CONFIG_PATH"):
-        resolve_config(run_dir=str(tmp_path))
-
-
-def test_config_env_var_wins_over_the_run_directory(tmp_path, monkeypatch):
-    # An externally managed pool stays reachable, since the run directory is
-    # only consulted when nothing was passed in.
-    named = tmp_path / "external.json"
-    named.write_text(json.dumps({"master_server_address": "external:50051"}))
-    (tmp_path / "mooncake.json").write_text(
-        json.dumps({"master_server_address": "provisioned:50051"})
-    )
-    monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(named))
-
-    assert resolve_config(run_dir=str(tmp_path)).master_server_address == "external:50051"
-
-
-@pytest.mark.parametrize("named", [{}, {"metadata_server": ""}], ids=["omitted", "empty"])
-def test_config_metadata_server_falls_back_to_the_handshake(tmp_path, monkeypatch, named):
-    # No metadata service means Mooncake's peer-to-peer handshake. An empty
-    # connstring is not one of the forms setup accepts, so leaving the field
-    # out of a hand-written config must not reach it.
-    path = tmp_path / "metadata.json"
-    path.write_text(json.dumps({"master_server_address": "127.0.0.1:50051", **named}))
-    monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(path))
-    assert resolve_config().metadata_server == "P2PHANDSHAKE"
-
-
-def test_config_without_a_model_key_is_refused_rather_than_guessed(tmp_path, monkeypatch):
-    """A key derived from the model path would let two checkpoints that share a
-    directory name read each other's pages as their own.
-    """
-    path = tmp_path / "no_model_key.json"
-    path.write_text(json.dumps({"master_server_address": "127.0.0.1:50051"}))
-    monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(path))
-    with pytest.raises(ValueError, match="needs a model key"):
-        resolve_config().resolve_model_key("/models/MiniMax-M3/")
-
-
-# ---- validation ----
-
-
-@pytest.mark.parametrize(
-    "field,value,match",
-    [
-        ("context_parallel_size", 2, "context parallelism"),
-        ("pipeline_parallel_size", 2, "pipeline parallelism"),
-    ],
-)
-def test_validate_llm_args_rejects_unsupported_parallelism(field, value, match):
-    args = make_llm_args()
-    setattr(args, field, value)
-    with pytest.raises(NotImplementedError, match=match):
-        validate_llm_args(args)
-
-
-def test_validate_llm_args_rejects_m3_index_value_cache():
-    args = make_llm_args()
-    args.sparse_attention_config = SimpleNamespace(sparse_disable_index_value=False)
-    with pytest.raises(NotImplementedError, match="sparse_disable_index_value"):
-        validate_llm_args(args)
-
-    args.sparse_attention_config = SimpleNamespace(sparse_disable_index_value=True)
-    validate_llm_args(args)
-
-
-def test_validate_layout_rejects_sliding_window():
-    with pytest.raises(NotImplementedError, match="sliding-window"):
-        validate_layout(make_layout(window_size=1024))
-    validate_layout(make_layout())
-
-
-# ---- the per-node budget ----
-#
-# Contribution is per rank and host DRAM is per node, so the ranks sharing one
-# each claim the segment independently. Unchecked, the answer is the OOM killer
-# minutes later during weight loading, naming no cause.
-
-
-def node_budget_config(segment_size, **overrides):
-    return MooncakeStoreConnectorConfig(
-        master_server_address="10.0.0.1:50051",
-        global_segment_size=segment_size,
-        **overrides,
-    )
-
-
-def test_a_segment_the_node_can_afford_is_accepted():
-    validate_node_budget(
-        node_budget_config(16 * 1024**3),
-        ranks_on_node=4,
-        available_bytes=256 * 1024**3,
-    )
-
-
-def test_a_segment_the_node_cannot_afford_is_refused():
-    """Eight attention-DP owners at 160GiB against a ~956GiB node."""
-    with pytest.raises(ValueError, match="cannot afford"):
-        validate_node_budget(
-            node_budget_config(160 * 1024**3),
-            ranks_on_node=8,
-            available_bytes=956 * 1024**3,
-        )
-
-
-def test_the_same_segment_is_fine_with_fewer_ranks_on_the_node():
-    """Four ranks of the same size fit, which is why the multiplier matters."""
-    validate_node_budget(
-        node_budget_config(160 * 1024**3),
-        ranks_on_node=4,
-        available_bytes=956 * 1024**3,
-    )
-
-
-def test_refusing_says_what_would_fit():
-    """A rejection a user cannot act on is only marginally better than an OOM."""
-    with pytest.raises(ValueError, match="at most"):
-        validate_node_budget(
-            node_budget_config(512 * 1024**3),
-            ranks_on_node=4,
-            available_bytes=256 * 1024**3,
-        )
-
-
-def test_the_budget_leaves_room_for_the_weights():
-    """Permitting every last byte would pass configs that die under load."""
-    available = 256 * 1024**3
-    # Exactly the available memory, which is precisely what must not be taken.
-    with pytest.raises(ValueError, match="cannot afford"):
-        validate_node_budget(
-            node_budget_config(available), ranks_on_node=1, available_bytes=available
-        )
-    validate_node_budget(
-        node_budget_config(available - NODE_BUDGET_RESERVE_BYTES),
-        ranks_on_node=1,
-        available_bytes=available,
-    )
-
-
-def test_staging_counts_against_the_same_budget():
-    """It is pinned for the process's lifetime and comes out of the same DRAM."""
-    segment = 100 * 1024**3
-    available = 128 * 1024**3 + NODE_BUDGET_RESERVE_BYTES
-    validate_node_budget(node_budget_config(segment), ranks_on_node=1, available_bytes=available)
-    # `both` stages in each direction, so it asks for two pools.
-    with pytest.raises(ValueError, match="cannot afford"):
-        validate_node_budget(
-            node_budget_config(available - NODE_BUDGET_RESERVE_BYTES, stage_through_host=True),
-            ranks_on_node=1,
-            available_bytes=available,
-        )
-
-
-def test_a_capacity_only_rank_is_charged_no_staging():
-    """It opens no staging pool in either direction, because it transfers nothing."""
-    available = 128 * 1024**3 + NODE_BUDGET_RESERVE_BYTES
-    validate_node_budget(
-        node_budget_config(128 * 1024**3, role=StoreRole.CAPACITY, stage_through_host=True),
-        ranks_on_node=1,
-        available_bytes=available,
-    )
-
-
-def test_a_zero_segment_is_always_affordable():
-    """A rank that contributes nothing cannot exhaust anything."""
-    validate_node_budget(node_budget_config(0), ranks_on_node=64, available_bytes=1024)
-
-
-def test_an_unreadable_budget_warns_rather_than_blocks(monkeypatch):
-    """Refusing to start because a figure could not be read helps nobody."""
-    monkeypatch.setattr(validation_module, "_available_host_memory", lambda: None)
-    validate_node_budget(node_budget_config(160 * 1024**3), ranks_on_node=8)
-
-
-# ---- connector identification ----
-#
-# py_executor_creator turns partial reuse off for this connector and finds it
-# through uses_connector. Failing to recognize the config would silently cost
-# the reuse the store exists to provide.
-
-
-@pytest.mark.parametrize(
-    "config, expected",
-    [
-        (KvCacheConnectorConfig(connector="mooncake-store"), True),
-        (
-            KvCacheConnectorConfig(
-                connector_module="tensorrt_llm._torch.pyexecutor.connectors.mooncake_store",
-                connector_scheduler_class="MooncakeStoreConnectorScheduler",
-                connector_worker_class="MooncakeStoreConnectorWorker",
-            ),
-            True,
-        ),
-        (KvCacheConnectorConfig(connector="kvbm"), False),
-        (None, False),
-    ],
-    ids=["preset", "hand_written_module", "another_connector", "no_connector"],
-)
-def test_uses_connector_recognizes_the_connector_however_it_is_spelled(config, expected):
-    assert uses_connector(config, "mooncake-store") is expected
-
-
-def test_uses_connector_rejects_an_unknown_preset():
-    config = KvCacheConnectorConfig(connector="mooncake-store")
-    with pytest.raises(ValueError, match="Unknown connector preset"):
-        uses_connector(config, "mooncake-stroe")
-
-
-# ---- native offload tiers ----
-#
-# The pool is the deployment's offload tier, so a native one would claim a
-# second share of the same node's DRAM.
-
-
-def test_default_cache_sizes_are_pinned_to_zero():
-    """Unset is not the same as no tier: None asks V2 to size one itself."""
-    config = KvCacheConfig()
-    assert config.host_cache_size is None
-    assert config.disk_cache_size is None
-
-    _disable_native_kv_offload(config)
-
-    assert config.host_cache_size == 0
-    assert config.disk_cache_size == 0
-
-
-def test_an_explicitly_sized_host_tier_is_overridden():
-    config = KvCacheConfig(host_cache_size=64 * 1024**3)
-    _disable_native_kv_offload(config)
-    assert config.host_cache_size == 0
-
-
-def test_an_explicitly_sized_disk_tier_is_overridden():
-    config = KvCacheConfig(disk_cache_size=64 * 1024**3, disk_cache_path="/tmp/kv")
-    _disable_native_kv_offload(config)
-    assert config.disk_cache_size == 0
-
-
-def test_overriding_an_explicit_size_says_so(caplog):
-    """Silently dropping a memory budget someone sized on purpose is a trap."""
-    config = KvCacheConfig(host_cache_size=64 * 1024**3)
-    with caplog.at_level("WARNING"):
-        _disable_native_kv_offload(config)
-    assert "host_cache_size" in caplog.text
-    assert "segment_size" in caplog.text
-
-
-def test_leaving_the_defaults_alone_warns_about_nothing(caplog):
-    """There is no budget to report having ignored."""
-    with caplog.at_level("WARNING"):
-        _disable_native_kv_offload(KvCacheConfig())
-    assert caplog.text == ""
-
-
 # ---- worker ----
-
-
-def test_worker_registers_every_pool_range(store_config, fake_store):
-    layout = make_layout(num_groups=2, regions_per_group=2)
-    with make_worker(fake_store, layout=layout) as worker:
-        assert fake_store.registered == [
-            (start, end - start) for start, end in PageAddressing(layout).registration_ranges()
-        ]
-        assert worker.is_registered
-
-
-def test_worker_rejects_v1_pool_registration(store_config, fake_store):
-    with make_worker(fake_store) as worker:
-        with pytest.raises(NotImplementedError, match="KVCacheManagerV2"):
-            worker.register_kv_caches(None)
 
 
 def test_worker_prefix_hit_needs_every_layer_group(store_config, fake_store):
@@ -834,23 +390,6 @@ def test_worker_load_addresses_the_requested_page(store_config, fake_store):
         assert sizes == [expected_sizes]
 
 
-def test_worker_save_skips_pages_already_in_the_store(store_config, fake_store):
-    with make_worker(fake_store, layout=make_layout()) as worker:
-        hashes = [bytes([index]) * 16 for index in range(2)]
-        fake_store.objects.add(worker._namespaces[0].key(hashes[0]))
-
-        worker._put(
-            [
-                RequestTransfers(
-                    1,
-                    [PageTransfer(hashes[0], 0, 0), PageTransfer(hashes[1], 0, 1)],
-                )
-            ]
-        )
-        assert len(fake_store.put_calls) == 1
-        assert fake_store.put_calls[0][0] == [worker._namespaces[0].key(hashes[1])]
-
-
 def test_worker_reports_a_request_finished_once_its_saves_drain(store_config, fake_store):
     with make_worker(fake_store, layout=make_layout()) as worker:
         # One submission outstanding: the request is closed but must not be released.
@@ -863,158 +402,11 @@ def test_worker_reports_a_request_finished_once_its_saves_drain(store_config, fa
         assert worker.get_finished([], []) == ([], [])
 
 
-def test_worker_reports_a_request_with_no_saves_immediately(store_config, fake_store):
-    with make_worker(fake_store, layout=make_layout()) as worker:
-        assert worker.get_finished([9], [5]) == ([9], [5])
-
-
-def test_worker_shutdown_closes_the_store(store_config, fake_store):
-    with make_worker(fake_store, layout=make_layout()) as worker:
-        worker.shutdown()
-        assert fake_store.closed
-        # Idempotent: a second call must not raise or reopen anything.
-        worker.shutdown()
-
-
-def test_worker_records_the_segment_it_mounted(store_config, fake_store, tmp_path):
-    """Capacity is a sum no participant can see, so each writes down its term."""
-    run_dir = tmp_path / "run"
-
-    with make_worker(fake_store, run_dir=str(run_dir)):
-        pass
-
-    (record,) = read_segments(str(run_dir))
-    assert record.host == "10.0.0.1"
-    assert record.segment_size == 1024**3
-    assert record.role == "both"
-    assert record.model_key == "test-model"
-
-
-# ---- the capacity-only role ----
-#
-# Its segment is mounted by the same connector every other rank uses, and every
-# path that would then touch the pool is short-circuited. The tests below are
-# one per path.
-
-
-@contextlib.contextmanager
-def make_capacity_worker(fake_store, store_config, *, layout=None, run_dir=None):
-    """A worker whose role contributes memory and drives no traffic."""
-    set_pool_setting(store_config, role="capacity")
-    with make_worker(fake_store, layout=layout, run_dir=run_dir) as worker:
-        yield worker
-
-
-def test_capacity_only_says_so(store_config, fake_store):
-    with make_capacity_worker(fake_store, store_config) as worker:
-        assert worker.capacity_only
-
-
-def test_a_transferring_worker_is_not_capacity_only(store_config, fake_store):
-    with make_worker(fake_store) as worker:
-        assert not worker.capacity_only
-
-
-def test_capacity_only_registers_no_kv_cache(store_config, fake_store):
-    """What removes the GPUDirect RDMA dependency from this side entirely."""
-    with make_capacity_worker(fake_store, store_config, layout=make_layout()) as worker:
-        assert fake_store.registered == []
-        assert not worker.is_registered
-
-
-def test_capacity_only_starts_no_save_thread(store_config, fake_store):
-    with make_capacity_worker(fake_store, store_config, layout=make_layout()) as worker:
-        assert worker._save_thread is None
-
-
-def test_capacity_only_opens_no_staging_pool(store_config, fake_store):
-    """Staging exists to reach GPU pages; there are none to reach here."""
-    set_pool_setting(store_config, stage_through_host=True)
-
-    with make_capacity_worker(fake_store, store_config, layout=make_layout()) as worker:
-        assert worker._load_staging is None
-        assert worker._save_staging is None
-        assert fake_store.registered == []
-
-
-def test_capacity_only_accepts_the_v1_registration(store_config, fake_store):
-    """Addressing nothing means the choice of KV cache manager stops mattering."""
-    with make_capacity_worker(fake_store, store_config) as worker:
-        worker.register_kv_caches(torch.empty(0))
-
-
-def test_a_transferring_worker_still_refuses_the_v1_registration(store_config, fake_store):
-    with make_worker(fake_store) as worker:
-        with pytest.raises(NotImplementedError, match="KVCacheManagerV2"):
-            worker.register_kv_caches(torch.empty(0))
-
-
-def test_capacity_only_looks_nothing_up(store_config, fake_store):
-    fake_store.objects.update({"anything"})
-    with make_capacity_worker(fake_store, store_config, layout=make_layout()) as worker:
-        assert worker.count_prefix_hit([b"a", b"b"]) == 0
-        assert fake_store.exist_calls == []
-
-
-def test_capacity_only_loads_nothing(store_config, fake_store):
-    with make_capacity_worker(fake_store, store_config, layout=make_layout()) as worker:
-        worker.start_load_kv(None)
-        assert fake_store.get_calls == []
-
-
-def test_capacity_only_saves_nothing(store_config, fake_store):
-    with make_capacity_worker(fake_store, store_config, layout=make_layout()) as worker:
-        worker.wait_for_save(None)
-        assert fake_store.put_calls == []
-
-
-def test_capacity_only_reports_no_transfers_outstanding(store_config, fake_store):
-    """Nothing is in flight, so a request is never held waiting on this rank."""
-    with make_capacity_worker(fake_store, store_config, layout=make_layout()) as worker:
-        assert worker.get_finished([7], []) == ([7], [])
-
-
-def test_capacity_only_still_mounts_its_segment(store_config, fake_store, tmp_path):
-    """The one thing it does do, and the only reason it exists."""
-    run_dir = tmp_path / "run"
-
-    with make_capacity_worker(fake_store, store_config, layout=make_layout(), run_dir=str(run_dir)):
-        pass
-
-    (record,) = read_segments(str(run_dir))
-    assert record.role == "capacity"
-    assert record.segment_size == 1024**3
-
-
-def test_capacity_only_scheduler_offers_and_saves_nothing(store_config):
-    """The leader half of the same short-circuit."""
-    set_pool_setting(store_config, role="capacity")
-
-    scheduler = MooncakeStoreConnectorScheduler(make_llm_args())
-    scheduler._worker = FakeWorker(hit_blocks=4)
-    request = make_request(1, list(range(4 * TOKENS_PER_BLOCK)))
-
-    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
-    output = SimpleNamespace(
-        new_requests=[
-            SimpleNamespace(
-                request_id=1,
-                new_tokens=list(range(4 * TOKENS_PER_BLOCK)),
-                new_block_ids_by_layer_group={0: [0, 1, 2, 3]},
-            )
-        ],
-        cached_requests=[],
-    )
-    metadata = scheduler.build_connector_meta(output)
-    assert metadata.loads == []
-    assert metadata.saves == []
-
-
 # ---- host staging ----
 
 
 @contextlib.contextmanager
-def make_staged_worker(fake_store, store_config, *, layout, budget=None, batch=None):
+def make_staged_worker(fake_store, store_config, *, layout, budget=None):
     """A worker configured to pass pages through pinned host slots.
 
     `budget` patches the pinned-memory ceiling rather than setting a field:
@@ -1022,8 +414,6 @@ def make_staged_worker(fake_store, store_config, *, layout, budget=None, batch=N
     ceiling is the only thing left that can bind.
     """
     set_pool_setting(store_config, stage_through_host=True)
-    if batch is not None:
-        set_pool_setting(store_config, transfer_batch_size=batch)
     with contextlib.ExitStack() as stack:
         if budget is not None:
             patch = stack.enter_context(pytest.MonkeyPatch.context())
@@ -1058,65 +448,6 @@ def fake_cuda(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
     monkeypatch.setattr(torch.cuda, "set_device", lambda index: recorded.append(index))
     return recorded
-
-
-@pytest.mark.parametrize(
-    "page_bytes,batch,budget,expected_slots",
-    [
-        (1024, 64, 1 << 20, 64),  # budget is ample: the full batch stages
-        (1024, 64, 8 * 1024, 8),  # budget binds before the batch does
-        (1024, 8, 1 << 20, 8),  # batch binds before the budget does
-        (1024, 64, 1024, 1),  # exactly one page fits
-        (1024, 64, 1, 1),  # below one page, raised to one rather than refused
-    ],
-)
-def test_plan_slot_geometry(page_bytes, batch, budget, expected_slots):
-    slot_bytes, num_slots = plan_slot_geometry(page_bytes, batch, budget)
-    # A slot always holds a whole page: the budget bounds the count, not the width.
-    assert slot_bytes == page_bytes
-    assert num_slots == expected_slots
-
-
-@pytest.mark.parametrize("bad", [(0, 8, 1024), (-1, 8, 1024), (1024, 0, 1024)])
-def test_plan_slot_geometry_rejects_degenerate_inputs(bad):
-    with pytest.raises(ValueError):
-        plan_slot_geometry(*bad)
-
-
-def test_staging_is_sized_from_the_layout_and_the_batch(store_config, fake_store):
-    """The allocation follows from the geometry rather than from a field.
-
-    A slot has to hold the largest page any layer group produces, and there is
-    no point holding more slots than one store call has pages, so both numbers
-    are known once the layout is registered. A configured size could only be
-    too small, which costs throughput quietly by narrowing the batch.
-    """
-    layout = make_layout(regions_per_group=2)
-    page_bytes = PageAddressing(layout).bytes_per_page(0)
-
-    with make_staged_worker(fake_store, store_config, layout=layout, batch=3) as worker:
-        assert worker._save_staging.slot_bytes == page_bytes
-        assert worker._save_staging.num_slots == 3
-        assert worker._batch_size == 3
-
-
-def test_staging_registers_host_buffers_and_never_the_pools(
-    store_config, fake_store, staged_copies
-):
-    layout = make_layout(regions_per_group=2)
-    with make_staged_worker(fake_store, store_config, layout=layout) as worker:
-        # Registering the pools is the step that needs GPUDirect, so staging
-        # must not do it at all.
-        pool_ranges = PageAddressing(layout).registration_ranges()
-        registered_starts = {address for address, _size in fake_store.registered}
-        assert registered_starts.isdisjoint({start for start, _end in pool_ranges})
-
-        # One pinned buffer per direction, since the default role is `both`.
-        assert len(fake_store.registered) == 2
-        assert registered_starts == {
-            worker._load_staging.slot_address(0),
-            worker._save_staging.slot_address(0),
-        }
 
 
 def test_staging_put_hands_the_store_one_host_buffer_per_page(
@@ -1213,6 +544,73 @@ def test_the_ranks_device_is_captured_and_adopted_by_the_save_thread(
         assert 0 not in fake_cuda
 
 
+def test_a_save_thread_that_cannot_start_fails_registration(
+    store_config, fake_store, fake_cuda, monkeypatch
+):
+    """A worker whose save thread died must not go on to report itself ready.
+
+    The thread's setup binds this rank's device. If that raises and the thread
+    exits, every later `wait_for_save` counts a save that nothing will ever
+    consume, and the requests holding those pages stay pinned for good.
+    """
+
+    def refuse(_index):
+        raise RuntimeError("cudaSetDevice failed")
+
+    monkeypatch.setattr(torch.cuda, "set_device", refuse)
+
+    with pytest.raises(RuntimeError, match="save thread"):
+        with make_worker(fake_store, layout=make_layout()):
+            pytest.fail("registration should not have completed")
+
+
+def test_shutdown_leaves_the_store_open_under_a_save_still_reading(
+    store_config, fake_store, monkeypatch
+):
+    """A timed join is not evidence that the thread stopped.
+
+    The save thread reads the KV pools through the store handle and the staging
+    slots, so closing the handle or dropping those buffers mid-transfer takes
+    the memory out from under it.
+    """
+    monkeypatch.setattr(worker_module, "SAVE_DRAIN_TIMEOUT", 0.1)
+    reading = threading.Event()
+    release = threading.Event()
+    store_put = fake_store.batch_put_from_multi_buffers
+
+    def blocking_put(*args, **kwargs):
+        reading.set()
+        assert release.wait(30.0), "the test never released the save thread"
+        return store_put(*args, **kwargs)
+
+    fake_store.batch_put_from_multi_buffers = blocking_put
+
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        # Queued directly: what matters is a thread inside the store call, not
+        # how the pass that produced the pages reached it.
+        worker._save_queue.put(
+            (
+                SimpleNamespace(synchronize=lambda: None),
+                [RequestTransfers(1, [PageTransfer(b"\x05" * 16, 0, 0)])],
+            )
+        )
+        assert reading.wait(30.0), "the save thread never reached the store"
+
+        worker.shutdown()
+
+        assert not fake_store.closed
+        assert worker._store is fake_store
+        # Kept rather than dropped, so a later call retries the join.
+        assert worker._save_thread is not None
+
+        release.set()
+        worker.shutdown()
+
+        assert fake_store.closed
+        assert worker._store is None
+        assert worker._save_thread is None
+
+
 def test_staging_narrows_the_batch_to_the_budget(store_config, fake_store, staged_copies):
     layout = make_layout(regions_per_group=2, num_slots=8)
     page_bytes = PageAddressing(layout).bytes_per_page(0)
@@ -1256,21 +654,16 @@ def make_scheduler(store_config, hit_blocks=0):
     return scheduler
 
 
-def request_data(request_id, new_tokens, page_indices, layer_group_id=0):
+def request_data(request_id, new_tokens, page_indices):
     return RequestData(
         request_id=request_id,
         new_tokens=list(new_tokens),
         new_block_ids=list(page_indices),
         computed_position=0,
         num_scheduled_tokens=len(new_tokens),
-        new_block_ids_by_layer_group={layer_group_id: list(page_indices)},
+        # Keyed by layer group id.
+        new_block_ids_by_layer_group={0: list(page_indices)},
     )
-
-
-def test_scheduler_offers_the_stored_prefix(store_config):
-    scheduler = make_scheduler(store_config, hit_blocks=2)
-    request = make_request(1, list(range(5 * TOKENS_PER_BLOCK)))
-    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, False)
 
 
 def test_scheduler_never_offers_the_whole_prompt(store_config):
@@ -1286,14 +679,6 @@ def test_scheduler_declines_partial_local_matches(store_config):
     scheduler = make_scheduler(store_config, hit_blocks=2)
     request = make_request(1, list(range(5 * TOKENS_PER_BLOCK)))
     assert scheduler.get_num_new_matched_tokens(request, TOKENS_PER_BLOCK + 1) == (0, False)
-
-
-def test_scheduler_offers_nothing_as_a_producer(store_config):
-    set_pool_setting(store_config, role="producer")
-    scheduler = make_scheduler(store_config, hit_blocks=2)
-    request = make_request(1, list(range(5 * TOKENS_PER_BLOCK)))
-    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
-    assert scheduler._worker.queries == []
 
 
 def test_scheduler_skips_local_prefix_when_looking_up(store_config):
@@ -1353,18 +738,6 @@ def test_scheduler_waits_for_a_block_to_fill_before_saving(store_config):
     assert [page.page_index for page in metadata.saves[0].pages] == [4]
 
 
-def test_scheduler_saves_nothing_as_a_consumer(store_config):
-    set_pool_setting(store_config, role="consumer")
-    scheduler = make_scheduler(store_config, hit_blocks=0)
-    tokens = list(range(2 * TOKENS_PER_BLOCK))
-    request = make_request(1, tokens)
-    scheduler.get_num_new_matched_tokens(request, 0)
-    metadata = scheduler.build_connector_meta(
-        SchedulerOutput(new_requests=[request_data(1, tokens, [4, 5])])
-    )
-    assert metadata.saves == []
-
-
 def test_scheduler_skips_blocks_without_a_page_in_every_group(store_config):
     scheduler = make_scheduler(store_config, hit_blocks=0)
     tokens = list(range(2 * TOKENS_PER_BLOCK))
@@ -1381,67 +754,6 @@ def test_scheduler_skips_blocks_without_a_page_in_every_group(store_config):
         (0, 4),
         (1, 7),
     ]
-
-
-def test_scheduler_cancel_load_truncates_the_offer(store_config):
-    scheduler = make_scheduler(store_config, hit_blocks=3)
-    tokens = list(range(6 * TOKENS_PER_BLOCK))
-    request = make_request(1, tokens)
-    scheduler.get_num_new_matched_tokens(request, 0)
-
-    # The runtime will not consume anything from block 1 onwards.
-    scheduler.cancel_load(request, TOKENS_PER_BLOCK, 6 * TOKENS_PER_BLOCK)
-    metadata = scheduler.build_connector_meta(
-        SchedulerOutput(new_requests=[request_data(1, tokens, list(range(10, 16)))])
-    )
-    assert [page.page_index for page in metadata.loads[0].pages] == [10]
-
-
-@pytest.mark.parametrize(
-    "cancel_ranges,expected_pages",
-    [
-        ([(4, 8)], [12, 13, 14]),
-        ([(4, 12)], [13, 14]),
-        ([(4, 8), (16, 20)], [12, 13]),
-        ([(16, 20), (4, 8)], [12, 13]),
-        ([(4, 20)], []),
-        ([(0, 24)], []),
-        ([(0, 4), (20, 24)], [11, 12, 13, 14]),
-        ([(8, 8)], [11, 12, 13, 14]),
-        ([(4, 5)], [12, 13, 14]),
-        ([(19, 24)], [11, 12, 13]),
-    ],
-)
-def test_scheduler_cancel_load_preserves_uncanceled_range(
-    store_config: Path,
-    cancel_ranges: list[tuple[int, int]],
-    expected_pages: list[int],
-) -> None:
-    """Cancel from either end of a nonzero-offset offer without losing its remainder."""
-    scheduler = make_scheduler(store_config, hit_blocks=4)
-    tokens = list(range(6 * TOKENS_PER_BLOCK))
-    request = make_request(1, tokens)
-    assert scheduler.get_num_new_matched_tokens(request, TOKENS_PER_BLOCK) == (16, False)
-    for start, end in cancel_ranges:
-        scheduler.cancel_load(request, start, end)
-    metadata = scheduler.build_connector_meta(
-        SchedulerOutput(new_requests=[request_data(1, tokens, list(range(10, 16)))])
-    )
-    assert [page.page_index for load in metadata.loads for page in load.pages] == expected_pages
-    # A consumed offer must not be issued again on the next iteration.
-    next_metadata = scheduler.build_connector_meta(
-        SchedulerOutput(cached_requests=[request_data(1, [], [])])
-    )
-    assert next_metadata.loads == []
-
-
-def test_scheduler_rejects_cancellation_that_splits_an_offer(store_config: Path) -> None:
-    scheduler = make_scheduler(store_config, hit_blocks=4)
-    tokens = list(range(6 * TOKENS_PER_BLOCK))
-    request = make_request(1, tokens)
-    scheduler.get_num_new_matched_tokens(request, 0)
-    with pytest.raises(ValueError, match="beginning or end"):
-        scheduler.cancel_load(request, TOKENS_PER_BLOCK, 2 * TOKENS_PER_BLOCK)
 
 
 def test_scheduler_request_finished_pins_pages_only_when_saving(store_config):
@@ -1492,6 +804,72 @@ def test_scheduler_isolates_requests_by_cache_salt(store_config):
     scheduler.get_num_new_matched_tokens(make_request(1, tokens, cache_salt="a"), 0)
     scheduler.get_num_new_matched_tokens(make_request(2, tokens, cache_salt="b"), 0)
     assert scheduler._worker.queries[0] != scheduler._worker.queries[1]
+
+
+def test_scheduler_isolates_requests_by_lora_adapter(store_config):
+    """Same prompt, different adapter, different keys.
+
+    Sharing them would serve one adapter's KV to the other, which is a wrong
+    answer rather than a slow one.
+    """
+    scheduler = make_scheduler(store_config, hit_blocks=1)
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0)
+    scheduler.get_num_new_matched_tokens(make_request(2, tokens, lora_task_id=0), 0)
+    scheduler.get_num_new_matched_tokens(make_request(3, tokens, lora_task_id=1), 0)
+
+    queries = scheduler._worker.queries
+    assert len({tuple(query) for query in queries}) == 3
+
+
+def test_scheduler_isolates_requests_by_multimodal_content(store_config):
+    """Two images behind the same placeholder tokens are two prefixes."""
+    scheduler = make_scheduler(store_config, hit_blocks=1)
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    scheduler.get_num_new_matched_tokens(
+        make_request(1, tokens, multimodal_hashes=[IMAGE_A_HASH]), 0
+    )
+    scheduler.get_num_new_matched_tokens(
+        make_request(2, tokens, multimodal_hashes=[IMAGE_B_HASH]), 0
+    )
+    scheduler.get_num_new_matched_tokens(make_request(3, tokens), 0)
+
+    queries = scheduler._worker.queries
+    assert len({tuple(query) for query in queries}) == 3
+
+    # The same image again is the same prefix, which is the point of keying on
+    # the content rather than refusing the request.
+    scheduler.get_num_new_matched_tokens(
+        make_request(4, tokens, multimodal_hashes=[IMAGE_A_HASH]), 0
+    )
+    assert queries[3] == queries[0]
+
+
+def test_scheduler_bypasses_multimodal_requests_it_cannot_identify(store_config):
+    """Media without hashes gets neither a lookup nor a save.
+
+    The prompt's placeholder tokens say nothing about the content behind them,
+    so there is no key that names this request's pages and no one else's.
+    """
+    scheduler = make_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens, multimodal_positions=[4], multimodal_lengths=[4])
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert scheduler._worker.queries == []
+
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, [7, 8, 9])])
+    )
+    assert metadata.loads == []
+    assert metadata.saves == []
+    # Nothing was handed to a save thread, so nothing pins its pages either.
+    assert scheduler.request_finished(request, [7, 8, 9]) is False
+
+
+def test_mooncake_declares_adp_support() -> None:
+    assert MooncakeStoreConnectorScheduler.supports_attention_dp
+    assert MooncakeStoreConnectorWorker.supports_attention_dp
 
 
 @pytest.mark.parametrize("producer_rank,consumer_rank", [(0, 3), (3, 1), (1, 0)])
@@ -1558,6 +936,62 @@ def test_tp_lookup_still_requires_all_attention_shards(
             assert adp.count_prefix_hit([block_hash]) == 0
 
 
-def test_mooncake_declares_adp_support() -> None:
-    assert MooncakeStoreConnectorScheduler.supports_attention_dp
-    assert MooncakeStoreConnectorWorker.supports_attention_dp
+def test_scheduler_cancel_load_truncates_the_offer(store_config):
+    scheduler = make_scheduler(store_config, hit_blocks=3)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+
+    # The runtime will not consume anything from block 1 onwards.
+    scheduler.cancel_load(request, TOKENS_PER_BLOCK, 6 * TOKENS_PER_BLOCK)
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, list(range(10, 16)))])
+    )
+    assert [page.page_index for page in metadata.loads[0].pages] == [10]
+
+
+@pytest.mark.parametrize(
+    "cancel_ranges,expected_pages",
+    [
+        ([(4, 8)], [12, 13, 14]),
+        ([(4, 12)], [13, 14]),
+        ([(4, 8), (16, 20)], [12, 13]),
+        ([(16, 20), (4, 8)], [12, 13]),
+        ([(4, 20)], []),
+        ([(0, 24)], []),
+        ([(0, 4), (20, 24)], [11, 12, 13, 14]),
+        ([(8, 8)], [11, 12, 13, 14]),
+        ([(4, 5)], [12, 13, 14]),
+        ([(19, 24)], [11, 12, 13]),
+    ],
+)
+def test_scheduler_cancel_load_preserves_uncanceled_range(
+    store_config: Path,
+    cancel_ranges: list[tuple[int, int]],
+    expected_pages: list[int],
+) -> None:
+    """Cancel from either end of a nonzero-offset offer without losing its remainder."""
+    scheduler = make_scheduler(store_config, hit_blocks=4)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    assert scheduler.get_num_new_matched_tokens(request, TOKENS_PER_BLOCK) == (16, False)
+    for start, end in cancel_ranges:
+        scheduler.cancel_load(request, start, end)
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, list(range(10, 16)))])
+    )
+    assert [page.page_index for load in metadata.loads for page in load.pages] == expected_pages
+    # A consumed offer must not be issued again on the next iteration.
+    next_metadata = scheduler.build_connector_meta(
+        SchedulerOutput(cached_requests=[request_data(1, [], [])])
+    )
+    assert next_metadata.loads == []
+
+
+def test_scheduler_rejects_cancellation_that_splits_an_offer(store_config: Path) -> None:
+    scheduler = make_scheduler(store_config, hit_blocks=4)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    with pytest.raises(ValueError, match="beginning or end"):
+        scheduler.cancel_load(request, TOKENS_PER_BLOCK, 2 * TOKENS_PER_BLOCK)
