@@ -19,50 +19,36 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch._experimental.modeling_v2._target import Phase, Target, phase_of
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import advance_step_generation
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
+    FlashinferSiluAndMul,
     flashinfer_silu_and_mul,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.load_paged_kv_cache_for_mla import (  # noqa: E501
     LoadPagedKvCacheForMla,
-    load_paged_kv_cache_for_mla,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_append_paged_kv_assign_q import (  # noqa: E501
     MlaRopeAppendPagedKvAssignQ,
-    mla_rope_append_paged_kv_assign_q,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_generation import (
     MlaRopeGeneration,
-    mla_rope_generation,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     ThopAttention,
-    thop_attention,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import (
-    Allgather,
-    allgather,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import (
-    Reducescatter,
-    reducescatter,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import BmmOut, bmm_out
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import CublasMm, cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import Allgather
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import Reducescatter
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import BmmOut
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import CublasMm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.nvfp4_gemm import Nvfp4Gemm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     Fp4BlockScaleMoeRunner,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fused_moe import fused_moe
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import (
-    NoauxTcOp,
-    noaux_tc_op,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fused_moe import FusedMoe
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import NoauxTcOp
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
     FlashinferFusedAddRmsnorm,
-    flashinfer_fused_add_rmsnorm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     FlashinferRmsnorm,
-    flashinfer_rmsnorm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     Fp4Quantize,
@@ -1512,28 +1498,204 @@ class MTPLayer:
     def __call__(self, *args, **kwargs) -> torch.Tensor:
         return self.forward(*args, **kwargs)
 
+    def post_load_weights(self) -> None:
+        """Bind every op this module calls, once, against the real weights.
+
+        Called from the shell after the core's own hook, because this module is built in
+        the shell's `__init__` -- while every parameter is still a meta tensor -- and
+        reads its operands out of `core._mtp`, which that hook derives.
+
+        Every binding here is `bind_const`: the module is a single layer, so there is no
+        per-layer table to index.
+        """
+        core = self.core
+        cfg = core.model_config.pretrained_config
+        mw = core._mtp
+        eps = cfg.rms_norm_eps
+        heads = cfg.num_attention_heads
+        nope = cfg.qk_nope_head_dim
+        rope_dim = cfg.qk_rope_head_dim
+        v_dim = cfg.v_head_dim
+        kv_lora = cfg.kv_lora_rank
+        q_lora = cfg.q_lora_rank
+        qk_dim = nope + rope_dim
+        lat_dim = kv_lora + rope_dim
+        # Under a one-model MTP mode the engine raises the KV pool's layer count by
+        # `num_nextn_predict_layers`, so this module addresses layer `num_hidden_layers`
+        # in the same pool as the trunk's 61 layers. Nothing in the config says so.
+        layer_idx = cfg.num_hidden_layers
+
+        self._head_norm = FlashinferRmsnorm()
+        self._head_norm.bind_const(weight=mw["head_norm"], eps=eps)
+        self._enorm = FlashinferRmsnorm()
+        self._enorm.bind_const(weight=mw["enorm"], eps=eps)
+        self._hnorm = FlashinferRmsnorm()
+        self._hnorm.bind_const(weight=mw["hnorm"], eps=eps)
+        self._norm1 = FlashinferRmsnorm()
+        self._norm1.bind_const(weight=mw["norm1"], eps=eps)
+        self._q_norm = FlashinferRmsnorm()
+        self._q_norm.bind_const(weight=mw["q_norm"], eps=eps)
+        self._kv_norm = FlashinferRmsnorm()
+        self._kv_norm.bind_const(weight=mw["kv_norm"], eps=eps)
+        self._norm2 = FlashinferFusedAddRmsnorm()
+        self._norm2.bind_const(weight=mw["norm2"], eps=eps)
+
+        self._eh = CublasMm()
+        self._eh.bind_const(mat_b=mw["eh"])
+        self._qa = CublasMm()
+        self._qa.bind_const(mat_b=mw["qa"])
+        self._qb = CublasMm()
+        self._qb.bind_const(mat_b=mw["qb"])
+        self._kva = CublasMm()
+        self._kva.bind_const(mat_b=mw["kva"])
+        self._kvb = CublasMm()
+        self._kvb.bind_const(mat_b=mw["kvb"])
+        self._o = CublasMm()
+        self._o.bind_const(mat_b=mw["o"])
+        self._sh_gu = CublasMm()
+        self._sh_gu.bind_const(mat_b=mw["sh_gu"])
+        self._sh_dn = CublasMm()
+        self._sh_dn.bind_const(mat_b=mw["sh_dn"])
+        self._silu = FlashinferSiluAndMul()
+
+        self._absorb = BmmOut()
+        self._absorb.bind_const(b=mw["k_b"])
+        self._expand = BmmOut()
+        self._expand.bind_const(b=mw["v_b_t"])
+
+        self._allgather = Allgather()
+        self._allgather.bind_const(sizes=None, group=core.dp_group)
+        self._reducescatter = Reducescatter()
+        self._reducescatter.bind_const(sizes=None, group=core.dp_group)
+
+        # fused_moe wants fp32 token_final_scales, which is why this router GEMM emits
+        # fp32 where the trunk's emits bf16.
+        self._router = CublasMm()
+        self._router.bind_const(mat_b=mw["router"], bias=None, out_dtype=torch.float32)
+        self._noaux = NoauxTcOp()
+        self._noaux.bind_const(
+            bias=mw["router_bias"],
+            n_group=cfg.n_group,
+            topk_group=cfg.topk_group,
+            topk=cfg.num_experts_per_tok,
+            routed_scaling_factor=float(cfg.routed_scaling_factor),
+        )
+        self._moe = FusedMoe()
+        self._moe.bind_const(
+            fc1_expert_weights=mw["fc1"],
+            fc1_expert_biases=None,
+            fc2_expert_weights=mw["fc2"],
+            fc2_expert_biases=None,
+            quant_scales=[],
+            ep_size=core.ep_size,
+            ep_rank=core.ep_rank,
+            activation_type=_FUSED_MOE_ACT_SWIGLU,
+        )
+
+        self._attn_ctx = ThopAttention()
+        self._attn_ctx.bind_const(
+            local_layer_idx=layer_idx,
+            num_heads=heads,
+            num_kv_heads=heads,
+            head_size=qk_dim,
+            q_lora_rank=q_lora,
+            kv_lora_rank=kv_lora,
+            qk_nope_head_dim=nope,
+            qk_rope_head_dim=rope_dim,
+            v_head_dim=v_dim,
+            is_fused_qkv=False,
+            attention_input_type=1,
+            q_pe=None,
+            cu_q_seqlens=None,
+            cu_kv_seqlens=None,
+            fmha_scheduler_counter=None,
+            predicted_tokens_per_seq=1,
+            **_CALL_INERT,
+            quant_mode=core.quant_mode,
+            q_scaling=core.q_scaling,
+        )
+        self._attn_gen = ThopAttention()
+        self._attn_gen.bind_const(
+            local_layer_idx=layer_idx,
+            num_heads=heads,
+            num_kv_heads=1,
+            head_size=lat_dim,
+            q_lora_rank=q_lora,
+            kv_lora_rank=kv_lora,
+            qk_nope_head_dim=nope,
+            qk_rope_head_dim=rope_dim,
+            v_head_dim=kv_lora,
+            is_fused_qkv=True,
+            attention_input_type=2,
+            k=None,
+            v=None,
+            **_CALL_INERT,
+            quant_mode=core.quant_mode,
+            q_scaling=core.q_scaling,
+        )
+
+        self._mla_append = MlaRopeAppendPagedKvAssignQ()
+        self._mla_append.bind_const(
+            layer_idx=layer_idx,
+            head_num=heads,
+            nope_size=nope,
+            rope_size=rope_dim,
+            lora_size=kv_lora,
+            kv_scale_orig_quant=None,
+            residual_dim=_KV_RESIDUAL_DIM,
+            beam_width=1,
+            quant_mode=core.quant_mode,
+        )
+        self._mla_load = LoadPagedKvCacheForMla()
+        self._mla_load.bind_const(
+            layer_idx=layer_idx,
+            kv_scale_quant_orig=None,
+            kv_lora_rank=kv_lora,
+            qk_rope_head_dim=rope_dim,
+            beam_width=1,
+            quant_mode=core.quant_mode,
+        )
+        self._mla_gen = MlaRopeGeneration()
+        self._mla_gen.bind_const(
+            layer_idx=layer_idx,
+            kv_scale_orig_quant=None,
+            kv_scale_quant_orig=None,
+            kv_cache_scale_orig_quant=None,
+            out_scale=None,
+            block_ids_per_seq=None,
+            helix_tensor_params=[None, None],
+            num_heads=heads,
+            num_kv_heads=1,
+            head_size=lat_dim,
+            residual_dim=_KV_RESIDUAL_DIM,
+            beam_width=1,
+            quant_mode=core.quant_mode,
+            q_scaling=core.q_scaling,
+            q_lora_rank=q_lora,
+            kv_lora_rank=kv_lora,
+            qk_nope_head_dim=nope,
+            qk_rope_head_dim=rope_dim,
+            v_head_dim=v_dim,
+            rope_append=True,
+        )
+
     def shared_head(
         self, hidden_states, lm_head, attn_metadata, return_context_logits
     ) -> torch.Tensor:
         """The module's own output head: its own RMS norm — a distinct parameter from the
         trunk's `model.norm` — then the trunk's `lm_head`."""
-        mw = self.core._mtp
         return self.logits_processor.forward(
-            flashinfer_rmsnorm(
-                hidden_states,
-                mw["head_norm"],
-                self.core.model_config.pretrained_config.rms_norm_eps,
-            ),
+            self._head_norm(hidden_states),
             lm_head,
             attn_metadata,
             return_context_logits,
         )
 
-    def _shared_mlp(self, x, mw):
+    def _shared_mlp(self, x):
         """The module's shared expert: one bf16 SwiGLU MLP over this rank's own tokens."""
-        return cublas_mm(flashinfer_silu_and_mul(cublas_mm(x, mw["sh_gu"])), mw["sh_dn"])
+        return self._sh_dn(self._silu(self._sh_gu(x)))
 
-    def _routed_experts(self, x, mw, all_rank_num_tokens, rows, dt):
+    def _routed_experts(self, x, all_rank_num_tokens, rows, dt):
         """The module's expert-parallel round trip, the trunk's shape at a different dtype.
 
         `fused_moe` wants fp32 `token_final_scales`, which is why the router GEMM emits fp32
@@ -1541,7 +1703,6 @@ class MTPLayer:
         above 256 tokens — a repeat reads out of bounds in `finalizeMoeRoutingKernel`, faulting
         or returning silent garbage — which a top-k over expert indices gives structurally."""
         core = self.core
-        cfg = core.model_config.pretrained_config
         dp_rows = _mtp_dp_rows(all_rank_num_tokens, core.rank, core.dp_size, rows)
         pad_rows = dp_rows - rows
         x_pad = (
@@ -1549,36 +1710,20 @@ class MTPLayer:
             if not pad_rows
             else nn.functional.pad(x, [0, 0, 0, pad_rows], mode="constant", value=0.0)
         )
-        x_all = allgather(x_pad, None, core.dp_group)
+        x_all = self._allgather(x_pad)
         parts = []
         for chunk in torch.split(x_all, _moe_chunk_sizes(x_all.shape[0]), 0):
-            logits = cublas_mm(chunk, mw["router"], None, torch.float32)
-            topk_w, topk_ids = noaux_tc_op(
-                logits,
-                mw["router_bias"],
-                cfg.n_group,
-                cfg.topk_group,
-                cfg.num_experts_per_tok,
-                float(cfg.routed_scaling_factor),
-            )
+            topk_w, topk_ids = self._noaux(self._router(chunk))
             parts.append(
-                fused_moe(
-                    chunk,
-                    topk_ids,
-                    topk_w,
-                    mw["fc1"],
-                    None,
-                    mw["fc2"],
-                    None,
-                    dt,
-                    [],
-                    ep_size=core.ep_size,
-                    ep_rank=core.ep_rank,
-                    activation_type=_FUSED_MOE_ACT_SWIGLU,
+                self._moe(
+                    input=chunk,
+                    token_selected_experts=topk_ids,
+                    token_final_scales=topk_w,
+                    output_dtype=dt,
                 )[0]
             )
         routed_all = parts[0] if len(parts) == 1 else torch.cat(parts, 0)
-        routed_pad = reducescatter(routed_all, None, core.dp_group)
+        routed_pad = self._reducescatter(routed_all)
         return routed_pad if not pad_rows else torch.split(routed_pad, [rows, pad_rows], 0)[0]
 
     def forward(
@@ -1597,15 +1742,17 @@ class MTPLayer:
         rope_dim = cfg.qk_rope_head_dim
         v_dim = cfg.v_head_dim
         kv_lora = cfg.kv_lora_rank
-        q_lora = cfg.q_lora_rank
         qk_dim = nope + rope_dim
         lat_dim = kv_lora + rope_dim
-        eps = cfg.rms_norm_eps
-        num_layers = cfg.num_hidden_layers
 
-        mw, rope = core._mtp, core._rope
+        rope = core._rope
         md = attn_metadata
+        # Rebound every call, not once: the worker rewrites `attn_metadata` in place
+        # between draft step 0 and step 1+, and `core._rope` may have grown on the
+        # engine's first step.
         step = _build_step_args(md)
+        self._attn_ctx.bind_const(**step, **rope, **core._call)
+        self._attn_gen.bind_const(**step, **rope, **core._call)
         rows = hidden_states.shape[0]
         dt = hidden_states.dtype
         dev = hidden_states.device
@@ -1625,71 +1772,52 @@ class MTPLayer:
         # Under a one-model MTP mode the engine raises the KV pool's layer count by
         # `num_nextn_predict_layers`, so this module addresses layer `num_hidden_layers` in the
         # same pool as the trunk's 61 layers. Nothing in the config stub or manifest says so.
-        layer_idx = num_layers
 
         e = nn.functional.embedding(input_ids, embed_tokens)
-        en = flashinfer_rmsnorm(e, mw["enorm"], eps)
-        hn = flashinfer_rmsnorm(hidden_states, mw["hnorm"], eps)
+        en = self._enorm(e)
+        hn = self._hnorm(hidden_states)
         halves = [en, hn] if _MTP_EMBED_BLOCK_FIRST else [hn, en]
-        x = cublas_mm(torch.cat(halves, -1), mw["eh"])
+        x = self._eh(torch.cat(halves, -1))
 
         residual = x
-        xn = flashinfer_rmsnorm(x, mw["norm1"], eps)
+        xn = self._norm1(x)
         attn_out = torch.empty([rows, heads * v_dim], dtype=dt, device=dev)
         attn_ctx, attn_gen = torch.split(attn_out, [tc, gen], 0)
-        q = cublas_mm(
-            flashinfer_rmsnorm(cublas_mm(xn, mw["qa"]), mw["q_norm"], eps),
-            mw["qb"],
-        )
-        kva = cublas_mm(xn, mw["kva"])
+        q = self._qb(self._q_norm(self._qa(xn)))
+        kva = self._kva(xn)
         ckv_raw, k_pe = torch.split(kva, [kv_lora, rope_dim], -1)
-        ckv = flashinfer_rmsnorm(ckv_raw, mw["kv_norm"], eps)
+        ckv = self._kv_norm(ckv_raw)
         latent = torch.cat([ckv, k_pe], -1)
         q_ctx, q_gen = torch.split(q, [tc, gen], 0)
         latent_ctx, latent_gen = torch.split(latent, [tc, gen], 0)
 
         if tc:
             if core._cached_ctx:
-                mla_rope_append_paged_kv_assign_q(
-                    q_ctx,
-                    latent_ctx,
-                    num_ctx,
-                    md.ctx_cached_token_indptr,
-                    md.ctx_kv_indptr,
-                    int(md.max_ctx_seq_len),
-                    rope["rotary_cos_sin"],
-                    heads,
-                    nope,
-                    rope_dim,
-                    kv_lora,
-                    block_offsets,
-                    pool_ptrs,
-                    pool_map,
-                    None,
-                    _KV_RESIDUAL_DIM,
-                    layer_idx,
-                    tokens_per_block,
-                    md.max_seq_len,
-                    1,
-                    core.quant_mode,
+                self._mla_append(
+                    q=q_ctx,
+                    latent_cache=latent_ctx,
+                    num_contexts=num_ctx,
+                    cu_ctx_cached_kv_lens=md.ctx_cached_token_indptr,
+                    cu_seq_lens=md.ctx_kv_indptr,
+                    max_input_uncached_seq_len=int(md.max_ctx_seq_len),
+                    cos_sin_cache=rope["rotary_cos_sin"],
+                    kv_cache_block_offsets=block_offsets,
+                    host_kv_cache_pool_pointers=pool_ptrs,
+                    host_kv_cache_pool_mapping=pool_map,
+                    tokens_per_block=tokens_per_block,
+                    attention_window_size=md.max_seq_len,
                 )
-                ckv_full, k_pe_full = load_paged_kv_cache_for_mla(
-                    dt,
-                    num_ctx,
-                    ctx_kv_tokens,
-                    int(md.max_ctx_kv_len),
-                    md.ctx_kv_indptr,
-                    block_offsets,
-                    pool_ptrs,
-                    pool_map,
-                    None,
-                    layer_idx,
-                    kv_lora,
-                    rope_dim,
-                    tokens_per_block,
-                    md.max_seq_len,
-                    1,
-                    core.quant_mode,
+                ckv_full, k_pe_full = self._mla_load(
+                    out_dtype=dt,
+                    num_contexts=num_ctx,
+                    num_ctx_kv_tokens=ctx_kv_tokens,
+                    max_ctx_kv_len=int(md.max_ctx_kv_len),
+                    cu_ctx_kv_lens=md.ctx_kv_indptr,
+                    kv_cache_block_offsets=block_offsets,
+                    host_kv_cache_pool_pointers=pool_ptrs,
+                    host_kv_cache_pool_mapping=pool_map,
+                    tokens_per_block=tokens_per_block,
+                    attention_window_size=md.max_seq_len,
                 )
                 latent_arg = None
             else:
@@ -1697,7 +1825,7 @@ class MTPLayer:
                 k_pe_full = None
                 latent_arg = latent_ctx
             tkv = ctx_kv_tokens
-            kv = cublas_mm(ckv_full, mw["kvb"])
+            kv = self._kvb(ckv_full)
             k_nope, v_view = torch.split(kv, [heads * nope, heads * v_dim], -1)
             k = torch.empty([tkv, heads, qk_dim], dtype=dt, device=dev)
             k_nope_dst, k_pe_dst = torch.split(k, [nope, rope_dim], -1)
@@ -1706,31 +1834,12 @@ class MTPLayer:
                 k_pe_dst.copy_(
                     torch.reshape(k_pe_full, [tkv, 1, rope_dim]).expand([tkv, heads, rope_dim])
                 )
-            thop_attention(
+            self._attn_ctx(
                 q=q_ctx,
                 k=torch.reshape(k, [tkv, heads * qk_dim]),
                 v=v_view,
                 output=attn_ctx,
                 latent_cache=latent_arg,
-                q_pe=None,
-                local_layer_idx=layer_idx,
-                is_fused_qkv=False,
-                attention_input_type=1,
-                num_heads=heads,
-                num_kv_heads=heads,
-                head_size=qk_dim,
-                q_lora_rank=q_lora,
-                kv_lora_rank=kv_lora,
-                qk_nope_head_dim=nope,
-                qk_rope_head_dim=rope_dim,
-                v_head_dim=v_dim,
-                cu_q_seqlens=None,
-                cu_kv_seqlens=None,
-                fmha_scheduler_counter=None,
-                predicted_tokens_per_seq=1,
-                **step,
-                **rope,
-                **core._call,
             )
 
         if gen:
@@ -1738,74 +1847,41 @@ class MTPLayer:
             q_nope, q_pe = torch.split(q3, [nope, rope_dim], -1)
             fused_q = torch.empty([gen, heads, lat_dim], dtype=dt, device=dev)
             fq_nope, _ = torch.split(fused_q, [kv_lora, rope_dim], -1)
-            bmm_out(torch.transpose(q_nope, 0, 1), mw["k_b"], torch.transpose(fq_nope, 0, 1))
+            self._absorb(a=torch.transpose(q_nope, 0, 1), out=torch.transpose(fq_nope, 0, 1))
             cu_q = torch.empty([gen + 1], dtype=torch.int32, device=dev)
             cu_kv = torch.empty([gen + 1], dtype=torch.int32, device=dev)
             counter = torch.empty([1], dtype=torch.uint32, device=dev)
             quant_q = torch.empty([gen, heads, lat_dim], dtype=torch.float8_e4m3fn, device=dev)
             bmm1_scale = torch.empty([2], dtype=torch.float32, device=dev)
             bmm2_scale = torch.empty([1], dtype=torch.float32, device=dev)
-            mla_rope_generation(
-                fused_q,
-                q_pe,
-                latent_gen,
-                rope["rotary_cos_sin"],
-                cu_q,
-                cu_kv,
-                counter,
-                bmm1_scale,
-                bmm2_scale,
-                quant_q,
-                md.kv_lens_cuda_runtime,
-                md.kv_lens_runtime,
-                md.prompt_lens_cpu_runtime,
-                num_ctx,
-                block_offsets,
-                pool_ptrs,
-                pool_map,
-                None,
-                None,
-                None,
-                None,
-                None,
-                [None, None],
-                gen_p,
-                layer_idx,
-                heads,
-                1,
-                lat_dim,
-                _KV_RESIDUAL_DIM,
-                tokens_per_block,
-                md.max_seq_len,
-                1,
-                core.quant_mode,
-                core.q_scaling,
-                q_lora,
-                kv_lora,
-                nope,
-                rope_dim,
-                v_dim,
-                True,
+            self._mla_gen(
+                fused_q=fused_q,
+                q_pe=q_pe,
+                latent_cache=latent_gen,
+                rotary_cos_sin=rope["rotary_cos_sin"],
+                cu_q_seqlens=cu_q,
+                cu_kv_seqlens=cu_kv,
+                fmha_scheduler_counter=counter,
+                mla_bmm1_scale=bmm1_scale,
+                mla_bmm2_scale=bmm2_scale,
+                quant_q_buffer=quant_q,
+                sequence_length=md.kv_lens_cuda_runtime,
+                host_past_key_value_lengths=md.kv_lens_runtime,
+                host_context_lengths=md.prompt_lens_cpu_runtime,
+                num_contexts=num_ctx,
+                kv_cache_block_offsets=block_offsets,
+                host_kv_cache_pool_pointers=pool_ptrs,
+                host_kv_cache_pool_mapping=pool_map,
+                predicted_tokens_per_seq=gen_p,
+                tokens_per_block=tokens_per_block,
+                attention_window_size=md.max_seq_len,
             )
             lat_out = torch.empty([gen, heads * kv_lora], dtype=dt, device=dev)
-            thop_attention(
+            self._attn_gen(
                 q=torch.reshape(fused_q, [gen, heads * lat_dim]),
-                k=None,
-                v=None,
                 output=lat_out,
                 latent_cache=latent_gen,
                 q_pe=q_pe,
-                local_layer_idx=layer_idx,
-                is_fused_qkv=True,
-                attention_input_type=2,
-                num_heads=heads,
-                num_kv_heads=1,
-                head_size=lat_dim,
-                q_lora_rank=q_lora,
-                kv_lora_rank=kv_lora,
-                qk_nope_head_dim=nope,
-                qk_rope_head_dim=rope_dim,
-                v_head_dim=kv_lora,
                 cu_q_seqlens=cu_q,
                 cu_kv_seqlens=cu_kv,
                 fmha_scheduler_counter=counter,
@@ -1813,20 +1889,16 @@ class MTPLayer:
                 mla_bmm2_scale=bmm2_scale,
                 quant_q_buffer=quant_q,
                 predicted_tokens_per_seq=gen_p,
-                **step,
-                **rope,
-                **core._call,
             )
-            bmm_out(
-                torch.transpose(torch.reshape(lat_out, [gen, heads, kv_lora]), 0, 1),
-                mw["v_b_t"],
-                torch.transpose(torch.reshape(attn_gen, [gen, heads, v_dim]), 0, 1),
+            self._expand(
+                a=torch.transpose(torch.reshape(lat_out, [gen, heads, kv_lora]), 0, 1),
+                out=torch.transpose(torch.reshape(attn_gen, [gen, heads, v_dim]), 0, 1),
             )
 
-        o = cublas_mm(attn_out, mw["o"])
-        flashinfer_fused_add_rmsnorm(o, residual, mw["norm2"], eps)
-        shared = self._shared_mlp(o, mw)
-        routed = self._routed_experts(o, mw, all_rank_num_tokens, rows, dt)
+        o = self._o(attn_out)
+        self._norm2(o, residual)
+        shared = self._shared_mlp(o)
+        routed = self._routed_experts(o, all_rank_num_tokens, rows, dt)
         return torch.add(residual, torch.add(routed, shared))
 
 
@@ -1924,3 +1996,6 @@ class ModelingV2DeepseekR10528Nvfp4Sm103Dep4(
     def post_load_weights(self):
         super().post_load_weights()
         self.model.post_load_weights()
+        if self.draft_model is not None:
+            for layer in self.draft_model.mtp_layers:
+                layer.post_load_weights()
