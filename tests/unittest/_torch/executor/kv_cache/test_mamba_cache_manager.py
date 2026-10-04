@@ -3719,6 +3719,8 @@ def test_v2_kda_replay_host_drafter_records_active_requests(monkeypatch):
     mgr._record_kda_replay_in_update_resources = True
     mgr._request_id_to_state_index = {101: 1, 303: 2}
     mgr._request_id_to_is_dummy = {101: False, 303: True}
+    mgr._suspended_kda_replay_state = {}
+    mgr._suspended_kda_replay_accepted = {}
     mgr.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32)
     base_update = MagicMock()
     monkeypatch.setattr(KVCacheManagerV2, "update_resources", base_update)
@@ -3743,6 +3745,204 @@ def test_v2_kda_replay_host_drafter_records_active_requests(monkeypatch):
 
     base_update.assert_called_once_with(scheduled_batch, None, None)
     assert mgr.prev_num_accepted_tokens.tolist() == [7, 2, 9]
+
+
+_KDA_REPLAY_BUFFERS = (
+    "kda_conv_q",
+    "kda_conv_k",
+    "kda_conv_v",
+    "kda_qkg_cache",
+    "kda_v_cache",
+    "kda_beta_cache",
+)
+
+
+class _SlotCache:
+    """A V2 KV cache stand-in that reports one SSM slot and can be suspended."""
+
+    def __init__(self, slot: int) -> None:
+        self.slot = slot
+        self.is_active = True
+
+    def get_ssm_block_base_index(self, _layer_group_id) -> int:
+        return self.slot
+
+    def suspend(self) -> None:
+        self.is_active = False
+
+
+def _v2_kda_replay_stub(num_slots=4):
+    """A V2 hybrid manager stub with CPU KDA replay buffers, for the state-index setup that prepare_resources runs."""
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.local_num_mamba_layers = 1
+    mgr._use_kda_replay_update = True
+    mgr._use_replay_state_update = False
+    mgr._request_id_to_state_index = {}
+    mgr._request_id_to_is_dummy = {}
+    mgr._suspended_kda_replay_state = {}
+    mgr._suspended_kda_replay_accepted = {}
+    mgr._host_state_indices = torch.zeros(num_slots, dtype=torch.int32)
+    mgr.cuda_state_indices = torch.zeros(num_slots, dtype=torch.int32)
+    mgr._dummy_request_mask = None
+    mgr.mamba_ssm_rand_seed = None
+    mgr.kv_cache_map = {}
+    mgr.ssm_layer_group_id = 0
+    mgr.prev_num_accepted_tokens = torch.zeros(num_slots, dtype=torch.int32)
+    for name in _KDA_REPLAY_BUFFERS:
+        setattr(mgr, name, torch.zeros(1, num_slots, 2, 4))
+    return mgr
+
+
+def _write_kda_replay_slot(mgr, slot, accepted, value):
+    """What a verify step leaves in its request's slot for the next one."""
+    mgr.prev_num_accepted_tokens[slot] = accepted
+    for name in _KDA_REPLAY_BUFFERS:
+        getattr(mgr, name)[:, slot] = value
+
+
+def _kda_replay_slot(mgr, slot):
+    return int(mgr.prev_num_accepted_tokens[slot]), [
+        float(getattr(mgr, name)[0, slot].flatten()[0]) for name in _KDA_REPLAY_BUFFERS
+    ]
+
+
+@pytest.mark.parametrize("resume_slot", [1, 0], ids=["new_slot", "old_slot"])
+def test_v2_kda_replay_state_follows_a_suspended_request(resume_slot):
+    """While a request is suspended its SSM page can move to a lower tier and its slot can go to another request. It
+    resumes in a new slot, or in its old one after that request has finished, with its own replay state either way."""
+    mgr = _v2_kda_replay_stub()
+    first = SimpleNamespace(py_request_id=1, is_dummy=False)
+    second = SimpleNamespace(py_request_id=2, is_dummy=False)
+    mgr.kv_cache_map[1] = _SlotCache(0)
+    mgr._setup_state_indices([first], num_contexts=0)
+    _write_kda_replay_slot(mgr, 0, accepted=2, value=1.0)
+    mgr.suspend_request(first)
+    assert not mgr.kv_cache_map[1].is_active
+
+    mgr.kv_cache_map[2] = _SlotCache(0)
+    mgr._setup_state_indices([second], num_contexts=1)
+    mgr._reset_context_mamba_slots(1)
+    mgr._setup_state_indices([second], num_contexts=0)
+    _write_kda_replay_slot(mgr, 0, accepted=3, value=7.0)
+    resumed = [first]
+    if resume_slot == 0:
+        del mgr.kv_cache_map[2]
+        del mgr._request_id_to_state_index[2]
+    else:
+        resumed.append(second)
+    mgr.kv_cache_map[1].slot = resume_slot
+    mgr.kv_cache_map[1].is_active = True
+    mgr._setup_state_indices(resumed, num_contexts=0)
+
+    assert _kda_replay_slot(mgr, resume_slot) == (2, [1.0] * len(_KDA_REPLAY_BUFFERS))
+    if resume_slot != 0:
+        assert _kda_replay_slot(mgr, 0) == (3, [7.0] * len(_KDA_REPLAY_BUFFERS))
+    assert not mgr._suspended_kda_replay_state
+
+
+def test_v2_kda_replay_late_acceptance_follows_a_suspended_request(monkeypatch):
+    """The host drafter's acceptance is recorded by update_resources after the next batch is scheduled. A request
+    suspended in between takes that acceptance with its saved replay state instead of writing its old slot."""
+    mgr = _v2_kda_replay_stub()
+    mgr._record_kda_replay_in_update_resources = True
+    monkeypatch.setattr(KVCacheManagerV2, "update_resources", MagicMock())
+    request = SimpleNamespace(
+        py_request_id=1, is_dummy=False, py_draft_tokens=[11, 12], py_num_accepted_draft_tokens=0
+    )
+    mgr.kv_cache_map[1] = _SlotCache(0)
+    mgr._setup_state_indices([request], num_contexts=0)
+    _write_kda_replay_slot(mgr, 0, accepted=1, value=1.0)
+    mgr.suspend_request(request)
+    mgr.kv_cache_map[2] = _SlotCache(0)
+    _write_kda_replay_slot(mgr, 0, accepted=3, value=7.0)
+    request.py_num_accepted_draft_tokens = 2
+    mgr.update_resources(SimpleNamespace(generation_requests=[request]))
+
+    assert int(mgr.prev_num_accepted_tokens[0]) == 3
+    mgr.kv_cache_map[1].slot = 2
+    mgr.kv_cache_map[1].is_active = True
+    mgr._setup_state_indices([request], num_contexts=0)
+    assert _kda_replay_slot(mgr, 2) == (2, [1.0] * len(_KDA_REPLAY_BUFFERS))
+
+
+def _v2_kda_replay_manager_with_large_slots():
+    """A real V2 hybrid manager at Kimi K3's per-rank KDA shapes (6 heads, K = V = 128, conv width 4) on 6 layers. An
+    SSM slot (~2.25 MiB) is larger than the 2 MiB allocation grain, so the SSM pool holds a handful of slots and runs
+    out before the attention pages do. max_util_for_resume 1.0 lets resume admit caches until the pool is full."""
+    num_mamba_layers = 6
+    return MambaHybridCacheManagerV2(
+        mamba_d_state=128,
+        mamba_d_conv=4,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
+        mamba_head_dim=128,
+        mamba_num_layers=num_mamba_layers,
+        mamba_layer_mask=[True] * num_mamba_layers + [False],
+        mamba_cache_dtype=torch.bfloat16,
+        mamba_ssm_cache_dtype=torch.float32,
+        kv_cache_config=KvCacheConfig(
+            max_tokens=4096, enable_block_reuse=False, max_util_for_resume=1.0
+        ),
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=1,
+        num_kv_heads=4,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=128,
+        max_batch_size=4,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        layer_mask=[False] * num_mamba_layers + [True],
+        vocab_size=1024,
+        conv_state_layout="q_k_v",
+        kda_replay_num_spec=2,
+    )
+
+
+@skip_no_cuda
+def test_v2_kda_replay_state_follows_a_suspended_request_on_the_runtime():
+    """The same on the V2 runtime: once new caches fill the SSM pool, the suspended request's SSM page moves to the
+    host tier and one of them takes its slot; the request resumes in another slot with its own replay state."""
+    mgr = _v2_kda_replay_manager_with_large_slots()
+    stream = mgr._stream.cuda_stream
+    others = []
+    request = None
+    try:
+        (request,) = mgr.add_dummy_requests(
+            [1], token_nums=[8], is_gen=True, max_num_draft_tokens=2
+        )
+        slot = mgr._request_id_to_state_index[1]
+        _write_kda_replay_slot(mgr, slot, accepted=2, value=1.0)
+        own = _kda_replay_slot(mgr, slot)
+        mgr.suspend_request(request)
+        holder = None
+        for _ in range(mgr.prev_num_accepted_tokens.shape[0] + 1):
+            cache = mgr.impl.create_kv_cache()
+            assert cache.resume(stream)
+            others.append(cache)
+            assert cache.resize(1)
+            if cache.get_ssm_block_base_index(mgr.ssm_layer_group_id) == slot:
+                holder = cache
+                break
+        assert holder is not None, "no cache took the suspended request's SSM slot"
+        _write_kda_replay_slot(mgr, slot, accepted=3, value=7.0)
+        for cache in others:
+            if cache is not holder:
+                cache.close()
+        others = [holder]
+        assert mgr.resume_request(request)
+        mgr._setup_state_indices([request], num_contexts=0)
+        new_slot = mgr._request_id_to_state_index[1]
+
+        assert new_slot != slot
+        assert _kda_replay_slot(mgr, new_slot) == own
+    finally:
+        for cache in others:
+            cache.close()
+        if request is not None:
+            mgr.free_resources(request)
+        mgr.shutdown()
 
 
 @skip_no_cuda

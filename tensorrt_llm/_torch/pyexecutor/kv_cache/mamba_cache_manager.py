@@ -3235,6 +3235,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         }
         self._request_id_to_state_index = {}
         self._request_id_to_is_dummy = {}
+        # KDA replay state of suspended requests (suspend_request), and the
+        # draft counts update_resources accepts for them after their suspend.
+        self._suspended_kda_replay_state: Dict[int, List[torch.Tensor]] = {}
+        self._suspended_kda_replay_accepted: Dict[int, int] = {}
 
         state_index_capacity = (self.max_batch_size +
                                 self._num_reserved_dummy_slots)
@@ -4268,6 +4272,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if slots.numel() > 0:
             self.prev_num_accepted_tokens[slots] = 0
 
+    def _kda_replay_state_buffers(self) -> List[Tuple[torch.Tensor, int]]:
+        """The per-slot KDA replay state kept outside the V2 pools, as
+        (buffer, slot dimension) pairs."""
+        assert self.prev_num_accepted_tokens is not None
+        buffers = [(self.prev_num_accepted_tokens, 0)]
+        for replay_buffer in (self.kda_conv_q, self.kda_conv_k, self.kda_conv_v,
+                              self.kda_qkg_cache, self.kda_v_cache,
+                              self.kda_beta_cache):
+            assert replay_buffer is not None
+            buffers.append((replay_buffer, 1))
+        return buffers
+
     def _relocate_kda_replay_slots(self, old_slots: List[int],
                                    new_slots: List[int]) -> None:
         """Move replay history when V2 remaps a live request's SSM slot."""
@@ -4285,26 +4301,43 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         destination_slots = torch.tensor([new for _, new in moves],
                                          dtype=torch.long,
                                          device=device)
-        replay_buffers = (
-            self.kda_conv_q,
-            self.kda_conv_k,
-            self.kda_conv_v,
-            self.kda_qkg_cache,
-            self.kda_v_cache,
-            self.kda_beta_cache,
-        )
-        for replay_buffer in replay_buffers:
-            assert replay_buffer is not None
-            replay_buffer.index_copy_(
-                1,
-                destination_slots,
-                replay_buffer.index_select(1, source_slots),
-            )
-        self.prev_num_accepted_tokens.index_copy_(
-            0,
-            destination_slots,
-            self.prev_num_accepted_tokens.index_select(0, source_slots),
-        )
+        for buffer, dim in self._kda_replay_state_buffers():
+            buffer.index_copy_(dim, destination_slots,
+                               buffer.index_select(dim, source_slots))
+
+    def suspend_request(self, req: LlmRequest) -> None:
+        """Suspend the request's KV cache and keep its KDA replay state.
+
+        The replay state is indexed by SSM slot, outside the V2 pools. While
+        the request is suspended, its pages can move to a lower tier and its
+        slot can go to another request; it resumes in whichever slot is free.
+        The slot's replay state is copied out here, and the request's next
+        ``_setup_state_indices`` writes it into the slot it resumes in.
+        """
+        request_id = req.py_request_id
+        kv_cache = self.kv_cache_map.get(request_id)
+        slot = self._request_id_to_state_index.get(request_id, -1)
+        if (self.use_kda_replay_update and slot >= 0 and kv_cache is not None
+                and kv_cache.is_active):
+            saved = []
+            for buffer, dim in self._kda_replay_state_buffers():
+                state = buffer.select(dim, slot)
+                host = torch.empty(state.shape,
+                                   dtype=state.dtype,
+                                   pin_memory=prefer_pinned())
+                host.copy_(state, non_blocking=True)
+                saved.append(host)
+            self._suspended_kda_replay_state[request_id] = saved
+            del self._request_id_to_state_index[request_id]
+        super().suspend_request(req)
+
+    def _restore_kda_replay_state(self, request_id: int, slot: int,
+                                  saved: List[torch.Tensor]) -> None:
+        for (buffer, dim), host in zip(self._kda_replay_state_buffers(), saved):
+            buffer.select(dim, slot).copy_(host, non_blocking=True)
+        accepted = self._suspended_kda_replay_accepted.pop(request_id, None)
+        if accepted is not None:
+            self.prev_num_accepted_tokens[slot] = accepted
 
     def add_dummy_requests(
         self,
@@ -4345,6 +4378,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._request_id_to_state_index.pop(request.py_request_id, None)
         self._request_id_to_is_dummy.pop(request.py_request_id, None)
         self._branch_snapshot_points.pop(request.py_request_id, None)
+        self._suspended_kda_replay_state.pop(request.py_request_id, None)
+        self._suspended_kda_replay_accepted.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -4399,15 +4434,33 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._request_id_to_is_dummy[req.py_request_id] = dummy
 
         if self.use_kda_replay_update:
+            # A suspended request that comes back as a context request starts
+            # over; one that comes back generating takes its replay state.
+            for request in requests[:num_contexts]:
+                self._suspended_kda_replay_state.pop(request.py_request_id,
+                                                     None)
+                self._suspended_kda_replay_accepted.pop(request.py_request_id,
+                                                        None)
+            saved_states = [
+                self._suspended_kda_replay_state.pop(request.py_request_id,
+                                                     None)
+                for request in replay_requests
+            ]
             new_state_values = [
                 self._request_id_to_state_index[request.py_request_id]
                 for request in replay_requests
             ]
             self._relocate_kda_replay_slots(old_state_values, new_state_values)
             self._reset_kda_replay_slots([
-                new for old, new in zip(old_state_values, new_state_values)
-                if old < 0
+                new for old, new, saved in zip(old_state_values,
+                                               new_state_values, saved_states)
+                if old < 0 and saved is None
             ])
+            for request, new, saved in zip(replay_requests, new_state_values,
+                                           saved_states):
+                if saved is not None:
+                    self._restore_kda_replay_state(request.py_request_id, new,
+                                                   saved)
 
     def _record_kda_replay_acceptance(
         self,
@@ -4531,6 +4584,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             raise RuntimeError(
                 "Mixed drafted/undrafted generation batch is not supported "
                 "for KDA replay bookkeeping")
+
+        for request in generation_requests:
+            # Suspended after this batch was scheduled: its saved replay state
+            # predates this acceptance, so the acceptance goes with it.
+            request_id = request.py_request_id
+            if (request_id in self._suspended_kda_replay_state and
+                    not self._request_id_to_is_dummy.get(request_id, False)):
+                self._suspended_kda_replay_accepted[request_id] = max(
+                    0, request.py_num_accepted_draft_tokens)
 
         active_requests = [
             request for request in generation_requests
@@ -4781,4 +4843,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.kda_qkg_cache = None
         self.kda_v_cache = None
         self.kda_beta_cache = None
+        self._suspended_kda_replay_state.clear()
+        self._suspended_kda_replay_accepted.clear()
         super().shutdown()
