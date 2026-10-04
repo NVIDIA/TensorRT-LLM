@@ -3,8 +3,9 @@
 #
 import copy
 import inspect
+import os
 from dataclasses import replace
-from typing import Dict, Generic, List, Optional, Tuple
+from typing import Dict, Generic, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -22,7 +23,7 @@ from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.mla import MLA
 from ..model_config import ModelConfig, TConfig
 from ..modules.decoder_layer import DecoderLayer
-from ..modules.embedding import Embedding, get_masked_input_and_mask
+from ..modules.embedding import Embedding, LMHead, get_masked_input_and_mask
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
@@ -36,6 +37,8 @@ from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
+                             apply_layerwise_quant_config,
+                             apply_quant_config_exclude_modules,
                              get_model_architecture,
                              get_registered_draft_model_builder,
                              register_auto_model, register_draft_model)
@@ -67,6 +70,57 @@ def _set_draft_kv_cache_quant_algo(draft_config: ModelConfig,
     if override is not None and draft_config.quant_config_dict is not None:
         for layer_quant_config in draft_config.quant_config_dict.values():
             layer_quant_config.kv_cache_quant_algo = algo
+
+
+def _replacement_mtp_model_config(model_config: ModelConfig) -> ModelConfig:
+    """Build an independent quantization scope for replacement MTP weights."""
+    from .checkpoints.auto_mapper import AutoCheckpointMapper
+
+    checkpoint_dir = str(model_config.spec_config.speculative_model)
+    quant_path = os.path.join(checkpoint_dir, "hf_quant_config.json")
+    quant_config, layer_configs = QuantConfig(), None
+    if os.path.isfile(quant_path):
+        quant_config, layer_configs = ModelConfig.load_modelopt_quant_config(
+            quant_path, checkpoint_dir, model_config.moe_backend)
+
+    mapper = AutoCheckpointMapper.get(
+        "HF", model_config.pretrained_config.architectures[0])
+    start_layer_idx = model_config.pretrained_config.num_hidden_layers
+    if layer_configs is not None:
+        normalized = {}
+        for name, config in layer_configs.items():
+            if name != "lm_head" and not name.startswith("mtp."):
+                continue
+            candidates = [name]
+            if name.endswith((".q_proj", ".k_proj", ".v_proj")):
+                candidates.append(name.rsplit(".", 1)[0] + ".qkv_proj")
+            if any(
+                    quant_config.is_module_excluded_from_quantization(candidate)
+                    for candidate in candidates):
+                raise ValueError(
+                    f"Replacement quantization exclusion conflicts with {name}")
+            mapped_name = mapper.map_mtp_module_name(name, start_layer_idx)
+            if mapped_name.startswith("mtp."):
+                raise ValueError(
+                    f"{type(mapper).__name__} does not map replacement MTP "
+                    f"quantization for {name}")
+            normalized[mapped_name] = config
+        layer_configs = normalized
+    if quant_config.exclude_modules is not None:
+        quant_config.exclude_modules = [
+            mapper.map_mtp_module_name(name, start_layer_idx)
+            for name in quant_config.exclude_modules
+        ]
+
+    draft_config = replace(model_config,
+                           quant_config=quant_config,
+                           quant_config_dict=layer_configs,
+                           skip_create_weights_in_init=True)
+    draft_config.extra_attrs = model_config.extra_attrs
+    _set_draft_kv_cache_quant_algo(draft_config, model_config)
+    for config in (draft_config.quant_config_dict or {}).values():
+        config.kv_cache_quant_algo = draft_config.quant_config.kv_cache_quant_algo
+    return draft_config
 
 
 def _slice_spec_position_ids(position_ids: Optional[torch.Tensor],
@@ -1292,11 +1346,16 @@ class MTPForCausalLM(nn.Module):
         start_layer_idx: int = 0,
         lm_head: nn.Module = None,
         model: nn.Module = None,
-    ):
+    ) -> None:
         super().__init__()
+        self.model_config = model_config
+        self.config = model_config.pretrained_config
+        self.start_layer_idx = start_layer_idx
+        spec_config = model_config.spec_config
         # Import here to avoid circular import
         model_type = model_config.pretrained_config.model_type
         mtp_layer = None
+        lm_head_quant_config = None
         match model_type:
             case "glm4_moe":
                 from .modeling_glm import Glm4MTP
@@ -1329,14 +1388,28 @@ class MTPForCausalLM(nn.Module):
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
 
-        spec_dec_mode = model_config.spec_config.spec_dec_mode
+        if (spec_config.uses_replacement_heads
+                and getattr(mtp_layer, "uses_shared_lm_head", True)):
+            if model_config.quant_config_dict is not None:
+                lm_head_quant_config = model_config.quant_config_dict.get(
+                    "lm_head")
+            elif (model_config.quant_config.quant_algo is not None
+                  and DecoderModelForCausalLM._checkpoint_has_lm_head_scale(
+                      model_config,
+                      checkpoint_dir=str(spec_config.speculative_model))):
+                lm_head_quant_config = model_config.quant_config
+            if model_config.quant_config.is_module_excluded_from_quantization(
+                    "lm_head"):
+                lm_head_quant_config = None
+
+        spec_dec_mode = spec_config.spec_dec_mode
         assert spec_dec_mode.is_mtp_one_model()
         checkpoint_mtp_num_layers = model_config.pretrained_config.num_nextn_predict_layers
         if spec_dec_mode.is_mtp_eagle_one_model():
             mtp_num_layers = 1
-            mtp_repeat_count = model_config.spec_config.max_draft_len
+            mtp_repeat_count = spec_config.max_draft_len
         else:
-            mtp_num_layers = min(model_config.spec_config.max_draft_len,
+            mtp_num_layers = min(spec_config.max_draft_len,
                                  checkpoint_mtp_num_layers)
             mtp_repeat_count = 1
 
@@ -1347,8 +1420,47 @@ class MTPForCausalLM(nn.Module):
                       model.aux_stream_dict)
             for layer_idx in range(mtp_num_layers)
         ])
-        self.lm_head = lm_head
+        self.owns_lm_head = lm_head_quant_config is not None
+        if self.owns_lm_head:
+            if getattr(model_config.pretrained_config, "tie_word_embeddings",
+                       False):
+                raise ValueError(
+                    "A quantized replacement MTP head cannot tie embeddings")
+            if (model_config.mapping.enable_attention_dp
+                    and model_config.mapping.enable_lm_head_tp_in_adp):
+                raise ValueError("Quantized replacement MTP LM heads require "
+                                 "enable_lm_head_tp_in_adp=False")
+            self.lm_head = LMHead(
+                model_config.pretrained_config.vocab_size,
+                model_config.pretrained_config.hidden_size,
+                dtype=model_config.pretrained_config.torch_dtype,
+                mapping=model_config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=model_config.lm_head_gather_output,
+                reduce_output=False,
+                use_custom_cublas_mm=getattr(lm_head, "use_custom_cublas_mm",
+                                             False),
+                quant_config=lm_head_quant_config,
+            )
+        else:
+            self.lm_head = lm_head
         self.embed_tokens = model.embed_tokens
+
+    def _quantization_named_modules(self) -> Iterator[tuple[str, nn.Module]]:
+        for name, module in self.named_modules():
+            if name.startswith("mtp_layers."):
+                _, layer_idx, *suffix = name.split(".")
+                prefix = f"model.layers.{self.start_layer_idx + int(layer_idx)}"
+                yield ".".join([prefix, *suffix]), module
+            elif self.owns_lm_head and (name == "lm_head"
+                                        or name.startswith("lm_head.")):
+                yield name, module
+
+    def apply_quant_config(self) -> None:
+        apply_layerwise_quant_config(self.model_config,
+                                     self._quantization_named_modules())
+        apply_quant_config_exclude_modules(self.model_config,
+                                           self._quantization_named_modules())
 
 
 def _get_requested_draft_moe_backend(model_config: ModelConfig,
@@ -1480,18 +1592,19 @@ def _build_eagle3_one_model_draft(model_config, draft_config, lm_head, model):
 @register_draft_model(SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL)
 def _build_mtp_one_model_draft(model_config, draft_config, lm_head, model):
     """Build the one-model MTP drafter (vanilla MTP and MTP-Eagle share it)."""
-    mtp_model_config = model_config
+    mtp_model_config = draft_config if draft_config is not None else model_config
     requested_moe_backend = getattr(model_config.spec_config, "moe_backend",
                                     None)
     if requested_moe_backend is not None:
         start_layer_idx = model_config.pretrained_config.num_hidden_layers
         mtp_model_config = _copy_model_config_with_moe_backend(
-            model_config,
+            mtp_model_config,
             requested_moe_backend,
-            quant_config=_get_mtp_moe_quant_config(model_config,
+            quant_config=_get_mtp_moe_quant_config(mtp_model_config,
                                                    start_layer_idx))
         model_type = model_config.pretrained_config.model_type
-        if (model_type in {"nemotron_h", "nemotron_h_puzzle"}
+        if (draft_config is None
+                and model_type in {"nemotron_h", "nemotron_h_puzzle"}
                 and mtp_model_config.moe_backend != model_config.moe_backend):
             raise ValueError(
                 "Nemotron-H embedded MTP layers cannot use a different MoE "
@@ -1663,12 +1776,18 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                                    model_config)
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
+                elif spec_config.uses_replacement_heads:
+                    self.draft_config = _replacement_mtp_model_config(
+                        model_config)
+
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                     spec_config)
 
                 self.draft_model = get_draft_model(model_config,
                                                    self.draft_config,
                                                    self.lm_head, self.model)
+                if spec_config.uses_replacement_heads:
+                    self.draft_config = self.draft_model.model_config
                 if self.draft_model is not None:
                     self.epilogue.append(self.draft_model)
                 if (spec_config.spec_dec_mode.is_parallel_draft()
@@ -1763,6 +1882,21 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         return logits
 
+    def _quantization_named_modules(self) -> Iterator[tuple[str, nn.Module]]:
+        if not getattr(self.spec_config, "uses_replacement_heads", False):
+            return super()._quantization_named_modules()
+        owned_ids = {
+            id(module)
+            for _, module in self.draft_model._quantization_named_modules()
+        }
+        return ((name, module) for name, module in self.named_modules()
+                if id(module) not in owned_ids)
+
+    def __post_init__(self) -> None:
+        if getattr(self.spec_config, "uses_replacement_heads", False):
+            self.draft_model.apply_quant_config()
+        super().__post_init__()
+
     def mtp_head_module_names(self) -> List[str]:
         """Names of the MTP heads under every alias they are reachable by.
 
@@ -1821,18 +1955,36 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             # load used allow_partial_loading=True, which silently left MTP
             # modules at random init when keys did not bind.
             n_total = len(weights)
+            lm_head_weights = {}
+            if getattr(self.draft_model, "owns_lm_head", False):
+                lm_head_weights = {
+                    name: value
+                    for name, value in weights.items()
+                    if name.startswith("lm_head.")
+                }
+                required_head_tensors = {"lm_head.weight"}
+                head_quant_algo = self.draft_model.lm_head.quant_config.quant_algo
+                if head_quant_algo in (QuantAlgo.FP8, QuantAlgo.W4A16_NVFP4):
+                    required_head_tensors.add("lm_head.weight_scale")
+                if head_quant_algo == QuantAlgo.W4A16_NVFP4:
+                    required_head_tensors.add("lm_head.weight_scale_2")
+                missing = sorted(required_head_tensors - lm_head_weights.keys())
+                if missing:
+                    raise ValueError(
+                        "Quantized replacement MTP checkpoint is missing " +
+                        ", ".join(missing))
             weights = select_mtp_checkpoint_weights(weights)
             if not weights:
                 raise ValueError(
                     "speculative_model was set for MTP but no 'mtp.*' weights "
                     f"were found in {self.spec_config.speculative_model!r}. "
                     "Expected keys like 'mtp.layers.0.*'.")
-            n_dropped = n_total - len(weights)
+            n_dropped = n_total - len(weights) - len(lm_head_weights)
             if n_dropped:
                 logger.warning(
-                    "Ignoring %d non-mtp.* tensors from speculative_model while "
-                    "loading MTP heads (kept %d mtp.* tensors).", n_dropped,
-                    len(weights))
+                    "Ignoring %d unrelated tensors from speculative_model while "
+                    "loading MTP heads (kept %d MTP and %d LM head tensors).",
+                    n_dropped, len(weights), len(lm_head_weights))
             if weight_mapper is None:
                 raise ValueError(
                     "weight_mapper is required to load separate MTP heads")
@@ -1844,6 +1996,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 num_hidden_layers=num_hidden_layers,
                 num_mtp_layers=num_mtp_layers,
             )
+            weights.update(lm_head_weights)
 
             # Skip optional modules (e.g. shared_head) only when absent from
             # this checkpoint; architectures that ship those tensors still load

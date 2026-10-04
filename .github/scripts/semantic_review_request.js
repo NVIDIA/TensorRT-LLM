@@ -15,7 +15,7 @@
 
 const { randomUUID } = require('node:crypto');
 const {
-  NAME, supported, eligible, isCommandUser, requests, identity, command, awaiting, reviewState, publish,
+  supported, eligible, isCommandUser, requests, command, reviewState, publish,
 } = require('./semantic_review');
 
 const REQUEST_LIMIT = 30;
@@ -87,7 +87,7 @@ async function pending({ github, context, number, manual, now = Date.now(), onVi
   const sameVersion = (r) => r.head === head && r.target === target && r.branch === branch;
   const previous = history.find(sameVersion);
   if (manual || !previous) return { ...snapshot, status: 'ready' };
-  if (previous.id === history[0].id && review?.check && review.request.id === previous.id && !review.result &&
+  if (previous.id === history[0].id && review?.request?.id === previous.id && !review.result &&
       now - Date.parse(previous.created_at) >= RETRY_AFTER_MS &&
       !history.some((r) => sameVersion(r) && r.automaticRetryOf)) {
     return { ...snapshot, status: 'ready', automaticRetryOf: previous.id };
@@ -136,17 +136,6 @@ async function requestOne({ github, commandGithub, context, core, number, manual
 
     const request = { id: randomUUID(), head, target, mergeBase, branch,
       ...(current.automaticRetryOf ? { automaticRetryOf: current.automaticRetryOf } : {}) };
-    const check = {
-      ...repo,
-      name: NAME,
-      external_id: identity(number, request),
-      status: 'in_progress',
-      started_at: new Date(now).toISOString(),
-      details_url: `https://github.com/${repo.owner}/${repo.repo}/pull/${number}`,
-      output: awaiting(request),
-    };
-    const { data: created } = await github.rest.checks.create({ ...check, head_sha: head });
-    request.checkId = created.id;
     try {
       await commandGithub.rest.issues.createComment({
         ...repo,
@@ -164,17 +153,7 @@ async function requestOne({ github, commandGithub, context, core, number, manual
       } catch (readError) {
         core.warning(`PR #${number}: request delivery remains unknown (HTTP ${readError.status || 'unknown'}).`);
       }
-      await github.rest.checks.update({
-        ...repo,
-        check_run_id: request.checkId,
-        ...(accepted === false ? { status: 'completed', conclusion: 'cancelled' } :
-          { status: 'in_progress' }),
-        output: {
-          title: 'Request delivery could not be confirmed',
-          summary: 'No AI verdict is available. A later scan can recover from the request comment or try again.',
-        },
-      });
-      throw error;
+      if (!accepted) throw error;
     }
     await publish({ github, context, core, number, head: current.review?.request?.head || head });
     return { status: 'requested', request };

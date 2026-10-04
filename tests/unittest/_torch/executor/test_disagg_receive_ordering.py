@@ -14,6 +14,7 @@ from tensorrt_llm._torch.pyexecutor.disagg_adapter import PyExecutorEffects
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 
 @pytest.fixture(params=["async", "sync"])
@@ -69,6 +70,9 @@ def _request(manager: Mock, request_id: int = 1) -> SimpleNamespace:
         prompt_len=128,
         py_draft_tokens=[],
         is_first_context_chunk=True,
+        # Read by _prepare_disagg_gen_resources to latch cached_tokens; a real
+        # request always carries it (C++ read-only property).
+        prepopulated_prompt_len=0,
     )
     manager.kv_cache_map[request_id] = Mock(capacity=0)
     manager.kv_cache_map[request_id].resize.return_value = True
@@ -89,7 +93,13 @@ def test_disagg_receive_waits_for_admission_event(
     manager._fill_fresh_kv_pages.side_effect = lambda _: events.append("fill")
     ready.record.side_effect = lambda _: events.append("record")
     ready.synchronize.side_effect = lambda: events.append("ready")
-    manager.report_batch_to_connector = Mock(side_effect=lambda _: events.append("connector"))
+
+    def report_connector(batch: ScheduledRequests, *, finalize_prefix_reservations: bool) -> None:
+        assert batch.context_requests == [request]
+        assert finalize_prefix_reservations is False
+        events.append("connector")
+
+    manager.report_batch_to_connector = Mock(side_effect=report_connector)
     receive = Mock(side_effect=lambda _: events.append("publish"))
 
     assert manager.prepare_disagg_gen_init(request)

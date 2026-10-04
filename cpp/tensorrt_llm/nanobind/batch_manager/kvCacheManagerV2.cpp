@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
+#include "kv_cache_manager_v2/cudaVirtMem.h"
 #include "kv_cache_manager_v2/eventManager.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/introspection.h"
@@ -1341,13 +1342,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__bool__", [](kv::ScratchDesc const& self) { return static_cast<bool>(self); });
 
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
-        .def(nb::init<std::optional<int>, int>(), nb::arg("window_size").none(), nb::arg("num_sink_blocks"))
+        .def(nb::init<std::optional<int>, int, bool>(), nb::arg("window_size").none(), nb::arg("num_sink_blocks"),
+            nb::arg("is_sparse") = false)
         // Sink tokens round up to whole blocks. Bound rather than repeated in Python so the
         // connector's view of a life cycle is built by the same code as the allocator's.
         .def_static("make", &kv::AttnLifeCycle::make, nb::arg("window_size").none(), nb::arg("num_sink_tokens").none(),
-            nb::arg("tokens_per_block"))
+            nb::arg("tokens_per_block"), nb::arg("is_sparse") = false)
         .def_prop_ro("window_size", [](kv::AttnLifeCycle const& self) { return self.windowSize; })
         .def_ro("num_sink_blocks", &kv::AttnLifeCycle::numSinkBlocks)
+        .def_ro("is_sparse", &kv::AttnLifeCycle::isSparse)
         .def("get_stale_range", &kv::AttnLifeCycle::getStaleRange, nb::arg("history_length"),
             nb::arg("tokens_per_block"))
         .def("__eq__", &kv::AttnLifeCycle::operator==);
@@ -1538,11 +1541,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("assert_valid", &kv::DiskCacheTierConfig::assertValid) DEF_COPY(kv::DiskCacheTierConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>>(), nb::arg("role"), nb::arg("size"),
-            nb::arg("tokens_per_block_override") = std::nullopt)
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool>(), nb::arg("role"), nb::arg("size"),
+            nb::arg("tokens_per_block_override") = std::nullopt, nb::arg("is_sparse") = false)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
-        .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride) DEF_COPY(kv::BufferConfig);
+        .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
+        .def_rw("is_sparse", &kv::BufferConfig::isSparse) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
         .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>>(),
@@ -2226,6 +2230,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("quota"), nb::arg("slot_size_lists"), nb::arg("ratio_list"), nb::arg("granularity"),
         nb::arg("min_slots"), nb::call_guard<nb::gil_scoped_release>());
+
+    // CUDA virtual-memory primitives, reached through _introspection because they carry no
+    // stability promise: the native disaggregated bounce buffer reserves one contiguous fabric
+    // region with them and maps physical chunks into it up front.
+    nb::class_<kv::PooledPhysMemAllocator>(mIntrospection, "PooledPhysMemAllocator")
+        .def(nb::init<size_t>(), nb::arg("phys_mem_size"))
+        .def_prop_ro("device_id", &kv::PooledPhysMemAllocator::deviceId);
+    nb::class_<kv::VirtMem>(mIntrospection, "VirtMem")
+        // keep_alive<1, 3>: VirtMem holds PooledPhysMemAllocator by reference, so the allocator
+        // must outlive it. Argument 3 is the allocator (1 is self, 2 is vm_size).
+        .def(nb::init<size_t, kv::PooledPhysMemAllocator&, size_t>(), nb::arg("vm_size"), nb::arg("phys_mem_allocator"),
+            nb::arg("init_num_phys_mem") = 0, nb::keep_alive<1, 3>())
+        .def("destroy", &kv::VirtMem::destroy)
+        .def_prop_ro("address", &kv::VirtMem::address);
 
     // ---- Cold-page codec --------------------------------------------------
     nb::class_<kv::IKvCacheColdPageCodec>(m, "IKvCacheColdPageCodec");

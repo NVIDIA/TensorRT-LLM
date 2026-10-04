@@ -16,7 +16,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { discover, run, requestOne } = require('./semantic_review_request');
-const { NAME, requests, publish } = require('./semantic_review');
+const { NAME, statusContext, requests, publish } = require('./semantic_review');
 
 const HEAD = '1'.repeat(40);
 const TARGET = '2'.repeat(40);
@@ -35,12 +35,12 @@ function pull(number = 1, changes = {}) {
 
 function fixture(prs = [pull()], options = {}) {
   const state = {
-    prs, checks: [], comments: new Map(), posts: [], updates: [], warnings: [],
+    prs, legacyChecks: [], statuses: [], comments: new Map(), posts: [], updates: [], warnings: [],
     failures: [], remaining: options.remaining ?? 5000, target: TARGET,
     mergeBase: BASE, service: SERVICE, readCounts: new Map(), refReads: 0,
     before: [], after: [], commandBefore: [], commandAfter: [],
     commandRemaining: options.commandRemaining ?? 5000, postErrors: new Map(), comparisons: 0,
-    now: NOW, nextCommentId: 1000, commentReads: new Map(), checkUpdateFailures: 0, readOrder: [],
+    now: NOW, nextCommentId: 1000, commentReads: new Map(), statusFailures: 0, readOrder: [],
   };
   const api = (method, commandToken = false) => async (args) => {
     const key = commandToken ? 'commandRemaining' : 'remaining';
@@ -81,10 +81,25 @@ function fixture(prs = [pull()], options = {}) {
         return { object: { sha: options.readTarget ?
           options.readTarget(state.refReads) : state.target } };
       }) },
-      repos: { compareCommits: api(() => {
-        state.comparisons += 1;
-        return { merge_base_commit: { sha: state.mergeBase } };
-      }) },
+      repos: {
+        compareCommits: api(() => {
+          state.comparisons += 1;
+          return { merge_base_commit: { sha: state.mergeBase } };
+        }),
+        listCommitStatusesForRef: api(({ ref }) => structuredClone(
+          state.statuses.filter((status) => status.sha === ref).reverse())),
+        createCommitStatus: api((args) => {
+          if (state.statusFailures > 0) {
+            state.statusFailures -= 1;
+            throw Object.assign(new Error('Status write unavailable'), { status: 502 });
+          }
+          const status = { ...args, id: state.statuses.length + 100,
+            creator: { login: 'github-actions[bot]', id: 41898282, type: 'Bot' },
+            created_at: new Date(state.now).toISOString() };
+          state.statuses.push(status);
+          return status;
+        }),
+      },
       issues: { listComments: api(({ issue_number: number }) => {
         const count = (state.commentReads.get(number) || 0) + 1;
         state.commentReads.set(number, count);
@@ -92,32 +107,13 @@ function fixture(prs = [pull()], options = {}) {
         return state.comments.get(number) || [];
       }) },
       checks: {
-        listForRef: api(({ ref, check_name: name }) => ({ check_runs: structuredClone(state.checks.filter(
+        listForRef: api(({ ref, check_name: name }) => ({ check_runs: structuredClone(state.legacyChecks.filter(
           (check) => check.head_sha === ref && check.name === name)) })),
-        create: api((args) => {
-          const check = { conclusion: null, completed_at: null, ...args, id: state.checks.length + 100,
-            app: { slug: 'github-actions' } };
-          state.checks.push(check);
-          return check;
-        }),
         update: api((args) => {
           state.updates.push(args);
           if (state.onCheckUpdate) state.onCheckUpdate(args);
-          if (args.conclusion === null || args.completed_at === null) {
-            throw Object.assign(new Error('Completed Check fields cannot be cleared'), { status: 422 });
-          }
-          if (state.checkUpdateFailures > 0) {
-            state.checkUpdateFailures -= 1;
-            throw Object.assign(new Error('Check update unavailable'), { status: 502 });
-          }
-          const check = state.checks.find((item) => item.id === args.check_run_id);
-          const wasCompleted = check.status === 'completed';
+          const check = state.legacyChecks.find((item) => item.id === args.check_run_id);
           Object.assign(check, args);
-          // GitHub does not reopen a completed run when conclusion is omitted.
-          if (wasCompleted && args.status === 'in_progress') check.status = 'completed';
-          if (check.status === 'completed' && check.conclusion) {
-            check.completed_at = new Date(state.now).toISOString();
-          }
           return check;
         }),
       },
@@ -142,8 +138,10 @@ function fixture(prs = [pull()], options = {}) {
       state.posts.push(args);
       const comments = state.comments.get(args.issue_number) || [];
       const comment = { id: state.nextCommentId++, user: SERVICE, body: args.body,
-        created_at: new Date(state.now).toISOString() };
+        created_at: new Date(state.now).toISOString(),
+        html_url: `https://github.com/NVIDIA/TensorRT-LLM/pull/${args.issue_number}#issuecomment-${state.nextCommentId - 1}` };
       state.comments.set(args.issue_number, comments.concat(comment));
+      state.onPostComment?.(comment);
       if (errorMode === 'after') throw failure();
       return comment;
     }, true) },
@@ -185,22 +183,24 @@ test('eligibility accepts either approval or auto-merge and requires an open sup
     const f = fixture([pull(1, changes)]);
     assert.equal((await f.one()).status, 'ineligible');
     assert.equal(f.state.posts.length, 0);
-    assert.equal(f.state.checks.length, 0);
+    assert.equal(f.state.statuses.length, 0);
   }
 });
 
-test('first request creates an in-progress check and records the exact analysis identity', async () => {
+test('first request records its identity before creating the PR-specific pending status', async () => {
   const f = fixture();
+  f.state.onPostComment = () => assert.equal(f.state.statuses.length, 0);
   const result = await f.one();
   const recorded = requests(f.state.comments.get(1))[0];
   assert.equal(result.status, 'requested');
   assert.deepEqual([recorded.head, recorded.target, recorded.mergeBase, recorded.branch],
     [HEAD, TARGET, BASE, 'main']);
-  assert.equal(recorded.checkId, f.state.checks.at(-1).id);
-  assert.equal(f.state.checks.at(-1).external_id, `semantic-review:1:${recorded.id}`);
-  assert.equal(f.state.checks.at(-1).status, 'in_progress');
-  assert.equal(f.state.checks.at(-1).conclusion, null);
+  assert.equal(recorded.checkId, undefined);
+  assert.equal(f.state.statuses.at(-1).context, statusContext(1));
+  assert.equal(f.state.statuses.at(-1).sha, HEAD);
+  assert.equal(f.state.statuses.at(-1).state, 'pending');
   assert.match(f.state.posts[0].body, /^@coderabbitai/);
+  assert.equal(f.state.legacyChecks.length, 0);
 });
 
 test('an unanswered request younger than two hours is skipped; manual dispatch forces a new request', async () => {
@@ -211,11 +211,10 @@ test('an unanswered request younger than two hours is skipped; manual dispatch f
   const forced = await f.one({ manual: true });
   assert.equal(forced.status, 'requested');
   assert.notEqual(first.request.id, forced.request.id);
-  assert.notEqual(first.request.checkId, forced.request.checkId);
-  assert.equal(f.state.checks.length, 2);
-  const oldCheck = f.state.checks.find((check) => check.id === first.request.checkId);
-  assert.equal(oldCheck.status, 'completed');
-  assert.equal(oldCheck.conclusion, 'cancelled');
+  assert.equal(f.state.statuses.length, 2);
+  assert.equal(f.state.statuses.at(-1).state, 'pending');
+  assert.equal(f.state.statuses.at(-1).context, statusContext(1));
+  assert.notEqual(f.state.statuses[0].target_url, f.state.statuses[1].target_url);
 });
 
 test('same SHA pair on a different target branch is a distinct request', async () => {
@@ -233,33 +232,40 @@ test('a forged request comment cannot suppress analysis', async () => {
   assert.equal((await f.one()).status, 'requested');
 });
 
-test('each new request creates a Check while retaining completed results as history', async () => {
+test('new versions replace the current PR status while preserving status history', async () => {
   const f = fixture();
   const first = await f.one();
   f.reply(first.request);
   await f.publish();
+  const completed = f.state.statuses.at(-1);
   f.state.target = OTHER;
   const second = await f.one();
-  assert.notEqual(first.request.checkId, second.request.checkId);
-  assert.equal(f.state.checks.find((check) => check.id === first.request.checkId).conclusion, 'success');
-  assert.equal(f.state.checks.at(-1).status, 'in_progress');
-  assert.equal(f.state.checks.at(-1).conclusion, null);
-  assert.match(f.state.checks.at(-1).external_id, new RegExp(second.request.id));
+  assert.notEqual(first.request.id, second.request.id);
+  assert.equal(completed.state, 'success');
+  assert.equal(f.state.statuses.at(-1).state, 'pending');
+  assert.equal(f.state.statuses.at(-1).context, completed.context);
   f.state.prs[0].head.sha = '5'.repeat(40);
   const third = await f.one();
-  assert.notEqual(third.request.checkId, second.request.checkId);
-  assert.equal(f.state.checks.length, 3);
+  assert.notEqual(third.request.id, second.request.id);
+  assert.equal(f.state.statuses.at(-1).sha, third.request.head);
+  assert.equal(f.state.statuses.length, 4);
 });
 
-test('a check from a different app or PR cannot be reused', async () => {
-  const f = fixture();
-  f.state.checks.push({ id: 77, name: NAME, head_sha: HEAD,
-    app: { slug: 'another-app' }, external_id: 'semantic-review:1:unrelated' });
-  f.state.checks.push({ id: 78, name: NAME, head_sha: HEAD,
-    app: { slug: 'github-actions' }, external_id: 'semantic-review:2:unrelated' });
-  const result = await f.one();
-  assert.notEqual(result.request.checkId, 77);
-  assert.notEqual(result.request.checkId, 78);
+test('different PRs sharing a head have independent status contexts', async () => {
+  const f = fixture([pull(1), pull(2)]);
+  const first = await f.one();
+  const second = await f.one({ number: 2 });
+  f.reply(first.request, 'FAIL');
+  await f.publish();
+  const latest = (number) => f.state.statuses.filter((status) =>
+    status.context === statusContext(number)).at(-1);
+  assert.equal(latest(1).state, 'failure');
+  assert.equal(latest(2).state, 'pending');
+  assert.equal(latest(1).sha, latest(2).sha);
+  f.reply(second.request, 'PASS', {}, 2);
+  await f.publish(2);
+  assert.equal(latest(1).state, 'failure');
+  assert.equal(latest(2).state, 'success');
 });
 
 test('a target already contained in the PR is analyzed with its real merge base', async () => {
@@ -280,22 +286,22 @@ test('live head changes, branch changes and approval removal stop stale requests
     } });
     assert.ok(['moved', 'ineligible'].includes((await f.one()).status));
     assert.equal(f.state.posts.length, 0);
-    assert.equal(f.state.checks.length, 0);
+    assert.equal(f.state.statuses.length, 0);
   }
   const f = fixture([pull()], { readTarget: (count) => count === 1 ? TARGET : OTHER });
   assert.equal((await f.one()).status, 'moved');
-  assert.equal(f.state.checks.length, 0);
+  assert.equal(f.state.statuses.length, 0);
 });
 
 test('a token with the right login but wrong immutable service ID is rejected', async () => {
   const f = fixture();
   f.state.service = { ...SERVICE, id: 999 };
   await assert.rejects(f.one(), { code: 'SEMANTIC_REVIEW_COMMAND_USER' });
-  assert.equal(f.state.checks.length, 0);
+  assert.equal(f.state.statuses.length, 0);
   assert.equal(f.state.posts.length, 0);
 });
 
-test('an unaccepted POST cancels only its new Check and remains eligible for another request', async () => {
+test('an unaccepted POST creates no status and remains eligible for another request', async () => {
   for (const hasCompletedRequest of [false, true]) {
     const f = fixture();
     if (hasCompletedRequest) {
@@ -304,32 +310,28 @@ test('an unaccepted POST cancels only its new Check and remains eligible for ano
       await f.publish();
       f.state.target = OTHER;
     }
+    const before = structuredClone(f.state.statuses);
     f.state.postErrors.set(1, 'before');
     await assert.rejects(f.one(), { status: 502 });
-    const undelivered = f.state.checks.at(-1);
-    assert.equal(undelivered.status, 'completed');
-    assert.equal(undelivered.conclusion, 'cancelled');
-    assert.match(undelivered.output.title, /could not be confirmed/);
+    assert.deepEqual(f.state.statuses, before);
     assert.equal(requests(f.state.comments.get(1) || []).length, Number(hasCompletedRequest));
     assert.deepEqual((await f.scan()).jobs, [{ number: 1, allowRequest: true }]);
     assert.equal((await f.one()).status, 'requested');
     assert.equal(f.state.posts.length, Number(hasCompletedRequest) + 1);
-    assert.equal(f.state.checks.length, Number(hasCompletedRequest) + 2);
-    assert.equal(f.state.checks.at(-1).status, 'in_progress');
-    assert.equal(undelivered.conclusion, 'cancelled');
-    if (hasCompletedRequest) assert.equal(f.state.checks[0].conclusion, 'success');
+    assert.equal(f.state.statuses.length, before.length + 1);
+    assert.equal(f.state.statuses.at(-1).state, 'pending');
+    if (hasCompletedRequest) assert.equal(before.at(-1).state, 'success');
   }
 });
 
 test('ambiguous POST acceptance is recovered from the trusted comment without a second request', async () => {
   const f = fixture();
   f.state.postErrors.set(1, 'after');
-  await assert.rejects(f.one(), { status: 502 });
+  assert.equal((await f.one()).status, 'requested');
   assert.equal(f.state.posts.length, 1);
   assert.equal((await f.one()).status, 'unchanged');
   assert.equal(f.state.posts.length, 1);
-  assert.equal(f.state.checks.at(-1).status, 'in_progress');
-  assert.equal(f.state.checks.at(-1).conclusion, null);
+  assert.equal(f.state.statuses.at(-1).state, 'pending');
 });
 
 test('consecutive scans resume below the last visited PR and wrap within a 30-request budget', async () => {
@@ -353,7 +355,7 @@ test('consecutive scans resume below the last visited PR and wrap within a 30-re
   assert.equal(second.requested, 30);
   assert.equal(f.state.comparisons, 0);
   assert.equal(f.state.posts.length, 0);
-  assert.equal(f.state.checks.length, 0);
+  assert.equal(f.state.statuses.length, 0);
 });
 
 test('already requested and newly ineligible candidates do not consume discovery slots', async () => {
@@ -385,7 +387,7 @@ test('discovery read errors consume slots and report failure while preserving ot
   assert.deepEqual(result.jobs, Array.from({ length: 24 }, (_, index) => ({ number: 34 - index, allowRequest: true })));
   assert.equal(f.state.warnings.length, 5);
   assert.equal(f.state.failures.length, 1);
-  assert.equal(f.state.checks.length, 0);
+  assert.equal(f.state.statuses.length, 0);
 });
 
 test('at most 30 workers run per discovery even when a POST is accepted ambiguously', async () => {
@@ -395,11 +397,11 @@ test('at most 30 workers run per discovery even when a POST is accepted ambiguou
   for (const number of numbers.slice(0, 3)) f.state.postErrors.set(number, 'after');
   const results = [];
   for (const number of numbers) results.push(await f.worker({ number }));
-  assert.equal(results.filter((result) => result.status === 'requested').length, 27);
-  assert.equal(results.filter((result) => result.status === 'failed').length, 3);
+  assert.equal(results.filter((result) => result.status === 'requested').length, 30);
+  assert.equal(results.filter((result) => result.status === 'failed').length, 0);
   assert.equal(f.state.posts.length, 30);
-  assert.equal(f.state.failures.length, 3);
-  assert.equal(f.state.checks.every((check) => check.status === 'in_progress' && check.conclusion === null), true);
+  assert.equal(f.state.failures.length, 0);
+  assert.equal(f.state.statuses.every((status) => status.state === 'pending'), true);
   assert.equal((await f.worker({ number: numbers[0] })).status, 'unchanged');
   assert.equal(f.state.posts.length, 30);
 });
@@ -441,9 +443,7 @@ test('worker preserves the 1000-request reserve independently for both tokens', 
     assert.equal(f.state.posts.length, 0);
     assert.ok(f.state.remaining >= 1000);
     assert.ok(f.state.commandRemaining >= 1000);
-    assert.equal(f.state.checks.every((check) =>
-      (check.status === 'in_progress' && check.conclusion === null) ||
-      (check.status === 'completed' && check.conclusion === 'cancelled')), true);
+    assert.equal(f.state.statuses.length, 0);
     assert.equal(f.state.failures.length, 0);
     assert.equal(f.state.before.length + f.state.after.length +
       f.state.commandBefore.length + f.state.commandAfter.length, 0);
@@ -462,7 +462,7 @@ test('rate-limit responses stop discovery without marking an AI failure', async 
     assert.equal(result.cursor, 1);
     assert.equal(result.failed, 0);
     assert.equal(f.state.failures.length, 0);
-    assert.equal(f.state.checks.length, 0);
+    assert.equal(f.state.statuses.length, 0);
   }
 });
 
@@ -472,7 +472,7 @@ test('worker operational errors fail its job, release quota hooks and never pass
   assert.equal((await f.worker()).status, 'failed');
   assert.equal(f.state.failures.length, 1);
   assert.equal(f.state.posts.length, 0);
-  assert.equal(f.state.checks.length, 0);
+  assert.equal(f.state.statuses.length, 0);
   assert.equal(f.state.before.length + f.state.after.length +
     f.state.commandBefore.length + f.state.commandAfter.length, 0);
 });
@@ -524,16 +524,14 @@ test('an unanswered pair gets one automatic retry at two hours and ignores the l
   assert.equal(requests(f.state.comments.get(1))[0].automaticRetryOf, first.request.id);
   f.reply(first.request);
   await f.publish();
-  assert.equal(f.state.checks.at(-1).status, 'in_progress');
-  assert.equal(f.state.checks.at(-1).conclusion, null);
+  assert.equal(f.state.statuses.at(-1).state, 'pending');
   f.state.now += 4 * HOUR;
   assert.deepEqual((await f.scan()).jobs, []);
   assert.equal((await f.one()).status, 'unchanged');
   assert.equal(f.state.posts.length, 2);
   f.reply(retried.request, 'FAIL');
   await f.publish();
-  assert.equal(f.state.checks.at(-1).status, 'completed');
-  assert.equal(f.state.checks.at(-1).conclusion, 'failure');
+  assert.equal(f.state.statuses.at(-1).state, 'failure');
 });
 
 test('only a valid bound reply suppresses the automatic retry', async () => {
@@ -551,15 +549,14 @@ test('only a valid bound reply suppresses the automatic retry', async () => {
     assert.equal(result.status, 'requested');
     assert.equal(result.request.automaticRetryOf, first.request.id);
     assert.equal(f.state.posts.length, 2);
-    assert.equal(f.state.checks.at(-1).status, 'in_progress');
-    assert.equal(f.state.checks.at(-1).conclusion, null);
+    assert.equal(f.state.statuses.at(-1).state, 'pending');
   }
 });
 
 test('valid PASS, FAIL, INCONCLUSIVE and missing-evidence replies are repaired without another AI request', async () => {
   for (const [verdict, expected, stripEvidence] of [
     ['PASS', 'success', false], ['FAIL', 'failure', false],
-    ['INCONCLUSIVE', 'neutral', false], ['PASS', 'neutral', true],
+    ['INCONCLUSIVE', 'pending', false], ['PASS', 'pending', true],
   ]) {
     const f = fixture();
     const first = await f.one();
@@ -570,24 +567,59 @@ test('valid PASS, FAIL, INCONCLUSIVE and missing-evidence replies are repaired w
     assert.equal(scan.requested, 0);
     assert.deepEqual(scan.jobs, [{ number: 1, allowRequest: false }]);
     assert.equal((await f.worker({ allowRequest: false, commandGithub: undefined })).status, 'reconciled');
-    assert.equal(f.state.checks.at(-1).status, 'completed');
-    assert.equal(f.state.checks.at(-1).conclusion, expected);
+    assert.equal(f.state.statuses.at(-1).state, expected);
+    if (expected === 'pending') {
+      assert.equal(f.state.statuses.at(-1).description, 'Review completed: inconclusive');
+    }
     assert.equal(f.state.posts.length, 1);
     assert.deepEqual((await f.scan()).jobs, []);
   }
 });
 
-test('a failed Check write is retried from the reply rather than asking AI again', async () => {
+test('a failed status write is retried from the reply rather than asking AI again', async () => {
   const f = fixture();
   const first = await f.one();
   f.reply(first.request, 'FAIL');
-  f.state.checkUpdateFailures = 1;
+  f.state.statusFailures = 1;
   await assert.rejects(f.publish(), { status: 502 });
-  assert.equal(f.state.checks.at(-1).status, 'in_progress');
+  assert.equal(f.state.statuses.at(-1).state, 'pending');
   f.state.now += 3 * HOUR;
   assert.deepEqual((await f.scan()).jobs, [{ number: 1, allowRequest: false }]);
   assert.equal((await f.worker({ commandGithub: undefined })).status, 'unchanged');
-  assert.equal(f.state.checks.at(-1).conclusion, 'failure');
+  assert.equal(f.state.statuses.at(-1).state, 'failure');
+  assert.equal(f.state.posts.length, 1);
+});
+
+test('an accepted comment whose initial status write fails is repaired without another AI request', async () => {
+  for (const completed of [false, true]) {
+    const f = fixture();
+    f.state.statusFailures = 1;
+    await assert.rejects(f.one(), { status: 502 });
+    const request = requests(f.state.comments.get(1))[0];
+    assert.equal(f.state.posts.length, 1);
+    assert.equal(f.state.statuses.length, 0);
+    if (completed) {
+      f.reply(request, 'INCONCLUSIVE');
+      f.state.now += 3 * HOUR;
+    }
+    const scan = await f.scan();
+    assert.equal(scan.requested, 0);
+    assert.deepEqual(scan.jobs, [{ number: 1, allowRequest: false }]);
+    await f.worker({ ...scan.jobs[0], commandGithub: undefined });
+    assert.equal(f.state.statuses.at(-1).state, 'pending');
+    assert.equal(f.state.statuses.at(-1).description,
+      completed ? 'Review completed: inconclusive' : 'Waiting for CodeRabbit response');
+    assert.equal(f.state.posts.length, 1);
+    assert.deepEqual((await f.scan()).jobs, []);
+  }
+});
+
+test('a reply received immediately after the request is published as the first status', async () => {
+  const f = fixture();
+  f.state.onPostComment = (comment) => f.reply(requests([comment])[0], 'FAIL');
+  const result = await f.one();
+  assert.equal(result.status, 'requested');
+  assert.deepEqual(f.state.statuses.map((status) => status.state), ['failure']);
   assert.equal(f.state.posts.length, 1);
 });
 
@@ -605,7 +637,7 @@ test('a reply arriving after discovery or during the worker cancels the planned 
     } else f.reply(first.request);
     assert.equal((await f.worker()).status, 'unchanged');
     assert.equal(f.state.posts.length, 1);
-    assert.equal(f.state.checks.at(-1).conclusion, 'success');
+    assert.equal(f.state.statuses.at(-1).state, 'success');
   }
 });
 
@@ -618,14 +650,12 @@ test('manual requests neither consume nor replenish the single automatic retry a
   assert.equal(retry.request.automaticRetryOf, first.request.id);
   f.reply(retry.request);
   await f.publish();
-  assert.equal(f.state.checks.at(-1).conclusion, 'success');
+  assert.equal(f.state.statuses.at(-1).state, 'success');
   const manual = await f.one({ manual: true });
   assert.equal(manual.request.automaticRetryOf, undefined);
   assert.notEqual(manual.request.id, retry.request.id);
-  assert.notEqual(manual.request.checkId, retry.request.checkId);
-  assert.equal(f.state.checks.find((check) => check.id === retry.request.checkId).conclusion, 'success');
-  assert.equal(f.state.checks.at(-1).status, 'in_progress');
-  assert.equal(f.state.checks.at(-1).conclusion, null);
+  assert.ok(f.state.statuses.some((status) => status.state === 'success'));
+  assert.equal(f.state.statuses.at(-1).state, 'pending');
   f.state.now += 3 * HOUR;
   assert.deepEqual((await f.scan()).jobs, []);
   assert.equal((await f.one()).status, 'unchanged');
@@ -664,9 +694,9 @@ test('repair recovers the recorded revisions after the current head, target or e
     }
     const result = await f.worker({ allowRequest: false, commandGithub: undefined });
     assert.equal(result.status, 'reconciled');
-    assert.equal(f.state.checks.at(-1).head_sha, HEAD);
-    assert.equal(f.state.checks.at(-1).conclusion, 'failure');
-    assert.match(f.state.checks.at(-1).output.summary, new RegExp(first.request.id));
+    assert.equal(f.state.statuses.at(-1).sha, HEAD);
+    assert.equal(f.state.statuses.at(-1).state, 'failure');
+    assert.match(f.state.statuses.at(-1).target_url, /#issuecomment-/);
     assert.equal(f.state.posts.length, 1);
   }
 });
@@ -693,7 +723,7 @@ test('repairs after a full request budget resume next rotation and cannot upgrad
   }
   assert.equal(f.state.posts.length, 32);
   assert.equal(requests(f.state.comments.get(1)).length, 1);
-  assert.equal(f.state.checks.find((check) => check.external_id.startsWith('semantic-review:1:')).conclusion, 'success');
+  assert.equal(f.state.statuses.filter((status) => status.context === statusContext(1)).at(-1).state, 'success');
 });
 
 test('automatic retries and new pairs share the same 30-request budget', async () => {
@@ -717,7 +747,7 @@ test('repair-only workers do not need a command token or consume its reserved qu
   f.state.remaining = 1000;
   const result = await f.worker({ allowRequest: false, commandGithub: undefined });
   assert.equal(result.status, 'reconciled');
-  assert.equal(f.state.checks.at(-1).conclusion, 'success');
+  assert.equal(f.state.statuses.at(-1).state, 'success');
   assert.equal(f.state.posts.length, 1);
   assert.equal(f.state.commandRemaining, 1000);
 });
@@ -753,42 +783,37 @@ test('a due automatic retry still preserves both token reserves', async () => {
   }
 });
 
-test('an edited invalid result becomes retryable even though the original Check completed', async () => {
+test('an edited invalid result becomes retryable even though a success status was published', async () => {
   const f = fixture();
   const first = await f.one();
   const reply = f.reply(first.request);
   await f.publish();
-  assert.equal(f.state.checks.at(-1).conclusion, 'success');
+  assert.equal(f.state.statuses.at(-1).state, 'success');
   reply.body = reply.body.replace('verdict=PASS', 'verdict=UNKNOWN');
   f.state.now += 3 * HOUR;
   assert.deepEqual((await f.scan()).jobs, [{ number: 1, allowRequest: true }]);
   const retry = await f.worker();
   assert.equal(retry.status, 'requested');
   assert.equal(retry.request.automaticRetryOf, first.request.id);
-  assert.equal(f.state.checks.at(-1).status, 'in_progress');
-  assert.equal(f.state.checks.at(-1).conclusion, null);
+  assert.equal(f.state.statuses.at(-1).state, 'pending');
   assert.equal(f.state.posts.length, 2);
 });
 
-test('a failed manual same-pair POST preserves the previous pending request and cancels the orphan Check', async () => {
+test('a failed manual same-pair POST preserves the previous pending request and status', async () => {
   const f = fixture();
   const first = await f.one();
-  const originalCheck = f.state.checks.at(-1);
+  const original = f.state.statuses.at(-1);
   f.state.postErrors.set(1, 'before');
   await assert.rejects(f.one({ manual: true }), { status: 502 });
-  const undelivered = f.state.checks.at(-1);
-  assert.notEqual(undelivered.id, originalCheck.id);
-  assert.equal(undelivered.status, 'completed');
-  assert.equal(undelivered.conclusion, 'cancelled');
-  assert.equal(originalCheck.status, 'in_progress');
-  assert.equal(originalCheck.conclusion, null);
+  assert.equal(f.state.statuses.length, 1);
+  assert.equal(f.state.statuses.at(-1), original);
+  assert.equal(original.state, 'pending');
   assert.equal(requests(f.state.comments.get(1)).length, 1);
   assert.equal((await f.one()).status, 'unchanged');
   assert.equal(f.state.posts.length, 1);
   f.reply(first.request, 'FAIL');
   await f.publish();
-  assert.equal(originalCheck.conclusion, 'failure');
-  assert.equal(undelivered.conclusion, 'cancelled');
+  assert.equal(f.state.statuses.at(-1).state, 'failure');
 });
 
 test('an ambiguously accepted automatic retry remains pending and consumes its one retry allowance', async () => {
@@ -796,27 +821,24 @@ test('an ambiguously accepted automatic retry remains pending and consumes its o
   const first = await f.one();
   f.state.now += 2 * HOUR;
   f.state.postErrors.set(1, 'after');
-  await assert.rejects(f.one(), { status: 502 });
+  assert.equal((await f.one()).status, 'requested');
   const accepted = requests(f.state.comments.get(1))[0];
   assert.notEqual(accepted.id, first.request.id);
   assert.equal(accepted.automaticRetryOf, first.request.id);
-  const retryCheck = f.state.checks.find((check) => check.id === accepted.checkId);
-  assert.equal(retryCheck.status, 'in_progress');
-  assert.equal(retryCheck.conclusion, null);
+  assert.equal(f.state.statuses.at(-1).state, 'pending');
   f.state.now += 3 * HOUR;
   assert.equal((await f.one()).status, 'unchanged');
   assert.equal(f.state.posts.length, 2);
   assert.equal(requests(f.state.comments.get(1)).filter((request) => request.automaticRetryOf).length, 1);
   f.reply(first.request);
   await f.publish();
-  assert.equal(retryCheck.status, 'in_progress');
-  assert.equal(retryCheck.conclusion, null);
+  assert.equal(f.state.statuses.at(-1).state, 'pending');
   f.reply(accepted);
   await f.publish();
-  assert.equal(retryCheck.conclusion, 'success');
+  assert.equal(f.state.statuses.at(-1).state, 'success');
 });
 
-test('failed delivery readback keeps the unknown request pending until a later comment read recovers it', async () => {
+test('failed delivery readback reports the error and a later scan recovers the accepted comment', async () => {
   const f = fixture();
   f.state.postErrors.set(1, 'after');
   f.state.onListComments = (_number, count) => {
@@ -824,98 +846,88 @@ test('failed delivery readback keeps the unknown request pending until a later c
   };
   await assert.rejects(f.one(), { status: 502 });
   assert.equal(f.state.posts.length, 1);
-  assert.equal(f.state.checks.at(-1).status, 'in_progress');
-  assert.equal(f.state.checks.at(-1).conclusion, null);
+  assert.equal(f.state.statuses.length, 0);
   assert.equal(f.state.warnings.length, 1);
   assert.match(f.state.warnings[0], /delivery remains unknown/);
-  assert.equal((await f.one()).status, 'unchanged');
+  const scan = await f.scan();
+  assert.deepEqual(scan.jobs, [{ number: 1, allowRequest: false }]);
+  assert.equal((await f.worker({ ...scan.jobs[0], commandGithub: undefined })).status, 'reconciled');
+  assert.equal(f.state.statuses.at(-1).state, 'pending');
   assert.equal(f.state.posts.length, 1);
-  assert.equal(f.state.checks.length, 1);
+  assert.equal((await f.one()).status, 'unchanged');
 });
 
-test('a scan repairs missed cancellation after an accepted retry finishes without requesting AI again', async () => {
+test('a scan repairs failed legacy Check cancellation without requesting AI again', async () => {
   const f = fixture();
   const first = await f.one();
-  const oldCheck = f.state.checks.at(-1);
-  f.state.now += 2 * HOUR;
-  f.state.postErrors.set(1, 'after');
-  await assert.rejects(f.one(), { status: 502 });
-  const retried = requests(f.state.comments.get(1))[0];
-  assert.equal(retried.automaticRetryOf, first.request.id);
-  assert.equal(oldCheck.status, 'in_progress');
-  f.reply(retried);
-  f.state.onCheckUpdate = ({ check_run_id: id }) => {
-    if (id === oldCheck.id) {
-      f.state.onCheckUpdate = undefined;
-      throw Object.assign(new Error('Cancellation unavailable'), { status: 502 });
-    }
+  const legacy = { id: 77, name: NAME, head_sha: HEAD, status: 'in_progress', conclusion: null,
+    app: { slug: 'github-actions' }, external_id: `semantic-review:1:${first.request.id}` };
+  f.state.legacyChecks.push(legacy);
+  f.state.statuses = [];
+  const comment = f.state.comments.get(1)[0];
+  comment.body = comment.body.replace(`"branch":"main"`, `"branch":"main","checkId":77`);
+  assert.equal(requests([comment])[0].checkId, 77);
+  f.reply(first.request);
+  f.state.onCheckUpdate = () => {
+    f.state.onCheckUpdate = undefined;
+    throw Object.assign(new Error('Cancellation unavailable'), { status: 502 });
   };
   await assert.rejects(f.publish(), { status: 502 });
-  const currentCheck = f.state.checks.find((check) => check.id === retried.checkId);
-  assert.equal(currentCheck.conclusion, 'success');
-  assert.equal(oldCheck.status, 'in_progress');
+  assert.equal(f.state.statuses.at(-1).state, 'success');
+  assert.equal(legacy.status, 'in_progress');
   const scan = await f.scan();
   assert.equal(scan.requested, 0);
   assert.deepEqual(scan.jobs, [{ number: 1, allowRequest: false }]);
-  assert.equal((await f.worker({ ...scan.jobs[0], commandGithub: undefined })).status, 'reconciled');
-  assert.equal(oldCheck.status, 'completed');
-  assert.equal(oldCheck.conclusion, 'cancelled');
-  assert.equal(currentCheck.conclusion, 'success');
-  assert.equal(f.state.posts.length, 2);
+  await f.worker({ ...scan.jobs[0], commandGithub: undefined });
+  assert.equal(legacy.status, 'completed');
+  assert.equal(legacy.conclusion, 'cancelled');
+  assert.equal(f.state.statuses.at(-1).state, 'success');
+  assert.equal(f.state.posts.length, 1);
   assert.deepEqual((await f.scan()).jobs, []);
 });
 
-test('a scan cancels an unrecorded manual attempt without replacing the existing PASS', async () => {
+test('an unknown failed manual attempt leaves the previous PASS unchanged', async () => {
   const f = fixture();
   const first = await f.one();
   f.reply(first.request);
   await f.publish();
-  const completed = f.state.checks.at(-1);
+  const completed = f.state.statuses.at(-1);
   const readback = f.state.commentReads.get(1) + 3;
   f.state.postErrors.set(1, 'before');
   f.state.onListComments = (_number, count) => {
     if (count === readback) throw Object.assign(new Error('Readback unavailable'), { status: 503 });
   };
   await assert.rejects(f.one({ manual: true }), { status: 502 });
-  const orphan = f.state.checks.at(-1);
-  assert.notEqual(orphan.id, completed.id);
-  assert.equal(orphan.status, 'in_progress');
+  assert.equal(f.state.statuses.at(-1), completed);
+  assert.equal(completed.state, 'success');
   assert.equal(requests(f.state.comments.get(1)).length, 1);
-  const scan = await f.scan();
-  assert.equal(scan.requested, 0);
-  assert.deepEqual(scan.jobs, [{ number: 1, allowRequest: false }]);
-  await f.worker({ ...scan.jobs[0], commandGithub: undefined });
-  assert.equal(orphan.conclusion, 'cancelled');
-  assert.equal(completed.conclusion, 'success');
-  assert.equal(f.state.posts.length, 1);
   assert.deepEqual((await f.scan()).jobs, []);
+  assert.equal(f.state.posts.length, 1);
 });
 
-test('a scan finds and cancels an orphan on the current head even without a request record or approval', async () => {
-  const f = fixture();
-  f.state.postErrors.set(1, 'before');
-  f.state.onListComments = (_number, count) => {
-    if (count === 3) throw Object.assign(new Error('Readback unavailable'), { status: 503 });
-  };
-  await assert.rejects(f.one(), { status: 502 });
-  const orphan = f.state.checks.at(-1);
-  assert.equal(orphan.status, 'in_progress');
-  assert.equal(requests(f.state.comments.get(1) || []).length, 0);
-  f.state.prs[0].labels = [];
+test('a scan cancels legacy orphans without a request record or approval and preserves other PRs and apps', async () => {
+  const f = fixture([pull(1, { labels: [] })]);
+  const orphan = { id: 77, name: NAME, head_sha: HEAD, status: 'in_progress', conclusion: null,
+    app: { slug: 'github-actions' }, external_id: 'semantic-review:1:unrecorded' };
+  const otherPR = { ...orphan, id: 78, external_id: 'semantic-review:2:unrecorded' };
+  const otherApp = { ...orphan, id: 79, app: { slug: 'another-app' } };
+  f.state.legacyChecks.push(orphan, otherPR, otherApp);
   const scan = await f.scan();
   assert.equal(scan.requested, 0);
   assert.deepEqual(scan.jobs, [{ number: 1, allowRequest: false }]);
   await f.worker({ ...scan.jobs[0], commandGithub: undefined });
   assert.equal(orphan.status, 'completed');
   assert.equal(orphan.conclusion, 'cancelled');
+  assert.equal(otherPR.status, 'in_progress');
+  assert.equal(otherApp.status, 'in_progress');
+  assert.equal(f.state.statuses.length, 0);
   assert.equal(f.state.posts.length, 0);
   assert.deepEqual((await f.scan()).jobs, []);
 });
 
-test('a FAIL received at the final recheck remains completed when a manual new request is sent', async () => {
+test('a FAIL received at the final recheck is published before the manual request resets the status', async () => {
   const f = fixture();
   const first = await f.one();
-  const previousCheck = f.state.checks.find((check) => check.id === first.request.checkId);
   const finalRead = f.state.commentReads.get(1) + 2;
   f.state.onListComments = (number, count) => {
     if (number === 1 && count === finalRead) f.reply(first.request, 'FAIL');
@@ -923,11 +935,7 @@ test('a FAIL received at the final recheck remains completed when a manual new r
   const manual = await f.one({ manual: true });
   assert.equal(manual.status, 'requested');
   assert.notEqual(manual.request.id, first.request.id);
-  assert.notEqual(manual.request.checkId, first.request.checkId);
-  assert.equal(previousCheck.status, 'completed');
-  assert.equal(previousCheck.conclusion, 'failure');
-  assert.equal(f.state.checks.at(-1).status, 'in_progress');
-  assert.equal(f.state.checks.at(-1).conclusion, null);
+  assert.deepEqual(f.state.statuses.map((status) => status.state), ['pending', 'failure', 'pending']);
   assert.equal(f.state.posts.length, 2);
 });
 
