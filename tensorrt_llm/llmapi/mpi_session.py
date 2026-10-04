@@ -18,6 +18,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 import zmq
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.bindings.internal import start_coordinator_watchdog
 from tensorrt_llm.logger import logger
 
 from .._utils import global_mpi_rank, mpi_barrier, mpi_rank
@@ -384,6 +385,36 @@ def _worker_identity_barrier():
     return (pid, _process_start_time(pid))
 
 
+_launcher_watchdog_started = False
+
+
+def _run_supervised(task: Callable[..., T], *args, **kwargs) -> T:
+    """Runs inside a pool worker; module-level so it is picklable.
+
+    Before its first task, the worker starts a native watchdog that SIGKILLs
+    it when its parent, the MPI launcher daemon, exits. The daemon shares the
+    pool owner's process group while the MPI runtime puts every spawned worker
+    in a process group of its own, so killing the owner's group takes the
+    daemon down but orphans the workers. An idle worker notices the lost
+    daemon from its MPI progress loop; a worker busy in a task, such as the
+    executor worker that runs for the engine's whole lifetime, does not, and
+    would keep its GPU memory. The watchdog does not need the Python GIL, so
+    it also fires while the task is wedged in native code.
+    """
+    global _launcher_watchdog_started
+    if not _launcher_watchdog_started:
+        try:
+            warning = start_coordinator_watchdog(os.getppid())
+        except (RuntimeError, ValueError) as e:
+            logger.error(
+                f"MPI pool worker could not supervise its launcher: {e}")
+            raise
+        if warning is not None:
+            logger.warning(f"MPI pool worker launcher watchdog: {warning}")
+        _launcher_watchdog_started = True
+    return task(*args, **kwargs)
+
+
 class MpiPoolSession(MpiSession):
 
     def __init__(self,
@@ -427,15 +458,12 @@ class MpiPoolSession(MpiSession):
     def submit(self, task: Callable[..., T], *args,
                **kwargs) -> List[Future[T]]:
         return [
-            self.mpi_pool.submit(task, *args, **kwargs)
+            self.mpi_pool.submit(_run_supervised, task, *args, **kwargs)
             for i in range(self.n_workers)
         ]
 
     def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
-        futures = [
-            self.mpi_pool.submit(task, *args, **kwargs)
-            for i in range(self.n_workers)
-        ]
+        futures = self.submit(task, *args, **kwargs)
         return [future.result() for future in futures]
 
     def shutdown(self, wait=True):

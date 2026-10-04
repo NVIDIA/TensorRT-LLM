@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import signal
 import subprocess  # nosec B404
 import sys
 import threading
+import time
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Literal
@@ -12,6 +14,7 @@ from typing import Literal
 import pytest
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.executor.worker_process_monitor import _read_process_state
 from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
                                              MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
@@ -107,6 +110,85 @@ def test_mpi_pool_session_flashinfer_workspace_isolation(monkeypatch):
     # Unset means FlashInfer derives the artifact cache from each worker's
     # isolated workspace, keeping downloaded compiler inputs per-rank.
     assert cubin_dirs == {None}
+
+
+_POOL_OWNER_SCRIPT = '''
+import os
+import sys
+import time
+from pathlib import Path
+
+
+def block_in_task(marker_dir):
+    from mpi4py import MPI
+
+    # Pin one task per worker so that no worker is left idle in MPI.
+    MPI.COMM_WORLD.barrier()
+    Path(marker_dir, str(os.getpid())).touch()
+    time.sleep(3600)
+
+
+if __name__ == "__main__":
+    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+    session = MpiPoolSession(n_workers=2)
+    session.submit(block_in_task, sys.argv[1])
+    time.sleep(3600)
+'''
+
+
+def _is_running(pid: int, start_time: int) -> bool:
+    state = _read_process_state(pid)
+    return state is not None and state[0] != "Z" and state[1] == start_time
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
+def test_mpi_pool_workers_exit_when_owner_process_group_is_killed(tmp_path):
+    # The MPI launcher daemon shares the owner's process group while every
+    # spawned worker has one of its own, so a group kill (as done by stall and
+    # timeout handlers) orphans the workers; a worker busy in a task must still
+    # exit instead of keeping its GPU memory.
+    script = tmp_path / "pool_owner.py"
+    script.write_text(_POOL_OWNER_SCRIPT)
+    markers = tmp_path / "busy"
+    markers.mkdir()
+    owner = Popen(  # nosec B603
+        [sys.executable, str(script), str(markers)],
+        start_new_session=True)
+    workers = {}
+    try:
+        deadline = time.monotonic() + _DEFAULT_IDENTITY_TIMEOUT
+        while len(workers) < 2:
+            assert owner.poll() is None, "pool owner exited early"
+            assert time.monotonic() < deadline, "pool workers never got busy"
+            for marker in markers.iterdir():
+                pid = int(marker.name)
+                if pid not in workers:
+                    state = _read_process_state(pid)
+                    assert state is not None, f"worker {pid} exited early"
+                    workers[pid] = state[1]
+            time.sleep(0.5)
+
+        os.killpg(owner.pid, signal.SIGKILL)
+        owner.wait()
+
+        deadline = time.monotonic() + 30
+        while (any(_is_running(pid, start) for pid, start in workers.items())
+               and time.monotonic() < deadline):
+            time.sleep(0.2)
+        survivors = [
+            pid for pid, start in workers.items() if _is_running(pid, start)
+        ]
+        assert not survivors, (
+            f"pool workers {survivors} outlived their owner's process group")
+    finally:
+        if owner.poll() is None:
+            os.killpg(owner.pid, signal.SIGKILL)
+            owner.wait()
+        for pid, start in workers.items():
+            if _is_running(pid, start):
+                os.kill(pid, signal.SIGKILL)
 
 
 def simple_task(x):
