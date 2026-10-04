@@ -1983,9 +1983,8 @@ class MooncakeStoreConfig(StrictBaseModel):
         "engines may read. Zero lends nothing: the server joins the pool and "
         "uses capacity its peers hold, so a pool whose every participant "
         "lends nothing has nowhere to put a page.")
-    transfer_batch_size: int = Field(64,
-                                     telemetry=False,
-                                     description="Page keys per store call.")
+    transfer_batch_size: PositiveInt = Field(
+        64, telemetry=False, description="Page keys per store call.")
     namespace: Optional[str] = Field(
         None,
         description="Key namespace, isolating this deployment's cache from "
@@ -2025,6 +2024,25 @@ class MooncakeStoreConfig(StrictBaseModel):
         "start on another node. Too short fails the server at startup, which "
         "is the intent: a master that is not there fails inside every rank "
         "after the model has loaded, as a bare status code.")
+
+    @field_validator("segment_size", mode="after")
+    @classmethod
+    def _check_segment_size(cls, value):
+        """Reject a size here rather than in every rank after bringup.
+
+        The connector parses it, so a typo would otherwise surface as a
+        per-rank failure with the model already loading.
+        """
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        try:
+            parsed = parse_size(value, strict_units=True)
+        except ValueError as exc:
+            raise ValueError(f"mooncake_store.segment_size: {exc}")
+        if parsed < 0:
+            raise ValueError(f"mooncake_store.segment_size: {value!r} is "
+                             f"{parsed} bytes; it cannot be negative.")
+        return value
 
 
 class KvCacheConnectorConfig(StrictBaseModel):
