@@ -99,26 +99,13 @@ _CALL_CONSTANTS = dict(
     skip_correction_threshold=0.0,
 )
 
-_FC1_K_ALIGN = 512
-
-
-def _pad_up(x: int, align: int) -> int:
-    return (x + align - 1) // align * align
+_FC1_K_ALIGN = _weights.FC1_K_ALIGN
 
 
 class GptOssModelingV2(ModelingV2Core):
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
         cfg = model_config.pretrained_config
-        # This checkpoint's config.json declares no dtype, so the shell would size lm_head fp32 while
-        # everything else is bf16, failing two layers away.
-        dt = model_config.torch_dtype
-
-        num_layers = cfg.num_hidden_layers
-        hidden = cfg.hidden_size
-        heads_q = cfg.num_attention_heads
-        heads_kv = cfg.num_key_value_heads
-        head_dim = cfg.head_dim
 
         rope = getattr(cfg, "rope_scaling", None) or getattr(cfg, "rope_parameters", None)
         self.theta = float(rope.get("rope_theta", getattr(cfg, "rope_theta", 0.0)))
@@ -127,30 +114,11 @@ class GptOssModelingV2(ModelingV2Core):
         self.sliding = [t == "sliding_attention" for t in layer_types]
         self.window = cfg.sliding_window
 
-        num_experts = cfg.num_local_experts
-        inter = cfg.intermediate_size
-
-        self.inter_pad = _pad_up(inter, 128)
-        self.fc1_k_pad = _pad_up(hidden, _FC1_K_ALIGN)
-        self.fc2_rows_pad = _pad_up(hidden, 128)
-
-        q_width = heads_q * head_dim
-        kv_width = heads_kv * head_dim
-
-        self.w = _weights.declare(
-            num_layers=num_layers,
-            hidden=hidden,
-            q_width=q_width,
-            kv_width=kv_width,
-            heads_q=heads_q,
-            num_experts=num_experts,
-            vocab=cfg.vocab_size,
-            fc1_rows=2 * self.inter_pad,
-            fc1_k_pad=self.fc1_k_pad,
-            inter_pad=self.inter_pad,
-            fc2_rows_pad=self.fc2_rows_pad,
-            dtype=dt,
-        )
+        d = _weights.MODEL_WEIGHTS.dims(self)
+        self.inter_pad = d.inter_pad
+        self.fc1_k_pad = d.fc1_k_pad
+        self.fc2_rows_pad = d.fc2_rows_pad
+        self.w = _weights.MODEL_WEIGHTS.declare(d)
 
         self._prefill: Target | None = None
         self._decode: Target | None = None
@@ -651,7 +619,7 @@ class ModelingV2GptOss120bSm103Tp1(DecoderModelForCausalLM[GptOssModelingV2, Pre
         )
 
     def load_weights(self, weights, *args, **kwargs):
-        _weights.load(self, weights)
+        _weights.MODEL_WEIGHTS.load(self, weights)
 
     def post_load_weights(self):
         super().post_load_weights()
