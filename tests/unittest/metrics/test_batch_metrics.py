@@ -158,6 +158,7 @@ def test_executor_publishes_without_iteration_stats_and_clears_before_idle(
     executor._update_batch_metrics(_batch(context=2, generation=5))
     assert executor._batch_metrics._batch_size._value.get() == 7
 
+    executor.kv_connector_manager = None
     executor.control_requests = []
     executor.is_shutdown = False
     executor._disable_mpi = False
@@ -310,6 +311,8 @@ def test_scheduler_publishes_prepared_batch(
     executor.device_id = 0
     executor.iter_counter = 0
     executor.enable_iter_perf_stats = enable_iter_perf_stats
+    executor.iter_perf_stats_interval = 1
+    executor._pending_num_new_active_requests = 0
     executor.enable_attention_dp = False
     executor._resource_governor_enabled = False
     executor._is_kv_manager_v2 = False
@@ -452,6 +455,7 @@ def test_executor_initializes_metrics_only_with_multiprocess_storage(
         print_iter_log=False,
         enable_iter_perf_stats=False,
         enable_iter_req_stats=False,
+        iter_perf_stats_interval=1,
         return_perf_metrics=enabled,
         stream_interval=1,
         model="org/model",
