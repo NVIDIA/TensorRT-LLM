@@ -516,7 +516,7 @@ def test_beam_search_disagg_first_token_is_end_id(
         ctx_llm.shutdown()
 
 
-@pytest.mark.parametrize("beam_width", [10])
+@pytest.mark.parametrize("beam_width", [10, 32, 64])
 @pytest.mark.threadleak(enabled=False)
 def test_beam_search_large_beam_width_regression(
     beam_width: int,

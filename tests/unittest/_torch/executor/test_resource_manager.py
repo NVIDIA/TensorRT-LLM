@@ -1314,6 +1314,16 @@ class TestResolveWindowSize(unittest.TestCase):
             mgr._resolve_window_size(None)
         self.assertEqual(mgr._resolve_window_size(8192), 8192)
 
+    def test_window_clamp_keeps_full_attention_max_seq_len_aligned(self):
+        mgr = self._make_manager([1024], is_vswa=False)
+        adjusted = mgr._validate_and_adjust_attention_windows(
+            [1024], {1024: (16, 0)}, tokens_per_block=32, max_seq_len=1024)
+
+        self.assertEqual(adjusted[0], {512: (16, 0)})
+        self.assertEqual(adjusted[1], 512)
+        self.assertEqual(adjusted[2], [512])
+        self.assertEqual(adjusted[3], {1024: 512})
+
 
 class TestRequestBudget(unittest.TestCase):
     """Unit tests for the beam-aware KV block budget estimation and the
