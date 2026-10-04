@@ -1514,6 +1514,8 @@ class PyExecutor:
             logger.error("Hang detected, shutting down immediately.")
             return
         self.worker_thread.join()
+        if self.kv_connector_manager is not None:
+            self.kv_connector_manager.shutdown()
         if self.dist.pp_size > 1:
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()

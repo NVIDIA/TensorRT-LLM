@@ -252,6 +252,13 @@ class KvCacheConnectorWorker(ABC):
         owners do not participate in its completion.
         """
 
+    def shutdown(self) -> None:
+        """Release whatever this worker holds, once the executor is done with it.
+
+        Called once, after the executor's worker thread has joined, so no
+        transfer can start afterwards. Implementations must be idempotent.
+        """
+
 
 class KvCacheConnectorScheduler(ABC):
     # ADP creates one adapter per rank. Adapters may connect to the same
@@ -894,3 +901,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def wait_for_initialization(self):
         if self.scheduler is not None:
             self.scheduler.wait_for_initialization()
+
+    def shutdown(self) -> None:
+        self.worker.shutdown()
