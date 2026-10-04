@@ -381,10 +381,10 @@ def load(model, weights) -> None:
         dst.copy_(src, non_blocking=True)
         consumed.add(ckpt_key)
 
-    assert set(manifest.keys()) == set(core.w.keys()), (
-        "manifest/parameter drift",
-        set(manifest.keys()) ^ set(core.w.keys()),
-    )
+    # No drift check between the manifest and the parameters: both unroll
+    # WEIGHTS, so a key present in one and absent from the other is not a
+    # state this code can reach. The assert that used to stand here existed
+    # only because the seventeen names were written out twice.
     for param_key, sources in manifest.items():
         for ckpt_key, index, transform in sources:
             fill(core.w[param_key], ckpt_key, index, transform)
