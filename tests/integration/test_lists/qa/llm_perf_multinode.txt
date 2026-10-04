@@ -105,7 +105,8 @@ perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_wideep_deepseek-r1-fp4_8k1k_
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_wideep_stress-deepseek-r1-fp4_8k1k_ctx2_gen1_dep32_bs128_eplb288_mtp3_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_stress-gpt-oss-120b-fp4_8k1k_ctx1_tp1_gen1_tp4_eplb0_eagle3_ccb-NIXL]
 
-# aggregated multi-node (ctx_only and gen_only reuse disagg config yamls)
+# aggregated multi-node (ctx_only, gen_only and gen_only_no_context reuse disagg
+# config yamls)
 
 # ctx_only
 perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-gb200_deepseek-r1-fp4_128k8k_con1_ctx1_pp8_gen1_tep8_eplb0_mtp3_ccb-NIXL]
@@ -127,3 +128,50 @@ perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_kimi-k25-thinking-fp4_8
 perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb300_kimi-k25-thinking-fp4_8k1k_con1024_ctx1_dep4_gen1_dep32_eplb416_mtp3_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb300_kimi-k25-thinking-fp4_8k1k_con4096_ctx1_dep4_gen1_dep16_eplb0_mtp0_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb300_kimi-k25-thinking-fp4_8k1k_con4_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]
+
+# gen_only_no_context
+#
+# Same decode-loop measurement as gen_only -- the gen worker's per-iteration
+# device step time -- but the worker fabricates its own KV blocks, so no ctx fleet
+# is allocated at all. aggr- prefix, not disagg-: the prefix names the launch path,
+# and this mode runs one pytest that owns the gen worker, the proxy and the client,
+# the same single-pytest path ctx_only already takes out of a disaggregated yaml.
+# The yaml is unchanged and shared with the disagg id above;
+# num_ctx_servers/num_gen_servers are overridden to (0, 1) by the mode itself.
+#
+# These four are a CONTROL GROUP, not a replacement. Every id here pairs with a
+# disagg-gen_only- id of the SAME config in the section above, and that section is
+# left intact: #19107 measured a per-case gap spanning -37%..+13%, so until the two
+# metrics are shown to track each other per case, neither can stand in for the
+# other. The pairs run side by side daily in schedule 25592 ("9. TRTLLM Gen-Only
+# No-Context Correlation Pipeline") so the correlation can be computed from >10
+# paired points per case rather than argued from two reps.
+#
+# Selection rule for the four: each config's disagg-gen_only- twin has real
+# decode-metric history in the multi-node perf DB, so the paired series starts from
+# a measured baseline rather than from nothing. Point counts over 1.3.0rc1..rc27, on
+# the GPU the config's prefix names:
+# - gb200_gpt-oss-120b con4: 16 pts, measured by #19107 (-8.58%, 1.26% spread)
+# - gb200_deepseek-r1 con1: 12 pts, measured by #19107 (-6.21%, 1.12% spread)
+# - gb300_glm-5 con1024: 11 pts, measured but 12.68% peak-to-peak
+# - gb300_kimi-k25 con4: 12 pts, never measured in the no-context arm
+# The two #19107 already characterised anchor the comparison; the two it could not
+# are the reason the schedule exists. Deliberately excluded: the con1024 kimi ids on
+# both GPUs (0 history points -- nothing to pair against) and gb200_wideep (8-node
+# gen worker, where #19107 saw a 20.4% Slurm-startup retry rate against 0%
+# single-node).
+#
+# Losing gen_only's ctx fleet does NOT lose cache-transceiver coverage: all four
+# configs also run disagg-e2e- in this same list, and e2e is what exercises the KV
+# transfer between workers. What gen_only adds over gen_only_no_context is *real* KV
+# arriving at the gen worker, which those e2e ids already cover for these configs.
+#
+# NOTE: baselines do not carry over between the two modes. s_benchmark_mode is an
+# OpenSearch match key, so each id here starts its own baseline lineage and its
+# decode metric is un-gated until enough history accumulates (<2 versions reports
+# `insufficient`). That is a cost of adding the arm, not of moving a case -- nothing
+# above loses its lineage, because nothing above was removed.
+perf/test_perf_sanity.py::test_e2e[aggr-gen_only_no_context-gb200_gpt-oss-120b-fp4_8k1k_con4_ctx1_tp1_gen1_tp4_eplb0_mtp0_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[aggr-gen_only_no_context-gb200_deepseek-r1-fp4_8k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[aggr-gen_only_no_context-gb300_glm-5-fp4_8k1k_con1024_ctx1_dep2_gen1_dep8_eplb256_mtp1_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[aggr-gen_only_no_context-gb300_kimi-k25-thinking-fp4_8k1k_con4_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]
