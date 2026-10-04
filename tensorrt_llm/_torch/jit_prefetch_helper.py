@@ -117,7 +117,14 @@ def main():
             return tl.constexpr(convert_to_tuple_if_list(v["constexpr"]))
         return convert_to_tuple_if_list(v)
 
+    # Hash the Triton install once (triton_key is cached), so the first
+    # compile request does not pay it.
+    from triton.runtime.cache import triton_key
+
+    triton_key()
     out = sys.stdout
+    out.write(json.dumps({"ready": True}) + "\n")
+    out.flush()
     for line in sys.stdin:
         line = line.strip()
         if not line:

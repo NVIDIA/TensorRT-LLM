@@ -1473,6 +1473,9 @@ class PyTorchModelEngine(ModelEngine):
         if provider and prefetcher.register("mamba_ssd", provider):
             logger.info(f"[JIT prefetch] Mamba SSD provider: "
                         f"{len(provider.shapes)} distinct layer shape(s)")
+        # Helpers were started when the prefetcher was created; make sure
+        # their start-up is paid here, inside warmup, not by a request.
+        prefetcher.wait_ready()
 
     def _plan_jit_prefetch(self, scheduled_requests: ScheduledRequests,
                            resource_manager: ResourceManager) -> None:

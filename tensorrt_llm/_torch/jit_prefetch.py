@@ -244,6 +244,32 @@ def _expand(call: KernelCall) -> Tuple[List[Dict[str, Any]], bool]:
     return out, tuned
 
 
+def _on_disk(jit_fn, signature, constexprs, attrs, options, backend) -> bool:
+    """True if triton.compile would load this variant from the on-disk cache.
+
+    Same key and lookup as triton.compiler.compile (Triton 3.8): the metadata
+    JSON named after the kernel, in the cache directory
+    sha256(get_cache_key(src, backend, options, env_vars)). A variant already
+    on disk loads in about a millisecond at launch, so a helper round trip
+    would only add a wait. Costs about 0.1 ms per variant once Triton's
+    install hash (``triton_key``, cached) has been computed.
+    """
+    import hashlib
+
+    from triton import knobs
+    from triton._C.libtriton import get_cache_invalidating_env_vars
+    from triton.runtime.cache import get_cache_key, get_cache_manager
+
+    if knobs.compilation.always_compile or knobs.runtime.add_stages_inspection_hook:
+        return False
+    src = jit_fn.ASTSource(jit_fn, signature, constexprs, attrs)
+    opts = backend.parse_options(dict(options.__dict__, **src.parse_options()))
+    key = get_cache_key(src, backend, opts, env_vars=get_cache_invalidating_env_vars())
+    manager = get_cache_manager(hashlib.sha256(key.encode("utf-8")).hexdigest())
+    name = f"{src.name[:150]}.json"
+    return (manager.get_group(name) or {}).get(name) is not None
+
+
 def _lookup_or_serialize(jit_fn, args, kwargs) -> Optional[Tuple[str, str]]:
     """Run Triton's binder; return None on a cache hit, else (key, spec JSON).
 
@@ -268,6 +294,8 @@ def _lookup_or_serialize(jit_fn, args, kwargs) -> Optional[Tuple[str, str]]:
     options, signature, constexprs, attrs = jit_fn._pack_args(
         backend, kwargs, bound_args, specialization, options
     )
+    if _on_disk(jit_fn, signature, constexprs, attrs, options, backend):
+        return None
     from triton.runtime.jit import get_full_name
 
     return key, serialize_specialization_data(
@@ -322,9 +350,15 @@ class JitPrefetcher:
         self._req_q = None
 
         self._executor_thread: Optional[int] = None
+        self._ready: Dict[int, threading.Event] = {}
         self._install_hooks()
         if self.prefetch:
             self._start_helpers()
+            # Hash the Triton install now (cached for the process lifetime),
+            # so the first serving-time disk-cache check does not pay it.
+            from triton.runtime.cache import triton_key
+
+            triton_key()
 
     @classmethod
     def get(cls) -> Optional["JitPrefetcher"]:
@@ -371,11 +405,26 @@ class JitPrefetcher:
                 bufsize=1,
             )
             self._procs.append(p)
+            self._ready[p.pid] = threading.Event()
             threading.Thread(target=self._feed_loop, args=(p,), daemon=True).start()
             threading.Thread(target=self._drain_loop, args=(p,), daemon=True).start()
         logger.info(
             f"[JIT prefetch] rank {self.rank}: {n} helper process(es) compiling into {cache_dir}"
         )
+
+    def wait_ready(self, timeout_s: float = 60.0) -> float:
+        """Block until every helper has imported Triton; return seconds waited.
+
+        Called at the end of warmup, so a helper's start-up (about 2 s for
+        the interpreter and the Triton import) is never paid by a request.
+        """
+        t0 = time.perf_counter()
+        for ev in self._ready.values():
+            ev.wait(timeout_s)
+        dt = time.perf_counter() - t0
+        n_ready = sum(ev.is_set() for ev in self._ready.values())
+        self._event(f"helpers ready {n_ready}/{len(self._ready)} after {dt * 1e3:.0f} ms")
+        return dt
 
     def _feed_loop(self, proc):
         # One request in flight per helper, so work spreads across helpers.
@@ -401,6 +450,9 @@ class JitPrefetcher:
             try:
                 r = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if r.get("ready"):
+                self._ready[proc.pid].set()
                 continue
             tag, ok, dt, err = r["tag"], r["ok"], r["s"], r["err"]
             ev_busy = self._busy.get(proc.pid)
