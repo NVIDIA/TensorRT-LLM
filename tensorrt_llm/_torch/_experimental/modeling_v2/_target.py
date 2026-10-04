@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """What runs a step, separated from what a model statically is.
 
-`ModelingV2Core` carries the static structure -- routing identity, weights,
-parallel and quantization configuration. A `Target` carries one way of running
-a forward over that structure. A core has two, and the runtime picks between
-them per call.
+A model's core -- deriving the shared `ModelingV2Core` base in `_core.py`,
+under its own model-specific name -- carries the static structure: routing
+identity, weights, parallel and quantization configuration. A `Target`
+carries one way of running a forward over that structure. A core has two,
+and the runtime picks between them per call.
 
 The split exists because the two phases are not one computation with different
 arguments. On MLA the generation path works in latent space (absorption) while

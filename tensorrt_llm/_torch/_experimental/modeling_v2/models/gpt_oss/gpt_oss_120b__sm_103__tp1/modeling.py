@@ -45,15 +45,11 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
+from tensorrt_llm._torch._experimental.modeling_v2._core import ModelingV2Core
 from tensorrt_llm._torch._experimental.modeling_v2._target import Phase, Target, phase_of
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import advance_step_generation
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
-    FusedQkNormRope,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
-    ThopAttention,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import FusedQkNormRope
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import ThopAttention
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import CublasMm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (  # noqa: E501
     Mxe4m3Mxe2m1BlockScaleMoeRunner,
@@ -61,16 +57,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_blo
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
     FlashinferFusedAddRmsnorm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
-    FlashinferRmsnorm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import (
-    Mxfp8Quantize,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import FlashinferRmsnorm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import Mxfp8Quantize
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 
 from . import weights as _weights
 
@@ -205,7 +197,7 @@ _CALL_CONSTANTS = dict(
 # hidden states up to, so the two always agree. Kept as a module constant
 # (not folded into a call site) because it has two readers: the quantizer's
 # bind_const below and `self.fc1_k_pad = _pad_up(self.hidden, _FC1_K_ALIGN)`
-# in `ModelingV2Core.__init__`.
+# in `GptOssModelingV2.__init__`.
 _FC1_K_ALIGN = 512
 
 
@@ -213,7 +205,7 @@ def _pad_up(x: int, align: int) -> int:
     return (x + align - 1) // align * align
 
 
-class ModelingV2Core(DecoderModel):
+class GptOssModelingV2(ModelingV2Core):
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
         cfg = model_config.pretrained_config
@@ -344,11 +336,6 @@ class ModelingV2Core(DecoderModel):
         )
 
         self._targets: dict[Phase, Target] | None = None
-        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it: read once here
-        # rather than per forward, and False for the whole life of a served
-        # engine. "pending" rather than "enabled" because the check runs once
-        # -- everything it looks at is fixed at engine construction.
-        self._contract_pending = step_contract_enabled()
 
     def build_layer_views(self) -> None:
         """Construct the per-phase targets, now that the weights are real.
@@ -372,30 +359,8 @@ class ModelingV2Core(DecoderModel):
             Phase.DECODE: DecodeTarget(self),
         }
 
-    def _check_step_contract(self, md) -> None:
-        """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE
-        asks for it: the metadata fields this target consumes must exist (they
-        are private trtllm surface). Everything checked is fixed at
-        engine construction — once per model instance is sound, and off in a
-        served engine, where the only thing this could still do is fail.
-
-        Called unconditionally every forward; the early return below is the
-        gate. That costs one Python call per forward, not per layer, against
-        a decode step measured in milliseconds -- accepted in exchange for
-        not scattering the `_contract_pending` check across every call site.
-        """
-        if not self._contract_pending:
-            return
-        # Calling the projection is the check: it reads every metadata field
-        # this target consumes, so a rename or removal upstream surfaces
-        # here rather than mid-forward. Deriving it this way is the point --
-        # a hand-kept list of the same names drifts silently the first time
-        # _build_step_args gains a field and nobody updates the copy.
-        try:
-            _build_step_args(md, num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
-        except AttributeError as exc:
-            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
-        self._contract_pending = False
+    def _probe_step_surface(self, md) -> None:
+        _build_step_args(md, num_contexts=md.num_contexts, num_ctx_tokens=md.num_ctx_tokens)
 
     def forward(
         self,
@@ -436,7 +401,7 @@ class PrefillTarget(Target):
     materializes K and V -- overrides `forward` itself instead.
     """
 
-    def __init__(self, core: ModelingV2Core) -> None:
+    def __init__(self, core: GptOssModelingV2) -> None:
         """Bind every op this target calls, once, against the real weights.
 
         `Target.__init__` only stores `self.core`; everything below is this
@@ -447,7 +412,7 @@ class PrefillTarget(Target):
         from `cfg` throughout: `core` carries none of it past what is
         genuinely derived (`inter_pad`, `fc1_k_pad`, `fc2_rows_pad`, `theta`,
         the `yarn_*` quantities) or read per layer by the forward
-        (`sliding`, `window`) -- see `ModelingV2Core.__init__` for which is
+        (`sliding`, `window`) -- see `GptOssModelingV2.__init__` for which is
         which. The one op-owned fixture built here -- `fused_qk_norm_rope`'s
         inert q/k norm weight -- is an input that op needs to satisfy its
         own signature, not state the model computes; the MoE runner's
@@ -474,7 +439,7 @@ class PrefillTarget(Target):
         # off a reference tensor, which would tie this fixture to whichever
         # tensor happened to be handy when it was written. rotary_dim is
         # cfg.head_dim directly -- equal for this checkpoint, and not worth
-        # a third name for the same value (see `ModelingV2Core.__init__`).
+        # a third name for the same value (see `GptOssModelingV2.__init__`).
         no_qk_norm = torch.zeros(cfg.head_dim, dtype=dtype, device=device)
         self._qk_rope = FusedQkNormRope()
         self._qk_rope.bind_const(
@@ -678,7 +643,7 @@ class DecodeTarget(Target):
     materializes K and V -- overrides `forward` itself instead.
     """
 
-    def __init__(self, core: ModelingV2Core) -> None:
+    def __init__(self, core: GptOssModelingV2) -> None:
         """Bind every op this target calls, once, against the real weights.
 
         `Target.__init__` only stores `self.core`; everything below is this
@@ -689,7 +654,7 @@ class DecodeTarget(Target):
         from `cfg` throughout: `core` carries none of it past what is
         genuinely derived (`inter_pad`, `fc1_k_pad`, `fc2_rows_pad`, `theta`,
         the `yarn_*` quantities) or read per layer by the forward
-        (`sliding`, `window`) -- see `ModelingV2Core.__init__` for which is
+        (`sliding`, `window`) -- see `GptOssModelingV2.__init__` for which is
         which. The one op-owned fixture built here -- `fused_qk_norm_rope`'s
         inert q/k norm weight -- is an input that op needs to satisfy its
         own signature, not state the model computes; the MoE runner's
@@ -716,7 +681,7 @@ class DecodeTarget(Target):
         # off a reference tensor, which would tie this fixture to whichever
         # tensor happened to be handy when it was written. rotary_dim is
         # cfg.head_dim directly -- equal for this checkpoint, and not worth
-        # a third name for the same value (see `ModelingV2Core.__init__`).
+        # a third name for the same value (see `GptOssModelingV2.__init__`).
         no_qk_norm = torch.zeros(cfg.head_dim, dtype=dtype, device=device)
         self._qk_rope = FusedQkNormRope()
         self._qk_rope.bind_const(
@@ -902,7 +867,7 @@ class DecodeTarget(Target):
         return x
 
 
-class ModelingV2GptOss120bSm103Tp1(DecoderModelForCausalLM[ModelingV2Core, PretrainedConfig]):
+class ModelingV2GptOss120bSm103Tp1(DecoderModelForCausalLM[GptOssModelingV2, PretrainedConfig]):
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config
         # DecoderModelForCausalLM sizes lm_head from the *pretrained* dtype,
@@ -914,7 +879,7 @@ class ModelingV2GptOss120bSm103Tp1(DecoderModelForCausalLM[ModelingV2Core, Pretr
         if cfg.torch_dtype is None:
             cfg.torch_dtype = model_config.torch_dtype
         super().__init__(
-            ModelingV2Core(model_config),
+            GptOssModelingV2(model_config),
             config=model_config,
             hidden_size=cfg.hidden_size,
             vocab_size=cfg.vocab_size,
