@@ -98,3 +98,30 @@ def test_kolibri_weight_mapper():
     assert "model.layers.1.mlp.gate.e_score_correction_bias" in remapped
     assert "model.layers.2.mlp.gate.e_score_correction_bias" in remapped
     assert "model.layers.0.mlp.shared_experts.gate_proj.weight" in remapped
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA GPU")
+def test_kolibri_e2e_dummy_forward(tiny_kolibri_config):
+    """Test full Kolibri 1 model forward pass on GPU with dummy weights."""
+    import json
+    import tempfile
+
+    from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        config_dict = tiny_kolibri_config.to_dict()
+        config_dict["architectures"] = ["Kolibri1ForCausalLM"]
+        config_dict["torch_dtype"] = "bfloat16"
+        with open(f"{tmp_dir}/config.json", "w") as f:
+            json.dump(config_dict, f)
+
+        llm = LLM(
+            model=tmp_dir,
+            backend="pytorch",
+            load_format="dummy",
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
+        )
+
+        outputs = llm.generate(["Hello world"], sampling_params=SamplingParams(max_tokens=4))
+        assert len(outputs) == 1
+        assert len(outputs[0].outputs[0].token_ids) > 0
