@@ -283,6 +283,12 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             if not engine_terminal:
                 abort_request("response stream closed")
             registration.release()
+            # grpc.aio keeps the done-callback registered above in a reference
+            # cycle with the RPC context after the call completes, and the
+            # callback's closure holds this cell. Clear it so the finished
+            # result (prompt, outputs, logprobs) is freed now rather than when
+            # the cyclic GC next runs. abort_request is a no-op from here on.
+            result_handle = None
 
 
 __all__ = ["OpenEngineInferenceServicer"]

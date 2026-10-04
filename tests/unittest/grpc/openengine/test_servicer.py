@@ -5,6 +5,7 @@
 
 import asyncio
 import base64
+import weakref
 from collections.abc import AsyncIterator, Sequence
 from types import SimpleNamespace
 from typing import Any
@@ -649,6 +650,77 @@ def test_generate_aborts_when_response_stream_closes() -> None:
     asyncio.run(close_after_first_response())
 
     assert llm.result_handle.aborted
+
+
+def test_generate_releases_result_after_completion() -> None:
+    """A finished RPC does not keep its result alive through the done-callback.
+
+    grpc.aio holds the done-callbacks of a completed call until its context is
+    collected, so anything they reference outlives the RPC. The fake context
+    plays that role by keeping the registered callback.
+    """
+
+    class _SelfIteratingHandle(_FakeResultHandle):
+        """Iterates the way GenerationResult does: ``__aiter__`` returns the handle."""
+
+        def __aiter__(self) -> "_SelfIteratingHandle":
+            self._iterator = iter(self._results)
+            return self
+
+        async def __anext__(self) -> Any:
+            try:
+                result = next(self._iterator)
+            except StopIteration:
+                raise StopAsyncIteration from None
+            result.finished = all(o.finish_reason for o in result.outputs)
+            self.finished = result.finished
+            self.prompt_token_ids = result.prompt_token_ids
+            self.outputs = result.outputs
+            self.cached_tokens = result.cached_tokens
+            self.error = result.error
+            return result
+
+    output = SimpleNamespace(
+        index=0,
+        token_ids=[10],
+        text="A",
+        logprobs=[],
+        prompt_logprobs=[],
+        finish_reason="length",
+        stop_reason=None,
+    )
+    result = SimpleNamespace(prompt_token_ids=[1], outputs=[output], cached_tokens=0, error=None)
+    handle_refs = []
+
+    class _HandOffLlm:
+        """Gives each result handle to the servicer and keeps only a weak reference."""
+
+        args = _fake_llm_args()
+        tokenizer = _FakeTokenizer()
+
+        def generate_async(self, **kwargs: Any) -> _SelfIteratingHandle:
+            kwargs["sampling_params"]._validate()
+            handle = _SelfIteratingHandle([result])
+            handle_refs.append(weakref.ref(handle))
+            return handle
+
+    servicer = OpenEngineInferenceServicer(_HandOffLlm(), model="test-model")
+    request = generation_pb2.GenerateRequest(
+        request_id="request-release",
+        model="test-model",
+        prompt="hello",
+    )
+    context = FakeServicerContext()
+
+    async def consume() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    asyncio.run(consume())
+
+    assert context.done_callbacks, "the servicer registers an RPC-done callback"
+    assert len(handle_refs) == 1
+    assert handle_refs[0]() is None
 
 
 def test_generate_aborts_stalled_response_consumer(monkeypatch: pytest.MonkeyPatch) -> None:
