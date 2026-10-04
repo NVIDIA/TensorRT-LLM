@@ -26,7 +26,6 @@ config asks for, so there is no separate process to run for it.
 
 import signal
 import tempfile
-import threading
 import time
 from typing import Optional
 
@@ -35,19 +34,35 @@ import click
 from tensorrt_llm.logger import logger
 
 
-def _until_signalled() -> threading.Event:
-    """An event that SIGINT and SIGTERM set.
+class _SignalRecord:
+    """The signal that asked this command to stop, once one has.
+
+    A handler runs on the thread it interrupted, so it must take no lock.
+    `logging` and `threading.Event` each take one, and a signal arriving while
+    the interrupted code holds that same lock deadlocks the command against
+    itself: the master goes unreaped and its manifest stays on disk, which is
+    the opposite of what handling the signal was for. Assigning an attribute
+    takes no lock, so the handler records the number here and the idle loop
+    reads it.
+    """
+
+    def __init__(self) -> None:
+        self.signal_number: Optional[int] = None
+
+
+def _until_signalled() -> _SignalRecord:
+    """A record that SIGINT and SIGTERM write their signal number into.
 
     This command holds a child process whose reaping, and a published manifest
     whose retraction, are in a `finally`. Default SIGTERM handling would skip
     both, leaving the master unreaped and an address that outlives it on disk
-    for the next run to dial.
+    for the next run to dial. Letting the loop return instead unwinds those
+    context managers.
     """
-    stopping = threading.Event()
+    stopping = _SignalRecord()
 
     def stop(signum, _frame):
-        logger.info(f"mooncake-store: signal {signum} received, shutting down")
-        stopping.set()
+        stopping.signal_number = signum
 
     for received in (signal.SIGINT, signal.SIGTERM):
         signal.signal(received, stop)
@@ -186,14 +201,17 @@ def mooncake_master(
         )
         started = time.monotonic()
         announced = started
-        while not stopping.is_set():
+        while stopping.signal_number is None:
             if (code := master.process.poll()) is not None:
                 # The pool is gone once the master dies, and every client is
                 # about to start failing.
                 raise click.ClickException(
                     f"mooncake_master exited with code {code}. See {master.log_path}"
                 )
-            stopping.wait(1.0)
+            # Plain sleep rather than a waited event: ending the wait early
+            # would mean setting a lock the handler must not take, and a whole
+            # second of shutdown latency buys nothing here.
+            time.sleep(1.0)
             now = time.monotonic()
             # Distinguishes a dead master from a dead fabric once clients
             # start failing.
@@ -203,6 +221,10 @@ def mooncake_master(
                     f"mooncake-store: master at {master.address} alive after "
                     f"{(now - started) / 60:.0f}m"
                 )
+
+    # Logged outside the handler, which must not take the logging lock, and
+    # outside the `with` above, so the release precedes the report of it.
+    logger.info(f"mooncake-store: signal {stopping.signal_number} received, shut down")
 
 
 @click.command("mooncake_pool_report")
