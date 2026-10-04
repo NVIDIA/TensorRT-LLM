@@ -20,6 +20,8 @@ shape and dtype are compared, which is all the declaration ever stated.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 __extra_import_path__ = [".."]  # noqa: F841 -- repo's file-scoped import hook
@@ -39,7 +41,11 @@ _DIMS = dict(
     num_experts=128,
     vocab=201088,
     fc1_rows=2 * 2944,
-    fc1_k_pad=2944,
+    # 2880 padded up to FC1_K_ALIGN (512), not to 128 like the other three.
+    # This read 2944 until `dims` was compared against it: the declaration
+    # tests feed both sides the same bundle, so a wrong number here agreed
+    # with itself and proved the table at a shape the model never allocates.
+    fc1_k_pad=3072,
     inter_pad=2944,
     fc2_rows_pad=2944,
     dtype=torch.bfloat16,
@@ -82,8 +88,33 @@ def _reference(d):
     return w
 
 
+def _fake_core():
+    """The configuration surface `dims` reads, carrying this target's numbers.
+
+    `dims` reads `model_config` only, never the half-built core around it,
+    which is what lets this run without constructing a model.
+    """
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(
+        num_hidden_layers=_DIMS["num_layers"],
+        hidden_size=_DIMS["hidden"],
+        num_attention_heads=_DIMS["heads_q"],
+        num_key_value_heads=_DIMS["kv_width"] // 64,
+        head_dim=64,
+        num_local_experts=_DIMS["num_experts"],
+        intermediate_size=2880,
+        vocab_size=_DIMS["vocab"],
+    )
+    return SimpleNamespace(
+        model_config=SimpleNamespace(pretrained_config=cfg, torch_dtype=_DIMS["dtype"])
+    )
+
+
 def test_the_table_declares_the_same_keys():
-    assert set(W.declare(**_DIMS).keys()) == set(_reference(_DIMS).keys())
+    assert set(W.MODEL_WEIGHTS.declare(SimpleNamespace(**_DIMS)).keys()) == set(
+        _reference(_DIMS).keys()
+    )
 
 
 def test_the_table_declares_the_same_shapes_and_dtypes():
@@ -92,7 +123,7 @@ def test_the_table_declares_the_same_shapes_and_dtypes():
     Checked per key rather than as one aggregate so a failure names the weight
     that drifted instead of only saying the two disagree.
     """
-    got, want = W.declare(**_DIMS), _reference(_DIMS)
+    got, want = W.MODEL_WEIGHTS.declare(SimpleNamespace(**_DIMS)), _reference(_DIMS)
     for key in sorted(want):
         assert tuple(got[key].shape) == tuple(want[key].shape), key
         assert got[key].dtype == want[key].dtype, key
@@ -103,5 +134,31 @@ def test_every_table_entry_states_a_source():
     nothing ever fills -- silently zero rather than an error, which is the
     failure mode `load`'s coverage assert exists to catch from the other side.
     """
-    for entry in W.WEIGHTS:
+    for entry in W.MODEL_WEIGHTS.WEIGHTS:
         assert entry.src, entry.name
+
+
+def test_dims_reproduces_the_declaration_numbers():
+    """`dims` is now the only place a derived width or padded size is worked
+    out; it has to land on the same numbers the declaration was written for.
+    """
+    d = W.MODEL_WEIGHTS.dims(_fake_core())
+    for key, want in _DIMS.items():
+        assert getattr(d, key) == want, key
+
+
+def test_the_table_builds_the_hand_written_manifest():
+    """The generated manifest against the hand-written one it replaces.
+
+    `weights._manifest` is dead code kept for exactly this comparison: the
+    checkpoint key, destination index and transform of all seventeen roles
+    used to be written out a second time there, and the point of the table is
+    that they are not. Compared against the real function rather than a
+    transcription, which is only possible while both still exist -- once this
+    is green, `_manifest` goes.
+    """
+    core = _fake_core()
+    got, want = W.MODEL_WEIGHTS.manifest(core), W._manifest(core)
+    assert set(got) == set(want)
+    for key in sorted(want):
+        assert got[key] == want[key], key
