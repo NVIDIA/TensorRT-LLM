@@ -289,6 +289,12 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
 
     if (is_single_group || is_multi_group)
     {
+        // No tokens: there is nothing to write, and a grid of zero blocks is an invalid launch.
+        if (num_tokens == 0)
+        {
+            return;
+        }
+
         cudaLaunchConfig_t config;
         auto* kernel_instance = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumDeepseekExperts, true>;
         int num_threads = NumDeepseekExperts;
@@ -344,8 +350,8 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
         config.numAttrs = 1;
         config.attrs = attrs;
 
-        cudaLaunchKernelEx(&config, kernel_instance, scores, topk_values, topk_indices, bias, num_tokens, n_group,
-            topk_group, topk, num_experts, num_experts / n_group, routed_scaling_factor);
+        TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, scores, topk_values, topk_indices, bias,
+            num_tokens, n_group, topk_group, topk, num_experts, num_experts / n_group, routed_scaling_factor));
         sync_check_cuda_error(stream);
     }
     else
