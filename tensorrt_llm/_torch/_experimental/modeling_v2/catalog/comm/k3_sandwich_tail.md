@@ -101,7 +101,9 @@ def k3_sandwich_tail(
 Inert (not exposed by the wrapper): `x_slab`, `slab_buf`, `src_slab`, `src_buf` — publishing `normed` into a
 Lamport slab and polling the reduced latent from its producer's slab, cross-call state of their own as for
 `comm/k3_sandwich_oproj`; and `lat_uc`, `lat_flags` — the latent all-reduce folded into this op over a second state
-object, a `K3SandwichLatentExchange` (see *Notes*).
+object, a `K3SandwichLatentExchange` (see *Notes*). Polling and the fold store the op's outputs before its final
+grid-dependency wait: a caller passing `src_slab` or `lat_uc` must make sure no predecessor still in flight reads
+memory those outputs may occupy (a stream synchronization before the call, or `TRTLLM_ENABLE_PDL=0`).
 
 ## State
 

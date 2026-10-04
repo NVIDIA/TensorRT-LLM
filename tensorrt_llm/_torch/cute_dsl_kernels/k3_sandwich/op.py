@@ -37,6 +37,12 @@ Polling the input (``src_slab``, ``src_buf``): when the producer of phase 1's in
 ``k3_sandwich_oproj``, the reduced latent for ``k3_sandwich_tail``) publishes it as such a slab (int32 [3][8][cols /
 2], sentinel 0xFFFFFFFF) and launches its dependents only after its own grid wait, the kernel polls buffer
 ``src_buf`` of it instead of waiting for the producer's grid; ``core`` / ``latent`` then give only the shape.
+
+The polled input and the folded latent all-reduce store their outputs before the kernel's final grid-dependency
+wait. A caller of either form must make sure that no predecessor still in flight reads memory those outputs may
+occupy, such as a block the caching allocator recycled after that predecessor's launch: synchronize the stream before
+the call (as ``test_k3_sandwich.py``'s ``check_fold_wrap`` does), or run without programmatic dependent launch
+(``TRTLLM_ENABLE_PDL=0``).
 """
 
 from __future__ import annotations

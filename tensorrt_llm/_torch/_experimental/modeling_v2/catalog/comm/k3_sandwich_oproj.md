@@ -68,7 +68,9 @@ take `S` 0-8. The inputs are read only.
 Inert (not exposed by the wrapper): `x_slab=None, slab_buf=0, src_slab=None, src_buf=0` — the op can also publish
 `normed` into a Lamport slab the next kernel polls, and poll `core` from its producer's slab. Each slab is cross-call
 state of its own (three sentinel-armed buffers the caller rotates by the call's ordinal), not part of the workspace;
-see *Notes*.
+see *Notes*. Polling stores the op's outputs before its final grid-dependency wait: a caller passing `src_slab` must
+make sure no predecessor still in flight reads memory those outputs may occupy (a stream synchronization before the
+call, or `TRTLLM_ENABLE_PDL=0`).
 
 ## State
 
