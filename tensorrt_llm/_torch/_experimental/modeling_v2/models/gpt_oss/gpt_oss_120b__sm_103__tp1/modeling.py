@@ -2,43 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """ModelingV2 target: gpt-oss-120b / sm_103 / tp1 — self-contained modeling code.
 
-Flat single-entry forward assembled from catalog entries only; every call
-that creates or transforms a tensor is a catalog entry, everything else is
-tensor-metadata reads and Python control flow. Attention consumes runtime
-state fully explicitly through thop_attention: per-step arguments are
-projected from the engine-prepared TrtllmAttentionMetadata once per forward,
-by each target's own `step_args`, and shared by all layers. The two targets'
-projections differ only in `num_contexts`/`num_ctx_tokens` -- see
-`PrefillTarget.step_args` and `DecodeTarget.step_args`. Two attention
-arguments are per-layer here rather than per-step: the fp32 sink logits (one
-extra softmax denominator column per query head) and attention_window_size —
-this checkpoint alternates sliding_attention (window 128) and full_attention
-layers, and the window is a pure mask, so one shared pool and one
-block-offset table serve both kinds.
-
-Every layer's MLP is an MXFP4 sparse mixture of experts (128 experts, top-4,
-renormalized, clamped GLU) run W4A8: mxfp8_quantize turns the bf16 hidden
-states into e4m3 data plus per-32 UE8M0 block scales — widening hidden 2880
-to the FC1 K alignment 3072 inside that call — and one
-mxe4m3_mxe2m1_block_scale_moe_runner call per layer covers routing, both
-grouped GEMMs, the clamped activation, the MXFP8 requantization between them
-and the combine. The router bias is folded into the router GEMM's fused bias
-because the MoE op silently ignores routing_bias on this routing method. The
-expert weights are declared in the kernel-ready padded/shuffled/swizzled
-layout — identical for the W4A16 and W4A8 members of this kernel family — and
-the manifest loop in weights.py transforms the checkpoint's block/scale
-tensors into it at load time.
-
-Weights are target-owned, and declared in the sibling weights.py: one table
-entry per role carries its shape, dtype, checkpoint source and load-time
-transform together, and the same table drives both the allocation and the
-manifest the loader walks. Storage is HF [out, in] row-major so checkpoint
-rows copy in unchanged; the column-major GEMM views are bound into the
-catalog entries after load. The registration shell inherits
-DecoderModelForCausalLM for lm_head, packed-batch logits gathering, and the
-meta-init/load/post-load hooks.
-
-The import-time and first-forward contract checks below fail fast on drift.
+Flat single-entry forward assembled from catalog entries only, running the
+MXFP4 sparse MoE W4A8 on a single GPU (tp1). Weights are target-owned and
+declared in the sibling weights.py. Each target is self-contained: it binds
+every op it calls against the real weights in its own `__init__` and shares
+no code with the other target.
 """
 
 import math
@@ -76,12 +44,6 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, r
 
 from . import weights as _weights
 
-# Per-call constants of this target's call shape — the values the in-tree
-# path sources from the attention module and forward args: packed-QKV
-# causal GQA, RoPE applied outside (fused_qk_norm_rope), bf16 activations
-# over a bf16 KV pool, no MLA / mRoPE / cross / relative-bias / sparse
-# features. attention_sinks and attention_window_size are per-layer, not
-# constants, and are passed at the call site.
 _CALL_CONSTANTS = dict(
     output_sf=None,
     k=None,
@@ -96,9 +58,7 @@ _CALL_CONSTANTS = dict(
     quant_mode=0,
     kv_scale_orig_quant=None,
     kv_scale_quant_orig=None,
-    # In-kernel RoPE is disabled (position_embedding_type=0): rotation
-    # happens outside in fused_qk_norm_rope. The rope_* values below are
-    # the contract's inert placeholders, not this model's rope config.
+    # In-kernel RoPE is disabled here; the rope_* values below are inert placeholders, not this model's rope config.
     position_embedding_type=0,
     rotary_inv_freq=None,
     rotary_cos_sin=None,
@@ -134,21 +94,11 @@ _CALL_CONSTANTS = dict(
     cross_kv=None,
     relative_attention_bias=None,
     relative_attention_max_distance=0,
-    # Held at the op's defaults. All three are MLA-only surface that this
-    # target does not use -- skip_correction is forced to 0.0 for a non-MLA layer by
-    # the engine's own resolver, and kv_norm_* folds an MLA kv_a_layernorm
-    # that does not exist here.
     kv_norm_weight=None,
     kv_norm_eps=1e-6,
     skip_correction_threshold=0.0,
 )
 
-# FC1's K alignment for the trtllm-gen MXFP4 weight family: it sizes the
-# declared expert operands and is the alignment mxfp8_quantize pads the
-# hidden states up to, so the two always agree. Kept as a module constant
-# (not folded into a call site) because it has two readers: the quantizer's
-# bind_const below and `self.fc1_k_pad = _pad_up(self.hidden, _FC1_K_ALIGN)`
-# in `GptOssModelingV2.__init__`.
 _FC1_K_ALIGN = 512
 
 
@@ -160,79 +110,26 @@ class GptOssModelingV2(ModelingV2Core):
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
         cfg = model_config.pretrained_config
-        # This checkpoint's config.json declares no dtype at all, so
-        # `pretrained_config.torch_dtype` is None. The engine resolves bf16
-        # regardless (ModelConfig.torch_dtype defaults it), but the shell
-        # sizes lm_head from the *pretrained* value and would materialize it
-        # in the torch default fp32 — two layers away from where it is read.
-        # The shell normalizes that before super().__init__ (see below), so
-        # by the time the core is built both surfaces agree, and both are
-        # asserted: the declaration the shell and the KV pool are sized from,
-        # and the value quant_mode=0 must agree with.
+        # This checkpoint's config.json declares no dtype, so the shell would size lm_head fp32 while
+        # everything else is bf16, failing two layers away.
         dt = model_config.torch_dtype
 
-        # Locals, not attributes: a core carries no forwarded configuration.
-        # Every reader of these five -- this method's own weight-shape
-        # declarations below, weights.py's load(), and the target's
-        # __init__/forward -- already has, or can cheaply reach, `cfg`
-        # (`core.model_config.pretrained_config`) and reads it from there
-        # directly. A copy onto `self` would only be a second name for the
-        # same value. `inter_pad`, `fc1_k_pad` and `fc2_rows_pad` further
-        # down are different: they are *derived* (padded up), not copied,
-        # so they stay attributes -- see the comment there. `sliding` and
-        # `window`, below, are attributes for a different reason: the
-        # forward reads them per layer, every step.
         num_layers = cfg.num_hidden_layers
         hidden = cfg.hidden_size
         heads_q = cfg.num_attention_heads
         heads_kv = cfg.num_key_value_heads
         head_dim = cfg.head_dim
 
-        # RoPE base: YaRN over the full head_dim, half-split (neox) pairs. The
-        # engine hands this checkpoint the transformers-5.x migrated rope
-        # dict (rope_theta lives inside it and cfg.rope_theta is absent);
-        # a checkpoint written before that migration keeps the flat field,
-        # so both shapes are resolved here. `theta` stays an attribute --
-        # nothing downstream of `head_dim` needs a second name for it either
-        # (`rotary_dim` equals it exactly for this checkpoint, so the target
-        # binds `rotary_dim=cfg.head_dim` directly).
-        #
-        # The YaRN low/high correction-dimension ramp and its attention-factor
-        # scalar are *not* derived here. Unlike `theta`, they are read only by
-        # `PrefillTarget.__init__` and `DecodeTarget.__init__`, to bind
-        # `fused_qk_norm_rope`, and nothing between their computation and that
-        # binding would touch a core attribute -- so `build_layer_views`
-        # computes them as locals, once, and passes them straight into both
-        # constructors instead of a `self.yarn_*` a core would otherwise carry
-        # for no reason but to be bound. See the comment there.
         rope = getattr(cfg, "rope_scaling", None) or getattr(cfg, "rope_parameters", None)
         self.theta = float(rope.get("rope_theta", getattr(cfg, "rope_theta", 0.0)))
 
-        # Sliding window: half the layers mask to the newest `window` keys,
-        # the rest are plain causal. The window is a mask only — the op
-        # appends at absolute positions — so both kinds share one pool, one
-        # layer->pool mapping and one block-offset table.
         layer_types = list(cfg.layer_types)
         self.sliding = [t == "sliding_attention" for t in layer_types]
         self.window = cfg.sliding_window
 
-        # Sparse MoE on every layer; no dense MLP branch exists. `num_experts`
-        # and `inter` are locals for the same reason as the five above.
-        # `topk` and `swiglu_limit` never even get that far: weights.py
-        # doesn't read them either, so (like `eps`, this checkpoint's
-        # `rms_norm_eps`) each target reads it straight off `cfg` at its own
-        # one call site instead -- see `PrefillTarget.__init__` and
-        # `DecodeTarget.__init__`.
         num_experts = cfg.num_local_experts
         inter = cfg.intermediate_size
 
-        # Kernel bounds the geometry must fit: fused_qk_norm_rope's head_dim
-        # set, thop_attention's GQA rule, and the MoE op's padded operand
-        # widths (the padded intermediate is what `intermediate_size` means
-        # to that call, and hidden_states reach it widened to fc1_k_pad by
-        # the quantizer). Derived, not copied, so these three stay
-        # attributes -- weights.py reaches them through `core.X` and would
-        # otherwise have to duplicate this padding math to get there.
         self.inter_pad = _pad_up(inter, 128)
         self.fc1_k_pad = _pad_up(hidden, _FC1_K_ALIGN)
         self.fc2_rows_pad = _pad_up(hidden, 128)
@@ -240,10 +137,6 @@ class GptOssModelingV2(ModelingV2Core):
         q_width = heads_q * head_dim
         kv_width = heads_kv * head_dim
 
-        # The weight table in weights.py is the single declaration: shape,
-        # dtype, checkpoint source and load-time transform for each of the
-        # seventeen roles, stated once. Asking it for the dict is what keeps
-        # the keys from being named here as well.
         self.w = _weights.declare(
             num_layers=num_layers,
             hidden=hidden,
@@ -265,29 +158,9 @@ class GptOssModelingV2(ModelingV2Core):
     def build_layer_views(self) -> None:
         """Construct the two targets, now that the weights are real.
 
-        Used to also derive per-layer GEMM views and the MoE/RoPE call
-        tensors itself, holding them in two attributes (a per-layer tuple
-        and a call-tensor dict) that this class no longer declares. Both are
-        deleted outright, not just unused: each target's own `__init__` now
-        binds its own per-layer weight tables and op-owned fixtures straight
-        into the catalog-entry instances it holds, so there is no longer a
-        parallel copy here for a call site to read out of -- and nothing else
-        reads `self.w` through this method. `PrefillTarget` and `DecodeTarget`
-        each do this independently; the two bindings are identical in
-        content, not shared in code.
-
-        What it derives itself -- the YaRN low/high correction-dimension ramp
-        and its attention-factor scalar -- is the one thing both targets'
-        constructors need that is neither a weight nor per-layer config:
-        computed once, here, as locals, and passed straight into both calls
-        below, rather than carried as four `self.yarn_*` attributes on the
-        core that would exist for no reason but to be bound (see the comment
-        in `__init__`). `theta` and `cfg` are cheap to re-reach from here, so
-        recomputing the ramp costs nothing a `self.` copy would have saved.
-
-        Meta is over by the time this runs, so real tensors may be built and
-        `.t()`'d; never called from `__init__`, where the shell's containers
-        are still meta."""
+        Must only be called after meta init is over, never from `__init__`, where the
+        shell's containers are still meta.
+        """
         cfg = self.model_config.pretrained_config
         rope = getattr(cfg, "rope_scaling", None) or getattr(cfg, "rope_parameters", None)
         rotary_dim = cfg.head_dim
@@ -328,15 +201,7 @@ class GptOssModelingV2(ModelingV2Core):
         )
 
     def _select_target(self, attn_metadata) -> Target:
-        """Which target runs this step.
-
-        A method rather than a lookup keyed on phase: today the phase
-        decides, but the criterion belongs in one place that can grow, not
-        in the shape of the table. Delegates to `phase_of` rather than
-        restating its predicate -- `num_contexts == 0` means decode has one
-        home, in `_target.py`, and this reads that answer instead of
-        re-deriving it.
-        """
+        """Which target runs this step."""
         return self._decode if phase_of(attn_metadata) is Phase.DECODE else self._prefill
 
     def forward(
@@ -345,37 +210,13 @@ class GptOssModelingV2(ModelingV2Core):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        """Route the step, and nothing else.
-
-        The contract check is no longer run here: it probes `step_args`, which
-        is a target's own projection and differs by phase, so each target runs
-        its own check on its own first forward instead -- see
-        `Target._check_step_contract` in `_target.py`.
-        """
-        # "A new engine step has begun" is the dispatcher's knowledge, not a
-        # target's: this runs once per engine forward, before either target
-        # binds per-step state, so validating() catches a target that forgot
-        # to rebind.
+        """Route the step, and nothing else."""
         advance_step_generation()
         return self._select_target(attn_metadata).forward(attn_metadata, *args, **kwargs)
 
 
 class PrefillTarget(Target):
-    """The general case: context rows, and possibly generation rows beside them.
-
-    In-flight batching puts both in one step, and that mixed batch routes here
-    rather than to decode -- so this target reads both counts off the metadata
-    and may not assume either is zero.
-
-    gpt_oss is not MLA, so `TrtllmAttention` accepts `mixed` and the
-    context/generation split stays inside the C++ dispatcher: this forward has
-    no phase branch to divide. `DecodeTarget`, below, runs the identical body
-    -- the two differ only in `step_args` -- as a separate, independent class:
-    targets in this tree do not share code with each other, even when sharing
-    would be free. A model whose phases run different computations --
-    deepseek's MLA, where generation works in latent space and context
-    materializes K and V -- overrides `forward` itself instead.
-    """
+    """The general case: context rows, and possibly generation rows beside them."""
 
     def __init__(
         self,
@@ -386,26 +227,7 @@ class PrefillTarget(Target):
         yarn_high: float,
         yarn_attn_factor: float,
     ) -> None:
-        """Bind every op this target calls, once, against the real weights.
-
-        `Target.__init__` only stores `self.core`; everything below is this
-        target's own addition, and is why gpt_oss needed one. Per-layer
-        weight tables go into each catalog entry's `bind_layered`, one layer
-        at a time, built straight from `core.w` and keeping the `.t()` views
-        the hot-path GEMMs already used (zero-copy). Configuration comes
-        from `cfg` throughout: `core` carries none of it past what is
-        genuinely derived (`inter_pad`, `fc1_k_pad`, `fc2_rows_pad`, `theta`)
-        or read per layer by the forward (`sliding`, `window`) -- see
-        `GptOssModelingV2.__init__` for which is which. The four `yarn_*`
-        arguments are the YaRN ramp `build_layer_views` computes once and
-        passes to both targets' constructors, rather than a `self.yarn_*` the
-        core would carry for no reason but to be bound -- see the comment
-        there. The one op-owned fixture built here -- `fused_qk_norm_rope`'s
-        inert q/k norm weight -- is an input that op needs to satisfy its
-        own signature, not state the model computes; the MoE runner's
-        per-expert activation vectors are the same kind of fixture, but the
-        op builds those itself now, via `bind_glu`.
-        """
+        """Bind every op this target calls, once, against the real weights."""
         super().__init__(core)
         cfg = core.model_config.pretrained_config
         w = core.w
@@ -420,13 +242,8 @@ class PrefillTarget(Target):
         for i in range(n):
             self._qkv.bind_layered(i, mat_b=w[f"l{i}_qkv"].t(), bias=w[f"l{i}_qkv_bias"])
 
-        # fused_qk_norm_rope requires valid q/k norm weight tensors even with
-        # is_qk_norm=False, where their values are unused; built from the
-        # scalars the op needs (head_dim, dtype, device) rather than copied
-        # off a reference tensor, which would tie this fixture to whichever
-        # tensor happened to be handy when it was written. rotary_dim is
-        # cfg.head_dim directly -- equal for this checkpoint, and not worth
-        # a third name for the same value (see `GptOssModelingV2.__init__`).
+        # fused_qk_norm_rope requires valid q/k norm weight tensors even when is_qk_norm=False, where
+        # the values are unused.
         no_qk_norm = torch.zeros(cfg.head_dim, dtype=dtype, device=device)
         self._qk_rope = FusedQkNormRope()
         self._qk_rope.bind_const(
@@ -447,17 +264,6 @@ class PrefillTarget(Target):
             is_qk_norm=False,
         )
 
-        # attention_window_size is absent here -- it is not knowable until a
-        # forward is underway (its full-attention value is
-        # attn_metadata.max_seq_len, the KV cache manager's *resolved* size,
-        # not known until after this target's __init__ runs at post-load),
-        # so every forward binds it fresh instead -- see the comment in
-        # `forward`. local_layer_idx is layered rather than passed at the
-        # call site even though it is exactly `layer`'s own value: it is a
-        # genuine op argument (the row thop_attention reads out of the pool
-        # mapping), not the binding mechanism's own index, and layering it
-        # here means the call site states `layer=i` once instead of the same
-        # `i` under two names.
         self._attn = ThopAttention()
         for i in range(n):
             self._attn.bind_layered(i, attention_sinks=w[f"l{i}_sinks"], local_layer_idx=i)
@@ -482,12 +288,8 @@ class PrefillTarget(Target):
             self._router.bind_layered(i, mat_b=w[f"l{i}_router"].t(), bias=w[f"l{i}_router_bias"])
 
         self._quant = Mxfp8Quantize()
-        # swizzled_layout=False: the MoE op reads the activation scales as a
-        # linear (row-major) buffer. The 128x4 swizzled order has the same
-        # byte count whenever num_tokens is a multiple of 128 -- which every
-        # decode CUDA-graph batch of 128 or 256 is -- and is then accepted
-        # silently as a wrong answer, so this is spelled out rather than
-        # left to the quantizer's default.
+        # The swizzled 128x4 order has the same byte count whenever num_tokens % 128 == 0, which every
+        # decode CUDA-graph batch is, so a wrong value here is accepted silently as a wrong answer.
         self._quant.bind_const(swizzled_layout=False, alignment=_FC1_K_ALIGN)
 
         self._moe = Mxe4m3Mxe2m1BlockScaleMoeRunner()
@@ -501,18 +303,10 @@ class PrefillTarget(Target):
                 gemm2_weights_scale=w[f"l{i}_fc2_s"],
                 gemm2_bias=w[f"l{i}_fc2_b"],
             )
-        # alpha, beta and the clamp limit: the op builds its own per-expert
-        # vectors from a count and a scalar -- see `bind_glu`. This target
-        # runs tp1, so every expert is local and `cfg.num_local_experts` is
-        # the whole count, not a per-layer table: every layer shares the
-        # same checkpoint constants (alpha, beta) and config scalar
-        # (swiglu_limit).
         self._moe.bind_glu(cfg.num_local_experts, cfg.swiglu_limit, device)
         self._moe.bind_const(
-            # The router bias rides the router GEMM's own epilogue instead
-            # (see the call site): routing_bias is bound to None here so a
-            # reader never has to find a bare positional None at the call and
-            # wonder what it is.
+            # The MoE op silently ignores routing_bias on this routing method; the bias rides the
+            # router GEMM epilogue instead.
             routing_bias=None,
             num_experts=cfg.num_local_experts,
             top_k=cfg.num_experts_per_tok,
@@ -524,9 +318,6 @@ class PrefillTarget(Target):
             local_expert_offset=0,
             local_num_experts=cfg.num_local_experts,
             routed_scaling_factor=None,
-            # Renormalize routing (top-k first, then fp32 softmax over the
-            # selected logits) and the only gated-activation kernel in this
-            # dtype family.
             routing_method_type=1,
             act_type=0,
         )
@@ -538,21 +329,7 @@ class PrefillTarget(Target):
         self._norm_next.bind_const(eps=cfg.rms_norm_eps)
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
-        """Project the prepared metadata onto thop_attention's explicit batch
-        state, once per forward; every runtime-owned value passes through as
-        the engine prepared it. CUDA-graph classes: tensors are engine-owned
-        persistent buffers refreshed in place (reference class); Python ints
-        are per-capture constants (host-derived class). attention_window_size
-        is absent here on purpose: it is per-layer, not per-step, and is
-        rebound every forward with `bind_layered` instead -- see the comment
-        in `forward`.
-
-        This target holds the mixed batch -- context rows, and possibly
-        generation rows beside them -- so `num_contexts` and `num_ctx_tokens`
-        are read off `md` rather than assumed; it may not assume either is
-        zero. Also the probe `Target._check_step_contract` calls to validate
-        this metadata surface on the first forward.
-        """
+        """Project the prepared metadata onto thop_attention's explicit batch state, once per forward."""
         return dict(
             sequence_length=md.kv_lens_cuda_runtime,
             host_past_key_value_lengths=md.kv_lens_runtime,
@@ -609,19 +386,6 @@ class PrefillTarget(Target):
         self._check_step_contract(attn_metadata)
         self._attn.bind_const(**self.step_args(attn_metadata))
 
-        # attention_window_size is per-layer, and rebound every forward
-        # rather than once: its full-attention value is
-        # attn_metadata.max_seq_len, which reads the KV cache manager's
-        # *resolved* max_seq_len, not known until the cache is sized --
-        # well after `PrefillTarget.__init__` runs at post-load. The value
-        # itself never changes between forwards once the cache exists (no
-        # attention backend reassigns `max_seq_len` per step -- see
-        # `AttentionMetadata` in interface.py -- and the only writes to it
-        # happen in `KVCacheManager.__init__` and engine construction, both
-        # long done by the time a forward reaches this target), so this
-        # recomputes the same 36-entry table every step. That cost is
-        # accepted in exchange for not carrying a one-shot flag and the
-        # branch that read it.
         full_window = attn_metadata.max_seq_len
         for i, sliding in enumerate(core.sliding):
             self._attn.bind_layered(
@@ -648,13 +412,7 @@ class PrefillTarget(Target):
             attn_out = self._attn(q=qkv, output=attn_out, layer=i)
             o = self._o_proj(attn_out, layer=i)
             o, residual = self._norm2(o, residual, layer=i)
-            # The router bias rides the GEMM epilogue: the MoE op silently
-            # ignores routing_bias on this routing method -- routing_bias
-            # itself is bound to None on self._moe (see __init__).
             router_logits = self._router(o, layer=i)
-            # The quantizer owns the hidden widening 2880 -> fc1_k_pad: it
-            # zero-fills the padded columns and their scale bytes, which
-            # multiply zero-valued padded weights.
             hidden_fp8, hidden_sf = self._quant(o)
             moe = self._moe(
                 routing_logits=router_logits,
@@ -668,22 +426,7 @@ class PrefillTarget(Target):
 
 
 class DecodeTarget(Target):
-    """The specialization: routed to only when there are no context rows.
-
-    It states the two counts rather than reading them. Not an optimization --
-    they are per-capture host constants either way -- but it is what makes the
-    invariant checkable: a decode target that reads the phase back has stopped
-    being one, and the source gate in test_modeling_v2_claims.py can see that.
-
-    gpt_oss is not MLA, so `TrtllmAttention` accepts `mixed` and the
-    context/generation split stays inside the C++ dispatcher: this forward has
-    no phase branch to divide. `PrefillTarget`, above, runs the identical body
-    -- the two differ only in `step_args` -- as a separate, independent class:
-    targets in this tree do not share code with each other, even when sharing
-    would be free. A model whose phases run different computations --
-    deepseek's MLA, where generation works in latent space and context
-    materializes K and V -- overrides `forward` itself instead.
-    """
+    """The specialization: routed to only when there are no context rows."""
 
     def __init__(
         self,
@@ -694,26 +437,7 @@ class DecodeTarget(Target):
         yarn_high: float,
         yarn_attn_factor: float,
     ) -> None:
-        """Bind every op this target calls, once, against the real weights.
-
-        `Target.__init__` only stores `self.core`; everything below is this
-        target's own addition, and is why gpt_oss needed one. Per-layer
-        weight tables go into each catalog entry's `bind_layered`, one layer
-        at a time, built straight from `core.w` and keeping the `.t()` views
-        the hot-path GEMMs already used (zero-copy). Configuration comes
-        from `cfg` throughout: `core` carries none of it past what is
-        genuinely derived (`inter_pad`, `fc1_k_pad`, `fc2_rows_pad`, `theta`)
-        or read per layer by the forward (`sliding`, `window`) -- see
-        `GptOssModelingV2.__init__` for which is which. The four `yarn_*`
-        arguments are the YaRN ramp `build_layer_views` computes once and
-        passes to both targets' constructors, rather than a `self.yarn_*` the
-        core would carry for no reason but to be bound -- see the comment
-        there. The one op-owned fixture built here -- `fused_qk_norm_rope`'s
-        inert q/k norm weight -- is an input that op needs to satisfy its
-        own signature, not state the model computes; the MoE runner's
-        per-expert activation vectors are the same kind of fixture, but the
-        op builds those itself now, via `bind_glu`.
-        """
+        """Bind every op this target calls, once, against the real weights."""
         super().__init__(core)
         cfg = core.model_config.pretrained_config
         w = core.w
@@ -728,13 +452,8 @@ class DecodeTarget(Target):
         for i in range(n):
             self._qkv.bind_layered(i, mat_b=w[f"l{i}_qkv"].t(), bias=w[f"l{i}_qkv_bias"])
 
-        # fused_qk_norm_rope requires valid q/k norm weight tensors even with
-        # is_qk_norm=False, where their values are unused; built from the
-        # scalars the op needs (head_dim, dtype, device) rather than copied
-        # off a reference tensor, which would tie this fixture to whichever
-        # tensor happened to be handy when it was written. rotary_dim is
-        # cfg.head_dim directly -- equal for this checkpoint, and not worth
-        # a third name for the same value (see `GptOssModelingV2.__init__`).
+        # fused_qk_norm_rope requires valid q/k norm weight tensors even when is_qk_norm=False, where
+        # the values are unused.
         no_qk_norm = torch.zeros(cfg.head_dim, dtype=dtype, device=device)
         self._qk_rope = FusedQkNormRope()
         self._qk_rope.bind_const(
@@ -755,17 +474,6 @@ class DecodeTarget(Target):
             is_qk_norm=False,
         )
 
-        # attention_window_size is absent here -- it is not knowable until a
-        # forward is underway (its full-attention value is
-        # attn_metadata.max_seq_len, the KV cache manager's *resolved* size,
-        # not known until after this target's __init__ runs at post-load),
-        # so every forward binds it fresh instead -- see the comment in
-        # `forward`. local_layer_idx is layered rather than passed at the
-        # call site even though it is exactly `layer`'s own value: it is a
-        # genuine op argument (the row thop_attention reads out of the pool
-        # mapping), not the binding mechanism's own index, and layering it
-        # here means the call site states `layer=i` once instead of the same
-        # `i` under two names.
         self._attn = ThopAttention()
         for i in range(n):
             self._attn.bind_layered(i, attention_sinks=w[f"l{i}_sinks"], local_layer_idx=i)
@@ -790,12 +498,8 @@ class DecodeTarget(Target):
             self._router.bind_layered(i, mat_b=w[f"l{i}_router"].t(), bias=w[f"l{i}_router_bias"])
 
         self._quant = Mxfp8Quantize()
-        # swizzled_layout=False: the MoE op reads the activation scales as a
-        # linear (row-major) buffer. The 128x4 swizzled order has the same
-        # byte count whenever num_tokens is a multiple of 128 -- which every
-        # decode CUDA-graph batch of 128 or 256 is -- and is then accepted
-        # silently as a wrong answer, so this is spelled out rather than
-        # left to the quantizer's default.
+        # The swizzled 128x4 order has the same byte count whenever num_tokens % 128 == 0, which every
+        # decode CUDA-graph batch is, so a wrong value here is accepted silently as a wrong answer.
         self._quant.bind_const(swizzled_layout=False, alignment=_FC1_K_ALIGN)
 
         self._moe = Mxe4m3Mxe2m1BlockScaleMoeRunner()
@@ -809,18 +513,10 @@ class DecodeTarget(Target):
                 gemm2_weights_scale=w[f"l{i}_fc2_s"],
                 gemm2_bias=w[f"l{i}_fc2_b"],
             )
-        # alpha, beta and the clamp limit: the op builds its own per-expert
-        # vectors from a count and a scalar -- see `bind_glu`. This target
-        # runs tp1, so every expert is local and `cfg.num_local_experts` is
-        # the whole count, not a per-layer table: every layer shares the
-        # same checkpoint constants (alpha, beta) and config scalar
-        # (swiglu_limit).
         self._moe.bind_glu(cfg.num_local_experts, cfg.swiglu_limit, device)
         self._moe.bind_const(
-            # The router bias rides the router GEMM's own epilogue instead
-            # (see the call site): routing_bias is bound to None here so a
-            # reader never has to find a bare positional None at the call and
-            # wonder what it is.
+            # The MoE op silently ignores routing_bias on this routing method; the bias rides the
+            # router GEMM epilogue instead.
             routing_bias=None,
             num_experts=cfg.num_local_experts,
             top_k=cfg.num_experts_per_tok,
@@ -832,9 +528,6 @@ class DecodeTarget(Target):
             local_expert_offset=0,
             local_num_experts=cfg.num_local_experts,
             routed_scaling_factor=None,
-            # Renormalize routing (top-k first, then fp32 softmax over the
-            # selected logits) and the only gated-activation kernel in this
-            # dtype family.
             routing_method_type=1,
             act_type=0,
         )
@@ -846,25 +539,7 @@ class DecodeTarget(Target):
         self._norm_next.bind_const(eps=cfg.rms_norm_eps)
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
-        """Project the prepared metadata onto thop_attention's explicit batch
-        state, once per forward; every runtime-owned value passes through as
-        the engine prepared it. CUDA-graph classes: tensors are engine-owned
-        persistent buffers refreshed in place (reference class); Python ints
-        are per-capture constants (host-derived class). attention_window_size
-        is absent here on purpose: it is per-layer, not per-step, and is
-        rebound every forward with `bind_layered` instead -- see the comment
-        in `forward`.
-
-        `num_contexts` and `num_ctx_tokens` are the literal `0` rather than
-        read off `md`: they are the two values this target knows by its
-        routing -- it is reached only when there are no context rows -- and
-        stating them is what makes that invariant checkable by
-        `test_a_decode_target_never_reads_the_phase_back` in
-        `test_modeling_v2_claims.py`; `PrefillTarget.step_args` holds the
-        mixed batch and genuinely reads both off `md` instead. Also the probe
-        `Target._check_step_contract` calls to validate this metadata surface
-        on the first forward.
-        """
+        """Project the prepared metadata onto thop_attention's explicit batch state, once per forward."""
         return dict(
             sequence_length=md.kv_lens_cuda_runtime,
             host_past_key_value_lengths=md.kv_lens_runtime,
@@ -921,19 +596,6 @@ class DecodeTarget(Target):
         self._check_step_contract(attn_metadata)
         self._attn.bind_const(**self.step_args(attn_metadata))
 
-        # attention_window_size is per-layer, and rebound every forward
-        # rather than once: its full-attention value is
-        # attn_metadata.max_seq_len, which reads the KV cache manager's
-        # *resolved* max_seq_len, not known until the cache is sized --
-        # well after `DecodeTarget.__init__` runs at post-load. The value
-        # itself never changes between forwards once the cache exists (no
-        # attention backend reassigns `max_seq_len` per step -- see
-        # `AttentionMetadata` in interface.py -- and the only writes to it
-        # happen in `KVCacheManager.__init__` and engine construction, both
-        # long done by the time a forward reaches this target), so this
-        # recomputes the same 36-entry table every step. That cost is
-        # accepted in exchange for not carrying a one-shot flag and the
-        # branch that read it.
         full_window = attn_metadata.max_seq_len
         for i, sliding in enumerate(core.sliding):
             self._attn.bind_layered(
@@ -960,13 +622,7 @@ class DecodeTarget(Target):
             attn_out = self._attn(q=qkv, output=attn_out, layer=i)
             o = self._o_proj(attn_out, layer=i)
             o, residual = self._norm2(o, residual, layer=i)
-            # The router bias rides the GEMM epilogue: the MoE op silently
-            # ignores routing_bias on this routing method -- routing_bias
-            # itself is bound to None on self._moe (see __init__).
             router_logits = self._router(o, layer=i)
-            # The quantizer owns the hidden widening 2880 -> fc1_k_pad: it
-            # zero-fills the padded columns and their scale bytes, which
-            # multiply zero-valued padded weights.
             hidden_fp8, hidden_sf = self._quant(o)
             moe = self._moe(
                 routing_logits=router_logits,
@@ -983,12 +639,8 @@ class DecodeTarget(Target):
 class ModelingV2GptOss120bSm103Tp1(DecoderModelForCausalLM[GptOssModelingV2, PretrainedConfig]):
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config
-        # DecoderModelForCausalLM sizes lm_head from the *pretrained* dtype,
-        # which this checkpoint's config.json does not declare — leaving
-        # lm_head.weight fp32 while every other tensor is bf16, and failing
-        # two layers away from here. The engine has already resolved the
-        # dtype it will run at; adopt it, rather than let the default of a
-        # missing field decide. Only fills the gap: a declared dtype wins.
+        # This checkpoint's config.json declares no dtype, so lm_head would be sized fp32 while every
+        # other tensor is bf16, failing two layers away.
         if cfg.torch_dtype is None:
             cfg.torch_dtype = model_config.torch_dtype
         super().__init__(
