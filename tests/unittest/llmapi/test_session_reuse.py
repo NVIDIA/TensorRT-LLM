@@ -197,6 +197,11 @@ def test_spawn_failure_propagates_without_retry(reuse_cache):
 def test_reuse_size_mismatch_builds_new(reuse_cache):
     s1 = reuse_cache.acquire(_FakePool, 2)
     s1.shutdown()
+
+    def _take_after_shutdown(_n_workers: int) -> None:
+        assert s1._real.shut
+
+    reuse_cache.prefetch.take = _take_after_shutdown
     s2 = reuse_cache.acquire(_FakePool, 4)
     assert s2._real.n_workers == 4 and s2._real is not s1._real
 
