@@ -338,9 +338,9 @@ def resolve_auto_ssm_cache_dtype(config, fallback):
     state pool is an explicit opt-in through
     kv_cache_config.mamba_ssm_cache_dtype; prefill, decode and sequential
     verify then stage the addressed rows through an fp32 copy and round the
-    committed state back to bf16. The fused MTP verify kernel
-    (``trtllm::kda_mtp_decode``) reads and writes a bf16 pool directly and
-    rounds the committed state to nearest.
+    committed state back to bf16. MTP replay reads the bf16 or fp32
+    checkpoint directly without modifying it; separate commit and flush
+    kernels update the checkpoint in its configured storage dtype.
     A checkpoint-declared
     mamba_ssm_cache_dtype is not applied to Kimi K3 (the released
     checkpoints do not carry the field); it is logged when it would have
