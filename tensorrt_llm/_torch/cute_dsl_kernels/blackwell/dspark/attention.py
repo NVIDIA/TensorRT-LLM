@@ -195,7 +195,7 @@ class DSparkPersistentTileScheduler:
 
 
 class DSparkAttention(DSparkAttentionKernel):
-    """Attention over a 128-token rolling window and one 5/6-token draft block."""
+    """Attention over a 128-token paged context window and one 5/6-token draft block."""
 
     window_size = 128
     block_size = 6
@@ -244,6 +244,7 @@ class DSparkAttention(DSparkAttentionKernel):
         seq_len_q: int = block_size,
         mma_qk_tiler_k: int = qk_tiler_k,
         inverse_rope_dim: int = 0,
+        history_page_size: int = 32,
     ):
         expected_config = {
             "acc_dtype": (acc_dtype, cutlass.Float32),
@@ -262,6 +263,8 @@ class DSparkAttention(DSparkAttentionKernel):
             raise ValueError("Unsupported DSpark kernel configuration: " + ", ".join(mismatches))
         if seq_len_q not in (5, 6):
             raise ValueError(f"DSpark block size must be 5 or 6, got {seq_len_q}")
+        if history_page_size not in (16, 32, 64, 128):
+            raise ValueError("DSpark history page size must be 16, 32, 64, or 128")
         if inverse_rope_dim not in (0, 64):
             raise ValueError(f"DSpark inverse_rope_dim must be 0 or 64, got {inverse_rope_dim}")
 
@@ -283,19 +286,25 @@ class DSparkAttention(DSparkAttentionKernel):
         self.tma_page_size_draft = self.qk_tiler_mn[1]
         self.fixed_cache_seq_len = self.window_size + seq_len_q
         self.inverse_rope_dim = inverse_rope_dim
+        self.history_page_size = history_page_size
+        # Each supported page size divides the cyclic 128-row window.
+        self.history_tile_sizes = tuple(sorted({1, 4, 16, min(history_page_size, 64)}))
 
     @cute.jit
     def wrapper(
         self,
         batch_size: cutlass.Int32,
-        num_window_pages: cutlass.Int32,
-        window_page_stride: cutlass.Int64,
+        num_pages: cutlass.Int32,
+        page_stride: cutlass.Int64,
+        table_width: cutlass.Int32,
+        table_stride: cutlass.Int64,
         q_ptr: cute.Pointer,
-        window_ptr: cute.Pointer,
+        pages_ptr: cute.Pointer,
         draft_ptr: cute.Pointer,
         page_table_ptr: cute.Pointer,
         cache_seqs_ptr: cute.Pointer,
         valid_len_ptr: cute.Pointer,
+        capacities_ptr: cute.Pointer,
         attn_sink_ptr: cute.Pointer,
         inverse_rope_freqs_ptr: cute.Pointer,
         o_tensor: cute.Tensor,
@@ -318,11 +327,11 @@ class DSparkAttention(DSparkAttentionKernel):
             ),
         )
         q = cute.make_tensor(q_ptr, layout=q_layout)
-        window = cute.make_tensor(
-            window_ptr,
+        pages = cute.make_tensor(
+            pages_ptr,
             layout=cute.make_layout(
-                (self.window_size, self.head_dim, num_window_pages),
-                stride=(self.head_dim, 1, window_page_stride),
+                (self.history_page_size, self.head_dim, num_pages),
+                stride=(self.head_dim, 1, page_stride),
             ),
         )
         draft = cute.make_tensor(
@@ -338,7 +347,7 @@ class DSparkAttention(DSparkAttentionKernel):
         )
         page_table = cute.make_tensor(
             page_table_ptr,
-            layout=cute.make_layout((1, batch_size), stride=(1, 1)),
+            layout=cute.make_layout((table_width, batch_size), stride=(1, table_stride)),
         )
         output = cute.make_tensor(o_tensor.iterator, layout=q_layout)
         cache_seqs = cute.make_tensor(
@@ -348,6 +357,9 @@ class DSparkAttention(DSparkAttentionKernel):
         valid_len = cute.make_tensor(
             valid_len_ptr,
             layout=cute.make_layout((batch_size,), stride=(1,)),
+        )
+        capacities = cute.make_tensor(
+            capacities_ptr, layout=cute.make_layout((batch_size,), stride=(1,))
         )
         attn_sink = cute.make_tensor(
             attn_sink_ptr,
@@ -363,12 +375,13 @@ class DSparkAttention(DSparkAttentionKernel):
 
         self(
             q,
-            window,
+            pages,
             draft,
             page_table,
             output,
             cache_seqs,
             valid_len,
+            capacities,
             softmax_scale,
             cutlass.Float32(1.0),
             attn_sink,
