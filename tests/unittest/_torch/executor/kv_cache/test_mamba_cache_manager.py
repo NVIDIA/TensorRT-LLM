@@ -3869,6 +3869,35 @@ def test_v2_kda_token_states_reserve_quota_before_sizing():
     assert build(128 << 20).cache_tiers[0].quota == (128 << 20) - reserved
 
 
+def test_v2_kda_token_states_reserve_the_slots_the_runtime_keeps():
+    """The quota checks and the build count the same slots when floor / max_util_for_resume is a whole number in
+    exact arithmetic: the runtime holds the ratio as a C++ float, so 19 / 0.95 keeps 21 slots, not 20."""
+    mgr = _v2_kda_token_state_manager(kda_token_states=True, enable_block_reuse=False)
+    plain = _v2_kda_token_state_manager(kda_token_states=False, enable_block_reuse=False)
+    for m in (mgr, plain):
+        m.max_batch_size = 18
+        m.kv_cache_config = KvCacheConfig(
+            avg_seq_len=64,
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+            max_util_for_resume=0.95,
+        )
+    assert mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots == 19
+    reserved = 21 * 2 * (2 << 20)
+    minimum = mgr._minimum_live_gpu_quota()
+    assert minimum - plain._minimum_live_gpu_quota() == reserved
+    quota = minimum + (64 << 20)
+    built = mgr._build_cache_config(
+        KVCacheManagerConfig(
+            tokens_per_block=32,
+            cache_tiers=[GpuCacheTierConfig(quota=quota)],
+            layers=_base_attention_layer_configs(2),
+            max_util_for_resume=0.95,
+        )
+    )
+    assert quota - built.cache_tiers[0].quota == reserved
+
+
 def test_mamba_cache_manager_delegates_kda_replay_capability() -> None:
     mgr = object.__new__(MambaCacheManager)
     mgr._impl = SimpleNamespace(use_kda_replay_update=True)

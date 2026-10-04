@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, NamedTuple,
                     Optional, Protocol, Sequence, Tuple, Union, cast)
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -4035,7 +4036,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return 0
         floor_slots = (self._max_resident_sequences() +
                        self._num_reserved_dummy_slots)
-        return math.ceil(floor_slots / max_util_for_resume)
+        # The runtime holds max_util_for_resume as a C++ float; round the
+        # Python value the same way, or the ceiling can differ by one slot
+        # when floor_slots / max_util_for_resume is a whole number.
+        return math.ceil(floor_slots / float(np.float32(max_util_for_resume)))
 
     def _quota_filling_request_capacity(self, gpu_quota: int) -> int:
         """A typical request capacity whose resident requests' attention pages
