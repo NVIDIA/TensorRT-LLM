@@ -409,9 +409,11 @@ def check_workspaces_are_armed_and_sized() -> None:
         assert ws.buffer_bytes == BUFFER_BYTES and BUFFER_BYTES % 32 == 0
         assert ws.comm_buffer(torch.bfloat16).shape == (3, BUFFER_BYTES // 2)
         armed = ws.lamport.view(torch.int32)
-        assert bool((armed == torch.tensor(INT32_MIN, dtype=torch.int32, device="cuda")).all()), (
-            "every word -0.0"
+        every_word = bool(
+            (armed == torch.tensor(INT32_MIN, dtype=torch.int32, device="cuda")).all()
         )
+        # The allgather is also the barrier that keeps every rank from pushing until every rank has looked.
+        assert R.all_true(every_word), "every word -0.0"
         rot(ws).unchanged("armed")
     for b, f in SPLITS:
         assert required_buffer_bytes(max(TOKENS), b, f, R.world) <= BUFFER_BYTES
@@ -649,9 +651,9 @@ def check_create_refuses_on_every_rank() -> None:
     WS_C = MnnvlWorkspace.create(R.mapping, BUFFER_BYTES, fabric_handle=R.fabric)
     ROT[id(WS_C)] = Rotation(WS_C)
     armed = WS_C.lamport.view(torch.int32)
-    assert bool((armed == torch.tensor(INT32_MIN, dtype=torch.int32, device="cuda")).all()), (
-        "the workspace created after the refusals: every word -0.0"
-    )
+    every_word = bool((armed == torch.tensor(INT32_MIN, dtype=torch.int32, device="cuda")).all())
+    # The allgather is also the barrier that keeps every rank from pushing until every rank has looked.
+    assert R.all_true(every_word), "the workspace created after the refusals: every word -0.0"
     rot(WS_C).unchanged("created after the refusals")
     call_and_check(AG(8500, 8, b, f), WS_C, "first call on the new workspace")
     call_and_check(AG(8501, 8, b, f), WS_A, "after the refusals")
