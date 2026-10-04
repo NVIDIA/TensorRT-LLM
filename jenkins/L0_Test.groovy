@@ -3161,6 +3161,10 @@ def RUN_MODE = "run_mode"
 // instead of inventing a second answer to "is BOLT on".
 @Field
 def BOLT_CONSUME_BUILD = "bolt_consume_build"
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -3169,6 +3173,12 @@ def globalVars = [
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): null,
     (BOLT_CONSUME_BUILD): false,
+    // Pre-declared so updateMapWithJson() populates it from the parent: that
+    // helper only updates keys already present here, so an absent key is
+    // silently dropped -- which for this one would mean running unpinned
+    // without saying so.
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PROFILE_BRANCH): "",
 ]
 
 class GlobalState {
@@ -5099,20 +5109,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
             }
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
-            // Gateway adapters (SMG, OpenEngine) are opt-in extras excluded
-            // from requirements.txt, each declaring its pins in a dedicated
-            // requirements-<gateway>.txt so it is tested under the dependency
-            // set its real opt-in users receive. Both are installed on every
-            // stage: their pins co-resolve, so no stage-name guard is needed to
-            // keep them apart, and no stage silently loses a gateway's coverage
-            // to an `importorskip` at collection.
-            //
-            // OpenEngine's bindings resolve only from a custom index
-            // (--extra-index-url https://buf.build/gen/python), but that flag is
-            // scoped to this one pip invocation and does not affect how any
-            // other package resolves.
+            // SMG's generated package remains an opt-in dependency. OpenEngine's
+            // private bindings and grpcio dependency are part of the base package.
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
                 // TODO(dlfw-26.08): reinstate causal-conv1d and mamba-ssm once

@@ -18,7 +18,7 @@ import time
 import uuid
 from collections import Counter, defaultdict
 from itertools import chain
-from typing import Any, Callable, Dict, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, cast
 
 import numpy as np
 import torch
@@ -45,13 +45,19 @@ from tensorrt_llm._torch.disaggregation.native.bounce import (
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.publish import PeerPublish
-from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
+from tensorrt_llm._torch.disaggregation.native.retirement import QuiescenceFatalEvent
+from tensorrt_llm._torch.disaggregation.native.transfer import (
+    RxSession,
+    TransferWorker,
+    TransferWorkerConfig,
+)
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_slot_bytes
 from tensorrt_llm._torch.distributed.communicator import Distributed
+from tensorrt_llm._torch.pyexecutor import hang_detector
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
@@ -62,14 +68,115 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, nvtx_range
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
+if TYPE_CHECKING:
+    from mpi4py import MPI
+
 _FP4_MLA_OWNERSHIP_BRIDGE_ENV = "TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE"
+_FATAL_LOG_JOIN_TIMEOUT_S = 0.5
+
+
+def _log_unproven_kv_transfer(event: QuiescenceFatalEvent) -> None:
+    """Emit best-effort fatal diagnostics on a dedicated thread.
+
+    Args:
+        event: The sticky expiry event retained by the watchdog.
+    """
+    try:
+        logger.critical(
+            "UNPROVEN_FATAL: hard-stopping through MPI/launcher; termination may include "
+            "other executors in the same job. Retaining KV "
+            f"and transport roots until process teardown. request_id={event.request_id}, "
+            f"direction={event.direction}, reason={event.reason}, "
+            f"deadline={event.deadline}, expired_at={event.expired_at}"
+        )
+    except Exception:  # noqa: BLE001 - diagnostics cannot alter containment
+        pass
+
+
+def _fail_unproven_kv_transfer(
+    event: QuiescenceFatalEvent, communicator: Optional["MPI.Comm"] = None
+) -> None:
+    """Terminate the executor world without running ordinary resource cleanup.
+
+    Called by the independent retirement watchdog after fatal expiry is sticky
+    and transfer admission is closed. The existing MPI/launcher crash path
+    makes the endpoint unhealthy; request failure is not memory-release proof.
+    The communicator identifies the executor, not an isolated failure domain:
+    Open MPI aborts the entire job, including other executors in split worlds.
+    Launcher-driven termination can likewise extend beyond this executor.
+    A supervisor may replace the world only after qualified platform teardown,
+    not merely after this function requests termination.
+
+    Args:
+        event: The first unproven physical owner whose drain deadline expired.
+        communicator: Validated executor world captured before the watchdog starts.
+    """
+    try:
+        log_thread = threading.Thread(
+            target=_log_unproven_kv_transfer,
+            args=(event,),
+            name="kv-retirement-fatal-log",
+            daemon=True,
+        )
+        log_thread.start()
+        # Allow a fast diagnostic to finish without waiting indefinitely for
+        # a blocked handler. Admission and unresolved roots remain fenced.
+        log_thread.join(timeout=_FATAL_LOG_JOIN_TIMEOUT_S)
+    finally:
+        # Do not call PyExecutor._handle_errors(), request termination, or
+        # transceiver.shutdown(): their normal cleanup may recycle KV pages.
+        hang_detector.propagate_hard_kill(diagnostics=False, communicator=communicator)
+
+
+def _retirement_executor_comm(mapping: Mapping) -> "MPI.Comm":
+    """Capture the MPI executor world that the deadline watchdog may abort.
+
+    Rank/size validation does not isolate termination. Shared MPI launches can
+    lose every executor when one executor reaches fatal expiry.
+
+    Args:
+        mapping: The executor's expected worker rank and world size.
+
+    Returns:
+        The exact communicator, retained rather than resolved on another thread.
+
+    Raises:
+        ValueError: MPI cannot safely terminate the complete executor world.
+    """
+    message = (
+        "KV retirement fail-stop requires an initialized MPI executor world with "
+        "MPI_THREAD_MULTIPLE and communicator rank/size matching Mapping; "
+        "non-MPI launchers are not qualified"
+    )
+    if not ENABLE_MULTI_DEVICE or mpi_disabled():
+        raise ValueError(message)
+    from mpi4py import MPI
+
+    if not MPI.Is_initialized() or MPI.Is_finalized() or MPI.Query_thread() != MPI.THREAD_MULTIPLE:
+        raise ValueError(message)
+    communicator = mpi_comm()
+    if (
+        communicator == MPI.COMM_NULL
+        or communicator.Is_inter()
+        or communicator.Get_size() != mapping.world_size
+        or communicator.Get_rank() != mapping.rank
+    ):
+        raise ValueError(message)
+    if mapping.rank == 0:
+        logger.warning(
+            "KV retirement fail-stop may terminate the entire MPI job, including other "
+            "CTX/GEN executors sharing the launch. A split communicator does not isolate "
+            "MPI_Abort. Use separate launcher jobs when independent availability is required, "
+            "and qualify their termination boundaries."
+        )
+    return communicator
 
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
@@ -158,6 +265,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             mapping, kv_cache_manager, cache_transceiver_config
         )
         self._fp4_mla_bridge_enabled = enforce_physical_ownership
+        self._retirement_mpi_comm = (
+            _retirement_executor_comm(mapping) if enforce_physical_ownership else None
+        )
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
 
         self._device_id = torch.cuda.current_device()
@@ -187,6 +297,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 tx_overall_timeout_s=transfer_timeout_s,
                 rx_timeout_s=transfer_timeout_s,
                 enforce_physical_ownership=enforce_physical_ownership,
+                quiescence_fatal_callback=(
+                    self._fail_unproven_transfer if enforce_physical_ownership else None
+                ),
                 # kv_cache_bounce_size_mb is the shared bounce capacity; agent_bounce_buffer_enable
                 # routes it to exactly one implementation: the Python bounce below (per-region,
                 # size 0 = off; the per-transfer size gates are internal, tuned via env:
@@ -212,6 +325,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"rank={rank}/{mapping.world_size}, backend=NIXL, runtime=PYTHON, "
                 "request_schedule_required=GENERATION_FIRST, attention_dp=True, pp=1, cp=1, "
                 "retry=False, async=True, layerwise=False, bounce_mb=0, "
+                "unproven_retirement=fail_stop, termination_scope=mpi_job_or_launcher, "
                 f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}"
             )
         logger.info(
@@ -251,6 +365,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # per-iter tp_allgather when this transceiver never sends/receives.
         self._ever_had_send_session: bool = False
         self._ever_had_recv_session: bool = False
+
+    def _fail_unproven_transfer(self, event: QuiescenceFatalEvent) -> None:
+        """Fail-stop while the watchdog retains this transceiver's resource roots.
+
+        The bound callback keeps request maps, KV manager, transfer worker and
+        agent alive through the watchdog's persistent fatal thread even if the
+        termination call raises or unexpectedly returns.
+
+        Args:
+            event: The sticky physical-retirement deadline expiry.
+        """
+        _fail_unproven_kv_transfer(event, self._retirement_mpi_comm)
 
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
@@ -343,6 +469,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _shutdown_once(self) -> None:
         if getattr(self, "_shutdown_complete", False):
             return
+        # Preflight may refuse closure while DMA remains active. Start the
+        # bounded drain before that refusal, not only in worker.shutdown().
+        self._transfer_worker.request_shutdown()
         # This flag records completed teardown, not an attempted shutdown. If
         # an active owner refuses closure, leave it false so shutdown can be
         # retried after the physical operation drains.
@@ -350,6 +479,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # separate drain snapshot would not be sufficient: late evidence can make an
         # owner unretirable before close() acquires its lock.
         for rid, session in list(self._recv_sessions.items()):
+            if getattr(session, "_retirement", None) is not None:
+                # Close unpublished admission before inspecting drain state.
+                # Published accessors remain retained; do not notify peers here.
+                session.cancel_local()
             self._close_session_or_raise(session, rid, "shutdown")
         for rid, session in list(self._send_sessions.items()):
             self._close_session_or_raise(session, rid, "shutdown")
@@ -803,6 +936,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 completed.append(rid)
             elif session.has_failed():
                 if self._ownership_blocks_retirement(session):
+                    if isinstance(session, RxSession):
+                        session.notify_cancel()
                     continue
                 failed.append(rid)
         return completed, failed
@@ -1026,7 +1161,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
             # A remote cancellation can win before the local TxSession is
             # created. Sender.setup_session() records that terminal state and
-            # reports safe pre-submission failures to every known receiver;
+            # acknowledges the fenced session to every known receiver;
             # leave retirement to the normal status path without attempting
             # to publish KV or auxiliary memory afterward.
             if session.has_failed():

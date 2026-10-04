@@ -42,6 +42,7 @@ struct AttnLifeCycle
 {
     std::optional<int> windowSize; // nullopt = no sliding window
     int numSinkBlocks = 0;         // divUp(numSinkTokens, tokensPerBlock)
+    bool isSparse = false;
     std::string cacheDomain = "target";
 
     HalfOpenRange<BlockOrdinal> getStaleRange(int historyLength, int tokensPerBlock) const
@@ -59,24 +60,25 @@ struct AttnLifeCycle
 
     bool operator==(AttnLifeCycle const& o) const noexcept
     {
-        return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks && cacheDomain == o.cacheDomain;
+        return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks && isSparse == o.isSparse
+            && cacheDomain == o.cacheDomain;
     }
 
     bool operator<(AttnLifeCycle const& o) const noexcept
     {
-        return std::tie(windowSize, numSinkBlocks, cacheDomain)
-            < std::tie(o.windowSize, o.numSinkBlocks, o.cacheDomain);
+        return std::tie(windowSize, numSinkBlocks, isSparse, cacheDomain)
+            < std::tie(o.windowSize, o.numSinkBlocks, o.isSparse, o.cacheDomain);
     }
 
-    static AttnLifeCycle make(
-        std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock, std::string cacheDomain = "target")
+    static AttnLifeCycle make(std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock,
+        bool isSparse = false, std::string cacheDomain = "target")
     {
         TLLM_CHECK_DEBUG(tokensPerBlock > 0);
         TLLM_CHECK_DEBUG(!ws.has_value() || *ws > 0);
         TLLM_CHECK_DEBUG(!numSinkTokens.has_value() || *numSinkTokens >= 0);
         TLLM_CHECK_DEBUG((!numSinkTokens.has_value() || *numSinkTokens == 0) || ws.has_value());
         int sinkBlocks = divUp(numSinkTokens.value_or(0), tokensPerBlock);
-        return AttnLifeCycle{ws, sinkBlocks, std::move(cacheDomain)};
+        return AttnLifeCycle{ws, sinkBlocks, isSparse, std::move(cacheDomain)};
     }
 };
 

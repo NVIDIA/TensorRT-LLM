@@ -1,12 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Semantic conflict review
+name: Semantic conflict review (disabled)
+# Bot-to-bot review requests and reply processing are disabled. Keep the manual
+# entry point and implementation available for inspecting historical runs.
 on:
-  schedule:
-    - cron: '23 */2 * * *'
-  issue_comment:
-    types: [created, edited, deleted]
   workflow_dispatch:
     inputs:
       pull_number:
@@ -25,9 +23,7 @@ concurrency:
 jobs:
   discover:
     name: Select PRs for semantic analysis
-    if: >-
-      github.repository == 'NVIDIA/TensorRT-LLM' &&
-      contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
+    if: ${{ false }}
     permissions:
       contents: read
       pull-requests: read
@@ -137,17 +133,48 @@ jobs:
       group: semantic-review-pr-${{ github.event.issue.number }}
       cancel-in-progress: false
       queue: max
-    if: >-
-      github.repository == 'NVIDIA/TensorRT-LLM' &&
-      github.event_name == 'issue_comment' && github.event.issue.pull_request &&
-      github.event.comment.user.login == 'coderabbitai[bot]' &&
-      github.event.comment.user.id == 136622811 &&
-      github.event.comment.user.type == 'Bot'
+    if: ${{ false }}
     permissions:
       contents: read
       issues: read
       statuses: write
       checks: write
+    outputs:
+      active: ${{ steps.publish.outputs.active }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/semantic_review.js
+          sparse-checkout-cone-mode: false
+      - id: publish
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const {publish} = require('./.github/scripts/semantic_review.js');
+            const state = await publish({github, context, core});
+            core.setOutput('active', state?.request ? 'true' : 'false');
+
+  tidy:
+    name: Tidy semantic review comments
+    needs: publish
+    # Runs on PRs with a semantic review request only. Comment writes are kept
+    # out of the publish job so the status/check writer never holds comment
+    # permissions and vice versa.
+    if: needs.publish.outputs.active == 'true'
+    concurrency:
+      group: semantic-review-pr-${{ github.event.issue.number }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: read
+      checks: read
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -160,5 +187,5 @@ jobs:
       - uses: actions/github-script@v8
         with:
           script: |
-            const {publish} = require('./.github/scripts/semantic_review.js');
-            await publish({github, context, core});
+            const {tidy} = require('./.github/scripts/semantic_review.js');
+            await tidy({github, context, core});

@@ -58,7 +58,8 @@ must eventually be `close()`d. Its normal flow is:
 
 1. Match the input `TokenSpan` against `BlockRadixTree` within a `ReuseScope`.
 2. Allocate request-local pages for unmatched blocks through `StorageManager`.
-3. Lock or migrate required committed pages to GPU before model execution.
+3. Lock or restore required pages before model execution: GPU for writable and
+   dense pages, level-1 host memory for cold sparse history.
 4. Commit completed blocks to the tree, making their immutable pages available
    for later requests; `stopCommitting()` finalizes this process.
 5. Suspend or close the request, returning pages to holding/eviction ownership.
@@ -67,6 +68,11 @@ must eventually be `close()`d. Its normal flow is:
 may have sliding-window and sink-token rules; SSM lifecycles represent a
 recurrent-state checkpoint. A pool-group index is a storage-layout index and is
 not interchangeable with a layer ID or lifecycle ID.
+
+Attention lifecycle identity also includes `isSparse`. All buffers in one
+attention layer must agree on this flag. Sparse buffers require `HOST_MEM` at
+level 1 and are invalid for SSM layers. Sparse and dense GPU pools stay separate
+even when their slot sizes match; compatible sparse buffers still coalesce.
 
 `StorageManager` coordinates GPU, host, and disk cache levels. It allocates
 slots, schedules pages for eviction, migrates pages between levels, and resizes
@@ -91,8 +97,8 @@ types/config/exceptions
 
 - `SUSPENDED`: no active CUDA-stream use; committed pages can be held or
   evicted.
-- `ACTIVE`: pages required by the request are locked to GPU and use the cache's
-  CUDA stream.
+- `ACTIVE`: pages required by the request are locked at their intended storage
+  levels and use the cache's CUDA stream.
 - `CLOSED`: resources are released; further use is invalid.
 
 `commit()` finalizes full blocks. Its `isEnd=true` form is a terminal-memory
@@ -105,7 +111,9 @@ pages and performs final commit-state bookkeeping.
 
 ### Page status
 
-- `LOCKED`: required on GPU; neither eviction nor dropping is permitted.
+- `LOCKED`: pinned at the current storage level; neither eviction nor dropping
+  is permitted. GPU locks support every lifecycle. Level-1 `HOST_MEM` locks
+  support sparse attention only; disk pages cannot be locked.
 - `HELD`: eviction is allowed, but dropping is not.
 - `DROPPABLE`: both eviction and dropping are allowed.
 
@@ -114,6 +122,14 @@ transitions. CUDA ready/finish events are part of their correctness contract:
 they establish write completion, migration ordering, and safe reuse across
 streams. A stream change for an active cache intentionally synchronizes the
 new stream with the old one.
+
+`batchedLockPages()` takes an explicit destination per page and restores cold
+pages before locking, deduplicating pages shared by multiple owners. Resume,
+prefetch, and prefix rebasing preserve host-resident sparse history. A partial
+prefix copies from the source's actual tier into a private GPU page without
+moving a shared host source. Rollback records the original lock level, and
+`ScratchSlotLock` remains GPU-only. This does not itself demote GPU history;
+offload requires a separate transfer and GPU-slot ownership handoff.
 
 ## Ownership and lifetime
 

@@ -661,14 +661,14 @@ files = [
 
 [[package]]
 name = "filelock"
-version = "4.0.7"
+version = "4.0.10"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-4.0.7-py3-none-any.whl", hash = "sha256:a93c4d93269b339a6af4848342c7e940d0f9928ad95eff64764699e5f1bf8a6a"},
-    {file = "filelock-4.0.7.tar.gz", hash = "sha256:da5915714a70b55d167fdc7e251ad91302b0a36816fb574dfafae8f4f2c9bb21"},
+    {file = "filelock-4.0.10-py3-none-any.whl", hash = "sha256:698048d158dc3c9e18cc5e88b3efdd4bd0e77d76686b22adb4511cc4b2c2f0db"},
+    {file = "filelock-4.0.10.tar.gz", hash = "sha256:00d6a81f976a6332551c2c10f39e12b4abb7e01c64d4c497b81a615bc9186f1f"},
 ]
 
 [[package]]
@@ -1424,14 +1424,14 @@ files = [
 
 [[package]]
 name = "platformdirs"
-version = "4.12.2"
+version = "4.12.3"
 description = "A small Python package for determining appropriate platform-specific dirs, e.g. a `user data dir`."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "platformdirs-4.12.2-py3-none-any.whl", hash = "sha256:29dbf06d96c500bc6bdbce75fb0a14d63279c93b1842f97e72a135b33e856983"},
-    {file = "platformdirs-4.12.2.tar.gz", hash = "sha256:eab5f70271a490ef74618bb314fbb86e3c7e82fa3b9c922c2ea0e0a1a155d329"},
+    {file = "platformdirs-4.12.3-py3-none-any.whl", hash = "sha256:080f3b39423b5abfca9a23d84c4e9795f54d395cd8459867a8ded44084fcd5f8"},
+    {file = "platformdirs-4.12.3.tar.gz", hash = "sha256:427fc0bb321ae0c5b037fa03238ca74820437be162e78b4848c4d4055b9b766c"},
 ]
 
 [[package]]
@@ -1951,32 +1951,32 @@ files = [
 
 [[package]]
 name = "ray"
-version = "2.58.0"
+version = "2.59.0"
 description = "Ray provides a simple, universal API for building distributed applications."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "ray-2.58.0-cp310-cp310-macosx_12_0_arm64.whl", hash = "sha256:a2235a5a17e865be053e8aff6d9e9e36d1edb45ad8162f57f7cdfd0202a5a397"},
-    {file = "ray-2.58.0-cp310-cp310-manylinux2014_aarch64.whl", hash = "sha256:62dd70c70f32cf0d4c69e752fdf85d421bc567475a8fb8bd2e8a306c360bea4b"},
-    {file = "ray-2.58.0-cp310-cp310-manylinux2014_x86_64.whl", hash = "sha256:5a45ede3edbf89b3ca61c72b84a4e64e701ef369c9e7d3968804a45937b79cf9"},
-    {file = "ray-2.58.0-cp310-cp310-win_amd64.whl", hash = "sha256:7b8910da3853c38ebbf72cca09091a3e1de956b81ee7275bf3cc70329260ba13"},
-    {file = "ray-2.58.0-cp311-cp311-macosx_12_0_arm64.whl", hash = "sha256:a55b33653aadc21c298bb029cc3ed9878b32b2b087fe2913c5e6e0e2db1f699e"},
-    {file = "ray-2.58.0-cp311-cp311-manylinux2014_aarch64.whl", hash = "sha256:c20bc4cba21d26c5634495d6599277ac47db7fc33bd3b26c0ec7781f8ccc3b3c"},
-    {file = "ray-2.58.0-cp311-cp311-manylinux2014_x86_64.whl", hash = "sha256:fc3dd2decebb35d1f3682c211ec9d6c9807b3152f0defa42ec0942817013e180"},
-    {file = "ray-2.58.0-cp311-cp311-win_amd64.whl", hash = "sha256:e4294fb246f980a2c2dee6a4ea34d6bc16ed568e7de9644f1abda469df30529a"},
-    {file = "ray-2.58.0-cp312-cp312-macosx_12_0_arm64.whl", hash = "sha256:308863a6468dc969d1d52a99233569d7a2a9c2745f589b74ff277e9769486077"},
-    {file = "ray-2.58.0-cp312-cp312-manylinux2014_aarch64.whl", hash = "sha256:62f2f17a4d50150969dcf0a4ccbdafbdafa87d6be225ee1208a7b56bd373a37c"},
-    {file = "ray-2.58.0-cp312-cp312-manylinux2014_x86_64.whl", hash = "sha256:1e20c4a8d2563d9580e78f7c15297a9f8afe92401b698bceb4106c34b30c01c6"},
-    {file = "ray-2.58.0-cp312-cp312-win_amd64.whl", hash = "sha256:d49ff40e28bafeae29eed8118ce4269a56589e3952268059fb57e60c8721df86"},
-    {file = "ray-2.58.0-cp313-cp313-macosx_12_0_arm64.whl", hash = "sha256:8a664cb1fbe0f7fd794ec6624ddc772494f8faafcefa83a58569f9a9c6994562"},
-    {file = "ray-2.58.0-cp313-cp313-manylinux2014_aarch64.whl", hash = "sha256:b911ba8b517f2d09c5d5f30865853e2589d039417a5491283df21892dc86498c"},
-    {file = "ray-2.58.0-cp313-cp313-manylinux2014_x86_64.whl", hash = "sha256:b2262140a199458c5ad6f7917ec758d057d1669f824048f785119c6ce2539363"},
-    {file = "ray-2.58.0-cp313-cp313-win_amd64.whl", hash = "sha256:643cb5eb01dd02282bacc640959c2282c329c08df6fd20ffedd5a5be51dca135"},
-    {file = "ray-2.58.0-cp314-cp314-macosx_12_0_arm64.whl", hash = "sha256:d92461ff0e278635b3c09aefc7fe56e114914a9dbe7abfd3d9c692ac6df1953b"},
-    {file = "ray-2.58.0-cp314-cp314-manylinux2014_aarch64.whl", hash = "sha256:2069657eea56bfddaba58cf23532a582dcc66bcbdf4cba4da8ad1fe2a72c028a"},
-    {file = "ray-2.58.0-cp314-cp314-manylinux2014_x86_64.whl", hash = "sha256:79765b3adaec0ece8ae4e7ae8cd599ff599a71e6dd4f0e773a1187b47261ca7b"},
-    {file = "ray-2.58.0-cp314-cp314-win_amd64.whl", hash = "sha256:82362347776a50a5145f1fa89aebfe8a72176e4344eb2caa67a9007871dd2ba0"},
+    {file = "ray-2.59.0-cp310-cp310-macosx_12_0_arm64.whl", hash = "sha256:3f89f68ade71fe6ff57fd15de893754905a09ebf6efe0d9e32870745c62b52a7"},
+    {file = "ray-2.59.0-cp310-cp310-manylinux2014_aarch64.whl", hash = "sha256:9bb40fee0b6eb8a747558d3baded99534f93a8be76e96d85d5564c1e9e510a64"},
+    {file = "ray-2.59.0-cp310-cp310-manylinux2014_x86_64.whl", hash = "sha256:48f0f8407c84cebb1bc2d25a3fb22b995f027b3c79e93947ef94ccaf417a57c6"},
+    {file = "ray-2.59.0-cp310-cp310-win_amd64.whl", hash = "sha256:b85d3cb7a6048f88a9d5a86d4e3ded293e90f46f7e8c4000ffcb5895dfd40eff"},
+    {file = "ray-2.59.0-cp311-cp311-macosx_12_0_arm64.whl", hash = "sha256:cedce6af865d078d318bc3f691e41527331d532dca0017fb824191c884e59a22"},
+    {file = "ray-2.59.0-cp311-cp311-manylinux2014_aarch64.whl", hash = "sha256:e59bbeed9fd3ae29e326bcf73a6dc6b957029004230e9f1e874670c4e390b147"},
+    {file = "ray-2.59.0-cp311-cp311-manylinux2014_x86_64.whl", hash = "sha256:645f4676ef6ff2ca8154e83edf0b38583d225b6c6fb83b6050ca1681dc3a8688"},
+    {file = "ray-2.59.0-cp311-cp311-win_amd64.whl", hash = "sha256:b967405ba6fb9d36bb04883bb8c4c1048f2e305f30a40080b1c7570efa7188ff"},
+    {file = "ray-2.59.0-cp312-cp312-macosx_12_0_arm64.whl", hash = "sha256:6a240b393819c0c8c03940d16faf952223003ab1d9736d5328cc5a5f71c95e1c"},
+    {file = "ray-2.59.0-cp312-cp312-manylinux2014_aarch64.whl", hash = "sha256:09e2dd8ba367f07f1829fc2e35f41e9c3fa9f6ec0babace13d70ebe14e8cf662"},
+    {file = "ray-2.59.0-cp312-cp312-manylinux2014_x86_64.whl", hash = "sha256:4055a7a60293ffee41005ab9b3ed9933e0f9b5d8450b214f3c0a7b1de5503f0e"},
+    {file = "ray-2.59.0-cp312-cp312-win_amd64.whl", hash = "sha256:71a8ff087739044a0d596daeccde33da02afd6d0dacfecae962c395cb3e90d78"},
+    {file = "ray-2.59.0-cp313-cp313-macosx_12_0_arm64.whl", hash = "sha256:843bf48f42722e0c143eba6846b5819716bb7e5e044b9e4779b1d3ac5933040b"},
+    {file = "ray-2.59.0-cp313-cp313-manylinux2014_aarch64.whl", hash = "sha256:583f26e1f1a04aefd230b908621dc3f3e1ca5e0d201ee09d5f040ca4b824e800"},
+    {file = "ray-2.59.0-cp313-cp313-manylinux2014_x86_64.whl", hash = "sha256:70fdc5bec47cc33a4f4e0d9b081f66505e119abd8a8bc6cb2c5d4926427fce6d"},
+    {file = "ray-2.59.0-cp313-cp313-win_amd64.whl", hash = "sha256:65288d38b5107a76f36965be1e9d7830613356e0c32d675a44410c30c714f495"},
+    {file = "ray-2.59.0-cp314-cp314-macosx_12_0_arm64.whl", hash = "sha256:af31158ee8fead4119c6e4b7b3e0cb3414416599df1da2e4c99e7c53fa5c5fb3"},
+    {file = "ray-2.59.0-cp314-cp314-manylinux2014_aarch64.whl", hash = "sha256:6d60f9b7a94fc138ac47a07564182769fd6b6cefae0714aa7499a553bdda2949"},
+    {file = "ray-2.59.0-cp314-cp314-manylinux2014_x86_64.whl", hash = "sha256:050781099ce641b7d89896e7b0d79c820813529da86c9b5c65ecb7c89403e667"},
+    {file = "ray-2.59.0-cp314-cp314-win_amd64.whl", hash = "sha256:d3a119eac653c0a1b3bf4e25609de123e5fb994a33d4e1f270ed1ce5e304693d"},
 ]
 
 [package.dependencies]
@@ -2007,20 +2007,20 @@ virtualenv = {version = ">=20.0.24,!=20.21.1", optional = true, markers = "extra
 
 [package.extras]
 adag = ["cupy-cuda12x ; sys_platform != \"darwin\""]
-air = ["aiohttp (>=3.14.1)", "aiohttp_cors", "colorful", "fastapi (>=0.133.0)", "fsspec", "grpcio (>=1.42.0)", "mmh3", "numpy (>=1.20)", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "pandas", "pandas (>=2.2.3)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pyarrow (>=17.0.0)", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "ray-haproxy (>=2.8.25,<2.9.0) ; sys_platform == \"linux\"", "requests", "smart_open", "starlette (>=1.0.1)", "tensorboardX (>=1.9)", "uvicorn[standard]", "virtualenv (>=20.0.24,!=20.21.1)", "watchfiles"]
-all = ["aiohttp (>=3.14.1)", "aiohttp_cors", "celery", "colorful", "cupy-cuda12x ; sys_platform != \"darwin\"", "dm_tree", "fastapi (>=0.133.0)", "fsspec", "grpcio", "grpcio (!=1.56.0) ; sys_platform == \"darwin\"", "grpcio (>=1.42.0)", "gymnasium (==1.2.2)", "lz4", "memray ; sys_platform != \"win32\"", "mmh3", "numpy (>=1.20)", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "ormsgpack (>=1.7.0)", "pandas", "pandas (>=2.2.3)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pyOpenSSL", "pyarrow (>=17.0.0)", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "pyyaml", "ray-haproxy (>=2.8.25,<2.9.0) ; sys_platform == \"linux\"", "requests", "scipy", "smart_open", "starlette (>=1.0.1)", "taskiq", "tensorboardX (>=1.9)", "uvicorn[standard]", "virtualenv (>=20.0.24,!=20.21.1)", "watchfiles"]
-all-cpp = ["aiohttp (>=3.14.1)", "aiohttp_cors", "celery", "colorful", "cupy-cuda12x ; sys_platform != \"darwin\"", "dm_tree", "fastapi (>=0.133.0)", "fsspec", "grpcio", "grpcio (!=1.56.0) ; sys_platform == \"darwin\"", "grpcio (>=1.42.0)", "gymnasium (==1.2.2)", "lz4", "memray ; sys_platform != \"win32\"", "mmh3", "numpy (>=1.20)", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "ormsgpack (>=1.7.0)", "pandas", "pandas (>=2.2.3)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pyOpenSSL", "pyarrow (>=17.0.0)", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "pyyaml", "ray-cpp (==2.58.0)", "ray-haproxy (>=2.8.25,<2.9.0) ; sys_platform == \"linux\"", "requests", "scipy", "smart_open", "starlette (>=1.0.1)", "taskiq", "tensorboardX (>=1.9)", "uvicorn[standard]", "virtualenv (>=20.0.24,!=20.21.1)", "watchfiles"]
+air = ["aiohttp (>=3.14.1)", "aiohttp_cors", "colorful", "fastapi (>=0.133.0)", "fsspec", "grpcio (>=1.42.0)", "jinja2", "mmh3", "numpy (>=1.20)", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "pandas", "pandas (>=2.2.3)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pyarrow (>=17.0.0)", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "ray-haproxy (>=2.8.25,<2.9.0) ; sys_platform == \"linux\"", "requests", "smart_open", "starlette (>=1.0.1)", "tensorboardX (>=1.9)", "uvicorn[standard]", "virtualenv (>=20.0.24,!=20.21.1)", "watchfiles"]
+all = ["aiohttp (>=3.14.1)", "aiohttp_cors", "celery", "colorful", "cupy-cuda12x ; sys_platform != \"darwin\"", "dm_tree", "fastapi (>=0.133.0)", "fsspec", "grpcio", "grpcio (!=1.56.0) ; sys_platform == \"darwin\"", "grpcio (>=1.42.0)", "gymnasium (==1.2.2)", "jinja2", "lz4", "memray ; sys_platform != \"win32\"", "mmh3", "numpy (>=1.20)", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "ormsgpack (>=1.7.0)", "pandas", "pandas (>=2.2.3)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pyOpenSSL", "pyarrow (>=17.0.0)", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "pyyaml", "ray-haproxy (>=2.8.25,<2.9.0) ; sys_platform == \"linux\"", "requests", "scipy", "smart_open", "starlette (>=1.0.1)", "taskiq", "tensorboardX (>=1.9)", "uvicorn[standard]", "virtualenv (>=20.0.24,!=20.21.1)", "watchfiles"]
+all-cpp = ["aiohttp (>=3.14.1)", "aiohttp_cors", "celery", "colorful", "cupy-cuda12x ; sys_platform != \"darwin\"", "dm_tree", "fastapi (>=0.133.0)", "fsspec", "grpcio", "grpcio (!=1.56.0) ; sys_platform == \"darwin\"", "grpcio (>=1.42.0)", "gymnasium (==1.2.2)", "jinja2", "lz4", "memray ; sys_platform != \"win32\"", "mmh3", "numpy (>=1.20)", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "ormsgpack (>=1.7.0)", "pandas", "pandas (>=2.2.3)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pyOpenSSL", "pyarrow (>=17.0.0)", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "pyyaml", "ray-cpp (==2.59.0)", "ray-haproxy (>=2.8.25,<2.9.0) ; sys_platform == \"linux\"", "requests", "scipy", "smart_open", "starlette (>=1.0.1)", "taskiq", "tensorboardX (>=1.9)", "uvicorn[standard]", "virtualenv (>=20.0.24,!=20.21.1)", "watchfiles"]
 cgraph = ["cupy-cuda12x ; sys_platform != \"darwin\""]
 client = ["grpcio", "grpcio (!=1.56.0) ; sys_platform == \"darwin\""]
-cpp = ["ray-cpp (==2.58.0)"]
+cpp = ["ray-cpp (==2.59.0)"]
 data = ["fsspec", "numpy (>=1.20)", "pandas (>=2.2.3)", "pyarrow (>=17.0.0)"]
 default = ["aiohttp (>=3.14.1)", "aiohttp_cors", "colorful", "grpcio (>=1.42.0)", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "requests", "smart_open", "virtualenv (>=20.0.24,!=20.21.1)"]
-llm = ["aiohttp (>=3.14.1)", "aiohttp_cors", "async-timeout ; python_version < \"3.11\"", "colorful", "fastapi (>=0.133.0)", "fsspec", "grpcio (>=1.42.0)", "hf_transfer", "jsonref (>=1.1.0)", "jsonschema", "meson", "mmh3", "ninja", "nixl (==1.3.1)", "nixl-cu13 (==1.3.1)", "numpy (>=1.20)", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "pandas (>=2.2.3)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pyarrow (>=17.0.0)", "pybind11", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "ray-haproxy (>=2.8.25,<2.9.0) ; sys_platform == \"linux\"", "requests", "smart_open", "starlette (>=1.0.1)", "typer", "uvicorn[standard]", "virtualenv (>=20.0.24,!=20.21.1)", "vllm[audio] (==0.26.0)", "watchfiles"]
+llm = ["aiohttp (>=3.14.1)", "aiohttp_cors", "async-timeout ; python_version < \"3.11\"", "colorful", "fastapi (>=0.133.0)", "fsspec", "grpcio (>=1.42.0)", "hf_transfer", "jinja2", "jsonref (>=1.1.0)", "jsonschema", "meson", "mmh3", "ninja", "nixl (==1.3.1)", "nixl-cu13 (==1.3.1)", "numpy (>=1.20)", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "pandas (>=2.2.3)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pyarrow (>=17.0.0)", "pybind11", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "ray-haproxy (>=2.8.25,<2.9.0) ; sys_platform == \"linux\"", "requests", "smart_open", "starlette (>=1.0.1)", "typer", "uvicorn[standard]", "virtualenv (>=20.0.24,!=20.21.1)", "vllm[audio] (==0.27.0)", "watchfiles"]
 observability = ["memray ; sys_platform != \"win32\""]
 rllib = ["dm_tree", "fsspec", "gymnasium (==1.2.2)", "lz4", "ormsgpack (>=1.7.0)", "pandas", "pyarrow (>=17.0.0)", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "pyyaml", "requests", "scipy", "tensorboardX (>=1.9)"]
-serve = ["aiohttp (>=3.14.1)", "aiohttp_cors", "colorful", "fastapi (>=0.133.0)", "grpcio (>=1.42.0)", "mmh3", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "ray-haproxy (>=2.8.25,<2.9.0) ; sys_platform == \"linux\"", "requests", "smart_open", "starlette (>=1.0.1)", "uvicorn[standard]", "virtualenv (>=20.0.24,!=20.21.1)", "watchfiles"]
-serve-async-inference = ["aiohttp (>=3.14.1)", "aiohttp_cors", "celery", "colorful", "fastapi (>=0.133.0)", "grpcio (>=1.42.0)", "mmh3", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "ray-haproxy (>=2.8.25,<2.9.0) ; sys_platform == \"linux\"", "requests", "smart_open", "starlette (>=1.0.1)", "taskiq", "uvicorn[standard]", "virtualenv (>=20.0.24,!=20.21.1)", "watchfiles"]
-serve-grpc = ["aiohttp (>=3.14.1)", "aiohttp_cors", "colorful", "fastapi (>=0.133.0)", "grpcio (>=1.42.0)", "mmh3", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pyOpenSSL", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "ray-haproxy (>=2.8.25,<2.9.0) ; sys_platform == \"linux\"", "requests", "smart_open", "starlette (>=1.0.1)", "uvicorn[standard]", "virtualenv (>=20.0.24,!=20.21.1)", "watchfiles"]
+serve = ["aiohttp (>=3.14.1)", "aiohttp_cors", "colorful", "fastapi (>=0.133.0)", "grpcio (>=1.42.0)", "jinja2", "mmh3", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "ray-haproxy (>=2.8.25,<2.9.0) ; sys_platform == \"linux\"", "requests", "smart_open", "starlette (>=1.0.1)", "uvicorn[standard]", "virtualenv (>=20.0.24,!=20.21.1)", "watchfiles"]
+serve-async-inference = ["aiohttp (>=3.14.1)", "aiohttp_cors", "celery", "colorful", "fastapi (>=0.133.0)", "grpcio (>=1.42.0)", "jinja2", "mmh3", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "ray-haproxy (>=2.8.25,<2.9.0) ; sys_platform == \"linux\"", "requests", "smart_open", "starlette (>=1.0.1)", "taskiq", "uvicorn[standard]", "virtualenv (>=20.0.24,!=20.21.1)", "watchfiles"]
+serve-grpc = ["aiohttp (>=3.14.1)", "aiohttp_cors", "colorful", "fastapi (>=0.133.0)", "grpcio (>=1.42.0)", "jinja2", "mmh3", "opencensus", "opentelemetry-exporter-prometheus", "opentelemetry-proto", "opentelemetry-sdk (>=1.30.0)", "prometheus_client (>=0.7.1)", "py-spy (>=0.2.0) ; python_version < \"3.12\"", "py-spy (>=0.4.0) ; python_version >= \"3.12\"", "pyOpenSSL", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "ray-haproxy (>=2.8.25,<2.9.0) ; sys_platform == \"linux\"", "requests", "smart_open", "starlette (>=1.0.1)", "uvicorn[standard]", "virtualenv (>=20.0.24,!=20.21.1)", "watchfiles"]
 train = ["fsspec", "pandas", "pyarrow (>=17.0.0)", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "requests", "tensorboardX (>=1.9)"]
 tune = ["fsspec", "pandas", "pyarrow (>=17.0.0)", "pydantic (>=2.13.0,<3) ; python_version >= \"3.14\"", "pydantic (>=2.5.0,<3) ; python_version < \"3.14\"", "requests", "tensorboardX (>=1.9)"]
 
@@ -2402,14 +2402,14 @@ zstd = ["backports-zstd (>=1.0.0) ; python_version < \"3.14\""]
 
 [[package]]
 name = "virtualenv"
-version = "21.14.1"
+version = "21.14.5"
 description = "Virtual Python Environment builder"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "virtualenv-21.14.1-py3-none-any.whl", hash = "sha256:6fd04089fc0dc33549e7abdff70fc3b63d4e15799f2dbf3281f80d13b9fce522"},
-    {file = "virtualenv-21.14.1.tar.gz", hash = "sha256:719b189804e66678017d9f63bbfc590c44f6b96ab4829513806394f9b375929c"},
+    {file = "virtualenv-21.14.5-py3-none-any.whl", hash = "sha256:b0651e0174982bba17cc6f0aaa2ef496730cb85a3f35eb5d1119d1c904f7d1da"},
+    {file = "virtualenv-21.14.5.tar.gz", hash = "sha256:c4cb6c13e46b57225a999c7e22a09b163393878facc7ac4c059a57f46faa1647"},
 ]
 
 [package.dependencies]
@@ -2690,4 +2690,4 @@ propcache = ">=0.2.1"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "238ac2411fbe2aed98bc0d8fca30dc59e89c1aa8650ed6a2b9ba1150eb828aa2"
+content-hash = "839269a1f9d370e9aa6816d3342315d5f98b1be0fd3c6437e1e62a9449fc2828"

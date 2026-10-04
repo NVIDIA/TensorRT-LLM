@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Sequence, Union
 
@@ -47,11 +50,16 @@ class MultimodalEncoder(_TorchLLM):
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
         checkpoint_format = getattr(self.args, "checkpoint_format", None)
         trust_remote_code = self.args.trust_remote_code
+        input_processor_kwargs = {}
+        video_pruning_rate = self.args.multimodal_config.video_pruning_rate
+        if video_pruning_rate is not None:
+            input_processor_kwargs["video_pruning_rate"] = video_pruning_rate
         self.input_processor = create_input_processor(
             self._hf_model_dir,
             self.tokenizer,
             checkpoint_format,
-            trust_remote_code=trust_remote_code)
+            trust_remote_code=trust_remote_code,
+            **input_processor_kwargs)
         self._tokenizer = self.input_processor.tokenizer
 
         assert isinstance(self.args, TorchLlmArgs)

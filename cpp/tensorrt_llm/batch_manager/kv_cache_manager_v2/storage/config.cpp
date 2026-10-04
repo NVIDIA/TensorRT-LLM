@@ -23,7 +23,9 @@
 #include <algorithm>
 #include <map>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_set>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -204,21 +206,36 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         slotGroups.push_back(std::move(var));
     }
 
-    // Merge equal storage sizes only within the same cache domain.
-    std::map<std::pair<std::string, std::vector<size_t>>, std::vector<SlotDescVariant>> poolGroupsByLayout;
+    // Only matching cache domains and sparsity may share GPU pools.
+    struct PoolGroupKey
+    {
+        std::string cacheDomain;
+        std::vector<size_t> slotSizes;
+        bool isSparse = false;
+
+        bool operator<(PoolGroupKey const& other) const
+        {
+            return std::tie(cacheDomain, slotSizes, isSparse)
+                < std::tie(other.cacheDomain, other.slotSizes, other.isSparse);
+        }
+    };
+
+    std::map<PoolGroupKey, std::vector<SlotDescVariant>> poolGroups;
     for (auto& sg : slotGroups)
     {
-        auto const* attn = std::get_if<AttnLifeCycle>(&registry[sg.lifeCycleId]);
+        auto const sizes = sg.slotSizeList();
+        auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
         std::string const cacheDomain = attn ? attn->cacheDomain : "target";
-        auto sizes = sg.slotSizeList();
-        poolGroupsByLayout[{cacheDomain, sizes.raw()}].push_back(std::move(sg));
+        bool const isSparse = attn != nullptr && attn->isSparse;
+        poolGroups[{.cacheDomain = cacheDomain, .slotSizes = sizes.raw(), .isSparse = isSparse}].push_back(
+            std::move(sg));
     }
 
     StorageConfig out;
     out.cacheTiers = TypedVec<CacheLevel, CacheTierConfig>{config.cacheTiers};
     out.expansion = expansionMap;
 
-    for (auto& [layout, variants] : poolGroupsByLayout)
+    for (auto& [key, variants] : poolGroups)
     {
         SlotDesc sd;
         sd.variants = std::move(variants);

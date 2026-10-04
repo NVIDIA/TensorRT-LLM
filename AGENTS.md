@@ -170,9 +170,9 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 
 ### Advisory semantic review
 
-See [.github/semantic-review.md](.github/semantic-review.md) for the two-hour
-rotating candidate scan, fixed-version AI results, bounded timeout recovery, and manual
-retry procedure.
+The bot-to-bot semantic review workflow is disabled. See
+[.github/semantic-review.md](.github/semantic-review.md) for its current status and
+historical implementation details.
 
 ### Triggering CI
 

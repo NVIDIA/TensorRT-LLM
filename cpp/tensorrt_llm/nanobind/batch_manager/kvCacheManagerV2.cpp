@@ -1342,14 +1342,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__bool__", [](kv::ScratchDesc const& self) { return static_cast<bool>(self); });
 
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
-        .def(nb::init<std::optional<int>, int, std::string>(), nb::arg("window_size").none(),
-            nb::arg("num_sink_blocks"), nb::arg("cache_domain") = "target")
+        .def(nb::init<std::optional<int>, int, bool, std::string>(), nb::arg("window_size").none(),
+            nb::arg("num_sink_blocks"), nb::arg("is_sparse") = false, nb::arg("cache_domain") = "target")
         // Sink tokens round up to whole blocks. Bound rather than repeated in Python so the
         // connector's view of a life cycle is built by the same code as the allocator's.
         .def_static("make", &kv::AttnLifeCycle::make, nb::arg("window_size").none(), nb::arg("num_sink_tokens").none(),
-            nb::arg("tokens_per_block"), nb::arg("cache_domain") = "target")
+            nb::arg("tokens_per_block"), nb::arg("is_sparse") = false, nb::arg("cache_domain") = "target")
         .def_prop_ro("window_size", [](kv::AttnLifeCycle const& self) { return self.windowSize; })
         .def_ro("num_sink_blocks", &kv::AttnLifeCycle::numSinkBlocks)
+        .def_ro("is_sparse", &kv::AttnLifeCycle::isSparse)
         .def_ro("cache_domain", &kv::AttnLifeCycle::cacheDomain)
         .def("get_stale_range", &kv::AttnLifeCycle::getStaleRange, nb::arg("history_length"),
             nb::arg("tokens_per_block"))
@@ -1541,11 +1542,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("assert_valid", &kv::DiskCacheTierConfig::assertValid) DEF_COPY(kv::DiskCacheTierConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>>(), nb::arg("role"), nb::arg("size"),
-            nb::arg("tokens_per_block_override") = std::nullopt)
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool>(), nb::arg("role"), nb::arg("size"),
+            nb::arg("tokens_per_block_override") = std::nullopt, nb::arg("is_sparse") = false)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
-        .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride) DEF_COPY(kv::BufferConfig);
+        .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
+        .def_rw("is_sparse", &kv::BufferConfig::isSparse) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
         .def(

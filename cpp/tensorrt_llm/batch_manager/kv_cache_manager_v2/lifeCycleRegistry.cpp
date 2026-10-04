@@ -35,9 +35,15 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock)
             cfg.validate();
             using T = std::decay_t<decltype(cfg)>;
             if constexpr (std::is_same_v<T, SsmLayerConfig>)
+            {
                 return SsmLifeCycle{};
+            }
             else
-                return AttnLifeCycle::make(cfg.slidingWindowSize, cfg.numSinkTokens, tokensPerBlock, cfg.cacheDomain);
+            {
+                bool const isSparse = !cfg.buffers.empty() && cfg.buffers.front().isSparse;
+                return AttnLifeCycle::make(
+                    cfg.slidingWindowSize, cfg.numSinkTokens, tokensPerBlock, isSparse, cfg.cacheDomain);
+            }
         },
         layer);
 }
