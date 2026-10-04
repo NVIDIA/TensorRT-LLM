@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import ast
+import copy
 import functools
+import gc
 import importlib.util
 import math
 import os
@@ -15,6 +17,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple
+from weakref import WeakKeyDictionary
 
 import pytest
 
@@ -49,6 +52,62 @@ def _extract_class(path: Path, name: str, methods: set[str] | None, namespace: d
     )
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace[name]
+
+
+def test_shared_slot_arena_is_default_and_model_local():
+    source = _TORCH_ROOT / "moe/fused_moe/mega_moe/rebalance_live_arena_v2.py"
+    text = source.read_text()
+    assert "TRTLLM_MOE_REBALANCE_SHARED_SLOTS" not in text
+    assert "TRTLLM_MOE_REBALANCE_SHARED_SLOT_SETS" not in text
+    assert "HierarchicalFabricArenaProvider" not in text
+
+    tree = ast.parse(text)
+    count = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "_HELPER_BANK_COUNT"
+            for target in node.targets
+        )
+    )
+    assert ast.literal_eval(count.value) == 2
+
+    scope_cls = _extract_class(source, "_PoolScope", None, {})
+    registry = WeakKeyDictionary()
+    provider_cls = _extract_class(
+        source,
+        "SharedSlotArenaProvider",
+        {"__init__"},
+        {
+            "_POOL_SCOPE_ATTRIBUTE": "_trtllm_rebalance_shared_slot_scope",
+            "_PoolScope": scope_cls,
+            "_SHARED_SLOT_POOLS": registry,
+        },
+    )
+
+    class StructurallyEqualOwner:
+        def __eq__(self, other):
+            return isinstance(other, StructurallyEqualOwner)
+
+        def __hash__(self):
+            return 1
+
+    first = StructurallyEqualOwner()
+    second = StructurallyEqualOwner()
+    first_provider = provider_cls(first)
+    same_model_provider = provider_cls(first)
+    second_provider = provider_cls(second)
+    cloned_provider = provider_cls(copy.deepcopy(first))
+
+    assert first_provider._pools is same_model_provider._pools
+    assert first_provider._pools is not second_provider._pools
+    assert first_provider._pools is not cloned_provider._pools
+    assert len(registry) == 3
+
+    del second_provider, second
+    gc.collect()
+    assert len(registry) == 2
 
 
 class _Routes:
