@@ -410,6 +410,21 @@ class DynamicResolutionImageTiler:
                         (num_tokens_available // target_patch_width) // required_divisor * required_divisor,
                     )
 
+        if target_patch_height * target_patch_width > num_tokens_available:
+            target_patch_height = max(
+                required_divisor,
+                (num_tokens_available // target_patch_width)
+                // required_divisor
+                * required_divisor,
+            )
+            if target_patch_height * target_patch_width > num_tokens_available:
+                target_patch_width = max(
+                    required_divisor,
+                    (num_tokens_available // target_patch_height)
+                    // required_divisor
+                    * required_divisor,
+                )
+
         num_embeddings = self._get_num_embeddings(target_patch_width, target_patch_height)
         token_count = target_patch_width * target_patch_height
 

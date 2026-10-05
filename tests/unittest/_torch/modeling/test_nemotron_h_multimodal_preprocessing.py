@@ -179,7 +179,7 @@ def test_compute_params_over_budget_scales_down():
 
 
 @pytest.mark.parametrize("img_size", [(65536, 16), (16, 65536)])
-@pytest.mark.parametrize("budget", [64, 256])
+@pytest.mark.parametrize("budget", [4, 64, 256])
 def test_compute_params_panoramic_images(img_size, budget):
     tiler = make_tiler(patch_size=16)
     img = Image.new("RGB", img_size)
