@@ -159,7 +159,6 @@ def _make_single_token_context_graph_batch(
             or request.context_current_position + 1 != request.py_prompt_len
             or request.py_beam_width != 1
             or get_draft_token_length(request) > 0
-            or request.py_is_first_draft
             or request.is_context_only_request
             or request.is_generation_only_request
             or request.py_disaggregated_params is not None
@@ -178,7 +177,6 @@ def _make_single_token_context_graph_batch(
         if (
             request.py_beam_width != 1
             or get_draft_token_length(request) > 0
-            or request.py_is_first_draft
             or request.py_disaggregated_params is not None
         ):
             return scheduled_requests, frozenset()
@@ -3410,7 +3408,6 @@ class DecoderRunner(ScheduledModelRunner):
         extend_requests = []
         extend_dummy_requests = []
         generation_requests = []
-        first_draft_requests = []
         # Collect generation request IDs during categorization to avoid
         # a separate iteration over scheduled_requests.generation_requests later.
         all_gen_request_ids = []
@@ -3440,8 +3437,6 @@ class DecoderRunner(ScheduledModelRunner):
                     extend_dummy_requests.append(request)
                 else:
                     extend_requests.append(request)
-            elif request.py_is_first_draft:
-                first_draft_requests.append(request)
             else:
                 generation_requests.append(request)
         extend_requests += extend_dummy_requests
@@ -3618,35 +3613,6 @@ class DecoderRunner(ScheduledModelRunner):
                     prompt_lengths.append(request.py_prompt_len)
 
             extra_inputs.add_generation_request(request)
-
-        for request in first_draft_requests:
-            request_ids.append(request.py_request_id)
-            draft_lens.append(0)
-            # Only the length and the last (original_max_draft_len+1) tokens are
-            # needed here; get_num_tokens is O(1) and get_tokens_range copies only
-            # the requested window, whereas get_tokens(0) marshals the whole
-            # O(seq_len) VecTokens into a Python list.
-            _num_tokens = request.get_num_tokens(0)
-            begin_compute = _num_tokens - self._config.original_max_draft_len - 1
-            end_compute = begin_compute + self._config.original_max_draft_len + 1
-            prompt_tokens = request.get_tokens_range(0, begin_compute, end_compute)
-            position_ids.extend(range(begin_compute, begin_compute + len(prompt_tokens)))
-            input_ids.extend(prompt_tokens)
-            gather_ids.append(
-                len(input_ids)
-                - 1
-                - (self._config.original_max_draft_len - request.py_num_accepted_draft_tokens)
-            )
-            num_accepted_draft_tokens.append(request.py_num_accepted_draft_tokens)
-
-            sequence_lengths.append(1 + self._config.original_max_draft_len)
-            prompt_lengths.append(request.py_prompt_len)
-            past_seen_token_num = begin_compute
-            num_cached_tokens_per_seq.append(past_seen_token_num - request.py_num_compressed_tokens)
-            extra_inputs.add_generation_request(request)
-
-            # update batch index
-            request.py_batch_idx = request.py_seq_slot
 
         # Cache invariant method result to avoid repeated calls per-request
         _n_gen = len(generation_requests)
@@ -4249,12 +4215,7 @@ class DecoderRunner(ScheduledModelRunner):
                 total_num_tokens=total_num_tokens,
             )
 
-        num_generation_tokens = (
-            len(generation_requests)
-            + len(extend_requests)
-            + sum(draft_lens)
-            + len(first_draft_requests)
-        )
+        num_generation_tokens = len(generation_requests) + len(extend_requests) + sum(draft_lens)
         self.iter_states["num_ctx_requests"] = num_ctx_requests
         self.iter_states["num_ctx_tokens"] = num_ctx_tokens
         self.iter_states["num_generation_tokens"] = num_generation_tokens
@@ -4266,7 +4227,6 @@ class DecoderRunner(ScheduledModelRunner):
                 (
                     (scheduled_requests.context_requests, 1),
                     (extend_requests, 1),
-                    (first_draft_requests, 1),
                     (generation_requests, beam_width if generation_requests else 1),
                 ),
             )
@@ -4300,7 +4260,6 @@ class DecoderRunner(ScheduledModelRunner):
                 and not _has_cp_helix
                 and num_ctx_requests == 0
                 and not extend_requests
-                and not first_draft_requests
                 and _n_gen > 0
                 and previous_batch_len == _n_gen
                 and num_tokens == 0

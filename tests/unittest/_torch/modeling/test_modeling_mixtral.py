@@ -325,7 +325,7 @@ class TestMixtral(unittest.TestCase):
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                key = (1, 0, False)
+                key = (1, 0)
                 graph_runner.capture(key,
                                      lambda inputs: mixtral.forward(**inputs),
                                      inputs)

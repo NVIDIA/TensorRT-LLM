@@ -58,7 +58,6 @@ def get_mrope_dummy_seq_slot(max_num_tokens: int, pp_size: int) -> int:
 class KeyType(NamedTuple):
     batch_size: int
     draft_len: int
-    is_first_draft: bool
     short_seq_len_mode: bool = False
     is_all_greedy_sample: bool = True
     # Sampling tier captured into this graph. FULL means the graph carries no
@@ -329,11 +328,6 @@ class CUDAGraphRunner:
                     # Use the authoritative context cursor so graph keying
                     # matches the decode-shaped input prepared for this row.
                     total_seq_len = request.context_current_position + 1
-                # First draft
-                elif request.py_is_first_draft:
-                    # get_num_tokens is O(1); len(get_tokens(0)) marshals the
-                    # whole O(seq_len) VecTokens into a Python list just for len.
-                    total_seq_len = request.get_num_tokens(0)
                 # With overlap scheduler disabled or dummy request or not assigned to a batch,
                 elif not overlap_scheduler_enabled or request.is_dummy or request.py_batch_idx is None:
                     total_seq_len = request.max_beam_num_tokens + num_draft_tokens
@@ -411,7 +405,6 @@ class CUDAGraphRunner:
             if not request.py_skip_cross_kv_projection)
         return KeyType(batch_size=batch_size,
                        draft_len=draft_len,
-                       is_first_draft=False,
                        short_seq_len_mode=short_seq_len_mode,
                        is_all_greedy_sample=is_all_greedy_sample,
                        sample_type=sample_type,
@@ -664,8 +657,8 @@ class CUDAGraphRunner:
                 enable_spec_decode: bool = False,
                 postprocess_fn: Optional[Callable] = None) -> Any:
         """Warm up and/or capture the forward pass for a graph key."""
-        # Preserve compatibility with direct callers that still pass the
-        # original three-field generation-only tuple.
+        # Preserve compatibility with direct callers that still pass a plain
+        # (batch_size, draft_len) generation-only tuple.
         key = KeyType(*key)
         batch_size = key.batch_size
         # [CUDA graph spec decode padding]
