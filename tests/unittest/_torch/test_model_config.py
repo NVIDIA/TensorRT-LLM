@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import struct
 import types
@@ -124,16 +127,79 @@ def test_validate_and_set_kv_cache_quant_auto_uses_checkpoint():
     assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
 
-def test_validate_and_set_kv_cache_quant_explicit_dtype_overrides():
+@pytest.mark.parametrize(
+    "kv_cache_dtype,expected_quant",
+    [("fp8", QuantAlgo.FP8), ("fp8_ds_mla", QuantAlgo.FP8), ("nvfp4", QuantAlgo.NVFP4)],
+)
+def test_validate_and_set_kv_cache_quant_explicit_dtype_overrides(kv_cache_dtype, expected_quant):
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
-    validate_and_set_kv_cache_quant(model_config, "nvfp4")
-    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+    validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
+    assert model_config.quant_config.kv_cache_quant_algo == expected_quant
 
 
-def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype():
+@pytest.mark.parametrize("is_encoder_decoder", [False, True])
+def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype(is_encoder_decoder):
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
+    model_config.is_encoder_decoder = is_encoder_decoder
     with pytest.raises(ValueError, match="Accepted types are"):
         validate_and_set_kv_cache_quant(model_config, "invalid_dtype")
+
+
+@pytest.mark.parametrize(
+    "kv_cache_dtype,checkpoint_quant",
+    [
+        ("fp8", None),
+        ("fp8_ds_mla", None),
+        ("nvfp4", None),
+        ("fp8", QuantAlgo.NVFP4),
+        ("auto", QuantAlgo.FP8),
+        ("auto", QuantAlgo.NVFP4),
+    ],
+)
+@pytest.mark.parametrize("sm107", [False, True])
+def test_validate_and_set_kv_cache_quant_rejects_quantized_cross_cache(
+    kv_cache_dtype: str,
+    checkpoint_quant: QuantAlgo | None,
+    sm107: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if sm107:
+        _mock_sm107(monkeypatch)
+    model_config = ModelConfig(
+        is_encoder_decoder=True,
+        quant_config=QuantConfig(kv_cache_quant_algo=checkpoint_quant),
+    )
+
+    with pytest.raises(ValueError, match="FP8 and NVFP4.*encoder-decoder"):
+        validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
+
+    assert model_config.quant_config.kv_cache_quant_algo == checkpoint_quant
+
+
+@pytest.mark.parametrize("model_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("is_encoder_decoder", [False, True])
+@pytest.mark.parametrize(
+    "weight_quant,checkpoint_quant",
+    [(None, None), (QuantAlgo.FP8, None), (None, QuantAlgo.INT8)],
+)
+def test_validate_and_set_kv_cache_quant_preserves_unaffected_configs(
+    model_dtype: torch.dtype,
+    is_encoder_decoder: bool,
+    weight_quant: QuantAlgo | None,
+    checkpoint_quant: QuantAlgo | None,
+) -> None:
+    pretrained_config = make_pretrained_config(head_dim=4, is_encoder_decoder=is_encoder_decoder)
+    pretrained_config.torch_dtype = model_dtype
+    model_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        quant_config=QuantConfig(quant_algo=weight_quant, kv_cache_quant_algo=checkpoint_quant),
+    )
+
+    validate_and_set_kv_cache_quant(model_config, "auto")
+
+    assert model_config.quant_config.kv_cache_quant_algo == checkpoint_quant
+    assert model_config.quant_config.quant_algo == weight_quant
+    assert model_config.torch_dtype == model_dtype
 
 
 def _mock_sm107(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -163,6 +163,14 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     effective_kv_cache_quant = (kv_cache_quant if pyt_kv_cache_dtype == "auto"
                                 else mapped_pyt_quant)
+    if (model_config.is_encoder_decoder
+            and effective_kv_cache_quant in (QuantAlgo.FP8, QuantAlgo.NVFP4)):
+        raise ValueError(
+            "FP8 and NVFP4 KV cache quantization is not supported for "
+            "encoder-decoder models in the PyTorch backend. Use "
+            "kv_cache_config.dtype='auto' with a checkpoint without "
+            "KV cache quantization.")
+
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
             and torch.cuda.is_available() and get_sm_version() == 107):
