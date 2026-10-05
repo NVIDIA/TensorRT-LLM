@@ -28,6 +28,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import KvCacheConnectorScheduler
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 
 TOKENS_PER_BLOCK = 32
@@ -638,3 +639,47 @@ class TestPhasesMustAgree:
         manager._deliver_connector_prefix(req)
 
         assert connector.commits == [(0, 64, False)]
+
+
+class FlatOnlyScheduler(KvCacheConnectorScheduler):
+    """A connector that knows nothing of layer groups, as most do."""
+
+    def __init__(self):
+        self.flat_calls = []
+
+    def build_connector_meta(self, scheduler_output):
+        raise NotImplementedError
+
+    def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        raise NotImplementedError
+
+    def request_finished(self, request, cache_block_ids):
+        raise NotImplementedError
+
+    def update_state_after_alloc(self, request, block_ids):
+        self.flat_calls.append(list(block_ids))
+
+
+class TestPerGroupAllocHook:
+    """`update_state_after_alloc_by_layer_group` is additive.
+
+    A page index is scoped to a layer group, so the flat list is only correct
+    for a model with one group. The per-group hook carries the general form,
+    and defaults to a no-op so that a connector written against the flat hook
+    alone is told exactly what it was told before.
+    """
+
+    def test_the_default_leaves_the_flat_hook_as_the_only_report(self):
+        scheduler = FlatOnlyScheduler()
+
+        scheduler.update_state_after_alloc(FakeRequest(), [7, 8, 9])
+        scheduler.update_state_after_alloc_by_layer_group(FakeRequest(), {0: [7, 8, 9]})
+
+        assert scheduler.flat_calls == [[7, 8, 9]]
+
+    def test_the_default_accepts_several_groups_without_guessing_a_flat_list(self):
+        scheduler = FlatOnlyScheduler()
+
+        scheduler.update_state_after_alloc_by_layer_group(FakeRequest(), {0: [7, 8], 1: [9, 10]})
+
+        assert scheduler.flat_calls == []

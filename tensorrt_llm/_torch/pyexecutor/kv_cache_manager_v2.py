@@ -2805,12 +2805,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 continue
             self._deliver_connector_prefix(request)
             request.py_connector_delivered = True
-            # Connectors that do not reason about layer groups see the single
-            # group's indices; with several groups there is no correct flat
-            # list, so report none and leave them to the layer-group-aware
-            # metadata carried on RequestData.
+            # Both forms are reported, as `RequestData` reports both: the flat
+            # list is empty unless the model has a single layer group. A
+            # request parked for an asynchronous load never reaches
+            # `build_scheduler_output`, so this is its only route to either.
             self.kv_connector_manager.update_state_after_alloc(
-                request, self.get_connector_page_indices(request)
+                request,
+                self.get_connector_page_indices(request),
+                self.get_page_indices_by_layer_group(request),
             )
 
         self.kv_connector_manager.build_scheduler_output(scheduled_batch, self)

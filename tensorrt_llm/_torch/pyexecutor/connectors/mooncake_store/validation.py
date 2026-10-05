@@ -137,8 +137,14 @@ def validate_node_budget(
     if config.stage_through_host:
         from .staging import MAX_STAGING_BUFFER_BYTES
 
-        # One pool per direction, and a capacity-only rank opens neither.
+        # One pool per direction, and a capacity-only rank opens neither. The
+        # asynchronous loader adds a second load-side budget, which its worker
+        # threads divide between them. The per-worker slot floor can take them
+        # over that share, by an amount only the page size settles, so a pool
+        # sized right at this limit wants headroom beyond the reserve.
         directions = int(config.role.loads) + int(config.role.saves)
+        if config.async_load and config.role.loads:
+            directions += 1
         staging_claim = ranks_on_node * directions * MAX_STAGING_BUFFER_BYTES
 
     claimed = segment_claim + staging_claim

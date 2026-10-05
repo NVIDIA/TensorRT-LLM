@@ -112,9 +112,8 @@ def plan_slot_geometry(
 class HostStagingPool:
     """A registered pinned buffer, sliced into per-page slots.
 
-    One pool serves one direction. Loads run on the executor thread and saves
-    on the connector's background thread, so sharing slots would need a lock on
-    the transfer path for no benefit.
+    One pool serves one direction, and the asynchronous loader one of its
+    threads, so no transfer path has to take a lock to claim a slot.
     """
 
     def __init__(
