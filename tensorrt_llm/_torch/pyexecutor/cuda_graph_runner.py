@@ -1,6 +1,6 @@
 import bisect
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
                     Tuple, TypeAlias)
 
@@ -9,6 +9,7 @@ import torch
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
                                           DecodingBaseConfig,
+                                          EncodeExtraInputSpec,
                                           SeqLenAwareSparseAttentionConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -18,7 +19,6 @@ from ..distributed import Distributed
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..moe.expert_statistic import ExpertStatistic
-from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
@@ -37,6 +37,11 @@ CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 # as a one-token context chunk to write its cross-KV cache, so enc-dec
 # dummies need one prompt token plus one generated token.
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
+
+
+def get_mrope_dummy_seq_slot(max_num_tokens: int, pp_size: int) -> int:
+    """Cache slot index reserved for MRoPE dummy/no-delta requests."""
+    return max_num_tokens * pp_size
 
 
 class KeyType(NamedTuple):
@@ -122,7 +127,6 @@ class CUDAGraphRunnerConfig:
     use_mrope: bool
     original_max_draft_len: int
     original_max_total_draft_tokens: int
-    is_draft_model: bool
     enable_attention_dp: bool
     is_encoder_decoder: bool
     batch_size: int
@@ -374,52 +378,37 @@ class CUDAGraphRunner:
                        else self._resolve_sample_type(
                            batch, promoted_context_request_ids))
 
-        if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
-                spec_resource_manager, Eagle3ResourceManager):
-            # If 'is_first_draft' is True, even with tree decoding, the length of draft_len will only be 'max_draft_len', not 'max_total_draft_token'.
-            # Because we will pad the input to 'max_draft_len' length for the first draft layer.
-            draft_len = self.config.original_max_draft_len if spec_resource_manager.is_first_draft else 0
-            key = KeyType(batch_size=batch_size,
-                          draft_len=draft_len,
-                          is_first_draft=spec_resource_manager.is_first_draft,
-                          short_seq_len_mode=short_seq_len_mode,
-                          is_all_greedy_sample=is_all_greedy_sample,
-                          sample_type=sample_type,
-                          peft_cache_data_type=peft_cache_data_type,
-                          use_lora_graph=use_lora_graph)
-        else:
-            # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
-            # so we need to get the draft length from the batch instead of using enable_spec_decode.
-            draft_len_list = []
-            for request in batch.generation_requests:
-                draft_len_list.append(len(request.py_draft_tokens))
-            draft_len = max(draft_len_list)
-            assert len(
-                set(draft_len_list)) == 1, "All draft lengths must be the same"
-            context_requests = batch.context_requests
-            num_contexts = len(context_requests)
-            context_query_len = 0
-            if num_contexts:
-                context_query_len = int(context_requests[0].context_chunk_size)
-                if any(
-                        int(request.context_chunk_size) != context_query_len
-                        for request in context_requests[1:]):
-                    return None
-            num_encoder_tokens = sum(
-                int(request.encoder_output_len) for request in context_requests
-                if not request.py_skip_cross_kv_projection)
-            key = KeyType(batch_size=batch_size,
-                          draft_len=draft_len,
-                          is_first_draft=False,
-                          short_seq_len_mode=short_seq_len_mode,
-                          is_all_greedy_sample=is_all_greedy_sample,
-                          sample_type=sample_type,
-                          num_contexts=num_contexts,
-                          context_query_len=context_query_len,
-                          num_encoder_tokens=num_encoder_tokens,
-                          peft_cache_data_type=peft_cache_data_type,
-                          use_lora_graph=use_lora_graph)
-        return key
+        # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
+        # so we need to get the draft length from the batch instead of using enable_spec_decode.
+        draft_len_list = []
+        for request in batch.generation_requests:
+            draft_len_list.append(len(request.py_draft_tokens))
+        draft_len = max(draft_len_list)
+        assert len(
+            set(draft_len_list)) == 1, "All draft lengths must be the same"
+        context_requests = batch.context_requests
+        num_contexts = len(context_requests)
+        context_query_len = 0
+        if num_contexts:
+            context_query_len = int(context_requests[0].context_chunk_size)
+            if any(
+                    int(request.context_chunk_size) != context_query_len
+                    for request in context_requests[1:]):
+                return None
+        num_encoder_tokens = sum(
+            int(request.encoder_output_len) for request in context_requests
+            if not request.py_skip_cross_kv_projection)
+        return KeyType(batch_size=batch_size,
+                       draft_len=draft_len,
+                       is_first_draft=False,
+                       short_seq_len_mode=short_seq_len_mode,
+                       is_all_greedy_sample=is_all_greedy_sample,
+                       sample_type=sample_type,
+                       num_contexts=num_contexts,
+                       context_query_len=context_query_len,
+                       num_encoder_tokens=num_encoder_tokens,
+                       peft_cache_data_type=peft_cache_data_type,
+                       use_lora_graph=use_lora_graph)
 
     def set_capture_sample_type(self,
                                 sample_type: Optional[SampleType]) -> None:
@@ -812,7 +801,8 @@ class CUDAGraphRunner:
                     "replay() got no mrope_delta_read_seq_slots for a "
                     "use_mrope graph; filling the static buffer with the "
                     "dummy seq slot instead of copying real values.")
-                mrope_dummy_seq_slot = self.config.max_num_tokens * self.config.mapping.pp_size
+                mrope_dummy_seq_slot = get_mrope_dummy_seq_slot(
+                    self.config.max_num_tokens, self.config.mapping.pp_size)
                 static_tensors['mrope_delta_read_seq_slots'][:num_slots].fill_(
                     mrope_dummy_seq_slot)
         else:
@@ -1246,6 +1236,11 @@ class EncoderCUDAGraphRunnerConfig:
     feature_dtype: Optional[torch.dtype] = None
     fixed_seq_len: Optional[int] = None
 
+    # Extra tensor inputs declared via EncodeCudaGraphConfig.extra_model_inputs.
+    # Each gets a device buffer (+ pinned host staging) sized at its bucket maximum.
+    cuda_graph_extra_inputs: List[EncodeExtraInputSpec] = field(
+        default_factory=list)
+
 
 class EncoderCUDAGraphRunner:
     """CUDA graph runner for no-cache encoder forward passes.
@@ -1273,7 +1268,23 @@ class EncoderCUDAGraphRunner:
         self.supported_batch_sizes = sorted(config.cuda_graph_batch_sizes)
         self.max_supported_batch_size = config.max_cuda_graph_batch_size
         self.feature_mode = config.feature_shape is not None
+        self.extra_input_specs: List[EncodeExtraInputSpec] = list(
+            config.cuda_graph_extra_inputs or [])
         self.is_encoder_decoder = config.is_encoder_decoder
+        if self.extra_input_specs and (self.feature_mode
+                                       or self.is_encoder_decoder):
+            # Neither mode prepares inputs through the encode-only path that
+            # validates them and synthesizes capture stand-ins: feature mode
+            # stages via its own mirrors, and the encoder-decoder runner
+            # overrides prepare_inputs/_prepare_capture_inputs. The graph would
+            # capture the caller's tensor and then read it stale (or freed).
+            unsupported = ("feature-mode"
+                           if self.feature_mode else "encoder-decoder")
+            raise ValueError(
+                "EncodeCudaGraphConfig.extra_model_inputs is not supported "
+                f"together with {unsupported} encoder CUDA graphs. "
+                f"Declared extra inputs: "
+                f"{[spec.name for spec in self.extra_input_specs]}")
         self.use_fixed_sequence_slots = config.use_fixed_sequence_slots
 
         if self.feature_mode:
@@ -1437,8 +1448,51 @@ class EncoderCUDAGraphRunner:
                        pin_memory=prefer_pinned()),
         }
 
+        self._create_extra_input_buffers(max_total_tokens, max_batch_size)
+
         # Cached arange used by replay() to build packed position_ids in-place via slice copies.
         self._arange_max = torch.arange(max_total_tokens, dtype=torch.int32)
+
+    def _create_extra_input_buffers(self, max_total_tokens: int,
+                                    max_batch_size: int) -> None:
+        """Allocate one static buffer per user-declared extra model input.
+
+        The symbolic axis is sized at its bucket maximum. The pinned host
+        shadow stages host-sourced inputs so their upload stays asynchronous.
+        """
+        for spec in self.extra_input_specs:
+            max_shape = spec.resolve_shape(num_tokens=max_total_tokens,
+                                           batch_size=max_batch_size)
+            torch_dtype = spec.torch_dtype()
+            self.shared_static_tensors[spec.name] = torch.zeros(
+                max_shape, device="cuda", dtype=torch_dtype)
+            self.shared_static_tensors_cpu[spec.name] = torch.zeros(
+                max_shape,
+                device="cpu",
+                dtype=torch_dtype,
+                pin_memory=prefer_pinned())
+
+    @staticmethod
+    def _extra_input_symbolic(spec: EncodeExtraInputSpec) -> Tuple[str, int]:
+        """``(symbolic_dim_name, axis)`` for a spec's single symbolic dim."""
+        return spec.symbolic_dim()
+
+    @staticmethod
+    def _extra_input_padded_size(spec: EncodeExtraInputSpec,
+                                 key: EncoderKeyType) -> int:
+        """Padded bucket size for a spec's symbolic axis.
+
+        - "num_tokens" -> padded_num_tokens (key[1])
+        - "batch_size" -> padded_batch_size (key[0])
+        """
+        sym, _ = spec.symbolic_dim()
+        if sym == "num_tokens":
+            return key[1]
+        if sym == "batch_size":
+            return key[0]
+        # Unreachable: the spec validator pins the symbolic dim to the known set.
+        raise ValueError(
+            f"EncodeExtraInputSpec.shape uses unknown symbolic dim {sym!r}")
 
     @staticmethod
     def _round_up(value: int, supported: List[int]) -> int:
@@ -1833,6 +1887,15 @@ class EncoderCUDAGraphRunner:
             return None, None
         return graph_attn_metadata, key
 
+    @staticmethod
+    def supports_metadata_type(metadata_cls: type) -> bool:
+        """Whether encoder graphs can replay with this attention metadata type.
+
+        Only TRTLLM attention qualifies: other backends (FlashInfer) keep
+        per-batch planner state that breaks graph replay.
+        """
+        return issubclass(metadata_cls, TrtllmAttentionMetadata)
+
     def maybe_get_cuda_graph(
         self,
         inputs: Dict[str, Any],
@@ -1851,10 +1914,7 @@ class EncoderCUDAGraphRunner:
         if not self.enabled:
             return None, None
 
-        # Only TRTLLM attention backend supports encoder CUDA graphs. Other
-        # backends (FlashInfer) have per-batch planner state that breaks
-        # graph replay.
-        if not isinstance(attn_metadata, TrtllmAttentionMetadata):
+        if not self.supports_metadata_type(type(attn_metadata)):
             logger.warning_once(
                 "Encoder CUDA graph only supports TrtllmAttentionMetadata; "
                 "falling back to eager.",
@@ -1986,6 +2046,52 @@ class EncoderCUDAGraphRunner:
             offset = actual_tokens
 
         staged_position_ids[offset:padded_num_tokens].fill_(0)
+
+        # Stage extra inputs for encode_only path
+        self._stage_extra_inputs(key, inputs)
+
+    def _stage_extra_inputs(self, key: EncoderKeyType,
+                            inputs: Dict[str, Any]) -> None:
+        """Copy user-declared extra model inputs into their device buffers.
+
+        These copies are issued eagerly on the current stream, ahead of the
+        replay, instead of being captured: callers may pass host or device
+        tensors, and a captured H2D would push device tensors through a
+        blocking D2H into the host shadow and back. Host sources are staged in
+        the pinned shadow so the upload stays asynchronous; device sources copy
+        D2D. The zero-filled tail covers the dummy requests ``pad_batch``
+        appends (batch_size specs) and token padding within the bucket
+        (num_tokens specs). ``encode()`` has already validated dtype/rank/shape,
+        so a failure here means an internal contract break.
+        """
+        for spec in self.extra_input_specs:
+            user_tensor = inputs[spec.name]
+            sym, axis = self._extra_input_symbolic(spec)
+            actual_len = int(user_tensor.shape[axis])
+            padded_size = self._extra_input_padded_size(spec, key)
+            if actual_len > padded_size:
+                raise ValueError(
+                    f"extra_model_inputs[{spec.name!r}]: tensor length "
+                    f"{actual_len} along symbolic {sym!r} axis exceeds "
+                    f"padded bucket size {padded_size}")
+            pad_len = padded_size - actual_len
+            device_buf = torch.narrow(self.shared_static_tensors[spec.name],
+                                      axis, 0, padded_size)
+            if user_tensor.is_cuda:
+                torch.narrow(device_buf, axis, 0,
+                             actual_len).copy_(user_tensor, non_blocking=True)
+                if pad_len > 0:
+                    torch.narrow(device_buf, axis, actual_len, pad_len).zero_()
+            else:
+                # retire_staging() has already waited out the previous replay,
+                # so no in-flight upload still reads this shadow.
+                host_buf = torch.narrow(
+                    self.shared_static_tensors_cpu[spec.name], axis, 0,
+                    padded_size)
+                torch.narrow(host_buf, axis, 0, actual_len).copy_(user_tensor)
+                if pad_len > 0:
+                    torch.narrow(host_buf, axis, actual_len, pad_len).zero_()
+                device_buf.copy_(host_buf, non_blocking=True)
 
     def _stage_encoder_decoder_inputs(
         self,
@@ -2146,6 +2252,13 @@ class EncoderCUDAGraphRunner:
             self.shared_static_tensors_cpu["position_ids"]
             [:, :padded_num_tokens],
         }
+        # Narrow each extra input along its symbolic axis to this bucket's
+        # padded size so the captured graph sees the shape it will see at replay.
+        for spec in self.extra_input_specs:
+            _, axis = self._extra_input_symbolic(spec)
+            padded_size = self._extra_input_padded_size(spec, key)
+            sliced_static_tensors[spec.name] = torch.narrow(
+                self.shared_static_tensors[spec.name], axis, 0, padded_size)
 
         capture_inputs = dict(inputs)
         capture_inputs.update(sliced_static_tensors)

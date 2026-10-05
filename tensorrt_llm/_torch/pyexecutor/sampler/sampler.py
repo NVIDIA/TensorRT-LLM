@@ -83,6 +83,7 @@ from .sampler_features import (
     apply_embedding_bias,
     check_stop_words_length,
     fast_greedy_sample_kernel,
+    meet_stop_token_criteria,
     scatter_new_tokens,
 )
 from .sampler_strategy import (
@@ -299,6 +300,9 @@ class MultimodalResult:
 
     def __post_init__(self) -> None:
         num_embeddings = len(self.mm_embeddings)
+        metadata = (self.extra_data or {}).get("mm_embedding_metadata")
+        if metadata is not None and len(metadata) != num_embeddings:
+            raise ValueError("mm_embedding_metadata batch size does not match mm_embeddings")
         num_lengths = len(self.mm_embedding_lengths)
         if num_lengths != num_embeddings:
             raise ValueError(
@@ -400,7 +404,13 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             request = requests[request_index]
             mm_embedding_lengths = state.data.mm_embedding_lengths[result_index]
 
-            request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
+            embedding_metadata = extra_data.get("mm_embedding_metadata")
+            if embedding_metadata is None:
+                request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
+            else:
+                request.py_result.append_mm_embeddings(
+                    mm_embedding, mm_embedding_lengths, embedding_metadata[result_index]
+                )
 
             # Store mrope data if available
             if mrope_position_ids is not None and mrope_position_deltas is not None:
@@ -634,9 +644,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # Number of leading rows of the fast-tier buffers the staged batch fills.
         self._fast_num_rows: int = 0
 
-        # AutoDeploy build creates the sampler in inference mode,
-        # which would disallow in-place mutating of new_tokens.
-        # So, we temporarily exit inference mode.
+        # The sampler can be created in inference mode, which disallows
+        # in-place mutation of new_tokens. Temporarily exit inference mode.
         with torch.inference_mode(False):
             self.store = self._create_store()
             self._request_grouper: _CachingRequestGrouper[Any] = _CachingRequestGrouper(
@@ -1713,7 +1722,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 or request.max_beam_num_tokens >= self.max_seq_len
             ):
                 request.finish_by(FinishReason.LENGTH, DEFAULT_BEAM_IDX)
-            elif request.py_stop_words_list and new_token in request.py_stop_words_list[0]:
+            elif meet_stop_token_criteria(request, new_token, DEFAULT_BEAM_IDX):
                 request.finish_by(FinishReason.STOP_WORDS, DEFAULT_BEAM_IDX)
             request.py_num_accepted_draft_tokens = 0
             request.py_rewind_len = 0

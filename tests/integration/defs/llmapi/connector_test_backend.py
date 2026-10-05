@@ -34,6 +34,7 @@ class RecordingConnectorWorker(PersistentKvCacheConnectorWorker):
     def __init__(self, llm_args: TorchLlmArgs) -> None:
         super().__init__(llm_args)
         self._pending_load_ids: set[int] = set()
+        self._pending_prefix_load_ids: list[int] = []
 
     def register_kv_cache_layout(self, layout: KvCacheLayout) -> None:
         super().register_kv_cache_layout(layout)
@@ -51,6 +52,20 @@ class RecordingConnectorWorker(PersistentKvCacheConnectorWorker):
                     atol=0,
                 )
             _record("loaded_blocks", len(self._metadata.load))
+
+    def get_finished_prefix_loads(self) -> list[int]:
+        finished = super().get_finished_prefix_loads()
+        if os.environ.get("CONNECTOR_TEST_STALL") == "1":
+            if finished:
+                _record("withheld_prefix_load", len(finished))
+            return []
+        if os.environ.get("CONNECTOR_TEST_ASYNC") == "1":
+            ready = self._pending_prefix_load_ids
+            self._pending_prefix_load_ids = finished
+            if ready:
+                _record("async_finished", len(ready))
+            return ready
+        return finished
 
     def get_finished(
         self, finished_gen_req_ids: list[int], started_loading_req_ids: list[int]
@@ -71,6 +86,15 @@ class RecordingConnectorScheduler(PersistentKvCacheConnectorLeader):
         super().__init__(llm_args)
         self._async_ids: set[int] = set()
         self._async_loads: list[tuple[Path, int]] = []
+
+    def reserve_prefix(
+        self, request: LlmRequest, num_computed_tokens: int, reservation_id: int
+    ) -> tuple[int, bool]:
+        asynchronous = os.environ.get("CONNECTOR_TEST_ASYNC") == "1"
+        if asynchronous and mpi_rank() != 0:
+            return 0, False
+        matched, _ = super().reserve_prefix(request, num_computed_tokens, reservation_id)
+        return matched, bool(matched and asynchronous)
 
     def get_num_new_matched_tokens(
         self, request: LlmRequest, num_computed_tokens: int
@@ -103,3 +127,31 @@ class RecordingConnectorScheduler(PersistentKvCacheConnectorLeader):
         metadata.load.extend(self._async_loads)
         self._async_loads = []
         return metadata
+
+
+def _run_timeout_consumer() -> None:
+    """One disposable process owns the executor that is expected to fail."""
+    import sys
+    import traceback
+
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig
+
+    options = json.loads(sys.argv[1])
+    options["kv_cache_config"] = KvCacheConfig(**options["kv_cache_config"])
+    options["kv_connector_config"] = KvCacheConnectorConfig(**options["kv_connector_config"])
+    prompt = sys.argv[2]
+    try:
+        with LLM(**options) as llm:
+            llm.generate([prompt] * 2, SamplingParams(max_tokens=8, ignore_eos=True))
+    except Exception:
+        traceback.print_exc()
+        sys.stderr.flush()
+        # Fatal connector failures require process exit; never construct a
+        # replacement executor or reuse a potentially damaged worker here.
+        os._exit(86)
+    raise AssertionError("The stalled connector unexpectedly completed")
+
+
+if __name__ == "__main__":
+    _run_timeout_consumer()

@@ -138,7 +138,8 @@ SLURM_NON_TERMINAL_STATES = [
 BOLT_WORKLOADS = [
     [name: "dsr1_agg_1k1k_c2",     testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_tp4_mtp3_1k1k]"],
     [name: "dsr1_agg_8k1k_c2",     testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_tp4_mtp3_8k1k]"],
-    [name: "dsr1_agg_1k1k_c1024",  testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]"],
+    // re-enable after TRTLLMINF-443
+    //[name: "dsr1_agg_1k1k_c1024",  testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]"],
     // --- disagg (multi-node): OUT OF SCOPE for this PR, left commented out.
     //     Disagg gen-worker bring-up under BOLT instrumentation is still flaky
     //     (servers hang / a gen worker crashes at startup), and the fan-out is
@@ -407,15 +408,19 @@ def submitProfileGen(pipeline)
         // then every later run just does a local lustre extract from the cached
         // .tar.xz (no WAN). The one-time fetch reuses fetch_verified().
         def llvmArch = (TARGET_ARCH == AARCH64_TRIPLE) ? "ARM64" : "X64"
-        def llvmVer  = "21.1.5"   // keep in sync with internal/slurm_merge.sh LLVM_BOLT_VERSION
-        def llvmTb   = "LLVM-${llvmVer}-Linux-${llvmArch}.tar.xz"
         // Cache lives OUTSIDE the bolt-ci retention root (purged at depth 4 after 7
         // days) so the per-run workspace reaper can't delete it.
         def llvmCacheDir = "${scratch}/users/svc_tensorrt/bolt-cache/llvm"
+        // The pin is read from the extracted tree (this stage runs after "Bootstrap:
+        // extract tarball"), so the collect hook, the merge job and this bootstrap
+        // all resolve the same llvm-bolt from one file. Tarball name and cache key
+        // are therefore built shell-side, where the version is known.
         def llvmStage = """
-            LLVM_URL='https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/${llvmTb}'
+            . '${ws}/TensorRT-LLM/src/scripts/bolt/internal/llvm_bolt_version.sh'
+            LLVM_TB="LLVM-\${LLVM_BOLT_VERSION}-Linux-${llvmArch}.tar.xz"
+            LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-\${LLVM_BOLT_VERSION}/\${LLVM_TB}"
             LLVM_CACHE_DIR='${llvmCacheDir}'
-            LLVM_CACHE_TB='${llvmCacheDir}/${llvmTb}'
+            LLVM_CACHE_TB="${llvmCacheDir}/\${LLVM_TB}"
             LLVM_DIR='${ws}/builds/llvm'
             PARTS=16
         """.stripIndent() + boltFetchLib + '''
@@ -759,7 +764,13 @@ def promoteBundle(pipeline, remote, String bundle)
         cat > "${netrc}"
         chmod 600 "${netrc}"
         curl -fsS --netrc-file "${netrc}" --retry 5 --retry-all-errors -T "${bundle}" "${base}/${bundleName}"
-        curl -fsS --netrc-file "${netrc}" --retry 5 --retry-all-errors -T "${bundle}" "${base}/latest.tar.gz"
+        # Matrix parameters label latest.tar.gz with the ref it now points at, so a
+        # consumer can resolve "which bundle is current" with a small metadata GET
+        # instead of downloading the bundle to read its manifest. Set in the SAME
+        # request as the upload, so the label and the bytes can never disagree --
+        # a separate pointer object would leave a window where they do.
+        curl -fsS --netrc-file "${netrc}" --retry 5 --retry-all-errors -T "${bundle}" \\
+             "${base}/latest.tar.gz;bolt.ref=${BOLT_REF};bolt.branch=${BRANCH};bolt.triple=${TRIPLE}"
     """.stripIndent()
     pipeline.withCredentials([pipeline.usernamePassword(credentialsId: 'urm-artifactory-creds',
             usernameVariable: 'ART_USER', passwordVariable: 'ART_PASS')]) {
@@ -768,7 +779,7 @@ def promoteBundle(pipeline, remote, String bundle)
         Utils.exec(pipeline, timeout: false, numRetries: 2, noNVDFEvent: true,
             script: feed + Utils.sshUserCmd(remote, b64BashRemoteCmdStdin(promote, "${bundle}.promote.sh")))
     }
-    pipeline.echo("Promoted. latest = ${base}/latest.tar.gz")
+    pipeline.echo("Promoted. latest = ${base}/latest.tar.gz (bolt.ref=${BOLT_REF})")
 }
 
 // ---------------------------------------------------------------------------

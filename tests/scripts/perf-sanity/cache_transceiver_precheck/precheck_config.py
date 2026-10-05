@@ -350,7 +350,9 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
     benchmark = cfg.get("benchmark", {}) or {}
 
     yaml_mode = str(benchmark.get("mode", ""))
-    if benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode:
+    if benchmark_mode == "gen_only_no_context" or (
+        benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode
+    ):
         # No ctx workers at launch -> no KV transfer in the real test either.
         return {"skip": True, "skip_reason": "gen_only_no_context mode has no KV transfer"}
 

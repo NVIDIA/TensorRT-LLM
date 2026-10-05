@@ -35,12 +35,20 @@ from typing import (
 # From _common.py
 NDEBUG: Final[int]
 DEFAULT_BEAM_INDEX: Final[BeamIndex]
+BAD_PAGE_INDEX: Final[int]
+GPU_LEVEL: Final[CacheLevel]
+CACHE_LEVEL1: Final[CacheLevel]
 
 class CorruptedError(Exception):
-    """Raised by every public entry point once a broken invariant has been recorded.
+    """Raised by every public entry point once a broken invariant has been recorded."""
 
-    Only the C++ backend has the latch that raises this; the pure-Python backend never does.
-    """
+class CuError(Exception):
+    """A CUDA driver call failed; carries the driver's own status code."""
+
+    error_code: Any
+
+class OutOfMemoryError(Exception): ...
+class OutOfPagesError(OutOfMemoryError): ...
 
 def poison_reason() -> str | None:
     """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
@@ -56,12 +64,36 @@ class CacheTier(enum.IntEnum):
     HOST_MEM = 1
     DISK = 2
 
+class PageStatus(enum.Enum):
+    LOCKED = enum.auto()
+    HELD = enum.auto()
+    DROPPABLE = enum.auto()
+
 class PageIndexMode(enum.IntEnum):
     SHARED = 0
     PER_LAYER = 1
 
 LifeCycleId = NewType("LifeCycleId", int)
 LayerGroupId: TypeAlias = LifeCycleId
+
+class AttnLifeCycle:
+    """The attention life cycle, keyed by its window, sink-token shape, and sparsity."""
+
+    @staticmethod
+    def make(
+        window_size: int | None,
+        num_sink_tokens: int | None,
+        tokens_per_block: int,
+        is_sparse: bool = False,
+    ) -> "AttnLifeCycle": ...
+    @property
+    def window_size(self) -> int | None: ...
+    @property
+    def num_sink_blocks(self) -> int: ...
+    @property
+    def is_sparse(self) -> bool: ...
+    def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
+
 CacheLevel = NewType("CacheLevel", int)
 TokenId = NewType("TokenId", int)
 TokenIdExt = Union[TokenId, bytes]
@@ -73,6 +105,7 @@ class ReuseScope(NamedTuple):
     lora_id: int | None = None
     salt: int | None = None
 
+SlidingWindowSize: TypeAlias = int | None
 LayerId = NewType("LayerId", int)
 CudaStream = NewType("CudaStream", int)
 BeamIndex = NewType("BeamIndex", int)
@@ -187,6 +220,7 @@ class BufferConfig:
     role: DataRole
     size: int
     tokens_per_block_override: int | None = None
+    is_sparse: bool = False
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
@@ -305,6 +339,7 @@ class KVCacheEventManager:
         attention_dp_gather: AttentionDpGatherFn | None = None,
         hash_algo: str = ...,
         window_size_by_layer_group: dict[int, int] | None = None,
+        mm_token_id_offset: int | None = None,
     ) -> None: ...
     def add_created_event(
         self,
@@ -333,7 +368,7 @@ class KVCacheEventManager:
     def flush_iteration_events(self) -> None: ...
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]: ...
 
-# Backend-neutral key builders (native C++ under the C++ backend, pure-Python otherwise).
+# Native key builders, shared with the radix tree so routing hashes match the engine's.
 def gen_multimodal_cache_key_tokens(
     id_offset: int,
     multi_modal_data_digest: bytes,
@@ -351,6 +386,8 @@ class _Status(enum.Enum):
     ACTIVE = enum.auto()
     SUSPENDED = enum.auto()
     CLOSED = enum.auto()
+
+KvCacheStatus: TypeAlias = _Status
 
 IndexSeq = array.array[int] | memoryview[int]
 
@@ -547,7 +584,6 @@ class KVCacheManager:
         self,
         config: KVCacheManagerConfig,
         event_manager: KVCacheEventManager | None = None,
-        # C++ backend only; the pure-Python backend does not accept this parameter.
         cold_page_codec: IKvCacheColdPageCodec | None = None,
     ) -> None: ...
     def __del__(self) -> None: ...
@@ -577,6 +613,11 @@ class KVCacheManager:
         reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
     ) -> int: ...
+    def probe_first_new_block_key(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        input_tokens: Sequence[TokenIdExt] | None = None,
+    ) -> bytes | None: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     def get_storage_statistics(self, cache_level: CacheLevel = ...) -> list[StorageStatistics]: ...
@@ -639,3 +680,6 @@ class KVCacheManager:
     def need_adjustment(self) -> bool: ...
     @property
     def commit_min_snapshot(self) -> bool: ...
+
+def exact_div(x: int, y: int) -> int: ...
+def typed_range(*args: int) -> range: ...

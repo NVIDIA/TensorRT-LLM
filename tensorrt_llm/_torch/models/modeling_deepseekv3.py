@@ -713,6 +713,7 @@ class DeepseekV3Linear(Linear):
         reduce_output: bool = True,  # ROW parallel only
         skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
+        use_cute_dsl_bf16_gemm: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
         lora: Optional[LoraLayer] = None,
     ):
@@ -720,16 +721,17 @@ class DeepseekV3Linear(Linear):
             in_features,
             out_features,
             bias,
-            dtype,
-            mapping,
-            tensor_parallel_mode,
-            gather_output,
-            quant_config,
-            weights_loading_config,
-            reduce_output,
-            skip_create_weights_in_init,
-            use_custom_cublas_mm,
-            lora,
+            dtype=dtype,
+            mapping=mapping,
+            tensor_parallel_mode=tensor_parallel_mode,
+            gather_output=gather_output,
+            quant_config=quant_config,
+            weights_loading_config=weights_loading_config,
+            reduce_output=reduce_output,
+            skip_create_weights_in_init=skip_create_weights_in_init,
+            use_custom_cublas_mm=use_custom_cublas_mm,
+            use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            lora=lora,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
         )
 
@@ -739,7 +741,12 @@ class DeepseekV3Linear(Linear):
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
         num_tokens = input.shape[0]
-        if (not self.has_any_quant and 1 <= num_tokens <= 16
+        has_any_quant = self.has_any_quant
+        use_cute_dsl_bf16_gemm = (self.use_cute_dsl_bf16_gemm
+                                  and not has_any_quant and is_sm_100f()
+                                  and self.weight.dtype == torch.bfloat16)
+        if (not use_cute_dsl_bf16_gemm and not has_any_quant
+                and 1 <= num_tokens <= 16
                 and get_sm_version() not in [120, 121]):
             output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
                 input, self.weight.t(), bias, None)
@@ -793,6 +800,7 @@ class DeepseekV3Attention(MLA):
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
             use_custom_cublas_mm=True,
+            use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm,
             use_cute_dsl_blockscaling_mm=model_config.
             use_cute_dsl_blockscaling_mm,
         )
@@ -843,7 +851,8 @@ class DeepseekV32Attention(MLA):
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+            use_custom_cublas_mm=True,
+            use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm)
 
 
 class DeepseekV3Gate(nn.Module):

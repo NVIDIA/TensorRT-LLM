@@ -14,6 +14,7 @@ l0_gb200_multi_gpus:
       stage: pre_merge
       backend: pytorch
   tests:
+  - unittest/_torch/moe/multi_gpu/test_moe_a2a_workspace.py TIMEOUT (10)
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_mhc.py
   # ---- curated pre-merge smoke set: diversify moe_backend across CUTLASS/TRTLLM/CUTEDSL ----
@@ -44,6 +45,7 @@ l0_gb200_multi_gpus:
   - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_b_overlap]
   - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_a_uniform_contention_opt]
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm
+  - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_nccl_ep_capability_e2e
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_nccl_ep_cuda_graph_replay_uses_updated_routing
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_checkpoint_preserves_cuda_graph_addresses

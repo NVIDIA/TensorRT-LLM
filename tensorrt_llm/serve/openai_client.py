@@ -38,12 +38,9 @@ from pydantic import BaseModel
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.conversation_id import (
-    SUBAGENT_AFFINITY_HEADER,
-    get_request_subagent_affinity_id,
-)
 from tensorrt_llm.serve.disagg_auth import (
     build_internal_disagg_auth_headers,
+    build_subagent_affinity_headers,
     request_requires_internal_disagg_auth,
 )
 from tensorrt_llm.serve.openai_protocol import (
@@ -211,11 +208,9 @@ class OpenAIHttpClient(OpenAIClient):
         self._internal_disagg_auth_key = internal_disagg_auth_key
 
     def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
-        headers: dict[str, str] = {}
-        # Carry rank affinity in a header so older workers can ignore it.
-        affinity_id = get_request_subagent_affinity_id(request)
-        if affinity_id is not None:
-            headers[SUBAGENT_AFFINITY_HEADER] = affinity_id
+        headers = build_subagent_affinity_headers(
+            self._internal_disagg_auth_key, request, self._role
+        )
         if self._role == ServerRole.GENERATION and request_requires_internal_disagg_auth(request):
             headers.update(
                 build_internal_disagg_auth_headers(self._internal_disagg_auth_key, request)
@@ -264,6 +259,21 @@ class OpenAIHttpClient(OpenAIClient):
                 server, _ = await self._router.get_next_server(request)
             else:
                 server, _ = await self._router.get_next_server(request, req_id=req_id)
+        # A retry below re-issues disagg_request_id, but the router keyed this
+        # request's reservation by the id it was routed with. Pin that id here so
+        # every later renew/finish still addresses the original reservation --
+        # otherwise the coordinator never sees a release for it and the placement
+        # load only drains when the expiration task fires. Only the context role
+        # needs this: the coordinator keys generation requests by ctx_request_id,
+        # which the retry loop never rewrites.
+        if (
+            req_id is None
+            and self._role == ServerRole.CONTEXT
+            and self._disagg_id_generator is not None
+        ):
+            pinned_dp = request.disaggregated_params
+            if pinned_dp is not None:
+                req_id = pinned_dp.disagg_request_id
         url = f"http://{server}/{endpoint}"
         # disaggregated_params is None when conditional_disagg bypasses ctx.
         _dp = request.disaggregated_params
@@ -309,6 +319,8 @@ class OpenAIHttpClient(OpenAIClient):
         _TRANSIENT_TCP_BUDGET = 0 if self._no_retry else 5
         loop_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET) + 1
         for attempt in range(loop_max):
+            if attempt > 0:
+                await self._router.renew_request(request, req_id=req_id)
             # Regenerate disagg_request_id on retry to avoid ID collision on workers
             if attempt > 0 and self._disagg_id_generator is not None:
                 dp = getattr(request, "disaggregated_params", None)
@@ -429,6 +441,7 @@ class OpenAIHttpClient(OpenAIClient):
                     f"{self._role} client error to {url}: {e} - retry {attempt} of {effective_max}",
                     traceback.format_exc(),
                 )
+                await self._router.renew_request(request, req_id=req_id)
                 await asyncio.sleep(self._retry_interval_sec)
                 self._metrics_collector.retry_requests.inc()
             except Exception as e:

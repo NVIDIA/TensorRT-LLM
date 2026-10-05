@@ -19,6 +19,8 @@ l0_dgx_h100:
   - llmapi/test_llm_api_connector.py::test_connector_adp_persistent_pool[True]
   - llmapi/test_llm_api_connector.py::test_connector_adp_async_without_dummy[False]
   - llmapi/test_llm_api_connector.py::test_connector_adp_async_without_dummy[True]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_transfer_timeout[False]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_transfer_timeout[True]
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu2"
   - unittest/_torch/multi_gpu -m "not post_merge" TIMEOUT (90)
@@ -125,7 +127,6 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_genbs1[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_python_transceiver_host_offload[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-TinyLlama-1.1B-Chat-v1.0]
   - accuracy/test_disaggregated_serving.py::TestQwen3_5_4B::test_ctx_pp_gen_tp_asymmetric

@@ -1308,6 +1308,8 @@ class KVCacheManager(BaseResourceManager):
                 if capture_sampling_params is not None else None,
                 top_p=capture_sampling_params.top_p
                 if capture_sampling_params is not None else None,
+                min_p=capture_sampling_params.min_p
+                if capture_sampling_params is not None else None,
             )
             # Here 1+max_num_draft_tokens is used to extend the prompt length to
             # a non-zero number to skip illegal memory access issue in MLA kernel

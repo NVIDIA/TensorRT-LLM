@@ -222,6 +222,15 @@
       "path": "cuda_graph_config.enable_padding"
     },
     {
+      "allowed_values": [
+        "num_tokens",
+        "batch_size"
+      ],
+      "capture_policy": "tuple[int|literal]",
+      "kind": "categorical",
+      "path": "cuda_graph_config.extra_model_inputs.shape"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "cuda_graph_config.max_batch_size"
@@ -384,7 +393,17 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "enable_return_routed_experts"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "enable_speculative_beam_history_d2h"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_tokenization_cache"
     },
     {
       "capture_policy": "bool",
@@ -400,6 +419,15 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "encoder_cuda_graph_config.enable_padding"
+    },
+    {
+      "allowed_values": [
+        "num_tokens",
+        "batch_size"
+      ],
+      "capture_policy": "tuple[int|literal]",
+      "kind": "categorical",
+      "path": "encoder_cuda_graph_config.extra_model_inputs.shape"
     },
     {
       "capture_policy": "int",
@@ -493,6 +521,11 @@
       "path": "guided_decoding_backend"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "iter_perf_stats_interval"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "iter_stats_max_iterations"
@@ -563,6 +596,11 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "kv_cache_config.block_reuse_config.policy"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens"
     },
     {
       "capture_policy": "bool",
@@ -906,6 +944,7 @@
         "AUTO",
         "CUTLASS",
         "CUTEDSL",
+        "CUTEDSL_FC12",
         "TRTLLM",
         "DEEPGEMM",
         "DENSEGEMM",
@@ -1067,6 +1106,11 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "peft_cache_config.optimal_adapter_size"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "per_request_spec_decode_stats"
     },
     {
       "capture_policy": "int",
@@ -1288,6 +1332,16 @@
       "path": "sparse_attention_config.enable_heuristic_topk"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.enable_kv_cache_offload"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.fuse_qkv_index_projection"
+    },
+    {
       "allowed_values": [
         "triton",
         "msa"
@@ -1477,6 +1531,11 @@
       "path": "sparse_attention_config.use_self_sampling_topk"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.uses_spcompress"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "sparse_attention_config.window_size"
@@ -1511,7 +1570,9 @@
       "allowed_values": [
         "VANILLA",
         "TRTLLM",
-        "FA4"
+        "FA4",
+        "AUTO",
+        "CUTEDSL"
       ],
       "capture_policy": "literal",
       "kind": "categorical",
@@ -1650,6 +1711,7 @@
         "AUTO",
         "CUTLASS",
         "CUTEDSL",
+        "CUTEDSL_FC12",
         "TRTLLM",
         "DEEPGEMM",
         "DENSEGEMM",
@@ -1692,6 +1754,11 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "speculative_config.sa_config.threshold"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.skip_ctx_buffer_budget_check"
     },
     {
       "capture_policy": "list[int]|none",

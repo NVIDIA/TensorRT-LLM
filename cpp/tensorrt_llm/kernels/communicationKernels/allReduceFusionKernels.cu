@@ -652,7 +652,7 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
         }
     }
     int threads_per_token = params.hidden_dim / kElemsPerAccess<DType>;
-    // Cluster launch is supported on Hopper (SM90) and datacenter Blackwell (SM100/SM103),
+    // Cluster launch is supported on Hopper (SM90) and datacenter Blackwell/Rubin (SM100/SM103/SM107),
     // but NOT on workstation Blackwell (SM120/SM121) which lacks cluster launch hardware.
     int cluster_size;
     bool const supports_cluster = (SM >= 90 && SM < 120);

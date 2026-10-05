@@ -31,7 +31,11 @@ from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .sparse_attention import SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig
+from .sparse_attention import (
+    SkipSoftmaxAttentionConfig,
+    SolAttentionConfig,
+    VideoSparseAttentionConfig,
+)
 
 # =============================================================================
 # Type aliases
@@ -95,7 +99,7 @@ class QuantAttentionConfig(StrictBaseModel):
 
 # Discriminated union of sparse attention configs.
 SparseAttentionConfig = Annotated[
-    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig],
+    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig, SolAttentionConfig],
     Field(discriminator="algorithm"),
 ]
 
@@ -122,7 +126,8 @@ class AttentionConfig(StrictBaseModel):
         status="prototype",
         description=(
             "Sparse attention recipe. Discriminated by algorithm: "
-            "skip_softmax (TRTLLM / CUTEDSL backends) or VSA (CUTEDSL backend)."
+            "skip_softmax (TRTLLM / CUTEDSL backends), vsa (CUTEDSL / TRTLLM backends), "
+            "or sol_attn (TRTLLM / CUTEDSL backends)."
         ),
     )
 
@@ -219,7 +224,8 @@ class AttentionConfig(StrictBaseModel):
         algo = self.sparse_attention_config.algorithm
         supported_backends = {
             "skip_softmax": ("TRTLLM", "CUTEDSL"),
-            "vsa": ("CUTEDSL",),
+            "vsa": ("CUTEDSL", "TRTLLM"),
+            "sol_attn": ("TRTLLM", "CUTEDSL"),
         }.get(algo)
         if supported_backends is None:
             return self
@@ -234,21 +240,19 @@ class AttentionConfig(StrictBaseModel):
         return self
 
     @model_validator(mode="after")
-    def _validate_cutedsl_quant_sparse_mutex(self) -> "AttentionConfig":
-        # VSA replaces the dense CuTeDSL path and cannot compose with quantized
-        # attention. SkipSoftmax is part of that dense path and can compose.
-        if (
-            self.backend == "CUTEDSL"
-            and self.quant_attention_config is not None
-            and self.sparse_attention_config is not None
-            and self.sparse_attention_config.algorithm == "vsa"
-        ):
-            raise ValueError(
-                "CUTEDSL backend: quant_attention_config and VSA "
-                "sparse_attention_config are mutually exclusive (the "
-                "CuTeDSLAttention dispatcher selects either the dense path "
-                "or the sparse VSA path, not both)."
-            )
+    def _validate_quant_sparse_mutex(self) -> "AttentionConfig":
+        if self.quant_attention_config is None or self.sparse_attention_config is None:
+            return self
+
+        # VSA and SOL replace the dense attention path on every backend that
+        # serves them and never consume quant_attention_config, so accepting a
+        # quantization recipe would silently ignore user configuration.
+        # SkipSoftmax is part of the dense path itself and can compose.
+        algorithm = self.sparse_attention_config.algorithm
+        if algorithm == "vsa":
+            raise ValueError("VSA and quant_attention_config are mutually exclusive.")
+        if algorithm == "sol_attn":
+            raise ValueError("SOL and quant_attention_config are mutually exclusive.")
         return self
 
 
@@ -838,7 +842,9 @@ __all__ = [
     "QuantAttentionConfig",
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
+    "SolAttentionConfig",
     "VideoSparseAttentionConfig",
+    "SolAttentionConfig",
     "AttentionConfig",
     "VAEConfig",
     "ParallelConfig",

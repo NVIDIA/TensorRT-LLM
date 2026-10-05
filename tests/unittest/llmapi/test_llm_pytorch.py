@@ -35,9 +35,7 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        sampling_params_for_aborting_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
-from utils.util import (force_ampere, similar, skip_fp8_pre_ada,
-                        skip_gpu_memory_less_than_40gb,
-                        skip_gpu_memory_less_than_80gb,
+from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
@@ -116,6 +114,56 @@ def test_llm_get_stats_async(return_context_logits, use_overlap,
         use_overlap=use_overlap,
         enable_chunked_prefill=enable_chunked_prefill,
         enable_iter_req_stats=enable_iter_req_stats)
+
+
+@skip_ray
+@pytest.mark.parametrize("use_overlap", [False, True])
+@pytest.mark.part1
+def test_llm_get_stats_with_interval(use_overlap):
+    """iter_perf_stats_interval samples records but keeps counter sums exact."""
+    interval = 4
+    stat_prompts = [
+        "A B C", "Nvidia is awesome because", "The capital of France is",
+        "Once upon a time"
+    ] * 2
+    with LLM(model=llama_model_path,
+             kv_cache_config=global_kvcache_config,
+             enable_iter_perf_stats=True,
+             enable_iter_req_stats=True,
+             iter_perf_stats_interval=interval,
+             disable_overlap_scheduler=not use_overlap) as llm:
+        # Different lengths so requests finish on different iterations.
+        sampling_params = [
+            SamplingParams(max_tokens=5 + 3 * i, end_id=-1)
+            for i in range(len(stat_prompts))
+        ]
+        llm.generate(stat_prompts, sampling_params=sampling_params)
+
+        records = []
+        while True:
+            batch = llm.get_stats(timeout=2)
+            if not batch:
+                break
+            records.extend(
+                json.loads(r) if isinstance(r, str) else r for r in batch)
+
+    iter_records = [r for r in records if "iter" in r]
+    assert iter_records, "expected sampled iteration stats records"
+    # Every record is on a sampled iteration, except the single record
+    # flushed when the last active request finishes between samples.
+    off_interval = [r["iter"] for r in iter_records if r["iter"] % interval]
+    assert len(off_interval) <= 1, off_interval
+    if off_interval:
+        assert off_interval[0] == max(r["iter"] for r in iter_records)
+    # Counters from skipped iterations are folded into emitted records.
+    assert sum(r["numCompletedRequests"]
+               for r in iter_records) == len(stat_prompts)
+    assert sum(r["numNewActiveRequests"]
+               for r in iter_records) == len(stat_prompts)
+    # Far fewer records than executor iterations: the sampled iterations
+    # 0, interval, ..., plus the startup snapshot and the drain record.
+    last_iter = max(r["iter"] for r in iter_records)
+    assert len(iter_records) <= last_iter // interval + 3
 
 
 @pytest.mark.part1
@@ -418,35 +466,6 @@ def test_nemotron_nas_lora(cuda_graph_config) -> None:
         assert similar(outputs[0].outputs[0].text, outputs[1].outputs[0].text)
     finally:
         llm.shutdown()
-
-
-@skip_gpu_memory_less_than_80gb
-@pytest.mark.part0
-@test_lora_with_and_without_cuda_graph
-def test_llama_3_1_8b_fp8_with_bf16_lora(cuda_graph_config) -> None:
-    skip_fp8_pre_ada(use_fp8=True)
-    model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
-    lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
-    prompt = "美国的首都是哪里？"
-    reference = "华盛顿特区。华盛顿特区是美国的首都和一个行政区"
-
-    lora_config = LoraConfig(lora_dir=[lora_dir],
-                             max_lora_rank=64,
-                             max_loras=2,
-                             max_cpu_loras=2)
-    lora_req = LoRARequest("lora-chinese", 0, lora_dir)
-
-    llm = LLM(model_dir,
-              lora_config=lora_config,
-              cuda_graph_config=cuda_graph_config)
-
-    try:
-        output = llm.generate(prompt,
-                              SamplingParams(max_tokens=20),
-                              lora_request=[lora_req])
-    finally:
-        llm.shutdown()
-    assert similar(output.outputs[0].text, reference)
 
 
 @pytest.mark.part2

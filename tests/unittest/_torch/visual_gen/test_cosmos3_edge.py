@@ -12,7 +12,6 @@ checkpoint (tokenizer, recipe/scheduler wiring, load + forward).
 
 import gc
 import io
-import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1569,11 +1568,11 @@ def _policy_parity_stats(actual: torch.Tensor, expected: torch.Tensor) -> dict[s
 
 
 class TestDiffusersParity:
-    """Per-step velocity parity against Diffusers.
+    """Per-step velocity parity against the installed Diffusers package.
 
-    Edge checkpoint parity uses the first Diffusers revision with the Edge
-    classes and remains an explicitly gated diagnostic. Policy action parity
-    below is checkpoint-free and runs against the pinned Diffusers package.
+    Edge checkpoint parity runs in a subprocess to isolate its heavyweight
+    reference and TRT-LLM pipelines. Policy action parity below is
+    checkpoint-free and runs against the installed Diffusers package.
     """
 
     def test_per_step_velocity_parity(self):
@@ -1581,9 +1580,6 @@ class TestDiffusersParity:
         import subprocess
         import sys
 
-        diffusers_main = os.environ.get("DIFFUSERS_MAIN_PATH")
-        if not diffusers_main:
-            pytest.skip("Set DIFFUSERS_MAIN_PATH to a diffusers checkout with Edge support")
         checkpoint = _require_edge_checkpoint()
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
@@ -1591,7 +1587,6 @@ class TestDiffusersParity:
         script = Path(__file__).parent / "cosmos3_edge_diffusers_parity.py"
         result = subprocess.run(
             [sys.executable, str(script), checkpoint],
-            env={**os.environ, "DIFFUSERS_MAIN_PATH": diffusers_main},
             capture_output=True,
             text=True,
             timeout=900,
@@ -1604,19 +1599,18 @@ class TestDiffusersParity:
         assert all(rel < 0.05 for rel in rels), result.stdout
 
     def test_policy_droid_joint_transformer_parity(self):
-        """L2: DROID-layout action DiT step vs pinned Diffusers.
+        """L2: DROID-layout action DiT step vs installed Diffusers.
 
         The emitted tensors are one-step BF16 video and action velocities. The
         model-specific behavior is a clean state row followed by 32 noisy
         actions, with domain-selected input/output heads. The trusted reference
-        is pinned Diffusers 0.40.0 with identical synthetic weights and packed
-        inputs. This is transparent T1; its tolerance covers reduction
+        is installed Diffusers 0.40.0 or newer with identical synthetic weights
+        and packed inputs. This is transparent T1; its tolerance covers reduction
         reordering between SDPA and TRT-LLM's vanilla attention backend.
 
-        Pinned Diffusers predates the Nemotron-dense Edge backbone, so this pair
-        deliberately exercises the shared action machinery on the Qwen3 recipe.
-        The Edge-only norm, MLP and generator K-normalization forks have focused
-        tests above.
+        This pair deliberately exercises the shared action machinery on the
+        Qwen3 recipe. The Edge-only norm, MLP and generator K-normalization
+        forks have focused tests above.
         """
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
