@@ -27,7 +27,8 @@ l0_dgx_b200:
   # ------------- VisualGen multi-GPU tests ---------------
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_parallel_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py
-  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-VANILLA]
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FA4]
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxParallelism::test_ulysses_2gpu_correctness
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxCombinedOptimizations::test_all_optimizations_combined
 - condition:
