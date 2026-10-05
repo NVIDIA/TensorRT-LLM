@@ -384,34 +384,6 @@ class NVLinkOneSided(Communication):
         )
         return int(layout[_tllm_internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX])
 
-    @staticmethod
-    def calculate_required_workspace_size(
-        ep_size: int,
-        top_k: int,
-        max_num_tokens: int,
-        hidden_size: int,
-        dtype: torch.dtype,
-        eplb_stats_num_experts: Optional[int] = None,
-        extra_payload_bytes_per_token: int = 0,
-        can_use_cft_counted_writes: Optional[bool] = None,
-        use_low_precision_combine: bool = False,
-    ) -> int:
-        # None sizes for what the constructor would select on this platform.
-        if can_use_cft_counted_writes is None:
-            can_use_cft_counted_writes = select_cft_counted_writes(get_force_cft())
-        layout = NVLinkOneSided._make_workspace_layout(
-            ep_size,
-            top_k,
-            max_num_tokens,
-            hidden_size,
-            dtype,
-            eplb_stats_num_experts,
-            extra_payload_bytes_per_token,
-            can_use_cft_counted_writes,
-            use_low_precision_combine,
-        )
-        return int(layout[_tllm_internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX])
-
     @classmethod
     def _init_constants(cls):
         """Initialize constants from C++ if not already done."""

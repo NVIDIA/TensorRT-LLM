@@ -708,15 +708,6 @@ def test_workspace_layout(cft: bool, fp8_combine: bool) -> None:
     assert dispatch_end <= field(layout, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX") < combine_start
     assert field(layout, "COMBINE_INPUT_SIZE_INDEX") == ep_size * capacity * hidden_size * 2
     assert dispatch_start % 256 == combine_start % 256 == total % 256 == 0
-    assert total == NVLinkOneSided.calculate_required_workspace_size(
-        ep_size,
-        top_k,
-        capacity,
-        hidden_size,
-        torch.bfloat16,
-        can_use_cft_counted_writes=cft,
-        use_low_precision_combine=fp8_combine,
-    )
     if cft:
         recv_start = field(layout, "COMBINE_RECV_OFFSET_INDEX")
         recv_bytes = field(layout, "COMBINE_RECV_SIZE_INDEX")
