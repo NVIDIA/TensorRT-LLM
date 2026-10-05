@@ -22,8 +22,8 @@ def _save_autotune_state(args: dict, reset_only: bool = False) -> None:
     if reset_only or args["h0"] is None or args["h0_i"] is None:
         return
     cu_seqlens = args["cu_seqlens"]
-    num_seqs = (len(cu_seqlens) - 1
-                if cu_seqlens is not None else args["k"].shape[0])
+    num_seqs = (len(cu_seqlens) -
+                1 if cu_seqlens is not None else args["k"].shape[0])
     indices = args["h0_i"][:num_seqs].to(torch.long)
     # Only these slots are updated by the indexed kernel. The pool may be
     # much larger than the active batch, so never clone the whole pool.
