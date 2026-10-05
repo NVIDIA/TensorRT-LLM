@@ -104,6 +104,27 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     }
 
     TLLM_LOG_TRACE("Init NCCL comm for group(%s) for rank %d", groupStr.c_str(), rank);
+    // Finish every environment update before getUniqueId(): on the group root, ncclGetUniqueId() starts NCCL's
+    // bootstrap thread, which reads the environment with getenv(), and a concurrent setenv() may reallocate
+    // environ underneath it.
+#if defined(_WIN32)
+    // Need static connection initialization for accurate KV cache size estimation
+    if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)
+        _putenv_s("NCCL_RUNTIME_CONNECT", "0");
+    // Disable graph register to avoid startup hangs
+    if (getenv("NCCL_GRAPH_REGISTER") == nullptr)
+        _putenv_s("NCCL_GRAPH_REGISTER", "0");
+#else
+    setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+    setenv("NCCL_GRAPH_REGISTER", "0", 0);
+    // NCCL aborts during init if it tries NVLS multicast but the fabric/IMEX
+    // plane can't bind it. Disable NVLS when the fabric is not usable so NCCL
+    // falls back to NVLink P2P. No-overwrite preserves an explicit user setting.
+    if (!tensorrt_llm::runtime::ipcNvlsFabricUsable())
+    {
+        setenv("NCCL_NVLS_ENABLE", "0", 0);
+    }
+#endif // _WIN32
     ncclUniqueId id = getUniqueId(group);
     int groupRank = 0;
     for (auto const& currentRank : group)
@@ -152,24 +173,6 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
             // STEP 2: Always free the pointer memory (regardless of whether *comm was valid)
             delete comm;
         });
-#if defined(_WIN32)
-    // Need static connection initialization for accurate KV cache size estimation
-    if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)
-        _putenv_s("NCCL_RUNTIME_CONNECT", "0");
-    // Disable graph register to avoid startup hangs
-    if (getenv("NCCL_GRAPH_REGISTER") == nullptr)
-        _putenv_s("NCCL_GRAPH_REGISTER", "0");
-#else
-    setenv("NCCL_RUNTIME_CONNECT", "0", 0);
-    setenv("NCCL_GRAPH_REGISTER", "0", 0);
-    // NCCL aborts during init if it tries NVLS multicast but the fabric/IMEX
-    // plane can't bind it. Disable NVLS when the fabric is not usable so NCCL
-    // falls back to NVLink P2P. No-overwrite preserves an explicit user setting.
-    if (!tensorrt_llm::runtime::ipcNvlsFabricUsable())
-    {
-        setenv("NCCL_NVLS_ENABLE", "0", 0);
-    }
-#endif // _WIN32
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
     config.graphUsageMode = 1;

@@ -143,6 +143,10 @@ def ACTION_INFO = "action_info"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def BOLT_CONSUME_BUILD = "bolt_consume_build"
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -152,6 +156,12 @@ def globalVars = [
     // that helper only updates keys already present in the target map, so a key that
     // is absent here (like this one previously) is silently dropped during the merge.
     (BOLT_CONSUME_BUILD): false,
+    // Pre-declared so updateMapWithJson() populates it from the parent: that
+    // helper only updates keys already present here, so an absent key is
+    // silently dropped -- which for this one would mean running unpinned
+    // without saying so.
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PROFILE_BRANCH): "",
 ]
 
 // TODO: Move common variables to an unified location
@@ -551,7 +561,6 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     def branch = env.gitlabTargetBranch ?: env.branch_name ?: "main"
     def triple = is_linux_x86_64 ? "x86_64-linux-gnu" : "aarch64-linux-gnu"
     def llvmArch = is_linux_x86_64 ? "X64" : "ARM64"
-    def llvmVer = "21.1.5"   // keep in sync with scripts/bolt internal/slurm_*.sh
     stage("BOLT consume") {
         // apply_latest.sh exit codes: 3 = no promoted bundle for branch/triple,
         // 2 = apply error, 0 = applied. Capture the code so a MISSING bundle (e.g.
@@ -561,11 +570,12 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
             set -e
             export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
             if ! command -v llvm-bolt >/dev/null 2>&1; then
-                echo '[bolt-consume] staging llvm-bolt ${llvmVer}'
-                tb=LLVM-${llvmVer}-Linux-${llvmArch}.tar.xz
+                . ${LLM_ROOT}/scripts/bolt/internal/llvm_bolt_version.sh
+                echo "[bolt-consume] staging llvm-bolt \${LLVM_BOLT_VERSION}"
+                tb=LLVM-\${LLVM_BOLT_VERSION}-Linux-${llvmArch}.tar.xz
                 mkdir -p .bolt-llvm
                 curl -fSL --retry 10 --retry-all-errors --retry-delay 15 --connect-timeout 60 \
-                     -o /tmp/\$tb https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/\$tb
+                     -o /tmp/\$tb "https://github.com/llvm/llvm-project/releases/download/llvmorg-\${LLVM_BOLT_VERSION}/\$tb"
                 tar -xJf /tmp/\$tb -C .bolt-llvm --strip-components=1
                 rm -f /tmp/\$tb
             fi

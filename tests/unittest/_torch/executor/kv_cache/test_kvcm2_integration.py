@@ -31,6 +31,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     Role,
     _extend_swa_windows_for_reuse,
     _KVCacheManagerInitStatus,
+    _swa_endpoint_priority,
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
 )
@@ -53,6 +54,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     DEFAULT_BEAM_INDEX,
     AttentionLayerConfig,
+    AttnLifeCycle,
     BatchDesc,
     BufferConfig,
     CacheLevel,
@@ -70,6 +72,65 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 
 TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "prompt,rewind,ordinal,window,sinks,expected",
+    [
+        (8192, 1024, 95, 4096, 0, 0),
+        (8192, 1024, 96, 4096, 0, 70),
+        (8192, 1024, 255, 4096, 0, 70),
+        (8192, 1024, 256, 4096, 0, 0),
+        (8192, 1024, 0, 4096, 1, 70),
+        (8192, 4096, 0, 4096, 0, 70),
+        (8193, 1024, 96, 4096, 0, 70),
+        (8193, 1024, 256, 4096, 0, 70),
+        (32, 1024, 0, 4096, 0, 70),
+        (8192, 1024, 0, None, 0, 35),
+    ],
+)
+def test_swa_endpoint_priority(
+    prompt: int, rewind: int, ordinal: int, window: int | None, sinks: int, expected: int
+) -> None:
+    priority = _swa_endpoint_priority(prompt, 32, rewind)
+    assert priority(ordinal, AttnLifeCycle(window, sinks)) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "rewind,is_dummy,is_draft,prompt,enabled",
+    [
+        (0, False, False, 8192, False),
+        (1024, False, False, 8192, True),
+        (4096, False, False, 8192, True),
+        (1024, True, False, 8192, False),
+        (1024, False, True, 8192, False),
+        (1024, False, False, None, False),
+    ],
+)
+def test_create_kv_cache_swa_endpoint_priority(
+    rewind: int, is_dummy: bool, is_draft: bool, prompt: int | None, enabled: bool
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._swa_endpoint_rewind = rewind
+    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
+    manager.enable_block_reuse = True
+    manager.is_draft = is_draft
+    manager.tokens_per_block = 32
+    manager.kv_cache_map = {}
+    manager.index_mapper = Mock()
+    manager.index_mapper.num_free_slots.return_value = 1
+    manager.max_beam_width = 1
+    manager.num_pools = 0
+    manager.impl = Mock()
+
+    manager._create_kv_cache(0, None, None, is_dummy=is_dummy, expected_prompt_length=prompt)
+
+    kwargs = manager.impl.create_kv_cache.call_args.kwargs
+    assert ("custom_priority_callback" in kwargs) is enabled
+    if enabled:
+        assert kwargs["custom_priority_callback"](255, AttnLifeCycle(4096, 0)) == 70
 
 
 class _CacheTierInitError(Exception):
@@ -1433,6 +1494,7 @@ class _ContextRequest:
     return_perf_metrics: bool = False
     context_current_position: int = 0
     py_connector_served_position: int = 0
+    py_num_connector_matched_tokens: int = 0
     prepopulated_prompt: tuple[int, int] | None = None
     multimodal_hashes: None = None
     multimodal_positions: None = None
@@ -1629,6 +1691,73 @@ def _run_context(
     request.context_current_position = request.prompt_len
     request.context_remaining_length = 0
     _update_context_resources(manager, batch)
+
+
+def _try_run_context(manager: KVCacheManagerV2, request: _ContextRequest) -> bool:
+    """Run a context request all the way through, reporting whether it fit."""
+    batch = _prepare_context_resources(manager, request)
+    if not manager.prepare_context(request):
+        return False
+    request.context_remaining_length = request.prompt_len - request.context_current_position
+    if not manager.resize_context(request, num_tokens=request.context_remaining_length):
+        return False
+    request.context_current_position = request.prompt_len
+    request.context_remaining_length = 0
+    _update_context_resources(manager, batch)
+    return True
+
+
+def test_preempt_request_gives_a_full_pool_back_its_pages(
+    manager: KVCacheManagerV2,
+) -> None:
+    """Preemption is the only way out of a full GPU-only pool.
+
+    With GPU as the last cache level a suspended page stays HELD, which the
+    eviction controller refuses to move, so suspension frees nothing. This
+    covers the release itself: the pages returning, and the connector's
+    matched-token count dropping.
+    """
+    victim = _ContextRequest(1, list(range(MAX_SEQ_LEN)), MAX_SEQ_LEN, "conv-1")
+    victim.py_num_connector_matched_tokens = TOKENS_PER_BLOCK
+    started: list[_ContextRequest] = [victim]
+
+    try:
+        assert _try_run_context(manager, victim)
+        assert manager.is_request_active(victim.py_request_id)
+
+        # The pool's capacity in requests follows from the fixture's layout and
+        # windows, so find it rather than hard-code it. Distinct tokens per
+        # request keep block reuse from hiding the pressure.
+        blocked = None
+        for request_id in range(2, 12):
+            candidate = _ContextRequest(
+                request_id,
+                [request_id * 1000 + i for i in range(MAX_SEQ_LEN)],
+                MAX_SEQ_LEN,
+                f"conv-{request_id}",
+            )
+            started.append(candidate)
+            if not _try_run_context(manager, candidate):
+                blocked = candidate
+                break
+        assert blocked is not None, "the pool never filled, so there is nothing to preempt for"
+
+        # Its own partial allocation goes back first, as the scheduler's retry
+        # does. What is missing is the victim's pages.
+        manager.free_resources(blocked)
+
+        assert manager.preempt_request(victim) is True
+        assert not manager.is_request_active(victim.py_request_id)
+        assert victim.py_request_id not in manager.kv_cache_map
+        # A replay recomputes from its own reuse match, so a stale count would
+        # skip a prefix the pool no longer holds for it.
+        assert victim.py_num_connector_matched_tokens == 0
+
+        blocked.context_current_position = 0
+        assert _try_run_context(manager, blocked)
+    finally:
+        for request in started:
+            _free_if_active(manager, request)
 
 
 def test_per_conversation_policy_delays_commit_until_last_context_chunk(

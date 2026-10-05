@@ -111,6 +111,37 @@ continue to run.
 For the native V2 cold-storage representation and codec extension contract, see
 [KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
 
+### SWA Endpoint Retention
+
+To prefer cached sliding-window attention (SWA) blocks near a prompt's endpoint
+under cache pressure, opt in with the prototype
+`kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens` option:
+
+```yaml
+kv_cache_config:
+  enable_block_reuse: true
+  use_kv_cache_manager_v2: true
+  block_reuse_config:
+    policy: all_reusable
+    swa_endpoint_rewind_tokens: 1024
+```
+
+For newly created pages, positive values assign priority `70` to sink blocks
+and SWA blocks overlapping the final `window_size + swa_endpoint_rewind_tokens`
+tokens of the reusable prompt prefix, excluding the final prompt token that is
+recomputed. Other SWA pages receive priority `0`; full-attention and other
+life cycles retain the default priority `35`. Blocks remain reusable until
+evicted. Within each eviction pool, lower priorities are evicted first, with
+LRU ordering among pages of equal priority.
+
+The endpoint is fixed for each request. Existing reused pages retain their
+assigned priorities: advancing the conversation does not automatically promote
+or demote them, and decoding does not advance the callback's endpoint.
+This preference does not guarantee residency or change attention windows or
+prefix matching. It excludes dummy and draft requests. The default, `0`, disables
+the entire endpoint-priority callback, including its preference for the final window.
+This option requires V2, block reuse, and the `all_reusable` policy.
+
 ### Mamba Snapshot Boundaries
 
 Hybrid Mamba models must retain the recurrent Mamba state together with the

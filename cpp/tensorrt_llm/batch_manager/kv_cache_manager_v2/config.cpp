@@ -66,12 +66,17 @@ void KVCacheManagerConfig::validate() const
         std::visit(
             [&](auto const& cfg)
             {
+                cfg.validate();
                 if (!seenLayerIds.insert(cfg.layerId).second)
                 {
                     throw AssertionError("KVCacheManagerConfig: duplicate layer id");
                 }
                 for (auto const& buf : cfg.buffers)
                 {
+                    if (buf.isSparse && (cacheTiers.size() < 2 || cacheTierOf(cacheTiers[1]) != CacheTier::HOST_MEM))
+                    {
+                        throw std::invalid_argument("Sparse buffers require cache level 1 to use HOST_MEM");
+                    }
                     if (buf.tokensPerBlockOverride.has_value()
                         && (*buf.tokensPerBlockOverride <= 0 || tokensPerBlock % *buf.tokensPerBlockOverride != 0))
                     {
