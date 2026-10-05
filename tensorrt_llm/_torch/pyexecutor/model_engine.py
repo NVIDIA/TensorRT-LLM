@@ -3347,6 +3347,13 @@ class PyTorchModelEngine(ModelEngine):
                 max_beam_width=self.max_beam_width)
             available_tokens = min(available_tokens, draft_available_tokens)
 
+        # With beam search the free blocks may not cover even one token per
+        # beam. add_dummy_requests cannot always catch this (it does not size
+        # VSWA pools per beam), so skip this batch size here.
+        if self.max_beam_width > 1 and available_tokens < 1:
+            free_warmup_requests()
+            return None
+
         token_num = max(
             ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM if is_enc_dec else 1,
             min(

@@ -29,7 +29,11 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import Encode
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    KVCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
 from tensorrt_llm._torch.speculative.utils import update_draft_len
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (
@@ -198,6 +202,114 @@ def test_warmup_builders_resynchronize_stale_draft_length(
             len(request.py_draft_tokens) == expected_buffer_width
             for request in batch.generation_requests
         )
+
+
+_BEAM_WIDTH = 4
+_BEAM_BATCH_SIZE = 4
+_BEAM_MAX_SEQ_LEN = 32
+_BEAM_TOKENS_PER_BLOCK = 8
+
+
+def _build_beam_search_engine(max_tokens: int) -> PyTorchModelEngine:
+    llm_args = TorchLlmArgs(
+        model="dummy",
+        max_batch_size=_BEAM_BATCH_SIZE,
+        max_num_tokens=_BEAM_BATCH_SIZE * _BEAM_MAX_SEQ_LEN,
+        max_seq_len=_BEAM_MAX_SEQ_LEN,
+        max_beam_width=_BEAM_WIDTH,
+        kv_cache_config=KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4]),
+    )
+    return _DummyModelEngine(llm_args, torch.half)
+
+
+def _create_beam_search_kv_cache_manager(
+    engine: PyTorchModelEngine, max_tokens: int
+) -> KVCacheManager:
+    return KVCacheManager(
+        KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=engine.model.config.num_key_value_heads,
+        head_dim=engine.model.config.head_dim,
+        tokens_per_block=_BEAM_TOKENS_PER_BLOCK,
+        max_seq_len=_BEAM_MAX_SEQ_LEN,
+        max_batch_size=_BEAM_BATCH_SIZE,
+        max_beam_width=_BEAM_WIDTH,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=tensorrt_llm.bindings.DataType.HALF,
+    )
+
+
+def test_cuda_graph_warmup_request_fits_beam_search_kv_blocks() -> None:
+    """The max-length warmup request must fit the blocks that beam search
+    allocates per beam instead of failing inside the block manager."""
+    # 16 blocks. The three one-token warmup requests take one block per beam
+    # (12), so the max-length request gets 4 blocks: one tail block per beam.
+    engine = _build_beam_search_engine(max_tokens=128)
+    kv_cache_manager = _create_beam_search_kv_cache_manager(engine, max_tokens=128)
+    resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+    try:
+        total_free = kv_cache_manager.get_num_free_blocks()
+        assert total_free == 16
+        warmup_request = engine._create_cuda_graph_warmup_request(
+            resource_manager, _BEAM_BATCH_SIZE, 0
+        )
+        with engine._release_batch_context(warmup_request, resource_manager) as batch:
+            assert batch is not None
+            assert len(batch.generation_requests) == _BEAM_BATCH_SIZE
+            assert kv_cache_manager.get_num_free_blocks() == 0
+        assert kv_cache_manager.get_num_free_blocks() == total_free
+    finally:
+        kv_cache_manager.shutdown()
+
+
+def test_cuda_graph_warmup_request_passes_beam_width_to_kv_cache_managers() -> None:
+    """Both the target and the draft KV cache capacity must be computed for
+    the configured beam width."""
+    engine = _build_beam_search_engine(max_tokens=1024)
+    target = _create_beam_search_kv_cache_manager(engine, max_tokens=1024)
+    draft = _create_beam_search_kv_cache_manager(engine, max_tokens=1024)
+    target.get_num_available_tokens = Mock(wraps=target.get_num_available_tokens)
+    draft.get_num_available_tokens = Mock(wraps=draft.get_num_available_tokens)
+    engine._get_draft_kv_cache_manager = lambda resource_manager: draft
+    resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: target})
+    try:
+        managers = (target, draft)
+        total_free = [manager.get_num_free_blocks() for manager in managers]
+        warmup_request = engine._create_cuda_graph_warmup_request(
+            resource_manager, _BEAM_BATCH_SIZE, 0
+        )
+        with engine._release_batch_context(warmup_request, resource_manager) as batch:
+            assert batch is not None
+        for manager, free_blocks in zip(managers, total_free):
+            manager.get_num_available_tokens.assert_called_once()
+            kwargs = manager.get_num_available_tokens.call_args.kwargs
+            assert kwargs["max_beam_width"] == _BEAM_WIDTH
+            assert kwargs["batch_size"] == _BEAM_BATCH_SIZE
+            assert manager.get_num_free_blocks() == free_blocks
+    finally:
+        target.shutdown()
+        draft.shutdown()
+
+
+def test_cuda_graph_warmup_request_skips_beam_search_batch_below_one_token() -> None:
+    """When the capacity reported for beam search is below one token, the
+    batch size is skipped and the warmup requests already added are freed."""
+    # Stands in for a manager whose pool cannot hold one more token per beam
+    # but whose add_dummy_requests cannot detect it (VSWA pools).
+    engine = _build_beam_search_engine(max_tokens=1024)
+    kv_cache_manager = _create_beam_search_kv_cache_manager(engine, max_tokens=1024)
+    kv_cache_manager.get_num_available_tokens = Mock(return_value=0)
+    resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+    try:
+        total_free = kv_cache_manager.get_num_free_blocks()
+        assert (
+            engine._create_cuda_graph_warmup_request(resource_manager, _BEAM_BATCH_SIZE, 0) is None
+        )
+        assert kv_cache_manager.get_num_free_blocks() == total_free
+    finally:
+        kv_cache_manager.shutdown()
 
 
 class _Tracker:

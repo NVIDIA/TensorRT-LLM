@@ -1142,6 +1142,59 @@ class TestResourceManager(unittest.TestCase):
             self.assertEqual(kv_cache_manager.get_num_free_blocks(), 0)
             for request in requests:
                 kv_cache_manager.free_resources(request)
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), total_free)
+        finally:
+            kv_cache_manager.shutdown()
+
+    def test_beam_search_dummy_requests_with_draft_tokens(self):
+        """Draft tokens appended to a beam-search dummy request are allocated
+        once per beam; capacity and the fit check must account for them."""
+        beam_width = 4
+        num_draft_tokens = 3
+        kv_cache_manager = self._create_beam_search_kv_cache_manager(beam_width)
+        try:
+            total_free = kv_cache_manager.get_num_free_blocks()
+            self.assertEqual(total_free, 32)
+            for request_id, token_num in enumerate([1, 5, 6, 8, 100]):
+                requests = kv_cache_manager.add_dummy_requests(
+                    [request_id], [token_num],
+                    is_gen=True,
+                    max_num_draft_tokens=num_draft_tokens,
+                    max_beam_width=beam_width)
+                self.assertIsNotNone(requests)
+                used_blocks = (total_free -
+                               kv_cache_manager.get_num_free_blocks())
+                self.assertEqual(
+                    used_blocks,
+                    kv_cache_manager._get_num_blocks_for_dummy_request(
+                        token_num, num_draft_tokens, beam_width),
+                    f"token_num={token_num}")
+                kv_cache_manager.free_resources(requests[0])
+
+            capacity = kv_cache_manager.get_num_available_tokens(
+                token_num_upper_bound=1024,
+                max_num_draft_tokens=num_draft_tokens,
+                max_beam_width=beam_width)
+            # The worst-case tail (7 prompt tokens + 3 draft tokens) takes two
+            # blocks per beam: 32 - 2 * 4 = 24 blocks remain for shared ones.
+            self.assertEqual(capacity, (24 + 1) * 8 - 1)
+            for token_num in range(1, capacity + 1):
+                requests = kv_cache_manager.add_dummy_requests(
+                    [0], [token_num],
+                    is_gen=True,
+                    max_num_draft_tokens=num_draft_tokens,
+                    max_beam_width=beam_width)
+                self.assertIsNotNone(requests, f"token_num={token_num}")
+                kv_cache_manager.free_resources(requests[0])
+
+            # 28 shared blocks plus two tail blocks per beam: 36 > 32.
+            self.assertIsNone(
+                kv_cache_manager.add_dummy_requests(
+                    [0], [230],
+                    is_gen=True,
+                    max_num_draft_tokens=num_draft_tokens,
+                    max_beam_width=beam_width))
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), total_free)
         finally:
             kv_cache_manager.shutdown()
 
