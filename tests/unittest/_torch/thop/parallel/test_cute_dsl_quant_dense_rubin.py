@@ -144,6 +144,12 @@ def _op_calls():
 def test_sm107_quant_ops_registered_only_with_sm107_cute_dsl():
     for name in SM107_QUANT_OPS:
         assert hasattr(torch.ops.trtllm, name) == IS_CUTLASS_DSL_RUBIN_AVAILABLE, name
+    if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+
+        runner = cute_dsl_custom_ops.CuteDSLFp8RubinPerTensorGemmRunner
+        (dynamic_spec,) = runner.tuning_config.dynamic_tensor_specs
+        assert (dynamic_spec.input_idx, dynamic_spec.dim_idx) == (0, 0)
 
 
 @skip_no_sm107_cute_dsl

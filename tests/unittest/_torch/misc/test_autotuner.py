@@ -901,7 +901,6 @@ def test_kernel_testing_single_context():
         f"Expected 3 tactics to be tested, got {len(tested_tactics)}"
 
 
-
 class MultiContextRunner(TunableRunner):
 
     def get_valid_tactics(self, inputs: List[FakeTensor],
@@ -2428,4 +2427,3 @@ def test_deep_gemm_jit_warmup_buckets():
     assert max(deep_gemm_jit_warmup_buckets(32)) < 128
     assert deep_gemm_jit_warmup_buckets(16384) == deep_gemm_jit_warmup_buckets(
         8192)
-

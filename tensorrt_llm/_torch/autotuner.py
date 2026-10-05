@@ -652,10 +652,9 @@ class AutoTunerProfilingCache:
             if (r.profiling_timer_cache_key() == _TORCH_PROFILER_TIMER_KEY
                     and (allow_timer_fallback
                          or AutoTuner._torch_profiler_unavailable)):
-                alternate_timer_key = (
-                    _TORCH_PROFILER_TIMER_KEY
-                    if AutoTuner._torch_profiler_unavailable else
-                    _CUDA_EVENT_FALLBACK_TIMER_KEY)
+                alternate_timer_key = (_TORCH_PROFILER_TIMER_KEY
+                                       if AutoTuner._torch_profiler_unavailable
+                                       else _CUDA_EVENT_FALLBACK_TIMER_KEY)
                 alternate_key = self.get_cache_key(
                     custom_op,
                     r,

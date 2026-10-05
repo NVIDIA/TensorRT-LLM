@@ -13988,14 +13988,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             **query_kwargs,
                         )
                         ranked_configs_by_swap[swap_ab] = ranked_configs
-                    valid_signatures = {
-                        signature
-                        for tactic in candidate_tactics
-                        if (signature := self._nvmmh_tactic_signature(
-                            tactic, match_fields)) is not None
-                    }
-                    if not valid_signatures:
-                        return fallback_tactics
 
                     def model_key(signature):
                         """Drop locally swept cluster fields from a model-matching signature."""
@@ -14007,7 +13999,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                     valid_keys = {
                         model_key(signature)
-                        for signature in valid_signatures
+                        for signature in baseline_signatures
                     }
                     config_by_key = {}
                     rank1_config_by_swap = {}
