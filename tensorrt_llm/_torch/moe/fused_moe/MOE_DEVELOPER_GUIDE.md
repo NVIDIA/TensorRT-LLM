@@ -648,12 +648,21 @@ boundary translates public activation IDs to the internal enum values.
 When SwiGLU parameters are present, it supplies missing alpha/beta defaults
 as tensors so the legacy archive consumes the clamp limit.
 Public routing helpers remain available in either build.
-`torch.ops.trtllm.is_oss_cutlass_moe()` reports the build mode of the loaded
-native library. CUTLASS eligibility uses it to reject post-SiLU clamping and
-routed-expert LoRA during backend selection for internal builds, before
-inference reaches the native runner.
-The same eligibility gate rejects SiTu and Relu2 activations and the MXFP8
-and W4A8-MXFP4-MXFP8 quantization formats in that build mode.
+The build mode is collected once into `MoEEnvironment.oss_cutlass_moe` and
+included in its fingerprint. Libraries without the build-mode query preserve
+the OSS default. CUTLASS eligibility rejects unavailable activation and
+quantization formats, post-SiLU clamping, dynamic FC2 scaling, and routed-expert
+LoRA. W4A8 AWQ uses per-expert activation-scale buffers and is unavailable in
+the legacy build. All-to-all is checked after the layer selects its communication
+strategy, during construction. Input layout and token-count options supplied
+to native operators directly retain runtime guards.
+The neutral SwiGLU tensors are cached by device, expert count and CUDA stream;
+warm forwards reuse them without allocations or fill kernels.
+
+The CPU resolution tests run in `l0_cpu.yml`; routing and activation numerics
+run in the H100 and B200 single-GPU lists. The H100 C++ kernel stage discovers
+both OSS and bundled-internal MoE variants through CTest. With OSS kernels
+disabled, `mixtureOfExpertsTest` exercises the bundled runner directly.
 
 Declare `limit_when_absent` only when the ABI has no encoding for "no clamp":
 `CuteDslFusedMoE` passes `float("inf")` because its epilogue always applies the

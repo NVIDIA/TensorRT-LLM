@@ -379,6 +379,7 @@ def build_moe_deployment(
         eplb_enabled=eplb_enabled,
         # Routed-expert LoRA only; attention-only LoRA stays False.
         moe_lora_enabled=has_moe_lora_targets(lora_config),
+        force_dynamic_quantization=model_config.force_dynamic_quantization,
         # Same expression the impls use to set ``use_fused_finalize``; any
         # LoRA counts, not just routed-expert LoRA.
         fused_finalize_enabled=(

@@ -130,57 +130,10 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 logger = logging.getLogger(__name__)
 
 
-@pytest.mark.parametrize("is_oss", [False, True], ids=["internal", "oss"])
-@pytest.mark.parametrize(
-    "activation,quant_algo,sm,reason",
-    [
-        pytest.param("SiTu", None, 90, MoERejectReason.ACTIVATION_UNSUPPORTED, id="situ"),
-        pytest.param("Relu2", None, 90, MoERejectReason.ACTIVATION_UNSUPPORTED, id="relu2"),
-        pytest.param("Swiglu", QuantAlgo.MXFP8, 100, MoERejectReason.QUANT_UNSUPPORTED, id="mxfp8"),
-        pytest.param(
-            "Swiglu",
-            QuantAlgo.W4A8_MXFP4_MXFP8,
-            100,
-            MoERejectReason.QUANT_UNSUPPORTED,
-            id="w4a8_mxfp4_mxfp8",
-        ),
-    ],
-)
-def test_cutlass_build_mode_resolution(monkeypatch, is_oss, activation, quant_algo, sm, reason):
-    monkeypatch.setattr(torch.ops.trtllm, "is_oss_cutlass_moe", lambda: is_oss)
-    report = resolve_moe_impl(
-        ModelConfig(moe_backend="CUTLASS"),
-        problem=MoEProblem(
-            quant=quant_algo.value if quant_algo is not None else None,
-            dtype_act=torch.bfloat16,
-            hidden_size=512,
-            intermediate_size=512,
-            num_experts=8,
-            top_k=2,
-            activation=activation,
-        ),
-        deployment=MoEDeployment(
-            ep_size=1,
-            tp_size=1,
-            parallel_size=1,
-            use_dp=False,
-            num_slots=8,
-            env=MoEEnvironment(sm=sm),
-        ),
-    )
-    if is_oss:
-        assert impl_class_for(report) is CutlassFusedMoE
-        assert not report.rejected
-    else:
-        assert report.winner is None
-        assert len(report.rejected) == 1
-        assert report.rejected[0].reason is reason
-        with pytest.raises(ValueError, match="USING_OSS_CUTLASS_MOE_GEMM=ON"):
-            impl_class_for(report)
-
-
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_cutlass_moe_routing_round_trip(dtype: torch.dtype) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUTLASS routing requires CUDA")
     torch.manual_seed(17)
     num_experts, hidden_size = 4, 128
     x = torch.randn(8, hidden_size, device="cuda", dtype=dtype)
@@ -232,8 +185,8 @@ def test_cutlass_moe_routing_round_trip(dtype: torch.dtype) -> None:
 def test_cutlass_moe_public_activation_ids(
     activation_type: ActivationType, clamp_limit: Optional[float]
 ) -> None:
-    if get_sm_version() < 80:
-        pytest.skip("BF16 CUTLASS MoE requires SM80 or newer")
+    if not torch.cuda.is_available() or get_sm_version() < 80:
+        pytest.skip("BF16 CUTLASS MoE requires CUDA and SM80 or newer")
 
     torch.manual_seed(17)
     dtype = torch.bfloat16

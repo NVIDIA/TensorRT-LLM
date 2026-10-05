@@ -54,6 +54,15 @@ using CUTLASS_MOE_GEMM_NAMESPACE::isGatedActivation;
 constexpr static float FP8_MAX = 448.f;
 constexpr static float FP4_MAX = 6.f;
 
+constexpr bool supportsUnpaddedMoeOutput()
+{
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
+    return true;
+#else
+    return false;
+#endif
+}
+
 __host__ __device__ constexpr float applyExpertShift(float weight_value, int expert)
 {
     float lookup_table[] = {0.5f, 1.0f, 2.0f};
@@ -1402,7 +1411,7 @@ protected:
                 quant_params = QuantParams::MXFP8MXFP4(mFP4ScalingFactorsW1, static_cast<float const*>(scale1_ptr),
                     mFP4ScalingFactorsW2, static_cast<float const*>(scale3_ptr));
 #else
-                GTEST_SKIP() << "MXFP8 x MXFP4 requires the open-source CUTLASS MoE kernels";
+                static_assert(!MXFP8_MXFP4, "MXFP8 x MXFP4 requires the open-source CUTLASS MoE kernels");
 #endif
             }
         }
@@ -2147,12 +2156,6 @@ template <class TypeParam_>
 void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
     int k, int tp_size, int ep_size, int64_t hidden_size, int64_t num_experts, int64_t num_tokens, bool enable_alltoall)
 {
-#if !defined(USING_OSS_CUTLASS_MOE_GEMM)
-    if (mUnpaddedHiddenSize > 0 && mUnpaddedHiddenSize != hidden_size)
-    {
-        GTEST_SKIP() << "Unpadded MoE output requires the open-source CUTLASS MoE kernels";
-    }
-#endif
     if (NVFP4 || (MXFP8_MXFP4 && isGatedActivation(mActType)))
     {
         // TODO Remove this when bias + FPX is supported
@@ -2364,6 +2367,10 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
     }                                                                                                                  \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##GptOss120b)                                                      \
     {                                                                                                                  \
+        if (!supportsUnpaddedMoeOutput())                                                                              \
+        {                                                                                                              \
+            GTEST_SKIP() << "Unpadded MoE output requires the open-source CUTLASS MoE kernels";                        \
+        }                                                                                                              \
         this->mIsLongTest = true;                                                                                      \
         this->mUseBias = true;                                                                                         \
         this->mActType = ActivationType::Swiglu;                                                                       \

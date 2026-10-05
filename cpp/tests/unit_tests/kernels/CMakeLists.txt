@@ -33,7 +33,8 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   target_compile_definitions(mixtureOfExpertsTest
                              PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
 
-  add_gtest(mixtureOfExpertsInternalTest moe/mixtureOfExpertsTest.cu)
+  add_gtest(mixtureOfExpertsInternalTest moe/mixtureOfExpertsTest.cu
+            TEST_PREFIX "Internal.")
   remove_compile_definition(mixtureOfExpertsInternalTest
                             USING_OSS_CUTLASS_MOE_GEMM)
 endif()
