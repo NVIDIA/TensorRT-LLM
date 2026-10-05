@@ -23,6 +23,7 @@
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/cudaEvent.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/funcGuard.h"
 #include "tensorrt_llm/common/tllmException.h"
 
@@ -365,6 +366,8 @@ public:
 
     cudaError_t enqueue(cudaStream_t stream)
     {
+        // Event merging must not create streams while a gate is held: stream creation can wait for host callbacks.
+        CudaStreamPool::instance();
         mStream = stream;
         return cudaLaunchHostFunc(stream, wait, this);
     }
