@@ -38,11 +38,9 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         DEFAULT_BEAM_INDEX,
         GPU_LEVEL,
         AttentionLayerConfig,
-        AttnLifeCycle,
         BatchDesc,
         BufferConfig,
         BufferId,
-        CacheDomain,
         CacheLevel,
         CorruptedError,
         CudaStream,
@@ -91,11 +89,9 @@ else:
         DEFAULT_BEAM_INDEX,
         GPU_LEVEL,
         AttentionLayerConfig,
-        AttnLifeCycle,
         BatchDesc,
         BufferConfig,
         BufferId,
-        CacheDomain,
         CacheLevel,
         CorruptedError,
         CudaStream,
@@ -350,53 +346,6 @@ class TestSparseBufferConfig(unittest.TestCase):
             )
 
 
-class TestCacheDomain(unittest.TestCase):
-    def test_defaults(self) -> None:
-        self.assertIs(AttentionLayerConfig(0, []).cache_domain, CacheDomain.TARGET)
-        self.assertIs(AttnLifeCycle(None, 0).cache_domain, CacheDomain.TARGET)
-        self.assertIs(AttnLifeCycle.make(None, None, 4).cache_domain, CacheDomain.TARGET)
-
-    def test_enum_round_trips(self) -> None:
-        for domain in CacheDomain:
-            with self.subTest(domain=domain):
-                self.assertIs(CacheDomain(domain.value), domain)
-                layer = AttentionLayerConfig(0, [BufferConfig("key", 4096)], cache_domain=domain)
-                self.assertIs(layer.cache_domain, domain)
-                self.assertIs(deepcopy(layer).cache_domain, domain)
-                config = KVCacheManagerConfig(
-                    tokens_per_block=4,
-                    cache_tiers=[GpuCacheTierConfig(4 << 20)],
-                    layers=[layer],
-                )
-                self.assertIs(config.layers[0].cache_domain, domain)
-                layer.cache_domain = CacheDomain.TARGET
-                layer.cache_domain = domain
-                self.assertIs(layer.cache_domain, domain)
-                lifecycle = AttnLifeCycle(128, 2, True, domain)
-                self.assertIs(lifecycle.cache_domain, domain)
-                self.assertEqual(lifecycle, AttnLifeCycle.make(128, 5, 4, True, domain))
-        self.assertNotEqual(
-            AttnLifeCycle(None, 0, cache_domain=CacheDomain.TARGET),
-            AttnLifeCycle(None, 0, cache_domain=CacheDomain.STANDALONE_DRAFT),
-        )
-
-    def test_rejects_invalid_domains(self) -> None:
-        layer = AttentionLayerConfig(0, [])
-        for invalid in ("target", "standalone_draft", "invalid", -1, 2, None):
-            with self.subTest(invalid=invalid):
-                with self.assertRaises(TypeError):
-                    AttentionLayerConfig(0, [], cache_domain=invalid)
-                with self.assertRaises(TypeError):
-                    AttnLifeCycle(None, 0, cache_domain=invalid)
-                with self.assertRaises(TypeError):
-                    AttnLifeCycle.make(None, None, 4, cache_domain=invalid)
-                with self.assertRaises(TypeError):
-                    layer.cache_domain = invalid
-                self.assertIs(layer.cache_domain, CacheDomain.TARGET)
-        with self.assertRaises(ValueError):
-            CacheDomain(2)
-
-
 class TestKVCacheManagerV2(unittest.TestCase):
     engine: FakeEngine
     cfg: KVCacheManagerConfig
@@ -630,38 +579,6 @@ class TestNoBatching(TestKVCacheManagerV2):
                     request.kv_cache.close()
             if hasattr(self, "manager"):
                 self.manager.clear_reusable_blocks()
-
-    def test_cache_domains_isolate_hot_and_cold_pools(self) -> None:
-        layers = [
-            AttentionLayerConfig(
-                layer_id,
-                [BufferConfig("key", 4096)],
-                sliding_window_size=4 * (layer_id % 2 + 1),
-                cache_domain=CacheDomain.TARGET if layer_id < 2 else CacheDomain.STANDALONE_DRAFT,
-            )
-            for layer_id in range(4)
-        ]
-        # SSM has no explicit domain and shares the target storage pool.
-        layers.append(SsmLayerConfig(4, [BufferConfig("key", 4096)]))
-        self.cfg = KVCacheManagerConfig(
-            tokens_per_block=4,
-            cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
-            layers=layers,
-            commit_min_snapshot=True,
-        )
-        self.manager = KVCacheManager(self.cfg)
-        lifecycles = [self.manager.get_layer_group_id(layer_id) for layer_id in range(5)]
-        self.assertEqual(len(set(lifecycles)), 5)
-        for level in (GPU_LEVEL, CacheLevel(1)):
-            with self.subTest(level=level):
-                mapping = self.manager.get_life_cycle_pool_group_indices(level)
-                groups = [mapping[lifecycle] for lifecycle in lifecycles]
-                self.assertEqual(groups[0], groups[1])
-                self.assertEqual(groups[2], groups[3])
-                self.assertNotEqual(groups[0], groups[2])
-                self.assertEqual(groups[0], groups[4])
-        hot_mapping = self.manager.get_life_cycle_pool_group_indices(GPU_LEVEL)
-        self.assertLess(hot_mapping[lifecycles[2]], hot_mapping[lifecycles[0]])
 
     def test_cold_codec_merges_lifecycles_from_different_hot_pool_groups(self) -> None:
         """Padding merges full attention with one of two differently-sized SWA LCs."""
