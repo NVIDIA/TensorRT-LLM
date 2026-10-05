@@ -1077,24 +1077,38 @@ class KVCacheV2Scheduler(RequestScheduler):
             if not self.kv_cache_manager.is_request_active(victim.py_request_id):
                 continue
 
-            released = self.kv_cache_manager.preempt_request(victim)
+            if not self.kv_cache_manager.preempt_request(victim):
+                # Parked rather than released, so the victim still holds its
+                # pages and has to stay off `evicted`: the `pause` an evicted
+                # request gets would overwrite the state that keeps it parked.
+                # The executor completes the release once the connector
+                # reports the saves retired; see
+                # `PyExecutor._resume_preempted_request`.
+                #
+                # It counts as preempted for the rest of this pass all the
+                # same. `pending_ctx` was collected before the parking, so
+                # without this the victim is re-admitted and runs a forward
+                # pass over the pages its own saves are still reading.
+                preempted_ids.add(victim.py_request_id)
+                logger.debug(
+                    f"[V2Scheduler] Preemption of request {victim.py_request_id} "
+                    "deferred until its connector saves retire"
+                )
+                return False
             logger.debug(
                 f"[V2Scheduler] Preempting request {victim.py_request_id} "
-                f"(state={victim.state.name}), pages "
-                f"{'released' if released else 'pending connector saves'}"
+                f"(state={victim.state.name})"
             )
             self._clear_request_runtime_state(victim)
             if self.draft_kv_cache_manager is not None:
                 self.draft_kv_cache_manager.free_resources(victim)
-            if released:
-                # Rewrites the prompt to include what was generated and resets
-                # state to CONTEXT_INIT, so the request re-enters as an
-                # ordinary prefill. Deferred releases are paused by the
-                # executor once the connector reports the saves retired.
-                victim.pause(self.max_input_len)
+            # Rewrites the prompt to include what was generated and resets
+            # state to CONTEXT_INIT, so the request re-enters as an ordinary
+            # prefill.
+            victim.pause(self.max_input_len)
             evicted.append(victim)
             preempted_ids.add(victim.py_request_id)
-            return released
+            return True
 
         return False
 
@@ -1147,6 +1161,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
         if num_gen_candidates == 0 and num_ctx_candidates == 0:
             # Legitimately idle: nothing to schedule.
+            self._reset_stall_state()
+            return
+
+        if self.kv_cache_manager.has_pending_preemption():
+            # A victim's pages are already given up, but it keeps its state
+            # until the connector's saves land, so nothing above sees them.
+            # The wait clears on its own.
             self._reset_stall_state()
             return
 

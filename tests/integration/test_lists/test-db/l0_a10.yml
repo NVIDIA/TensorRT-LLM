@@ -41,9 +41,10 @@ l0_a10:
   - unittest/_torch/executor/test_kv_cache_compression_manager.py
   - unittest/_torch/executor/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/executor/test_kv_cache_layout.py
+  - unittest/_torch/executor/test_mooncake_store_cli.py
+  - unittest/_torch/executor/test_mooncake_store_common.py
   - unittest/_torch/executor/test_mooncake_store_connector.py
-  - unittest/_torch/executor/test_mooncake_store_donor.py
-  - unittest/_torch/executor/test_mooncake_store_master.py
+  - unittest/_torch/executor/test_mooncake_store_real_pool.py
   - unittest/_torch/executor/test_error_classification.py
   - unittest/_torch/modules/dwdp/test_dwdp_fixup_moe_backends.py
   - unittest/_torch/modules/dwdp/test_dwdp_manager.py
@@ -222,6 +223,8 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_uniform_sliding_window[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_sliding_window_prefix_is_backed_by_history[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_vswa_reports_page_indices_per_layer_group[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_cross_engine_prefix_reuse
+  - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_chunked_prefill_survives_a_small_cache
   # third-party policy checks CPU-only
   - thirdparty/test_cmake_third_party.py::test_cmake_listfiles
   - thirdparty/test_git_modules.py::test_gitmodules

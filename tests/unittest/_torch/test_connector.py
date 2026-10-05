@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,7 +24,7 @@ import pytest
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     AsyncRequests, KvCacheConnectorManager, KvCacheConnectorScheduler,
-    KvCacheConnectorSchedulerOutputManager)
+    KvCacheConnectorSchedulerOutputManager, KvCacheConnectorWorker)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
@@ -248,6 +248,95 @@ def test_cancel_load_is_additive():
     a no-op default rather than becoming another abstract method.
     """
     assert "cancel_load" not in KvCacheConnectorScheduler.__abstractmethods__
+
+
+class MinimalWorker(KvCacheConnectorWorker):
+    """A worker with nothing filled in beyond the abstract methods."""
+
+    def register_kv_caches(self, kv_cache_tensor):
+        pass
+
+    def start_load_kv(self, stream):
+        pass
+
+    def wait_for_layer_load(self, layer_idx, stream):
+        pass
+
+    def save_kv_layer(self, layer_idx, stream):
+        pass
+
+    def wait_for_save(self, stream):
+        pass
+
+    def get_finished(self, finished_gen_req_ids, started_loading_req_ids):
+        return [], []
+
+
+def test_a_connector_is_assumed_to_move_kv():
+    """Several executor restrictions exist only because a connector normally
+    registers page addresses and transfers against them: the capacity
+    scheduler is pinned to GUARANTEED_NO_EVICT, cache tiers below GPU are
+    refused, and every decoder layer gets a pre/post hook. So the default has
+    to be the restrictive one, and a connector written before `capacity_only`
+    existed keeps every guard that was written for it.
+    """
+    assert not MinimalWorker(MagicMock()).capacity_only
+
+
+def test_the_manager_reports_whether_its_worker_moves_kv():
+    """The executor asks the manager, since that is the only handle it holds."""
+
+    class CapacityWorker(MinimalWorker):
+        capacity_only = True
+
+    assert not KvCacheConnectorManager(MinimalWorker(MagicMock()),
+                                       scheduler=MagicMock()).capacity_only
+    assert KvCacheConnectorManager(CapacityWorker(MagicMock()),
+                                   scheduler=MagicMock()).capacity_only
+
+
+def test_a_capacity_only_manager_builds_no_scheduler_output():
+    """A capacity-only manager skips the per-iteration scheduler output, and a
+    transferring one still builds it."""
+
+    class CapacityWorker(MinimalWorker):
+        capacity_only = True
+
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [
+        MagicMock(is_dummy_request=False,
+                  request_id=7,
+                  state=LlmRequestState.GENERATION_IN_PROGRESS)
+    ]
+
+    capacity = KvCacheConnectorManager(CapacityWorker(MagicMock()),
+                                       scheduler=MagicMock())
+    capacity.build_scheduler_output(scheduled_batch, MagicMock())
+    # With no output built, handle_metadata binds nothing to the worker.
+    capacity.handle_metadata()
+    capacity.scheduler.build_connector_meta.assert_not_called()
+    assert capacity.worker.get_connector_meta() is None
+
+    # The transferring role needs the output and must be unaffected.
+    transferring = KvCacheConnectorManager(MinimalWorker(MagicMock()),
+                                           scheduler=MagicMock())
+    transferring.build_scheduler_output(scheduled_batch, MagicMock())
+    transferring.handle_metadata()
+    transferring.scheduler.build_connector_meta.assert_called_once()
+
+
+def test_releasing_an_allocation_for_replay_tells_the_connector():
+    """The connector's per-request state is keyed to the pages being freed."""
+    scheduler = MagicMock()
+    manager = KvCacheConnectorManager(MinimalWorker(MagicMock()),
+                                      scheduler=scheduler)
+
+    req = MagicMock()
+    req.request_id = 11
+
+    manager.reset_request_state(req)
+
+    scheduler.request_reset.assert_called_once_with(req)
 
 
 def test_scheduler_output_num_scheduled_tokens_with_mtp():

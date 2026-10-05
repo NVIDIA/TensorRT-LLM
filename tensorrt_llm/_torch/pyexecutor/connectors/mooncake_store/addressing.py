@@ -14,15 +14,15 @@
 # limitations under the License.
 """Turning a `KvCacheLayout` into addresses Mooncake can transfer.
 
-Mooncake's batch APIs take, per key, a list of `(address, size)` buffers. That
-is exactly the shape of a V2 page: a layer group's regions each contribute one
-byte range at `base + stride * page_index`, and the concatenation of those
-ranges in region order is the page's payload.
+Mooncake's batch APIs take, per key, a list of `(address, size)` buffers, which
+is the shape of a V2 page: a layer group's regions each contribute one byte
+range at `base + stride * page_index`, and their concatenation in region order
+is the page's payload.
 
-Region order is therefore the value's serialization, and it is stable for a
-given model and parallel layout because `build_kv_cache_layout_v2` derives it
-from the allocator's own aggregation. `bytes_per_page` goes into
-the key namespace to keep a geometry change from being read as a valid page.
+Region order is therefore the value's serialization, stable for a given model
+and parallel layout because `build_kv_cache_layout_v2` derives it from the
+allocator's own aggregation. `bytes_per_page` goes into the key namespace so a
+geometry change cannot be read as a valid page.
 """
 
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -35,11 +35,10 @@ __all__ = ["PageAddressing", "merge_intervals"]
 def merge_intervals(intervals: Iterable[Tuple[int, int]]) -> List[Tuple[int, int]]:
     """Collapse `(start, end)` byte ranges into a minimal disjoint cover.
 
-    Registration is per range and a range may not be registered twice, but
-    several regions routinely live inside one pool allocation: sliding-window
-    layer groups share it, and a non-uniform slot (MiniMax-M3's index-K sitting
-    beside K/V) splits one pool into several regions. Merging first means the
-    caller does not have to know which case it is in.
+    A range may not be registered twice, but several regions routinely live
+    inside one pool allocation: sliding-window layer groups share it, and a
+    non-uniform slot such as MiniMax-M3's index-K beside K/V splits one pool
+    into several regions. Merging first spares the caller that distinction.
     """
     ordered = sorted((int(start), int(end)) for start, end in intervals if end > start)
     merged: List[Tuple[int, int]] = []
@@ -68,9 +67,8 @@ class PageAddressing:
                 )
             self._regions[group.layer_group_id] = group.regions
             self._bytes_per_page[group.layer_group_id] = group.bytes_per_page
-            # Every region of a group is drawn from the same pool group, so they
-            # share a slot count; disagreement would mean the page index space is
-            # not the single space the layout documents.
+            # Regions of a group come from the same pool group and so share a
+            # slot count. Disagreement would make the page index ambiguous.
             slot_counts = {region.num_slots for region in group.regions}
             if len(slot_counts) != 1:
                 raise ValueError(
@@ -126,10 +124,9 @@ class PageAddressing:
     def registration_ranges(self) -> List[Tuple[int, int]]:
         """Byte ranges to hand to `register_buffer`, deduplicated and merged.
 
-        A region's slots are strided rather than packed, so the range covering it
-        is the whole span from the first slot to the end of the last. Registering
-        the span is what makes every slot's address valid for RDMA, and merging
-        keeps a shared pool from being registered once per region.
+        A region's slots are strided rather than packed, so its range spans
+        from the first slot to the end of the last. Registering the whole span
+        is what makes every slot's address valid for RDMA.
         """
         spans: List[Tuple[int, int]] = []
         for regions in self._regions.values():

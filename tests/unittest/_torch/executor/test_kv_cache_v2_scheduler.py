@@ -908,7 +908,10 @@ class TestContextPreemption:
         """A connector still reading these pages defers the release.
 
         Freeing them now would let a later request overwrite bytes
-        mid-transfer, so the executor pauses the request only once the
+        mid-transfer, so the victim is parked rather than released and has to
+        stay off every output list: an evicted request is paused by the
+        executor, and that pause would overwrite the state keeping it parked.
+        `PyExecutor._resume_preempted_request` pauses it instead, once the
         connector reports the saves retired.
         """
         mgr = make_kv_cache_manager(
@@ -923,7 +926,9 @@ class TestContextPreemption:
 
         mgr.preempt_request.assert_called_once_with(victim)
         victim.pause.assert_not_called()
-        assert ids(out.paused_requests) == [99]
+        assert ids(out.paused_requests) == []
+        assert ids(out.context_requests) == []
+        assert ids(out.generation_requests) == []
 
     def test_preempted_victim_not_scheduled_in_the_same_pass(self):
         """Re-admitting the victim would spend the pages it just released."""

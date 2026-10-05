@@ -121,6 +121,21 @@ class KvCacheConnectorWorker(ABC):
         self._metadata = None
         super().__init__()
 
+    @property
+    def capacity_only(self) -> bool:
+        """Whether this worker contributes resources but transfers no KV.
+
+        Several guards around the executor exist to protect the page addresses
+        a connector registers: the capacity scheduler is restricted, cache
+        tiers below GPU are refused, and per-layer hooks are installed. A
+        worker that registers nothing and moves nothing needs none of them, so
+        it overrides this and the executor leaves its engine alone.
+
+        Overriding does not make a connector optional. It still participates in
+        construction and shutdown; it simply has no KV of its own in flight.
+        """
+        return False
+
     def bind_connector_meta(self, metadata: object):
         self._metadata = metadata
 
@@ -237,6 +252,13 @@ class KvCacheConnectorWorker(ABC):
         owners do not participate in its completion.
         """
 
+    def shutdown(self) -> None:
+        """Release whatever this worker holds, once the executor is done with it.
+
+        Called once, after the executor's worker thread has joined, so no
+        transfer can start afterwards. Implementations must be idempotent.
+        """
+
 
 class KvCacheConnectorScheduler(ABC):
     # ADP creates one adapter per rank. Adapters may connect to the same
@@ -289,6 +311,19 @@ class KvCacheConnectorScheduler(ABC):
             If true, this indicates that the kv cache manager should wait
             to deallocate the blocks until the saving has completed
             (determined by ``get_finished`` on the workers).
+        """
+
+    def request_reset(self, request: LlmRequest) -> None:
+        """
+        Called when a request's allocation is released for it to run again.
+
+        Rollback and failed admission take this path, where request_finished
+        ends a request instead. Another request may own the released pages
+        before this one is readmitted, so state the connector recorded in page
+        indices has to be dropped or rebuilt here. The default is a no-op.
+
+        Args:
+            request: The request whose allocation was released.
         """
 
     @abstractmethod
@@ -551,6 +586,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.worker = worker
         self.scheduler = scheduler
         self.enable_attention_dp = enable_attention_dp
+        #: Whether the attached connector moves KV at all. Read by the
+        #: executor to decide which of its connector-related restrictions
+        #: apply; see `KvCacheConnectorWorker.capacity_only`.
+        self.capacity_only = bool(worker.capacity_only)
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -682,6 +721,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def build_scheduler_output(
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
     ):
+        if self.capacity_only:
+            # A capacity-only connector registers no pages, so any scheduler
+            # output would describe no loads and no saves. Both KV cache
+            # managers call this once per iteration from `prepare_resources`,
+            # which on a generation server is inter-token latency.
+            # `handle_metadata` returns early when no output was built.
+            return
         self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
             scheduled_batch, self.new_async_requests, kv_cache_manager
         )
@@ -760,6 +806,28 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         return saving_async
 
+    def reset_request_state(self, req: LlmRequest) -> None:
+        """
+        Retire the bookkeeping keyed to an allocation released for replay.
+
+        The scheduler-output deltas describe the pages the request held: left
+        behind, the replay lands in `cached_requests` carrying a block-id delta
+        against pages that no longer exist. Needs no collective, since it
+        decides nothing the ranks have to agree on.
+
+        Args:
+            req: The request whose allocation was released.
+        """
+        if req.is_dummy_request:
+            return
+
+        self.scheduler_output_manager.requests.pop(req.request_id, None)
+        self.scheduler_output_manager.external_loads.pop(req.request_id, None)
+        self.finished_async_loading_requests.pop(req.request_id, None)
+        # The connector's own per-request state is keyed to the allocation too.
+        if self.scheduler is not None:
+            self.scheduler.request_reset(req)
+
     def get_finished(self) -> List[LlmRequest]:
         """
         Process requests that have finished loading and saving.
@@ -833,3 +901,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def wait_for_initialization(self):
         if self.scheduler is not None:
             self.scheduler.wait_for_initialization()
+
+    def shutdown(self) -> None:
+        self.worker.shutdown()

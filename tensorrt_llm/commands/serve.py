@@ -28,7 +28,7 @@ from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
 from tensorrt_llm.commands._serve_stability import stability_option
-from tensorrt_llm.commands.mooncake import mooncake_donor, mooncake_master
+from tensorrt_llm.commands.mooncake import mooncake_master, mooncake_pool_report
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
@@ -41,7 +41,6 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               parse_metadata_server_config_file,
                                               validate_config_bool)
 from tensorrt_llm.llmapi.llm_args import (KvCacheConnectorConfig,
-                                          MooncakeDonationConfig,
                                           MultimodalConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
@@ -521,28 +520,23 @@ def _terminate_attached_frontends(children: list) -> None:
 @contextlib.contextmanager
 def _provision_kv_cache_pool(llm_args: dict,
                              owns_engine: bool = True) -> Iterator[None]:
-    """Bring up the shared cache this server needs or feeds, for its lifetime.
+    """Bring up the shared cache this server joins, for its lifetime.
 
     A connector backed by a cluster-wide pool needs that pool reachable before
     any rank opens a handle, and the ranks are spawned by the LLM constructor,
     so this wraps the construction. A deployment that provisions the pool
     externally is detected and left alone.
 
-    A server may also lend the pool host memory without using it, which is how
-    a pool spans nodes whose engines have no connector. That segment has to be
-    mounted before traffic arrives and held for as long as the pages placed in
-    it are expected to be there.
-
-    Only the process that owns the engine does either. An attached frontend
+    Only the process that owns the engine does this. An attached frontend
     re-execs this command line but shares the launcher's executor, so it would
-    otherwise stand up a second pool and lend a second segment.
+    otherwise render a second client config over the first.
     """
     if not owns_engine:
         yield
         return
 
-    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import (
-        maybe_donate_segment, maybe_provision_pool)
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import \
+        maybe_provision_pool
 
     connector_config = llm_args.get("kv_connector_config")
     if isinstance(connector_config, dict):
@@ -552,12 +546,7 @@ def _provision_kv_cache_pool(llm_args: dict,
         connector_config = KvCacheConnectorConfig(**connector_config)
         llm_args["kv_connector_config"] = connector_config
 
-    donation = llm_args.get("mooncake_donation")
-    if isinstance(donation, dict):
-        donation = MooncakeDonationConfig(**donation)
-        llm_args["mooncake_donation"] = donation
-
-    with maybe_provision_pool(connector_config), maybe_donate_segment(donation):
+    with maybe_provision_pool(connector_config):
         yield
 
 
@@ -2545,10 +2534,11 @@ main = DefaultGroup(
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
         "mm_embedding_serve": serve_encoder,
         "embeddings": serve_embedding,
-        # The parts of a Mooncake pool that cannot belong to a server, for
-        # deployments where a pool outlives or spans them.
+        # The part of a Mooncake pool that cannot belong to a server, since it
+        # outlives and is shared by all of them, and the report of what they
+        # collectively contributed to it.
         "mooncake_master": mooncake_master,
-        "mooncake_donor": mooncake_donor,
+        "mooncake_pool_report": mooncake_pool_report,
     })
 
 if __name__ == "__main__":

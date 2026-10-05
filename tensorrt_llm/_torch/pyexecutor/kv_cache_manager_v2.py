@@ -978,7 +978,13 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
         cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=int(quota))]
-        if kv_connector_manager is not None and kv_cache_config.host_cache_size is None:
+        # A capacity-only connector is exempt from the disable below: it
+        # registers nothing for migration to invalidate, and it would otherwise
+        # lose the tier the scheduler spills to for no reason.
+        connector_registers_pages = (
+            kv_connector_manager is not None and not kv_connector_manager.capacity_only
+        )
+        if connector_registers_pages and kv_cache_config.host_cache_size is None:
             # A KV connector registers device addresses for its pages, and a
             # page evicted to another tier has its GPU slot reassigned, so the
             # automatic host tier below would silently migrate pages out from
@@ -2639,6 +2645,17 @@ class KVCacheManagerV2(BaseResourceManager):
         """True while a deferred preemption is still waiting on a connector."""
         return bool(self._pending_preemption)
 
+    def is_preemption_pending(self, req: LlmRequest) -> bool:
+        """True while *req* is parked mid-preemption waiting on a connector.
+
+        `preempt_request` parks the victim in the state the finish path uses,
+        which `LlmRequest.isFinished` reports as finished. That is what keeps
+        it out of the schedulable range, but a caller that reads the state as
+        "done generating" -- the response path above all -- has to ask here
+        instead, since this request is going to run again.
+        """
+        return req.py_request_id in self._pending_preemption
+
     def preempt_request(self, req: LlmRequest) -> bool:
         """Give up *req*'s KV cache so its pages can be reclaimed.
 
@@ -3522,6 +3539,12 @@ class KVCacheManagerV2(BaseResourceManager):
         # blocking every later preemption through has_pending_preemption.
         self._pending_preemption.pop(request.py_request_id, None)
         self._release_undelivered_connector_prefix(request)
+        if self.kv_connector_manager is not None and not self.is_draft:
+            # A replay allocates different pages, so state the connector keyed
+            # to these ones has to go. Rollback and failed admission release an
+            # allocation here for a request that will run again, where
+            # `request_finished` ends one.
+            self.kv_connector_manager.reset_request_state(request)
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
