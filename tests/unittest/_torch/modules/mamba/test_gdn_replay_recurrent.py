@@ -49,8 +49,8 @@ def _seq_ref_step(S, q, k, v, g, beta, scale):
             qt = q[t, h].float()
             kt = k[t, h].float()
             vt = v[t, hv].float()
-            qt = qt / (qt.norm() + 1e-6) * scale
-            kt = kt / (kt.norm() + 1e-6)
+            qt = qt / (qt.square().sum() + 1e-6).sqrt() * scale
+            kt = kt / (kt.square().sum() + 1e-6).sqrt()
             St = S[hv] * torch.exp(g[t, hv].float())
             vt = (vt - (St * kt[None, :]).sum(-1)) * beta[t, hv].float()
             St = St + kt[None, :] * vt[:, None]
