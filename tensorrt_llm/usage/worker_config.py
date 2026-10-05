@@ -16,6 +16,8 @@ import os
 import secrets
 import socket
 import threading
+import time
+import uuid
 from collections.abc import Iterator
 from typing import Any
 
@@ -28,7 +30,7 @@ FIELDS = (
 _MAX_WORKERS = 4096
 _MAX_PACKET = 2048
 _PROTOCOL = 1
-_GRACE_SECONDS = 0.1
+_COLLECTION_SECONDS = 1.0
 Endpoint = tuple[str, int, bytes]
 
 
@@ -54,8 +56,6 @@ def send_snapshot(endpoint: Endpoint, rank: int, snapshot: dict) -> None:
     """Send once, without waiting for a receiver or exposing raw config objects."""
     try:
         host, port, key = endpoint
-        # Endpoint comes from the owner and is numeric: sendto must not do DNS.
-        socket.inet_pton(socket.AF_INET, host)
         body = json.dumps(
             {"protocol": _PROTOCOL, "rank": rank, "snapshot": snapshot},
             sort_keys=True,
@@ -88,15 +88,23 @@ def publish_worker_config(args: Any, rank: int) -> None:
         # Collection can outlast an opt-out change.
         if not _enabled(args):
             return
-        send_snapshot(
-            endpoint,
-            rank,
-            {
-                "manifest": meta["capture_manifest_digest"],
-                "policy": meta["field_policy_version"],
-                "values": values,
-            },
-        )
+        snapshot = {
+            "manifest": meta["capture_manifest_digest"],
+            "policy": meta["field_policy_version"],
+            "values": values,
+        }
+
+        def send() -> None:
+            # Hostname resolution and socket I/O must not delay engine startup.
+            try:
+                host, port, key = endpoint
+                address = socket.gethostbyname(host)
+                if _enabled(args):
+                    send_snapshot((address, port, key), rank, snapshot)
+            except Exception:
+                pass  # Optional telemetry must not raise from a worker daemon.
+
+        threading.Thread(target=send, daemon=True, name="trtllm-worker-snapshot").start()
     except Exception:
         return
 
@@ -108,39 +116,53 @@ class WorkerConfigCollector:
         if type(expected) is not int or not 1 <= expected <= _MAX_WORKERS:
             raise ValueError("Unsupported model-worker count")
         self.expected = expected
-        self.endpoint: Endpoint | None = None
-        self._host = host
         self._key = secrets.token_bytes(32)
         self._snapshots: dict[int, dict] = {}
         self._invalid_ranks: set[int] = set()
         self._stop = threading.Event()
-        self._ready = threading.Event()
         self._complete = threading.Event()
+        self._finished = threading.Event()
+        self._deadline: float | None = None
+        # Binding a local socket needs neither DNS nor a receiver-readiness wait.
+        # Workers resolve the advertised hostname in their background senders.
+        self._receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self._receiver.bind((host or "0.0.0.0", 0))
+            self._receiver.settimeout(0.02)
+            self.endpoint = (
+                host or socket.gethostname(),
+                self._receiver.getsockname()[1],
+                self._key,
+            )
+        except Exception:
+            self._receiver.close()
+            raise
         self._thread = threading.Thread(
             target=self._receive, daemon=True, name="trtllm-worker-config"
         )
-        self._thread.start()
-        # DNS/socket failures never hold up model construction indefinitely.
-        self._ready.wait(_GRACE_SECONDS)
-        if self.endpoint is None:
-            self._stop.set()
+        try:
+            self._thread.start()
+        except Exception:
+            self._receiver.close()
+            raise
 
     def _receive(self) -> None:
         try:
-            host = self._host or socket.gethostbyname(socket.gethostname())
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
-                receiver.bind((host, 0))
-                receiver.settimeout(0.02)
-                self.endpoint = (host, receiver.getsockname()[1], self._key)
-                self._ready.set()
+            with self._receiver as receiver:
                 while not self._stop.is_set():
+                    if self._deadline is not None and (
+                        self._complete.is_set() or time.monotonic() >= self._deadline
+                    ):
+                        break
                     try:
                         packet = receiver.recv(_MAX_PACKET + 1)
                     except socket.timeout:
                         continue
                     self._accept(packet)
-        except Exception:
-            self._ready.set()
+        except OSError:
+            pass
+        finally:
+            self._finished.set()
 
     def _accept(self, packet: bytes) -> None:
         if not 32 < len(packet) <= _MAX_PACKET:
@@ -184,19 +206,28 @@ class WorkerConfigCollector:
         except (ValueError, TypeError, KeyError):
             return
 
-    def finish(self, wait: bool = True) -> dict:
-        """Freeze observations after a small grace period, then release the socket."""
-        if wait and self.endpoint is not None:
-            self._complete.wait(_GRACE_SECONDS)
+    def start_deadline(self) -> None:
+        """Arm background cleanup after startup, even if no reporter takes ownership."""
+        self._deadline = time.monotonic() + _COLLECTION_SECONDS
+
+    def cancel(self) -> None:
+        """Cancel without waiting on the application's startup/shutdown thread."""
         self._stop.set()
-        self._thread.join(_GRACE_SECONDS)
+
+    def finish(self, wait: bool = True) -> dict:
+        """Read the final observations; only the telemetry thread may wait here."""
+        if self._deadline is None:
+            self.start_deadline()
+        if wait:
+            self._finished.wait(max(0, self._deadline - time.monotonic()) + 0.05)
+        self.cancel()
         # Never read a dictionary still being modified by a delayed receiver.
-        snapshots = list(self._snapshots.values()) if not self._thread.is_alive() else []
+        snapshots = list(self._snapshots.values()) if self._finished.is_set() else []
         return {"expected": self.expected, "snapshots": snapshots}
 
 
 @contextlib.contextmanager
-def observe_workers(args: Any) -> Iterator[None]:
+def observe_workers(args: Any) -> Iterator[WorkerConfigCollector | None]:
     """Add optional collection around engine creation; always clean up on failure."""
     collector = None
     expected = None
@@ -215,17 +246,21 @@ def observe_workers(args: Any) -> Iterator[None]:
     except Exception:
         pass
     try:
-        yield
+        yield collector
+    except BaseException:
+        if collector is not None:
+            collector.cancel()
+        raise
     finally:
         if expected is not None:
-            try:
-                args._worker_config_observation = (
-                    collector.finish()
-                    if collector is not None
-                    else {"expected": expected, "snapshots": []}
-                )
-            except Exception:
-                args._worker_config_observation = {"expected": expected, "snapshots": []}
+            if collector is not None:
+                collector.start_deadline()
+            args._worker_config_observation = {
+                "expected": expected,
+                "snapshots": [],
+                "pending": collector is not None,
+                "capture_id": uuid.uuid4().hex,
+            }
             args._worker_config_endpoint = None
 
 
@@ -254,7 +289,9 @@ def merge_observation(config: dict, meta: dict, observation: dict) -> None:
         else:
             config[path] = values[0]
             verified.append(path)
-    if all_workers_responded:
+    if observation.get("pending"):
+        status = "pending"
+    elif all_workers_responded:
         status = "complete"
     elif compatible_snapshots:
         status = "partial"
@@ -274,3 +311,5 @@ def merge_observation(config: dict, meta: dict, observation: dict) -> None:
             },
         }
     )
+    if "capture_id" in observation:
+        meta["capture_id"] = observation["capture_id"]

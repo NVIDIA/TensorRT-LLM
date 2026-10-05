@@ -10,7 +10,12 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.usage import usage_lib
 
-from .test_e2e_capture import CaptureHandler, _assert_event_matches_sms_schema, _get_model_path
+from .test_e2e_capture import (
+    CaptureHandler,
+    _assert_event_matches_sms_schema,
+    _get_model_path,
+    _wait_for_event,
+)
 from .test_e2e_capture import capture_server as capture_server
 from .test_e2e_capture import reset_usage_state as reset_usage_state
 
@@ -51,6 +56,7 @@ def test_worker_config_tp2(
         )
         assert len(outputs) == 1 and outputs[0].outputs[0].token_ids
         assert CaptureHandler.capture_event.wait(30), "No initial telemetry report received"
+        _wait_for_event("trtllm_worker_config_update")
 
     initial_reports = [
         event
@@ -70,7 +76,21 @@ def test_worker_config_tp2(
         "kv_cache_config.enable_partial_reuse": False,
     }
     assert metadata["capture_version"] == "3"
-    assert metadata["worker_capture"] == {
+    assert metadata["worker_capture"]["status"] == "pending"
+    assert not set(expected_values) & config.keys()
+    updates = [
+        event
+        for payload in CaptureHandler.captured_payloads
+        for event in payload["events"]
+        if event["name"] == "trtllm_worker_config_update"
+    ]
+    assert len(updates) == 1
+    update = updates[0]
+    assert CaptureHandler.captured_payloads[0]["events"][0]["name"] == "trtllm_initial_report"
+    assert update["parameters"]["captureId"] == metadata["capture_id"]
+    worker_config = json.loads(update["parameters"]["workerConfigJson"])
+    worker_meta = json.loads(update["parameters"]["workerConfigMetaJson"])
+    assert worker_meta["worker_capture"] == {
         "expected": 2,
         "received": 2,
         "status": "complete",
@@ -78,7 +98,8 @@ def test_worker_config_tp2(
         "conflicting_fields": [],
         "unavailable_fields": [],
     }
-    assert {path: config[path] for path in expected_values} == expected_values
+    assert worker_config == expected_values
     assert model_path not in json.dumps(parameters)
     assert "_worker_config_endpoint" not in json.dumps(parameters)
     _assert_event_matches_sms_schema(event)
+    _assert_event_matches_sms_schema(update)

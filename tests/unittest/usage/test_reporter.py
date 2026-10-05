@@ -60,6 +60,66 @@ def _reset_process_telemetry_state():
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.mark.parametrize("outcome", ["complete", "missing", "failure", "exit", "disabled"])
+def test_initial_attempt_precedes_worker_collection(monkeypatch, reporter_session, outcome):
+    from tensorrt_llm.usage import worker_config as wc
+
+    sent = []
+    meta = {
+        "capture_id": "a" * 32,
+        "capture_manifest_digest": "f" * 64,
+        "field_policy_version": "1",
+    }
+    for name in ("_collect_system_info", "_collect_gpu_info"):
+        monkeypatch.setattr(usage_lib, name, lambda: {})
+    monkeypatch.setattr(usage_lib, "_architecture_telemetry_fields", lambda args: ("", ""))
+    monkeypatch.setattr(
+        usage_lib, "_collect_llm_api_config_payloads", lambda args: ("{}", json.dumps(meta))
+    )
+
+    def send(payload):
+        sent.append(payload)
+        if payload["events"][0]["name"] == "trtllm_worker_config_update":
+            usage_lib._HEARTBEAT_STOP.set()
+
+    monkeypatch.setattr(usage_lib, "_send_to_gxt", send)
+
+    def finish():
+        assert [p["events"][0]["name"] for p in sent] == ["trtllm_initial_report"]
+        if outcome == "failure":
+            usage_lib._HEARTBEAT_STOP.set()
+            raise OSError("receiver failed")
+        if outcome == "exit":
+            usage_lib.report_exit(usage_lib.TerminalOutcome(termination_kind="exception"))
+        if outcome == "disabled":
+            usage_lib._SESSION.disable()
+            usage_lib._HEARTBEAT_STOP.set()
+        observed = {
+            "manifest": meta["capture_manifest_digest"],
+            "policy": "1",
+            "values": {key: False if key == wc.PARTIAL_REUSE_FIELD else 0 for key in wc.FIELDS},
+        }
+        return {"expected": 2, "snapshots": [] if outcome == "missing" else [observed, observed]}
+
+    usage_lib._background_reporter(
+        None, None, worker_config_collector=SimpleNamespace(finish=finish)
+    )
+    names = [p["events"][0]["name"] for p in sent]
+    if outcome in ("complete", "missing"):
+        assert names == ["trtllm_initial_report", "trtllm_worker_config_update"]
+        update = sent[1]["events"][0]["parameters"]
+        assert update["captureId"] == meta["capture_id"]
+        coverage = json.loads(update["workerConfigMetaJson"])["worker_capture"]
+        assert coverage["status"] == ("complete" if outcome == "complete" else "unavailable")
+        from .test_e2e_capture import _assert_event_matches_sms_schema
+
+        _assert_event_matches_sms_schema(sent[1]["events"][0])
+    else:
+        assert names == ["trtllm_initial_report"] + (
+            ["trtllm_exit_report"] if outcome == "exit" else []
+        )
+
+
 @pytest.fixture
 def reporter_session(enable_telemetry):
     """Create the session required by the background reporter."""
@@ -152,7 +212,7 @@ class TestReportUsage:
             )
             call_args = thread_cls.call_args
             assert call_args.kwargs["target"].__name__ == "_background_reporter"
-            assert call_args.kwargs["args"] == (mock_args, mock_config, "")
+            assert call_args.kwargs["args"] == (mock_args, mock_config, "", None)
 
     def test_report_usage_telemetry_disabled_no_thread(self, monkeypatch):
         """report_usage with TelemetryConfig(disabled=True) should not start a thread."""

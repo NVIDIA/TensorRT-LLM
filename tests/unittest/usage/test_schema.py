@@ -251,7 +251,7 @@ class TestSchemaConstants:
         [
             ("CLIENT_ID", "616561816355034"),
             ("EVENT_PROTOCOL", "1.6"),
-            ("EVENT_SCHEMA_VER", "0.7"),
+            ("EVENT_SCHEMA_VER", "0.8"),
             ("EVENT_SYS_VER", "trtllm-telemetry/1.0"),
         ],
     )
@@ -422,11 +422,12 @@ class TestSchemaCompliance:
         sms_schema = self._load_sms_schema()
         assert sms_schema["$schema"] == "http://json-schema.org/draft-07/schema#"
 
-    def test_schema_has_three_events(self):
+    def test_schema_has_supported_events(self):
         """SMS schema defines exactly the supported telemetry events."""
         sms_schema = self._load_sms_schema()
         events = sms_schema["definitions"]["events"]
         assert set(events.keys()) == {
+            "trtllm_worker_config_update",
             "trtllm_initial_report",
             "trtllm_heartbeat",
             "trtllm_exit_report",
@@ -435,6 +436,7 @@ class TestSchemaCompliance:
     @pytest.mark.parametrize(
         ("event_name", "model"),
         [
+            ("trtllm_worker_config_update", schema.TrtllmWorkerConfigUpdate),
             ("trtllm_initial_report", schema.TrtllmInitialReport),
             ("trtllm_heartbeat", schema.TrtllmHeartbeat),
             ("trtllm_exit_report", schema.TrtllmExitReport),
@@ -497,7 +499,12 @@ class TestSchemaCompliance:
 
     @pytest.mark.parametrize(
         "event_name",
-        ["trtllm_initial_report", "trtllm_heartbeat", "trtllm_exit_report"],
+        [
+            "trtllm_initial_report",
+            "trtllm_heartbeat",
+            "trtllm_exit_report",
+            "trtllm_worker_config_update",
+        ],
     )
     def test_all_event_fields_are_required_and_closed(self, event_name):
         """Every SMS event requires its declared fields and rejects extras."""
@@ -552,6 +559,7 @@ class TestSchemaCompliance:
         """Every event has GDPR metadata in eventMeta."""
         sms_schema = self._load_sms_schema()
         for event_name in (
+            "trtllm_worker_config_update",
             "trtllm_initial_report",
             "trtllm_heartbeat",
             "trtllm_exit_report",

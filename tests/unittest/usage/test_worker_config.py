@@ -6,6 +6,7 @@ import hmac
 import json
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -242,7 +243,9 @@ def test_unavailable_collection_does_not_fail_startup(monkeypatch, mode):
     with wc.observe_workers(args):
         pass
     assert args._worker_config_endpoint is None
-    assert args._worker_config_observation == {"expected": 2, "snapshots": []}
+    assert args._worker_config_observation["expected"] == 2
+    assert args._worker_config_observation["snapshots"] == []
+    assert args._worker_config_observation["pending"] is False
 
 
 def test_new_construction_does_not_reuse_an_old_observation(monkeypatch):
@@ -263,8 +266,15 @@ def test_worker_uses_existing_sanitizer(monkeypatch):
     args._worker_config_endpoint = ("127.0.0.1", 9, b"key")
     monkeypatch.setattr(wc, "_enabled", lambda args: True)
     sent = []
-    monkeypatch.setattr(wc, "send_snapshot", lambda *a: sent.append(a))
+    complete = threading.Event()
+
+    def send(*args):
+        sent.append(args)
+        complete.set()
+
+    monkeypatch.setattr(wc, "send_snapshot", send)
     wc.publish_worker_config(args, 1)
+    assert complete.wait(2)
     assert sent[0][2]["values"][wc.PARTIAL_REUSE_FIELD] is False
     assert "private" not in json.dumps(sent[0][2])
 
@@ -338,3 +348,32 @@ def test_executor_hook_observes_after_runtime_mutation(monkeypatch):
     )
     worker.setup_engine()
     assert observed == [False]
+
+
+def test_startup_never_waits_for_receiver_or_snapshots(monkeypatch):
+    monkeypatch.setattr(wc, "_enabled", lambda args: True)
+    monkeypatch.setattr(wc.socket, "gethostbyname", lambda *a: pytest.fail("startup used DNS"))
+    monkeypatch.setattr(
+        wc.WorkerConfigCollector, "finish", lambda *a: pytest.fail("startup waited")
+    )
+    args = SimpleNamespace(encode_only=False, parallel_config=SimpleNamespace(world_size=2))
+    with wc.observe_workers(args) as collector:
+        assert collector.endpoint is not None
+    assert args._worker_config_observation["pending"] is True
+    assert len(args._worker_config_observation["capture_id"]) == 32
+    collector.cancel()
+    assert collector._finished.wait(2)
+
+
+def test_pending_initial_capture_never_uses_parent_worker_values():
+    args = Args()
+    args._worker_config_observation = {
+        "expected": 2,
+        "snapshots": [],
+        "pending": True,
+        "capture_id": "a" * 32,
+    }
+    config, meta = map(json.loads, collect_llm_api_config_payloads(args))
+    assert not set(wc.FIELDS) & config.keys()
+    assert meta["worker_capture"]["status"] == "pending"
+    assert meta["capture_id"] == "a" * 32

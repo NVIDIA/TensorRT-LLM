@@ -39,7 +39,7 @@ _LONG_STR = 256  # NvTelemetry "LongString" maxLength
 
 CLIENT_ID = "616561816355034"
 EVENT_PROTOCOL = "1.6"
-EVENT_SCHEMA_VER = "0.7"
+EVENT_SCHEMA_VER = "0.8"
 EVENT_SYS_VER = "trtllm-telemetry/1.0"
 CLIENT_TYPE = "Native"
 CLIENT_VARIANT = "Release"
@@ -191,6 +191,18 @@ class TrtllmInitialReport(_LlmCounterSnapshot):
     features_json: str = Field(default="{}", alias="featuresJson")
     llm_api_config_json: str = Field(default="{}", alias="llmApiConfigJson")
     llm_api_config_meta_json: str = Field(default="{}", alias="llmApiConfigMetaJson")
+
+    model_config = {"populate_by_name": True}
+
+
+class TrtllmWorkerConfigUpdate(BaseModel):
+    """One parent-owned enrichment of the initial report, never a usage session."""
+
+    capture_id: str = Field(
+        ..., alias="captureId", min_length=32, max_length=32, pattern="^[0-9a-f]{32}$"
+    )
+    worker_config_json: str = Field(..., alias="workerConfigJson", max_length=2048)
+    worker_config_meta_json: str = Field(..., alias="workerConfigMetaJson", max_length=4096)
 
     model_config = {"populate_by_name": True}
 
@@ -427,7 +439,7 @@ def get_iso_timestamp(dt: Optional[datetime] = None) -> str:
 
 
 def build_gxt_payload(
-    event: Union[TrtllmInitialReport, TrtllmHeartbeat, TrtllmExitReport],
+    event: Union[TrtllmInitialReport, TrtllmHeartbeat, TrtllmExitReport, TrtllmWorkerConfigUpdate],
     *,
     session_id: str,
     trtllm_version: str,
@@ -446,6 +458,8 @@ def build_gxt_payload(
 
     if isinstance(event, TrtllmInitialReport):
         event_name = "trtllm_initial_report"
+    elif isinstance(event, TrtllmWorkerConfigUpdate):
+        event_name = "trtllm_worker_config_update"
     elif isinstance(event, TrtllmHeartbeat):
         event_name = "trtllm_heartbeat"
     elif isinstance(event, TrtllmExitReport):
