@@ -43,7 +43,8 @@ its in-memory cache) and plans that one. If the autotuner has not tuned this
 key yet, choosing a config means benchmarking on the GPU, which this module
 does not do; it compiles every candidate config instead, so the benchmark at
 first launch runs on cached cubins. The benchmark itself still runs at that
-launch and is counted separately in the stats.
+launch, unchanged, and is counted separately in the stats. Which config runs is
+always the autotuner's own choice; this module never selects or reuses one.
 
 Measurement hooks (always on when the module is enabled) log every compile and
 every autotune benchmark that happens in the executor after warmup, with its
@@ -182,22 +183,6 @@ def shadow_launches() -> _ShadowLaunches:
     return _ShadowLaunches()
 
 
-def _seed_from_sibling(autotuner, key: tuple):
-    """Reuse a tuned config for a key that differs only in optional args.
-
-    The autotuner key is (explicit key values..., dtypes of tensor args).
-    Passing a tensor instead of None for an optional argument (e.g.
-    ``initial_states``) appends a dtype and forces a fresh benchmark. When an
-    entry with the same explicit values already exists, its config is reused.
-    Opt-in (``TLLM_JIT_PREFETCH_SEED_TUNE=1``): it changes which config runs.
-    """
-    n = len([k for k in autotuner.keys])
-    for k, cfg in autotuner.cache.items():
-        if k[:n] == key[:n]:
-            return cfg
-    return None
-
-
 def _expand(call: KernelCall) -> Tuple[List[Dict[str, Any]], bool]:
     """Expand a planned call into concrete JITFunction kwargs per config.
 
@@ -213,14 +198,6 @@ def _expand(call: KernelCall) -> Tuple[List[Dict[str, Any]], bool]:
     else:
         key = _autotune_key(autotuner, jit_fn, call.args, base)
         cfg = autotuner.cache.get(key) if len(autotuner.configs) > 1 else autotuner.configs[0]
-        if cfg is None and os.environ.get("TLLM_JIT_PREFETCH_SEED_TUNE", "0") == "1":
-            cfg = _seed_from_sibling(autotuner, key)
-            if cfg is not None:
-                autotuner.cache[key] = cfg
-                logger.info(
-                    f"[JIT prefetch] seeded autotune key {key} of "
-                    f"{jit_fn.fn.__name__} from a sibling key"
-                )
         if cfg is not None:
             configs = [cfg]
             tuned = True
