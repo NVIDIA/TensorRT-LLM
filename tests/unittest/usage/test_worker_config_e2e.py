@@ -20,7 +20,7 @@ from .test_e2e_capture import reset_usage_state as reset_usage_state
 @pytest.mark.private_mpi_session
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.usefixtures("reset_usage_state", "enable_telemetry")
-@pytest.mark.parametrize("orchestrator", ["mpi", "rpc"])
+@pytest.mark.parametrize("orchestrator", ["mpi", "rpc", pytest.param("ray", marks=pytest.mark.ray)])
 def test_worker_config_tp2(
     orchestrator: str,
     capture_server: str,  # noqa: F811 - imported pytest fixture
