@@ -49,6 +49,7 @@ from tensorrt_llm._torch.distributed.mnnvl_memory import (
     cuda,
 )
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
+from tensorrt_llm.bindings import BuildInfo
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -167,6 +168,13 @@ def _cft_device_support_reason() -> str | None:
 
 def select_cft_counted_writes(force_cft: bool | None) -> bool:
     """Resolve CFT availability identically for workspace sizing and construction."""
+    if not BuildInfo.CFT_COUNTED_WRITES:
+        tllm_logger.warning_once(
+            "CFT counted writes disabled: this build was compiled against CUDA "
+            "below 13.4 and has no logical endpoint support. Falling back to fence.",
+            key="moe_a2a_cft_not_compiled",
+        )
+        return False
     driver_version = None
     if force_cft is not False:
         driver_version = _get_nvidia_driver_version()
