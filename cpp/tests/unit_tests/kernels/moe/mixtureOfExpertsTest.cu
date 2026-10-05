@@ -1310,6 +1310,18 @@ protected:
     using ConfigsToTestVec = std::vector<std::pair<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
         tensorrt_llm::cutlass_extensions::CutlassGemmConfig>>;
 
+    bool isFinalizeFused(tensorrt_llm::cutlass_extensions::CutlassGemmConfig const& gemm2) const
+    {
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+        return gemm2.epilogue_fusion_type
+            == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+#else
+        // The bundled runner controls finalize fusion with its runtime flag,
+        // rather than the tactic's epilogue_fusion_type metadata.
+        return gemm2.is_tma_warp_specialized && mUseFusedFinalizeInternal && !W4A8_AWQ;
+#endif
+    }
+
     auto getAllTileConfigsToTest()
     {
         if (mOverrideSelectedConfig1 && mOverrideSelectedConfig2)
@@ -1878,8 +1890,7 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
         auto [expected_experts, token_final_scales] = populateRouting(num_experts, num_tokens, k);
 
         runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k);
-        bool is_finalize_fusion = gemm2.epilogue_fusion_type
-            == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+        bool is_finalize_fusion = isFinalizeFused(gemm2);
         bool should_be_deterministic = !is_finalize_fusion || mK < 3;
         if (should_be_deterministic && !mIsLongTest)
         {
@@ -2210,8 +2221,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                     // Only need to init the inputs on the first iteration
                     runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k,
                         MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
-                    bool is_finalize_fusion = gemm2.epilogue_fusion_type
-                        == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+                    bool is_finalize_fusion = isFinalizeFused(gemm2);
                     bool should_be_deterministic
                         = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
@@ -2228,8 +2238,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 else
                 {
                     runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
-                    bool is_finalize_fusion = gemm2.epilogue_fusion_type
-                        == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+                    bool is_finalize_fusion = isFinalizeFused(gemm2);
                     bool should_be_deterministic
                         = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
@@ -2677,12 +2686,16 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
 #define GET_WS_PTR(type, name) auto* name = reinterpret_cast<type>(workspace + workspaces.at(#name).second)
 
             GET_WS_PTR(int64_t*, expert_first_token_offset);
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
             GET_WS_PTR(int*, unpermuted_row_to_permuted_row);
             GET_WS_PTR(int*, permuted_row_to_unpermuted_row);
-#ifdef USING_OSS_CUTLASS_MOE_GEMM
             GET_WS_PTR(int*, token_selected_experts);
 #else
+            GET_WS_PTR(int*, source_to_dest);
+            GET_WS_PTR(int*, dest_to_source);
             GET_WS_PTR(int*, unpermuted_selected_experts);
+            auto* unpermuted_row_to_permuted_row = source_to_dest;
+            auto* permuted_row_to_unpermuted_row = dest_to_source;
 #endif
 #undef GET_WS_PTR
 
@@ -2760,11 +2773,7 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
                         int64_t idx = token_idx * k + k_idx;
                         int64_t expert_idx = host_token_selected_experts[idx];
 
-#ifdef USING_OSS_CUTLASS_MOE_GEMM
                         if (expert_idx < num_experts_per_node)
-#else
-                        if (expert_idx < num_experts)
-#endif
                         {
                             int64_t unpermuted_row = k_idx * num_tokens + token_idx;
                             int64_t permuted_row = host_expert_first_token_offset_size[expert_idx]
