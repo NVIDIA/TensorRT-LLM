@@ -263,8 +263,8 @@ class DSparkAttention(DSparkAttentionKernel):
             raise ValueError("Unsupported DSpark kernel configuration: " + ", ".join(mismatches))
         if seq_len_q not in (5, 6):
             raise ValueError(f"DSpark block size must be 5 or 6, got {seq_len_q}")
-        if history_page_size not in (16, 32, 64, 128):
-            raise ValueError("DSpark history page size must be 16, 32, 64, or 128")
+        if history_page_size not in (16, 32, 64, 128, 256):
+            raise ValueError("DSpark history page size must be 16, 32, 64, 128, or 256")
         if inverse_rope_dim not in (0, 64):
             raise ValueError(f"DSpark inverse_rope_dim must be 0 or 64, got {inverse_rope_dim}")
 
@@ -287,7 +287,7 @@ class DSparkAttention(DSparkAttentionKernel):
         self.fixed_cache_seq_len = self.window_size + seq_len_q
         self.inverse_rope_dim = inverse_rope_dim
         self.history_page_size = history_page_size
-        # Each supported page size divides the cyclic 128-row window.
+        # Subdivide the 64-row loads at physical-page and cyclic-window boundaries.
         self.history_tile_sizes = tuple(sorted({1, 4, 16, min(history_page_size, 64)}))
 
     @cute.jit

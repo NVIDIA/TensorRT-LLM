@@ -452,7 +452,7 @@ def cute_dsl_dspark_rmsnorm_rope_page_write(
     if (
         x.shape[1] != 1
         or kv_cache.ndim != 3
-        or kv_cache.shape[1] not in (16, 32, 64, 128)
+        or kv_cache.shape[1] not in (16, 32, 64, 128, 256)
         or kv_cache.shape[2] != _DSV4_DSPARK_HEAD_DIM
         or kv_cache.dtype != x.dtype
         or kv_cache.stride(1) != _DSV4_DSPARK_HEAD_DIM

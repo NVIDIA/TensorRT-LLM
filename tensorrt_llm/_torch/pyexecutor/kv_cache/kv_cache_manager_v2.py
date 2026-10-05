@@ -3465,12 +3465,12 @@ class KVCacheManagerV2(BaseResourceManager):
         """Embedded DSpark writes the complete live suffix of target history."""
         return getattr(self, "draft_attention_backend", None) == "DSv4"
 
-    def get_draft_block_table(
+    def get_draft_block_indices(
         self,
         request_ids: List[int],
         histories: Optional[Sequence[StandaloneDraftHistory]] = None,
-    ) -> torch.Tensor:
-        """Current rank-local page mappings; unused tail entries point to page zero."""
+    ) -> List[List[int]]:
+        """Validated rank-local mappings for allocated draft pages, without padding."""
         for request_id in request_ids:
             cache = self.kv_cache_map.get(request_id)
             if cache is None or not cache.is_active:
@@ -3481,7 +3481,6 @@ class KVCacheManagerV2(BaseResourceManager):
         if expanded:
             converter = self.impl.get_page_index_converter(self.layer_offsets[layer_idx], Role.KEY)
             batch_indices = [converter(indices, PageIndexMode.SHARED) for indices in batch_indices]
-        table = torch.zeros((len(request_ids), self.draft_max_blocks_per_seq), dtype=torch.int32)
         for row, indices in enumerate(batch_indices):
             cache = self.kv_cache_map[request_ids[row]]
             if (
@@ -3508,6 +3507,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 raise ValueError(
                     "Draft cache contains missing pages in its required history or scratch"
                 )
+        return batch_indices
+
+    def get_draft_block_table(
+        self,
+        request_ids: List[int],
+        histories: Optional[Sequence[StandaloneDraftHistory]] = None,
+    ) -> torch.Tensor:
+        """Current rank-local page mappings; unused tail entries point to page zero."""
+        batch_indices = self.get_draft_block_indices(request_ids, histories)
+        table = torch.zeros((len(request_ids), self.draft_max_blocks_per_seq), dtype=torch.int32)
+        for row, indices in enumerate(batch_indices):
             table[row, : len(indices)] = torch.tensor(indices, dtype=torch.int32)
         return table
 

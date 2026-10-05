@@ -125,9 +125,9 @@ def fused_dsv4_dspark_attention(
         raise RuntimeError("Embedded DSpark attention requires SM100 or SM103")
     batch, block, heads, dim = q.shape
     page_size = kv_pages.shape[1]
-    if block not in (5, 6) or (heads, dim) != (128, 512) or page_size not in (16, 32, 64, 128):
+    if block not in (5, 6) or (heads, dim) != (128, 512) or page_size not in (16, 32, 64, 128, 256):
         raise ValueError(
-            "DSpark requires block 5/6, 128 heads, head_dim 512 and 16/32/64/128-token pages"
+            "DSpark requires block 5/6, 128 heads, head_dim 512 and 16/32/64/128/256-token pages"
         )
     if q.dtype != torch.bfloat16 or draft_block.dtype != q.dtype or kv_pages.dtype != q.dtype:
         raise ValueError("DSpark Q, draft KV and pages must use BF16")

@@ -216,6 +216,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._draft_kv_buffers = ()
         self._draft_block_tables = None
         self._draft_capacities = None
+        self._draft_page_indices: dict[int, tuple[int, ...]] = {}
+        self._draft_metadata_host_buffers: list[dict] = []
         self._managed_residency = {}
         # Set in _lazy_init from the RoPE table the drafter will build; None
         # leaves positions unbounded (direct construction in tests).
@@ -382,6 +384,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._draft_kv_manager = manager
         self._draft_kv_buffers = buffers
         self._managed_residency.clear()
+        self._draft_page_indices.clear()
         self._draft_block_tables = torch.zeros(
             (self._batch_to_slot.shape[0], manager.draft_max_blocks_per_seq),
             dtype=torch.int32,
@@ -409,16 +412,26 @@ class DSv4DSparkWorker(SpecWorkerBase):
         ]
         real_ids = [request_ids[row] for row in real_rows]
         self._release_inactive_slots(real_ids)
-        table = self._draft_kv_manager.get_draft_block_table(real_ids)
-        tables_host = torch.zeros_like(self._draft_block_tables, device="cpu")
-        tables_host[real_rows] = table
-        self._draft_block_tables.copy_(tables_host, non_blocking=True)
-        capacities_host = torch.zeros_like(self._draft_capacities, device="cpu")
-        capacities_host[real_rows] = torch.tensor(
-            [self._draft_kv_manager.kv_cache_map[rid].capacity for rid in real_ids],
-            dtype=torch.long,
-        )
-        self._draft_capacities.copy_(capacities_host, non_blocking=True)
+        batch_indices = self._draft_kv_manager.get_draft_block_indices(real_ids)
+        mappings = {row: tuple(indices) for row, indices in zip(real_rows, batch_indices)}
+        updates = []
+        for row in sorted(self._draft_page_indices.keys() | mappings.keys()):
+            previous = self._draft_page_indices.get(row, ())
+            current = mappings.get(row, ())
+            if current == previous:
+                continue
+            # Clear removed mappings as well as uploading new/reassigned pages.
+            width = max(len(previous), len(current))
+            old = previous + (0,) * (width - len(previous))
+            new = current + (0,) * (width - len(current))
+            first = next((i for i in range(width) if old[i] != new[i]), width)
+            if first == width:
+                continue
+            last = width
+            while old[last - 1] == new[last - 1]:
+                last -= 1
+            updates.append((row, first, new[first:last]))
+        self._draft_page_indices = mappings
         self._ctx_len[self._scratch_slot] = 0
         self._valid_len[self._scratch_slot] = 0
         batch_slots = [self._scratch_slot] * len(request_ids)
@@ -437,10 +450,42 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._ctx_len[slot] = position
             self._valid_len[slot] = min(self._win, position)
             self._managed_residency[request_id] = cache
-        self._batch_to_slot.fill_(self._scratch_slot)
-        self._batch_to_slot[: len(request_ids)].copy_(
-            torch.tensor(batch_slots, dtype=torch.long, device=self._batch_to_slot.device)
+        # Staging may still be read by an earlier asynchronous H2D. Reuse it
+        # only after its copy event, independently of overlapped model execution.
+        count = sum(len(indices) for _, _, indices in updates)
+        host = next(
+            (buffers for buffers in self._draft_metadata_host_buffers if buffers["event"].query()),
+            None,
         )
+        if host is None:
+            host = {
+                "tables": torch.empty(count, dtype=torch.int32, pin_memory=prefer_pinned()),
+                "capacities": torch.empty(
+                    self._draft_capacities.shape, dtype=torch.long, pin_memory=prefer_pinned()
+                ),
+                "slots": torch.empty(
+                    self._batch_to_slot.shape, dtype=torch.long, pin_memory=prefer_pinned()
+                ),
+                "event": torch.cuda.Event(),
+            }
+            self._draft_metadata_host_buffers.append(host)
+        elif host["tables"].numel() < count:
+            host["tables"] = torch.empty(count, dtype=torch.int32, pin_memory=prefer_pinned())
+        offset = 0
+        for row, first, indices in updates:
+            size = len(indices)
+            source = host["tables"][offset : offset + size]
+            source.copy_(torch.tensor(indices, dtype=torch.int32))
+            self._draft_block_tables[row, first : first + size].copy_(source, non_blocking=True)
+            offset += size
+        host["capacities"].zero_()
+        for row, request_id in zip(real_rows, real_ids):
+            host["capacities"][row] = self._draft_kv_manager.kv_cache_map[request_id].capacity
+        self._draft_capacities.copy_(host["capacities"], non_blocking=True)
+        host["slots"].fill_(self._scratch_slot)
+        host["slots"][: len(batch_slots)] = torch.tensor(batch_slots, dtype=torch.long)
+        self._batch_to_slot.copy_(host["slots"], non_blocking=True)
+        host["event"].record()
 
     def _seed_context_pages(
         self,

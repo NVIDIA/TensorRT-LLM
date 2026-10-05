@@ -777,6 +777,7 @@ class DSparkAttentionKernel:
                 # Construct fixed common/tma_qk/tma_pv params for load_tma
                 tma_common_params = SimpleNamespace(
                     blk_coord=blk_coord,
+                    position=cutlass.Int32(cache_seqs[blk_coord[2]]),
                     window_end=cutlass.Int32(cache_seqs[blk_coord[2]]) % 128,
                     load_q_pipeline=load_q_pipeline,
                     load_kv_pipeline=load_kv_pipeline,
@@ -1315,8 +1316,14 @@ class DSparkAttentionKernel:
                     & (page == common_params.sPT[context_row + rows - 1, page_table_stage])
                 )
             if legal:
-                # Page sizes divide 128, so cyclic and logical page offsets agree.
-                offset = context_row % self.history_page_size // rows
+                # Recover the absolute position represented by this cyclic row.
+                # A 256-token page contains two distinct 128-token window cycles.
+                position = (
+                    common_params.position
+                    - 1
+                    - (common_params.position - 1 - context_row + 128) % 128
+                )
+                offset = position % self.history_page_size // rows
                 if cutlass.const_expr(is_k_load):
                     src = gmem[tile][None, offset, head_tile, page]
                     dst = smem[tile][None, row // rows, 0, kv_stage]
