@@ -37,7 +37,7 @@ To implement a custom KV connector, you need to implement both the scheduler and
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, TypeVar
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Set, Tuple, TypeVar
 
 import torch
 
@@ -251,6 +251,32 @@ class KvCacheConnectorWorker(ABC):
         With attention DP each request has one local worker; unrelated DP
         owners do not participate in its completion.
         """
+
+    def take_failed_load_requests(self) -> Set[int]:
+        """Requests this worker could not load every offered page for.
+
+        The runtime has already counted those positions as computed, so such a
+        request cannot take part in the forward pass. Reporting it asks the
+        executor to drop its allocation and let the scheduler admit it again.
+        Implementations clear the set on return.
+
+        Returns:
+            The affected request IDs. Empty by default, which is what a
+            connector whose failed load raises has to report.
+        """
+        return set()
+
+    def drop_bound_saves(self, request_ids: Iterable[int]) -> int:
+        """Drop these requests' saves from the metadata bound for this pass.
+
+        A request that leaves the batch after its metadata was built computes
+        none of its scheduled tail, so none of it may be published.
+
+        Returns:
+            The number of save entries removed. Zero by default, which suits a
+            connector that does not bind saves per pass.
+        """
+        return 0
 
     def shutdown(self) -> None:
         """Release whatever this worker holds, once the executor is done with it.
@@ -805,6 +831,26 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
         return saving_async
+
+    def take_failed_load_requests(self) -> Set[int]:
+        """Requests the worker could not load every offered page for this iteration.
+
+        See `PyExecutor._recover_failed_connector_loads` for what happens to
+        them.
+        """
+        return self.worker.take_failed_load_requests()
+
+    def forget_request(self, req: LlmRequest) -> None:
+        """Drop everything keyed to a request that is about to restart from scratch.
+
+        Saves bound for this pass go first, since the request computes none of
+        its scheduled tail. `reset_request_state` then retires the
+        per-allocation bookkeeping, the connector's own included.
+        """
+        if req.is_dummy_request:
+            return
+        self.worker.drop_bound_saves([req.request_id])
+        self.reset_request_state(req)
 
     def reset_request_state(self, req: LlmRequest) -> None:
         """

@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
 from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
-                    Tuple, Union)
+                    Set, Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -3765,6 +3765,48 @@ class PyExecutor:
             self.kv_connector_manager.handle_metadata()
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
+            failed = self.kv_connector_manager.take_failed_load_requests()
+            if failed:
+                self._recover_failed_connector_loads(scheduled_batch, failed)
+
+    def _recover_failed_connector_loads(self,
+                                        scheduled_batch: ScheduledRequests,
+                                        failed_ids: Set[int]) -> None:
+        """Restart context requests whose connector prefix could not be loaded.
+
+        The connector offered a stored prefix, the scheduler skipped the request
+        past it, and the pages were then not there to load. Those positions
+        already count as computed, so the request cannot take part in this
+        forward pass. Drop its allocation and progress but leave it active: the
+        scheduler admits it again next iteration from local reuse, and the
+        connector is asked afresh without the lost pages.
+
+        Only a connector whose worker owns whole pages reports failures here, so
+        the decision needs no agreement across ranks.
+        """
+        dropped = []
+        for key in ("context_requests_chunking", "context_requests_last_chunk"):
+            kept = []
+            for req in getattr(scheduled_batch, key):
+                (dropped if req.request_id in failed_ids else kept).append(req)
+            setattr(scheduled_batch, key, kept)
+        draft_kv_cache_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        for req in dropped:
+            self.kv_cache_manager.drop_context_allocation(req)
+            if isinstance(draft_kv_cache_manager, KVCacheManagerV2):
+                draft_kv_cache_manager.free_resources(req)
+            self.kv_connector_manager.forget_request(req)
+        logger.warning(
+            f"kv connector: {len(dropped)} context request(s) restarted after a "
+            f"failed prefix load: {[req.request_id for req in dropped]}")
+        if self.enable_attention_dp and scheduled_batch.batch_size == 0:
+            # Keep this owner in the collective forward while it has nothing of
+            # its own left to run.
+            self._pad_empty_attention_dp_batch(scheduled_batch)
+            if scheduled_batch.batch_size:
+                self.resource_manager.prepare_resources(
+                    scheduled_batch, publish_connector_output=False)
 
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
