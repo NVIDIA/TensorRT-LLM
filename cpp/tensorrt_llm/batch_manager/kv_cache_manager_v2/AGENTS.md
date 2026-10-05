@@ -140,6 +140,14 @@ moving a shared host source. Rollback records the original lock level, and
 `ScratchSlotLock` remains GPU-only. This does not itself demote GPU history;
 offload requires a separate transfer and GPU-slot ownership handoff.
 
+Prefill admission, prefetch, and rebasing promote a host-locked sparse page into
+one shared GPU slot. Promotion waits for all owners' prior work and finished
+readers, updates every owner's page indices and metadata version, and releases
+the source host slot with a copy-completion fence. Allocation or copy failure
+preserves host ownership. Decoding owners retain deferred-offload work so that
+`Batch.publish()` retries demotion after the prefill owner enters decode,
+suspends, or closes, even without history growth.
+
 ## Ownership and lifetime
 
 The high-level ownership shape is:
