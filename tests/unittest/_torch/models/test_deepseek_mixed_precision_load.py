@@ -27,7 +27,10 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+    reason="FP8 E4M3 dequantization requires SM89 or newer",
+)
 
 
 @pytest.mark.parametrize(

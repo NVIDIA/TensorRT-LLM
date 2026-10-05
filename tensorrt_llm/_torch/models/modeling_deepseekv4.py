@@ -572,6 +572,7 @@ class DeepseekV4WeightLoader:
             return self._load_weights_impl(weights, skip_modules=skip_modules)
 
     def _load_weights_impl(self, weights: Dict, skip_modules: List[str] = []):
+        """Load checkpoint tensors into local model and derived MLA parameters."""
         # If the checkpoint uses raw DS-V4 keys (layers.X.attn.wkv.weight,
         # mtp.0.*, embed.weight, head.weight), rewrite them to the model's
         # named-parameter keys before iterating modules. The detection is by

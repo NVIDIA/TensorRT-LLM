@@ -171,6 +171,7 @@ class DeepseekV3WeightLoader:
     def load_weights(self,
                      weights: ConsumableWeightsDict,
                      skip_modules: List[str] = []):
+        """Load checkpoint tensors into local model and derived MLA parameters."""
 
         def requantize_weight_with_new_scale(weight, weight_scale, old_scale_2,
                                              new_scale_2, device):
