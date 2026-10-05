@@ -77,6 +77,7 @@ del _BatchDescFieldSpec, _dataclasses_bd
 BufferConfig = _cpp.BufferConfig
 BufferId = _cpp.BufferId
 CoalescedBuffer = _cpp.CoalescedBuffer
+CacheDomain = _cpp.CacheDomain
 CacheTier = _cpp.CacheTier
 CorruptedError = _cpp.CorruptedError
 CuError = _cpp.CuError
@@ -205,6 +206,7 @@ __all__ = [
     "BufferId",
     "CoalescedBuffer",
     "CacheLevel",
+    "CacheDomain",
     "CacheTier",
     "CacheTierConfig",
     "CudaStream",

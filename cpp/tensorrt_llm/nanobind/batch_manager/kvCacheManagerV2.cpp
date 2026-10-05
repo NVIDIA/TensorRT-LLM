@@ -873,6 +873,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("DROPPABLE", kv::PageStatus::DROPPABLE)
         .export_values();
 
+    nb::enum_<kv::CacheDomain>(m, "CacheDomain")
+        .value("STANDALONE_DRAFT", kv::CacheDomain::kStandaloneDraft)
+        .value("TARGET", kv::CacheDomain::kTarget);
+
     nb::enum_<kv::CacheTier>(m, "CacheTier")
         .value("GPU_MEM", kv::CacheTier::GPU_MEM)
         .value("HOST_MEM", kv::CacheTier::HOST_MEM)
@@ -1342,12 +1346,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__bool__", [](kv::ScratchDesc const& self) { return static_cast<bool>(self); });
 
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
-        .def(nb::init<std::optional<int>, int, bool, std::string>(), nb::arg("window_size").none(),
-            nb::arg("num_sink_blocks"), nb::arg("is_sparse") = false, nb::arg("cache_domain") = "target")
+        .def(nb::init<std::optional<int>, int, bool, kv::CacheDomain>(), nb::arg("window_size").none(),
+            nb::arg("num_sink_blocks"), nb::arg("is_sparse") = false,
+            nb::arg("cache_domain") = kv::CacheDomain::kTarget)
         // Sink tokens round up to whole blocks. Bound rather than repeated in Python so the
         // connector's view of a life cycle is built by the same code as the allocator's.
         .def_static("make", &kv::AttnLifeCycle::make, nb::arg("window_size").none(), nb::arg("num_sink_tokens").none(),
-            nb::arg("tokens_per_block"), nb::arg("is_sparse") = false, nb::arg("cache_domain") = "target")
+            nb::arg("tokens_per_block"), nb::arg("is_sparse") = false,
+            nb::arg("cache_domain") = kv::CacheDomain::kTarget)
         .def_prop_ro("window_size", [](kv::AttnLifeCycle const& self) { return self.windowSize; })
         .def_ro("num_sink_blocks", &kv::AttnLifeCycle::numSinkBlocks)
         .def_ro("is_sparse", &kv::AttnLifeCycle::isSparse)
@@ -1550,10 +1556,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("is_sparse", &kv::BufferConfig::isSparse) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
-        .def(
-            nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>, std::string>(),
+        .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>,
+                 kv::CacheDomain>(),
             nb::arg("layer_id"), nb::arg("buffers"), nb::arg("sliding_window_size") = std::nullopt,
-            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("cache_domain") = "target")
+            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("cache_domain") = kv::CacheDomain::kTarget)
         .def_rw("layer_id", &kv::AttentionLayerConfig::layerId)
         .def_rw("buffers", &kv::AttentionLayerConfig::buffers)
         .def_rw("sliding_window_size", &kv::AttentionLayerConfig::slidingWindowSize)

@@ -144,19 +144,34 @@ TEST(KvCacheManagerV2ConfigTest, AttentionLifecycleFactoryPreservesSparsityAndCa
 {
     auto const dense = AttnLifeCycle::make(128, 5, 4);
     auto const sparse = AttnLifeCycle::make(128, 5, 4, true);
-    auto const draft = AttnLifeCycle::make(128, 5, 4, true, "standalone_draft");
+    auto const draft = AttnLifeCycle::make(128, 5, 4, true, CacheDomain::kStandaloneDraft);
 
+    EXPECT_EQ(AttentionLayerConfig{}.cacheDomain, CacheDomain::kTarget);
+    EXPECT_EQ(AttnLifeCycle{}.cacheDomain, CacheDomain::kTarget);
     EXPECT_EQ(dense.numSinkBlocks, 2);
-    EXPECT_EQ(dense.cacheDomain, "target");
+    EXPECT_EQ(dense.cacheDomain, CacheDomain::kTarget);
     EXPECT_FALSE(dense.isSparse);
     EXPECT_TRUE(sparse.isSparse);
     EXPECT_TRUE(draft.isSparse);
-    EXPECT_EQ(draft.cacheDomain, "standalone_draft");
+    EXPECT_EQ(draft.cacheDomain, CacheDomain::kStandaloneDraft);
     EXPECT_FALSE(dense == sparse);
     EXPECT_FALSE(sparse == draft);
     EXPECT_TRUE(dense < sparse || sparse < dense);
-    EXPECT_TRUE(sparse < draft || draft < sparse);
-    EXPECT_TRUE(draft == AttnLifeCycle::make(128, 8, 4, true, "standalone_draft"));
+    EXPECT_TRUE(draft < sparse);
+    EXPECT_TRUE(draft == AttnLifeCycle::make(128, 8, 4, true, CacheDomain::kStandaloneDraft));
+}
+
+TEST(KvCacheManagerV2ConfigTest, CacheDomainPreservesScratchReuse)
+{
+    auto const target = AttnLifeCycle::make(4, 0, 4);
+    auto const draft = AttnLifeCycle::make(4, 0, 4, false, CacheDomain::kStandaloneDraft);
+    HalfOpenRange<BlockOrdinal> const scratch{BlockOrdinal{0}, BlockOrdinal{3}};
+    HalfOpenRange<BlockOrdinal> const rewindScratch{BlockOrdinal{0}, BlockOrdinal{2}};
+    HalfOpenRange<BlockOrdinal> const empty{BlockOrdinal{0}, BlockOrdinal{0}};
+    EXPECT_EQ(computeScratchRange(target, 0, 16, 4, 0), scratch);
+    EXPECT_EQ(computeScratchRange(target, 0, 16, 4, 4), rewindScratch);
+    EXPECT_EQ(computeScratchRange(draft, 0, 16, 4, 0), empty);
+    EXPECT_EQ(computeScratchRange(draft, 0, 16, 4, 4), empty);
 }
 
 TEST(KvCacheManagerV2ConfigTest, MatchingSlotShapesSharePoolsOnlyWithinEachCacheDomainAndSparsity)
@@ -167,7 +182,7 @@ TEST(KvCacheManagerV2ConfigTest, MatchingSlotShapesSharePoolsOnlyWithinEachCache
     {
         auto layer = makeAttentionLayer(layerId, layerId % 4 >= 2);
         layer.slidingWindowSize = layerId % 2 == 0 ? 128 : 256;
-        layer.cacheDomain = layerId < 4 ? "target" : "standalone_draft";
+        layer.cacheDomain = layerId < 4 ? CacheDomain::kTarget : CacheDomain::kStandaloneDraft;
         config.layers.push_back(layer);
     }
     ASSERT_NO_THROW(config.validate());
@@ -180,11 +195,15 @@ TEST(KvCacheManagerV2ConfigTest, MatchingSlotShapesSharePoolsOnlyWithinEachCache
     auto poolGroup = [&](LayerId layerId) { return grouping[lifeCycle(layerId)]; };
     EXPECT_EQ(registry.size(), LifeCycleId{8});
     EXPECT_EQ(storage.slotDescList.size(), PoolGroupIndex{4});
+    EXPECT_EQ(poolGroup(4), PoolGroupIndex{0});
+    EXPECT_EQ(poolGroup(6), PoolGroupIndex{1});
+    EXPECT_EQ(poolGroup(0), PoolGroupIndex{2});
+    EXPECT_EQ(poolGroup(2), PoolGroupIndex{3});
     for (LayerId first = 0; first < 8; ++first)
     {
         auto const& attention = std::get<AttnLifeCycle>(registry[lifeCycle(first)]);
         EXPECT_EQ(attention.isSparse, first % 4 >= 2);
-        EXPECT_EQ(attention.cacheDomain, first < 4 ? "target" : "standalone_draft");
+        EXPECT_EQ(attention.cacheDomain, first < 4 ? CacheDomain::kTarget : CacheDomain::kStandaloneDraft);
         for (LayerId second = first + 1; second < 8; ++second)
         {
             EXPECT_NE(lifeCycle(first), lifeCycle(second));

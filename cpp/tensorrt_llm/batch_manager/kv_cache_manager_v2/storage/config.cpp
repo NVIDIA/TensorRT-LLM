@@ -209,7 +209,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     // Only matching cache domains and sparsity may share GPU pools.
     struct PoolGroupKey
     {
-        std::string cacheDomain;
+        CacheDomain cacheDomain;
         std::vector<size_t> slotSizes;
         bool isSparse = false;
 
@@ -225,7 +225,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     {
         auto const sizes = sg.slotSizeList();
         auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
-        std::string const cacheDomain = attn ? attn->cacheDomain : "target";
+        CacheDomain const cacheDomain = attn ? attn->cacheDomain : CacheDomain::kTarget;
         bool const isSparse = attn != nullptr && attn->isSparse;
         poolGroups[{.cacheDomain = cacheDomain, .slotSizes = sizes.raw(), .isSparse = isSparse}].push_back(
             std::move(sg));

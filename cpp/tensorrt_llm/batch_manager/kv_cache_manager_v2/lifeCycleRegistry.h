@@ -25,7 +25,6 @@
 #include <algorithm>
 #include <map>
 #include <optional>
-#include <string>
 #include <tuple>
 #include <utility>
 #include <variant>
@@ -43,7 +42,7 @@ struct AttnLifeCycle
     std::optional<int> windowSize; // nullopt = no sliding window
     int numSinkBlocks = 0;         // divUp(numSinkTokens, tokensPerBlock)
     bool isSparse = false;
-    std::string cacheDomain = "target";
+    CacheDomain cacheDomain = CacheDomain::kTarget;
 
     HalfOpenRange<BlockOrdinal> getStaleRange(int historyLength, int tokensPerBlock) const
     {
@@ -71,14 +70,14 @@ struct AttnLifeCycle
     }
 
     static AttnLifeCycle make(std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock,
-        bool isSparse = false, std::string cacheDomain = "target")
+        bool isSparse = false, CacheDomain cacheDomain = CacheDomain::kTarget)
     {
         TLLM_CHECK_DEBUG(tokensPerBlock > 0);
         TLLM_CHECK_DEBUG(!ws.has_value() || *ws > 0);
         TLLM_CHECK_DEBUG(!numSinkTokens.has_value() || *numSinkTokens >= 0);
         TLLM_CHECK_DEBUG((!numSinkTokens.has_value() || *numSinkTokens == 0) || ws.has_value());
         int sinkBlocks = divUp(numSinkTokens.value_or(0), tokensPerBlock);
-        return AttnLifeCycle{ws, sinkBlocks, isSparse, std::move(cacheDomain)};
+        return AttnLifeCycle{ws, sinkBlocks, isSparse, cacheDomain};
     }
 };
 
@@ -127,7 +126,7 @@ inline HalfOpenRange<BlockOrdinal> computeScratchRange(
 {
     auto const* attn = std::get_if<AttnLifeCycle>(&lc);
     // Draft history must retain private pages for later drafting or transfer.
-    if (!attn || !attn->windowSize.has_value() || attn->cacheDomain == "standalone_draft")
+    if (!attn || !attn->windowSize.has_value() || attn->cacheDomain == CacheDomain::kStandaloneDraft)
     {
         return {BlockOrdinal{0}, BlockOrdinal{0}};
     }

@@ -51,6 +51,13 @@ enum class PageStatus : int
     DROPPABLE = 2, // Allow eviction and dropping.
 };
 
+// Standalone draft pools precede target pools in storage layout.
+enum class CacheDomain : int
+{
+    kStandaloneDraft = 0,
+    kTarget = 1,
+};
+
 enum class CacheTier : int
 {
     GPU_MEM = 0,

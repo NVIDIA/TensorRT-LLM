@@ -151,7 +151,7 @@ struct AttentionLayerConfig
     std::optional<int> numSinkTokens;
 
     // Layers in different ownership domains must not share lifecycle or storage pools.
-    std::string cacheDomain = "target";
+    CacheDomain cacheDomain = CacheDomain::kTarget;
 
     [[nodiscard]] std::optional<int> windowSize() const noexcept
     {

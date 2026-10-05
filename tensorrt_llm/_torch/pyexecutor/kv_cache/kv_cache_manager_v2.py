@@ -69,6 +69,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttnLifeCycle,
     BatchDesc,
     BufferConfig,
+    CacheDomain,
     CacheLevel,
     CacheTier,
     CacheTierConfig,
@@ -3105,7 +3106,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         for role in self._get_buffer_roles_for_layer(local_id)
                     ],
                     sliding_window_size=self.draft_retention_window_size,
-                    cache_domain="standalone_draft",
+                    cache_domain=CacheDomain.STANDALONE_DRAFT,
                 )
             )
             self.layer_offsets[global_id] = local_id
@@ -3213,7 +3214,7 @@ class KVCacheManagerV2(BaseResourceManager):
         target_life_cycles: list[AttnLifeCycle | None] = []
         for layer in config.layers:
             if isinstance(layer, AttentionLayerConfig):
-                if layer.cache_domain == "standalone_draft":
+                if layer.cache_domain == CacheDomain.STANDALONE_DRAFT:
                     continue
                 life_cycle = AttnLifeCycle.make(
                     layer.sliding_window_size,
