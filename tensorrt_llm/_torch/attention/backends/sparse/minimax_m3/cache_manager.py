@@ -1033,11 +1033,14 @@ class MiniMaxM3DraftKVCacheView:
         Not delegated to :meth:`KVCacheManagerV2.copy_batch_block_offsets`, which
         would follow the target's per-layer page tables through ``__getattr__``.
         """
+        assert beam_width == 1, "beam_width must be 1 for KVCacheManagerV2"
         manager = self._manager
+        copy_idx = manager.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
+        assert copy_idx.shape[0] == num_seqs
         copy_batch_block_offsets_to_device(
             self.host_kv_cache_block_offsets,
             dst_tensor,
-            manager.index_mapper.get_copy_index(request_ids, num_contexts, beam_width),
+            copy_idx,
             self.index_scales,
             self.kv_offset,
             manager._stream.cuda_stream,

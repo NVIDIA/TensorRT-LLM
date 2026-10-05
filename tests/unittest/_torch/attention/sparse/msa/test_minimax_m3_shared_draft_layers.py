@@ -341,6 +341,7 @@ def test_shared_draft_layer_count_follows_the_base_manager():
     assert shared_draft_layer_count(None, None) == 0
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("local_draft_layers", [[], [60], [61]])
 @pytest.mark.parametrize("swa_scratch_reuse", [False, True])
 def test_draft_kv_cache_view_accessor_respects_local_layers(
@@ -374,6 +375,7 @@ def test_draft_kv_cache_view_accessor_respects_local_layers(
     assert manager._shared_draft_layer_ids == [60, 61]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("via_accessor", [False, True])
 def test_draft_kv_cache_view_rejects_multiple_local_layers(via_accessor: bool) -> None:
     """The single-pool view must reject a second layer before publishing wrong pointers."""
