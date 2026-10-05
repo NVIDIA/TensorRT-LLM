@@ -3752,6 +3752,15 @@ class KVCacheManagerV2(BaseResourceManager):
         self._disagg_receive_ready[req.py_request_id] = ready
         return True
 
+    def take_disagg_receive_ready(self, req: LlmRequest) -> torch.cuda.Event | None:
+        """Hand over the readiness event recorded at ``req``'s disagg admission.
+
+        The caller then owns the ordering guarantee: the receive destination
+        may be published only after the event completes. ``prepare_resources``
+        does not wait on a taken event.
+        """
+        return self._disagg_receive_ready.pop(req.py_request_id, None)
+
     def get_history_length(self, req: LlmRequest) -> int | None:
         """Return the cache's current history_length, or None if no cache.
 
