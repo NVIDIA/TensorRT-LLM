@@ -656,9 +656,8 @@ class ModelConfig(Generic[TConfig]):
             # would overwrite other layers' explicit mixed-precision recipes.
             fp8_mla_projections = [
                 name for name, cfg in mixed_quant_configs.items()
-                if cfg.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-                and name.endswith((".self_attn.kv_b_proj",
-                                   ".self_attn.k_b_proj", ".eh_proj"))
+                if cfg.quant_algo == QuantAlgo.FP8_BLOCK_SCALES and
+                name.endswith((".self_attn.kv_b_proj", ".self_attn.k_b_proj"))
             ]
             if fp8_mla_projections:
                 existing = list(quant_config.exclude_modules or [])

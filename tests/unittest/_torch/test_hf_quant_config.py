@@ -21,7 +21,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import (
+    apply_layerwise_quant_config,
+    apply_quant_config_exclude_modules,
+)
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -222,7 +225,6 @@ def test_mixed_precision_excludes_only_fp8_mla_projections(tmp_path: Path) -> No
     expected_exclusions = {
         "model.layers.0.self_attn.kv_b_proj",
         "model.layers.1.self_attn.k_b_proj",
-        "model.layers.1.eh_proj",
     }
     inner = _mixed_precision_quant_cfg(
         tmp_path, {name: {"quant_algo": algo} for name, algo in recipes.items()}
@@ -248,14 +250,9 @@ def test_mixed_precision_excludes_only_fp8_mla_projections(tmp_path: Path) -> No
             skip_create_weights_in_init=True,
         )
         modules[name] = module
-    model = SimpleNamespace(
-        model_config=SimpleNamespace(
-            quant_config=quant_config, quant_config_dict=layer_quant_config
-        ),
-        named_modules=lambda: modules.items(),
-    )
-    DecoderModelForCausalLM.apply_layerwise_quant_config(model)
-    DecoderModelForCausalLM.apply_quant_config_exclude_modules(model)
+    model_config = SimpleNamespace(quant_config=quant_config, quant_config_dict=layer_quant_config)
+    apply_layerwise_quant_config(model_config, iter(modules.items()))
+    apply_quant_config_exclude_modules(model_config, iter(modules.items()))
     for name, algo in recipes.items():
         assert layer_quant_config[name].quant_algo == QuantAlgo(algo)
         expected = None if name in expected_exclusions else QuantAlgo(algo)
@@ -278,6 +275,7 @@ def test_mixed_precision_keeps_user_exclusions(tmp_path: Path, exclusion: str) -
     ("name", "algo"),
     [
         ("model.layers.0.self_attn.q_proj", "FP8_BLOCK_SCALES"),
+        ("model.layers.0.eh_proj", "FP8_BLOCK_SCALES"),
         ("model.layers.0.self_attn.kv_b_proj", "NVFP4"),
         ("model.layers.0.self_attn.kv_b_proj", "W4A8_AWQ"),
     ],

@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3WeightLoader
+from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4WeightLoader
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -29,10 +30,16 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 
 
+@pytest.mark.parametrize(
+    "loader_cls", [DeepseekV3WeightLoader, DeepseekV4WeightLoader], ids=["v3", "v4"]
+)
 @pytest.mark.parametrize(("tp_size", "tp_rank"), [(1, 0), (2, 0), (2, 1)])
 @pytest.mark.parametrize("exclusion", ["model.layers.0.self_attn.kv_b_proj", "*kv_b_proj*"])
 def test_mla_loader_dequantizes_only_excluded_fp8_checkpoint_layers(
-    tp_size: int, tp_rank: int, exclusion: str
+    loader_cls: type[DeepseekV3WeightLoader] | type[DeepseekV4WeightLoader],
+    tp_size: int,
+    tp_rank: int,
+    exclusion: str,
 ) -> None:
     """Real loader/kernel covers unaligned FP8 heads alongside scaleless BF16."""
     heads, qk_dim, v_dim, kv_rank = 4, 192, 128, 128
@@ -89,7 +96,7 @@ def test_mla_loader_dequantizes_only_excluded_fp8_checkpoint_layers(
             # No scale exists for the BF16 layer, even under a user wildcard.
         references.append(reference)
 
-    DeepseekV3WeightLoader(model).load_weights(weights)
+    loader_cls(model).load_weights(weights)
 
     for layer, reference in zip(model.model.layers, references):
         local = reference.reshape(heads, qk_dim + v_dim, kv_rank).chunk(tp_size, dim=0)[tp_rank]
