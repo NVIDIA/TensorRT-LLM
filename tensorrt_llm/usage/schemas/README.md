@@ -42,6 +42,42 @@ login context.
 
 ## Events
 
+### Initialization-time worker configuration observations
+
+Capture version `3` preserves the existing flat `llmApiConfigJson` format.
+For `kv_cache_config.host_cache_size`, `disk_cache_size`, and
+`enable_partial_reuse`, it replaces parent values with privacy-filtered
+post-initialization worker argument values only when every expected model
+worker reports the same value. Other fields remain parent-sourced. These
+observations do not measure allocated cache capacity or later runtime changes.
+
+`llmApiConfigMetaJson.worker_capture` contains `expected`, `received`,
+`status` (`complete`, `partial`, or `unavailable`), and bounded lists named
+`verified_fields`, `conflicting_fields`, and `unavailable_fields`. `received`
+counts compatible snapshots; `complete` does not imply every field is verified. Conflicting
+or unavailable values are omitted, not replaced with null, false, or the
+original parent value. Worker counts exclude postprocessing processes and
+must not be used as deployment counts or GPU-hour weights. Version `2` and
+fields outside the verified list must not be presented as worker-verified.
+
+Collection is optional and obeys the existing opt-outs. Model workers send one
+authenticated JSON datagram to the constructing process after engine setup;
+they do not start usage-reporting sessions. The endpoint and authentication key
+are private startup arguments and never enter telemetry payloads. Messages are
+capped at 2 KiB and collection at 4096 workers. Setup and final collection each
+wait at most 100 ms, plus a bounded 100 ms receiver-thread join. There are no
+acknowledgements, retries or MPI collectives. Unreachable host addresses,
+firewalls, dropped packets, or worker capture failures produce incomplete
+coverage without failing inference. The same best-effort channel is used by
+MPI/IPC, MPI/RPC, Ray, and inline decoder workers.
+
+Attached frontends and deferred Ray initialization do not initiate collection
+and report unavailable worker observations. Encoder-only execution currently
+retains parent-only capture.
+Observations belong to one LLM construction; the existing first-initial-report
+per-process behavior is unchanged. Dashboard support for the new missingness
+states should be deployed before enabling the new producer in production.
+
 ### `trtllm_initial_report`
 
 Sent once after the first successful LLM initialization. Contains system info

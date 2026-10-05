@@ -488,7 +488,14 @@ class BaseLLM:
             # Raw JSON preserves explicit keys; GenerationConfig fills defaults.
             self._generation_config_explicit_values: dict[str, Any] = {}
 
-            self._build_model()
+            try:
+                from tensorrt_llm.usage.worker_config import observe_workers
+                worker_observation = observe_workers(self.args)
+            except Exception:
+                from contextlib import nullcontext
+                worker_observation = nullcontext()
+            with worker_observation:
+                self._build_model()
 
         except Exception:
             # _owns_mpi_session is assigned before this try block, so it is

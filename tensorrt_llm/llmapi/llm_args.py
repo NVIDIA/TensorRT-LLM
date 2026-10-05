@@ -5443,6 +5443,10 @@ class BaseLlmArgs(StrictBaseModel):
         return {str(k): str(val) for k, val in v.items()}
 
     _parallel_config: Optional[_ParallelConfig] = PrivateAttr(default=None)
+    # Internal startup channel, never a public/captured configuration field.
+    _worker_config_endpoint: Optional[tuple[str, int,
+                                            bytes]] = PrivateAttr(default=None)
+    _worker_config_observation: Optional[dict] = PrivateAttr(default=None)
 
     @property
     def parallel_config(self) -> _ParallelConfig:
