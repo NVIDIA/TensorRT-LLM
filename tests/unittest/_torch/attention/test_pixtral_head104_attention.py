@@ -16,10 +16,10 @@ from tensorrt_llm._utils import get_sm_version
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
-def test_pixtral_sm100_attention(dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pixtral_head104_attention(dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch) -> None:
     """Compare ragged head-104 attention to FP32 SDPA without quadratic workspace."""
-    if get_sm_version() not in (100, 103):
-        pytest.skip("Exercises the SM100-family Pixtral FMHA dispatcher")
+    if get_sm_version() not in (90, 100, 103, 120):
+        pytest.skip("Exercises Pixtral FMHA on SM90, SM100-family, and SM120 GPUs")
     # Exercise thop's dispatcher regardless of optional library configuration.
     monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
     generator = torch.Generator(device="cuda").manual_seed(6665906)

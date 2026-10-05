@@ -2200,9 +2200,15 @@ def selected_mask_types(kspec):
         # encoder models (head_size = 32 / 64 / 128) need packed_qkv input layout + padding mask.
         elif kspec.input_layout == InputLayout.PACKED_QKV:
             # NOTE: 72/80 are added for vision transformers. Pixtral's head size
-            # 104 is needed on SM100, where it falls back from TRTLLM-GEN.
+            # 104 uses warp specialization on SM90 and non-tiled kernels on SM120.
+            pixtral_padding = kspec.head_size == 104 and (
+                kspec.sm == 100 or
+                (kspec.sm in (90, 120) and kspec.dtype in ('fp16', 'bf16')
+                 and not kspec.enable_skip_softmax
+                 and kspec.warp_specialization == (kspec.sm == 90) and
+                 (kspec.sm != 120 or not kspec.tiled)))
             if (kspec.head_size not in [32, 64, 72, 80, 128]
-                    and not (kspec.sm == 100 and kspec.head_size == 104)):
+                    and not pixtral_padding):
                 padding_mask = '0'
         # only cross attention (head_size = 32/64/128) needs contiguous_q_kv input layout + padding mask / custom_mask.
         elif kspec.input_layout == InputLayout.CONTIGUOUS_Q_KV:
