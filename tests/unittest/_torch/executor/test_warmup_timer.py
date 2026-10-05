@@ -30,10 +30,13 @@ def test_warmup_phase_repeated_names(warmup_timing):
     """Repeated names accumulate and the summary reports identity and percentages."""
     engine, clock, log = warmup_timing
     clock.side_effect = [0, 2, 3, 6]
+    metrics = {}
     for _ in range(2):
-        with engine.phase("attention"):
+        with engine.phase("attention", metrics=metrics, metric_name="attention_warmup_seconds"):
             pass
     assert engine.timings == {"attention": 5}
+    assert metrics == {"attention_warmup_seconds": 5}
+    assert clock.call_count == 4
     engine.summary(10)
     log.info.assert_any_call(
         "[warmup][pid=42][rank=3][purpose=memory_profiling][pass=1] "
@@ -47,12 +50,14 @@ def test_warmup_phase_failure_records_elapsed(warmup_timing, error_type):
     """Preserve elapsed time and the original exception on interrupted warmup."""
     engine, clock, log = warmup_timing
     clock.side_effect = [2, 7]
+    metrics = {}
     error = error_type("warmup failed")
     with pytest.raises(error_type) as caught:
-        with engine.phase("attention"):
+        with engine.phase("attention", metrics=metrics):
             raise error
     assert caught.value is error
     assert engine.timings == {"attention": 5}
+    assert metrics == {"attention": 5}
     log.warning.assert_called_once_with(
         "[warmup][pid=42][rank=3][purpose=memory_profiling][pass=1] attention: failed after 5.0s"
     )
@@ -120,11 +125,13 @@ def test_warmup_shapes_are_not_double_counted(warmup_timing, log_start):
     """Shape timing stays visible without inflating the enclosing phase total."""
     _, clock, log = warmup_timing
     clock.side_effect = [0, 1, 2, 5, 7, 10]
+    metrics = {}
     with warmup_timer._WarmupTimer(rank=3) as timer:
         with timer.phase("general"):
-            with timer.phase("general shape", record=False, log_start=log_start):
+            with timer.phase("general shape", record=False, log_start=log_start, metrics=metrics):
                 pass
     assert timer.timings == {"general": 6}
+    assert metrics == {"general shape": 3}
     messages = [call.args[0] for call in log.info.call_args_list]
     assert any("general shape: done in 3.0s" in msg for msg in messages)
     assert any("general shape: start" in msg for msg in messages) == log_start
