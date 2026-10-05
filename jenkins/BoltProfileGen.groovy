@@ -173,7 +173,7 @@ def createKubernetesPodConfig(image, arch = "amd64")
                   kubernetes.io/os: linux"""
     def containerConfig = """
                   - name: alpine
-                    image: urm.nvidia.com/docker/alpine:latest
+                    image: artifactory.pdx.nvidia.com/docker-remote/alpine:latest
                     command: ['cat']
                     tty: true
                     resources:

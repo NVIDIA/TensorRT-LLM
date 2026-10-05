@@ -192,7 +192,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     case "agent":
         containerConfig = """
                   - name: python3
-                    image: urm.nvidia.com/docker/python:3.12-slim
+                    image: artifactory.pdx.nvidia.com/docker-remote/python:3.12-slim
                     command: ['cat']
                     tty: true
                     resources:
@@ -632,8 +632,8 @@ def buildImage(config, imageKeyToTag, versionOverride)
         }
 
         // Replace the base image and triton image with the internal mirror
-        BASE_IMAGE = BASE_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
-        TRITON_IMAGE = TRITON_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
+        BASE_IMAGE = BASE_IMAGE.replace("nvcr.io/", "artifactory.pdx.nvidia.com/docker-remote/")
+        TRITON_IMAGE = TRITON_IMAGE.replace("nvcr.io/", "artifactory.pdx.nvidia.com/docker-remote/")
 
         // Gated by BOLT_OVERLAY_ENABLED: when the overlay is enabled the
         // raw build is published to <tag>-noprofiles and the CANONICAL <tag> is
@@ -999,7 +999,7 @@ pipeline {
     }
     environment {
         CCACHE_DIR="${CCACHE_DIR}"
-        PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+        PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // Picked up by docker/Makefile and handed to `docker buildx build` as a
         // BuildKit secret, which authenticates the github.com clones inside the
         // image build (docker/common/github_auth.sh).
