@@ -375,11 +375,25 @@ def _host_batch(*, prefill=False):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("prefill", [False, True])
-def test_offload_admits_decode_or_fresh_prefill(prefill):
+def test_offload_admits_prefill_and_rejects_decode(prefill):
     metadata = _host_batch(prefill=prefill)
-    DeepseekV4TrtllmAttentionMetadata.validate_sparse_offload_batch(metadata)
+    if prefill:
+        DeepseekV4TrtllmAttentionMetadata.validate_sparse_offload_batch(metadata)
+    else:
+        with pytest.raises(NotImplementedError, match="decode attention.*requires refetch"):
+            DeepseekV4TrtllmAttentionMetadata.validate_sparse_offload_batch(metadata)
     assert not metadata.sparse_offload_state.prepared
     assert metadata.sparse_offload_state.is_prefill == prefill
+
+
+@pytest.mark.cpu_only
+def test_offload_admits_cached_resident_prefill() -> None:
+    metadata = _host_batch(prefill=True)
+    metadata.kv_cache_params.num_cached_tokens_per_seq = [128, 127]
+    for request_id, cached in zip(metadata.request_ids, [128, 127], strict=True):
+        metadata.kv_cache_manager.kv_cache_map[request_id].history_length = cached
+    DeepseekV4TrtllmAttentionMetadata.validate_sparse_offload_batch(metadata)
+    assert metadata.sparse_offload_state.is_prefill
 
 
 @pytest.mark.cpu_only
@@ -823,9 +837,7 @@ def test_fetch_graph_replay_refreshes_requests_topk_and_padding(monkeypatch, deb
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "policy", ["enable_block_reuse", "kv_compression_manages_history", "_has_cp_helix", "is_draft"]
-)
+@pytest.mark.parametrize("policy", ["kv_compression_manages_history", "is_draft"])
 def test_offload_rejects_other_history_policies_during_initialization(policy: str) -> None:
     manager = _manager()
     setattr(manager, policy, True)
