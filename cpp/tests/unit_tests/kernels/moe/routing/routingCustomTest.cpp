@@ -1677,6 +1677,169 @@ TYPED_TEST(RoutingCustomKernelTest, NoOpWithExpertParallelization)
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// Small-token kernel (routingIndicesSmallTokenKernel): the default single-block path for <= 8 tokens
+// through the 512-expert tier. run() selects it unless TLLM_ROUTING_SMALL_TOKEN_FASTPATH=0, so these
+// cases exercise it end to end against the host reference (weights, permutation, CTA tile maps).
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+TEST(RoutingCustomSelectionTest, SmallTokenKernelSelectionTable)
+{
+    using moe::dev::routing::RoutingPostprocessType;
+    using moe::dev::routing::RoutingPreprocessType;
+    using moe::dev::routing::routingCustom::prefersSmallTokenKernel;
+    using moe::dev::routing::routingCustom::SmallTokenKernelSingleTokenPerExpertMaxNumExperts;
+
+    auto const sigmoidBias = [](int32_t numTokens, int32_t tier)
+    {
+        return prefersSmallTokenKernel(
+            RoutingPreprocessType::SigmoidBias, RoutingPostprocessType::ScaledSumNormalize, numTokens, tier);
+    };
+    auto const renormalize = [](int32_t numTokens, int32_t tier)
+    { return prefersSmallTokenKernel(RoutingPreprocessType::None, RoutingPostprocessType::Softmax, numTokens, tier); };
+
+    // Token capacity = min(8, warps in the tier): 4 at 128, 5 at 160, 8 from 256 up.
+    struct Bound
+    {
+        int32_t tier;
+        int32_t maxTokens;
+    };
+
+    for (Bound b : {Bound{128, 4}, Bound{160, 5}, Bound{256, 8}, Bound{384, 8}, Bound{512, 8}})
+    {
+        for (int32_t numTokens = 1; numTokens <= b.maxTokens; ++numTokens)
+        {
+            // A per-expert preprocess at a single token stays with the cooperative kernel above the named
+            // crossover tier (the measured exception in prefersSmallTokenKernel()).
+            bool const expectSigmoidBias
+                = !(numTokens == 1 && b.tier > SmallTokenKernelSingleTokenPerExpertMaxNumExperts);
+            EXPECT_EQ(sigmoidBias(numTokens, b.tier), expectSigmoidBias)
+                << "tier " << b.tier << ", " << numTokens << " tokens";
+            EXPECT_TRUE(renormalize(numTokens, b.tier)) << "tier " << b.tier << ", " << numTokens << " tokens";
+        }
+        EXPECT_FALSE(sigmoidBias(b.maxTokens + 1, b.tier)) << "tier " << b.tier;
+        EXPECT_FALSE(renormalize(b.maxTokens + 1, b.tier)) << "tier " << b.tier;
+    }
+    EXPECT_FALSE(prefersSmallTokenKernel(RoutingPreprocessType::Sigmoid, RoutingPostprocessType::SumNormalize, 1, 512));
+    EXPECT_TRUE(prefersSmallTokenKernel(RoutingPreprocessType::Sigmoid, RoutingPostprocessType::SumNormalize, 1, 128));
+    // From 576 experts up the cooperative / classic selection is kept.
+    for (int32_t tier : {576, 1024, 2048})
+    {
+        EXPECT_FALSE(sigmoidBias(1, tier)) << "tier " << tier;
+        EXPECT_FALSE(renormalize(4, tier)) << "tier " << tier;
+    }
+    // Softmax-over-experts runs through the same one-warp-per-token TopK, so it is eligible too.
+    EXPECT_TRUE(prefersSmallTokenKernel(RoutingPreprocessType::Softmax, RoutingPostprocessType::None, 4, 128));
+};
+
+// GLM 5.2 / DeepSeek nGroup<=1 decode shape: 256 experts, top-8, SigmoidBias + ScaledSumNormalize, tile 8.
+TYPED_TEST(RoutingCustomKernelTest, SmallTokenSigmoidBiasE256OneToken)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Renormalize)
+                     .withPreprocessType(RoutingPreprocessType::SigmoidBias)
+                     .withPostprocessType(RoutingPostprocessType::ScaledSumNormalize)
+                     .withRoutedScalingFactor(2.5f)
+                     .withNumTokens(1)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withTileTokensDim(8)
+                     .withUsePdl(true)
+                     .withGetExpWeights(true)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingCustomKernelTest, SmallTokenSigmoidBiasE256SixTokens)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Renormalize)
+                     .withPreprocessType(RoutingPreprocessType::SigmoidBias)
+                     .withPostprocessType(RoutingPostprocessType::ScaledSumNormalize)
+                     .withRoutedScalingFactor(2.5f)
+                     .withNumTokens(6)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withTileTokensDim(8)
+                     .withUsePdl(true)
+                     .withGetExpWeights(true)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingCustomKernelTest, SmallTokenSigmoidBiasE256EightTokens)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Renormalize)
+                     .withPreprocessType(RoutingPreprocessType::SigmoidBias)
+                     .withPostprocessType(RoutingPostprocessType::ScaledSumNormalize)
+                     .withRoutedScalingFactor(2.5f)
+                     .withNumTokens(8)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withTileTokensDim(16)
+                     .withGetExpWeights(true)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingCustomKernelTest, SmallTokenSigmoidBiasE256WithExpertParallelization)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Renormalize)
+                     .withPreprocessType(RoutingPreprocessType::SigmoidBias)
+                     .withPostprocessType(RoutingPostprocessType::ScaledSumNormalize)
+                     .withRoutedScalingFactor(2.5f)
+                     .withNumTokens(6)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withExpertParallelization(8, 3)
+                     .withTileTokensDim(8)
+                     .withGetExpWeights(true)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingCustomKernelTest, SmallTokenRenormalizeE128FourTokens)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Renormalize)
+                     .withNumTokens(4)
+                     .withNumExperts(128)
+                     .withTopK(8)
+                     .withTileTokensDim(256)
+                     .withUsePdl(true)
+                     .withGetExpWeights(true)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingCustomKernelTest, SmallTokenRenormalizeE512K22EightTokens)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Renormalize)
+                     .withNumTokens(8)
+                     .withNumExperts(512)
+                     .withTopK(22)
+                     .withTileTokensDim(8)
+                     .withGetExpWeights(true)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingCustomKernelTest, SmallTokenRenormalizeNaiveE256)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::RenormalizeNaive)
+                     .withNumTokens(7)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withTileTokensDim(8)
+                     .withGetExpWeights(true)
+                     .build();
+    this->runTest(param);
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // Dynamic-block kernel tests (5-16 tokens, ≤512 experts)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

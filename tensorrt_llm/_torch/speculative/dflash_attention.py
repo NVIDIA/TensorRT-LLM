@@ -103,8 +103,13 @@ def validate_dflash_fa4_runtime(
         raise RuntimeError(f"DFlash FA4 attention does not support head_dim={head_dim} on SM90.")
 
 
-def _get_trtllm_gen_unavailability_reason() -> Optional[str]:
-    """Return why the DFlash TRTLLM backend cannot be initialized."""
+def dflash_trtllm_gen_unavailability_reason() -> Optional[str]:
+    """Return why the DFlash TRTLLM backend cannot be initialized, or None.
+
+    Public because ``attention_backend="AUTO"`` resolves through it: a
+    drafter that prefers TRTLLM has to know whether to fall back before it
+    commits, and ``get_dflash_trtllm_gen_ops`` only reports by raising.
+    """
     if not IS_FLASHINFER_AVAILABLE:
         return "flashinfer is not installed"
 
@@ -124,7 +129,7 @@ def _get_trtllm_gen_unavailability_reason() -> Optional[str]:
 @lru_cache(maxsize=1)
 def get_dflash_trtllm_gen_ops() -> DFlashTrtllmGenOps:
     """Load TRTLLM-Gen operations after validating common prerequisites."""
-    unavailable_reason = _get_trtllm_gen_unavailability_reason()
+    unavailable_reason = dflash_trtllm_gen_unavailability_reason()
     if unavailable_reason is not None:
         raise RuntimeError(f"DFlash TRTLLM attention backend is unavailable: {unavailable_reason}.")
 

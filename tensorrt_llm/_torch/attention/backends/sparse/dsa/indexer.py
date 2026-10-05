@@ -38,7 +38,8 @@ from tensorrt_llm.deep_gemm import (
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .params import DSAParams, use_self_sampling_gvr
+from ..params import use_self_sampling_gvr
+from .params import DSAParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 

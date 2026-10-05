@@ -20,12 +20,16 @@ Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16.
 """
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
 
 from ...attention.backends.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
+
+# 2CTA regresses long sequences; must precede the import below.
+os.environ.setdefault("FA_DISABLE_2CTA", "1")
 
 
 def _install_cutlass_dsl_compatibility() -> None:

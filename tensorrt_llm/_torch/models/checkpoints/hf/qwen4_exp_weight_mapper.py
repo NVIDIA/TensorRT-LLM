@@ -70,7 +70,7 @@ What differs from the stock HF loader (why a bespoke mapper is required):
 """
 
 import re
-from typing import Optional
+from typing import Iterator, Optional
 
 import torch
 from torch import nn
@@ -232,6 +232,17 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
             module, module_name, module_weights, allow_partial_loading=allow_partial_loading
         )
 
+    def _runtime_named_modules(self) -> Iterator[tuple[str, nn.Module]]:
+        """Expose draft modules using the checkpoint's appended layer indices."""
+        for name, module in self.model.named_modules():
+            if name.startswith("mtp_layers."):
+                _, layer_idx, *suffix = name.split(".")
+                checkpoint_layer_idx = self.config.pretrained_config.num_hidden_layers + int(
+                    layer_idx
+                )
+                name = ".".join([f"model.layers.{checkpoint_layer_idx}", *suffix])
+            yield name, module
+
     def preprocess_weights(self, weights: dict, allow_partial_loading: bool = False) -> dict:
         config = self.config.pretrained_config
         tp_size = 1 if self.config.mapping.enable_attention_dp else self.config.mapping.tp_size
@@ -250,7 +261,7 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
         if self.config.mapping.has_pp():
             owned_layer_ids = set()
             layer_prefix = "model.layers."
-            for module_name, module in self.model.named_modules():
+            for module_name, module in self._runtime_named_modules():
                 if not module_name.startswith(layer_prefix):
                     continue
                 suffix = module_name[len(layer_prefix) :]
@@ -422,15 +433,15 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
         # Pack each layer's HC down and injection projections into a single
         # aligned GEMM. Final mix-only heads have no injection projection and
         # keep the original `input_mix_weight_down` parameter.
+        runtime_modules = dict(self._runtime_named_modules()) if hc_down_inject else {}
         for prefix, parts in hc_down_inject.items():
             down = parts.get("down")
             inject = parts.get("inject")
-            try:
-                target = self.model.get_submodule(prefix)
-            except (AttributeError, KeyError) as error:
+            target = runtime_modules.get(prefix)
+            if target is None:
                 raise ValueError(
                     f"No runtime Hyper-Connection module for checkpoint prefix {prefix!r}"
-                ) from error
+                )
             packed_projection = getattr(target, "input_mix_weight_down_block_inject", None)
             direct_projection = getattr(target, "input_mix_weight_down", None)
             if packed_projection is None:
@@ -508,7 +519,7 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
         is `model.layers.<L>.ple.ple_embedding`.
         """
         target_name = ple_prefix + ".ple_embedding"
-        for name, module in self.model.named_modules():
+        for name, module in self._runtime_named_modules():
             if name == target_name:
                 return module
         return None

@@ -295,6 +295,30 @@ def generate_head_data(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
+def test_mhc_pre_mapping_tuning_bucket_coverage() -> None:
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcPreMappingRunner
+
+    spec = MhcPreMappingRunner.tuning_config.dynamic_tensor_specs[0]
+    for max_tokens in (1024, 1025, 8191, 8192, 8193, 13000, 13312, 16384, 32768):
+        tuned_buckets = set(spec.gen_tuning_buckets(max_tokens)) | {max_tokens}
+        for num_tokens in range(1, max_tokens + 1):
+            bucket = spec.map_to_tuning_buckets(num_tokens)
+            step = 128 if num_tokens <= 8192 else 1024
+            assert num_tokens <= bucket < num_tokens + step
+            assert bucket in tuned_buckets
+    assert tuple(bucket for bucket in spec.gen_tuning_buckets(16384) if bucket > 8192) == (
+        9216,
+        10240,
+        11264,
+        12288,
+        13312,
+        14336,
+        15360,
+        16384,
+    )
+
+
 @pytest.mark.parametrize("n", [1, 32, 64, 128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("hc_mult", [4])

@@ -13,11 +13,18 @@ no runtime adapter load/unload, and KV events are published out of band.
 
 import asyncio
 import time
-from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Optional
 
 import grpc
-from openengine.v1 import (
+
+from tensorrt_llm import __version__ as trtllm_version
+from tensorrt_llm.logger import logger
+from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS
+
+from .bindings import (
+    MINIMUM_CLIENT_REVISION,
+    SCHEMA_RELEASE,
+    SCHEMA_REVISION,
     kv_pb2,
     lifecycle_pb2,
     lora_pb2,
@@ -25,32 +32,10 @@ from openengine.v1 import (
     openengine_pb2_grpc,
     server_pb2,
 )
-
-from tensorrt_llm import __version__ as trtllm_version
-from tensorrt_llm.logger import logger
-from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS
-
 from .capabilities import supported_guides
 from .errors import AbortFailedError
 
 __all__ = ["OpenEngineControlServicer"]
-
-_SCHEMA_REVISION = 1
-_MINIMUM_CLIENT_REVISION = 1
-# BSR commit of the openengine schema this server was generated against. Derived
-# from the installed bindings rather than hand-copied: the version is
-# "<v>+<bsr commit>", and a hardcoded copy would keep advertising a stale
-# release after requirements-openengine.txt is bumped.
-_SCHEMA_PACKAGE = "openengine-openengine-protocolbuffers-python"
-
-
-def _schema_release() -> str:
-    try:
-        return version(_SCHEMA_PACKAGE).rpartition("+")[2]
-    except PackageNotFoundError:
-        logger.warning(f"OpenEngine schema package '{_SCHEMA_PACKAGE}' is not installed")
-        return ""
-
 
 _ENGINE_NAME = "tensorrt_llm"
 
@@ -151,9 +136,9 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             engine_role=server_pb2.ENGINE_ROLE_UNSPECIFIED,
             instance_id=str(getattr(self._llm, "llm_id", "") or ""),
             supported_models=[self._model],
-            schema_revision=_SCHEMA_REVISION,
-            minimum_client_revision=_MINIMUM_CLIENT_REVISION,
-            schema_release=_schema_release(),
+            schema_revision=SCHEMA_REVISION,
+            minimum_client_revision=MINIMUM_CLIENT_REVISION,
+            schema_release=SCHEMA_RELEASE,
         )
 
         parallelism = server_pb2.ParallelismInfo()
@@ -183,7 +168,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
                     # request. Advertising cleanup a client cannot invoke would
                     # have it drop a prefill whose KV blocks stay pinned.
                     supports_abort_cleanup=False,
-                    schema_version=_SCHEMA_REVISION,
+                    schema_version=SCHEMA_REVISION,
                 )
             )
 

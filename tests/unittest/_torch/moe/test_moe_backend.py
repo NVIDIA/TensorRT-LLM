@@ -14,6 +14,7 @@
 # limitations under the License.
 """MoE backend unit tests."""
 
+import dataclasses
 import importlib
 import itertools
 import logging
@@ -70,6 +71,7 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
     TRTLLMGenFusedMoE,
@@ -100,6 +102,7 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
     TrtllmCutedslMegaMoeNvfp4Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
+    _reject_unsupported_activation,
     build_moe_deployment,
     impl_class_for,
     resolve_moe_impl,
@@ -1304,6 +1307,41 @@ def test_megamoe_plain_swiglu_carries_no_constants():
 
     assert (params.alpha, params.beta) == (None, None)
     assert params.clamp is None
+    assert params.clamp_after_silu is False
+
+
+def test_cutlass_materializes_post_silu_clamp_mode():
+    params = materialize_activation_params(
+        SwigluActivation(clamp=5.0, clamp_after_silu=True),
+        CutlassFusedMoE.activation_support,
+        num_local_experts=2,
+        device="cpu",
+        owner="CutlassFusedMoE",
+    )
+
+    assert torch.equal(params.clamp, torch.full((2,), 5.0))
+    assert params.clamp_after_silu is True
+
+
+def test_deepgemm_rejects_post_silu_clamp_materialization():
+    with pytest.raises(ValueError, match="does not implement post-SiLU clamping"):
+        materialize_activation_params(
+            SwigluActivation(clamp=5.0, clamp_after_silu=True),
+            DeepGemmFusedMoE.activation_support,
+            num_local_experts=2,
+            owner="DeepGemmFusedMoE",
+        )
+
+
+def test_post_silu_clamp_mode_requires_limit():
+    with pytest.raises(ValueError, match="requires a clamp value"):
+        SwigluActivation(clamp_after_silu=True)
+
+
+def test_fused_moe_appends_post_silu_mode_to_positional_schema():
+    registered_schema = torch.ops.trtllm.fused_moe.default._schema
+
+    assert registered_schema.arguments[-1].name == "swiglu_clamp_after_silu"
 
 
 def test_create_moe_forwards_situ_activation_as_one_carrier(monkeypatch):
@@ -3247,6 +3285,30 @@ def test_nvfp4_fc1_row_alignment_gate(
     else:
         # Other gates may still turn the layer down; this one must not.
         assert verdict.reject_reason is not MoERejectReason.SHAPE_UNALIGNED
+
+
+@pytest.mark.parametrize(
+    "backend_cls",
+    [CutlassFusedMoE, CuteDslFusedMoE],
+    ids=["cutlass", "cutedsl"],
+)
+def test_situ_survives_resolution_not_just_construction(backend_cls):
+    """A SiTU layer must be admitted by the *resolver*, not only build.
+
+    Every other SiTU test constructs a backend directly and so never consults
+    ``activation_support``. Resolution does, and it reads the **class**
+    attribute, because it judges candidates before any instance exists. A
+    backend that declared its alpha/beta shape per instance instead passed
+    every unit test and then resolved away to CUTLASS on real hardware with
+    "kernels take no activation alpha, which this layer's SiTu supplies" --
+    silently, because Kimi K3 permits degradation for this backend.
+    """
+    problem = dataclasses.replace(
+        _nvfp4_problem(2048, "SiTu"),
+        activation_constants=frozenset({"alpha", "beta"}),
+    )
+    rejection = _reject_unsupported_activation(backend_cls, problem)
+    assert rejection is None, f"{backend_cls.__name__} refuses SiTU at resolution: {rejection}"
 
 
 def test_unresolvable_layer_error_carries_rejection_details():

@@ -379,8 +379,15 @@ def _make_transport(
 
 
 def _recv_req(block_counts, rid=1, slice_id=0):
+    # Positional block tables: `n` held slots followed by one -1 hole, which
+    # the reserve sizing must not count.
     return SimpleNamespace(
-        block_ids_per_layer_groups=[SimpleNamespace(size=n) for n in block_counts],
+        block_ids_per_layer_groups=[
+            np.concatenate([np.arange(n, dtype=np.int64), np.array([-1], dtype=np.int64)])
+            if n
+            else np.array([], dtype=np.int64)
+            for n in block_counts
+        ],
         unique_rid=rid,
         slice_id=slice_id,
         bounce_dst_base=None,
