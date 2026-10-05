@@ -207,7 +207,7 @@ decoding is incompatible with KV-cache block reuse.
 ## Suffix-automaton speculative decoding
 
 Suffix-automaton (SA) speculation is supported for aggregated serving: set
-`speculative_config: {decoding_type: SA}` in the extra LLM API options. For
+`speculative_config: {decoding_type: SA, max_draft_len: 2}` in the extra LLM API options. For
 GSM8K evaluation, pass `--sa` to the eval job (see "Run the model" above),
 which selects `eval_extra_llm_options_sa.yaml`.
 
