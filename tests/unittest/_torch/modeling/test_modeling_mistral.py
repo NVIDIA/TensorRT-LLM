@@ -804,15 +804,7 @@ def test_native_processed_images_preserve_item_sizes(
     def apply_chat_template(
         *args: Any, return_tensors: str | None, **kwargs: Any
     ) -> transformers.BatchEncoding:
-        if return_tensors == "pt":
-            return transformers.BatchEncoding(
-                {
-                    "input_ids": torch.tensor([encoded.input_ids]),
-                    "attention_mask": torch.tensor([encoded.attention_mask]),
-                    "pixel_values": torch.stack(pixels),
-                    "image_sizes": torch.tensor(sizes),
-                }
-            )
+        assert return_tensors is None
         return encoded
 
     tokenizer.transformers_tokenizer.apply_chat_template.side_effect = apply_chat_template
