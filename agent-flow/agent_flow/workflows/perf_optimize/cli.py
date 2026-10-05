@@ -158,6 +158,13 @@ def _run_disagg_sol(args) -> None:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(2)
     print(json.dumps(record, indent=2, default=str))
+    # Exit with the halves' outcome, not 0 regardless. A half that died left no
+    # checkpoint, so anything watching this process could only infer success
+    # from the exit code -- and 0 said a crashed campaign had finished.
+    failed = {t: c for t, c in (record.get("exit_status") or {}).items() if c}
+    if failed:
+        print(f"error: campaign(s) exited non-zero: {failed}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _add_dry_run(parser: argparse.ArgumentParser) -> None:

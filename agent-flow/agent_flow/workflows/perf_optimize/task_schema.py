@@ -76,8 +76,16 @@ from agent_flow.workflows.perf_analyze.task_schema import (
 from agent_flow.workflows.perf_analyze.task_schema import (
     load_and_validate_task_yaml as _base_load_and_validate,
 )
-from agent_flow.workflows.perf_optimize.bench_cli import BenchCliError
-from agent_flow.workflows.perf_optimize.bench_cli import plan as sweep_plan
+
+# `bench_cli` is imported inside the one function that uses it, not here.
+# The service lints a task.yaml by loading THIS module from its path, with the
+# dotted name pre-registered in `sys.modules`, specifically so a sibling import
+# resolves from that cache instead of executing `agent_flow/__init__.py` --
+# which pulls in `layers` and `anyio`, neither of which the dashboard's
+# stdlib-plus-PyYAML runtime has. `bench_cli` is not among the modules it
+# pre-registers, so importing it at module scope made `agent_flow` load for
+# real and every lint fail with `ModuleNotFoundError: anyio`. That is every
+# task, not just the ones this file was changed for.
 from agent_flow.workflows.perf_optimize.disagg import (
     DISAGG_CONFIG_KEY,
     DISAGG_FIELD,
@@ -566,6 +574,12 @@ def _validate_sol_track_block(data: dict[str, Any], errors: list[str]) -> dict[s
         # directory per case, which schema validation may not do. The
         # agent's own dry-run step re-derives it against the harness
         # before an allocation is spent.
+        # Deferred, so importing this module for its key census costs nothing.
+        # Reached only when a spec actually names a sweep, which is a campaign
+        # being validated in a real workflow environment rather than linted.
+        from agent_flow.workflows.perf_optimize.bench_cli import BenchCliError
+        from agent_flow.workflows.perf_optimize.bench_cli import plan as sweep_plan
+
         return sweep_plan(sweep)
     except BenchCliError as exc:
         errors.append(f"could not expand {path}: {exc}")
