@@ -280,8 +280,6 @@ unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_qwen3_gdn_re
 unittest/_torch/executor/test_pytorch_model_engine.py::PyTorchModelEngineTestCase::test_prepare_tp_inputs_with_helix_parallelism SKIP (https://nvbugs/6818710)
 unittest/_torch/modeling/test_modeling_nemotron_h_multimodal.py::test_nemotron_nano_v2_vl_image_batch_equivalence SKIP (https://nvbugs/6758946)
 unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm SKIP (https://nvbugs/6853741)
-unittest/_torch/modeling_v2/comm/test_modeling_v2_allgather_op_matrix.py::test_allgather_op_matrix SKIP (https://nvbugs/6843474)
-unittest/_torch/modeling_v2/comm/test_modeling_v2_reducescatter_op_matrix.py::test_reducescatter_op_matrix SKIP (https://nvbugs/6843474)
 unittest/_torch/modeling_v2/moe/test_modeling_v2_noaux_tc_op.py::test_input_not_mutated_and_deterministic SKIP (https://nvbugs/6852473)
 unittest/_torch/modeling_v2/quantization/test_modeling_v2_fp4_quantize.py::test_input_not_mutated_and_deterministic SKIP (https://nvbugs/6852473)
 unittest/_torch/modeling_v2/quantization/test_modeling_v2_mxfp8_quantize.py::test_input_not_mutated SKIP (https://nvbugs/6852473)
