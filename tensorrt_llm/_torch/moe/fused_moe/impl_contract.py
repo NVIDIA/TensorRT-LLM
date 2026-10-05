@@ -241,6 +241,7 @@ class MoEEnvironment:
     sm: int  # e.g. 100, 103
     available_deps: Tuple[str, ...] = ()
     env_flags: Tuple[Tuple[str, str], ...] = ()  # sorted (name, value) pairs
+    oss_cutlass_moe: bool = True
 
     def has_dep(self, name: str) -> bool:
         return name in self.available_deps
@@ -259,7 +260,7 @@ class MoEEnvironment:
 
     def fingerprint(self) -> str:
         """Return a stable fingerprint for the selection environment."""
-        payload = repr((self.sm, sorted(self.available_deps), self.env_flags))
+        payload = repr((self.sm, sorted(self.available_deps), self.env_flags, self.oss_cutlass_moe))
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -286,6 +287,7 @@ class MoEDeployment:
     # ``model_config.locality_domain_policy.enabled``. Whether the machine can
     # actually serve it is ``env.has_dep(MoEDep.LOCALITY_DOMAIN)``.
     locality_domain_requested: bool = False
+    force_dynamic_quantization: bool = False
 
     @property
     def smart_router(self) -> bool:
@@ -518,6 +520,8 @@ class MoEResolutionReport:
                 "num_slots": self.deployment.num_slots,
                 "eplb_enabled": self.deployment.eplb_enabled,
                 "moe_lora_enabled": self.deployment.moe_lora_enabled,
+                "force_dynamic_quantization": self.deployment.force_dynamic_quantization,
+                "oss_cutlass_moe": self.deployment.env.oss_cutlass_moe,
                 "sm": self.deployment.env.sm,
                 "env_flags": dict(self.deployment.env.env_flags),
             },
