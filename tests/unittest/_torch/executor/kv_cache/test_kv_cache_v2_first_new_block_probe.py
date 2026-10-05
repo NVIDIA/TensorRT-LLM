@@ -48,6 +48,7 @@ def make_stub_manager(
     mgr = object.__new__(KVCacheManagerV2)
     mgr.tokens_per_block = tokens_per_block
     mgr.enable_block_reuse = enable_block_reuse
+    mgr._swa_endpoint_rewind = 0
     # Read by _context_reuse_tokens, which both paths marshal through. Non-zero
     # for a one-model draft, which reads D prompt tokens past the target's end.
     mgr.reuse_match_backoff = reuse_match_backoff

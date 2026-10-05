@@ -5,7 +5,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {readFileSync} = require('node:fs');
 const {join} = require('node:path');
-const {NAME, identity, statusContext, requests, parseResult, command, awaiting, reviewState, publish} = require('./semantic_review');
+const {NAME, identity, statusContext, requests, parseResult, command, awaiting, reviewState, publish,
+  STICKY_MARKER, tidy} = require('./semantic_review');
 const cases = require('./semantic_review_cases');
 
 const repo = {owner: 'NVIDIA', repo: 'TensorRT-LLM'};
@@ -14,7 +15,7 @@ const bot = {login: 'coderabbitai[bot]', id: 136622811, type: 'Bot'};
 const id = n => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const request = (n = 1, extra = {}) => ({id: id(n), head: 'a'.repeat(40),
   target: 'b'.repeat(40), mergeBase: 'c'.repeat(40), branch: 'main', ...extra});
-const comment = (n, body, user = bot) => ({id: n, body, user,
+const comment = (n, body, user = bot) => ({id: n, body, user, node_id: `IC_${n}`,
   created_at: new Date(1700000000000 + n * 1000).toISOString(),
   html_url: `https://github.com/NVIDIA/TensorRT-LLM/pull/1#issuecomment-${n}`});
 const record = (n, r) => comment(n, `<!-- semantic-review-request:${JSON.stringify(r)} -->`, service);
@@ -31,8 +32,25 @@ const legacy = (r = request(), extra = {}) => ({id: 100, name: NAME, head_sha: r
   conclusion: null, output: awaiting(r), ...extra});
 function harness(r = request()) {
   const state = {comments: [record(10, r)], writes: [], updates: [], summaries: [], reads: 0,
-    refs: [], updateFailures: new Set(), statusFailures: 0, statusErrorCode: 503, statuses: [], checks: []};
+    refs: [], updateFailures: new Set(), statusFailures: 0, statusErrorCode: 503, statuses: [], checks: [],
+    commentWrites: [], commentEdits: [], minimized: [], restored: [], graphqlFailures: 0,
+    warnings: []};
   const github = {
+    graphql: async (query, variables) => {
+      if (state.graphqlFailures-- > 0) {
+        throw Object.assign(new Error('GraphQL failed'), {status: 502});
+      }
+      if (query.includes('unminimizeComment')) {
+        state.minimized.splice(state.minimized.indexOf(variables.id), 1);
+        state.restored.push(variables.id);
+        return {unminimizeComment: {unminimizedComment: {isMinimized: false}}};
+      }
+      if (query.includes('minimizeComment')) {
+        state.minimized.push(variables.id);
+        return {minimizeComment: {minimizedComment: {isMinimized: true}}};
+      }
+      return {nodes: variables.ids.map(id => ({id, isMinimized: state.minimized.includes(id)}))};
+    },
     paginate: async (method, args) => {
       if (method === github.rest.issues.listComments) {
         state.reads += 1;
@@ -41,7 +59,19 @@ function harness(r = request()) {
       const {data} = await method(args);
       return data.check_runs || data;
     },
-    rest: {issues: {listComments() {}}, repos: {
+    rest: {issues: {listComments() {},
+      createComment: async ({issue_number, body}) => {
+        const id = Math.max(0, ...state.comments.map(comment => comment.id)) + 1;
+        state.commentWrites.push({issue_number, body});
+        state.comments.push({id, body, user: publisher, node_id: `IC_${id}`,
+          created_at: new Date(1700000000000 + id * 1000).toISOString()});
+        return {data: {id}};
+      },
+      updateComment: async ({comment_id, body}) => {
+        state.commentEdits.push({comment_id, body});
+        Object.assign(state.comments.find(comment => comment.id === comment_id), {body});
+      },
+    }, repos: {
       listCommitStatusesForRef: async ({ref}) => ({data: structuredClone(
         state.statuses.filter(status => status.sha === ref))}),
       createCommitStatus: async args => {
@@ -73,13 +103,17 @@ function harness(r = request()) {
     }},
   };
   const core = {summary: {addRaw(text) {state.summaries.push(text); return this;}, async write() {}},
+    warning(message) {state.warnings.push(message);},
     setFailed() {throw new Error('AI verdict must not fail the orchestration job');}};
   const deliver = async event => publish({github, core, context: {
     repo, eventName: 'issue_comment', payload: {issue: {number: 1, pull_request: {}}, comment: event},
   }});
-  return {state, deliver,
+  const sticky = () => state.comments.find(comment =>
+    comment.user?.login === publisher.login && comment.body?.includes(STICKY_MARKER));
+  return {state, deliver, sticky,
     inspect: extra => reviewState({github, repo, number: 1, ...extra}),
-    repair: (comments, extra) => publish({github, core, context: {repo}, number: 1, comments, ...extra})};
+    repair: (comments, extra) => publish({github, core, context: {repo}, number: 1, comments, ...extra}),
+    tidy: extra => tidy({github, core, context: {repo}, number: 1, ...extra})};
 }
 
 test('request records require the pinned account and valid immutable metadata', () => {
@@ -439,17 +473,168 @@ test('fixed historical inputs round-trip request identity and all three result v
   }
 });
 
-test('privileged jobs run trusted code and serialize request switches with publication', () => {
+test('sticky summary is created once, edited in place, and never pings the reviewer', async () => {
+  const r = request();
+  const {state, sticky, tidy} = harness(r);
+  await tidy();
+  assert.equal(state.commentWrites.length, 1);
+  assert.ok(sticky().body.startsWith(STICKY_MARKER));
+  assert.match(sticky().body, /Waiting for CodeRabbit response/);
+  assert.doesNotMatch(sticky().body, /@coderabbitai/);
+  assert.deepEqual(state.minimized, []);
+  await tidy();
+  assert.equal(state.commentWrites.length, 1);
+  assert.equal(state.commentEdits.length, 0);
+  state.comments.push(reply(20, r, 'FAIL'));
+  await tidy();
+  assert.equal(state.commentWrites.length, 1);
+  assert.equal(state.commentEdits.length, 1);
+  assert.match(sticky().body, /Possible semantic conflict/);
+  assert.match(sticky().body, /#issuecomment-20\)/);
+  assert.deepEqual(state.minimized.sort(), ['IC_10', 'IC_20']);
+  await tidy();
+  assert.equal(state.commentEdits.length, 1);
+  assert.deepEqual(state.minimized.sort(), ['IC_10', 'IC_20']);
+});
+
+test('superseded request pairs are minimized; the active pair waits for its verdict', async () => {
+  const old = request();
+  const {state, sticky, tidy} = harness(old);
+  state.comments.push(reply(20, old));
+  await tidy();
+  assert.deepEqual(state.minimized.sort(), ['IC_10', 'IC_20']);
+  const next = request(2, {target: 'd'.repeat(40)});
+  state.comments.push(record(30, next));
+  await tidy();
+  assert.deepEqual(state.minimized.sort(), ['IC_10', 'IC_20']);
+  assert.match(sticky().body, /Waiting for CodeRabbit response/);
+  assert.match(sticky().body, /\| PASS \|/);
+  state.comments.push(reply(40, next, 'FAIL'));
+  await tidy();
+  assert.deepEqual(state.minimized.sort(), ['IC_10', 'IC_20', 'IC_30', 'IC_40']);
+  assert.match(sticky().body, /Possible semantic conflict/);
+});
+
+test('a superseded request without a reply is minimized and listed without a result', async () => {
+  const old = request();
+  const {state, sticky, tidy} = harness(old);
+  state.comments.push(record(30, request(2)));
+  await tidy();
+  assert.deepEqual(state.minimized, ['IC_10']);
+  assert.match(sticky().body, /\| NO RESULT \|/);
+  assert.match(sticky().body, /\| WAITING \|/);
+});
+
+test('the sticky summary follows a revoked verdict instead of an older PASS', async () => {
+  const r = request();
+  const {state, sticky, repair, tidy} = harness(r);
+  const latest = reply(30, r, 'FAIL');
+  state.comments.push(reply(20, r), latest);
+  await repair();
+  state.comments.splice(state.comments.indexOf(latest), 1);
+  await repair();
+  assert.equal(state.status.description, 'Waiting for CodeRabbit response');
+  await tidy();
+  assert.match(sticky().body, /Waiting for CodeRabbit response/);
+  assert.doesNotMatch(sticky().body, /No semantic conflict found/);
+});
+
+test('history rows follow the newest reply, and all bound replies are minimized', async () => {
+  const a = request();
+  const {state, sticky, repair, tidy} = harness(a);
+  state.comments.push(reply(20, a));
+  await repair();
+  state.comments.push(reply(30, a, 'FAIL'));
+  await repair();
+  state.comments.push(record(40, request(2, {target: 'd'.repeat(40)})));
+  await tidy();
+  assert.match(sticky().body, /\| FAIL \| \[reply\]\([^)]*#issuecomment-30\)/);
+  assert.doesNotMatch(sticky().body, /\| PASS \|/);
+  assert.deepEqual(state.minimized.sort(), ['IC_10', 'IC_20', 'IC_30']);
+});
+
+test('history rows do not resurrect a verdict revoked before supersession', async () => {
+  const a = request();
+  const {state, sticky, repair, tidy} = harness(a);
+  state.comments.push(reply(20, a));
+  await repair();
+  const revoked = reply(30, a, 'FAIL');
+  state.comments.push(revoked);
+  await repair();
+  state.comments.splice(state.comments.indexOf(revoked), 1);
+  await repair();
+  state.comments.push(record(40, request(2, {target: 'd'.repeat(40)})));
+  await tidy();
+  assert.match(sticky().body, /\| NO RESULT \|/);
+  assert.doesNotMatch(sticky().body, /\| PASS \|/);
+  assert.deepEqual(state.minimized.sort(), ['IC_10', 'IC_20']);
+});
+
+test('a revoked verdict restores the minimized active request to visible', async () => {
+  const r = request();
+  const {state, sticky, tidy} = harness(r);
+  const verdict = reply(20, r);
+  state.comments.push(verdict);
+  await tidy();
+  assert.deepEqual(state.minimized.sort(), ['IC_10', 'IC_20']);
+  state.comments.splice(state.comments.indexOf(verdict), 1);
+  state.graphqlFailures = 1;
+  await tidy();
+  assert.match(sticky().body, /Waiting for CodeRabbit response/);
+  assert.deepEqual(state.restored, []);
+  assert.equal(state.warnings.length, 1);
+  await tidy();
+  assert.deepEqual(state.restored, ['IC_10']);
+  assert.deepEqual(state.minimized, ['IC_20']);
+  await tidy();
+  assert.deepEqual(state.restored, ['IC_10']);
+});
+
+test('minimization failures warn without blocking the sticky summary, then heal', async () => {
+  const r = request();
+  const {state, tidy} = harness(r);
+  state.comments.push(reply(20, r));
+  state.graphqlFailures = 1;
+  await tidy();
+  assert.equal(state.commentWrites.length, 1);
+  assert.deepEqual(state.minimized, []);
+  assert.equal(state.warnings.length, 1);
+  state.graphqlFailures = 0;
+  await tidy();
+  assert.deepEqual(state.minimized.sort(), ['IC_10', 'IC_20']);
+});
+
+test('tidy without a semantic review request or trusted event is a no-op', async () => {
+  const {state, tidy} = harness();
+  state.comments = [comment(5, 'Ordinary review feedback.')];
+  await tidy();
+  assert.equal(state.commentWrites.length + state.commentEdits.length, 0);
+  assert.deepEqual(state.minimized, []);
+  assert.equal(await tidy({number: undefined, context: {repo, payload: {issue: {number: 1}}}}), undefined);
+});
+
+test('disabled semantic workflow cannot request or process bot replies and retains trusted job isolation', () => {
   const workflow = readFileSync(join(__dirname, '../workflows/semantic-review.yml'), 'utf8');
   assert.doesNotMatch(workflow, /pull_request_target:|pull_request:/);
-  assert.match(workflow, /cron: '23 \*\/2 \* \* \*'/);
+  assert.doesNotMatch(workflow, /^  (schedule|issue_comment|pull_request|pull_request_target):/m);
+  assert.match(workflow, /^  workflow_dispatch:/m);
+  const discoverJob = workflow.split('  discover:')[1].split('  request:')[0];
+  const requestJob = workflow.split('  request:')[1].split('  publish:')[0];
+  assert.match(discoverJob, /if: \$\{\{ false \}\}/);
+  assert.match(requestJob, /needs: discover/);
   assert.match(workflow, /group: semantic-review-pr-\$\{\{ matrix.number \}\}/);
   assert.match(workflow, /group: semantic-review-pr-\$\{\{ github.event.issue.number \}\}/);
-  assert.equal(workflow.match(/      cancel-in-progress: false\n      queue: max/g).length, 2);
-  assert.equal(workflow.match(/ref: \$\{\{ github.event.repository.default_branch \}\}/g).length, 3);
-  assert.match(workflow, /types: \[created, edited, deleted\]/);
+  assert.equal(workflow.match(/      cancel-in-progress: false\n      queue: max/g).length, 3);
+  assert.equal(workflow.match(/ref: \$\{\{ github.event.repository.default_branch \}\}/g).length, 4);
   assert.equal(workflow.match(/secrets\./g).length, 1);
-  assert.doesNotMatch(workflow.split('  publish:')[1], /SEMANTIC_COMMAND_TOKEN|issues: write/);
+  const publishJob = workflow.split('  publish:')[1].split('  tidy:')[0];
+  const tidyJob = workflow.split('  tidy:')[1];
+  assert.match(publishJob, /if: \$\{\{ false \}\}/);
+  assert.doesNotMatch(publishJob, /SEMANTIC_COMMAND_TOKEN|issues: write|pull-requests: write/);
+  assert.doesNotMatch(tidyJob, /SEMANTIC_COMMAND_TOKEN|statuses: write|checks: write/);
+  assert.match(tidyJob, /needs: publish/);
+  assert.match(tidyJob, /if: needs.publish.outputs.active == 'true'/);
+  assert.match(tidyJob, /issues: write/);
   assert.equal(workflow.match(/statuses: write/g).length, 2);
   assert.match(workflow, /statuses: read/);
 });

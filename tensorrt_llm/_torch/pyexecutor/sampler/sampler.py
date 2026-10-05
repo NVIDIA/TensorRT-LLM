@@ -300,6 +300,9 @@ class MultimodalResult:
 
     def __post_init__(self) -> None:
         num_embeddings = len(self.mm_embeddings)
+        metadata = (self.extra_data or {}).get("mm_embedding_metadata")
+        if metadata is not None and len(metadata) != num_embeddings:
+            raise ValueError("mm_embedding_metadata batch size does not match mm_embeddings")
         num_lengths = len(self.mm_embedding_lengths)
         if num_lengths != num_embeddings:
             raise ValueError(
@@ -401,7 +404,13 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             request = requests[request_index]
             mm_embedding_lengths = state.data.mm_embedding_lengths[result_index]
 
-            request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
+            embedding_metadata = extra_data.get("mm_embedding_metadata")
+            if embedding_metadata is None:
+                request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
+            else:
+                request.py_result.append_mm_embeddings(
+                    mm_embedding, mm_embedding_lengths, embedding_metadata[result_index]
+                )
 
             # Store mrope data if available
             if mrope_position_ids is not None and mrope_position_deltas is not None:
