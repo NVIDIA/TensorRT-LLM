@@ -308,6 +308,7 @@ class AgentLayer(Module):
             "disallowed_tools": self._resolve_disallowed_tools(),
             "extra_mcp_servers": self.config.backend.extra_mcp_servers,
             "cwd": self.config.backend.cwd,
+            "required_tools": self.config.required_tools,
         }
 
     @asynccontextmanager

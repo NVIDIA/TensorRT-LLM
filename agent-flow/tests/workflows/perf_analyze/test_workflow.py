@@ -9,11 +9,13 @@ import pytest
 import yaml
 
 from agent_flow import CLAUDE_CODE_DEFAULT_MODEL
+from agent_flow.agent_runtime import AgentConfig
 from agent_flow.workflows.perf_analyze import cli as cli_module
 from agent_flow.workflows.perf_analyze import progress as progress_module
 from agent_flow.workflows.perf_analyze import state as state_module
 from agent_flow.workflows.perf_analyze import workflow as workflow_module
 from agent_flow.workflows.perf_analyze.prompts import build_perf_analyze_prompts
+from agent_flow.workflows.perf_analyze.prompts._common import BOUNDED_WAITS
 from agent_flow.workflows.perf_analyze.sol_methodology import SolMethodology
 
 Workflow = workflow_module.PerfAnalyzeWorkflow
@@ -1082,3 +1084,11 @@ def test_a_workspace_the_workflow_refuses_keeps_its_previous_snapshot(tmp_path):
     assert (ws / PROMPTS_DIRNAME / "analyzer.md").read_text(encoding="utf-8") == (
         "the previous run's\n"
     )
+
+
+def test_every_role_is_told_to_bound_its_waits():
+    layer = workflow_module._make_agent(
+        "role", "Role prompt.", AgentConfig(backend="claude-code", model="claude-test")
+    )
+
+    assert layer.config.system_prompt == f"Role prompt.\n\n{BOUNDED_WAITS}"

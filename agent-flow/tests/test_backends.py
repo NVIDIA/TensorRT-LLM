@@ -934,6 +934,105 @@ class TestClaudeBackgroundWork:
         assert sdk_client.consumed == len(sdk_client.messages)
         assert [e.text for e in events if isinstance(e, ResultEvent)] == ["server is up"]
 
+    async def test_send_message_stops_leftover_waiters_once_the_role_delivered(self):
+        # The opt-010 case: the role called its deliverable tool and ended its
+        # turn, leaving a shell waiter whose pattern never appears. It is
+        # stopped at once rather than after the ceiling.
+        sdk_client = FakeBackgroundSdkClient(
+            [
+                _session_state("running"),
+                _make_assistant_message([_make_tool_use_block("Bash", {}, id="w")]),
+                _task_started("waiter", "local_bash"),
+                _make_assistant_message(
+                    [_make_tool_use_block("mcp__agent-tools__append_optimizer_progress", {})]
+                ),
+                _make_result_message("done"),
+                _session_state("idle"),
+                _UNTIL_STOPPED,
+                _task_notification("waiter"),
+            ]
+        )
+        client = ClaudeCodeClient(sdk_client, required_tools=("append_optimizer_progress",))
+
+        with anyio.fail_after(5):
+            events = [event async for event in client.send_message("optimize")]
+
+        assert sdk_client.stopped == ["waiter"]
+        assert sdk_client.consumed == len(sdk_client.messages)
+        assert [e.text for e in events if isinstance(e, ResultEvent)] == ["done"]
+
+    async def test_send_message_keeps_waiting_on_workflow_after_delivery(self):
+        # Delivery stops only shells and monitors; a workflow still running is
+        # pending work whose result the parent has to handle.
+        sdk_client = FakeBackgroundSdkClient(
+            [
+                _session_state("running"),
+                _make_assistant_message([_make_tool_use_block("Workflow", {}, id="wf")]),
+                _task_started("wf", "local_workflow"),
+                _task_started("waiter", "local_bash"),
+                _make_assistant_message([_make_tool_use_block("append_qa_progress", {})]),
+                _make_result_message("launched"),
+                _session_state("idle"),
+                _task_notification("wf"),
+                _session_state("running"),
+                _make_assistant_message([TextBlock(text="merged")]),
+                _make_result_message("final"),
+                _session_state("idle"),
+                _UNTIL_STOPPED,
+                _task_notification("waiter"),
+            ]
+        )
+        client = ClaudeCodeClient(sdk_client, required_tools=("append_qa_progress",))
+
+        with anyio.fail_after(5):
+            events = [event async for event in client.send_message("qa")]
+
+        assert sdk_client.stopped == ["waiter"]
+        assert [e.text for e in events if isinstance(e, ResultEvent)] == ["final"]
+
+    async def test_send_message_waits_on_waiters_before_delivery(self, monkeypatch):
+        # Before the deliverable tool is called a waiter may be how the role
+        # gets woken, so it is only stopped at the ceiling.
+        monkeypatch.setattr(cc_mod, "_BACKGROUND_WAIT_CEILING_S", 0.2)
+        sdk_client = FakeBackgroundSdkClient(
+            [
+                _session_state("running"),
+                _make_assistant_message([_make_tool_use_block("Monitor", {}, id="m")]),
+                _task_started("monitor", "monitor"),
+                _make_result_message("waiting for the job"),
+                _session_state("idle"),
+                _UNTIL_STOPPED,
+                _task_notification("monitor"),
+            ]
+        )
+        client = ClaudeCodeClient(sdk_client, required_tools=("append_optimizer_progress",))
+
+        start = anyio.current_time()
+        events = [event async for event in client.send_message("optimize")]
+
+        assert anyio.current_time() - start >= 0.2
+        assert sdk_client.stopped == ["monitor"]
+        assert [e.text for e in events if isinstance(e, ResultEvent)] == ["waiting for the job"]
+
+    async def test_subagent_delivery_does_not_count_for_the_role(self):
+        sdk_client = FakeBackgroundSdkClient([])
+        client = ClaudeCodeClient(sdk_client, required_tools=("append_optimizer_progress",))
+        sdk_client.messages = [
+            _session_state("running"),
+            _make_assistant_message([_make_tool_use_block("Agent", {}, id="sub")]),
+            _make_assistant_message(
+                [_make_tool_use_block("append_optimizer_progress", {})], parent_tool_use_id="sub"
+            ),
+            _task_started("waiter", "local_bash"),
+            _make_result_message("waiting"),
+            _session_state("idle"),
+        ]
+
+        with anyio.move_on_after(0.3):
+            [event async for event in client.send_message("optimize")]
+
+        assert sdk_client.stopped == []
+
     async def test_send_message_ends_at_result_without_session_state(self):
         sdk_client = FakeBackgroundSdkClient([_make_result_message("done")])
         client = ClaudeCodeClient(sdk_client)
@@ -1075,6 +1174,23 @@ class TestClaudeBackendCreateClient:
         # or the network without restrictions.
         options = await self._capture_options(monkeypatch)
         assert options.sandbox == {"enabled": False}
+
+    async def test_create_client_hands_required_tools_to_the_client(self, monkeypatch):
+        class FakeSdkClient:
+            def __init__(self, options):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+        monkeypatch.setattr(cc_mod, "ClaudeSDKClient", FakeSdkClient)
+        async with ClaudeCodeBackend().create_client(
+            system_prompt="hi", model="claude-test", required_tools=("append_qa_progress",)
+        ) as client:
+            assert client._required_tools == ("append_qa_progress",)
 
     async def test_create_client_asks_cli_for_session_state(self, monkeypatch):
         options = await self._capture_options(monkeypatch)

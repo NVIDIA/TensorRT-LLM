@@ -196,6 +196,22 @@ visible and whether memory is free between runs.
 """
 
 
+BOUNDED_WAITS = """\
+## Waiting on jobs and servers
+
+- Bound every wait: give each polling loop a deadline (expected duration plus a
+  margin), and make its exit condition cover failure and termination too (e.g.
+  `srun exit code`, `FATAL`, the job's output being complete), not only the
+  success string.
+- Do not leave unbounded `until ...; done` waiters running in the background.
+  Prefer one bounded foreground poll per job, and stop any background waiter
+  you no longer need before you finish.
+- If a wait hits its deadline without success, first check your own script
+  (pattern, path, job id, command shape) against the actual log before assuming
+  the job or cluster is slow; fix it, then wait again.
+"""
+
+
 SERVE_FLAGS_REFERENCE = """\
 ### Server configuration
 
