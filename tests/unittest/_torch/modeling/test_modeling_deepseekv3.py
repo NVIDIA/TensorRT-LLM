@@ -81,7 +81,7 @@ def test_layerwise_quant_config_preserves_unquantized_router() -> None:
         quant_config_dict={"gate": quant_config, "projection": quant_config}
     )
 
-    modeling_utils.DecoderModelForCausalLM.apply_layerwise_quant_config(model)
+    modeling_utils.apply_layerwise_quant_config(model.model_config, model.named_modules())
     gate.create_weights()
 
     assert gate.quant_config is None
