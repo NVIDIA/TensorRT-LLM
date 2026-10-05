@@ -77,6 +77,10 @@ counter in older records as unknown, not zero.
 
 #### Parallelism fields
 
+In partial reports, `0` for `tensorParallelSize`, `pipelineParallelSize`, or
+`contextParallelSize` means unknown (not captured), not a real parallelism degree;
+exclude these sentinel values from parallelism averages and distributions.
+
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
 | `tensorParallelSize` | PositiveInt | Tensor parallelism degree. | `8` |
