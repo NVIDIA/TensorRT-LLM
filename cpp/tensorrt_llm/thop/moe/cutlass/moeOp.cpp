@@ -205,7 +205,8 @@ struct ActivationParamBuffers
 ActivationParams makeActivationParams(ActivationType activation_type,
     torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
     torch::optional<torch::Tensor> const& swiglu_limit, bool const swiglu_clamp_after_silu,
-    [[maybe_unused]] ActivationParamBuffers& buffers)
+    [[maybe_unused]] ActivationParamBuffers& buffers,
+    [[maybe_unused]] std::pair<torch::Tensor, torch::Tensor>& capture_buffers)
 {
     auto const* swiglu_alpha_ptr
         = reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr);
@@ -230,7 +231,13 @@ ActivationParams makeActivationParams(ActivationType activation_type,
         // present. Keep neutral tensors per device, expert count and stream so
         // repeated forwards do not allocate or refill them, or cross streams.
         auto const stream = at::cuda::getCurrentCUDAStream(reference.device().index()).stream();
-        auto& defaults = buffers.defaults[{reference.device().index(), reference.numel(), stream}];
+        cudaStreamCaptureStatus capture_status;
+        TLLM_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+        // Captured fills execute only on replay. Keep these tensors local to
+        // this forward so no later call can reuse an uninitialized graph buffer.
+        auto& defaults = capture_status != cudaStreamCaptureStatusNone
+            ? capture_buffers
+            : buffers.defaults[{reference.device().index(), reference.numel(), stream}];
         if (!swiglu_alpha_ptr)
         {
             if (!defaults.first.defined())
@@ -707,8 +714,9 @@ public:
             "SiTu does not support swiglu_limit.");
         // A SwiGLU clamp promotes base_activation_type to SwigluBias above,
         // which selects the only CUTLASS adaptor that consumes clampAfterSilu.
+        std::pair<torch::Tensor, torch::Tensor> capture_buffers;
         auto activation_params = makeActivationParams(base_activation_type, swiglu_alpha, swiglu_beta, swiglu_limit,
-            swiglu_clamp_after_silu, mActivationParamBuffers);
+            swiglu_clamp_after_silu, mActivationParamBuffers, capture_buffers);
 
         // ===== Routed-expert LoRA activation flags =====
         // LoRA is activated by the per-request (fc1_lora_ranks) or slot-indexed
@@ -977,8 +985,9 @@ public:
             "SiTu requires both swiglu_alpha and swiglu_beta.");
         TORCH_CHECK(!isSiTuActivation(base_activation_type) || !swiglu_limit.has_value(),
             "SiTu does not support swiglu_limit.");
+        std::pair<torch::Tensor, torch::Tensor> capture_buffers;
         auto activation_params = makeActivationParams(base_activation_type, swiglu_alpha, swiglu_beta, swiglu_limit,
-            swiglu_clamp_after_silu, mActivationParamBuffers);
+            swiglu_clamp_after_silu, mActivationParamBuffers, capture_buffers);
 
         // Validate the fc1/fc2 inter-size relationship now that the activation type (gated vs
         // non-gated) is finalized. INT8-woq uses a transposed weight layout, so its fc1/fc2 dim

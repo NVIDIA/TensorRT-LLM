@@ -657,7 +657,9 @@ the legacy build. All-to-all is checked after the layer selects its communicatio
 strategy, during construction. Input layout and token-count options supplied
 to native operators directly retain runtime guards.
 The neutral SwiGLU tensors are cached by device, expert count and CUDA stream;
-warm forwards reuse them without allocations or fill kernels.
+warm eager forwards reuse them without allocations or fill kernels. During CUDA
+graph capture, each forward creates its own defaults and records their fills in
+that graph instead of retaining graph-pool tensors in the runner cache.
 
 The CPU resolution tests run in `l0_cpu.yml`; routing and activation numerics
 run in the H100 and B200 single-GPU lists. The H100 C++ kernel stage discovers

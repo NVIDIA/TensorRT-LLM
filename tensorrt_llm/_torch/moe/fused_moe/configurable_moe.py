@@ -228,13 +228,14 @@ class ConfigurableMoE(MoE):
             self.event_dict = None
 
         # Validate configuration
-        self.validate_config()
+        validated = False
         try:
+            self.validate_config()
             self.validate_backend(self.backend)
-        except ValueError:
-            if self.comm is not None:
+            validated = True
+        finally:
+            if not validated and self.comm is not None:
                 self.comm.destroy()
-            raise
 
         # Mark as _weights_removed to skip ConfigurableMoE's post_load_weights in model_loader
         # The backend's post_load_weights will be called directly by model_loader
