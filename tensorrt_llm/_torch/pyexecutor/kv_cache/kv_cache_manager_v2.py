@@ -1752,7 +1752,16 @@ class KVCacheManagerV2(BaseResourceManager):
         self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
         self._early_freed_index_requests: set[int] = set()
         self._prepare_page_table_tensor(index_mapper_capacity)
-        if any(self.impl.is_sparse(buf.layer_id, buf.role) for buf in self.impl.all_buffer_ids):
+        self._sparse_layer_group_ids = tuple(
+            sorted(
+                {
+                    self.layer_to_pool_mapping_dict[buf.layer_id]
+                    for buf in self.impl.all_buffer_ids
+                    if self.impl.is_sparse(buf.layer_id, buf.role)
+                }
+            )
+        )
+        if self._sparse_layer_group_ids:
             self.sparse_metadata_batch = Batch(
                 self.impl, index_mapper_capacity, self.max_blocks_per_seq, self.max_beam_width
             )
@@ -5771,10 +5780,15 @@ class KVCacheManagerV2(BaseResourceManager):
         max_blocks: Optional[int] = None,
     ):
         self._publish_sparse_metadata()
+        # Sparse history can remain on GPU while offload is deferred. Check all
+        # mapped pages after publication, which can retry the deferred offload.
         if self.sparse_metadata_batch is not None and any(
-            self.kv_cache_map[req_id].is_decoding
-            and self.kv_cache_map[req_id].history_length >= self.tokens_per_block
+            level is not None and level != GPU_LEVEL
             for req_id in request_ids
+            for layer_group_id in self._sparse_layer_group_ids
+            for level in self.kv_cache_map[req_id]
+            .get_page_storage_snapshot(layer_group_id)
+            .cache_levels
         ):
             raise RuntimeError(
                 "Offloaded sparse history requires Batch metadata and sparse fetch; "

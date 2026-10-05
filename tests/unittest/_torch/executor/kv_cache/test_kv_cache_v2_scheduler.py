@@ -101,19 +101,121 @@ def test_sparse_metadata_republishes_after_connector_acceptance() -> None:
     ]
 
 
-def test_sparse_host_indices_cannot_reach_dense_attention_offsets() -> None:
+@pytest.fixture
+def sparse_offset_manager() -> KVCacheManagerV2:
     manager = object.__new__(KVCacheManagerV2)
     manager._stream = Mock(cuda_stream=123)
     manager.sparse_metadata_batch = Mock()
+    manager._sparse_layer_group_ids = (1, 3)
     manager.tokens_per_block = 4
-    manager.kv_cache_map = {7: Mock(is_decoding=True, history_length=4)}
+    manager.kv_cache_map = {req_id: Mock(is_decoding=True, history_length=8) for req_id in (7, 8)}
+    for cache in manager.kv_cache_map.values():
+        cache.get_page_storage_snapshot.return_value = Mock(
+            cache_levels=[0, 0], eligible_history_blocks=0
+        )
+    manager._use_per_layer_page_tables = False
+    manager._copy_batch_block_offsets_per_layer = Mock()
+    manager.index_mapper = Mock()
+    manager.index_mapper.get_copy_index.return_value = Mock(shape=(2,))
+    manager.host_kv_cache_block_offsets = Mock()
+    manager.index_scales = Mock()
+    manager.kv_offset = Mock()
+    return manager
+
+
+@pytest.mark.parametrize("per_layer", [False, True])
+@pytest.mark.parametrize(
+    "cache_levels",
+    [pytest.param([0, 0], id="gpu"), pytest.param([None, 0, None], id="invalid-slots")],
+)
+def test_sparse_gpu_resident_history_uses_dense_attention_offsets(
+    sparse_offset_manager: KVCacheManagerV2, cache_levels: list[int | None], per_layer: bool
+) -> None:
+    manager = sparse_offset_manager
+    manager._use_per_layer_page_tables = per_layer
+    manager.kv_cache_map[8].get_page_storage_snapshot.return_value.cache_levels = cache_levels
+    unscheduled_cache = Mock(is_decoding=True, history_length=8)
+    unscheduled_cache.get_page_storage_snapshot.return_value = Mock(cache_levels=[1, 1])
+    manager.kv_cache_map[9] = unscheduled_cache
+    destination = Mock()
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2."
+        "copy_batch_block_offsets_to_device"
+    ) as dense_copy:
+        manager.copy_batch_block_offsets(destination, [7, 8], 1, 0, 2)
+        if per_layer:
+            manager._copy_batch_block_offsets_per_layer.assert_called_once_with(
+                destination, [7, 8], manager.index_mapper.get_copy_index.return_value, 0, 2
+            )
+            dense_copy.assert_not_called()
+        else:
+            dense_copy.assert_called_once_with(
+                manager.host_kv_cache_block_offsets,
+                destination,
+                manager.index_mapper.get_copy_index.return_value,
+                manager.index_scales,
+                manager.kv_offset,
+                123,
+            )
+            manager._copy_batch_block_offsets_per_layer.assert_not_called()
+    for req_id in (7, 8):
+        assert manager.kv_cache_map[req_id].get_page_storage_snapshot.call_args_list == [
+            call(1),
+            call(3),
+        ]
+    unscheduled_cache.get_page_storage_snapshot.assert_not_called()
+    manager.sparse_metadata_batch.publish.assert_called_once_with(123)
+
+
+@pytest.mark.parametrize(
+    ("cache_levels", "eligible_history_blocks"),
+    [
+        pytest.param([1, 1], 2, id="host"),
+        pytest.param([0, 1], 0, id="host-after-gpu"),
+        pytest.param([None, 1], 0, id="host-after-invalid-slot"),
+    ],
+)
+def test_sparse_host_indices_cannot_reach_dense_attention_offsets(
+    sparse_offset_manager: KVCacheManagerV2,
+    cache_levels: list[int | None],
+    eligible_history_blocks: int,
+) -> None:
+    manager = sparse_offset_manager
+    snapshots = {
+        1: Mock(cache_levels=[0, 0], eligible_history_blocks=0),
+        3: Mock(cache_levels=cache_levels, eligible_history_blocks=eligible_history_blocks),
+    }
+    manager.kv_cache_map[8].get_page_storage_snapshot.side_effect = snapshots.__getitem__
     with patch(
         "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2."
         "copy_batch_block_offsets_to_device"
     ) as dense_copy:
         with pytest.raises(RuntimeError, match="Offloaded sparse history"):
-            manager.copy_batch_block_offsets(Mock(), [7], 1, 0, 1)
+            manager.copy_batch_block_offsets(Mock(), [7, 8], 1, 0, 2)
         dense_copy.assert_not_called()
+    manager._copy_batch_block_offsets_per_layer.assert_not_called()
+    manager.sparse_metadata_batch.publish.assert_called_once_with(123)
+
+
+def test_sparse_dense_offsets_check_residency_after_publication(
+    sparse_offset_manager: KVCacheManagerV2,
+) -> None:
+    manager = sparse_offset_manager
+    snapshot = manager.kv_cache_map[8].get_page_storage_snapshot.return_value
+
+    def offload_history(stream: int) -> None:
+        snapshot.cache_levels = [1, 1]
+        snapshot.eligible_history_blocks = 2
+
+    manager.sparse_metadata_batch.publish.side_effect = offload_history
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2."
+        "copy_batch_block_offsets_to_device"
+    ) as dense_copy:
+        with pytest.raises(RuntimeError, match="Offloaded sparse history"):
+            manager.copy_batch_block_offsets(Mock(), [7, 8], 1, 0, 2)
+        dense_copy.assert_not_called()
+    manager._copy_batch_block_offsets_per_layer.assert_not_called()
     manager.sparse_metadata_batch.publish.assert_called_once_with(123)
 
 
