@@ -525,9 +525,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             # Hybrid draft layers use MiniMaxM3DraftKVCacheView, which also
             # carries their P128 trtllm-gen opt-in.
             return
-        # Draft layers run at the target's 128-token pages. trtllm-gen has P128
-        # kernels for their dense-GQA shapes but not for every shape, so opt in
-        # here rather than in the global allowlist.
+        # Draft layers run at the target's 128-token pages. Opt in to P128 here, not
+        # globally: trtllm-gen ships P128 kernels for these dense-GQA draft shapes, but
+        # many other shapes in its artifact are P32-only.
         if self.tokens_per_block == 128:
             self.trtllm_gen_extra_tokens_per_block = frozenset({128})
         if self._use_per_layer_page_tables:
@@ -960,8 +960,8 @@ class MiniMaxM3DraftKVCacheView:
 
     dtype = DataType.FP8
     num_pools = num_attention_op_pools = 1
-    # trtllm-gen has P128 kernels for the draft layer's dense-GQA shape but not
-    # for every shape, so only this view opts in.
+    # P128 is opted in here, not globally: trtllm-gen ships P128 kernels for this
+    # dense-GQA draft shape, but many other shapes in its artifact are P32-only.
     trtllm_gen_extra_tokens_per_block = frozenset({128})
 
     def __init__(self, manager: MiniMaxM3KVCacheManagerV2, draft_layer_ids: Sequence[int]) -> None:
