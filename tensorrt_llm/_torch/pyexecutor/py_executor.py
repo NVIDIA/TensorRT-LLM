@@ -114,7 +114,7 @@ from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
-from .scheduler import (RequestScheduler, ScheduledRequests,
+from .scheduler import (RequestScheduler, ScheduledRequests, SchedulerOutput,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter, count_retiring_requests
@@ -2815,6 +2815,7 @@ class PyExecutor:
                 # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
                 (scheduled_batch, fitting_disagg_gen_init_requests, _,
                  _) = self._pp_schedule_and_propagate(microbatch_id)
+                local_scheduler_output = None
                 if self.dist.rank != 0:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
@@ -2831,6 +2832,9 @@ class PyExecutor:
                     self.disagg.revert_deferred_gen_init(
                         local_disagg_candidates,
                         fitting_disagg_gen_init_requests)
+
+                self._validate_kv_cache_admission(scheduled_batch,
+                                                  local_scheduler_output)
 
                 if (self._mm_encoder_item_scheduling_enabled
                         and scheduled_batch.scheduled_mm_encoder_items):
@@ -6514,6 +6518,49 @@ class PyExecutor:
                 return context_requests[:i]
         return context_requests
 
+    def _validate_kv_cache_admission(
+            self,
+            scheduled_batch: ScheduledRequests,
+            local_output: Optional[SchedulerOutput] = None) -> None:
+        """Fail together before forward if offload admission differs across ranks.
+
+        Host restoration and offload can fail independently on each rank. PP's
+        propagated schedule must also have been allocated by each local scheduler.
+        Attention DP compares only ranks that execute the same requests.
+        """
+        manager = self.kv_cache_manager
+        if (not isinstance(manager, KVCacheManagerV2)
+                or not manager.requires_synchronized_admission
+                or self.dist.world_size == 1):
+            return
+        context = scheduled_batch.context_requests
+        generation = scheduled_batch.generation_requests
+        local_ids = None if local_output is None else {
+            req.py_request_id
+            for req in (local_output.context_requests +
+                        local_output.generation_requests)
+        }
+        admitted = all(
+            manager.is_request_active(req.py_request_id) and (
+                local_ids is None or req.py_request_id in local_ids)
+            for req in context + generation)
+        signature = (
+            [(req.py_request_id, req.context_current_position,
+              req.context_chunk_size) for req in context],
+            [(req.py_request_id, req.max_beam_num_tokens)
+             for req in generation],
+        )
+        group = self.dist.tp_rank if self.enable_attention_dp else 0
+        statuses = self.dist.allgather((group, admitted, signature))
+        signatures = {}
+        for rank_group, rank_admitted, rank_signature in statuses:
+            if (not rank_admitted or signatures.setdefault(
+                    rank_group, rank_signature) != rank_signature):
+                raise RuntimeError(
+                    "Sparse KV offload admission differs across ranks; "
+                    "a rank could not allocate the scheduled KV or restore its prefix"
+                )
+
     @nvtx_range("_schedule")
     def _schedule(self):
         self._maybe_record_hang_diagnostic_phase("scheduling",
@@ -6578,6 +6625,9 @@ class PyExecutor:
         scheduled_requests.scheduled_mm_encoder_items = (
             scheduler_output.scheduled_mm_encoder_items)
         scheduled_requests.recompute_paused_requests = scheduler_output.recompute_paused_requests
+
+        if self.dist.pp_size == 1:
+            self._validate_kv_cache_admission(scheduled_requests)
 
         self._maybe_record_hang_diagnostic_phase("scheduled",
                                                  scheduled_requests)

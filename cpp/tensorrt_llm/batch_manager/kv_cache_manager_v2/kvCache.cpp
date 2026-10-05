@@ -358,7 +358,9 @@ void KvCache::activate()
         size_t idx = 0;
         for (auto& t : targets)
         {
-            TLLM_CHECK_DEBUG(t.page == locks[idx].page());
+            TLLM_CHECK_DEBUG(t.page == locks[idx].page()
+                || (t.cacheLevel == kHotLevel && locks[idx].page()->cacheLevel == kHotLevel
+                    && locks[idx].page()->isCommitted()));
             BeamIndex bi = t.beamIndex;
             LifeCycleId lc = t.lifeCycle;
             if (t.ordinal == kBadBlockOrdinal)

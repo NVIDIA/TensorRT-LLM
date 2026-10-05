@@ -21,7 +21,10 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4CacheManager
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
+    DeepseekV4CacheManager,
+    DeepseekV4TrtllmAttentionMetadata,
+)
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     cache_manager as deepseek_v4_cache,
 )
@@ -40,6 +43,8 @@ from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
     Nvfp4ColdPageQuantizationCompression,
 )
+from tensorrt_llm._torch.memory_buffer_utils import Buffers
+from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor._util import CacheCost
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
@@ -159,6 +164,7 @@ def _manager(tokens_per_block=128):
         cache.num_blocks = len(cache.pages)
         cache.capacity = cache.num_blocks * tokens_per_block
         cache.beam_width = 1
+        cache.is_decoding = False
     return manager
 
 
@@ -277,6 +283,69 @@ def test_completed_history_advances_without_reuse_or_capacity_growth(tokens_per_
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("suspended", [False, True])
+@pytest.mark.parametrize("admitted", [False, True])
+def test_decode_admission_orders_offload_before_capacity_growth(
+    suspended: bool, admitted: bool
+) -> None:
+    manager, cache, request, _ = _history_case()
+    cache.history_length = request.max_beam_num_tokens - 1
+    cache.is_active = not suspended
+    operations = []
+    caller_stream = object()
+    manager._stream.wait_stream.side_effect = lambda stream: operations.append("wait")
+
+    def enter_decode(*args, **kwargs) -> bool:
+        operations.append("resume" if suspended else "enter_decode")
+        if admitted:
+            cache.is_active = True
+        return admitted
+
+    cache.enter_decode = Mock(side_effect=enter_decode)
+    cache.resume = Mock(side_effect=enter_decode)
+    resize = cache.resize
+
+    def grow(capacity: int) -> bool:
+        operations.append("resize")
+        return resize(capacity, None)
+
+    cache.resize = grow
+    manager._generation_draft_slots = Mock(return_value=0)
+    manager._restore_page_index_bufs = Mock()
+    manager._fill_fresh_kv_pages = Mock()
+    manager._log_window_crossing = Mock()
+    with (
+        patch("torch.cuda.current_stream", return_value=caller_stream),
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        assert manager.try_allocate_generation(request) is admitted
+    assert operations == ["wait", "resume" if suspended else "enter_decode"] + (
+        ["resume"] if suspended and admitted else []
+    ) + (["resize"] if admitted else [])
+    manager._stream.wait_stream.assert_called_once_with(caller_stream)
+    if suspended:
+        cache.resume.assert_called_once_with(manager._stream.cuda_stream, is_decoding=True)
+    else:
+        cache.enter_decode.assert_called_once_with()
+    assert cache.history_length == request.max_beam_num_tokens - 1
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("suspended", [False, True])
+def test_decode_admission_rejects_graph_capture_before_mutation(suspended: bool) -> None:
+    manager, cache, request, _ = _history_case()
+    cache.is_active = not suspended
+    cache.enter_decode = Mock()
+    cache.resume = Mock()
+    with patch("torch.cuda.is_current_stream_capturing", return_value=True):
+        with pytest.raises(RuntimeError, match="outside CUDA graph capture"):
+            manager.try_allocate_generation(request)
+    cache.enter_decode.assert_not_called()
+    cache.resume.assert_not_called()
+    assert not cache.calls
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("context", [False, True])
 @pytest.mark.parametrize(
     "problem", ["resize_failure", "wrong_stream", "capture", "suspended", "removed"]
@@ -309,6 +378,71 @@ def test_history_update_rejects_failures_and_skips_inactive(context: bool, probl
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("completed", [127, 128, 129, 255, 256, 257])
+def test_sparse_offload_helix_history_uses_local_tokens(rank: int, completed: int) -> None:
+    manager, _, request, _ = _history_case()
+    manager._has_cp_helix = True
+    manager._helix_cp_rank, manager._helix_cp_size = rank, 2
+    request.total_input_len_cp = 127
+    request.prompt_len = 127 if rank == 0 else 0
+    request.max_beam_num_tokens = request.prompt_len + completed - 127 + 1
+    cycles, remainder = divmod(completed, 256)
+    expected = cycles * 128 + min(128, max(0, remainder - rank * 128))
+    assert manager._completed_generation_history(request) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("operation", ["suspend_request", "resume_request", "free_resources"])
+def test_sparse_offload_lifetime_orders_model_work(operation: str) -> None:
+    manager, _, request, _ = _history_case()
+    with (
+        patch.object(KVCacheManagerV2, operation) as base,
+        patch("torch.cuda.current_stream") as current_stream,
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        getattr(manager, operation)(request)
+        manager._stream.wait_stream.assert_called_once_with(current_stream.return_value)
+        base.assert_called_once()
+
+
+@pytest.mark.cpu_only
+def test_sparse_offload_suspended_completion_is_applied_before_growth() -> None:
+    manager, cache, request, _ = _history_case()
+    cache.is_active = False
+    cache.history_length = 126
+    request.max_beam_num_tokens = 129
+    operations = []
+
+    def resume(*args, **kwargs) -> bool:
+        operations.append("resume")
+        cache.is_active = True
+        return True
+
+    cache.resume = resume
+    manager._restore_page_index_bufs = Mock()
+    resize = cache.resize
+
+    def completed(capacity, history) -> bool:
+        operations.append("history")
+        return resize(capacity, history)
+
+    cache.resize = completed
+    with (
+        patch.object(
+            KVCacheManagerV2,
+            "try_allocate_generation",
+            side_effect=lambda req: operations.append("grow") or True,
+        ),
+        patch("torch.cuda.current_stream"),
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        assert manager.try_allocate_generation(request)
+    assert operations == ["resume", "history", "grow"]
+    assert cache.history_length == 128
+
+
+@pytest.mark.cpu_only
 def test_descriptor_uses_common_pool_origin_and_layer_relative_bound() -> None:
     manager = _manager()
     descriptors = manager.get_sparse_offload_descriptors()
@@ -332,6 +466,7 @@ def test_descriptor_uses_common_pool_origin_and_layer_relative_bound() -> None:
 def test_chunked_prefill_checked_from_scheduled_request(first, last, enabled):
     manager = _manager()
     manager._enable_kv_cache_offload = enabled
+    manager._wait_for_sparse_model_work = Mock()
     batch = SimpleNamespace(
         context_requests=[SimpleNamespace(is_first_context_chunk=first, is_last_context_chunk=last)]
     )
@@ -419,23 +554,65 @@ def test_sparse_offload_cache_roles(
 
 
 @pytest.mark.cpu_only
-def test_sparse_offload_rejects_inference_before_cache_allocation() -> None:
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        "host_default",
+        "host_zero",
+        "nvfp4",
+        "footer",
+        "beam",
+        "speculation",
+        "draft",
+        "disagg",
+        "connector",
+        "codec",
+    ],
+)
+def test_sparse_offload_validates_configuration_before_allocation(unsupported: str) -> None:
     sparse_config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True)
+    kv_config = KvCacheConfig(enable_block_reuse=False, host_cache_size=1 << 20)
+    kwargs = dict(
+        max_beam_width=1,
+        mapping=Mapping(),
+        dtype=DataType.BF16,
+        disable_overlap_scheduler=True,
+    )
+    if unsupported == "host_default":
+        kv_config.host_cache_size = None
+    elif unsupported == "host_zero":
+        kv_config.host_cache_size = 0
+    elif unsupported == "nvfp4":
+        kwargs["dtype"] = DataType.NVFP4
+    elif unsupported == "footer":
+        kv_config.dtype = "fp8_ds_mla"
+    elif unsupported == "beam":
+        kwargs["max_beam_width"] = 2
+    elif unsupported == "speculation":
+        kwargs["spec_config"] = object()
+    elif unsupported == "draft":
+        kwargs["is_draft"] = True
+    elif unsupported == "disagg":
+        kwargs["is_disagg"] = True
+    elif unsupported == "connector":
+        kwargs["kv_connector_manager"] = object()
+    else:
+        kwargs["cold_page_codec_provider"] = object()
     with (
         patch.object(deepseek_v4_cache, "get_sm_version") as get_sm_version,
         patch.object(deepseek_v4_cache.KVCacheManagerV2, "__init__") as initialize_cache,
-        pytest.raises(NotImplementedError, match="KVCM v2 sparse runtime"),
+        pytest.raises((ValueError, NotImplementedError), match="sparse offload"),
     ):
         DeepseekV4CacheManager(
-            kv_cache_config=KvCacheConfig(enable_block_reuse=False, host_cache_size=1 << 20),
+            kv_cache_config=kv_config,
             kv_cache_type=CacheTypeCpp.SELFKONLY,
             num_layers=len(sparse_config.compress_ratios),
             max_batch_size=1,
             tokens_per_block=128,
             max_seq_len=256,
             vocab_size=128,
-            mapping=Mapping(),
             sparse_attn_config=sparse_config,
+            **kwargs,
         )
 
     get_sm_version.assert_not_called()
@@ -709,6 +886,10 @@ class TestDeepseekV4CacheManager:
         enable_swa_scratch_reuse: bool = True,
         cold_page_codec_provider: object | None = None,
         host_cache_size: int | None = None,
+        enable_kv_cache_offload: bool = False,
+        enable_block_reuse: bool = False,
+        disable_overlap_scheduler: bool = True,
+        mapping: Mapping | None = None,
     ) -> Tuple[DeepseekV4CacheManager, DeepSeekV4SparseAttentionConfig]:
         """Helper to create a DeepseekV4CacheManager for testing."""
 
@@ -720,6 +901,7 @@ class TestDeepseekV4CacheManager:
             index_head_dim=self.index_head_dim,
             window_size=self.window_size,
             compress_ratios=compress_ratios,
+            enable_kv_cache_offload=enable_kv_cache_offload,
             **config_kwargs,
         )
 
@@ -727,7 +909,7 @@ class TestDeepseekV4CacheManager:
         if max_input_len is None:
             max_input_len = max_seq_len
         kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
+            enable_block_reuse=enable_block_reuse,
             max_tokens=max_seq_len * max_batch_size,
             event_buffer_max_size=0,
             enable_swa_scratch_reuse=enable_swa_scratch_reuse,
@@ -735,7 +917,7 @@ class TestDeepseekV4CacheManager:
         )
 
         # Create mapping (single GPU, no parallelism)
-        mapping = Mapping(
+        mapping = mapping or Mapping(
             world_size=tp_size,
             rank=0,
             tp_size=tp_size,
@@ -763,9 +945,353 @@ class TestDeepseekV4CacheManager:
             is_draft=is_draft,
             spec_config=spec_config,
             cold_page_codec_provider=cold_page_codec_provider,
+            disable_overlap_scheduler=disable_overlap_scheduler,
         )
 
         return cache_manager, sparse_attn_config
+
+    @pytest.mark.parametrize("tokens_per_block", [128, 256])
+    @pytest.mark.parametrize("dtype", [DataType.BF16, DataType.FP8])
+    @pytest.mark.parametrize("enable_block_reuse", [False, True])
+    @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+    @pytest.mark.parametrize("is_cuda_graph", [False, True])
+    def test_sparse_offload_runtime_phase_boundaries(
+        self,
+        tokens_per_block: int,
+        dtype: DataType,
+        enable_block_reuse: bool,
+        disable_overlap_scheduler: bool,
+        is_cuda_graph: bool,
+    ) -> None:
+        with torch.cuda.stream(torch.cuda.Stream()):
+            manager, config = self._create_deepseek_v4_cache_manager(
+                tokens_per_block=tokens_per_block,
+                max_batch_size=1,
+                max_seq_len=3 * tokens_per_block,
+                compress_ratios=[4, 4, 128],
+                dtype=dtype,
+                compressor_dtype=DataType.FLOAT,
+                indexer_k_dtype="fp8",
+                host_cache_size=16 << 20,
+                enable_kv_cache_offload=True,
+                enable_block_reuse=enable_block_reuse,
+                disable_overlap_scheduler=disable_overlap_scheduler,
+            )
+            prompt_len = tokens_per_block + 1
+            request = self._create_request(request_id=20, prompt_len=prompt_len)
+            batch = ScheduledRequests()
+            batch.context_requests_last_chunk = [request]
+            try:
+                assert manager.prepare_context(request)
+                assert manager.resize_context(request, request.context_chunk_size)
+                manager.prepare_resources(batch)
+                cache = manager.kv_cache_map[request.py_request_id]
+                groups = {}
+                for (layer, attn_type), layer_id in manager._layer_attn_to_layer_id.items():
+                    is_sparse = manager.impl.is_sparse(layer_id, attn_type.role)
+                    assert is_sparse == (
+                        layer < 2 and attn_type == DeepseekV4AttentionType.COMPRESS
+                    )
+                    groups[layer, attn_type] = manager.impl.get_layer_group_id(layer_id)
+                sparse_group = groups[0, DeepseekV4AttentionType.COMPRESS]
+                assert sparse_group == groups[1, DeepseekV4AttentionType.COMPRESS]
+                assert sparse_group != groups[0, DeepseekV4AttentionType.INDEXER_COMPRESS]
+                assert sparse_group != groups[2, DeepseekV4AttentionType.COMPRESS]
+
+                with (
+                    patch.object(manager, "get_sparse_offload_descriptors") as describe_fetch,
+                    patch.object(manager, "prepare_sparse_offload") as prepare_fetch,
+                ):
+                    metadata = DeepseekV4TrtllmAttentionMetadata(
+                        seq_lens=torch.tensor([prompt_len], dtype=torch.int32),
+                        num_contexts=1,
+                        max_num_requests=1,
+                        kv_cache_params=KVCacheParams(
+                            use_cache=True, num_cached_tokens_per_seq=[0]
+                        ),
+                        kv_cache_manager=manager,
+                        request_ids=[request.py_request_id],
+                        prompt_lens=[prompt_len],
+                        max_num_tokens=3 * tokens_per_block,
+                        mapping=Mapping(),
+                        sparse_attention_config=config,
+                        is_cuda_graph=is_cuda_graph,
+                        cuda_graph_buffers=Buffers() if is_cuda_graph else None,
+                    )
+                    metadata.prepare()
+                    assert metadata.sparse_offload_state is None
+                    assert (metadata.compress_block_tables[4][0, :2] >= 0).all()
+                    describe_fetch.assert_not_called()
+                    prepare_fetch.assert_not_called()
+
+                request.context_current_position = prompt_len
+                request.add_new_token(1, 0)
+                manager.update_context_resources(batch)
+                before = cache.get_page_storage_snapshot(sparse_group)
+                assert list(before.cache_levels) == [0, 0]
+                assert before.eligible_history_blocks == 0
+                assert not cache.is_decoding
+
+                assert manager.try_allocate_generation(request)
+                after = cache.get_page_storage_snapshot(sparse_group)
+                assert cache.is_decoding
+                assert cache.history_length == prompt_len
+                assert list(after.cache_levels) == [1, 0]
+                assert after.eligible_history_blocks == 1
+                assert after.base_page_indices[1] == before.base_page_indices[1]
+                for group in set(groups.values()) - {sparse_group}:
+                    assert all(
+                        level in (None, 0)
+                        for level in cache.get_page_storage_snapshot(group).cache_levels
+                    )
+
+                metadata.num_contexts = 0
+                metadata.seq_lens = torch.ones(1, dtype=torch.int32)
+                with patch.object(manager, "compute_sliding_block_tables") as build_tables:
+                    with pytest.raises(
+                        NotImplementedError, match="decode attention.*requires refetch"
+                    ):
+                        metadata.prepare()
+                    build_tables.assert_not_called()
+            finally:
+                if request.py_request_id in manager.kv_cache_map:
+                    manager.free_resources(request)
+                manager.shutdown()
+
+    @pytest.mark.parametrize("tokens_per_block", [128, 256])
+    @pytest.mark.parametrize("dtype", [DataType.BF16, DataType.FP8])
+    @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+    def test_sparse_offload_orders_graph_replay_and_restores_produced_kv(
+        self, tokens_per_block: int, dtype: DataType, disable_overlap_scheduler: bool
+    ) -> None:
+        prompt_len = tokens_per_block + 1
+        with torch.cuda.stream(torch.cuda.Stream()):
+            manager, config = self._create_deepseek_v4_cache_manager(
+                tokens_per_block=tokens_per_block,
+                max_batch_size=4,
+                max_seq_len=3 * tokens_per_block,
+                compress_ratios=[4, 4],
+                dtype=dtype,
+                compressor_dtype=DataType.FLOAT,
+                indexer_k_dtype="fp8",
+                host_cache_size=16 << 20,
+                enable_kv_cache_offload=True,
+                enable_block_reuse=True,
+                enable_swa_scratch_reuse=False,
+                disable_overlap_scheduler=disable_overlap_scheduler,
+            )
+        torch.cuda.current_stream().wait_stream(manager._stream)
+        requests = []
+        try:
+            for index in range(2):
+                request = LlmRequest(
+                    request_id=20 + index,
+                    max_new_tokens=4,
+                    input_tokens=[index] * prompt_len,
+                    sampling_config=SamplingConfig(),
+                    is_streaming=False,
+                )
+                requests.append(request)
+                assert manager.prepare_context(request)
+                assert manager.resize_context(request, request.context_chunk_size)
+            batch = ScheduledRequests()
+            batch.context_requests_last_chunk = requests.copy()
+            manager.prepare_resources(batch)
+            metadata = DeepseekV4TrtllmAttentionMetadata(
+                seq_lens=torch.tensor([prompt_len, prompt_len], dtype=torch.int32),
+                num_contexts=2,
+                max_num_requests=4,
+                kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0, 0]),
+                kv_cache_manager=manager,
+                request_ids=[request.py_request_id for request in requests],
+                prompt_lens=[prompt_len, prompt_len],
+                max_num_tokens=2 * prompt_len,
+                mapping=Mapping(),
+                sparse_attention_config=config,
+                is_cuda_graph=True,
+                cuda_graph_buffers=Buffers(),
+            )
+            metadata.prepare()
+            table = metadata.compress_block_tables[4]
+            table_pointer = table.data_ptr()
+            buffers = [
+                manager.get_buffers(layer, DeepseekV4AttentionType.COMPRESS).view(torch.uint8)
+                for layer in range(2)
+            ]
+            payloads = [
+                torch.zeros((2, *buffer.shape[1:]), dtype=torch.uint8, device="cuda")
+                for buffer in buffers
+            ]
+
+            def produce_kv() -> None:
+                torch.cuda._sleep(2_000_000)
+                indices = table[:2, 0].to(torch.int64)
+                for buffer, payload in zip(buffers, payloads, strict=True):
+                    buffer.index_copy_(0, indices, payload)
+
+            model_stream = torch.cuda.Stream()
+            model_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(model_stream):
+                produce_kv()
+            model_stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=model_stream):
+                produce_kv()
+
+            for iteration, order in enumerate((requests, list(reversed(requests)))):
+                metadata.request_ids = [request.py_request_id for request in order]
+                metadata.prepare()
+                assert metadata.compress_block_tables[4].data_ptr() == table_pointer
+                for layer, payload in enumerate(payloads):
+                    payload[0].fill_(0x11 + layer + iteration)
+                    payload[1].fill_(0x33 + layer + iteration)
+                model_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(model_stream):
+                    graph.replay()
+                # The executor joins the replay stream before updating history.
+                torch.cuda.current_stream().wait_stream(model_stream)
+
+            for request in requests:
+                request.context_current_position = prompt_len
+                request.add_new_token(1, 0)
+            manager.update_context_resources(batch)
+            for request in requests:
+                assert manager.try_allocate_generation(request)
+                cache = manager.kv_cache_map[request.py_request_id]
+                layer_id = manager._layer_attn_to_layer_id[0, DeepseekV4AttentionType.COMPRESS]
+                group = manager.impl.get_layer_group_id(layer_id)
+                assert list(cache.get_page_storage_snapshot(group).cache_levels) == [1, 0]
+
+            # Native host-prefix copies must contain the last replay's writes,
+            # even though no device synchronization preceded decode admission.
+            for index in range(2):
+                probe = LlmRequest(
+                    request_id=30 + index,
+                    max_new_tokens=4,
+                    input_tokens=[index] * prompt_len,
+                    sampling_config=SamplingConfig(),
+                    is_streaming=False,
+                )
+                requests.append(probe)
+                assert manager.prepare_context(probe)
+                assert probe.context_current_position == tokens_per_block
+                assert manager.resize_context(probe, probe.context_chunk_size)
+                probe_batch = ScheduledRequests()
+                probe_batch.context_requests_last_chunk = [probe]
+                manager.prepare_resources(probe_batch)
+                torch.cuda.current_stream().wait_stream(manager._stream)
+                for layer, buffer in enumerate(buffers):
+                    indices = self._get_page_indices(
+                        probe, manager, layer, DeepseekV4AttentionType.COMPRESS
+                    )
+                    expected = (0x34 if index == 0 else 0x12) + layer
+                    assert (buffer[indices[0]] == expected).all()
+        finally:
+            for request in reversed(requests):
+                if request.py_request_id in manager.kv_cache_map:
+                    manager.free_resources(request)
+            manager.shutdown()
+
+    @pytest.mark.parametrize("source_state", ["gpu", "host_closed", "host_locked"])
+    @pytest.mark.parametrize("partial", [False, True])
+    @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+    @pytest.mark.parametrize("dtype", [DataType.BF16, DataType.FP8])
+    def test_sparse_offload_cached_prefill(
+        self, source_state: str, partial: bool, disable_overlap_scheduler: bool, dtype: DataType
+    ) -> None:
+        tokens_per_block = 128
+        prompt_len = 2 * tokens_per_block
+        ratios = [4, 128]
+        with torch.cuda.stream(torch.cuda.Stream()):
+            manager, config = self._create_deepseek_v4_cache_manager(
+                tokens_per_block=tokens_per_block,
+                max_batch_size=2,
+                max_seq_len=4 * tokens_per_block,
+                compress_ratios=ratios,
+                dtype=dtype,
+                compressor_dtype=DataType.FLOAT,
+                indexer_k_dtype="fp8",
+                host_cache_size=32 << 20,
+                enable_kv_cache_offload=True,
+                enable_block_reuse=True,
+                enable_swa_scratch_reuse=False,
+                disable_overlap_scheduler=disable_overlap_scheduler,
+            )
+        first = self._create_request(20, prompt_len)
+        second = self._create_request(21, tokens_per_block + (7 if partial else 1))
+        try:
+            expected = self._create_random_cache(
+                seq_len=prompt_len,
+                head_dim=self.head_dim,
+                sparse_attn_config=config,
+                dtype=binding_to_torch_dtype(dtype),
+                compressor_dtype=torch.float32,
+            )
+            assert manager.prepare_context(first)
+            assert manager.resize_context(first, first.context_chunk_size)
+            batch = ScheduledRequests()
+            batch.context_requests_last_chunk = [first]
+            manager.prepare_resources(batch)
+            self._write_request_prefill(first, prompt_len, manager, expected)
+            first.context_current_position = prompt_len
+            first.add_new_token(1, 0)
+            manager.update_context_resources(batch)
+            layer_id = manager._layer_attn_to_layer_id[0, DeepseekV4AttentionType.COMPRESS]
+            group = manager.impl.get_layer_group_id(layer_id)
+            first_cache = manager.kv_cache_map[first.py_request_id]
+            if source_state != "gpu":
+                assert manager.try_allocate_generation(first)
+                assert first_cache.get_page_storage_snapshot(group).cache_levels[0] == 1
+            if source_state == "host_closed":
+                manager.free_resources(first)
+
+            assert manager.prepare_context(second)
+            reused = second.context_current_position
+            assert reused == second.prompt_len - 1
+            second_cache = manager.kv_cache_map[second.py_request_id]
+            assert second_cache.num_committed_tokens == reused
+            assert not second_cache.is_decoding
+            assert manager.resize_context(second, second.context_chunk_size)
+            batch.context_requests_last_chunk = [second]
+            manager.prepare_resources(batch)
+            metadata = DeepseekV4TrtllmAttentionMetadata(
+                seq_lens=torch.tensor([second.context_chunk_size], dtype=torch.int32),
+                num_contexts=1,
+                max_num_requests=2,
+                kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[reused]),
+                kv_cache_manager=manager,
+                request_ids=[second.py_request_id],
+                prompt_lens=[second.context_chunk_size],
+                max_num_tokens=4 * tokens_per_block,
+                mapping=Mapping(),
+                sparse_attention_config=config,
+            )
+            metadata.prepare()
+            assert metadata.sparse_offload_state is None
+            assert all(
+                level == 0 for level in second_cache.get_page_storage_snapshot(group).cache_levels
+            )
+            actual = self._read_request(second, reused, manager, ratios)
+            self._assert_cache_equal(reused, ratios, expected, actual)
+            if source_state == "host_locked":
+                assert first_cache.get_page_storage_snapshot(group).cache_levels[0] == 1
+            # Completing cached prefill commits the reused and newly written KV
+            # in the same original-token units, before native decode admission.
+            self._write_request_decode(second, reused, manager, expected)
+            second.context_current_position = second.prompt_len
+            second.add_new_token(1, 0)
+            manager.update_context_resources(batch)
+            assert second_cache.history_length == second.prompt_len
+            assert manager.try_allocate_generation(second)
+            if source_state == "gpu":
+                assert second_cache.get_page_storage_snapshot(group).eligible_history_blocks == 0
+                assert manager.try_allocate_generation(first)
+            assert second_cache.get_page_storage_snapshot(group).eligible_history_blocks == 1
+        finally:
+            for request in (second, first):
+                if request.py_request_id in manager.kv_cache_map:
+                    manager.free_resources(request)
+            manager.shutdown()
 
     def test_nvfp4_cold_page_codec_accepts_real_csa_hca_lifecycle(self):
         provider = Nvfp4ColdPageQuantizationCompression(

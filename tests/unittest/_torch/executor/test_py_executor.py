@@ -34,6 +34,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
     LlmRequestState,
@@ -60,6 +61,61 @@ from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfi
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    "mismatch", ["prefix", "request", "generation", "allocation", "pp_schedule"]
+)
+def test_sparse_offload_admission_rejects_rank_disagreement(mismatch: str) -> None:
+    manager = Mock(spec=KVCacheManagerV2)
+    manager.requires_synchronized_admission = True
+    manager.is_request_active.return_value = mismatch != "allocation"
+    context = types.SimpleNamespace(
+        py_request_id=1, context_current_position=128, context_chunk_size=1
+    )
+    generation = types.SimpleNamespace(py_request_id=2, max_beam_num_tokens=130)
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [context]
+    batch.generation_requests = [generation]
+    peer_signature = ([(1, 128, 1)], [(2, 130)])
+    if mismatch == "prefix":
+        peer_signature = ([(1, 0, 129)], [(2, 130)])
+    elif mismatch == "request":
+        peer_signature = ([(3, 128, 1)], [(2, 130)])
+    elif mismatch == "generation":
+        peer_signature = ([(1, 128, 1)], [(2, 129)])
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_manager = manager
+    executor.enable_attention_dp = False
+    executor.dist = Mock(world_size=2)
+    executor.dist.allgather.side_effect = lambda local: [local, (0, True, peer_signature)]
+    local_output = (
+        types.SimpleNamespace(context_requests=[], generation_requests=[generation])
+        if mismatch == "pp_schedule"
+        else None
+    )
+
+    with pytest.raises(RuntimeError, match="admission differs across ranks"):
+        executor._validate_kv_cache_admission(batch, local_output)
+    executor.dist.allgather.assert_called_once()
+
+
+def test_sparse_offload_admission_allows_empty_attention_dp_rank() -> None:
+    manager = Mock(spec=KVCacheManagerV2)
+    manager.requires_synchronized_admission = True
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_manager = manager
+    executor.enable_attention_dp = True
+    executor.dist = Mock(world_size=4, tp_rank=1)
+    # Each attention-DP lane agrees across PP stages; their request sets differ.
+    executor.dist.allgather.return_value = [
+        (0, True, ([(1, 128, 1)], [])),
+        (1, True, ([], [])),
+        (0, True, ([(1, 128, 1)], [])),
+        (1, True, ([], [])),
+    ]
+    executor._validate_kv_cache_admission(ScheduledRequests())
+    executor.dist.allgather.assert_called_once_with((1, True, ([], [])))
 
 
 @pytest.mark.parametrize(

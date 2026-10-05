@@ -123,7 +123,7 @@ CommittedPage::CommittedPage(
     , block(blk.get())
     , numTokensInBlock(numTokensInBlock_)
 {
-    TLLM_CHECK_DEBUG(0 < numTokensInBlock_ && numTokensInBlock_ <= static_cast<int>(blk->tokens.size()));
+    TLLM_CHECK_DEBUG(0 < numTokensInBlock_ && (!blk || numTokensInBlock_ <= static_cast<int>(blk->tokens.size())));
 }
 
 CommittedPage::~CommittedPage()
@@ -519,10 +519,11 @@ void SharedPageLock::releasePageIndex()
 // batchedLockPages
 // ---------------------------------------------------------------------------
 
-std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<BatchedLockTarget> const& targets)
+std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<BatchedLockTarget> const& inputTargets)
 {
     auto* storeMgr = kvCache.storageManager();
     TLLM_CHECK_DEBUG(storeMgr);
+    auto targets = inputTargets;
     // All pages must belong to the same storage manager.
     TLLM_CHECK_DEBUG(targets.empty()
         || std::all_of(targets.begin(), targets.end(), [&](auto const& t) { return t.page->manager == storeMgr; }));
@@ -531,6 +532,8 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
     // Reserve and migrate once per page, but issue one lock per owner below.
     std::unordered_map<Page*, CacheLevel> destinations;
     TypedVec<CacheLevel, std::vector<SharedPtr<Page>>> pagesByLevel(storeMgr->numCacheLevels());
+    std::vector<SharedPtr<Page>> copySources;
+    TypedVec<LifeCycleId, SlotCount> copyCounts(storeMgr->numLifeCycles(), 0);
     for (auto const& target : targets)
     {
         auto const& page = target.page;
@@ -539,13 +542,22 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
         {
             throw LogicError("Invalid destination for page locking; offload requires a separate handoff");
         }
-        if (page->status() == PageStatus::LOCKED && page->cacheLevel != level)
+        bool const needsCopy = page->status() == PageStatus::LOCKED && page->cacheLevel != level;
+        if (needsCopy && (!page->isCommitted() || page->cacheLevel != kSparseHistoryLevel || level != kHotLevel))
             throw LogicError("Cannot migrate a page locked by another owner");
         auto const [it, inserted] = destinations.emplace(page.get(), level);
         if (!inserted && it->second != level)
             throw LogicError("Conflicting lock levels for a shared page");
         if (inserted)
-            pagesByLevel[level].push_back(page);
+        {
+            if (needsCopy)
+            {
+                copySources.push_back(page);
+                ++copyCounts[page->lifeCycle];
+            }
+            else
+                pagesByLevel[level].push_back(page);
+        }
     }
 
     // Protect every destination group while any group is allocating. On failure,
@@ -568,6 +580,57 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
               CacheLevel dstLevel) { kvCache._recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
     DropRecorder const dropRecorder = [&kvCache](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
     { kvCache._recordDroppedPages(pages, cacheLevel); };
+
+    // A prefill owner needs GPU addresses even when another owner has pinned the
+    // immutable prefix on host. Keep the radix-tree page authoritative and give
+    // this request a detached committed copy, with the same token coverage.
+    std::unordered_map<Page*, SharedPtr<PageHolder>> privatePages;
+    if (!copySources.empty())
+    {
+        auto slots = storeMgr->newGpuSlots(copyCounts, migrationRecorder, dropRecorder);
+        auto releaseSlots = FuncGuard(
+            [&]()
+            {
+                for (LifeCycleId lc{0}; lc < slots.size(); ++lc)
+                    for (auto& slot : slots[lc])
+                        if (slot.hasValidSlot())
+                            storeMgr->releaseSlot(lc, kHotLevel, std::move(slot));
+            });
+        auto const stream = reinterpret_cast<CudaStream>(kvCache.cudaStream());
+        for (auto const& source : copySources)
+        {
+            auto& slot = slots[source->lifeCycle].back();
+            slot.readyEvent.waitInStream(stream);
+            source->readyEvent.waitInStream(stream);
+            auto sourceLock = source->holder.lock()->uniqLock.lock();
+            // Fence both allocations even if submission fails after a partial copy.
+            auto finishCopy = FuncGuard(
+                [&]()
+                {
+                    CachedCudaEvent const done(stream);
+                    slot.readyEvent = done;
+                    sourceLock->notifyFinish(done);
+                });
+            storeMgr->copySlotData(source->lifeCycle, kHotLevel, source->cacheLevel, slot.slotId(), source->slotId(),
+                kvCache.cudaStream());
+            finishCopy.run();
+            auto const& committed = static_cast<CommittedPage const&>(*source);
+            auto copy = makeShared<CommittedPage>(storeMgr, SharedPtr<Block>{}, source->lifeCycle, kHotLevel,
+                committed.numTokensInBlock, source->priority);
+            copy->setSlot(slot);
+            privatePages.emplace(source.get(), copy->hold());
+            slots[source->lifeCycle].pop_back();
+            KVCacheIterationStatsDelta stats;
+            stats.iterOnboardBlocks = 1;
+            for (auto const bytes : storeMgr->slotSize(
+                     source->cacheLevel, storeMgr->getPoolGroupIndex(source->cacheLevel, source->lifeCycle)))
+                stats.iterOnboardBytes += bytes;
+            kvCache._recordDirectIterationStats(source->lifeCycle, stats);
+        }
+        for (auto& target : targets)
+            if (auto const it = privatePages.find(target.page.get()); it != privatePages.end())
+                target.page = it->second->page;
+    }
     for (CacheLevel level{0}; level < pagesByLevel.size(); ++level)
     {
         auto const& pages = pagesByLevel[level];
