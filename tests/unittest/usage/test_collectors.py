@@ -458,10 +458,9 @@ class TestFeatureExtraction:
         assert result["cuda_graphs"] is False
 
     def test_cuda_graphs_no_config(self):
-        """CUDA graphs are disabled when no graph config is present."""
-        mock = MagicMock()
-        mock.cuda_graph_config = None
-        result = json.loads(usage_lib._collect_features(mock))
+        """CUDA graphs are disabled when the args have no graph config attribute."""
+        args = object()
+        result = json.loads(usage_lib._collect_features(args))
         assert result["cuda_graphs"] is False
 
     # --- Chunked context ---
