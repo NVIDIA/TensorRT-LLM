@@ -68,6 +68,20 @@ _STATS_ENV = "TLLM_JIT_STATS"
 _WORKERS_ENV = "TLLM_JIT_PREFETCH_WORKERS"
 
 
+def _default_workers() -> int:
+    """Helpers per rank: the CPUs this process may use, shared among the
+    ranks on the node, capped. Compiling is single-threaded per variant."""
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cpus = os.cpu_count() or 2
+    local = int(
+        os.environ.get("OMPI_COMM_WORLD_LOCAL_SIZE", os.environ.get("SLURM_NTASKS_PER_NODE", "1"))
+        or 1
+    )
+    return max(2, min(16, cpus // max(1, local) - 2))
+
+
 def prefetch_enabled() -> bool:
     return os.environ.get(_ENABLE_ENV, "0") == "1"
 
@@ -202,11 +216,11 @@ def _expand(call: KernelCall) -> Tuple[List[Dict[str, Any]], bool]:
             configs = [cfg]
             tuned = True
         else:
-            autotuner.nargs = dict(zip(autotuner.arg_names, call.args))
-            try:
-                configs = autotuner.prune_configs(base)
-            finally:
-                autotuner.nargs = None
+            # Every candidate config: the superset of what the benchmark at
+            # first launch will compile. Autotuner.prune_configs is not called
+            # because it reads autotuner.nargs, which the real Autotuner.run
+            # owns on the executor thread; this may run on another thread.
+            configs = list(autotuner.configs)
             tuned = False
     out = []
     for cfg in configs:
@@ -302,6 +316,7 @@ class _Stats:
     plan_s: float = 0.0
     wait_n: int = 0
     wait_s: float = 0.0
+    bg_submitted: int = 0
     events: List[str] = field(default_factory=list)
 
 
@@ -316,7 +331,8 @@ class JitPrefetcher:
         self.stats = _Stats()
         self._providers: List[Callable[[Any], List[KernelCall]]] = []
         self._provider_names: set = set()
-        self._seen: set = set()
+        self._spec_prio: Dict[str, int] = {}
+        self._bg_started = False
         self._inflight: Dict[int, str] = {}
         self._tag_event: Dict[int, threading.Event] = {}
         self._key_event: Dict[str, threading.Event] = {}
@@ -367,9 +383,9 @@ class JitPrefetcher:
         }
         env.update(TRITON_CACHE_DIR=cache_dir, CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
         env.pop("PYTHONPATH", None)
-        n = max(1, int(os.environ.get(_WORKERS_ENV, "2")))
+        n = max(1, int(os.environ.get(_WORKERS_ENV, str(_default_workers()))))
         self._procs = []
-        self._req_q = queue.Queue()
+        self._req_q = queue.PriorityQueue()
         for i in range(n):
             p = subprocess.Popen(
                 [sys.executable, "-u", helper, pkg_root],
@@ -406,14 +422,7 @@ class JitPrefetcher:
     def _feed_loop(self, proc):
         # One request in flight per helper, so work spreads across helpers.
         while True:
-            item = self._req_q.get()
-            if item is None:
-                try:
-                    proc.stdin.close()
-                except OSError:
-                    pass
-                return
-            tag, spec = item
+            _prio, tag, spec = self._req_q.get()
             self._busy.setdefault(proc.pid, threading.Event()).clear()
             try:
                 proc.stdin.write(json.dumps({"tag": tag, "spec": spec}) + "\n")
@@ -468,6 +477,11 @@ class JitPrefetcher:
         self.bind_executor_thread()
         if not self.prefetch or not self._providers:
             return
+        if not self._bg_started:
+            self._bg_started = True
+            threading.Thread(
+                target=self._enumerate_all, daemon=True, name="jit_prefetch_enumerate"
+            ).start()
         t0 = time.perf_counter()
         for provider in self._providers:
             try:
@@ -481,7 +495,9 @@ class JitPrefetcher:
                 self._plan_call(call)
         self.stats.plan_s += time.perf_counter() - t0
 
-    def _plan_call(self, call: KernelCall):
+    def _plan_call(self, call: KernelCall, priority: int = 0):
+        """Plan one call. ``priority`` 0 = the batch being scheduled now,
+        1 = background enumeration; lower is compiled first."""
         jit_fn, _, _ = _unwrap_jit(call.fn)
         try:
             variants, tuned = _expand(call)
@@ -504,10 +520,15 @@ class JitPrefetcher:
                 self.stats.already_compiled += 1
                 continue
             key, spec = found
-            if spec in self._seen:
-                continue
-            self._seen.add(spec)
             with self._lock:
+                prev = self._spec_prio.get(spec)
+                if prev is not None and prev <= priority:
+                    continue
+                # New, or queued at background priority and now needed by
+                # the current batch: queue it (again) at the higher priority.
+                # The helper compiles a variant at most once; a duplicate
+                # request is a disk-cache hit there.
+                self._spec_prio[spec] = priority
                 self._tag += 1
                 tag = self._tag
                 self._inflight[tag] = call.label
@@ -515,10 +536,46 @@ class JitPrefetcher:
                 self._tag_event[tag] = ev
                 self._key_event[key] = ev
                 self.stats.submitted += 1
-            self._req_q.put((tag, spec))
+            self._req_q.put((priority, tag, spec))
             if os.environ.get("TLLM_JIT_PREFETCH_DEBUG_KEYS") == "1":
                 print(f"[JIT keys] PLANNED {jit_fn.fn.__name__} key={key}", flush=True)
-            self._event(f"submit {call.label}{'' if tuned else ' (untuned: all configs)'}")
+            if priority == 0:
+                self._event(f"submit {call.label}{'' if tuned else ' (untuned: all configs)'}")
+            else:
+                self.stats.bg_submitted += 1
+
+    def _enumerate_all(self) -> None:
+        """Queue every variant each provider can reach, at background priority.
+
+        Runs on its own thread so the executor never waits for it. It plans
+        with the same meta-tensor replay as ``plan``, only over the batch
+        compositions a provider enumerates (``enumerate_batches``) instead of
+        the one batch being scheduled. Variants the current batch needs are
+        always queued ahead of these.
+        """
+        t0 = time.perf_counter()
+        n_batches = 0
+        for provider in self._providers:
+            enum = getattr(provider, "enumerate_batches", None)
+            if enum is None:
+                continue
+            seen: set = set()
+            for batch_ctx in enum():
+                n_batches += 1
+                try:
+                    calls = provider(batch_ctx, seen=seen)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning_once(
+                        f"[JIT prefetch] enumeration failed: {e}", key=f"jitp_enum_{id(provider)}"
+                    )
+                    break
+                for call in calls:
+                    self._plan_call(call, priority=1)
+        self._event(
+            f"background enumeration: {n_batches} batch classes, "
+            f"{self.stats.bg_submitted} variants queued in "
+            f"{(time.perf_counter() - t0) * 1e3:.0f} ms"
+        )
 
     # -- measurement hooks ------------------------------------------------
     def _install_hooks(self):
@@ -635,6 +692,7 @@ class JitPrefetcher:
             f" submitted={s.submitted} helper_ok={s.helper_ok}"
             f" helper_fail={s.helper_fail} helper_s={s.helper_s:.3f}"
             f" plan_s={s.plan_s:.3f} wait_n={s.wait_n} wait_s={s.wait_s:.3f}"
+            f" bg_submitted={s.bg_submitted} workers={len(self._procs)}"
         )
 
     def shutdown(self):

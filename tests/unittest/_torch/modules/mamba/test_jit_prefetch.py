@@ -148,3 +148,25 @@ def test_planned_keys_cover_real_launches(token_major, ctx_lens, any_cached):
     assert real, "recorded no real launches"
     missing = real - planned
     assert not missing, f"real launches the planner did not predict: {missing}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("token_major", [True, False])
+@pytest.mark.parametrize(
+    "ctx_lens,any_cached",
+    [([512], False), ([300, 212], False), ([300, 213], True), ([1, 511], True), ([17] * 3, True)],
+)
+def test_enumeration_covers_real_launches(token_major, ctx_lens, any_cached):
+    """The background enumeration alone must plan every real launch of any
+    batch within the engine limits."""
+    s = _shape(token_major)
+    prov = mjp.MambaSSDProvider.__new__(mjp.MambaSSDProvider)
+    prov.shapes, prov._seen_keys = [s], set()
+    prov.max_num_tokens, prov.max_batch_size = 512, 64
+    seen = set()
+    planned = set()
+    for batch in prov.enumerate_batches():
+        planned |= _keys(prov(batch, seen=seen))
+    real = _keys(_real_calls(s, ctx_lens, any_cached))
+    missing = real - planned
+    assert not missing, f"real launches the enumeration did not predict: {missing}"

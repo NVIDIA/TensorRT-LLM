@@ -34,7 +34,8 @@ the multi-sequence chunk-index kernel, and Triton's integer specialization of
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from types import SimpleNamespace
+from typing import Any, Iterator, List, Optional
 
 import torch
 
@@ -87,8 +88,11 @@ class _MixerShape:
 class MambaSSDProvider:
     """Plans the SSD prefill launches of every distinct Mamba2 layer shape."""
 
-    def __init__(self, model):
+    def __init__(self, model, max_num_tokens: int = 0, max_batch_size: int = 0):
         from .mamba2_mixer import Mamba2Mixer
+
+        self.max_num_tokens = int(max_num_tokens)
+        self.max_batch_size = int(max_batch_size)
 
         shapes = {}
         for m in model.modules():
@@ -134,19 +138,81 @@ class MambaSSDProvider:
             tuple(classes),
         )
 
-    def __call__(self, batch_ctx: Any) -> List[KernelCall]:
+    def __call__(self, batch_ctx: Any, seen: Optional[set] = None) -> List[KernelCall]:
+        """Plan one batch. ``seen`` is the caller's dedup set (the executor
+        and the background enumeration each keep their own)."""
         ctx_lens: List[int] = batch_ctx.ctx_chunk_lens
         if not ctx_lens:
             return []
         any_cached: bool = batch_ctx.any_ctx_cached
+        seen = self._seen_keys if seen is None else seen
         key = self.batch_key(ctx_lens, any_cached)
-        if key in self._seen_keys:
+        if key in seen:
             return []
-        self._seen_keys.add(key)
+        seen.add(key)
         calls: List[KernelCall] = []
         for s in self.shapes:
             calls.extend(self._plan_one(s, ctx_lens, any_cached))
         return calls
+
+    def enumerate_batches(self) -> Iterator[Any]:
+        """One representative batch per ``batch_key`` class reachable within
+        the engine's limits (max_num_tokens context tokens, max_batch_size
+        sequences).
+
+        The class is everything in a batch that reaches a kernel signature
+        (token count, sequence count and the derived chunk counts, through
+        Triton's ==1 / %16 / other integer classes, plus whether any request
+        has cached state). Candidates cover each class of the sequence count
+        and of the token total, split evenly or with a remainder so that both
+        chunk-aligned and ragged sequence boundaries occur; duplicates of a
+        class are dropped.
+        """
+        T_max = self.max_num_tokens
+        N_max = self.max_batch_size
+        if T_max <= 0 or N_max <= 0:
+            return
+        chunk = self.shapes[0].chunk_size if self.shapes else 128
+        n_cands = sorted({n for n in (1, 2, 3, 15, 16, 17, 31, 32, 33) if n <= N_max})
+        t_base = (
+            1,
+            2,
+            15,
+            16,
+            17,
+            chunk - 1,
+            chunk,
+            chunk + 1,
+            2 * chunk - 1,
+            2 * chunk,
+            2 * chunk + 1,
+            T_max - 1,
+            T_max,
+        )
+        t_cands = sorted({t for t in t_base if 1 <= t <= T_max})
+        seen_cls = set()
+        for any_cached in (False, True):
+            for n in n_cands:
+                for T in t_cands:
+                    if T < n:
+                        continue
+                    q, r = divmod(T, n)
+                    splits = [[q] * (n - 1) + [q + r]]
+                    if n > 1 and q > 1:
+                        # A ragged boundary: move one token between the first two.
+                        splits.append(
+                            [q - 1, q + 1] + [q] * (n - 3) + [q + r]
+                            if n > 2
+                            else [q - 1, q + 1 + r]
+                        )
+                    for lens in splits:
+                        if sum(lens) != T or min(lens) < 1:
+                            continue
+                        cls = self.batch_key(lens, any_cached)
+                        if cls in seen_cls:
+                            continue
+                        seen_cls.add(cls)
+                        yield SimpleNamespace(ctx_chunk_lens=lens, any_ctx_cached=any_cached)
 
     def _plan_one(self, s: _MixerShape, ctx_lens: List[int], any_cached: bool) -> List[KernelCall]:
         from .mamba2_metadata import (

@@ -1469,7 +1469,9 @@ class PyTorchModelEngine(ModelEngine):
         if prefetcher is None or not prefetch_enabled():
             return
         from ..modules.mamba.jit_prefetch import MambaSSDProvider
-        provider = MambaSSDProvider(self.model)
+        provider = MambaSSDProvider(self.model,
+                                    max_num_tokens=self.max_num_tokens,
+                                    max_batch_size=self.batch_size)
         if provider and prefetcher.register("mamba_ssd", provider):
             logger.info(f"[JIT prefetch] Mamba SSD provider: "
                         f"{len(provider.shapes)} distinct layer shape(s)")
