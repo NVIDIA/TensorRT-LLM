@@ -170,3 +170,33 @@ def test_enumeration_covers_real_launches(token_major, ctx_lens, any_cached):
     real = _keys(_real_calls(s, ctx_lens, any_cached))
     missing = real - planned
     assert not missing, f"real launches the enumeration did not predict: {missing}"
+
+
+def test_record_roundtrip(tmp_path, monkeypatch):
+    """A record written by one prefetcher is read back for replay, and a
+    record from another Triton version or GPU target is discarded."""
+    import json
+
+    from tensorrt_llm._torch import jit_prefetch as jp
+
+    monkeypatch.setenv("TLLM_JIT_RECORD_DIR", str(tmp_path))
+    monkeypatch.setenv("TLLM_JIT_STATS", "1")
+    monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
+    rec = tmp_path / "jit_record.rank0.jsonl"
+
+    p = jp.JitPrefetcher(rank=0)
+    header = json.loads(rec.read_text().splitlines()[0])
+    spec = json.dumps({"key": "k1", "name": "m.f"})
+    p._record_fh.write(json.dumps({"name": "f", "spec": spec}) + "\n")
+    p._record_fh.close()
+
+    p2 = jp.JitPrefetcher(rank=0)
+    assert [r[0] for r in p2._replay] == ["k1"]
+    p2._record_fh.close()
+
+    rec.write_text(
+        json.dumps({**header, "triton": "0.0.0"}) + "\n" + rec.read_text().split("\n", 1)[1]
+    )
+    p3 = jp.JitPrefetcher(rank=0)
+    assert p3._replay == []
+    p3._record_fh.close()

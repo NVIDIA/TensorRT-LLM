@@ -66,6 +66,13 @@ from tensorrt_llm.logger import logger
 _ENABLE_ENV = "TLLM_JIT_PREFETCH"
 _STATS_ENV = "TLLM_JIT_STATS"
 _WORKERS_ENV = "TLLM_JIT_PREFETCH_WORKERS"
+_RECORD_ENV = "TLLM_JIT_RECORD_DIR"
+_PROVIDERS_ENV = "TLLM_JIT_PREFETCH_PROVIDERS"
+
+# Queue priorities, lowest first: the executor is blocked on it; the batch
+# being scheduled needs it; a previous process compiled it (record replay);
+# a provider can reach it (background enumeration).
+_PRIO_URGENT, _PRIO_BATCH, _PRIO_REPLAY, _PRIO_ENUM = -1, 0, 1, 2
 
 
 def _default_workers() -> int:
@@ -84,6 +91,12 @@ def _default_workers() -> int:
 
 def prefetch_enabled() -> bool:
     return os.environ.get(_ENABLE_ENV, "0") == "1"
+
+
+def providers_enabled() -> bool:
+    """Per-module variant providers (approach A). ``TLLM_JIT_PREFETCH_PROVIDERS=none``
+    leaves only record/replay (approach B)."""
+    return os.environ.get(_PROVIDERS_ENV, "all") != "none"
 
 
 def stats_enabled() -> bool:
@@ -317,6 +330,9 @@ class _Stats:
     wait_n: int = 0
     wait_s: float = 0.0
     bg_submitted: int = 0
+    replay_submitted: int = 0
+    recorded: int = 0
+    urgent: int = 0
     events: List[str] = field(default_factory=list)
 
 
@@ -336,6 +352,10 @@ class JitPrefetcher:
         self._inflight: Dict[int, str] = {}
         self._tag_event: Dict[int, threading.Event] = {}
         self._key_event: Dict[str, threading.Event] = {}
+        self._key_spec: Dict[str, Tuple[str, str]] = {}
+        self._record_fh = None
+        self._recorded: set = set()
+        self._replay: List[Tuple[str, str, str]] = []
         self._tag = 0
         self._lock = threading.Lock()
         self._procs = []
@@ -345,6 +365,7 @@ class JitPrefetcher:
         self._executor_thread: Optional[int] = None
         self._ready: Dict[int, threading.Event] = {}
         self._install_hooks()
+        self._open_record()
         if self.prefetch:
             self._start_helpers()
             # Hash the Triton install now (cached for the process lifetime),
@@ -352,6 +373,10 @@ class JitPrefetcher:
             from triton.runtime.cache import triton_key
 
             triton_key()
+            for key, spec, label in self._replay:
+                self._submit(key, spec, label, _PRIO_REPLAY)
+            if self._replay:
+                self._event(f"replaying {len(self._replay)} recorded variants")
 
     @classmethod
     def get(cls) -> Optional["JitPrefetcher"]:
@@ -520,29 +545,45 @@ class JitPrefetcher:
                 self.stats.already_compiled += 1
                 continue
             key, spec = found
-            with self._lock:
-                prev = self._spec_prio.get(spec)
-                if prev is not None and prev <= priority:
-                    continue
-                # New, or queued at background priority and now needed by
-                # the current batch: queue it (again) at the higher priority.
-                # The helper compiles a variant at most once; a duplicate
-                # request is a disk-cache hit there.
-                self._spec_prio[spec] = priority
-                self._tag += 1
-                tag = self._tag
-                self._inflight[tag] = call.label
-                ev = threading.Event()
-                self._tag_event[tag] = ev
-                self._key_event[key] = ev
-                self.stats.submitted += 1
-            self._req_q.put((priority, tag, spec))
+            if not self._submit(key, spec, call.label, priority):
+                continue
             if os.environ.get("TLLM_JIT_PREFETCH_DEBUG_KEYS") == "1":
                 print(f"[JIT keys] PLANNED {jit_fn.fn.__name__} key={key}", flush=True)
-            if priority == 0:
+            if priority == _PRIO_BATCH:
                 self._event(f"submit {call.label}{'' if tuned else ' (untuned: all configs)'}")
-            else:
+
+    def _submit(self, key: str, spec: str, label: str, priority: int) -> bool:
+        """Queue one variant; False if it is already queued at this priority
+        or a more urgent one.
+
+        A variant queued at a lower priority and now needed sooner is queued
+        again at the new priority, sharing the first request's completion
+        event; whichever helper finishes first releases a waiting executor.
+        The other request is a disk-cache hit in its helper.
+        """
+        with self._lock:
+            prev = self._spec_prio.get(spec)
+            if prev is not None and prev <= priority:
+                return False
+            self._spec_prio[spec] = priority
+            self._tag += 1
+            tag = self._tag
+            self._inflight[tag] = label
+            ev = self._key_event.get(key)
+            if ev is None or ev.is_set():
+                ev = threading.Event()
+                self._key_event[key] = ev
+            self._tag_event[tag] = ev
+            self._key_spec[key] = (spec, label)
+            self.stats.submitted += 1
+            if priority == _PRIO_REPLAY:
+                self.stats.replay_submitted += 1
+            elif priority == _PRIO_ENUM:
                 self.stats.bg_submitted += 1
+            elif priority == _PRIO_URGENT:
+                self.stats.urgent += 1
+        self._req_q.put((priority, tag, spec))
+        return True
 
     def _enumerate_all(self) -> None:
         """Queue every variant each provider can reach, at background priority.
@@ -570,7 +611,7 @@ class JitPrefetcher:
                     )
                     break
                 for call in calls:
-                    self._plan_call(call, priority=1)
+                    self._plan_call(call, priority=_PRIO_ENUM)
         self._event(
             f"background enumeration: {n_batches} batch classes, "
             f"{self.stats.bg_submitted} variants queued in "
@@ -631,6 +672,11 @@ class JitPrefetcher:
             ):
                 print(f"[JIT keys] UNPLANNED {fn.name} key={key}", flush=True)
             if ev is not None and not ev.is_set():
+                # Still queued behind other work: move it to the front so the
+                # executor waits for one compile, not for the queue to drain.
+                spec_label = me._key_spec.get(key)
+                if spec_label is not None:
+                    me._submit(key, spec_label[0], spec_label[1], _PRIO_URGENT)
                 t0 = time.perf_counter()
                 ev.wait(wait_timeout_s)
                 dt = time.perf_counter() - t0
@@ -649,6 +695,34 @@ class JitPrefetcher:
             return None
 
         knobs.runtime.jit_cache_hook = cache_hook
+
+        prev_post_hook = knobs.runtime.jit_post_compile_hook
+
+        def post_compile_hook(*, key, repr, fn, compile, is_manual_warmup, already_compiled):
+            # JITFunction._do_compile calls this after every in-memory cache
+            # miss in this process: a real compile or a disk-cache load. That
+            # is exactly the set of variants this process launched, which is
+            # what the next process should compile first (approach B).
+            spec = compile.get("specialization_data") if isinstance(compile, dict) else None
+            if me._record_fh is not None and spec and spec not in me._recorded:
+                with me._lock:
+                    if spec not in me._recorded:
+                        me._recorded.add(spec)
+                        me._record_fh.write(json.dumps({"name": fn.name, "spec": spec}) + "\n")
+                        me._record_fh.flush()
+                        stats.recorded += 1
+            if prev_post_hook is not None:
+                return prev_post_hook(
+                    key=key,
+                    repr=repr,
+                    fn=fn,
+                    compile=compile,
+                    is_manual_warmup=is_manual_warmup,
+                    already_compiled=already_compiled,
+                )
+            return None
+
+        knobs.runtime.jit_post_compile_hook = post_compile_hook
 
         prev_listener = knobs.autotuning.listener
 
@@ -676,6 +750,55 @@ class JitPrefetcher:
 
         knobs.autotuning.listener = listener
 
+    def _open_record(self) -> None:
+        """Open this rank's record file and load the variants to replay.
+
+        ``$TLLM_JIT_RECORD_DIR/jit_record.rank<r>.jsonl``: a header line
+        (record format, Triton version, GPU target) followed by one line per
+        variant, holding Triton's own specialization JSON. A record written
+        by another Triton version or for another GPU target is discarded and
+        rewritten. A stale entry can only cost a helper compile: the executor
+        loads a cubin solely when its own cache-key lookup asks for it.
+        """
+        rec_dir = os.environ.get(_RECORD_ENV)
+        if not rec_dir:
+            return
+        import triton
+        from triton.runtime.driver import driver
+
+        header = {
+            "jit_record": 1,
+            "triton": triton.__version__,
+            "target": str(driver.active.get_current_target()),
+        }
+        os.makedirs(rec_dir, exist_ok=True)
+        path = os.path.join(rec_dir, f"jit_record.rank{self.rank}.jsonl")
+        mode = "w"
+        if os.path.exists(path):
+            with open(path) as f:
+                lines = f.read().splitlines()
+            try:
+                valid = bool(lines) and json.loads(lines[0]) == header
+            except json.JSONDecodeError:
+                valid = False
+            if valid:
+                mode = "a"
+                for line in lines[1:]:
+                    try:
+                        rec = json.loads(line)
+                        spec = rec["spec"]
+                        key = json.loads(spec)["key"]
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        continue
+                    if spec not in self._recorded:
+                        self._recorded.add(spec)
+                        self._replay.append((key, spec, str(rec.get("name", "?"))))
+        self._record_fh = open(path, mode)
+        if mode == "w":
+            self._record_fh.write(json.dumps(header) + "\n")
+            self._record_fh.flush()
+        self._event(f"record {path}: {len(self._replay)} variants to replay")
+
     def _event(self, msg: str):
         line = f"[JIT stats] rank {self.rank} t={time.time():.3f} {msg}"
         self.stats.events.append(line)
@@ -692,7 +815,8 @@ class JitPrefetcher:
             f" submitted={s.submitted} helper_ok={s.helper_ok}"
             f" helper_fail={s.helper_fail} helper_s={s.helper_s:.3f}"
             f" plan_s={s.plan_s:.3f} wait_n={s.wait_n} wait_s={s.wait_s:.3f}"
-            f" bg_submitted={s.bg_submitted} workers={len(self._procs)}"
+            f" bg_submitted={s.bg_submitted} replay_submitted={s.replay_submitted}"
+            f" recorded={s.recorded} urgent={s.urgent} workers={len(self._procs)}"
         )
 
     def shutdown(self):

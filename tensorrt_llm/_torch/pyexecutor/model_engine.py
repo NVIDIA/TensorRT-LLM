@@ -1463,10 +1463,14 @@ class PyTorchModelEngine(ModelEngine):
     def _init_jit_prefetch(self) -> None:
         """Start JIT prefetch / JIT stats after warmup (env-gated, see
         ``tensorrt_llm/_torch/jit_prefetch.py``)."""
-        from ..jit_prefetch import JitPrefetcher, prefetch_enabled
+        from ..jit_prefetch import (JitPrefetcher, prefetch_enabled,
+                                    providers_enabled)
         prefetcher = JitPrefetcher.init(rank=self.mapping.rank)
         self._jit_prefetcher = prefetcher
         if prefetcher is None or not prefetch_enabled():
+            return
+        if not providers_enabled():
+            prefetcher.wait_ready()
             return
         from ..modules.mamba.jit_prefetch import MambaSSDProvider
         provider = MambaSSDProvider(self.model,
