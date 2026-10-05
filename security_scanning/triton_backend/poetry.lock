@@ -634,14 +634,14 @@ test = ["pytest (>=6)"]
 
 [[package]]
 name = "filelock"
-version = "4.0.9"
+version = "4.0.11"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-4.0.9-py3-none-any.whl", hash = "sha256:9287fd61b99a806e5202be29a83034c0808a1b9830e820537c2f5773981f7eeb"},
-    {file = "filelock-4.0.9.tar.gz", hash = "sha256:635e7d67fa92654eed444e75e9ca18426d34e77ad9c469bf4373f75a932f7b22"},
+    {file = "filelock-4.0.11-py3-none-any.whl", hash = "sha256:1cbdc4ace7fb11d2f6d073f5c3d91537a23b3d58d2bf2fdffc12c6d717a589c6"},
+    {file = "filelock-4.0.11.tar.gz", hash = "sha256:9dc453a1edd25626a6fc97c2cb1bd9f7e46345843d40b3181c071761fb9a5f7a"},
 ]
 
 [[package]]

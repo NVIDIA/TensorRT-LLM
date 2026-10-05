@@ -1459,7 +1459,6 @@ def getOssComplianceFileChanged(pipeline, globalVars)
         "requirements.txt",
         "requirements-dev.txt",
         "cpp/CMakeLists.txt",
-        "cpp/conanfile.py",
         ".github/CODEOWNERS",
         "jenkins/license_cpp.json",
         "tensorrt_llm/usage/llm_args_golden_manifest.json",
@@ -2698,6 +2697,17 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             // main, so a ref with no promoted bundle still gets profiles.
                             'boltOverlayEnabled': true,
                             'boltProfilesRequired': true,
+                            // The overlay above only bakes in the profile bundle; it
+                            // leaves the installed wheel unoptimized. This BOLTs the
+                            // wheel the SBSA release image installs, applying the
+                            // branch's last promoted bundle during the image build.
+                            // Deliberately not this run's profiles: those are not
+                            // published until BoltProfileGen finishes, hours after
+                            // this build starts, so depending on them would serialize
+                            // every release behind a multi-hour GPU job. Inert on
+                            // x86_64 (no promoted bundle) and whenever the wheel is
+                            // built from source rather than downloaded.
+                            'boltOptimizeWheel': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
@@ -2757,9 +2767,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'uploadPath': UPLOAD_PATH,
                             // Must match Build-Docker-Images above: this path pushes the
                             // same tags, so the scanned+registered image has to be the
-                            // BOLTed canonical one rather than a plain build.
+                            // BOLTed canonical one rather than a plain build, built on
+                            // the BOLT-optimized wheel rather than the first tarball to
+                            // appear.
                             'boltOverlayEnabled': true,
                             'boltProfilesRequired': true,
+                            'boltOptimizeWheel': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
