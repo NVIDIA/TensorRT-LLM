@@ -245,7 +245,6 @@ set(TRTLLM_LINK_LIBS
     fb_gemm_src
     cutlass_src
     cute_dsl_src
-    runtime_src
     compressorKernels_src
     csa2_sparse_context_src
     csa2_sparse_decode_src
@@ -360,6 +359,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_runtime_memory
     tllm_runtime_moe_load_balance
     tllm_runtime_multicast
+    tllm_runtime_nccl
     tllm_runtime_numpy
     tllm_runtime_nvls_buffers
     tllm_runtime_topology

@@ -14,8 +14,6 @@
 # the License.
 include(FetchContent)
 
-set(SRCS ncclCommunicator.cpp)
-
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 
 if(NOT WIN32)
@@ -224,21 +222,21 @@ set_target_properties(
   tllm_runtime_multicast PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE
                                                        ON)
 
-add_library(runtime_src OBJECT ${SRCS})
-set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-add_cuda_architectures(runtime_src 89)
-target_link_libraries(runtime_src PUBLIC ipc_nvls_memory_src)
-
-target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
-
+add_library(tllm_runtime_nccl STATIC ncclCommunicator.cpp)
+add_library(tllm::runtime_nccl ALIAS tllm_runtime_nccl)
+target_link_libraries(
+  tllm_runtime_nccl
+  PUBLIC tllm::runtime_distributed
+  PRIVATE tllm::common_environment Threads::Threads)
 if(ENABLE_MULTI_DEVICE)
-  target_link_libraries(runtime_src PUBLIC ${NCCL_LIB})
+  target_link_libraries(tllm_runtime_nccl PRIVATE tllm::runtime_ipc_nvls
+                                                  ${NCCL_LIB})
+  target_include_directories(tllm_runtime_nccl SYSTEM
+                             PRIVATE ${NCCL_INCLUDE_DIR})
 endif()
-
-if(NOT WIN32)
-  target_link_libraries(runtime_src PUBLIC NUMA::NUMA)
-endif()
+target_compile_features(tllm_runtime_nccl PUBLIC cxx_std_20)
+set_target_properties(tllm_runtime_nccl PROPERTIES CXX_EXTENSIONS OFF
+                                                   POSITION_INDEPENDENT_CODE ON)
 
 # Add utils subdirectory for pg_utils module
 add_subdirectory(utils)
