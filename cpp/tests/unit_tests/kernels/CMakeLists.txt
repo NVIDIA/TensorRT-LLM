@@ -86,7 +86,18 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;smooth-quant;gpu"
   REQUIRES_GPU)
-add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
+add_tllm_gtest(
+  weightOnlyKernelTest
+  OWNER
+  kernel
+  SOURCES
+  weightOnly/weightOnlyKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_weight_only
+  tllm::kernel_weight_only_gemm
+  LABELS
+  "unit;kernels;weight-only;gpu"
+  REQUIRES_GPU)
 add_tllm_gtest(
   mlaPreprocessTest
   OWNER
