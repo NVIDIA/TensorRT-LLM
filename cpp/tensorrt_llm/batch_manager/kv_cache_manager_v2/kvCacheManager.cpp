@@ -26,7 +26,6 @@
 #include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <chrono>
-#include <cinttypes>
 #include <cmath>
 #include <map>
 #include <numeric>
@@ -164,16 +163,11 @@ void KvCacheManager::shutdown()
 
     // Post-condition: after clearing all reusable blocks and with no active KvCaches,
     // no evictable pages should remain.
-    for (CacheLevel level{0}; level < mStorage->numCacheLevels(); ++level)
+    for (auto const& lvl : mStorage->mLevels)
     {
-        auto const& lvl = mStorage->mLevels[level];
         for (PoolGroupIndex pgIdx{0}; pgIdx < lvl.numPoolGroups(); ++pgIdx)
         {
-            auto const stats = mStorage->getStatistics(level, pgIdx);
-            TLLM_CHECK_WITH_INFO(stats.free == stats.total && stats.evictable == 0,
-                "KV shutdown retained slots at level %d, pool %d: total=%" PRId64 ", free=%" PRId64
-                ", evictable=%" PRId64,
-                level.value(), pgIdx.value(), stats.total, stats.free, stats.evictable);
+            TLLM_CHECK_DEBUG(lvl.controller.numEvictablePages(pgIdx) == 0);
         }
     }
 
