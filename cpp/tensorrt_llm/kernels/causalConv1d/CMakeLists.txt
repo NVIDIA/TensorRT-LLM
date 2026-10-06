@@ -16,6 +16,7 @@
 #
 
 add_library(causalConv1d_src OBJECT causalConv1d.cu)
+target_link_libraries(causalConv1d_src PRIVATE tllm::common_environment)
 
 target_compile_options(causalConv1d_src
                        PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-maxrregcount=32>)

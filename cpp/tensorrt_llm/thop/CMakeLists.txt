@@ -40,17 +40,27 @@ target_link_libraries(th_utils PUBLIC tllm::runtime_buffers ${TORCH_LIBRARIES}
                                       Python3::Python)
 
 function(add_th_common_family target)
-  add_library(${target} OBJECT ${ARGN})
+  cmake_parse_arguments(PARSE_ARGV 1 ARG "COMPONENT_LOCAL" ""
+                        "SOURCES;LINK_LIBRARIES")
+  if(ARG_UNPARSED_ARGUMENTS
+     OR ARG_KEYWORDS_MISSING_VALUES
+     OR NOT ARG_SOURCES)
+    message(FATAL_ERROR "${target}: specify SOURCES and valid family arguments")
+  endif()
+  add_library(${target} OBJECT ${ARG_SOURCES})
   set_property(TARGET ${target} PROPERTY POSITION_INDEPENDENT_CODE ON)
   set_target_properties(${target} PROPERTIES CXX_STANDARD 20
                                              CXX_STANDARD_REQUIRED ON)
-  target_link_libraries(
-    ${target} PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
-                      ${SHARED_TARGET} pg_utils)
+  target_link_libraries(${target} PRIVATE tllm::torch_utils
+                                          ${ARG_LINK_LIBRARIES})
+  if(NOT ARG_COMPONENT_LOCAL)
+    target_link_libraries(${target} PRIVATE ${SHARED_TARGET} pg_utils)
+  endif()
 endfunction()
 
 add_th_common_family(
   th_common_attention
+  SOURCES
   mlaPreprocessOp.cpp
   attentionOp.cpp
   fmhaPackMaskOp.cpp
@@ -84,6 +94,7 @@ add_subdirectory(minimaxM3)
 
 add_th_common_family(
   th_common_gemm_quant
+  SOURCES
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
@@ -123,8 +134,8 @@ add_th_common_family(
 # TODO: th_common_moe does not compile with USING_OSS_CUTLASS_MOE_GEMM=OFF
 # because moe/utils/moeUtilOp.cpp depends on OSS-specific MoE utility types and
 # function signatures.
-add_th_common_family(th_common_moe fusedTopkSoftmax.cpp llama4MinLatency.cpp
-                     noAuxTcOp.cpp dsv3RouterGemmOp.cpp)
+add_th_common_family(th_common_moe SOURCES fusedTopkSoftmax.cpp
+                     llama4MinLatency.cpp noAuxTcOp.cpp dsv3RouterGemmOp.cpp)
 
 # MoE torch ops live in moe/<backend|role>/; that directory adds them to
 # th_common_moe with target_sources() so the list stays next to the files.
@@ -132,6 +143,7 @@ add_subdirectory(moe)
 
 add_th_common_family(
   th_common_distributed
+  SOURCES
   allgatherOp.cpp
   allreduceOp.cpp
   alltoallOp.cpp
@@ -151,11 +163,32 @@ add_th_common_family(
   dwdpFabricGatherOp.cpp)
 
 add_th_common_family(
-  th_common_sequence causalConv1dOp.cpp gdnVerifyOp.cpp mambaConv1dOp.cpp
-  mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)
+  th_common_sequence
+  COMPONENT_LOCAL
+  SOURCES
+  causalConv1dOp.cpp
+  gdnVerifyOp.cpp
+  mambaConv1dOp.cpp
+  mamba2MTPSSMCacheOp.cpp
+  selectiveScanOp.cpp
+  LINK_LIBRARIES
+  tllm::kernel_recurrent
+  tllm::common_cuda
+  causalConv1d_src
+  selective_scan_src
+  mamba2_mtp_ssm_cache_src)
+# Object-library dependencies need their objects forwarded to final consumers.
+target_sources(
+  th_common_sequence
+  INTERFACE $<TARGET_OBJECTS:causalConv1d_src>
+            $<TARGET_OBJECTS:selective_scan_src>
+            $<TARGET_OBJECTS:mamba2_mtp_ssm_cache_src>)
+add_library(tllm::torch_sequence ALIAS th_common_sequence)
 
 add_th_common_family(
   th_common_visual_gen
+  COMPONENT_LOCAL
+  SOURCES
   fusedAdaptiveLayerNormOp.cpp
   fusedDiTQKNormRopeOp.cpp
   fusedDiTSplitQKNormRopeOp.cpp
@@ -166,14 +199,19 @@ add_th_common_family(
   rotateRowsOp.cpp
   scatterKvSlotsOp.cpp
   denseFp8FmhaOp.cpp
-  fusedDiTQKNormRopeFp8Op.cpp)
-# denseFp8FmhaOp.cpp includes the trtllm-gen FMHA runner headers; the interface
-# target carries the compile definitions those headers need to match the
-# library's struct layouts.
-target_link_libraries(th_common_visual_gen PRIVATE trtllm_gen_fmha_interface)
+  fusedDiTQKNormRopeFp8Op.cpp
+  LINK_LIBRARIES
+  tllm::kernel_dit
+  tllm::kernel_attention_utilities
+  tllm::kernel_tensor_operations
+  tllm::kernel_cache_indexing
+  trtllm_gen_fmha
+  trtllm_gen_fmha_interface)
+add_library(tllm::torch_visual_gen ALIAS th_common_visual_gen)
 
 add_th_common_family(
   th_common_decoding
+  SOURCES
   logitsBitmaskOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp
   specDecOp.cpp
