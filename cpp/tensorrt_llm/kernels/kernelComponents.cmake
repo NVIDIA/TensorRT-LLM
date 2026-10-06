@@ -106,3 +106,9 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   target_include_directories(
     tllm_kernel_moe_lora PUBLIC ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include)
 endif()
+
+add_tllm_kernel_library(
+  tllm_kernel_attention_mask SOURCES trtllmGenKernels/fmha/prepareCustomMask.cu
+  LINK_LIBRARIES trtllm_gen_fmha_interface)
+target_include_directories(tllm_kernel_attention_mask
+                           PUBLIC ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include)
