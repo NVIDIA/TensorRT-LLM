@@ -125,3 +125,8 @@ target_include_directories(tllm_kernel_attention_mask
 add_tllm_kernel_library(
   tllm_kernel_cuda_core_gemm SOURCES weightOnlyBatchedGemv/cudaCoreGemm.cu
   LINK_LIBRARIES tllm::common_environment tllm::kernel_cutlass_headers)
+
+add_tllm_kernel_library(
+  tllm_kernel_gemm_utilities SOURCES cutlass_kernels/cutlass_heuristic.cpp
+  cutlass_kernels/cutlass_preprocessors.cpp LINK_LIBRARIES
+  tllm::kernel_cutlass_headers)
