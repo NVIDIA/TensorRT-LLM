@@ -256,7 +256,17 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;kernels;attention-mask;gpu")
-add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
+add_tllm_gtest(
+  fmhaDsv4EpilogueFusionTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaDsv4EpilogueFusionTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_trtllm_gen_fmha
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;fmha;gpu")
 set(fmha_test_sources ../../../tensorrt_llm/kernels/fmhaDispatcher.cpp)
 set(fmha_test_libraries context_attention_src trtllm_gen_fmha ${CUDA_DRV_LIB}
                         tllm::common_environment tllm::common_logging)
