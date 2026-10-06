@@ -572,6 +572,7 @@ class DeepseekV4WeightLoader:
             return self._load_weights_impl(weights, skip_modules=skip_modules)
 
     def _load_weights_impl(self, weights: Dict, skip_modules: List[str] = []):
+        """Load checkpoint tensors into local model and derived MLA parameters."""
         # If the checkpoint uses raw DS-V4 keys (layers.X.attn.wkv.weight,
         # mtp.0.*, embed.weight, head.weight), rewrite them to the model's
         # named-parameter keys before iterating modules. The detection is by
@@ -922,10 +923,11 @@ class DeepseekV4WeightLoader:
                 mark_consumed = can_mark_consumed and not is_shared_mtp_layer
                 if names[-1] == "kv_b_proj":
                     # TODO: remove weight_dequant after enabling fp8_bmm
+                    # Exact exclusions name the checkpoint layer; excluded BF16
+                    # weights have no FP8 block scales to dequantize.
                     dequant_kv_b_proj = (
-                        self.model_config.quant_config.is_module_excluded_from_quantization(
-                            names[-1]
-                        )
+                        self.model_config.quant_config.is_module_excluded_from_quantization(name)
+                        and weights[f"{name}.weight"].dtype == torch.float8_e4m3fn
                     )
                     if dequant_kv_b_proj:
                         kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans_dequant(name)
