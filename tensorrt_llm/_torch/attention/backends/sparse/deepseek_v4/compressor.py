@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from enum import IntEnum
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
@@ -59,6 +60,13 @@ _KV_CACHE_DTYPE_MAP = {
 NVFP4_COMPRESS_RESIDUAL_DIM = 64
 
 
+def get_nvfp4_compress_residual_dim() -> int:
+    """Resolve the NVFP4 COMPRESS layout from the MLA residual startup switch."""
+    if os.environ.get("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1") == "1":
+        return NVFP4_COMPRESS_RESIDUAL_DIM
+    return 0
+
+
 def resolve_kv_cache_dtype(kv_cache_dtype: Union[str, KVCacheDtype]) -> KVCacheDtype:
     if isinstance(kv_cache_dtype, str):
         return _KV_CACHE_DTYPE_MAP[kv_cache_dtype]
@@ -111,7 +119,10 @@ class Compressor(nn.Module):
         self.layer_idx = layer_idx
         self.kv_cache_dtype: KVCacheDtype = resolve_kv_cache_dtype(kv_cache_dtype)
         self.nvfp4_residual_dim = (
-            self.rope_head_dim if self.kv_cache_dtype == KVCacheDtype.NVFP4_BLOCKWISE else 0
+            self.rope_head_dim
+            if self.kv_cache_dtype == KVCacheDtype.NVFP4_BLOCKWISE
+            and get_nvfp4_compress_residual_dim() > 0
+            else 0
         )
         if self.nvfp4_residual_dim != 0 and self.nvfp4_residual_dim != NVFP4_COMPRESS_RESIDUAL_DIM:
             raise ValueError(

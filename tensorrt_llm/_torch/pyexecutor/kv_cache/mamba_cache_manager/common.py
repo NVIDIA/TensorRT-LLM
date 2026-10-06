@@ -31,6 +31,7 @@ else:
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.pyexecutor.config_utils import mamba_effective_tp_size
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager,
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
 
 
 GB = 1 << 30
+_mamba_effective_tp_size = mamba_effective_tp_size
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -227,19 +229,6 @@ class MambaRole:
 
     SSM_STATE = DataRole("ssm_state")
     CONV_STATE = DataRole("conv_state")
-
-
-def _mamba_effective_tp_size(mapping: Mapping) -> int:
-    """TP degree for sizing per-rank recurrent-state pools.
-
-    Attention-DP replicates the state and takes precedence; helix
-    repurposes CP ranks as plain TP for recurrent-state layers.
-    """
-    if mapping.enable_attention_dp:
-        return 1
-    if mapping.has_cp_helix():
-        return mapping.tp_size * mapping.cp_size
-    return mapping.tp_size
 
 
 def get_tensor_size_bytes(tensor):

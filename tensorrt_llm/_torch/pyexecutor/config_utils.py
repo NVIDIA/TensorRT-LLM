@@ -3,7 +3,7 @@
 
 import dataclasses
 from collections.abc import Mapping as AbcMapping
-from typing import List, Optional, Sequence
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 import transformers
@@ -11,6 +11,9 @@ import transformers
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
 
 
 def resolve_cache_transceiver_config(
@@ -134,7 +137,7 @@ def is_gemma4_hybrid(config):
 
 def is_hybrid_linear(config):
     return is_nemotron_hybrid(config) or is_qwen3_hybrid(config) or \
-        is_kimi_linear(config) or is_qwen4_exp(config)
+        is_kimi_linear(config) or is_qwen4_exp(config) or is_glm5_next(config)
 
 
 def is_kimi_linear(config):
@@ -194,6 +197,67 @@ def get_kimi_linear_layer_masks(config):
 
 def get_kimi_linear_num_attention_layers(config):
     full_mask, _ = get_kimi_linear_layer_masks(config)
+    return sum(full_mask)
+
+
+def is_glm5_next(config: transformers.PretrainedConfig) -> bool:
+    """True for GLM-5.3-Flash ("glm5_next") hybrid KDA + sparse-MLA text models.
+
+    Handles both the flattened text config (model_type "glm5_next_text") and
+    the composite VLM config (model_type "glm5_next" with a nested
+    text_config).
+    """
+    return getattr(config, "model_type",
+                   None) in ("glm5_next", "glm5_next_text")
+
+
+def unwrap_glm5_next_text_config(
+        config: transformers.PretrainedConfig) -> transformers.PretrainedConfig:
+    """Return the flattened GLM-5.3-Flash text config.
+
+    ``is_glm5_next`` accepts both the flattened text config and the composite
+    "glm5_next" config with a nested ``text_config``; consumers read
+    text-level fields (``layer_types``, ``linear_attn_config``,
+    ``kv_lora_rank``, ...), so they must unwrap the composite form first.
+    """
+    if getattr(config, "model_type", None) == "glm5_next":
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None:
+            return text_config
+    return config
+
+
+def get_glm5_next_layer_masks(
+        config: transformers.PretrainedConfig) -> tuple[list[bool], list[bool]]:
+    """Return (full_attention_layer_mask, kda_layer_mask) for GLM-5.3-Flash.
+
+    The text config's literal ``layer_types`` list names every decoder layer
+    as exactly one of ``linear_attention`` (KDA) or
+    ``deepseek_sparse_attention`` (sparse MLA + indexer); 34 + 11 on the real
+    checkpoint.
+    """
+    config = unwrap_glm5_next_text_config(config)
+    if (getattr(config, "layer_types", None) is None
+            or len(config.layer_types) != config.num_hidden_layers):
+        raise ValueError(
+            "glm5_next layer_types must contain num_hidden_layers entries")
+    full_mask, kda_mask = [], []
+    for layer_idx, layer_type in enumerate(config.layer_types):
+        is_kda = layer_type == "linear_attention"
+        is_full = layer_type == "deepseek_sparse_attention"
+        if is_kda == is_full:
+            raise ValueError(
+                f"glm5_next layer {layer_idx} must be exactly one of "
+                f"linear_attention / deepseek_sparse_attention; got "
+                f"{layer_type!r}")
+        kda_mask.append(is_kda)
+        full_mask.append(is_full)
+    return full_mask, kda_mask
+
+
+def get_glm5_next_num_attention_layers(
+        config: transformers.PretrainedConfig) -> int:
+    full_mask, _ = get_glm5_next_layer_masks(config)
     return sum(full_mask)
 
 
@@ -334,6 +398,22 @@ def is_mla(config):
     return False
 
 
+def supports_fp4_mla_attention(model_config: "ModelConfig") -> bool:
+    """Whether the model uses the dedicated dense TRTLLM FP4 MLA path."""
+    return (is_mla(model_config.pretrained_config)
+            and model_config.attn_backend == "TRTLLM"
+            and model_config.sparse_attention_config is None
+            and not is_hybrid_linear(model_config.pretrained_config))
+
+
+def uses_fp4_mla_attention(model_config: "ModelConfig") -> bool:
+    """Use the resolved quantization, never the requested cache dtype."""
+    quant_config = getattr(model_config, "quant_config", None)
+    return (quant_config is not None
+            and quant_config.quant_mode.has_fp4_kv_cache()
+            and supports_fp4_mla_attention(model_config))
+
+
 def is_minimax_m3(sparse_attention_config):
     """True when the sparse attention config selects the MiniMax-M3 algorithm."""
     return sparse_attention_config is not None and sparse_attention_config.algorithm == "minimax_m3"
@@ -423,6 +503,22 @@ def get_qwen3_hybrid_num_attention_layers(config):
     return sum(layer_mask)
 
 
+def mamba_effective_tp_size(mapping) -> int:
+    """TP degree for sizing per-rank mamba/KDA state (budgeting AND allocation).
+
+    Attention-DP replicates the state and takes precedence; helix repurposes
+    CP ranks as plain TP for recurrent-state layers. Must match the runtime
+    pool construction (mamba_cache_manager) or the budget split withholds
+    unsharded-state bytes the allocator never uses (observed: 27.2 GiB/rank
+    mis-withheld on a helix16 gen worker whose real pool is 1/16-sharded).
+    """
+    if mapping.enable_attention_dp:
+        return 1
+    if mapping.has_cp_helix():
+        return mapping.tp_size * mapping.cp_size
+    return mapping.tp_size
+
+
 @dataclasses.dataclass
 class MambaKVCacheParams:
     """Normalized mamba-related inputs for kv_cache_manager_cls.
@@ -482,7 +578,7 @@ class MambaKVCacheParams:
 
     def get_states_bytes_per_layer(self, mapping) -> int:
         """Return the total bytes of Mamba state per layer, used for budgeting."""
-        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        tp_size = mamba_effective_tp_size(mapping)
         d_inner = self.head_dim * self.num_heads
         conv_dim = (d_inner + 2 * self.n_groups * self.state_size) // tp_size
         nheads = self.num_heads // tp_size
@@ -509,6 +605,9 @@ def extract_mamba_kv_cache_params(config,
     elif is_kimi_linear(config):
         from ..modules.kimi_kda.cache_manager import \
             get_kimi_cache_params as extract
+    elif is_glm5_next(config):
+        from ..attention.backends.sparse.glm_kpool.cache_manager import \
+            get_glm5_next_cache_params as extract
     else:
         raise ValueError(
             f"{type(config).__name__} is not a supported hybrid Mamba config")
@@ -725,6 +824,7 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     deepseek_v32="DeepseekV3Config",
     kimi_k2="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
+    k3_dspark="K3DsparkConfig",
     laguna="LagunaConfig",
 )  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
 
@@ -803,6 +903,13 @@ def load_pretrained_config(model_name_or_path: str,
         model_config.text_config = transformers.Qwen3NextConfig.from_dict(
             Qwen35ConfigCompat.normalize(config_dict, require_text_config=True))
         _normalize_qwen35_quantization_config(model_config)
+    elif model_type in ("glm5_next", "glm5_next_text"):
+        from tensorrt_llm._torch import configs
+        config_name = ("Glm5NextConfig"
+                       if model_type == "glm5_next" else "Glm5NextTextConfig")
+        config_class = getattr(transformers, config_name,
+                               getattr(configs, config_name))
+        model_config = config_class.from_dict(config_dict, **kwargs)
     elif model_type == "glm_moe_dsa":
         # GLM-MoE-DSA configs tag every layer with
         # layer_types=['deepseek_sparse_attention', ...] for HF bookkeeping.

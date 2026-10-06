@@ -9,6 +9,9 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
+    Glm5NextCacheManager,
+)
 from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNIntermediateState,
     GDNLayerCache,
@@ -60,6 +63,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
         Qwen35HybridCacheManagerV2,
         Qwen4ExpHybridCacheManagerV2,
         KimiK3HybridCacheManagerV2,
+        Glm5NextCacheManager,
     ],
 )
 def test_model_managers_inherit_the_common_lifecycle(manager_cls):
@@ -81,6 +85,7 @@ def test_model_managers_inherit_the_common_lifecycle(manager_cls):
         Qwen35HybridCacheManagerV2,
         Qwen4ExpHybridCacheManagerV2,
         KimiK3HybridCacheManagerV2,
+        Glm5NextCacheManager,
     ],
 )
 def test_v2_managers_do_not_expose_legacy_accessors(manager_cls):
@@ -127,6 +132,7 @@ def test_legacy_managers_keep_compatibility_accessors():
         Qwen35HybridCacheManagerV2,
         Qwen4ExpHybridCacheManagerV2,
         KimiK3HybridCacheManagerV2,
+        Glm5NextCacheManager,
         Mamba2State,
         ReplayHistory,
         GDNReplayState,
@@ -235,6 +241,7 @@ def test_qwen_managers_share_gdn_algorithm_not_model_inheritance():
         Qwen35HybridCacheManagerV2,
         Qwen4ExpHybridCacheManagerV2,
         KimiK3HybridCacheManagerV2,
+        Glm5NextCacheManager,
     ],
 )
 def test_model_initialization_validates_selected_replay(manager_cls):
@@ -261,10 +268,11 @@ def test_model_initialization_validates_selected_replay(manager_cls):
         (None, None, None),
     ],
 )
+@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManagerV2, Glm5NextCacheManager])
 def test_k3_initializes_only_the_selected_state(
-    monkeypatch, requested_num_spec, selected_num_spec, decoding_type
+    monkeypatch, requested_num_spec, selected_num_spec, decoding_type, manager_cls
 ):
-    manager = object.__new__(KimiK3HybridCacheManagerV2)
+    manager = object.__new__(manager_cls)
     manager._requested_num_spec = requested_num_spec
     manager._kda_replay = None
     manager.spec_config = (
@@ -277,17 +285,17 @@ def test_k3_initializes_only_the_selected_state(
     replay_factory = Mock(wraps=KDAReplayState)
     selector = Mock(return_value=selected_num_spec)
     monkeypatch.setitem(
-        KimiK3HybridCacheManagerV2._initialize_model_state.__globals__,
+        manager_cls._initialize_model_state.__globals__,
         "KDAIntermediateState",
         intermediate_factory,
     )
     monkeypatch.setitem(
-        KimiK3HybridCacheManagerV2._initialize_model_state.__globals__,
+        manager_cls._initialize_model_state.__globals__,
         "KDAReplayState",
         replay_factory,
     )
     monkeypatch.setitem(
-        KimiK3HybridCacheManagerV2._initialize_model_state.__globals__,
+        manager_cls._initialize_model_state.__globals__,
         "get_kda_replay_num_spec",
         selector,
     )
@@ -350,6 +358,7 @@ def test_base_manager_without_model_state(monkeypatch):
         Qwen35HybridCacheManagerV2,
         Qwen4ExpHybridCacheManagerV2,
         KimiK3HybridCacheManagerV2,
+        Glm5NextCacheManager,
     ],
 )
 def test_seed_accessor_is_not_a_common_manager_capability(manager_cls):
@@ -972,6 +981,7 @@ def test_algorithm_methods_do_not_depend_on_manager(cls):
         Qwen35HybridCacheManagerV2,
         Qwen4ExpHybridCacheManagerV2,
         KimiK3HybridCacheManagerV2,
+        Glm5NextCacheManager,
     ],
 )
 def test_model_compatibility_properties_follow_owned_state(manager_cls):

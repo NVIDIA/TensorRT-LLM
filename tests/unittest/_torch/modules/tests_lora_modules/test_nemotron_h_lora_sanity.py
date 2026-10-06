@@ -14,13 +14,11 @@
 # limitations under the License.
 """Sanity tests for Nemotron-H LoRA support."""
 
-import json
 import os
 import tempfile
 
 import pytest
-import torch
-from safetensors.torch import save_file
+from nemotron_h_lora_utils import create_nemotron_h_lora_adapter
 from utils.llm_data import llm_models_root
 from utils.util import skip_gpu_memory_less_than_80gb, skip_num_gpus_less_than, skip_pre_blackwell
 
@@ -28,85 +26,10 @@ import tensorrt_llm.bindings as _tb
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.executor.request import LoRARequest
 
-
-def _create_lora_adapter(output_dir, base_model_path, lora_rank=8):
-    """Create a dummy LoRA adapter targeting attention, Mamba, shared expert,
-    and MoE latent projection layers with small non-zero weights."""
-    os.makedirs(output_dir, exist_ok=True)
-
-    with open(os.path.join(base_model_path, "config.json")) as f:
-        cfg = json.load(f)
-
-    hidden = cfg["hidden_size"]
-    q_dim = cfg["num_attention_heads"] * cfg["head_dim"]
-    kv_dim = cfg["num_key_value_heads"] * cfg["head_dim"]
-    pattern = cfg["hybrid_override_pattern"]
-    shared_intermediate = cfg["moe_shared_expert_intermediate_size"]
-    latent = cfg["moe_latent_size"]
-    d_inner = cfg["mamba_head_dim"] * cfg["mamba_num_heads"]
-    d_in_proj = 2 * d_inner + 2 * cfg["n_groups"] * cfg["ssm_state_size"] + cfg["mamba_num_heads"]
-
-    with open(os.path.join(output_dir, "adapter_config.json"), "w") as f:
-        json.dump(
-            {
-                "base_model_name_or_path": base_model_path,
-                "bias": "none",
-                "peft_type": "LORA",
-                "r": lora_rank,
-                "lora_alpha": 16,
-                "target_modules": [
-                    "q_proj",
-                    "k_proj",
-                    "v_proj",
-                    "o_proj",
-                    "in_proj",
-                    "out_proj",
-                    "shared_experts.up_proj",
-                    "shared_experts.down_proj",
-                    "fc1_latent_proj",
-                    "fc2_latent_proj",
-                ],
-                "task_type": "CAUSAL_LM",
-            },
-            f,
-        )
-
-    weights = {}
-
-    def _add(key, in_dim, out_dim):
-        weights[f"{key}.lora_A.weight"] = (
-            torch.randn(lora_rank, in_dim, dtype=torch.bfloat16) * 0.01
-        )
-        weights[f"{key}.lora_B.weight"] = (
-            torch.randn(out_dim, lora_rank, dtype=torch.bfloat16) * 0.001
-        )
-
-    def _layer(idx, suffix):
-        return f"base_model.model.backbone.layers.{idx}.{suffix}"
-
-    attn_dims = {
-        "q_proj": (hidden, q_dim),
-        "k_proj": (hidden, kv_dim),
-        "v_proj": (hidden, kv_dim),
-        "o_proj": (q_dim, hidden),
-    }
-    mamba_dims = {"in_proj": (hidden, d_in_proj), "out_proj": (d_inner, hidden)}
-
-    for idx, kind in enumerate(pattern):
-        if kind == "*":
-            for proj, (i, o) in attn_dims.items():
-                _add(_layer(idx, f"mixer.{proj}"), i, o)
-        elif kind == "M":
-            for proj, (i, o) in mamba_dims.items():
-                _add(_layer(idx, f"mixer.{proj}"), i, o)
-        elif kind == "E":
-            _add(_layer(idx, "mlp.shared_experts.up_proj"), hidden, shared_intermediate)
-            _add(_layer(idx, "mlp.shared_experts.down_proj"), shared_intermediate, hidden)
-            _add(_layer(idx, "mlp.fc1_latent_proj"), hidden, latent)
-            _add(_layer(idx, "mlp.fc2_latent_proj"), latent, hidden)
-
-    save_file(weights, os.path.join(output_dir, "adapter_model.safetensors"))
-    return output_dir
+# Weak enough that the adapter stays close to identity, which is all these
+# sanity tests need: they assert that a LoRA run produces tokens at all, not
+# that the adapter moved them.
+_SANITY_STD = (0.01, 0.001)
 
 
 def _get_lora_config(lora_dir):
@@ -139,7 +62,9 @@ class TestNemotronHLoRA:
     def test_lora_pp1_sanity(self):
         """LoRA inference with pp_size=1 produces tokens for base and LoRA."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            lora_dir = _create_lora_adapter(os.path.join(tmpdir, "lora"), self.model_path)
+            lora_dir = create_nemotron_h_lora_adapter(
+                os.path.join(tmpdir, "lora"), self.model_path, std=_SANITY_STD
+            )
             with LLM(
                 model=self.model_path,
                 lora_config=_get_lora_config(lora_dir),
@@ -155,7 +80,9 @@ class TestNemotronHLoRA:
     def test_lora_pp2_sanity(self):
         """LoRA inference with pp_size=2 produces tokens."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            lora_dir = _create_lora_adapter(os.path.join(tmpdir, "lora"), self.model_path)
+            lora_dir = create_nemotron_h_lora_adapter(
+                os.path.join(tmpdir, "lora"), self.model_path, std=_SANITY_STD
+            )
             with LLM(
                 model=self.model_path,
                 lora_config=_get_lora_config(lora_dir),

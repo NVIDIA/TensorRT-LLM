@@ -64,6 +64,7 @@ def capture_piecewise_cuda_graph(enable: bool):
 
 
 def inplace_info():
+    """Map functionalized mutation outputs to their original argument names."""
     inplace_map = {
         torch.ops.trtllm.flashinfer_fused_add_rmsnorm.default: {
             1: "input",
@@ -221,6 +222,12 @@ def inplace_info():
         },
         "minimax_m3_attn_custom_op_inplace": {
             1: "output"
+        },
+        # The ordinary outputs are compact Q/index-Q; the next
+        # two outputs of auto_functionalized are the mutated paged caches.
+        "minimax_m3_fused_sparse_qkv_producer": {
+            2: "kv_cache",
+            3: "index_k_cache"
         },
         "fused_sigmoid_mul_inplace": {
             1: "attention_output"

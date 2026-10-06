@@ -19,7 +19,7 @@
 #   Top-K                     			  @NVIDIA/trt-llm-topk-devs
 #   VisualGen (AIGV)         			  @NVIDIA/trt-llm-torch-visual-gen-devs
 #   Scaffolding              			  @WeiHaocheng @dc3671
-#   Self-managed: AutoDeploy, Triton backend, Dynamo.  Governance/legal: unchanged.
+#   Self-managed: Triton backend, Dynamo.  Governance/legal: unchanged.
 #
 # New handles (trt-llm-devs / doc / agent / runtime / models / perf / moe / kernels / multi-gpu-ci-review)
 # must be created & populated before activation (unknown owner blocks merge).
@@ -385,15 +385,18 @@
 /tensorrt_llm/scaffolding @WeiHaocheng @dc3671
 /tests/unittest/scaffolding @WeiHaocheng @dc3671
 
-# ===== SELF-MANAGED =====
-/docs/source/features/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-doc-owners
-/examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/scripts/check_auto_deploy_imports.py @NVIDIA/trt-llm-torch-autodeploy-devs
-/scripts/check_model_registry.py @NVIDIA/trt-llm-torch-autodeploy-devs
-/tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tests/unittest/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tests/unittest/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tests/integration/defs/accuracy/test_llm_api_autodeploy.py @NVIDIA/trt-llm-torch-autodeploy-devs
+# ===== MODELING_V2 =====
+# Overrides the /tensorrt_llm/_torch runtime-devs rule above for this subtree.
+# Individual handles rather than a team, like SCAFFOLDING: this is one bounded
+# experiment with named owners, not a standing domain.
+/tensorrt_llm/_torch/_experimental/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
+/tests/unittest/_torch/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
+/tests/integration/defs/accuracy/test_modeling_v2_deepseek_v3.py @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
+/tests/integration/defs/accuracy/test_modeling_v2_gpt_oss.py @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
+# The two catalog categories whose contracts state kernel behaviour the
+# attention and MoE owners are the authority on; co-owned rather than reassigned.
+/tensorrt_llm/_torch/_experimental/modeling_v2/catalog/attention @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @xxi-nv @yuxianq
+/tensorrt_llm/_torch/_experimental/modeling_v2/catalog/moe @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @xxi-nv @yuxianq
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
@@ -466,10 +469,6 @@
 /constraints.txt @NVIDIA/trt-llm-oss-compliance
 /cpp/CMakeLists.txt @NVIDIA/trt-llm-oss-compliance
 /cpp/cmake/** @NVIDIA/trt-llm-oss-compliance
-/cpp/conan.lock @NVIDIA/trt-llm-oss-compliance
-/cpp/conandata.yml @NVIDIA/trt-llm-oss-compliance
-/cpp/conanfile.py @NVIDIA/trt-llm-oss-compliance
-/cpp/libnuma_conan.py @NVIDIA/trt-llm-oss-compliance
 /docker/common/** @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /jenkins/license_cpp.json @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /pyproject.toml @NVIDIA/trt-llm-oss-compliance
@@ -487,7 +486,7 @@
 ### Usage telemetry / privacy review
 /tensorrt_llm/usage/ @NVIDIA/trt-llm-usage-telemetry-devs
 /tests/unittest/usage/ @NVIDIA/trt-llm-usage-telemetry-devs
-/tensorrt_llm/usage/llm_args_golden_manifest.json @NVIDIA/trt-llm-usage-telemetry-devs @NVIDIA/trt-llm-oss-compliance @NVIDIA/trt-llm-noncommitted-api-review-committee
+/tensorrt_llm/usage/llm_args_golden_manifest.json @NVIDIA/trt-llm-usage-telemetry-devs
 
 # Uncomment only on release branches (e.g. release/0.19):
 # * @NVIDIA/trt-llm-release-branch-approval
