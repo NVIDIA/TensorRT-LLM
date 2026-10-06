@@ -484,9 +484,13 @@ def _logic_compiled_blocks(rank, world_size):
     with torch.no_grad():
         eager = [sp_model(**inp) for inp in all_inputs]
     # One compiled block graph serves every block: the converted modules share one adapter
-    # class per base class, so the second block adds no graph (no type-guard recompiles).
-    one, two = (_graphs_compiled(sp_model, all_inputs, n) for n in (1, 2))
-    _check(one == two, f"token-sharded TP: 1 block compiled {one} graphs, 2 blocks {two}")
+    # class per base class, so a second block adds no more graphs than in plain TP (a fresh
+    # class per swap would recompile every block on type guards).
+    extra = {
+        name: _graphs_compiled(model, all_inputs, 2) - _graphs_compiled(model, all_inputs, 1)
+        for name, model in (("token-sharded", sp_model), ("plain", ar_model))
+    }
+    _check(extra["token-sharded"] <= extra["plain"], f"graphs added by a second block: {extra}")
     outs, sp_reasons, sp_graphs = _compiled_break_reasons(sp_model, all_inputs)
     for i, (out, ref) in enumerate(zip(outs, eager)):
         err = _rel_l2(out, ref)

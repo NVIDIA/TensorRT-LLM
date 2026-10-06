@@ -411,8 +411,20 @@ def _logic_real_adapters(rank, world_size, device):
         reduce_output=True,
         allreduce_strategy=nccl,
     ).to(device)
+    row_ok = Linear(
+        k_in,
+        n_out,
+        bias=False,
+        dtype=torch.bfloat16,
+        mapping=mapping,
+        tensor_parallel_mode=TensorParallelMode.ROW,
+        reduce_output=True,
+        allreduce_strategy=nccl,
+    ).to(device)
     with pytest.raises(ValueError, match="must be a column-parallel Linear"):
-        convert_to_token_sharded_tp(_as_model(proj=col_as_row), tp, exceptions={"proj": "column"})
+        convert_to_token_sharded_tp(
+            _as_model(proj=col_as_row, row=row_ok), tp, exceptions={"proj": "column"}
+        )
     unsharded = Linear(
         k_in,
         n_out,
