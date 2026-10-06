@@ -2448,8 +2448,12 @@ def _unfittable_rank(**kwargs):
     return stub, ScheduledRequests()
 
 
-def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch():
+@pytest.mark.parametrize("has_local_request", [False, True])
+def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch(has_local_request: bool) -> None:
     stub, scheduled_batch = _unfittable_rank()
+    if not has_local_request:
+        # Local cancellation can empty this owner while peers still need forward.
+        stub.active_requests = []
 
     _run_pad_empty(stub, scheduled_batch)
 
@@ -2458,8 +2462,8 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch():
     dummy = scheduled_batch.generation_requests[0]
     assert dummy.is_attention_dp_dummy is True
     assert dummy in stub.active_requests
-    # A generation dummy, not the context dummy the pre-schedule path would
-    # pick: this rank is empty precisely because it is short of KV cache.
+    # Post-schedule padding uses a generation dummy for both a starved owner
+    # and an owner left empty by cancellation.
     assert stub.add_dummy_calls[0]["is_gen"] is True
     assert stub.add_dummy_calls[0]["token_nums"] is None
 
@@ -2485,14 +2489,16 @@ def test_pad_empty_batch_no_op_when_attention_dp_disabled():
     assert scheduled_batch.batch_size == 0
 
 
-def test_pad_empty_batch_no_op_when_rank_has_no_active_requests():
-    # The pre-schedule path already covers this case.
+def test_pad_empty_batch_no_op_when_no_rank_has_active_requests() -> None:
     stub, scheduled_batch = _unfittable_rank()
     stub.active_requests = []
+    stub.expected_num_active_requests = 0
 
     _run_pad_empty(stub, scheduled_batch)
 
     assert stub.add_dummy_calls == []
+    assert stub.active_requests == []
+    assert scheduled_batch.batch_size == 0
 
 
 def test_pad_empty_batch_respects_max_num_active_requests():
