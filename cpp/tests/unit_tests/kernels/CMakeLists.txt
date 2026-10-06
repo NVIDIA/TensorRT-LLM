@@ -13,7 +13,18 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_gtest(logitsBitmaskTest logitsBitmaskTest.cpp)
+add_tllm_gtest(
+  logitsBitmaskTest
+  OWNER
+  kernel
+  SOURCES
+  logitsBitmaskTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_logits
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;logits;gpu"
+  REQUIRES_GPU)
 add_gtest(cascadeAttentionKernelTest cascadeAttentionKernelTest.cpp)
 add_gtest(cascadeAttentionNumericsTest cascadeAttentionNumericsTest.cu)
 

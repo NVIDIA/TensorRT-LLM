@@ -280,6 +280,13 @@ target_link_libraries(
     $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
     $<LINK_LIBRARY:WHOLE_ARCHIVE,${INTERNAL_CUTLASS_KERNELS_TARGET}>)
 
+foreach(component IN LISTS TLLM_KERNEL_COMPONENT_TARGETS)
+  target_link_libraries(${SHARED_TARGET}
+                        PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${component}>)
+  set_property(TARGET ${SHARED_TARGET}
+               PROPERTY LINK_LIBRARY_OVERRIDE_${component} WHOLE_ARCHIVE)
+endforeach()
+
 # Components also link each other normally; retain all component exports here.
 set_property(TARGET ${SHARED_TARGET}
              PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_error WHOLE_ARCHIVE)
