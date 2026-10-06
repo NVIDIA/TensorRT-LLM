@@ -33,10 +33,26 @@ add_tllm_gtest(
   tllm::executor_types
   LABELS
   "unit;executor;host")
-add_tllm_gtest(requestTest SOURCES requestTest.cpp FULL_STACK LABELS
-               "unit;full-stack")
-add_tllm_gtest(responseTest SOURCES responseTest.cpp FULL_STACK LABELS
-               "unit;full-stack")
+add_tllm_gtest(
+  requestTest
+  OWNER
+  executor
+  SOURCES
+  requestTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_values
+  LABELS
+  "unit;executor;host")
+add_tllm_gtest(
+  responseTest
+  OWNER
+  executor
+  SOURCES
+  responseTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_values
+  LABELS
+  "unit;executor;host")
 
 add_tllm_gtest(
   executorConfigTest
@@ -48,14 +64,40 @@ add_tllm_gtest(
   tllm::executor_types
   LABELS
   "unit;executor;host")
-add_tllm_gtest(executorTensorTest SOURCES tensorTest.cpp FULL_STACK LABELS
-               "unit;full-stack")
+add_tllm_gtest(
+  executorTensorTest
+  OWNER
+  executor
+  SOURCES
+  tensorTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_values
+  LABELS
+  "unit;executor;gpu"
+  REQUIRES_GPU)
 add_tllm_gtest(serializeUtilsTest SOURCES serializeUtilsTest.cpp FULL_STACK
                LABELS "unit;full-stack")
-add_tllm_gtest(loraConfigTest SOURCES loraConfigTest.cpp FULL_STACK LABELS
-               "unit;full-stack")
-add_tllm_gtest(coalesceTest SOURCES coalesceTest.cpp FULL_STACK LABELS
-               "unit;full-stack")
+add_tllm_gtest(
+  loraConfigTest
+  OWNER
+  executor
+  SOURCES
+  loraConfigTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_values
+  LABELS
+  "unit;executor;gpu"
+  REQUIRES_GPU)
+add_tllm_gtest(
+  coalesceTest
+  OWNER
+  executor
+  SOURCES
+  coalesceTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_transfer_agent
+  LABELS
+  "unit;executor;host")
 add_tllm_gtest(genUniqueAgentNameTest SOURCES genUniqueAgentNameTest.cpp
                FULL_STACK LABELS "unit;full-stack")
 target_link_libraries(genUniqueAgentNameTest PRIVATE ${Python3_LIBRARIES})

@@ -39,8 +39,16 @@ target_sources(bounceMessageCodecTest PRIVATE ${BOUNCE_DIR}/BounceMessage.cpp)
 # Header-only: knob resolution (agent_bounce_params dict > TRTLLM_NIXL_BOUNCE_*
 # env > default), byte-size suffixes, garbage fallback, derived-timeout
 # invariants.
-add_tllm_gtest(bounceConfigTest SOURCES bounceConfigTest.cpp FULL_STACK LABELS
-               "unit;full-stack")
+add_tllm_gtest(
+  bounceConfigTest
+  OWNER
+  executor
+  SOURCES
+  bounceConfigTest.cpp
+  LINK_LIBRARIES
+  tllm::common_logging
+  LABELS
+  "unit;executor;host")
 add_tllm_gtest(buddyAllocatorTest SOURCES buddyAllocatorTest.cpp FULL_STACK
                LABELS "unit;full-stack")
 target_sources(buddyAllocatorTest PRIVATE ${BOUNCE_DIR}/BuddyAllocator.cpp)
