@@ -23,7 +23,12 @@ For online benchmarking, see [Benchmarking VisualGen](../../../tensorrt_llm/serv
 
 Before running these examples, ensure you have:
 
-1. **Install modules**: Install optional dependency:
+1. **Command-line dependencies**: Install [jq](https://jqlang.github.io/jq/) for the Cosmos3 examples that build JSON request bodies and extract prompts:
+
+   ```bash
+   # Ubuntu/Debian
+   apt-get install jq
+   ```
 
    **Optional**: For better video compression (H.264/MP4), install [ffmpeg](https://ffmpeg.org/):
    ```bash
