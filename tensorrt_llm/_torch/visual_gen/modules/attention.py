@@ -96,6 +96,9 @@ class Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads or num_attention_heads
         self.head_dim = head_dim or (hidden_size // num_attention_heads)
         self.qkv_mode = QKVMode(qkv_mode) if isinstance(qkv_mode, str) else qkv_mode
+        # SEPARATE_QKV only: True when to_k / to_v read the hidden states (self-attention)
+        # rather than encoder states (cross-attention).
+        self.separate_qkv_is_self_attention = separate_qkv_is_self_attention
         self.bias = bias
 
         self.tp_size = self.mapping.tp_size if self.mapping else 1

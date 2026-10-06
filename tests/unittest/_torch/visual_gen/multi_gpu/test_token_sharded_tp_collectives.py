@@ -45,6 +45,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.nn as nn
 
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
@@ -64,6 +65,15 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 __extra_import_path__ = [".."]
 
 from token_sharded_tp_test_utils import padded_rows, swizzle_ref, unswizzle_ref
+
+from tensorrt_llm._torch.visual_gen.parallel.token_sharded_modules import (  # noqa: E402
+    TokenShardedColumn,
+    TokenShardedMLP,
+    TokenShardedRow,
+    convert_to_token_sharded_tp,
+    register_token_sharded_adapter,
+)
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder  # noqa: E402
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -461,6 +471,70 @@ def _logic_column_linear_nvfp4(rank, world_size, device):
         _check(ok, f"NVFP4 column_linear {(b, s, plan.local_rows)}", device)
 
 
+def _logic_adapters_nvfp4(rank, world_size, device):
+    """Converted real Linears: a static-NVFP4 column projection fed this rank's bf16 rows
+    quantizes them with its own scale before the all-gather, so its GEMM sees exactly the
+    bytes it would produce on all rows; a row projection built to all-reduce reduce-scatters."""
+    from tensorrt_llm.functional import AllReduceStrategy
+
+    k_in, n_out = 256, 128 * world_size
+    torch.manual_seed(1)
+    weight = torch.randn(n_out, k_in, dtype=torch.bfloat16) * 0.05
+    bias = torch.randn(n_out, dtype=torch.bfloat16) * 0.1
+    w_row = torch.randn(k_in, n_out, dtype=torch.bfloat16) * 0.05
+    mapping = _mapping(rank, world_size)
+    for b, s in _SHAPES:
+        x = torch.randn(b, s, k_in, generator=torch.Generator().manual_seed(s)).to(
+            device, torch.bfloat16
+        )
+        ckpt = _nvfp4_checkpoint(weight, x.float().abs().amax().cpu())
+        col = Linear(
+            k_in,
+            n_out,
+            bias=True,
+            dtype=torch.bfloat16,
+            mapping=mapping,
+            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            reduce_output=False,
+        ).to(device)
+        col.load_weights([{**ckpt, "bias": bias}])
+        col.post_load_weights()
+        row = Linear(
+            n_out,
+            k_in,
+            bias=False,
+            dtype=torch.bfloat16,
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
+            reduce_output=True,
+            allreduce_strategy=AllReduceStrategy.NCCL,
+        ).to(device)
+        row.load_weights([{"weight": w_row}])
+        h_ref = col(x.reshape(b * s, k_in)).view(b, s, -1)  # the Linear quantizes all rows
+        y_ref = row(h_ref)  # all-reduced
+        block = nn.Module()
+        block.col, block.row = col, row
+        root = nn.Module()
+        root.blocks = nn.ModuleList([block])
+        tp = _helper()
+        convert_to_token_sharded_tp(root, tp, exceptions={"col": "column"})
+        plan = tp.begin(b, s)
+        h = col(tp.local_view(tp.shard(x)))
+        _check(torch.equal(h, h_ref), f"NVFP4 column adapter {(b, s)}", device)
+        mask = _real_row_mask(plan, device)
+        mine = slice(plan.row_start, plan.row_start + plan.local_rows)
+        y = row(h).reshape(plan.local_rows, -1)
+        _check_close(
+            y[mask],
+            padded_rows(y_ref, plan)[mine][mask],
+            device,
+            1e-2,
+            1e-2,
+            f"row adapter {(b, s)}",
+        )
+
+
 # =============================================================================
 # B8 / B9. torch.compile(fullgraph=True) and CUDA-graph capture of a boundary chain
 # =============================================================================
@@ -621,6 +695,113 @@ def _logic_cuda_graph(rank, world_size, device):
 
 
 # =============================================================================
+# B8. The layout: sharder round trip and adapters vs the full computation (exact)
+# =============================================================================
+#
+# Projections with integer-valued fp32 weights and inputs make every sum exact, so the
+# adapters' all-gather / reduce-scatter must reproduce the full computation bit for bit on
+# any backend. The fakes stand in for TRT-LLM Linear / MLP (whose TP construction needs a
+# CUDA device mesh; the NCCL kernel checks and the Wan tests convert real modules).
+
+
+class _FakeColumn(nn.Module):
+    """Column-parallel GEMM: this rank's output features."""
+
+    def __init__(self, w):
+        super().__init__()
+        self.w = nn.Parameter(w, requires_grad=False)
+
+    def forward(self, x):
+        return x @ self.w.t()
+
+
+class _FakeRow(nn.Module):
+    """Row-parallel GEMM: K-partial sums, the bias added on rank 0 only."""
+
+    def __init__(self, w, b):
+        super().__init__()
+        self.w = nn.Parameter(w, requires_grad=False)
+        self.b = nn.Parameter(b, requires_grad=False)
+
+    def forward(self, x):
+        return x @ self.w.t() + self.b
+
+
+class _FakeMLP(nn.Module):
+    def __init__(self, up, down):
+        super().__init__()
+        self.up, self.down = up, down
+
+    def forward(self, x):
+        return self.down(torch.relu(self.up(x)))
+
+
+register_token_sharded_adapter(_FakeColumn, TokenShardedColumn)
+register_token_sharded_adapter(_FakeRow, TokenShardedRow)
+register_token_sharded_adapter(_FakeMLP, TokenShardedMLP)
+
+
+def _ints(gen, *shape):
+    return torch.randint(-3, 4, shape, generator=gen).float()
+
+
+def _logic_layout_round_trip(rank, world_size, device):
+    tp = _helper()
+    sharder = SequenceSharder(size=1, rank=0, group=None)
+    sharder.use_token_sharded_tp(tp)
+    for b, s in _SHAPES:
+        x = _ints(torch.Generator().manual_seed(b * 100 + s), b, s, 8).to(device)
+        x_loc = sharder.shard(x, dim=1)
+        _check(
+            torch.equal(sharder.gather(x_loc, dim=1), x),
+            f"shard/gather round trip {(b, s)}",
+            device,
+        )
+
+
+def _logic_adapters(rank, world_size, device):
+    k, n, hidden = 8, 4 * world_size, 6
+    gen = torch.Generator().manual_seed(7)
+    w_col, w_row, bias = _ints(gen, n, k), _ints(gen, hidden, n), _ints(gen, hidden)
+    w_up, w_down, b_down = _ints(gen, n, k), _ints(gen, hidden, n), _ints(gen, hidden)
+    cols = slice(rank * n // world_size, (rank + 1) * n // world_size)
+    rank0_bias = bias if rank == 0 else torch.zeros_like(bias)
+    block = nn.Module()
+    block.col = _FakeColumn(w_col[cols])
+    block.row = _FakeRow(w_row[:, cols], rank0_bias)
+    block.mlp = _FakeMLP(
+        _FakeColumn(w_up[cols]), _FakeRow(w_down[:, cols], b_down if rank == 0 else 0 * b_down)
+    )
+    root = nn.Module()
+    root.blocks = nn.ModuleList([block]).to(device)
+    tp = _helper()
+    convert_to_token_sharded_tp(root, tp)
+    for b, s in _SHAPES:
+        plan = tp.begin(b, s)
+        x = _ints(torch.Generator().manual_seed(b * 10 + s), b, s, k).to(device)
+        x_loc = tp.local_view(tp.shard(x))
+        mask = _real_row_mask(plan, device)
+        h = block.col(x_loc)  # all tokens, this rank's features
+        _check(torch.equal(h, x @ w_col[cols].t().to(device)), f"column adapter {(b, s)}", device)
+        mine = slice(plan.row_start, plan.row_start + plan.local_rows)
+        want = padded_rows(x @ w_col.t().to(device) @ w_row.t().to(device) + bias.to(device), plan)
+        got = block.row(h)
+        _check(
+            got.shape[:2] == x_loc.shape[:2]
+            and torch.equal(got.reshape(plan.local_rows, -1)[mask], want[mine][mask]),
+            f"row adapter {(b, s)}",
+            device,
+        )
+        ref = torch.relu(x @ w_up.t().to(device)) @ w_down.t().to(device) + b_down.to(device)
+        got = block.mlp(x_loc)
+        _check(
+            torch.equal(got.reshape(plan.local_rows, -1)[mask], padded_rows(ref, plan)[mine][mask]),
+            f"MLP adapter {(b, s)}",
+            device,
+        )
+
+
+# =============================================================================
 # Test entry points
 # =============================================================================
 
@@ -632,9 +813,16 @@ _LOGIC_CHECKS = (
     _logic_all_gather,
     _logic_all_gather_rejects_bad_fp4,
     _logic_rank_disagreement,
+    _logic_layout_round_trip,
+    _logic_adapters,
 )
 # Real NVFP4 kernels and TRT-LLM Linear/MLP modules over NCCL.
-_KERNEL_CHECKS = (_logic_fp4_quantize_gather, _logic_row_linear, _logic_column_linear_nvfp4)
+_KERNEL_CHECKS = (
+    _logic_fp4_quantize_gather,
+    _logic_row_linear,
+    _logic_column_linear_nvfp4,
+    _logic_adapters_nvfp4,
+)
 # torch.compile(fullgraph=True) and CUDA-graph capture of a boundary chain.
 _GRAPH_CHECKS = (_logic_compile_fullgraph, _logic_cuda_graph)
 

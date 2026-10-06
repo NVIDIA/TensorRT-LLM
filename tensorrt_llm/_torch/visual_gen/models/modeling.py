@@ -33,6 +33,11 @@ class BaseDiffusionModel(nn.Module):
     # Models that implement parallel_config.tp_layout='token_sharded' (token-sharded residual
     # stream inside the TP group, see parallel/token_sharded_tp.py) set this to True.
     _supports_token_sharded_tp: ClassVar[bool] = False
+    # For that layout (parallel/token_sharded_modules.py): the module lists holding the
+    # transformer blocks, and {module-name pattern: kind, adapter or "keep"} for what the
+    # conversion rules cannot decide (relative to a block).
+    _token_sharded_tp_blocks: ClassVar[tuple[str, ...]] = ("blocks",)
+    _token_sharded_tp_exceptions: ClassVar[dict] = {}
 
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__()
@@ -50,6 +55,27 @@ class BaseDiffusionModel(nn.Module):
         self.model_config = model_config
         self.component_name = model_config.component_name
         self.pretrained_config = model_config.pretrained_config
+
+    def _apply_tp_layout(self) -> None:
+        """Set up ``parallel_config.tp_layout``; call at the end of ``__init__``.
+
+        Token-sharded: switches ``self.sharder`` to the layout and converts the TP modules of
+        ``_token_sharded_tp_blocks`` in place (the model is built exactly as for plain TP).
+        Replicated (plain TP): nothing to do.
+        """
+        from ..parallel.token_sharded_modules import convert_to_token_sharded_tp
+        from ..parallel.token_sharded_tp import TokenShardedTP
+
+        tp = TokenShardedTP.from_model_config(self.model_config)
+        if tp is None:
+            return
+        self.sharder.use_token_sharded_tp(tp)
+        convert_to_token_sharded_tp(
+            self,
+            tp,
+            containers=type(self)._token_sharded_tp_blocks,
+            exceptions=type(self)._token_sharded_tp_exceptions,
+        )
 
     def forward(self, *args, timestep: torch.Tensor | None = None, **kwargs):
         """Run the diffusion transformer.

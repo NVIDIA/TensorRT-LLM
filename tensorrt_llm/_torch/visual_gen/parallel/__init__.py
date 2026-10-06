@@ -14,16 +14,37 @@
 # limitations under the License.
 """Parallelism for VisualGen transformers.
 
-``token_sharded_tp``: the token-sharded tensor parallelism helper
-(``parallel_config.tp_layout='token_sharded'``). See ``TOKEN_SHARDED_TP_DEVELOPER_GUIDE.md`` in
-this directory.
+Token-sharded tensor parallelism (``parallel_config.tp_layout='token_sharded'``):
+
+* ``token_sharded_tp``: the plan of which tokens each TP rank holds, the collectives and
+  the NVFP4 scaling-factor regroup (``TokenShardedTP``, ``TokenShardPlan``);
+* ``token_sharded_modules``: the adapters that convert a model's existing TP modules, and
+  the rules that pick them.
+
+See ``TOKEN_SHARDED_TP_DEVELOPER_GUIDE.md`` in this directory.
 """
 
+from .token_sharded_modules import (
+    TokenShardedAdapter,
+    TokenShardedColumn,
+    TokenShardedMLP,
+    TokenShardedRow,
+    classify,
+    convert_to_token_sharded_tp,
+    register_token_sharded_adapter,
+)
 from .token_sharded_tp import RowNorm, TokenShardedTP, TokenShardPlan, static_nvfp4_input_scale
 
 __all__ = [
     "RowNorm",
     "TokenShardPlan",
+    "TokenShardedAdapter",
+    "TokenShardedColumn",
+    "TokenShardedMLP",
+    "TokenShardedRow",
     "TokenShardedTP",
+    "classify",
+    "convert_to_token_sharded_tp",
+    "register_token_sharded_adapter",
     "static_nvfp4_input_scale",
 ]

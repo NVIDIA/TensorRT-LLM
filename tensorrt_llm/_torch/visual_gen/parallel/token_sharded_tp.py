@@ -66,6 +66,7 @@ Two API layers:
 See ``TOKEN_SHARDED_TP_DEVELOPER_GUIDE.md`` next to this file.
 """
 
+import dataclasses
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -642,6 +643,49 @@ class TokenShardedTP:
         self._check_local_rows("unshard", x_loc)
         out = self._drop_padding(_all_gather_rows(x_loc, self.group_name))
         return out.view(p.batch_size, p.seq_len, -1)
+
+    def local_view(self, t: torch.Tensor) -> torch.Tensor:
+        """This rank's ``[m, *rest]`` rows -> ``[n, g, *rest]`` sample groups (a view).
+
+        ``n = len(plan.entry_batch)`` and ``g = plan.rows_per_entry``: every group lies inside
+        one sample, so a per-sample ``[n, 1, D]`` table (:meth:`per_sample_table`) broadcasts
+        over the shard as a ``[B, 1, D]`` table does over ``[B, S, D]``.
+        """
+        p = self.plan
+        return t.view(len(p.entry_batch), p.rows_per_entry, *t.shape[1:])
+
+    def gather_input(self, consumer: nn.Module | None, act: Activation) -> Activation:
+        """A column projection's input: this rank's rows -> all ``B * S`` real rows.
+
+        ``act`` is ``[n, g, K]`` or ``[m, K]``: bf16, or an :class:`Fp4QuantizedTensor`
+        quantized with ``consumer``'s static scale. A bf16 input is quantized here when
+        ``consumer`` has a static NVFP4 input scale (decided per call: the scale exists only
+        after loading), so the all-gather moves NVFP4.
+        """
+        if isinstance(act, Fp4QuantizedTensor):
+            payload = act.fp4_tensor
+            act = dataclasses.replace(act, fp4_tensor=payload.reshape(-1, payload.shape[-1]))
+        else:
+            act = act.reshape(-1, act.shape[-1])
+            scale = static_nvfp4_input_scale(consumer)
+            if scale is not None:
+                act = quantize_nvfp4(act, scale)
+        self._check_fp4_consumer(consumer, act, "gather_input", "the consuming projection")
+        return self.all_gather(act)
+
+    def pad_row_input(self, act: torch.Tensor) -> torch.Tensor:
+        """A row projection's input for all tokens -> ``[B * S_pad, K]`` (zero rows per sample).
+
+        ``act`` is ``[B, S, K]`` or ``[B * S, K]``; the padded stream is not accepted.
+        """
+        p = self.plan
+        if tuple(act.shape[:-1]) not in ((p.batch_size, p.seq_len), (p.num_tokens,)):
+            raise ValueError(
+                f"TokenShardedTP.pad_row_input: expected a [B={p.batch_size}, S={p.seq_len}, K] "
+                f"or [B * S={p.num_tokens}, K] input for the current plan; got shape "
+                f"{tuple(act.shape)}."
+            )
+        return self._add_padding(act)
 
     def shard_rows(self, t: torch.Tensor) -> torch.Tensor:
         """``[B, S, *rest]`` per-token metadata -> ``[m, *rest]`` (zeros for pad rows).
