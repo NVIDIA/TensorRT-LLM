@@ -192,8 +192,7 @@ class BaseMultimodalInputProcessor(ABC):
     supports_token_id_mm_expansion: ClassVar[bool] = False
 
     # Whether the subclass takes `enable_tokenization_cache` in `__init__` and
-    # serves text-only prompts from the prefix-tokenization cache. Only such
-    # subclasses receive the flag from `create_input_processor`.
+    # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
 
     def __init__(self,
@@ -209,6 +208,27 @@ class BaseMultimodalInputProcessor(ABC):
         self._use_fast: bool = kwargs.get('use_fast', True)
         self._trust_remote_code = trust_remote_code
         self._multimodal_hashing_supported: Optional[bool] = None
+
+    def _init_tokenization_cache(self, enable_tokenization_cache: bool,
+                                 tokenizer: PreTrainedTokenizerBase) -> None:
+        """Build the cache on `tokenizer` if `enable_tokenization_cache`.
+
+        Enable it only if this processor's ids for a text-only prompt equal
+        `tokenizer(prompt, add_special_tokens=False)`.
+        """
+        self._prefix_token_cache_tokenizer = tokenizer
+        self._prefix_token_cache = (create_prefix_token_cache(tokenizer)
+                                    if enable_tokenization_cache else None)
+
+    def _encode_with_tokenization_cache(
+            self, prompt: str,
+            sampling_params: Optional[SamplingParams]) -> Optional[List[int]]:
+        if (self._prefix_token_cache is None or sampling_params is None
+                or sampling_params.add_special_tokens
+                or sampling_params.truncate_prompt_tokens is not None):
+            return None
+        return self._prefix_token_cache.encode(
+            self._prefix_token_cache_tokenizer, prompt)
 
     def attach_multimodal_embeddings(
         self,
@@ -990,8 +1010,8 @@ def create_input_processor(
             logger.info("Unregistered model, using DefaultInputProcessor")
             input_processor_cls = None
         if input_processor_cls is not None:
-            if getattr(input_processor_cls, "supports_tokenization_cache",
-                       False):
+            if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
+                    and input_processor_cls.supports_tokenization_cache):
                 kwargs["enable_tokenization_cache"] = enable_tokenization_cache
             return input_processor_cls(model_path_or_dir,
                                        config,
