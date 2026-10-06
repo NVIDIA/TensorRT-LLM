@@ -184,3 +184,12 @@ add_tllm_kernel_library(
 
 list(APPEND TLLM_KERNEL_COMPONENT_TARGETS
      trtllm_gen_fp8_block_scale_moe_routing)
+
+add_tllm_kernel_library(
+  tllm_kernel_moe_block_scale SOURCES moe/trtllmGen/DevKernel.cu LINK_LIBRARIES
+  tllm::kernel_cutlass_headers)
+
+set_property(TARGET tllm_kernel_moe_block_scale
+             PROPERTY CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+target_compile_options(tllm_kernel_moe_block_scale
+                       PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--split-compile=0>)
