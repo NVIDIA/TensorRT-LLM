@@ -226,6 +226,8 @@ set_cuda_architectures(fp8_blockscale_gemm_src ${CUTLASS_COMMON_ARCHS})
 set(GEMM_SWIGLU_SM90_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
 add_library(gemm_swiglu_sm90_src STATIC ${GEMM_SWIGLU_SM90_SRC_CU})
+add_library(tllm::kernel_gated_gemm ALIAS gemm_swiglu_sm90_src)
+target_link_libraries(gemm_swiglu_sm90_src PUBLIC tllm::kernel_gemm_utilities)
 set_cuda_architectures(gemm_swiglu_sm90_src 90)
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
