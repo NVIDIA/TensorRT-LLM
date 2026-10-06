@@ -147,8 +147,18 @@ set_target_properties(
   tllm_common_mcast_registry PROPERTIES CXX_EXTENSIONS OFF
                                         POSITION_INDEPENDENT_CODE ON)
 
+add_library(tllm_common_safetensors STATIC safetensors.cpp)
+add_library(tllm::common_safetensors ALIAS tllm_common_safetensors)
+target_link_libraries(tllm_common_safetensors PUBLIC tllm::common_logging)
+target_include_directories(tllm_common_safetensors SYSTEM
+                           PRIVATE ${CMAKE_BINARY_DIR}/_deps/json-src/include)
+target_compile_features(tllm_common_safetensors PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_common_safetensors PROPERTIES CXX_EXTENSIONS OFF
+                                     POSITION_INDEPENDENT_CODE ON)
+
 add_library(common_src OBJECT cudaArchitectures.cpp cudaFp8Utils.cu opUtils.cpp
-                              safetensors.cpp sageQuant.cu)
+                              sageQuant.cu)
 
 list(JOIN CMAKE_CUDA_ARCHITECTURES_ORIG "," TRTLLM_BUILT_CUDA_ARCHITECTURES)
 list(JOIN CMAKE_CUDA_ARCHITECTURES_WITH_KERNELS ","
