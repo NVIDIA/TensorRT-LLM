@@ -15,12 +15,8 @@
 include(FetchContent)
 
 set(SRCS
-    bufferManagerNvls.cpp
-    utils/debugUtils.cu
-    ipcUtils.cpp
-    mcastDeviceMemory.cpp
-    moeLoadBalancer/hostAccessibleDeviceAllocator.cpp
-    moeLoadBalancer/moeLoadBalancer.cpp
+    bufferManagerNvls.cpp utils/debugUtils.cu ipcUtils.cpp
+    mcastDeviceMemory.cpp moeLoadBalancer/moeLoadBalancer.cpp
     ncclCommunicator.cpp)
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
@@ -119,6 +115,23 @@ target_link_libraries(
 target_compile_features(tllm_runtime_gdr PUBLIC cxx_std_20)
 set_target_properties(tllm_runtime_gdr PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(
+  tllm_runtime_host_accessible_memory STATIC
+  moeLoadBalancer/hostAccessibleDeviceAllocator.cpp
+  moeLoadBalancer/topologyDetector.cpp)
+add_library(tllm::runtime_host_accessible_memory ALIAS
+            tllm_runtime_host_accessible_memory)
+target_link_libraries(
+  tllm_runtime_host_accessible_memory
+  PUBLIC tllm::runtime_gdr Threads::Threads
+  PRIVATE tllm::common_environment)
+if(NOT WIN32)
+  target_link_libraries(tllm_runtime_host_accessible_memory PUBLIC NUMA::NUMA)
+endif()
+target_compile_features(tllm_runtime_host_accessible_memory PUBLIC cxx_std_20)
+set_target_properties(tllm_runtime_host_accessible_memory
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(tllm_runtime_locality STATIC
             locality_domain/locality_domain_utils.cpp)
 add_library(tllm::runtime_locality ALIAS tllm_runtime_locality)
@@ -166,8 +179,9 @@ add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_cuda_architectures(runtime_src 89)
-target_link_libraries(runtime_src PUBLIC ipc_nvls_memory_src
-                                         tllm::runtime_topology)
+target_link_libraries(
+  runtime_src PUBLIC ipc_nvls_memory_src tllm::runtime_topology
+                     tllm::runtime_host_accessible_memory)
 
 target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 
