@@ -59,3 +59,23 @@ add_tllm_kernel_library(tllm_kernel_logits SOURCES logitsBitmask.cu)
 add_tllm_kernel_library(
   tllm_kernel_nvfp4_cold_page SOURCES nvfp4ColdPageKernels.cu LINK_LIBRARIES
   tllm::common_environment)
+
+add_tllm_kernel_library(
+  tllm_kernel_rope
+  SOURCES
+  attentionMask.cu
+  gptKernels.cu
+  unfusedAttentionKernels.cu
+  unfusedAttentionKernels/unfusedAttentionKernels_2_bf16_bf16.cu
+  unfusedAttentionKernels/unfusedAttentionKernels_2_bf16_fp4.cu
+  unfusedAttentionKernels/unfusedAttentionKernels_2_bf16_fp8.cu
+  unfusedAttentionKernels/unfusedAttentionKernels_2_bf16_int8.cu
+  unfusedAttentionKernels/unfusedAttentionKernels_2_float_float.cu
+  unfusedAttentionKernels/unfusedAttentionKernels_2_float_fp8.cu
+  unfusedAttentionKernels/unfusedAttentionKernels_2_float_int8.cu
+  unfusedAttentionKernels/unfusedAttentionKernels_2_half_fp4.cu
+  unfusedAttentionKernels/unfusedAttentionKernels_2_half_fp8.cu
+  unfusedAttentionKernels/unfusedAttentionKernels_2_half_half.cu
+  unfusedAttentionKernels/unfusedAttentionKernels_2_half_int8.cu
+  LINK_LIBRARIES
+  tllm::common_environment)

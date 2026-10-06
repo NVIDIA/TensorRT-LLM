@@ -50,8 +50,30 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
                             USING_OSS_CUTLASS_MOE_GEMM)
 endif()
 
-add_gtest(ropeTest ropeTest.cu)
-add_gtest(shiftKCacheKernelTest shiftKCacheKernelTest.cu)
+add_tllm_gtest(
+  ropeTest
+  OWNER
+  kernel
+  SOURCES
+  ropeTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_rope
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;rope;gpu"
+  REQUIRES_GPU)
+add_tllm_gtest(
+  shiftKCacheKernelTest
+  OWNER
+  kernel
+  SOURCES
+  shiftKCacheKernelTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_rope
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;rope;gpu"
+  REQUIRES_GPU)
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
 add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
 add_gtest(mlaPreprocessTest mlaPreprocessTest.cu)
@@ -109,7 +131,18 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   add_gtest(moeLoraSlotExpandTest moe/moeLoraSlotExpandTest.cu)
 endif()
 
-add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
+add_tllm_gtest(
+  sparseKvCacheTest
+  OWNER
+  kernel
+  SOURCES
+  sparseKvCacheTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_rope
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;rope;sparse-kv-cache;gpu"
+  REQUIRES_GPU)
 add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)
 add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
 
