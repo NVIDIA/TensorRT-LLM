@@ -370,7 +370,7 @@ def dspark_attention_forward(
 
     if window_size != 128 or rd != 64:
         raise ValueError("Embedded DSpark attention requires a 128-token window and 64 RoPE dims")
-    if IS_CUTLASS_DSL_AVAILABLE and _get_dspark_arch_str() is not None:
+    if IS_CUTLASS_DSL_AVAILABLE and _get_dspark_arch_str() is not None and block in (5, 6):
         main_rope_freqs = torch.view_as_real(main_freqs).reshape(-1, rd // 2, 2).contiguous()
         inverse_rope_freqs = torch.view_as_real(blk_freqs).contiguous()
         cute_dsl_dspark_rmsnorm_rope_page_write(

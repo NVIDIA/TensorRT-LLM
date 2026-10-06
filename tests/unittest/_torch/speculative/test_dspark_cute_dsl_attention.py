@@ -3,6 +3,8 @@
 
 """GPU correctness tests for paged DSpark CuteDSL attention and preparation."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -37,7 +39,7 @@ def force_sm107(request, monkeypatch):
         monkeypatch.setattr(dspark, "cute_dsl_dspark_rmsnorm_rope_draft_block", unsupported_kernel)
         monkeypatch.setattr(torch.ops.trtllm, "fused_dsv4_dspark_attention", unsupported_kernel)
         assert preparation_op._get_dspark_arch_str() is None
-    yield
+    yield request.param
     preparation_op._get_dspark_arch_str.cache_clear()
 
 
@@ -280,16 +282,20 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size):
 
 @pytest.mark.parametrize("heads", (64, 128))
 @pytest.mark.parametrize("page_size", (32, 256))
-def test_dspark_attention_forward_matches_reference(heads, page_size, force_sm107):
+@pytest.mark.parametrize("block", (3, 5, 6))
+def test_dspark_attention_forward_matches_reference(
+    heads, page_size, block, force_sm107, monkeypatch
+):
     inputs = _make_inputs(
         17,
+        block=block,
         heads=heads,
         page_size=page_size,
         positions=[1, 33, 129, 390, 0],
         valid_lengths=[1, 3, 128, 3, 0],
         capacities=[512, 512, 512, 512, 0],
     )
-    batch, block, hidden, rank, groups, o_rank = 5, 6, 64, 64, 8, 32
+    batch, hidden, rank, groups, o_rank = 5, 64, 64, 8, 32
 
     def weight(*shape):
         return torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * 0.02
@@ -334,6 +340,15 @@ def test_dspark_attention_forward_matches_reference(heads, page_size, force_sm10
         kwargs["wo_a"].view(groups, o_rank, -1),
     )
     expected = F.linear(output.flatten(2), kwargs["wo_b"])
+    fused_calls = []
+    for module, name in (
+        (dspark, "cute_dsl_dspark_rmsnorm_rope_page_write"),
+        (dspark, "cute_dsl_dspark_rmsnorm_rope_draft_block"),
+        (torch.ops.trtllm, "fused_dsv4_dspark_attention"),
+    ):
+        call = Mock(wraps=getattr(module, name))
+        monkeypatch.setattr(module, name, call)
+        fused_calls.append(call)
     actual = dspark.dspark_attention_forward(
         x,
         main_x,
@@ -344,6 +359,11 @@ def test_dspark_attention_forward_matches_reference(heads, page_size, force_sm10
         inputs["valid_lengths"],
         **kwargs,
     )
+    for call in fused_calls:
+        if not force_sm107 and block in (5, 6):
+            call.assert_called_once()
+        else:
+            call.assert_not_called()
     torch.testing.assert_close(actual, expected, rtol=8e-2, atol=1e-2)
     torch.testing.assert_close(inputs["kv_pages"], expected_cache, rtol=2e-2, atol=2e-2)
 
