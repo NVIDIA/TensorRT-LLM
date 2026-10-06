@@ -502,8 +502,14 @@ for the DROID Policy workflow.
 
 **T2AV — video with synchronized audio**
 
-Static FP8 Nano and Super use the same requests below. Start their generator
-with the FP8 revision config (substitute `nvidia/Cosmos3-Super` for Super):
+BF16 Cosmos3-Nano and Cosmos3-Super support video generation with synchronized
+audio. Start the generator with the appropriate config from
+[Starting the server](#starting-the-server), then set `enable_audio: true` in
+the request below.
+
+To use static FP8 instead, start the generator with the FP8 revision config
+(substitute `nvidia/Cosmos3-Super` for Super). The request is the same for BF16
+and FP8:
 
 ```bash
 trtllm-serve nvidia/Cosmos3-Nano --visual_gen_args ../configs/cosmos3-fp8-1gpu.yaml
