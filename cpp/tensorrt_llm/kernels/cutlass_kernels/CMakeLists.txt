@@ -181,7 +181,7 @@ set(FP8_BLOCKSCALE_GEMM_SRC_CU
 file(GLOB_RECURSE FP4_SRC_CU fp4_gemm/*.cu)
 
 # Get the sources for AllReduce GEMM
-file(GLOB_RECURSE ARGEMM_SRC_CU allreduce_gemm/*.cu)
+set(ARGEMM_SRC_CU allreduce_gemm/allreduce_gemm_runner.cu)
 
 message(
   VERBOSE
@@ -314,7 +314,14 @@ endif()
 
 if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   add_library(ar_gemm_src STATIC ${ARGEMM_SRC_CU})
-  target_link_libraries(ar_gemm_src PRIVATE ipc_nvls_memory_src)
+  add_library(tllm::kernel_gemm_all_reduce ALIAS ar_gemm_src)
+  target_link_libraries(
+    ar_gemm_src
+    PUBLIC tllm::kernel_cutlass_headers
+    PRIVATE tllm::runtime_ipc_nvls)
+  target_compile_features(ar_gemm_src PUBLIC cxx_std_20)
+  set_target_properties(ar_gemm_src PROPERTIES CUDA_STANDARD 20
+                                               CUDA_STANDARD_REQUIRED ON)
   target_include_directories(
     ar_gemm_src
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../internal_cutlass_kernels/include)
