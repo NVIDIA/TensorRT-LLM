@@ -534,8 +534,8 @@ def test_compile_without_real_specimens_and_cached_wrapper_avoids_views(monkeypa
         patch.setattr(torch, "empty", unexpected_compile_op)
         patch.setattr(torch, "empty_like", unexpected_compile_op)
         patch.setattr(dspark_attention_op.cute.runtime, "from_dlpack", unexpected_compile_op)
-        compiled = dspark_attention_op._compile_dspark_attention(5, arch_str, 256)
-    dspark_attention_op._dspark_attention_kernel_cache[(5, 256, arch_str)] = compiled
+        compiled = dspark_attention_op._compile_dspark_attention(5, arch_str, 256, 128)
+    dspark_attention_op._dspark_attention_kernel_cache[(5, 128, 256, arch_str)] = compiled
 
     args = _make_inputs(41, block=5, start_pos_values=[257, 9])
     q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, freqs = args

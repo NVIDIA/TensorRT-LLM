@@ -1728,7 +1728,14 @@ class DSparkAttentionKernel:
         tTR_tS_for_sink = tmem_thr_copy.partition_D(cS)
         local_row = tTR_tS_for_sink[0][0]
         head_idx = common_params.blk_coord[0] * cta_qk_tiler[0] + local_row
-        my_sink = common_params.attn_sink_unscaled[head_idx]
+        my_sink = self.acc_dtype(0)
+        # TMA zero-fills query rows outside the head dimension. The matching
+        # sink loads must also be masked for a partially occupied head tile.
+        if cutlass.const_expr(cute.size(common_params.attn_sink_unscaled) < self.mma_qk_tiler[0]):
+            if head_idx < cute.size(common_params.attn_sink_unscaled):
+                my_sink = common_params.attn_sink_unscaled[head_idx]
+        else:
+            my_sink = common_params.attn_sink_unscaled[head_idx]
         if cutlass.const_expr(self.attn_sink_is_scaled):
             my_sink = my_sink * LOG2_E / softmax_params.softmax_scale_log2
 
@@ -2187,8 +2194,12 @@ class DSparkAttentionKernel:
                 common_params.blk_coord[2],
             ),
         )
+        # Keep both CTA head tiles in the coordinate layout, including when
+        # only the first 64 heads are stored. A unit head-tile mode has zero
+        # stride and would otherwise alias the second CTA to the first.
+        output_coord_shape = (self.mma_pv_tiler[0], *common_params.mO.shape[1:])
         cO = cute.local_tile(
-            cute.make_identity_tensor(common_params.mO.shape),
+            cute.make_identity_tensor(output_coord_shape),
             cta_pv_tiler_mn,
             (
                 common_params.blk_coord[0],

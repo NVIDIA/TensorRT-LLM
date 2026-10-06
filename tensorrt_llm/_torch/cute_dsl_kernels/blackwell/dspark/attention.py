@@ -245,7 +245,11 @@ class DSparkAttention(DSparkAttentionKernel):
         mma_qk_tiler_k: int = qk_tiler_k,
         inverse_rope_dim: int = 0,
         history_page_size: int = 32,
+        num_heads: int = num_heads,
     ):
+        if num_heads not in (64, 128):
+            raise ValueError(f"DSpark attention must have 64 or 128 heads, got {num_heads}")
+        self.num_heads = num_heads
         expected_config = {
             "acc_dtype": (acc_dtype, cutlass.Float32),
             "mma_qk_tiler_mn": (mma_qk_tiler_mn, self.qk_tiler_mn),

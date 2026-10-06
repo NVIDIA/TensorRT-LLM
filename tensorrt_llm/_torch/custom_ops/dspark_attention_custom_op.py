@@ -16,7 +16,7 @@ from ..cute_dsl_kernels.blackwell.dspark.attention import DSparkAttention
 from ..cute_dsl_kernels.blackwell.utils import make_ptr
 from .dspark_rmsnorm_rope_custom_op import _get_dspark_arch_str
 
-_DSV4_DSPARK_NUM_HEADS = 128
+_DSV4_DSPARK_NUM_HEADS = (64, 128)
 _DSV4_DSPARK_HEAD_DIM = 512
 _DSV4_DSPARK_WINDOW_SIZE = 128
 _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE = 8
@@ -24,7 +24,7 @@ _DSV4_DSPARK_BLOCK_SIZES = (5, 6)
 _DSV4_DSPARK_ROPE_DIM = 64
 
 
-_dspark_attention_kernel_cache: dict[tuple[int, int, str], Callable[..., None]] = {}
+_dspark_attention_kernel_cache: dict[tuple[int, int, int, str], Callable[..., None]] = {}
 
 
 def _make_compile_gmem_pointer(dtype: Type[Numeric], assumed_align: int) -> Pointer:
@@ -41,9 +41,10 @@ def _compile_dspark_attention(
     block_size: int,
     arch_str: str,
     page_size: int,
+    num_heads: int,
 ) -> Callable[..., None]:
     """Compile the pointer host wrapper without runtime tensor specimens."""
-    num_heads, head_dim = _DSV4_DSPARK_NUM_HEADS, _DSV4_DSPARK_HEAD_DIM
+    head_dim = _DSV4_DSPARK_HEAD_DIM
     batch = cute.sym_int()
     output_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.BFloat16,
@@ -72,6 +73,7 @@ def _compile_dspark_attention(
         inverse_rope_dim=_DSV4_DSPARK_ROPE_DIM,
         arch_str=arch_str,
         history_page_size=page_size,
+        num_heads=num_heads,
     )
     # Scalars and typed, aligned compile-only pointers define the runtime ABI.
     # ``output_fake`` keeps one tensor argument for TVM-FFI environment-stream
@@ -125,9 +127,14 @@ def fused_dsv4_dspark_attention(
         raise RuntimeError("Embedded DSpark attention requires SM100 or SM103")
     batch, block, heads, dim = q.shape
     page_size = kv_pages.shape[1]
-    if block not in (5, 6) or (heads, dim) != (128, 512) or page_size not in (16, 32, 64, 128, 256):
+    if (
+        block not in _DSV4_DSPARK_BLOCK_SIZES
+        or heads not in _DSV4_DSPARK_NUM_HEADS
+        or dim != _DSV4_DSPARK_HEAD_DIM
+        or page_size not in (16, 32, 64, 128, 256)
+    ):
         raise ValueError(
-            "DSpark requires block 5/6, 128 heads, head_dim 512 and 16/32/64/128/256-token pages"
+            "DSpark requires block 5/6, 64/128 heads, head_dim 512 and 16/32/64/128/256-token pages"
         )
     if q.dtype != torch.bfloat16 or draft_block.dtype != q.dtype or kv_pages.dtype != q.dtype:
         raise ValueError("DSpark Q, draft KV and pages must use BF16")
@@ -173,12 +180,12 @@ def fused_dsv4_dspark_attention(
         )
     ):
         raise ValueError("All DSpark attention inputs must be on the same CUDA device")
-    cache_key = (block, page_size, arch_str)
+    cache_key = (block, heads, page_size, arch_str)
     compiled = _dspark_attention_kernel_cache.get(cache_key)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("DSpark paged attention must run eagerly before graph capture")
-        compiled = _compile_dspark_attention(block, arch_str, page_size)
+        compiled = _compile_dspark_attention(block, arch_str, page_size, heads)
         _dspark_attention_kernel_cache[cache_key] = compiled
     output = torch.empty_like(q)
     compiled(
