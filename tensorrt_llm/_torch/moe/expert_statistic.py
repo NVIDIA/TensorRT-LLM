@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import os
 
@@ -92,8 +95,10 @@ class ExpertStatistic:
                 "num_experts": expert_count,
                 "num_experts_per_token": token_selected_experts.size(-1)
             }
-        counts = torch.bincount(token_selected_experts.flatten(),
-                                minlength=expert_count)
+        ids = token_selected_experts.flatten().long()
+        valid = (ids >= 0) & (ids < expert_count)
+        counts = torch.zeros(expert_count, dtype=torch.int64, device=ids.device)
+        counts.scatter_add_(0, ids.clamp(0, expert_count - 1), valid.long())
         key = f"{self.current_iter_id}_{self.current_layer}"
         if key not in self._records:
             self._records[key] = counts.cpu()

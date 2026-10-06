@@ -95,6 +95,7 @@ class CutlassFusedMoE(MoEImplBase):
     # Routed-expert MoE LoRA is fused into this backend's op only. Subclasses
     # inherit this object wholesale, so they must restate every field.
     capabilities = MoEStaticCapability(
+        supports_graph_padding_trim=True,
         supports_moe_lora=True,
         supports_expert_bias=True,
         supports_eplb=True,

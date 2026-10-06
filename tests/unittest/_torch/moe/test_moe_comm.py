@@ -3160,3 +3160,104 @@ class TestMoEComm:
             local_num_tokens,
             top_k,
         )
+
+
+def _worker_prefill_padding_replay(config: CommTestConfig) -> None:
+    """Padding sends no payload, even with one expert/rank and changing replay counts."""
+    from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import _mask_prefill_padding_routes
+
+    rank = tllm.mpi_rank()
+    torch.cuda.set_device(rank)
+    env_key = "TRTLLM_MOE_A2A_FORCE_CFT"
+    old_value = os.environ.get(env_key)
+    os.environ[env_key] = "0"
+    comm = None
+    try:
+        mapping = Mapping(
+            rank=rank, tp_size=config.ep_size, moe_ep_size=config.ep_size, world_size=config.ep_size
+        )
+        comm = create_comm_object(config.comm_type, mapping, config)
+        count = config.all_num_tokens[rank]
+        payload = torch.full(
+            (count, config.hidden_size), rank + 1, device="cuda", dtype=torch.bfloat16
+        )
+        original = (
+            torch.arange(count, device="cuda", dtype=torch.int32)
+            .remainder(config.num_experts)
+            .view(count, 1)
+        )
+        original = original.expand(-1, config.top_k).clone()
+        if config.top_k > 1:
+            original[:, 1:] = -1
+            original[:, 1] = config.num_experts
+        slots = original.clone()
+        row_mask = torch.zeros(count, device="cuda", dtype=torch.bool)
+
+        def forward():
+            slots.copy_(original)
+            masked_slots = _mask_prefill_padding_routes(slots, row_mask, 0)
+            received, _, received_slots, _ = comm.dispatch(
+                payload, None, masked_slots, None, config.all_num_tokens
+            )
+            return comm.combine(received), received_slots
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            forward()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output, received_slots = forward()
+        MPI.COMM_WORLD.barrier()
+        # Include a globally empty replay and repeatedly return to a full one.
+        for counts in (
+            [count] * config.ep_size,
+            [0] * config.ep_size,
+            list(range(config.ep_size)),
+            [count] * config.ep_size,
+            [count] + [0] * (config.ep_size - 1),
+        ):
+            row_mask[: counts[rank]].fill_(False)
+            row_mask[counts[rank] :].fill_(True)
+            graph.replay()
+            expected = payload.clone()
+            expected[counts[rank] :].zero_()
+            matches = torch.equal(output, expected)
+            # Collect before asserting so a failing rank cannot strand its peers.
+            local_received = int((received_slots[:, 0] >= 0).sum().item())
+            results = MPI.COMM_WORLD.allgather((matches, local_received))
+            assert all(result[0] for result in results), (counts, results)
+            assert sum(result[1] for result in results) == sum(counts), (counts, results)
+    finally:
+        if comm is not None:
+            comm.destroy()
+        if old_value is None:
+            os.environ.pop(env_key, None)
+        else:
+            os.environ[env_key] = old_value
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.parametrize("extra_experts", [0, 1])
+@pytest.mark.parametrize("top_k", [1, 4])
+def test_nvlink_prefill_padding_graph_replay(mpi_pool_executor, extra_experts, top_k):
+    """Validate invalid-route safety, empty ranks, and changing GPU counts under graph replay."""
+    ep_size = mpi_pool_executor.num_workers
+    config = CommTestConfig(
+        comm_type=COMM_NVLINK_ONE_SIDED,
+        ep_size=ep_size,
+        num_experts=ep_size + extra_experts,
+        top_k=top_k,
+        hidden_size=1024,
+        all_num_tokens=[16] * ep_size,
+    )
+    _skip_if_rank_mask_config_unsupported(config)
+    futures = [
+        mpi_pool_executor.submit(_worker_prefill_padding_replay, config) for _ in range(ep_size)
+    ]
+    for future in futures:
+        future.result()
