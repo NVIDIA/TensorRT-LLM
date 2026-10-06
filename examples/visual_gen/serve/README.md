@@ -284,10 +284,7 @@ generator checkpoint:
 | T2I — text-to-image | `/v1/images/generations` | `extra_params: {"output_type": "image"}` |
 | Reasoner — chat | `/v1/chat/completions` | starting the server **without** `--visual_gen_args` or `--enable_visual_gen` |
 
-The typed reference field declares the input modality at the HTTP boundary.
-Uploads are resolved to raw encoded bytes before dispatch, and every worker
-receives those bytes rather than a path or an `UploadFile`. This section is the
-served analogue of the offline usage block in
+For offline usage, see
 [`../models/cosmos3/README.md`](../models/cosmos3/README.md).
 
 ### Starting the server
@@ -319,11 +316,9 @@ trtllm-serve nvidia/Cosmos3-Edge-Policy-DROID --enable_visual_gen
 
 The distilled image-to-video checkpoint reads its fixed four-step schedule from
 the checkpoint. Its default 720p x 189-frame workload needs more device memory
-than one H200 provides: validation on an H200 with 139.8 GiB usable memory
-reached 138.21 GiB in use before VAE decode requested another 1.76 GiB. Use a
-higher-memory GPU, such as Blackwell, or the single-node 4-GPU config shown
-above on Hopper. Edge and DROID need no YAML because their checkpoint defaults
-already are the deployed shape, but they do need
+than one H200 provides. Use a higher-memory GPU, such as Blackwell, or the
+single-node 4-GPU config shown above on Hopper. Edge and DROID need no YAML
+because their checkpoint defaults already are the deployed shape, but they do need
 `--enable_visual_gen` to select the generator rather than the Reasoner. The
 DROID checkpoint metadata then selects Policy mode and supplies its deployment
 defaults. A local checkpoint directory works in place of any Hub ID.
@@ -336,14 +331,7 @@ Guardrails are enabled by default. Install and authenticate per
 Cosmos3 supplies defaults for the universal generation controls, so `prompt`
 alone is a complete T2V request. Conditioned modes additionally require their
 reference, control, or action inputs. The examples pass the shape explicitly to
-show what is being asked for. Query the loaded pipeline for the values it will
-use:
-
-```python
-generator = VisualGen(model="nvidia/Cosmos3-Nano")
-print(generator.default_params)      # resolution, frames, fps, steps, guidance
-print(generator.extra_param_specs)   # accepted extra_params keys
-```
+show what is being asked for.
 
 **T2V — text-to-video**
 
@@ -403,8 +391,8 @@ Upload an MP4/AVI instead of an image; see
 quick reference for the conditioning knobs. Only the first (or last, per
 `condition_video_keep`) `max(condition_video_latent_indexes) * 4 + 1` reference
 frames condition the output — 5 frames with the defaults. Output size is fixed
-by the request; references are center-cropped, not aspect-matched. Validated for
-Nano / Super only.
+by the request; references are center-cropped, not aspect-matched. Use Nano or
+Super for this mode.
 
 **Transfer — control-video generation**
 
@@ -522,10 +510,6 @@ with the FP8 revision config (substitute `nvidia/Cosmos3-Super` for Super):
 trtllm-serve nvidia/Cosmos3-Nano --visual_gen_args ../configs/cosmos3-fp8-1gpu.yaml
 ```
 
-Both were validated on one B300; see the
-[FP8 validation results](../models/cosmos3/README.md#static-fp8-checkpoints).
-Image-conditioned FP8 audio-video (TI2AV) remains unvalidated.
-
 ```bash
 curl -X POST "http://localhost:8000/v1/videos/sync" \
   -H "Content-Type: application/json" \
@@ -600,11 +584,10 @@ Nano and Super static-FP8 checkpoints also support the standalone Reasoner:
 text, image and video inputs produce text through `/v1/chat/completions`.
 Use a local FP8 checkpoint directory containing a root `hf_quant_config.json`
 with the ModelOpt FP8 quantization configuration, alongside the weights and
-their calibrated scales. The LLM loader reads this file to select FP8; the generator's
-`transformer/config.json` alone does not establish Reasoner quantization.
+their calibrated scales.
 
 Start the server in terminal 1. Set `MODEL_DIR` to either your Nano or Super
-FP8 checkpoint directory; both were exercised on one B300:
+FP8 checkpoint directory:
 
 ```bash
 MODEL_DIR=/path/to/Cosmos3-Nano-FP8
@@ -662,33 +645,16 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-The standalone Reasoner uses native W8A8 with the checkpoint's static scales;
-`lm_head`, embeddings and the vision tower remain BF16. The
-`runtime.diffusion_step_policy` setting, including `reasoner: a16`, governs
-the understanding stream inside the generator and is ignored by this LLM path.
-The generator's single-GPU FP8 restriction does not establish multi-GPU
-Reasoner support; the Reasoner validation here covers one GPU only.
-
-Validation on Tue 6 Oct 2026 used TensorRT-LLM main `37d332fa1c` and local
-checkpoint directories on one B300. All 19 client requests in the
-[Cosmos3 Reasoner cookbook](https://github.com/NVIDIA/cosmos/blob/main/cookbooks/cosmos3/reasoner/run_with_tensorrt_llm.ipynb)
-passed for Nano FP8, Nano BF16 and Super FP8. The test used a cluster-specific
-launcher; the plain server command above was not independently tested. Hub ID
-plus `--revision fp8` has not been validated for this LLM path. These functional
-checks do not constitute a general FP8 output-quality benchmark.
-
 ### Notes
 
 - **A guardrail block surfaces as HTTP 500** (`Video generation failed` /
-  `Image generation failed`): the pipeline returns an empty result rather than a
-  distinguishable error.
+  `Image generation failed`).
 - **Distilled checkpoints** (`...-4Step`) fix their step count and guidance;
   simplest is to omit `num_inference_steps` and `guidance_scale`. A value that
   matches the checkpoint is accepted, a conflicting one returns HTTP 400 naming
   the value it requires.
-- **Prompt quality**: the checkpoints were tuned on the structured captions the
-  model cards ship, which give noticeably cleaner output than a one-line summary.
-  Send one as the `prompt` string, and the offline example's
+- **Structured prompts**: send a structured caption from the model card as the
+  `prompt` string, and the offline example's
   [negative prompt](../models/cosmos3/cosmos3_negative_prompt.json) as
   `negative_prompt` — JSON-shaped prompts are re-parsed, so formatting does not
   matter.
