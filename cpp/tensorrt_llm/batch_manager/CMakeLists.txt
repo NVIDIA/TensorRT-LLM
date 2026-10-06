@@ -115,6 +115,16 @@ target_link_libraries(tllm_batch_scheduler PUBLIC tllm::kv_cache_legacy)
 target_include_directories(tllm_batch_scheduler
                            PRIVATE ${maybe_nvtx_includedir})
 
+add_library(tllm_context_transfer_consensus STATIC
+            contextTransferVoteReducer.cpp)
+add_library(tllm::context_transfer_consensus ALIAS
+            tllm_context_transfer_consensus)
+target_link_libraries(tllm_context_transfer_consensus PUBLIC tllm::common_error)
+target_compile_features(tllm_context_transfer_consensus PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_context_transfer_consensus PROPERTIES CXX_EXTENSIONS OFF
+                                             POSITION_INDEPENDENT_CODE ON)
+
 foreach(component tllm_kv_cache_host_memory tllm_kv_cache tllm_kv_cache_legacy
                   tllm_batch_scheduler)
   target_compile_features(${component} PUBLIC cxx_std_20)
@@ -127,8 +137,9 @@ target_compile_options(
 add_cuda_architectures(tllm_kv_cache 89)
 
 add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
-target_link_libraries(${BATCH_MANAGER_STATIC_TARGET}
-                      PUBLIC tllm::kv_cache tllm::batch_scheduler)
+target_link_libraries(
+  ${BATCH_MANAGER_STATIC_TARGET} PUBLIC tllm::kv_cache tllm::batch_scheduler
+                                        tllm::context_transfer_consensus)
 target_include_directories(
   ${BATCH_MANAGER_STATIC_TARGET}
   PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}
