@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
+#include "tensorrt_llm/batch_manager/rnnCacheRouting.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -455,63 +456,20 @@ void RnnCacheFormatter::unformat(TransferSession& session)
 
 bool RnnCacheFormatter::inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const
 {
-    if (!selfConfig.hasRnnConfig() || !destConfig.hasRnnConfig())
-    {
-        return false;
-    }
-
-    if (selfConfig.getConvStateDataType() != destConfig.getConvStateDataType())
-    {
-        TLLM_LOG_WARNING("RnnCacheFormatter::inquireSupport: conv state data type mismatch (self=%d, dest=%d)",
-            static_cast<int>(selfConfig.getConvStateDataType()), static_cast<int>(destConfig.getConvStateDataType()));
-        return false;
-    }
-
-    if (selfConfig.getSsmStateDataType() != destConfig.getSsmStateDataType())
-    {
-        TLLM_LOG_WARNING("RnnCacheFormatter::inquireSupport: SSM state data type mismatch (self=%d, dest=%d)",
-            static_cast<int>(selfConfig.getSsmStateDataType()), static_cast<int>(destConfig.getSsmStateDataType()));
-        return false;
-    }
-
-    auto const& selfModel = selfConfig.getRnnModelConfig();
-    auto const& destModel = destConfig.getRnnModelConfig();
-
-    if (selfModel.mDState != destModel.mDState || selfModel.mHeadDim != destModel.mHeadDim
-        || selfModel.mDConv != destModel.mDConv || selfModel.mNGroups != destModel.mNGroups
-        || selfModel.mNumLayers != destModel.mNumLayers)
-    {
-        TLLM_LOG_WARNING("RnnCacheFormatter::inquireSupport: model config mismatch");
-        return false;
-    }
-
-    auto const& selfParallel = selfConfig.getParallelConfig();
-    auto const& destParallel = destConfig.getParallelConfig();
-
-    if (selfParallel.mContextParallelism != 1 || destParallel.mContextParallelism != 1)
-    {
-        TLLM_LOG_WARNING("RnnCacheFormatter::inquireSupport: RNN only supports CP=1 (selfCP=%d, destCP=%d)",
-            selfParallel.mContextParallelism, destParallel.mContextParallelism);
-        return false;
-    }
-
-    return true;
+    return rnn_cache_routing::inquireSupport(selfConfig, destConfig);
 }
 
 std::vector<RnnCacheFormatter::SizeType32> RnnCacheFormatter::getCounterparts(
     CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
 {
-    auto targetInfo = executor::kv_cache::targetIRanksForRnn(destConfig, selfConfig, selfIdx);
-    return targetInfo.mIRanks;
+    return rnn_cache_routing::getCounterparts(selfConfig, selfIdx, destConfig);
 }
 
 std::pair<std::vector<size_t>, std::vector<size_t>> RnnCacheFormatter::pickRecvConnections(size_t numConnections,
     CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
     std::vector<SizeType32> const& counterPartRanks) const
 {
-    auto targetInfo = executor::kv_cache::targetIRanksForRnn(destConfig, selfConfig, selfIdx);
-    return cache_formatter_utils::pickRecvConnections(
-        numConnections, selfConfig, selfIdx, destConfig, counterPartRanks, targetInfo);
+    return rnn_cache_routing::pickRecvConnections(numConnections, selfConfig, selfIdx, destConfig, counterPartRanks);
 }
 
 } // namespace tensorrt_llm::batch_manager

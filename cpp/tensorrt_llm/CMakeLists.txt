@@ -317,6 +317,7 @@ target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 set(TLLM_FACADE_COMPONENT_TARGETS
     ipc_nvls_memory_src
     tllm_batch_request_info
+    tllm_batch_rnn_cache_routing
     tllm_batch_scheduler
     tllm_common_cublas
     tllm_common_cuda
