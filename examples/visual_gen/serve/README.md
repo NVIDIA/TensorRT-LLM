@@ -73,7 +73,7 @@ Current supported & tested models:
 3. FLUX.2 for image generation (t2i)
 4. LTX-2 for video generation with audio (t2v, ti2v)
 5. Qwen-Image for image generation (t2i)
-6. Cosmos3 for video (t2v, i2v/ti2v, v2v), Transfer, Action, synchronized audio-video (t2av), and image (t2i) generation — see [Cosmos3](#cosmos3-t2v--i2v--v2v--transfer--action--t2av--t2i)
+6. [Cosmos3](#cosmos3-t2v--i2v--v2v--transfer--action--t2av--t2i) for video (t2v, i2v/ti2v, v2v), Transfer, Action, synchronized audio-video (t2av), and image (t2i) generation
 
 ### 1. Synchronous Image Generation (`sync_image_gen.py`)
 
