@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Single-GPU tests of the TP sequence-parallel row-local kernels (fused LN + NVFP4).
+"""Single-GPU tests of the token-sharded TP row-local kernels (fused LN + NVFP4).
 
 TP ranks are simulated: every rank's shard of a full ``[B * S, 5120]`` input goes
 through the helper's row-local norm/quantize, and the result (FP4 bytes per row, and
@@ -25,12 +25,12 @@ from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
-from tensorrt_llm._torch.visual_gen.modules import tp_sequence_parallel
 from tensorrt_llm._torch.visual_gen.modules.fused_norm_quant import (
     apply_fused_layernorm_adaln_quant,
     apply_fused_layernorm_affine_quant,
 )
-from tensorrt_llm._torch.visual_gen.modules.tp_sequence_parallel import (
+from tensorrt_llm._torch.visual_gen.parallel import token_sharded_tp
+from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import (
     RowNorm,
     TokenShardPlan,
     apply_row_norm,
@@ -45,7 +45,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 # tests/unittest/_torch/visual_gen: shared SF-layout references and simulated ranks.
 __extra_import_path__ = ["../.."]
 
-from tp_sequence_parallel_test_utils import simulated_helper, swizzle_ref, unswizzle_ref
+from token_sharded_tp_test_utils import simulated_helper, swizzle_ref, unswizzle_ref
 
 D = 5120
 EPS = 1e-6
@@ -164,7 +164,7 @@ def test_row_norm_uses_fused_op_only_when_eligible(monkeypatch):
         return wrapped
 
     for name in ("apply_fused_layernorm_adaln_quant", "apply_fused_layernorm_affine_quant"):
-        monkeypatch.setattr(tp_sequence_parallel, name, spy(getattr(tp_sequence_parallel, name)))
+        monkeypatch.setattr(token_sharded_tp, name, spy(getattr(token_sharded_tp, name)))
 
     torch.manual_seed(2)
     x = torch.randn(64, D, device="cuda", dtype=torch.bfloat16)

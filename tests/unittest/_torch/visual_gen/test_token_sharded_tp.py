@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the TP sequence-parallel helper (no process group, no GPU).
+"""CPU tests for the token-sharded TP helper (no process group, no GPU).
 
 Plans are simulated per rank: every rank's shard of a full tensor is checked against
 the same operation on the full tensor, sliced by that rank's rows.
@@ -25,20 +25,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from tp_sequence_parallel_test_utils import (
-    padded_rows,
-    simulated_helper,
-    swizzle_ref,
-    unswizzle_ref,
-)
+from token_sharded_tp_test_utils import padded_rows, simulated_helper, swizzle_ref, unswizzle_ref
 
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
-from tensorrt_llm._torch.visual_gen.modules.tp_sequence_parallel import (
+from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import (
     RowNorm,
+    TokenShardedTP,
     TokenShardPlan,
-    TPSequenceParallel,
     apply_residual,
     apply_row_norm,
     regroup_swizzled_sf,
@@ -365,25 +360,23 @@ class _PlainDiT(BaseDiffusionModel):
 
 
 class _SpTpDiT(BaseDiffusionModel):
-    _supports_tp_sequence_parallel = True
+    _supports_token_sharded_tp = True
 
 
 def test_capability_gate():
-    cfg = DiffusionModelConfig(parallel=ParallelConfig(tp_size=2, tp_sequence_parallel=True))
+    cfg = DiffusionModelConfig(parallel=ParallelConfig(tp_size=2, tp_layout="token_sharded"))
     with pytest.raises(ValueError, match="not implemented for _PlainDiT"):
         _PlainDiT(cfg)
     _SpTpDiT(cfg)
-    for flag in (None, False):
-        _PlainDiT(
-            DiffusionModelConfig(parallel=ParallelConfig(tp_size=2, tp_sequence_parallel=flag))
-        )
+    for layout in (None, "replicated"):
+        _PlainDiT(DiffusionModelConfig(parallel=ParallelConfig(tp_size=2, tp_layout=layout)))
 
 
 def test_wan_opts_in():
     from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 
-    assert WanTransformer3DModel._supports_tp_sequence_parallel is True
-    assert BaseDiffusionModel._supports_tp_sequence_parallel is False
+    assert WanTransformer3DModel._supports_token_sharded_tp is True
+    assert BaseDiffusionModel._supports_token_sharded_tp is False
 
 
 def _stub_config(flag, tp_size=2, ulysses=1, ring=1, attn2d=(1, 1), cache_backend=None):
@@ -396,7 +389,7 @@ def _stub_config(flag, tp_size=2, ulysses=1, ring=1, attn2d=(1, 1), cache_backen
         attn2d_col_size=attn2d[1],
     )
     return SimpleNamespace(
-        parallel=SimpleNamespace(tp_sequence_parallel=flag),
+        parallel=SimpleNamespace(token_sharded_tp=flag),
         visual_gen_mapping=vgm,
         cache_backend=cache_backend,
     )
@@ -404,28 +397,28 @@ def _stub_config(flag, tp_size=2, ulysses=1, ring=1, attn2d=(1, 1), cache_backen
 
 def test_from_model_config_validation():
     for flag in (None, False):
-        assert TPSequenceParallel.from_model_config(_stub_config(flag)) is None
-    assert TPSequenceParallel.from_model_config(SimpleNamespace()) is None
+        assert TokenShardedTP.from_model_config(_stub_config(flag)) is None
+    assert TokenShardedTP.from_model_config(SimpleNamespace()) is None
     with pytest.raises(ValueError, match=r"tp_size > 1 and seq_size == 1 \(got tp_size=1,"):
-        TPSequenceParallel.from_model_config(_stub_config(True, tp_size=1))
+        TokenShardedTP.from_model_config(_stub_config(True, tp_size=1))
     no_vgm = _stub_config(True)
     no_vgm.visual_gen_mapping = None
     with pytest.raises(ValueError, match="needs a VisualGenMapping"):
-        TPSequenceParallel.from_model_config(no_vgm)
+        TokenShardedTP.from_model_config(no_vgm)
     for kwargs in (dict(ulysses=2), dict(ring=2), dict(attn2d=(2, 1))):
         with pytest.raises(ValueError, match=r"seq_size == 1 \(got tp_size=2, seq_size=2"):
-            TPSequenceParallel.from_model_config(_stub_config(True, **kwargs))
+            TokenShardedTP.from_model_config(_stub_config(True, **kwargs))
     with pytest.raises(ValueError, match="does not support cache_backend='cache_dit'"):
-        TPSequenceParallel.from_model_config(_stub_config(True, cache_backend="cache_dit"))
+        TokenShardedTP.from_model_config(_stub_config(True, cache_backend="cache_dit"))
 
 
 def test_helper_requires_a_group():
     with pytest.raises(ValueError, match="needs a torch.distributed TP process group; got None"):
-        TPSequenceParallel(None)
+        TokenShardedTP(None)
 
 
 def test_plan_before_begin_raises():
-    sp = TPSequenceParallel.__new__(TPSequenceParallel)
+    sp = TokenShardedTP.__new__(TokenShardedTP)
     sp._plan = None
     with pytest.raises(RuntimeError, match=r"begin\(batch_size, seq_len\) must be called"):
         _ = sp.plan

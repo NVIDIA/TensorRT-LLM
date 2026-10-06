@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,15 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Visual Generation Modules
+"""Parallelism for VisualGen transformers.
 
-This module provides modular neural network components for visual generation models.
+``token_sharded_tp``: the token-sharded tensor parallelism helper
+(``parallel_config.tp_layout='token_sharded'``). See ``TOKEN_SHARDED_TP_DEVELOPER_GUIDE.md`` in
+this directory.
 """
 
-from .attention import Attention, QKVMode
+from .token_sharded_tp import RowNorm, TokenShardedTP, TokenShardPlan, static_nvfp4_input_scale
 
 __all__ = [
-    "Attention",
-    "QKVMode",
+    "RowNorm",
+    "TokenShardPlan",
+    "TokenShardedTP",
+    "static_nvfp4_input_scale",
 ]

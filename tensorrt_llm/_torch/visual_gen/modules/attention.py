@@ -56,7 +56,7 @@ class Attention(nn.Module):
     With ``tp_size > 1`` the output projection ``to_out`` is row-parallel and
     all-reduces its output. Built with ``reduce_output=False`` it returns this rank's
     K-partial sums instead (bias on tp_rank 0 only) and the caller owns the reduction,
-    e.g. ``TPSequenceParallel.row_linear``; ``split_qkv()`` / ``attend()`` then let the
+    e.g. ``TokenShardedTP.row_linear``; ``split_qkv()`` / ``attend()`` then let the
     caller run the projections itself.
     """
 
@@ -665,7 +665,7 @@ class Attention(nn.Module):
         q/k/v are this rank's [B, S, H_local * head_dim] / [B, S_kv, KV_local * head_dim]
         projections (e.g. from ``get_qkv`` or ``split_qkv``). Returns the attention output
         [B, S, H_local * head_dim] *before* ``to_out``, so callers that own the output
-        projection (e.g. ``TPSequenceParallel.row_linear``) can apply it themselves.
+        projection (e.g. ``TokenShardedTP.row_linear``) can apply it themselves.
         """
         q, k = self.apply_qk_norm(q, k)
 

@@ -40,9 +40,9 @@ from tensorrt_llm._torch.visual_gen.modules.fused_norm_quant import (
     apply_fused_layernorm_affine_quant,
 )
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
-from tensorrt_llm._torch.visual_gen.modules.tp_sequence_parallel import (
+from tensorrt_llm._torch.visual_gen.parallel import (
     RowNorm,
-    TPSequenceParallel,
+    TokenShardedTP,
     static_nvfp4_input_scale,
 )
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -296,7 +296,7 @@ class WanBlock(nn.Module):
         model_config: DiffusionModelConfig,
         _layer_idx: int,
         added_kv_proj_dim: int = None,
-        sp_tp: Optional[TPSequenceParallel] = None,
+        sp_tp: Optional[TokenShardedTP] = None,
     ):
         """Build one Wan transformer block.
 
@@ -304,8 +304,8 @@ class WanBlock(nn.Module):
             model_config: The transformer's DiffusionModelConfig.
             _layer_idx: Block index.
             added_kv_proj_dim: Input dim of the I2V image K/V projections, or None.
-            sp_tp: The transformer's TPSequenceParallel helper when
-                parallel_config.tp_sequence_parallel is on (the residual stream is then
+            sp_tp: The transformer's TokenShardedTP helper when
+                parallel_config.tp_layout='token_sharded' is on (the residual stream is then
                 token-sharded across the TP group and the three row-parallel projections
                 return partial sums); None for the all-reduce TP path.
         """
@@ -443,10 +443,10 @@ class WanBlock(nn.Module):
         )
         if _is_vsa and sp_tp is not None:
             raise ValueError(
-                "tp_sequence_parallel does not support Video Sparse Attention "
+                "Token-sharded TP does not support Video Sparse Attention "
                 "(sparse_attention_config.algorithm='vsa') yet: the VSA gates are projected "
                 "from the block input, which is token-sharded across TP ranks. Unset "
-                "tp_sequence_parallel or disable VSA."
+                "parallel_config.tp_layout or disable VSA."
             )
         if _is_vsa:
             q_dim = num_heads * head_dim
@@ -703,7 +703,7 @@ class WanBlock(nn.Module):
         """Text (+ I2V image) cross-attention from projected queries q [B, S, H_local * Dh].
 
         Returns the attention output before attn2.to_out (shared by the all-reduce and the
-        sequence-parallel TP paths).
+        token-sharded TP paths).
         """
         # I2V: Split encoder_hidden_states into image and text parts if needed
         encoder_hidden_states_img = None
@@ -754,7 +754,7 @@ class WanBlock(nn.Module):
         freqs_sin: Optional[torch.Tensor],
         timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Sequence-parallel TP block (parallel_config.tp_sequence_parallel).
+        """Token-sharded TP block (parallel_config.tp_layout='token_sharded').
 
         x: this TP rank's [local_rows, D] rows of the token-sharded residual stream;
         returns the updated rows. attn1/attn2 to_out and ffn.down_proj were built with
@@ -821,7 +821,7 @@ class WanBlock(nn.Module):
 
 class WanTransformer3DModel(BaseDiffusionModel):
     _supports_gradient_checkpointing = True
-    _supports_tp_sequence_parallel = True
+    _supports_token_sharded_tp = True
 
     def __init__(
         self,
@@ -833,8 +833,8 @@ class WanTransformer3DModel(BaseDiffusionModel):
 
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 12)
         self.sharder = SequenceSharder.from_vgm(vgm, num_attention_heads=num_heads)
-        # Sequence-parallel TP (parallel_config.tp_sequence_parallel); None when off.
-        self._sp_tp = TPSequenceParallel.from_model_config(model_config)
+        # Token-sharded TP (parallel_config.tp_layout='token_sharded'); None when off.
+        self._sp_tp = TokenShardedTP.from_model_config(model_config)
 
         config = model_config.pretrained_config
 
@@ -1020,7 +1020,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
         rope = self.sharder.shard_rope((freqs_cos, freqs_sin), seq_len=seq_len, seq_dim=1)
         if rope is not None:
             freqs_cos, freqs_sin = rope
-        # Sequence-parallel TP: the residual stream becomes this TP rank's [rows, D] token
+        # Token-sharded TP: the residual stream becomes this TP rank's [rows, D] token
         # shard; RoPE, text embeddings and temb stay replicated (attention sees all tokens).
         sp_tp = self._sp_tp
         if sp_tp is not None:
@@ -1193,7 +1193,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 module.post_load_weights()
 
         # Wire each norm's fp4_scale from the first downstream Linear that consumes its output.
-        # The SP-TP path all-gathers these activations as NVFP4, so it uses the helper's
+        # The token-sharded TP path all-gathers these activations as NVFP4, so it uses the helper's
         # documented eligibility rule (static_nvfp4_input_scale, which also requires NVFP4
         # activation quantization); both rules agree for every current quant method.
         fp4_input_scale = (
@@ -1217,8 +1217,8 @@ class WanTransformer3DModel(BaseDiffusionModel):
             ]
             n_fp4 = sum(scale is not None for scale in scales)
             logger.info_once(
-                f"tp_sequence_parallel: {n_fp4}/{len(scales)} block-boundary activations are "
+                f"Token-sharded TP: {n_fp4}/{len(scales)} block-boundary activations are "
                 "all-gathered as NVFP4 (static input_scale); the rest are gathered as BF16 "
                 "(dynamic, AWQ, FP8 or unquantized consumers).",
-                key=("tp_sequence_parallel_fp4_gather", n_fp4, len(scales)),
+                key=("token_sharded_tp_fp4_gather", n_fp4, len(scales)),
             )

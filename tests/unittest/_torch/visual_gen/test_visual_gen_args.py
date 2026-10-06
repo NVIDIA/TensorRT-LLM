@@ -528,20 +528,27 @@ class TestParallelConfigValidation:
         assert pc.seq_parallel_size == 8
 
 
-class TestTPSequenceParallelConfig:
-    """parallel_config.tp_sequence_parallel validation and round trips."""
+class TestTokenShardedTPConfig:
+    """parallel_config.tp_layout validation and round trips."""
 
     def test_default_is_none(self):
-        assert ParallelConfig().tp_sequence_parallel is None
+        pc = ParallelConfig()
+        assert pc.tp_layout is None
+        assert pc.token_sharded_tp is False
 
-    @pytest.mark.parametrize("flag", [None, False])
-    def test_unset_or_false_accepted_without_tp(self, flag):
-        pc = ParallelConfig(tp_size=1, tp_sequence_parallel=flag)
-        assert pc.tp_sequence_parallel is flag
+    @pytest.mark.parametrize("layout", [None, "replicated"])
+    def test_unset_or_replicated_accepted_without_tp(self, layout):
+        pc = ParallelConfig(tp_size=1, tp_layout=layout)
+        assert pc.tp_layout == layout
+        assert pc.token_sharded_tp is False
+
+    def test_replicated_is_off(self):
+        # "replicated" is a truthy string: callers must test the property, not the field.
+        assert ParallelConfig(tp_size=2, tp_layout="replicated").token_sharded_tp is False
 
     def test_requires_tp(self):
         with pytest.raises(ValidationError, match=r"requires tp_size > 1 \(got tp_size=1\)"):
-            ParallelConfig(tp_sequence_parallel=True)
+            ParallelConfig(tp_layout="token_sharded")
 
     @pytest.mark.parametrize(
         "seq_kwargs",
@@ -550,29 +557,30 @@ class TestTPSequenceParallelConfig:
     )
     def test_rejects_sequence_sharding(self, seq_kwargs):
         with pytest.raises(ValidationError, match="cannot be combined with ulysses_size"):
-            ParallelConfig(tp_size=2, tp_sequence_parallel=True, **seq_kwargs)
+            ParallelConfig(tp_size=2, tp_layout="token_sharded", **seq_kwargs)
 
     def test_composes_with_cfg(self):
-        pc = ParallelConfig(cfg_size=2, tp_size=2, tp_sequence_parallel=True)
-        assert pc.tp_sequence_parallel is True
+        pc = ParallelConfig(cfg_size=2, tp_size=2, tp_layout="token_sharded")
+        assert pc.token_sharded_tp is True
         assert pc.n_workers == 4
 
-    def test_invalid_type_rejected(self):
+    @pytest.mark.parametrize("layout", ["sometimes", True, "sequence"])
+    def test_invalid_value_rejected(self, layout):
         with pytest.raises(ValidationError):
-            ParallelConfig(tp_size=2, tp_sequence_parallel="sometimes")
+            ParallelConfig(tp_size=2, tp_layout=layout)
 
     def test_rejects_cache_dit(self):
         with pytest.raises(ValidationError, match="cache_backend='cache_dit' is not supported"):
             VisualGenArgs(
                 model="/tmp/model",
-                parallel_config=ParallelConfig(tp_size=2, tp_sequence_parallel=True),
+                parallel_config=ParallelConfig(tp_size=2, tp_layout="token_sharded"),
                 cache_config=CacheDiTConfig(),
             )
 
     def test_teacache_accepted(self):
         args = VisualGenArgs(
             model="/tmp/model",
-            parallel_config=ParallelConfig(tp_size=2, tp_sequence_parallel=True),
+            parallel_config=ParallelConfig(tp_size=2, tp_layout="token_sharded"),
             cache_config=TeaCacheConfig(),
         )
         assert args.cache_backend == "teacache"
@@ -584,12 +592,12 @@ class TestTPSequenceParallelConfig:
             "parallel_config:\n"
             "  cfg_size: 2\n"
             "  tp_size: 2\n"
-            "  tp_sequence_parallel: true\n"
+            "  tp_layout: token_sharded\n"
         )
         args = VisualGenArgs.from_yaml(yaml_path)
-        assert args.parallel_config.tp_sequence_parallel is True
+        assert args.parallel_config.token_sharded_tp is True
         dumped = args.model_dump()
-        assert dumped["parallel_config"]["tp_sequence_parallel"] is True
+        assert dumped["parallel_config"]["tp_layout"] == "token_sharded"
         assert VisualGenArgs(**dumped).parallel_config == args.parallel_config
 
 

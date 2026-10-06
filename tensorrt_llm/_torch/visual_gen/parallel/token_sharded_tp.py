@@ -12,11 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Sequence-parallel tensor parallelism (Megatron-style) for VisualGen DiT blocks.
+"""Token-sharded tensor parallelism (Megatron-style sequence parallelism) for VisualGen DiT blocks.
 
 With plain tensor parallelism (TP) every row-parallel projection ends in an
 all-reduce and every rank holds the full, replicated residual stream. With
-``parallel_config.tp_sequence_parallel`` the residual stream between projections is
+``parallel_config.tp_layout='token_sharded'`` the residual stream between projections is
 instead *token-sharded* across the TP group:
 
 Layout
@@ -41,11 +41,11 @@ Invariant
     shape is padded).
 
 Numerics
-    SP-TP differs from the all-reduce path in its collectives: the reduce-scatter may
+    Token-sharded TP differs from the all-reduce path in its collectives: the reduce-scatter may
     sum the K-partials in a different order *and with a different NCCL algorithm*. With
     NCCL's default tuning at ``tp >= 8`` on NVSwitch systems the all-reduce runs as NVLS
     while the reduce-scatter runs as a ring, which rounds to bf16 after each hop, so
-    SP-TP is then measurably less precise than all-reduce TP (``NCCL_ALGO=
+    Token-sharded TP is then measurably less precise than all-reduce TP (``NCCL_ALGO=
     "ReduceScatter:NVLS"`` restores bitwise parity at a latency cost). Row-local norms
     reuse the model's own kernels (the fused op at ``D == 5120``, the model's LayerNorm
     module through ``RowNorm.module`` otherwise).
@@ -63,7 +63,7 @@ Two API layers:
   ``row_linear_residual_norm``, ``mlp_residual``. These are the only call sites a
   communication/compute overlap or a fused GEMM+collective kernel has to replace.
 
-See ``TP_SEQUENCE_PARALLEL_DEVELOPER_GUIDE.md`` next to this file.
+See ``TOKEN_SHARDED_TP_DEVELOPER_GUIDE.md`` next to this file.
 """
 
 import math
@@ -87,7 +87,10 @@ from ...modules.linear import (
     is_static_nvfp4_input_eligible,
 )
 from ...utils import Fp4QuantizedTensor, compute_swizzled_sf_shape
-from .fused_norm_quant import apply_fused_layernorm_adaln_quant, apply_fused_layernorm_affine_quant
+from ..modules.fused_norm_quant import (
+    apply_fused_layernorm_adaln_quant,
+    apply_fused_layernorm_affine_quant,
+)
 
 if TYPE_CHECKING:
     from ..config import DiffusionModelConfig
@@ -95,7 +98,7 @@ if TYPE_CHECKING:
 __all__ = [
     "NVFP4_SF_VEC_SIZE",
     "RowNorm",
-    "TPSequenceParallel",
+    "TokenShardedTP",
     "TokenShardPlan",
     "apply_residual",
     "apply_row_norm",
@@ -125,7 +128,7 @@ class TokenShardPlan:
     """Static token-shard plan for one ``(batch_size, seq_len)`` on one TP rank.
 
     Python ints only, so it is compile/graph safe; cached per shape by
-    :meth:`TPSequenceParallel.begin`.
+    :meth:`TokenShardedTP.begin`.
 
     Padding rule: with ``d = gcd(tp, B)`` and ``t' = tp / d`` every sample is padded at
     its end to ``S_pad = round_up(S, t')`` tokens. Then every aligned group of
@@ -255,7 +258,7 @@ def static_nvfp4_input_scale(linear: nn.Module | None) -> torch.Tensor | None:
     calibrated scale (no AWQ ``pre_quant_scale``, no forced dynamic quantization), i.e.
     iff a row-local quantize with this scale yields exactly the bytes the Linear would
     produce itself, so the activation can be all-gathered as NVFP4. This is the rule
-    ``TPSequenceParallel`` users (Wan included) wire their ``RowNorm.quant_scale`` from.
+    ``TokenShardedTP`` users (Wan included) wire their ``RowNorm.quant_scale`` from.
     """
     if not is_static_nvfp4_input_eligible(linear):
         return None
@@ -281,7 +284,7 @@ def quantize_nvfp4(h: torch.Tensor, input_scale: torch.Tensor) -> Fp4QuantizedTe
 def _check_table_rows(op: str, rows: int, entries: int) -> None:
     if entries < 1 or rows % entries != 0:
         raise ValueError(
-            f"TPSequenceParallel.{op}: a per-row-group table of {entries} entries does not "
+            f"TokenShardedTP.{op}: a per-row-group table of {entries} entries does not "
             f"divide the {rows} local rows; build it with per_sample_table()/shard_rows()."
         )
 
@@ -295,7 +298,7 @@ def apply_residual(
         x: Residual rows ``[m, D]``.
         y: Rows to add ``[m, D]`` (same dtype as ``x``).
         gate: Optional ``[n, D]`` table; entry ``j`` applies to local rows
-            ``[j * m / n, (j + 1) * m / n)`` (see ``TPSequenceParallel.per_sample_table``).
+            ``[j * m / n, (j + 1) * m / n)`` (see ``TokenShardedTP.per_sample_table``).
 
     Returns:
         ``[m, D]`` in ``x.dtype``.
@@ -436,11 +439,11 @@ def _reduce_scatter_rows(y: torch.Tensor, group_name: str) -> torch.Tensor:
 
 
 # =============================================================================
-# TPSequenceParallel
+# TokenShardedTP
 # =============================================================================
 
 
-class TPSequenceParallel:
+class TokenShardedTP:
     """Megatron-style sequence parallelism inside a VisualGen TP group (see module docstring).
 
     Not an nn.Module (no parameters/state_dict; safe under MetaInitMode). One instance
@@ -458,18 +461,18 @@ class TPSequenceParallel:
     def __init__(self, group: dist.ProcessGroup | None, *, tp_rank: int | None = None) -> None:
         if group is None:
             raise ValueError(
-                "TPSequenceParallel needs a torch.distributed TP process group; got None "
+                "TokenShardedTP needs a torch.distributed TP process group; got None "
                 "(is the VisualGenMapping device mesh initialized?)."
             )
         tp_size = dist.get_world_size(group)
         if tp_size < 2:
             raise ValueError(
-                f"TPSequenceParallel needs a process group with at least 2 ranks (got {tp_size})."
+                f"TokenShardedTP needs a process group with at least 2 ranks (got {tp_size})."
             )
         actual_rank = dist.get_rank(group)
         if tp_rank is not None and tp_rank != actual_rank:
             raise ValueError(
-                f"TPSequenceParallel: tp_rank={tp_rank} does not match this process's rank in "
+                f"TokenShardedTP: tp_rank={tp_rank} does not match this process's rank in "
                 f"the TP process group ({actual_rank}); a rank's token shard must follow the "
                 "group rank order."
             )
@@ -483,32 +486,32 @@ class TPSequenceParallel:
         self._plan: TokenShardPlan | None = None
 
     @classmethod
-    def from_model_config(cls, model_config: "DiffusionModelConfig") -> "TPSequenceParallel | None":
-        """The helper for a VisualGen model, or None unless ``tp_sequence_parallel`` is set.
+    def from_model_config(cls, model_config: "DiffusionModelConfig") -> "TokenShardedTP | None":
+        """The helper for a VisualGen model, or None unless ``tp_layout`` is ``'token_sharded'``.
 
         Re-validates the mapping and cache backend for callers that build a
         ``DiffusionModelConfig`` directly (the ``VisualGenArgs`` validators cover the
         user-facing path).
         """
         parallel = getattr(model_config, "parallel", None)
-        if not getattr(parallel, "tp_sequence_parallel", None):
+        if not getattr(parallel, "token_sharded_tp", False):
             return None
         vgm = model_config.visual_gen_mapping
         if vgm is None:
             raise ValueError(
-                "TPSequenceParallel: tp_sequence_parallel=True needs a VisualGenMapping "
+                "TokenShardedTP: tp_layout='token_sharded' needs a VisualGenMapping "
                 "(model_config.visual_gen_mapping is None)."
             )
         if vgm.tp_size <= 1 or vgm.seq_size > 1:
             raise ValueError(
-                "TPSequenceParallel: tp_sequence_parallel=True needs a VisualGenMapping "
+                "TokenShardedTP: tp_layout='token_sharded' needs a VisualGenMapping "
                 f"with tp_size > 1 and seq_size == 1 (got tp_size={vgm.tp_size}, "
                 f"seq_size={vgm.seq_size}: ulysses={vgm.ulysses_size}, ring={vgm.ring_size}, "
                 f"attn2d={vgm.attn2d_row_size}x{vgm.attn2d_col_size})."
             )
         if model_config.cache_backend == "cache_dit":
             raise ValueError(
-                "TPSequenceParallel: tp_sequence_parallel=True does not support "
+                "TokenShardedTP: tp_layout='token_sharded' does not support "
                 "cache_backend='cache_dit' (per-block skip decisions would see "
                 "token-sharded hidden states)."
             )
@@ -539,11 +542,11 @@ class TPSequenceParallel:
             if plan.is_padded:
                 extra = batch_size * (plan.padded_seq_len - seq_len)
                 logger.info_once(
-                    f"tp_sequence_parallel: {batch_size}x{seq_len} tokens do not split evenly "
+                    f"Token-sharded TP: {batch_size}x{seq_len} tokens do not split evenly "
                     f"over tp_size={self.tp_size}; padding each sample to "
                     f"{plan.padded_seq_len} tokens ({extra} extra rows; adds copies at each "
                     "block boundary).",
-                    key=("tp_sequence_parallel_padding", batch_size, seq_len, self.tp_size),
+                    key=("token_sharded_tp_padding", batch_size, seq_len, self.tp_size),
                 )
             self._plans[key] = plan
         self._plan = plan
@@ -555,7 +558,7 @@ class TPSequenceParallel:
         if any(tuple(s) != (batch_size, seq_len) for s in shapes):
             layout = [(rank, b, s) for rank, (b, s) in enumerate(shapes)]
             raise ValueError(
-                f"TPSequenceParallel: TP ranks disagree on the token layout {layout}; all "
+                f"TokenShardedTP: TP ranks disagree on the token layout {layout}; all "
                 "ranks of a TP group must run the transformer on identically shaped inputs."
             )
 
@@ -563,7 +566,7 @@ class TPSequenceParallel:
     def plan(self) -> TokenShardPlan:
         if self._plan is None:
             raise RuntimeError(
-                "TPSequenceParallel.begin(batch_size, seq_len) must be called (in the model "
+                "TokenShardedTP.begin(batch_size, seq_len) must be called (in the model "
                 "forward) before the first block runs."
             )
         return self._plan
@@ -580,7 +583,7 @@ class TPSequenceParallel:
         if p.is_padded:
             expected += f" (B * S) or {p.padded_rows} (B * S_pad)"
         return ValueError(
-            f"TPSequenceParallel.{op}: expected {expected} rows for the current plan "
+            f"TokenShardedTP.{op}: expected {expected} rows for the current plan "
             f"({self._plan_desc()}); got {rows}."
         )
 
@@ -588,7 +591,7 @@ class TPSequenceParallel:
         m = self.plan.local_rows
         if t.dim() != 2 or t.shape[0] != m:
             raise ValueError(
-                f"TPSequenceParallel.{op}: expected this rank's [{m}, K] rows for the current "
+                f"TokenShardedTP.{op}: expected this rank's [{m}, K] rows for the current "
                 f"plan ({self._plan_desc()}); got shape {tuple(t.shape)}. Did you forget "
                 "shard(), or call begin() for another shape in between?"
             )
@@ -600,7 +603,7 @@ class TPSequenceParallel:
         p = self.plan
         if table.shape[0] not in (len(p.entry_batch), p.local_rows):
             raise ValueError(
-                f"TPSequenceParallel.{op}: {name} has {table.shape[0]} entries; the current "
+                f"TokenShardedTP.{op}: {name} has {table.shape[0]} entries; the current "
                 f"plan ({self._plan_desc()}) expects this shard's per-sample table "
                 f"({len(p.entry_batch)} entries, per_sample_table()) or per-row table "
                 f"({p.local_rows} rows, shard_rows()). A global [B, ...] table would "
@@ -613,7 +616,7 @@ class TPSequenceParallel:
         p = self.plan
         if t.dim() < 2 or tuple(t.shape[:2]) != (p.batch_size, p.seq_len):
             raise ValueError(
-                f"TPSequenceParallel.{op}: expected a [B={p.batch_size}, S={p.seq_len}, ...] "
+                f"TokenShardedTP.{op}: expected a [B={p.batch_size}, S={p.seq_len}, ...] "
                 f"tensor for the current plan; got shape {tuple(t.shape)}."
             )
         pieces = []
@@ -732,14 +735,14 @@ class TPSequenceParallel:
         m = self.plan.local_rows
         if a.reciprocal_scale is not None:
             raise ValueError(
-                "TPSequenceParallel.all_gather: cannot gather an Fp4QuantizedTensor with a "
+                "TokenShardedTP.all_gather: cannot gather an Fp4QuantizedTensor with a "
                 "per-rank dynamic scale (reciprocal_scale is set): each rank used a different "
                 "global scale. Gather the BF16 activation, or quantize with the consumer's "
                 "static input_scale."
             )
         if a.unquantized_hidden_states is not None:
             raise ValueError(
-                "TPSequenceParallel.all_gather: the Fp4QuantizedTensor carries a local "
+                "TokenShardedTP.all_gather: the Fp4QuantizedTensor carries a local "
                 "unquantized_hidden_states side-car, which cannot be gathered with it; drop "
                 "the side-car (gather payload + scaling factors only) or gather the BF16 "
                 "activation."
@@ -747,7 +750,7 @@ class TPSequenceParallel:
         payload = a.fp4_tensor
         if payload.dtype != torch.uint8 or payload.dim() != 2 or payload.shape[0] != m:
             raise ValueError(
-                f"TPSequenceParallel.all_gather: NVFP4 payload must be uint8 [{m}, K/2] for "
+                f"TokenShardedTP.all_gather: NVFP4 payload must be uint8 [{m}, K/2] for "
                 f"the current plan ({self._plan_desc()}); got {payload.dtype} "
                 f"{tuple(payload.shape)}."
             )
@@ -755,7 +758,7 @@ class TPSequenceParallel:
         expected = swizzled_sf_numel(m, k // NVFP4_SF_VEC_SIZE)
         if not a.is_sf_swizzled or a.scaling_factor.numel() != expected:
             raise ValueError(
-                "TPSequenceParallel.all_gather: NVFP4 scaling factors must be 128x4-swizzled "
+                "TokenShardedTP.all_gather: NVFP4 scaling factors must be 128x4-swizzled "
                 f"for {m} rows x {k // NVFP4_SF_VEC_SIZE} SF columns ({expected} bytes); got "
                 f"{a.scaling_factor.numel()} bytes (is_sf_swizzled={a.is_sf_swizzled})."
             )
@@ -801,12 +804,12 @@ class TPSequenceParallel:
             )
         if not ok:
             raise ValueError(
-                f"TPSequenceParallel.{op}: expected {what} to be a {mode.name.lower()}-parallel "
+                f"TokenShardedTP.{op}: expected {what} to be a {mode.name.lower()}-parallel "
                 f"Linear {detail}."
             )
         if linear.tp_size != self.tp_size:
             raise ValueError(
-                f"TPSequenceParallel.{op}: {what} is sharded for tp_size={linear.tp_size}, "
+                f"TokenShardedTP.{op}: {what} is sharded for tp_size={linear.tp_size}, "
                 f"but the helper's TP group has {self.tp_size} ranks."
             )
 
@@ -820,7 +823,7 @@ class TPSequenceParallel:
             and static_nvfp4_input_scale(consumer) is None
         ):
             raise ValueError(
-                f"TPSequenceParallel.{op}: got an NVFP4 activation, but {what} has no static "
+                f"TokenShardedTP.{op}: got an NVFP4 activation, but {what} has no static "
                 "NVFP4 input_scale (static_nvfp4_input_scale() is None); gather BF16 for it."
             )
 
@@ -848,7 +851,7 @@ class TPSequenceParallel:
         p = self.plan
         if tuple(act.shape[:-1]) not in ((p.batch_size, p.seq_len), (p.num_tokens,)):
             raise ValueError(
-                f"TPSequenceParallel.{op}: expected a [B={p.batch_size}, S={p.seq_len}, K] or "
+                f"TokenShardedTP.{op}: expected a [B={p.batch_size}, S={p.seq_len}, K] or "
                 f"[B * S={p.num_tokens}, K] input for the current plan; got shape "
                 f"{tuple(act.shape)}."
             )

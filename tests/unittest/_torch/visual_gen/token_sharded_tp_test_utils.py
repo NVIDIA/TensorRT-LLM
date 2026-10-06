@@ -12,22 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared references for the TPSequenceParallel tests (CPU, collective and kernel files).
+"""Shared references for the TokenShardedTP tests (CPU, collective and kernel files).
 
 * An independent element-by-element model of the 128x4-swizzled NVFP4 scaling-factor
   layout (``swizzle_ref`` / ``unswizzle_ref``), written from
   ``get_sf_out_offset_128x4`` in ``cpp/.../quantization.cuh`` rather than from the
   helper's ``regroup_swizzled_sf``.
-* ``simulated_helper``: a ``TPSequenceParallel`` bound to one simulated rank's plan
+* ``simulated_helper``: a ``TokenShardedTP`` bound to one simulated rank's plan
   without a process group, for row-local ops (no collective is called).
 * ``padded_rows``: the global padded ``[B * S_pad]`` stream a plan shards.
 """
 
 import torch
 
-from tensorrt_llm._torch.visual_gen.modules.tp_sequence_parallel import (
+from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import (
+    TokenShardedTP,
     TokenShardPlan,
-    TPSequenceParallel,
     swizzled_sf_numel,
 )
 from tensorrt_llm.math_utils import pad_up
@@ -65,12 +65,12 @@ def unswizzle_ref(buf: torch.Tensor, rows: int, sf_cols: int) -> torch.Tensor:
     return buf.reshape(-1)[sf_offsets(rows, sf_cols, buf.device)].view(rows, sf_cols)
 
 
-def simulated_helper(plan: TokenShardPlan) -> TPSequenceParallel:
-    """A TPSequenceParallel bound to one simulated rank's plan (no process group).
+def simulated_helper(plan: TokenShardPlan) -> TokenShardedTP:
+    """A TokenShardedTP bound to one simulated rank's plan (no process group).
 
     Only row-local methods (shard, tables, residual, norm, padding) may be called.
     """
-    sp = TPSequenceParallel.__new__(TPSequenceParallel)
+    sp = TokenShardedTP.__new__(TokenShardedTP)
     sp.group, sp.group_name = None, "simulated"
     sp.tp_size, sp.tp_rank = plan.tp_size, plan.tp_rank
     sp._plans = {(plan.batch_size, plan.seq_len): plan}

@@ -1,22 +1,22 @@
-# Sequence-Parallel Tensor Parallelism (SP-TP) Developer Guide
+# Token-Sharded Tensor Parallelism Developer Guide
 
 ## Scope
 
-This guide covers `parallel_config.tp_sequence_parallel` in VisualGen:
+This guide covers `parallel_config.tp_layout='token_sharded'` in VisualGen:
 
-- `tensorrt_llm/_torch/visual_gen/modules/tp_sequence_parallel.py` — the model-neutral
-  helper (`TPSequenceParallel`, `TokenShardPlan`, `RowNorm`, row-local functions).
+- `tensorrt_llm/_torch/visual_gen/parallel/token_sharded_tp.py` — the model-neutral
+  helper (`TokenShardedTP`, `TokenShardPlan`, `RowNorm`, row-local functions).
 - `tensorrt_llm/_torch/visual_gen/modules/fused_norm_quant.py` — the fused
   LayerNorm(+AdaLN / affine)(+NVFP4) wrappers the helper uses at `D == 5120`.
 - `tensorrt_llm/_torch/visual_gen/models/wan/transformer_wan.py` — the first adopter
   (`WanBlock._forward_sp_tp`).
 
-Use it when adding SP-TP to another DiT (in-tree or your own model code), or when
+Use it when adding token-sharded TP to another DiT (in-tree or your own model code), or when
 changing the helper. User-facing configuration is in
 [docs/source/models/visual-generation.md](../../../../docs/source/models/visual-generation.md)
 (Multi-GPU Parallelism).
 
-Status: prototype. `tp_sequence_parallel: None` (the default) means off.
+Status: prototype. `tp_layout` unset (the default) or `replicated` means off.
 
 ## What it does
 
@@ -26,7 +26,7 @@ With plain tensor parallelism (TP) every rank holds the full residual stream
 (residual add, LayerNorm, AdaLN modulation, NVFP4 quantization) runs redundantly on all
 `B * S` tokens on every rank.
 
-SP-TP (Megatron-style sequence parallelism) keeps the residual stream **token-sharded**
+Token-sharded TP (Megatron-style sequence parallelism) keeps the residual stream **token-sharded**
 across the TP group between projections. Each all-reduce becomes a reduce-scatter
 (to the rank's rows) plus an all-gather (before the next column-parallel projection):
 
@@ -55,7 +55,7 @@ C: reduce-scatter ─► gated residual ─► next block's norm1
   (2 bytes/element), so fewer bytes cross NVLink than with the all-reduce.
 
 It is **not** Ulysses or Ring attention: those shard the sequence *through* attention
-(`ulysses_size`, `ring_size`, `attn2d_size`); SP-TP only shards it *between* projections
+(`ulysses_size`, `ring_size`, `attn2d_size`); token-sharded TP only shards it *between* projections
 inside a TP group. Combining the two is currently rejected.
 
 ## Invariants
@@ -85,7 +85,7 @@ inside a TP group. Combining the two is currently rejected.
   `tp = 4` both use the same algorithm class and reach the same precision. At
   **`tp >= 8` on NVSwitch systems** NCCL's default tuning runs the all-reduce as NVLS but
   the reduce-scatter as a ring, which rounds to bf16 after each of its `tp - 1` hops, so
-  SP-TP is measurably less precise than all-reduce TP there.
+  Token-sharded TP is measurably less precise than all-reduce TP there.
   Measured on 8x B200 (NGC 1.3.0rc29), bf16 partials of shape `[151200, 5120]` (Wan
   14B, 720p 81 frames, batched CFG) against the fp32 sum rounded once:
 
@@ -97,12 +97,12 @@ inside a TP group. Combining the two is currently rejected.
 
   On one static-NVFP4 Wan block (`D = 5120`, TP8) the default ring reduce-scatter
   raises the block's rel-L2 against an fp32-exact all-reduce from 5.3e-3 (AR-TP) to
-  6.4e-3; with `NCCL_ALGO="ReduceScatter:NVLS"` SP-TP is bitwise equal to AR-TP, at
+  6.4e-3; with `NCCL_ALGO="ReduceScatter:NVLS"` token-sharded TP is bitwise equal to AR-TP, at
   about 40 % more reduce-scatter time (`[75600, 5120]`: 1.09 ms ring, 1.52 ms NVLS).
-  The block test D8 bounds SP-TP's error against an fp32-exact all-reduce at 1.5x
+  The block test D8 bounds token-sharded TP's error against an fp32-exact all-reduce at 1.5x
   AR-TP's.
 - **Per-token AdaLN (2-D timesteps, e.g. TI2V).** The all-reduce path uses the fused
-  per-token AdaLN kernel (SM100, hidden size % 256 == 0); SP-TP applies per-token
+  per-token AdaLN kernel (SM100, hidden size % 256 == 0); token-sharded TP applies per-token
   modulation on the shard with the model's LayerNorm module. The results differ in the
   last bits.
 
@@ -144,7 +144,7 @@ The plan is a frozen dataclass of Python ints (compile and CUDA-graph safe), cac
 
 ## Building blocks
 
-`TPSequenceParallel` is not an `nn.Module`: it holds no parameters or tensors, one
+`TokenShardedTP` is not an `nn.Module`: it holds no parameters or tensors, one
 instance per transformer (per token stream), and blocks keep a plain reference.
 
 | Call | Shapes / contract |
@@ -207,12 +207,12 @@ the same as the global one, so that case cannot be caught.
 | `norm` callable | Row-local `[m, N] → [m, N]` or an `Fp4QuantizedTensor` for `m` rows. |
 | NVFP4 activations | Quantize with the **consumer's** static input scale (`static_nvfp4_input_scale(consumer)`) and give the result only to that consumer: a TRT-LLM `Linear` fed a pre-quantized input without `reciprocal_scale` uses its own `input_scale`-derived alpha, and the helper cannot check that the two scales are the same tensor. |
 
-## Using SP-TP in your own DiT
+## Using token-sharded TP in your own DiT
 
-1. **Group.** Inside VisualGen: `TPSequenceParallel.from_model_config(model_config)`
-   (returns `None` unless `tp_sequence_parallel` is set, and validates the mapping).
+1. **Group.** Inside VisualGen: `TokenShardedTP.from_model_config(model_config)`
+   (returns `None` unless `tp_layout` is `token_sharded`, and validates the mapping).
    Elsewhere the helper itself only needs a `torch.distributed` group:
-   `TPSequenceParallel(tp_process_group)`; the group rank order is the token-shard order.
+   `TokenShardedTP(tp_process_group)`; the group rank order is the token-shard order.
 2. **Layers.** TRT-LLM `Linear` / `MLP` / `GatedMLP` need a TRT-LLM `Mapping` whose TP
    communicators exist: inside VisualGen that is `model_config.mapping`; outside it build
    the mapping with `VisualGenMapping(...).to_llm_mapping()` and give `MLP` / `GatedMLP`
@@ -223,7 +223,7 @@ the same as the global one, so that case cannot be caught.
    - Row projections: `Linear(..., tensor_parallel_mode=ROW, reduce_output=False)`,
      `MLP(reduce_output=False)` / `GatedMLP(reduce_output=False)`, VisualGen
      `Attention(reduce_output=False)` (its `to_out`).
-   - For a `BaseDiffusionModel` subclass set `_supports_tp_sequence_parallel = True`
+   - For a `BaseDiffusionModel` subclass set `_supports_token_sharded_tp = True`
      (otherwise the base class rejects the option).
 3. **Per forward (eager).** `sp.begin(B, S)`, `x = sp.shard(x)`, the blocks, then
    `x = sp.unshard(x)` before the (replicated) output head.
@@ -241,7 +241,7 @@ the same as the global one, so that case cannot be caught.
 class MyBlock(nn.Module):
     def __init__(self, model_config, sp):
         super().__init__()
-        self.sp = sp  # TPSequenceParallel or None
+        self.sp = sp  # TokenShardedTP or None
         mapping = model_config.mapping
         self.norm1 = LayerNorm(hidden_size=D, eps=1e-6, has_weights=False, has_bias=False)
         self.qkv = Linear(D, 3 * D, mapping=mapping, reduce_output=False,
@@ -285,7 +285,7 @@ class MyBlock(nn.Module):
 The rule: gather NVFP4 iff the consumer has a **static** NVFP4 input scale
 (`static_nvfp4_input_scale(linear)` is not `None`); quantizing each shard with that
 scale gives exactly the bytes the consumer would produce on all rows. Wan wires its
-`RowNorm.quant_scale` values with this function when SP-TP is on.
+`RowNorm.quant_scale` values with this function when token-sharded TP is on.
 
 | Checkpoint / mode | Gathered | Numerics vs all-reduce TP |
 |---|---|---|
@@ -306,7 +306,7 @@ Inductor).
 ## torch.compile and CUDA graphs
 
 - `begin`, `shard` and `unshard` run in the eager model forward; blocks are compiled one
-  by one as today. Inside a block SP-TP adds only functional collectives
+  by one as today. Inside a block token-sharded TP adds only functional collectives
   (`all_gather_single` / `reduce_scatter_single` on the group *name*, each followed by
   an explicit wait), views/pads, existing custom ops and reads of the plan's Python ints.
 - Each new `(B, S)` specializes the block graphs: the plan's ints are guarded as
@@ -315,7 +315,7 @@ Inductor).
   under `torch._dynamo.config.cache_size_limit` (the pipeline sets 128), beyond which
   Dynamo falls back to eager.
 - No logging and no object collectives run inside blocks.
-- SP-TP adds no graph break of its own (tested against the all-reduce path's break
+- Token-sharded TP adds no graph break of its own (tested against the all-reduce path's break
   reasons); blocks keep the pre-existing QK-norm all-reduce break.
 - CUDA graphs: the runner's eager warmups create the plan (and its shape check) before
   capture; nothing in the captured region allocates on the host or copies host to device.
@@ -348,7 +348,7 @@ Inductor).
 - Composition with Ulysses / ring (nest the token shard inside the sequence shard).
 - Other models: a declarative per-model plan (module-name patterns mapped to gather / scatter
   styles, applied with hooks), so a model's own block forward runs unchanged on a per-sample
-  token layout; `_supports_tp_sequence_parallel` stays the opt-in. The explicit boundary ops
+  token layout; `_supports_token_sharded_tp` stays the opt-in. The explicit boundary ops
   remain for paths that need fused norm + quantize (Wan today).
 - Coalescing the payload and scaling-factor all-gathers.
 - Symbolic plan sizes, so blocks stay shape-dynamic across `(B, S)`.
@@ -357,9 +357,9 @@ Inductor).
 
 | Level | File |
 |---|---|
-| Plan, row-local ops, SF layout, shape/table checks, validation (CPU) | `tests/unittest/_torch/visual_gen/test_tp_sequence_parallel.py` |
-| Collectives, gloo and NCCL (bitwise), Linear/MLP/GatedMLP checks, compile, CUDA graphs | `tests/unittest/_torch/visual_gen/multi_gpu/test_tp_sequence_parallel_collectives.py` |
-| Fused LN + NVFP4 on shards (SM100) | `tests/unittest/_torch/visual_gen/kernels/parallel/test_tp_sequence_parallel_norm.py` |
-| Wan model / block level (bitwise vs emulated all-reduce, vs single GPU, vs fp32-exact all-reduce) | `tests/unittest/_torch/visual_gen/multi_gpu/test_wan_tp_sequence_parallel.py` |
+| Plan, row-local ops, SF layout, shape/table checks, validation (CPU) | `tests/unittest/_torch/visual_gen/test_token_sharded_tp.py` |
+| Collectives, gloo and NCCL (bitwise), Linear/MLP/GatedMLP checks, compile, CUDA graphs | `tests/unittest/_torch/visual_gen/multi_gpu/test_token_sharded_tp_collectives.py` |
+| Fused LN + NVFP4 on shards (SM100) | `tests/unittest/_torch/visual_gen/kernels/parallel/test_token_sharded_tp_norm.py` |
+| Wan model / block level (bitwise vs emulated all-reduce, vs single GPU, vs fp32-exact all-reduce) | `tests/unittest/_torch/visual_gen/multi_gpu/test_wan_token_sharded_tp.py` |
 | E2E LPIPS (`cfg2_tp2_sp`) | `tests/integration/defs/examples/visual_gen/test_visual_gen_multi_gpu.py` |
-| Shared SF-layout references for the tests above | `tests/unittest/_torch/visual_gen/tp_sequence_parallel_test_utils.py` |
+| Shared SF-layout references for the tests above | `tests/unittest/_torch/visual_gen/token_sharded_tp_test_utils.py` |

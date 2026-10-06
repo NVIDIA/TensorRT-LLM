@@ -12,26 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Multi-GPU tests for Wan with parallel_config.tp_sequence_parallel (SP-TP).
+"""Multi-GPU tests for Wan with parallel_config.tp_layout='token_sharded' (token-sharded TP).
 
-SP-TP token-shards the residual stream inside the TP group (reduce-scatter +
+Token-sharded TP shards the residual stream's tokens inside the TP group (reduce-scatter +
 all-gather instead of all-reduce). Every model/block case compares three things with
 the same weights:
 
-* SP-TP vs the all-reduce TP model whose three row-parallel all-reduces are replaced by
+* Token-sharded TP vs the all-reduce TP model whose three row-parallel all-reduces are replaced by
   the helper's own reduce-scatter + all-gather (``_EmulatedAllReduce``): both paths then
   reduce identically, so the transformer blocks' output must match bitwise and any wiring
   difference (modulation tables, per-token rows, padding, norms, FP4 gathers) shows up;
-* SP-TP vs the single-GPU model (relative L2, against rank 0's reference), with a
+* Token-sharded TP vs the single-GPU model (relative L2, against rank 0's reference), with a
   self-check that the bound is well below the effect of a modulation mix-up;
-* SP-TP vs the real all-reduce TP model / an fp32-exact all-reduce (the only remaining
+* Token-sharded TP vs the real all-reduce TP model / an fp32-exact all-reduce (the only remaining
   difference is the collective's reduction order and algorithm).
 
 Assertions are rank-lockstep (the verdict is all-reduced before asserting), so a failure
 on one rank does not leave its peers waiting in a collective.
 
 Run with (needs >= 4 GPUs; the TP8 block case needs 8):
-    pytest tests/unittest/_torch/visual_gen/multi_gpu/test_wan_tp_sequence_parallel.py -v
+    pytest tests/unittest/_torch/visual_gen/multi_gpu/test_wan_token_sharded_tp.py -v
 """
 
 import os
@@ -90,7 +90,7 @@ def _check(ok, msg):
 class _EmulatedAllReduce(nn.Module):
     """A row-parallel Linear's all-reduce done as the helper's reduce-scatter + all-gather.
 
-    Put into an all-reduce TP model, it makes that model reduce exactly like SP-TP, so
+    Put into an all-reduce TP model, it makes that model reduce exactly like token-sharded TP, so
     the two must agree bitwise. Needs ``sp.begin(B, S)`` for the forward's shape.
     """
 
@@ -138,10 +138,10 @@ def _capture_head_input(model):
 
 
 def _use_eager_per_token_adaln(model):
-    """Make an all-reduce Wan model run per-token AdaLN eagerly, as SP-TP does.
+    """Make an all-reduce Wan model run per-token AdaLN eagerly, as token-sharded TP does.
 
     The fused per-token AdaLN kernel (SM100, hidden size % 256 == 0) is an optimization of
-    the all-reduce path only; SP-TP applies per-token modulation on the shard with the
+    the all-reduce path only; token-sharded TP applies per-token modulation on the shard with the
     model's LayerNorm module, so the bitwise wiring check compares like with like.
     """
     for blk in model.blocks:
@@ -172,7 +172,7 @@ def _amplify_modulation(model, seed=11):
 
 
 def _build_models(rank, world_size, config_dict):
-    """Single-GPU reference, SP-TP model and all-reduce TP model with the same weights."""
+    """Single-GPU reference, token-sharded TP model and all-reduce TP model with the same weights."""
     from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 
     device = torch.device(f"cuda:{rank}")
@@ -182,7 +182,7 @@ def _build_models(rank, world_size, config_dict):
     _stabilize_model_weights(ref)
     _amplify_modulation(ref)
     torch.manual_seed(123)
-    sp_cfg = _make_model_config(config_dict, tp_size=world_size, tp_sequence_parallel=True)
+    sp_cfg = _make_model_config(config_dict, tp_size=world_size, tp_layout="token_sharded")
     sp_model = WanTransformer3DModel(sp_cfg).to(device).to(torch.bfloat16)
     _copy_ref_weights_to_tp(ref, sp_model, rank, world_size, config_dict)
     assert sp_model._sp_tp is not None and sp_model._sp_tp.tp_size == world_size
@@ -214,14 +214,14 @@ def _inputs(device, batch, thw, timestep, image_dim=None, seed=456):
 
 
 # =============================================================================
-# D1-D5. SP-TP vs emulated / real all-reduce TP and vs single GPU
+# D1-D5. Token-sharded TP vs emulated / real all-reduce TP and vs single GPU
 # =============================================================================
 
-# SP-TP vs single GPU (rel-L2). A modulation mix-up must move the reference by more than
+# Token-sharded TP vs single GPU (rel-L2). A modulation mix-up must move the reference by more than
 # _SENSITIVITY x this bound.
 _SINGLE_GPU_REL_L2 = 2e-2
 _SENSITIVITY = 10
-# SP-TP vs the real all-reduce TP model (reduction order of the collectives only).
+# Token-sharded TP vs the real all-reduce TP model (reduction order of the collectives only).
 _ALL_REDUCE_REL_L2 = 5e-3
 
 
@@ -263,25 +263,25 @@ def _logic_vs_single_gpu(
             mixed_err = _rel_l2(mixed_out, ref_out)
     ok = sp_out.shape == ref_out.shape == inputs["hidden_states"].shape
     _check(ok and bool(torch.isfinite(sp_out).all()), f"{case}: shape/finite {sp_out.shape}")
-    # SP-TP only changes the transformer blocks: their output must be bitwise equal. The
+    # Token-sharded TP only changes the transformer blocks: their output must be bitwise equal. The
     # replicated output head may still round differently when the all-reduce path hands it
     # a differently strided tensor (expand_timesteps broadcasts temb per token there).
     _check(
         torch.equal(sp_blocks["x"], emu_blocks["x"]),
-        f"{case}: SP-TP blocks != all-reduce TP blocks with the same collectives (rel-L2 "
+        f"{case}: token-sharded TP blocks != all-reduce TP blocks with the same collectives (rel-L2 "
         f"{_rel_l2(sp_blocks['x'], emu_blocks['x']):.3e})",
     )
     err = _rel_l2(sp_out, emu_out)
     _check(err <= 1e-3, f"{case}: output vs all-reduce TP with the same collectives {err:.3e}")
     err = _rel_l2(sp_out, ref_out)
-    _check(err <= _SINGLE_GPU_REL_L2, f"{case}: SP-TP vs single GPU rel-L2 {err:.3e}")
+    _check(err <= _SINGLE_GPU_REL_L2, f"{case}: token-sharded TP vs single GPU rel-L2 {err:.3e}")
     if mixed_err is not None:
         _check(
             mixed_err >= _SENSITIVITY * _SINGLE_GPU_REL_L2,
             f"{case}: a modulation mix-up moves the reference only by rel-L2 {mixed_err:.3e}",
         )
     err = _rel_l2(sp_out, ar_out)
-    _check(err <= _ALL_REDUCE_REL_L2, f"{case}: SP-TP vs all-reduce TP rel-L2 {err:.3e}")
+    _check(err <= _ALL_REDUCE_REL_L2, f"{case}: token-sharded TP vs all-reduce TP rel-L2 {err:.3e}")
 
 
 def _logic_cases(rank, world_size, cases):
@@ -338,7 +338,7 @@ _TP2_CASES = [
         )
         for thw in ((2, 4, 4), (1, 6, 6))
     ],
-    # D5b: expand_timesteps=True with 1-D per-sample timesteps (SP-TP keeps temb [B, 6, D]).
+    # D5b: expand_timesteps=True with 1-D per-sample timesteps (token-sharded TP keeps temb [B, 6, D]).
     dict(
         case="D5b_expand_uniform",
         config_dict=_T2V_EXPAND,
@@ -350,7 +350,7 @@ _TP2_CASES = [
 ]
 
 
-class TestWanTPSequenceParallel:
+class TestWanTokenShardedTP:
     def test_tp2_cases(self):
         """D1 (T2V B=1), D4 (I2V), D5 (per-token temb, S=8 and padded S=9), D5b
         (expand_timesteps with per-sample temb), TP2, in one spawn."""
@@ -426,17 +426,19 @@ def _logic_compiled_blocks(rank, world_size):
     outs, sp_reasons = _compiled_break_reasons(sp_model, all_inputs)
     for i, (out, ref) in enumerate(zip(outs, eager)):
         err = _rel_l2(out, ref)
-        _check(err <= 1e-2, f"compiled vs eager SP-TP, input {i}: rel-L2 {err:.3e}")
-    # SP-TP adds no graph break of its own: every break reason also occurs on the
+        _check(err <= 1e-2, f"compiled vs eager token-sharded TP, input {i}: rel-L2 {err:.3e}")
+    # Token-sharded TP adds no graph break of its own: every break reason also occurs on the
     # all-reduce path (the pre-existing QK-norm all-reduce / mesh lookup break).
     _, ar_reasons = _compiled_break_reasons(ar_model, all_inputs)
-    _check(sp_reasons <= ar_reasons, f"SP-TP-only graph breaks: {sp_reasons - ar_reasons}")
+    _check(
+        sp_reasons <= ar_reasons, f"token-sharded TP-only graph breaks: {sp_reasons - ar_reasons}"
+    )
 
 
-class TestWanTPSequenceParallelCompile:
+class TestWanTokenShardedTPCompile:
     def test_compiled_blocks_tp2(self):
         """D6: per-block torch.compile (fullgraph=False), two shapes and a revisit, TP2:
-        matches eager SP-TP and adds no graph break beyond the all-reduce path's."""
+        matches eager token-sharded TP and adds no graph break beyond the all-reduce path's."""
         run_test_in_distributed(world_size=2, test_fn=_logic_compiled_blocks)
 
 
@@ -478,10 +480,10 @@ def _logic_cuda_graph(rank, world_size):
         torch.cuda.synchronize()
 
 
-class TestWanTPSequenceParallelCudaGraph:
+class TestWanTokenShardedTPCudaGraph:
     def test_cuda_graph_tp2(self):
         """D7: CUDAGraphRunner-wrapped forward, two keys (one padded) with switches and
-        revisits, TP2 == eager SP-TP (bitwise)."""
+        revisits, TP2 == eager token-sharded TP (bitwise)."""
         run_test_in_distributed(world_size=2, test_fn=_logic_cuda_graph)
 
 
@@ -500,7 +502,7 @@ _E2M1_MAX, _FP8_MAX = 6.0, 448.0
 _ATTN1_QKV = ("attn1.to_q", "attn1.to_k", "attn1.to_v")  # fused into attn1.qkv_proj
 
 
-def _block_config(vgm, quant, tp_sequence_parallel):
+def _block_config(vgm, quant, token_sharded):
     world_size = vgm.tp_size
     cfg = DiffusionModelConfig(
         pretrained_config=SimpleNamespace(**_D5120_BLOCK),
@@ -508,7 +510,9 @@ def _block_config(vgm, quant, tp_sequence_parallel):
         torch_compile=TorchCompileConfig(enable=False),
         attention=AttentionConfig(backend="VANILLA"),
         visual_gen_mapping=vgm,
-        parallel=ParallelConfig(tp_size=world_size, tp_sequence_parallel=tp_sequence_parallel),
+        parallel=ParallelConfig(
+            tp_size=world_size, tp_layout="token_sharded" if token_sharded else None
+        ),
         skip_create_weights_in_init=False,
     )
     cfg.mapping = vgm.to_llm_mapping()
@@ -561,7 +565,7 @@ def _to_nvfp4(entry, act_amax, weight_amax=None):
 
 def _load_block(block, linear_weights, params, sp_tp=False):
     from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import get_nvfp4_input_scale
-    from tensorrt_llm._torch.visual_gen.modules.tp_sequence_parallel import static_nvfp4_input_scale
+    from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import static_nvfp4_input_scale
 
     for name, module in block.named_modules():
         if not isinstance(module, Linear):
@@ -621,7 +625,7 @@ def _logic_nvfp4_block(rank, world_size, *, batch, thw):
         WanBlock,
         WanRotaryPosEmbed,
     )
-    from tensorrt_llm._torch.visual_gen.modules.tp_sequence_parallel import TPSequenceParallel
+    from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import TokenShardedTP
 
     device = torch.device(f"cuda:{rank}")
     d, ffn, text_len = 5120, _D5120_BLOCK["ffn_dim"], 64
@@ -648,7 +652,7 @@ def _logic_nvfp4_block(rank, world_size, *, batch, thw):
     ar_block = WanBlock(_block_config(vgm, True, False), 0).to(device)
     _load_block(ar_block, fp4_weights, params)
     sp_cfg = _block_config(vgm, True, True)
-    sp = TPSequenceParallel.from_model_config(sp_cfg)
+    sp = TokenShardedTP.from_model_config(sp_cfg)
     sp_block = WanBlock(sp_cfg, 0, sp_tp=sp).to(device)
     _load_block(sp_block, fp4_weights, params, sp_tp=True)
     for blk in (ar_block, sp_block):
@@ -687,23 +691,23 @@ def _logic_nvfp4_block(rank, world_size, *, batch, thw):
     expected = {"attn1.qkv_proj": fp4, "attn2.to_q": fp4, "ffn": fp4}
     _check(seen == expected, f"boundary inputs {seen}")
     desc = f"tp={world_size} B={batch} S={seq} padded={sp.plan.is_padded}"
-    _check(torch.equal(out, emu), f"{desc}: SP-TP != emulated all-reduce block")
+    _check(torch.equal(out, emu), f"{desc}: token-sharded TP != emulated all-reduce block")
     cos = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.float().flatten(), dim=0)
     err = _rel_l2(out, ref)
     _check(
         cos.item() >= 0.999 and err <= 2e-2, f"{desc}: vs all-reduce cos={cos:.6f} rel-L2={err:.3e}"
     )
-    # Precision against a correctly rounded all-reduce: SP-TP's reduce-scatter may use a
+    # Precision against a correctly rounded all-reduce: token-sharded TP's reduce-scatter may use a
     # different NCCL algorithm than the all-reduce (ring vs NVLS at TP8), but must stay
     # within 1.5x of the all-reduce block's error.
     sp_err, ar_err = _rel_l2(out, exact), _rel_l2(ref, exact)
     _check(
         sp_err <= 1.5 * ar_err + 1e-6,
-        f"{desc}: vs fp32-exact all-reduce: SP-TP rel-L2 {sp_err:.3e}, all-reduce TP {ar_err:.3e}",
+        f"{desc}: vs fp32-exact all-reduce: token-sharded TP rel-L2 {sp_err:.3e}, all-reduce TP {ar_err:.3e}",
     )
 
 
-class TestWanTPSequenceParallelNVFP4Block:
+class TestWanTokenShardedTPNVFP4Block:
     @pytest.mark.parametrize(
         "world_size,batch,thw",
         [(2, 2, (1, 16, 16)), (3, 2, (3, 5, 7)), (4, 2, (3, 5, 7)), (8, 2, (4, 15, 16))],
@@ -733,7 +737,7 @@ def _logic_vsa_rejected(rank, world_size):
         dict(_WAN_T2V_TEST_CONFIG, attention_head_dim=128),
         tp_size=world_size,
         backend="CUTEDSL",
-        tp_sequence_parallel=True,
+        tp_layout="token_sharded",
     )
     cfg.attention = AttentionConfig(
         backend="CUTEDSL", sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9)
@@ -742,9 +746,9 @@ def _logic_vsa_rejected(rank, world_size):
         WanTransformer3DModel(cfg)
 
 
-class TestWanTPSequenceParallelRejections:
+class TestWanTokenShardedTPRejections:
     def test_vsa_rejected(self):
-        """D9: tp_sequence_parallel + VSA raises."""
+        """D9: token-sharded TP + VSA raises."""
         run_test_in_distributed(world_size=2, test_fn=_logic_vsa_rejected)
 
 

@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Collective tests for the TP sequence-parallel helper (TPSequenceParallel).
+"""Collective tests for the token-sharded TP helper (TokenShardedTP).
 
 Every case runs over a real process group: the ``*_gloo`` tests on CPU (gloo; selected
 by ``-m cpu_only`` in the CPU lane) and the ``*_nccl`` tests on GPUs. The functional
@@ -30,7 +30,7 @@ blocked in a collective instead of hanging until the NCCL watchdog
 receive the device (CPU for gloo).
 
 Run with:
-    pytest tests/unittest/_torch/visual_gen/multi_gpu/test_tp_sequence_parallel_collectives.py -v
+    pytest tests/unittest/_torch/visual_gen/multi_gpu/test_token_sharded_tp_collectives.py -v
 """
 
 import os
@@ -48,9 +48,9 @@ import torch.multiprocessing as mp
 
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
-from tensorrt_llm._torch.visual_gen.modules.tp_sequence_parallel import (
+from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import (
     RowNorm,
-    TPSequenceParallel,
+    TokenShardedTP,
     quantize_nvfp4,
     static_nvfp4_input_scale,
     swizzled_sf_numel,
@@ -63,7 +63,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 # directory on sys.path for the multi_gpu package; spawned workers inherit it).
 __extra_import_path__ = [".."]
 
-from tp_sequence_parallel_test_utils import padded_rows, swizzle_ref, unswizzle_ref
+from token_sharded_tp_test_utils import padded_rows, swizzle_ref, unswizzle_ref
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -139,7 +139,7 @@ def _real_row_mask(plan, device):
 
 
 def _helper():
-    return TPSequenceParallel(dist.group.WORLD)
+    return TokenShardedTP(dist.group.WORLD)
 
 
 def _check(ok, msg, device):

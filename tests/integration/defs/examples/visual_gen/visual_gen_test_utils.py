@@ -757,15 +757,15 @@ def _run_wan_lpips_pipeline(
     with _lpips_deterministic_algorithms(fully_eager=fully_eager):
         args = VisualGenArgs(**args_kwargs)
         pipeline = PipelineLoader(args).load(skip_warmup=True)
-        if args.parallel_config.tp_sequence_parallel:
-            # At TP2 sequence-parallel TP is bitwise equal to all-reduce TP, so the LPIPS
+        if args.parallel_config.token_sharded_tp:
+            # At TP2 token-sharded TP is bitwise equal to all-reduce TP, so the LPIPS
             # scores cannot show whether it engaged: check the transformers built it.
             for name in ("transformer", "transformer_2"):
                 transformer = getattr(pipeline, name, None)
                 if transformer is not None:
                     assert getattr(transformer, "_sp_tp", None) is not None, (
-                        f"parallel_config.tp_sequence_parallel is set but pipeline.{name} "
-                        "did not build its TPSequenceParallel helper"
+                        f"parallel_config.tp_layout='token_sharded' but pipeline.{name} "
+                        "did not build its TokenShardedTP helper"
                     )
         try:
             with torch.no_grad():

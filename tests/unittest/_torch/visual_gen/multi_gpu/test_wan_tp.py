@@ -156,11 +156,11 @@ _WAN_I2V_UNEVEN_TP3_CONFIG = dict(_WAN_I2V_TEST_CONFIG)
 
 
 def _make_model_config(
-    pretrained_dict, tp_size=1, ulysses_size=1, backend="VANILLA", tp_sequence_parallel=False
+    pretrained_dict, tp_size=1, ulysses_size=1, backend="VANILLA", tp_layout=None
 ):
     """Create DiffusionModelConfig for testing with TP and/or Ulysses.
 
-    tp_sequence_parallel=True enables parallel_config.tp_sequence_parallel (needs tp_size > 1).
+    tp_layout="token_sharded" enables the token-sharded TP layout (needs tp_size > 1).
     """
     pretrained_config = SimpleNamespace(**pretrained_dict)
     ws = tp_size * ulysses_size
@@ -180,7 +180,7 @@ def _make_model_config(
         parallel=ParallelConfig(
             tp_size=tp_size,
             ulysses_size=ulysses_size,
-            tp_sequence_parallel=tp_sequence_parallel,
+            tp_layout=tp_layout,
         ),
         cache=None,
         attention_metadata_state=(

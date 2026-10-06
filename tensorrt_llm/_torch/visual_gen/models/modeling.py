@@ -30,21 +30,21 @@ if TYPE_CHECKING:
 class BaseDiffusionModel(nn.Module):
     """Base class for TRT-LLM VisualGen model components."""
 
-    # Models that implement parallel_config.tp_sequence_parallel (token-sharded residual
-    # stream inside the TP group, see modules/tp_sequence_parallel.py) set this to True.
-    _supports_tp_sequence_parallel: ClassVar[bool] = False
+    # Models that implement parallel_config.tp_layout='token_sharded' (token-sharded residual
+    # stream inside the TP group, see parallel/token_sharded_tp.py) set this to True.
+    _supports_token_sharded_tp: ClassVar[bool] = False
 
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__()
         parallel = getattr(model_config, "parallel", None)
         if (
-            getattr(parallel, "tp_sequence_parallel", None)
-            and not type(self)._supports_tp_sequence_parallel
+            getattr(parallel, "token_sharded_tp", False)
+            and not type(self)._supports_token_sharded_tp
         ):
             raise ValueError(
-                "parallel_config.tp_sequence_parallel=True is not implemented for "
+                "parallel_config.tp_layout='token_sharded' is not implemented for "
                 f"{type(self).__name__} (the model does not set "
-                "_supports_tp_sequence_parallel = True). Unset tp_sequence_parallel to use "
+                "_supports_token_sharded_tp = True). Unset tp_layout to use "
                 "all-reduce tensor parallelism."
             )
         self.model_config = model_config
