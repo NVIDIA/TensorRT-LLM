@@ -212,3 +212,18 @@ add_tllm_kernel_library(
   LINK_LIBRARIES ${mmha_targets})
 
 list(APPEND TLLM_KERNEL_COMPONENT_TARGETS trtllm_gen_fmha)
+
+add_tllm_kernel_library(
+  tllm_kernel_lora
+  SOURCES
+  groupGemm.cu
+  splitkGroupGemm.cu
+  lora/lora.cpp
+  lora/dora.cpp
+  lora/loraGroupGEMMParamFillRowReorderFusion.cu
+  doraScaling.cu
+  LINK_LIBRARIES
+  tllm::common_cublas
+  tllm::kernel_cutlass_headers
+  tllm::runtime_buffers
+  tllm::common_environment)
