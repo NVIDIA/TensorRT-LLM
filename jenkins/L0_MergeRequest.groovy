@@ -217,6 +217,25 @@ def BOLT_CONSUME = "bolt_consume"
 // resolveBoltConsume() still applies the post-merge and branch restrictions.
 @Field
 def ENABLE_BOLT_PREMERGE_CONSUME = false
+// Version-controlled rollout switch for post-merge BOLT, same idiom as above.
+//
+// Post-merge cannot use the pre-merge shape, where the BOLTed build REPLACES the
+// canonical tarball: that tarball is BoltProfileGen's input and must stay
+// un-BOLTed, or the next bundle is generated from already-optimized binaries.
+// So post-merge publishes BOTH -- canonical untouched, plus bolted-<tarName>
+// carrying a bolt.ref property naming the bundle applied.
+//
+// On means post-merge SBSA also runs its tests against bolted-<tarName> instead
+// of only publishing it. Turning it off stops both the extra publish and the
+// test-side switch; the canonical tarball is never touched either way, so a
+// post-merge run with this off is byte-for-byte what it is today.
+//
+// This is deliberately not the pre-merge switch above. Post-merge is scoped to
+// one branch and one arch, and it exercises the same apply-to-tarball path a
+// pre-merge build would, which is what makes it the smoke test for flipping
+// ENABLE_BOLT_PREMERGE_CONSUME afterwards.
+@Field
+def ENABLE_BOLT_POSTMERGE_VARIANT = true
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -268,6 +287,13 @@ def BOLT_CONSUME_BUILD = "bolt_consume_build"
 // unpinned, i.e. today's read-`latest`-per-consumer behaviour.
 @Field
 def BOLT_PROFILE_REF = "bolt_profile_ref"
+// Whether this run's build publishes bolted-<tarName> beside an untouched
+// canonical. Decided once: the build needs it to know what to publish, and the
+// test stages need it to know what to fetch. Two copies of the condition would
+// eventually disagree, and the failure would be tests silently reading the
+// un-BOLTed tarball -- indistinguishable from a healthy run.
+@Field
+def BOLT_PUBLISH_VARIANT = "bolt_publish_variant"
 // The branch whose promote directory holds that bundle. A ref alone does not
 // address an object -- the path is <branch>/<triple>/bolt-profile-<ref>-<triple>
 // -- and consumers used to supply the branch themselves from four different
@@ -277,6 +303,25 @@ def BOLT_PROFILE_REF = "bolt_profile_ref"
 // branch with the ref means a pinned consumer never has to guess.
 @Field
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+// The one triple with a BOLT profile producer. BoltProfileGen runs aarch64 only,
+// so this is the only triple with a promoted bundle to resolve or apply. Named
+// once because the pin resolver and the consume scope below must not disagree.
+@Field
+def BOLT_PRODUCER_TRIPLE = "aarch64-linux-gnu"
+// The triples BOLT consume applies to. Stated explicitly rather than inferred
+// from the pin: "which bundle" and "which architectures consume BOLT" are
+// independent questions, and answering the second from the first made the
+// x86_64 path behave differently depending on whether the pin happened to
+// resolve -- an unresolvable pin is non-fatal by design, so x86_64 would then
+// go on to stage llvm-bolt and request a bundle that does not exist before
+// giving up. Both consumers are launched for both architectures off this one
+// map, so the scope has to travel with it.
+//
+// Adding a triple here also needs a per-triple pin: BOLT_PROFILE_REF names one
+// bundle under one promote directory, so a second architecture reading it would
+// demand aarch64's bundle. Change the two together.
+@Field
+def BOLT_CONSUME_TRIPLES = "bolt_consume_triples"
 @Field
 def RELEASE_TARGET = "release_target"
 def globalVars = [
@@ -290,14 +335,24 @@ def globalVars = [
     (RELEASE_TARGET): runMode == "nightly_release" ?
         normalizeReleaseTargets(gitlabParamsFromBot.get(RELEASE_TARGET, null)) : [],
     (BOLT_PROFILE_REF): "",
+    (BOLT_PUBLISH_VARIANT): (env.JOB_NAME ==~ /.*PostMerge.*/) && ENABLE_BOLT_POSTMERGE_VARIANT,
     (BOLT_PROFILE_BRANCH): "",
+    (BOLT_CONSUME_TRIPLES): BOLT_PRODUCER_TRIPLE,
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // Compare against "true" rather than relying on Groovy truthiness: the bot phrase
 // is free-form JSON, and a quoted "false" would otherwise read as opt-in.
+// globalVars[BOLT_PUBLISH_VARIANT], not the raw ENABLE_BOLT_POSTMERGE_VARIANT:
+// the raw flag carries no job scope, so ORing it into `requested` would make
+// every PRE-merge job targeting main pass resolveBoltConsume and start
+// consuming in the replace-canonical shape. That silently takes over what
+// ENABLE_BOLT_PREMERGE_CONSUME governs, and pre-merge behaviour is supposed to
+// be untouched by this work. The globalVars value is already PostMerge-scoped.
 globalVars[BOLT_CONSUME_BUILD] = resolveBoltConsume(
-    ENABLE_BOLT_PREMERGE_CONSUME || gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true",
-    globalVars[TARGET_BRANCH])
+    ENABLE_BOLT_PREMERGE_CONSUME || globalVars[BOLT_PUBLISH_VARIANT] ||
+        gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true",
+    globalVars[TARGET_BRANCH],
+    globalVars[BOLT_PUBLISH_VARIANT])
 if (runMode == "nightly_release") {
     globalVars[TRTLLM_VERSION_OVERRIDE] = params.version
 }
@@ -594,10 +649,12 @@ def preparation(pipeline, testFilter, globalVars)
         // where the resolver's script lives.
         stage("Pin BOLT Profile Bundle") {
             def pinBranch = globalVars[BUILD_BRANCH]
-            def pinRef = resolveBoltProfileRef(pinBranch)
+            def pinRef = resolveBoltProfileRef(pinBranch, BOLT_PRODUCER_TRIPLE)
             globalVars[BOLT_PROFILE_REF] = pinRef
-            // Only meaningful alongside a ref, so it is left empty when the pin
-            // does not resolve -- a consumer cannot then half-honour a pin.
+            // The branch is only meaningful alongside a ref, so it is left empty
+            // when the pin does not resolve -- a consumer cannot then half-honour
+            // a pin. Which architectures consume BOLT is unaffected either way;
+            // that is BOLT_CONSUME_TRIPLES, decided independently of this.
             globalVars[BOLT_PROFILE_BRANCH] = pinRef ? pinBranch : ""
         }
         stage("Upload Build Info") {
@@ -2108,12 +2165,17 @@ def resolveBoltProfileRef(String branch, String triple = "aarch64-linux-gnu")
     return ref
 }
 
-def resolveBoltConsume(boolean requested, String targetBranch)
+def resolveBoltConsume(boolean requested, String targetBranch, boolean postMergeVariant = false)
 {
     if (!requested) {
         return false
     }
-    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+    // Post-merge is allowed only in the publish-both shape. The exclusion exists
+    // to protect BoltProfileGen's input, and publishing the optimized build under
+    // a second name protects it just as well as not building one -- canonical is
+    // still the un-BOLTed tarball the producer profiles. Without that shape the
+    // build would replace canonical, which is what the exclusion forbids.
+    if ((env.JOB_NAME ==~ /.*PostMerge.*/) && !postMergeVariant) {
         echo "BOLT consume requested but disabled: the post-merge build is the un-BOLTed input BoltProfileGen profiles."
         return false
     }
@@ -2310,6 +2372,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         // profile bundle so the tests below exercise bolted binaries.
                         // Off unless resolveBoltConsume() allowed it (pre-merge, main).
                         'boltConsume': globalVars[BOLT_CONSUME_BUILD],
+                        // Publish the BOLTed build beside an untouched canonical rather
+                        // than replacing it. Post-merge only: canonical is the un-BOLTed
+                        // tarball BoltProfileGen profiles.
+                        'boltPublishVariant': globalVars[BOLT_PUBLISH_VARIANT],
                     ]
                     // launchJob returns UNSTABLE (without throwing) when the build
                     // sub-job was infra-incomplete: only infra aborts, no genuine
@@ -2492,9 +2558,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     def additionalParameters = [
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         // Off unless resolveBoltConsume() allowed it. Post-merge is
-                        // excluded there precisely because this tarball is what the
-                        // BOLT-Profile-Gen stage below profiles.
+                        // allowed only together with boltPublishVariant below, which
+                        // keeps canonical -- the BOLT-Profile-Gen input -- un-BOLTed.
                         'boltConsume': globalVars[BOLT_CONSUME_BUILD],
+                        'boltPublishVariant': globalVars[BOLT_PUBLISH_VARIANT],
                     ]
                     // launchJob returns UNSTABLE (without throwing) when the build
                     // sub-job was infra-incomplete: only infra aborts, no genuine
@@ -2537,6 +2604,20 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 'targetArch': "aarch64-linux-gnu",
                                 'branch': globalVars[BUILD_BRANCH],
                                 'promote': "true",
+                                // Exactly ONE writer publishes a BOLTed build per
+                                // commit, and this launch site is where that choice
+                                // is made. The SBSA build stage is that writer (see
+                                // BOLT_PUBLISH_VARIANT): it publishes
+                                // bolted-<tarName> and leaves canonical un-BOLTed on
+                                // purpose, canonical being this job's own input and
+                                // what every consumer not yet migrated still
+                                // fetches. BoltProfileGen's canonical repush is the
+                                // other writer and would overwrite exactly that.
+                                // Already its default, but sent explicitly: the
+                                // default lives in a job config editable outside
+                                // this repo, and a flip there would silently put
+                                // both writers on the same object.
+                                'boltPublishCanonical': "false",
                             ]
                             launchJob(pipeline, "/LLM/helpers/BoltProfileGen", false, false, globalVars, "SBSA", additionalParameters)
                         }
