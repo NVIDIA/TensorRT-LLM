@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@user/yiqingy/add_gr100_computelab', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -6506,6 +6506,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 2, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 4, 4, 8, 1, true],
+        "GR100-PyTorch-Post-Merge-1": ["auto:gr100-x1", "l0_gr100", 1, 1, 1, 1, true],
     ]
     x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
     fullSet += x86SlurmTestConfigs.keySet()
