@@ -788,7 +788,7 @@ def get_num_extra_kv_tokens(spec_config):
 
 def get_draft_kv_cache_manager(spec_config, resource_manager):
     """
-    Return the one-model draft cache manager, including a shared subpage view
+    Return the one-model draft cache manager, including a shared draft KV view
     when the target manager owns the draft cache storage.
     """
     from ..pyexecutor.resource_manager import ResourceManagerType
@@ -803,7 +803,7 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
         return draft
     target = resource_manager.get_resource_manager(
         ResourceManagerType.KV_CACHE_MANAGER)
-    get_view = getattr(target, "get_draft_subpage_view", None)
+    get_view = getattr(target, "get_draft_kv_cache_view", None)
     return get_view() if get_view is not None else None
 
 
@@ -978,44 +978,35 @@ def get_static_draft_len(model_engine: "ModelEngine") -> int:
     return model_engine.max_total_draft_tokens
 
 
-def update_draft_len(model_engine: "ModelEngine",
-                     scheduled_batch: "ScheduledRequests",
-                     *,
-                     draft_len: Optional[int] = None,
-                     speculation_permanently_disabled: bool = False) -> None:
-    """Resolve this batch's draft length and synchronize its draft buffers.
+def resolve_draft_len(spec_config: Optional["DecodingBaseConfig"],
+                      scheduled_batch: "ScheduledRequests",
+                      *,
+                      max_draft_len: int,
+                      static_draft_len: int,
+                      draft_len: Optional[int] = None,
+                      speculation_permanently_disabled: bool = False) -> int:
+    """Synchronize this batch's draft buffers and return its draft length.
 
-    Normal iterations must call this before ``prepare_resources`` so KV cache
-    allocation uses the selected draft length. Dynamic and explicit lengths
-    pad or truncate generation-request buffers to a uniform width, as required
-    by CUDA graph replay and the attention kernel. Static normal decoding
-    preserves the drafter's proposals instead.
-
-    Warmup supplies the explicit length used to allocate its dummy batch,
-    including graph shapes that differ from the normal batch-size schedule.
+    Dynamic and explicit lengths pad or truncate generation-request buffers to
+    a uniform width, as required by CUDA graph replay and the attention kernel.
+    Static decoding preserves the drafter's proposals instead.
     """
-    if not hasattr(model_engine, 'max_draft_len'):
-        return
-
     if speculation_permanently_disabled:
         for request in scheduled_batch.generation_requests:
             request.py_draft_tokens = []
-        model_engine.runtime_draft_len = 0
-        return
+        return 0
 
-    spec_config = model_engine.spec_config
     if draft_len is None:
         if (spec_config is not None
                 and spec_config.draft_len_schedule is not None
                 and spec_config.spec_dec_mode.support_dynamic_draft_len()):
             draft_len = get_draft_len_for_batch_size(
                 spec_config.draft_len_schedule, scheduled_batch.batch_size,
-                model_engine.max_draft_len)
+                max_draft_len)
         else:
             # Static decoding preserves the proposals produced by the drafter,
             # including requests intentionally entering with no draft tokens.
-            model_engine.runtime_draft_len = get_static_draft_len(model_engine)
-            return
+            return static_draft_len
 
     draft_buffer_pad = 0  # Buffer sentinel, not PARD mask_token_id.
     rejection_on = getattr(spec_config, "use_rejection_sampling", False)
@@ -1044,4 +1035,26 @@ def update_draft_len(model_engine: "ModelEngine",
         elif current_num_draft_tokens > draft_len:
             request.py_draft_tokens = request.py_draft_tokens[:draft_len]
 
-    model_engine.runtime_draft_len = draft_len
+    return draft_len
+
+
+def update_draft_len(model_engine: "ModelEngine",
+                     scheduled_batch: "ScheduledRequests",
+                     *,
+                     draft_len: Optional[int] = None,
+                     speculation_permanently_disabled: bool = False) -> None:
+    """Resolve this batch's draft length and store it on the engine.
+
+    Normal iterations must call this before ``prepare_resources`` so KV cache
+    allocation uses the selected draft length.
+    """
+    if not hasattr(model_engine, 'max_draft_len'):
+        return
+
+    model_engine.runtime_draft_len = resolve_draft_len(
+        model_engine.spec_config,
+        scheduled_batch,
+        max_draft_len=model_engine.max_draft_len,
+        static_draft_len=get_static_draft_len(model_engine),
+        draft_len=draft_len,
+        speculation_permanently_disabled=speculation_permanently_disabled)
