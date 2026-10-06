@@ -37,6 +37,13 @@ pytestmark = pytest.mark.cpu_only
 CONNECTOR_MODULE = "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_failed_executor_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.pyexecutor import py_executor
+
+    monkeypatch.setattr(py_executor, "_failed_kv_connector_executors", {})
+
+
 class ADPAdapterMock(MagicMock):
     supports_attention_dp = True
 
@@ -117,6 +124,14 @@ def forbid_connector_collectives() -> Iterator[None]:
 def test_adp_requires_explicit_backend_support(unsupported: type) -> None:
     with pytest.raises(NotImplementedError, match="supports_attention_dp=True"):
         KvCacheConnectorManager.validate_attention_dp(ADPAdapterMock, unsupported)
+
+
+@pytest.mark.parametrize("pp_size,cp_size", [(2, 1), (1, 2)])
+def test_adp_rejects_unsupported_topology(pp_size: int, cp_size: int) -> None:
+    with pytest.raises(NotImplementedError, match="requires PP=1 and CP=1"):
+        KvCacheConnectorManager.validate_attention_dp(
+            ADPAdapterMock, ADPAdapterMock, pp_size=pp_size, cp_size=cp_size
+        )
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -572,7 +587,7 @@ def test_shutdown_drains_save_before_loop_exit(
         executor._profiler = lambda: nullcontext(MagicMock())
         executor.hang_detector = MagicMock()
         executor.hang_detector.detected.return_value = False
-        executor.disagg = MagicMock()
+        executor._disagg_coordinator = MagicMock()
         executor._poll_encoder_steps = MagicMock()
         executor._wait_for_model_engine_input_copy = MagicMock()
         executor._flush_pending_transfer_responses = MagicMock()
@@ -1255,8 +1270,96 @@ def test_rank_state_preserves_transfer_snapshot_and_old_payloads() -> None:
     assert not old_state.connector_poll_failed
 
 
+@pytest.mark.parametrize("loading_rank", [0, 1])
+def test_control_drain_keeps_owner_collectives_aligned(loading_rank: int) -> None:
+    from tensorrt_llm._torch.pyexecutor.connectors.prefix_load_completion import (
+        PrefixLoadCompletionTracker,
+    )
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
+    from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter
+
+    collective = _OwnerCollective()
+    executors = []
+    for rank in (0, 1):
+        executor = object.__new__(PyExecutor)
+        _configure_recovery_controls(executor)
+        executor.dist.tp_size = executor.dist.world_size = 2
+        executor.dist.tp_rank = executor.dist.rank = rank
+        executor.dist.has_pp = False
+        executor.dist.tp_allgather.side_effect = partial(collective.gather, rank)
+        executor.dist.tp_allgather_int64.side_effect = partial(collective.gather_int64, rank)
+        executor.dist.broadcast_int64.side_effect = AssertionError(
+            "Request broadcast must be skipped on every owner during control drain"
+        )
+        executor.adp_router = DefaultADPRouter(executor.dist)
+        executor.request_broadcaster = RequestBroadcaster(executor.dist, executor.hang_detector)
+        manager = executor.kv_connector_manager = _manager(rank)
+        manager.prefix_reservations_enabled = True
+        manager._prefix_completion_tracker = PrefixLoadCompletionTracker()
+        manager.worker.get_finished_prefix_loads.return_value = []
+        executor.control_requests = [SimpleNamespace(control_requires_drain=True)]
+        executor.control_request_barrier = MagicMock()
+        executor.control_action_done = MagicMock()
+        executor._pop_sleep_wakeup_abort = MagicMock(return_value=None)
+        executor.request_accumulated = []
+        executor._disable_mpi = False
+        executor.waiting_queue = MagicMock()
+        executor.waiting_queue.__len__.return_value = 0
+        executor.enable_iter_perf_stats = False
+        executor._pop_from_waiting_queue = MagicMock(return_value=[])
+        executor._enable_non_overlap_adp_forward_intent = True
+        executor._should_exclude_last_generation_logits = MagicMock(return_value=False)
+        executor.num_fetch_requests = executor.num_fetch_requests_cur_rank = 0
+        executor.max_num_active_requests = 2
+        executor._release_transfer = MagicMock()
+        executor._terminate_request = MagicMock()
+        executors.append(executor)
+
+    owner = executors[loading_rank]
+    manager = owner.kv_connector_manager
+    request = _request(7)
+    request.is_finished = True
+    owner.active_requests = [request]
+    manager.scheduler.reserve_prefix.return_value = (4, True)
+    manager.reserve_prefix(request, 0)
+    manager.accept_prefix_load(request, 0, 4, [[2]])
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [request]
+    manager.build_scheduler_output(batch, None)
+    manager.handle_metadata()
+    manager.mark_prefix_loads_dispatched()
+    assert manager.defer_load_termination(request)
+    manager.worker.get_finished_prefix_loads.side_effect = [[], [], [1]]
+
+    def run(executor: PyExecutor) -> None:
+        for iteration in range(3):
+            executor._fetch_new_requests(executor.waiting_queue, executor.active_requests)
+            executor._handle_control_request()
+            if iteration < 2:
+                executor.control_request_barrier.set.assert_not_called()
+            else:
+                executor.control_request_barrier.set.assert_called_once_with()
+
+    with (
+        patch("torch.cuda.synchronize"),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.merge_requests", return_value=[]),
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        futures = [pool.submit(run, executor) for executor in executors]
+        for future in futures:
+            future.result(timeout=10)
+
+    for executor in executors:
+        executor.dist.broadcast_int64.assert_not_called()
+        assert executor.control_requests == []
+        assert not executor._kv_connector_has_pending
+    owner._terminate_request.assert_called_once_with(request)
+
+
 @pytest.mark.parametrize("outcome", ["complete", "cancel", "timeout", "shutdown"])
-def test_prefix_load_recovery_lifetime(outcome: str) -> None:
+@pytest.mark.parametrize("overlap", [False, True])
+def test_prefix_load_recovery_lifetime(outcome: str, overlap: bool) -> None:
     from tensorrt_llm._torch.pyexecutor.connectors.prefix_load_completion import (
         PrefixLoadCompletionTracker,
     )
@@ -1273,6 +1376,7 @@ def test_prefix_load_recovery_lifetime(outcome: str) -> None:
     executor.kv_cache_manager = MagicMock(spec=KVCacheManagerV2)
     executor.kv_cache_manager.get_page_indices_by_layer_group.return_value = [[2, 3]]
     executor.resource_manager = MagicMock()
+    executor.resource_manager.get_resource_manager.return_value = None
     executor._terminate_request = MagicMock()
     executor._release_transfer = MagicMock()
     executor._kv_connector_config.transfer_timeout_sec = 1.0
@@ -1286,15 +1390,58 @@ def test_prefix_load_recovery_lifetime(outcome: str) -> None:
         lambda: [1] if outcome in ("complete", "cancel") else []
     )
 
-    def pad(scheduled: ScheduledRequests) -> None:
-        if not executor.active_requests:
-            scheduled.generation_requests.append(_request(999, dummy=True))
+    # Keep the production padding helper: the canceled request initially owns
+    # the sole slot, which becomes reusable only after its response is flushed.
+    executor.expected_num_active_requests = 1
+    executor.max_num_active_requests = 1
+    executor.max_total_draft_tokens = 0
+    executor._should_skip_dummy_for_benchmark_disagg = MagicMock(return_value=False)
+    executor._count_schedulable_active_requests = MagicMock(return_value=0)
+    executor._has_adp_dummy_kv_capacity = lambda _: executor._terminate_request.called
+    executor.kv_cache_manager.add_dummy_requests.return_value = [_request(999, dummy=True)]
+
+    class RecoveryComplete(Exception):
+        pass
+
+    queue_checks = 0
+
+    def can_queue(scheduled: ScheduledRequests) -> tuple[bool, bool]:
+        nonlocal queue_checks
+        queue_checks += 1
+        if queue_checks == 2:
+            assert scheduled.batch_size == 1
+            raise RecoveryComplete
+        return True, True
+
+    executor.device_id = 0
+    executor._profiler = lambda: nullcontext(MagicMock())
+    executor._resource_governor_enabled = False
+    executor._is_kv_manager_v2 = False
+    executor._mm_encoder_item_scheduling_enabled = False
+    executor.enable_iter_perf_stats = False
+    executor._can_pause_for_rebalance = MagicMock(return_value=False)
+    executor._wait_for_model_engine_input_copy = MagicMock()
+    executor._prepare_and_schedule_batch = MagicMock(return_value=(batch, None))
+    executor.is_benchmark_disagg = False
+    executor._disagg_coordinator = MagicMock()
+    executor._check_benchmark_disagg_gate = MagicMock(return_value=(True, False))
+    executor._terminate_requests = MagicMock()
+    executor._pause_requests = MagicMock()
+    executor._can_queue = can_queue
+    executor._prepare_disagg_gen_transmission_complete = MagicMock()
+    executor._handle_dynamic_draft_len = MagicMock()
+    executor.kv_cache_transceiver = None
+    executor.drafter = None
+    executor.previous_batch = None
+    executor.hang_detector.checkpoint.side_effect = [None] * 200 + [
+        AssertionError("Recovery failed to exit after prefix completion")
+    ]
+    run = executor._executor_loop_overlap if overlap else executor._executor_loop
 
     def finish(reason: object) -> None:
         request.is_finished = True
         request.state = LlmRequestState.GENERATION_COMPLETE
 
-    executor._pad_empty_attention_dp_batch = pad
     request.finish_by_reason.side_effect = finish
     if outcome == "cancel":
         executor.canceled_req_ids = [7]
@@ -1302,6 +1449,9 @@ def test_prefix_load_recovery_lifetime(outcome: str) -> None:
         executor.executor_request_queue.enqueue_shutdown_request()
     with (
         patch("torch.cuda.current_stream"),
+        patch("torch.cuda.set_device"),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.cudart"),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT"),
         patch(
             "tensorrt_llm._torch.pyexecutor.py_executor.time.monotonic",
             side_effect=itertools.count(step=0.01),
@@ -1310,11 +1460,12 @@ def test_prefix_load_recovery_lifetime(outcome: str) -> None:
     ):
         if outcome in ("timeout", "shutdown"):
             with pytest.raises(RuntimeError, match="Timed out|Shutdown requested"):
-                executor._kv_connector_start_batch(batch)
+                run()
             assert manager.has_pending_transfers(7)
             executor._terminate_request.assert_not_called()
         else:
-            executor._kv_connector_start_batch(batch)
+            with pytest.raises(RecoveryComplete):
+                run()
             assert not manager.has_pending_transfers(7)
             if outcome == "cancel":
                 executor._terminate_request.assert_called_once_with(request)
@@ -1325,4 +1476,4 @@ def test_prefix_load_recovery_lifetime(outcome: str) -> None:
                 assert not executor._pending_response_terminations
             else:
                 assert batch.context_requests == [request]
-                executor.resource_manager.prepare_resources.assert_not_called()
+                executor.resource_manager.prepare_resources.assert_called_once_with(batch)

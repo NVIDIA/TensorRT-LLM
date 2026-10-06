@@ -6143,10 +6143,12 @@ class PyExecutor:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
         connector = self.kv_connector_manager
         control_pending = len(self.control_requests) != 0
-        # A draining control request must still receive transfer completions.
-        if control_pending and not (connector is not None
-                                    and connector.prefix_reservations_enabled
-                                    and connector.has_pending_loads()):
+        # ADP polls owner-local completions before routing. All owners must
+        # skip this broadcast together while a control request drains. TP
+        # still needs the broadcast to deliver rank-zero prefix completions.
+        if control_pending and (self.enable_attention_dp or not (
+                connector is not None and connector.prefix_reservations_enabled
+                and connector.has_pending_loads())):
             return
 
         # Calculate timeout. Never wait once the shutdown sentinel has been
@@ -7561,12 +7563,12 @@ class PyExecutor:
             return
         if scheduled_batch is None or scheduled_batch.batch_size != 0:
             return
-        if not self.active_requests or self.expected_num_active_requests <= 0:
+        # A canceled connector load can remove the last local request during
+        # recovery while peers still need this owner to participate in forward.
+        if self.expected_num_active_requests <= 0:
             return
-        # Unlike the pre-schedule path, this one pads a rank that already holds
-        # active requests, so it must respect the cap that
-        # `_pad_attention_dp_dummy_request` asserts against. A rank at the cap
-        # is not starved anyway.
+        # This path can still hold active requests, so respect the same cap
+        # that `_pad_attention_dp_dummy_request` asserts against.
         if len(self.active_requests) >= self.max_num_active_requests:
             return
         # The fill gate suppresses forwards on purpose; dummies added then are

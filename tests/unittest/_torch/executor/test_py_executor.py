@@ -2709,8 +2709,9 @@ class TestPendingTransferResponseFlush:
         executor._terminate_request.assert_called_once_with(request)
 
     @staticmethod
-    def _make_executor_loop_stub():
+    def _make_executor_loop_stub() -> PyExecutor:
         executor = object.__new__(PyExecutor)
+        executor.enable_attention_dp = False
         executor.device_id = 0
         profiler = MagicMock()
         profiler.__enter__.return_value = Mock()

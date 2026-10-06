@@ -381,7 +381,7 @@ The capability flag commits an implementation to these requirements:
 * Prefix reservations and their completion IDs are owner-local. The runtime
   applies `get_finished_prefix_loads` locally, without a rank-zero broadcast,
   and includes accepted loads in cancellation, deadline and idle accounting.
-* Independently arriving writes/readers share content safely, with complete
+* Independently arriving writers/readers share content safely, with complete
   publication, compatible representations and backend pinning during reads.
 
 Async loading may remove every real request from an owner's scheduled batch.

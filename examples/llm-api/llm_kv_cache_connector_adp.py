@@ -1,5 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+### :title Attention-DP KV Cache Connector
+### :order 7
+### :section Customization
 """V2 ADP filesystem connector: stable prefix keys and atomic publication.
 
 Set both connector classes below and enable_attention_dp=True. Every owner

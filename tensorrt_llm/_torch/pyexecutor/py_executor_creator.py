@@ -962,11 +962,11 @@ def _create_py_executor(
                 module, kv_connector_config.connector_scheduler_class)
 
             if mapping.enable_attention_dp:
-                if mapping.pp_size != 1 or mapping.cp_size != 1:
-                    raise NotImplementedError(
-                        "Attention-DP KV connector requires PP=1 and CP=1.")
                 KvCacheConnectorManager.validate_attention_dp(
-                    worker_cls, scheduler_cls)
+                    worker_cls,
+                    scheduler_cls,
+                    pp_size=mapping.pp_size,
+                    cp_size=mapping.cp_size)
 
             rank = tensorrt_llm.mpi_rank()
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.

@@ -775,7 +775,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def validate_attention_dp(
         worker_cls: type[KvCacheConnectorWorker],
         scheduler_cls: type[KvCacheConnectorScheduler],
+        *,
+        pp_size: int = 1,
+        cp_size: int = 1,
     ) -> None:
+        if pp_size != 1 or cp_size != 1:
+            raise NotImplementedError("Attention-DP KV connector requires PP=1 and CP=1.")
         for connector_cls in (worker_cls, scheduler_cls):
             if getattr(connector_cls, "supports_attention_dp", False) is not True:
                 raise NotImplementedError(
