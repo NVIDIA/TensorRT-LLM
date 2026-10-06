@@ -228,7 +228,18 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;rope;sparse-kv-cache;gpu"
   REQUIRES_GPU)
-add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)
+add_tllm_gtest(
+  prepareCustomMaskTest
+  OWNER
+  kernel
+  SOURCES
+  prepareCustomMaskTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_attention_mask
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;attention-mask;gpu"
+  REQUIRES_GPU)
 add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
 
 add_tllm_gtest(
