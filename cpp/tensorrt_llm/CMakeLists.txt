@@ -345,6 +345,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_runtime_lora
     tllm_runtime_lora_cache
     tllm_runtime_memory
+    tllm_runtime_moe_load_balance
     tllm_runtime_numpy
     tllm_runtime_topology
     tllm_runtime_utils
