@@ -123,8 +123,16 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;runtime;gpu")
-add_tllm_gtest(workerPoolTest SOURCES workerPoolTest.cpp FULL_STACK LABELS
-               "unit;full-stack;host")
+add_tllm_gtest(
+  workerPoolTest
+  OWNER
+  runtime
+  SOURCES
+  workerPoolTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_worker_pool
+  LABELS
+  "unit;runtime;host")
 add_tllm_gtest(
   worldConfigTest
   OWNER
