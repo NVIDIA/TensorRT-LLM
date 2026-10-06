@@ -184,6 +184,8 @@ file(GLOB_RECURSE ARGEMM_SRC_CU allreduce_gemm/*.cu)
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 set(ALL_SRCS ${SRC_CPP};${SRC_CU})
+list(REMOVE_ITEM ALL_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/cutlass_heuristic.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/cutlass_preprocessors.cpp")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_rowwise_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_blockscale_gemm/.*")
@@ -207,6 +209,7 @@ message(VERBOSE "ARgemm srcs ${ARGEMM_SRC_CU}")
 message(VERBOSE "All srcs ${ALL_SRCS}")
 
 add_library(cutlass_src STATIC ${ALL_SRCS})
+target_link_libraries(cutlass_src PUBLIC tllm::kernel_gemm_utilities)
 
 add_library(fpA_intB_gemm_src STATIC ${MIXED_SRC_CPP} ${MIXED_SRC_CU})
 add_cuda_architectures(fpA_intB_gemm_src 89)
