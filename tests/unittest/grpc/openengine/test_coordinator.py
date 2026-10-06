@@ -347,7 +347,6 @@ async def test_abort_all_deadline_preserves_group_and_partial_outcomes(monkeypat
 @pytest.mark.asyncio
 async def test_peer_abort_rpc_deadline_preserves_group(monkeypatch):
     """A slow peer's gRPC deadline is an incomplete abort, not a group failure."""
-    monkeypatch.setattr(coordination, "_RPC_TIMEOUT", 0.05)
 
     class SlowFrontend(FrontendClient):
         async def _abort(self, message, context):
@@ -357,10 +356,45 @@ async def test_peer_abort_rpc_deadline_preserves_group(monkeypatch):
     async with group(client_type=SlowFrontend) as (_, (first, second), failures):
         reservation = await first.reserve("slow")
         reservation.bind(Handle())
-        assert await second.request("abort") == {"aborted": 0, "failed": 1}
+        with monkeypatch.context() as patch:
+            patch.setattr(coordination, "_RPC_TIMEOUT", 0.05)
+            assert await second.request("abort") == {"aborted": 0, "failed": 1}
         assert (await second.request("status"))["ready"]
         assert not failures
         await reservation.release()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_abort_peer_cancels_slow_sibling(monkeypatch):
+    """A lost peer must stop admission before another peer's abort deadline."""
+    async with group() as (coordinator, (first, second), failures):
+        unavailable = await first.reserve("unavailable")
+        slow = await second.reserve("slow")
+        await first._server.stop(0)
+        slow_started = asyncio.Event()
+        slow_cancelled = asyncio.Event()
+        unavailable_request = coordinator._peers[0].request
+
+        async def peer_unavailable(message):
+            await slow_started.wait()
+            return await unavailable_request(message)
+
+        async def slow_peer(message):
+            slow_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                slow_cancelled.set()
+
+        monkeypatch.setattr(coordinator._peers[0], "request", peer_unavailable)
+        monkeypatch.setattr(coordinator._peers[1], "request", slow_peer)
+        with pytest.raises(CoordinationError):
+            await asyncio.wait_for(second.request("abort"), timeout=2)
+        assert slow_cancelled.is_set()
+        assert not coordinator.ready
+        assert failures
+        await unavailable.release()
+        await slow.release()
 
 
 @pytest.mark.asyncio

@@ -214,25 +214,30 @@ class Coordinator:
             by_frontend: dict[int, list] = defaultdict(list)
             for key, (token, frontend) in snapshot:
                 by_frontend[frontend].append([key, token])
+            tasks = [
+                asyncio.create_task(self._abort_frontend(frontend, requests, deadline))
+                for frontend, requests in by_frontend.items()
+            ]
             try:
-                replies = await asyncio.gather(
-                    *(
-                        self._abort_frontend(frontend, requests, deadline)
-                        for frontend, requests in by_frontend.items()
-                    ),
-                    return_exceptions=True,
-                )
-                for reply in replies:
-                    if isinstance(reply, BaseException):
-                        raise reply
+                if tasks:
+                    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+                    for task in done:
+                        if (error := task.exception()) is not None:
+                            raise error
+                replies = [task.result() for task in tasks]
+                return {
+                    "aborted": sum(reply["aborted"] for reply in replies),
+                    "failed": sum(reply["failed"] for reply in replies),
+                }
             except grpc.aio.AioRpcError as error:
                 self.ready = False
                 self._fail(f"Frontend control connection failed: {error}")
                 await context.abort(grpc.StatusCode.UNAVAILABLE, "Frontend control failed")
-            return {
-                "aborted": sum(reply["aborted"] for reply in replies),
-                "failed": sum(reply["failed"] for reply in replies),
-            }
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
         await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Unknown private operation")
 
 

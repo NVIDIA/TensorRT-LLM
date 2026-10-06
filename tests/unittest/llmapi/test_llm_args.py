@@ -3483,8 +3483,11 @@ class TestServeDefaults:
         with (
                 patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
                       return_value=False),
-                pytest.raises(click.UsageError,
-                              match="num_serve_frontends must be 1"),
+                pytest.raises(
+                    click.UsageError,
+                    match=
+                    "Multiple gRPC frontends require --grpc-protocol openengine"
+                ),
         ):
             serve_main(
                 args=[
