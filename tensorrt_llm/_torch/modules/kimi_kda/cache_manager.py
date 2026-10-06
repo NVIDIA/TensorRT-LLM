@@ -596,7 +596,7 @@ def get_kda_replay_num_spec(
     return spec_config.tokens_per_gen_step - 1
 
 
-class KimiK3HybridCacheManagerV2(MambaHybridCacheManagerV2):
+class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     """KDA/MLA cache layout and K3-only replay lifecycle handling."""
 
     @override
@@ -616,7 +616,7 @@ class KimiK3HybridCacheManagerV2(MambaHybridCacheManagerV2):
         super().__init__(*args, **kwargs)
 
     @override
-    def _initialize_model_state(self) -> KDAIntermediateState | KDAReplayState:
+    def _initialize_spec_state(self) -> KDAIntermediateState | KDAReplayState:
         num_spec = self._requested_num_spec
         if num_spec is None:
             num_spec = get_kda_replay_num_spec(self.spec_config, manager_supports_replay=True)
@@ -796,7 +796,7 @@ __all__ = [
     "KDAIntermediateState",
     "KDAReplayState",
     "KDAReplayLayerCache",
-    "KimiK3HybridCacheManagerV2",
+    "KimiK3HybridCacheManager",
     "allocate_kda_replay_fields",
     "get_kda_replay_num_spec",
     "get_kimi_cache_params",

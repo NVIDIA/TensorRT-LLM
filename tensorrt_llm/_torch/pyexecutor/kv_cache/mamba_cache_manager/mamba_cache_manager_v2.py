@@ -264,7 +264,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             conv_section_dims=tuple(self.conv_section_dims),
             conv_state_layout=conv_state_layout,
         )
-        self._speculative_state: MambaState | None = self._initialize_model_state()
+        self._speculative_state: MambaState | None = self._initialize_spec_state()
 
         if isinstance(num_kv_heads, int):
             per_layer_kv_heads = [num_kv_heads] * total_layers
@@ -319,7 +319,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             or super()._disagg_transfer_overwrites_whole_cached_prefix()
         )
 
-    def _initialize_model_state(self) -> MambaState | None:
+    def _initialize_spec_state(self) -> MambaState | None:
         """Return validated model-owned state before constructing the pool."""
         if self.spec_config is not None:
             raise NotImplementedError(

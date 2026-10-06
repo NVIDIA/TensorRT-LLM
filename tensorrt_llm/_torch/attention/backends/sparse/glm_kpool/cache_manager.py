@@ -101,7 +101,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         super().__init__(*args, **kwargs)
 
     @override
-    def _initialize_model_state(self) -> KDAIntermediateState | KDAReplayState:
+    def _initialize_spec_state(self) -> KDAIntermediateState | KDAReplayState:
         num_spec = self._requested_num_spec
         if num_spec is None:
             num_spec = get_kda_replay_num_spec(self.spec_config, manager_supports_replay=True)

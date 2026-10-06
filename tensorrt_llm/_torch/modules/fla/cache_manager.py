@@ -582,7 +582,7 @@ def validate_gdn_layout(
         state.validate(manager._state_layout)
 
 
-class Qwen35HybridCacheManagerV2(MambaHybridCacheManagerV2):
+class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
     """Qwen3.5/Qwen3Next recurrent state with shared GDN replay."""
 
     @override
@@ -593,7 +593,7 @@ class Qwen35HybridCacheManagerV2(MambaHybridCacheManagerV2):
         super().__init__(*args, **kwargs)
 
     @override
-    def _initialize_model_state(self) -> GDNIntermediateState | GDNReplayState:
+    def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState:
         state = create_gdn_state(self, self._requested_replay)
 
         validate_gdn_layout(self, state)
@@ -635,7 +635,7 @@ __all__ = [
     "GDNIntermediateState",
     "GDNLayerCache",
     "GDNReplayState",
-    "Qwen35HybridCacheManagerV2",
+    "Qwen35HybridCacheManager",
     "create_gdn_state",
     "select_gdn_replay_state",
     "validate_gdn_layout",

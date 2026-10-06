@@ -16,16 +16,16 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     MambaLayerGroup,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.modules.fla.cache_manager import GDNReplayState, Qwen35HybridCacheManagerV2
+from tensorrt_llm._torch.modules.fla.cache_manager import GDNReplayState, Qwen35HybridCacheManager
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     _KDA_BETA_CACHE_ALIGNMENT_BYTES,
     KDAReplayState,
-    KimiK3HybridCacheManagerV2,
+    KimiK3HybridCacheManager,
 )
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
     Mamba2State,
-    NemotronHybridCacheManagerV2,
+    NemotronHybridCacheManager,
     ReplayHistory,
     ReplayStateUpdateMetadata,
     _advance_replay_state,
@@ -324,7 +324,7 @@ def _capture_kimi_v2_manager_ctor(
     V2 manager and capture the constructor arguments."""
     captured: dict[str, object] = {}
 
-    class RecordingV2Manager(KimiK3HybridCacheManagerV2):
+    class RecordingV2Manager(KimiK3HybridCacheManager):
         def __init__(self, *args: object, **kwargs: object) -> None:
             captured["args"] = args
             captured["kwargs"] = kwargs
@@ -334,7 +334,7 @@ def _capture_kimi_v2_manager_ctor(
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
     monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
 
-    assert get_kv_cache_manager_cls(model_config, kv_cache_config) is KimiK3HybridCacheManagerV2
+    assert get_kv_cache_manager_cls(model_config, kv_cache_config) is KimiK3HybridCacheManager
 
     _create_kv_cache_manager(
         model_engine=None,
@@ -392,12 +392,12 @@ def test_kimi_explicit_v2_manager_enables_owned_kda_replay_policy(
     _, kwargs = _capture_kimi_v2_manager_ctor(monkeypatch, spec_config)
 
     assert "speculative_state" not in kwargs
-    mgr = object.__new__(KimiK3HybridCacheManagerV2)
+    mgr = object.__new__(KimiK3HybridCacheManager)
     mgr.spec_config = spec_config
     mgr._mamba_ssm_stochastic_rounding = False
     mgr._requested_num_spec = None
     mgr._state_layout = SimpleNamespace(spec_config=spec_config, mamba_pp_layers=())
-    mgr._speculative_state = mgr._initialize_model_state()
+    mgr._speculative_state = mgr._initialize_spec_state()
     policy = mgr._kda_replay
     assert isinstance(policy, KDAReplayState)
     assert policy.num_speculative_tokens == spec_config.tokens_per_gen_step - 1
@@ -488,8 +488,8 @@ def test_v2_manager_rejects_model_type_kwarg() -> None:
 @pytest.mark.parametrize(
     ("use_v2", "enable_block_reuse", "expected"),
     [
-        (True, False, Qwen35HybridCacheManagerV2),
-        (True, True, Qwen35HybridCacheManagerV2),
+        (True, False, Qwen35HybridCacheManager),
+        (True, True, Qwen35HybridCacheManager),
         (False, True, CppMambaHybridCacheManager),
         ("auto", True, CppMambaHybridCacheManager),
     ],
@@ -606,7 +606,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     assert captured_mixed["max_num_tokens"] == 256
     assert captured_v2["use_replay_state_update"] is None
     assert "speculative_state" not in captured_v2
-    mgr = object.__new__(Qwen35HybridCacheManagerV2)
+    mgr = object.__new__(Qwen35HybridCacheManager)
     mgr.spec_config = common_kwargs["spec_config"]
     mgr.ssm_state_dtype = torch.bfloat16
     mgr._requested_replay = None
@@ -614,7 +614,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     mgr._state_layout = SimpleNamespace(
         spec_config=mgr.spec_config, mamba_pp_layers=(), n_groups_per_rank=1
     )
-    mgr._speculative_state = mgr._initialize_model_state()
+    mgr._speculative_state = mgr._initialize_spec_state()
     assert isinstance(mgr._speculative_state, GDNReplayState)
     assert captured_v2["max_num_tokens"] == 256
     assert captured_v2["vocab_size"] == pretrained_config.vocab_size
@@ -795,7 +795,7 @@ def test_hybrid_cache_manager_factory_routes_explicit_v2_disagg(monkeypatch, bac
                 backend=backend, transceiver_runtime="PYTHON"
             ),
         )
-        is Qwen35HybridCacheManagerV2
+        is Qwen35HybridCacheManager
     )
 
 
@@ -989,7 +989,7 @@ def test_qwen3_gdn_replay_uses_v2_preference(
     )
 
     assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is expected_v2
-    expected_manager = Qwen35HybridCacheManagerV2 if expected_v2 else CppMambaHybridCacheManager
+    expected_manager = Qwen35HybridCacheManager if expected_v2 else CppMambaHybridCacheManager
     assert (
         get_kv_cache_manager_cls(
             _hybrid_model_config(),
@@ -2436,17 +2436,17 @@ def _build_v2_hybrid_with_mamba_layer(
         dtype=kv_cache_dtype,
     )
     model_cls = (
-        KimiK3HybridCacheManagerV2
+        KimiK3HybridCacheManager
         if isinstance(speculative_state, KDAReplayState)
-        else Qwen35HybridCacheManagerV2
+        else Qwen35HybridCacheManager
         if conv_state_layout == "q_k_v"
-        else NemotronHybridCacheManagerV2
+        else NemotronHybridCacheManager
     )
 
     class ModelStateManager(model_cls):
-        def _initialize_model_state(self):
+        def _initialize_spec_state(self):
             if speculative_state is None:
-                return super()._initialize_model_state()
+                return super()._initialize_spec_state()
             elif isinstance(speculative_state, KDAReplayState):
                 self._kda_replay = speculative_state
                 self._kda_replay.validate(self._state_layout)
@@ -3778,7 +3778,7 @@ def test_v2_kda_replay_policy_supports_attention_only_pp_rank():
 
 
 def test_v2_kda_replay_policy_records_acceptance_and_skips_dummy_rows():
-    mgr = object.__new__(KimiK3HybridCacheManagerV2)
+    mgr = object.__new__(KimiK3HybridCacheManager)
     mgr.local_num_mamba_layers = 1
     policy = KDAReplayState(
         num_speculative_tokens=2,
@@ -3809,7 +3809,7 @@ def test_legacy_mamba_cache_manager_delegates_kda_replay_capability() -> None:
 
 
 def test_v2_kda_replay_policy_resets_context_slots():
-    mgr = object.__new__(KimiK3HybridCacheManagerV2)
+    mgr = object.__new__(KimiK3HybridCacheManager)
     policy = KDAReplayState(
         num_speculative_tokens=2,
     )
@@ -3826,7 +3826,7 @@ def test_v2_kda_replay_policy_resets_context_slots():
 
 
 def test_v2_kda_replay_host_drafter_records_active_requests(monkeypatch):
-    mgr = object.__new__(KimiK3HybridCacheManagerV2)
+    mgr = object.__new__(KimiK3HybridCacheManager)
     mgr.local_num_mamba_layers = 1
     mgr.spec_config = SimpleNamespace(decoding_type="NGram")
     mgr._request_id_to_state_index = {101: 1, 303: 2}
@@ -4011,7 +4011,7 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
     the seeded slots.
     """
     torch.manual_seed(0)
-    mgr = object.__new__(KimiK3HybridCacheManagerV2)
+    mgr = object.__new__(KimiK3HybridCacheManager)
     policy = KDAReplayState(num_speculative_tokens=2)
     mgr._kda_replay = policy
     policy._committed_window = 4
@@ -4212,7 +4212,7 @@ def test_v2_gdn_replay_all_layer_commit_matches_contiguous_layout():
 
 
 def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
-    mgr = object.__new__(Qwen35HybridCacheManagerV2)
+    mgr = object.__new__(Qwen35HybridCacheManager)
     batch_size = 16
     mgr.local_num_mamba_layers = 1
     policy = GDNReplayState(tokens_per_gen_step=4)
@@ -4266,7 +4266,7 @@ def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
 
 
 def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
-    mgr = object.__new__(NemotronHybridCacheManagerV2)
+    mgr = object.__new__(NemotronHybridCacheManager)
     mgr.local_num_mamba_layers = 1
     mgr._request_id_to_state_index = {
         100: 0,
@@ -4318,7 +4318,7 @@ def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
 
 
 def test_v2_hybrid_dynamic_tree_promotes_accepted_leaf_state(monkeypatch):
-    mgr = object.__new__(NemotronHybridCacheManagerV2)
+    mgr = object.__new__(NemotronHybridCacheManager)
     mgr.local_num_mamba_layers = 1
     policy = Mamba2State()
     policy.intermediate_indices = torch.arange(2, dtype=torch.int32)

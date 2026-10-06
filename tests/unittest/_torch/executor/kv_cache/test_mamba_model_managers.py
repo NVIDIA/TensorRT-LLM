@@ -16,25 +16,25 @@ from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNIntermediateState,
     GDNLayerCache,
     GDNReplayState,
-    Qwen35HybridCacheManagerV2,
+    Qwen35HybridCacheManager,
 )
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAIntermediateLayerCache,
     KDAIntermediateState,
     KDAReplayLayerCache,
     KDAReplayState,
-    KimiK3HybridCacheManagerV2,
+    KimiK3HybridCacheManager,
 )
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
     Mamba2LayerCache,
     Mamba2State,
-    NemotronHybridCacheManagerV2,
+    NemotronHybridCacheManager,
     ReplayHistory,
 )
 from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     PLE_CONV_STATE,
     PLE_NGRAM_CONTEXT,
-    Qwen4ExpHybridCacheManagerV2,
+    Qwen4ExpHybridCacheManager,
     Qwen4ExpPLECacheParams,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
@@ -59,10 +59,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 @pytest.mark.parametrize(
     "manager_cls",
     [
-        NemotronHybridCacheManagerV2,
-        Qwen35HybridCacheManagerV2,
-        Qwen4ExpHybridCacheManagerV2,
-        KimiK3HybridCacheManagerV2,
+        NemotronHybridCacheManager,
+        Qwen35HybridCacheManager,
+        Qwen4ExpHybridCacheManager,
+        KimiK3HybridCacheManager,
         Glm5NextCacheManager,
     ],
 )
@@ -81,10 +81,10 @@ def test_model_managers_inherit_the_common_lifecycle(manager_cls):
     "manager_cls",
     [
         MambaHybridCacheManagerV2,
-        NemotronHybridCacheManagerV2,
-        Qwen35HybridCacheManagerV2,
-        Qwen4ExpHybridCacheManagerV2,
-        KimiK3HybridCacheManagerV2,
+        NemotronHybridCacheManager,
+        Qwen35HybridCacheManager,
+        Qwen4ExpHybridCacheManager,
+        KimiK3HybridCacheManager,
         Glm5NextCacheManager,
     ],
 )
@@ -128,10 +128,10 @@ def test_legacy_managers_keep_compatibility_accessors():
     [
         MambaHybridCacheManager,
         MambaHybridCacheManagerV2,
-        NemotronHybridCacheManagerV2,
-        Qwen35HybridCacheManagerV2,
-        Qwen4ExpHybridCacheManagerV2,
-        KimiK3HybridCacheManagerV2,
+        NemotronHybridCacheManager,
+        Qwen35HybridCacheManager,
+        Qwen4ExpHybridCacheManager,
+        KimiK3HybridCacheManager,
         Glm5NextCacheManager,
         Mamba2State,
         ReplayHistory,
@@ -187,7 +187,7 @@ def _shutdown_manager(manager, monkeypatch):
     """Exercise real shutdown while replacing only the native pool teardown."""
     manager._recurrent_buffers = {"buffer": object()}
     manager._branch_snapshot_points = {"request": object()}
-    if isinstance(manager, Qwen4ExpHybridCacheManagerV2):
+    if isinstance(manager, Qwen4ExpHybridCacheManager):
         manager._ple_conv_states = {42: object()}
         manager._ple_ngram_contexts = {42: object()}
 
@@ -198,7 +198,7 @@ def _shutdown_manager(manager, monkeypatch):
         assert not manager._recurrent_buffers
         assert not manager._branch_snapshot_points
         assert not manager.all_ssm_states and not manager.all_conv_states
-        if isinstance(manager, Qwen4ExpHybridCacheManagerV2):
+        if isinstance(manager, Qwen4ExpHybridCacheManager):
             assert not manager._ple_conv_states and not manager._ple_ngram_contexts
 
     pool_shutdown = Mock(side_effect=check_before_pool_shutdown)
@@ -213,7 +213,7 @@ def _prepare_model_layout(manager):
     manager._state_layout = replace(_layout(), spec_config=manager.spec_config)
     manager.local_num_mamba_layers = 2
     manager._global_n_groups = 2
-    if isinstance(manager, Qwen4ExpHybridCacheManagerV2):
+    if isinstance(manager, Qwen4ExpHybridCacheManager):
         manager._ple_params = None
         manager._is_ple_draft = False
         manager._pretrained_config = None
@@ -223,12 +223,12 @@ def _prepare_model_layout(manager):
 
 def test_qwen_managers_share_gdn_algorithm_not_model_inheritance():
     states = []
-    for cls in (Qwen35HybridCacheManagerV2, Qwen4ExpHybridCacheManagerV2):
+    for cls in (Qwen35HybridCacheManager, Qwen4ExpHybridCacheManager):
         manager = object.__new__(cls)
         manager._requested_replay = True
         manager.spec_config = SimpleNamespace(tokens_per_gen_step=3)
         _prepare_model_layout(manager)
-        manager._speculative_state = manager._initialize_model_state()
+        manager._speculative_state = manager._initialize_spec_state()
         states.append(manager._speculative_state)
     assert all(type(state) is GDNReplayState for state in states)
     assert states[0] is not states[1]
@@ -237,10 +237,10 @@ def test_qwen_managers_share_gdn_algorithm_not_model_inheritance():
 @pytest.mark.parametrize(
     "manager_cls",
     [
-        NemotronHybridCacheManagerV2,
-        Qwen35HybridCacheManagerV2,
-        Qwen4ExpHybridCacheManagerV2,
-        KimiK3HybridCacheManagerV2,
+        NemotronHybridCacheManager,
+        Qwen35HybridCacheManager,
+        Qwen4ExpHybridCacheManager,
+        KimiK3HybridCacheManager,
         Glm5NextCacheManager,
     ],
 )
@@ -255,7 +255,7 @@ def test_model_initialization_validates_selected_replay(manager_cls):
         manager._state_layout, n_groups_per_rank=0, conv_state_layout="x_b_c"
     )
     with pytest.raises(ValueError, match="requires"):
-        manager._initialize_model_state()
+        manager._initialize_spec_state()
 
 
 @pytest.mark.parametrize(
@@ -268,7 +268,7 @@ def test_model_initialization_validates_selected_replay(manager_cls):
         (None, None, None),
     ],
 )
-@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManagerV2, Glm5NextCacheManager])
+@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
 def test_k3_initializes_only_the_selected_state(
     monkeypatch, requested_num_spec, selected_num_spec, decoding_type, manager_cls
 ):
@@ -285,22 +285,22 @@ def test_k3_initializes_only_the_selected_state(
     replay_factory = Mock(wraps=KDAReplayState)
     selector = Mock(return_value=selected_num_spec)
     monkeypatch.setitem(
-        manager_cls._initialize_model_state.__globals__,
+        manager_cls._initialize_spec_state.__globals__,
         "KDAIntermediateState",
         intermediate_factory,
     )
     monkeypatch.setitem(
-        manager_cls._initialize_model_state.__globals__,
+        manager_cls._initialize_spec_state.__globals__,
         "KDAReplayState",
         replay_factory,
     )
     monkeypatch.setitem(
-        manager_cls._initialize_model_state.__globals__,
+        manager_cls._initialize_spec_state.__globals__,
         "get_kda_replay_num_spec",
         selector,
     )
 
-    manager._speculative_state = manager._initialize_model_state()
+    manager._speculative_state = manager._initialize_spec_state()
     num_spec = requested_num_spec if requested_num_spec is not None else selected_num_spec
     if num_spec is not None:
         intermediate_factory.assert_not_called()
@@ -339,7 +339,7 @@ def test_k3_initializes_only_the_selected_state(
 def test_base_manager_without_model_state(monkeypatch):
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.spec_config = None
-    manager._speculative_state = manager._initialize_model_state()
+    manager._speculative_state = manager._initialize_spec_state()
     assert manager._speculative_state is None
     manager._setup_model_state()
     manager._reset_context_mamba_slots(num_contexts=1)
@@ -355,9 +355,9 @@ def test_base_manager_without_model_state(monkeypatch):
     [
         MambaHybridCacheManager,
         MambaHybridCacheManagerV2,
-        Qwen35HybridCacheManagerV2,
-        Qwen4ExpHybridCacheManagerV2,
-        KimiK3HybridCacheManagerV2,
+        Qwen35HybridCacheManager,
+        Qwen4ExpHybridCacheManager,
+        KimiK3HybridCacheManager,
         Glm5NextCacheManager,
     ],
 )
@@ -366,7 +366,7 @@ def test_seed_accessor_is_not_a_common_manager_capability(manager_cls):
 
 
 def test_mamba2_seed_lifecycle_without_speculative_decoding(monkeypatch):
-    manager = object.__new__(NemotronHybridCacheManagerV2)
+    manager = object.__new__(NemotronHybridCacheManager)
     manager.spec_config = None
     manager._requested_replay = False
     manager._mamba_ssm_stochastic_rounding = True
@@ -374,7 +374,7 @@ def test_mamba2_seed_lifecycle_without_speculative_decoding(monkeypatch):
     views = _state_views()
     manager.all_ssm_states = views.all_ssm_states
     manager.all_conv_states = views.all_conv_states
-    manager._speculative_state = manager._initialize_model_state()
+    manager._speculative_state = manager._initialize_spec_state()
     manager._setup_model_state()
     seeds = manager.get_mamba_ssm_rand_seed()
     before = seeds.clone()
@@ -425,7 +425,7 @@ def test_base_manager_requires_model_for_speculative_decoding():
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.spec_config = SimpleNamespace(tokens_per_gen_step=3)
     with pytest.raises(NotImplementedError, match="model-specific"):
-        manager._initialize_model_state()
+        manager._initialize_spec_state()
     manager._speculative_state = None
     manager.local_num_mamba_layers = 1
     manager._generation_state_indices = torch.empty(0, dtype=torch.int32)
@@ -440,7 +440,7 @@ def test_base_manager_requires_model_for_speculative_decoding():
 
 @pytest.mark.parametrize(
     "manager_cls",
-    [NemotronHybridCacheManagerV2, Qwen35HybridCacheManagerV2, Qwen4ExpHybridCacheManagerV2],
+    [NemotronHybridCacheManager, Qwen35HybridCacheManager, Qwen4ExpHybridCacheManager],
 )
 @pytest.mark.parametrize("mode", ["plain", "intermediate", "replay"])
 def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
@@ -448,14 +448,14 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
     manager.spec_config = SimpleNamespace(tokens_per_gen_step=3) if mode != "plain" else None
     manager._requested_replay = mode == "replay"
     _prepare_model_layout(manager)
-    manager._speculative_state = manager._initialize_model_state()
+    manager._speculative_state = manager._initialize_spec_state()
     state = manager._speculative_state
     assert isinstance(state, (Mamba2State, GDNIntermediateState)) == (mode != "replay")
     assert isinstance(state, (ReplayHistory, GDNReplayState)) == (mode == "replay")
 
     manager._state_layout = object()
     manager.local_num_mamba_layers = 0
-    if manager_cls is Qwen4ExpHybridCacheManagerV2:
+    if manager_cls is Qwen4ExpHybridCacheManager:
         manager._ple_conv_states = {}
         manager._ple_ngram_contexts = {}
     manager.mamba_layer_offsets = {42: 0}
@@ -522,7 +522,7 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
 
 
 def test_ple_adds_buffers_without_overriding_snapshot_or_budget_solver():
-    manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager._mamba_layer_mask = [True, True]
     manager.mamba_pp_layers = [0, 1]
     manager.ssm_bytes, manager.conv_bytes = 128, 288
@@ -551,7 +551,7 @@ def test_warmup_cleanup_clears_registered_persistent_roles_only(
         mamba_cache_manager_v2 as module,
     )
 
-    manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager._mamba_layer_mask = [False, True]
     manager.pp_layers = manager.mamba_pp_layers = [1]
     manager.layer_offsets = manager.mamba_layer_offsets = {1: 0}
@@ -649,7 +649,7 @@ def test_gdn_bind_accepts_affine_and_indirect_views(affine):
     assert (state._state_descriptors is not None) != affine
     assert state.old_x.shape == (3, 5, 2, 16, 2, 4)
     owners = []
-    for cls in (Qwen35HybridCacheManagerV2, Qwen4ExpHybridCacheManagerV2):
+    for cls in (Qwen35HybridCacheManager, Qwen4ExpHybridCacheManager):
         owner = object.__new__(cls)
         owner._speculative_state = state
         owners.append(owner)
@@ -977,17 +977,17 @@ def test_algorithm_methods_do_not_depend_on_manager(cls):
 @pytest.mark.parametrize(
     "manager_cls",
     [
-        NemotronHybridCacheManagerV2,
-        Qwen35HybridCacheManagerV2,
-        Qwen4ExpHybridCacheManagerV2,
-        KimiK3HybridCacheManagerV2,
+        NemotronHybridCacheManager,
+        Qwen35HybridCacheManager,
+        Qwen4ExpHybridCacheManager,
+        KimiK3HybridCacheManager,
         Glm5NextCacheManager,
     ],
 )
 def test_model_compatibility_properties_follow_owned_state(manager_cls):
     manager = object.__new__(manager_cls)
     manager._speculative_state = GDNIntermediateState()
-    if manager_cls is KimiK3HybridCacheManagerV2:
+    if manager_cls is KimiK3HybridCacheManager:
         manager._kda_replay = None
     fields = {
         "intermediate_state_indices": "intermediate_indices",
@@ -1006,7 +1006,7 @@ def test_model_compatibility_properties_follow_owned_state(manager_cls):
 
 
 def test_k3_resolves_transfer_requests_before_calling_algorithm():
-    manager = object.__new__(KimiK3HybridCacheManagerV2)
+    manager = object.__new__(KimiK3HybridCacheManager)
     manager._request_id_to_state_index = {101: 3, 202: 1}
     replay = KDAReplayState(2)
     replay.prev_num_accepted_tokens = torch.zeros(5, dtype=torch.int32)
@@ -1023,7 +1023,7 @@ def test_k3_resolves_transfer_requests_before_calling_algorithm():
 
 @pytest.mark.parametrize("draft_lengths", [[], [0, 0], [1, 0], [1, 1]])
 def test_k3_host_acceptance_handles_empty_mixed_and_completed_requests(draft_lengths):
-    manager = object.__new__(KimiK3HybridCacheManagerV2)
+    manager = object.__new__(KimiK3HybridCacheManager)
     replay = KDAReplayState(2)
     replay.prev_num_accepted_tokens = torch.tensor([5, 6], dtype=torch.int32)
     manager._kda_replay = replay
@@ -1049,7 +1049,7 @@ def test_k3_host_acceptance_handles_empty_mixed_and_completed_requests(draft_len
 def _slot_view_manager(
     monkeypatch, *, scale=6, role_count=2, page_shape=(4, 2, 3), dtype=torch.float32
 ):
-    manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.layer_offsets = {42: 0}
     page_elements = 1
     for dim in page_shape:
@@ -1071,7 +1071,7 @@ def _slot_view_manager(
         get_page_index_converter=lambda layer, role: converter,
         get_page_index_upper_bound=lambda layer, role: 3 * scale - layer_offset,
     )
-    globals_ = Qwen4ExpHybridCacheManagerV2._get_view_by_role_and_layer.__globals__
+    globals_ = Qwen4ExpHybridCacheManager._get_view_by_role_and_layer.__globals__
     monkeypatch.setitem(globals_, "TensorWrapper", lambda address, dtype, shape: (address, shape))
 
     def convert(wrapper):
@@ -1124,7 +1124,7 @@ def test_slot_role_view_rejects_incompatible_physical_layout(monkeypatch, invali
 
 
 def test_qwen4_position_uses_model_owned_slot_view(monkeypatch):
-    manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.qsa_position_layer_id = 42
     manager.tokens_per_block = 4
     manager._get_view_by_role_and_layer = Mock(
@@ -1140,8 +1140,8 @@ def test_qwen4_position_uses_model_owned_slot_view(monkeypatch):
 
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 def test_qwen4_main_kv_view_supplies_only_logical_geometry(monkeypatch, kv_layout):
-    manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
-    namespace = Qwen4ExpHybridCacheManagerV2.get_buffers.__globals__
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
+    namespace = Qwen4ExpHybridCacheManager.get_buffers.__globals__
     manager._qsa_enabled = True
     manager.dtype = next(iter(namespace["QSA_SPARSE_KV_CACHE_DTYPES"]))
     manager.kv_cache_type = namespace["CacheTypeCpp"].SELF
@@ -1167,7 +1167,7 @@ def test_qwen4_main_kv_view_supplies_only_logical_geometry(monkeypatch, kv_layou
 
 @pytest.mark.parametrize("invalid", [None, "pool", "scale", "expansion"])
 def test_qwen4_attention_pool_layout_validates_backend_contract(invalid):
-    manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.layer_offsets = {42: 0}
     manager.qsa_position_layer_id = 42
     manager.qsa_sparse_layer_ids = [42]
@@ -1189,7 +1189,7 @@ def test_qwen4_attention_pool_layout_validates_backend_contract(invalid):
 
 
 def test_qwen4_requires_one_mapping_and_skips_nonlocal_layers():
-    manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.qsa_position_layer_id = 42
     manager.qsa_sparse_layer_ids = [42, 43, 99]
     manager.layer_offsets = {42: 0, 43: 1}
@@ -1242,9 +1242,9 @@ def test_constructor_validates_before_pool_and_binds_after_slot_capacity(monkeyp
             get_page_index_upper_bound=lambda layer, role: 5,
         )
 
-    class ObservedQwen4(Qwen4ExpHybridCacheManagerV2):
-        def _initialize_model_state(self):
-            state = super()._initialize_model_state()
+    class ObservedQwen4(Qwen4ExpHybridCacheManager):
+        def _initialize_spec_state(self):
+            state = super()._initialize_spec_state()
             events.append("validate")
             return state
 

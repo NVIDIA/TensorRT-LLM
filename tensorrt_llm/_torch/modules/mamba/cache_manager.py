@@ -476,7 +476,7 @@ def select_mamba2_state(
     )
 
 
-class NemotronHybridCacheManagerV2(MambaHybridCacheManagerV2):
+class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
     """Nemotron/Mamba2 geometry, replay selection and seed ownership."""
 
     _speculative_state: Mamba2State | ReplayHistory
@@ -489,7 +489,7 @@ class NemotronHybridCacheManagerV2(MambaHybridCacheManagerV2):
         super().__init__(*args, **kwargs)
 
     @override
-    def _initialize_model_state(self) -> Mamba2State | ReplayHistory:
+    def _initialize_spec_state(self) -> Mamba2State | ReplayHistory:
         if self._requested_replay is not None:
             state = create_mamba2_state(
                 spec_config=self.spec_config,
@@ -546,7 +546,7 @@ __all__ = [
     "Mamba2LayerCache",
     "Mamba2State",
     "ReplayHistory",
-    "NemotronHybridCacheManagerV2",
+    "NemotronHybridCacheManager",
     "create_mamba2_state",
     "select_mamba2_state",
     "get_nemotron_cache_params",

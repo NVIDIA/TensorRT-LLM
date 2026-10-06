@@ -36,7 +36,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.module import (
     select_qsa_paged_tokens,
     select_qsa_tokens,
 )
-from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManagerV2
+from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
 from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 
 
@@ -1451,7 +1451,7 @@ def test_fused_qsa_prefill_bounds_sparse_attention_to_visible_tokens() -> None:
 
 
 def test_qsa_side_buffers_use_exact_geometry_and_one_position_role() -> None:
-    manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager._qsa_enabled = True
     manager.qsa_index_dim = 128
     manager.qsa_index_kv_heads = 1
@@ -1477,7 +1477,7 @@ def test_qsa_position_buffer_keeps_shared_index_mode_outside_dynamo() -> None:
             del layer_idx, role
             return 0
 
-    manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.qsa_position_layer_id = 7
     manager.layer_offsets = {7: 2}
     manager.impl = _Impl()

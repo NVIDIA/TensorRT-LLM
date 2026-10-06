@@ -42,9 +42,9 @@ def get_sparse_attn_kv_cache_manager(
     elif sparse_attention_config.algorithm == "qsa":
         if not use_kv_cache_manager_v2:
             raise ValueError("QSA sparse attention requires KV cache manager V2")
-        from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManagerV2
+        from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
 
-        return Qwen4ExpHybridCacheManagerV2
+        return Qwen4ExpHybridCacheManager
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm: {sparse_attention_config.algorithm}"

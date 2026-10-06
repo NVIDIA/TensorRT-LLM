@@ -161,7 +161,7 @@ def _qwen4_exp_ple_state_bytes_per_rank(
     return local_ple_layers * ple_bytes_per_layer
 
 
-class Qwen4ExpHybridCacheManagerV2(MambaHybridCacheManagerV2):
+class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
     """Hybrid GDN/KV manager with lifecycle-coupled sparse side buffers.
 
     QSA adds a per-layer index-K cache and request-wide position coordinates.
@@ -519,7 +519,7 @@ class Qwen4ExpHybridCacheManagerV2(MambaHybridCacheManagerV2):
         ]
 
     @override
-    def _initialize_model_state(self) -> GDNIntermediateState | GDNReplayState:
+    def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState:
         state = create_gdn_state(self, self._requested_replay)
 
         validate_gdn_layout(self, state)
@@ -609,7 +609,7 @@ def get_qwen4_exp_ple_cache_params(config, *, total_layers: int, is_draft: bool)
 
 
 __all__ = [
-    "Qwen4ExpHybridCacheManagerV2",
+    "Qwen4ExpHybridCacheManager",
     "Qwen4ExpPLECacheParams",
     "extract_qwen4_exp_ple_cache_params",
     "get_qwen4_exp_ple_layer_mask",

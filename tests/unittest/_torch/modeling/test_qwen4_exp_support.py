@@ -553,7 +553,7 @@ def test_v2_cache_estimator_counts_ple_lifecycle_state(
 ) -> None:
     from tensorrt_llm._torch.configs import Qwen4ExpTextConfig
     from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
-        Qwen4ExpHybridCacheManagerV2,
+        Qwen4ExpHybridCacheManager,
         extract_qwen4_exp_ple_cache_params,
     )
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MambaStateConfig
@@ -573,10 +573,10 @@ def test_v2_cache_estimator_counts_ple_lifecycle_state(
             ),
         ),
     }
-    with_ple = Qwen4ExpHybridCacheManagerV2.get_cache_size_per_token(
+    with_ple = Qwen4ExpHybridCacheManager.get_cache_size_per_token(
         SimpleNamespace(pretrained_config=config, quant_config=None), **common
     )
-    without_ple = Qwen4ExpHybridCacheManagerV2.get_cache_size_per_token(
+    without_ple = Qwen4ExpHybridCacheManager.get_cache_size_per_token(
         SimpleNamespace(pretrained_config=no_ple_config, quant_config=None), **common
     )
 
@@ -593,7 +593,7 @@ def test_ple_states_use_v2_lifecycle_buffers(monkeypatch) -> None:
     from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
         PLE_CONV_STATE,
         PLE_NGRAM_CONTEXT,
-        Qwen4ExpHybridCacheManagerV2,
+        Qwen4ExpHybridCacheManager,
     )
 
     ngram_context = torch.full((12, 2), 11, dtype=torch.int64)
@@ -615,8 +615,8 @@ def test_ple_states_use_v2_lifecycle_buffers(monkeypatch) -> None:
             return conv_state
         raise AssertionError(f"unexpected role {role}")
 
-    monkeypatch.setattr(Qwen4ExpHybridCacheManagerV2, "_get_state_buffer", fake_get_state_buffer)
-    manager = object.__new__(Qwen4ExpHybridCacheManagerV2)
+    monkeypatch.setattr(Qwen4ExpHybridCacheManager, "_get_state_buffer", fake_get_state_buffer)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager._ple_layer_ids = [1]
     manager._ple_ngram_context_shape = [2]
     manager._ple_conv_state_shape = [16, 6]

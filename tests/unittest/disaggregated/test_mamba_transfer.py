@@ -37,10 +37,10 @@ from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import Atte
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm import peer
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.modules.fla.cache_manager import Qwen35HybridCacheManagerV2
-from tensorrt_llm._torch.modules.mamba.cache_manager import NemotronHybridCacheManagerV2
+from tensorrt_llm._torch.modules.fla.cache_manager import Qwen35HybridCacheManager
+from tensorrt_llm._torch.modules.mamba.cache_manager import NemotronHybridCacheManager
 from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
-    Qwen4ExpHybridCacheManagerV2,
+    Qwen4ExpHybridCacheManager,
     Qwen4ExpPLECacheParams,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
@@ -232,11 +232,11 @@ def _create_managers(
         if not use_v2:
             manager_cls = MixedMambaHybridCacheManager
         elif with_ple:
-            manager_cls = Qwen4ExpHybridCacheManagerV2
+            manager_cls = Qwen4ExpHybridCacheManager
         elif conv_state_layout == "q_k_v":
-            manager_cls = Qwen35HybridCacheManagerV2
+            manager_cls = Qwen35HybridCacheManager
         else:
-            manager_cls = NemotronHybridCacheManagerV2
+            manager_cls = NemotronHybridCacheManager
         manager_kwargs = (
             {
                 "is_disagg": True,
@@ -304,7 +304,7 @@ def _zero_mamba_states(manager):
     for layer_idx in _mamba_layer_ids(manager):
         manager.get_conv_states(layer_idx).zero_()
         manager.get_ssm_states(layer_idx).zero_()
-    if isinstance(manager, Qwen4ExpHybridCacheManagerV2):
+    if isinstance(manager, Qwen4ExpHybridCacheManager):
         for state in manager._ple_conv_states.values():
             state.zero_()
         for state in manager._ple_ngram_contexts.values():

@@ -406,17 +406,17 @@ def get_kv_cache_manager_cls(
                 sparse_attn_config, use_kv_cache_manager_v2=True)
         if is_kimi_linear(config):
             from ..modules.kimi_kda.cache_manager import \
-                KimiK3HybridCacheManagerV2
-            return KimiK3HybridCacheManagerV2
+                KimiK3HybridCacheManager
+            return KimiK3HybridCacheManager
         if is_qwen4_exp(config):
             from ..modules.qwen4_exp.cache_manager import \
-                Qwen4ExpHybridCacheManagerV2
-            return Qwen4ExpHybridCacheManagerV2
+                Qwen4ExpHybridCacheManager
+            return Qwen4ExpHybridCacheManager
         if is_qwen3_hybrid(config):
-            from ..modules.fla.cache_manager import Qwen35HybridCacheManagerV2
-            return Qwen35HybridCacheManagerV2
-        from ..modules.mamba.cache_manager import NemotronHybridCacheManagerV2
-        return NemotronHybridCacheManagerV2
+            from ..modules.fla.cache_manager import Qwen35HybridCacheManager
+            return Qwen35HybridCacheManager
+        from ..modules.mamba.cache_manager import NemotronHybridCacheManager
+        return NemotronHybridCacheManager
     elif sparse_attn_config is not None:
         if sparse_attn_algorithm == "qsa":
             # The QSA manager extends the hybrid manager because it must retain

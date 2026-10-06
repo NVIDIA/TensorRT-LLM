@@ -521,7 +521,7 @@ def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache, verify_kernel
         "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
         return_value=verify_kernel is True,
     ):
-        state = manager._initialize_model_state()
+        state = manager._initialize_spec_state()
     assert manager.use_kda_replay_update is (verify_kernel is True)
     if verify_kernel is True:
         assert state.num_speculative_tokens == 3
