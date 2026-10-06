@@ -826,3 +826,122 @@ def test_cft_device_support(
         assert reason is None
     else:
         assert unsupported.name in reason
+
+
+# ============================================================================
+# CFT dispatch health flags for the host watchdog
+# ============================================================================
+
+
+def _run_watchdog_worker(_unused: int) -> dict:
+    """Dispatch once under CFT with a watchdog armed, and report what it saw."""
+    # Import locally so cloudpickle does not serialize torch's dynamic ops namespace.
+    import os
+
+    import torch
+
+    os.environ[FORCE_CFT_ENV] = "1"
+
+    from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import EPGroupHealth
+
+    rank = MPI.COMM_WORLD.Get_rank()
+    ep_size = MPI.COMM_WORLD.Get_size()
+    torch.cuda.set_device(rank)
+    MnnvlMemory.initialize()
+
+    from tensorrt_llm.bindings import BuildInfo
+
+    cft_reason = None
+    if not BuildInfo.CFT_COUNTED_WRITES:
+        cft_reason = "build was compiled against CUDA below 13.4"
+    elif not cft_driver_is_supported(_get_nvidia_driver_version()):
+        cft_reason = "CFT requires driver 615 or newer"
+    else:
+        cft_reason = _cft_device_support_reason()
+    reasons = MPI.COMM_WORLD.allgather((MnnvlMemory.supports_mnnvl(), cft_reason))
+    if not all(item[0] for item in reasons):
+        return {"skip": "NVLink one-sided is not supported on every participating GPU"}
+    if any(item[1] for item in reasons):
+        return {"skip": str(reasons)}
+
+    timeouts: list = []
+    mapping = Mapping(rank=rank, world_size=ep_size, tp_size=ep_size, moe_ep_size=ep_size)
+    comm = NVLinkOneSided(
+        mapping=mapping,
+        num_slots=ep_size * 2,
+        top_k=1,
+        max_num_tokens_per_rank=8,
+        hidden_size=512,
+        dtype=torch.bfloat16,
+        ep_group_health=EPGroupHealth(ep_size),
+        alltoall_watchdog_timeout_s=5.0,
+        alltoall_watchdog_poll_interval_s=0.02,
+        alltoall_watchdog_on_timeout=timeouts.append,
+    )
+    try:
+        # Every input to the selection is uniform across an MNNVL domain and was
+        # screened above, so a disabled CFT here is a defect, not a skip.
+        assert comm.can_use_cft_counted_writes, "CFT was screened as available but not selected"
+
+        num_tokens = 4
+        slots = torch.randint(0, ep_size * 2, (num_tokens, 1), dtype=torch.int32, device="cuda")
+        payload = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device="cuda")
+        scales = torch.ones(num_tokens, 1, dtype=torch.float32, device="cuda")
+        comm.dispatch(payload, None, slots, scales, [num_tokens] * ep_size)
+        torch.cuda.synchronize()
+
+        # The flags the watchdog polls live in this rank's own workspace row.
+        offset = comm.moe_a2a_metainfo[comm.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX].item()
+        flags = (
+            comm.workspace[comm.ep_rank, offset : offset + ep_size * 4]
+            .view(torch.int32)
+            .cpu()
+            .tolist()
+        )
+        flag_val_offset = comm.moe_a2a_metainfo[comm.FLAG_VAL_OFFSET_INDEX].item()
+        expected = int(
+            comm.workspace[comm.ep_rank, flag_val_offset : flag_val_offset + 4]
+            .view(torch.int32)
+            .cpu()
+            .item()
+        )
+        MPI.COMM_WORLD.barrier()
+        return {
+            "rank": rank,
+            "flags": flags,
+            "expected_flag": expected,
+            "timeouts": [t.missing_ranks for t in timeouts],
+        }
+    finally:
+        comm.destroy()
+
+
+@pytest.mark.parametrize("ep_size", [2, 4])
+def test_cft_dispatch_publishes_watchdog_flags(ep_size: int) -> None:
+    """CFT dispatch must publish completion flags so the watchdog sees live peers.
+
+    CFT signals data arrival through counted-write counters, but the host
+    watchdog can only observe the completion flag table. Without the flags a
+    healthy collective is reported as every peer missing.
+    """
+    if torch.cuda.device_count() < ep_size:
+        pytest.skip(f"requires {ep_size} GPUs")
+    executor = MPIPoolExecutor(ep_size)
+    try:
+        results = list(executor.map(_run_watchdog_worker, range(ep_size)))
+        skipped = [r["skip"] for r in results if "skip" in r]
+        if skipped:
+            pytest.skip(skipped[0])
+        results.sort(key=lambda r: r["rank"])
+        for result in results:
+            rank = result["rank"]
+            expected = result["expected_flag"]
+            assert result["flags"] == [expected] * ep_size, (
+                f"rank {rank}: dispatch completion flags {result['flags']} did not all "
+                f"reach {expected}; the watchdog would report healthy peers as missing"
+            )
+            assert result["timeouts"] == [], (
+                f"rank {rank}: watchdog reported {result['timeouts']} on a healthy collective"
+            )
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
