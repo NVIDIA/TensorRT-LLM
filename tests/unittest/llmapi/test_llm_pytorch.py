@@ -116,6 +116,56 @@ def test_llm_get_stats_async(return_context_logits, use_overlap,
         enable_iter_req_stats=enable_iter_req_stats)
 
 
+@skip_ray
+@pytest.mark.parametrize("use_overlap", [False, True])
+@pytest.mark.part1
+def test_llm_get_stats_with_interval(use_overlap):
+    """iter_perf_stats_interval samples records but keeps counter sums exact."""
+    interval = 4
+    stat_prompts = [
+        "A B C", "Nvidia is awesome because", "The capital of France is",
+        "Once upon a time"
+    ] * 2
+    with LLM(model=llama_model_path,
+             kv_cache_config=global_kvcache_config,
+             enable_iter_perf_stats=True,
+             enable_iter_req_stats=True,
+             iter_perf_stats_interval=interval,
+             disable_overlap_scheduler=not use_overlap) as llm:
+        # Different lengths so requests finish on different iterations.
+        sampling_params = [
+            SamplingParams(max_tokens=5 + 3 * i, end_id=-1)
+            for i in range(len(stat_prompts))
+        ]
+        llm.generate(stat_prompts, sampling_params=sampling_params)
+
+        records = []
+        while True:
+            batch = llm.get_stats(timeout=2)
+            if not batch:
+                break
+            records.extend(
+                json.loads(r) if isinstance(r, str) else r for r in batch)
+
+    iter_records = [r for r in records if "iter" in r]
+    assert iter_records, "expected sampled iteration stats records"
+    # Every record is on a sampled iteration, except the single record
+    # flushed when the last active request finishes between samples.
+    off_interval = [r["iter"] for r in iter_records if r["iter"] % interval]
+    assert len(off_interval) <= 1, off_interval
+    if off_interval:
+        assert off_interval[0] == max(r["iter"] for r in iter_records)
+    # Counters from skipped iterations are folded into emitted records.
+    assert sum(r["numCompletedRequests"]
+               for r in iter_records) == len(stat_prompts)
+    assert sum(r["numNewActiveRequests"]
+               for r in iter_records) == len(stat_prompts)
+    # Far fewer records than executor iterations: the sampled iterations
+    # 0, interval, ..., plus the startup snapshot and the drain record.
+    last_iter = max(r["iter"] for r in iter_records)
+    assert len(iter_records) <= last_iter // interval + 3
+
+
 @pytest.mark.part1
 def test_llm_capture_request_error():
     _test_llm_capture_request_error(pytorch_backend=True, tp_size=1)

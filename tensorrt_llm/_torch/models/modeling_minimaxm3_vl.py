@@ -1737,15 +1737,19 @@ class MiniMaxM3VLInputProcessor:
     ``MINIMAX_M3_VL_VISION_END_TOKEN`` above, resolved via the tokenizer).
     """
 
+    supports_tokenization_cache = True
+
     def __init__(
         self,
         model_path: str,
         config: Any,
         tokenizer: Any = None,
         trust_remote_code: bool = True,
+        enable_tokenization_cache: bool = False,
         **kwargs: Any,
     ):
         from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+        from tensorrt_llm.logger import logger
 
         BaseMultimodalInputProcessor.__init__(
             self,
@@ -1770,6 +1774,15 @@ class MiniMaxM3VLInputProcessor:
             use_fast=self._use_fast,
             trust_remote_code=trust_remote_code,
         )
+        # The HF processor tokenizes with add_special_tokens=True and the cache with False,
+        # so their ids match only if the tokenizer adds no special tokens.
+        if enable_tokenization_cache and self._processor.tokenizer.num_special_tokens_to_add() != 0:
+            logger.warning(
+                "enable_tokenization_cache is ignored: the MiniMax-M3 tokenizer adds "
+                "special tokens, so cached ids would differ from the HF processor's."
+            )
+            enable_tokenization_cache = False
+        self._init_tokenization_cache(enable_tokenization_cache, self._processor.tokenizer)
         text_cfg = getattr(config, "text_config", None)
         if isinstance(text_cfg, dict):
             self._dtype = getattr(text_cfg, "torch_dtype", torch.bfloat16)
@@ -2050,6 +2063,9 @@ class MiniMaxM3VLInputProcessor:
                 templated_text = "\n".join(explicit)
         else:
             templated_text = text_prompt or ""
+            ids = self._encode_with_tokenization_cache(templated_text, sampling_params)
+            if ids is not None:
+                return ids, {"multimodal_data": {}}
 
         # Run the HF processor. ``return_tensors='pt'`` yields tensors
         # in the BatchFeature output.

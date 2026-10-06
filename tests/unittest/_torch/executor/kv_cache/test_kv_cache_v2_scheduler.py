@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 
 pytestmark = pytest.mark.cpu_only
@@ -34,7 +35,10 @@ pytestmark = pytest.mark.cpu_only
 
 @pytest.mark.parametrize("active", [False, True])
 @pytest.mark.parametrize("admitted", [False, True])
-def test_generation_admits_decode_before_capacity_growth(active: bool, admitted: bool) -> None:
+@pytest.mark.parametrize("beam_admitted", [False, True])
+def test_generation_admits_decode_before_capacity_growth(
+    active: bool, admitted: bool, beam_admitted: bool
+) -> None:
     manager = object.__new__(KVCacheManagerV2)
     cache = Mock(is_active=active, capacity=8)
     cache.enter_decode.return_value = admitted
@@ -43,6 +47,7 @@ def test_generation_admits_decode_before_capacity_growth(active: bool, admitted:
     manager.kv_cache_map = {1: cache}
     manager._stream = Mock(cuda_stream=123)
     manager._restore_page_index_bufs = Mock()
+    manager._ensure_generation_beam_width = Mock(return_value=beam_admitted)
     manager._generation_draft_slots = Mock(return_value=0)
     manager._allocated_draft_lens = {}
     manager._has_cp_helix = False
@@ -50,14 +55,36 @@ def test_generation_admits_decode_before_capacity_growth(active: bool, admitted:
     manager._log_window_crossing = Mock()
     req = Mock(py_request_id=1)
 
-    assert manager.try_allocate_generation(req) == admitted
+    allocated = admitted and beam_admitted
+    assert manager.try_allocate_generation(req) == allocated
     admission = call.enter_decode() if active else call.resume(123, is_decoding=True)
-    assert cache.mock_calls == [admission] + ([call.resize(9)] if admitted else [])
+    assert cache.mock_calls == [admission] + ([call.resize(9)] if allocated else [])
+    if admitted:
+        manager._ensure_generation_beam_width.assert_called_once_with(req, cache)
+    else:
+        manager._ensure_generation_beam_width.assert_not_called()
     if not active and admitted:
         manager._restore_page_index_bufs.assert_called_once_with(1, cache)
     else:
         manager._restore_page_index_bufs.assert_not_called()
-    assert manager._allocated_draft_lens == ({1: 0} if admitted else {})
+    assert manager._allocated_draft_lens == ({1: 0} if allocated else {})
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_resume_restores_page_buffers_and_sparse_metadata_row(sparse: bool) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.index_mapper = Mock()
+    manager.index_mapper.get_index.return_value = 3
+    manager._set_page_index_bufs = Mock()
+    manager.sparse_metadata_batch = Mock() if sparse else None
+    cache = Mock()
+
+    manager._restore_page_index_bufs(7, cache)
+
+    manager._set_page_index_bufs.assert_called_once_with(7, cache)
+    if sparse:
+        manager.index_mapper.get_index.assert_called_once_with(7)
+        manager.sparse_metadata_batch.add.assert_called_once_with(cache, 3)
 
 
 @pytest.mark.parametrize("is_draft", [False, True])
@@ -107,6 +134,8 @@ def sparse_offset_manager() -> KVCacheManagerV2:
     manager._stream = Mock(cuda_stream=123)
     manager.sparse_metadata_batch = Mock()
     manager._sparse_layer_group_ids = (1, 3)
+    manager.max_copy_beam_width = 1
+    manager.kv_cache_type = CacheTypeCpp.SELF
     manager.tokens_per_block = 4
     manager.kv_cache_map = {req_id: Mock(is_decoding=True, history_length=8) for req_id in (7, 8)}
     for cache in manager.kv_cache_map.values():
@@ -236,6 +265,8 @@ def test_sparse_publication_failure_stops_metadata_preparation() -> None:
 def test_dense_metadata_preparation_uses_existing_offsets() -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager._stream = Mock(cuda_stream=123)
+    manager.max_copy_beam_width = 1
+    manager.kv_cache_type = CacheTypeCpp.SELF
     manager._use_per_layer_page_tables = False
     manager.index_mapper = Mock()
     manager.index_mapper.get_copy_index.return_value = Mock(shape=(1,))
@@ -262,10 +293,10 @@ def test_sparse_index_slot_release_detaches_batch_before_reuse() -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager.is_draft = False
     manager._stream = Mock(cuda_stream=123)
-    manager.max_beam_width = 1
+    manager.max_beam_width = 2
     manager.num_pools = 1
     manager._early_freed_index_requests = set()
-    cache = Mock()
+    cache = Mock(beam_width=1)
     manager.kv_cache_map = {7: cache}
     manager.sparse_metadata_batch = Mock()
     manager.index_mapper = Mock()

@@ -1281,6 +1281,8 @@ class Step3p7MTP(nn.Module):
     draft logits are requested.
     """
 
+    uses_shared_lm_head = False
+
     def __init__(
         self,
         model_config: ModelConfig,

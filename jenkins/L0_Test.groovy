@@ -3161,6 +3161,10 @@ def RUN_MODE = "run_mode"
 // instead of inventing a second answer to "is BOLT on".
 @Field
 def BOLT_CONSUME_BUILD = "bolt_consume_build"
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -3169,6 +3173,12 @@ def globalVars = [
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): null,
     (BOLT_CONSUME_BUILD): false,
+    // Pre-declared so updateMapWithJson() populates it from the parent: that
+    // helper only updates keys already present here, so an absent key is
+    // silently dropped -- which for this one would mean running unpinned
+    // without saying so.
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PROFILE_BRANCH): "",
 ]
 
 class GlobalState {
@@ -5702,7 +5712,8 @@ def checkKitmakerWheelDryRun(pipeline, kitmakerDryRunMetadata)
 // a missing bundle as a skip; it has to, because the same switch covers x86_64,
 // where nothing is promoted yet. This path is aarch64-only and the switch is
 // main-only, so there is always a bundle to find.
-def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch)
+def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch, String boltProfileRef = "",
+                           String boltProfileBranch = "")
 {
     def llvmArch = (cpu_arch == AARCH64_TRIPLE) ? "ARM64" : "X64"
     // apply_latest.sh resolves exactly one branch, so try the build's own branch
@@ -5713,6 +5724,13 @@ def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch)
         .collect { it?.toString()?.trim() }
         .findAll { it }
         .unique()
+    // A pin now supplies its own branch, so nothing is left to guess: the ref
+    // names one object under that branch's promote directory. Walking candidates
+    // would only add ways to fetch something other than what was pinned.
+    if (boltProfileRef && boltProfileBranch) {
+        branches = [boltProfileBranch]
+        echo "[bolt-wheel] pinned to BOLT bundle ${boltProfileRef} on ${boltProfileBranch}"
+    }
 
     stage("BOLT release wheel") {
         sh """
@@ -5738,14 +5756,23 @@ def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch)
         for (b in branches) {
             rc = sh(returnStatus: true, script: """
                 export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
+                export BOLT_PROFILE_REF='${boltProfileRef}'
+                # Quoted: the branch comes from job env and the wheel name from a
+                # directory listing, so an unquoted expansion would let a shell
+                # metacharacter in either run before apply_latest.sh starts.
                 bash tensorrt_llm/scripts/bolt/internal/apply_latest.sh \
-                     ${b} ${cpu_arch} ${wheel} ${wheel}.bolted
+                     '${b}' '${cpu_arch}' '${wheel}' '${wheel}.bolted'
             """)
             if (rc != 3) {
                 appliedFrom = b
                 break
             }
             echo "[bolt-wheel] no promoted bundle for ${b}/${cpu_arch}; trying next candidate branch"
+        }
+        if (rc == 3 && boltProfileRef) {
+            error("[bolt-wheel] pinned BOLT bundle ${boltProfileRef} (${cpu_arch}) not found under any of " +
+                  "${branches.join(', ')}. This pipeline pinned a bundle the release wheel cannot fetch; " +
+                  "refusing to publish a wheel optimized with anything else.")
         }
         if (rc == 3) {
             error("[bolt-wheel] no promoted BOLT bundle for any of ${branches.join(', ')} (${cpu_arch}); " +
@@ -5756,7 +5783,8 @@ def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch)
             error("[bolt-wheel] apply_latest.sh failed (rc=${rc}) for ${appliedFrom}/${cpu_arch}")
         }
         sh "mv -f ${wheel}.bolted ${wheel}"
-        echo "[bolt-wheel] ${wheel} is now BOLTed (profiles from ${appliedFrom}/${cpu_arch})"
+        echo "[bolt-wheel] ${wheel} is now BOLTed (profiles from ${appliedFrom}/${cpu_arch}" +
+             (boltProfileRef ? ", bundle ${boltProfileRef})" : ")")
     }
 }
 
@@ -5769,7 +5797,9 @@ def runLLMBuild(
     cpver="cp312",
     plat_name="",
     is_dlfw=false,
-    boltConsume=false)
+    boltConsume=false,
+    boltProfileRef="",
+    boltProfileBranch="")
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -5805,9 +5835,7 @@ def runLLMBuild(
         "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
         "TRTLLM_VERSION_OVERRIDE=${version_override}",
     ]) {
-        withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
-        }
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
     }
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
@@ -5832,7 +5860,8 @@ def runLLMBuild(
     // inside an already-released image to prove that image can still build from
     // source; optimizing it would prove nothing and only add a failure mode.
     if (boltConsume && cpu_arch == AARCH64_TRIPLE && !wheel_path) {
-        applyLatestBoltToWheel(pipeline, "tensorrt_llm/build/${wheelName}", cpu_arch)
+        applyLatestBoltToWheel(pipeline, "tensorrt_llm/build/${wheelName}", cpu_arch,
+                               boltProfileRef, boltProfileBranch)
     }
 
     def rootWheelUploadPath = "${cpu_arch}/${wheel_path}"
@@ -7008,11 +7037,17 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             // Same switch the build helpers use for the tarball, so the released
             // wheel and the released tarball are never optimized differently.
             def boltConsume = globalVars[BOLT_CONSUME_BUILD]?.toString() == "true"
+            // The bundle this pipeline pinned, so the released wheel is optimized
+            // with the same profiles the tested build was. Empty means unpinned:
+            // apply_latest.sh then takes whatever `latest` is, i.e. today's
+            // behaviour.
+            def boltProfileRef = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
+            def boltProfileBranch = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
                 wheelPath = runLLMBuild(
                     pipeline, cpu_arch, values[3], "", versionOverride, cpver,
-                    values[7], isDlfw, boltConsume)
+                    values[7], isDlfw, boltConsume, boltProfileRef, boltProfileBranch)
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.

@@ -166,7 +166,20 @@ def _format_result(
                     )
                 )
 
-        if output.finish_reason and output.index not in args.finished_indices:
+        # Context compute can report its finish reason before the asynchronous
+        # KV handoff makes the engine result final. PrefillReady, not this
+        # intermediate finish reason, terminates a successful context stream.
+        handoff_pending = (
+            args.is_context_only
+            and output.finish_reason is not None
+            and output.index not in args.prefill_ready_sent
+            and not result.finished
+        )
+        if (
+            output.finish_reason
+            and output.index not in args.finished_indices
+            and not handoff_pending
+        ):
             args.finished_indices.add(output.index)
             newly_finished.append(output)
 
