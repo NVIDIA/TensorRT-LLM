@@ -124,6 +124,7 @@ def test_create_kv_cache_swa_endpoint_priority(
     manager.max_beam_width = 1
     manager.num_pools = 0
     manager.impl = Mock()
+    manager.impl.create_kv_cache.return_value.beam_width = 1
 
     manager._create_kv_cache(0, None, None, is_dummy=is_dummy, expected_prompt_length=prompt)
 
@@ -196,6 +197,7 @@ def _make_cache_config_for_test(
     assert len(max_attention_window_vec) == len(pp_layers)
 
     cache_manager = object.__new__(KVCacheManagerV2)
+    cache_manager.max_beam_width = 1
     cache_manager.kv_cache_type = kv_cache_type
     cache_manager.dtype = dtype
     cache_manager.head_dim_per_layer = [128] * len(pp_layers)
@@ -1232,12 +1234,13 @@ def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
 def test_generation_allocation_reserves_dynamic_width() -> None:
     request = SimpleNamespace(
         py_request_id=80,
+        py_beam_width=1,
         py_num_accepted_draft_tokens=2,
         py_rewind_len=2,
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         max_beam_num_tokens=103,
     )
-    kv_cache = Mock(is_active=True, capacity=100)
+    kv_cache = Mock(is_active=True, capacity=100, beam_width=1)
 
     def resize(capacity, history_length=None):
         if capacity is not None:
@@ -1246,6 +1249,8 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
 
     kv_cache.resize.side_effect = resize
     manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELFKONLY
+    manager.max_beam_width = 1
     manager.is_draft = True
     manager._has_cp_helix = False
     manager.kv_cache_map = {request.py_request_id: kv_cache}
@@ -1342,9 +1347,11 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
     request.context_chunk_size = 128
     request.move_to_next_context_chunk()
 
-    kv_cache = Mock(num_committed_tokens=64, is_active=True, capacity=192)
+    kv_cache = Mock(num_committed_tokens=64, is_active=True, capacity=192, beam_width=1)
     manager = object.__new__(KVCacheManagerV2)
     manager.kv_connector_manager = None
+    manager.kv_cache_type = CacheType.SELFKONLY
+    manager.max_beam_width = 1
     manager.is_draft = True
     manager.enable_block_reuse = True
     manager.enable_joint_kv_cache_reuse = True

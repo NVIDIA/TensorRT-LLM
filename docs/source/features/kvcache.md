@@ -108,6 +108,17 @@ configured `pool_ratio` does not match the derived group count, the manager
 logs a warning and keeps the single-window default, so existing configurations
 continue to run.
 
+The C++ implementation of V2 supports beam search for dense-attention models,
+including context-first disaggregated serving with the Python transceiver
+(`cache_transceiver_config.transceiver_runtime: PYTHON`, `backend: NIXL`).
+Select V2 on both workers and configure their `max_beam_width` for the requested
+beam width. The transceiver transfers the shared prompt KV once; the generation
+worker expands the beams after the transfer completes. Block reuse remains
+supported. The Python implementation selected by
+`TLLM_KV_CACHE_MANAGER_V2_BACKEND=python` is separate from the Python transceiver
+and does not support beam search. Hybrid Mamba, sparse attention, KV connectors,
+and pipelined KV transfer remain unsupported with V2 beam search.
+
 For the native V2 cold-storage representation and codec extension contract, see
 [KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
 
