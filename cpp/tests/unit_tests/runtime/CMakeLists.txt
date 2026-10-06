@@ -84,8 +84,16 @@ add_tllm_gtest(
   tllm::runtime_distributed
   LABELS
   "unit;runtime;host")
-add_tllm_gtest(localizationTest SOURCES localizationTest.cu FULL_STACK LABELS
-               "unit;full-stack;gpu")
+add_tllm_gtest(
+  localizationTest
+  OWNER
+  runtime
+  SOURCES
+  localizationTest.cu
+  LINK_LIBRARIES
+  tllm::runtime_locality
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   localityDomainPublicConfigTest
   OWNER

@@ -19,7 +19,6 @@ set(SRCS
     mcastGroupComm.cpp
     utils/runtimeUtils.cpp
     utils/debugUtils.cu
-    locality_domain/locality_domain_utils.cpp
     loraUtils.cpp
     loraModule.cpp
     loraCache.cpp
@@ -106,6 +105,17 @@ target_link_libraries(
   PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 target_compile_features(tllm_runtime_gdr PUBLIC cxx_std_20)
 set_target_properties(tllm_runtime_gdr PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(tllm_runtime_locality STATIC
+            locality_domain/locality_domain_utils.cpp)
+add_library(tllm::runtime_locality ALIAS tllm_runtime_locality)
+target_link_libraries(
+  tllm_runtime_locality
+  PUBLIC tllm::common_cuda CUDA::cuda_driver
+  PRIVATE Threads::Threads)
+target_compile_features(tllm_runtime_locality PUBLIC cxx_std_20)
+set_target_properties(tllm_runtime_locality PROPERTIES POSITION_INDEPENDENT_CODE
+                                                       ON)
 
 foreach(component
         tllm_runtime_memory tllm_runtime_buffers tllm_runtime_distributed

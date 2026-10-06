@@ -289,6 +289,7 @@ foreach(
   tllm_runtime_distributed
   tllm_runtime_topology
   tllm_runtime_worker_pool
+  tllm_runtime_locality
   tllm_runtime_numpy
   tllm_runtime_gdr
   tllm_common_environment
@@ -331,6 +332,7 @@ foreach(
   tllm_runtime_distributed
   tllm_runtime_topology
   tllm_runtime_worker_pool
+  tllm_runtime_locality
   tllm_runtime_gdr
   tllm_runtime_numpy
   tllm_executor_serialization
