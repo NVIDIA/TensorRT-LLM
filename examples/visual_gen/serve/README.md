@@ -282,7 +282,6 @@ generator checkpoint:
 | Action — policy / forward / inverse dynamics | same | `extra_params.action_mode`, or a checkpoint-selected Policy mode; returns a tensor payload |
 | T2AV — video with synchronized audio | same | `extra_params: {"enable_audio": true}` |
 | T2I — text-to-image | `/v1/images/generations` | `extra_params: {"output_type": "image"}` |
-| Reasoner — chat | `/v1/chat/completions` | starting the server **without** `--visual_gen_args` or `--enable_visual_gen` |
 
 For offline usage, see
 [`../models/cosmos3/README.md`](../models/cosmos3/README.md).
@@ -554,96 +553,6 @@ curl -s -X POST "http://localhost:8000/v1/images/generations" \
 
 With the default `"response_format": "url"` the response carries a
 `/v1/images/{image_id}/content` URL to download instead.
-
-### Reasoner chat
-
-A Cosmos3 checkpoint holds two models: the **Reasoner** (a Qwen3-VL-based VLM)
-and the **Generator** (video / image diffusion). `--visual_gen_args` or
-`--enable_visual_gen` selects the Generator — omit both to serve the Reasoner:
-
-```bash
-trtllm-serve nvidia/Cosmos3-Nano --port 8000
-```
-
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Cosmos3-Nano",
-    "messages": [{"role": "user", "content": "Describe what a robot arm does."}],
-    "max_tokens": 60
-  }'
-```
-
-The two are mutually exclusive: a Reasoner server returns 404 on `/v1/videos/*`
-and `/v1/images/*`, and a generation server has no `/v1/chat/completions`.
-
-#### Static FP8 Reasoner
-
-Nano and Super static-FP8 checkpoints also support the standalone Reasoner:
-text, image and video inputs produce text through `/v1/chat/completions`.
-Use a local FP8 checkpoint directory containing a root `hf_quant_config.json`
-with the ModelOpt FP8 quantization configuration, alongside the weights and
-their calibrated scales.
-
-Start the server in terminal 1. Set `MODEL_DIR` to either your Nano or Super
-FP8 checkpoint directory:
-
-```bash
-MODEL_DIR=/path/to/Cosmos3-Nano-FP8
-trtllm-serve "$MODEL_DIR" --host 127.0.0.1 --port 8000 \
-    --max_num_tokens 32768
-```
-
-Once `curl -f http://127.0.0.1:8000/health` returns HTTP 200, run the client
-in terminal 2 (`pip install openai` if needed). Replace the image and video
-paths with files accessible to the server; `file://` URLs refer to the
-server's filesystem, including its container mounts when applicable:
-
-```python
-from pathlib import Path
-
-from openai import OpenAI
-
-client = OpenAI(api_key="EMPTY", base_url="http://127.0.0.1:8000/v1")
-model = client.models.list().data[0].id
-
-# Text understanding
-response = client.chat.completions.create(
-    model=model,
-    messages=[{"role": "user", "content": "Describe what a robot arm does."}],
-    max_tokens=4096,
-)
-print(response.choices[0].message.content)
-
-# Image understanding
-image_url = Path("/path/to/image.jpg").resolve().as_uri()
-response = client.chat.completions.create(
-    model=model,
-    messages=[{"role": "user", "content": [
-        {"type": "image_url", "image_url": {"url": image_url}},
-        {"type": "text", "text": "Caption the image in detail."},
-    ]}],
-    max_tokens=4096,
-)
-print(response.choices[0].message.content)
-
-# Video understanding: decode at 4 FPS without a second sampling pass
-video_url = Path("/path/to/video.mp4").resolve().as_uri()
-response = client.chat.completions.create(
-    model=model,
-    messages=[{"role": "user", "content": [
-        {"type": "video_url", "video_url": {"url": video_url}},
-        {"type": "text", "text": "Describe the video in detail."},
-    ]}],
-    max_tokens=4096,
-    extra_body={
-        "media_io_kwargs": {"video": {"num_frames": -1, "fps": 4}},
-        "mm_processor_kwargs": {"do_sample_frames": False},
-    },
-)
-print(response.choices[0].message.content)
-```
 
 ### Notes
 

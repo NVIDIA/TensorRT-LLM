@@ -114,6 +114,8 @@ Then, start the server with the configuration file:
    trtllm-serve Qwen/Qwen2-VL-7B-Instruct \
        --config ./config.yml
 
+For Cosmos3 Reasoner text, image and video requests, see the `Cosmos3 Reasoner serving examples <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/cosmos3>`_. Start with ``trtllm-serve <model>`` without VisualGen flags. For static-FP8 Nano and Super checkpoints, include the root ``hf_quant_config.json`` alongside the checkpoint weights.
+
 Multimodal Chat API
 ~~~~~~~~~~~~~~~~~~~
 
@@ -238,9 +240,7 @@ Visual Generation Serving
    trtllm-serve nvidia/Cosmos3-Nano \
        --enable_visual_gen
 
-For checkpoints that support both LLM and Visual Generation, such as Cosmos3, pass ``--enable_visual_gen`` to select the VisualGen runtime when ``--visual_gen_args`` is not specified. Omitting both flags serves the Cosmos3 Reasoner, which accepts text, image and video inputs through ``/v1/chat/completions``. The ``--visual_gen_args`` flag accepts a YAML file that configures quantization, parallelism, and TeaCache. Available visual generation endpoints include ``/v1/images/generations``, ``/v1/videos``, ``/v1/videos/sync`` (with ``/v1/videos/generations`` kept as a deprecated alias), and video management APIs.
-
-For static-FP8 Nano and Super Reasoner checkpoints, include the root ``hf_quant_config.json`` alongside the checkpoint weights. See the `Cosmos3 Reasoner serving examples <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve#reasoner-chat>`_ for launch commands and text, image and video requests.
+For checkpoints that support both LLM and Visual Generation, such as Cosmos3, pass ``--enable_visual_gen`` to select the VisualGen runtime when ``--visual_gen_args`` is not specified. The ``--visual_gen_args`` flag accepts a YAML file that configures quantization, parallelism, and TeaCache. Available visual generation endpoints include ``/v1/images/generations``, ``/v1/videos``, ``/v1/videos/sync`` (with ``/v1/videos/generations`` kept as a deprecated alias), and video management APIs.
 
 For full details, see the :doc:`../../models/visual-generation.md` feature documentation. Example client scripts are available in the `examples/visual_gen/serve/ <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve>`_ directory.
 
