@@ -436,6 +436,5 @@ class Qwen3ForTextReranking(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
                                    input_ids,
                                    position_ids=position_ids,
                                    inputs_embeds=inputs_embeds)
-        logits = self.score(hidden_states)
         end_indices = torch.cumsum(attn_metadata.seq_lens, dim=0) - 1
-        return logits[end_indices]
+        return self.score(hidden_states[end_indices])
