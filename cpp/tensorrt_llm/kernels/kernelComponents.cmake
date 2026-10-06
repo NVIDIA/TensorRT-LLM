@@ -63,6 +63,10 @@ function(add_tllm_kernel_library target)
       PARENT_SCOPE)
 endfunction()
 
+add_tllm_kernel_library(
+  tllm_kernel_custom_all_reduce SOURCES customAllReduceKernels.cu
+  LINK_LIBRARIES tllm::common_environment)
+
 add_tllm_kernel_library(tllm_kernel_logits SOURCES logitsBitmask.cu)
 
 add_tllm_kernel_library(
