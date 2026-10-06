@@ -1018,6 +1018,7 @@ class KvCacheCreator:
                     "get_cache_bytes_per_request",
                     model_config,
                     kv_cache_config,
+                    mapping=mapping,
                     is_draft=is_draft,
                     # Zero is a valid weight: a manager whose entire retention
                     # is intercept-funded spends nothing per request from the
@@ -1033,6 +1034,7 @@ class KvCacheCreator:
                     "get_cache_quota_per_request",
                     model_config,
                     kv_cache_config,
+                    mapping=mapping,
                     is_draft=is_draft,
                     **extra_kwargs)
                 if quota_per_request is not None:
@@ -1046,6 +1048,7 @@ class KvCacheCreator:
                                       model_config,
                                       kv_cache_config: KvCacheConfig,
                                       *,
+                                      mapping=None,
                                       is_draft: bool = False,
                                       allow_zero: bool = False,
                                       **extra_kwargs) -> Optional[int]:
@@ -1058,16 +1061,17 @@ class KvCacheCreator:
         estimate_method = getattr(manager_cls, method_name, None)
         if estimate_method is None:
             return None
-        estimate = estimate_method(model_config,
-                                   self._mapping,
-                                   tokens_per_block=self._tokens_per_block,
-                                   max_seq_len=self._max_seq_len,
-                                   max_batch_size=self._max_batch_size,
-                                   max_num_tokens=self._max_num_tokens,
-                                   kv_cache_config=kv_cache_config,
-                                   spec_config=self._speculative_config,
-                                   is_draft=is_draft,
-                                   **extra_kwargs)
+        estimate = estimate_method(
+            model_config,
+            mapping if mapping is not None else self._mapping,
+            tokens_per_block=self._tokens_per_block,
+            max_seq_len=self._max_seq_len,
+            max_batch_size=self._max_batch_size,
+            max_num_tokens=self._max_num_tokens,
+            kv_cache_config=kv_cache_config,
+            spec_config=self._speculative_config,
+            is_draft=is_draft,
+            **extra_kwargs)
         # Mocked manager classes in tests return non-int sentinels; treat
         # anything but a usable int as "no estimate".
         if isinstance(estimate, int) and (estimate > 0 or
