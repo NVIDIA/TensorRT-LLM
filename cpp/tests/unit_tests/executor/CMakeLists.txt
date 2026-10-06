@@ -131,14 +131,21 @@ add_tllm_gtest(
   "unit;executor;host")
 add_tllm_gtest(
   ucxCommTest
+  OWNER
+  executor
   SOURCES
   ucxCommTest.cpp
-  FULL_STACK
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  ${CMAKE_DL_LIBS}
+  ${Python3_LIBRARIES}
   LABELS
-  "unit;full-stack;gpu"
+  "unit;executor;ucx;integration;gpu"
   TIMEOUT
   60)
-target_link_libraries(ucxCommTest PRIVATE ${Python3_LIBRARIES})
+if(TARGET tensorrt_llm_ucx_wrapper)
+  target_link_libraries(ucxCommTest PRIVATE tensorrt_llm_ucx_wrapper)
+endif()
 
 # NIXL bounce-buffer v2 KV-cache transfer tests live in their own subdirectory
 # (mirrors the source layout under nixl_utils/bounce/). It self-gates on zmq and
