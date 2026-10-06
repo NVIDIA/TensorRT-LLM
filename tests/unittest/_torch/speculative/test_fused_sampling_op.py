@@ -14,11 +14,11 @@
 # limitations under the License.
 """Correctness of the fused sampling op against Torch references.
 
-Semantic tests use the production pipeline -- ``min_p_renorm_probs`` then top-k then
-top-p renorm, the order ``sampler_strategy._compute_probs`` uses and
-``docs/source/features/sampling.md`` documents.  A separate numerical-error matrix uses
-a mechanically independent pure-Torch implementation, so sharing a backend cannot make
-the fused op and its oracle reproduce the same arithmetic mistake.
+Semantic tests use a reference pipeline -- softmax, ``min_p_renorm_probs``, then
+flashinfer's top-k and top-p renorm, the filter order ``docs/source/features/sampling.md``
+documents.  A separate numerical-error matrix uses a mechanically independent pure-Torch
+implementation, so sharing a backend cannot make the fused op and its oracle reproduce the
+same arithmetic mistake.
 
 What is deliberately NOT asserted: equality of sampled token *ids* against the flashinfer
 path. The two consume their RNG differently, so identical ids are not expected; token
@@ -76,7 +76,7 @@ def _reference_probs(
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
 ) -> torch.Tensor:
-    """The TorchSampler pipeline: temperature+softmax, then min-p, top-k, top-p."""
+    """TorchSampler's filter order: temperature+softmax, then min-p, top-k, top-p."""
     probs = torch.softmax(logits.float() / temperatures.unsqueeze(-1), dim=-1)
     if (min_ps > 0).any():
         probs = min_p_renorm_probs(probs, min_ps)

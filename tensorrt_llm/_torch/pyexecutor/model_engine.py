@@ -112,8 +112,7 @@ from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager, ResourceManagerType)
 from .sampler import SampleStateTensors
-from .sampler.ops.flashinfer import (warmup_sample_from_logits_op,
-                                     warmup_sampling_module)
+from .sampler.ops.flashinfer import warmup_sampling_module
 from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
@@ -1445,12 +1444,6 @@ class PyTorchModelEngine(ModelEngine):
         self._eager_workspace_reclaimer = None
         with self._warmup_timer.phase("sampling_module_prewarm"):
             warmup_sampling_module()
-            if self.enable_in_graph_sampling:
-                # The fast tier samples inside the captured graph via a
-                # torch.compile'd op; compile it now so capture does not.
-                warmup_sample_from_logits_op(self.model.config.vocab_size,
-                                             torch.device('cuda'), self.dtype,
-                                             self._cuda_graph_batch_sizes or [])
 
         if kv_cache_manager is None:
             logger.info("Skipping warm up as no KV Cache manager allocated.")
