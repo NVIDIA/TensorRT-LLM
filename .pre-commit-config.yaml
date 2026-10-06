@@ -1579,10 +1579,9 @@ repos:
     rev: v0.9.4
     hooks:
     -   id: ruff
-        args: [--fix, --exit-non-zero-on-fix, --exclude=tensorrt_llm/grpc/openengine/_generated]
+        args: [--fix, --exit-non-zero-on-fix]
         exclude: *legacy_files
     -   id: ruff-format
-        args: [--exclude=tensorrt_llm/grpc/openengine/_generated]
         exclude: *legacy_files
 -   repo: local
     hooks:
