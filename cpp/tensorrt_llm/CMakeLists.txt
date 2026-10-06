@@ -350,6 +350,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_runtime_distributed
     tllm_runtime_gdr
     tllm_runtime_host_accessible_memory
+    tllm_runtime_ipc
     tllm_runtime_locality
     tllm_runtime_lora
     tllm_runtime_lora_cache
