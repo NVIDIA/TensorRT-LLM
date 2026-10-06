@@ -337,6 +337,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_common_logging
     tllm_common_native_memory
     tllm_common_nccl
+    tllm_common_nccl_comm
     tllm_common_profiler
     tllm_context_transfer_consensus
     tllm_executor_agent_connection

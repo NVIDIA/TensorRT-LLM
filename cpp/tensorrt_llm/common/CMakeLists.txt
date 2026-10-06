@@ -122,6 +122,17 @@ if(ENABLE_MULTI_DEVICE)
 endif()
 set_target_properties(tllm_common_nccl PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(tllm_common_nccl_comm STATIC ncclCommUtils.cpp)
+add_library(tllm::common_nccl_comm ALIAS tllm_common_nccl_comm)
+target_link_libraries(
+  tllm_common_nccl_comm
+  PUBLIC tllm::common_nccl
+  PRIVATE tllm::runtime_distributed tllm::runtime_ipc_nvls
+          tllm::common_native_memory)
+target_compile_features(tllm_common_nccl_comm PUBLIC cxx_std_20)
+set_target_properties(tllm_common_nccl_comm PROPERTIES POSITION_INDEPENDENT_CODE
+                                                       ON)
+
 add_library(
   common_src OBJECT cudaArchitectures.cpp cudaFp8Utils.cu mcastDevMemUtils.cpp
                     opUtils.cpp safetensors.cpp sageQuant.cu)
@@ -141,4 +152,4 @@ set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET common_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_link_libraries(
   common_src PUBLIC trtllm_gen_fmha_interface tllm::common_cublas
-                    tllm::common_native_memory tllm::common_nccl)
+                    tllm::common_native_memory tllm::common_nccl_comm)
