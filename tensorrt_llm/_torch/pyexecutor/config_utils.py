@@ -9,7 +9,9 @@ import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          is_speculators_dspark_config,
+                                          translate_speculators_dspark_config)
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -1018,6 +1020,18 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
+    elif is_speculators_dspark_config(config_dict):
+        # A DSpark drafter in the vLLM speculators format: no top-level
+        # model_type, and its auto_map needs the speculators package. Build
+        # the backbone's config from the translation the spec config uses.
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        translated = translate_speculators_dspark_config(config_dict)
+        model_config = CONFIG_MAPPING["qwen3"].from_dict(translated)
+        logger.info(
+            f"{model_name_or_path}: speculators-format DSpark drafter, read as "
+            f"qwen3 with target_layer_ids "
+            f"{translated['dflash_config']['target_layer_ids']} "
+            f"(aux_hidden_state_layer_ids - 1) and no sliding window")
     elif is_qwen_image_bench_config(config_dict):
         from tensorrt_llm._torch.models.modeling_qwen3_5 import (
             Qwen35ConfigCompat, _normalize_qwen35_quantization_config)
