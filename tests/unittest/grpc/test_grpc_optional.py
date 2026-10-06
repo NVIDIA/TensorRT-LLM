@@ -243,7 +243,7 @@ def test_smg_rejects_multiple_frontends_before_engine_start(tmp_path, via_config
     (model / "config.json").write_text(
         '{"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]}'
     )
-    args = [str(model), "--grpc"]
+    args = [str(model), "--grpc", "--gpus_per_node", "1"]
     if via_config:
         config = tmp_path / "serve.yml"
         config.write_text("num_serve_frontends: 4\n")

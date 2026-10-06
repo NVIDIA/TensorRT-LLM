@@ -313,6 +313,38 @@ async def test_abort_all_batches_preserve_outcomes(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_abort_all_deadline_preserves_group_and_partial_outcomes(monkeypatch):
+    """Exhausting the snapshot budget must cancel dispatch without killing serving."""
+    monkeypatch.setattr(coordination, "_ABORT_TIMEOUT", 2.0)
+    monkeypatch.setattr(coordination, "_RPC_TIMEOUT", 1.0)
+    monkeypatch.setattr(coordination, "_ABORT_BATCH_SIZE", 1)
+    async with group() as (coordinator, (first, second), failures):
+        for i in range(3):
+            reservation = await first.reserve(str(i))
+            reservation.bind(Handle())
+        original_request = coordinator._peers[0].request
+        calls = 0
+        cancelled = asyncio.Event()
+
+        async def delayed_batch(message):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return await original_request(message)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        monkeypatch.setattr(coordinator._peers[0], "request", delayed_batch)
+        assert await second.request("abort") == {"aborted": 1, "failed": 2}
+        assert cancelled.is_set()
+        assert calls == 2
+        assert (await second.request("status"))["ready"]
+        assert not failures
+
+
+@pytest.mark.asyncio
 async def test_expired_heartbeat_stops_admission_and_cannot_be_revived(monkeypatch):
     """A live but unresponsive frontend must invalidate the whole group's readiness."""
     now = 100.0

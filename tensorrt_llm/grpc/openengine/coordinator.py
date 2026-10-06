@@ -139,14 +139,25 @@ class Coordinator:
                 return False
         return self._healthy()
 
-    async def _abort_frontend(self, frontend: int, requests: list) -> dict:
+    async def _abort_frontend(self, frontend: int, requests: list, deadline: float) -> dict:
         aborted = failed = 0
         # One outstanding batch per frontend bounds fan-out independently of
         # the snapshot size. Each batch retains the original generation tokens.
         for start in range(0, len(requests), _ABORT_BATCH_SIZE):
-            reply = await self._peers[frontend].request(
-                {"requests": requests[start : start + _ABORT_BATCH_SIZE]}
-            )
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return {"aborted": aborted, "failed": failed + len(requests) - start}
+            try:
+                reply = await asyncio.wait_for(
+                    self._peers[frontend].request(
+                        {"requests": requests[start : start + _ABORT_BATCH_SIZE]}
+                    ),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                # The current batch has no confirmed outcome. Include it and
+                # unsent batches as failures without invalidating the group.
+                return {"aborted": aborted, "failed": failed + len(requests) - start}
             aborted += reply["aborted"]
             failed += reply["failed"]
         return {"aborted": aborted, "failed": failed}
@@ -187,6 +198,9 @@ class Coordinator:
         if operation == "abort":
             # Snapshot before awaiting peer RPCs. Every dispatched item carries
             # its generation token, including entries in abort-all snapshots.
+            # Reserve one control-RPC interval to deliver partial outcomes
+            # before the caller's overall abort deadline expires.
+            deadline = monotonic() + _ABORT_TIMEOUT - _RPC_TIMEOUT
             request_id = message.get("request_id")
             if request_id is None:
                 snapshot = list(self._requests.items())
@@ -199,7 +213,7 @@ class Coordinator:
             try:
                 replies = await asyncio.gather(
                     *(
-                        self._abort_frontend(frontend, requests)
+                        self._abort_frontend(frontend, requests, deadline)
                         for frontend, requests in by_frontend.items()
                     )
                 )

@@ -74,7 +74,7 @@ Readiness requires the whole frontend group. Failure of a frontend, coordinator 
 
 With multiple frontends, request IDs in `Generate` and `Abort(request_id)` are limited to 1024 UTF-8 bytes. Larger IDs return `INVALID_ARGUMENT` before reaching the coordinator, without affecting other requests or frontend readiness.
 
-Abort snapshots are sent in batches of at most 128 requests, with at most one batch in flight per target frontend. Each batch is below 1 MiB even with maximum-length, JSON-escaped IDs. Private abort operations have a 30-second overall deadline; individual batch RPCs retain the 5-second control deadline.
+Abort snapshots are sent in batches of at most 128 requests, with at most one batch in flight per target frontend. Each batch is below 1 MiB even with maximum-length, JSON-escaped IDs. Private abort operations have a 30-second caller deadline. The coordinator limits snapshot dispatch to 25 seconds, leaving 5 seconds to return the outcome; individual batch RPCs retain the 5-second control deadline. When the snapshot budget expires, confirmed outcomes are preserved and unconfirmed or unsent requests are counted as failures. The public abort returns `INTERNAL` for incomplete cancellation without stopping the serving group.
 
 Frontends send heartbeats once per second. A missing heartbeat for 10 seconds withdraws group readiness, stops admission, and shuts down the group; a late heartbeat cannot restore readiness. Coordinator RPCs must still complete within 5 seconds (except abort operations). The coordinator shares frontend 0's event loop, so a sufficiently long CPU stall there also stops the group. Provision CPU capacity for control traffic and synchronous input processing as well as token streaming.
 

@@ -154,7 +154,10 @@ def _wait_attached_frontends_ready(
         for fd in readable:
             child = pending.pop(fd)
             if os.read(fd, 1) != b"R":  # EOF: pipe closed without READY
-                return_code = child.poll()
+                try:
+                    return_code = child.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    return_code = None
                 if return_code is not None and return_code != 0 and report_failure is not None:
                     report_failure(return_code, "server", "model_initialization")
                 raise RuntimeError(

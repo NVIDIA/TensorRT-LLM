@@ -20,6 +20,34 @@ from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc as rpc
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.mark.parametrize("exits", [True, False])
+def test_readiness_eof_waits_for_exit_status(exits):
+    """EOF can precede a reapable exit, but waiting for telemetry stays bounded."""
+    from tensorrt_llm.serve import _frontend_processes as processes
+
+    child = Mock(pid=1)
+    child.poll.return_value = None
+    if exits:
+        child.wait.return_value = 7
+    else:
+        child.wait.side_effect = subprocess.TimeoutExpired("frontend", 1.0)
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    report_failure = Mock()
+    try:
+        with pytest.raises(RuntimeError, match="before signaling READY"):
+            processes._wait_attached_frontends_ready(
+                [child], [read_fd], report_failure=report_failure
+            )
+        child.wait.assert_called_once_with(timeout=1.0)
+        if exits:
+            report_failure.assert_called_once_with(7, "server", "model_initialization")
+        else:
+            report_failure.assert_not_called()
+    finally:
+        os.close(read_fd)
+
+
 @pytest.mark.parametrize("last_child_ready", [False, True])
 def test_ready_child_death_fails_startup(monkeypatch, last_child_ready):
     """READY children must remain supervised until every sibling has started."""
