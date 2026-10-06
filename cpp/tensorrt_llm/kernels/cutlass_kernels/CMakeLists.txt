@@ -180,17 +180,6 @@ file(GLOB_RECURSE FP4_SRC_CU fp4_gemm/*.cu)
 # Get the sources for AllReduce GEMM
 file(GLOB_RECURSE ARGEMM_SRC_CU allreduce_gemm/*.cu)
 
-# Get the sources for all the remaining sources
-file(GLOB_RECURSE SRC_CPP *.cpp)
-file(GLOB_RECURSE SRC_CU *.cu)
-set(ALL_SRCS ${SRC_CPP};${SRC_CU})
-list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_rowwise_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_blockscale_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "fp4_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "allreduce_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "low_latency_gemm/.*")
-
 message(
   VERBOSE
   "Mixed srcs ${MIXED_SRC_CPP} ${MIXED_SRC_CU} ${MIXED_CU_INSTANTIATIONS}")
@@ -202,9 +191,9 @@ message(VERBOSE "Fbgemm srcs ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS}")
 message(VERBOSE "FP8 Blockscale GEMM srcs ${FP8_BLOCKSCALE_GEMM_SRC_CU}")
 message(VERBOSE "FP4 srcs ${FP4_SRC_CU} ${FP4_CU_INSTANTIATIONS}")
 message(VERBOSE "ARgemm srcs ${ARGEMM_SRC_CU}")
-message(VERBOSE "All srcs ${ALL_SRCS}")
 
-add_library(cutlass_src STATIC ${ALL_SRCS})
+add_library(cutlass_src INTERFACE)
+target_link_libraries(cutlass_src INTERFACE tllm::kernel_gemm_utilities)
 
 add_library(fpA_intB_gemm_src STATIC ${MIXED_SRC_CPP} ${MIXED_SRC_CU})
 add_cuda_architectures(fpA_intB_gemm_src 89)
