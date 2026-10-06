@@ -105,6 +105,11 @@ if(FAST_BUILD)
     STATUS "FAST_BUILD enabled for kernels: using -O1 for CUDA compilation")
 endif()
 
+include(kernelComponents.cmake)
+set(TLLM_KERNEL_COMPONENT_TARGETS
+    ${TLLM_KERNEL_COMPONENT_TARGETS}
+    PARENT_SCOPE)
+
 # Marlin NVFP4: build Ada/Hopper kernels and the dense W4A16/repack kernels used
 # on SM12x. Unsupported device passes emit empty kernel stubs.
 file(GLOB_RECURSE MARLIN_SRC "marlin/*.cu" "marlin/*.cpp")
