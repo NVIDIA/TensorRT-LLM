@@ -111,15 +111,20 @@ if(ENABLE_CUBLASLT_FP4_GEMM)
   target_compile_definitions(tllm_common_cublas PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
 endif()
 
+add_library(tllm_common_nccl STATIC ncclUtils.cpp)
+add_library(tllm::common_nccl ALIAS tllm_common_nccl)
+target_link_libraries(tllm_common_nccl PUBLIC tllm::common_cuda)
+target_compile_features(tllm_common_nccl PUBLIC cxx_std_20)
+target_compile_definitions(
+  tllm_common_nccl PUBLIC ENABLE_MULTI_DEVICE=$<BOOL:${ENABLE_MULTI_DEVICE}>)
+if(ENABLE_MULTI_DEVICE)
+  target_link_libraries(tllm_common_nccl PUBLIC ${NCCL_LIB})
+endif()
+set_target_properties(tllm_common_nccl PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(
-  common_src OBJECT
-  cudaArchitectures.cpp
-  cudaFp8Utils.cu
-  mcastDevMemUtils.cpp
-  ncclUtils.cpp
-  opUtils.cpp
-  safetensors.cpp
-  sageQuant.cu)
+  common_src OBJECT cudaArchitectures.cpp cudaFp8Utils.cu mcastDevMemUtils.cpp
+                    opUtils.cpp safetensors.cpp sageQuant.cu)
 
 list(JOIN CMAKE_CUDA_ARCHITECTURES_ORIG "," TRTLLM_BUILT_CUDA_ARCHITECTURES)
 list(JOIN CMAKE_CUDA_ARCHITECTURES_WITH_KERNELS ","
@@ -136,4 +141,4 @@ set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET common_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_link_libraries(
   common_src PUBLIC trtllm_gen_fmha_interface tllm::common_cublas
-                    tllm::common_native_memory)
+                    tllm::common_native_memory tllm::common_nccl)
