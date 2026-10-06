@@ -15,11 +15,6 @@
 set(BATCH_MANAGER_TARGET_NAME tensorrt_llm_batch_manager)
 set(BATCH_MANAGER_STATIC_TARGET ${BATCH_MANAGER_TARGET_NAME}_static)
 
-set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
-
-# keep this list sorted alphabetically
-set(SRCS kvCacheManagerV2Utils.cpp kvCacheManagerV2Utils.cu)
-
 set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
 file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
@@ -195,45 +190,33 @@ set_target_properties(
   tllm_batch_cache_transceiver PROPERTIES CXX_EXTENSIONS OFF
                                           POSITION_INDEPENDENT_CODE ON)
 
-add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
-target_link_libraries(
-  ${BATCH_MANAGER_STATIC_TARGET}
-  PUBLIC tllm::kv_cache
-         tllm::batch_scheduler
-         tllm::context_transfer_consensus
-         tllm::peft_cache
-         tllm::batch_request_info
-         tllm::batch_rnn_cache_routing
-         tllm::batch_cache_transceiver)
-target_include_directories(
-  ${BATCH_MANAGER_STATIC_TARGET}
-  PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}
-         ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
-
+add_library(tllm_kv_cache_v2_utils STATIC kvCacheManagerV2Utils.cpp
+                                          kvCacheManagerV2Utils.cu)
+add_library(tllm::kv_cache_v2_utils ALIAS tllm_kv_cache_v2_utils)
+target_include_directories(tllm_kv_cache_v2_utils
+                           PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR})
+target_link_libraries(tllm_kv_cache_v2_utils PUBLIC tllm::runtime_buffers
+                                                    torch_cpu c10)
+target_compile_features(tllm_kv_cache_v2_utils PUBLIC cxx_std_20)
 set_target_properties(
-  ${BATCH_MANAGER_STATIC_TARGET}
-  PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
-             POSITION_INDEPENDENT_CODE ON)
+  tllm_kv_cache_v2_utils
+  PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-set_property(TARGET ${BATCH_MANAGER_STATIC_TARGET}
-             PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
-target_compile_definitions(${BATCH_MANAGER_STATIC_TARGET}
-                           PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
-
-if(ENABLE_UCX)
-  find_package(ucx REQUIRED)
-  find_package(ucxx REQUIRED)
-  target_include_directories(
-    ${BATCH_MANAGER_STATIC_TARGET}
-    PRIVATE $<TARGET_PROPERTY:ucxx::ucxx,INTERFACE_INCLUDE_DIRECTORIES>)
-  target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC)
-
-endif()
-
+add_library(${BATCH_MANAGER_STATIC_TARGET} INTERFACE)
 find_library(TORCH_PYTHON_LIB torch_python REQUIRED
              HINTS ${TORCH_INSTALL_PREFIX}/lib)
 target_link_libraries(
   ${BATCH_MANAGER_STATIC_TARGET}
-  PUBLIC ${TORCH_PYTHON_LIB} Python3::Python pg_utils
-  PRIVATE tensorrt_llm_xgrammar_static)
+  INTERFACE tllm::kv_cache_v2_utils
+            tllm::kv_cache
+            tllm::batch_scheduler
+            tllm::context_transfer_consensus
+            tllm::peft_cache
+            tllm::batch_request_info
+            tllm::batch_rnn_cache_routing
+            tllm::batch_cache_transceiver
+            ${TORCH_PYTHON_LIB}
+            Python3::Python
+            pg_utils
+            tensorrt_llm_xgrammar_static)

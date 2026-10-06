@@ -345,6 +345,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_kv_cache
     tllm_kv_cache_host_memory
     tllm_kv_cache_legacy
+    tllm_kv_cache_v2_utils
     tllm_peft_cache
     tllm_runtime_buffers
     tllm_runtime_distributed
@@ -385,8 +386,6 @@ endforeach()
 # Link kernel_src and cutlass_src. static internal cutlass lib overridden.
 target_link_libraries(${SHARED_TARGET} PUBLIC kernels_src cutlass_src)
 
-# Cyclic dependency of batch manager on TRT-LLM
-target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
 # Cyclic dependency of executor on TRT-LLM
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
 
