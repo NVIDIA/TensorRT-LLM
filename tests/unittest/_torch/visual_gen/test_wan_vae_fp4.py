@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.visual_gen.models.wan.fp4_fused_quant import (
+    nvfp4_quant,
     rmsnorm_silu_nvfp4_quant,
     silu_nvfp4_quant,
 )
@@ -34,8 +35,13 @@ def _require_supported_gpu() -> None:
         pytest.skip("NVFP4 Wan VAE requires an SM100 or SM103 GPU")
 
 
-@pytest.mark.parametrize("channels", [128, 192, 512])
-def test_fused_silu_nvfp4_quant_matches_trtllm_quantize(channels: int) -> None:
+@pytest.mark.parametrize(
+    ("channels", "padded_channels"),
+    [(96, 128), (128, 128), (192, 192), (384, 512), (512, 512)],
+)
+def test_fused_silu_nvfp4_quant_matches_trtllm_quantize(
+    channels: int, padded_channels: int
+) -> None:
     """Compare fused bytes, including activation blocks beyond calibration."""
     _require_supported_gpu()
     torch.manual_seed(0)
@@ -44,32 +50,76 @@ def test_fused_silu_nvfp4_quant_matches_trtllm_quantize(channels: int) -> None:
     activation[1, 0] = -0.0
     global_scale = torch.tensor([448.0 * 6.0], device="cuda", dtype=torch.float32)
 
+    padded_activation = F.pad(activation, (0, padded_channels - channels))
     expected = torch.ops.trtllm.fp4_quantize(
-        F.silu(activation),
+        F.silu(padded_activation),
         global_scale,
         16,
         False,
         False,
     )
-    actual = silu_nvfp4_quant(activation, global_scale)
+    actual = silu_nvfp4_quant(activation, global_scale, padded_channels=padded_channels)
 
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
     torch.testing.assert_close(actual[1], expected[1].reshape_as(actual[1]), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(("channels", "padded_channels"), [(96, 128), (384, 512)])
+def test_nvfp4_quant_emits_padded_channels_without_bf16_padding(
+    channels: int, padded_channels: int
+) -> None:
+    _require_supported_gpu()
+    torch.manual_seed(channels)
+    activation = torch.randn((17, channels), device="cuda", dtype=torch.bfloat16)
+    global_scale = ((448.0 * 6.0) / activation.abs().amax().float().clamp(min=1e-8)).reshape(1)
+    expected = torch.ops.trtllm.fp4_quantize(
+        F.pad(activation, (0, padded_channels - channels)),
+        global_scale,
+        16,
+        False,
+        False,
+    )
+    actual = nvfp4_quant(activation, global_scale, padded_channels=padded_channels)
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], expected[1].reshape_as(actual[1]), rtol=0, atol=0)
+
+
+def test_nvfp4_quant_zeroes_exact_c96_scale_storage_tail() -> None:
+    """Partial-K TMA storage must not expose uninitialized FP8 scale bytes."""
+    _require_supported_gpu()
+    torch.manual_seed(96)
+    activation = torch.randn((17, 96), device="cuda", dtype=torch.bfloat16)
+    global_scale = ((448.0 * 6.0) / activation.abs().amax().float().clamp(min=1e-8)).reshape(1)
+    expected = torch.ops.trtllm.fp4_quantize(
+        activation,
+        global_scale,
+        16,
+        False,
+        False,
+    )
+    actual = nvfp4_quant(activation, global_scale, padded_channels=96)
+    expected_scales = expected[1].reshape(17, 6)
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1][:, :6], expected_scales, rtol=0, atol=0)
+    torch.testing.assert_close(actual[1][:, 6:], torch.zeros_like(actual[1][:, 6:]))
+
+
 def test_fused_rmsnorm_silu_nvfp4_quant_matches_trtllm_quantize() -> None:
     _require_supported_gpu()
     torch.manual_seed(0)
-    rows, channels = 17, 192
+    rows, channels, padded_channels = 17, 96, 128
     activation = torch.randn((rows, channels), device="cuda", dtype=torch.bfloat16)
     gamma = torch.randn((channels,), device="cuda", dtype=torch.bfloat16)
+    padded_gamma = F.pad(gamma, (0, padded_channels - channels))
     global_scale = torch.tensor([448.0 * 6.0 / 4.0], device="cuda", dtype=torch.float32)
     scale = channels**0.5
     normalized = F.normalize(activation.float(), dim=1).to(torch.bfloat16)
     normalized = normalized * scale
     normalized = normalized * gamma
     expected = torch.ops.trtllm.fp4_quantize(
-        F.silu(normalized),
+        F.pad(F.silu(normalized), (0, padded_channels - channels)),
         global_scale,
         16,
         False,
@@ -78,8 +128,9 @@ def test_fused_rmsnorm_silu_nvfp4_quant_matches_trtllm_quantize() -> None:
     actual = rmsnorm_silu_nvfp4_quant(
         activation,
         global_scale,
-        gamma,
+        padded_gamma,
         scale,
+        padded_channels=padded_channels,
     )
 
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
@@ -136,6 +187,32 @@ def test_nvfp4_wan_conv_bias_residual_and_spatial_padding() -> None:
     )
     cosine_similarity = F.cosine_similarity(actual.flatten(), expected.flatten(), dim=0)
 
+    assert relative_l2_error.item() < 0.25
+    assert cosine_similarity.item() > 0.96
+
+
+@pytest.mark.parametrize("output_channels", [192, 384])
+def test_nvfp4_wan_conv_uses_exact_large_output_channels(output_channels: int) -> None:
+    """Large non-256 output tails are valid and do not require zero padding."""
+    _require_supported_gpu()
+    torch.manual_seed(output_channels)
+    base = WanCausalConv3d(192, output_channels, 3, padding=1).cuda().to(torch.bfloat16).eval()
+    activation = torch.randn((1, 192, 1, 8, 10), device="cuda", dtype=torch.bfloat16)
+    conv = NVFP4WanCausalConv3d(base).cuda().to(torch.bfloat16).eval()
+
+    first = conv(activation)
+    second = conv(activation)
+    expected = base(activation)
+
+    assert conv._fp4_pq is not None
+    assert conv._fp4_pq["padded_out_channels"] == output_channels
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+    relative_l2_error = torch.linalg.vector_norm(
+        first.float() - expected.float()
+    ) / torch.linalg.vector_norm(expected.float())
+    cosine_similarity = F.cosine_similarity(
+        first.float().flatten(), expected.float().flatten(), dim=0
+    )
     assert relative_l2_error.item() < 0.25
     assert cosine_similarity.item() > 0.96
 
