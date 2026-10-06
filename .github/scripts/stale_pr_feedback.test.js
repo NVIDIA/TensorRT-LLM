@@ -64,8 +64,35 @@ test('mark inactive waiting PR, ignoring bot chatter', () => {
   const s = snapshot(); s.issue.labels = [{name: 'waiting for feedback'}]; s.timeline = [];
   s.comments.push({user: bot, created_at: at(19)});
   assert.equal(decide(s, Date.parse(at(20))), 'mark');
-  s.comments.push({user, created_at: at(19)});
+  s.comments.push({user: maintainer, created_at: at(19)});
   assert.equal(decide(s, Date.parse(at(20))), 'skip');
+});
+test('author response before stale clears waiting for feedback', () => {
+  const s = snapshot(); s.issue.labels = [{name: 'waiting for feedback'}];
+  s.timeline = [{event: 'labeled', label: {name: 'waiting for feedback'}, actor: maintainer, created_at: at(10)}];
+  s.timeline.push({event: 'committed', author: {name: 'Author', email: 'a@example.com'}, committer: {date: at(12)}});
+  assert.equal(decide(s, Date.parse(at(13))), 'answered');
+  s.timeline.pop(); s.reviews.push({user, submitted_at: at(12), state: 'COMMENTED'});
+  assert.equal(decide(s, Date.parse(at(13))), 'answered');
+  s.reviews.pop(); s.comments.push({user: maintainer, created_at: at(12)});
+  assert.equal(decide(s, Date.parse(at(13))), 'skip');
+  s.comments.pop(); s.comments.push({user, created_at: at(9)});
+  assert.equal(decide(s, Date.parse(at(13))), 'skip');
+  assert.equal(decide(s, Date.parse(at(24))), 'mark');
+});
+test('legacy waiting label without a timeline event is never cleared by old author comments', () => {
+  const s = snapshot(); s.issue.labels = [{name: 'waiting for feedback'}]; s.timeline = [];
+  s.comments.push({user, created_at: at(5)});
+  assert.equal(decide(s, Date.parse(at(6))), 'skip');
+});
+test('publication applies answered: waiting removed, Investigating added', async () => {
+  const s = snapshot(); s.issue.labels = [{name: 'waiting for feedback'}];
+  s.timeline = [{event: 'labeled', label: {name: 'waiting for feedback'}, actor: maintainer, created_at: at(10)}];
+  s.reviews.push({user, submitted_at: at(12), state: 'APPROVED'});
+  const {github, writes} = client(s); const errors = [];
+  await run({github, context: {repo: {}}, core: {info() {}, setFailed: e => errors.push(e)}, now: Date.parse(at(13))});
+  assert.deepEqual(errors, []);
+  assert.deepEqual(writes, [['removeLabel', {issue_number: 14488, name: 'waiting for feedback'}], ['addLabels', {issue_number: 14488, labels: ['Investigating']}]]);
 });
 test('closed PRs and issues are excluded', () => {
   const s = snapshot(); s.issue.state = 'closed';

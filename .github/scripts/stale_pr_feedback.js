@@ -33,7 +33,8 @@ function timestamp(value) {
 // renames) is maintainer bookkeeping or unrelated traffic, regardless of actor.
 const ACTIVITY_EVENTS = new Set(['head_ref_force_pushed', 'reopened', 'ready_for_review']);
 
-// Returns one of: skip, mark, unstale (author responded: drop both labels),
+// Returns one of: skip, mark, answered (author responded before the PR went
+// stale: drop waiting for feedback), unstale (author responded: drop both labels),
 // lift (another human responded: drop only stale), baseline, close.
 function decide({issue, timeline, comments, reviews, reviewComments, head}, now) {
   const labels = issue.labels.map(label => label.name.toLowerCase());
@@ -43,6 +44,7 @@ function decide({issue, timeline, comments, reviews, reviewComments, head}, now)
   let lastActivity = timestamp(issue.created_at);
   let authorActivity = lastActivity;
   let waitingAt = lastActivity;
+  let waitingKnown = false;
   let staleAt;
   const record = (time, byAuthor) => {
     lastActivity = Math.max(lastActivity, time);
@@ -50,7 +52,7 @@ function decide({issue, timeline, comments, reviews, reviewComments, head}, now)
   };
   for (const event of timeline) {
     const label = event.label?.name?.toLowerCase();
-    if (label === WAITING && event.event === 'labeled') waitingAt = timestamp(event.created_at);
+    if (label === WAITING && event.event === 'labeled') { waitingAt = timestamp(event.created_at); waitingKnown = true; }
     if (label === STALE && event.event === 'labeled') staleAt = timestamp(event.created_at);
     if (label === STALE && event.event === 'unlabeled') staleAt = undefined;
     if (!ACTIVITY_EVENTS.has(event.event) || isBot(event.actor)) continue;
@@ -68,6 +70,10 @@ function decide({issue, timeline, comments, reviews, reviewComments, head}, now)
     record(timestamp(item.updated_at || item.submitted_at || item.created_at), isAuthor(item.user));
   }
   if (!labels.includes(STALE)) {
+    // The label workflow clears the request on comments only; pushes and formal
+    // reviews by the author are answers too. Legacy PRs without a label event
+    // have no request time to compare against and keep the label.
+    if (waitingKnown && authorActivity > waitingAt) return 'answered';
     return now - Math.max(lastActivity, waitingAt) >= 14 * DAY ? 'mark' : 'skip';
   }
   // Never infer a closure deadline from updated_at: bot writes also update it.
@@ -133,6 +139,9 @@ async function run({github, context, core, now = Date.now(), dryRun = false}) {
       }
       if (action === 'unstale') {
         await github.rest.issues.removeLabel({...args, name: STALE});
+        await github.rest.issues.removeLabel({...args, name: WAITING});
+        await github.rest.issues.addLabels({...args, labels: ['Investigating']});
+      } else if (action === 'answered') {
         await github.rest.issues.removeLabel({...args, name: WAITING});
         await github.rest.issues.addLabels({...args, labels: ['Investigating']});
       } else if (action === 'lift') {
