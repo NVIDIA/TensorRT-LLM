@@ -196,11 +196,21 @@ foreach(target_name gemmSwigluRunnerTest;gemmSwigluKernelTestSm90Fp8)
   endif()
 endforeach()
 
-set(ROUTING_KERNEL_TEST_SRC
-    moe/routing/routingTest.cpp moe/routing/routingLlama4Test.cpp
-    moe/routing/routingCustomTest.cpp moe/routing/routingDeepSeekTest.cpp)
-add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
-target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
+add_tllm_gtest(
+  routingKernelsTest
+  OWNER
+  kernel
+  SOURCES
+  moe/routing/routingTest.cpp
+  moe/routing/routingLlama4Test.cpp
+  moe/routing/routingCustomTest.cpp
+  moe/routing/routingDeepSeekTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_moe_routing
+  tllm::runtime_buffers
+  Python3::Python
+  LABELS
+  "unit;kernels;moe-routing;gpu")
 
 add_gtest(blockScaleMoeActivationTest moe/blockScaleMoeActivationTest.cu)
 add_gtest(blockScaleMoeFinalizeTest moe/blockScaleMoeFinalizeTest.cu)

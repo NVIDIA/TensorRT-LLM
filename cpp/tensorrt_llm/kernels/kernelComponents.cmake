@@ -181,3 +181,6 @@ add_tllm_kernel_library(
   LINK_LIBRARIES
   tllm::kernel_cutlass_headers
   tllm::common_environment)
+
+list(APPEND TLLM_KERNEL_COMPONENT_TARGETS
+     trtllm_gen_fp8_block_scale_moe_routing)
