@@ -330,6 +330,7 @@ foreach(
   tllm_runtime_buffers
   tllm_runtime_distributed
   tllm_runtime_topology
+  tllm_runtime_worker_pool
   tllm_common_environment
   tllm_executor_values
   tllm_executor_transfer_agent
@@ -369,6 +370,7 @@ foreach(
   tllm_runtime_buffers
   tllm_runtime_distributed
   tllm_runtime_topology
+  tllm_runtime_worker_pool
   tllm_executor_serialization
   tllm_common_environment
   tllm_executor_values
