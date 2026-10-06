@@ -29,11 +29,22 @@ python models/flux1.py --visual_gen_args configs/flux1-dev-fp4-1gpu.yaml
 python models/flux2.py --visual_gen_args configs/flux2-dev-fp4-1gpu.yaml
 python models/cosmos3_ti2v.py --visual_gen_args configs/cosmos3-nano-1gpu.yaml --prompt "A robot arm picks fruit in a grocery store"
 python models/qwen_image.py --visual_gen_args configs/qwen-image-fp8-1gpu.yaml
+python models/qwen_image_21.py --visual_gen_args configs/qwen-image-2.1-bf16-1gpu.yaml
+python models/qwen_image_21.py --visual_gen_args configs/qwen-image-2.1-bf16-1gpu.yaml --image /path/to/reference.png --prompt "Restyle this scene as watercolor"
 python models/qwen_image_layered.py --visual_gen_args configs/qwen-image-layered-1gpu.yaml --image /path/to/image.png
 python models/qwen_image_layered.py --visual_gen_args configs/qwen-image-layered-fp8-1gpu.yaml --image /path/to/image.png
 python models/qwen_image_edit.py --visual_gen_args configs/qwen-image-edit-2511-fp4-1gpu.yaml --image /path/to/source.png --prompt "Make the image look like a watercolor painting"
 python models/hunyuan_t2v.py --visual_gen_args configs/hunyuan-t2v-fp8-1gpu.yaml
 ```
+
+Qwen-Image 2.1 supports text-to-image and optional reference-image conditioning.
+The TRTLLM implementation owns the pipeline orchestration, scheduler,
+transformer/attention, and conditioning tensor recipes.  Its image VAE boundary
+uses the explicitly declared `diffusers.AutoencoderKLQwenImage21` fallback until
+a native TRTLLM VAE replacement is available; production coverage includes the
+`qwen-image-2.1-bf16-1gpu.yaml` example config, focused unit tests under
+`tests/unittest/_torch/visual_gen/test_qwen_image_21_*.py`, and the Blackwell
+perf-sanity entry `tests/scripts/perf-sanity/visual_gen/qwen_image_21_blackwell.yaml`.
 
 See the [MiniMax-H3 notes](../../docs/source/models/visual-generation.md#minimax-h3-notes)
 for supported tasks, the TRTLLM attention restriction, and checkpoint licensing.
