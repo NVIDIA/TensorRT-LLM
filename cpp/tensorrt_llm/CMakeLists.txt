@@ -197,8 +197,6 @@ add_subdirectory(runtime)
 
 add_subdirectory(batch_manager)
 
-set(EXECUTOR_TARGET tensorrt_llm_executor_static)
-set(EXECUTOR_TARGET_ARCH ${TARGET_ARCH})
 set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
 
 if(NIXL_ROOT)
@@ -211,8 +209,6 @@ if(MOONCAKE_ROOT)
 endif()
 
 add_subdirectory(executor)
-
-target_link_libraries(${EXECUTOR_TARGET} INTERFACE Threads::Threads)
 
 set(TRTLLM_LINK_LIBS
     ${CUDA_DRV_LIB}
@@ -338,6 +334,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_executor_cache_routing
     tllm_executor_cache_transfer_cuda
     tllm_executor_json_serialization
+    tllm_executor_kv_cache_events
     tllm_executor_memory_desc
     tllm_executor_mpi_connection
     tllm_executor_serialization
@@ -366,8 +363,8 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_runtime_worker_pool
     userbuffers_src)
 
-foreach(component ${TLLM_FACADE_COMPONENT_TARGETS} ${EXECUTOR_TARGET}
-                  fp8_blockscale_gemm_src ${INTERNAL_CUTLASS_KERNELS_TARGET})
+foreach(component ${TLLM_FACADE_COMPONENT_TARGETS} fp8_blockscale_gemm_src
+                  ${INTERNAL_CUTLASS_KERNELS_TARGET})
   target_link_libraries(${SHARED_TARGET}
                         PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${component}>)
 endforeach()
@@ -387,9 +384,6 @@ endforeach()
 
 # Link kernel_src and cutlass_src. static internal cutlass lib overridden.
 target_link_libraries(${SHARED_TARGET} PUBLIC kernels_src cutlass_src)
-
-# Cyclic dependency of executor on TRT-LLM
-target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
 
 if(TARGET ${UCX_WRAPPER_TARGET})
   add_dependencies(${SHARED_TARGET} ${UCX_WRAPPER_TARGET})
