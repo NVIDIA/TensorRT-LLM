@@ -13,12 +13,39 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_gtest(executorSamplingConfigTest samplingConfigTest.cpp)
-add_gtest(kvCacheConfigTest kvCacheConfigTest.cpp)
+add_tllm_gtest(
+  executorSamplingConfigTest
+  OWNER
+  executor
+  SOURCES
+  samplingConfigTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_serialization
+  LABELS
+  "unit;executor;host")
+add_tllm_gtest(
+  kvCacheConfigTest
+  OWNER
+  executor
+  SOURCES
+  kvCacheConfigTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_types
+  LABELS
+  "unit;executor;host")
 add_gtest(requestTest requestTest.cpp)
 add_gtest(responseTest responseTest.cpp)
 
-add_gtest(executorConfigTest executorConfigTest.cpp)
+add_tllm_gtest(
+  executorConfigTest
+  OWNER
+  executor
+  SOURCES
+  executorConfigTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_types
+  LABELS
+  "unit;executor;host")
 add_gtest(executorTensorTest tensorTest.cpp)
 add_gtest(serializeUtilsTest serializeUtilsTest.cpp)
 add_gtest(requestWithIdTest requestWithIdTest.cpp)
