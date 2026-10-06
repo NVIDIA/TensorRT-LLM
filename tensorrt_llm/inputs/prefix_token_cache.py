@@ -1,20 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prefix-tokenization cache for the default input processor.
 
 In multi-turn agentic serving each turn's prompt is the previous turn's prompt
-plus a small delta, yet the frontend re-tokenizes the whole thing every turn. On
-a GLM-5.2 disaggregated context server with ~38k-token prompts, nsys attributed
-47.4% of context wall-clock to "tokenize prompt" at 43.7 ms/request. Caching the
-tokenization of the longest cached prefix and tokenizing only the tail brought
-that to 5.49 ms/request (10.5% of wall) with byte-identical token IDs.
+plus a small delta, yet the frontend re-tokenizes the whole thing every turn.
+Caching the tokenization of the longest cached prefix and tokenizing only the
+tail keeps the token IDs identical to tokenizing the whole prompt.
 
 CORRECTNESS. Splitting a string and tokenizing the tail in isolation is NOT
 generally equal to tokenizing the whole: BPE merges can straddle the split. So
 the cache backs off `overlap` tokens from the split point, re-tokenizes from
 there, and requires the first `resync` re-tokenized ids to equal the cached ids
 over the same span. That proves the tokenizer has re-synchronized at the seam;
-if it has not, the prompt is tokenized in full. Validated on real trajectories:
-192/192 exact token-ID matches, 0 resync fallbacks, thread-safe under 8
-concurrent input_processor workers.
+if it has not, the prompt is tokenized in full.
 
 Off by default; enable with TLLM_PREFIX_TOKEN_CACHE=1.
 """

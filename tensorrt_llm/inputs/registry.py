@@ -120,8 +120,8 @@ class DefaultInputProcessor(InputProcessor):
             "<|reserved_200013|>",
         }
         # Multi-turn prompts grow by a small delta each turn, so re-tokenizing
-        # the whole prompt every turn dominates context-server wall time
-        # (measured: 47.4% of it, 43.7 ms/request at ~38k tokens). When the
+        # the whole prompt every turn dominates context-server wall time.
+        # When the
         # prefix cache is enabled and the request is a plain long text prompt,
         # reuse the tokenization of the longest cached prefix and tokenize only
         # the tail. Requires a fast tokenizer for offset mappings, and is
