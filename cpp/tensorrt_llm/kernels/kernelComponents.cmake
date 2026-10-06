@@ -85,3 +85,7 @@ add_tllm_kernel_library(tllm_kernel_sparse_attention SOURCES
 
 add_tllm_kernel_library(tllm_kernel_mla SOURCES mlaKernels.cu LINK_LIBRARIES
                         tllm::common_environment)
+
+add_tllm_kernel_library(
+  tllm_kernel_mla_chunked_prefill SOURCES mlaChunkedPrefill.cu
+  INCLUDE_DIRECTORIES ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include)
