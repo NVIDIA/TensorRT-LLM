@@ -56,8 +56,16 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;runtime;host")
-add_tllm_gtest(ipcNvlsMemoryTest SOURCES ipcNvlsMemoryTest.cpp FULL_STACK
-               LABELS "unit;full-stack;gpu")
+add_tllm_gtest(
+  ipcNvlsMemoryTest
+  OWNER
+  runtime
+  SOURCES
+  ipcNvlsMemoryTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_ipc_nvls
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   iTensorTest
   OWNER
