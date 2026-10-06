@@ -1735,10 +1735,6 @@ class MiniMaxM3VLInputProcessor:
     video placeholders are framed by the image start/end tokens
     (``MINIMAX_M3_VL_VISION_START_TOKEN`` /
     ``MINIMAX_M3_VL_VISION_END_TOKEN`` above, resolved via the tokenizer).
-
-    With ``enable_tokenization_cache``, text-only prompts are tokenized through
-    the prefix-tokenization cache instead of the HF processor, under the same
-    rules as ``DefaultInputProcessor``.
     """
 
     supports_tokenization_cache = True
@@ -1778,9 +1774,8 @@ class MiniMaxM3VLInputProcessor:
             use_fast=self._use_fast,
             trust_remote_code=trust_remote_code,
         )
-        # The HF processor tokenizes a text-only prompt with add_special_tokens=True
-        # (the tokenizer default) and the cache with add_special_tokens=False, so the
-        # cache is exact only if the tokenizer adds no special tokens; MiniMax-M3's adds none.
+        # The HF processor tokenizes with add_special_tokens=True and the cache with False,
+        # so their ids match only if the tokenizer adds no special tokens.
         if enable_tokenization_cache and self._processor.tokenizer.num_special_tokens_to_add() != 0:
             logger.warning(
                 "enable_tokenization_cache is ignored: the MiniMax-M3 tokenizer adds "
