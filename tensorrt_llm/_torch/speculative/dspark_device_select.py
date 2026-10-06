@@ -43,7 +43,7 @@ from typing import Callable, Optional, Union
 
 import torch
 
-from .dspark_ragged import build_qo_indptr, build_row_maps_device, fill_bucket_device
+from .ragged_helpers import build_qo_indptr, build_row_maps_device, fill_bucket_device
 from .dspark_schedule import (
     NEUTRAL_CONFIDENCE_LOGIT,
     DSparkScheduleConfig,

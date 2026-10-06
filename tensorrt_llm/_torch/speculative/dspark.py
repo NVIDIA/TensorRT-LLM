@@ -31,11 +31,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from .dflash import DFlashWorker, dflash_draft_slot_ids
-from .dspark_schedule import (
-    HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT,
-    NATIVE_UNIFORM_VERIFY_OUTPUT,
-    NEUTRAL_CONFIDENCE_LOGIT,
-)
+from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
 from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
@@ -44,19 +40,6 @@ if TYPE_CHECKING:
 # Unscored-slot fill: sigmoid saturates to 1.0, so an unwritten row schedules
 # as "verify the whole block" (fail-safe).
 _NEUTRAL_CONFIDENCE_LOGIT = NEUTRAL_CONFIDENCE_LOGIT
-
-
-def _publish_policy_window_output(
-    outputs: dict, verify_lens: Optional[torch.Tensor], batch_size: int
-) -> None:
-    """Publish the authoritative verify-window source for this exact step."""
-    if verify_lens is None:
-        outputs[NATIVE_UNIFORM_VERIFY_OUTPUT] = True
-        return
-    if verify_lens.shape[0] >= batch_size:
-        outputs["verify_lens"] = verify_lens[:batch_size]
-    else:
-        outputs[HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT] = True
 
 
 def _dspark_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -> int:

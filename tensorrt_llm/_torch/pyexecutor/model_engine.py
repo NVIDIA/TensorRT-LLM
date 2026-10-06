@@ -68,7 +68,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            prepare_attn_metadata_for_draft_replay,
                            restore_attn_metadata_after_draft_replay,
                            update_spec_config_from_loaded_model)
-from ..speculative.dspark_ragged import ragged_gather_index_lists
+from ..speculative.ragged_helpers import ragged_gather_index_lists
 from ..speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_static_draft_len, resolve_draft_len
@@ -5003,7 +5003,7 @@ class PyTorchModelEngine(ModelEngine):
         requests = batch.generation_requests
         if not requests:
             return
-        from ..speculative.dspark_ragged import RaggedVerifyLayout
+        from ..speculative.ragged_helpers import RaggedVerifyLayout
 
         lens = torch.ones(len(requests), dtype=torch.int32)
         layout = RaggedVerifyLayout.from_verify_lens(
@@ -5077,7 +5077,7 @@ class PyTorchModelEngine(ModelEngine):
         max_verify_len = 1 + int(self.spec_config.max_draft_len)
         token_lens = [1 + int(v) for v in verify_lens]
 
-        from ..speculative.dspark_ragged import resolve_ragged_pad_split
+        from ..speculative.ragged_helpers import resolve_ragged_pad_split
 
         # Resolve rows first, then tokens: the bucket grid depends on the
         # widest rank's row count. `all_can_graph` (third peer-stat element;
@@ -5513,7 +5513,7 @@ class PyTorchModelEngine(ModelEngine):
                 attn_metadata.ragged_verify_lens = None
             return
 
-        from ..speculative.dspark_ragged import build_qo_indptr
+        from ..speculative.ragged_helpers import build_qo_indptr
 
         n = len(token_lens)
         # Persistent buffers: a captured graph baked in the address it saw at

@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
@@ -13,6 +14,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     KeyType,
     cuda_graph_dummy_request_id,
 )
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 
 
 class _Batch:
@@ -190,3 +192,79 @@ def test_releasing_padding_dummies_invalidates_the_cached_agreement():
     assert runner.release_padding_dummy(SimpleNamespace(), 5)
     assert freed == [low, high]
     assert runner.adp_shape_agreement is None
+
+
+def _tier_lookup_runner(batch, *, confidence_enabled, in_graph_sampling, peer_tier):
+    runner = _runner_stub()
+    payloads = []
+
+    def gather(payload):
+        payloads.append(tuple(payload))
+        peer = list(payload)
+        peer[-1] = peer_tier.value
+        return np.asarray([payload, peer], dtype=np.int64)
+
+    runner.config = SimpleNamespace(
+        enable_attention_dp=True,
+        mapping=SimpleNamespace(tp_size=2),
+        dist=SimpleNamespace(tp_allgather_int64=gather),
+        use_mrope=False,
+        enable_in_graph_sampling=in_graph_sampling,
+    )
+    runner.enabled = True
+    runner.enable_in_graph_sampling = in_graph_sampling
+    runner.is_encoder_decoder = False
+    runner.enable_encoder_decoder_mixed_cuda_graph = False
+    runner._dspark_confidence_enabled = confidence_enabled
+    runner._dspark_trims_submitted_tokens = confidence_enabled
+    runner.adp_shape_agreement = None
+    runner.agreed_ragged_bucket = 16 if confidence_enabled else None
+    runner.sparse_config = None
+    runner._capture_sample_type = None
+    runner._sample_type_resolver = lambda _batch, _override: SampleType.FAST
+    runner._capture_allowed = False
+    runner.graph_metadata = {
+        KeyType(
+            batch_size=4, draft_len=5, is_first_draft=False,
+            sample_type=tier, ragged_verify_bucket=runner.agreed_ragged_bucket
+        ): {"attn_metadata": tier, "spec_metadata": None}
+        for tier in (SampleType.FULL, SampleType.FAST)
+    }
+    return runner, payloads
+
+
+@pytest.mark.parametrize("confidence_enabled", [False, True])
+@pytest.mark.parametrize("peer_tier", [SampleType.FAST, SampleType.FULL])
+def test_graph_lookup_agrees_sampling_tier_without_aliasing_ragged_bucket(
+    confidence_enabled, peer_tier
+):
+    batch = _Batch([SimpleNamespace(py_draft_tokens=[1] * 5, py_verify_len=3) for _ in range(4)])
+    runner, payloads = _tier_lookup_runner(
+        batch, confidence_enabled=confidence_enabled,
+        in_graph_sampling=True, peer_tier=peer_tier
+    )
+
+    metadata, _, key = runner.maybe_get_cuda_graph(batch, True, SimpleNamespace())
+
+    assert metadata is peer_tier
+    assert key.sample_type is peer_tier
+    assert payloads == [
+        (True, 4, 16, 5, SampleType.FAST.value) if confidence_enabled
+        else (True, 4, SampleType.FAST.value)
+    ]
+
+
+@pytest.mark.parametrize("in_graph_sampling", [False, True])
+def test_cached_shape_does_not_replace_in_graph_sampling_tier_agreement(in_graph_sampling):
+    batch = _Batch([SimpleNamespace(py_draft_tokens=[1] * 5, py_verify_len=3) for _ in range(4)])
+    runner, payloads = _tier_lookup_runner(
+        batch, confidence_enabled=True, in_graph_sampling=in_graph_sampling,
+        peer_tier=SampleType.FAST
+    )
+    runner.adp_shape_agreement = _agreement(batch, peer_sizes=(4, 4))
+
+    metadata, _, key = runner.maybe_get_cuda_graph(batch, True, SimpleNamespace())
+
+    assert metadata is (SampleType.FAST if in_graph_sampling else SampleType.FULL)
+    assert key.sample_type is metadata
+    assert len(payloads) == int(in_graph_sampling)

@@ -9,7 +9,7 @@ import torch
 import tensorrt_llm._torch.speculative.dspark_device_select as device_select
 import tensorrt_llm._torch.speculative.dspark_schedule as dspark_schedule
 from tensorrt_llm._torch.speculative.dspark_device_select import select_windows_device
-from tensorrt_llm._torch.speculative.dspark_ragged import fill_bucket_device
+from tensorrt_llm._torch.speculative.ragged_helpers import fill_bucket_device
 from tensorrt_llm._torch.speculative.dspark_schedule import (
     DSparkScheduleConfig,
     schedule_verify_lens_topk,
