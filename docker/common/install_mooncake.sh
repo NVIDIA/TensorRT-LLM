@@ -5,6 +5,7 @@ set -ex
 source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
 
 MOONCAKE_VERSION="v0.3.7.post2"
+YALANTINGLIBS_VERSION="0.5.5"
 MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 MOONCAKE_INSTALL_PATH="/usr/local/Mooncake"
 
@@ -30,7 +31,7 @@ apt-get install -y --no-install-recommends \
 
 mkdir -p /third-party-source
 
-git clone --depth 1 https://github.com/alibaba/yalantinglibs.git
+git clone --depth 1 --branch "${YALANTINGLIBS_VERSION}" https://github.com/alibaba/yalantinglibs.git
 tar -czf /third-party-source/yalantinglibs.tar.gz yalantinglibs
 cd yalantinglibs
 mkdir build && cd build
