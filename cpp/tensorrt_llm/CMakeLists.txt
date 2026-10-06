@@ -328,6 +328,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_common_profiler
     tllm_context_transfer_consensus
     tllm_executor_agent_name
+    tllm_executor_cache_routing
     tllm_executor_memory_desc
     tllm_executor_serialization
     tllm_executor_transfer_agent
