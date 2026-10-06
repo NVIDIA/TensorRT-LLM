@@ -44,7 +44,7 @@ that would rather set it in the config than on the command line.
 Use a **single GPU** for Nano and Super FP8 T2V, T2I, I2V, V2V and T2AV;
 every multi-GPU generator configuration is refused with an explicit error, so
 use BF16 there. Static FP8 Reasoner serving has a separate deployment path; see
-[Reasoner chat](../../serve/README.md#reasoner-chat).
+[Reasoner serving](../../../models/core/cosmos3/README.md).
 
 For T2AV, use the same audio-enabled prompt as BF16 with the FP8 checkpoint:
 
