@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Usage accounting for the Responses API under disaggregated serving.
 
 The generation worker cannot measure prefix reuse: the whole prompt reaches it
@@ -11,8 +13,14 @@ PR #14177.
 import unittest
 from types import SimpleNamespace
 
+import pytest
+
 from tensorrt_llm.serve.openai_protocol import PromptTokensDetails, UsageInfo
 from tensorrt_llm.serve.responses_utils import _create_usage
+
+# The CPU-* CI stages run pytest with -m 'cpu_only', and tests/unittest/conftest.py
+# drops every file without this marker there.
+pytestmark = pytest.mark.cpu_only
 
 
 def result(prompt_len, output_len, cached, ctx_usage=None):

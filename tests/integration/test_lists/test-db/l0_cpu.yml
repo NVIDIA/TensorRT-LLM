@@ -120,7 +120,6 @@ l0_cpu:
   - unittest/api_stability
   - unittest/bindings
   - unittest/disaggregated
-  - unittest/disaggregated/test_disagg_responses_api.py
   - unittest/dynamo
   - unittest/evaluate/test_image_generation_eval_cli.py
   - unittest/executor/test_base_worker.py ISOLATION
@@ -161,9 +160,12 @@ l0_cpu:
   - unittest/llmapi/apps/test_request_metrics.py::test_unpopulated_kv_transfer_timestamps_stay_absent
   - unittest/llmapi/apps/test_responses_custom_tools.py
   - unittest/llmapi/apps/test_responses_input_preprocess.py
+  - unittest/llmapi/apps/test_responses_store_replay.py
+  - unittest/llmapi/apps/test_responses_stream_final_consistency.py
   - unittest/llmapi/apps/test_responses_streaming_events.py
   - unittest/llmapi/apps/test_responses_streaming_tool_calls.py
   - unittest/llmapi/apps/test_responses_usage.py
+  - unittest/llmapi/apps/test_responses_usage_disagg.py
   - unittest/llmapi/apps/test_serving_extensions.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_web_search_shared.py
