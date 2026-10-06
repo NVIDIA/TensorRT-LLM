@@ -42,3 +42,6 @@ class DecoderRunnerConfig(RunnerConfig):
     is_multimodal: bool
     is_encoder_decoder: bool
     mm_encoder_cache_enabled: bool
+    enable_autotuner: bool
+    cuda_graph_specialize_lora: bool
+    enable_encoder_decoder_mixed_cuda_graph: bool

@@ -17,7 +17,7 @@ import sys
 import unittest
 from collections import OrderedDict
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -348,9 +348,18 @@ def test_compiled_mxfp8_warmup_backend_selection(
     monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=flashinfer_tune))
     method = MXFP8LinearMethod()
     engine = SimpleNamespace(
-        llm_args=SimpleNamespace(enable_autotuner=True),
-        _torch_compile_enabled=compile_enabled,
-        _torch_compile_prefill_only=prefill_only,
+        _config=SimpleNamespace(
+            enable_autotuner=True,
+            torch_compile_enabled=compile_enabled,
+            torch_compile_prefill_only=prefill_only,
+            max_num_tokens=16,
+            max_batch_size=16,
+            max_seq_len=2,
+            original_max_draft_len=0,
+            max_total_draft_tokens=0,
+            is_spec_decode=False,
+            max_draft_len=0,
+        ),
         _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
         _warmup_timer=_WarmupTimer(rank=0),
@@ -366,11 +375,6 @@ def test_compiled_mxfp8_warmup_backend_selection(
         mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
         dist=object(),
         kv_cache_manager_key="kv_cache",
-        max_num_tokens=16,
-        batch_size=16,
-        max_seq_len=2,
-        original_max_draft_len=0,
-        max_total_draft_tokens=0,
         is_draft_model=False,
         guided_decoder=None,
         no_cuda_graph=lambda: contextlib.nullcontext(),
@@ -381,10 +385,8 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _should_run_warmup_batch=Mock(return_value=True),
         _release_megamoe_profiling_scratch=Mock(),
         # The serving flag differs from the configuration; warmup follows the configuration.
-        is_spec_decode=False,
         enable_spec_decode=True,
         spec_config=None,
-        max_draft_len=0,
         _forward_warmup=Mock(),
     )
     engine._model_caller = ModelCaller(engine.model, prefill_compile_only=prefill_only)
@@ -582,9 +584,12 @@ def test_warmup_builders_resynchronize_stale_draft_buffers(
     engine, resource_manager = _build_engine_and_resource_manager()
     runner = engine._runner
     runner.spec_config = config
-    runner.max_draft_len = config.max_draft_len
-    runner.max_total_draft_tokens = config.tokens_per_gen_step - 1
-    runner.max_draft_loop_tokens = runner.max_total_draft_tokens
+    runner._config = replace(
+        runner._config,
+        max_draft_len=config.max_draft_len,
+        max_total_draft_tokens=config.tokens_per_gen_step - 1,
+        max_draft_loop_tokens=config.tokens_per_gen_step - 1,
+    )
     runner.get_runtime_tokens_per_gen_step = config.get_runtime_tokens_per_gen_step
     # Profiling a batch of two leaves K=2; every requested warmup shape below
     # differs from that value and must synchronize the requests, while the
@@ -593,7 +598,7 @@ def test_warmup_builders_resynchronize_stale_draft_buffers(
     batch_size = 2
 
     if draft_len is None:
-        expected_draft_len = runner.max_draft_len
+        expected_draft_len = runner._config.max_draft_len
         warmup_request = runner._create_warmup_request(
             resource_manager,
             num_tokens=batch_size * config.tokens_per_gen_step,
@@ -696,16 +701,21 @@ def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
                 patch.object(kv_cache_manager, "get_num_available_tokens", return_value=8)
             )
             stack.enter_context(
-                patch.object(runner, "llm_args", SimpleNamespace(enable_autotuner=False))
+                patch.object(runner, "_config", replace(runner._config, enable_autotuner=False))
             )
             runner._run_mamba_hybrid_warmup(resource_manager)
         else:
             stack.enter_context(
                 patch.object(
-                    runner, "prefill_cuda_graph_backend", PrefillCudaGraphBackend.BREAKABLE
+                    runner,
+                    "_config",
+                    replace(
+                        runner._config,
+                        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+                        prefill_cuda_graph_num_tokens=[4],
+                    ),
                 )
             )
-            stack.enter_context(patch.object(runner, "_prefill_cuda_graph_num_tokens", [4]))
             runner._capture_prefill_cuda_graphs(resource_manager)
 
     assert forward_warmup.call_count > 0
@@ -865,8 +875,9 @@ class TestWarmupCleanup(unittest.TestCase):
         runner._warmup_timer = _WarmupTimer(rank=0)
         runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         runner.model = SimpleNamespace(config=SimpleNamespace(vocab_size=128))
-        runner.dtype = torch.float16
-        runner._cuda_graph_batch_sizes = [1, 4]
+        runner._config = SimpleNamespace(
+            dtype=torch.float16, cuda_graph_batch_sizes=[1, 4], enable_in_graph_sampling=False
+        )
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine._metrics = runner._metrics = {}
         model_engine.moe_load_balancer = None
@@ -908,7 +919,7 @@ class TestWarmupCleanup(unittest.TestCase):
                     events.clear()
                     warmup_sampling.reset_mock()
                     warmup_in_graph_sampling.reset_mock()
-                    runner.enable_in_graph_sampling = enabled
+                    runner._config.enable_in_graph_sampling = enabled
                     runner._eager_workspace_reclaimer = object()
                     model_engine._warmup_impl(resource_manager)
                     self.assertEqual(
@@ -970,13 +981,14 @@ class TestWarmupCleanup(unittest.TestCase):
         """Verify generation graph timing excludes prefill and includes LoRA warmup cleanup."""
         runner = object.__new__(DecoderRunner)
         runner.model = SimpleNamespace(modules=lambda: [])
-        runner.llm_args = SimpleNamespace(enable_autotuner=True)
+        runner._config = SimpleNamespace(
+            enable_autotuner=True, prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE
+        )
         runner._lora = SimpleNamespace(cuda_graph_manager=object())
         runner.cuda_graph_runner = SimpleNamespace(
             enabled=True,
             is_warmup_only=False,
         )
-        runner.prefill_cuda_graph_backend = PrefillCudaGraphBackend.PIECEWISE
         runner._metrics = {}
         resource_manager = object()
         events = []
@@ -1082,7 +1094,7 @@ class TestWarmupCleanup(unittest.TestCase):
             events.clear()
             generation.reset_mock()
             runner.cuda_graph_runner.enabled = False
-            runner.prefill_cuda_graph_backend = PrefillCudaGraphBackend.DISABLED
+            runner._config.prefill_cuda_graph_backend = PrefillCudaGraphBackend.DISABLED
             runner._run_cuda_graph_warmup(resource_manager)
             self.assertEqual(
                 events,
@@ -1173,9 +1185,8 @@ class TestWarmupCleanup(unittest.TestCase):
 
             engine = SimpleNamespace(
                 _warmup_timer=_WarmupTimer(rank=0),
-                llm_args=SimpleNamespace(enable_autotuner=False),
+                _config=SimpleNamespace(enable_autotuner=False, torch_compile_enabled=False),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
-                _torch_compile_enabled=False,
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -1237,9 +1248,18 @@ class TestWarmupCleanup(unittest.TestCase):
 
             engine = SimpleNamespace(
                 _warmup_timer=_WarmupTimer(rank=0),
-                llm_args=SimpleNamespace(enable_autotuner=True),
+                _config=SimpleNamespace(
+                    enable_autotuner=True,
+                    torch_compile_enabled=False,
+                    max_num_tokens=16,
+                    max_batch_size=16,
+                    max_seq_len=2,
+                    original_max_draft_len=0,
+                    max_total_draft_tokens=0,
+                    is_spec_decode=False,
+                    max_draft_len=0,
+                ),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
-                _torch_compile_enabled=False,
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -1247,14 +1267,9 @@ class TestWarmupCleanup(unittest.TestCase):
                     ]
                 ),
                 kv_cache_manager_key="kv_cache",
-                max_num_tokens=16,
-                batch_size=16,
-                max_seq_len=2,
-                original_max_draft_len=0,
                 mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 dist=object(),
                 guided_decoder=None,
-                max_total_draft_tokens=0,
                 no_cuda_graph=lambda: contextlib.nullcontext(),
                 _create_warmup_request=Mock(return_value=object()),
                 _release_batch_context=Mock(
@@ -1267,9 +1282,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 ),
                 _should_run_warmup_batch=Mock(return_value=True),
                 _release_megamoe_profiling_scratch=Mock(),
-                is_spec_decode=False,
                 spec_config=None,
-                max_draft_len=0,
                 _forward_warmup=Mock(side_effect=lambda *args, **kwargs: calls.append("forward")),
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
@@ -1357,9 +1370,18 @@ class TestWarmupCleanup(unittest.TestCase):
             method = MXFP8LinearMethod()
             engine = SimpleNamespace(
                 _warmup_timer=_WarmupTimer(rank=0),
-                llm_args=SimpleNamespace(enable_autotuner=True),
+                _config=SimpleNamespace(
+                    enable_autotuner=True,
+                    torch_compile_enabled=False,
+                    max_num_tokens=16,
+                    max_batch_size=16,
+                    max_seq_len=2,
+                    original_max_draft_len=0,
+                    max_total_draft_tokens=0,
+                    is_spec_decode=False,
+                    max_draft_len=0,
+                ),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
-                _torch_compile_enabled=False,
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -1367,14 +1389,9 @@ class TestWarmupCleanup(unittest.TestCase):
                     ]
                 ),
                 kv_cache_manager_key="kv_cache",
-                max_num_tokens=16,
-                batch_size=16,
-                max_seq_len=2,
-                original_max_draft_len=0,
                 mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 dist=object(),
                 guided_decoder=None,
-                max_total_draft_tokens=0,
                 no_cuda_graph=lambda: contextlib.nullcontext(),
                 _create_warmup_request=Mock(return_value=object()),
                 _release_batch_context=Mock(
@@ -1387,9 +1404,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 ),
                 _should_run_warmup_batch=Mock(return_value=False),
                 _release_megamoe_profiling_scratch=Mock(),
-                is_spec_decode=False,
                 spec_config=None,
-                max_draft_len=0,
                 _forward_warmup=Mock(),
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
@@ -1462,9 +1477,18 @@ class TestWarmupCleanup(unittest.TestCase):
             method = MXFP8LinearMethod()
             engine = SimpleNamespace(
                 _warmup_timer=_WarmupTimer(rank=0),
-                llm_args=SimpleNamespace(enable_autotuner=True),
+                _config=SimpleNamespace(
+                    enable_autotuner=True,
+                    torch_compile_enabled=False,
+                    max_num_tokens=16,
+                    max_batch_size=16,
+                    max_seq_len=2,
+                    original_max_draft_len=0,
+                    max_total_draft_tokens=0,
+                    is_spec_decode=False,
+                    max_draft_len=0,
+                ),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
-                _torch_compile_enabled=False,
                 model=SimpleNamespace(
                     modules=lambda: [
                         SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
@@ -1472,22 +1496,15 @@ class TestWarmupCleanup(unittest.TestCase):
                     ]
                 ),
                 kv_cache_manager_key="kv_cache",
-                max_num_tokens=16,
-                batch_size=16,
-                max_seq_len=2,
-                original_max_draft_len=0,
                 mapping=SimpleNamespace(tp_size=2, has_pp=lambda: True),
                 dist=dist,
                 guided_decoder=None,
-                max_total_draft_tokens=0,
                 no_cuda_graph=lambda: contextlib.nullcontext(),
                 _create_warmup_request=Mock(return_value=object()),
                 _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
                 _should_run_warmup_batch=Mock(return_value=True),
                 _release_megamoe_profiling_scratch=Mock(),
-                is_spec_decode=False,
                 spec_config=None,
-                max_draft_len=0,
                 _forward_warmup=Mock(),
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
@@ -1536,9 +1553,8 @@ class TestWarmupCleanup(unittest.TestCase):
             method = MXFP8LinearMethod()
             engine = SimpleNamespace(
                 _warmup_timer=_WarmupTimer(rank=0),
-                llm_args=SimpleNamespace(enable_autotuner=False),
+                _config=SimpleNamespace(enable_autotuner=False, torch_compile_enabled=False),
                 cuda_graph_runner=SimpleNamespace(enabled=False),
-                _torch_compile_enabled=False,
                 model=SimpleNamespace(modules=lambda: [SimpleNamespace(quant_method=method)]),
             )
 

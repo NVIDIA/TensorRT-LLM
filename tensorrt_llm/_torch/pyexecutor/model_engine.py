@@ -742,6 +742,12 @@ class PyTorchModelEngine(ModelEngine):
             is_multimodal=self.is_multimodal,
             is_encoder_decoder=self._is_encoder_decoder_model(),
             mm_encoder_cache_enabled=self._mm_encoder_cache_enabled,
+            enable_autotuner=self.llm_args.enable_autotuner,
+            cuda_graph_specialize_lora=(
+                self.llm_args.lora_config is not None
+                and self.llm_args.lora_config.cuda_graph_specialize_lora),
+            enable_encoder_decoder_mixed_cuda_graph=(
+                self.llm_args.enable_encoder_decoder_mixed_cuda_graph),
         )
         return runner_cls(
             self.model,
@@ -752,7 +758,6 @@ class PyTorchModelEngine(ModelEngine):
             dist=self.dist,
             moe_load_balancer=self.moe_load_balancer,
             spec_config=self.spec_config,
-            llm_args=self.llm_args,
             sparse_attention_config=self.sparse_attention_config,
             torch_compile_backend=self._torch_compile_backend,
             get_runtime_tokens_per_gen_step=self.

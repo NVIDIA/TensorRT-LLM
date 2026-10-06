@@ -4,7 +4,7 @@
 import unittest
 import weakref
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -300,28 +300,30 @@ def _make_forward_only_engine(
             rope_scaling=None)))
     decoder.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     engine.enable_spec_decode = False
-    decoder.is_spec_decode = False
+    decoder._config = SimpleNamespace(
+        is_spec_decode=False,
+        max_beam_width=1,
+        is_encode_only=False,
+        attention_backend=None,
+        original_max_draft_len=0,
+        original_max_total_draft_tokens=0,
+        spec_dec_max_total_draft_tokens=0,
+        use_mrope=False,
+        is_encoder_decoder=False,
+    )
     decoder.guided_decoder = None
-    decoder.max_beam_width = 1
-    decoder._is_encode_only = False
-    engine.llm_args = decoder.llm_args = SimpleNamespace(mm_encoder_only=False)
+    engine.llm_args = SimpleNamespace(mm_encoder_only=False)
     engine.mapping = decoder.mapping = SimpleNamespace(
         cp_size=1,
         enable_lm_head_tp_in_adp=False,
     )
     engine.runtime_draft_len = 0
-    decoder.attn_backend = None
-    decoder.original_max_draft_len = 0
-    decoder.original_max_total_draft_tokens = 0
-    decoder._spec_dec_max_total_draft_tokens = 0
     decoder.spec_config = None
     decoder.get_runtime_tokens_per_gen_step = Mock(return_value=1)
     engine.iter_states = decoder.iter_states = {}
     decoder.forward_pass_callable = None
     decoder._stage_in_graph_sampling = None
     decoder.moe_load_balancer = None
-    decoder.use_mrope = False
-    decoder.is_encoder_decoder = False
     decoder._get_draft_kv_cache_manager = Mock(return_value=None)
     engine._runner = decoder
     decoder._lora = SimpleNamespace(cuda_graph_manager=None)
@@ -681,7 +683,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             config=SimpleNamespace(vocab_size=100),
             mm_token_ids=torch.tensor([99], dtype=torch.int32),
         )
-        engine.use_mrope = False
+        engine._config = SimpleNamespace(use_mrope=False)
         request = _create_request_with_tokens([11, 99, 22], 1)
 
         request.context_current_position = 2
@@ -701,7 +703,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine.model.mm_token_ids = torch.tensor([99], dtype=torch.int32)
         engine.model.model_config = SimpleNamespace(
             pretrained_config=SimpleNamespace(rope_scaling={"type": "mrope"}))
-        engine.use_mrope = True
+        engine._config.use_mrope = True
         request = _create_request_with_tokens([11, 22], 3)
         request.context_current_position = 1
         request.py_multimodal_data = {"mrope_config": {}}
@@ -927,8 +929,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine = object.__new__(DecoderRunner)
         engine._lora = SimpleNamespace(cuda_graph_manager=object())
         engine._force_lora_graph_for_capture = None
-        lora_config = SimpleNamespace(cuda_graph_specialize_lora=True)
-        engine.llm_args = SimpleNamespace(lora_config=lora_config)
+        engine._config = SimpleNamespace(cuda_graph_specialize_lora=True)
         request = _make_request_stub(7)
         batch = ScheduledRequests()
         batch.generation_requests = [request]
@@ -939,7 +940,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertTrue(engine._use_lora_cuda_graph(batch))
 
         request.lora_task_id = None
-        lora_config.cuda_graph_specialize_lora = False
+        engine._config.cuda_graph_specialize_lora = False
         self.assertTrue(engine._use_lora_cuda_graph(batch))
 
         engine._force_lora_graph_for_capture = False
@@ -1261,8 +1262,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         key = (1, 0, False, False, True, True)
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(key)
         engine._runner._lora = SimpleNamespace(cuda_graph_manager=object())
-        engine.llm_args.lora_config = SimpleNamespace(
-            cuda_graph_specialize_lora=True)
+        engine._runner._config.cuda_graph_specialize_lora = True
         generation = _make_request_stub(2)
         generation.lora_task_id = 42
         batch = ScheduledRequests()
@@ -1301,9 +1301,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                     engine.enable_spec_decode = True
                     engine.runtime_draft_len = 1
                 elif case == "beam":
-                    engine._runner.max_beam_width = 2
+                    engine._runner._config.max_beam_width = 2
                 elif case == "encoder_decoder":
-                    engine._runner.is_encoder_decoder = True
+                    engine._runner._config.is_encoder_decoder = True
                 elif case == "ple_recurrent_state":
                     engine.model.has_ple = True
                 elif case == "nested_ple_recurrent_state":
@@ -1374,11 +1374,13 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         engine = object.__new__(DecoderRunner)
         engine.attn_metadata = None
-        engine.attn_backend = SimpleNamespace(
-            Metadata=DSAtrtllmAttentionMetadata)
+        engine._config = SimpleNamespace(
+            attention_backend=SimpleNamespace(
+                Metadata=DSAtrtllmAttentionMetadata),
+            original_max_draft_len=2,
+            cuda_graph_batch_sizes=[8],
+        )
         engine.kv_cache_manager_key = "kv"
-        engine.original_max_draft_len = 2
-        engine._cuda_graph_batch_sizes = [8]
         engine._get_draft_kv_cache_manager = Mock(return_value=None)
         metadata = Mock(spec=DSAtrtllmAttentionMetadata)
 
@@ -1406,7 +1408,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         engine = object.__new__(DecoderRunner)
         engine.attn_metadata = None
-        engine.attn_backend = SimpleNamespace(Metadata=TrtllmAttentionMetadata)
+        engine._config = SimpleNamespace(attention_backend=SimpleNamespace(
+            Metadata=TrtllmAttentionMetadata))
         engine._set_up_attn_metadata = Mock()
 
         engine._ensure_dsa_attn_metadata_for_warmup(Mock())
@@ -1965,7 +1968,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         # Test with a huge batch size. The warmup run should bail out of
         # warmup instead of crashing (there's not enough KV cache space for this).
-        model_engine._runner._cuda_graph_batch_sizes.append(1000000000)
+        model_engine._runner._config.cuda_graph_batch_sizes.append(1000000000)
 
         num_free_before = kv_cache_manager.get_num_free_blocks()
         model_engine.warmup(resource_manager)
@@ -2274,7 +2277,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         # Initialize model engine buffers.
         max_num_tokens = 512
-        model_engine._runner.max_num_tokens = max_num_tokens
+        model_engine._runner._config = replace(model_engine._runner._config,
+                                               max_num_tokens=max_num_tokens)
         model_engine._runner.input_ids_cuda = torch.zeros(max_num_tokens,
                                                           dtype=torch.int32,
                                                           device='cuda')
@@ -2331,7 +2335,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         model_engine.model.model_config.pretrained_config.rope_scaling = {
             "type": "mrope"
         }
-        model_engine._runner.use_mrope = True
+        model_engine._runner._config = replace(model_engine._runner._config,
+                                               use_mrope=True)
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=32)
@@ -2352,7 +2357,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                           kv_cache_manager=kv_cache_manager)
         attn_metadata.is_cuda_graph = False
 
-        model_engine._runner.max_num_tokens = 32
+        model_engine._runner._config = replace(model_engine._runner._config,
+                                               max_num_tokens=32)
         model_engine._runner.input_ids_cuda = torch.zeros(32,
                                                           dtype=torch.int32,
                                                           device='cuda')
@@ -2424,7 +2430,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         model_engine.model.model_config.pretrained_config.rope_scaling = {
             "type": "mrope"
         }
-        model_engine._runner.use_mrope = True
+        model_engine._runner._config = replace(model_engine._runner._config,
+                                               use_mrope=True)
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=max_num_tokens)
@@ -2445,7 +2452,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                           kv_cache_manager=kv_cache_manager)
         attn_metadata.is_cuda_graph = False
 
-        model_engine._runner.max_num_tokens = max_num_tokens
+        model_engine._runner._config = replace(model_engine._runner._config,
+                                               max_num_tokens=max_num_tokens)
         model_engine._runner.input_ids_cuda = torch.zeros(max_num_tokens,
                                                           dtype=torch.int32,
                                                           device='cuda')
@@ -2568,7 +2576,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         model_engine.model.model_config.pretrained_config.rope_scaling = {
             "type": "mrope"
         }
-        model_engine._runner.use_mrope = True
+        model_engine._runner._config = replace(model_engine._runner._config,
+                                               use_mrope=True)
         model_engine._runner.mrope_position_ids_cuda = torch.zeros(
             (3, 1, model_engine.max_num_tokens),
             dtype=torch.int32,

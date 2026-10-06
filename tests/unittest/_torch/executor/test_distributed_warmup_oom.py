@@ -70,9 +70,8 @@ def _engine(
         tp_size=tp_size,
     )
     engine._reset_moe_alltoall_state = mock.Mock()
-    engine.is_spec_decode = False
+    engine._config = SimpleNamespace(is_spec_decode=False, max_draft_len=0)
     engine.spec_config = None
-    engine.max_draft_len = 0
     return engine
 
 
@@ -431,11 +430,14 @@ _KV_ALLOC_ERROR = "Can't allocate new blocks for window size 8"
 def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[DecoderRunner, object]:
     engine = _engine(world_size=world_size, dwdp_size=dwdp_size)
     engine.kv_cache_manager_key = "kv"
-    engine.max_num_tokens = 8
-    engine.batch_size = 4
-    engine.max_seq_len = 8
-    engine.original_max_draft_len = 0
-    engine.llm_args = SimpleNamespace(enable_autotuner=False)
+    engine._config = SimpleNamespace(
+        **vars(engine._config),
+        max_num_tokens=8,
+        max_batch_size=4,
+        max_seq_len=8,
+        original_max_draft_len=0,
+        enable_autotuner=False,
+    )
     engine.no_cuda_graph = contextlib.nullcontext
     # The warmup resolves its chunk-alignment variant off the model's Mamba
     # metadata class; a model declaring none takes the ``Mamba2Metadata``
