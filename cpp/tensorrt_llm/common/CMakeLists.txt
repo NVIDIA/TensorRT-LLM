@@ -74,10 +74,21 @@ target_link_libraries(tllm_common_environment PUBLIC tllm::common_cuda)
 set_target_properties(tllm_common_environment
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(tllm_common_cublas STATIC cublasMMWrapper.cpp)
+add_library(tllm::common_cublas ALIAS tllm_common_cublas)
+target_link_libraries(tllm_common_cublas PUBLIC tllm::common_cuda CUDA::cublas
+                                                CUDA::cublasLt)
+target_compile_features(tllm_common_cublas PUBLIC cxx_std_20)
+set_target_properties(tllm_common_cublas PROPERTIES POSITION_INDEPENDENT_CODE
+                                                    ON)
+if(ENABLE_CUBLASLT_FP4_GEMM)
+  target_compile_definitions(tllm_common_cublas
+                             PRIVATE ENABLE_CUBLASLT_FP4_GEMM)
+endif()
+
 add_library(
   common_src OBJECT
   attentionOp.cpp
-  cublasMMWrapper.cpp
   cudaFp8Utils.cu
   cudaProfilerUtils.cpp
   mcastDevMemUtils.cpp
@@ -88,7 +99,8 @@ add_library(
 add_cuda_architectures(common_src 89)
 set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET common_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-target_link_libraries(common_src PUBLIC trtllm_gen_fmha_interface)
+target_link_libraries(common_src PUBLIC trtllm_gen_fmha_interface
+                                        tllm::common_cublas)
 
 if(ENABLE_CUBLASLT_FP4_GEMM)
   target_compile_definitions(common_src PRIVATE ENABLE_CUBLASLT_FP4_GEMM)

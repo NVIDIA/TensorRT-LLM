@@ -274,7 +274,7 @@ target_link_libraries(
   ${SHARED_TARGET}
   PRIVATE
     $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_error,tllm_common_logging,tllm_common_cuda,tllm_executor_types,tllm_executor_serialization,tllm_runtime_memory,tllm_runtime_buffers,tllm_runtime_distributed,tllm_runtime_topology>
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_environment,tllm_executor_values,tllm_executor_transfer_agent,tllm_kv_cache_host_memory,tllm_kv_cache,tllm_kv_cache_legacy,tllm_batch_scheduler,tllm_kernel_kv_cache_copy>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_cublas,tllm_common_environment,tllm_executor_values,tllm_executor_transfer_agent,tllm_kv_cache_host_memory,tllm_kv_cache,tllm_kv_cache_legacy,tllm_batch_scheduler,tllm_kernel_kv_cache_copy>
     $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
     $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
     $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
@@ -286,6 +286,9 @@ foreach(component IN LISTS TLLM_KERNEL_COMPONENT_TARGETS)
   set_property(TARGET ${SHARED_TARGET}
                PROPERTY LINK_LIBRARY_OVERRIDE_${component} WHOLE_ARCHIVE)
 endforeach()
+
+set_property(TARGET ${SHARED_TARGET}
+             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_cublas WHOLE_ARCHIVE)
 
 # Components also link each other normally; retain all component exports here.
 set_property(TARGET ${SHARED_TARGET}
