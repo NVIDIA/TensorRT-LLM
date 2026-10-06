@@ -1527,6 +1527,44 @@ TEST_F(KvCacheManagerV2PageStorageTest, SnapshotsRawMixedTierIndicesAndDecodeEli
     EXPECT_EQ(pageAt(*cache, 2, sparseGroup)->cacheLevel, kHotLevel);
 }
 
+TEST_F(KvCacheManagerV2PageStorageTest, SnapshotsSkipSharedPromptBeamRows)
+{
+    auto config = sparseConfig();
+    config.enablePartialCommit = false;
+    std::get<AttentionLayerConfig>(config.layers.front()).buffers.front().size = 4096;
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    auto const apiLock = manager->lockExclusive();
+    auto cache = manager->createKvCache({}, {}, std::nullopt, {}, /*expectedPromptLength=*/8);
+    auto closeCache = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(12, 8));
+    cache->setBeamWidth(BeamIndex{3});
+
+    for (BeamIndex bi{0}; bi < cache->beamWidth(); ++bi)
+    {
+        auto const snapshot = cache->getPageStorageSnapshot(LifeCycleId{0}, bi);
+        ASSERT_EQ(snapshot.basePageIndices().size(), 3U);
+        ASSERT_EQ(snapshot.cacheLevels().size(), 3U);
+        EXPECT_EQ(snapshot.eligibleHistoryBlocks(), 0);
+        EXPECT_EQ(snapshot.readyEvents().size(), bi == kDefaultBeamIndex ? 3U : 1U);
+        for (int ordinal = 0; ordinal < 3; ++ordinal)
+        {
+            if (bi != kDefaultBeamIndex && ordinal < 2)
+            {
+                EXPECT_EQ(snapshot.basePageIndices()[ordinal], kBadPageIndex.value());
+                EXPECT_EQ(snapshot.cacheLevels()[ordinal], std::nullopt);
+            }
+            else
+            {
+                auto const& page = blockPageGetPage(cache->blocks()[BlockOrdinal{ordinal}].pages[bi][LifeCycleId{0}]);
+                ASSERT_NE(page, nullptr);
+                EXPECT_EQ(snapshot.basePageIndices()[ordinal], slotIdToPageIndexValue(page->slotId()));
+                EXPECT_EQ(snapshot.cacheLevels()[ordinal], kHotLevel);
+            }
+        }
+    }
+}
+
 TEST_F(KvCacheManagerV2PageStorageTest, DirtyAcknowledgmentTracksBindingsCommitAndRequestLifetime)
 {
     auto manager = std::make_shared<KvCacheManager>(sparseConfig());
@@ -2219,6 +2257,47 @@ TEST_F(KvCacheManagerV2DecodeOffloadTest, EntryScansUnchangedWatermarkAndResumeK
         auto const page = pageAt(*cache, ord);
         EXPECT_EQ(page->cacheLevel, kSparseHistoryLevel);
         EXPECT_EQ(cache->getBasePageIndices(LifeCycleId{0})[ord], slotIdToPageIndexValue(page->slotId()));
+    }
+}
+
+TEST_F(KvCacheManagerV2DecodeOffloadTest, BeamExpansionOffloadsOnlyExistingHistoryRows)
+{
+    auto config = sparseConfig();
+    config.enablePartialCommit = false;
+    std::get<AttentionLayerConfig>(config.layers.front()).buffers.front().size = 4096;
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    auto const apiLock = manager->lockExclusive();
+    auto cache = manager->createKvCache({}, {}, std::nullopt, {}, /*expectedPromptLength=*/8);
+    auto closeCache = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(12, 8));
+    cache->setBeamWidth(BeamIndex{3});
+    ASSERT_EQ(cache->blocks()[BlockOrdinal{0}].pages.size(), BeamIndex{1});
+    ASSERT_EQ(cache->blocks()[BlockOrdinal{1}].pages.size(), BeamIndex{1});
+    ASSERT_EQ(cache->blocks()[BlockOrdinal{2}].pages.size(), BeamIndex{3});
+
+    ASSERT_TRUE(cache->enterDecode());
+    EXPECT_TRUE(cache->isDecoding());
+    for (int historyLength : {8, 12})
+    {
+        ASSERT_TRUE(cache->resize(16, historyLength));
+        for (BlockOrdinal ordinal{0}; ordinal < cache->numBlocks(); ++ordinal)
+        {
+            auto const& pages = cache->blocks()[ordinal].pages;
+            for (BeamIndex bi{0}; bi < pages.size(); ++bi)
+            {
+                auto const& page = blockPageGetPage(pages[bi][LifeCycleId{0}]);
+                ASSERT_NE(page, nullptr);
+                EXPECT_EQ(page->cacheLevel,
+                    ordinal < BlockOrdinal{historyLength / cache->tokensPerBlock()} ? kSparseHistoryLevel : kHotLevel);
+                EXPECT_EQ(page->status(), PageStatus::LOCKED);
+                EXPECT_EQ(cache->getBasePageIndices(LifeCycleId{0}, bi)[ordinal.value()],
+                    slotIdToPageIndexValue(page->slotId()));
+            }
+        }
+        EXPECT_EQ(cache->getPageStorageSnapshot(LifeCycleId{0}).eligibleHistoryBlocks(),
+            historyLength / cache->tokensPerBlock());
+        EXPECT_EQ(cache->getPageStorageSnapshot(LifeCycleId{0}, BeamIndex{1}).eligibleHistoryBlocks(), 0);
     }
 }
 

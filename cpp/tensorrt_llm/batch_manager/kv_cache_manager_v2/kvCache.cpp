@@ -241,7 +241,7 @@ void KvCache::_offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int histo
             throw std::invalid_argument("Sparse history must already have allocated pages");
         for (BlockOrdinal ord = range.beg; ord < range.end; ++ord)
         {
-            for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
+            for (BeamIndex bi{0}; bi < mBlocks[ord].pages.size(); ++bi)
             {
                 auto page = _page(ord, bi, lcId);
                 TLLM_CHECK_DEBUG(page && page->status() == PageStatus::LOCKED);
@@ -2946,7 +2946,8 @@ std::optional<int> KvCache::pageStorageRow() const
 
 PageStorageSnapshot KvCache::getPageStorageSnapshot(LayerGroupId lgId, BeamIndex beamIdx) const
 {
-    auto const apiLock = mManager->lockShared();
+    // Page::status() temporarily acquires a holder with non-atomic reference counts.
+    auto const apiLock = mManager->lockExclusive();
     auto const& buf = mBasePageIndices.at(beamIdx).at(lgId);
     PageStorageSnapshot snapshot;
     snapshot.mVersion = mPageStorageVersion;
@@ -2971,8 +2972,13 @@ PageStorageSnapshot KvCache::getPageStorageSnapshot(LayerGroupId lgId, BeamIndex
     snapshot.mReadyEvents.reserve(numBlocks);
     for (BlockOrdinal ord{0}; ord < mBlocks.size(); ++ord)
     {
+        auto const& pages = mBlocks[ord].pages;
+        if (beamIdx >= pages.size())
+        {
+            continue;
+        }
         int const index = snapshot.mBasePageIndices[toSizeT(ord)];
-        auto const& page = blockPageGetPage(mBlocks[ord].pages.at(beamIdx).at(lgId));
+        auto const& page = blockPageGetPage(pages.at(beamIdx).at(lgId));
         // The scalar count exposes only the contiguous host prefix, stopping at any deferred GPU page.
         if (ord.value() == snapshot.mEligibleHistoryBlocks && ord.value() < completeSparseHistory && page
             && index != kBadPageIndex.value() && page->cacheLevel == kSparseHistoryLevel)
