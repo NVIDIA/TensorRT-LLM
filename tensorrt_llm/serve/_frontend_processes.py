@@ -5,7 +5,7 @@
 
 import json
 import os
-import select
+import selectors
 
 # Re-exec the serving CLI with sys.executable and an argument list, without a shell.
 import subprocess  # nosec B404
@@ -141,39 +141,43 @@ def _wait_attached_frontends_ready(
     timeout = float(os.getenv("TLLM_FRONTEND_READY_TIMEOUT", "300"))
     deadline = time.monotonic() + timeout
     pending = dict(zip(ready_fds, children))
-    while pending:
-        if cancelled is not None and cancelled.is_set():
-            raise FrontendStartupCancelled("Frontend startup cancelled")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise RuntimeError(
-                f"{len(pending)} attached frontend(s) not ready within "
-                f"{timeout:.0f}s (TLLM_FRONTEND_READY_TIMEOUT)"
-            )
-        readable, _, _ = select.select(list(pending), [], [], min(remaining, 1.0))
-        for fd in readable:
-            child = pending.pop(fd)
-            if os.read(fd, 1) != b"R":  # EOF: pipe closed without READY
-                try:
-                    return_code = child.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    return_code = None
-                if return_code is not None and return_code != 0 and report_failure is not None:
-                    report_failure(return_code, "server", "model_initialization")
+    with selectors.DefaultSelector() as selector:
+        for fd in ready_fds:
+            selector.register(fd, selectors.EVENT_READ)
+        while pending:
+            if cancelled is not None and cancelled.is_set():
+                raise FrontendStartupCancelled("Frontend startup cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise RuntimeError(
-                    f"Attached frontend (pid {child.pid}) exited before signaling READY"
+                    f"{len(pending)} attached frontend(s) not ready within "
+                    f"{timeout:.0f}s (TLLM_FRONTEND_READY_TIMEOUT)"
                 )
-            logger.info(f"Attached frontend (pid {child.pid}) is ready")
-        # READY is only a startup milestone: keep checking those children while
-        # siblings initialize, including the iteration that consumes the last READY.
-        for child in children:
-            if child.poll() is not None:
-                if child.returncode != 0 and report_failure is not None:
-                    report_failure(child.returncode, "server", "model_initialization")
-                raise RuntimeError(
-                    f"Attached frontend (pid {child.pid}) exited with code "
-                    f"{child.returncode} during frontend startup"
-                )
+            for key, _ in selector.select(min(remaining, 1.0)):
+                fd = key.fd
+                selector.unregister(fd)
+                child = pending.pop(fd)
+                if os.read(fd, 1) != b"R":  # EOF: pipe closed without READY
+                    try:
+                        return_code = child.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        return_code = None
+                    if return_code is not None and return_code != 0 and report_failure is not None:
+                        report_failure(return_code, "server", "model_initialization")
+                    raise RuntimeError(
+                        f"Attached frontend (pid {child.pid}) exited before signaling READY"
+                    )
+                logger.info(f"Attached frontend (pid {child.pid}) is ready")
+            # READY is only a startup milestone: keep checking those children while
+            # siblings initialize, including the iteration that consumes the last READY.
+            for child in children:
+                if child.poll() is not None:
+                    if child.returncode != 0 and report_failure is not None:
+                        report_failure(child.returncode, "server", "model_initialization")
+                    raise RuntimeError(
+                        f"Attached frontend (pid {child.pid}) exited with code "
+                        f"{child.returncode} during frontend startup"
+                    )
 
 
 def _signal_frontend_ready(multi_frontend: MultiFrontendMode) -> None:

@@ -3,7 +3,9 @@
 
 """Real frontend processes must fail and shut down as one serving instance."""
 
+import fcntl
 import os
+import resource
 import signal
 import socket
 import subprocess
@@ -48,6 +50,25 @@ def test_readiness_eof_waits_for_exit_status(exits):
         os.close(read_fd)
 
 
+def test_readiness_pipe_supports_high_file_descriptors():
+    """Loaded engines may allocate pipe descriptors beyond select's FD_SETSIZE."""
+    from tensorrt_llm.serve import _frontend_processes as processes
+
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 1024:
+        pytest.skip("This host cannot allocate descriptor 1024")
+    read_fd, write_fd = os.pipe()
+    high_fd = fcntl.fcntl(read_fd, fcntl.F_DUPFD, 1024)
+    child = Mock(pid=1, returncode=None)
+    child.poll.return_value = None
+    try:
+        os.write(write_fd, b"R")
+        processes._wait_attached_frontends_ready([child], [high_fd])
+    finally:
+        os.close(high_fd)
+        os.close(read_fd)
+        os.close(write_fd)
+
+
 @pytest.mark.parametrize("last_child_ready", [False, True])
 def test_ready_child_death_fails_startup(monkeypatch, last_child_ready):
     """READY children must remain supervised until every sibling has started."""
@@ -59,16 +80,29 @@ def test_ready_child_death_fails_startup(monkeypatch, last_child_ready):
     pipes = [os.pipe(), os.pipe()]
     calls = 0
 
-    def select_ready(read_fds, write_fds, error_fds, timeout):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return [pipes[0][0]], [], []
-        assert calls == 2, "Startup kept waiting after a READY child died"
-        children[0].returncode = -9
-        return ([pipes[1][0]] if last_child_ready else []), [], []
+    class ReadySelector:
+        def __enter__(self):
+            return self
 
-    monkeypatch.setattr(processes.select, "select", select_ready)
+        def __exit__(self, *args):
+            pass
+
+        def register(self, fd, events):
+            pass
+
+        def unregister(self, fd):
+            pass
+
+        def select(self, timeout):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return [(Mock(fd=pipes[0][0]), None)]
+            assert calls == 2, "Startup kept waiting after a READY child died"
+            children[0].returncode = -9
+            return [(Mock(fd=pipes[1][0]), None)] if last_child_ready else []
+
+    monkeypatch.setattr(processes.selectors, "DefaultSelector", ReadySelector)
     report_failure = Mock()
     try:
         for _, write_fd in pipes:

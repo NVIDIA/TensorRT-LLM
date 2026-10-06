@@ -322,7 +322,10 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             )
 
         if request.include_inference_probe and (self._frontend is None or model_ready):
-            checks.append(await self._inference_probe(request.model or self._model))
+            try:
+                checks.append(await self._inference_probe(request.model or self._model))
+            except CoordinationError as error:
+                await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
 
         state = lifecycle_pb2.HEALTH_STATE_READY
         for check in checks:

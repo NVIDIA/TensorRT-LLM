@@ -238,6 +238,45 @@ async def test_generate_cleanup_failure_preserves_grpc_status(model, expected_co
 
 
 @pytest.mark.asyncio
+async def test_health_probe_cleanup_failure_is_unavailable():
+    """Coordinator loss after a completed probe must not surface as UNKNOWN."""
+    async with group() as (coordinator, (frontend, _), failures):
+
+        class ProbeHandle(Handle):
+            async def aresult(self):
+                return None
+
+        llm = SimpleNamespace(
+            llm_id="shared-engine",
+            args=SimpleNamespace(guided_decoding_backend=None),
+            tokenizer=None,
+            _check_health=lambda: True,
+            generate_async=lambda *args, **kwargs: ProbeHandle(),
+        )
+        original_request = frontend.request
+
+        async def lose_coordinator_on_release(operation, **fields):
+            if operation == "release":
+                await coordinator.close()
+            return await original_request(operation, **fields)
+
+        frontend.request = lose_coordinator_on_release
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model", frontend=frontend)
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                control = openengine_pb2_grpc.ControlStub(channel)
+                with pytest.raises(grpc.aio.AioRpcError) as error:
+                    await control.Health(
+                        lifecycle_pb2.HealthRequest(include_inference_probe=True), timeout=5
+                    )
+                assert error.value.code() == grpc.StatusCode.UNAVAILABLE
+            assert failures
+        finally:
+            await server.stop()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "request_id", ["\x01" * (12 * 1024 * 1024), "é" * 513], ids=["json-expansion", "utf8-size"]
 )
