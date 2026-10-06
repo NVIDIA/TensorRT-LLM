@@ -74,8 +74,20 @@ add_tllm_gtest(
   tllm::executor_values
   LABELS
   "unit;executor;gpu")
-add_tllm_gtest(serializeUtilsTest SOURCES serializeUtilsTest.cpp FULL_STACK
-               LABELS "unit;full-stack;host")
+add_tllm_gtest(
+  serializeUtilsTest
+  OWNER
+  executor
+  SOURCES
+  serializeUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_values
+  tllm::executor_memory_desc
+  tllm::batch_request_info
+  tllm::runtime_distributed
+  ${Python3_LIBRARIES}
+  LABELS
+  "unit;executor;host")
 add_tllm_gtest(
   loraConfigTest
   OWNER
@@ -117,7 +129,6 @@ add_tllm_gtest(
   TIMEOUT
   60)
 target_link_libraries(ucxCommTest PRIVATE ${Python3_LIBRARIES})
-target_link_libraries(serializeUtilsTest PRIVATE ${Python3_LIBRARIES})
 
 # NIXL bounce-buffer v2 KV-cache transfer tests live in their own subdirectory
 # (mirrors the source layout under nixl_utils/bounce/). It self-gates on zmq and
