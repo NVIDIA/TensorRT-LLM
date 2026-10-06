@@ -138,6 +138,15 @@ def test_token_sharded_mode_shards_only_the_sequence_dim():
         sharder.shard(torch.randn(8, 3), dim=0)
 
 
+def test_tables_follow_the_stream_plan():
+    """Only the token stream (no expected_seq_len) selects the plan; a per-token table must
+    match it rather than re-plan the forward."""
+    sharder, _ = _token_sharded(2, 8, 2, 0)
+    sharder.shard(torch.randn(2, 8, 4), dim=1)
+    with pytest.raises(ValueError, match="token stream"):
+        sharder.shard(torch.randn(4, 8, 6, 4), dim=1, expected_seq_len=8)
+
+
 # =============================================================================
 # Sequence mode (Ulysses / Ring / Attention2D) and inactive sharders are unchanged
 # =============================================================================
@@ -332,6 +341,76 @@ def test_block_without_row_projections_is_rejected():
         classify(_Model(block))
 
 
+def test_adapter_classes_convert_like_their_kind():
+    """An exception (or registry entry) naming an adapter class prepares the module as the
+    kind does: a row stops all-reducing."""
+    model = _Model(_WanLikeBlock())
+    convert_to_token_sharded_tp(model, _helper(), exceptions={"attn1.to_out.0": TokenShardedRow})
+    row = model.blocks[0].attn1.to_out[0]
+    assert isinstance(row, TokenShardedRow)
+    assert (row.reduce_output, row.all_reduce) == (False, None)
+
+
+class _JointProjection(nn.Module):
+    """A custom module with its own all-reduce, as a model package might have."""
+
+    def __init__(self):
+        super().__init__()
+        self.allreduce = _all_reduce()
+
+
+class _TokenShardedJoint(TokenShardedAdapter):
+    @classmethod
+    def prepare(cls, module, tp, name):
+        module.allreduce = None  # reduce-scatters in forward instead
+
+
+def test_registered_adapters_prepare_their_module(monkeypatch):
+    from tensorrt_llm._torch.visual_gen.parallel import token_sharded_modules
+
+    monkeypatch.setitem(token_sharded_modules._REGISTRY, _JointProjection, _TokenShardedJoint)
+    block = _WanLikeBlock()
+    block.joint = _JointProjection()
+    model = _Model(block)
+    convert_to_token_sharded_tp(model, _helper())
+    assert isinstance(model.blocks[0].joint, _TokenShardedJoint)
+    assert model.blocks[0].joint.allreduce is None
+
+
+def _row_as_column(block):
+    return {"attn1.to_out.0": "column"}
+
+
+def _column_as_row(block):
+    return {"add_k_proj": "row"}
+
+
+def _down_proj_for_another_tp_size(block):
+    block.ffn.down_proj.tp_size = 4
+    return {}
+
+
+def _row_built_for_fused_gemm_all_reduce(block):
+    block.attn1.to_out[0].use_fused_gemm_allreduce = True
+    return {}
+
+
+@pytest.mark.parametrize(
+    "misbuild,error",
+    [
+        (_row_as_column, "column-parallel Linear"),
+        (_column_as_row, "row-parallel Linear"),
+        (_down_proj_for_another_tp_size, "tp_size=4"),
+        (_row_built_for_fused_gemm_all_reduce, "fused GEMM"),
+    ],
+)
+def test_conversion_rejects_projections_built_for_another_layout(misbuild, error):
+    block = _WanLikeBlock()
+    exceptions = misbuild(block)
+    with pytest.raises(ValueError, match=error):
+        convert_to_token_sharded_tp(_Model(block), _helper(), exceptions=exceptions)
+
+
 class _ToyDiT(BaseDiffusionModel):
     _supports_token_sharded_tp = True
 
@@ -348,3 +427,55 @@ def test_plain_tp_model_is_left_unchanged(layout):
     assert model.sharder.token_sharded_tp is False
     assert not any(isinstance(m, TokenShardedAdapter) for m in model.modules())
     assert model.blocks[0].attn1.to_out[0].reduce_output is True
+    model.check_tp_layout_applied()
+
+
+class _ForgetfulDiT(BaseDiffusionModel):
+    """Declares support but never calls _apply_tp_layout()."""
+
+    _supports_token_sharded_tp = True
+
+    def __init__(self, model_config, with_sharder=True):
+        super().__init__(model_config)
+        if with_sharder:
+            self.sharder = SequenceSharder(size=1, rank=0, group=None)
+        self.blocks = nn.ModuleList([_WanLikeBlock()])
+
+
+def test_a_supporting_model_must_apply_the_layout():
+    config = DiffusionModelConfig(parallel=ParallelConfig(tp_size=_TP, tp_layout="token_sharded"))
+    with pytest.raises(RuntimeError, match="_apply_tp_layout"):
+        _ForgetfulDiT(config).check_tp_layout_applied()
+    with pytest.raises(AttributeError, match="sharder"):
+        _ForgetfulDiT(config, with_sharder=False)._apply_tp_layout()
+
+
+# =============================================================================
+# Attention: a self-attention whose q and k would cover different tokens
+# =============================================================================
+
+
+class _GatheringProjection(nn.Module):
+    """Stands in for a converted projection: returns all tokens (here: twice the shard)."""
+
+    def forward(self, x):
+        return torch.cat([x, x], dim=1)
+
+
+def test_self_attention_rejects_q_and_k_over_different_tokens():
+    attn = Attention(
+        hidden_size=64,
+        num_attention_heads=4,
+        qkv_mode=QKVMode.SEPARATE_QKV,
+        config=DiffusionModelConfig(),
+    )
+    attn.to_q, attn.to_k, attn.to_v = nn.Identity(), nn.Identity(), nn.Identity()
+    x = torch.randn(1, 4, 64)
+    q, k, v = attn.get_qkv(x)
+    assert q.shape == k.shape == v.shape == x.shape
+    attn.to_q = _GatheringProjection()  # to_q converted, to_k / to_v not: a misbinding
+    with pytest.raises(ValueError, match="separate_qkv_is_self_attention"):
+        attn.get_qkv(x)
+    # Cross-attention: k / v read the encoder states, so their token count differs.
+    q, k, _ = attn.get_qkv(x, encoder_hidden_states=torch.randn(1, 3, 64))
+    assert (q.shape[1], k.shape[1]) == (8, 3)

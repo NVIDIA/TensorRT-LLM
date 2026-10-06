@@ -144,8 +144,8 @@ def test_tables_match_full_rows(batch, seq, tp, dtype):
         per_row = tab.repeat_interleave(p.rows_per_entry, dim=0)
         sample_of_row = torch.arange(batch).repeat_interleave(p.padded_seq_len)[rows]
         assert torch.equal(per_row, table[sample_of_row])
-        # shard_rows == the global padded stream sliced (zeros on pad rows).
-        assert torch.equal(sp.shard_rows(per_token), padded_rows(per_token, p)[rows])
+        # shard == the global padded stream sliced (zeros on pad rows), tables included.
+        assert torch.equal(sp.shard(per_token), padded_rows(per_token, p)[rows])
         assert torch.equal(sp.shard(x), padded_rows(x, p)[rows])
 
 
@@ -297,8 +297,8 @@ def test_shape_errors():
     sp = simulated_helper(TokenShardPlan.build(2, 8, 2, 0))  # m = 8, unpadded
     with pytest.raises(ValueError, match=r"shard: expected a \[B=2, S=8, \.\.\.\] tensor"):
         sp.shard(torch.zeros(2, 9, 4))
-    with pytest.raises(ValueError, match=r"shard_rows: expected a \[B=2, S=8"):
-        sp.shard_rows(torch.zeros(16, 4))
+    with pytest.raises(ValueError, match=r"shard: expected a \[B=2, S=8"):
+        sp.shard(torch.zeros(16, 4))
     with pytest.raises(ValueError, match=r"reduce_scatter: expected 16 rows for the current"):
         sp.reduce_scatter(torch.zeros(15, 4))
     # Forgetting shard(): the full [B * S, D] or [B, S, D] is not this rank's [m, D].

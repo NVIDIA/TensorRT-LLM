@@ -561,7 +561,8 @@ class WanBlock(nn.Module):
         # The modulation table must match x: per-sample [B, 6, D] or per-token [B, S, 6, D].
         # Under token-sharded TP x is this rank's [n, g, D] sample groups and the tables must
         # be the shard's (SequenceSharder.shard / shard_per_sample); a global table would mix
-        # samples (silently, in the fused AdaLN kernel).
+        # samples (silently, in the fused AdaLN kernel). The shape check catches that unless
+        # n == B (gcd(tp, B) == 1, e.g. TP3 with B = 2), where only the sharder's table is right.
         if temb.shape[: temb.ndim - 2] != x.shape[: temb.ndim - 2]:
             raise ValueError(
                 f"WanBlock: modulation table {tuple(temb.shape)} does not match the hidden "

@@ -18,16 +18,8 @@ from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransfo
 pytestmark = pytest.mark.cpu_only
 
 
-@pytest.mark.parametrize(
-    ("expand_timesteps", "expected_temb_shape"),
-    [(False, (2, 6, 8)), (True, (2, 3, 6, 8))],
-)
-def test_uniform_timestep_modulation_routing(
-    expand_timesteps: bool, expected_temb_shape: tuple[int, ...]
-) -> None:
-    """Wan 5B expands T2V modulation only after the condition embedder."""
-    batch_size = 2
-    seq_len = 3
+def _routing_model(expand_timesteps: bool, token_sharded_tp: bool = False):
+    """A Wan model whose forward runs on mocks (sharder, embedders, blocks), B=2, S=3, D=8."""
     hidden_size = 8
 
     model = WanTransformer3DModel.__new__(WanTransformer3DModel)
@@ -44,7 +36,7 @@ def test_uniform_timestep_modulation_routing(
     model.sharder.shard_rope.return_value = None
     model.sharder.gather.side_effect = lambda tensor, **_kwargs: tensor
     model.sharder.shard_per_sample.side_effect = lambda tensor: tensor
-    model.sharder.token_sharded_tp = False
+    model.sharder.token_sharded_tp = token_sharded_tp
 
     def condition_embedder(
         timestep: torch.Tensor,
@@ -72,15 +64,29 @@ def test_uniform_timestep_modulation_routing(
     model.norm_out = torch.nn.Identity()
     model.proj_out = torch.nn.Identity()
     model.unpatchify = mock.Mock(side_effect=lambda tensor, _shape: tensor)
+    return model
 
-    hidden_states = torch.zeros(batch_size, hidden_size, 1, 1, seq_len)
+
+def _run(model) -> torch.Tensor:
     timestep = torch.tensor([0.25, 0.75])
-    encoder_hidden_states = torch.zeros(batch_size, 1, hidden_size)
     model(
-        hidden_states=hidden_states,
+        hidden_states=torch.zeros(2, 8, 1, 1, 3),
         timestep=timestep,
-        encoder_hidden_states=encoder_hidden_states,
+        encoder_hidden_states=torch.zeros(2, 1, 8),
     )
+    return timestep
+
+
+@pytest.mark.parametrize(
+    ("expand_timesteps", "expected_temb_shape"),
+    [(False, (2, 6, 8)), (True, (2, 3, 6, 8))],
+)
+def test_uniform_timestep_modulation_routing(
+    expand_timesteps: bool, expected_temb_shape: tuple[int, ...]
+) -> None:
+    """Wan 5B expands T2V modulation only after the condition embedder."""
+    model = _routing_model(expand_timesteps)
+    timestep = _run(model)
 
     timestep_call = model.condition_embedder.call_args
     assert timestep_call.kwargs["timestep_seq_len"] is None
@@ -90,3 +96,16 @@ def test_uniform_timestep_modulation_routing(
     assert runtime_call.args[1].shape == expected_temb_shape
     if expand_timesteps:
         assert runtime_call.args[1].stride(1) == 0
+
+
+@pytest.mark.parametrize("expand_timesteps", [False, True])
+def test_token_sharded_tp_keeps_the_per_sample_table(expand_timesteps: bool) -> None:
+    """Under token-sharded TP a uniform timestep keeps its per-sample table (the sharder
+    gives each shard its samples' entries; no [B, S] broadcast) and the per-token AdaLN
+    kernels stay off."""
+    model = _routing_model(expand_timesteps, token_sharded_tp=True)
+    _run(model)
+
+    model._pertoken_adaln_runtime.prepare.assert_not_called()
+    (table,), _ = model.sharder.shard_per_sample.call_args
+    assert table.shape == (2, 6, 8)

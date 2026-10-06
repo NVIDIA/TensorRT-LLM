@@ -85,6 +85,14 @@ class TokenShardedAdapter:
 
     _token_sharded_tp: "TokenShardedTP"
 
+    @classmethod
+    def prepare(cls, module: nn.Module, tp: "TokenShardedTP", name: str) -> None:
+        """Check ``module`` and set it up for this adapter, before its class is swapped.
+
+        Raise ``ValueError`` if the module was not built for this adapter; an adapter whose
+        module all-reduces stops it here (its ``forward`` reduce-scatters instead).
+        """
+
 
 class TokenShardedColumn(TokenShardedAdapter):
     """Column-parallel projection reading the token stream: all-gather, then the GEMM.
@@ -92,6 +100,15 @@ class TokenShardedColumn(TokenShardedAdapter):
     Takes this rank's rows (``[n, g, K]`` or ``[m, K]``, bf16 or a static-scale NVFP4
     ``Fp4QuantizedTensor``) and returns ``[B, S, N_local]`` for all tokens.
     """
+
+    @classmethod
+    def prepare(cls, module: nn.Module, tp: "TokenShardedTP", name: str) -> None:
+        _check_linear(module, name, TensorParallelMode.COLUMN, tp)
+        if module.gather_output:
+            raise ValueError(
+                f"token-sharded TP: {name} must be a column-parallel Linear without "
+                "gather_output to all-gather its input."
+            )
 
     def forward(self, input, *args, **kwargs):
         tp = self._token_sharded_tp
@@ -108,6 +125,11 @@ class TokenShardedRow(TokenShardedAdapter):
     runs on ``B * S_pad`` rows, whose pad rows carry only rank 0's bias).
     """
 
+    @classmethod
+    def prepare(cls, module: nn.Module, tp: "TokenShardedTP", name: str) -> None:
+        _check_linear(module, name, TensorParallelMode.ROW, tp)
+        _stop_all_reduce(module, name)
+
     def forward(self, input, *args, **kwargs):
         tp = self._token_sharded_tp
         partial = super().forward(tp.pad_row_input(input), *args, **kwargs)
@@ -121,6 +143,15 @@ class TokenShardedMLP(TokenShardedAdapter):
     the reduce-scatter.
     """
 
+    @classmethod
+    def prepare(cls, module: nn.Module, tp: "TokenShardedTP", name: str) -> None:
+        if not isinstance(module, (MLP, GatedMLP)):
+            raise ValueError(f"token-sharded TP: {name} must be an MLP or GatedMLP.")
+        up = "up_proj" if hasattr(module, "up_proj") else "gate_up_proj"
+        _check_linear(getattr(module, up, None), f"{name}.{up}", TensorParallelMode.COLUMN, tp)
+        _check_linear(module.down_proj, f"{name}.down_proj", TensorParallelMode.ROW, tp)
+        _stop_all_reduce(module.down_proj, f"{name}.down_proj")
+
     def forward(self, x, *args, **kwargs):
         tp = self._token_sharded_tp
         consumer = getattr(self, "up_proj", None) or getattr(self, "gate_up_proj", None)
@@ -129,6 +160,31 @@ class TokenShardedMLP(TokenShardedAdapter):
 
 
 _KIND_ADAPTERS = {COLUMN: TokenShardedColumn, ROW: TokenShardedRow, MLP_KIND: TokenShardedMLP}
+
+
+def _check_linear(module: nn.Module | None, name: str, mode: TensorParallelMode, tp) -> None:
+    kind = "column" if mode == TensorParallelMode.COLUMN else "row"
+    if not isinstance(module, Linear) or module.tp_mode != mode:
+        raise ValueError(f"token-sharded TP: {name} must be a {kind}-parallel Linear.")
+    if module.tp_size != tp.tp_size:
+        raise ValueError(
+            f"token-sharded TP: {name} is sharded for tp_size={module.tp_size}, but the TP "
+            f"group has {tp.tp_size} ranks."
+        )
+
+
+def _stop_all_reduce(linear: Linear, name: str) -> None:
+    """Leave ``linear`` in the state ``reduce_output=False`` builds, as the runtime reads it."""
+    if linear.use_fused_gemm_allreduce:
+        # create_weights() already chose the quant method and workspace for the fused op.
+        raise ValueError(
+            f"token-sharded TP: {name} was built for the fused GEMM + all-reduce "
+            "(use_fused_gemm_allreduce), which cannot be undone after construction."
+        )
+    linear.reduce_output = False
+    linear.all_reduce = None
+
+
 _REGISTRY: dict[type, type] = {}
 _ADAPTED: dict[tuple[type, type], type] = {}
 
@@ -201,6 +257,13 @@ def _classify_block(block: nn.Module, exceptions: Mapping[str, object]) -> dict[
             for proj in _stream_projections(m):
                 kinds[f"{name}.{proj}"] = COLUMN
     for pattern, kind in exceptions.items():
+        if kind not in (COLUMN, ROW, MLP_KIND, KEEP) and not (
+            isinstance(kind, type) and issubclass(kind, TokenShardedAdapter)
+        ):
+            raise ValueError(
+                f"token-sharded TP exception {pattern!r}: {kind!r} is not 'column', 'row', "
+                "'mlp', 'keep' or a TokenShardedAdapter subclass."
+            )
         names = [name for name, _ in block.named_modules() if name and fnmatchcase(name, pattern)]
         if not names:
             raise ValueError(f"token-sharded TP exception {pattern!r} matches no module.")
@@ -297,34 +360,9 @@ def classify(
 # =============================================================================
 
 
-def _drop_all_reduce(linear: Linear) -> None:
-    # The state construction with reduce_output=False produces: the quant methods' apply()
-    # paths also key on all_reduce (NCCL-window output buffers, bias-in-GEMM).
-    linear.reduce_output = False
-    linear.all_reduce = None
-    linear.use_fused_gemm_allreduce = False
-
-
 def _convert(module: nn.Module, kind: object, tp: "TokenShardedTP", name: str) -> None:
     adapter = _KIND_ADAPTERS.get(kind, kind)
-    if kind == ROW:
-        _drop_all_reduce(module)
-    elif kind == MLP_KIND:
-        _drop_all_reduce(module.down_proj)
-    elif kind == COLUMN and (
-        not isinstance(module, Linear)
-        or module.tp_mode != TensorParallelMode.COLUMN
-        or module.gather_output
-    ):
-        raise ValueError(
-            f"token-sharded TP: {name} must be a column-parallel Linear without "
-            "gather_output to all-gather its input."
-        )
-    if isinstance(module, Linear) and module.tp_size != tp.tp_size:
-        raise ValueError(
-            f"token-sharded TP: {name} is sharded for tp_size={module.tp_size}, but the TP "
-            f"group has {tp.tp_size} ranks."
-        )
+    adapter.prepare(module, tp, name)
     module.__class__ = _adapted_class(adapter, type(module))
     module._token_sharded_tp = tp
 

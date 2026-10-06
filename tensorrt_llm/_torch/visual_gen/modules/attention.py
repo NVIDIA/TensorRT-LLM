@@ -53,9 +53,10 @@ def apply_rotary_emb(
 class Attention(nn.Module):
     """Attention module for visual generation models.
 
-    Batch and sequence lengths are taken from the projected ``q`` (not from the input), so
-    the projections may change the token count: under token-sharded TP the input is this
-    rank's tokens and the converted ``qkv_proj`` / ``to_q`` return all of them.
+    ``forward`` and ``attend`` take batch and sequence lengths from the projected ``q`` (not
+    from the input), so the projections may change the token count: under token-sharded TP
+    the input is this rank's tokens and the converted ``qkv_proj`` / ``to_q`` return all of
+    them. ``forward_async`` (async Ulysses) reads them from its input.
     """
 
     def __init__(
@@ -431,6 +432,13 @@ class Attention(nn.Module):
             q = self.to_q(hidden_states)
             k = self.to_k(kv_source)
             v = self.to_v(kv_source)
+            if encoder_hidden_states is None and q.shape[:-1] != k.shape[:-1]:
+                raise ValueError(
+                    f"{type(self).__name__}: self-attention q {tuple(q.shape)} and k "
+                    f"{tuple(k.shape)} cover different tokens. Under token-sharded TP a "
+                    "SEPARATE_QKV self-attention needs separate_qkv_is_self_attention=True, so "
+                    "that to_k / to_v gather the tokens too."
+                )
         return q, k, v
 
     def split_qkv(self, qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

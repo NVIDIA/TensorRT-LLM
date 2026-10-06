@@ -179,22 +179,34 @@ def _nvfp4_linear(k_in=512, n_out=256, input_scale=True, **kwargs):
     return lin
 
 
-@pytest.mark.parametrize("use_tunable", [False, True])
-def test_quantize_nvfp4_matches_linear_input_prepare(use_tunable):
+def test_quantize_nvfp4_matches_linear_input_prepare(monkeypatch):
     lin = _nvfp4_linear()
     scale = static_nvfp4_input_scale(lin)
     assert scale is not None
     x = torch.randn(300, 512, device="cuda", dtype=torch.bfloat16) * 2
-    prev = NVFP4LinearMethod.use_tunable_quantize
-    NVFP4LinearMethod.use_tunable_quantize = use_tunable
-    try:
-        ref_fp4, ref_sf, _ = lin.quant_method._input_prepare(lin, x)
-        got = quantize_nvfp4(x, scale)
-    finally:
-        NVFP4LinearMethod.use_tunable_quantize = prev
+    monkeypatch.setattr(NVFP4LinearMethod, "use_tunable_quantize", False)
+    ref_fp4, ref_sf, _ = lin.quant_method._input_prepare(lin, x)
+    got = quantize_nvfp4(x, scale)
     assert torch.equal(got.fp4_tensor, ref_fp4)
     assert torch.equal(got.scaling_factor.reshape(-1), ref_sf.reshape(-1))
     assert got.is_sf_swizzled
+
+
+def test_quantize_nvfp4_is_pinned_to_the_plain_op(monkeypatch):
+    """Even when VisualGen tunes the Linears' quantize: the tunable op may pick FlashInfer's
+    kernel, which shuffles rows and scaling factors in 128-row tiles."""
+
+    def tunable(*args, **kwargs):
+        raise AssertionError("quantize_nvfp4 must not use trtllm::tunable_fp4_quantize")
+
+    monkeypatch.setattr(NVFP4LinearMethod, "use_tunable_quantize", True)
+    monkeypatch.setattr(torch.ops.trtllm, "tunable_fp4_quantize", tunable)
+    x = torch.randn(300, 512, device="cuda", dtype=torch.bfloat16) * 2
+    scale = torch.tensor([448.0 * 6.0 / 8.0], device="cuda")
+    got = quantize_nvfp4(x, scale)
+    ref_fp4, ref_sf = torch.ops.trtllm.fp4_quantize(x, scale, 16, False)
+    assert torch.equal(got.fp4_tensor, ref_fp4)
+    assert torch.equal(got.scaling_factor.reshape(-1), ref_sf.reshape(-1))
 
 
 def test_static_nvfp4_input_scale_eligibility():

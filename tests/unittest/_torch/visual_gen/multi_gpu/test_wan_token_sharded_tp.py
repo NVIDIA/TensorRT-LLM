@@ -54,6 +54,7 @@ from tensorrt_llm._torch.visual_gen.config import (
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm._torch.visual_gen.parallel import (
+    TokenShardedAdapter,
     TokenShardedRow,
     TokenShardedTP,
     classify,
@@ -128,13 +129,38 @@ def _replace_all_reduce(model, make):
     """Replace every all-reduce token-sharded TP turns into a reduce-scatter with ``make()``.
 
     Driven by the converter's own rules (``classify`` on the plain-TP model's blocks), so it
-    covers whatever the conversion covers.
+    covers whatever the conversion covers: the row projections' and the MLPs' all-reduces
+    (column projections have none).
     """
     for name, kind in classify(model).items():
+        if kind not in ("row", "mlp"):
+            continue
         module = model.get_submodule(name)
         linear = module.down_proj if kind == "mlp" else module
         assert linear.all_reduce is not None, name
         linear.all_reduce = make()
+
+
+_WAN_BLOCK_CONVERSION = {
+    "attn1.qkv_proj": "column",
+    "attn1.to_out.0": "row",
+    "attn2.to_q": "column",
+    "attn2.to_out.0": "row",
+    "ffn": "mlp",
+}
+
+
+def _check_wan_conversion(sp_model, ar_model):
+    """The rules convert exactly these five modules of every Wan block (T2V and I2V: the
+    image K/V projections read the image embeddings, not the stream), and nothing else."""
+    want = {
+        f"blocks.{i}.{name}": kind
+        for i in range(len(ar_model.blocks))
+        for name, kind in _WAN_BLOCK_CONVERSION.items()
+    }
+    assert classify(ar_model) == want
+    converted = {n for n, m in sp_model.named_modules() if isinstance(m, TokenShardedAdapter)}
+    assert converted == set(want)
 
 
 def _capture_head_input(model):
@@ -203,6 +229,7 @@ def _build_models(rank, world_size, config_dict):
     ar_model = WanTransformer3DModel(ar_cfg).to(device).to(torch.bfloat16)
     _copy_ref_weights_to_tp(ref, ar_model, rank, world_size, config_dict)
     assert not ar_model.sharder.token_sharded_tp
+    _check_wan_conversion(sp_model, ar_model)
     return ref, sp_model, ar_model
 
 
@@ -428,6 +455,25 @@ def _compiled_break_reasons(model, all_inputs):
     return outs, {str(k) for k in counters["graph_break"]}, counters["stats"]["unique_graphs"]
 
 
+def _graphs_compiled(model, all_inputs, num_blocks):
+    """Graphs compiled when the model runs its first ``num_blocks`` blocks, each compiled as
+    the pipeline does (the model's blocks are restored afterwards)."""
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+
+    blocks = model.blocks
+    try:
+        model.blocks = nn.ModuleList([torch.compile(b) for b in list(blocks)[:num_blocks]])
+        torch._dynamo.reset()
+        counters.clear()
+        with torch.no_grad():
+            for inp in all_inputs:
+                model(**inp)
+        return counters["stats"]["unique_graphs"]
+    finally:
+        model.blocks = blocks
+
+
 def _logic_compiled_blocks(rank, world_size):
     device = torch.device(f"cuda:{rank}")
     _, sp_model, ar_model = _build_models(rank, world_size, _WAN_T2V_TEST_CONFIG)
@@ -437,6 +483,10 @@ def _logic_compiled_blocks(rank, world_size):
     ]
     with torch.no_grad():
         eager = [sp_model(**inp) for inp in all_inputs]
+    # One compiled block graph serves every block: the converted modules share one adapter
+    # class per base class, so the second block adds no graph (no type-guard recompiles).
+    one, two = (_graphs_compiled(sp_model, all_inputs, n) for n in (1, 2))
+    _check(one == two, f"token-sharded TP: 1 block compiled {one} graphs, 2 blocks {two}")
     outs, sp_reasons, sp_graphs = _compiled_break_reasons(sp_model, all_inputs)
     for i, (out, ref) in enumerate(zip(outs, eager)):
         err = _rel_l2(out, ref)
@@ -447,8 +497,6 @@ def _logic_compiled_blocks(rank, world_size):
     _check(
         sp_reasons <= ar_reasons, f"token-sharded TP-only graph breaks: {sp_reasons - ar_reasons}"
     )
-    # One compiled block graph serves every block: the converted modules share one adapter
-    # class per base class, so blocks do not recompile on type guards.
     _check(
         sp_graphs <= ar_graphs,
         f"token-sharded TP compiled {sp_graphs} graphs, plain TP {ar_graphs}",

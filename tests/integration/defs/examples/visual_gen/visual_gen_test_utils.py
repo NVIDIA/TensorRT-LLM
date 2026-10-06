@@ -759,13 +759,17 @@ def _run_wan_lpips_pipeline(
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         if args.parallel_config.token_sharded_tp:
             # At TP2 token-sharded TP is bitwise equal to all-reduce TP, so the LPIPS
-            # scores cannot show whether it engaged: check the transformers built it.
+            # scores cannot show whether it engaged: check the transformers converted.
+            from tensorrt_llm._torch.visual_gen.parallel import TokenShardedAdapter
+
             for name in ("transformer", "transformer_2"):
                 transformer = getattr(pipeline, name, None)
                 if transformer is not None:
-                    assert getattr(transformer, "_sp_tp", None) is not None, (
+                    assert transformer.sharder.token_sharded_tp and any(
+                        isinstance(m, TokenShardedAdapter) for m in transformer.blocks.modules()
+                    ), (
                         f"parallel_config.tp_layout='token_sharded' but pipeline.{name} "
-                        "did not build its TokenShardedTP helper"
+                        "was not converted to token-sharded TP"
                     )
         try:
             with torch.no_grad():

@@ -49,7 +49,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
-from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
 from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import (
     TokenShardedTP,
     quantize_nvfp4,
@@ -355,7 +355,12 @@ def _logic_real_adapters(rank, world_size, device):
     row_lin.load_weights([{"weight": weight, "bias": bias}])
     config = ModelConfig(mapping=mapping, allreduce_strategy=nccl)
     mlp = MLP(
-        hidden_size=k_in, intermediate_size=k_in, bias=True, dtype=torch.bfloat16, config=config
+        hidden_size=k_in,
+        intermediate_size=k_in,
+        bias=True,
+        activation=gelu_tanh,  # Wan's FFN activation
+        dtype=torch.bfloat16,
+        config=config,
     ).to(device)
     gated = GatedMLP(
         hidden_size=k_in, intermediate_size=k_in, bias=False, dtype=torch.bfloat16, config=config
@@ -365,8 +370,12 @@ def _logic_real_adapters(rank, world_size, device):
         for name, prm in m.named_parameters():
             prm.data.copy_((torch.randn(prm.shape, generator=gen) * 0.02).to(prm.dtype))
     tp = _helper()
-    act0 = torch.randn(1, 8, k_in, device=device, dtype=torch.bfloat16)
-    mlp_ref = {name: m(act0.reshape(8, k_in)) for name, m in (("mlp", mlp), ("gated", gated))}
+    mlps = (("mlp", mlp), ("gated", gated))
+    mlp_refs = {}  # plain TP on all rows, before the conversion
+    for b, s in _SHAPES:
+        act = torch.randn(b, s, k_in, generator=torch.Generator().manual_seed(100 + s))
+        act = act.to(device, torch.bfloat16)
+        mlp_refs[(b, s)] = act, {n: m(act.reshape(b * s, k_in)).view(b, s, -1) for n, m in mlps}
     convert_to_token_sharded_tp(_as_model(row=row_lin, mlp=mlp, gated=gated), tp)
     k_loc = k_in // world_size
     for b, s in _SHAPES:
@@ -380,11 +389,15 @@ def _logic_real_adapters(rank, world_size, device):
         ]
         mask = _real_row_mask(plan, device)
         _check_close(got[mask], ref[mask], device, 1e-2, 1e-2, f"row adapter {(b, s)}")
-    plan = tp.begin(1, 8)
-    mine = slice(plan.row_start, plan.row_start + plan.local_rows)
-    for name, m in (("mlp", mlp), ("gated", gated)):
-        got = m(tp.local_view(tp.shard(act0))).reshape(plan.local_rows, -1)
-        _check_close(got, mlp_ref[name][mine], device, 2e-2, 2e-2, f"{name} adapter")
+    for b, s in _SHAPES:
+        plan = tp.begin(b, s)
+        act, refs = mlp_refs[(b, s)]
+        mine = slice(plan.row_start, plan.row_start + plan.local_rows)
+        mask = _real_row_mask(plan, device)
+        for name, m in mlps:
+            got = m(tp.local_view(tp.shard(act))).reshape(plan.local_rows, -1)
+            want = padded_rows(refs[name], plan)[mine]
+            _check_close(got[mask], want[mask], device, 2e-2, 2e-2, f"{name} adapter {(b, s)}")
 
     # Misuse, rejected at conversion: a row Linear as a column projection, and a Linear
     # sharded for another TP size (it would compute full outputs, summed tp times).
@@ -434,10 +447,27 @@ def _nvfp4_checkpoint(weight, act_amax):
     }
 
 
+def _spy_all_gather(tp):
+    """Record what each of ``tp``'s all-gathers moves."""
+    moved = []
+    gather = tp.all_gather
+
+    def spy(act):
+        moved.append(act)
+        return gather(act)
+
+    tp.all_gather = spy
+    return moved
+
+
 def _logic_adapters_nvfp4(rank, world_size, device):
-    """Converted real Linears: a static-NVFP4 column projection fed this rank's bf16 rows
-    quantizes them with its own scale before the all-gather, so its GEMM sees exactly the
-    bytes it would produce on all rows; a row projection built to all-reduce reduce-scatters."""
+    """Converted real modules, converted before their weights load (as in a model): a
+    static-NVFP4 column projection and a static-NVFP4 MLP fed this rank's bf16 rows quantize
+    them with the consumer's scale before the all-gather (NVFP4 crosses the wire), so the
+    GEMMs see exactly the bytes they would produce on all rows; a row projection built to
+    all-reduce reduce-scatters."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.mlp import MLP
     from tensorrt_llm.functional import AllReduceStrategy
 
     k_in, n_out = 256, 128 * world_size
@@ -445,24 +475,23 @@ def _logic_adapters_nvfp4(rank, world_size, device):
     weight = torch.randn(n_out, k_in, dtype=torch.bfloat16) * 0.05
     bias = torch.randn(n_out, dtype=torch.bfloat16) * 0.1
     w_row = torch.randn(k_in, n_out, dtype=torch.bfloat16) * 0.05
+    w_up = torch.randn(n_out, k_in, dtype=torch.bfloat16) * 0.05
+    w_down = torch.randn(k_in, n_out, dtype=torch.bfloat16) * 0.05
     mapping = _mapping(rank, world_size)
-    for b, s in _SHAPES:
-        x = torch.randn(b, s, k_in, generator=torch.Generator().manual_seed(s)).to(
-            device, torch.bfloat16
-        )
-        ckpt = _nvfp4_checkpoint(weight, x.float().abs().amax().cpu())
+    nccl = AllReduceStrategy.NCCL
+    nvfp4 = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+
+    def build():
         col = Linear(
             k_in,
             n_out,
             bias=True,
             dtype=torch.bfloat16,
             mapping=mapping,
-            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+            quant_config=nvfp4,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             reduce_output=False,
         ).to(device)
-        col.load_weights([{**ckpt, "bias": bias}])
-        col.post_load_weights()
         row = Linear(
             n_out,
             k_in,
@@ -471,26 +500,67 @@ def _logic_adapters_nvfp4(rank, world_size, device):
             mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             reduce_output=True,
-            allreduce_strategy=AllReduceStrategy.NCCL,
+            allreduce_strategy=nccl,
         ).to(device)
+        config = ModelConfig(mapping=mapping, allreduce_strategy=nccl, quant_config=nvfp4)
+        mlp = MLP(
+            hidden_size=k_in,
+            intermediate_size=n_out,
+            bias=False,
+            activation=gelu_tanh,  # Wan's FFN activation (MLP fuses GELU + NVFP4 for it)
+            dtype=torch.bfloat16,
+            config=config,
+        ).to(device)
+        return col, row, mlp
+
+    def load(col, row, mlp, ckpt, up_ckpt, down_ckpt):
+        col.load_weights([{**ckpt, "bias": bias}])
         row.load_weights([{"weight": w_row}])
-        h_ref = col(x.reshape(b * s, k_in)).view(b, s, -1)  # the Linear quantizes all rows
-        y_ref = row(h_ref)  # all-reduced
+        mlp.up_proj.load_weights([up_ckpt])
+        mlp.down_proj.load_weights([down_ckpt])
+        for lin in (col, mlp.up_proj, mlp.down_proj):
+            lin.post_load_weights()
+
+    for b, s in _SHAPES:
+        x = torch.randn(b, s, k_in, generator=torch.Generator().manual_seed(s)).to(
+            device, torch.bfloat16
+        )
+        amax = x.float().abs().amax().cpu()
+        ckpts = (
+            _nvfp4_checkpoint(weight, amax),
+            _nvfp4_checkpoint(w_up, amax),
+            _nvfp4_checkpoint(w_down, torch.tensor(4.0)),
+        )
+        col_ref, row_ref, mlp_ref = build()
+        load(col_ref, row_ref, mlp_ref, *ckpts)
+        h_ref = col_ref(x.reshape(b * s, k_in)).view(b, s, -1)  # the Linear quantizes all rows
+        y_ref = row_ref(h_ref)  # all-reduced
+        f_ref = mlp_ref(x.reshape(b * s, k_in)).view(b, s, -1)  # all-reduced
+        col, row, mlp = build()
         tp = _helper()
-        convert_to_token_sharded_tp(_as_model(col=col, row=row), tp, exceptions={"col": "column"})
+        convert_to_token_sharded_tp(
+            _as_model(col=col, row=row, mlp=mlp), tp, exceptions={"col": "column"}
+        )
+        load(col, row, mlp, *ckpts)
+        moved = _spy_all_gather(tp)
         plan = tp.begin(b, s)
-        h = col(tp.local_view(tp.shard(x)))
-        _check(torch.equal(h, h_ref), f"NVFP4 column adapter {(b, s)}", device)
+        x_loc = tp.local_view(tp.shard(x))
         mask = _real_row_mask(plan, device)
         mine = slice(plan.row_start, plan.row_start + plan.local_rows)
+        h = col(x_loc)
+        _check(
+            isinstance(moved[-1], Fp4QuantizedTensor) and torch.equal(h, h_ref),
+            f"NVFP4 column adapter {(b, s)}",
+            device,
+        )
         y = row(h).reshape(plan.local_rows, -1)
         _check_close(
-            y[mask],
-            padded_rows(y_ref, plan)[mine][mask],
-            device,
-            1e-2,
-            1e-2,
-            f"row adapter {(b, s)}",
+            y[mask], padded_rows(y_ref, plan)[mine][mask], device, 1e-2, 1e-2, f"row {(b, s)}"
+        )
+        f = mlp(x_loc).reshape(plan.local_rows, -1)
+        _check(isinstance(moved[-1], Fp4QuantizedTensor), f"NVFP4 MLP gather {(b, s)}", device)
+        _check_close(
+            f[mask], padded_rows(f_ref, plan)[mine][mask], device, 2e-2, 2e-2, f"MLP {(b, s)}"
         )
 
 
@@ -548,7 +618,9 @@ def _make_chain(tp, col, row, ln_w, ln_b, fp4_scale):
         x = (x_loc.float() + row(q).float() * gate).to(x_loc.dtype)
         h2 = F.layer_norm(x.float(), (d,), ln_w, ln_b).to(x.dtype)
         g2 = tp.all_gather(quantize_nvfp4(h2, fp4_scale))  # the chain's own quantize
-        g = tp.all_gather(Fp4QuantizedTensor(fp4_payload, fp4_sf))  # of a given FP4 input
+        # A given FP4 input as fused norms emit it ([n, g, K/2]), through the adapters' path.
+        given = Fp4QuantizedTensor(fp4_payload.view(*x_loc.shape[:2], -1), fp4_sf)
+        g = tp.gather_input(None, given)
         g3 = tp.all_gather(quantize_nvfp4(h_given, fp4_scale))  # quantize of a given bf16 input
         return (
             x,
@@ -690,6 +762,7 @@ class _FakeRow(nn.Module):
         self.b = nn.Parameter(b, requires_grad=False)
 
     def forward(self, x):
+        self.rows_seen = x.shape[0]
         return x @ self.w.t() + self.b
 
 
@@ -702,9 +775,14 @@ class _FakeMLP(nn.Module):
         return self.down(torch.relu(self.up(x)))
 
 
-register_token_sharded_adapter(_FakeColumn, TokenShardedColumn)
-register_token_sharded_adapter(_FakeRow, TokenShardedRow)
-register_token_sharded_adapter(_FakeMLP, TokenShardedMLP)
+def _fake(adapter):
+    """``adapter`` for a fake module: no Linear / MLP to check, no all-reduce to stop."""
+    return type(f"Fake{adapter.__name__}", (adapter,), {"prepare": classmethod(lambda *a: None)})
+
+
+register_token_sharded_adapter(_FakeColumn, _fake(TokenShardedColumn))
+register_token_sharded_adapter(_FakeRow, _fake(TokenShardedRow))
+register_token_sharded_adapter(_FakeMLP, _fake(TokenShardedMLP))
 
 
 def _ints(gen, *shape):
@@ -758,6 +836,8 @@ def _logic_adapters(rank, world_size, device):
             f"row adapter {(b, s)}",
             device,
         )
+        # The GEMM runs on the padded stream (pad rows carry only rank 0's bias, then drop).
+        _check(block.row.rows_seen == plan.padded_rows, f"row GEMM input rows {(b, s)}", device)
         ref = torch.relu(x @ w_up.t().to(device)) @ w_down.t().to(device) + b_down.to(device)
         got = block.mlp(x_loc)
         _check(

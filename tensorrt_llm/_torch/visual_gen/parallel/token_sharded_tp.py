@@ -63,7 +63,6 @@ layout through a model's existing sharder call sites, and
 See ``TOKEN_SHARDED_TP_DEVELOPER_GUIDE.md`` next to this file.
 """
 
-import dataclasses
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -77,7 +76,7 @@ import torch.nn.functional as F
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import pad_up
 
-from ...modules.linear import Linear, NVFP4LinearMethod, is_static_nvfp4_input_eligible
+from ...modules.linear import Linear, is_static_nvfp4_input_eligible
 from ...utils import Fp4QuantizedTensor, compute_swizzled_sf_shape
 
 if TYPE_CHECKING:
@@ -238,9 +237,9 @@ def static_nvfp4_input_scale(linear: nn.Module | None) -> torch.Tensor | None:
     Non-None iff ``linear`` quantizes its input to NVFP4 with 16-element blocks from a
     calibrated scale (no AWQ ``pre_quant_scale``, no forced dynamic quantization), i.e.
     iff a row-local quantize with this scale yields exactly the bytes the Linear would
-    produce itself, so the activation can be all-gathered as NVFP4. This is the rule
-    The column adapters quantize before their all-gather by this rule, and models that
-    fuse the quantize into their norm (Wan) wire the norm's scale from it.
+    produce itself, so the activation can be all-gathered as NVFP4. The column and MLP
+    adapters quantize before their all-gather by this rule, and models that fuse the
+    quantize into their norm (Wan) wire the norm's scale from it.
     """
     if not is_static_nvfp4_input_eligible(linear):
         return None
@@ -252,14 +251,13 @@ def static_nvfp4_input_scale(linear: nn.Module | None) -> torch.Tensor | None:
 def quantize_nvfp4(h: torch.Tensor, input_scale: torch.Tensor) -> Fp4QuantizedTensor:
     """Static-scale NVFP4 quantize of ``h`` ([..., K] -> [rows, K/2] + swizzled SF).
 
-    Uses the same quantize op as ``NVFP4LinearMethod._input_prepare`` so the bytes match
-    what the consuming Linear would produce on the same rows.
+    Pinned to ``trtllm::fp4_quantize``, the op ``NVFP4LinearMethod._input_prepare`` uses
+    without tuning, even when VisualGen tunes the Linear's quantize: the tunable op may pick
+    FlashInfer's kernel, which shuffles rows and scaling factors in 128-row tiles, while
+    the all-gather and :func:`regroup_swizzled_sf` need plain row order and the 128x4 layout.
     """
     h2 = h.reshape(-1, h.shape[-1]).contiguous()
-    if NVFP4LinearMethod.use_tunable_quantize:
-        fp4, sf = torch.ops.trtllm.tunable_fp4_quantize(h2, input_scale, NVFP4_SF_VEC_SIZE, False)
-    else:
-        fp4, sf = torch.ops.trtllm.fp4_quantize(h2, input_scale, NVFP4_SF_VEC_SIZE, False)
+    fp4, sf = torch.ops.trtllm.fp4_quantize(h2, input_scale, NVFP4_SF_VEC_SIZE, False)
     return Fp4QuantizedTensor(fp4, sf, is_sf_swizzled=True)
 
 
@@ -493,7 +491,13 @@ class TokenShardedTP:
         """
         if isinstance(act, Fp4QuantizedTensor):
             payload = act.fp4_tensor
-            act = dataclasses.replace(act, fp4_tensor=payload.reshape(-1, payload.shape[-1]))
+            act = Fp4QuantizedTensor(  # the constructor, not dataclasses.replace: compiled code
+                payload.reshape(-1, payload.shape[-1]),
+                act.scaling_factor,
+                act.is_sf_swizzled,
+                act.unquantized_hidden_states,
+                act.reciprocal_scale,
+            )
         else:
             act = act.reshape(-1, act.shape[-1])
             scale = static_nvfp4_input_scale(consumer)
@@ -515,14 +519,6 @@ class TokenShardedTP:
                 f"{tuple(act.shape)}."
             )
         return self._add_padding(act)
-
-    def shard_rows(self, t: torch.Tensor) -> torch.Tensor:
-        """``[B, S, *rest]`` per-token metadata -> ``[m, *rest]`` (zeros for pad rows).
-
-        Returns a view when the rank's rows lie in one sample and are unpadded.
-        """
-        pieces = self._local_pieces(t, "shard_rows")
-        return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
 
     def per_sample_table(self, t: torch.Tensor) -> torch.Tensor:
         """``[B, *rest]`` per-sample table -> this shard's ``[n_entries, *rest]`` table.
@@ -637,7 +633,7 @@ class TokenShardedTP:
             )
         return payload, a.scaling_factor.reshape(-1), k
 
-    # --- GEMM-owning boundary ops (the seam later overlap / fused kernels replace) -----
+    # --- consumer checks ----------------------------------------------------------------
 
     @staticmethod
     def _check_fp4_consumer(consumer: object, act: Activation, op: str, what: str) -> None:

@@ -1463,6 +1463,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/visual_gen/modules/vae/",
         "tensorrt_llm/_torch/visual_gen/modules/attention.py",
         "tensorrt_llm/_torch/visual_gen/parallel/",
+        "tensorrt_llm/_torch/visual_gen/utils.py",
+        "tensorrt_llm/_torch/visual_gen/models/modeling.py",
         "tensorrt_llm/_torch/visual_gen/executor.py",
         "tensorrt_llm/_torch/visual_gen/mapping.py",
         "tensorrt_llm/_torch/visual_gen/pipeline.py",

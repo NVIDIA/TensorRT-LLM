@@ -292,6 +292,10 @@ class SequenceSharder:
         with zeros to a multiple of ``size`` before sharding.  The matching
         :meth:`gather` call must then pass ``unpad_to`` to slice the padding
         back off.
+
+        Under token-sharded TP the call without ``expected_seq_len`` shards the token
+        stream and selects the forward's plan from its ``[B, S]``; tensors passed with
+        ``expected_seq_len`` (per-token tables) must match that plan.
         """
         if tensor is not None and self._token_sharded_tp is not None:
             return self._shard_tokens(tensor, dim, expected_seq_len)
@@ -336,7 +340,16 @@ class SequenceSharder:
         if expected_seq_len is not None and tensor.shape[1] != expected_seq_len:
             return tensor
         tp = self._token_sharded_tp
-        tp.begin(tensor.shape[0], tensor.shape[1])
+        if expected_seq_len is None:
+            tp.begin(tensor.shape[0], tensor.shape[1])  # the token stream: plans this forward
+        else:
+            p = tp.plan
+            if tuple(tensor.shape[:2]) != (p.batch_size, p.seq_len):
+                raise ValueError(
+                    f"token-sharded TP: a per-token tensor {tuple(tensor.shape)} does not match "
+                    f"the token stream's [B={p.batch_size}, S={p.seq_len}] plan; shard the "
+                    "stream first (without expected_seq_len)."
+                )
         return tp.local_view(tp.shard(tensor))
 
     def shard_attention_input(
