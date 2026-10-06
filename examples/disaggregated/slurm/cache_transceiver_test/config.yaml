@@ -1,13 +1,12 @@
 # Configuration for the 2-node KV cache transceiver bandwidth / UCX-tuning harness.
 #
 # Fill in the placeholders (<...>) and run:
-#     python3 submit.py -c config.yaml
+#     ./submit.py
 #
 # The job allocates 2 nodes; one runs the context (ctx) group, the other the
 # generation (gen) group, each using `hardware.gpus_per_node` GPUs. For every
-# UCX env-var set in `ucx_env_sweep`, every transceiver combination in
-# `test_matrix.combinations`, and every request length, the harness transfers KV cache
-# ctx -> gen, verifies correctness, and reports the achieved bandwidth.
+# UCX env-var set, transceiver combination, and request length, the harness
+# transfers KV cache ctx -> gen, verifies correctness, and reports bandwidth.
 
 slurm:
   partition: "<partition>"
@@ -57,6 +56,32 @@ test_matrix:
   num_requests_per_length: 8
   # Warmup requests per (combination, length); excluded from bandwidth stats.
   warmup_requests: 2
+
+host_transfer_benchmark:
+  # Transport-only NIXL payload benchmark on the same two nodes and UCX sweep.
+  # "gpu" is the direct GPU-only baseline. Each mode verifies every byte.
+  enabled: true
+  modes: ["gpu", "host", "host_to_gpu", "gpu_to_host"]
+  bytes_per_transfer: 16777216
+  warmup: 2
+  samples: 8
+  # Keep registrations live for this interval after submission in the delayed
+  # completion and logical cancellation cases; exclude these from bandwidth.
+  delayed_completion_ms: 100
+  timeout_ms: 30000
+
+kvcm_transfer_benchmark:
+  # Native KVCM V2 sparse pages, including actual GPU→host offload and detached
+  # receive reservations. The same NIXL path is used for every mode.
+  enabled: true
+  modes: ["gpu", "host", "host_to_gpu", "gpu_to_host", "mixed"]
+  page_bytes: 1048576
+  pages: 16
+  tokens_per_block: 32
+  warmup: 2
+  samples: 8
+  delayed_completion_ms: 100
+  timeout_ms: 30000
 
 kv_cache:
   # KV cache geometry. Sized so transfers are large enough to measure bandwidth.
