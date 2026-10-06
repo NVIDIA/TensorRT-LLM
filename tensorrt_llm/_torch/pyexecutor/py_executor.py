@@ -7865,7 +7865,9 @@ class PyExecutor:
 
     def _release_multimodal_resources(self, request: LlmRequest) -> None:
         """Release this request's cache entries and discard unused MM data."""
-        state = request.py_mm_encoder_state
+        # Termination also sees request-like objects without MM fields, such
+        # as disaggregation transfer requests.
+        state = getattr(request, "py_mm_encoder_state", None)
         if state is not None:
             cache_keys = state.pop_all_cache_keys()
             request.py_mm_encoder_state = None
@@ -7875,7 +7877,7 @@ class PyExecutor:
             for cache_key in cache_keys:
                 encoder_cache.release(cache_key)
 
-        mm_data = request.py_multimodal_data
+        mm_data = getattr(request, "py_multimodal_data", None)
         if mm_data:
             strip_mm_data_for_generation(mm_data)
 
