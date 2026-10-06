@@ -13,27 +13,103 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_gtest(bufferManagerTest bufferManagerTest.cpp)
-add_gtest(cudaMemPoolTest cudaMemPoolTest.cpp)
+add_tllm_gtest(
+  bufferManagerTest
+  OWNER
+  runtime
+  SOURCES
+  bufferManagerTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;gpu"
+  REQUIRES_GPU)
+add_tllm_gtest(
+  cudaMemPoolTest
+  OWNER
+  runtime
+  SOURCES
+  cudaMemPoolTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_memory
+  LABELS
+  "unit;runtime;gpu"
+  REQUIRES_GPU)
 add_gtest(gdrcopyTest gdrcopyTest.cpp)
 add_gtest(hostAccessibleDeviceAllocatorTest
           hostAccessibleDeviceAllocatorTest.cu)
-add_gtest(iBufferTest iBufferTest.cpp)
+add_tllm_gtest(
+  iBufferTest
+  OWNER
+  runtime
+  SOURCES
+  iBufferTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;host")
 add_gtest(ipcNvlsMemoryTest ipcNvlsMemoryTest.cpp)
-add_gtest(iTensorTest iTensorTest.cpp)
+add_tllm_gtest(
+  iTensorTest
+  OWNER
+  runtime
+  SOURCES
+  iTensorTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;host")
 add_gtest(loraCacheTest loraCacheTest.cpp)
 add_gtest(loraUtilsTest loraUtilsTest.cpp)
 add_gtest(moeLoadBalancerTest moeLoadBalancerTest.cpp)
-add_gtest(runtimeMpiUtilsTest mpiUtilsTest.cpp)
+add_tllm_gtest(
+  runtimeMpiUtilsTest
+  OWNER
+  runtime
+  SOURCES
+  mpiUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_distributed
+  LABELS
+  "unit;runtime;host")
 add_gtest(localizationTest localizationTest.cu)
 add_gtest(localityDomainPublicConfigTest localityDomainPublicConfigTest.cpp)
 add_gtest(sanitizerTest sanitizerTest.cpp)
-add_gtest(tllmBuffersTest tllmBuffersTest.cpp)
+add_tllm_gtest(
+  tllmBuffersTest
+  OWNER
+  runtime
+  SOURCES
+  tllmBuffersTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;gpu"
+  REQUIRES_GPU)
 add_gtest(transposeKVKernelTest transposeKVKernelTest.cpp)
 add_gtest(utilsTest utilsTest.cpp)
-add_gtest(virtualMemoryTest virtualMemoryTest.cpp)
+add_tllm_gtest(
+  virtualMemoryTest
+  OWNER
+  runtime
+  SOURCES
+  virtualMemoryTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;gpu"
+  REQUIRES_GPU)
 add_gtest(workerPoolTest workerPoolTest.cpp)
-add_gtest(worldConfigTest worldConfigTest.cpp)
+add_tllm_gtest(
+  worldConfigTest
+  OWNER
+  runtime
+  SOURCES
+  worldConfigTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_distributed
+  LABELS
+  "unit;runtime;host")
 
 if(${BUILD_PYT})
   add_gtest(torchTest torchTest.cpp)
