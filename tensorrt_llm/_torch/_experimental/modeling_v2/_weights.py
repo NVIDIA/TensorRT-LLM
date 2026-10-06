@@ -17,6 +17,11 @@ from typing import Any, Callable
 import torch
 import torch.nn as nn
 
+#: `layers=ALL_LAYERS` is the common case and the default. A sentinel rather
+#: than a lambda so the table reads as data, and rather than `True` so the
+#: field has one type of answer: which layers.
+ALL_LAYERS = object()
+
 
 @dataclass(frozen=True)
 class W:
@@ -25,10 +30,22 @@ class W:
     `shape` takes the dimension bundle and returns the declared shape; every
     shape in these models is derived from configuration rather than constant.
 
-    `src` is a checkpoint key template with `{p}` standing for the layer
-    prefix, or a sequence of `(template, slice_fn)` pairs when one parameter is
-    assembled from several checkpoint tensors. `slice_fn` takes the dimension
-    bundle and returns an index into the destination parameter.
+    `src` says where the bytes come from, in one of three forms:
+
+    * a checkpoint key template, with `{p}` standing for the layer prefix;
+    * a sequence of `(template, slice_fn)` pairs, when one parameter is
+      assembled from several checkpoint tensors side by side -- `slice_fn`
+      takes the dimension bundle and returns an index into the destination;
+    * a callable `(d, i) -> [(key, index), ...]`, taking the dimension bundle
+      and the layer index. The first two forms are special cases of it; this
+      one exists for sources that are not a fixed template -- a per-rank
+      expert window, or a prefix that differs between layer families. A `key`
+      may itself be a tuple, meaning the transform is handed those tensors
+      together.
+
+    `layers` says which layers carry this weight: `ALL_LAYERS` for every one,
+    `None` for a weight that is not per-layer at all, or a callable
+    `d -> iterable[int]` when only some layers have it.
 
     `transform` runs on the source tensor before the copy, on the
     destination's device. `None` means the checkpoint tensor is already the
@@ -37,10 +54,26 @@ class W:
 
     name: str
     shape: Callable[[Any], tuple[int, ...]]
-    src: str | tuple[tuple[str, Callable], ...]
+    src: str | tuple[tuple[str, Callable], ...] | Callable
     dtype: torch.dtype | None = None
     transform: Callable | None = None
-    per_layer: bool = True
+    layers: object | None = ALL_LAYERS
+
+    def layer_indices(self, d: SimpleNamespace) -> list[int] | None:
+        """The layers this weight exists on, or None if it is not per-layer."""
+        if self.layers is None:
+            return None
+        if self.layers is ALL_LAYERS:
+            return list(range(d.num_layers))
+        return list(self.layers(d))
+
+    def sources(self, d: SimpleNamespace, i: int | None, prefix: str) -> list[tuple[Any, Any]]:
+        """`[(checkpoint key or key tuple, index into the param | None), ...]`."""
+        if callable(self.src):
+            return list(self.src(d, i))
+        if isinstance(self.src, str):
+            return [(self.src.format(p=prefix), None)]
+        return [(template.format(p=prefix), slice_fn(d)) for template, slice_fn in self.src]
 
 
 class ModelWeights:
@@ -78,35 +111,32 @@ class ModelWeights:
         w = nn.ParameterDict()
         for entry in self.WEIGHTS:
             dtype = entry.dtype or d.dtype
-            keys = (
-                [f"l{i}_{entry.name}" for i in range(d.num_layers)]
-                if entry.per_layer
-                else [entry.name]
-            )
-            for key in keys:
+            for key, _, _ in self._targets(entry, d):
                 w[key] = nn.Parameter(
                     torch.empty(*entry.shape(d), dtype=dtype), requires_grad=False
                 )
         return w
 
-    def manifest(self, core) -> dict[str, list[tuple[str, Any, Callable | None]]]:
+    def _targets(self, entry: W, d: SimpleNamespace) -> list[tuple[str, int | None, str]]:
+        """`[(param key, layer index | None, checkpoint layer prefix), ...]`.
+
+        One place decides which parameters an entry declares, so `declare` and
+        `manifest` cannot disagree about whether a weight exists.
+        """
+        layers = entry.layer_indices(d)
+        if layers is None:
+            return [(entry.name, None, "")]
+        return [(f"l{i}_{entry.name}", i, self.LAYER_PREFIX.format(i=i)) for i in layers]
+
+    def manifest(self, core) -> dict[str, list[tuple[Any, Any, Callable | None]]]:
         """param key -> [(checkpoint key, index into the param | None, transform | None)]."""
         d = self.dims(core)
-        rows: dict[str, list[tuple[str, Any, Callable | None]]] = {}
+        rows: dict[str, list[tuple[Any, Any, Callable | None]]] = {}
         for entry in self.WEIGHTS:
-            targets = (
-                [(f"l{i}_{entry.name}", self.LAYER_PREFIX.format(i=i)) for i in range(d.num_layers)]
-                if entry.per_layer
-                else [(entry.name, "")]
-            )
-            for key, prefix in targets:
-                if isinstance(entry.src, str):
-                    rows[key] = [(entry.src.format(p=prefix), None, entry.transform)]
-                else:
-                    rows[key] = [
-                        (template.format(p=prefix), slice_fn(d), entry.transform)
-                        for template, slice_fn in entry.src
-                    ]
+            for key, i, prefix in self._targets(entry, d):
+                rows[key] = [
+                    (ckpt, index, entry.transform) for ckpt, index in entry.sources(d, i, prefix)
+                ]
         return rows
 
     def expected_unconsumed(self, core, weights) -> set[str]:

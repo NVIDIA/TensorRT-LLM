@@ -242,12 +242,12 @@ class GptOssWeights(ModelWeights):
             src="{p}.mlp.experts.down_proj_bias",
             transform=_prep_fc2_bias,
         ),
-        W("final_norm", shape=lambda d: (d.hidden,), src="model.norm.weight", per_layer=False),
+        W("final_norm", shape=lambda d: (d.hidden,), src="model.norm.weight", layers=None),
         W(
             "embed",
             shape=lambda d: (d.vocab, d.hidden),
             src="model.embed_tokens.weight",
-            per_layer=False,
+            layers=None,
         ),
     )
 
@@ -273,56 +273,3 @@ class GptOssWeights(ModelWeights):
 
 
 MODEL_WEIGHTS = GptOssWeights()
-
-
-def _manifest(core) -> dict:
-    """The hand-written manifest `ModelWeights.manifest` replaces.
-
-    Dead code, kept for one commit so the equivalence test can compare the
-    generated manifest against the thing it is replacing rather than against a
-    transcription of it. Deleted once that test has run green.
-    """
-    cfg = core.model_config.pretrained_config
-    q_width = cfg.num_attention_heads * cfg.head_dim
-    kv_width = cfg.num_key_value_heads * cfg.head_dim
-    rows: dict = {}
-    for i in range(cfg.num_hidden_layers):
-        p = f"model.layers.{i}"
-        rows[f"l{i}_norm1"] = [(f"{p}.input_layernorm.weight", None, None)]
-        rows[f"l{i}_qkv"] = [
-            (f"{p}.self_attn.q_proj.weight", (slice(0, q_width),), None),
-            (
-                f"{p}.self_attn.k_proj.weight",
-                (slice(q_width, q_width + kv_width),),
-                None,
-            ),
-            (
-                f"{p}.self_attn.v_proj.weight",
-                (slice(q_width + kv_width, q_width + 2 * kv_width),),
-                None,
-            ),
-        ]
-        rows[f"l{i}_qkv_bias"] = [
-            (f"{p}.self_attn.q_proj.bias", (slice(0, q_width),), None),
-            (f"{p}.self_attn.k_proj.bias", (slice(q_width, q_width + kv_width),), None),
-            (
-                f"{p}.self_attn.v_proj.bias",
-                (slice(q_width + kv_width, q_width + 2 * kv_width),),
-                None,
-            ),
-        ]
-        rows[f"l{i}_sinks"] = [(f"{p}.self_attn.sinks", None, _to_fp32)]
-        rows[f"l{i}_o"] = [(f"{p}.self_attn.o_proj.weight", None, None)]
-        rows[f"l{i}_o_bias"] = [(f"{p}.self_attn.o_proj.bias", None, None)]
-        rows[f"l{i}_norm2"] = [(f"{p}.post_attention_layernorm.weight", None, None)]
-        rows[f"l{i}_router"] = [(f"{p}.mlp.router.weight", None, None)]
-        rows[f"l{i}_router_bias"] = [(f"{p}.mlp.router.bias", None, None)]
-        rows[f"l{i}_fc1_w"] = [(f"{p}.mlp.experts.gate_up_proj_blocks", None, _prep_fc1_weight)]
-        rows[f"l{i}_fc1_s"] = [(f"{p}.mlp.experts.gate_up_proj_scales", None, _prep_fc1_scale)]
-        rows[f"l{i}_fc1_b"] = [(f"{p}.mlp.experts.gate_up_proj_bias", None, _prep_fc1_bias)]
-        rows[f"l{i}_fc2_w"] = [(f"{p}.mlp.experts.down_proj_blocks", None, _prep_fc2_weight)]
-        rows[f"l{i}_fc2_s"] = [(f"{p}.mlp.experts.down_proj_scales", None, _prep_fc2_scale)]
-        rows[f"l{i}_fc2_b"] = [(f"{p}.mlp.experts.down_proj_bias", None, _prep_fc2_bias)]
-    rows["final_norm"] = [("model.norm.weight", None, None)]
-    rows["embed"] = [("model.embed_tokens.weight", None, None)]
-    return rows
