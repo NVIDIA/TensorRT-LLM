@@ -326,6 +326,7 @@ foreach(
   tllm_runtime_distributed
   tllm_runtime_topology
   tllm_runtime_worker_pool
+  tllm_runtime_utils
   tllm_runtime_lora_cache
   tllm_runtime_lora
   ipc_nvls_memory_src
@@ -374,6 +375,7 @@ foreach(
   tllm_runtime_distributed
   tllm_runtime_topology
   tllm_runtime_worker_pool
+  tllm_runtime_utils
   tllm_runtime_lora_cache
   tllm_runtime_lora
   ipc_nvls_memory_src
