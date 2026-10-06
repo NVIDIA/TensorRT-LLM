@@ -342,6 +342,7 @@ foreach(
   tllm_kv_cache_legacy
   tllm_batch_scheduler
   tllm_context_transfer_consensus
+  tllm_peft_cache
   tllm_kernel_kv_cache_copy
   ${BATCH_MANAGER_TARGET}
   ${EXECUTOR_TARGET}
@@ -392,6 +393,7 @@ foreach(
   tllm_kv_cache_legacy
   tllm_batch_scheduler
   tllm_context_transfer_consensus
+  tllm_peft_cache
   tllm_kernel_kv_cache_copy)
   set_property(TARGET ${SHARED_TARGET}
                PROPERTY LINK_LIBRARY_OVERRIDE_${component} WHOLE_ARCHIVE)
