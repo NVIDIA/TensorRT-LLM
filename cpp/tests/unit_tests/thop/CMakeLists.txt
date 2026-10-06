@@ -16,12 +16,13 @@
 if(${BUILD_PYT})
   add_tllm_gtest(
     thUtilsTest
+    OWNER
+    runtime
     SOURCES
     thUtilsTest.cpp
     eagerMoeWorkspaceTest.cpp
-    FULL_STACK
+    LINK_LIBRARIES
+    tllm::torch_utils
     LABELS
-    "unit;full-stack;gpu")
-  target_link_libraries(thUtilsTest PUBLIC th_utils ${Python3_LIBRARIES}
-                                           ${TORCH_LIBRARIES})
+    "unit;runtime;thop;host")
 endif()
