@@ -69,6 +69,15 @@ add_tllm_kernel_library(
 
 add_tllm_kernel_library(tllm_kernel_rms_norm SOURCES rmsnormKernels.cu)
 
+add_tllm_kernel_library(
+  tllm_kernel_all_reduce_fusion
+  SOURCES
+  communicationKernels/allReduceFusionKernels.cu
+  communicationKernels/allReduceWorkspace.cu
+  LINK_LIBRARIES
+  tllm::common_environment
+  tllm::runtime_ipc)
+
 add_tllm_kernel_library(tllm_kernel_logits SOURCES logitsBitmask.cu)
 
 add_tllm_kernel_library(

@@ -27,8 +27,20 @@ if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
     tllm::runtime_distributed
     LABELS
     "unit;kernels;all-reduce;multi-gpu;gpu")
-  add_tllm_gtest(allReduceFusionTest SOURCES allReduce/allReduceFusionTest.cu
-                 FULL_STACK LABELS "unit;full-stack;gpu")
+  add_tllm_gtest(
+    allReduceFusionTest
+    OWNER
+    kernel
+    SOURCES
+    allReduce/allReduceFusionTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_all_reduce_fusion
+    tllm::kernel_rms_norm
+    tllm::kernel_quantization
+    tllm::runtime_distributed
+    ${NCCL_LIB}
+    LABELS
+    "unit;kernels;all-reduce;multi-gpu;gpu")
   add_tllm_gtest(gemmAllReduceTest SOURCES allReduce/gemmAllReduceTest.cu
                  FULL_STACK LABELS "unit;full-stack;gpu")
   if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
