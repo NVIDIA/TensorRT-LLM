@@ -2076,6 +2076,15 @@ class Sender(SenderBase):
                     tasks = None
                     terminal = True
                     include_aux = bool(session._claim_unsubmitted_aux_failures_locked((info,)))
+                elif self._is_repeat_request(info):
+                    # The pieces were, or are being, served to this rank's first
+                    # request; serving them again would write twice and overrun
+                    # the per-piece transfer count. Refuse the whole request so
+                    # the receiver never sees FAILED for some pieces and writes
+                    # for others. No aux claim: that slot is the first request's.
+                    tasks = None
+                    terminal = True
+                    include_aux = bool(getattr(session, "_need_aux", False))
                 else:
                     self._save_peer_req_info(info)
                     tasks = list(session.kv_tasks)
@@ -2220,6 +2229,16 @@ class Sender(SenderBase):
         if endpoint not in self._dealers:
             self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return self._dealers[endpoint]
+
+    def _is_repeat_request(self, info: RecvReqInfo) -> bool:
+        """A second REQUEST_DATA for the same piece from the same receiver rank.
+
+        Each piece is asked for once per rank. A repeat means a later receiver
+        attempt reused the key after the first one retired on its side while
+        this session was still live.
+        """
+        prior = (self._get_req_info(info.unique_rid) or {}).get(info.instance_rank)
+        return prior is not None and prior.slice_id == info.slice_id
 
     def _save_peer_req_info(self, peer_transfer_req_info: RecvReqInfo):
         req_info = peer_transfer_req_info
@@ -3027,8 +3046,16 @@ class Receiver(ReceiverBase):
         self._dealers.clear()
         self._messenger.stop()
 
-    def clear_session(self, unique_rid: int):
+    def clear_session(self, unique_rid: int, session: Optional["RxSession"] = None):
+        """Remove ``unique_rid`` from the table; with ``session`` given, only if it is the holder.
+
+        A refused attempt shares the holder's key and must not evict it on close.
+        """
         with self._sessions_lock:
+            if session is not None:
+                entry = self._resolve_session_entry(unique_rid, self._sessions.get(unique_rid))
+                if entry is not None and entry is not session:
+                    return
             self._sessions.pop(unique_rid, None)
 
     def _get_ownership_admission_lock(self) -> threading.Lock:
@@ -3061,20 +3088,47 @@ class Receiver(ReceiverBase):
             release_admission = self._acquire_ownership_admission()
         pre_cancel = False
         cancelled_by_peer = False
+        holder: Optional["RxSession"] = None
         try:
             with self._sessions_lock:
                 if self._shutdown:
                     raise RuntimeError("cannot create an RxSession after Receiver shutdown")
-                if getattr(rx_session, "_enforce_physical_ownership", False):
-                    self._sessions[rx_session.disagg_request_id] = rx_session
-                else:
-                    self._sessions[rx_session.disagg_request_id] = weakref.ref(rx_session)
-                if rx_session.disagg_request_id in self._pre_cancelled_rids:
-                    pre_cancel = True
-                    cancelled_by_peer = self._pre_cancelled_rids.pop(rx_session.disagg_request_id)
+                key = rx_session.disagg_request_id
+                holder = self._resolve_session_entry(key, self._sessions.get(key))
+                if holder is rx_session or (holder is not None and holder._closed):
+                    holder = None
+                if holder is None:
+                    if getattr(rx_session, "_enforce_physical_ownership", False):
+                        self._sessions[key] = rx_session
+                    else:
+                        self._sessions[key] = weakref.ref(rx_session)
+                    if key in self._pre_cancelled_rids:
+                        pre_cancel = True
+                        cancelled_by_peer = self._pre_cancelled_rids.pop(key)
         finally:
             if release_admission is not None:
                 release_admission()
+        if holder is not None:
+            # The key is the context request's id, which every generation attempt
+            # for that request shares. Only one attempt may hold it at a time:
+            # letting a later attempt replace the holder would hand it the
+            # holder's results and let the holder's teardown evict it. The
+            # newcomer fails admission locally and never asks the sender, so the
+            # holder keeps the transfer and the request behind the newcomer
+            # retires as an error through the ordinary sweep. Not raised: an
+            # exception here would reach the executor loop and fail every
+            # active request.
+            logger.warning(
+                f"RxSession {rx_session.disagg_request_id}: refusing a second attempt while "
+                f"the earlier one is still active"
+            )
+            rx_session.fail_admission(
+                RuntimeError(
+                    f"RxSession {rx_session.disagg_request_id}: an earlier attempt for this "
+                    "context request is still active"
+                )
+            )
+            return
         if pre_cancel:
             if getattr(rx_session, "_enforce_physical_ownership", False):
                 rx_session.cancel_local(by_peer=cancelled_by_peer)
@@ -3646,6 +3700,9 @@ class RxSession(RxSessionBase):
         TxSession key when it answers. ``disagg_request_id`` only agrees with it
         when the orchestrator handed both servers the same id, so it is a
         fallback rather than the first choice.
+
+        Every generation attempt for one context request therefore shares the
+        key; the Receiver admits one at a time (see ``Receiver.setup_session``).
         """
         params = self._base_args.params
         if params.ctx_request_id is not None:
@@ -3812,6 +3869,16 @@ class RxSession(RxSessionBase):
         )
         task.bind_logical_outcomes(self._logical_outcomes)
         self._kv_tasks.append(task)
+        if self._closed or self._terminal_status is not None:
+            # Admission already failed (a refused second attempt) or the session
+            # has ended. Settle the piece here: dispatching would look the session
+            # up by its key and reach whoever holds it. The ownership path makes
+            # the same decision in prepare_receive.
+            task.fail(
+                self._exception
+                or RuntimeError(f"RxSession {self.disagg_request_id} is no longer admitting")
+            )
+            return
         self._receiver.dispatch_task(task)
 
     def prepare_receive(
@@ -4374,7 +4441,7 @@ class RxSession(RxSessionBase):
             # leaked; a no-op for finished or non-bounce transfers.
             for task in self._kv_tasks:
                 self._receiver._bounce.orphan_reservation((self.disagg_request_id, task.slice_id))
-            self._receiver.clear_session(self.disagg_request_id)
+            self._receiver.clear_session(self.disagg_request_id, self)
         return True
 
     def __enter__(self):
