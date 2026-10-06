@@ -1591,6 +1591,23 @@ class TestPerRequestWeightedSplit:
         assert draft_config.max_gpu_total_bytes == 300
         assert target_config.max_gpu_total_bytes == 700
 
+    def test_floor_exceeding_slope_budget_is_infeasible(self):
+        """The floor must never push the target below its intercept. If even
+        one mirror's allocator quota does not fit after both intercepts, the
+        allocator will overrun the budget regardless of the split, so the GPU
+        split fails fast exactly like an unfundable fixed cost."""
+        c = self._creator(
+            1_000,
+            target=CacheCost(slope=80, intercept=400, bytes_per_request=900),
+            draft=CacheCost(slope=20, bytes_per_request=100, quota_per_request=700),
+        )
+
+        # The slope budget is 1000 - 400 = 600, below the 700-byte one-mirror
+        # quota. Flooring anyway would hand the draft 700 and the target 300,
+        # below its 400-byte intercept.
+        with pytest.raises(ValueError, match="insufficient"):
+            c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
     def test_fully_covered_target_weight_hands_slope_budget_to_draft(self):
         """A target whose entire retention is intercept-funded reports a zero
         slope-funded weight: the draft takes the remainder, still capped at

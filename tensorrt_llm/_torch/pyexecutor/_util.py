@@ -2252,6 +2252,9 @@ class KvCacheCreator:
         the manager reports it. That quota also floors the draft share: the
         allocator raises any smaller quota at construction regardless of the
         split, so assigning less would silently overcommit the target's share.
+        A floor that does not fit in the budget remaining after both
+        intercepts makes the split infeasible (``None``), like an unfundable
+        fixed cost; flooring anyway would push the target below its intercept.
         """
         intercept_total = target_kv.intercept + draft_kv.intercept
         slope_budget = total_budget - intercept_total
@@ -2292,6 +2295,19 @@ class KvCacheCreator:
                                       draft_bytes_per_mirror)
             draft_slope_share = min(draft_slope_share, max_useful_draft_bytes)
         if draft_kv.quota_per_request is not None:
+            if draft_kv.quota_per_request > slope_budget:
+                # The allocator will raise the draft quota to this one-request
+                # floor at construction regardless of the split, so a budget
+                # that cannot fund it alongside both intercepts is infeasible,
+                # exactly like an unfundable fixed cost. Flooring anyway would
+                # silently push the target below its intercept.
+                logger.warning(
+                    f"KV cache budget {total_budget} cannot fund the draft "
+                    f"manager's minimum allocator quota "
+                    f"({draft_kv.quota_per_request} bytes for one max-length "
+                    f"request) beyond the fixed cache cost {intercept_total}; "
+                    f"cannot split between target and draft.")
+                return None
             # The allocator raises any smaller quota to this one-request floor
             # at construction regardless of the split, so assigning less would
             # silently overcommit the target's share.
