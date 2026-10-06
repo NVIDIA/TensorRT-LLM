@@ -509,6 +509,18 @@ def filter_mm_token_from_input_ids(
     return text_token_indices, mm_token_indices
 
 
+def _as_copy_index(index: torch.Tensor,
+                   destination: torch.Tensor) -> torch.Tensor:
+    """Return ``index`` as the int64 index ``index_copy_`` needs on ``destination``.
+
+    Explicit indices can come from callers with another dtype or device; for the
+    executor's int64 device indices this is a no-op.
+    """
+    return index.to(device=destination.device,
+                    dtype=torch.long,
+                    non_blocking=True)
+
+
 def fuse_input_embeds(
     embedding_layer: Embedding,
     input_ids: torch.IntTensor,
@@ -596,7 +608,8 @@ def fuse_input_embeds(
                                    mm_embed.shape[-1],
                                    device=text_embed.device,
                                    dtype=text_embed.dtype)
-        input_embeds[text_token_indices, :] = text_embed
+        input_embeds.index_copy_(
+            0, _as_copy_index(text_token_indices, input_embeds), text_embed)
     if extra_embeds is not None and len(extra_embeds) > 0:
         # only support single modality for deepstack features for now
         for i, extra_feature in enumerate(extra_embeds):
@@ -606,11 +619,15 @@ def fuse_input_embeds(
                 device=extra_feature.device,
                 dtype=extra_feature.dtype,
             )
-            extra_embed[mm_token_indices, :] = extra_feature
+            extra_embed.index_copy_(
+                0, _as_copy_index(mm_token_indices, extra_embed), extra_feature)
             extra_embeds[i] = extra_embed
 
-    input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype,
-                                                    device=input_embeds.device)
+    input_embeds.index_copy_(
+        0,
+        _as_copy_index(mm_token_indices, input_embeds),
+        mm_embed.to(dtype=input_embeds.dtype, device=input_embeds.device),
+    )
     if extra_embeds is not None and len(extra_embeds) > 0:
         return None, cast(torch.FloatTensor, input_embeds), extra_embeds
     return None, cast(torch.FloatTensor, input_embeds)

@@ -22,9 +22,15 @@ import time
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, cast
 
+import msgspec
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
+    KVEventBatch,
+    StreamingKVCacheEventManager,
+)
 from tensorrt_llm._utils import KVCacheEventSerializer
+from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 from tensorrt_llm.runtime.kv_cache_hash import (
     KV_CACHE_HASH_ALGO_V1,
     KV_CACHE_HASH_ALGO_V2_SHA256_64,
@@ -166,6 +172,22 @@ def _add_stored_life_cycle(event_manager, block, life_cycle_id):
     _introspection.event_manager_add_stored_life_cycle(event_manager, block, life_cycle_id)
 
 
+def _add_streaming_stored_block(event_sink, block):
+    _introspection.streaming_event_sink_add_stored_block(event_sink, block)
+
+
+def _add_streaming_stored_life_cycle(event_sink, block, life_cycle_id):
+    _introspection.streaming_event_sink_add_stored_life_cycle(event_sink, block, life_cycle_id)
+
+
+def _add_streaming_removed_block(event_sink, block):
+    _introspection.streaming_event_sink_add_removed_block(event_sink, block)
+
+
+def _add_streaming_removed_life_cycle(event_sink, block, life_cycle_id):
+    _introspection.streaming_event_sink_add_removed_life_cycle(event_sink, block, life_cycle_id)
+
+
 def _token_ids(start, end):
     return [TokenId(token_id) for token_id in range(start, end)]
 
@@ -245,6 +267,290 @@ def test_event_manager_queue_and_stored_coalescing():
         "block0",
         "block1",
     ]
+
+
+@pytest.mark.parametrize("lora_id", [None, 0, 7, 2**64 - 1])
+def test_native_streaming_sink_to_python_wire_structs(real_block_factory, lora_id):
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+        max_entries=8,
+    )
+    event_sink = manager.event_sink
+    manager.start()
+    try:
+        manager.set_layer_group_window_sizes({0: 128, 1: 64})
+        published = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+        make_block = real_block_factory(event_sink, num_life_cycles=2, tokens_per_block=2)
+
+        first = make_block(_token_ids(1, 3), [2, 2], reuse_scope=ReuseScope(lora_id=lora_id))
+        partial = make_block(_token_ids(5, 7), [1, 2], parent=first)
+        second = make_block(_token_ids(3, 5), [2, 2], parent=first)
+
+        _add_streaming_stored_block(event_sink, first)
+        _add_streaming_stored_block(event_sink, partial)
+        _add_streaming_stored_life_cycle(event_sink, second, 1)
+        _add_streaming_stored_life_cycle(event_sink, second, 0)
+        # Native capture statistics are available before draining or publishing.
+        assert manager.stored_blocks == 2
+        assert manager.partial_blocks_suppressed == 1
+        assert manager.non_target_life_cycles_ignored == 1
+        assert manager.dropped_events == 0
+        assert published == []
+        manager.flush_iteration_events()
+
+        first_hash = int.from_bytes(_block_key(first)[:8], byteorder="big", signed=True)
+        second_hash = int.from_bytes(_block_key(second)[:8], byteorder="big", signed=True)
+        assert len(published) == 1
+        stored = published[0].events
+        assert len(stored) == 1
+        assert stored[0].block_hashes == [first_hash, second_hash]
+        assert stored[0].parent_block_hash is None
+        assert stored[0].token_ids == [1, 2, 3, 4]
+        assert stored[0].lora_id == lora_id
+        assert stored[0].lora_name is None
+        wire_batch = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]), type=KVEventBatch)
+        assert wire_batch.events[0].lora_id == lora_id
+
+        # Descendants retain the scope after their parent's event has been drained.
+        third = make_block(_token_ids(7, 9), [2, 2], parent=second)
+        _add_streaming_stored_block(event_sink, third)
+        manager.flush_iteration_events()
+        assert published[-1].events[0].parent_block_hash == second_hash
+        assert published[-1].events[0].lora_id == lora_id
+
+        _add_streaming_removed_life_cycle(event_sink, second, 1)
+        _add_streaming_removed_block(event_sink, first)
+        _add_streaming_removed_life_cycle(event_sink, second, 0)
+        assert manager.removed_blocks == 2
+        assert manager.non_target_life_cycles_ignored == 2
+        manager.flush_iteration_events()
+
+        assert len(published) == 3
+        removed = published[2].events
+        assert len(removed) == 1
+        assert removed[0].block_hashes == [first_hash, second_hash]
+        assert manager.stored_blocks == 3
+        assert manager.removed_blocks == 2
+        assert manager.partial_blocks_suppressed == 1
+        assert manager.non_target_life_cycles_ignored == 2
+        assert manager.dropped_events == 0
+        _add_streaming_stored_block(event_sink, first)
+        manager.flush_iteration_events()
+        assert published[-1].events[0].block_hashes == [first_hash]
+        assert published[-1].events[0].lora_id == lora_id
+    finally:
+        manager.shutdown()
+
+
+def test_native_streaming_sink_separates_lora_scopes(real_block_factory):
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+    )
+    manager.start()
+    try:
+        manager.set_layer_group_window_sizes({0: 128})
+        published = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+        make_block = real_block_factory(manager.event_sink, tokens_per_block=2)
+        for lora_id in (None, 0, 7, 8):
+            first = make_block(_token_ids(1, 3), [2], reuse_scope=ReuseScope(lora_id=lora_id))
+            second = make_block(_token_ids(3, 5), [2], parent=first)
+            _add_streaming_stored_block(manager.event_sink, first)
+            _add_streaming_stored_block(manager.event_sink, second)
+        manager.flush_iteration_events()
+        stored = published[0].events
+        assert [event.lora_id for event in stored] == [None, 0, 7, 8]
+        assert all(event.token_ids == [1, 2, 3, 4] for event in stored)
+        assert all(len(event.block_hashes) == 2 for event in stored)
+        assert len({block_hash for event in stored for block_hash in event.block_hashes}) == 8
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "uuid_a,uuid_b", [(None, None), ("frontend-a", "frontend-b"), ("", None), ("image-图片", None)]
+)
+def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factory, uuid_a, uuid_b):
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+        max_entries=8,
+        mm_token_id_offset=1000,
+    )
+    event_sink = manager.event_sink
+    manager.start()
+    try:
+        manager.set_layer_group_window_sizes({0: 128})
+        published = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+        make_block = real_block_factory(event_sink, tokens_per_block=4)
+        digest_a = bytes(range(32))
+        digest_b = bytes(reversed(range(32)))
+        first = make_block([1, MmItemContext(digest_a, uuid_a), 1001, 1002], [4])
+        gap = make_block([2, 3, 4, 5], [4], parent=first)
+        continued = make_block([1003, 7, 1004, 1005], [4], parent=gap)
+        last = make_block([1006, MmItemContext(digest_b, uuid_b), 1001, 9], [4], parent=continued)
+
+        for block in (first, gap, continued, last):
+            _add_streaming_stored_block(event_sink, block)
+        manager.flush_iteration_events()
+
+        assert len(published) == 1
+        assert len(published[0].events) == 1
+        stored = published[0].events[0]
+        assert stored.token_ids == [
+            1,
+            digest_a.hex(),
+            1001,
+            1002,
+            2,
+            3,
+            4,
+            5,
+            1003,
+            7,
+            1004,
+            1005,
+            1006,
+            digest_b.hex(),
+            1001,
+            9,
+        ]
+        assert [
+            [(key.hash, key.start_offset, key.uuid) for key in block_keys]
+            for block_keys in stored.mm_keys
+        ] == [
+            [(digest_a.hex(), 0, uuid_a)],
+            [],
+            [(digest_a.hex(), 3, uuid_a), (digest_a.hex(), 4, uuid_a)],
+            [(digest_a.hex(), 6, uuid_a), (digest_b.hex(), 0, uuid_b)],
+        ]
+        # UUIDs are event metadata, not an additional input to the block-key hash.
+        digest_only_tokens = [
+            bytes.fromhex(token) if isinstance(token, str) else token
+            for token in stored.token_ids
+        ]
+        assert stored.block_hashes == [
+            truncate_sha256_hash_to_int64(key)
+            for key in _blockchain_keys(4, digest_only_tokens)
+        ]
+        payload = msgspec.msgpack.encode(published[0])
+        assert msgspec.msgpack.decode(payload, type=KVEventBatch) == published[0]
+        wire_keys = msgspec.msgpack.decode(payload)[1][0]["mm_keys"]
+        for actual_keys, expected_keys in zip(wire_keys, stored.mm_keys, strict=True):
+            assert actual_keys == [
+                {
+                    "type": "mm_key",
+                    "hash": key.hash,
+                    "start_offset": key.start_offset,
+                    **({"uuid": key.uuid} if key.uuid is not None else {}),
+                }
+                for key in expected_keys
+            ]
+        assert manager.stored_blocks == 4
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("overflow", [False, True])
+def test_native_streaming_removals_are_never_dropped_by_the_entry_cap(real_block_factory, overflow):
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+        max_entries=2,
+    )
+    manager.start()
+    try:
+        manager.set_layer_group_window_sizes({0: 128})
+        published = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+        event_sink = manager.event_sink
+        make_block = real_block_factory(event_sink, tokens_per_block=2)
+        first = make_block(_token_ids(1, 3), [2])
+        second = make_block(_token_ids(3, 5), [2], parent=first)
+        _add_streaming_stored_block(event_sink, first)
+        _add_streaming_stored_block(event_sink, second)
+        if overflow:
+            third = make_block(_token_ids(5, 7), [2], parent=second)
+            _add_streaming_stored_block(event_sink, third)
+
+        # Both removal entry points must bypass the saturated store cap.
+        _add_streaming_removed_block(event_sink, first)
+        _add_streaming_removed_life_cycle(event_sink, second, 0)
+        manager.flush_iteration_events()
+
+        assert manager.stored_blocks == 2
+        assert manager.removed_blocks == 2
+        assert manager.dropped_events == int(overflow)
+        assert len(published) == 1
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]))
+        assert [event["type"] for event in decoded[1]] == ["BlockStored", "BlockRemoved"]
+        expected_hashes = [
+            int.from_bytes(_block_key(block)[:8], byteorder="big", signed=True)
+            for block in (first, second)
+        ]
+        assert decoded[1][0]["block_hashes"] == expected_hashes
+        assert decoded[1][1]["block_hashes"] == expected_hashes
+    finally:
+        manager.shutdown()
+
+
+def test_native_streaming_sink_drops_descendants_of_unpublished_parent(real_block_factory):
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+        max_entries=1,
+    )
+    event_sink = manager.event_sink
+    manager.start()
+    try:
+        manager.set_layer_group_window_sizes({0: 128})
+        published = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+        make_block = real_block_factory(event_sink, tokens_per_block=2)
+        first = make_block(_token_ids(1, 3), [2])
+        dropped_parent = make_block(_token_ids(3, 5), [2], parent=first)
+        child = make_block(_token_ids(5, 7), [2], parent=dropped_parent)
+
+        _add_streaming_stored_block(event_sink, first)
+        _add_streaming_stored_block(event_sink, dropped_parent)
+        manager.flush_iteration_events()
+        _add_streaming_stored_block(event_sink, child)
+        manager.flush_iteration_events()
+
+        assert len(published) == 1
+        assert published[0].events[0].token_ids == [1, 2]
+        assert manager.stored_blocks == 1
+        assert manager.dropped_events == 2
+    finally:
+        manager.shutdown()
+
+
+def test_native_streaming_sink_rejects_negative_life_cycle_id():
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+    )
+    try:
+        with pytest.raises(ValueError, match="lifeCycle must be non-negative"):
+            manager.event_sink.set_target_life_cycle(-1)
+    finally:
+        manager.shutdown()
 
 
 def test_event_manager_attention_dp_gather_callback():

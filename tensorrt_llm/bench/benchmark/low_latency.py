@@ -31,6 +31,7 @@ from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
+from tensorrt_llm.commands._telemetry import TelemetryCommand
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
@@ -47,7 +48,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
 
-@click.command(name="latency")
+@click.command(name="latency", cls=TelemetryCommand, telemetry_llm_startup=True)
 @optgroup.group("Engine run configuration",
                 help="Runtime settings for executing a TensorRT LLM model.")
 @optgroup.option(
