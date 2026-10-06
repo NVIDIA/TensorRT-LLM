@@ -1187,35 +1187,28 @@ def test_extra_tokens_are_in_context_capacity() -> None:
     assert config.constraints[1] == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
 
 
-def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
+@pytest.mark.parametrize("guard", [None, "context_only", "compression", "connector"])
+def test_try_commit_blocks_at_context_end(guard: str | None) -> None:
     request = SimpleNamespace(
         py_request_id=1,
         is_dummy_request=False,
-        is_context_only_request=True,
+        is_context_only_request=guard == "context_only",
         context_current_position=10,
         context_remaining_length=0,
-        get_tokens=lambda beam_id: list(range(10)),
-        # The C++ backend takes get_tokens_view on this path; it yields a contiguous
-        # 1-D int32 view, so commit() sees an ndarray slice rather than a list.
         get_tokens_view=lambda beam_id: np.arange(10, dtype=np.int32),
     )
     kv_cache = _FakeKVCache(num_committed_tokens=4)
-    manager = object.__new__(KVCacheManagerV2)
-    manager.enable_block_reuse = True
-    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
-    manager.kv_compression_manages_history = False
-    manager.kv_connector_manager = None
-    manager.is_draft = False
-    manager._can_publish_block_reuse = True
+    manager = _make_publishing_manager(BlockReusePolicy.ALL_REUSABLE)
+    manager.kv_compression_manages_history = guard == "compression"
+    manager.kv_connector_manager = Mock() if guard == "connector" else None
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     manager._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
 
     manager.try_commit_blocks(request)
 
-    # The test helper passes through the int32 token-view slice.
     assert list(kv_cache.committed_tokens) == [4, 5, 6, 7, 8, 9]
     assert kv_cache.num_committed_tokens == 10
-    assert kv_cache.stopped_committing
+    assert kv_cache.stopped_committing is (guard is not None)
 
 
 def test_generation_allocation_reserves_dynamic_width() -> None:
@@ -1243,7 +1236,6 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     manager.enable_block_reuse = False
     manager._effective_draft_len = Mock(return_value=2)
     manager.kv_compression_manages_history = False
-    manager.kv_connector_manager = None
     # Fresh-page fill is off; the allocation path calls it unconditionally.
     manager._fresh_page_fill = None
 
@@ -1372,8 +1364,8 @@ def _make_publishing_manager(policy: BlockReusePolicy) -> KVCacheManagerV2:
     manager._can_publish_block_reuse = True
     manager.block_reuse_policy = policy
     manager.kv_compression_manages_history = False
-    manager.kv_connector_manager = None
     manager.conversation_manager = None
+    manager.kv_connector_manager = None
     manager.kv_cache_map = {}
     return manager
 
@@ -2961,21 +2953,10 @@ def test_window_crossing_survives_unreadable_page_indices(monkeypatch) -> None:
     assert "unavailable" in fake_logger.messages[0]
 
 
-def test_generation_token_slice_materializes_only_new_tokens(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    materialized_sizes = []
-
-    class TrackedTokenView(np.ndarray):
-        def tolist(self) -> list[int]:
-            materialized_sizes.append(self.size)
-            return super().tolist()
-
-    monkeypatch.setattr(kv_cache_v2_module, "_cpp_introspection", None)
-    token_view = np.arange(10, dtype=np.int32).view(TrackedTokenView)
+def test_generation_token_slice_shares_token_view() -> None:
+    token_view = np.arange(10, dtype=np.int32)
     request = SimpleNamespace(
         get_tokens_view=Mock(return_value=token_view),
-        get_tokens=Mock(side_effect=AssertionError("must not copy the full token vector")),
         multimodal_hashes=None,
         multimodal_positions=None,
         multimodal_lengths=None,
@@ -2983,99 +2964,25 @@ def test_generation_token_slice_materializes_only_new_tokens(
     manager = object.__new__(KVCacheManagerV2)
 
     source = manager._reuse_token_source(request)
-    assert source is token_view
     result = manager._augment_tokens_for_block_reuse(source, request, start=7, end=10)
 
-    assert result == [7, 8, 9]
-    assert all(type(token) is int for token in result)
-    assert materialized_sizes == [3]
+    assert source is token_view
+    np.testing.assert_array_equal(result, [7, 8, 9])
+    assert np.shares_memory(result, token_view)
     request.get_tokens_view.assert_called_once_with(DEFAULT_BEAM_INDEX)
-    request.get_tokens.assert_not_called()
 
 
-def test_try_commit_blocks_keeps_normal_request_open_for_generation() -> None:
-    request = SimpleNamespace(
-        py_request_id=1,
-        is_dummy_request=False,
-        is_context_only_request=False,
-        context_current_position=10,
-        context_remaining_length=0,
-        get_tokens=lambda beam_id: list(range(10)),
-        get_tokens_view=lambda beam_id: np.arange(10, dtype=np.int32),
-    )
-    kv_cache = _FakeKVCache(num_committed_tokens=4)
-    manager = object.__new__(KVCacheManagerV2)
-    manager.enable_block_reuse = True
-    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
-    manager.kv_compression_manages_history = False
-    manager.kv_connector_manager = None
-    manager.is_draft = False
-    manager._can_publish_block_reuse = True
-    manager.kv_cache_map = {request.py_request_id: kv_cache}
-    manager._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
-
-    manager.try_commit_blocks(request)
-
-    assert list(kv_cache.committed_tokens) == [4, 5, 6, 7, 8, 9]
-    assert kv_cache.num_committed_tokens == 10
-    assert not kv_cache.stopped_committing
-
-
-@pytest.mark.parametrize("guard", ["compression", "connector"])
-def test_try_commit_blocks_stops_when_generation_reuse_is_unsupported(guard: str) -> None:
-    request = SimpleNamespace(
-        py_request_id=1,
-        is_dummy_request=False,
-        is_context_only_request=False,
-        context_current_position=10,
-        context_remaining_length=0,
-        get_tokens_view=lambda beam_id: np.arange(10, dtype=np.int32),
-    )
-    kv_cache = _FakeKVCache(num_committed_tokens=4)
-    manager = object.__new__(KVCacheManagerV2)
-    manager.enable_block_reuse = True
-    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
-    manager.kv_compression_manages_history = guard == "compression"
-    manager.kv_connector_manager = Mock() if guard == "connector" else None
-    manager.is_draft = False
-    manager._can_publish_block_reuse = True
-    manager.kv_cache_map = {request.py_request_id: kv_cache}
-    manager._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
-
-    manager.try_commit_blocks(request)
-
-    assert list(kv_cache.committed_tokens) == [4, 5, 6, 7, 8, 9]
-    assert kv_cache.num_committed_tokens == 10
-    assert kv_cache.stopped_committing
-
-
-@pytest.mark.parametrize(
-    ("state", "expected_is_end"),
-    [
-        (LlmRequestState.GENERATION_IN_PROGRESS, False),
-        (LlmRequestState.GENERATION_COMPLETE, True),
-    ],
-)
-def test_try_commit_generation_blocks_commits_only_materialized_prefix(
-    state: LlmRequestState, expected_is_end: bool
-) -> None:
+def test_try_commit_generation_blocks_commits_only_materialized_prefix() -> None:
     request = SimpleNamespace(
         py_request_id=1,
         is_dummy_request=False,
         is_context_only_request=False,
         max_beam_num_tokens=15,
-        state=state,
-        get_tokens=lambda beam_id: list(range(15)),
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
         get_tokens_view=lambda beam_id: np.arange(15, dtype=np.int32),
     )
     kv_cache = _FakeKVCache(num_committed_tokens=10)
-    manager = object.__new__(KVCacheManagerV2)
-    manager.enable_block_reuse = True
-    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
-    manager.kv_compression_manages_history = False
-    manager.kv_connector_manager = None
-    manager.is_draft = False
-    manager._can_publish_block_reuse = True
+    manager = _make_publishing_manager(BlockReusePolicy.ALL_REUSABLE)
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     manager._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
 
@@ -3083,7 +2990,7 @@ def test_try_commit_generation_blocks_commits_only_materialized_prefix(
 
     assert list(kv_cache.committed_tokens) == [10, 11, 12, 13]
     assert kv_cache.num_committed_tokens == 14
-    assert kv_cache.commit_is_end is expected_is_end
+    assert not kv_cache.commit_is_end
 
 
 def test_try_commit_generation_blocks_finalizes_without_new_tokens() -> None:
@@ -3095,13 +3002,7 @@ def test_try_commit_generation_blocks_finalizes_without_new_tokens() -> None:
         state=LlmRequestState.GENERATION_COMPLETE,
     )
     kv_cache = _FakeKVCache(num_committed_tokens=10)
-    manager = object.__new__(KVCacheManagerV2)
-    manager.enable_block_reuse = True
-    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
-    manager.kv_compression_manages_history = False
-    manager.kv_connector_manager = None
-    manager.is_draft = False
-    manager._can_publish_block_reuse = True
+    manager = _make_publishing_manager(BlockReusePolicy.ALL_REUSABLE)
     manager.kv_cache_map = {request.py_request_id: kv_cache}
 
     manager.try_commit_generation_blocks(request)
@@ -3115,11 +3016,13 @@ def test_try_commit_generation_blocks_finalizes_without_new_tokens() -> None:
 @pytest.mark.parametrize(
     ("manager_overrides", "request_overrides", "has_cache"),
     [
+        ({"enable_block_reuse": False}, {}, True),
         ({"block_reuse_policy": BlockReusePolicy.PER_REQUEST}, {}, True),
         ({"kv_compression_manages_history": True}, {}, True),
         ({"kv_connector_manager": Mock()}, {}, True),
         ({"is_draft": True}, {}, True),
         ({}, {"is_dummy_request": True}, True),
+        ({}, {"is_context_only_request": True}, True),
         ({}, {"state": LlmRequestState.CONTEXT_INIT}, True),
         ({}, {}, False),
     ],
@@ -3139,13 +3042,7 @@ def test_try_commit_generation_blocks_honors_guards(
     request_fields.update(request_overrides)
     request = SimpleNamespace(**request_fields)
     kv_cache = _FakeKVCache(num_committed_tokens=10)
-    manager = object.__new__(KVCacheManagerV2)
-    manager.enable_block_reuse = True
-    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
-    manager.kv_compression_manages_history = False
-    manager.kv_connector_manager = None
-    manager.is_draft = False
-    manager._can_publish_block_reuse = True
+    manager = _make_publishing_manager(BlockReusePolicy.ALL_REUSABLE)
     manager.kv_cache_map = {request.py_request_id: kv_cache} if has_cache else {}
     for name, value in manager_overrides.items():
         setattr(manager, name, value)

@@ -89,7 +89,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     SsmLayerConfig,
     SwaScratchReuseConfig,
     TokenIdExt,
-    _cpp_introspection,
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
@@ -4352,11 +4351,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
 
     def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:
-        """Return a zero-copy beam-0 token view for block reuse.
-
-        The C++ backend consumes this view directly. The pure-Python backend materializes only
-        the selected chunk in ``_augment_tokens_for_block_reuse``.
-        """
+        """Return a zero-copy beam-0 token view for block reuse."""
         return req.get_tokens_view(DEFAULT_BEAM_INDEX)
 
     def _augment_tokens_for_block_reuse(
@@ -4388,10 +4383,7 @@ class KVCacheManagerV2(BaseResourceManager):
             or req.multimodal_positions is None
             or req.multimodal_lengths is None
         ):
-            chunk = tokens[chunk_start:chunk_end] if is_sliced else tokens
-            if _cpp_introspection is None and hasattr(chunk, "tolist"):
-                return chunk.tolist()
-            return chunk
+            return tokens[chunk_start:chunk_end] if is_sliced else tokens
 
         # Reached only with block reuse on, since every caller gates on it, and
         # only for a multimodal request. Both augment helpers below mint synthetic
