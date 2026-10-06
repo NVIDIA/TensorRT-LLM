@@ -53,6 +53,12 @@ from tensorrt_llm._torch.visual_gen.config import (
     TorchCompileConfig,
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._torch.visual_gen.parallel import (
+    TokenShardedRow,
+    TokenShardedTP,
+    classify,
+    convert_to_token_sharded_tp,
+)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import ParallelConfig
@@ -118,12 +124,17 @@ class _ExactAllReduce(nn.Module):
         return y.to(output.dtype)
 
 
-def _replace_all_reduce(blocks, make):
-    """Replace the three row-parallel all-reduces of every WanBlock with ``make()``."""
-    for blk in blocks:
-        for lin in (blk.attn1.to_out[0], blk.attn2.to_out[0], blk.ffn.down_proj):
-            assert lin.all_reduce is not None
-            lin.all_reduce = make()
+def _replace_all_reduce(model, make):
+    """Replace every all-reduce token-sharded TP turns into a reduce-scatter with ``make()``.
+
+    Driven by the converter's own rules (``classify`` on the plain-TP model's blocks), so it
+    covers whatever the conversion covers.
+    """
+    for name, kind in classify(model).items():
+        module = model.get_submodule(name)
+        linear = module.down_proj if kind == "mlp" else module
+        assert linear.all_reduce is not None, name
+        linear.all_reduce = make()
 
 
 def _capture_head_input(model):
@@ -185,12 +196,13 @@ def _build_models(rank, world_size, config_dict):
     sp_cfg = _make_model_config(config_dict, tp_size=world_size, tp_layout="token_sharded")
     sp_model = WanTransformer3DModel(sp_cfg).to(device).to(torch.bfloat16)
     _copy_ref_weights_to_tp(ref, sp_model, rank, world_size, config_dict)
-    assert sp_model._sp_tp is not None and sp_model._sp_tp.tp_size == world_size
+    assert sp_model.sharder.token_sharded_tp
+    assert isinstance(sp_model.blocks[0].attn1.to_out[0], TokenShardedRow)
     torch.manual_seed(123)
     ar_cfg = _make_model_config(config_dict, tp_size=world_size)
     ar_model = WanTransformer3DModel(ar_cfg).to(device).to(torch.bfloat16)
     _copy_ref_weights_to_tp(ref, ar_model, rank, world_size, config_dict)
-    assert ar_model._sp_tp is None
+    assert not ar_model.sharder.token_sharded_tp
     return ref, sp_model, ar_model
 
 
@@ -249,10 +261,12 @@ def _logic_vs_single_gpu(
         ref_out = ref(**inputs)
         dist.broadcast(ref_out, 0)
         sp_blocks = _capture_head_input(sp_model)
-        sp_out = sp_model(**inputs)  # also begins the helper's plan for this shape
+        sp_out = sp_model(**inputs)
         ar_out = ar_model(**inputs)
         _use_eager_per_token_adaln(ar_model)
-        _replace_all_reduce(ar_model.blocks, lambda: _EmulatedAllReduce(sp_model._sp_tp))
+        emu = TokenShardedTP(ar_model.model_config.visual_gen_mapping.tp_group_pg)
+        emu.begin(batch, thw[0] * (thw[1] // 2) * (thw[2] // 2))
+        _replace_all_reduce(ar_model, lambda: _EmulatedAllReduce(emu))
         emu_blocks = _capture_head_input(ar_model)
         emu_out = ar_model(**inputs)
         mixed_err = None
@@ -399,8 +413,8 @@ class TestWanTokenShardedTP:
 
 
 def _compiled_break_reasons(model, all_inputs):
-    """Compile every block as the pipeline does; run the inputs; return the outputs and
-    the set of graph-break reasons."""
+    """Compile every block as the pipeline does; run the inputs; return the outputs, the
+    set of graph-break reasons and the number of graphs compiled."""
     import torch._dynamo
     from torch._dynamo.utils import counters
 
@@ -411,7 +425,7 @@ def _compiled_break_reasons(model, all_inputs):
     )
     with torch.no_grad():
         outs = [model(**inp) for inp in all_inputs]
-    return outs, {str(k) for k in counters["graph_break"]}
+    return outs, {str(k) for k in counters["graph_break"]}, counters["stats"]["unique_graphs"]
 
 
 def _logic_compiled_blocks(rank, world_size):
@@ -423,15 +437,21 @@ def _logic_compiled_blocks(rank, world_size):
     ]
     with torch.no_grad():
         eager = [sp_model(**inp) for inp in all_inputs]
-    outs, sp_reasons = _compiled_break_reasons(sp_model, all_inputs)
+    outs, sp_reasons, sp_graphs = _compiled_break_reasons(sp_model, all_inputs)
     for i, (out, ref) in enumerate(zip(outs, eager)):
         err = _rel_l2(out, ref)
         _check(err <= 1e-2, f"compiled vs eager token-sharded TP, input {i}: rel-L2 {err:.3e}")
     # Token-sharded TP adds no graph break of its own: every break reason also occurs on the
     # all-reduce path (the pre-existing QK-norm all-reduce / mesh lookup break).
-    _, ar_reasons = _compiled_break_reasons(ar_model, all_inputs)
+    _, ar_reasons, ar_graphs = _compiled_break_reasons(ar_model, all_inputs)
     _check(
         sp_reasons <= ar_reasons, f"token-sharded TP-only graph breaks: {sp_reasons - ar_reasons}"
+    )
+    # One compiled block graph serves every block: the converted modules share one adapter
+    # class per base class, so blocks do not recompile on type guards.
+    _check(
+        sp_graphs <= ar_graphs,
+        f"token-sharded TP compiled {sp_graphs} graphs, plain TP {ar_graphs}",
     )
 
 
@@ -563,7 +583,14 @@ def _to_nvfp4(entry, act_amax, weight_amax=None):
     }
 
 
-def _load_block(block, linear_weights, params, sp_tp=False):
+def _as_model(block):
+    """A one-block model whose ``blocks`` container the converter's rules walk."""
+    model = nn.Module()
+    model.blocks = nn.ModuleList([block])
+    return model
+
+
+def _load_block(block, linear_weights, params, token_sharded=False):
     from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import get_nvfp4_input_scale
     from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import static_nvfp4_input_scale
 
@@ -582,7 +609,7 @@ def _load_block(block, linear_weights, params, sp_tp=False):
         else:
             block.get_parameter(name).data.copy_(value)
     # Same wiring as WanTransformer3DModel.post_load_weights.
-    fp4_input_scale = static_nvfp4_input_scale if sp_tp else get_nvfp4_input_scale
+    fp4_input_scale = static_nvfp4_input_scale if token_sharded else get_nvfp4_input_scale
     block._norm1_fp4_scale = fp4_input_scale(block.attn1.qkv_proj)
     block._norm2_fp4_scale = fp4_input_scale(block.attn2.to_q)
     block._norm3_fp4_scale = fp4_input_scale(block.ffn.up_proj)
@@ -625,7 +652,6 @@ def _logic_nvfp4_block(rank, world_size, *, batch, thw):
         WanBlock,
         WanRotaryPosEmbed,
     )
-    from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import TokenShardedTP
 
     device = torch.device(f"cuda:{rank}")
     d, ffn, text_len = 5120, _D5120_BLOCK["ffn_dim"], 64
@@ -653,8 +679,9 @@ def _logic_nvfp4_block(rank, world_size, *, batch, thw):
     _load_block(ar_block, fp4_weights, params)
     sp_cfg = _block_config(vgm, True, True)
     sp = TokenShardedTP.from_model_config(sp_cfg)
-    sp_block = WanBlock(sp_cfg, 0, sp_tp=sp).to(device)
-    _load_block(sp_block, fp4_weights, params, sp_tp=True)
+    sp_block = WanBlock(sp_cfg, 0).to(device)
+    convert_to_token_sharded_tp(_as_model(sp_block), sp)
+    _load_block(sp_block, fp4_weights, params, token_sharded=True)
     for blk in (ar_block, sp_block):
         assert all(
             s is not None
@@ -681,11 +708,15 @@ def _logic_nvfp4_block(rank, world_size, *, batch, thw):
 
     with torch.no_grad():
         ref = ar_block(*block_inputs)
-        sp.begin(batch, seq)
-        out = sp.unshard(sp_block(sp.shard(x), *block_inputs[1:]))
-        _replace_all_reduce([ar_block], lambda: _EmulatedAllReduce(sp))
+        plan = sp.begin(batch, seq)
+        # The block sees this rank's [n, g, D] sample groups and the shard's table.
+        out = sp_block(
+            sp.local_view(sp.shard(x)), enc, sp.per_sample_table(temb), *block_inputs[3:]
+        )
+        out = sp.unshard(out.reshape(plan.local_rows, -1))
+        _replace_all_reduce(_as_model(ar_block), lambda: _EmulatedAllReduce(sp))
         emu = ar_block(*block_inputs)
-        _replace_all_reduce([ar_block], _ExactAllReduce)
+        _replace_all_reduce(_as_model(ar_block), _ExactAllReduce)
         exact = ar_block(*block_inputs)
     fp4 = ["Fp4QuantizedTensor"]
     expected = {"attn1.qkv_proj": fp4, "attn2.to_q": fp4, "ffn": fp4}

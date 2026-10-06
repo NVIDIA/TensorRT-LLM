@@ -53,11 +53,9 @@ def apply_rotary_emb(
 class Attention(nn.Module):
     """Attention module for visual generation models.
 
-    With ``tp_size > 1`` the output projection ``to_out`` is row-parallel and
-    all-reduces its output. Built with ``reduce_output=False`` it returns this rank's
-    K-partial sums instead (bias on tp_rank 0 only) and the caller owns the reduction,
-    e.g. ``TokenShardedTP.row_linear``; ``split_qkv()`` / ``attend()`` then let the
-    caller run the projections itself.
+    Batch and sequence lengths are taken from the projected ``q`` (not from the input), so
+    the projections may change the token count: under token-sharded TP the input is this
+    rank's tokens and the converted ``qkv_proj`` / ``to_q`` return all of them.
     """
 
     def __init__(
@@ -79,7 +77,6 @@ class Attention(nn.Module):
         enable_sequence_parallel: bool = True,
         async_ulysses: bool = False,
         separate_qkv_is_self_attention: bool = False,
-        reduce_output: bool = True,
     ):
         super().__init__()
 
@@ -227,7 +224,7 @@ class Attention(nn.Module):
                     skip_create_weights_in_init=self.skip_create_weights_in_init,
                     force_dynamic_quantization=self.force_dynamic_quantization,
                     tensor_parallel_mode=TensorParallelMode.ROW if self.tp_size > 1 else None,
-                    reduce_output=(self.tp_size > 1 and reduce_output),
+                    reduce_output=(self.tp_size > 1),
                     allreduce_strategy=self.allreduce_strategy,
                     override_tp_sharding=(self.local_q_dim_start, self.local_q_dim_end),
                 )
@@ -667,8 +664,8 @@ class Attention(nn.Module):
 
         q/k/v are this rank's [B, S, H_local * head_dim] / [B, S_kv, KV_local * head_dim]
         projections (e.g. from ``get_qkv`` or ``split_qkv``). Returns the attention output
-        [B, S, H_local * head_dim] *before* ``to_out``, so callers that own the output
-        projection (e.g. ``TokenShardedTP.row_linear``) can apply it themselves.
+        [B, S, H_local * head_dim] *before* ``to_out``, for callers that apply the output
+        projection themselves.
         """
         q, k = self.apply_qk_norm(q, k)
 

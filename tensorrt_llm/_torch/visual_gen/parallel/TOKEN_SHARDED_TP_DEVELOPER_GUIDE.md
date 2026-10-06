@@ -4,15 +4,15 @@
 
 This guide covers `parallel_config.tp_layout='token_sharded'` in VisualGen:
 
-- `tensorrt_llm/_torch/visual_gen/parallel/token_sharded_tp.py` — the model-neutral
-  helper (`TokenShardedTP`, `TokenShardPlan`, `RowNorm`, row-local functions).
-- `tensorrt_llm/_torch/visual_gen/modules/fused_norm_quant.py` — the fused
-  LayerNorm(+AdaLN / affine)(+NVFP4) wrappers the helper uses at `D == 5120`.
-- `tensorrt_llm/_torch/visual_gen/models/wan/transformer_wan.py` — the first adopter
-  (`WanBlock._forward_sp_tp`).
+- `tensorrt_llm/_torch/visual_gen/parallel/token_sharded_tp.py`: the plan of which tokens
+  each TP rank holds and the collectives (`TokenShardPlan`, `TokenShardedTP`).
+- `tensorrt_llm/_torch/visual_gen/parallel/token_sharded_modules.py`: the adapters that
+  convert a model's existing TP modules, and the rules that pick them.
+- `SequenceSharder` (`tensorrt_llm/_torch/visual_gen/utils.py`): the call sites models
+  already have for Ulysses also carry this layout.
+- `tensorrt_llm/_torch/visual_gen/models/wan/transformer_wan.py`: the first adopter.
 
-Use it when adding token-sharded TP to another DiT (in-tree or your own model code), or when
-changing the helper. User-facing configuration is in
+Use it when adopting token-sharded TP in another DiT, or when changing the layout code. User-facing configuration is in
 [docs/source/models/visual-generation.md](../../../../docs/source/models/visual-generation.md)
 (Multi-GPU Parallelism).
 
@@ -71,11 +71,10 @@ inside a TP group. Combining the two is currently rejected.
    rows, which is row-local and gives the same bytes per row.
 4. All ranks of a TP group run the transformer on identically shaped inputs
    (`begin()` checks this on the first use of each shape).
-5. Per-row math is the model's own: the fused op at `D == 5120`, the model's
-   `LayerNorm` module (`RowNorm.module`) otherwise. The unit tests assert that the
-   transformer blocks' output is **bitwise equal** to the all-reduce model's when that
-   model's all-reduces are done as the same reduce-scatter + all-gather. What remains is
-   listed under Numerics.
+5. Per-row math is the model's own code, run on the shard: the block's norms, modulation
+   and residual adds are unchanged. The unit tests assert that the transformer blocks'
+   output is **bitwise equal** to the all-reduce model's when that model's all-reduces are
+   done as the same reduce-scatter + all-gather. What remains is listed under Numerics.
 
 ## Numerics versus all-reduce TP
 
@@ -132,160 +131,120 @@ Padding rules at the boundaries:
 
 - `shard` zero-fills pad rows; `unshard` / `all_gather` drop them (for `B = 1` this is a
   free prefix view).
-- `row_linear` pads the GEMM **input** (`tp` times smaller than the output partial);
+- `TokenShardedRow` pads the GEMM **input** (`tp` times smaller than the output partial);
   zero pad rows leave a dynamic amax unchanged and only carry tp_rank 0's bias, which
   stays confined to pad rows.
-- `mlp_residual` runs the MLP on the real `B * S` rows only (pad rows are non-zero after
-  a norm and would perturb dynamic-amax quantization inside the MLP) and pads the output
-  partial before the reduce-scatter.
+- `TokenShardedMLP` runs the MLP on the real `B * S` rows only (pad rows are non-zero
+  after a norm and would perturb dynamic-amax quantization inside the MLP) and pads the
+  output partial before the reduce-scatter.
 
 The plan is a frozen dataclass of Python ints (compile and CUDA-graph safe), cached per
 `(B, S)`.
 
-## Building blocks
+## How a model runs it
 
-`TokenShardedTP` is not an `nn.Module`: it holds no parameters or tensors, one
-instance per transformer (per token stream), and blocks keep a plain reference.
+One forward, unchanged, with two pieces installed by `BaseDiffusionModel._apply_tp_layout()`
+(called at the end of the model's `__init__`).
 
-| Call | Shapes / contract |
+**1. The sharder carries the layout.** `SequenceSharder.use_token_sharded_tp(helper)` makes
+the call sites a model already has for Ulysses carry token-sharded TP:
+
+| Call | Under token-sharded TP |
 |---|---|
-| `begin(B, S)` | Eager, once per forward before the blocks. Selects the cached plan; the first use of a shape does one `all_gather_object` shape check (error on disagreement). |
-| `shard(x)` | `[B, S, D]` (any strides) → contiguous `[m, D]`. |
-| `unshard(x_loc)` | `[m, D]` → `[B, S, D]` (all-gather, padding dropped). |
-| `shard_rows(t)` | Per-token metadata `[B, S, *rest]` → `[m, *rest]` (zeros on pad rows). |
-| `per_sample_table(t)` | Per-sample table `[B, *rest]` → this shard's `[n, *rest]`; entry `j` applies to local rows `[j * g, (j + 1) * g)`. Built from slices only (graph-capture safe). |
-| `reduce_scatter(partial)` | `[B * S_pad, N]` (or `[B * S, N]` / `[B, S, N]`, padded here) → `[m, N]`. |
-| `all_gather(act_loc)` | `[m, K]` → `[B * S, K]`; an `Fp4QuantizedTensor` → payload `[B * S, K/2]` + SF regrouped for `B * S` rows. |
-| `residual(x, y, gate=None)` | `x + y`, or `x + y * gate` in fp32 (`gate`: this shard's `[n, D]` table). |
-| `norm(x, RowNorm)` | Row-local LayerNorm (+AdaLN and/or affine) (+static NVFP4 quantize). |
+| `shard(x, dim=1)`: residual stream, per-token tables | `begin(B, S)`, then this rank's rows as `[n, g, ...]` sample groups |
+| `shard_per_sample(t)`: per-sample `[B, ...]` tables | the shard's `[n, ...]` entries |
+| `gather(x, dim=1)` | all real tokens, `[B, S, ...]` |
+| `shard_rope(...)`, `shard_attention_input(...)`: RoPE, positions, masks, attention-side K/V | unchanged: attention sees all tokens |
+| `is_active`, `size`, `rank`, `group` | their sequence-parallel meaning (inactive), so Ulysses-only code stays off |
+| `token_sharded_tp` | True |
 
-Every call checks its input's leading dimensions against the current plan (so a
-forgotten `shard()` or a `begin()` for another shape in between raises instead of
-silently reinterpreting rows), and `residual` / `norm` check that each table has this
-shard's entry count (`per_sample_table`) or row count (`shard_rows`).
+`[n, g, D]` is `n = len(plan.entry_batch)` groups of `g = plan.rows_per_entry` rows, each
+inside one sample. A per-sample `[n, 1, D]` table broadcasts over it as a `[B, 1, D]` table
+does over `[B, S, D]`, so block code written for `[B, S, D]` runs unchanged on the shard,
+and a fused AdaLN kernel gets `seq_len_per_batch = g` from the shapes.
 
-GEMM-owning boundary ops — the seam that later overlap / fused GEMM+collective kernels
-replace, so model code does not change again:
+**2. The converter swaps the boundary modules.** Each converted module becomes a cached
+subclass of its own class (a `module.__class__` swap, as PyTorch's FSDP2 `fully_shard`
+does): parameters, state-dict names, quant methods and `isinstance` checks are unchanged,
+and the GEMM stays the module's (`super().forward`).
 
-| Call | Does |
-|---|---|
-| `column_linear(linear, act_loc)` | all-gather → column-parallel `linear` → `[B, S, N_local]` |
-| `row_linear(linear, act)` | pad → row-parallel `linear` (K-partials) → reduce-scatter → `[m, N]` |
-| `row_linear_residual_norm(linear, act, residual, *, gate, norm)` | `row_linear` → residual → norm; returns `(x, h)` |
-| `mlp_residual(mlp, act_loc, residual, *, gate)` | all-gather → MLP → reduce-scatter → residual |
+| Adapter | Applied to (rule) | Its forward |
+|---|---|---|
+| `TokenShardedColumn` | an `Attention`'s projections that read the hidden states: `qkv_proj`, `to_q`, and `to_k` / `to_v` when `separate_qkv_is_self_attention` (R3) | quantize first if the consumer has a static NVFP4 input scale; all-gather the real rows; the GEMM; returns `[B, S, N_local]` |
+| `TokenShardedRow` | a row-parallel `Linear` that all-reduces (R1) | pad the GEMM input per sample; the GEMM with its all-reduce off; reduce-scatter; returns `[n, g, N]` |
+| `TokenShardedMLP` | an `MLP` / `GatedMLP` whose `down_proj` all-reduces (R2) | all-gather the real rows (quantized first for a static NVFP4 input projection); the MLP; pad the output; reduce-scatter |
 
-TRT-LLM modules passed to them are checked: a `Linear` must have the expected TP mode
-(`ROW` with `reduce_output=False`, or `COLUMN` without `gather_output`) and the helper's
-TP size; for `mlp_residual` any module with a TRT-LLM `down_proj` (`MLP`, `GatedMLP`,
-...) has its `down_proj` checked the same way; an NVFP4-gathered input must reach a
-`Linear` that has a static NVFP4 input scale. Any other callable is accepted as is and
-must follow the contracts below.
+Everything else runs as in plain TP: QK-norm (`RMSNormTPAware` reduces over heads within
+each token), encoder-side K/V projections, the embedders, the output head. The model is built
+exactly as for plain TP: the converter turns off the converted projections' all-reduce
+(`reduce_output`, `all_reduce`, `use_fused_gemm_allreduce`). Attention takes batch and
+sequence lengths from the projected q, so a column adapter may return more tokens than it
+was given.
 
-`RowNorm(eps, weight, bias, scale, shift, quant_scale, identity, module)`: affine
-(`weight`/`bias`) and/or AdaLN (`scale`/`shift`, `[n, D]` tables); `identity=True` skips
-the norm but still quantizes. At `D == 5120` with bf16 on CUDA and exactly one of affine
-or AdaLN the fused `fused_adaptive_layernorm(_quant)` op runs; otherwise fp32 LayerNorm
-(`module(x.float())` when `module` is given — pass the model's own LayerNorm so the
-kernel matches the all-reduce path — else `F.layer_norm`), then the modulation, then
-`quantize_nvfp4` if `quant_scale` is set. Custom norms (e.g. RMSNorm) can be passed to
-`row_linear_residual_norm(norm=callable)` and call `quantize_nvfp4`.
+**Wan.** The rules give exactly five conversions per block: `attn1.qkv_proj` and
+`attn2.to_q` (column), `attn1.to_out.0` and `attn2.to_out.0` (row), `ffn` (MLP). Wan
+declares no exceptions. Its forward adds one `shard_per_sample` call and keys four sites on
+`sharder.token_sharded_tp`: the `expand_timesteps` broadcast, the per-token AdaLN runtime
+(off on shards), the static-scale rule for its norms' NVFP4 output, and the VSA
+rejection. `WanBlock.forward` raises when the modulation table does not match its hidden
+states, so a global table cannot silently mix samples in the fused AdaLN kernel.
 
-Never pass a global `[B, D]` modulation table to a row-local op on a shard: the fused
-AdaLN kernel indexes `batch = local_row // seq_len_per_batch`, so on a shard it would
-silently mix CFG halves. Build the shard's table with `per_sample_table` /
-`shard_rows`. The helper rejects a table whose length is neither the shard's entry count
-nor its row count; when `B` and `tp` are coprime the per-sample table has `B` entries,
-the same as the global one, so that case cannot be caught.
+## The converter
 
-## Contracts for custom callables
+- `classify(model, containers=..., exceptions=...)` returns `{module name: kind}` without
+  converting; `convert_to_token_sharded_tp(...)` converts and logs one line.
+- **Exceptions** (`_token_sharded_tp_exceptions`, relative to a block):
+  `{pattern: "column" | "row" | "mlp" | adapter class | "keep"}`, for what the rules
+  cannot decide.
+- **`register_token_sharded_adapter(module_cls, adapter)`**: an adapter for a custom module
+  class (e.g. a joint projection with its own all-reduce), used wherever the class appears.
+- **Validation** raises when:
+  - a block has nothing to convert (is the model built with `tp_size > 1`?);
+  - an all-reduce would act on a token shard. Allowed are a converted projection's own, a
+    TP-aware RMSNorm's per-token head reduction, and a column `Linear`'s unused one.
+    Anything else needs a registered adapter or an exception.
+  - the blocks of one container would convert differently (they share one compiled graph).
 
-| Argument | Contract |
-|---|---|
-| `row_linear` / `row_linear_residual_norm` `linear` | Takes `[B * S_pad, K_local]` (or the input's leading shape); returns this rank's K-partial sums `[rows, N]`. Add the bias on exactly one rank, otherwise the reduce-scatter sums it `tp` times. |
-| `column_linear` `linear` | Takes `[B * S, K]` bf16 or an `Fp4QuantizedTensor`; returns a contiguous `[B * S, N_local]` (the result is viewed as `[B, S, N_local]`). |
-| `mlp_residual` `mlp` | Takes `[B * S, K]` (or FP4); returns K-partial sums `[B * S, N]`, bias on exactly one rank. |
-| `norm` callable | Row-local `[m, N] → [m, N]` or an `Fp4QuantizedTensor` for `m` rows. |
-| NVFP4 activations | Quantize with the **consumer's** static input scale (`static_nvfp4_input_scale(consumer)`) and give the result only to that consumer: a TRT-LLM `Linear` fed a pre-quantized input without `reciprocal_scale` uses its own `input_scale`-derived alpha, and the helper cannot check that the two scales are the same tensor. |
+  Converting twice also raises.
+- **Adapter classes are cached** per (adapter, base class), so one compiled block graph serves
+  all blocks. Deepcopy and pickle of a converted model are not supported.
 
-## Using token-sharded TP in your own DiT
+## Adopting it in another model
 
-1. **Group.** Inside VisualGen: `TokenShardedTP.from_model_config(model_config)`
-   (returns `None` unless `tp_layout` is `token_sharded`, and validates the mapping).
-   Elsewhere the helper itself only needs a `torch.distributed` group:
-   `TokenShardedTP(tp_process_group)`; the group rank order is the token-shard order.
-2. **Layers.** TRT-LLM `Linear` / `MLP` / `GatedMLP` need a TRT-LLM `Mapping` whose TP
-   communicators exist: inside VisualGen that is `model_config.mapping`; outside it build
-   the mapping with `VisualGenMapping(...).to_llm_mapping()` and give `MLP` / `GatedMLP`
-   a `ModelConfig(mapping=..., allreduce_strategy=AllReduceStrategy.NCCL)` (their column
-   projections are built with the default all-reduce, whose `AUTO` strategy needs an IPC
-   workspace). Or pass your own GEMM callables.
-   - Column projections: `Linear(..., tensor_parallel_mode=COLUMN, reduce_output=False)`.
-   - Row projections: `Linear(..., tensor_parallel_mode=ROW, reduce_output=False)`,
-     `MLP(reduce_output=False)` / `GatedMLP(reduce_output=False)`, VisualGen
-     `Attention(reduce_output=False)` (its `to_out`).
-   - For a `BaseDiffusionModel` subclass set `_supports_token_sharded_tp = True`
-     (otherwise the base class rejects the option).
-3. **Per forward (eager).** `sp.begin(B, S)`, `x = sp.shard(x)`, the blocks, then
-   `x = sp.unshard(x)` before the (replicated) output head.
-4. **Per boundary.**
-   `x, h = sp.row_linear_residual_norm(out_proj, o, x, gate=..., norm=RowNorm(...))`,
-   then `y = sp.column_linear(in_proj, h)`; MLPs: `sp.mlp_residual(mlp, h, x, gate=...)`.
-5. **Modulation.** `sp.per_sample_table(table + temb)` for `[B, ...]` AdaLN;
-   `sp.shard_rows(...)` for per-token metadata.
-6. **FP4 gather.** `RowNorm(quant_scale=static_nvfp4_input_scale(next_linear))`.
-7. **Attention.** VisualGen `Attention` exposes `split_qkv()` and `attend()` (QK-norm,
-   RoPE and attention on already-projected q/k/v, returning the output before `to_out`),
-   so the column projection can run through `column_linear`.
-
-```python
-class MyBlock(nn.Module):
-    def __init__(self, model_config, sp):
-        super().__init__()
-        self.sp = sp  # TokenShardedTP or None
-        mapping = model_config.mapping
-        self.norm1 = LayerNorm(hidden_size=D, eps=1e-6, has_weights=False, has_bias=False)
-        self.qkv = Linear(D, 3 * D, mapping=mapping, reduce_output=False,
-                          tensor_parallel_mode=TensorParallelMode.COLUMN, ...)
-        self.out = Linear(D, D, mapping=mapping, reduce_output=sp is None,
-                          tensor_parallel_mode=TensorParallelMode.ROW, ...)
-        self.mlp = MLP(hidden_size=D, intermediate_size=F, bias=True, config=model_config,
-                       reduce_output=sp is None)
-
-    def forward_sp(self, x_loc, temb):
-        sp = self.sp
-        shift, scale, gate, c_shift, c_scale, c_gate = sp.per_sample_table(
-            self.table.float() + temb.float()).unbind(1)
-        h = sp.norm(x_loc, RowNorm(scale=scale, shift=shift, module=self.norm1,
-                                   quant_scale=static_nvfp4_input_scale(self.qkv)))
-        o = my_attention(sp.column_linear(self.qkv, h))  # all [B, S] tokens
-        x_loc, h = sp.row_linear_residual_norm(
-            self.out, o, x_loc, gate=gate,
-            norm=RowNorm(scale=c_scale, shift=c_shift,
-                         quant_scale=static_nvfp4_input_scale(self.mlp.up_proj)))
-        return sp.mlp_residual(self.mlp, h, x_loc, gate=c_gate)
-```
+1. Plain TP must work: the rules read its TP metadata.
+2. Set `_supports_token_sharded_tp = True`, call `self._apply_tp_layout()` at the end of
+   `__init__` (after `self.sharder` exists), and set `_token_sharded_tp_blocks` if the block
+   containers are not `blocks`.
+3. Route the residual stream and per-token tables through `sharder.shard` / `gather` (as for
+   Ulysses), per-sample tables through `sharder.shard_per_sample`, and attention-side inputs
+   (RoPE, positions, masks) through `shard_rope` / `shard_attention_input`.
+4. Code between projections must be row-local, and must take batch and sequence lengths
+   from the projected q (not from the block input) where it needs them.
+5. Add exceptions or register adapters for custom modules, and add a bitwise test at
+   `B = 2`, `TP = 2` against the model's plain-TP twin with its all-reduces emulated
+   (`classify` finds them).
 
 ## Current limits
 
-- One helper holds one plan: `begin()` replaces it. Dual-stream (MMDiT) models need one
-  helper per token stream.
-- `column_linear` all-gathers on every call, so separate q/k/v projections done that
-  way gather three times. The alternative, one `sp.all_gather` followed by direct GEMM
-  calls, works but sits outside the boundary ops that later overlap work replaces.
-- Model-owned attention classes must split projection, attention and output projection
-  themselves (VisualGen `Attention` provides `split_qkv()` / `attend()`).
-- `RowNorm` is LayerNorm only; RMSNorm goes through a `norm=` callable.
-- The rank-agreement check runs on the first use of each shape only: a rank that reuses
-  a cached shape while a peer starts a new one is not detected (the collectives then
-  hang or fail instead of raising).
-- NVFP4 gathers need static scales; dynamic NVFP4 gathers BF16 (see below).
+- **One token stream per model.** MMDiT text + image or audio + video need a plan per
+  stream, and Attention recording which stream its q and k/v read.
+- **Separate q/k/v self-attention projections gather three times**, once per projection.
+- **The rank-agreement check runs only on the first use of each shape.** A rank that reuses a
+  cached shape while a peer starts a new one is not detected: the collectives then hang or
+  fail instead of raising.
+- **NVFP4 gathers need static scales;** dynamic NVFP4 gathers BF16 (see below).
+- **The NVFP4 quantize before the gather uses the consuming `Linear`'s op.** That is the
+  autotuned one when VisualGen enables it, and its tactic is chosen per rank. Agreeing on it
+  across ranks, or pinning the plain op, is a follow-up.
+- **Per-token AdaLN fused kernels stay off under this layout.**
 
 ## Quantization: what is all-gathered
 
 The rule: gather NVFP4 iff the consumer has a **static** NVFP4 input scale
 (`static_nvfp4_input_scale(linear)` is not `None`); quantizing each shard with that
-scale gives exactly the bytes the consumer would produce on all rows. Wan wires its
-`RowNorm.quant_scale` values with this function when token-sharded TP is on.
+scale gives exactly the bytes the consumer would produce on all rows. The column and MLP
+adapters quantize a bf16 input by this rule (decided per call); Wan's fused norms already
+emit NVFP4 at `D == 5120`, with their scales wired by the same rule.
 
 | Checkpoint / mode | Gathered | Numerics vs all-reduce TP |
 |---|---|---|
@@ -305,10 +264,12 @@ Inductor).
 
 ## torch.compile and CUDA graphs
 
-- `begin`, `shard` and `unshard` run in the eager model forward; blocks are compiled one
-  by one as today. Inside a block token-sharded TP adds only functional collectives
-  (`all_gather_single` / `reduce_scatter_single` on the group *name*, each followed by
-  an explicit wait), views/pads, existing custom ops and reads of the plan's Python ints.
+- The sharder's `shard` / `gather` run in the eager model forward (with `begin`); blocks
+  are compiled one by one as today. Inside a block token-sharded TP adds only the adapters'
+  functional collectives (`all_gather_single` / `reduce_scatter_single` on the group
+  *name*, each followed by an explicit wait), views/pads, existing custom ops and reads of
+  the plan's Python ints. The adapter classes are cached per base class, so blocks share
+  one graph.
 - Each new `(B, S)` specializes the block graphs: the plan's ints are guarded as
   constants, so unlike the all-reduce path the blocks do not become shape-dynamic after
   a few shapes. Warm up every served shape, and keep the number of distinct shapes well
@@ -328,7 +289,7 @@ Inductor).
 
 | Setting | Behavior | Tested |
 |---|---|---|
-| `cfg_size = 2` | Composes (TP groups sit inside each CFG half). | E2E LPIPS (`cfg2_tp2_sp`) |
+| `cfg_size = 2` | Composes (TP groups sit inside each CFG half). | E2E LPIPS (`cfg2_tp2_ts`) |
 | Batched CFG (`B = 2`) | Composes; a shard may straddle the cond/uncond boundary (per-shard tables handle it). | Unit (TP 2/3/4/8) |
 | Uneven heads (e.g. `tp_size = 3`) | Composes (token sharding is independent of head sharding). | Unit |
 | torch.compile, CUDA graphs | Compose. | Unit |
@@ -338,28 +299,30 @@ Inductor).
 | TeaCache | Expected to compose (it wraps the whole forward); accepted by the config. | Config only |
 | CPU offload, parallel VAE, runtime LoRA | Expected to compose (they do not touch the block boundaries). | Not tested |
 
-## Extension points (later work)
+## Where later optimizations land
 
-- Communication/compute overlap, fused GEMM + reduce-scatter (with a residual + norm +
-  quantize epilogue) and fused all-gather + GEMM replace `column_linear`,
-  `row_linear_residual_norm` and `mlp_residual`; call sites do not change.
-- Dynamic-scale NVFP4 gather (all-reduce-max of the local amax, then quantize the shard)
-  and static FP8 gather.
-- Composition with Ulysses / ring (nest the token shard inside the sequence shard).
-- Other models: a declarative per-model plan (module-name patterns mapped to gather / scatter
-  styles, applied with hooks), so a model's own block forward runs unchanged on a per-sample
-  token layout; `_supports_token_sharded_tp` stays the opt-in. The explicit boundary ops
-  remain for paths that need fused norm + quantize (Wan today).
-- Coalescing the payload and scaling-factor all-gathers.
-- Symbolic plan sizes, so blocks stay shape-dynamic across `(B, S)`.
+| Optimization | Lands in | Model change |
+|---|---|---|
+| FP8 block-scale all-gather (1x128 per-token scales) | `TokenShardedColumn` / `TokenShardedMLP`, plus row alignment in the plan | none |
+| Fused GEMM + reduce-scatter; per-destination GEMM + copy-engine push | `TokenShardedRow` (an inner adapter on `down_proj` for MLPs) | none |
+| Per-source GEMMs as rows arrive (copy-engine all-gather) | the column / MLP adapters; needs `out=` on the GEMM runners | none |
+| Attention overlapped with `to_out`'s reduce-scatter | an Attention method plus a per-chunk API on `TokenShardedRow` | one branch in the block |
+| Reduce-scatter fused with the residual + norm | a layout op with one return type in both layouts | the block passes its epilogue |
+| Dynamic-scale NVFP4 gather; coalesced payload + scaling-factor gathers | the column / MLP adapters | none |
+| Composition with Ulysses / ring | nest the token shard inside the sequence shard | none expected |
+| Symbolic plan sizes (blocks stay shape-dynamic across `(B, S)`) | `TokenShardPlan` | none |
+
+Each optimization keeps the adapter's plain path (`super().forward`) as its fallback, chosen
+by a shape/dtype rule, and is tested against it.
 
 ## Tests
 
 | Level | File |
 |---|---|
-| Plan, row-local ops, SF layout, shape/table checks, validation (CPU) | `tests/unittest/_torch/visual_gen/test_token_sharded_tp.py` |
-| Collectives, gloo and NCCL (bitwise), Linear/MLP/GatedMLP checks, compile, CUDA graphs | `tests/unittest/_torch/visual_gen/multi_gpu/test_token_sharded_tp_collectives.py` |
-| Fused LN + NVFP4 on shards (SM100) | `tests/unittest/_torch/visual_gen/kernels/parallel/test_token_sharded_tp_norm.py` |
+| Plan, per-shard tables, SF layout, shape checks, capability gate, Wan's table check (CPU) | `tests/unittest/_torch/visual_gen/test_token_sharded_tp.py` |
+| Sharder mode, converter rules and validation (CPU) | `tests/unittest/_torch/visual_gen/test_token_sharded_tp_layout.py` |
+| Collectives, sharder round trip and adapters (gloo, exact); real Linear / MLP / GatedMLP, NVFP4, fullgraph compile, CUDA graphs (NCCL) | `tests/unittest/_torch/visual_gen/multi_gpu/test_token_sharded_tp_collectives.py` |
+| Fused LN + NVFP4 on shards (Blackwell) | `tests/unittest/_torch/visual_gen/kernels/parallel/test_token_sharded_tp_norm.py` |
 | Wan model / block level (bitwise vs emulated all-reduce, vs single GPU, vs fp32-exact all-reduce) | `tests/unittest/_torch/visual_gen/multi_gpu/test_wan_token_sharded_tp.py` |
-| E2E LPIPS (`cfg2_tp2_sp`) | `tests/integration/defs/examples/visual_gen/test_visual_gen_multi_gpu.py` |
+| E2E LPIPS (`cfg2_tp2_ts`) | `tests/integration/defs/examples/visual_gen/test_visual_gen_multi_gpu.py` |
 | Shared SF-layout references for the tests above | `tests/unittest/_torch/visual_gen/token_sharded_tp_test_utils.py` |

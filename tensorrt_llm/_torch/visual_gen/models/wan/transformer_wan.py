@@ -40,11 +40,7 @@ from tensorrt_llm._torch.visual_gen.modules.fused_norm_quant import (
     apply_fused_layernorm_affine_quant,
 )
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
-from tensorrt_llm._torch.visual_gen.parallel import (
-    RowNorm,
-    TokenShardedTP,
-    static_nvfp4_input_scale,
-)
+from tensorrt_llm._torch.visual_gen.parallel import static_nvfp4_input_scale
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
@@ -296,7 +292,6 @@ class WanBlock(nn.Module):
         model_config: DiffusionModelConfig,
         _layer_idx: int,
         added_kv_proj_dim: int = None,
-        sp_tp: Optional[TokenShardedTP] = None,
     ):
         """Build one Wan transformer block.
 
@@ -304,15 +299,9 @@ class WanBlock(nn.Module):
             model_config: The transformer's DiffusionModelConfig.
             _layer_idx: Block index.
             added_kv_proj_dim: Input dim of the I2V image K/V projections, or None.
-            sp_tp: The transformer's TokenShardedTP helper when
-                parallel_config.tp_layout='token_sharded' is on (the residual stream is then
-                token-sharded across the TP group and the three row-parallel projections
-                return partial sums); None for the all-reduce TP path.
         """
         super().__init__()
         config = model_config.pretrained_config
-        # Plain reference (not a submodule): the helper holds no parameters or tensors.
-        self._sp_tp = sp_tp
 
         if hasattr(config, "hidden_size"):
             hidden_size = config.hidden_size
@@ -373,7 +362,6 @@ class WanBlock(nn.Module):
             layer_idx=_layer_idx,
             async_ulysses=self._use_async_ulysses,
             module_name=f"blocks.{_layer_idx}.attn1",
-            reduce_output=sp_tp is None,
         )
 
         # Cross-attention with separate Q, K, V
@@ -388,7 +376,6 @@ class WanBlock(nn.Module):
             layer_idx=_layer_idx,
             module_name=f"blocks.{_layer_idx}.attn2",
             enable_sequence_parallel=False,
-            reduce_output=sp_tp is None,
         )
 
         if cross_attn_norm:
@@ -426,7 +413,7 @@ class WanBlock(nn.Module):
             dtype=dtype,
             config=model_config,
             layer_idx=_layer_idx,
-            reduce_output=(tp_size != 1) and sp_tp is None,
+            reduce_output=(tp_size != 1),
         )
 
         # VSA gates (CUTEDSL backend, sparse_attention_config.algorithm == "vsa").
@@ -441,7 +428,7 @@ class WanBlock(nn.Module):
             and _sa_cfg is not None
             and getattr(_sa_cfg, "algorithm", None) == "vsa"
         )
-        if _is_vsa and sp_tp is not None:
+        if _is_vsa and getattr(model_config.parallel, "token_sharded_tp", False):
             raise ValueError(
                 "Token-sharded TP does not support Video Sparse Attention "
                 "(sparse_attention_config.algorithm='vsa') yet: the VSA gates are projected "
@@ -571,9 +558,15 @@ class WanBlock(nn.Module):
         freqs_sin,
         timestep=None,
     ):
-        if self._sp_tp is not None:
-            return self._forward_sp_tp(
-                x, encoder_hidden_states, temb, freqs_cos, freqs_sin, timestep
+        # The modulation table must match x: per-sample [B, 6, D] or per-token [B, S, 6, D].
+        # Under token-sharded TP x is this rank's [n, g, D] sample groups and the tables must
+        # be the shard's (SequenceSharder.shard / shard_per_sample); a global table would mix
+        # samples (silently, in the fused AdaLN kernel).
+        if temb.shape[: temb.ndim - 2] != x.shape[: temb.ndim - 2]:
+            raise ValueError(
+                f"WanBlock: modulation table {tuple(temb.shape)} does not match the hidden "
+                f"states {tuple(x.shape)}; under token-sharded TP pass the sharder's "
+                "per-shard tables."
             )
         pertoken_adaln = self._pertoken_adaln.prepare(x, temb, self.scale_shift_table)
         if pertoken_adaln is None:
@@ -702,8 +695,7 @@ class WanBlock(nn.Module):
     ) -> torch.Tensor:
         """Text (+ I2V image) cross-attention from projected queries q [B, S, H_local * Dh].
 
-        Returns the attention output before attn2.to_out (shared by the all-reduce and the
-        token-sharded TP paths).
+        Returns the attention output before attn2.to_out.
         """
         # I2V: Split encoder_hidden_states into image and text parts if needed
         encoder_hidden_states_img = None
@@ -745,79 +737,6 @@ class WanBlock(nn.Module):
             attn2_output = attn2_output + attn_img_output
         return attn2_output
 
-    def _forward_sp_tp(
-        self,
-        x: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        temb: torch.Tensor,
-        freqs_cos: Optional[torch.Tensor],
-        freqs_sin: Optional[torch.Tensor],
-        timestep: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Token-sharded TP block (parallel_config.tp_layout='token_sharded').
-
-        x: this TP rank's [local_rows, D] rows of the token-sharded residual stream;
-        returns the updated rows. attn1/attn2 to_out and ffn.down_proj were built with
-        reduce_output=False, so each boundary is a reduce-scatter, row-local residual and
-        norm (+ static NVFP4 quantize), then an all-gather into the next projection.
-        Attention always sees the full [B, S] tokens (heads sharded as in plain TP).
-        """
-        sp = self._sp_tp
-        if temb.ndim == 4:  # per-token modulation [B, S, 6, D] (TI2V / 2-D timesteps)
-            mod = self.scale_shift_table.float() + sp.shard_rows(temb).float()  # [m, 6, D]
-        else:  # per-sample modulation [B, 6, D]
-            mod = sp.per_sample_table(self.scale_shift_table.float() + temb.float())  # [n, 6, D]
-        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = mod.unbind(1)
-        freqs = (freqs_cos, freqs_sin) if freqs_cos is not None and freqs_sin is not None else None
-
-        h = sp.norm(
-            x,
-            RowNorm(
-                eps=self.norm1.variance_epsilon,
-                scale=scale_msa,
-                shift=shift_msa,
-                quant_scale=self._norm1_fp4_scale,
-                module=self.norm1,
-            ),
-        )
-        q, k, v = self.attn1.split_qkv(sp.column_linear(self.attn1.qkv_proj, h))
-        attn1_out = self.attn1.attend(q, k, v, freqs=freqs, timestep=timestep)
-        # Boundary A: attn1.to_out -> reduce-scatter -> gated residual -> norm2 (+quant)
-        x, h = sp.row_linear_residual_norm(
-            self.attn1.to_out[0], attn1_out, x, gate=gate_msa, norm=self._sp_tp_norm2()
-        )
-        attn2_out = self._cross_attention(
-            sp.column_linear(self.attn2.to_q, h), encoder_hidden_states, timestep
-        )
-        # Boundary B: attn2.to_out -> reduce-scatter -> residual add -> norm3 + AdaLN (+quant)
-        x, h = sp.row_linear_residual_norm(
-            self.attn2.to_out[0],
-            attn2_out,
-            x,
-            norm=RowNorm(
-                eps=self.norm3.variance_epsilon,
-                scale=c_scale_msa,
-                shift=c_shift_msa,
-                quant_scale=self._norm3_fp4_scale,
-                module=self.norm3,
-            ),
-        )
-        # Boundary C: ffn (up + GELU, down) -> reduce-scatter -> gated residual; the next
-        # block's norm1 reads these rows.
-        return sp.mlp_residual(self.ffn, h, x, gate=c_gate_msa)
-
-    def _sp_tp_norm2(self) -> RowNorm:
-        if isinstance(self.norm2, LayerNorm):
-            return RowNorm(
-                eps=self.norm2.variance_epsilon,
-                weight=self.norm2.weight,
-                bias=self.norm2.bias,
-                quant_scale=self._norm2_fp4_scale,
-                module=self.norm2,
-            )
-        # cross_attn_norm=False: no norm, but still quantize for a static NVFP4 to_q.
-        return RowNorm(identity=True, quant_scale=self._norm2_fp4_scale)
-
 
 class WanTransformer3DModel(BaseDiffusionModel):
     _supports_gradient_checkpointing = True
@@ -833,8 +752,6 @@ class WanTransformer3DModel(BaseDiffusionModel):
 
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 12)
         self.sharder = SequenceSharder.from_vgm(vgm, num_attention_heads=num_heads)
-        # Token-sharded TP (parallel_config.tp_layout='token_sharded'); None when off.
-        self._sp_tp = TokenShardedTP.from_model_config(model_config)
 
         config = model_config.pretrained_config
 
@@ -909,7 +826,6 @@ class WanTransformer3DModel(BaseDiffusionModel):
                     model_config=model_config,
                     _layer_idx=i,
                     added_kv_proj_dim=added_kv_proj_dim,
-                    sp_tp=self._sp_tp,
                 )
                 for i in range(num_layers)
             ]
@@ -945,6 +861,9 @@ class WanTransformer3DModel(BaseDiffusionModel):
         )
 
         self.__post_init__()
+        # parallel_config.tp_layout='token_sharded': convert the blocks' TP modules (the
+        # projections that read or write the residual stream) and switch self.sharder.
+        self._apply_tp_layout()
 
     @property
     def device(self):
@@ -1020,12 +939,9 @@ class WanTransformer3DModel(BaseDiffusionModel):
         rope = self.sharder.shard_rope((freqs_cos, freqs_sin), seq_len=seq_len, seq_dim=1)
         if rope is not None:
             freqs_cos, freqs_sin = rope
-        # Token-sharded TP: the residual stream becomes this TP rank's [rows, D] token
-        # shard; RoPE, text embeddings and temb stay replicated (attention sees all tokens).
-        sp_tp = self._sp_tp
-        if sp_tp is not None:
-            sp_tp.begin(B, seq_len)
-            x = sp_tp.shard(x)
+        # Under token-sharded TP the sharder gives each TP rank its tokens as [n, g, D]
+        # sample groups and leaves RoPE whole (attention sees all tokens).
+        token_sharded = self.sharder.token_sharded_tp
 
         # Time and text/image embeddings. WAN timestep embeddings use the
         # scheduler's 1000-step scale internally.
@@ -1054,10 +970,12 @@ class WanTransformer3DModel(BaseDiffusionModel):
         else:
             # batch_size, 6, hidden_size
             temb_proj = temb_proj.unflatten(1, (6, self.config.hidden_size))
-            if self.config.expand_timesteps and sp_tp is None:
+            if self.config.expand_timesteps and not token_sharded:
                 # x is already sequence-sharded; uniform T2V timesteps only need
                 # a local broadcast view for fused AdaLN.
                 temb_proj = temb_proj.unsqueeze(1).expand(-1, x.shape[1], -1, -1)
+            # Token-sharded TP: the entries of this rank's sample groups (no-op otherwise).
+            temb_proj = self.sharder.shard_per_sample(temb_proj)
 
         # I2V: Concatenate image and text embeddings if image embeddings are provided
         if encoder_hidden_states_image is not None:
@@ -1073,7 +991,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 [encoder_hidden_states_image, encoder_hidden_states], dim=1
             )
 
-        if sp_tp is None:
+        if not token_sharded:  # per-token AdaLN kernels stay off on token shards
             x = self._pertoken_adaln_runtime.prepare(x, temb_proj)
 
         # Transformer blocks (attention handles distributed communication internally)
@@ -1086,9 +1004,6 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 freqs_sin,
                 timestep=timestep,
             )
-
-        if sp_tp is not None:  # [rows, D] -> [B, S, D], once per forward
-            x = sp_tp.unshard(x)
 
         # All-gather sequence from all ranks: [B, S/P] -> [B, S] (no-op when inactive).
         x = self.sharder.gather(x, dim=1)
@@ -1197,7 +1112,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
         # documented eligibility rule (static_nvfp4_input_scale, which also requires NVFP4
         # activation quantization); both rules agree for every current quant method.
         fp4_input_scale = (
-            static_nvfp4_input_scale if self._sp_tp is not None else get_nvfp4_input_scale
+            static_nvfp4_input_scale if self.sharder.token_sharded_tp else get_nvfp4_input_scale
         )
         for block in self.blocks:
             if not isinstance(block, WanBlock):
@@ -1208,7 +1123,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
             block._norm2_fp4_scale = fp4_input_scale(getattr(block.attn2, "to_q", None))
             block._norm3_fp4_scale = fp4_input_scale(getattr(block.ffn, "up_proj", None))
 
-        if self._sp_tp is not None:
+        if self.sharder.token_sharded_tp:
             scales = [
                 getattr(block, f"_norm{i}_fp4_scale")
                 for block in self.blocks

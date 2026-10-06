@@ -24,18 +24,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.nn.functional as F
 from token_sharded_tp_test_utils import padded_rows, simulated_helper, swizzle_ref, unswizzle_ref
 
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import (
-    RowNorm,
     TokenShardedTP,
     TokenShardPlan,
-    apply_residual,
-    apply_row_norm,
     regroup_swizzled_sf,
     swizzled_sf_numel,
 )
@@ -107,7 +103,7 @@ def test_plan_build_rejects_invalid():
 
 
 # =============================================================================
-# A2. Row-local ops: shard result == full-tensor result sliced by rows
+# A2. Per-shard tables: shard result == full-tensor result sliced by rows
 # =============================================================================
 
 # (B, S, tp): unpadded, rank straddling a sample boundary, interior padding,
@@ -151,95 +147,6 @@ def test_tables_match_full_rows(batch, seq, tp, dtype):
         # shard_rows == the global padded stream sliced (zeros on pad rows).
         assert torch.equal(sp.shard_rows(per_token), padded_rows(per_token, p)[rows])
         assert torch.equal(sp.shard(x), padded_rows(x, p)[rows])
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("batch,seq,tp", _ROW_LOCAL_CASES)
-def test_residual_matches_full_rows(batch, seq, tp, dtype):
-    x, y, table, per_token = _row_local_inputs(batch, seq, dtype)
-    for rank in range(tp):
-        p = TokenShardPlan.build(batch, seq, tp, rank)
-        sp = simulated_helper(p)
-        rows = rank_slice(p)
-        x_full, y_full = padded_rows(x, p), padded_rows(y, p)
-        x_loc, y_loc = sp.shard(x), sp.shard(y)
-        # Ungated: plain add.
-        assert torch.equal(sp.residual(x_loc, y_loc), (x_full + y_full)[rows])
-        # Per-sample gate: full tensor with the global [B, D] table (g = S_pad).
-        gate = table[:, 2]
-        ref = apply_residual(x_full, y_full, gate)[rows]
-        assert torch.equal(sp.residual(x_loc, y_loc, sp.per_sample_table(gate)), ref)
-        # Per-token gate (g = 1).
-        gate_tok = per_token[:, :, 2]
-        ref = apply_residual(x_full, y_full, padded_rows(gate_tok, p))[rows]
-        assert torch.equal(sp.residual(x_loc, y_loc, sp.shard_rows(gate_tok)), ref)
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("batch,seq,tp", _ROW_LOCAL_CASES)
-def test_row_norm_matches_full_rows(batch, seq, tp, dtype):
-    x, _, table, per_token = _row_local_inputs(batch, seq, dtype)
-    gen = torch.Generator().manual_seed(7)
-    weight, bias = torch.randn(_D, generator=gen), torch.randn(_D, generator=gen)
-    for rank in range(tp):
-        p = TokenShardPlan.build(batch, seq, tp, rank)
-        sp = simulated_helper(p)
-        rows = rank_slice(p)
-        x_full, x_loc = padded_rows(x, p), sp.shard(x)
-        # AdaLN with a per-sample table.
-        full = RowNorm(scale=table[:, 1], shift=table[:, 0])
-        loc = RowNorm(
-            scale=sp.per_sample_table(table[:, 1]), shift=sp.per_sample_table(table[:, 0])
-        )
-        assert torch.equal(sp.norm(x_loc, loc), apply_row_norm(x_full, full)[rows])
-        # AdaLN with a per-token table.
-        full = RowNorm(
-            scale=padded_rows(per_token[:, :, 1], p), shift=padded_rows(per_token[:, :, 0], p)
-        )
-        loc = RowNorm(
-            scale=sp.shard_rows(per_token[:, :, 1]), shift=sp.shard_rows(per_token[:, :, 0])
-        )
-        assert torch.equal(sp.norm(x_loc, loc), apply_row_norm(x_full, full)[rows])
-        # Affine.
-        spec = RowNorm(eps=1e-5, weight=weight, bias=bias)
-        assert torch.equal(sp.norm(x_loc, spec), apply_row_norm(x_full, spec)[rows])
-        # Identity.
-        assert torch.equal(sp.norm(x_loc, RowNorm(identity=True)), x_full[rows])
-
-
-def test_row_norm_matches_wan_eager_math():
-    """Eager apply_row_norm == Wan's eager norm1/norm2/norm3 expressions.
-
-    Wan: ``norm1(x.float()) * (1 + scale) + shift`` and ``norm2(x.float()).to(x.dtype)``,
-    where ``LayerNorm.forward`` is fp32 layer_norm with fp32 weight/bias (weight=1 and
-    bias=0 buffers when has_weights/has_bias is False). That module is maybe_compile'd,
-    so bitwise equality is not guaranteed; compare with a tight tolerance.
-    """
-    gen = torch.Generator().manual_seed(0)
-    b, s, eps = 2, 40, 1e-6
-    x = torch.randn(b, s, _D, generator=gen).to(torch.bfloat16)
-    temb = torch.randn(b, 6, _D, generator=gen)
-    shift, scale = temb[:, 0:1], temb[:, 1:2]  # [B, 1, D] like chunk(6, dim=1)
-    ones, zeros = torch.ones(_D), torch.zeros(_D)
-    ref = F.layer_norm(x.float(), (_D,), ones, zeros, eps) * (1 + scale) + shift
-    ref = ref.to(x.dtype).reshape(b * s, _D)
-    got = apply_row_norm(
-        x.reshape(b * s, _D), RowNorm(eps=eps, scale=scale.squeeze(1), shift=shift.squeeze(1))
-    )
-    torch.testing.assert_close(got.float(), ref.float(), rtol=1e-6, atol=1e-6)
-
-    weight, bias = torch.randn(_D, generator=gen), torch.randn(_D, generator=gen)
-    ref = F.layer_norm(x.float(), (_D,), weight, bias, eps).to(x.dtype).reshape(b * s, _D)
-    got = apply_row_norm(x.reshape(b * s, _D), RowNorm(eps=eps, weight=weight, bias=bias))
-    torch.testing.assert_close(got.float(), ref.float(), rtol=1e-6, atol=1e-6)
-
-
-def test_row_local_ops_reject_mismatched_table():
-    x = torch.randn(10, _D)
-    with pytest.raises(ValueError, match="does not divide"):
-        apply_residual(x, x, torch.randn(3, _D))
-    with pytest.raises(ValueError, match="does not divide"):
-        apply_row_norm(x, RowNorm(scale=torch.randn(4, _D), shift=torch.randn(4, _D)))
 
 
 # =============================================================================
@@ -309,45 +216,6 @@ def test_regroup_zero_copy_for_padded_single_sample():
     assert plan.is_padded and plan.local_rows == 128
     got = regroup_swizzled_sf(sf_cat, plan, 8)
     assert got.data_ptr() == sf_cat.data_ptr() and got.is_contiguous()
-
-
-# =============================================================================
-# A5. RowNorm validation
-# =============================================================================
-
-
-def test_row_norm_validation():
-    t = torch.zeros(1, 8)
-    with pytest.raises(ValueError, match="scale and shift"):
-        RowNorm(scale=t)
-    with pytest.raises(ValueError, match="scale and shift"):
-        RowNorm(shift=t)
-    with pytest.raises(ValueError, match="weight and bias"):
-        RowNorm(weight=t[0])
-    with pytest.raises(ValueError, match="identity=True excludes"):
-        RowNorm(identity=True, weight=t[0], bias=t[0])
-    with pytest.raises(ValueError, match="identity=True excludes"):
-        RowNorm(identity=True, scale=t, shift=t)
-    with pytest.raises(ValueError, match="identity=True excludes"):
-        RowNorm(identity=True, module=torch.nn.Identity())
-    RowNorm(identity=True, quant_scale=torch.ones(1))  # identity + quantize is allowed
-
-
-def test_row_norm_module_is_used_on_eager_path():
-    """RowNorm.module replaces F.layer_norm on the eager path (same kernel as the model)."""
-    gen = torch.Generator().manual_seed(3)
-    x = torch.randn(12, _D, generator=gen).to(torch.bfloat16)
-    scale, shift = torch.randn(2, _D, generator=gen), torch.randn(2, _D, generator=gen)
-    calls = []
-
-    class Spy(torch.nn.Module):
-        def forward(self, h):
-            calls.append(h.dtype)
-            return F.layer_norm(h, (_D,), None, None, 1e-6)
-
-    got = apply_row_norm(x, RowNorm(scale=scale, shift=shift, module=Spy()))
-    assert calls == [torch.float32]
-    assert torch.equal(got, apply_row_norm(x, RowNorm(scale=scale, shift=shift)))
 
 
 # =============================================================================
@@ -440,32 +308,13 @@ def test_shape_errors():
         sp.unshard(torch.zeros(2, 8, 4))
     with pytest.raises(ValueError, match="payload must be uint8"):
         sp.all_gather(Fp4QuantizedTensor(torch.zeros(16, 2, dtype=torch.uint8), torch.zeros(512)))
-    with pytest.raises(ValueError, match=r"row_linear: expected a \[B=2, S=8, K\] or"):
-        sp.row_linear(lambda a: a, torch.zeros(2 * 9, 4))
+    with pytest.raises(ValueError, match=r"pad_row_input: expected a \[B=2, S=8, K\] or"):
+        sp.pad_row_input(torch.zeros(2 * 9, 4))
     sp = simulated_helper(TokenShardPlan.build(1, 7, 2, 0))  # padded: S_pad = 8
     with pytest.raises(ValueError, match=r"expected 7 \(B \* S\) or 8 \(B \* S_pad\) rows"):
         sp.reduce_scatter(torch.zeros(6, 4))
-    with pytest.raises(ValueError, match=r"row_linear: expected"):
-        sp.row_linear(lambda a: a, torch.zeros(8, 4))  # the padded stream is not accepted
-
-
-@pytest.mark.parametrize("batch,seq,tp", [(2, 16, 2), (2, 16, 4), (4, 8, 2)])
-def test_global_table_rejected_on_shard(batch, seq, tp):
-    """A global [B, D] table (the documented trap) raises instead of mixing samples."""
-    x = torch.randn(batch, seq, _D)
-    table = torch.randn(batch, _D)
-    for rank in range(tp):
-        p = TokenShardPlan.build(batch, seq, tp, rank)
-        assert len(p.entry_batch) != batch  # the global table has the wrong entry count
-        sp = simulated_helper(p)
-        x_loc = sp.shard(x)
-        with pytest.raises(ValueError, match="gate has 2 entries|gate has 4 entries"):
-            sp.residual(x_loc, x_loc, table)
-        with pytest.raises(ValueError, match="RowNorm.scale has .* per_sample_table"):
-            sp.norm(x_loc, RowNorm(scale=table, shift=table))
-        # The shard's own tables pass.
-        sp.residual(x_loc, x_loc, sp.per_sample_table(table))
-        sp.norm(x_loc, RowNorm(scale=sp.per_sample_table(table), shift=sp.per_sample_table(table)))
+    with pytest.raises(ValueError, match=r"pad_row_input: expected"):
+        sp.pad_row_input(torch.zeros(8, 4))  # the padded stream is not accepted
 
 
 def test_fp4_gather_rejects_side_car_and_dynamic_scale():
@@ -489,3 +338,27 @@ def test_padding_roundtrip(batch, seq, tp):
     assert padded.shape[0] == batch * sp.plan.padded_seq_len
     assert torch.equal(sp._drop_padding(padded), t)
     assert torch.equal(sp._add_padding(t.view(batch, seq, 3)), padded)
+
+
+# =============================================================================
+# A7. A Wan block rejects a modulation table that does not match its hidden states
+# =============================================================================
+
+
+def test_wan_block_rejects_a_global_table_on_a_shard():
+    """Under token-sharded TP a block sees [n, g, D] sample groups; a global [B, 6, D]
+    table (instead of the sharder's shard_per_sample) must raise, not mix samples."""
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanBlock
+
+    cfg = DiffusionModelConfig(
+        pretrained_config=SimpleNamespace(
+            num_attention_heads=4, attention_head_dim=16, ffn_dim=128, eps=1e-6
+        )
+    )
+    block = WanBlock(cfg, 0)
+    x = torch.zeros(1, 8, 64)  # one sample group of 8 rows (CFG B=2 at TP2)
+    rope = (torch.zeros(8, 16), torch.zeros(8, 16))
+    with pytest.raises(ValueError, match="modulation table"):
+        block(x, torch.zeros(2, 4, 64), torch.zeros(2, 6, 64), *rope)  # global per-sample
+    with pytest.raises(ValueError, match="modulation table"):
+        block(x, torch.zeros(2, 4, 64), torch.zeros(1, 16, 6, 64), *rope)  # wrong per-token

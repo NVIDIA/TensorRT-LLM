@@ -14,9 +14,10 @@
 # limitations under the License.
 """Single-GPU tests of the token-sharded TP row-local kernels (fused LN + NVFP4).
 
-TP ranks are simulated: every rank's shard of a full ``[B * S, 5120]`` input goes
-through the helper's row-local norm/quantize, and the result (FP4 bytes per row, and
-the regrouped scaling factors of all shards) must equal the same op on all rows.
+TP ranks are simulated: every rank's shard of a full ``[B * S, 5120]`` input goes through
+the fused norm + quantize ops as a Wan block runs them on a shard (per-shard modulation
+table, ``seq_len_per_batch = rows_per_entry``), and the result (FP4 bytes per row, and the
+regrouped scaling factors of all shards) must equal the same op on all rows.
 """
 
 import pytest
@@ -29,11 +30,8 @@ from tensorrt_llm._torch.visual_gen.modules.fused_norm_quant import (
     apply_fused_layernorm_adaln_quant,
     apply_fused_layernorm_affine_quant,
 )
-from tensorrt_llm._torch.visual_gen.parallel import token_sharded_tp
 from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import (
-    RowNorm,
     TokenShardPlan,
-    apply_row_norm,
     quantize_nvfp4,
     regroup_swizzled_sf,
     static_nvfp4_input_scale,
@@ -109,13 +107,14 @@ def test_fused_adaln_quant_shards_match_full(batch, seq, tp):
     shards = []
     for plan in plans:
         sp = simulated_helper(plan)
-        spec = RowNorm(
-            eps=EPS,
-            scale=sp.per_sample_table(scale),
-            shift=sp.per_sample_table(shift),
-            quant_scale=qscale,
+        q = apply_fused_layernorm_adaln_quant(
+            sp.shard(x),
+            sp.per_sample_table(scale),
+            sp.per_sample_table(shift),
+            plan.rows_per_entry,
+            qscale,
+            EPS,
         )
-        q = sp.norm(sp.shard(x), spec)
         assert isinstance(q, Fp4QuantizedTensor)
         assert q.fp4_tensor.shape == (plan.local_rows, D // 2)
         shards.append(q)
@@ -143,54 +142,11 @@ def test_fused_affine_quant_shards_match_full(batch, seq, tp):
     for plan in plans:
         sp = simulated_helper(plan)
         x_loc = sp.shard(x)
-        shards.append(
-            sp.norm(x_loc, RowNorm(eps=EPS, weight=weight, bias=bias, quant_scale=qscale))
-        )
+        shards.append(apply_fused_layernorm_affine_quant(x_loc, weight, bias, qscale, EPS))
         loc, glob = _real_rows(plan)
-        h = sp.norm(x_loc, RowNorm(eps=EPS, weight=weight, bias=bias))
+        h = apply_fused_layernorm_affine_quant(x_loc, weight, bias, None, EPS)
         assert torch.equal(h[loc.cuda()], full_bf16[glob.cuda()])
     _check_shards_match_full(full, shards, plans)
-
-
-def test_row_norm_uses_fused_op_only_when_eligible(monkeypatch):
-    """The fused op runs for bf16 CUDA D == 5120 with exactly one of AdaLN / affine only."""
-    calls = []
-
-    def spy(fn):
-        def wrapped(*args, **kwargs):
-            calls.append(fn.__name__)
-            return fn(*args, **kwargs)
-
-        return wrapped
-
-    for name in ("apply_fused_layernorm_adaln_quant", "apply_fused_layernorm_affine_quant"):
-        monkeypatch.setattr(token_sharded_tp, name, spy(getattr(token_sharded_tp, name)))
-
-    torch.manual_seed(2)
-    x = torch.randn(64, D, device="cuda", dtype=torch.bfloat16)
-    scale = torch.randn(2, D, device="cuda") * 0.1
-    shift = torch.randn(2, D, device="cuda") * 0.1
-    weight = torch.randn(D, device="cuda") * 0.1 + 1.0
-    bias = torch.randn(D, device="cuda") * 0.1
-    adaln = RowNorm(eps=EPS, scale=scale, shift=shift)
-    affine = RowNorm(eps=EPS, weight=weight, bias=bias)
-
-    fused = apply_row_norm(x, adaln)
-    assert calls == ["apply_fused_layernorm_adaln_quant"]
-    assert torch.equal(fused, apply_fused_layernorm_adaln_quant(x, scale, shift, 32, None, EPS))
-    calls.clear()
-    apply_row_norm(x, affine)
-    assert calls == ["apply_fused_layernorm_affine_quant"]
-
-    # Ineligible: fp32 input, D != 5120, both AdaLN and affine, CPU -> eager path.
-    calls.clear()
-    eager = apply_row_norm(x.float(), adaln)
-    torch.testing.assert_close(eager, fused.float(), rtol=2e-2, atol=2e-2)
-    x_small = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
-    apply_row_norm(x_small, RowNorm(eps=EPS, scale=scale[:, :256], shift=shift[:, :256]))
-    apply_row_norm(x, RowNorm(eps=EPS, weight=weight, bias=bias, scale=scale, shift=shift))
-    apply_row_norm(x.cpu(), RowNorm(eps=EPS, scale=scale.cpu(), shift=shift.cpu()))
-    assert calls == []
 
 
 # =============================================================================

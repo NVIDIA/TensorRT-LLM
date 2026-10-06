@@ -46,16 +46,16 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
+import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import (
-    RowNorm,
     TokenShardedTP,
     quantize_nvfp4,
-    static_nvfp4_input_scale,
     swizzled_sf_numel,
 )
+from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -298,7 +298,7 @@ def _logic_fp4_quantize_gather(rank, world_size, device):
 
 
 # =============================================================================
-# B6. row_linear with a row-parallel Linear == unsharded Linear, sliced (NCCL)
+# B6. Converted real Linear / MLP / GatedMLP vs the plain modules (NCCL)
 # =============================================================================
 
 
@@ -312,7 +312,26 @@ def _mapping(rank, world_size):
     return vgm.to_llm_mapping()
 
 
-def _logic_row_linear(rank, world_size, device):
+def _as_model(**modules):
+    """A one-block model (``blocks`` container) holding ``modules``, for the converter."""
+    block = nn.Module()
+    for name, module in modules.items():
+        setattr(block, name, module)
+    model = nn.Module()
+    model.blocks = nn.ModuleList([block])
+    return model
+
+
+def _logic_real_adapters(rank, world_size, device):
+    """Real TRT-LLM modules built as for plain TP (row projections all-reduce), converted by
+    the rules: the row Linear reduce-scatters, MLP / GatedMLP run on all tokens and
+    reduce-scatter; misuse is rejected at conversion."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+    from tensorrt_llm._torch.modules.mlp import MLP
+    from tensorrt_llm.functional import AllReduceStrategy
+    from tensorrt_llm.mapping import Mapping
+
     k_in, n_out = 384, 96  # 384 splits evenly over tp in {2, 3, 4}
     torch.manual_seed(0)
     # Small magnitudes keep the per-rank bf16 rounding of the K-partials (inherent to any
@@ -322,6 +341,7 @@ def _logic_row_linear(rank, world_size, device):
     ref_lin = Linear(k_in, n_out, bias=True, dtype=torch.bfloat16).to(device)
     ref_lin.load_weights([{"weight": weight, "bias": bias}])
     mapping = _mapping(rank, world_size)
+    nccl = AllReduceStrategy.NCCL
     row_lin = Linear(
         k_in,
         n_out,
@@ -329,47 +349,57 @@ def _logic_row_linear(rank, world_size, device):
         dtype=torch.bfloat16,
         mapping=mapping,
         tensor_parallel_mode=TensorParallelMode.ROW,
-        reduce_output=False,
+        reduce_output=True,
+        allreduce_strategy=nccl,
     ).to(device)
     row_lin.load_weights([{"weight": weight, "bias": bias}])
+    config = ModelConfig(mapping=mapping, allreduce_strategy=nccl)
+    mlp = MLP(
+        hidden_size=k_in, intermediate_size=k_in, bias=True, dtype=torch.bfloat16, config=config
+    ).to(device)
+    gated = GatedMLP(
+        hidden_size=k_in, intermediate_size=k_in, bias=False, dtype=torch.bfloat16, config=config
+    ).to(device)
+    gen = torch.Generator().manual_seed(3)
+    for m in (mlp, gated):
+        for name, prm in m.named_parameters():
+            prm.data.copy_((torch.randn(prm.shape, generator=gen) * 0.02).to(prm.dtype))
+    tp = _helper()
+    act0 = torch.randn(1, 8, k_in, device=device, dtype=torch.bfloat16)
+    mlp_ref = {name: m(act0.reshape(8, k_in)) for name, m in (("mlp", mlp), ("gated", gated))}
+    convert_to_token_sharded_tp(_as_model(row=row_lin, mlp=mlp, gated=gated), tp)
     k_loc = k_in // world_size
-    sp = _helper()
     for b, s in _SHAPES:
-        plan = sp.begin(b, s)
+        plan = tp.begin(b, s)
         act = torch.randn(b, s, k_in, generator=torch.Generator().manual_seed(s)).to(
             device, torch.bfloat16
         )
-        got = sp.row_linear(row_lin, act[..., rank * k_loc : (rank + 1) * k_loc])
+        got = row_lin(act[..., rank * k_loc : (rank + 1) * k_loc]).reshape(plan.local_rows, -1)
         ref = padded_rows(ref_lin(act).view(b, s, n_out), plan)[
             plan.row_start : plan.row_start + plan.local_rows
         ]
         mask = _real_row_mask(plan, device)
-        _check_close(got[mask], ref[mask], device, 1e-2, 1e-2, f"row_linear {(b, s)}")
+        _check_close(got[mask], ref[mask], device, 1e-2, 1e-2, f"row adapter {(b, s)}")
+    plan = tp.begin(1, 8)
+    mine = slice(plan.row_start, plan.row_start + plan.local_rows)
+    for name, m in (("mlp", mlp), ("gated", gated)):
+        got = m(tp.local_view(tp.shard(act0))).reshape(plan.local_rows, -1)
+        _check_close(got, mlp_ref[name][mine], device, 2e-2, 2e-2, f"{name} adapter")
 
-    # Misuse: an all-reduced row Linear (would sum twice) and mode mismatches.
-    row_lin.reduce_output = True
-    with pytest.raises(ValueError, match="built with reduce_output=False"):
-        sp.row_linear(row_lin, act[..., :k_loc])
-    with pytest.raises(ValueError, match="built with reduce_output=False"):
-        sp.row_linear_residual_norm(row_lin, act[..., :k_loc], None)
-    row_lin.reduce_output = False
-    col_lin = Linear(
+    # Misuse, rejected at conversion: a row Linear as a column projection, and a Linear
+    # sharded for another TP size (it would compute full outputs, summed tp times).
+    col_as_row = Linear(
         k_in,
-        n_out * world_size,
+        n_out,
         bias=False,
         dtype=torch.bfloat16,
         mapping=mapping,
-        tensor_parallel_mode=TensorParallelMode.COLUMN,
-        reduce_output=False,
+        tensor_parallel_mode=TensorParallelMode.ROW,
+        reduce_output=True,
+        allreduce_strategy=nccl,
     ).to(device)
-    with pytest.raises(ValueError, match="expected linear to be a row-parallel Linear"):
-        sp.row_linear(col_lin, act)
-    with pytest.raises(ValueError, match="expected linear to be a column-parallel Linear"):
-        sp.column_linear(row_lin, act)
-    # A row Linear sharded for another TP size (e.g. built from a tp=1 mapping) computes
-    # full outputs on every rank; the reduce-scatter would sum them tp times.
-    from tensorrt_llm.mapping import Mapping
-
+    with pytest.raises(ValueError, match="must be a column-parallel Linear"):
+        convert_to_token_sharded_tp(_as_model(proj=col_as_row), tp, exceptions={"proj": "column"})
     unsharded = Linear(
         k_in,
         n_out,
@@ -380,44 +410,13 @@ def _logic_row_linear(rank, world_size, device):
         reduce_output=False,
     ).to(device)
     with pytest.raises(
-        ValueError, match=f"sharded for tp_size=1, but the helper's TP group has {world_size}"
+        ValueError, match=f"sharded for tp_size=1, but the TP group has {world_size}"
     ):
-        sp.row_linear(unsharded, act)
-
-    from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.modules.mlp import MLP
-    from tensorrt_llm.functional import AllReduceStrategy
-
-    mlp = MLP(
-        hidden_size=k_in,
-        intermediate_size=k_in,
-        bias=True,
-        dtype=torch.bfloat16,
-        config=ModelConfig(mapping=mapping, allreduce_strategy=AllReduceStrategy.NCCL),
-        reduce_output=False,
-    )
-    mlp.down_proj.reduce_output = True
-    with pytest.raises(ValueError, match="mlp.down_proj to be a row-parallel Linear built with"):
-        sp.mlp_residual(mlp, act, act)
-
-    # GatedMLP is not an MLP subclass: the down_proj check is duck-typed, so an
-    # all-reducing GatedMLP is rejected too (it would come out tp times too large).
-    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
-
-    gated = GatedMLP(
-        hidden_size=k_in,
-        intermediate_size=k_in,
-        bias=False,
-        dtype=torch.bfloat16,
-        config=ModelConfig(mapping=mapping, allreduce_strategy=AllReduceStrategy.NCCL),
-        reduce_output=True,
-    )
-    with pytest.raises(ValueError, match="mlp.down_proj to be a row-parallel Linear built with"):
-        sp.mlp_residual(gated, act, act)
+        convert_to_token_sharded_tp(_as_model(proj=unsharded), tp, exceptions={"proj": "row"})
 
 
 # =============================================================================
-# B7. column_linear with a static-NVFP4 Linear == same Linear on the full FP4 input
+# B7. Converted static-NVFP4 column Linear == the same Linear on all rows
 # =============================================================================
 
 
@@ -433,42 +432,6 @@ def _nvfp4_checkpoint(weight, act_amax):
         "weight_scale_2": weight_scale_2.cpu(),
         "input_scale": (act_amax / (fp8_max * e2m1_max)).reshape(1).float().cpu(),
     }
-
-
-def _logic_column_linear_nvfp4(rank, world_size, device):
-    k_in, n_out = 256, 128 * world_size
-    torch.manual_seed(1)
-    weight = torch.randn(n_out, k_in, dtype=torch.bfloat16) * 0.05
-    bias = torch.randn(n_out, dtype=torch.bfloat16) * 0.1
-    mapping = _mapping(rank, world_size)
-    sp = _helper()
-    for b, s in _SHAPES:
-        plan = sp.begin(b, s)
-        x = torch.randn(b, s, k_in, generator=torch.Generator().manual_seed(s)).to(
-            device, torch.bfloat16
-        )
-        ckpt = _nvfp4_checkpoint(weight, x.float().abs().amax().cpu())  # 1-pass calibration
-        lin = Linear(
-            k_in,
-            n_out,
-            bias=True,
-            dtype=torch.bfloat16,
-            mapping=mapping,
-            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            reduce_output=False,
-        ).to(device)
-        lin.load_weights([{**ckpt, "bias": bias}])
-        lin.post_load_weights()
-        scale = static_nvfp4_input_scale(lin)
-        assert scale is not None
-        got = sp.column_linear(lin, quantize_nvfp4(sp.shard(x), scale))
-        ref_in = Fp4QuantizedTensor(
-            *torch.ops.trtllm.fp4_quantize(x.reshape(b * s, k_in), scale, 16, False)
-        )
-        ref = lin(ref_in).view(b, s, -1)
-        ok = got.shape == ref.shape == (b, s, n_out // world_size) and torch.equal(got, ref)
-        _check(ok, f"NVFP4 column_linear {(b, s, plan.local_rows)}", device)
 
 
 def _logic_adapters_nvfp4(rank, world_size, device):
@@ -513,12 +476,8 @@ def _logic_adapters_nvfp4(rank, world_size, device):
         row.load_weights([{"weight": w_row}])
         h_ref = col(x.reshape(b * s, k_in)).view(b, s, -1)  # the Linear quantizes all rows
         y_ref = row(h_ref)  # all-reduced
-        block = nn.Module()
-        block.col, block.row = col, row
-        root = nn.Module()
-        root.blocks = nn.ModuleList([block])
         tp = _helper()
-        convert_to_token_sharded_tp(root, tp, exceptions={"col": "column"})
+        convert_to_token_sharded_tp(_as_model(col=col, row=row), tp, exceptions={"col": "column"})
         plan = tp.begin(b, s)
         h = col(tp.local_view(tp.shard(x)))
         _check(torch.equal(h, h_ref), f"NVFP4 column adapter {(b, s)}", device)
@@ -562,26 +521,35 @@ def _boundary_chain_parts(rank, world_size, device, d=256, n_col=128):
         dtype=torch.bfloat16,
         mapping=mapping,
         tensor_parallel_mode=TensorParallelMode.ROW,
-        reduce_output=False,
+        reduce_output=True,  # built as for plain TP; the conversion turns it into a reduce-scatter
+        allreduce_strategy=AllReduceStrategy.NCCL,
     ).to(device)
     row.load_weights([{"weight": row_w, "bias": torch.full((d,), 0.1)}])
     return col, row
 
 
-def _make_chain(sp, col, row, ln_w, ln_b, fp4_scale):
-    """norm -> column_linear -> row_linear_residual_norm (+NVFP4 quantize) -> FP4 all-gathers."""
+def _converted_chain_parts(rank, world_size, device, d):
+    tp = _helper()
+    col, row = _boundary_chain_parts(rank, world_size, device, d)
+    convert_to_token_sharded_tp(_as_model(col=col, row=row), tp, exceptions={"col": "column"})
+    return tp, col, row
+
+
+def _make_chain(tp, col, row, ln_w, ln_b, fp4_scale):
+    """AdaLN norm -> converted column Linear -> converted row Linear -> gated residual ->
+    LayerNorm + NVFP4 quantize -> FP4 all-gathers, on this rank's [n, g, D] sample groups
+    (the row-local ops written as a model writes them)."""
 
     def chain(x_loc, fp4_payload, fp4_sf, table, h_given):
-        mod = sp.per_sample_table(table)  # [n, 3, D]
-        shift, scale, gate = mod.unbind(1)
-        h = sp.norm(x_loc, RowNorm(scale=scale, shift=shift))
-        q = sp.column_linear(col, h)
-        x, h2 = sp.row_linear_residual_norm(
-            row, q, x_loc, gate=gate, norm=RowNorm(weight=ln_w, bias=ln_b, quant_scale=fp4_scale)
-        )
-        g2 = sp.all_gather(h2)  # NVFP4 payload + regrouped SF of the chain's own quantize
-        g = sp.all_gather(Fp4QuantizedTensor(fp4_payload, fp4_sf))  # of a given FP4 input
-        g3 = sp.all_gather(quantize_nvfp4(h_given, fp4_scale))  # quantize of a given bf16 input
+        d = x_loc.shape[-1]
+        shift, scale, gate = tp.per_sample_table(table)[:, :, None].unbind(1)  # [n, 1, D] each
+        h = F.layer_norm(x_loc.float(), (d,)) * (1 + scale) + shift
+        q = col(h.to(x_loc.dtype))  # all tokens, this rank's features
+        x = (x_loc.float() + row(q).float() * gate).to(x_loc.dtype)
+        h2 = F.layer_norm(x.float(), (d,), ln_w, ln_b).to(x.dtype)
+        g2 = tp.all_gather(quantize_nvfp4(h2, fp4_scale))  # the chain's own quantize
+        g = tp.all_gather(Fp4QuantizedTensor(fp4_payload, fp4_sf))  # of a given FP4 input
+        g3 = tp.all_gather(quantize_nvfp4(h_given, fp4_scale))  # quantize of a given bf16 input
         return (
             x,
             g2.fp4_tensor,
@@ -605,15 +573,14 @@ def _chain_inputs(sp, b, s, d, device):
         0, 256, (swizzled_sf_numel(plan.local_rows, d // 16),), dtype=torch.uint8, generator=gen
     )
     h_given = (torch.randn(plan.local_rows, d, generator=gen) * 2).to(device, torch.bfloat16)
-    return sp.shard(x), payload.to(device), sf.to(device), table, h_given
+    return sp.local_view(sp.shard(x)), payload.to(device), sf.to(device), table, h_given
 
 
 def _logic_compile_fullgraph(rank, world_size, device):
     import torch._dynamo
 
     d = 256
-    sp = _helper()
-    col, row = _boundary_chain_parts(rank, world_size, device, d)
+    sp, col, row = _converted_chain_parts(rank, world_size, device, d)
     ln_w = torch.ones(d, device=device)
     ln_b = torch.zeros(d, device=device)
     fp4_scale = torch.tensor([448.0 * 6.0 / 8.0], device=device)
@@ -657,8 +624,7 @@ def _logic_compile_fullgraph(rank, world_size, device):
 
 def _logic_cuda_graph(rank, world_size, device):
     d = 256
-    sp = _helper()
-    col, row = _boundary_chain_parts(rank, world_size, device, d)
+    sp, col, row = _converted_chain_parts(rank, world_size, device, d)
     ln_w = torch.ones(d, device=device)
     ln_b = torch.zeros(d, device=device)
     fp4_scale = torch.tensor([448.0 * 6.0 / 8.0], device=device)
@@ -817,12 +783,7 @@ _LOGIC_CHECKS = (
     _logic_adapters,
 )
 # Real NVFP4 kernels and TRT-LLM Linear/MLP modules over NCCL.
-_KERNEL_CHECKS = (
-    _logic_fp4_quantize_gather,
-    _logic_row_linear,
-    _logic_column_linear_nvfp4,
-    _logic_adapters_nvfp4,
-)
+_KERNEL_CHECKS = (_logic_fp4_quantize_gather, _logic_real_adapters, _logic_adapters_nvfp4)
 # torch.compile(fullgraph=True) and CUDA-graph capture of a boundary chain.
 _GRAPH_CHECKS = (_logic_compile_fullgraph, _logic_cuda_graph)
 

@@ -46,29 +46,25 @@ Numerics
     NCCL's default tuning at ``tp >= 8`` on NVSwitch systems the all-reduce runs as NVLS
     while the reduce-scatter runs as a ring, which rounds to bf16 after each hop, so
     Token-sharded TP is then measurably less precise than all-reduce TP (``NCCL_ALGO=
-    "ReduceScatter:NVLS"`` restores bitwise parity at a latency cost). Row-local norms
-    reuse the model's own kernels (the fused op at ``D == 5120``, the model's LayerNorm
-    module through ``RowNorm.module`` otherwise).
+    "ReduceScatter:NVLS"`` restores bitwise parity at a latency cost). The row-local
+    norms and residual adds are the model's own code, run on the shard.
 
 This is not Ulysses or Ring attention (``ulysses_size`` / ``ring_size`` /
 ``attn2d_size``): those shard the sequence *through* attention; this only shards it
 *between* projections inside a TP group, and is exclusive with them for now.
 
-Two API layers:
-
-* primitives: :class:`TokenShardPlan`, ``shard`` / ``unshard``, modulation tables,
-  ``reduce_scatter``, ``all_gather`` (bf16 or NVFP4 with scaling-factor regroup), and
-  row-local ``residual`` / ``norm`` / :func:`quantize_nvfp4`;
-* GEMM-owning boundary ops: ``column_linear``, ``row_linear``,
-  ``row_linear_residual_norm``, ``mlp_residual``. These are the only call sites a
-  communication/compute overlap or a fused GEMM+collective kernel has to replace.
+This module holds :class:`TokenShardPlan` and :class:`TokenShardedTP`: the plan cache,
+``shard`` / ``unshard``, per-shard modulation tables, ``reduce_scatter`` / ``all_gather``
+(bf16, or NVFP4 with the scaling-factor regroup) and the adapters' input preparation.
+Models do not call it directly: ``SequenceSharder.use_token_sharded_tp`` carries the
+layout through a model's existing sharder call sites, and
+``token_sharded_modules`` converts its TP modules.
 
 See ``TOKEN_SHARDED_TP_DEVELOPER_GUIDE.md`` next to this file.
 """
 
 import dataclasses
 import math
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -81,28 +77,16 @@ import torch.nn.functional as F
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import pad_up
 
-from ...modules.linear import (
-    Linear,
-    NVFP4LinearMethod,
-    TensorParallelMode,
-    is_static_nvfp4_input_eligible,
-)
+from ...modules.linear import Linear, NVFP4LinearMethod, is_static_nvfp4_input_eligible
 from ...utils import Fp4QuantizedTensor, compute_swizzled_sf_shape
-from ..modules.fused_norm_quant import (
-    apply_fused_layernorm_adaln_quant,
-    apply_fused_layernorm_affine_quant,
-)
 
 if TYPE_CHECKING:
     from ..config import DiffusionModelConfig
 
 __all__ = [
     "NVFP4_SF_VEC_SIZE",
-    "RowNorm",
     "TokenShardedTP",
     "TokenShardPlan",
-    "apply_residual",
-    "apply_row_norm",
     "quantize_nvfp4",
     "regroup_swizzled_sf",
     "static_nvfp4_input_scale",
@@ -110,13 +94,9 @@ __all__ = [
 ]
 
 NVFP4_SF_VEC_SIZE = 16
-# Hidden size supported by torch.ops.trtllm.fused_adaptive_layernorm(_quant).
-_FUSED_LN_HIDDEN_SIZE = 5120
 
-# A row-parallel boundary input / activation: bf16 rows or a static-scale NVFP4 tensor.
+# A column projection's input: bf16 rows or a static-scale NVFP4 tensor.
 Activation = torch.Tensor | Fp4QuantizedTensor
-# A GEMM (column- or row-parallel): a TRT-LLM Linear or any callable with the same contract.
-GemmFn = Callable[[Activation], torch.Tensor]
 
 
 # =============================================================================
@@ -259,7 +239,8 @@ def static_nvfp4_input_scale(linear: nn.Module | None) -> torch.Tensor | None:
     calibrated scale (no AWQ ``pre_quant_scale``, no forced dynamic quantization), i.e.
     iff a row-local quantize with this scale yields exactly the bytes the Linear would
     produce itself, so the activation can be all-gathered as NVFP4. This is the rule
-    ``TokenShardedTP`` users (Wan included) wire their ``RowNorm.quant_scale`` from.
+    The column adapters quantize before their all-gather by this rule, and models that
+    fuse the quantize into their norm (Wan) wire the norm's scale from it.
     """
     if not is_static_nvfp4_input_eligible(linear):
         return None
@@ -280,144 +261,6 @@ def quantize_nvfp4(h: torch.Tensor, input_scale: torch.Tensor) -> Fp4QuantizedTe
     else:
         fp4, sf = torch.ops.trtllm.fp4_quantize(h2, input_scale, NVFP4_SF_VEC_SIZE, False)
     return Fp4QuantizedTensor(fp4, sf, is_sf_swizzled=True)
-
-
-def _check_table_rows(op: str, rows: int, entries: int) -> None:
-    if entries < 1 or rows % entries != 0:
-        raise ValueError(
-            f"TokenShardedTP.{op}: a per-row-group table of {entries} entries does not "
-            f"divide the {rows} local rows; build it with per_sample_table()/shard_rows()."
-        )
-
-
-def apply_residual(
-    x: torch.Tensor, y: torch.Tensor, gate: torch.Tensor | None = None
-) -> torch.Tensor:
-    """Row-local residual on ``m`` rows: ``x + y``, or ``x + y * gate`` in fp32.
-
-    Args:
-        x: Residual rows ``[m, D]``.
-        y: Rows to add ``[m, D]`` (same dtype as ``x``).
-        gate: Optional ``[n, D]`` table; entry ``j`` applies to local rows
-            ``[j * m / n, (j + 1) * m / n)`` (see ``TokenShardedTP.per_sample_table``).
-
-    Returns:
-        ``[m, D]`` in ``x.dtype``.
-    """
-    if gate is None:
-        return x + y
-    m, d = x.shape
-    n = gate.shape[0]
-    _check_table_rows("residual", m, n)
-    g = m // n
-    out = x.float().view(n, g, d) + y.float().view(n, g, d) * gate.float().unsqueeze(1)
-    return out.to(x.dtype).view(m, d)
-
-
-@dataclass(frozen=True, eq=False)
-class RowNorm:
-    """Row-local LayerNorm spec for a block boundary (see :func:`apply_row_norm`).
-
-    ``y = LN(x) [* weight + bias] [* (1 + scale) + shift]``, then an optional static
-    NVFP4 quantize. The fused op covers exactly one of affine (``weight``/``bias``) and
-    AdaLN (``scale``/``shift``); a spec with both, or with neither, runs the eager path.
-
-    Attributes:
-        eps: LayerNorm epsilon.
-        weight: Affine LayerNorm weight ``[D]`` (given together with ``bias``).
-        bias: Affine LayerNorm bias ``[D]``.
-        scale: AdaLN scale table ``[n, D]``; entry ``j`` applies to local rows
-            ``[j * m / n, (j + 1) * m / n)``. Build it with ``per_sample_table`` /
-            ``shard_rows``, never from a global ``[B, D]`` table.
-        shift: AdaLN shift table ``[n, D]`` (given together with ``scale``).
-        quant_scale: The consumer's static NVFP4 ``input_scale``
-            (:func:`static_nvfp4_input_scale`); when set the norm returns an
-            :class:`Fp4QuantizedTensor`.
-        identity: Skip the norm (e.g. Wan ``cross_attn_norm=False``) but still quantize
-            when ``quant_scale`` is set.
-        module: Optional LayerNorm module (e.g. the model's own ``norm1``) that the eager
-            path calls as ``module(x.float())`` instead of ``F.layer_norm``, so it runs the
-            same kernel as the model's all-reduce path. It must compute the same function
-            as ``eps`` / ``weight`` / ``bias`` (the fused path uses those).
-    """
-
-    eps: float = 1e-6
-    weight: torch.Tensor | None = None
-    bias: torch.Tensor | None = None
-    scale: torch.Tensor | None = None
-    shift: torch.Tensor | None = None
-    quant_scale: torch.Tensor | None = None
-    identity: bool = False
-    module: nn.Module | None = None
-
-    def __post_init__(self) -> None:
-        if (self.scale is None) != (self.shift is None):
-            raise ValueError("RowNorm: scale and shift must be given together.")
-        if (self.weight is None) != (self.bias is None):
-            raise ValueError("RowNorm: weight and bias must be given together.")
-        if self.identity and (
-            self.weight is not None or self.scale is not None or self.module is not None
-        ):
-            raise ValueError("RowNorm: identity=True excludes weight/bias/scale/shift/module.")
-
-
-def apply_row_norm(x: torch.Tensor, spec: RowNorm) -> Activation:
-    """Row-local LayerNorm (+AdaLN / affine) (+static NVFP4 quantize) on ``x`` [m, D].
-
-    Uses the fused ``fused_adaptive_layernorm(_quant)`` op when it applies (D == 5120,
-    bf16, CUDA, exactly one of modulation/affine); otherwise fp32 LayerNorm
-    (``spec.module`` if set, else ``F.layer_norm``) with the same math as the Wan block,
-    followed by :func:`quantize_nvfp4` when ``spec.quant_scale`` is set.
-
-    Args:
-        x: Local rows ``[m, D]``.
-        spec: The norm to apply; its tables must have ``n`` entries with ``n | m``.
-
-    Returns:
-        ``[m, D]`` in ``x.dtype``, or an :class:`Fp4QuantizedTensor` (payload
-        ``[m, D/2]``, 128x4-swizzled SF for ``m`` rows) when ``spec.quant_scale`` is set.
-    """
-    m, d = x.shape
-    modulated = spec.scale is not None
-    affine = spec.weight is not None
-    if spec.identity:
-        h = x
-    elif (
-        d == _FUSED_LN_HIDDEN_SIZE
-        and x.dtype == torch.bfloat16
-        and x.is_cuda
-        and modulated != affine
-    ):
-        if modulated:
-            n = spec.scale.shape[0]
-            _check_table_rows("norm", m, n)
-            return apply_fused_layernorm_adaln_quant(
-                x, spec.scale, spec.shift, m // n, spec.quant_scale, spec.eps
-            )
-        return apply_fused_layernorm_affine_quant(
-            x, spec.weight, spec.bias, spec.quant_scale, spec.eps
-        )
-    else:
-        if spec.module is not None:
-            y = spec.module(x.float())
-        else:
-            y = F.layer_norm(
-                x.float(),
-                (d,),
-                spec.weight.float() if affine else None,
-                spec.bias.float() if affine else None,
-                spec.eps,
-            )
-        if modulated:
-            n = spec.scale.shape[0]
-            _check_table_rows("norm", m, n)
-            g = m // n
-            y = y.view(n, g, d) * (
-                1 + spec.scale.float().unsqueeze(1)
-            ) + spec.shift.float().unsqueeze(1)
-            y = y.view(m, d)
-        h = y.to(x.dtype)
-    return quantize_nvfp4(h, spec.quant_scale) if spec.quant_scale is not None else h
 
 
 # =============================================================================
@@ -595,20 +438,6 @@ class TokenShardedTP:
                 f"TokenShardedTP.{op}: expected this rank's [{m}, K] rows for the current "
                 f"plan ({self._plan_desc()}); got shape {tuple(t.shape)}. Did you forget "
                 "shard(), or call begin() for another shape in between?"
-            )
-
-    def _check_table(self, op: str, name: str, table: torch.Tensor | None) -> None:
-        # Python-int shape check (a compile-time guard under torch.compile).
-        if table is None:
-            return
-        p = self.plan
-        if table.shape[0] not in (len(p.entry_batch), p.local_rows):
-            raise ValueError(
-                f"TokenShardedTP.{op}: {name} has {table.shape[0]} entries; the current "
-                f"plan ({self._plan_desc()}) expects this shard's per-sample table "
-                f"({len(p.entry_batch)} entries, per_sample_table()) or per-row table "
-                f"({p.local_rows} rows, shard_rows()). A global [B, ...] table would "
-                "silently apply other samples' modulation on a shard."
             )
 
     # --- entry / exit / per-token metadata (once per forward) ---------------------------
@@ -808,54 +637,7 @@ class TokenShardedTP:
             )
         return payload, a.scaling_factor.reshape(-1), k
 
-    def residual(
-        self, x_loc: torch.Tensor, y_loc: torch.Tensor, gate: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        """Row-local residual ``x + y (* gate)``; see :func:`apply_residual`.
-
-        ``gate`` must be this shard's table (``per_sample_table`` / ``shard_rows``).
-        """
-        self._check_table("residual", "gate", gate)
-        return apply_residual(x_loc, y_loc, gate)
-
-    def norm(self, x_loc: torch.Tensor, spec: RowNorm) -> Activation:
-        """Row-local norm (+quantize); see :func:`apply_row_norm`.
-
-        ``spec.scale`` / ``spec.shift`` must be this shard's tables.
-        """
-        self._check_table("norm", "RowNorm.scale", spec.scale)
-        self._check_table("norm", "RowNorm.shift", spec.shift)
-        return apply_row_norm(x_loc, spec)
-
     # --- GEMM-owning boundary ops (the seam later overlap / fused kernels replace) -----
-
-    def _check_linear(self, linear: object, mode: TensorParallelMode, op: str, what: str) -> None:
-        """TP mode / size / reduction checks for a TRT-LLM Linear (other callables pass)."""
-        if not isinstance(linear, Linear):
-            return
-        if mode == TensorParallelMode.ROW:
-            ok = linear.tp_mode == TensorParallelMode.ROW and not linear.reduce_output
-            detail = (
-                f"built with reduce_output=False (got tensor_parallel_mode={linear.tp_mode}, "
-                f"reduce_output={linear.reduce_output}); an all-reduced output would be "
-                "summed again by the reduce-scatter"
-            )
-        else:
-            ok = linear.tp_mode == TensorParallelMode.COLUMN and not linear.gather_output
-            detail = (
-                f"without gather_output (got tensor_parallel_mode={linear.tp_mode}, "
-                f"gather_output={linear.gather_output})"
-            )
-        if not ok:
-            raise ValueError(
-                f"TokenShardedTP.{op}: expected {what} to be a {mode.name.lower()}-parallel "
-                f"Linear {detail}."
-            )
-        if linear.tp_size != self.tp_size:
-            raise ValueError(
-                f"TokenShardedTP.{op}: {what} is sharded for tp_size={linear.tp_size}, "
-                f"but the helper's TP group has {self.tp_size} ranks."
-            )
 
     @staticmethod
     def _check_fp4_consumer(consumer: object, act: Activation, op: str, what: str) -> None:
@@ -870,118 +652,3 @@ class TokenShardedTP:
                 f"TokenShardedTP.{op}: got an NVFP4 activation, but {what} has no static "
                 "NVFP4 input_scale (static_nvfp4_input_scale() is None); gather BF16 for it."
             )
-
-    def column_linear(self, linear: GemmFn, act_loc: Activation) -> torch.Tensor:
-        """All-gather ``act_loc`` then run the column-parallel ``linear`` on ``B * S`` rows.
-
-        Args:
-            linear: A column-parallel TRT-LLM ``Linear`` (checked: COLUMN, no
-                ``gather_output``, same tp_size) or any callable taking ``[B * S, K]``
-                (or an :class:`Fp4QuantizedTensor`) and returning a contiguous
-                ``[B * S, N_local]``.
-            act_loc: This rank's ``[m, K]`` rows (bf16, or static-scale NVFP4 from
-                ``norm(..., RowNorm(quant_scale=static_nvfp4_input_scale(linear)))``).
-
-        Returns:
-            ``[B, S, N_local]``.
-        """
-        self._check_linear(linear, TensorParallelMode.COLUMN, "column_linear", "linear")
-        self._check_fp4_consumer(linear, act_loc, "column_linear", "linear")
-        p = self.plan
-        return linear(self.all_gather(act_loc)).view(p.batch_size, p.seq_len, -1)
-
-    def _row_linear(self, linear: GemmFn, act: torch.Tensor, op: str) -> torch.Tensor:
-        self._check_linear(linear, TensorParallelMode.ROW, op, "linear")
-        p = self.plan
-        if tuple(act.shape[:-1]) not in ((p.batch_size, p.seq_len), (p.num_tokens,)):
-            raise ValueError(
-                f"TokenShardedTP.{op}: expected a [B={p.batch_size}, S={p.seq_len}, K] or "
-                f"[B * S={p.num_tokens}, K] input for the current plan; got shape "
-                f"{tuple(act.shape)}."
-            )
-        return self.reduce_scatter(linear(self._add_padding(act)))
-
-    def row_linear(self, linear: GemmFn, act: torch.Tensor) -> torch.Tensor:
-        """Row-parallel ``linear`` on all tokens, then reduce-scatter -> ``[m, N]``.
-
-        ``act`` is padded per sample before the GEMM (cheaper than padding the
-        ``[B * S, N]`` partial), so the GEMM sees ``B * S_pad`` rows on padded plans; zero
-        pad rows leave a dynamic amax unchanged and only carry the bias of tp_rank 0.
-
-        Args:
-            linear: A row-parallel TRT-LLM ``Linear`` built with ``reduce_output=False``
-                (checked), or any callable returning K-partial sums ``[rows, N]`` with the
-                bias added on exactly one rank.
-            act: ``[B, S, K_local]`` or ``[B * S, K_local]`` (the rank's K slice of all
-                tokens, e.g. an attention output before ``to_out``).
-
-        Returns:
-            ``[m, N]`` reduced rows.
-        """
-        return self._row_linear(linear, act, "row_linear")
-
-    def row_linear_residual_norm(
-        self,
-        linear: GemmFn,
-        act: torch.Tensor,
-        residual: torch.Tensor,
-        *,
-        gate: torch.Tensor | None = None,
-        norm: RowNorm | Callable[[torch.Tensor], Activation] | None = None,
-    ) -> tuple[torch.Tensor, Activation | None]:
-        """``x = residual + row_linear(linear, act) (* gate)``; ``h = norm(x)``.
-
-        Args:
-            linear: As for :meth:`row_linear`.
-            act: As for :meth:`row_linear`.
-            residual: This rank's ``[m, N]`` residual rows.
-            gate: Optional gate table for this shard (``per_sample_table`` /
-                ``shard_rows``), ``[n, N]``.
-            norm: A :class:`RowNorm`, any row-local callable ``[m, N] -> [m, N]`` or
-                :class:`Fp4QuantizedTensor` (e.g. a custom RMSNorm that calls
-                :func:`quantize_nvfp4`), or None.
-
-        Returns:
-            ``(x, h)``: the new ``[m, N]`` residual rows and ``norm(x)`` (None without a
-            norm).
-        """
-        x = self.residual(residual, self._row_linear(linear, act, "row_linear_residual_norm"), gate)
-        if norm is None:
-            return x, None
-        h = self.norm(x, norm) if isinstance(norm, RowNorm) else norm(x)
-        return x, h
-
-    def mlp_residual(
-        self,
-        mlp: GemmFn,
-        act_loc: Activation,
-        residual: torch.Tensor,
-        *,
-        gate: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """All-gather -> ``mlp`` (up, act, down K-partials) -> reduce-scatter -> residual.
-
-        The MLP runs on the ``B * S`` real rows only (pad rows would be non-zero after a
-        norm and perturb dynamic-amax quantization inside it); its output partial is
-        padded per sample before the reduce-scatter.
-
-        Args:
-            mlp: A TRT-LLM ``MLP`` / ``GatedMLP`` (any module whose ``down_proj`` is a
-                TRT-LLM ``Linear``: checked to be row-parallel with
-                ``reduce_output=False``) or any callable returning K-partial sums
-                ``[B * S, N]`` with the bias added on exactly one rank.
-            act_loc: This rank's ``[m, K]`` rows (bf16, or static-scale NVFP4 for the
-                MLP's input projection).
-            residual: This rank's ``[m, N]`` residual rows.
-            gate: Optional gate table for this shard, ``[n, N]``.
-
-        Returns:
-            The new ``[m, N]`` residual rows.
-        """
-        self._check_linear(
-            getattr(mlp, "down_proj", None), TensorParallelMode.ROW, "mlp_residual", "mlp.down_proj"
-        )
-        up = getattr(mlp, "up_proj", None) or getattr(mlp, "gate_up_proj", None)
-        self._check_fp4_consumer(up, act_loc, "mlp_residual", "the MLP's input projection")
-        y = mlp(self.all_gather(act_loc))
-        return self.residual(residual, self.reduce_scatter(y), gate)

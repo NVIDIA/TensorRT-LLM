@@ -33,10 +33,9 @@ from .token_sharded_modules import (
     convert_to_token_sharded_tp,
     register_token_sharded_adapter,
 )
-from .token_sharded_tp import RowNorm, TokenShardedTP, TokenShardPlan, static_nvfp4_input_scale
+from .token_sharded_tp import TokenShardedTP, TokenShardPlan, static_nvfp4_input_scale
 
 __all__ = [
-    "RowNorm",
     "TokenShardPlan",
     "TokenShardedAdapter",
     "TokenShardedColumn",

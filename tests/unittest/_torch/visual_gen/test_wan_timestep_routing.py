@@ -43,6 +43,8 @@ def test_uniform_timestep_modulation_routing(
     model.sharder.shard.side_effect = lambda tensor, **_kwargs: tensor
     model.sharder.shard_rope.return_value = None
     model.sharder.gather.side_effect = lambda tensor, **_kwargs: tensor
+    model.sharder.shard_per_sample.side_effect = lambda tensor: tensor
+    model.sharder.token_sharded_tp = False
 
     def condition_embedder(
         timestep: torch.Tensor,
