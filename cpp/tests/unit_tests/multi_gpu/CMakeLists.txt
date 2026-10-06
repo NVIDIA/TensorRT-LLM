@@ -61,14 +61,23 @@ add_tllm_gtest(
   tllm::runtime_distributed
   LABELS
   "unit;kernels;userbuffers;multi-gpu;gpu")
-add_tllm_gtest(ncclUtilsTest SOURCES ncclUtilsTest.cpp FULL_STACK LABELS
-               "unit;full-stack;gpu")
-target_link_libraries(ncclUtilsTest PRIVATE ${Python3_LIBRARIES})
+add_tllm_gtest(
+  ncclUtilsTest
+  OWNER
+  common
+  SOURCES
+  ncclUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::common_nccl_comm
+  tllm::runtime_memory
+  LABELS
+  "unit;common;nccl;multi-gpu;gpu")
 if(BUILD_PYT)
   target_compile_definitions(cacheTransceiverTest PUBLIC BUILD_PYT)
   target_link_libraries(cacheTransceiverTest PUBLIC ${TORCH_LIBRARIES})
 endif()
 if(BUILD_PYT)
-  target_compile_definitions(ncclUtilsTest PUBLIC BUILD_PYT)
-  target_link_libraries(ncclUtilsTest PUBLIC ${TORCH_LIBRARIES})
+  target_compile_definitions(ncclUtilsTest PRIVATE BUILD_PYT)
+  target_link_libraries(ncclUtilsTest PRIVATE ${TORCH_LIBRARIES}
+                                              Python3::Python)
 endif()
