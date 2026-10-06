@@ -224,11 +224,15 @@ routes, and optional token-validity bits mask ragged KV tails. Plans contain
 only static format, proxy, geometry, and capacity choices; every run receives
 the live routes, summaries, validity bits, page tables, and sequence lengths.
 
-`PrimsTSBlockSparseFmha` owns its wrapper-plan cache by default. Integrations
-whose attention layers execute serially may explicitly bind a model-scoped
-cache to reuse graph-stable route workspaces across compatible layers. The
-cache must not be shared by concurrent forwards; each independent model
-component must own separate state.
+`PrimsTSBlockSparseFmha` keeps its planned wrappers in the attention metadata
+(`TrtllmAttentionMetadata.fmha_plan_caches`), like the FlashInfer wrappers and
+the MSA plans. Every layer that runs with one metadata object plans each static
+profile once and reuses its graph-stable route workspace, so the sharing
+granularity is the metadata: one per batch in the LLM path, where each
+CUDA-graph batch size gets its own copy, and one per component and sequence
+shape in VisualGen, whose layers share a shape-keyed metadata cache. Layers
+that share a metadata object execute serially, so they never run a planned
+wrapper concurrently.
 
 `TrtllmAttention.block_sparse_attn_predict(q, k, v, metadata, forward_args)`
 is the backend hook that produces this payload; `prepare_sparse_runtime_params`

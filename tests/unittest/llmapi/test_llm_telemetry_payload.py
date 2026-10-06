@@ -104,7 +104,7 @@ class TestPayloadVerification:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=capture_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop),
         ):
             usage_lib._background_reporter(llm_args, pretrained_config, usage_context)
 

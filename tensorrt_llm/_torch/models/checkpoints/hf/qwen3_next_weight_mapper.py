@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 
 import torch
@@ -92,6 +95,29 @@ def _permute_rows(tensor: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
 @register_mapper("HF", "Qwen3NextForCausalLM")
 class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
 
+    @staticmethod
+    def map_mtp_module_name(name: str, num_hidden_layers: int) -> str:
+        """Map MTP head indices and shared input/output projections."""
+        if name.startswith("mtp.layers."):
+            _, _, layer_idx, *suffix = name.split(".")
+            if layer_idx.isdecimal():
+                return ".".join([
+                    f"model.layers.{num_hidden_layers + int(layer_idx)}",
+                    *suffix
+                ])
+        mapping = {
+            "mtp.fc": "fc",
+            "mtp.norm": "shared_head.norm",
+            "mtp.pre_fc_norm_embedding": "pre_fc_norm_embedding",
+            "mtp.pre_fc_norm_hidden": "pre_fc_norm_hidden",
+        }
+        for prefix, runtime_name in mapping.items():
+            if name == prefix or name.startswith(prefix + "."):
+                return f"model.layers.{num_hidden_layers}.{runtime_name}{name[len(prefix):]}"
+        if name in ("mtp", "mtp*", "mtp.*"):
+            return f"model.layers.{num_hidden_layers}"
+        return name
+
     def should_skip_module(self, module_name: str) -> bool:
         if module_name.startswith("draft_model"):
             return True
@@ -175,27 +201,9 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
         linear_key_dim = config.linear_key_head_dim * config.linear_num_key_heads  # 16 * 128
         linear_value_dim = config.linear_value_head_dim * config.linear_num_value_heads  # 32 * 128
 
-        mtp_mapping = {
-            "mtp.fc": "fc",
-            "mtp.norm": "shared_head.norm",
-            "mtp.pre_fc_norm_embedding": "pre_fc_norm_embedding",
-            "mtp.pre_fc_norm_hidden": "pre_fc_norm_hidden",
-        }
-
         new_weights = {}
         for name, _ in weights.items():
-            key = name
-
-            if key.startswith("mtp.layers."):
-                _, _, mtp_layer_idx, module_name = key.split(".", 3)
-                key = (f"model.layers.{mtp_layer_offset + int(mtp_layer_idx)}."
-                       f"{module_name}")
-            elif key.startswith("mtp."):
-                for mtp_prefix, trtllm_name in mtp_mapping.items():
-                    if key.startswith(mtp_prefix):
-                        suffix = key[len(mtp_prefix):]
-                        key = f"model.layers.{mtp_layer_offset}.{trtllm_name}{suffix}"
-                        break
+            key = self.map_mtp_module_name(name, mtp_layer_offset)
 
             if "A_log" in key:
                 w = split(weights[name], tp_size, tp_rank)

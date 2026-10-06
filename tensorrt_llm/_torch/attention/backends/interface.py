@@ -957,7 +957,13 @@ class AttentionForwardArgs:
     # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
+    # Optional normalized diffusion timestep for timestep-varying sparse attention.
     timestep: Optional[torch.Tensor] = cpp_metadata(dtype=torch.int32)
+    # Dense-prefix (0) or sparse (1) phase of a timestep-scheduled sparse
+    # algorithm, resolved on the host by the caller. When set, backends use it
+    # instead of reading ``timestep``, which CUDA Graph capture cannot do.
+    sparse_attn_phase: Optional[int] = None
+
     sparse_backend_args: Optional[SparseBackendForwardArgs] = None
     sparse_runtime_params: SparseRuntimeParams = field(
         default_factory=SparseRuntimeParams)

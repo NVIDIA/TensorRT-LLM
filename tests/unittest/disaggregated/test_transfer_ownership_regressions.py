@@ -388,7 +388,7 @@ def test_pre_cancelled_rx_session_never_publishes_destination(
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
     receiver.dispatch_task = Mock()
-    receiver.send_cancel_to_senders = Mock()
+    receiver.send_cancel_to_senders = Mock(return_value=None)
 
     monkeypatch.setattr(
         transfer_mod.tensorrt_llm.bindings,
@@ -416,7 +416,7 @@ def test_remote_cancel_resolves_strong_owned_session() -> None:
     receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
-    receiver.send_cancel_to_senders = Mock()
+    receiver.send_cancel_to_senders = Mock(return_value=None)
     session = _make_rx_session(receiver, rid)
 
     assert receiver._sessions[rid] is session
@@ -530,8 +530,8 @@ def test_failed_receive_consensus_waits_for_every_rank_to_drain() -> None:
         side_effect=[
             [[], []],
             [
-                [[], [rid], [], [rid]],
-                [[], [], [], []],
+                [[], [rid], [], [rid], []],
+                [[], [], [], [], []],
             ],
         ]
     )
@@ -547,8 +547,8 @@ def test_failed_receive_consensus_waits_for_every_rank_to_drain() -> None:
         side_effect=[
             [[rid], [rid]],
             [
-                [[], [rid], [], [rid]],
-                [[], [rid], [], [rid]],
+                [[], [rid], [], [rid], []],
+                [[], [rid], [], [rid], []],
             ],
         ]
     )
@@ -1133,6 +1133,7 @@ def test_completed_session_is_not_reported_retired_when_close_refuses() -> None:
         is_completed=Mock(return_value=True),
         has_failed=Mock(return_value=False),
         wait_complete=Mock(return_value=WaitResult.COMPLETED),
+        kv_write_verified=Mock(return_value=True),
         close=Mock(return_value=False),
     )
     transceiver = object.__new__(KvCacheTransceiverV2)
@@ -1234,13 +1235,14 @@ def test_shutdown_refuses_to_drop_active_receive_owner() -> None:
     transceiver._send_reqs = {}
     transceiver._recv_sessions = {rid: session}
     transceiver._recv_reqs = {rid: object()}
-    transceiver._transfer_worker = SimpleNamespace(shutdown=Mock())
+    transceiver._transfer_worker = SimpleNamespace(request_shutdown=Mock(), shutdown=Mock())
 
     with pytest.raises(RuntimeError, match="physical resources remain active"):
         transceiver.shutdown()
 
     assert not transceiver._shutdown_complete
     assert transceiver._recv_sessions[rid] is session
+    transceiver._transfer_worker.request_shutdown.assert_called_once_with()
     session.close.assert_not_called()
     transceiver._transfer_worker.shutdown.assert_not_called()
 
@@ -1268,7 +1270,7 @@ def test_shutdown_fails_stop_when_receive_close_refuses_after_preflight() -> Non
     transceiver._send_reqs = {rid + 1: object()}
     transceiver._recv_sessions = {rid: recv_session}
     transceiver._recv_reqs = {rid: object()}
-    transceiver._transfer_worker = SimpleNamespace(shutdown=Mock())
+    transceiver._transfer_worker = SimpleNamespace(request_shutdown=Mock(), shutdown=Mock())
 
     with pytest.raises(RuntimeError, match="session close refused"):
         transceiver.shutdown()
@@ -1310,7 +1312,9 @@ def test_concurrent_shutdown_is_serialized() -> None:
     transceiver._send_reqs = {}
     transceiver._recv_sessions = {}
     transceiver._recv_reqs = {}
-    transceiver._transfer_worker = SimpleNamespace(shutdown=worker_shutdown)
+    transceiver._transfer_worker = SimpleNamespace(
+        request_shutdown=Mock(), shutdown=worker_shutdown
+    )
 
     first = _start_checked_thread(transceiver.shutdown, thread_results)
     assert entered.wait(timeout=10)
@@ -1337,10 +1341,15 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender = object.__new__(transfer_mod.Sender)
     sender._enforce_physical_ownership = True
     sender._sessions_lock, sender._sessions = threading.Lock(), {}
+    sender._pre_cancelled_rids = {}
     sender._shutdown = sender._shutdown_requested = False
     sender._ownership_poisoned, sender._ownership_poison_lock = None, threading.Lock()
     sender._loaded_remote_agents_lock, sender._loaded_remote_agents = threading.Lock(), set()
     sender._instance_rank = 0
+    sender._num_threads = 1
+    sender._pending_settlements = [{}]
+    sender._pending_session_quiescence = {}
+    sender._send_task_queues = [queue.Queue()]
     return sender
 
 
@@ -1370,30 +1379,27 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
     session = SimpleNamespace(
         disagg_request_id=rid,
         _need_aux=True,
+        lock=threading.Lock(),
+        has_failed=Mock(return_value=True),
+        resources_drained=Mock(return_value=True),
         cancel_local=Mock(return_value=True),
         _claim_unsubmitted_aux_failure=Mock(return_value=True),
     )
+    dealer = Mock()
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
 
     sender.setup_session(session)
 
     assert sender._sessions == {rid: session}
-    assert sender._pre_cancelled_rids == {}
-    session.cancel_local.assert_called_once_with(by_peer=True)
-    session._claim_unsubmitted_aux_failure.assert_called_once_with(info)
-    make_result.assert_called_once_with(5, rid, 0, True, AgentResult.FAILED)
-    assert sender._send_task_queues[0].get_nowait() == (
-        "receiver",
-        [MessageType.KV_AGENT_RESULT, b"failed"],
-    )
-    assert sender._send_task_queues[0].get_nowait() == (
-        "receiver",
-        [
-            MessageType.AUX_AGENT_RESULT,
-            b"5",
-            b"97",
-            AgentResult.FAILED.value.encode("ascii"),
-        ],
-    )
+    assert sender._pre_cancelled_rids == {rid: True}
+    session.cancel_local.assert_called_once_with(by_peer=True, report_unsubmitted_aux=False)
+    session._claim_unsubmitted_aux_failure.assert_not_called()
+    make_result.assert_not_called()
+    marker = sender._send_task_queues[0].get_nowait()
+    assert marker == transfer_mod._SessionQuiescence(rid, 2, "receiver")
+    assert sender._send_session_quiesced(marker)
+    dealer.send.assert_called_once_with([MessageType.SESSION_QUIESCED, b"5", b"97"])
+    assert not sender._pending_session_quiescence
     assert sender._send_task_queues[0].empty()
 
 
@@ -1401,6 +1407,7 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
 def test_sender_failed_result_routes_messages_directly_in_order(monkeypatch) -> None:
     rid = 98
     sender = object.__new__(transfer_mod.Sender)
+    sender._enforce_physical_ownership = False
     sender._instance_rank = 5
     sender._registrar = SimpleNamespace(
         get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="receiver"))
@@ -2484,7 +2491,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
 
     recv_tasks = []
 
-    def receive_after_rooting(_chunk: Chunk) -> None:
+    def receive_after_rooting(_chunk: Chunk, expected_write_bytes=None) -> None:
         assert receiver._recv_reqs[rid] is recv_req
         recv_tasks.append(SimpleNamespace(status=None, _exception=None))
 
