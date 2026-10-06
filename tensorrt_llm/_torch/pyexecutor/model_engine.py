@@ -5088,9 +5088,11 @@ class PyTorchModelEngine(ModelEngine):
                         request.py_mrope_delta_cache_slot = request.py_seq_slot
 
                 # Re-assign the multimodal_data to the request after to_device for generation
-                # requests. Item scheduling instead builds a per-forward copy holding this chunk's
-                # joined embedding rows; keep it off the request so a chunked prefill does not
-                # retain those rows between chunks outside the encoder-cache memory budget.
+                # requests. Item scheduling instead builds a per-forward prompt-window copy
+                # holding this chunk's joined embedding rows; keep it off the request so a
+                # chunked prefill does not retain those rows outside the encoder-cache memory
+                # budget, and so the request keeps its full CPU payload for later items and a
+                # restarted prefill.
                 if request.py_mm_encoder_state is None:
                     request.py_multimodal_data = multimodal_params.multimodal_data
                 multimodal_params_list.append(multimodal_params)

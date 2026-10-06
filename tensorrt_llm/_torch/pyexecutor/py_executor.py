@@ -99,8 +99,9 @@ from .kv_cache_stats import append_kv_cache_iteration_stats
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
                           MultimodalEncoderRequestError, get_draft_token_length,
+                          get_mm_pending_items,
                           initialize_multimodal_encoder_request,
-                          is_multimodal_encoder_ready)
+                          is_mm_context_chunk_ready, release_consumed_mm_items)
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import PPCommTag
@@ -4503,6 +4504,9 @@ class PyExecutor:
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    if self._mm_encoder_item_scheduling_enabled:
+                        self._fail_mm_contexts_with_unready_outputs(
+                            scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -5370,6 +5374,9 @@ class PyExecutor:
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    if self._mm_encoder_item_scheduling_enabled:
+                        self._fail_mm_contexts_with_unready_outputs(
+                            scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -6011,11 +6018,11 @@ class PyExecutor:
             return progressed
 
         for request in self.active_requests:
-            state = request.py_mm_encoder_state
-            if state is None or is_multimodal_encoder_ready(request):
-                continue
-            consume_pending(state.encoder_token_lengths,
-                            state.pending_item_indices())
+            pending_item_indices = get_mm_pending_items(request)
+            if pending_item_indices:
+                consume_pending(
+                    request.py_mm_encoder_state.encoder_token_lengths,
+                    pending_item_indices)
 
         admitted = []
         deferred = []
@@ -6252,7 +6259,10 @@ class PyExecutor:
                             self.model_engine,
                             "bytes_per_mm_encoder_embedding",
                             0,
-                        ))
+                        ),
+                        whole_request_output_resident=getattr(
+                            self.scheduler, "context_chunk_unit_size",
+                            None) is None)
                 return False
             except Exception as e:
                 self._handle_errors(str(e),
@@ -6703,10 +6713,41 @@ class PyExecutor:
         scheduled_requests.reset_context_requests([
             request for request in scheduled_requests.context_requests
             if request.request_id not in failed_request_ids
-            and is_multimodal_encoder_ready(request)
+            and is_mm_context_chunk_ready(request)
         ])
         scheduled_requests.scheduled_mm_encoder_items = None
 
+        self._handle_errors(error_msg,
+                            requests=failed_requests,
+                            charge_budget=False)
+
+    def _fail_mm_contexts_with_unready_outputs(
+            self, scheduled_requests: ScheduledRequests) -> None:
+        """Fail item-scheduled contexts whose final chunk uses an unready output.
+
+        The scheduler selects items for the chunk it expects to run, starting
+        after the estimated reusable KV prefix. KV cache V1 applies the actual
+        reuse while preparing resources; if less of the prefix is reused, the
+        chunk can start at an item that was never encoded. Fail only those
+        requests instead of the whole forward step.
+        """
+        failed_requests = [
+            request for request in scheduled_requests.context_requests
+            if not is_mm_context_chunk_ready(request,
+                                             request.context_current_position)
+        ]
+        if not failed_requests:
+            return
+        failed_request_ids = {request.request_id for request in failed_requests}
+        scheduled_requests.reset_context_requests([
+            request for request in scheduled_requests.context_requests
+            if request.request_id not in failed_request_ids
+        ])
+        error_msg = (
+            "Multimodal prefill chunk needs encoder outputs that were not "
+            "prepared because less of the KV cache prefix was reused than "
+            "scheduling estimated")
+        logger.error(f"{error_msg}: request_ids={sorted(failed_request_ids)}")
         self._handle_errors(error_msg,
                             requests=failed_requests,
                             charge_budget=False)
@@ -7855,6 +7896,9 @@ class PyExecutor:
                     request.context_current_position +
                     request.context_chunk_size)
                 request.move_to_next_context_chunk()
+                if request.py_mm_encoder_state is not None:
+                    release_consumed_mm_items(
+                        request, self.model_engine.mm_encoder_cache)
             if request.context_remaining_length == 0:
                 # Prefill is done for this request; drop pinned encoder outputs
                 # (multimodal_embedding) and raw pre-encoder tensors that multimodal models stashed

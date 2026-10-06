@@ -25,12 +25,14 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     get_multimodal_encoder_token_lengths,
     initialize_multimodal_encoder_request,
     is_multimodal_encoder_ready,
+    release_consumed_mm_items,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     MultimodalEagerEncoderScheduler,
     MultimodalScheduler,
     ScheduledRequests,
+    SchedulerOutput,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
@@ -54,15 +56,30 @@ class _RejectMultimodalCapacityScheduler:
 
 
 class _MicroBatchScheduler:
+    def __init__(self, *, chunk_size=None):
+        self.chunk_size = chunk_size
+
     def schedule(self, requests, inflight_request_ids):
         del inflight_request_ids
+        for request in requests:
+            request.context_chunk_size = min(
+                request.context_remaining_length,
+                self.chunk_size or request.context_remaining_length,
+            )
         return [], list(requests), []
 
 
 class _BaseScheduler:
-    def __init__(self):
+    def __init__(self, *, chunk_size=None):
         self.capacity_scheduler = _CapacityScheduler()
-        self.micro_batch_scheduler = _MicroBatchScheduler()
+        self.micro_batch_scheduler = _MicroBatchScheduler(chunk_size=chunk_size)
+
+    def schedule_request(self, requests, inflight_request_ids):
+        fitting, disagg, paused = self.capacity_scheduler.schedule_request(requests)
+        encoder, context, generation = self.micro_batch_scheduler.schedule(
+            fitting, inflight_request_ids
+        )
+        return SchedulerOutput(encoder, context, generation, paused, disagg, len(fitting))
 
     def can_schedule(self, requests):
         return bool(requests)
@@ -80,6 +97,7 @@ def _scheduler(
     cache_capacity=1 << 20,
     base_scheduler=None,
     scheduler_cls=MultimodalScheduler,
+    context_chunk_unit_size=None,
 ):
     return scheduler_cls(
         base_scheduler or _BaseScheduler(),
@@ -89,6 +107,7 @@ def _scheduler(
         get_item_cache_keys=_item_cache_keys,
         bytes_per_encoder_embedding=4,
         retain_cache_entries=False,
+        context_chunk_unit_size=context_chunk_unit_size,
     )
 
 
@@ -317,6 +336,96 @@ def test_eager_scheduler_encodes_request_rejected_by_llm_capacity():
 
     assert output.scheduled_mm_encoder_items == {1: [0]}
     assert output.context_requests == [text_request]
+
+
+@pytest.mark.parametrize(
+    ("scheduler_cls", "max_num_tokens", "chunk_size", "reusable_tokens", "expected_items"),
+    [
+        # The whole request fits one encoder step: keep whole-request batching.
+        (MultimodalScheduler, 2, 3, 0, [0, 1]),
+        # It does not: encode only the item the proposed chunk uses ...
+        (MultimodalScheduler, 1, 3, 0, [0]),
+        # ... or end the chunk before the item that cannot be encoded now.
+        (MultimodalScheduler, 1, None, 0, [0]),
+        # Items inside the estimated reusable KV prefix are never encoded.
+        (MultimodalScheduler, 2, 3, 2, [1]),
+        # EAGER follows the chunk, then spends leftover budget on the later item.
+        (MultimodalEagerEncoderScheduler, 2, 3, 0, [0, 1]),
+    ],
+)
+def test_scheduler_encodes_only_the_items_of_the_prompt_window(
+    scheduler_cls, max_num_tokens, chunk_size, reusable_tokens, expected_items
+):
+    scheduler = _scheduler(
+        max_batch_size=2,
+        max_num_tokens=max_num_tokens,
+        base_scheduler=_BaseScheduler(chunk_size=chunk_size),
+        scheduler_cls=scheduler_cls,
+        context_chunk_unit_size=1,
+    )
+    request = make_mm_request(1, [1, 1], interleaved=True)
+    request.estimated_reusable_tokens = reusable_tokens
+
+    output = scheduler.schedule_request([request], set())
+
+    assert output.scheduled_mm_encoder_items == {1: expected_items}
+    assert output.context_requests == [request]
+    assert request.context_chunk_size == 3
+    bound_items = [key is not None for key in request.py_mm_encoder_state.item_cache_keys]
+    assert bound_items == [item_idx in expected_items for item_idx in range(2)]
+
+
+@pytest.mark.parametrize("whole_request_output_resident", [True, False])
+def test_admission_checks_only_outputs_resident_at_once(whole_request_output_resident):
+    request = make_mm_request(1, [1, 1])
+    budget = dict(
+        max_num_tokens=1 << 30,
+        max_output_bytes=4,  # One 1-row item.
+        bytes_per_encoder_embedding=4,
+        whole_request_output_resident=whole_request_output_resident,
+    )
+
+    if whole_request_output_resident:
+        with pytest.raises(ValueError, match="enable chunked prefill"):
+            initialize_multimodal_encoder_request(request, **budget)
+    else:
+        initialize_multimodal_encoder_request(request, **budget)
+        assert request.py_mm_encoder_state.embedding_lengths == [1, 1]
+
+
+def test_completed_context_chunk_releases_only_consumed_items():
+    request = make_mm_request(1, [1, 1], interleaved=True)
+    state = request.py_mm_encoder_state
+    cache = TensorLRUCache(16)
+    cache_keys = _item_cache_keys(request)
+    for item_idx, cache_key in enumerate(cache_keys):
+        cache.acquire(cache_key, 4, retain_after_release=False)
+        cache.commit(cache_key, torch.ones(1))
+        state.set_item_cache_key(item_idx, cache_key, ready=True)
+    # Past item 0 (position 1), not yet past item 1 (position 3).
+    request.context_current_position = 2
+
+    release_consumed_mm_items(request, cache)
+
+    assert state.item_cache_keys == [None, cache_keys[1]]
+    assert cache.stats().item_count == 1
+
+
+def test_context_using_an_unprepared_output_after_kv_reuse_fails_alone():
+    unprepared = make_mm_request(1, [1, 1], interleaved=True)
+    prepared = make_mm_request(2, [1, 1], interleaved=True, ready=[0])
+    for request in (unprepared, prepared):
+        request.context_chunk_size = 3
+    handled = []
+    executor = object.__new__(PyExecutor)
+    executor._handle_errors = lambda error_msg, **kwargs: handled.append(kwargs)
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.reset_context_requests([unprepared, prepared])
+
+    executor._fail_mm_contexts_with_unready_outputs(scheduled_requests)
+
+    assert scheduled_requests.context_requests == [prepared]
+    assert handled == [{"requests": [unprepared], "charge_budget": False}]
 
 
 def test_forward_multimodal_encoder_step_scopes_failure_to_item_owners():

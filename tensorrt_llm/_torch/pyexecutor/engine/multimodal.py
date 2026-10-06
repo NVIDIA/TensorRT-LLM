@@ -37,12 +37,7 @@ from tensorrt_llm.inputs.registry import (
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderSchedulingPolicy, TorchLlmArgs
 from tensorrt_llm.logger import logger
 
-from ..llm_request import (
-    LlmRequest,
-    MultimodalEncoderProgress,
-    MultimodalEncoderRequestError,
-    _Unset,
-)
+from ..llm_request import LlmRequest, MultimodalEncoderRequestError, _Unset, get_mm_items_for_chunk
 
 
 def resolve_mm_encoder_token_budget(base_budget: int, model_max_atomic_item_tokens: int) -> int:
@@ -241,8 +236,9 @@ def resolve_mm_encoder_output_budget(
     ``max_num_tokens`` does not participate.
 
     It is the minimum capacity of the unified encoder-output cache and is reserved during
-    KV-capacity estimation. Optional reuse may make the same cache larger. A request whose
-    total embedding exceeds this budget is rejected at admission.
+    KV-capacity estimation. Optional reuse may make the same cache larger. Admission rejects a
+    request whose outputs that must be resident at once exceed this budget: its largest item
+    with context chunking, its complete embedding without.
 
     The embedding capacity is validated before the model is consulted, so a processor that
     cannot report one raises regardless of what the model implements.
@@ -350,8 +346,9 @@ class MultimodalItemScheduler:
         * (D) reuse cache bytes -- ``encoder_cache_max_bytes`` may make the same
           ``TensorLRUCache`` larger than (C); it does not create a second pool.
 
-        Prefill currently waits for every item in a request, so admission rejects a request
-        whose complete MM embedding exceeds (C).
+        Prefill needs only the items in its current prompt window and releases an item after
+        consuming it, so with context chunking only the largest item must fit (C). Without
+        chunking, admission rejects a request whose complete MM embedding exceeds (C).
         """
         if encoder_max_num_tokens is None:
             raise ValueError(
@@ -535,11 +532,7 @@ class MultimodalItemScheduler:
                 request_ids=producer_request_ids,
             )
 
-        try:
-            expected_dtype = self.model.embedding_dtype
-        except (AttributeError, NotImplementedError):
-            expected_dtype = self.model.model_config.torch_dtype
-        expected_width = self.bytes_per_embedding // expected_dtype.itemsize
+        expected_dtype, expected_width = self._embedding_dtype_and_width()
 
         # Validate the entire batch before publishing any output. Otherwise a
         # bad later item could leave earlier items READY and later requests
@@ -568,13 +561,21 @@ class MultimodalItemScheduler:
 
         # Every scheduled key is now committed. One pass over the requests
         # also marks the items of requests that only share a committed entry.
+        # Raw inputs stay on the request until its prefill completes: a later
+        # item may still need encoding, and a released item is encoded again
+        # if the request restarts its prefill.
         for request in requests:
             state = request.py_mm_encoder_state
-            if state is None:
-                continue
-            state.mark_cache_keys_ready(scheduled_cache_keys)
-            if state.progress is MultimodalEncoderProgress.READY:
-                strip_mm_encoder_inputs(request.py_multimodal_data)
+            if state is not None:
+                state.mark_cache_keys_ready(scheduled_cache_keys)
+
+    def _embedding_dtype_and_width(self) -> tuple[torch.dtype, int]:
+        """Return the dtype and row width of one MM encoder output."""
+        try:
+            expected_dtype = self.model.embedding_dtype
+        except (AttributeError, NotImplementedError):
+            expected_dtype = self.model.model_config.torch_dtype
+        return expected_dtype, self.bytes_per_embedding // expected_dtype.itemsize
 
     def build_multimodal_data_for_llm(
         self, request: LlmRequest, runtime: MultimodalRuntimeData | None = None
@@ -584,39 +585,64 @@ class MultimodalItemScheduler:
         The request keeps its original metadata and cache references. The
         returned per-forward payload marks its tensor as already chunk-local
         so the common gather can also slice any full-request peers in a batch.
+        Only the items whose rows the chunk uses must be ready; earlier items
+        may already be released and later items not yet encoded.
         """
         state = request.py_mm_encoder_state
         if state is None:
             return request.py_multimodal_data
-        if state.progress is not MultimodalEncoderProgress.READY:
-            raise MultimodalEncoderRequestError(
-                f"MM request {request.request_id} reached prefill before its encoder outputs "
-                "were ready"
-            )
         encoder_cache = self.encoder_cache
         if encoder_cache is None:
             raise RuntimeError("MM request state requires an encoder cache")
 
+        if runtime is None:
+            item_indices = list(range(state.num_items))
+            start, end = 0, None
+        else:
+            item_indices = get_mm_items_for_chunk(
+                request, runtime.past_seen_token_num, runtime.chunk_end_pos
+            )
+            start = runtime.num_cached_mm_tokens
+            end = start + runtime.num_mm_tokens_in_chunk
+            # Make the row range relative to the first used item.
+            first_row = sum(state.embedding_lengths[: item_indices[0]]) if item_indices else 0
+            start -= first_row
+            end -= first_row
+
         segments: list[torch.Tensor] = []
-        for item_idx, cache_key in enumerate(state.item_cache_keys):
-            segment = encoder_cache.get(cache_key, record_stats=False)
+        for item_idx in item_indices:
+            cache_key = state.item_cache_keys[item_idx]
+            segment = (
+                encoder_cache.get(cache_key, record_stats=False)
+                if state.item_ready[item_idx]
+                else None
+            )
             if segment is None:
                 raise MultimodalEncoderRequestError(
-                    f"Ready MM item {item_idx} is absent from the encoder cache"
+                    f"MM request {request.request_id} reached prefill before the encoder "
+                    f"output of item {item_idx} was ready",
+                    request_ids={request.request_id},
                 )
             segments.append(segment)
 
         multimodal_data = dict(request.py_multimodal_data or {})
-        # Requests served only by cache hits skip `forward_items`, so their raw
-        # inputs are still attached. Drop them from this copy to keep them off
-        # the device; the cached outputs replace them.
+        # Requests served only by cache hits skip `forward_items`, and raw
+        # inputs stay on the request until its prefill completes. Drop them
+        # from this copy to keep them off the device; the cached outputs
+        # replace them.
         strip_mm_encoder_inputs(multimodal_data)
-        start = runtime.num_cached_mm_tokens if runtime is not None else 0
-        end = start + runtime.num_mm_tokens_in_chunk if runtime is not None else None
-        # Slice before joining: a long request must not copy all of its
-        # cached output for every small LLM chunk. One segment stays a view.
-        # TODO: Remove the remaining current-chunk join at the common LLM
-        # fusion boundary in the separate embedding-materialization follow-up.
-        multimodal_data["multimodal_embedding"] = _join_embeddings(segments, start=start, end=end)
+        if segments:
+            # Slice before joining: a long request must not copy all of its
+            # cached output for every small LLM chunk. One segment stays a view.
+            # TODO: Remove the remaining current-chunk join at the common LLM
+            # fusion boundary in the separate embedding-materialization follow-up.
+            embedding = _join_embeddings(segments, start=start, end=end)
+        else:
+            # A chunk without MM rows still attaches an empty embedding so the
+            # model does not encode this request inline.
+            dtype, width = self._embedding_dtype_and_width()
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            embedding = torch.empty((0, width), dtype=dtype, device=device)
+        multimodal_data["multimodal_embedding"] = embedding
         multimodal_data["multimodal_embedding_is_chunk"] = True
         return multimodal_data

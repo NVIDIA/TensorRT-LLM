@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     initialize_multimodal_encoder_request,
     is_multimodal_encoder_ready,
     make_mm_encoder_transient_cache_key,
+    release_consumed_mm_items,
 )
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -306,7 +307,8 @@ def test_item_encoder_validates_all_outputs_before_commit(invalid_output: str) -
     scheduler.forward_items(requests, selected)
     assert scheduler.encoder_cache.current_bytes == 24
     assert all(is_multimodal_encoder_ready(request) for request in requests)
-    assert all("image" not in request.py_multimodal_data for request in requests)
+    # Raw inputs stay until prefill completes, in case a released item is needed again.
+    assert all("image" in request.py_multimodal_data for request in requests)
 
 
 @pytest.mark.parametrize("window", [None, (0, 3), (2, 7), (6, 8), (3, 5)])
@@ -327,6 +329,8 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(
     monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
     mm_item_scheduler = bare_mm_item_scheduler(_Model())
     mm_item_scheduler.bytes_per_embedding = 8
+    # Two image-A rows, a text-only gap, then three image-B rows.
+    embed_mask_cumsum = torch.tensor([0, 1, 2, 2, 2, 3, 4, 5])
     request = make_llm_request(
         1,
         multimodal_data={
@@ -340,7 +344,9 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(
                 output_embedding_lengths=[2, 3],
             ),
             "multimodal_embedding_lengths": [2, 3],
+            "multimodal_embed_mask_cumsum": embed_mask_cumsum,
         },
+        input_tokens=list(range(8)),
     )
     initialize_multimodal_encoder_request(request, max_num_tokens=8)
     _bind_items(mm_item_scheduler, request)
@@ -358,27 +364,27 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(
     second = mm_item_scheduler.encoder_cache.get(state.item_cache_keys[1])
     torch.testing.assert_close(second, torch.full((3, 2), 3.0))
     assert "multimodal_embedding" not in request.py_multimodal_data
-    assert "image" not in request.py_multimodal_data
+    assert "image" in request.py_multimodal_data
     assert is_multimodal_encoder_ready(request)
 
     runtime = None
     if window is not None:
-        # Two image-A rows, a text-only gap, then three image-B rows.
         runtime = MultimodalRuntimeData(
-            embed_mask_cumsum=torch.tensor([0, 1, 2, 2, 2, 3, 4, 5]),
+            embed_mask_cumsum=embed_mask_cumsum,
             past_seen_token_num=window[0],
             chunk_end_pos=window[1],
         )
+        # Progress past image A releases it; later chunks read only image B.
+        request.context_current_position = window[0]
+        release_consumed_mm_items(request, mm_item_scheduler.encoder_cache)
     start = runtime.num_cached_mm_tokens if runtime is not None else 0
     end = start + runtime.num_mm_tokens_in_chunk if runtime is not None else 5
     expected = torch.cat([first, second])[start:end]
     with patch("torch.cat", wraps=torch.cat) as join:
         multimodal_data = mm_item_scheduler.build_multimodal_data_for_llm(request, runtime)
     output = multimodal_data["multimodal_embedding"]
-    torch.testing.assert_close(
-        output,
-        expected,
-    )
+    # A chunk without image rows gets an empty embedding on the default device.
+    torch.testing.assert_close(output, expected, check_device=False)
     assert join.call_count == int(start < 2 < end)
     if start < end and join.call_count == 0:
         source = first if end <= 2 else second
@@ -386,7 +392,7 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(
     assert multimodal_data["multimodal_embedding_is_chunk"]
     assert "multimodal_embedding_is_chunk" not in request.py_multimodal_data
     assert "multimodal_embedding" not in request.py_multimodal_data
-    assert mm_item_scheduler.encoder_cache.current_bytes == 40
+    assert mm_item_scheduler.encoder_cache.current_bytes == (24 if start >= 2 else 40)
 
 
 def test_admission_requires_item_rows_to_fill_prompt_embedding_slots() -> None:
