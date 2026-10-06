@@ -15,6 +15,15 @@
 # the License.
 #
 
+add_library(tllm_kernel_cutlass_headers INTERFACE)
+add_library(tllm::kernel_cutlass_headers ALIAS tllm_kernel_cutlass_headers)
+target_include_directories(
+  tllm_kernel_cutlass_headers
+  INTERFACE ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include
+            ${CMAKE_BINARY_DIR}/_deps/cutlass-src/tools/util/include
+            ${CMAKE_CURRENT_LIST_DIR}/../cutlass_extensions/include)
+target_link_libraries(tllm_kernel_cutlass_headers INTERFACE tllm::common_cuda)
+
 function(add_tllm_kernel_library target)
   set(multi_value_args SOURCES LINK_LIBRARIES INCLUDE_DIRECTORIES)
   cmake_parse_arguments(PARSE_ARGV 1 ARG "" "" "${multi_value_args}")
@@ -112,3 +121,7 @@ add_tllm_kernel_library(
   LINK_LIBRARIES trtllm_gen_fmha_interface)
 target_include_directories(tllm_kernel_attention_mask
                            PUBLIC ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include)
+
+add_tllm_kernel_library(
+  tllm_kernel_cuda_core_gemm SOURCES weightOnlyBatchedGemv/cudaCoreGemm.cu
+  LINK_LIBRARIES tllm::common_environment tllm::kernel_cutlass_headers)
