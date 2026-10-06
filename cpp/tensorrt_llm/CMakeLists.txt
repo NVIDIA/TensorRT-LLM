@@ -333,6 +333,7 @@ foreach(
   tllm_common_environment
   tllm_executor_values
   tllm_executor_transfer_agent
+  tllm_executor_agent_name
   tllm_kv_cache_host_memory
   tllm_kv_cache
   tllm_kv_cache_legacy
@@ -378,6 +379,7 @@ foreach(
   tllm_common_environment
   tllm_executor_values
   tllm_executor_transfer_agent
+  tllm_executor_agent_name
   tllm_kv_cache_host_memory
   tllm_kv_cache
   tllm_kv_cache_legacy

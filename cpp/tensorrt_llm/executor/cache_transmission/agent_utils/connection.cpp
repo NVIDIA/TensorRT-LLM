@@ -21,9 +21,7 @@
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <limits>
 #include <numeric>
-#include <random>
 #include <string>
-#include <unistd.h>
 #include <utility>
 
 using tensorrt_llm::pg_utils::get_world_pg;
@@ -31,25 +29,6 @@ using tensorrt_llm::pg_utils::PgHelper;
 
 namespace tensorrt_llm::executor::kv_cache
 {
-
-std::string genUniqueAgentName()
-{
-    static std::atomic<uint64_t> counter{0};
-
-    // Generate a per-process random suffix to disambiguate agents across containers
-    // that may share the same hostname (--network host) and PID namespace.
-    static uint64_t const sRandomSuffix = []()
-    {
-        std::random_device rd;
-        return (static_cast<uint64_t>(rd()) << 32) | rd();
-    }();
-
-    char hostname[1024];
-    gethostname(hostname, sizeof(hostname));
-    auto pid = static_cast<uint64_t>(::getpid());
-    return std::string(hostname) + "_" + std::to_string(pid) + "_" + std::to_string(sRandomSuffix) + "_"
-        + std::to_string(counter++);
-}
 
 // NIXL connection is specific, and different from the UCX and mpi connection,
 // since NIXL only support one-sided communication. gen send buffer metaData to
