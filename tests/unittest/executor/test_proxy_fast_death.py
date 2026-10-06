@@ -621,6 +621,41 @@ def test_shutdown_keeps_blocking_semantics_when_engine_alive():
     assert proxy.workers_started is False
 
 
+def test_shutdown_bounds_wait_on_worker_that_never_finishes(monkeypatch):
+    """A worker that never completes (with no error queued) cannot wedge shutdown.
+
+    The wait is one deadline shared by all futures, and running out of it
+    routes the rest of teardown through the dead-engine path.
+    """
+    monkeypatch.setattr(GenerationExecutorProxy, "_WORKER_SHUTDOWN_TIMEOUT_S", 0.5)
+    proxy = _teardown_proxy(engine_dead=False)
+    r = _FakeResult()
+    proxy._results = {1: r}
+    done = _Future()
+    done.set_result(None)
+    stuck = [_Future() for _ in range(4)]  # never complete
+    proxy.mpi_futures = [done, *stuck]
+
+    dispatcher = _Mock()
+    dispatcher.is_alive.return_value = True
+    proxy.dispatch_result_thread = dispatcher
+
+    start = _time.monotonic()
+    proxy.shutdown()
+    elapsed = _time.monotonic() - start
+
+    # One shared deadline, not one per stuck future (which would be 2 s here).
+    assert elapsed < 1.5
+    assert proxy._engine_dead is True
+    item = r.queue.get_nowait()
+    assert isinstance(item, EngineDeadError)
+    assert isinstance(item.root_cause, TimeoutError)
+    dispatcher.join.assert_called_once_with(timeout=5.0)
+    proxy.mpi_session.abandon.assert_called_once_with()
+    proxy.mpi_session.shutdown.assert_not_called()
+    assert proxy.workers_started is False
+
+
 def test_shutdown_does_not_shut_down_external_session():
     """An externally owned session must stay alive even on a dead engine."""
     proxy = _teardown_proxy(engine_dead=True)

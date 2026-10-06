@@ -113,13 +113,13 @@ _new_capsule.argtypes = [c_void_p, c_char_p, c_void_p]
 # block -- the tensor data stays owned by the caller.
 #
 # The consumer invokes this from its storage destructor, which for PyTorch runs inside
-# ~TensorImpl, after THPVariable_clear has already freed the tensor's __dict__. So the block
-# must not depend on any Python object's lifetime; hence raw memory owned by this deleter
-# rather than a ctypes object kept alive by a Python reference.
-@CFUNCTYPE(None, POINTER(DLManagedTensor))
-def _free_dlpack_block(dmt_ptr):
-    # The DLManagedTensor is the first member of the block, so their addresses coincide.
-    _raw_free(dmt_ptr)
+# ~TensorImpl: on whichever thread drops the last reference, possibly during interpreter
+# finalization, and after THPVariable_clear has already freed the tensor's __dict__. So
+# neither the block nor the deleter may depend on Python: the block is raw memory, and the
+# deleter is PyMem_RawFree itself, which needs no GIL and no Python object to stay alive.
+# Its void(void*) signature is ABI-identical to the deleter's, and the DLManagedTensor is
+# the first member of the block, so the pointer it receives is the block's address.
+_free_dlpack_block = ctypes.cast(_raw_free, CFUNCTYPE(None, POINTER(DLManagedTensor)))
 
 
 class CapsuleWrapper:
@@ -134,17 +134,25 @@ class CapsuleWrapper:
     Telling those two cases apart relies on the DLPack requirement that a consumer rename
     the capsule to "used_dltensor" when it takes ownership; a consumer that imported without
     renaming would leave both sides believing they own the block.
+
+    Attributes:
+        capsule: The "dltensor" PyCapsule to hand to a DLPack consumer.
     """
 
-    def __init__(self, capsule, block_addr):
-        self.capsule = capsule  # The main PyCapsule object that can be passed to other libraries
+    # Held on the class so that __del__ does not depend on module globals, which interpreter
+    # finalization may already have cleared.
+    _capsule_is_valid = _capsule_is_valid
+    _raw_free = _raw_free
+
+    def __init__(self, capsule: object, block_addr: int) -> None:
+        self.capsule = capsule
         self._block_addr = block_addr
 
-    def __del__(self):
+    def __del__(self) -> None:
         # A capsule still answering to "dltensor" was never imported (see class docstring),
         # so its block is still ours to free.
-        if _capsule_is_valid(self.capsule, b"dltensor"):
-            _raw_free(self._block_addr)
+        if self._capsule_is_valid(self.capsule, b"dltensor"):
+            self._raw_free(self._block_addr)
 
 
 def create_dlpack_capsule(ptr, segment_size, segment_stride, num_segments, torch_dtype, dev_id):
