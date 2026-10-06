@@ -13,6 +13,8 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
+add_subdirectory(bounce)
+
 # ============================================================================
 # NIXL Wrapper Library
 # ============================================================================
@@ -62,15 +64,12 @@ if(NIXL_ROOT)
   if(ZMQ_FOUND)
     target_sources(
       ${NIXL_WRAPPER_TARGET}
-      PRIVATE bounce/BounceTransferPlan.cpp
-              bounce/BuddyAllocator.cpp
-              bounce/CreditScheduler.cpp
-              bounce/BounceMessage.cpp
-              bounce/BounceArena.cpp
-              bounce/ExecPool.cpp
-              bounce/GatherScatterKernel.cu
-              bounce/ZmqControlChannel.cpp
+      PRIVATE bounce/BounceArena.cpp bounce/ExecPool.cpp
+              bounce/GatherScatterKernel.cu bounce/ZmqControlChannel.cpp
               bounce/BounceTransport.cpp)
+    target_link_libraries(
+      ${NIXL_WRAPPER_TARGET}
+      PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_executor_bounce_core>)
     target_include_directories(
       ${NIXL_WRAPPER_TARGET} PRIVATE ${CMAKE_BINARY_DIR}/_deps/cppzmq-src
                                      ${ZMQ_INCLUDE_DIRS})
