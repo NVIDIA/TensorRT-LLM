@@ -359,6 +359,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
             max_total_draft_tokens=0,
             is_spec_decode=False,
             max_draft_len=0,
+            spec_config=None,
         ),
         _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
@@ -386,7 +387,6 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _release_megamoe_profiling_scratch=Mock(),
         # The serving flag differs from the configuration; warmup follows the configuration.
         enable_spec_decode=True,
-        spec_config=None,
         _forward_warmup=Mock(),
     )
     engine._model_caller = ModelCaller(engine.model, prefill_compile_only=prefill_only)
@@ -583,9 +583,9 @@ def test_warmup_builders_resynchronize_stale_draft_buffers(
     config = config_cls(max_draft_len=3, speculative_model="dummy", draft_len_schedule={1: 3, 4: 2})
     engine, resource_manager = _build_engine_and_resource_manager()
     runner = engine._runner
-    runner.spec_config = config
     runner._config = replace(
         runner._config,
+        spec_config=config,
         max_draft_len=config.max_draft_len,
         max_total_draft_tokens=config.tokens_per_gen_step - 1,
         max_draft_loop_tokens=config.tokens_per_gen_step - 1,
@@ -1258,6 +1258,7 @@ class TestWarmupCleanup(unittest.TestCase):
                     max_total_draft_tokens=0,
                     is_spec_decode=False,
                     max_draft_len=0,
+                    spec_config=None,
                 ),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
@@ -1282,7 +1283,6 @@ class TestWarmupCleanup(unittest.TestCase):
                 ),
                 _should_run_warmup_batch=Mock(return_value=True),
                 _release_megamoe_profiling_scratch=Mock(),
-                spec_config=None,
                 _forward_warmup=Mock(side_effect=lambda *args, **kwargs: calls.append("forward")),
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
@@ -1380,6 +1380,7 @@ class TestWarmupCleanup(unittest.TestCase):
                     max_total_draft_tokens=0,
                     is_spec_decode=False,
                     max_draft_len=0,
+                    spec_config=None,
                 ),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
@@ -1404,7 +1405,6 @@ class TestWarmupCleanup(unittest.TestCase):
                 ),
                 _should_run_warmup_batch=Mock(return_value=False),
                 _release_megamoe_profiling_scratch=Mock(),
-                spec_config=None,
                 _forward_warmup=Mock(),
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
@@ -1487,6 +1487,7 @@ class TestWarmupCleanup(unittest.TestCase):
                     max_total_draft_tokens=0,
                     is_spec_decode=False,
                     max_draft_len=0,
+                    spec_config=None,
                 ),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 model=SimpleNamespace(
@@ -1504,7 +1505,6 @@ class TestWarmupCleanup(unittest.TestCase):
                 _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
                 _should_run_warmup_batch=Mock(return_value=True),
                 _release_megamoe_profiling_scratch=Mock(),
-                spec_config=None,
                 _forward_warmup=Mock(),
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)

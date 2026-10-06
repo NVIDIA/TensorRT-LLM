@@ -70,7 +70,6 @@ from tensorrt_llm._torch.speculative import (
     SpecMetadata,
     get_draft_kv_cache_manager,
     get_num_extra_kv_tokens,
-    get_spec_metadata,
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
 )
@@ -102,7 +101,12 @@ from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
-from ...metadata import build_attention_metadata, update_spec_metadata
+from ...metadata import (
+    build_attention_metadata,
+    create_spec_metadata,
+    get_spec_managers,
+    update_spec_metadata,
+)
 from ...model_call import ModelCaller
 from ..common import (
     _moe_a2a_steady_state_budget_for_capture,
@@ -211,7 +215,6 @@ class DecoderRunner(ScheduledModelRunner):
         mapping: Mapping,
         dist: Optional[Distributed],
         moe_load_balancer: Optional[MoeLoadBalancer],
-        spec_config: Optional[DecodingBaseConfig],
         sparse_attention_config: Any,
         torch_compile_backend: Optional[Backend],
         get_runtime_tokens_per_gen_step: Callable[[int], int],
@@ -227,7 +230,6 @@ class DecoderRunner(ScheduledModelRunner):
         self.mapping = mapping
         self.dist = dist
         self.moe_load_balancer = moe_load_balancer
-        self.spec_config = spec_config
         self.sparse_attention_config = sparse_attention_config
         self._torch_compile_backend = torch_compile_backend
         self.get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
@@ -322,7 +324,7 @@ class DecoderRunner(ScheduledModelRunner):
         # Resource creation runs again after capacity estimation, once the old
         # executor has released its graphs. Replace the complete preparation state.
         self._lora = LoraParamBuilder(
-            spec_config=self.spec_config,
+            spec_config=self._config.spec_config,
             attn_backend=self._config.attention_backend,
             cuda_graph_manager=cuda_graph_manager,
         )
@@ -408,7 +410,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._trtllm_gen_jit_warmup = False
         self._force_lora_graph_for_capture: Optional[bool] = None
         self._lora = LoraParamBuilder(
-            spec_config=self.spec_config,
+            spec_config=self._config.spec_config,
             attn_backend=self._config.attention_backend,
             cuda_graph_manager=None,
         )
@@ -437,7 +439,7 @@ class DecoderRunner(ScheduledModelRunner):
             cuda_graph_batch_sizes=self._config.cuda_graph_batch_sizes,
             max_cuda_graph_batch_size=self._config.max_cuda_graph_batch_size,
             max_beam_width=self._config.max_beam_width,
-            spec_config=self.spec_config,
+            spec_config=self._config.spec_config,
             cuda_graph_mem_pool=self._cuda_graph_mem_pool,
             dynamic_draft_len_mapping=self._dynamic_draft_len_mapping,
             max_num_tokens=self._config.max_num_tokens,
@@ -499,7 +501,7 @@ class DecoderRunner(ScheduledModelRunner):
         Returns the draft KV cache manager only in one-model speculative decoding
         mode where the target model manages a separate draft KV cache.
         """
-        return get_draft_kv_cache_manager(self.spec_config, resource_manager)
+        return get_draft_kv_cache_manager(self._config.spec_config, resource_manager)
 
     @contextlib.contextmanager
     def no_cuda_graph(self):
@@ -1804,13 +1806,13 @@ class DecoderRunner(ScheduledModelRunner):
         """
         # Dynamic draft length for CUDA graphs is only supported for one-model path
         if (
-            not self.spec_config
-            or not self.spec_config.draft_len_schedule
-            or not self.spec_config.spec_dec_mode.support_dynamic_draft_len()
+            not self._config.spec_config
+            or not self._config.spec_config.draft_len_schedule
+            or not self._config.spec_config.spec_dec_mode.support_dynamic_draft_len()
         ):
             return None
 
-        schedule = self.spec_config.draft_len_schedule
+        schedule = self._config.spec_config.draft_len_schedule
         schedule_keys = list(schedule.keys())
 
         mapping = {}
@@ -1833,9 +1835,9 @@ class DecoderRunner(ScheduledModelRunner):
         """
         # Case 1: One-model with dynamic draft length
         if (
-            self.spec_config is not None
-            and self.spec_config.draft_len_schedule is not None
-            and self.spec_config.spec_dec_mode.support_dynamic_draft_len()
+            self._config.spec_config is not None
+            and self._config.spec_config.draft_len_schedule is not None
+            and self._config.spec_config.spec_dec_mode.support_dynamic_draft_len()
         ):
             graphs = [
                 (graph_bs, draft_len)
@@ -1872,9 +1874,9 @@ class DecoderRunner(ScheduledModelRunner):
         draft_lengths = [get_static_draft_len(self)]
         should_capture_no_spec = (
             self._config.max_total_draft_tokens > 0
-            and not self.spec_config.spec_dec_mode.use_one_engine()
+            and not self._config.spec_config.spec_dec_mode.use_one_engine()
             # Assume speculation is always on if no max_concurrency set (saves memory)
-            and self.spec_config.max_concurrency is not None
+            and self._config.spec_config.max_concurrency is not None
         )
         if should_capture_no_spec:
             draft_lengths.append(0)
@@ -2101,8 +2103,8 @@ class DecoderRunner(ScheduledModelRunner):
                                 f"max_seq_len={max_seq_len}"
                             )
                             enable_spec_decode = draft_len > 0 or (
-                                self.spec_config is not None
-                                and self.spec_config.spec_dec_mode.use_one_engine()
+                                self._config.spec_config is not None
+                                and self._config.spec_config.spec_dec_mode.use_one_engine()
                             )
                             if self._config.is_encoder_decoder:
                                 prepare_cross_batch(
@@ -2144,7 +2146,8 @@ class DecoderRunner(ScheduledModelRunner):
         # get_spec_decoder hands them a plain TorchSampler, so they belong on
         # the TorchSampler branch and do need the FAST graphs.
         uses_own_spec_decoder = (
-            self.spec_config is not None and self.spec_config.spec_dec_mode.use_one_engine()
+            self._config.spec_config is not None
+            and self._config.spec_config.spec_dec_mode.use_one_engine()
         )
 
         def _capture_variant(
@@ -2639,7 +2642,7 @@ class DecoderRunner(ScheduledModelRunner):
         result.generation_requests = gen_requests
         static_draft_len = get_static_draft_len(self)
         resolve_draft_len(
-            self.spec_config,
+            self._config.spec_config,
             result,
             max_draft_len=self._config.max_draft_len,
             static_draft_len=static_draft_len,
@@ -2777,7 +2780,7 @@ class DecoderRunner(ScheduledModelRunner):
             ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM if is_enc_dec else 1,
             min(
                 available_tokens,
-                max_seq_len - 1 - get_num_extra_kv_tokens(self.spec_config) - _kv_draft,
+                max_seq_len - 1 - get_num_extra_kv_tokens(self._config.spec_config) - _kv_draft,
             ),
         )
         model_config = self.model.model_config.pretrained_config
@@ -2838,7 +2841,7 @@ class DecoderRunner(ScheduledModelRunner):
             if not self._add_cross_dummy_requests(result.all_requests(), resource_manager):
                 return None
         resolve_draft_len(
-            self.spec_config,
+            self._config.spec_config,
             result,
             max_draft_len=self._config.max_draft_len,
             static_draft_len=get_static_draft_len(self),
@@ -2984,14 +2987,8 @@ class DecoderRunner(ScheduledModelRunner):
     def _set_up_spec_metadata(self, spec_resource_manager: Optional[BaseResourceManager]):
         if self.spec_metadata is not None:
             return self.spec_metadata
-        self.spec_metadata = get_spec_metadata(
-            self.spec_config,
-            self.model.config,
-            self._config.max_batch_size,
-            max_num_tokens=self._config.max_num_tokens,
-            spec_resource_manager=spec_resource_manager,
-            max_seq_len=self._config.max_seq_len,
-            num_seq_slots=self._config.max_num_seq_slots,
+        self.spec_metadata = create_spec_metadata(
+            self._config, self.model.config, spec_resource_manager
         )
         return self.spec_metadata
 
@@ -4234,7 +4231,7 @@ class DecoderRunner(ScheduledModelRunner):
                 helix_is_inactive_rank.append(False)
                 return base
 
-        spec_config = self.spec_config if enable_spec_decode else None
+        spec_config = self._config.spec_config if enable_spec_decode else None
         if not self._config.disable_overlap_scheduler and spec_config is not None:
             assert spec_config.spec_dec_mode.support_overlap_scheduler(), (
                 f"{spec_config.decoding_type} does not support overlap scheduler"
@@ -5056,7 +5053,7 @@ class DecoderRunner(ScheduledModelRunner):
             # positions, so the fast path advances that buffer in place and
             # returns the same layout (see _apply_steady_gen_fast_prepare).
             if (
-                self.spec_config is None
+                self._config.spec_config is None
                 and spec_metadata is None
                 and new_tokens_device is not None
                 and self.guided_decoder is None
@@ -5126,8 +5123,8 @@ class DecoderRunner(ScheduledModelRunner):
 
         # Initialize SA state for new requests (MTP+SA, EAGLE3+SA, PARD+SA, etc.)
         has_sa_enhancer = (
-            self.spec_config is not None
-            and getattr(self.spec_config, "sa_config", None) is not None
+            self._config.spec_config is not None
+            and getattr(self._config.spec_config, "sa_config", None) is not None
         )
         if has_sa_enhancer and resource_manager is not None and self.mapping.is_last_pp_rank():
             from tensorrt_llm._torch.speculative.suffix_automaton import SuffixAutomatonManager
@@ -5204,29 +5201,16 @@ class DecoderRunner(ScheduledModelRunner):
         if isinstance(attn_metadata, TrtllmAttentionMetadata):
             attn_metadata.trtllm_gen_jit_warmup = self._trtllm_gen_jit_warmup
         if enable_spec_decode:
-            spec_resource_manager = resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER
-            )
-            spec_tree_manager = None
-            if spec_resource_manager is not None and hasattr(
-                spec_resource_manager, "spec_tree_manager"
-            ):
-                spec_tree_manager = spec_resource_manager.spec_tree_manager
+            spec_resource_manager, spec_tree_manager = get_spec_managers(resource_manager)
             spec_metadata = self._set_up_spec_metadata(spec_resource_manager)
             assert spec_metadata is not None
             update_spec_metadata(
                 spec_metadata,
+                self._config,
                 scheduled_requests,
                 attn_metadata,
                 spec_tree_manager=spec_tree_manager,
                 runtime_draft_len=runtime_draft_len,
-                runtime_tokens_per_gen_step=(
-                    self.get_runtime_tokens_per_gen_step(runtime_draft_len)
-                ),
-                attention_backend=self._config.attention_backend,
-                original_max_draft_len=self._config.original_max_draft_len,
-                original_max_total_draft_tokens=(self._config.original_max_total_draft_tokens),
-                spec_dec_max_total_draft_tokens=(self._config.spec_dec_max_total_draft_tokens),
             )
         else:
             spec_resource_manager = None
@@ -5240,8 +5224,8 @@ class DecoderRunner(ScheduledModelRunner):
         # iterations can therefore safely reuse a zero-draft graph.
         can_promote_spec_decode = not enable_spec_decode or (
             runtime_draft_len == 0
-            and self.spec_config is not None
-            and self.spec_config.is_linear_tree
+            and self._config.spec_config is not None
+            and self._config.spec_config.is_linear_tree
         )
         # TODO: Generalize these conservative gates as actual-draft, beam, and
         # context-parallel providers for decoder-only LLMs gain support for

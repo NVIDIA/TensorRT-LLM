@@ -20,6 +20,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.sampler.sampler import SampleStateTensors
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,17 @@ class RunnerConfig:
     without_logits: bool
     attention_backend: type[AttentionBackend]
     attention_runtime_features: AttentionRuntimeFeatures
+
+
+@dataclass(frozen=True)
+class SpecDecodeRunnerConfig(RunnerConfig):
+    """Settings of runners that assemble speculative-decoding metadata."""
+
+    spec_config: DecodingBaseConfig | None
+    num_seq_slots: int | None
+    original_max_draft_len: int
+    original_max_total_draft_tokens: int
+    spec_dec_max_total_draft_tokens: int
 
 
 class ModelRunner(ABC):

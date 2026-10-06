@@ -1742,8 +1742,8 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
     try:
         runner = SimpleNamespace(
             kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
-            spec_config=spec_config,
             _config=SimpleNamespace(
+                spec_config=spec_config,
                 max_draft_len=draft_len,
                 max_draft_loop_tokens=draft_len,
                 max_seq_len=manager.max_seq_len,

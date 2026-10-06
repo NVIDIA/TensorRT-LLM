@@ -15,19 +15,28 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
 )
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.speculative import SpecMetadata
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.speculative import SpecMetadata, get_spec_metadata
 from tensorrt_llm.mapping import Mapping
 
 from ..config_utils import is_mla
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm._torch.pyexecutor.resource_manager import (
+        BaseResourceManager,
+        KVCacheManager,
+        ResourceManager,
+    )
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 
+    from .runners.interface import SpecDecodeRunnerConfig
+
 __all__ = [
     "build_attention_metadata",
+    "create_spec_metadata",
+    "get_spec_managers",
     "update_spec_metadata",
 ]
 
@@ -91,32 +100,59 @@ def build_attention_metadata(
     )
 
 
+def get_spec_managers(
+    resource_manager: ResourceManager,
+) -> tuple[BaseResourceManager | None, SpecTreeManager | None]:
+    """Return the speculative resource manager and its tree manager, if any."""
+    spec_resource_manager = resource_manager.get_resource_manager(
+        ResourceManagerType.SPEC_RESOURCE_MANAGER
+    )
+    return spec_resource_manager, getattr(spec_resource_manager, "spec_tree_manager", None)
+
+
+def create_spec_metadata(
+    config: SpecDecodeRunnerConfig,
+    pretrained_config: object,
+    spec_resource_manager: BaseResourceManager | None,
+) -> SpecMetadata | None:
+    """Create speculative metadata sized by the runner capacities."""
+    return get_spec_metadata(
+        config.spec_config,
+        pretrained_config,
+        config.max_batch_size,
+        max_num_tokens=config.max_num_tokens,
+        spec_resource_manager=spec_resource_manager,
+        max_seq_len=config.max_seq_len,
+        num_seq_slots=config.num_seq_slots,
+    )
+
+
 def update_spec_metadata(
     spec_metadata: SpecMetadata,
+    config: SpecDecodeRunnerConfig,
     scheduled_requests: ScheduledRequests,
     attn_metadata: AttentionMetadata,
     spec_tree_manager: SpecTreeManager | None,
     *,
     runtime_draft_len: int,
-    runtime_tokens_per_gen_step: int,
-    attention_backend: type[AttentionBackend],
-    original_max_draft_len: int,
-    original_max_total_draft_tokens: int,
-    spec_dec_max_total_draft_tokens: int,
 ) -> None:
     """Update speculative and attention metadata for one scheduled batch."""
     spec_metadata.runtime_draft_len = runtime_draft_len
-    spec_metadata.runtime_tokens_per_gen_step = runtime_tokens_per_gen_step
+    spec_metadata.runtime_tokens_per_gen_step = config.spec_config.get_runtime_tokens_per_gen_step(
+        runtime_draft_len
+    )
 
-    is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(attention_backend)
+    is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
+        config.attention_backend
+    )
     # Parallel-draft modes advertise their full generation width rather than a
     # conventional draft length, so attention needs the total-token capacity.
     if spec_metadata.spec_dec_mode.is_parallel_draft():
-        max_draft_len = original_max_total_draft_tokens
-        max_total_draft_tokens = original_max_total_draft_tokens
+        max_draft_len = config.original_max_total_draft_tokens
+        max_total_draft_tokens = config.original_max_total_draft_tokens
     else:
-        max_draft_len = original_max_draft_len
-        max_total_draft_tokens = spec_dec_max_total_draft_tokens
+        max_draft_len = config.original_max_draft_len
+        max_total_draft_tokens = config.spec_dec_max_total_draft_tokens
 
     if spec_tree_manager is not None:
         spec_tree_manager.slot_storage.fill_all_slot_ids(

@@ -12,9 +12,9 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.compilation.backend import Backend
+from tensorrt_llm._torch.pyexecutor.engine import metadata as metadata_module
 from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
-from tensorrt_llm._torch.pyexecutor.engine.runners import no_kv_cache as no_kv_cache_module
 from tensorrt_llm._torch.pyexecutor.engine.runners import resolve_runner_type
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderRunner
@@ -411,7 +411,7 @@ def test_no_kv_cache_runner_owns_spec_metadata_setup(
         is_spec_dec_dynamic_tree=False,
     )
     get_spec_metadata = Mock(return_value=spec_metadata)
-    monkeypatch.setattr(no_kv_cache_module, "get_spec_metadata", get_spec_metadata)
+    monkeypatch.setattr(metadata_module, "get_spec_metadata", get_spec_metadata)
     runner = _make_runner(
         PoolingRunner,
         _model(is_generation=False),

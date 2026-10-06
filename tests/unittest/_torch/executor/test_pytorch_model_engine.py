@@ -310,6 +310,7 @@ def _make_forward_only_engine(
         spec_dec_max_total_draft_tokens=0,
         use_mrope=False,
         is_encoder_decoder=False,
+        spec_config=None,
     )
     decoder.guided_decoder = None
     engine.llm_args = SimpleNamespace(mm_encoder_only=False)
@@ -318,7 +319,6 @@ def _make_forward_only_engine(
         enable_lm_head_tp_in_adp=False,
     )
     engine.runtime_draft_len = 0
-    decoder.spec_config = None
     decoder.get_runtime_tokens_per_gen_step = Mock(return_value=1)
     engine.iter_states = decoder.iter_states = {}
     decoder.forward_pass_callable = None
@@ -1058,7 +1058,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(key)
         engine.enable_spec_decode = True
-        engine._runner.spec_config = SimpleNamespace(is_linear_tree=True)
+        engine._runner._config.spec_config = SimpleNamespace(
+            is_linear_tree=True,
+            get_runtime_tokens_per_gen_step=Mock(return_value=1))
         graph_attn_metadata = runner.maybe_get_cuda_graph.return_value[0]
         runner.maybe_get_cuda_graph.return_value = (
             graph_attn_metadata,
@@ -1100,7 +1102,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(None)
         engine.enable_spec_decode = True
-        engine._runner.spec_config = SimpleNamespace(is_linear_tree=True)
+        engine._runner._config.spec_config = SimpleNamespace(
+            is_linear_tree=True,
+            get_runtime_tokens_per_gen_step=Mock(return_value=1))
         context = _make_request_stub(1)
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = [context]
@@ -1127,7 +1131,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(None)
         engine.enable_spec_decode = True
-        engine._runner.spec_config = SimpleNamespace(is_linear_tree=False)
+        engine._runner._config.spec_config = SimpleNamespace(
+            is_linear_tree=False,
+            get_runtime_tokens_per_gen_step=Mock(return_value=1))
         context = _make_request_stub(1)
         generation = _make_request_stub(2)
         batch = ScheduledRequests()
@@ -1334,7 +1340,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             _make_forward_only_engine(None)
         engine.enable_spec_decode = True
         engine.runtime_draft_len = 2
-        engine._runner.spec_config = SimpleNamespace(is_linear_tree=False)
+        engine._runner._config.spec_config = SimpleNamespace(
+            is_linear_tree=False,
+            get_runtime_tokens_per_gen_step=Mock(return_value=1))
         prepared_inputs = engine._runner._prepare_inputs.return_value[0]
         # Tree input preparation widens the length after graph selection.
         engine._runner._prepare_inputs.return_value = (prepared_inputs, None, 7)

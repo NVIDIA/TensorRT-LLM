@@ -9,11 +9,11 @@ import torch
 
 from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, PrefillCudaGraphBackend
 
-from ..interface import RunnerConfig
+from ..interface import SpecDecodeRunnerConfig
 
 
 @dataclass(frozen=True)
-class DecoderRunnerConfig(RunnerConfig):
+class DecoderRunnerConfig(SpecDecodeRunnerConfig):
     """Capacities and graph/compile settings resolved by the engine."""
 
     dtype: torch.dtype
@@ -24,10 +24,6 @@ class DecoderRunnerConfig(RunnerConfig):
     max_draft_len: int
     max_total_draft_tokens: int
     max_draft_loop_tokens: int
-    original_max_draft_len: int
-    original_max_total_draft_tokens: int
-    spec_dec_max_total_draft_tokens: int
-    max_num_seq_slots: int
     cuda_graph_config: CudaGraphConfig | None
     cuda_graph_batch_sizes: list[int]
     cuda_graph_padding_enabled: bool

@@ -721,12 +721,13 @@ class PyTorchModelEngine(ModelEngine):
             max_draft_len=self.max_draft_len,
             max_total_draft_tokens=self.max_total_draft_tokens,
             max_draft_loop_tokens=self.max_draft_loop_tokens,
+            spec_config=self.spec_config,
+            num_seq_slots=self.max_num_seq_slots,
             original_max_draft_len=self.original_max_draft_len,
             original_max_total_draft_tokens=(
                 self.original_max_total_draft_tokens),
             spec_dec_max_total_draft_tokens=(
                 self._spec_dec_max_total_draft_tokens),
-            max_num_seq_slots=self.max_num_seq_slots,
             cuda_graph_config=self.cuda_graph_config,
             cuda_graph_batch_sizes=self._cuda_graph_batch_sizes,
             cuda_graph_padding_enabled=self._cuda_graph_padding_enabled,
@@ -757,7 +758,6 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             dist=self.dist,
             moe_load_balancer=self.moe_load_balancer,
-            spec_config=self.spec_config,
             sparse_attention_config=self.sparse_attention_config,
             torch_compile_backend=self._torch_compile_backend,
             get_runtime_tokens_per_gen_step=self.

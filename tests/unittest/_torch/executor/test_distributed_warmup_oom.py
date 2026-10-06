@@ -70,8 +70,7 @@ def _engine(
         tp_size=tp_size,
     )
     engine._reset_moe_alltoall_state = mock.Mock()
-    engine._config = SimpleNamespace(is_spec_decode=False, max_draft_len=0)
-    engine.spec_config = None
+    engine._config = SimpleNamespace(is_spec_decode=False, max_draft_len=0, spec_config=None)
     return engine
 
 
