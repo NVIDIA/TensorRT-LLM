@@ -92,6 +92,14 @@ if(ENABLE_CUBLASLT_FP4_GEMM)
   target_compile_definitions(tllm_common_cublas PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
 endif()
 
+add_library(tllm_common_attention_workspace STATIC attentionWorkspace.cpp)
+add_library(tllm::common_attention_workspace ALIAS
+            tllm_common_attention_workspace)
+target_link_libraries(tllm_common_attention_workspace PUBLIC tllm::common_error)
+target_compile_features(tllm_common_attention_workspace PUBLIC cxx_std_20)
+set_target_properties(tllm_common_attention_workspace
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(
   common_src OBJECT
   cudaArchitectures.cpp
@@ -115,5 +123,6 @@ set_source_files_properties(
 add_cuda_architectures(common_src 89)
 set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET common_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-target_link_libraries(common_src PUBLIC trtllm_gen_fmha_interface
-                                        tllm::common_cublas)
+target_link_libraries(
+  common_src PUBLIC trtllm_gen_fmha_interface tllm::common_cublas
+                    tllm::common_attention_workspace)

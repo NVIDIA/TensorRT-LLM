@@ -40,9 +40,9 @@ add_tllm_gtest(
   SOURCES
   attentionWorkspaceTest.cpp
   LINK_LIBRARIES
-  tllm::common_logging
+  tllm::common_attention_workspace
   LABELS
-  "unit;common;host")
+  "unit;common;attention;host")
 add_tllm_gtest(
   memoryUtilsTest
   OWNER
