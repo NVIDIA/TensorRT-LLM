@@ -198,11 +198,21 @@ if(NIXL_ROOT)
     # wrapper; this test only uses the public agent API (the zmq include is
     # needed only because the shared bounceTestNixlNode.h helpers pull in
     # ZmqControlChannel.h at compile time).
-    add_tllm_gtest(bounceAgentE2ETest SOURCES bounceAgentE2ETest.cpp FULL_STACK
-                   LABELS "unit;full-stack;gpu")
+    add_tllm_gtest(
+      bounceAgentE2ETest
+      OWNER
+      executor
+      SOURCES
+      bounceAgentE2ETest.cpp
+      LINK_LIBRARIES
+      tllm::executor_transfer_agent
+      tllm::common_cuda
+      tensorrt_llm_nixl_wrapper
+      NIXL::nixl
+      ${NIXL_BUILD_LIBRARY}
+      Threads::Threads
+      LABELS
+      "unit;executor;bounce;integration;gpu")
     target_include_directories(bounceAgentE2ETest PRIVATE ${BOUNCE_TEST_INCS})
-    target_link_libraries(
-      bounceAgentE2ETest PRIVATE tensorrt_llm_nixl_wrapper NIXL::nixl
-                                 ${NIXL_BUILD_LIBRARY})
   endif()
 endif()
