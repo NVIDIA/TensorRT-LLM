@@ -55,3 +55,7 @@ function(add_tllm_kernel_library target)
 endfunction()
 
 add_tllm_kernel_library(tllm_kernel_logits SOURCES logitsBitmask.cu)
+
+add_tllm_kernel_library(
+  tllm_kernel_nvfp4_cold_page SOURCES nvfp4ColdPageKernels.cu LINK_LIBRARIES
+  tllm::common_environment)
