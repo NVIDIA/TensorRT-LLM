@@ -586,10 +586,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.worker = worker
         self.scheduler = scheduler
         self.enable_attention_dp = enable_attention_dp
-        #: Whether the attached connector moves KV at all. Read by the
-        #: executor to decide which of its connector-related restrictions
-        #: apply; see `KvCacheConnectorWorker.capacity_only`.
-        self.capacity_only = bool(worker.capacity_only)
+        #: Whether the connector moves KV at all. A capacity-only one registers
+        #: no page, so every hook below returns early for it.
+        self.capacity_only = worker.capacity_only is True
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -645,6 +644,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         (KVCacheManagerV2, whose scheduling pass is speculative) query here and
         commit later via ``commit_new_matched_tokens``.
         """
+        if self.capacity_only:
+            # Answering costs a leader broadcast per request. Checked ahead of
+            # the generation-only guard, which this role's requests all trip.
+            return 0, False
+
         if request.is_dummy_request:
             return 0, False
         if request.is_generation_only_request:
@@ -669,6 +673,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         ``build_scheduler_output``, and ``new_async_requests.loading`` is read
         by that same call to suppress the request's ``RequestData``.
         """
+        if self.capacity_only:
+            # Only `build_scheduler_output` clears `external_loads`, and this
+            # role skips it, so an entry recorded here would never be removed.
+            return
+
         if request.is_dummy_request:
             return
 
@@ -745,6 +754,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             The scheduled requests with the context requests that are being loaded asynchronously removed.
         """
+        if self.capacity_only:
+            # Nothing is offered asynchronously, so both lists below would be
+            # rebuilt unchanged.
+            return
 
         for key in ["context_requests_chunking", "context_requests_last_chunk"]:
             allowed_context_requests = []
@@ -785,6 +798,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             operations. If true, we do not immediately call
             free_resources on the request.
         """
+
+        if self.capacity_only:
+            # No save can be in flight, so no page has to stay pinned, and the
+            # leader broadcast below would run on every finished request.
+            return False
 
         if req.is_dummy_request:
             return False
@@ -835,6 +853,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             The requests that have newly finished saving.
         """
+        if self.capacity_only:
+            # Every list below is empty, and the ranks agree on them through an
+            # allgather that would run once per iteration.
+            return []
+
         started_loading_req_ids = list(self.new_async_requests.loading_ids)
         finished_gen_req_ids = list(self.new_async_requests.saving_ids)
 
@@ -885,7 +908,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         return list(all_finished.saving.values())
 
     def update_state_after_alloc(self, req: LlmRequest, block_ids: List[int]) -> None:
-        if req.is_dummy_request or self.scheduler is None:
+        if req.is_dummy_request or self.scheduler is None or self.capacity_only:
             return
         self.scheduler.update_state_after_alloc(req, block_ids)
 

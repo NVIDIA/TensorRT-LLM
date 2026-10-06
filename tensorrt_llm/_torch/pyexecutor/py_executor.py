@@ -1003,6 +1003,19 @@ class PyExecutor:
         if start_worker:
             self.start_worker()
 
+    @property
+    def _kv_connector_moves_kv(self) -> bool:
+        """Whether an attached connector has any work to do.
+
+        A capacity-only connector transfers nothing, so both its hooks and the
+        executor work around them are no-ops.
+
+        Read through `getattr` because some callers also run on the minimal
+        executors unit tests assemble.
+        """
+        connector = getattr(self, "kv_connector_manager", None)
+        return connector is not None and not connector.capacity_only
+
     def _maybe_init_kv_connector_manager(self) -> None:
         if self.kv_connector_manager is not None:
             # A connector that moves no KV cannot contend with the transceiver
@@ -3751,7 +3764,7 @@ class PyExecutor:
 
     def _kv_connector_start_batch(self,
                                   scheduled_batch: ScheduledRequests) -> None:
-        if self.kv_connector_manager:
+        if self._kv_connector_moves_kv:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
                 scheduled_batch)
             if self.enable_attention_dp and scheduled_batch.batch_size == 0:
@@ -3767,7 +3780,7 @@ class PyExecutor:
                 torch.cuda.current_stream())
 
     def _kv_connector_terminate_requests(self):
-        if self.kv_connector_manager:
+        if self._kv_connector_moves_kv:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
                 if self._resume_preempted_request(req):
@@ -3806,7 +3819,7 @@ class PyExecutor:
         return True
 
     def _kv_connector_wait_for_save(self):
-        if self.kv_connector_manager is not None:
+        if self._kv_connector_moves_kv:
             self.kv_connector_manager.worker.wait_for_save(
                 torch.cuda.current_stream())
 
@@ -4122,7 +4135,7 @@ class PyExecutor:
                     self._kv_connector_start_batch(scheduled_batch)
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
-                if self.kv_connector_manager:
+                if self._kv_connector_moves_kv:
                     can_queue, _ = self._can_queue(scheduled_batch)
 
                 if not can_queue:
@@ -4599,7 +4612,7 @@ class PyExecutor:
                     self._kv_connector_start_batch(scheduled_batch)
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
-                if self.kv_connector_manager:
+                if self._kv_connector_moves_kv:
                     can_queue, can_queue_this_rank = self._can_queue(
                         scheduled_batch)
 
@@ -6269,7 +6282,9 @@ class PyExecutor:
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.monotonic()
 
-        if self.kv_connector_manager:
+        # A capacity-only connector has no save to start, so the gather above
+        # would run on every finished request for nothing.
+        if self._kv_connector_moves_kv:
             if not self.disable_overlap_scheduler:
                 requests = self.previous_batch.scheduled_requests.all_requests(
                 ) if self.previous_batch is not None else []

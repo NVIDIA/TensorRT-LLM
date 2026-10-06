@@ -1275,6 +1275,29 @@ def test_scheduler_bypasses_multimodal_requests_it_cannot_identify(store_config)
     assert scheduler.request_finished(request, [7, 8, 9]) is False
 
 
+def test_scheduler_does_no_per_request_work_for_a_capacity_only_role(store_config):
+    """It transfers nothing, so a request costs it nothing.
+
+    No hash chain is built, nothing is looked up, and no state is kept for a
+    save to be planned from.
+    """
+    set_pool_setting(store_config, role="capacity")
+    scheduler = make_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert scheduler._worker.queries == []
+    assert scheduler._requests == {}
+
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, [7, 8, 9])])
+    )
+    assert metadata.loads == []
+    assert metadata.saves == []
+    assert scheduler.request_finished(request, [7, 8, 9]) is False
+
+
 def test_mooncake_declares_adp_support() -> None:
     assert MooncakeStoreConnectorScheduler.supports_attention_dp
     assert MooncakeStoreConnectorWorker.supports_attention_dp

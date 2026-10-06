@@ -811,7 +811,10 @@ class KVCacheManager(BaseResourceManager):
                     for _ in range(get_draft_token_length(req)):
                         self.impl.add_token(req.py_request_id)
 
-                    if self.kv_connector_manager is not None:
+                    # A capacity-only connector cannot reach these blocks, so
+                    # the lookup below would be for nothing.
+                    if (self.kv_connector_manager is not None
+                            and not self.kv_connector_manager.capacity_only):
                         block_ids = self.get_cache_indices(req)
                         self.kv_connector_manager.update_state_after_alloc(
                             req, block_ids)
