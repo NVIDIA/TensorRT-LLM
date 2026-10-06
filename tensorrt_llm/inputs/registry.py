@@ -251,7 +251,8 @@ class BaseMultimodalInputProcessor(ABC):
     # inputs to `call_with_token_ids` instead of detokenizing upstream.
     supports_token_id_mm_expansion: ClassVar[bool] = False
 
-    # Whether the subclass accepts `enable_tokenization_cache` in `__init__`.
+    # Whether the subclass takes `enable_tokenization_cache` in `__init__` and
+    # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
 
     def get_mm_encoder_item_metadata(
@@ -282,7 +283,11 @@ class BaseMultimodalInputProcessor(ABC):
 
     def _init_tokenization_cache(self, enable_tokenization_cache: bool,
                                  tokenizer: PreTrainedTokenizerBase) -> None:
-        """Enable only if cached ids match the HF processor's for text-only prompts."""
+        """Build the cache on `tokenizer` if `enable_tokenization_cache`.
+
+        Enable it only if this processor's ids for a text-only prompt equal
+        `tokenizer(prompt, add_special_tokens=False)`.
+        """
         self._prefix_token_cache_tokenizer = tokenizer
         self._prefix_token_cache = (create_prefix_token_cache(tokenizer)
                                     if enable_tokenization_cache else None)
