@@ -63,34 +63,25 @@ class FallbackFmha(Fmha):
     supports_skip_correction = True
     supports_workspace_reclamation = True
 
-    # Head sizes with NO fused context FMHA kernel, per SM version. This is a
-    # blocklist of proven-absent combinations, not a support matrix: sourced
-    # from the runtime fallback warning "Fall back to unfused MHA ...
-    # headSize = 64 ... in sm_103" and the silent-wrong-answer incident it
-    # caused. Extend it as further combinations are proven.
+    # Head sizes whose fused context FMHA kernel is proven absent for at
+    # least one KV cache dtype, per SM version. This is a blocklist of
+    # proven-problematic cells, not a support matrix: sourced from the
+    # runtime fallback warning "Fall back to unfused MHA ... headSize = 64
+    # ... in sm_103" and the silent-wrong-answer incident it caused. Inside
+    # a blocklisted cell, the ``fused_context_fmha_kernel_exists`` native
+    # lookup decides per KV dtype and page size which configurations the
+    # running build can serve. Outside it, no probe runs: the lookup is a
+    # fixed-convention diagnostic (dense causal Q_PAGED_KV, Q and output
+    # precision inferred from the KV precision) that does not model every
+    # configuration the op can run (MLA, cross attention, 16-bit context
+    # math over an FP8 KV cache), so probing unconditionally would refuse
+    # configurations the op serves correctly. The authoritative
+    # exact-parameter check is the op-level refusal in
+    # thop/attentionOp.cpp's get_attention_op; this gate exists to move the
+    # proven-problematic cells to metadata construction with a remedial
+    # error. Extend as further combinations are proven.
     CONTEXT_FMHA_ABSENT_HEAD_DIMS: ClassVar[dict[int, tuple[int, ...]]] = {
         103: (64,),
-    }
-
-    # Exemptions to the blocklist above: KV cache dtypes whose fused context
-    # FMHA kernel a full build carries for an otherwise-blocked (sm,
-    # head_dim). FP8 KV on sm103/hd64 is proven by hand (no unfused-MHA
-    # fallback at boot or under sustained load, deterministic greedy replays,
-    # correct long-context recall through chunked prefill and block reuse);
-    # the 16-bit KV entries are proven by ``test_context_fmha_kernel_presence``
-    # (head-size-64 kernels present for matched 16-bit Q/KV across the SM100
-    # family) and exercised by the SM103 L0 suites that run paged-context
-    # attention with a BF16 KV cache. The NVFP4 KV entry is proven by the same
-    # test (head-size-64 E4M3-Q / E2M1-KV kernels present across the SM100
-    # family; the SM103 trtllm-gen table carries them with E4M3 and BF16
-    # output). Every entry is an assertion about a
-    # kernel set the running build may not contain (a build whose
-    # ``--cuda_architectures`` omits the SM carries none of these), so
-    # ``validate_metadata`` confirms each against the native kernel lookup
-    # rather than trusting it: on a build without the kernel the combination
-    # stays refused. Unlisted dtypes stay refused (fail closed).
-    CONTEXT_FMHA_PRESENT_KV_DTYPES: ClassVar[dict[tuple[int, int], tuple[DataType, ...]]] = {
-        (103, 64): (DataType.FP8, DataType.NVFP4, DataType.BF16, DataType.HALF),
     }
 
     @classmethod
@@ -108,12 +99,15 @@ class FallbackFmha(Fmha):
         FMHA library selection, so the refusal must happen here at metadata
         construction, where the features are enabled.
 
-        ``CONTEXT_FMHA_PRESENT_KV_DTYPES`` exempts combinations whose kernel
-        was proven present by hand. That is an assertion about a kernel set
-        that can change under it, so every exemption is confirmed against the
-        native kernel lookup before it is honoured: a dropped kernel fails
-        here instead of in flight. A build whose bindings predate the lookup
-        cannot be checked, so its exemptions are not honoured (fail closed).
+        Inside a blocklisted (SM, head_dim) cell the decision is per KV
+        dtype and page size, made by asking the build what it contains via
+        the ``fused_context_fmha_kernel_exists`` native lookup: a present
+        kernel admits the configuration, an absent one refuses it. Nothing
+        about kernel presence is hand-maintained. The check fails closed
+        wherever it cannot be made: managers without a ``dtype`` or
+        ``tokens_per_block`` attribute, and builds whose bindings predate
+        the lookup (which also predate the op-level refusal, so passing
+        unverified would reintroduce the silent corruption there).
         """
         if not metadata.use_paged_context_fmha:
             return
@@ -124,82 +118,82 @@ class FallbackFmha(Fmha):
         head_dims = head_dim if isinstance(head_dim, list) else [head_dim]
         sm = get_sm_version()
         absent = [dim for dim in head_dims if dim in cls.CONTEXT_FMHA_ABSENT_HEAD_DIMS.get(sm, ())]
+        if not absent:
+            return
         kv_dtype = getattr(manager, "dtype", None)
         tokens_per_block = getattr(manager, "tokens_per_block", None)
-        if (
-            absent
-            and kv_dtype is not None
-            and tokens_per_block is not None
-            and all(
-                kv_dtype in cls.CONTEXT_FMHA_PRESENT_KV_DTYPES.get((sm, dim), ()) for dim in absent
-            )
-        ):
+        if kv_dtype is not None and tokens_per_block is not None:
             kernel_exists = getattr(thop, "fused_context_fmha_kernel_exists", None)
             if kernel_exists is None:
                 raise RuntimeError(
-                    f"CONTEXT_FMHA_PRESENT_KV_DTYPES exempts head_dim {absent} "
-                    f"on SM {sm} for KV cache dtype {kv_dtype}, but this "
-                    f"build's bindings predate the "
-                    f"fused_context_fmha_kernel_exists lookup, so the "
-                    f"exemption cannot be verified against the kernels the "
-                    f"build contains. An unverified exemption risks a silent "
+                    f"Paged-context FMHA with head_dim {absent} on SM {sm} "
+                    f"requires confirming the fused context kernel against "
+                    f"this build via the fused_context_fmha_kernel_exists "
+                    f"lookup, but this build's bindings predate it. Bindings "
+                    f"that old also predate the op-level paged-context "
+                    f"refusal, so an unverified pass would risk a silent "
                     f"fall back to unfused MHA that corrupts the cached "
-                    f"prefix, so the combination stays refused. Rebuild the "
+                    f"prefix; the configuration stays refused. Rebuild the "
                     f"bindings, or use the FlashInfer attention backend."
                 )
             # Probe with the output precision the kernel table pairs with
-            # this KV precision (matched 16-bit output; FP8 output for the
+            # this KV precision (matched output; FP8 output for the
             # FP8/NVFP4 KV kernels), mirroring the binding's probe
-            # convention in test_context_fmha_kernel_presence.py.
+            # convention in test_context_fmha_kernel_presence.py. Dtypes the
+            # lookup does not model report absent, so they stay refused.
             if kv_dtype in (DataType.FP8, DataType.NVFP4):
                 probe_output_dtype = DataType.FP8
             else:
                 probe_output_dtype = kv_dtype
-            for dim in absent:
-                if kernel_exists(
+            if all(
+                kernel_exists(
                     head_size=dim,
                     kv_cache_dtype=kv_dtype,
                     tokens_per_block=tokens_per_block,
                     output_dtype=probe_output_dtype,
-                ):
-                    continue
-                raise RuntimeError(
-                    f"CONTEXT_FMHA_PRESENT_KV_DTYPES exempts head_dim {dim} "
-                    f"on SM {sm} for KV cache dtype {kv_dtype}, but this "
-                    f"build contains no fused context FMHA kernel for that "
-                    f"combination at {tokens_per_block} tokens per block. The "
-                    f"exemption table asserts a kernel the kernel set does "
-                    f"not have, so paged-context FMHA would fall back to "
-                    f"unfused MHA and silently corrupt the cached prefix. "
-                    f"Drop the ({sm}, {dim}) entry from "
-                    f"FallbackFmha.CONTEXT_FMHA_PRESENT_KV_DTYPES "
-                    f"once the kernel is gone, or build with it present. A "
-                    f"build whose --cuda_architectures does not name SM {sm} "
-                    f"carries no kernels for SM {sm} at all and lands here "
-                    f"too; check the architecture list first."
                 )
-            logger.info(
-                f"Paged-context FMHA enabled for head_dim {absent} on SM "
-                f"{sm}: the fused context FMHA kernel is proven present for "
-                f"KV cache dtype {kv_dtype}."
+                for dim in absent
+            ):
+                logger.info(
+                    f"Paged-context FMHA enabled for head_dim {absent} on SM "
+                    f"{sm}: this build's fused context FMHA kernel is present "
+                    f"for KV cache dtype {kv_dtype} at {tokens_per_block} "
+                    f"tokens per block."
+                )
+                return
+            cause = (
+                f"this build contains no fused context FMHA kernel for that "
+                f"combination with KV cache dtype {kv_dtype} at "
+                f"{tokens_per_block} tokens per block"
             )
-            return
-        if absent:
-            features = [
+        else:
+            missing = [
                 name
-                for name in ("chunked_prefill", "cache_reuse", "has_speculative_draft_tokens")
-                if getattr(metadata.runtime_features, name, False)
+                for name, value in (("dtype", kv_dtype), ("tokens_per_block", tokens_per_block))
+                if value is None
             ]
-            raise RuntimeError(
-                f"The TRTLLM attention backend has no fused context FMHA "
-                f"kernel for head_dim {absent} on SM {sm}, but "
-                f"{'/'.join(features)} requires attending to cached KV during "
-                f"the context phase (use_paged_context_fmha). The unfused "
-                f"fallback silently drops and corrupts the cached prefix, "
-                f"producing plausible wrong answers. Use the FlashInfer "
-                f"attention backend, or disable KV block reuse, chunked "
-                f"prefill and speculative decoding for this model."
+            cause = (
+                f"the KV cache manager exposes no {' or '.join(missing)}, so "
+                f"the fused context FMHA kernel cannot be confirmed present "
+                f"(the check fails closed)"
             )
+        features = [
+            name
+            for name in ("chunked_prefill", "cache_reuse", "has_speculative_draft_tokens")
+            if getattr(metadata.runtime_features, name, False)
+        ]
+        raise RuntimeError(
+            f"{'/'.join(features)} requires attending to cached KV during "
+            f"the context phase (use_paged_context_fmha), but for head_dim "
+            f"{absent} on SM {sm} {cause}. The unfused fallback silently "
+            f"drops and corrupts the cached prefix, producing plausible "
+            f"wrong answers, so the configuration is refused. A build whose "
+            f"--cuda_architectures does not name SM {sm} carries no kernels "
+            f"for SM {sm} at all and lands here too; check the architecture "
+            f"list first. Otherwise use the FlashInfer attention backend, or "
+            f"disable KV block reuse, chunked prefill and speculative "
+            f"decoding for this model."
+        )
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
