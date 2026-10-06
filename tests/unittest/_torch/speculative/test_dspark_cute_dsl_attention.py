@@ -23,6 +23,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(params=[False, True], ids=["native", "sm107_fallback"])
+def force_sm107(request, monkeypatch):
+    if request.param:
+        monkeypatch.setattr(preparation_op, "get_sm_version", lambda: 107)
+        preparation_op._get_dspark_arch_str.cache_clear()
+
+        def unsupported_kernel(*args, **kwargs):
+            pytest.fail("SM107 entered an SM100/SM103-only kernel")
+
+        monkeypatch.setattr(dspark, "cute_dsl_dspark_rmsnorm_rope", unsupported_kernel)
+        monkeypatch.setattr(dspark, "cute_dsl_dspark_rmsnorm_rope_page_write", unsupported_kernel)
+        monkeypatch.setattr(dspark, "cute_dsl_dspark_rmsnorm_rope_draft_block", unsupported_kernel)
+        monkeypatch.setattr(torch.ops.trtllm, "fused_dsv4_dspark_attention", unsupported_kernel)
+        assert preparation_op._get_dspark_arch_str() is None
+    yield
+    preparation_op._get_dspark_arch_str.cache_clear()
+
+
 def _make_inputs(
     seed=0,
     batch=2,
@@ -261,9 +279,17 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size):
 
 
 @pytest.mark.parametrize("heads", (64, 128))
-def test_dspark_attention_forward_matches_reference(heads):
-    inputs = _make_inputs(17, heads=heads, positions=[5, 390], valid_lengths=[5, 3])
-    batch, block, hidden, rank, groups, o_rank = 2, 6, 64, 64, 8, 32
+@pytest.mark.parametrize("page_size", (32, 256))
+def test_dspark_attention_forward_matches_reference(heads, page_size, force_sm107):
+    inputs = _make_inputs(
+        17,
+        heads=heads,
+        page_size=page_size,
+        positions=[1, 33, 129, 390, 0],
+        valid_lengths=[1, 3, 128, 3, 0],
+        capacities=[512, 512, 512, 512, 0],
+    )
+    batch, block, hidden, rank, groups, o_rank = 5, 6, 64, 64, 8, 32
 
     def weight(*shape):
         return torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * 0.02
@@ -324,7 +350,7 @@ def test_dspark_attention_forward_matches_reference(heads):
 
 def test_self_jit_reuses_one_kernel_across_runtime_shapes_and_scales(monkeypatch):
     assert [attention_op._get_dspark_arch_str(sm) for sm in (100, 103)] == ["sm_100", "sm_103"]
-    assert all(attention_op._get_dspark_arch_str(sm) is None for sm in (90, 101, 109))
+    assert all(attention_op._get_dspark_arch_str(sm) is None for sm in (90, 101, 107, 109))
     cache = {}
     monkeypatch.setattr(attention_op, "_dspark_attention_kernel_cache", cache)
     for batch in (1, 3, 32):
@@ -741,7 +767,7 @@ def test_batched_attention_respects_partial_window_valid_len():
         torch.testing.assert_close(actual[row], expected, rtol=5e-2, atol=3e-2)
 
 
-def test_batched_attention_cuda_graph_capture_replay():
+def test_batched_attention_cuda_graph_capture_replay(force_sm107):
     g = _make_batched_inputs(seed=0)
     eager = _run(g)
     stream = torch.cuda.Stream()

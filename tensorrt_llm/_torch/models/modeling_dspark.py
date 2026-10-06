@@ -126,6 +126,7 @@ from .modeling_utils import DecoderModel, register_auto_model, register_draft_mo
 if IS_CUTLASS_DSL_AVAILABLE:
     from ..custom_ops import dspark_attention_custom_op  # noqa: F401
     from ..custom_ops.dspark_rmsnorm_rope_custom_op import (
+        _get_dspark_arch_str,
         cute_dsl_dspark_rmsnorm_rope,
         cute_dsl_dspark_rmsnorm_rope_draft_block,
         cute_dsl_dspark_rmsnorm_rope_page_write,
@@ -369,33 +370,66 @@ def dspark_attention_forward(
 
     if window_size != 128 or rd != 64:
         raise ValueError("Embedded DSpark attention requires a 128-token window and 64 RoPE dims")
-    main_rope_freqs = torch.view_as_real(main_freqs).reshape(-1, rd // 2, 2).contiguous()
-    inverse_rope_freqs = torch.view_as_real(blk_freqs).contiguous()
-    cute_dsl_dspark_rmsnorm_rope_page_write(
-        main_kv_input,
-        kv_norm_w,
-        main_rope_freqs,
-        kv_cache,
-        block_tables,
-        start_pos,
-        capacities,
-        eps,
-    )
-    draft_block = cute_dsl_dspark_rmsnorm_rope_draft_block(
-        block_kv_input, kv_norm_w, inverse_rope_freqs.reshape(-1, rd // 2, 2), eps
-    )
-    o = torch.ops.trtllm.fused_dsv4_dspark_attention(
-        q,
-        draft_block,
-        kv_cache,
-        block_tables,
-        start_pos,
-        valid_len,
-        capacities,
-        attn_sink,
-        inverse_rope_freqs,
-        softmax_scale,
-    )
+    if IS_CUTLASS_DSL_AVAILABLE and _get_dspark_arch_str() is not None:
+        main_rope_freqs = torch.view_as_real(main_freqs).reshape(-1, rd // 2, 2).contiguous()
+        inverse_rope_freqs = torch.view_as_real(blk_freqs).contiguous()
+        cute_dsl_dspark_rmsnorm_rope_page_write(
+            main_kv_input,
+            kv_norm_w,
+            main_rope_freqs,
+            kv_cache,
+            block_tables,
+            start_pos,
+            capacities,
+            eps,
+        )
+        draft_block = cute_dsl_dspark_rmsnorm_rope_draft_block(
+            block_kv_input, kv_norm_w, inverse_rope_freqs.reshape(-1, rd // 2, 2), eps
+        )
+        o = torch.ops.trtllm.fused_dsv4_dspark_attention(
+            q,
+            draft_block,
+            kv_cache,
+            block_tables,
+            start_pos,
+            valid_len,
+            capacities,
+            attn_sink,
+            inverse_rope_freqs,
+            softmax_scale,
+        )
+    else:
+        main_kv = _rmsnorm_rope_batched(main_kv_input, kv_norm_w, eps, rd, main_freqs)
+        draft_block = _rmsnorm_rope_batched(block_kv_input, kv_norm_w, eps, rd, blk_freqs)
+        write_dspark_context(
+            main_kv,
+            start_pos[:, None],
+            torch.ones_like(start_pos[:, None], dtype=torch.bool),
+            kv_cache,
+            block_tables,
+            capacities,
+        )
+
+        # Gather only the retained context window; masked rows may have no pages.
+        positions = start_pos[:, None] - window_size + torch.arange(window_size, device=x.device)
+        valid = (positions >= (start_pos - valid_len).clamp_min(0)[:, None]) & (
+            positions < capacities[:, None]
+        )
+        page_size = kv_cache.shape[1]
+        columns = (positions // page_size).clamp(0, block_tables.shape[1] - 1)
+        pages = block_tables.gather(1, columns).long()
+        valid = valid & (pages >= 0)
+        context = kv_cache[pages.clamp_min(0), positions % page_size]
+        context = torch.where(valid[..., None], context, 0)
+        kv = torch.cat((context, draft_block), dim=1)
+
+        scores = torch.einsum("bshd,btd->bsht", q.float(), kv.float()) * softmax_scale
+        mask = torch.cat((valid, torch.ones((g, block), device=x.device, dtype=torch.bool)), dim=1)
+        scores = scores.masked_fill(~mask[:, None, None, :], float("-inf"))
+        sink = attn_sink.float()[None, None, :, None].expand(g, block, -1, 1)
+        probs = torch.cat((scores, sink), dim=-1).softmax(-1)[..., :-1]
+        o = torch.einsum("bsht,btd->bshd", probs, kv.float()).to(q.dtype)
+        o = _rope_last_dims_batched(o, rd, blk_freqs, inverse=True)
 
     # Grouped low-rank O projection.
     o = o.reshape(g, block, n_groups, -1)
