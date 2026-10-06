@@ -270,15 +270,20 @@ target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
 target_link_libraries(
   ${SHARED_TARGET}
-  PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_error,tllm_common_logging>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,${INTERNAL_CUTLASS_KERNELS_TARGET}>)
+  PRIVATE
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_error,tllm_common_logging,tllm_executor_types,tllm_executor_serialization>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,${INTERNAL_CUTLASS_KERNELS_TARGET}>)
 
-# Logging also links common_error normally; retain all common exports here.
+# Components also link each other normally; retain all component exports here.
 set_property(TARGET ${SHARED_TARGET}
              PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_error WHOLE_ARCHIVE)
+set_property(TARGET ${SHARED_TARGET}
+             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_logging WHOLE_ARCHIVE)
+set_property(TARGET ${SHARED_TARGET}
+             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_executor_types WHOLE_ARCHIVE)
 
 # Link kernel_src and cutlass_src. static internal cutlass lib overridden.
 target_link_libraries(${SHARED_TARGET} PUBLIC kernels_src cutlass_src)
