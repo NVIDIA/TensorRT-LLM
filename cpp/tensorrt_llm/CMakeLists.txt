@@ -207,7 +207,6 @@ set(TRTLLM_LINK_LIBS
     compressorKernels_src
     fusedSamplingKernels_src
     mhcKernels_src
-    userbuffers_src
     ${DECODER_SHARED_TARGET_0}
     ${DECODER_SHARED_TARGET_1})
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
@@ -305,6 +304,7 @@ foreach(
   tllm_context_transfer_consensus
   tllm_peft_cache
   tllm_kernel_kv_cache_copy
+  userbuffers_src
   ${BATCH_MANAGER_TARGET}
   ${EXECUTOR_TARGET}
   fp8_blockscale_gemm_src
@@ -358,7 +358,8 @@ foreach(
   tllm_batch_scheduler
   tllm_context_transfer_consensus
   tllm_peft_cache
-  tllm_kernel_kv_cache_copy)
+  tllm_kernel_kv_cache_copy
+  userbuffers_src)
   set_property(TARGET ${SHARED_TARGET}
                PROPERTY LINK_LIBRARY_OVERRIDE_${component} WHOLE_ARCHIVE)
 endforeach()
