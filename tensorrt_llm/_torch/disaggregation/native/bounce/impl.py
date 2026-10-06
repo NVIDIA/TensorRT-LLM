@@ -125,7 +125,7 @@ class VmmBounceTransport(BounceTransport):
         for d in self._reg_descs:
             self._agent.register_memory(d)
 
-        self._send_stream = self._new_stream()
+        self._send_stream = self._new_stream(non_blocking=True)
         self._send_stream_lock = threading.Lock()
 
         self._init_recv_state()
@@ -168,8 +168,9 @@ class VmmBounceTransport(BounceTransport):
         )
         self._scatter_thread.start()
 
-    def _new_stream(self):
-        return CUASSERT(cudart.cudaStreamCreate())[0]
+    def _new_stream(self, *, non_blocking: bool = False) -> cudart.cudaStream_t:
+        flags = cudart.cudaStreamNonBlocking if non_blocking else cudart.cudaStreamDefault
+        return CUASSERT(cudart.cudaStreamCreateWithFlags(flags))[0]
 
     def _gather_blocking(self, src_addr: int, write_meta, total: int) -> None:
         """Gather the scattered fragments into the send region and block until done. The whole gather

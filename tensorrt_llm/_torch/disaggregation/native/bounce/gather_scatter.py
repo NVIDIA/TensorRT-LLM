@@ -153,12 +153,6 @@ def _launch_batched_copy(
     # pack all three address arrays into one pinned buffer and one async copy, so the kernel is
     # ordered after it
     stream_handle = int(stream)
-    pinned, devt = _get_meta_buffers(stream_handle, 3 * n, dev)
-    host = pinned.numpy()
-    host[:n] = dst_addrs
-    host[n : 2 * n] = src_addrs
-    host[2 * n : 3 * n] = nvec
-
     n_chunks = triton.cdiv(max_nvec, _BLOCK)
     grid = (n, n_chunks)
 
@@ -166,6 +160,12 @@ def _launch_batched_copy(
     # kernel finish before the refill
     ext_stream = torch.cuda.ExternalStream(stream_handle)
     with torch.cuda.stream(ext_stream):
+        # Allocate on the consuming stream so cached storage is ordered before its next use.
+        pinned, devt = _get_meta_buffers(stream_handle, 3 * n, dev)
+        host = pinned.numpy()
+        host[:n] = dst_addrs
+        host[n : 2 * n] = src_addrs
+        host[2 * n : 3 * n] = nvec
         devt[: 3 * n].copy_(pinned[: 3 * n], non_blocking=True)
         _batched_copy_kernel[grid](
             devt[:n],

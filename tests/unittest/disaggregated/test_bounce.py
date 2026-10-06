@@ -413,7 +413,7 @@ def _make_transport(
     monkeypatch, block_bytes_per_group, capacity=1 << 30, min_bytes=1, min_blocks=1
 ):
     monkeypatch.setattr(btr, "SlotAllocator", _FakeAlloc)
-    monkeypatch.setattr(btr.VmmBounceTransport, "_new_stream", lambda self: 0)
+    monkeypatch.setattr(btr.VmmBounceTransport, "_new_stream", lambda self, **kwargs: 0)
     monkeypatch.setattr(
         btr.VmmBounceTransport,
         "_start_scatter_worker",
