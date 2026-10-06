@@ -11,6 +11,7 @@ is covered end-to-end by integration tests rather than unit-tested here.
 """
 
 import contextlib
+import gc
 import os
 import sys
 import unittest
@@ -730,6 +731,8 @@ def _run_warmup_tracked(
     (call_order_list, log_records_or_None).
     """
     tracker = _Tracker()
+    # Engines left by earlier tests are cyclic; finalize them before tracking.
+    gc.collect()
     helix_ctx = (
         patch.object(model_engine.mapping, "has_cp_helix", return_value=True)
         if force_helix_cp
