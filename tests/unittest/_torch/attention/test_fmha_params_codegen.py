@@ -149,6 +149,7 @@ def test_legacy_arguments_build_python_params() -> None:
         "num_heads": 8,
         "num_seqs": 2,
         "mask_type": AttentionMaskType.causal,
+        "uses_spcompress": True,
         "max_attention_window_size": 2048,
         "not_an_fmha_field": "ignored",
     }
@@ -157,6 +158,7 @@ def test_legacy_arguments_build_python_params() -> None:
 
     assert config.num_heads == 8
     assert config.mask_type == AttentionMaskType.causal
+    assert config.uses_spcompress is True
     assert params.num_seqs == 2
     assert params.max_attention_window_size == 2048
     assert params.layer_idx == 3
@@ -279,14 +281,18 @@ def test_static_config_plain_scalars_reach_native_holder(monkeypatch) -> None:
         q_scaling: float = 0.0
         remove_padding: bool = False
         use_kv_cache: bool = False
+        uses_spcompress: bool = False
 
     sys.modules["tensorrt_llm.bindings.internal"].thop.StaticAttentionConfig = NativeStaticConfig
-    native = StaticAttentionConfig(num_heads=8, q_scaling=0.125).to_thop_config()
+    native = StaticAttentionConfig(
+        num_heads=8, q_scaling=0.125, uses_spcompress=True
+    ).to_thop_config()
 
     assert native.num_heads == 8
     assert native.q_scaling == 0.125
     assert native.remove_padding is True
     assert native.use_kv_cache is False
+    assert native.uses_spcompress is True
 
 
 def test_nested_none_does_not_replace_native_value(monkeypatch) -> None:

@@ -3250,7 +3250,7 @@ int AttentionOp::prepare(FmhaParams& p, bool isGen)
         TORCH_CHECK(p.fwd.attention_sinks.value().scalar_type() == torch::kFloat32,
             "Expected attention_sinks to have float dtype");
     }
-    if (mCfg.quant_mode.hasFp4KvCache())
+    if (mCfg.quant_mode.hasFp4KvCache() && !mCfg.is_mla_enable)
     {
         TORCH_CHECK(!p.fwd.kv_scale_orig_quant.has_value() || p.fwd.kv_scale_orig_quant.value().size(0) == 3,
             "FP4 KV cache expects kv_scale_orig_quant to have 3 elements.");
@@ -3413,6 +3413,11 @@ void AttentionOp::initialize()
         || use_sage_attn;
     mFP8AttenOutput = mCfg.is_fp8_out;
     mFuseFp4Quant = mCfg.is_fp4_out;
+    if (mCfg.uses_spcompress)
+    {
+        TORCH_CHECK(mSM == 107, "uses_spcompress is only supported on SM107. Got SM version: ", mSM);
+        TORCH_CHECK(mFP8ContextFMHA || mFP8ContextMLA, "uses_spcompress requires FP8 context FMHA or FP8 context MLA.");
+    }
     // Pre-check whether FMHA is supported in order to save memory allocation.
     if (mEnableContextFMHA)
     {
@@ -3649,6 +3654,7 @@ void AttentionOp::initialize()
         fmhaParams.hasAlibi = isALiBi();
         fmhaParams.scaleAlibi = isAliBiWithScale();
         fmhaParams.useSparseMLA = cfgUseSparseMLA();
+        fmhaParams.useSpcompress = mCfg.uses_spcompress;
         fmhaParams.useTllmGenSparseAttention = cfgUseTllmGenSparseAttention();
         fmhaParams.fusesDsv4InvRopeFp8Quant = mCfg.fuses_dsv4_inv_rope_fp8_quant;
 

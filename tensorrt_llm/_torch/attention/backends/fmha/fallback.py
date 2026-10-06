@@ -311,6 +311,7 @@ class FallbackFmha(PhasedFmha):
         kv_norm_weight: Optional[torch.Tensor] = None,
         kv_norm_eps: float = 1e-6,
         skip_correction_threshold: float = 0.0,
+        uses_spcompress: Optional[bool] = None,
     ) -> None:
         """Shared MHA/MLA replacement for the removed monolithic ``thop.attention``.
 

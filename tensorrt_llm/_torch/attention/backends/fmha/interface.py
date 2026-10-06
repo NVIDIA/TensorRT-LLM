@@ -61,6 +61,7 @@ _STATIC_CONFIG_DIRECT_ARGS = (
     "sage_attn_num_elts_per_blk_v",
     "sage_attn_qk_int8",
     "skip_correction_threshold",
+    "uses_spcompress",
 )
 
 
@@ -87,6 +88,7 @@ class StaticAttentionConfig:
     dense_context_fmha: bool = False
     fuses_dsv4_inv_rope_fp8_quant: bool = False
     use_sparse_attention: bool = False
+    uses_spcompress: bool = False
     use_tllm_gen_sparse_attention: bool = False
     use_nvfp4_mla_kv_cache: bool = False
     is_spec_decoding_enabled: bool = False
@@ -173,6 +175,7 @@ class StaticAttentionConfig:
             cross_attention=params.is_cross,
             fuses_dsv4_inv_rope_fp8_quant=fwd.enable_dsv4_epilogue_fusion,
             use_sparse_attention=has_sparse_attention,
+            uses_spcompress=attn.uses_spcompress,
             use_tllm_gen_sparse_attention=use_tllm_gen_sparse_attention,
             use_nvfp4_mla_kv_cache=(
                 quant_mode.has_fp4_kv_cache()
