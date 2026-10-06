@@ -174,9 +174,15 @@ def test_launch_queue_is_on_only_and_reaches_process_entrypoints(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     monkeypatch.delenv(_QUEUE, raising=False)
 
-    def config(enabled=True, slots=4):
+    def config(enabled=True, slots=4, active=None):
+        if active is None:
+            active = enabled and slots > 0
         return SimpleNamespace(
-            rebalance=SimpleNamespace(enabled=enabled, helper_slots_per_rank=slots)
+            rebalance=SimpleNamespace(
+                enabled=enabled,
+                helper_slots_per_rank=slots,
+                is_active=active,
+            )
         )
 
     original = {"KEEP": "value"}
@@ -194,6 +200,10 @@ def test_launch_queue_is_on_only_and_reaches_process_entrypoints(monkeypatch):
         assert _QUEUE not in os.environ
 
     initialized = True
+    before = {"KEEP": "value"}
+    assert module.configure_moe_launch_queues(config(active=False), before) is before
+    assert _QUEUE not in os.environ
+
     with pytest.raises(RuntimeError, match="before CUDA initialization"):
         module.configure_moe_launch_queues(config(), original)
     assert original == {"KEEP": "value"}

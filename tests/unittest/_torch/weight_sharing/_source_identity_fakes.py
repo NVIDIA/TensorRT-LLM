@@ -151,6 +151,7 @@ class FakeModelConfig:
         quant_config=_UNSET,
         attn_backend: str = "TRTLLM",
         moe_backend: str = "CUTLASS",
+        moe_rebalance=None,
     ):
         self.mapping = mapping or FakeMapping()
         self.pretrained_config = (
@@ -161,6 +162,7 @@ class FakeModelConfig:
         self.force_dynamic_quantization = False
         self.attn_backend = attn_backend
         self.moe_backend = moe_backend
+        self.moe_rebalance = moe_rebalance
         self.nvfp4_gemm_allowed_backends = ["cutlass", "cublaslt", "cuda_core"]
         self.moe_disable_finalize_fusion = False
         self.use_low_precision_moe_combine = False

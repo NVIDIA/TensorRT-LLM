@@ -43,6 +43,7 @@ from tensorrt_llm._torch.weight_sharing import (
     SourceIdentityMismatchError,
     check_weight_sharing_compatibility,
 )
+from tensorrt_llm.llmapi.llm_args import MoeRebalanceConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -115,6 +116,19 @@ def test_backend_mismatch_flags_global():
     result = a.matches(b)
     assert not result.matched
     assert "backend_fingerprint" in result.mismatched_fields
+
+
+def test_moe_rebalance_override_controls_backend_identity(monkeypatch):
+    rebalance = MoeRebalanceConfig(enabled=True, helper_slots_per_rank=3)
+    base = identity_from(FakeModelConfig())
+
+    monkeypatch.delenv("TRTLLM_MOE_REBALANCE_DISABLE", raising=False)
+    active = identity_from(FakeModelConfig(moe_rebalance=rebalance))
+    assert not base.matches(active).matched
+
+    monkeypatch.setenv("TRTLLM_MOE_REBALANCE_DISABLE", "1")
+    disabled = identity_from(FakeModelConfig(moe_rebalance=rebalance))
+    assert base.matches(disabled).matched
 
 
 def test_model_layout_field_mismatch_flags_global_and_shard():

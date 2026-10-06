@@ -29,7 +29,7 @@ def configure_moe_launch_queues(
     must still arrange for this setting before initializing their contexts.
     """
     rebalance = getattr(moe_config, "rebalance", None)
-    if rebalance is None or not rebalance.enabled or rebalance.helper_slots_per_rank <= 0:
+    if rebalance is None or not rebalance.is_active:
         return env_overrides
 
     name = "CUDA_SCALE_LAUNCH_QUEUES"

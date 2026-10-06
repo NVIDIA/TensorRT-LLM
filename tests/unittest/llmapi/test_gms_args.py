@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tensorrt_llm.llmapi.llm_args import LoadFormat, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import LoadFormat, MoeRebalanceConfig, TorchLlmArgs
 
 pytestmark = pytest.mark.cpu_only
 
@@ -170,6 +170,17 @@ class TestGmsMoeCompatibility:
             moe_config={"rebalance": rebalance},
         )
         assert args.load_format == load_format
+
+    def test_disable_override_makes_rebalance_inactive(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_MOE_REBALANCE_DISABLE", "1")
+        rebalance = MoeRebalanceConfig(enabled=True, helper_slots_per_rank=3)
+        assert not rebalance.is_active
+
+        args = _make_args(
+            load_format=LoadFormat.GMS,
+            moe_config={"rebalance": rebalance},
+        )
+        assert args.load_format == LoadFormat.GMS
 
 
 class TestLoadFormatGms:

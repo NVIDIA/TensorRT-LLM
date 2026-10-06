@@ -672,18 +672,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
         # Resolve helper capacity once; create_weights and routing share this value.
         self._rebalance_config = getattr(model_config, "moe_rebalance", None)
-        # The config and disable override must agree on every EP rank.
-        _rebalance_env_disabled = os.environ.get(
-            "TRTLLM_MOE_REBALANCE_DISABLE", ""
-        ).strip().lower() in {"1", "true", "yes", "on"}
         _rebalance_requested = (
-            self._rebalance_config is not None
-            and bool(getattr(self._rebalance_config, "enabled", False))
-            # ``helper_slots_per_rank == 0`` is defined as equivalent to
-            # disabled (see MoeRebalanceConfig): no helper capacity means no
-            # receive pool to allocate and M == H anyway.
-            and int(getattr(self._rebalance_config, "helper_slots_per_rank", 0)) > 0
-            and not _rebalance_env_disabled
+            self._rebalance_config is not None and self._rebalance_config.is_active
         )
         # S controls the weight axis, symmetric workspace, and compiled helper gate.
         self._rebalance_autotune_helpers_initialized = False

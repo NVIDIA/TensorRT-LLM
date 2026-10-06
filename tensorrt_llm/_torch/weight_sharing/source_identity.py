@@ -184,24 +184,14 @@ def _quant_to_dict(quant_config: Any) -> Any:
 
 def _moe_rebalance_is_inert(rebalance_config: Any) -> bool:
     """Whether rebalancing leaves the resident weight layout unchanged."""
-    if rebalance_config is None:
-        return True
-    if not getattr(rebalance_config, "enabled", False):
-        return True
-    return int(getattr(rebalance_config, "helper_slots_per_rank", 0) or 0) <= 0
+    return rebalance_config is None or not rebalance_config.is_active
 
 
 def _moe_rebalance_to_dict(rebalance_config: Any) -> Optional[dict]:
-    """Hash only fields that affect the rebalance weight layout."""
+    """Hash fields that affect the rebalance weight layout."""
     if rebalance_config is None:
         return None
-    phases = getattr(rebalance_config, "phases", None)
-    return {
-        "enabled": getattr(rebalance_config, "enabled", False),
-        "helper_slots_per_rank": getattr(rebalance_config, "helper_slots_per_rank", 0),
-        "phases": list(phases) if phases is not None else None,
-        "transport": getattr(rebalance_config, "transport", None),
-    }
+    return rebalance_config.model_dump(mode="python")
 
 
 @dataclass(frozen=True)

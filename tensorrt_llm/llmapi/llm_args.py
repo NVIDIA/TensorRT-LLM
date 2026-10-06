@@ -1870,6 +1870,15 @@ class MoeRebalanceConfig(StrictBaseModel):
         "Number of extra helper slots (S) each rank hosts on top of the experts it owns (H). Every live weight plane grows to M = H + S rows: [0, H) are the resident experts, [H, M) are runtime-only helper slots. 0 means no helper capacity, which is equivalent to leaving rebalance disabled."
     )
 
+    @property
+    def is_active(self) -> bool:
+        """Whether runtime expert rebalancing is enabled for this process."""
+        env_disabled = os.environ.get(
+            "TRTLLM_MOE_REBALANCE_DISABLE",
+            "").strip().lower() in {"1", "true", "yes", "on"}
+        return (self.enabled and self.helper_slots_per_rank > 0
+                and not env_disabled)
+
 
 _MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "CUTEDSL_FC12", "TRTLLM",
                       "DEEPGEMM", "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
@@ -7206,8 +7215,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
         rebalance = (None
                      if self.moe_config is None else self.moe_config.rebalance)
-        rebalance_active = (rebalance is not None and rebalance.enabled
-                            and rebalance.helper_slots_per_rank > 0)
+        rebalance_active = rebalance is not None and rebalance.is_active
         if self.load_format == LoadFormat.GMS and rebalance_active:
             raise ValueError(
                 "LoadFormat.GMS is incompatible with active "
