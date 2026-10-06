@@ -145,20 +145,3 @@ def test_dims_reproduces_the_declaration_numbers():
     d = W.MODEL_WEIGHTS.dims(_fake_core())
     for key, want in _DIMS.items():
         assert getattr(d, key) == want, key
-
-
-def test_the_table_builds_the_hand_written_manifest():
-    """The generated manifest against the hand-written one it replaces.
-
-    `weights._manifest` is dead code kept for exactly this comparison: the
-    checkpoint key, destination index and transform of all seventeen roles
-    used to be written out a second time there, and the point of the table is
-    that they are not. Compared against the real function rather than a
-    transcription, which is only possible while both still exist -- once this
-    is green, `_manifest` goes.
-    """
-    core = _fake_core()
-    got, want = W.MODEL_WEIGHTS.manifest(core), W._manifest(core)
-    assert set(got) == set(want)
-    for key in sorted(want):
-        assert got[key] == want[key], key
