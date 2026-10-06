@@ -401,6 +401,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _init_sync_policy(self):
         m = self._mapping
+        # The ctx side never syncs over CP: helix pairs a cp=1 context instance
+        # with a cp=N generation instance (see attention/peer.py check_peer_compatible),
+        # so on the context side the CP group is always a single rank.
         self._ctx_need_tp_sync = m.tp_size > 1 and not m.enable_attention_dp
         self._ctx_need_pp_sync = m.pp_size > 1
         if m.enable_attention_dp:
@@ -409,6 +412,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # spans PP x CP (like the C++ transceiver's mGroupDataComm). Without it
             # a CP rank can start decoding before its partner received the KV and
             # the helix all-to-all deadlocks.
+            #
+            # Invariant: the collective below runs once per call to
+            # check_gen_transfer_status, and the executor enters that call behind
+            # a rank-local `admitted` predicate (receive_gen_init). The CP ranks
+            # of one DP group must therefore admit the same requests in the same
+            # iteration. The PP loop broadcasts the schedule over CP; the pp=1
+            # loops rely on deterministic scheduling (identical request stream
+            # and global-token KV capacity on every CP rank). The same
+            # requirement already held for non-DP tp x cp, which gathers over
+            # the world behind the same predicate.
             self._gen_need_sync = m.pp_size * m.cp_size > 1
             self._gen_allgather: Callable = self._dp_group_allgather
         else:
