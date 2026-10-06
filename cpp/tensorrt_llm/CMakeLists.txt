@@ -385,9 +385,7 @@ target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
 # Cyclic dependency of executor on TRT-LLM
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
 
-# Cyclic dependency of UCX data transceiver on TRT-LLM
 if(TARGET ${UCX_WRAPPER_TARGET})
-  target_link_libraries(${UCX_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
   add_dependencies(${SHARED_TARGET} ${UCX_WRAPPER_TARGET})
 endif()
 
