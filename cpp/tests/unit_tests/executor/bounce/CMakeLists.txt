@@ -13,29 +13,43 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-# Unit tests for the NIXL bounce-buffer v2 KV-cache transfer. The code under
-# test lives in tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/; the
-# bounce core .cpp files are compiled directly into each test (they are also
-# built into the NIXL wrapper for production). Three tiers, each independently
-# gated: - pure-logic / GPU tests  (no NIXL, no zmq, no network) - control-plane
-# tests     (need zmq + the fetched cppzmq header) - real-NIXL e2e tests (need
-# NIXL_ROOT + zmq; two real agents, real RDMA)
+# Bounce tests cover host logic, CUDA execution, ZeroMQ control channels and
+# real NIXL transport. Transport tests require NIXL_ROOT and ZeroMQ.
 set(BOUNCE_DIR
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/executor/cache_transmission/nixl_utils/bounce
 )
 
 # ---- Pure-logic + GPU unit tests (no NIXL / zmq / network) ----
-add_tllm_gtest(creditSchedulerTest SOURCES creditSchedulerTest.cpp FULL_STACK
-               LABELS "unit;full-stack")
-target_sources(creditSchedulerTest PRIVATE ${BOUNCE_DIR}/CreditScheduler.cpp
-                                           ${BOUNCE_DIR}/BuddyAllocator.cpp)
-add_tllm_gtest(bounceTransferPlanTest SOURCES bounceTransferPlanTest.cpp
-               FULL_STACK LABELS "unit;full-stack")
-target_sources(bounceTransferPlanTest
-               PRIVATE ${BOUNCE_DIR}/BounceTransferPlan.cpp)
-add_tllm_gtest(bounceMessageCodecTest SOURCES bounceMessageCodecTest.cpp
-               FULL_STACK LABELS "unit;full-stack")
-target_sources(bounceMessageCodecTest PRIVATE ${BOUNCE_DIR}/BounceMessage.cpp)
+add_tllm_gtest(
+  creditSchedulerTest
+  OWNER
+  executor
+  SOURCES
+  creditSchedulerTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_bounce_core
+  LABELS
+  "unit;executor;bounce;host")
+add_tllm_gtest(
+  bounceTransferPlanTest
+  OWNER
+  executor
+  SOURCES
+  bounceTransferPlanTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_bounce_core
+  LABELS
+  "unit;executor;bounce;host")
+add_tllm_gtest(
+  bounceMessageCodecTest
+  OWNER
+  executor
+  SOURCES
+  bounceMessageCodecTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_bounce_core
+  LABELS
+  "unit;executor;bounce;host")
 # Header-only: knob resolution (agent_bounce_params dict > TRTLLM_NIXL_BOUNCE_*
 # env > default), byte-size suffixes, garbage fallback, derived-timeout
 # invariants.
@@ -49,9 +63,16 @@ add_tllm_gtest(
   tllm::common_logging
   LABELS
   "unit;executor;host")
-add_tllm_gtest(buddyAllocatorTest SOURCES buddyAllocatorTest.cpp FULL_STACK
-               LABELS "unit;full-stack")
-target_sources(buddyAllocatorTest PRIVATE ${BOUNCE_DIR}/BuddyAllocator.cpp)
+add_tllm_gtest(
+  buddyAllocatorTest
+  OWNER
+  executor
+  SOURCES
+  buddyAllocatorTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_bounce_core
+  LABELS
+  "unit;executor;bounce;host")
 # GPU test: execution-context pool (stream/event/scratch/hostPinned)
 # acquire/release.
 add_tllm_gtest(execPoolTest SOURCES execPoolTest.cpp FULL_STACK LABELS
@@ -102,6 +123,10 @@ if(NIXL_ROOT)
   # Same gate as the zmq-only tier above.
   if(BOUNCE_CPPZMQ_AVAILABLE)
     set(BOUNCE_REACTOR_SRCS
+        ${BOUNCE_DIR}/BounceTransport.cpp ${BOUNCE_DIR}/BounceArena.cpp
+        ${BOUNCE_DIR}/ExecPool.cpp ${BOUNCE_DIR}/GatherScatterKernel.cu
+        ${BOUNCE_DIR}/ZmqControlChannel.cpp)
+    set(BOUNCE_TSAN_SRCS
         ${BOUNCE_DIR}/BounceTransport.cpp
         ${BOUNCE_DIR}/BounceTransferPlan.cpp
         ${BOUNCE_DIR}/BuddyAllocator.cpp
@@ -119,8 +144,14 @@ if(NIXL_ROOT)
     # One reactor test target: the bounce sources compiled in, plus the shared
     # include/link sets.
     function(add_bounce_reactor_test name src)
+      cmake_parse_arguments(ARG "INSTRUMENTED" "" "" ${ARGN})
       add_tllm_gtest(${name} SOURCES ${src} FULL_STACK LABELS "unit;full-stack")
-      target_sources(${name} PRIVATE ${BOUNCE_REACTOR_SRCS})
+      if(ARG_INSTRUMENTED)
+        target_sources(${name} PRIVATE ${BOUNCE_TSAN_SRCS})
+      else()
+        target_sources(${name} PRIVATE ${BOUNCE_REACTOR_SRCS})
+        target_link_libraries(${name} PRIVATE tllm::executor_bounce_core)
+      endif()
       target_include_directories(${name} PRIVATE ${BOUNCE_TEST_INCS})
       target_link_libraries(${name} PRIVATE ${BOUNCE_TEST_LIBS})
     endfunction()
@@ -142,7 +173,7 @@ if(NIXL_ROOT)
            "Build a ThreadSanitizer variant of the bounce reactor test" OFF)
     if(BOUNCE_TSAN)
       add_bounce_reactor_test(bounceTransportTsanTest
-                              bounceTransportFailureTest.cpp)
+                              bounceTransportFailureTest.cpp INSTRUMENTED)
       target_compile_options(
         bounceTransportTsanTest
         PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=thread -g>
