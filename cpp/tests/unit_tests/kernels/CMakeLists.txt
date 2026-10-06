@@ -25,8 +25,29 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;logits;gpu"
   REQUIRES_GPU)
-add_gtest(cascadeAttentionKernelTest cascadeAttentionKernelTest.cpp)
-add_gtest(cascadeAttentionNumericsTest cascadeAttentionNumericsTest.cu)
+add_tllm_gtest(
+  cascadeAttentionKernelTest
+  OWNER
+  kernel
+  SOURCES
+  cascadeAttentionKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_cascade_attention
+  LABELS
+  "unit;kernels;cascade-attention;gpu"
+  REQUIRES_GPU)
+add_tllm_gtest(
+  cascadeAttentionNumericsTest
+  OWNER
+  kernel
+  SOURCES
+  cascadeAttentionNumericsTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_cascade_attention
+  tllm::kernel_attention_decode
+  LABELS
+  "unit;kernels;cascade-attention;gpu"
+  REQUIRES_GPU)
 
 macro(remove_compile_definition TARGET_NAME DEFINITION)
   get_target_property(DEFS ${TARGET_NAME} COMPILE_DEFINITIONS)

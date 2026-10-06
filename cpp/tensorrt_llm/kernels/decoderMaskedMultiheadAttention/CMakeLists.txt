@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -40,11 +40,6 @@ foreach(HEAD ${basic_heads})
   list(APPEND SRC_CU ${HEAD_SRCS})
 endforeach()
 
-# Cascade attention kernel. Compiled together with the basic heads so it lives
-# in the same shared library as the MMHA dispatcher that calls into it. Uses Dh
-# in {64, 128}.
-list(APPEND SRC_CU ${CMAKE_CURRENT_SOURCE_DIR}/cascadeAttentionKernel.cu)
-
 # skip mmha 48, 80, 96, 104, 112, 144, 160, 192 and 224 for fast build
 if(FAST_BUILD)
   set(extra_heads 256)
@@ -82,9 +77,18 @@ if(NOT WIN32)
                PROPERTY POSITION_INDEPENDENT_CODE ON)
   set_property(TARGET ${DECODER_SHARED_TARGET_1}
                PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  foreach(target ${DECODER_SHARED_TARGET_0} ${DECODER_SHARED_TARGET_1})
+    target_link_libraries(${target} PUBLIC tllm::common_environment
+                                           tllm::kernel_cascade_attention)
+  endforeach()
 else()
-  target_sources(decoder_attention_src PRIVATE ${SRC_CPP} ${SRC_CU}
-                                               ${SRC_CU_EXTRA})
+  target_sources(decoder_attention_src PRIVATE ${SRC_CPP})
+  add_library(tllm_mmha STATIC ${SRC_CU} ${SRC_CU_EXTRA})
+  target_link_libraries(tllm_mmha PUBLIC tllm::common_environment
+                                         tllm::kernel_cascade_attention)
+  set_target_properties(tllm_mmha PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                             CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  target_link_libraries(decoder_attention_src PUBLIC tllm_mmha)
 endif()
 
 target_link_libraries(decoder_attention_src PUBLIC nvrtc_wrapper_src
