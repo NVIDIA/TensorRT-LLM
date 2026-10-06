@@ -15,8 +15,6 @@
 # the License.
 #
 
-file(GLOB_RECURSE SRC_CPP *.cpp)
-file(GLOB_RECURSE SRC_CU *.cu)
 set(ROUTING_CUSTOM_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingCustomBlock.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingCustomCluster.cu
@@ -29,7 +27,6 @@ set(ROUTING_OTHER_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingFromTopKIds.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingLlama4.cu)
 set(ROUTING_SRC_CU ${ROUTING_CUSTOM_SRC_CU} ${ROUTING_OTHER_SRC_CU})
-list(REMOVE_ITEM SRC_CU ${ROUTING_SRC_CU})
 
 # Custom routing uses one translation unit per kernel family and disables NVCC's
 # internal split pipeline so ptxas can process the families in parallel.
@@ -51,9 +48,10 @@ set_source_files_properties(
   ${ROUTING_OTHER_SRC_CU}
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--split-compile=0>")
 
-add_library(trtllm_gen_fp8_block_scale_moe OBJECT ${SRC_CPP} ${SRC_CU})
-target_link_libraries(trtllm_gen_fp8_block_scale_moe
-                      PUBLIC tllm::kernel_moe_routing)
+add_library(trtllm_gen_fp8_block_scale_moe OBJECT runner.cu)
+target_link_libraries(
+  trtllm_gen_fp8_block_scale_moe PUBLIC tllm::kernel_moe_routing
+                                        tllm::kernel_moe_block_scale)
 set_property(TARGET trtllm_gen_fp8_block_scale_moe
              PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET trtllm_gen_fp8_block_scale_moe

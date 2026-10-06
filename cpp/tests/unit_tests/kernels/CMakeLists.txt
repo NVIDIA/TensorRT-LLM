@@ -212,8 +212,28 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;moe-routing;gpu")
 
-add_gtest(blockScaleMoeActivationTest moe/blockScaleMoeActivationTest.cu)
-add_gtest(blockScaleMoeFinalizeTest moe/blockScaleMoeFinalizeTest.cu)
+add_tllm_gtest(
+  blockScaleMoeActivationTest
+  OWNER
+  kernel
+  SOURCES
+  moe/blockScaleMoeActivationTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_moe_block_scale
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;moe-block-scale;gpu")
+add_tllm_gtest(
+  blockScaleMoeFinalizeTest
+  OWNER
+  kernel
+  SOURCES
+  moe/blockScaleMoeFinalizeTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_moe_block_scale
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;moe-block-scale;gpu")
 
 add_tllm_gtest(
   moeLoadBalanceKernelTest
