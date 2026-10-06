@@ -32,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     MultimodalScheduler,
     ScheduledRequests,
 )
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -282,6 +283,23 @@ def test_multimodal_scheduler_preserves_non_multimodal_requests():
 
     assert output.scheduled_mm_encoder_items is None
     assert output.context_requests == [request]
+
+
+@pytest.mark.parametrize("scheduler_cls", [MultimodalScheduler, MultimodalEagerEncoderScheduler])
+def test_multimodal_scheduler_forwards_async_transfer_manager(scheduler_cls):
+    v2_scheduler = KVCacheV2Scheduler.__new__(KVCacheV2Scheduler)
+    v2_scheduler._async_transfer_manager = None
+    transfer_manager = Mock()
+
+    scheduler_cls(v2_scheduler, max_batch_size=1, max_num_tokens=1).set_async_transfer_manager(
+        transfer_manager
+    )
+    # A wrapped scheduler without the hook is left untouched.
+    scheduler_cls(_BaseScheduler(), max_batch_size=1, max_num_tokens=1).set_async_transfer_manager(
+        transfer_manager
+    )
+
+    assert v2_scheduler._async_transfer_manager is transfer_manager
 
 
 def test_request_rejects_item_above_effective_startup_maximum():
