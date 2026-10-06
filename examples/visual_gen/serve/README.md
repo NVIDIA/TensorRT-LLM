@@ -510,6 +510,17 @@ for the DROID Policy workflow.
 
 **T2AV — video with synchronized audio**
 
+Static FP8 Nano and Super use the same requests below. Start their generator
+with the FP8 revision config (substitute `nvidia/Cosmos3-Super` for Super):
+
+```bash
+trtllm-serve nvidia/Cosmos3-Nano --visual_gen_args ../configs/cosmos3-fp8-1gpu.yaml
+```
+
+Both were validated on one B300; see the
+[FP8 validation results](../models/cosmos3/README.md#static-fp8-checkpoints).
+Image-conditioned FP8 audio-video (TI2AV) remains unvalidated.
+
 ```bash
 curl -X POST "http://localhost:8000/v1/videos/sync" \
   -H "Content-Type: application/json" \
@@ -555,7 +566,7 @@ curl -s -X POST "http://localhost:8000/v1/images/generations" \
 With the default `"response_format": "url"` the response carries a
 `/v1/images/{image_id}/content` URL to download instead.
 
-**Reasoner — chat**
+### Reasoner chat
 
 A Cosmos3 checkpoint holds two models: the **Reasoner** (a Qwen3-VL-based VLM)
 and the **Generator** (video / image diffusion). `--visual_gen_args` or
@@ -577,6 +588,89 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 
 The two are mutually exclusive: a Reasoner server returns 404 on `/v1/videos/*`
 and `/v1/images/*`, and a generation server has no `/v1/chat/completions`.
+
+#### Static FP8 Reasoner
+
+Nano and Super static-FP8 checkpoints also support the standalone Reasoner:
+text, image and video inputs produce text through `/v1/chat/completions`.
+Use a local FP8 checkpoint directory containing a root `hf_quant_config.json`
+with the ModelOpt FP8 quantization configuration, alongside the weights and
+their calibrated scales. The LLM loader reads this file to select FP8; the generator's
+`transformer/config.json` alone does not establish Reasoner quantization.
+
+Start the server in terminal 1. Set `MODEL_DIR` to either your Nano or Super
+FP8 checkpoint directory; both were exercised on one B300:
+
+```bash
+MODEL_DIR=/path/to/Cosmos3-Nano-FP8
+trtllm-serve "$MODEL_DIR" --host 127.0.0.1 --port 8000 \
+    --max_num_tokens 32768
+```
+
+Once `curl -f http://127.0.0.1:8000/health` returns HTTP 200, run the client
+in terminal 2 (`pip install openai` if needed). Replace the image and video
+paths with files accessible to the server; `file://` URLs refer to the
+server's filesystem, including its container mounts when applicable:
+
+```python
+from pathlib import Path
+
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://127.0.0.1:8000/v1")
+model = client.models.list().data[0].id
+
+# Text understanding
+response = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": "Describe what a robot arm does."}],
+    max_tokens=4096,
+)
+print(response.choices[0].message.content)
+
+# Image understanding
+image_url = Path("/path/to/image.jpg").resolve().as_uri()
+response = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": image_url}},
+        {"type": "text", "text": "Caption the image in detail."},
+    ]}],
+    max_tokens=4096,
+)
+print(response.choices[0].message.content)
+
+# Video understanding: decode at 4 FPS without a second sampling pass
+video_url = Path("/path/to/video.mp4").resolve().as_uri()
+response = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": [
+        {"type": "video_url", "video_url": {"url": video_url}},
+        {"type": "text", "text": "Describe the video in detail."},
+    ]}],
+    max_tokens=4096,
+    extra_body={
+        "media_io_kwargs": {"video": {"num_frames": -1, "fps": 4}},
+        "mm_processor_kwargs": {"do_sample_frames": False},
+    },
+)
+print(response.choices[0].message.content)
+```
+
+The standalone Reasoner uses native W8A8 with the checkpoint's static scales;
+`lm_head`, embeddings and the vision tower remain BF16. The
+`runtime.diffusion_step_policy` setting, including `reasoner: a16`, governs
+the understanding stream inside the generator and is ignored by this LLM path.
+The generator's single-GPU FP8 restriction does not establish multi-GPU
+Reasoner support; the Reasoner validation here covers one GPU only.
+
+Validation on Tue 6 Oct 2026 used TensorRT-LLM main `37d332fa1c` and local
+checkpoint directories on one B300. All 19 client requests in the
+[Cosmos3 Reasoner cookbook](https://github.com/NVIDIA/cosmos/blob/main/cookbooks/cosmos3/reasoner/run_with_tensorrt_llm.ipynb)
+passed for Nano FP8, Nano BF16 and Super FP8. The test used a cluster-specific
+launcher; the plain server command above was not independently tested. Hub ID
+plus `--revision fp8` has not been validated for this LLM path. These functional
+checks do not constitute a general FP8 output-quality benchmark.
 
 ### Notes
 

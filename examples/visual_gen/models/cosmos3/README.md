@@ -32,23 +32,52 @@ them with `--revision`:
 ```bash
 python cosmos3.py --model nvidia/Cosmos3-Nano --revision fp8 \
     --prompt_file prompts/t2v.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 ```
 
 `nvidia/Cosmos3-Super` works the same way. A local checkout of that branch is
 equally fine; pass its directory to `--model` and omit `--revision`.
 
-`../configs/cosmos3-fp8-1gpu.yaml` carries the same `revision: fp8` for callers
+`../../configs/cosmos3-fp8-1gpu.yaml` carries the same `revision: fp8` for callers
 that would rather set it in the config than on the command line.
 
-T2V, T2I, I2V and V2V are validated on a **single GPU**; every multi-GPU
-configuration is refused with an explicit error, so use BF16 there.
+T2V, T2I, I2V, V2V and T2AV are validated on a **single GPU** for Nano and Super;
+every multi-GPU generator configuration is refused with an explicit error, so
+use BF16 there. Static FP8 Reasoner serving has a separate deployment path; see
+[Reasoner chat](../../serve/README.md#reasoner-chat).
 
-These checkpoints ship the audio tower (`sound_gen: true`), so T2AV/TI2AV run
-rather than being refused — audio is quantized and generated like any other
-supported task. It simply has not been exercised as thoroughly as the four
-video/image tasks above, and no FP8 audio quality claim is made. FP8 output
-quality in general has not been benchmarked against BF16.
+For T2AV, use the same audio-enabled prompt as BF16 with the FP8 checkpoint:
+
+```bash
+python cosmos3.py --model nvidia/Cosmos3-Nano --revision fp8 \
+    --prompt_file prompts/t2av.json \
+    --visual_gen_args ../../configs/cosmos3-fp8-1gpu.yaml \
+    --output_path cosmos3_fp8_t2av.mp4
+```
+
+Substitute `nvidia/Cosmos3-Super` for Super. For a local FP8 checkpoint, pass its
+directory as `--model` and omit `--revision`; the config's revision is ignored
+for local paths.
+
+T2AV validation on Tue 6 Oct 2026 used one B300 with 35 steps, 189 frames,
+1280×720 resolution and guidance scale 6. Both checkpoints produced stereo
+48 kHz audio with the same tensor shape as BF16. Same-seed comparisons gave:
+
+| Checkpoint | Audio waveform correlation | Spectrogram correlation | End-to-end speedup over BF16 |
+|---|---|---|---|
+| Nano | 0.91 | 0.94 | 1.39× |
+| Super | 0.98 | 0.97 | 1.17× |
+
+A listening check found no audible difference from BF16 in these samples.
+These are sample comparisons, not a general audio or video quality benchmark.
+TI2AV (image-conditioned audio-video) remains unvalidated; no FP8 audio quality
+claim is made for that mode.
+
+The generator applies the checkpoint's `diffusion_step_policy` automatically:
+these FP8 checkpoints use BF16 activations for the first and last three
+denoising steps. The INFO message `Cosmos3 diffusion_step_policy: ... FP8
+linears wrapped` confirms that the policy was installed. This policy does not
+apply to the standalone Reasoner.
 
 ## Guardrails
 
@@ -62,6 +91,12 @@ pip install opencv-python-headless
 
 Accept the terms for the guardrail checkpoint at https://huggingface.co/nvidia/Cosmos-1.0-Guardrail and set a valid `HF_TOKEN` (the checkpoint is downloaded automatically on first run).
 
+The generator checks this dependency at startup, including for BF16 and FP8.
+Per-request `use_guardrails: false` (or `--disable_guardrails` in the example)
+does not bypass startup: without `cosmos_guardrail`, set the environment
+variable below before starting the engine if you take responsibility for
+deployment without guardrails.
+
 To run without guardrails (you are responsible for safe deployment):
 
 ```bash
@@ -70,7 +105,7 @@ export TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1
 
 ## Media I/O dependencies
 
-- Saving `.mp4` output requires the `ffmpeg` CLI on `PATH` (`apt-get install -y ffmpeg`); without it the encoder falls back to `.avi`.
+- Saving `.mp4` output, including video with audio, requires the `ffmpeg` CLI on `PATH` (`apt-get install -y ffmpeg`). An explicit `output.save("output.mp4")` raises if ffmpeg is unavailable. Only automatic format selection falls back to `.avi`, which drops audio. This applies to BF16 and FP8.
 - Decoding MP4/AVI reference videos (V2V) happens in the worker processes on NVDEC via PyNvVideoCodec, a declared TensorRT-LLM dependency — nothing extra to install. Tested combinations: H.264 in MP4 and H.264 in AVI; other containers/codecs/profiles depend on the demuxer and the GPU's NVDEC capabilities and are best-effort.
 - Transfer's `edge`/`blur` controls are derived on the GPU from the reference video — nothing extra to install. Precomputed controls (`depth`/`seg`/`wsm`, or a precomputed `edge`/`blur`) are decoded like any other reference video.
 
