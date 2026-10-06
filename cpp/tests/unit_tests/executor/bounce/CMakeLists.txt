@@ -111,29 +111,21 @@ add_tllm_gtest(
   "unit;executor;bounce;gpu"
   REQUIRES_GPU)
 
-# ---- Control-plane unit test — needs only zmq (+ the fetched cppzmq header),
-# no NIXL. ZMQ_FOUND is reused by the real-NIXL block below. ----
-find_package(PkgConfig)
-if(PKG_CONFIG_FOUND)
-  pkg_check_modules(ZMQ libzmq)
-endif()
-# Both zmq tiers need libzmq AND the fetched cppzmq header: without the latter
-# the sources compile-fail on zmq.hpp even though libzmq itself was found.
-if(ZMQ_FOUND AND EXISTS ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
+# ---- Control-plane unit test: ZeroMQ and cppzmq, without NIXL. ----
+if(TARGET tllm_executor_bounce_control)
   set(BOUNCE_CPPZMQ_AVAILABLE TRUE)
+  add_tllm_gtest(
+    zmqControlChannelTest
+    OWNER
+    executor
+    SOURCES
+    zmqControlChannelTest.cpp
+    LINK_LIBRARIES
+    tllm::executor_bounce_control
+    LABELS
+    "unit;executor;bounce;host")
 else()
   set(BOUNCE_CPPZMQ_AVAILABLE FALSE)
-endif()
-if(BOUNCE_CPPZMQ_AVAILABLE)
-  add_tllm_gtest(zmqControlChannelTest SOURCES zmqControlChannelTest.cpp
-                 FULL_STACK LABELS "unit;full-stack")
-  target_sources(
-    zmqControlChannelTest PRIVATE ${BOUNCE_DIR}/ZmqControlChannel.cpp
-                                  ${BOUNCE_DIR}/BounceMessage.cpp)
-  target_include_directories(
-    zmqControlChannelTest PRIVATE ${CMAKE_BINARY_DIR}/_deps/cppzmq-src
-                                  ${ZMQ_INCLUDE_DIRS})
-  target_link_libraries(zmqControlChannelTest PRIVATE ${ZMQ_LIBRARIES})
 endif()
 
 # ---- Real-NIXL tests (need NIXL_ROOT). The bounce DATA PLANE is always real
@@ -145,8 +137,7 @@ if(NIXL_ROOT)
   # when NIXL is on); all of them share this source set + include/link sets.
   # Same gate as the zmq-only tier above.
   if(BOUNCE_CPPZMQ_AVAILABLE)
-    set(BOUNCE_REACTOR_SRCS ${BOUNCE_DIR}/BounceTransport.cpp
-                            ${BOUNCE_DIR}/ZmqControlChannel.cpp)
+    set(BOUNCE_REACTOR_SRCS ${BOUNCE_DIR}/BounceTransport.cpp)
     set(BOUNCE_TSAN_SRCS
         ${BOUNCE_DIR}/BounceTransport.cpp
         ${BOUNCE_DIR}/BounceTransferPlan.cpp
@@ -157,10 +148,9 @@ if(NIXL_ROOT)
         ${BOUNCE_DIR}/ExecPool.cpp
         ${BOUNCE_DIR}/GatherScatterKernel.cu
         ${BOUNCE_DIR}/ZmqControlChannel.cpp)
-    set(BOUNCE_TEST_INCS ${CMAKE_BINARY_DIR}/_deps/cppzmq-src
-                         ${ZMQ_INCLUDE_DIRS})
+    set(BOUNCE_TEST_INCS ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
     set(BOUNCE_TEST_LIBS tensorrt_llm_nixl_wrapper NIXL::nixl
-                         ${NIXL_BUILD_LIBRARY} ${ZMQ_LIBRARIES})
+                         ${NIXL_BUILD_LIBRARY} PkgConfig::TLLM_BOUNCE_ZMQ)
 
     # One reactor test target: the bounce sources compiled in, plus the shared
     # include/link sets.

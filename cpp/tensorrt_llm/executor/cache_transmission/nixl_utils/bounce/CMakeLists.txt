@@ -48,3 +48,22 @@ target_compile_features(tllm_executor_bounce_arena PUBLIC cxx_std_20)
 target_compile_options(tllm_executor_bounce_arena PRIVATE -Wno-error)
 set_target_properties(tllm_executor_bounce_arena
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(TLLM_BOUNCE_ZMQ QUIET IMPORTED_TARGET GLOBAL libzmq)
+endif()
+if(TLLM_BOUNCE_ZMQ_FOUND AND EXISTS ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
+  add_library(tllm_executor_bounce_control STATIC EXCLUDE_FROM_ALL
+              ZmqControlChannel.cpp)
+  add_library(tllm::executor_bounce_control ALIAS tllm_executor_bounce_control)
+  target_link_libraries(
+    tllm_executor_bounce_control PUBLIC tllm::executor_bounce_core
+                                        PkgConfig::TLLM_BOUNCE_ZMQ)
+  target_include_directories(tllm_executor_bounce_control SYSTEM
+                             PUBLIC ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
+  target_compile_features(tllm_executor_bounce_control PUBLIC cxx_std_20)
+  target_compile_options(tllm_executor_bounce_control PRIVATE -Wno-error)
+  set_target_properties(tllm_executor_bounce_control
+                        PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
