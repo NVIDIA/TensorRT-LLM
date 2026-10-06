@@ -123,30 +123,6 @@ void AgentConnection::SenderState::setActiveBufferIdx(size_t bufferIdx) const
     mActiveBufferIdx = bufferIdx;
 }
 
-void MemoryDesc::serialize(MemoryDesc const& memoryDesc, std::ostream& os)
-{
-    namespace su = executor::serialize_utils;
-    su::serialize(memoryDesc.mAddr, os);
-    su::serialize(memoryDesc.mLen, os);
-    su::serialize(memoryDesc.mDeviceId, os);
-}
-
-MemoryDesc MemoryDesc::deserialize(std::istream& is)
-{
-    namespace su = executor::serialize_utils;
-    auto addr = su::deserialize<decltype(mAddr)>(is);
-    auto len = su::deserialize<decltype(mLen)>(is);
-    auto deviceId = su::deserialize<decltype(mDeviceId)>(is);
-    return MemoryDesc{addr, len, deviceId};
-}
-
-size_t MemoryDesc::serializedSize(MemoryDesc const& memoryDesc)
-{
-    namespace su = executor::serialize_utils;
-    return su::serializedSize(memoryDesc.mAddr) + su::serializedSize(memoryDesc.mLen)
-        + su::serializedSize(memoryDesc.mDeviceId);
-}
-
 void AgentConnection::send(DataContext const& ctx, void const* data, size_t size) const
 {
     MemoryDesc srcDesc{

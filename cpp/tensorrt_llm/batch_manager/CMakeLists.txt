@@ -124,6 +124,17 @@ set_target_properties(
   tllm_context_transfer_consensus PROPERTIES CXX_EXTENSIONS OFF
                                              POSITION_INDEPENDENT_CODE ON)
 
+add_library(tllm_batch_request_info STATIC requestInfo.cpp)
+add_library(tllm::batch_request_info ALIAS tllm_batch_request_info)
+target_link_libraries(
+  tllm_batch_request_info
+  PUBLIC tllm::kv_cache_legacy
+  PRIVATE ${Python3_LIBRARIES})
+target_compile_features(tllm_batch_request_info PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_batch_request_info PROPERTIES CXX_EXTENSIONS OFF
+                                     POSITION_INDEPENDENT_CODE ON)
+
 add_library(tllm_peft_cache STATIC peftCacheManager.cpp)
 add_library(tllm::peft_cache ALIAS tllm_peft_cache)
 target_link_libraries(
@@ -150,7 +161,7 @@ add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
 target_link_libraries(
   ${BATCH_MANAGER_STATIC_TARGET}
   PUBLIC tllm::kv_cache tllm::batch_scheduler tllm::context_transfer_consensus
-         tllm::peft_cache)
+         tllm::peft_cache tllm::batch_request_info)
 target_include_directories(
   ${BATCH_MANAGER_STATIC_TARGET}
   PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}
