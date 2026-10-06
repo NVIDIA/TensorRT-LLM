@@ -2488,6 +2488,7 @@ class TxSession(TxSessionBase):
 
         self._exception: Optional[Exception] = None
         self._closed = False
+        self._external_accesses: list = []
         self._terminal_status: Optional[SessionStatus] = None
         self.transfer_start_time = None
         self.transfer_end_time = None
@@ -2676,6 +2677,11 @@ class TxSession(TxSessionBase):
     def resources_drained(self) -> bool:
         if not getattr(self, "_enforce_physical_ownership", False):
             return not any(task.status == TaskStatus.TRANSFERRING for task in self.kv_tasks)
+        if any(
+            not owner.resources_drained
+            for _cache, _id, owner in getattr(self, "_external_accesses", ())
+        ):
+            return False
         retirement = getattr(self, "_retirement", None)
         if retirement is not None and not retirement.can_retire():
             return False
@@ -2877,6 +2883,30 @@ class TxSession(TxSessionBase):
     def exception(self) -> Optional[Exception]:
         return self._exception
 
+    def retain_external_access(self, cache, access_id: int, physical_owner) -> None:
+        """Own native storage before publication; release only after physical settlement.
+
+        The existing physical owner must reserve access before this call.
+        Receive claims must be finalized by the caller after verified writes.
+        Session close settles claims once their physical owners drain.
+        """
+        with self.lock:
+            if (
+                self._closed
+                or not self._enforce_physical_ownership
+                or self._logical_outcomes.terminal is not None
+                or physical_owner.resources_drained
+            ):
+                raise RuntimeError(
+                    "External access requires an open session with physical ownership"
+                )
+            self._external_accesses.append((cache, access_id, physical_owner))
+            try:
+                cache.expose_external_access(access_id)
+            except Exception:
+                self._external_accesses.pop()
+                raise
+
     def close(self) -> bool:
         with self.lock:
             if self._closed:
@@ -2887,6 +2917,9 @@ class TxSession(TxSessionBase):
             if retirement is not None and not retirement.close():
                 return False
             self._closed = True
+        for cache, access_id, _owner in getattr(self, "_external_accesses", ()):
+            cache.end_external_access(access_id)
+        self._external_accesses = []
         if self._aux_buffer is not None and self.aux_slot is not None:
             self._aux_buffer.free_slot(self.aux_slot)
             self.aux_slot = None
@@ -3707,6 +3740,7 @@ class RxSession(RxSessionBase):
             raise
         self._exception: Optional[Exception] = None
         self._closed = False
+        self._external_accesses: list = []
         self._terminal_status: Optional[SessionStatus] = None
         self.transfer_start_time = None
         self.transfer_end_time = None
@@ -4297,6 +4331,11 @@ class RxSession(RxSessionBase):
     def resources_drained(self) -> bool:
         if not self._enforce_physical_ownership:
             return not any(task.status == TaskStatus.TRANSFERRING for task in self._kv_tasks)
+        if any(
+            not owner.resources_drained
+            for _cache, _id, owner in getattr(self, "_external_accesses", ())
+        ):
+            return False
         retirement = getattr(self, "_retirement", None)
         if retirement is not None and not retirement.can_retire():
             return False
@@ -4449,6 +4488,30 @@ class RxSession(RxSessionBase):
                 time.sleep(0.001)
         return self._failed_wait_result() if self.has_failed() else self._completed_wait_result()
 
+    def retain_external_access(self, cache, access_id: int, physical_owner) -> None:
+        """Own native storage before publication; release only after physical settlement.
+
+        The existing physical owner must reserve access before this call.
+        Receive claims must be finalized by the caller after verified writes.
+        Session close settles claims once their physical owners drain.
+        """
+        with self.lock:
+            if (
+                self._closed
+                or not self._enforce_physical_ownership
+                or self._logical_outcomes.terminal is not None
+                or physical_owner.resources_drained
+            ):
+                raise RuntimeError(
+                    "External access requires an open session with physical ownership"
+                )
+            self._external_accesses.append((cache, access_id, physical_owner))
+            try:
+                cache.expose_external_access(access_id)
+            except Exception:
+                self._external_accesses.pop()
+                raise
+
     def close(self) -> bool:
         if self._enforce_physical_ownership:
             with self.lock:
@@ -4477,6 +4540,9 @@ class RxSession(RxSessionBase):
             if getattr(self, "_closed", False):
                 return True
             self._closed = True
+        for cache, access_id, _owner in getattr(self, "_external_accesses", ()):
+            cache.end_external_access(access_id)
+        self._external_accesses = []
         if self._aux_buffer is not None and self.aux_slot is not None:
             self._aux_buffer.free_slot(self.aux_slot)
             self.aux_slot = None

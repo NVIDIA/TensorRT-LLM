@@ -742,6 +742,8 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
 
 bool StorageManager::isEvictable(Page const& page, std::optional<CacheLevel> level) const noexcept
 {
+    if (page.externalAccessPins != 0)
+        return false;
     PageStatus s = page.status();
     CacheLevel lvl = level.value_or(page.cacheLevel);
     return (s == PageStatus::DROPPABLE && page.isCommitted()) || (s == PageStatus::HELD && lvl < numCacheLevels() - 1);
@@ -1115,6 +1117,8 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
     std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder,
     bool defrag)
 {
+    if (updateSrc && std::any_of(srcPages.begin(), srcPages.end(), [](auto const& page) { return page->externalAccessPins != 0; }))
+        throw OutOfPagesError("Cannot relocate externally pinned storage");
     TLLM_CHECK_DEBUG(defrag || dstLevel != srcLevel);
     if (srcPages.empty())
     {

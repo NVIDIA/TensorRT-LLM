@@ -3396,4 +3396,217 @@ TEST_F(KvCacheManagerV2PageLockTest, ScratchSlotReturnsToGpuPool)
     EXPECT_EQ(manager->getStorageStatistics(kSparseHistoryLevel).at(PoolGroupIndex{0}).free, hostFree);
 }
 
+TEST_F(KvCacheManagerV2PageLockTest, TransferReadPinsSharedHostAddressAndDefersClose)
+{
+    auto manager = std::make_shared<KvCacheManager>(sparseConfig());
+    auto const apiLock = manager->lockExclusive();
+    auto page = seedPrefix(*manager, kSparseHistoryLevel);
+    auto cache = manager->createKvCache({}, tokens());
+    auto prefill = manager->createKvCache({}, tokens());
+    auto cleanup = FuncGuard(
+        [&]()
+        {
+            cache->close();
+            prefill->close();
+        });
+    ASSERT_TRUE(cache->resume(stream(), true));
+    auto const access = cache->beginExternalRead({LifeCycleId{0}}, 4);
+    auto const descriptor = cache->getExternalAccessPages(access).front();
+    EXPECT_EQ(descriptor.cacheLevel, kSparseHistoryLevel);
+    EXPECT_EQ(descriptor.slotId, page->slotId());
+    EXPECT_EQ(descriptor.validTokens, 4);
+    EXPECT_EQ(descriptor.address, descriptor.poolBaseAddress + descriptor.bytes * toSizeT(descriptor.slotId));
+    cache->waitExternalAccessReady(access);
+    cache->exposeExternalAccess(access);
+    EXPECT_THROW(cache->resize(8, 4), LogicError);
+    EXPECT_THROW(cache->suspend(), LogicError);
+    EXPECT_THROW(cache->commit(tokens()), LogicError);
+    EXPECT_THROW(cache->stopCommitting(), LogicError);
+    EXPECT_FALSE(prefill->resume(stream()));
+    EXPECT_EQ(page->slotId(), descriptor.slotId);
+    EXPECT_EQ(page->cacheLevel, descriptor.cacheLevel);
+    cache->close();
+    EXPECT_FALSE(cache->isClosed());
+    EXPECT_THROW(manager->shutdown(), LogicError);
+    cache->endExternalAccess(access); // Models a physically settled transport read.
+    EXPECT_TRUE(cache->isClosed());
+    EXPECT_EQ(page->externalAccessPins, 0);
+    EXPECT_THROW(cache->endExternalAccess(access), LogicError);
+    ASSERT_TRUE(prefill->resume(stream()));
+    EXPECT_EQ(page->cacheLevel, kHotLevel);
+}
+
+TEST_F(KvCacheManagerV2PageLockTest, ReceiveSlotRemainsDetachedUntilVerifiedFinalization)
+{
+    auto config = sparseConfig();
+    std::get<AttentionLayerConfig>(config.layers.front()).buffers.front().size = 4096;
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    auto const apiLock = manager->lockExclusive();
+    auto cache = manager->createKvCache();
+    auto cleanup = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(4, 4));
+    cache->suspend();
+    auto page = pageAt(*cache);
+    auto const oldSlot = page->slotId();
+    auto const access = cache->reserveExternalReceive(LifeCycleId{0}, BlockOrdinal{0}, kSparseHistoryLevel);
+    auto const region = cache->getExternalAccessPages(access).front();
+    EXPECT_EQ(page->cacheLevel, kHotLevel);
+    EXPECT_EQ(page->slotId(), oldSlot);
+    EXPECT_THROW(cache->resume(stream(), true), LogicError);
+    EXPECT_THROW(manager->resize(kSparseHistoryLevel, 8 << 20), LogicError);
+    cache->waitExternalAccessReady(access);
+    cache->exposeExternalAccess(access);
+    std::memset(reinterpret_cast<void*>(region.address), 0x5A, region.bytes);
+    EXPECT_THROW(cache->finalizeExternalReceive(access, 3, stream()), LogicError);
+    EXPECT_EQ(page->cacheLevel, kHotLevel);
+    cache->finalizeExternalReceive(access, 4, stream());
+    EXPECT_THROW(cache->resume(stream(), true), LogicError);
+    cache->endExternalAccess(access);
+    EXPECT_EQ(page->cacheLevel, kSparseHistoryLevel);
+    EXPECT_EQ(page->slotId(), region.slotId);
+    EXPECT_EQ(cache->numCommittedBlocks(), 0);
+    ASSERT_TRUE(cache->resume(stream(), true));
+    EXPECT_EQ(cache->getPageStorageSnapshot(LifeCycleId{0}).cacheLevels()[0], kSparseHistoryLevel);
+    EXPECT_EQ(*reinterpret_cast<unsigned char*>(region.address), 0x5A);
+}
+
+TEST_F(KvCacheManagerV2PageLockTest, UnexposedReceiveReservationReleasesItsSlotWithoutPublishing)
+{
+    auto config = sparseConfig();
+    std::get<AttentionLayerConfig>(config.layers.front()).buffers.front().size = 4096;
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    auto const apiLock = manager->lockExclusive();
+    auto cache = manager->createKvCache();
+    auto cleanup = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(5, 5));
+    cache->suspend();
+    auto const before = manager->storage().getStatistics(kSparseHistoryLevel).free;
+    EXPECT_THROW(cache->reserveExternalReceive(LifeCycleId{0}, BlockOrdinal{1}, kSparseHistoryLevel), LogicError);
+    {
+        auto const access = cache->reserveExternalReceive(LifeCycleId{0}, BlockOrdinal{0}, kSparseHistoryLevel);
+        EXPECT_EQ(manager->storage().getStatistics(kSparseHistoryLevel).free, before - 1);
+        cache->endExternalAccess(access);
+    }
+    EXPECT_EQ(manager->storage().getStatistics(kSparseHistoryLevel).free, before);
+    EXPECT_EQ(pageAt(*cache)->cacheLevel, kHotLevel);
+    EXPECT_EQ(pageAt(*cache)->externalAccessPins, 0);
+    ASSERT_TRUE(cache->resume(stream(), true));
+}
+
+TEST_F(KvCacheManagerV2PageLockTest, DiscardedExposedReceiveCannotResumeIncompleteHistory)
+{
+    auto config = sparseConfig();
+    std::get<AttentionLayerConfig>(config.layers.front()).buffers.front().size = 4096;
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    auto const apiLock = manager->lockExclusive();
+    auto cache = manager->createKvCache();
+    auto cleanup = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(4, 4));
+    cache->suspend();
+    auto const access = cache->reserveExternalReceive(LifeCycleId{0}, BlockOrdinal{0}, kSparseHistoryLevel);
+    cache->waitExternalAccessReady(access);
+    cache->exposeExternalAccess(access);
+    cache->endExternalAccess(access); // The writer stopped without providing verified coverage.
+    EXPECT_THROW(cache->resume(stream(), true), LogicError);
+    EXPECT_THROW(cache->stopCommitting(), LogicError);
+    EXPECT_THROW(cache->reserveExternalReceive(LifeCycleId{0}, BlockOrdinal{0}, kSparseHistoryLevel), LogicError);
+    cache->close();
+    EXPECT_TRUE(cache->isClosed());
+}
+
+TEST_F(KvCacheManagerV2PageLockTest, TransferExposureRequiresCompletedCudaWrites)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeConfig());
+    auto const apiLock = manager->lockExclusive();
+    auto cache = manager->createKvCache();
+    auto cleanup = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(4, 4));
+    EXPECT_THROW(cache->beginExternalRead({LifeCycleId{0}, LifeCycleId{0}}, 4), LogicError);
+    EXPECT_EQ(pageAt(*cache)->externalAccessPins, 0);
+    StreamGate gate;
+    auto releaseGate = FuncGuard([&]() { gate.release(); });
+    ASSERT_EQ(gate.enqueue(mStream), cudaSuccess);
+    auto const access = cache->beginExternalRead({LifeCycleId{0}}, 4);
+    EXPECT_FALSE(cache->externalAccessReady(access));
+    EXPECT_THROW(cache->exposeExternalAccess(access), LogicError);
+    gate.release();
+    cache->waitExternalAccessReady(access);
+    EXPECT_TRUE(cache->externalAccessReady(access));
+    cache->exposeExternalAccess(access);
+    cache->endExternalAccess(access);
+    EXPECT_EQ(pageAt(*cache)->externalAccessPins, 0);
+}
+
+TEST_F(KvCacheManagerV2PageLockTest, ExternalClaimsRejectStaleIdsAndRetainOverlappingPins)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeConfig());
+    auto const apiLock = manager->lockExclusive();
+    auto cache = manager->createKvCache();
+    auto cleanup = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(4, 4));
+    auto const first = cache->beginExternalRead({LifeCycleId{0}}, 4);
+    auto const second = cache->beginExternalRead({LifeCycleId{0}}, 4);
+    EXPECT_GT(second, first);
+    EXPECT_EQ(pageAt(*cache)->externalAccessPins, 2);
+    cache->endExternalAccess(first);
+    EXPECT_THROW(cache->endExternalAccess(first), LogicError);
+    EXPECT_THROW(cache->getExternalAccessPages(first), LogicError);
+    EXPECT_EQ(pageAt(*cache)->externalAccessPins, 1);
+    EXPECT_THROW(cache->resize(8, 4), LogicError);
+    cache->endExternalAccess(second);
+    EXPECT_EQ(pageAt(*cache)->externalAccessPins, 0);
+    auto const third = cache->beginExternalRead({LifeCycleId{0}}, 4);
+    EXPECT_GT(third, second);
+    cache->close(); // Unpublished claims are reclaimed with the request.
+    EXPECT_TRUE(cache->isClosed());
+    EXPECT_THROW(cache->getExternalAccessPages(third), LogicError);
+    manager->shutdown();
+}
+
+TEST_F(KvCacheManagerV2PageLockTest, RequestCloseReclaimsUnpublishedReceiveSlots)
+{
+    auto config = sparseConfig();
+    std::get<AttentionLayerConfig>(config.layers.front()).buffers.front().size = 4096;
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    auto const apiLock = manager->lockExclusive();
+    auto cache = manager->createKvCache();
+    auto cleanup = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(4, 4));
+    cache->suspend();
+    auto const before = manager->storage().getStatistics(kSparseHistoryLevel).free;
+    auto const access = cache->reserveExternalReceive(LifeCycleId{0}, BlockOrdinal{0}, kSparseHistoryLevel);
+    EXPECT_EQ(manager->storage().getStatistics(kSparseHistoryLevel).free, before - 1);
+    cache->close();
+    EXPECT_TRUE(cache->isClosed());
+    EXPECT_EQ(manager->storage().getStatistics(kSparseHistoryLevel).free, before);
+    EXPECT_THROW(cache->endExternalAccess(access), LogicError);
+    manager->shutdown();
+}
+
+TEST_F(KvCacheManagerV2PageLockTest, ExposedClaimRetainsRequestUntilSettlement)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeConfig());
+    auto const apiLock = manager->lockExclusive();
+    auto cache = manager->createKvCache();
+    ASSERT_TRUE(cache->resume(stream()));
+    ASSERT_TRUE(cache->resize(4, 4));
+    auto const access = cache->beginExternalRead({LifeCycleId{0}}, 4);
+    cache->waitExternalAccessReady(access);
+    cache->exposeExternalAccess(access);
+    std::weak_ptr<KvCache> weakCache = cache;
+    cache->close();
+    cache.reset();
+    ASSERT_FALSE(weakCache.expired());
+    EXPECT_THROW(manager->shutdown(), LogicError);
+    weakCache.lock()->endExternalAccess(access);
+    EXPECT_TRUE(weakCache.expired());
+    manager->shutdown();
+}
+
 } // namespace

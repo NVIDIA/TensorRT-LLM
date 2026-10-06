@@ -197,6 +197,16 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
     def tokens_per_block(self) -> int:
         return self._mgr.tokens_per_block
 
+    def begin_external_read(self, req: LlmRequest, groups: list[int], tokens: int):
+        """Pin native physical storage before constructing host-aware transport extents."""
+        return self._mgr.kv_cache_map[req.py_request_id].begin_external_read(groups, tokens)
+
+    def reserve_external_receive(self, req: LlmRequest, group: int, ordinal: int, level: int):
+        """Reserve unpublished native storage for a suspended receive request."""
+        return self._mgr.kv_cache_map[req.py_request_id].reserve_external_receive(
+            group, ordinal, level
+        )
+
     def _global_cached_token_count(self, req: LlmRequest) -> int:
         if not self.enable_block_reuse:
             return 0
@@ -220,7 +230,7 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         if any(slot >= 0 and level != GPU_LEVEL for slot, level in zip(slots, levels)):
             raise RuntimeError(
                 "GPU KV transfer requires locked GPU pages; offloaded history requires "
-                "a native transfer lease and host pool layout"
+                "a native external-access claim and host pool layout"
             )
         return slots
 
