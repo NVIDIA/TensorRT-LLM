@@ -77,8 +77,8 @@ def test_cached_model_loader_returns_model_dir(tmp_path):
 
 
 @pytest.mark.cpu_only
-def test_attached_model_loader_resolves_hub_on_nonzero_device(monkeypatch,
-                                                               tmp_path):
+def test_attached_model_loader_resolves_hub_on_nonzero_device(
+        monkeypatch, tmp_path):
     args = TorchLlmArgs(model="example/model", gpus_per_node=1)
     loader = CachedModelLoader(args, is_attached_frontend=True)
     model = SimpleNamespace(is_hub_model=True,
@@ -90,8 +90,8 @@ def test_attached_model_loader_resolves_hub_on_nonzero_device(monkeypatch,
     monkeypatch.setattr("tensorrt_llm.llmapi.llm_utils.download_hf_model",
                         download)
 
-    assert loader._download_hf_model_if_needed(model,
-                                               revision="pinned-revision") == tmp_path
+    assert loader._download_hf_model_if_needed(
+        model, revision="pinned-revision") == tmp_path
     assert model.model_dir == tmp_path
     download.assert_called_once_with("example/model", "pinned-revision")
 
