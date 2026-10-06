@@ -251,8 +251,10 @@ class BaseMultimodalInputProcessor(ABC):
     # inputs to `call_with_token_ids` instead of detokenizing upstream.
     supports_token_id_mm_expansion: ClassVar[bool] = False
 
-    # Whether the subclass takes `enable_tokenization_cache` in `__init__` and
-    # serves text-only prompts from the prefix-tokenization cache. Only such
+    # Whether the subclass serves text-only prompts from the prefix-tokenization
+    # cache: it takes `enable_tokenization_cache` in `__init__`, passes it to
+    # `_init_tokenization_cache`, and tries `_encode_with_tokenization_cache`
+    # before running the HF processor on a text-only prompt. Only such
     # subclasses receive the flag from `create_input_processor`.
     supports_tokenization_cache: ClassVar[bool] = False
 
@@ -281,6 +283,35 @@ class BaseMultimodalInputProcessor(ABC):
         self._use_fast: bool = kwargs.get('use_fast', True)
         self._trust_remote_code = trust_remote_code
         self._multimodal_hashing_supported: Optional[bool] = None
+
+    def _init_tokenization_cache(self, enable_tokenization_cache: bool,
+                                 tokenizer: PreTrainedTokenizerBase) -> None:
+        """Set up the prefix-tokenization cache for text-only prompts.
+
+        `tokenizer` is the tokenizer the HF processor applies to a text-only
+        prompt. The cache returns `tokenizer(prompt, add_special_tokens=False)`
+        ids; the subclass passes `enable_tokenization_cache=False` unless those
+        match its HF processor's ids for text-only prompts.
+        """
+        self._prefix_token_cache_tokenizer = tokenizer
+        self._prefix_token_cache = (create_prefix_token_cache(tokenizer)
+                                    if enable_tokenization_cache else None)
+
+    def _encode_with_tokenization_cache(
+            self, prompt: str,
+            sampling_params: Optional[SamplingParams]) -> Optional[List[int]]:
+        """Cached ids of a text-only `prompt`, or None to run the HF processor.
+
+        Same rule as `DefaultInputProcessor`: only requests with
+        `add_special_tokens=False` and no prompt truncation, because the cache
+        never adds special tokens and never truncates.
+        """
+        if (self._prefix_token_cache is None or sampling_params is None
+                or sampling_params.add_special_tokens
+                or sampling_params.truncate_prompt_tokens is not None):
+            return None
+        return self._prefix_token_cache.encode(
+            self._prefix_token_cache_tokenizer, prompt)
 
     def attach_multimodal_embeddings(
         self,
