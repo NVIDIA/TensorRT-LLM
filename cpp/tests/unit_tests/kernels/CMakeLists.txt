@@ -181,9 +181,39 @@ add_tllm_gtest(
   REQUIRES_GPU)
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
-  add_gtest(moeLoraPointerExpandTest moe/moeLoraPointerExpandTest.cu)
-  add_gtest(moeLoraProblemBuilderTest moe/moeLoraProblemBuilderTest.cu)
-  add_gtest(moeLoraSlotExpandTest moe/moeLoraSlotExpandTest.cu)
+  add_tllm_gtest(
+    moeLoraPointerExpandTest
+    OWNER
+    kernel
+    SOURCES
+    moe/moeLoraPointerExpandTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_moe_lora
+    LABELS
+    "unit;kernels;moe-lora;gpu"
+    REQUIRES_GPU)
+  add_tllm_gtest(
+    moeLoraProblemBuilderTest
+    OWNER
+    kernel
+    SOURCES
+    moe/moeLoraProblemBuilderTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_moe_lora
+    LABELS
+    "unit;kernels;moe-lora;gpu"
+    REQUIRES_GPU)
+  add_tllm_gtest(
+    moeLoraSlotExpandTest
+    OWNER
+    kernel
+    SOURCES
+    moe/moeLoraSlotExpandTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_moe_lora
+    LABELS
+    "unit;kernels;moe-lora;gpu"
+    REQUIRES_GPU)
 endif()
 
 add_tllm_gtest(
