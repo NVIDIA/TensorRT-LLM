@@ -145,7 +145,8 @@ class GenerationExecutor(ABC):
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
         """
-        assert isinstance(prompt_token_ids[0], int)
+        assert isinstance(prompt_token_ids, np.ndarray) or isinstance(
+            prompt_token_ids[0], int)
         assert isinstance(sampling_params, SamplingParams)
 
         self._maybe_initialize_iteration_results()
@@ -379,6 +380,28 @@ class GenerationExecutor(ABC):
     @abstractmethod
     def shutdown(self):
         pass
+
+    def start_profile(self,
+                      output_dir: Optional[str] = None,
+                      num_steps: Optional[int] = None,
+                      start_step: int = 0,
+                      activities: Optional[List[str]] = None) -> None:
+        """Start runtime profiling in the backend engine.
+
+        Default implementation logs a warning. Subclasses that back a
+        ``PyExecutor`` should override to forward the call.
+        """
+        logger.warning(f"start_profile is not supported on executor type "
+                       f"{type(self).__name__}.")
+
+    def stop_profile(self) -> None:
+        """Stop runtime profiling in the backend engine.
+
+        Default implementation logs a warning. Subclasses that back a
+        ``PyExecutor`` should override to forward the call.
+        """
+        logger.warning(f"stop_profile is not supported on executor type "
+                       f"{type(self).__name__}.")
 
     @property
     def resource_governor_queue(self):

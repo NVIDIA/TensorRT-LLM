@@ -496,7 +496,8 @@ def test_prefetch_files_emits_progress_heartbeat(tmp_path, monkeypatch):
     assert len(progress_logs) >= 12
 
 
-def test_kimi_k3_lazy_load_records_the_checkpoint_dir(tmp_path):
+@pytest.mark.parametrize("model_type", ["kimi_k3", "glm5_next", "glm5_next_text"])
+def test_lazy_load_records_the_checkpoint_dir(tmp_path, model_type):
     """A model that re-opens shards itself needs the directory back.
 
     Kimi K3 streams its rank-local experts per shard file to avoid holding
@@ -509,16 +510,17 @@ def test_kimi_k3_lazy_load_records_the_checkpoint_dir(tmp_path):
     import safetensors.torch
     import torch
 
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "kimi_k3"}))
-    safetensors.torch.save_file(
-        {"w": torch.zeros(2, 2)}, tmp_path / "model-00001-of-00001.safetensors"
-    )
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    stored = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    safetensors.torch.save_file({"w": stored}, tmp_path / "model-00001-of-00001.safetensors")
 
     loader = HfWeightLoader()
     try:
         weights = loader.load_weights(str(tmp_path), Mapping())
         assert isinstance(weights, ConsumableWeightsDict)
         assert weights.checkpoint_dir == str(tmp_path)
+        assert not torch.is_tensor(weights["w"])
+        torch.testing.assert_close(weights["w"][:], stored, rtol=0, atol=0)
     finally:
         loader.cleanup()
 

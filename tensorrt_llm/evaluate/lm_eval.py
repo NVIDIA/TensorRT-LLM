@@ -855,7 +855,9 @@ class LmEvalEvaluator(Evaluator):
                  post_process_fn: Optional[Callable[[str], str]] = None,
                  preserve_caller_max_tokens: bool = False,
                  num_fewshot: Optional[int] = None,
-                 stop_strings: Optional[List[str]] = None):
+                 stop_strings: Optional[List[str]] = None,
+                 shuffle_dataset: bool = True,
+                 fewshot_random_seed: Optional[int] = None):
         try:
             import lm_eval
         except ImportError as e:
@@ -889,6 +891,11 @@ class LmEvalEvaluator(Evaluator):
         # larger than the lm-eval task's max_gen_toks. Used by thinking
         # models (e.g. Kimi K2.5) whose CoT output exceeds the task default.
         self.preserve_caller_max_tokens = preserve_caller_max_tokens
+        # shuffle_dataset=False and fewshot_random_seed reproduce the lm-eval
+        # CLI's exemplar selection (unshuffled data, few-shot sampler seed).
+        self.shuffle_dataset = shuffle_dataset
+        self.fewshot_random_seed = (random_seed if fewshot_random_seed is None
+                                    else fewshot_random_seed)
 
         task_manager = TaskManager(
             include_path=f"{os.path.dirname(__file__)}/lm_eval_tasks")
@@ -909,7 +916,7 @@ class LmEvalEvaluator(Evaluator):
                     }
                 else:
                     # NOTE: Few-shot random seed
-                    task_obj.set_fewshot_seed(seed=random_seed)
+                    task_obj.set_fewshot_seed(seed=self.fewshot_random_seed)
                     # Caller override of the task yaml's shot count, the same
                     # call lm-eval's own simple_evaluate makes. Without it a
                     # 0-shot chat evaluation of a task whose yaml pins 5 shots
@@ -925,9 +932,10 @@ class LmEvalEvaluator(Evaluator):
                     adjusted_task_dict[task_name] = task_obj
 
                     # NOTE: Shuffle dataset
-                    data = adjusted_task_dict[task_name].dataset
-                    for split in data.keys():
-                        data[split] = data[split].shuffle(random_seed)
+                    if self.shuffle_dataset:
+                        data = adjusted_task_dict[task_name].dataset
+                        for split in data.keys():
+                            data[split] = data[split].shuffle(random_seed)
 
             return adjusted_task_dict
 
@@ -1250,6 +1258,126 @@ class GSM8K(LmEvalEvaluator):
                 "apply_chat_template", False
             ), "apply_chat_template must be True when fewshot_as_multiturn is True"
         GSM8K.command_harness(ctx, **kwargs)
+
+
+class GSM8KInferenceX(LmEvalEvaluator):
+    """GSM8K under the InferenceX (formerly InferenceMAX) protocol.
+
+    Mirrors SemiAnalysisAI/InferenceX (infx/evals/gsm8k.yaml + run_lm_eval):
+    chat template with the 5 exemplars in the single user turn (InferenceX
+    passes --apply_chat_template but not --fewshot_as_multiturn), the
+    documented 12288-token eval-only generation budget, strict "#### N"
+    extraction, and lm-eval's default exemplar selection (unshuffled data,
+    few-shot seed 1234), so scores are comparable to
+    inferencex.semianalysis.com/evaluation. Thinking mode follows the chat
+    template default unless chat_template_kwargs sets it; InferenceX serves
+    with thinking enabled where the framework offers a server-side default.
+    The answer filter sees the raw generation, whereas a served InferenceX
+    run scores the reasoning-parsed content; this only matters if a model
+    writes "#### N" inside its thinking.
+    """
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("apply_chat_template", True)
+        kwargs.setdefault("fewshot_as_multiturn", False)
+        kwargs.setdefault("shuffle_dataset", False)
+        kwargs.setdefault("fewshot_random_seed", 1234)
+        super().__init__("gsm8k_inferencex", **kwargs)
+
+    @click.command("gsm8k_inferencex")
+    @click.option("--dataset_path",
+                  type=str,
+                  default=None,
+                  help="The path to GSM8K dataset. "
+                  "If unspecified, the dataset is downloaded from HF hub.")
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to run the evaluation; None means full dataset."
+    )
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed; data order is fixed under this protocol.")
+    @click.option("--apply_chat_template",
+                  type=click.BOOL,
+                  default=True,
+                  help="Whether to apply chat template.")
+    @click.option(
+        "--chat_template_kwargs",
+        type=str,
+        default=None,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help=
+        'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
+    @click.option("--fewshot_as_multiturn",
+                  type=click.BOOL,
+                  default=False,
+                  help="Apply fewshot as multiturn. InferenceX keeps the "
+                  "exemplars in the single user turn.")
+    @click.option("--num_fewshot",
+                  type=int,
+                  default=None,
+                  help="Override the task yaml's shot count. Use 0 with "
+                  "--apply_chat_template for a single-question chat "
+                  "evaluation.")
+    @click.option("--system_prompt",
+                  type=str,
+                  default=None,
+                  help="System prompt.")
+    @click.option("--max_input_length",
+                  type=int,
+                  default=4096,
+                  help="Maximum prompt length.")
+    @click.option("--max_output_length",
+                  type=int,
+                  default=12288,
+                  help="Maximum generation length.")
+    @click.option("--temperature",
+                  type=float,
+                  default=None,
+                  help="Sampling temperature. Overrides task yaml gen_kwargs.")
+    @click.option(
+        "--top_p",
+        type=float,
+        default=None,
+        help="Nucleus sampling top_p. Overrides task yaml gen_kwargs.")
+    @click.option("--top_k",
+                  type=int,
+                  default=None,
+                  help="Top-k sampling. Overrides task yaml gen_kwargs.")
+    @click.option("--sampling_seed",
+                  type=int,
+                  default=None,
+                  help="Random seed for generation sampling.")
+    @click.option(
+        "--stop_strings",
+        type=str,
+        default=None,
+        callback=_parse_stop_strings,
+        help='Replace the task yaml\'s stop strings, as a JSON list, e.g. '
+        '\'["</s>", "<|im_end|>"]\'.')
+    @click.option("--log_samples",
+                  is_flag=True,
+                  default=False,
+                  help="Log sample outputs for debugging.")
+    @click.option("--output_path",
+                  type=str,
+                  default=None,
+                  help="Path to save evaluation results.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the task infos.")
+    @click.pass_context
+    @staticmethod
+    def command(ctx, **kwargs) -> None:
+        if kwargs.get("fewshot_as_multiturn", False):
+            assert kwargs.get(
+                "apply_chat_template", False
+            ), "apply_chat_template must be True when fewshot_as_multiturn is True"
+        GSM8KInferenceX.command_harness(ctx, **kwargs)
 
 
 class GPQADiamond(LmEvalEvaluator):

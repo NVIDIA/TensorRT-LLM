@@ -23,6 +23,7 @@
 
 #include "tensorrt_llm/kernels/minimaxM3SelectBlocks.h"
 
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/moeTopKFuncs.cuh"
 
 #include <cmath>
@@ -249,6 +250,9 @@ __global__ void minimaxM3SelectBlocksSmallKernel(float const* __restrict__ score
 
     int32_t const query = outputRow / numKvHeads;
     int32_t const kvHead = outputRow % numKvHeads;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
     int32_t const rawValidBlocks = nValidBlocks[query];
     int32_t const validBlocks = max(0, min(rawValidBlocks, numBlocks));
     int64_t const localStart
@@ -302,6 +306,9 @@ __global__ void minimaxM3SelectBlocks64Kernel(float const* __restrict__ scores, 
 
     int32_t const query = outputRow / numKvHeads;
     int32_t const kvHead = outputRow % numKvHeads;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
     int32_t const rawValidBlocks = nValidBlocks[query];
     int32_t const validBlocks = max(0, min(rawValidBlocks, numBlocks));
     int64_t const localStart
@@ -385,6 +392,9 @@ __global__ void minimaxM3SelectBlocks128Kernel(float const* __restrict__ scores,
 
     int32_t const query = outputRow / numKvHeads;
     int32_t const kvHead = outputRow % numKvHeads;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
     int32_t const rawValidBlocks = nValidBlocks[query];
     int32_t const validBlocks = max(0, min(rawValidBlocks, numBlocks));
     int64_t const localStart
@@ -805,6 +815,9 @@ __global__ __launch_bounds__(kNumThreadsPerBlock) void minimaxM3SelectBlocksHist
     int32_t const outputRow = blockIdx.x;
     int32_t const query = outputRow / numKvHeads;
     int32_t const kvHead = outputRow % numKvHeads;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
     int32_t const rawValidBlocks = nValidBlocks[query];
     int32_t const validBlocks = max(0, min(rawValidBlocks, numBlocks));
     int64_t const localStart
@@ -919,6 +932,9 @@ __global__ __launch_bounds__(kNumThreadsPerBlock) void minimaxM3SelectBlocksHist
     }
 }
 
+// Every variant launches with PDL so it can start in the tail of the index
+// score kernel that produces scores, and waits internally just before its first
+// dependent load.
 template <bool HeadMajorOutput>
 void launchMinimaxM3SelectBlocks(float const* scores, int64_t headStride, int64_t blockStride, int64_t queryStride,
     int32_t const* nValidBlocks, int32_t* output, int32_t numKvHeads, int32_t numBlocks, int32_t totalQueries,
@@ -933,30 +949,32 @@ void launchMinimaxM3SelectBlocks(float const* scores, int64_t headStride, int64_
     {
         constexpr int kHistogramThreads = 512;
         constexpr int kHistogramBins = 2048;
-        minimaxM3SelectBlocksHistogramKernel<kHistogramThreads, kHistogramBins, HeadMajorOutput>
-            <<<numOutputRows, kHistogramThreads, 0, stream>>>(scores, headStride, blockStride, queryStride,
-                nValidBlocks, output, numKvHeads, numBlocks, totalQueries, initBlocks, localBlocks);
+        common::launchWithPdlWhenEnabled("minimaxM3SelectBlocksHistogram",
+            minimaxM3SelectBlocksHistogramKernel<kHistogramThreads, kHistogramBins, HeadMajorOutput>, numOutputRows,
+            kHistogramThreads, 0, stream, scores, headStride, blockStride, queryStride, nValidBlocks, output,
+            numKvHeads, numBlocks, totalQueries, initBlocks, localBlocks);
         return;
     }
 
     int32_t const gridSize = (numOutputRows + kWarpsPerBlock - 1) / kWarpsPerBlock;
     if (numBlocks <= kWarpSize)
     {
-        minimaxM3SelectBlocksSmallKernel<1, HeadMajorOutput><<<gridSize, kThreadsPerBlock, 0, stream>>>(scores,
+        common::launchWithPdlWhenEnabled("minimaxM3SelectBlocksSmall",
+            minimaxM3SelectBlocksSmallKernel<1, HeadMajorOutput>, gridSize, kThreadsPerBlock, 0, stream, scores,
             headStride, blockStride, queryStride, nValidBlocks, output, numKvHeads, numBlocks, totalQueries, initBlocks,
             localBlocks);
     }
     else if (numBlocks <= 2 * kWarpSize)
     {
-        minimaxM3SelectBlocks64Kernel<HeadMajorOutput><<<gridSize, kThreadsPerBlock, 0, stream>>>(scores, headStride,
-            blockStride, queryStride, nValidBlocks, output, numKvHeads, numBlocks, totalQueries, initBlocks,
-            localBlocks);
+        common::launchWithPdlWhenEnabled("minimaxM3SelectBlocks64", minimaxM3SelectBlocks64Kernel<HeadMajorOutput>,
+            gridSize, kThreadsPerBlock, 0, stream, scores, headStride, blockStride, queryStride, nValidBlocks, output,
+            numKvHeads, numBlocks, totalQueries, initBlocks, localBlocks);
     }
     else
     {
-        minimaxM3SelectBlocks128Kernel<HeadMajorOutput><<<gridSize, kThreadsPerBlock, 0, stream>>>(scores, headStride,
-            blockStride, queryStride, nValidBlocks, output, numKvHeads, numBlocks, totalQueries, initBlocks,
-            localBlocks);
+        common::launchWithPdlWhenEnabled("minimaxM3SelectBlocks128", minimaxM3SelectBlocks128Kernel<HeadMajorOutput>,
+            gridSize, kThreadsPerBlock, 0, stream, scores, headStride, blockStride, queryStride, nValidBlocks, output,
+            numKvHeads, numBlocks, totalQueries, initBlocks, localBlocks);
     }
 }
 

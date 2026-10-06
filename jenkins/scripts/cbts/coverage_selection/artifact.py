@@ -14,19 +14,21 @@
 """Resolve which post-merge CBTS touch DBs to use.
 
 Candidates are recent builds of `<ARTIFACT_BASE>` with both x86 and SBSA
-coverage tarballs. A candidate must have collected a revision at or before the
-PR base; the candidate closest to that base wins, with build number only a
-tie-break. Revision ordering comes from the forge compare API — the CI checkout
-is depth-1, so git cannot answer it — and needs `GITHUB_API_TOKEN`, the anonymous
-quota being per-IP and exhausted by shared CI egress.
+coverage tarballs. The newest complete pair wins. A squashed PR commit must
+cherry-pick cleanly for Tier 2's residual paths at that DB's revision;
+otherwise Tier 2 declines. Revision
+metadata comes from the forge compare API and needs `GITHUB_API_TOKEN`, the
+anonymous quota being per-IP and exhausted by shared CI egress.
 
 The selected architecture DBs are merged locally through the compact coverage
 schema, producing the one DB consumed by `main.py`.
 
-Two entry points. `--print-selection` prints `{urls, build, commit, lag,
-base_commit, drift, drift_status}` and stops. `--prepare DIR` goes on to
-download, unpack, and merge the winner, drop that JSON beside it, and print
-`{path, meta}` — the two paths `main.py` needs.
+Four entry points. `--resolve-pin FILE` reuses or creates the stable build pin
+for a PR head. `--resolve-build` prints the newest (or explicitly pinned) build
+metadata without checking or downloading the PR diff. `--print-selection` also
+checks diff compatibility and stops. `--prepare DIR` downloads, unpacks, and
+merges the winner, drops that JSON beside it, and prints the two paths consumed
+by CBTS.
 """
 
 from __future__ import annotations
@@ -34,8 +36,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -43,7 +47,7 @@ import urllib.error
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "coverage_utils"))
 
@@ -61,22 +65,36 @@ META_NAME = "cbts_coverage_db.json"
 # Per-build metadata carrying `commit=<sha>`; absent on some builds.
 BUILD_INFO_NAME = "build_info.txt"
 
+# Stable coverage selection per PR head. Jenkins uploads newly created pin files
+# through its Artifactory credential; this module owns lookup, schema, and paths.
+PIN_VERSION = 1
+PIN_BASE = "sw-tensorrt-generic/llm-artifacts/LLM/main/cbts/coverage-db-pins/v1"
+PIN_NAME = "cbts_db_pin.json"
+
 # Branch the DB is collected from; must match ARTIFACT_BASE.
 COVERAGE_BRANCH = "main"
 # Read by `compare_distance`; the anonymous quota is unusable from shared CI egress IPs.
 GITHUB_TOKEN_ENV = "GITHUB_API_TOKEN"
+# Authoritative source of the main-branch revisions represented by coverage DBs.
+COVERAGE_GIT_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
 
 _URM = "https://urm.nvidia.com/artifactory"
 _GITHUB_COMPARE = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/compare"
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
-# Cover the 30-commit freshness window plus missing or unsuccessful builds.
+# Cover missing or unsuccessful recent builds.
 _MAX_PROBE = 50
 # Per-request timeout in seconds, for the small JSON/metadata calls.
 _TIMEOUT = 15
 # Socket timeout for the tarball itself, which runs to hundreds of MB.
 _DOWNLOAD_TIMEOUT = 300
+# Timeout for local Git operations and the small fetches used by the patch check.
+_GIT_TIMEOUT = 120
 # Tarball download attempts.
 _RETRIES = 3
+
+_PatchApplyStatus = Literal["clean", "conflict", "unknown"]
+_COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
+_PR_NUMBER_RE = re.compile(r"[1-9][0-9]*")
 
 
 def _get(url: str, headers: Optional[dict] = None) -> tuple[Optional[int], Optional[bytes]]:
@@ -138,6 +156,98 @@ def build_commit(build: int, artifact_base: str = ARTIFACT_BASE) -> Optional[str
         if key.strip() == "commit" and value.strip():
             return value.strip()
     return None
+
+
+def _pin_decline(reason: str) -> dict:
+    """Return a machine-readable, fail-closed pin resolution result."""
+    return {
+        "status": "declined",
+        "compatibility": "unknown",
+        "decline_reason": f"coverage tier declined: {reason}",
+        "pin_upload_required": False,
+    }
+
+
+def _valid_pin(pin: object, pr_number: str, pr_head: str) -> bool:
+    """Whether an Artifactory pin matches this PR identity and schema."""
+    if not isinstance(pin, dict):
+        return False
+    build = pin.get("coverage_db_build")
+    commit = pin.get("coverage_db_commit")
+    return (
+        pin.get("version") == PIN_VERSION
+        and str(pin.get("pr_number")) == pr_number
+        and pin.get("pr_head") == pr_head
+        and type(build) is int
+        and build > 0
+        and isinstance(commit, str)
+        and _COMMIT_RE.fullmatch(commit) is not None
+    )
+
+
+def resolve_pin(
+    pin_path: str,
+    pr_number: str,
+    pr_head: str,
+    pr_base_commit: str,
+) -> dict:
+    """Reuse a PR-head coverage pin or create the local file Jenkins must upload."""
+    if _PR_NUMBER_RE.fullmatch(pr_number) is None or _COMMIT_RE.fullmatch(pr_head) is None:
+        return _pin_decline("invalid PR identity for coverage DB pin")
+    target = f"{PIN_BASE}/{pr_number}/{pr_head}/"
+    status, data = _get(f"{_URM}/{target}{PIN_NAME}")
+    if status == 200:
+        try:
+            pin = json.loads(data) if data else None
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pin = None
+        if not _valid_pin(pin, pr_number, pr_head):
+            return _pin_decline("invalid coverage DB pin")
+        assert isinstance(pin, dict)
+        return {
+            "status": "ready",
+            "build": pin["coverage_db_build"],
+            "commit": pin["coverage_db_commit"],
+            "pin_upload_required": False,
+        }
+    if status != 404:
+        return _pin_decline("coverage DB pin query failed")
+
+    selected = select_tarball(pr_base_commit)
+    if selected is None:
+        return _pin_decline("coverage DB could not be resolved")
+    build = selected.get("build")
+    commit = selected.get("commit")
+    if (
+        type(build) is not int
+        or build <= 0
+        or not isinstance(commit, str)
+        or _COMMIT_RE.fullmatch(commit) is None
+    ):
+        return _pin_decline("selected coverage DB metadata invalid")
+
+    pin = {
+        "version": PIN_VERSION,
+        "pr_number": pr_number,
+        "pr_head": pr_head,
+        "coverage_db_build": build,
+        "coverage_db_commit": commit,
+    }
+    try:
+        output = Path(pin_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(pin))
+    except OSError as e:
+        print(f"[artifact] coverage DB pin could not be written: {e}", file=sys.stderr)
+        return _pin_decline("coverage DB pin could not be written")
+    return {
+        "status": "ready",
+        "build": build,
+        "commit": commit,
+        "pin_upload_required": True,
+        "pin_path": pin_path,
+        "pin_target": target,
+    }
 
 
 @lru_cache(maxsize=None)
@@ -204,18 +314,171 @@ def drift(db_commit: str, base_commit: str) -> tuple[Optional[int], str]:
         return None, "unknown"
 
 
+def _run_git(
+    args: list[str],
+    *,
+    cwd: Path,
+    input_data: Optional[bytes] = None,
+    env: Optional[dict[str, str]] = None,
+    timeout: int = _GIT_TIMEOUT,
+) -> Optional[subprocess.CompletedProcess[bytes]]:
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            input=input_data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        command = args[0] if args else "command"
+        print(f"[artifact] git {command} timed out after {timeout}s", file=sys.stderr)
+        return None
+
+
+def _patch_apply_status(
+    pr_base_commit: str,
+    pr_head: str,
+    db_commit: str,
+    repo_root: Path = Path("."),
+    upstream_url: Optional[str] = None,
+    relevant_paths: Optional[list[str]] = None,
+) -> _PatchApplyStatus:
+    """Check the relevant paths of a squashed PR commit against the DB revision."""
+    repo_source = repo_root.resolve()
+    main_repo = upstream_url or COVERAGE_GIT_REPO
+    checked_out_head = _run_git(["rev-parse", "HEAD"], cwd=repo_source)
+    if (
+        checked_out_head is None
+        or checked_out_head.returncode != 0
+        or checked_out_head.stdout.decode("ascii", "replace").strip() != pr_head
+    ):
+        print(f"[artifact] checked-out revision is not PR head {pr_head[:10]}", file=sys.stderr)
+        return "unknown"
+    with tempfile.TemporaryDirectory(prefix="cbts_patch_check_") as temp_dir:
+        temp = Path(temp_dir)
+        repo = temp / "repo"
+        initialized = _run_git(["init", str(repo)], cwd=temp)
+        if initialized is None or initialized.returncode != 0:
+            print("[artifact] could not initialize the patch-check repository", file=sys.stderr)
+            return "unknown"
+
+        # The PR head is guaranteed to be the checked-out revision. The base and coverage
+        # commits come from the authoritative upstream repository.
+        fetched_head = _run_git(
+            ["fetch", "--no-tags", "--depth=1", str(repo_source), "HEAD"], cwd=repo
+        )
+        if fetched_head is None or fetched_head.returncode != 0:
+            print(
+                f"[artifact] could not load PR head {pr_head[:10]} for patch check",
+                file=sys.stderr,
+            )
+            return "unknown"
+
+        revisions = list(dict.fromkeys((pr_base_commit, db_commit)))
+        fetched_revisions = _run_git(
+            ["fetch", "--no-tags", "--depth=1", main_repo, *revisions], cwd=repo
+        )
+        if fetched_revisions is None or fetched_revisions.returncode != 0:
+            print(
+                "[artifact] could not load the base/coverage revisions for patch check",
+                file=sys.stderr,
+            )
+            return "unknown"
+
+        checked_out_db = _run_git(["checkout", "--detach", db_commit], cwd=repo)
+        if checked_out_db is None or checked_out_db.returncode != 0:
+            print("[artifact] could not check out the coverage revision", file=sys.stderr)
+            return "unknown"
+
+        squashed_pr = _run_git(
+            [
+                "-c",
+                "user.name=CBTS",
+                "-c",
+                "user.email=cbts@nvidia.com",
+                "commit-tree",
+                f"{pr_head}^{{tree}}",
+                "-p",
+                pr_base_commit,
+                "-m",
+                "squashed PR for CBTS compatibility check",
+            ],
+            cwd=repo,
+        )
+        if squashed_pr is None or squashed_pr.returncode != 0:
+            print("[artifact] could not create the squashed PR commit", file=sys.stderr)
+            return "unknown"
+
+        pr_commit = squashed_pr.stdout.decode("ascii", "replace").strip()
+        applied = _run_git(["cherry-pick", "--no-commit", pr_commit], cwd=repo)
+        if applied is None:
+            return "unknown"
+        if applied.returncode == 0:
+            return "clean"
+        if relevant_paths is None:
+            return "conflict"
+        unmerged = _run_git(
+            ["diff", "--name-only", "--diff-filter=U", "-z"],
+            cwd=repo,
+        )
+        if unmerged is None or unmerged.returncode != 0:
+            return "unknown"
+        conflict_paths = {
+            path.decode("utf-8", "surrogateescape") for path in unmerged.stdout.split(b"\0") if path
+        }
+        if not conflict_paths:
+            return "unknown"
+        relevant_conflicts = conflict_paths.intersection(relevant_paths)
+        if relevant_conflicts:
+            return "conflict"
+        print(
+            "[artifact] ignoring conflict(s) outside the Tier-2 residual: "
+            + ", ".join(sorted(conflict_paths)),
+            file=sys.stderr,
+        )
+        return "clean"
+
+
+def _selection_accepts_pr_diff(
+    sel: dict,
+    pr_base_commit: str,
+    pr_head: str,
+    relevant_paths: Optional[list[str]] = None,
+) -> bool:
+    sel["patch_apply_status"] = _patch_apply_status(
+        pr_base_commit,
+        pr_head,
+        sel["commit"],
+        relevant_paths=relevant_paths,
+    )
+    if sel["patch_apply_status"] == "clean":
+        sel["coverage_decline_reason"] = ""
+        sel["coverage_decline_category"] = ""
+        return True
+    sel["coverage_decline_reason"] = (
+        "coverage tier declined: Tier-2 residual does not apply cleanly to "
+        f"selected DB commit {sel['commit'][:10]} ({sel['patch_apply_status']})"
+    )
+    sel["coverage_decline_category"] = f"compatibility_{sel['patch_apply_status']}"
+    print(f"[artifact] {sel['coverage_decline_reason']}", file=sys.stderr)
+    return False
+
+
 def select_tarball(
     pr_base_commit: str,
     artifact_base: str = ARTIFACT_BASE,
     jenkins_base: str = _JENKINS_BASE,
     max_probe: int = _MAX_PROBE,
 ) -> Optional[dict]:
-    """Closest complete architecture pair collected at or before `pr_base_commit`."""
+    """Newest complete architecture pair with measurable PR-base topology."""
     build = latest_build_number(jenkins_base)
     if build is None:
         print("[artifact] could not resolve latest build number", file=sys.stderr)
         return None
-    candidates = []
     for b in range(build, max(0, build - max_probe), -1):
         urls = tarball_urls(b, artifact_base)
         if not all(_exists(url) for url in urls):
@@ -227,57 +490,81 @@ def select_tarball(
         distance, status = drift(commit, pr_base_commit)
         if distance is None:
             print(
-                f"[artifact] build {b}: ordering against the PR base unknown; skipped",
+                f"[artifact] latest complete build {b}: topology against the PR base unknown",
                 file=sys.stderr,
             )
-            continue
-        if status not in ("ahead", "identical"):
+            return None
+        if status not in ("ahead", "behind", "identical"):
             print(
-                f"[artifact] build {b}: relation to the PR base is {status or 'unknown'}; skipped",
+                f"[artifact] latest complete build {b}: relation to the PR base is "
+                f"{status or 'unknown'}",
                 file=sys.stderr,
             )
-            continue
-        candidates.append(
-            {
-                "url": urls[0],
-                "urls": urls,
-                "build": b,
-                "commit": commit,
-                "base_commit": pr_base_commit,
-                "drift": distance,
-                "drift_status": status,
-            }
-        )
-    if not candidates:
+            return None
+        selected = {
+            "url": urls[0],
+            "urls": urls,
+            "build": b,
+            "commit": commit,
+            "base_commit": pr_base_commit,
+            "drift": distance,
+            "drift_status": status,
+            "lag": compare_distance(commit),
+        }
+        if selected["lag"] is None:
+            print(f"[artifact] build {b}: lag behind main unknown", file=sys.stderr)
+        return selected
+    print(
+        f"[artifact] no complete x86/SBSA coverage pair in the last {max_probe} builds",
+        file=sys.stderr,
+    )
+    return None
+
+
+def select_build(
+    build: int,
+    pr_base_commit: str,
+    expected_commit: Optional[str] = None,
+    artifact_base: str = ARTIFACT_BASE,
+) -> Optional[dict]:
+    """Resolve and validate one explicitly pinned coverage build."""
+    urls = tarball_urls(build, artifact_base)
+    if not all(_exists(url) for url in urls):
+        print(f"[artifact] pinned build {build}: coverage pair is incomplete", file=sys.stderr)
+        return None
+    commit = build_commit(build, artifact_base)
+    if not commit:
+        print(f"[artifact] pinned build {build}: commit unknown", file=sys.stderr)
+        return None
+    if expected_commit is not None and commit != expected_commit:
         print(
-            f"[artifact] no complete x86/SBSA coverage pair at or before the PR base "
-            f"in the last {max_probe} builds",
+            f"[artifact] pinned build {build}: commit changed from {expected_commit} to {commit}",
             file=sys.stderr,
         )
         return None
-    best = min(candidates, key=lambda c: (c["drift"], -c["build"]))
-    best["lag"] = compare_distance(best["commit"])
-    if best["lag"] is None:
+    distance, status = drift(commit, pr_base_commit)
+    if distance is None:
         print(
-            f"[artifact] build {best['build']}: lag behind main unknown",
+            f"[artifact] pinned build {build}: topology against the PR base unknown",
             file=sys.stderr,
         )
-    return best
-
-
-def measure_drift(sel: dict, pr_head: Optional[str]) -> dict:
-    """Add PR-base relation metadata to a pinned selection, in place."""
-    sel.setdefault("base_commit", None)
-    sel.setdefault("drift", None)
-    sel.setdefault("drift_status", "unknown")
-    if not pr_head or not sel.get("commit"):
-        return sel
-    base = merge_base(pr_head)
-    if not base:
-        return sel
-    sel["base_commit"] = base
-    sel["drift"], sel["drift_status"] = drift(sel["commit"], base)
-    return sel
+        return None
+    if status not in ("ahead", "behind", "identical"):
+        print(
+            f"[artifact] pinned build {build}: relation to the PR base is {status or 'unknown'}",
+            file=sys.stderr,
+        )
+        return None
+    return {
+        "url": urls[0],
+        "urls": urls,
+        "build": build,
+        "commit": commit,
+        "base_commit": pr_base_commit,
+        "drift": distance,
+        "drift_status": status,
+        "lag": compare_distance(commit),
+    }
 
 
 def describe(sel: dict) -> str:
@@ -291,7 +578,8 @@ def describe(sel: dict) -> str:
     return (
         f"[artifact] selected build {sel.get('build')}, "
         f"DB commit {(sel.get('commit') or 'unknown')[:10]}; topology from DB: "
-        f"PR base {base} ({base_distance}), current main tip ({lag})"
+        f"PR base {base} ({base_distance}), current main tip ({lag}); "
+        f"PR diff compatibility: {sel.get('patch_apply_status', 'unknown')}"
     )
 
 
@@ -329,26 +617,47 @@ def extract(tarball: Path, dest: Path) -> bool:
     return True
 
 
-def prepare(dest_dir: str, pr_head: Optional[str]) -> Optional[dict]:
+def prepare(
+    dest_dir: str,
+    pr_head: Optional[str],
+    relevant_paths: list[str],
+    build: Optional[int] = None,
+    expected_commit: Optional[str] = None,
+) -> Optional[dict]:
     """Resolve, download, and merge the DB pair; `{path, meta}` or None on failure.
 
     `meta` is the selection JSON on disk, which `main.py --coverage-db-meta` reads.
     Paths are relative to the caller's cwd, matching the Groovy caller's `cd ${LLM_ROOT}`.
     """
     if not pr_head:
-        print("[artifact] PR head is required to select an ancestor coverage DB", file=sys.stderr)
+        print("[artifact] PR head is required to select a coverage DB", file=sys.stderr)
         return None
     pr_base_commit = merge_base(pr_head)
     if not pr_base_commit:
         print("[artifact] could not resolve the PR base commit", file=sys.stderr)
         return None
-    sel = select_tarball(pr_base_commit)
+    sel = (
+        select_build(build, pr_base_commit, expected_commit=expected_commit)
+        if build is not None
+        else select_tarball(pr_base_commit)
+    )
     if sel is None:
         return None
+    compatible = _selection_accepts_pr_diff(
+        sel,
+        pr_base_commit,
+        pr_head,
+        relevant_paths,
+    )
     print(describe(sel), file=sys.stderr)
 
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
+    meta = dest / META_NAME
+    meta.write_text(json.dumps(sel))
+    if not compatible:
+        return {"path": None, "meta": str(meta)}
+
     db = dest / DB_NAME
     with tempfile.TemporaryDirectory(prefix="cbts_artifacts_", dir=dest) as temp_dir:
         temp = Path(temp_dir)
@@ -371,9 +680,22 @@ def prepare(dest_dir: str, pr_head: Optional[str]) -> Optional[dict]:
             return None
         connection.close()
 
-    meta = dest / META_NAME
-    meta.write_text(json.dumps(sel))
     return {"path": str(db), "meta": str(meta)}
+
+
+def _load_paths_json(path: Optional[str]) -> Optional[list[str]]:
+    """Load the non-empty JSON list of repository-relative Tier-2 paths."""
+    if not path:
+        return None
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[artifact] residual paths unreadable ({path}): {e}", file=sys.stderr)
+        return None
+    if not isinstance(data, list) or not data or not all(isinstance(item, str) for item in data):
+        print("[artifact] residual paths must be a non-empty JSON string list", file=sys.stderr)
+        return None
+    return sorted(set(data))
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -381,33 +703,84 @@ def main(argv: Optional[list[str]] = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument(
+        "--resolve-pin",
+        metavar="FILE",
+        default=None,
+        help="reuse a PR-head build pin or write a new pin to FILE for Jenkins upload",
+    )
+    ap.add_argument(
+        "--resolve-build",
+        action="store_true",
+        help="resolve and print build metadata without checking or downloading the PR diff",
+    )
+    ap.add_argument(
         "--print-selection",
         action="store_true",
-        help="resolve and print {urls, build, commit, lag, base_commit, drift, drift_status} as JSON",
+        help="resolve and print {urls, build, commit, lag, base_commit, drift, "
+        "drift_status, patch_apply_status} as JSON",
     )
     ap.add_argument(
         "--build", type=int, default=None, help="pin a build number (skip auto-resolve)"
     )
     ap.add_argument(
+        "--expected-commit",
+        default=None,
+        help="require an explicitly pinned build to retain this coverage commit",
+    )
+    ap.add_argument(
         "--prepare",
         metavar="DIR",
         default=None,
-        help="resolve, download and merge the architecture DBs into DIR, then print "
-        "{path, meta} as JSON",
+        help="resolve, validate, download and merge the architecture DBs into DIR, then "
+        "print {path, meta} as JSON",
     )
     ap.add_argument(
         "--pr-head",
         default=None,
-        help="required PR head revision; its merge base is the inclusive upper bound "
-        "for eligible coverage revisions",
+        help="required PR head revision; its merge base measures DB drift and defines "
+        "the diff checked against the selected coverage revision",
+    )
+    ap.add_argument(
+        "--pr-number",
+        default=None,
+        help="PR number used by --resolve-pin to address the stable Artifactory path",
+    )
+    ap.add_argument(
+        "--paths-json",
+        default=None,
+        help="JSON list of Tier-2 residual paths; required for the compatibility check",
     )
     args = ap.parse_args(argv)
 
-    if not args.print_selection and not args.prepare:
-        ap.error("one of --print-selection / --prepare is required")
+    if (
+        sum(
+            (
+                args.resolve_pin is not None,
+                args.resolve_build,
+                args.print_selection,
+                args.prepare is not None,
+            )
+        )
+        != 1
+    ):
+        ap.error(
+            "exactly one of --resolve-pin / --resolve-build / --print-selection / "
+            "--prepare is required"
+        )
+    if args.expected_commit is not None and args.build is None:
+        ap.error("--expected-commit requires --build")
 
     if args.prepare:
-        ready = prepare(args.prepare, args.pr_head)
+        relevant_paths = _load_paths_json(args.paths_json)
+        if relevant_paths is None:
+            return 1
+        ready = prepare(
+            args.prepare,
+            args.pr_head,
+            relevant_paths,
+            build=args.build,
+            expected_commit=args.expected_commit,
+        )
         if ready is None:
             return 1
         print(json.dumps(ready))
@@ -420,24 +793,40 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not pr_base_commit:
         return 1
 
+    if args.resolve_pin is not None:
+        if not args.pr_number:
+            print("[artifact] --pr-number is required by --resolve-pin", file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                resolve_pin(
+                    args.resolve_pin,
+                    str(args.pr_number),
+                    args.pr_head,
+                    pr_base_commit,
+                )
+            )
+        )
+        return 0
+
     if args.build is not None:
-        urls = tarball_urls(args.build)
-        if not all(_exists(url) for url in urls):
-            return 1
-        commit = build_commit(args.build)
-        best = {
-            "url": urls[0],
-            "urls": urls,
-            "build": args.build,
-            "commit": commit,
-            "lag": compare_distance(commit) if commit else None,
-        }
-        measure_drift(best, args.pr_head)
-        if best["drift_status"] not in ("ahead", "identical"):
-            return 1
+        best = select_build(
+            args.build,
+            pr_base_commit,
+            expected_commit=args.expected_commit,
+        )
     else:
         best = select_tarball(pr_base_commit)
     if best is None:
+        return 1
+    if args.resolve_build:
+        print(json.dumps(best))
+        return 0
+
+    relevant_paths = _load_paths_json(args.paths_json)
+    if relevant_paths is None:
+        return 1
+    if not _selection_accepts_pr_diff(best, pr_base_commit, args.pr_head, relevant_paths):
         return 1
     print(json.dumps(best))
     return 0

@@ -136,6 +136,10 @@ def kda_decode_mtp_kernel(
         bos = cu_seqlens[i_n]
         eos = cu_seqlens[i_n + 1]
         slot = ssm_state_indices[i_n]
+    # V2 can interleave many layers between state slots. Promote the index
+    # before multiplying by static strides: the element offset can exceed
+    # INT32_MAX even when each individual stride fits in int32.
+    slot = Int64(slot)
     h0_idx = slot * HV + i_hv
     hk_off = i_h * K
     hv_off = i_hv * V

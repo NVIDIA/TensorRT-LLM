@@ -41,77 +41,44 @@ struct Gmem_tile_o_hopper_16bits
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of elements per STG.
-    enum
-    {
-        ELEMENTS_PER_STG = 2
-    };
+    static constexpr int ELEMENTS_PER_STG = 2;
 
     // The size in bytes of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = 2
-    };
+    static constexpr int BYTES_PER_ELEMENT = 2;
 
     // The size of each STG.
-    enum
-    {
-        BYTES_PER_STG = ELEMENTS_PER_STG * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_STG = ELEMENTS_PER_STG * BYTES_PER_ELEMENT;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = Cta_tile::VALID_N * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ROW = Cta_tile::VALID_N * BYTES_PER_ELEMENT;
 
     // The number of rows accessed by each thread.
-    enum
-    {
-        ROWS_PER_THREAD = Mma_tile::M_PER_MMA / 8 / Cta_tile::WARPS_PER_CTA
-    };
+    static constexpr int ROWS_PER_THREAD = Mma_tile::M_PER_MMA / 8 / Cta_tile::WARPS_PER_CTA;
 
-    enum
-    {
-        ROWS = Cta_tile::M
-    };
+    static constexpr int ROWS = Cta_tile::M;
 
     // The number of columns access by each thread.
     // Note there are 2 elements per reg.
-    enum
-    {
-        COLS_PER_THREAD = Mma_tile::N_PER_MMA / 4 / 2
-    };
+    static constexpr int COLS_PER_THREAD = Mma_tile::N_PER_MMA / 4 / 2;
 
     // The number of valid columns (stored to GMEM) by each thread.
-    enum
-    {
-        VALID_COLS_PER_THREAD_FOR_LAST_MMA = (Cta_tile::VALID_N % Mma_tile::N_PER_MMA) == 0
-            ? COLS_PER_THREAD
-            : (Cta_tile::VALID_N % Mma_tile::N_PER_MMA) / 8
-    };
+    static constexpr int VALID_COLS_PER_THREAD_FOR_LAST_MMA = (Cta_tile::VALID_N % Mma_tile::N_PER_MMA) == 0
+        ? COLS_PER_THREAD
+        : (Cta_tile::VALID_N % Mma_tile::N_PER_MMA) / 8;
 
-    enum
-    {
-        VALID_MMAS_N = fmha::Div_up<Cta_tile::VALID_N, Mma_tile::N_PER_MMA>::VALUE
-    };
+    static constexpr int VALID_MMAS_N = fmha::Div_up<Cta_tile::VALID_N, Mma_tile::N_PER_MMA>::VALUE;
 
     static_assert(Cta_tile::VALID_N % 8 == 0, "The valid head dimension needs to be multiple of 8.");
 
     // The number of accumulator held by each thread, per HGMMA instruction.
-    enum
-    {
-        ELTS_PER_THREAD = ROWS_PER_THREAD * COLS_PER_THREAD
-    };
+    static constexpr int ELTS_PER_THREAD = ROWS_PER_THREAD * COLS_PER_THREAD;
 
     // Currently, we assume for o matrix, GMMA M/N shape matches CTA M/N shape.
     static_assert(Mma_tile::M_PER_MMA == Cta_tile::M && Mma_tile::N_PER_MMA * Mma_tile::MMAS_N == Cta_tile::N,
         "Currently, we assume for o matrix, GMMA M shape matches CTA M shape. ");
 
     // Step N for one quad
-    enum
-    {
-        STEP_N = 8 * BYTES_PER_ELEMENT
-    };
+    static constexpr int STEP_N = 8 * BYTES_PER_ELEMENT;
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -516,144 +483,81 @@ struct Gmem_tile_o_gmma_32bit_8bit
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of elements per STG.
-    enum
-    {
-        ELEMENTS_PER_STG = 4
-    };
+    static constexpr int ELEMENTS_PER_STG = 4;
 
     // The size in bytes of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = 1
-    };
+    static constexpr int BYTES_PER_ELEMENT = 1;
 
     // The size of each STG.
-    enum
-    {
-        BYTES_PER_STG = ELEMENTS_PER_STG * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_STG = ELEMENTS_PER_STG * BYTES_PER_ELEMENT;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = Cta_tile::VALID_N * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ROW = Cta_tile::VALID_N * BYTES_PER_ELEMENT;
 
-    enum
-    {
-        ROWS = Cta_tile::M
-    };
+    static constexpr int ROWS = Cta_tile::M;
 
     // The number of rows accessed by each thread.
-    enum
-    {
-        ROWS_PER_THREAD = Mma_tile::M_PER_MMA / 8 / Cta_tile::WARPS_M
-    };
+    static constexpr int ROWS_PER_THREAD = Mma_tile::M_PER_MMA / 8 / Cta_tile::WARPS_M;
 
     static_assert(ROWS_PER_THREAD == 2);
     static_assert(ROWS_PER_THREAD == Mma_tile::ROWS_PER_THREAD);
 
     // The number of columns access by each thread.
     // The number of core matrices in N.
-    enum
-    {
-        COLS_PER_THREAD = Mma_tile::N_PER_MMA / 4 / 2
-    }; // N_PER_MMA = GMMA_N
+    static constexpr int COLS_PER_THREAD = Mma_tile::N_PER_MMA / 4 / 2; // N_PER_MMA = GMMA_N
 
     static_assert(COLS_PER_THREAD == Mma_tile::COLS_PER_THREAD / 2);
     // Assume there is an even number of core matrices, such that we can pack two
     static_assert(COLS_PER_THREAD % 2 == 0);
 
     // Number of valid N columns.
-    enum
-    {
-        VALID_N = Cta_tile::VALID_N
-    };
+    static constexpr int VALID_N = Cta_tile::VALID_N;
 
     // The number of valid columns (stored to GMEM) by each thread.
-    enum
-    {
-        VALID_COLS_PER_THREAD_FOR_LAST_MMA
-        = (VALID_N % Mma_tile::N_PER_MMA) == 0 ? COLS_PER_THREAD : (VALID_N % Mma_tile::N_PER_MMA) / 8
-    };
+    static constexpr int VALID_COLS_PER_THREAD_FOR_LAST_MMA
+        = (VALID_N % Mma_tile::N_PER_MMA) == 0 ? COLS_PER_THREAD : (VALID_N % Mma_tile::N_PER_MMA) / 8;
 
-    enum
-    {
-        VALID_MMAS_N = fmha::Div_up<VALID_N, Mma_tile::N_PER_MMA>::VALUE
-    };
+    static constexpr int VALID_MMAS_N = fmha::Div_up<VALID_N, Mma_tile::N_PER_MMA>::VALUE;
 
     static_assert(VALID_N % 8 == 0, "The valid head dimension needs to be multiple of 8.");
 
     // The number of N elements must be multiple of 16 in order to pack 4 elements as uint32_t.
-    enum
-    {
-        PACK_4_ELTS = VALID_N % 16 == 0
-    };
+    static constexpr int PACK_4_ELTS = VALID_N % 16 == 0;
 
     // The number of accumulator held by each thread, per HGMMA instruction.
-    enum
-    {
-        ELTS_PER_THREAD = ROWS_PER_THREAD * COLS_PER_THREAD * 2
-    };
+    static constexpr int ELTS_PER_THREAD = ROWS_PER_THREAD * COLS_PER_THREAD * 2;
 
     // Currently, we assume for o matrix, GMMA M shape matches CTA M shape.
     static_assert(Mma_tile::M_PER_MMA == Cta_tile::M && Mma_tile::N_PER_MMA * Mma_tile::MMAS_N == Cta_tile::N,
         "Currently, we assume for o matrix, GMMA M/N shape matches CTA M/N shape. ");
 
     // Step N for one quad (pack 4 elements for a thread, so 16 elements for a quad)
-    enum
-    {
-        STEP_N = 16 * BYTES_PER_ELEMENT
-    };
+    static constexpr int STEP_N = 16 * BYTES_PER_ELEMENT;
 
     // The number of head_dimension groups.
-    enum
-    {
-        N_GROUPS = fmha::Div_up<Cta_tile::N * BYTES_PER_ELEMENT, 128>::VALUE
-    };
+    static constexpr int N_GROUPS = fmha::Div_up<Cta_tile::N * BYTES_PER_ELEMENT, 128>::VALUE;
 
     // The head_dimension per group.
-    enum
-    {
-        N_PER_GROUP = Cta_tile::N / N_GROUPS
-    };
+    static constexpr int N_PER_GROUP = Cta_tile::N / N_GROUPS;
 
     static_assert(N_GROUPS * N_PER_GROUP == Cta_tile::N);
 
     // The head_dimension bytes per group
-    enum
-    {
-        N_BYTES_PER_GROUP = Cta_tile::N * BYTES_PER_ELEMENT / N_GROUPS
-    };
+    static constexpr int N_BYTES_PER_GROUP = Cta_tile::N * BYTES_PER_ELEMENT / N_GROUPS;
 
     // Pack 2x4 core matrices, use STSMx4
-    enum
-    {
-        STSM_PER_MMA = COLS_PER_THREAD / 4
-    };
+    static constexpr int STSM_PER_MMA = COLS_PER_THREAD / 4;
 
     // The number of registers per 16x16 block
-    enum
-    {
-        REGS_PER_QUAD = 8
-    };
+    static constexpr int REGS_PER_QUAD = 8;
 
     // Bytes per bank
-    enum
-    {
-        BYTES_PER_BANK = 16
-    };
+    static constexpr int BYTES_PER_BANK = 16;
 
     // The number of banks in N per group
-    enum
-    {
-        N_BANKS_PER_GROUP = N_BYTES_PER_GROUP / BYTES_PER_BANK
-    };
+    static constexpr int N_BANKS_PER_GROUP = N_BYTES_PER_GROUP / BYTES_PER_BANK;
 
-    enum
-    {
-        USE_TMA_STORE = USE_TMA_STORE_
-    };
+    static constexpr int USE_TMA_STORE = USE_TMA_STORE_;
 
     // Ctor.
     template <typename Params, typename Block_info, typename Shared>
@@ -1150,77 +1054,44 @@ struct Gmem_tile_o_qgmma_fp32_16bits
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of elements per STG.
-    enum
-    {
-        ELEMENTS_PER_STG = 2
-    };
+    static constexpr int ELEMENTS_PER_STG = 2;
 
     // The size in bytes of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = 2
-    };
+    static constexpr int BYTES_PER_ELEMENT = 2;
 
     // The size of each STG.
-    enum
-    {
-        BYTES_PER_STG = ELEMENTS_PER_STG * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_STG = ELEMENTS_PER_STG * BYTES_PER_ELEMENT;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = Cta_tile::VALID_N * BYTES_PER_ELEMENT
-    };
+    static constexpr int BYTES_PER_ROW = Cta_tile::VALID_N * BYTES_PER_ELEMENT;
 
     // The number of rows accessed by each thread.
-    enum
-    {
-        ROWS_PER_THREAD = Mma_tile::M_PER_MMA / 8 / Cta_tile::WARPS_PER_CTA
-    };
+    static constexpr int ROWS_PER_THREAD = Mma_tile::M_PER_MMA / 8 / Cta_tile::WARPS_PER_CTA;
 
-    enum
-    {
-        ROWS = Cta_tile::M
-    };
+    static constexpr int ROWS = Cta_tile::M;
 
     // The number of columns access by each thread.
     // Note there are 2 elements per reg.
-    enum
-    {
-        COLS_PER_THREAD = Mma_tile::N_PER_MMA / 4 / 2
-    };
+    static constexpr int COLS_PER_THREAD = Mma_tile::N_PER_MMA / 4 / 2;
 
     // The number of valid columns (stored to GMEM) by each thread.
-    enum
-    {
-        VALID_COLS_PER_THREAD_FOR_LAST_MMA = (Cta_tile::VALID_N % Mma_tile::N_PER_MMA) == 0
-            ? COLS_PER_THREAD
-            : (Cta_tile::VALID_N % Mma_tile::N_PER_MMA) / 8
-    };
+    static constexpr int VALID_COLS_PER_THREAD_FOR_LAST_MMA = (Cta_tile::VALID_N % Mma_tile::N_PER_MMA) == 0
+        ? COLS_PER_THREAD
+        : (Cta_tile::VALID_N % Mma_tile::N_PER_MMA) / 8;
 
-    enum
-    {
-        VALID_MMAS_N = fmha::Div_up<Cta_tile::VALID_N, Mma_tile::N_PER_MMA>::VALUE
-    };
+    static constexpr int VALID_MMAS_N = fmha::Div_up<Cta_tile::VALID_N, Mma_tile::N_PER_MMA>::VALUE;
 
     static_assert(Cta_tile::VALID_N % 8 == 0, "The valid head dimension needs to be multiple of 8.");
 
     // The number of accumulator held by each thread, per HGMMA instruction.
-    enum
-    {
-        ELTS_PER_THREAD = ROWS_PER_THREAD * COLS_PER_THREAD
-    };
+    static constexpr int ELTS_PER_THREAD = ROWS_PER_THREAD * COLS_PER_THREAD;
 
     // Currently, we assume for o matrix, GMMA M/N shape matches CTA M/N shape.
     static_assert(Mma_tile::M_PER_MMA == Cta_tile::M && Mma_tile::N_PER_MMA * Mma_tile::MMAS_N == Cta_tile::N,
         "Currently, we assume for o matrix, GMMA M shape matches CTA M shape. ");
 
     // Step N for one quad
-    enum
-    {
-        STEP_N = 8 * BYTES_PER_ELEMENT
-    };
+    static constexpr int STEP_N = 8 * BYTES_PER_ELEMENT;
 
     // Ctor.
     template <typename Params, typename Block_info, typename Shared>

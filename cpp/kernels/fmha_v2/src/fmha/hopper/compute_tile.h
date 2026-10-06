@@ -51,20 +51,11 @@ struct Compute_tile_with_gmma<Traits, Cta_tile, Smem_tile_a, Smem_tile_b,
         "GMMA desc for A and B should have the same strategy.");
 
     // The number of MMAs.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
-    enum
-    {
-        MMAS_K = Mma_tile::MMAS_K
-    };
+    static constexpr int MMAS_K = Mma_tile::MMAS_K;
 
     // Ctor.
     inline __device__ Compute_tile_with_gmma() {}
@@ -338,21 +329,12 @@ struct Compute_tile_with_gmma<Traits, Cta_tile, Smem_tile_a, Smem_tile_b,
         "GMMA desc for A and B should have the same strategy.");
 
     // The number of MMAs.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
     // TODO
-    enum
-    {
-        MMAS_K = Mma_tile::MMAS_K * Cta_tile::WARPS_K
-    };
+    static constexpr int MMAS_K = Mma_tile::MMAS_K * Cta_tile::WARPS_K;
 
     // Ctor.
     inline __device__ Compute_tile_with_gmma() {}

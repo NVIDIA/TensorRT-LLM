@@ -92,6 +92,11 @@ private:
 //! acquire(..., stream) inserts waits for prior users on stream and returns without host synchronization.
 //! acquire(..., nullopt) synchronizes prior users before returning. The returned StagingBuffer retains the same
 //! optional stream and uses it to protect the range when the lease is retired.
+//!
+//! Not thread-safe, by design. Every instance is owned by a single KvCacheManager and is reached
+//! only through that manager's migration paths, which run under its exclusive lock; the class
+//! therefore does no locking of its own. A caller that reaches acquire() while holding only a
+//! shared lock races silently — there is no internal lock to deadlock against.
 class StagingBufferManager
 {
 public:
@@ -103,7 +108,7 @@ public:
     StagingBufferManager(StagingBufferManager&&) = delete;
     StagingBufferManager& operator=(StagingBufferManager&&) = delete;
 
-    //! Acquires a staging slice. The owning KVCM serializes access.
+    //! Acquires a staging slice. Callers must serialize; see the class comment.
     //! \param minSize Minimum required bytes.
     //! \param maxSize Best-effort upper bound.
     //! \param sizeGranularity Required positive size multiple in bytes.

@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Compiler toolchain only. This file must not be included in wheel metadata or runtime environments.
+grpcio==1.67.1
+grpcio-tools==1.67.1
+protobuf==5.27.2
+setuptools==84.0.0

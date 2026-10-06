@@ -46,7 +46,6 @@ mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickst
     --checkpoint_format mistral \
     --spec_decode_algo EAGLE3 \
     --spec_decode_max_draft_len 1 \
-    --use_one_model \
     --draft_model_dir ${mistral_large_3_eagle_model_path} \
     --eagle3_model_arch mistral_large3 \
     --moe_backend TRTLLM

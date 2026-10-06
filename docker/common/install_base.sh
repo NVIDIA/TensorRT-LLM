@@ -24,14 +24,16 @@ install_boost() {
 }
 
 set_bash_env() {
-  if [ ! -f ${BASH_ENV} ];then
-    touch ${BASH_ENV}
+  # The wrapper installed at `ENV` sources this original file with xtrace disabled.
+  local original_sh_env="${TRTLLM_ORIGINAL_SH_ENV:-${ENV}}"
+  if [ ! -f "${BASH_ENV}" ]; then
+    touch "${BASH_ENV}"
   fi
   # In the existing base images, as long as `ENV` is set, it will be enabled by `BASH_ENV`.
-  if [ ! -f ${ENV} ];then
-    touch ${ENV}
-    (echo "test -f ${ENV} && source ${ENV}" && cat ${BASH_ENV}) > /tmp/shinit_f
-    mv /tmp/shinit_f ${BASH_ENV}
+  if [ ! -f "${original_sh_env}" ]; then
+    touch "${original_sh_env}"
+    (echo "test -f \"${ENV}\" && source \"${ENV}\"" && cat "${BASH_ENV}") > /tmp/shinit_f
+    mv /tmp/shinit_f "${BASH_ENV}"
   fi
 }
 
@@ -184,7 +186,7 @@ install_gcctoolset_rockylinux() {
     rdma-core-devel \
     zeromq-devel \
     -y
-  echo "source scl_source enable gcc-toolset-11" >> "${ENV}"
+  echo ". scl_source enable gcc-toolset-11" >> "${ENV}"
   echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
 }
 

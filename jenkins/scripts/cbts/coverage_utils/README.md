@@ -35,7 +35,7 @@ not lines executed (far cheaper than line tracing).
 
 `isCbtsStage()` in `jenkins/L0_Test.groovy` then gates each stage on that propagated flag plus:
 
-- not a perf stage, and not a TensorRT / CPP / AutoDeploy stage
+- not a perf stage, and not a TensorRT / CPP stage
 - single-GPU only — stages named with `-<N>_GPUs` or `-<N>_Nodes` (multi-GPU / multi-node) are disabled in phase 1 and enabled incrementally later
 - `CBTS_EXCLUDE_STAGES` (per-stage skip)
 

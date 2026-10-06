@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/batchedPageCopy.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/coldPageCodec.h"
-#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/coldPageCopy.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/stagingBuffer.h"
 #include "tensorrt_llm/common/tllmException.h"
 

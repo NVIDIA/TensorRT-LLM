@@ -55,26 +55,22 @@ protected:
         uint64_t reqId = optionalReqId.value_or((rand() % INT64_MAX) + 1);
         auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen, 1);
         std::optional<std::shared_ptr<std::vector<int32_t>>> draftTokens = std::nullopt;
-        std::optional<LlmRequest::TensorPtr> draftLogits = std::nullopt;
         if (draftTokensLen > 0)
         {
             draftTokens = std::make_shared<std::vector<int32_t>>(draftTokensLen, 2);
-            draftLogits = BufferManager::cpu(
-                ITensor::makeShape({draftTokensLen, /* vocabSizePadded*/ 42}), tensorrt_llm::DataType::kFLOAT);
         }
         return std::make_shared<LlmRequest>(reqId, maxNewTokens, inputTokens, samplingConfig,
             /*isStreaming=*/false,
             /*endId=*/std::nullopt,
-            /*padId=*/std::nullopt,
             /*positionIds=*/std::nullopt,
             /*promptEmbeddingTable=*/std::nullopt, /*promptVocabSize=*/std::nullopt,
             /*multimodalHashes=*/std::nullopt, /*multimodalPos=*/std::nullopt, /*multimodalLength=*/std::nullopt,
             /*multimodalUuids=*/std::nullopt, /*multimodalEmbedding=*/std::nullopt,
             /*mropeRotaryCosSin=*/std::nullopt, /*mropePositionDeltas*/ std::nullopt,
             /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-            /*loraConfig=*/std::nullopt, /*lookaheadConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
+            /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
             /*returnLogProbs=*/false,
-            /*returnContextLogits=*/false, /*returnGenerationLogits=*/false, draftTokens, draftLogits);
+            /*returnContextLogits=*/false, /*returnGenerationLogits=*/false, draftTokens);
     }
 
     RequestTable forward(

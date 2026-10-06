@@ -158,31 +158,41 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
             del mgr
 
     def test_page_table_uses_physical_pool_representative(self):
-        mgr = KVCacheManagerV2(**_make_kwargs(head_dim=[64, 192, 64, 192]))
-        real_impl = mgr.impl
-        try:
-            pool_id = 0
-            physical_layer = mgr._pool_layer_ids_by_role[(pool_id, Role.KEY)]
-            other_layer = next(
-                layer_id
-                for layer_id in real_impl.layer_grouping[pool_id]
-                if int(layer_id) != int(physical_layer)
-            )
-            impl_proxy = Mock(wraps=real_impl)
-            impl_proxy.layer_grouping = ((other_layer, physical_layer),)
-            mgr.impl = impl_proxy
+        for head_dim in (128, [64, 192, 64, 192]):
+            with self.subTest(head_dim=head_dim):
+                mgr = KVCacheManagerV2(**_make_kwargs(head_dim=head_dim))
+                real_impl = mgr.impl
+                try:
+                    pool_id = 0
+                    physical_layer = mgr._pool_layer_ids_by_role[(pool_id, Role.KEY)]
+                    layers = real_impl.layer_grouping[pool_id]
+                    other_layer = next(layer for layer in layers if layer != physical_layer)
+                    impl_proxy = Mock(wraps=real_impl)
+                    impl_proxy.layer_grouping = (
+                        (other_layer, *(layer for layer in layers if layer != other_layer)),
+                    )
+                    mgr.impl = impl_proxy
 
-            mgr._prepare_page_table_tensor(index_mapper_capacity=1)
+                    mgr._prepare_page_table_tensor(index_mapper_capacity=1)
 
-            self.assertEqual(
-                impl_proxy.get_mem_pool_base_address.call_args_list[0].args,
-                (physical_layer, Role.KEY, PageIndexMode.SHARED),
-            )
-            impl_proxy.get_page_index_scale.assert_called_once_with(physical_layer, Role.KEY)
-        finally:
-            mgr.impl = real_impl
-            mgr.shutdown()
-            del mgr
+                    # Both paths still use a physical representative for group
+                    # metadata. Per-layer pointer lookups can precede it.
+                    shared_key_calls = [
+                        call.args
+                        for call in impl_proxy.get_mem_pool_base_address.call_args_list
+                        if call.args[1:] == (Role.KEY, PageIndexMode.SHARED)
+                    ]
+                    self.assertEqual(
+                        shared_key_calls[0],
+                        (physical_layer, Role.KEY, PageIndexMode.SHARED),
+                    )
+                    impl_proxy.get_page_index_scale.assert_called_once_with(
+                        physical_layer, Role.KEY
+                    )
+                finally:
+                    mgr.impl = real_impl
+                    mgr.shutdown()
+                    del mgr
 
     def test_subclass_registers_index_key_only_on_sparse_layers(self):
         # Sparse layer convention: layers 0-2 dense (no INDEX_KEY), 3+ sparse

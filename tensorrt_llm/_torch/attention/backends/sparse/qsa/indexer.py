@@ -12,9 +12,10 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
 
+from ..params import use_self_sampling_gvr
 from .constants import (
     QSA_COS_SIN_CACHE_COMPONENTS,
     QSA_INDEX_HEAD_TO_ROTARY_WIDTH_RATIO,
@@ -124,7 +125,6 @@ class QSAIndexer(nn.Module):
             dtype=config.torch_dtype,
             quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=True,
         )
         self.q_layernorm = RMSNorm(
             hidden_size=params.index_head_dim,
@@ -176,13 +176,34 @@ class QSAIndexer(nn.Module):
             )
         self._pending_speculative_cache = None
         use_cute_dsl_prefill_topk = IS_CUTLASS_DSL_AVAILABLE and is_sm_100f()
+        # Both QSA selection sites drive TopK through its row-range (prefill)
+        # entry, including decode, so the prefill engine is the one that runs.
+        use_gvr_topk = use_self_sampling_gvr(
+            enable_heuristic_topk=params.enable_heuristic_topk,
+            use_self_sampling_topk=True,
+            index_topk=params.block_topk,
+            compress_ratio=params.compress_ratio,
+            is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
+            sm_version=get_sm_version(),
+        )
+        if params.enable_heuristic_topk and not use_gvr_topk:
+            logger.warning_once(
+                "QSA enable_heuristic_topk=True but the self-sampling GVR "
+                f"prerequisites are not met (cutlass_dsl={IS_CUTLASS_DSL_AVAILABLE}, "
+                f"sm={get_sm_version()}, block_topk={params.block_topk}, "
+                f"compress_ratio={params.compress_ratio}); using the exact "
+                "radix Top-K instead.",
+                key="qsa_gvr_prereq_radix_fallback",
+            )
+        if use_gvr_topk:
+            prefill_top_k_implementation = TopKImplementation.CUTE_DSL_GVR
+        elif use_cute_dsl_prefill_topk:
+            prefill_top_k_implementation = TopKImplementation.CUTE_DSL_RADIX
+        else:
+            prefill_top_k_implementation = TopKImplementation.CUDA_RADIX
         self.top_k = TopK(
             params.block_topk,
-            prefill_implementation=(
-                TopKImplementation.CUTE_DSL_RADIX
-                if use_cute_dsl_prefill_topk
-                else TopKImplementation.CUDA_RADIX
-            ),
+            prefill_implementation=prefill_top_k_implementation,
             decode_implementation=TopKImplementation.CUDA_RADIX,
             compress_ratio=params.compress_ratio,
         )

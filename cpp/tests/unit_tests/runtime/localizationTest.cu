@@ -150,6 +150,13 @@ protected:
         bool owned = false;
 
         StreamHolder() = default;
+
+        explicit StreamHolder(CUstream stream, bool owned = false) noexcept
+            : stream(stream)
+            , owned(owned)
+        {
+        }
+
         StreamHolder(StreamHolder const&) = delete;
         StreamHolder& operator=(StreamHolder const&) = delete;
 

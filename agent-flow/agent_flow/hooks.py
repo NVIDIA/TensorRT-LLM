@@ -1,24 +1,14 @@
-"""Reusable hook helpers for the claude-code backend.
+"""Shared required-tool policy and legacy Claude-specific hook helpers.
 
-The Claude Agent SDK supports a ``hooks`` option on ``ClaudeAgentOptions``
-that lets callers intercept events such as ``Stop`` (the agent trying to end
-its turn). This module builds common hook patterns on top of that API.
+Use ``AgentLayerConfig(required_tools=("append_progress", "update_status"))``
+to require every listed tool in either backend. ``AgentLayer`` observes
+root-agent calls, then sends one corrective SDK turn in the same session
+if calls are missing. It raises ``RequiredToolCallError`` if that bounded
+correction still leaves required calls missing.
 
-The primary helper is :func:`require_tool_call_stop_hook`, which produces a
-``Stop`` hook that blocks the agent from ending a turn until it has called
-at least one of a set of required tools. This upgrades prompt-only "please
-call X before stopping" instructions into a runtime guarantee.
-
-Example::
-
-    from agent_flow import BackendConfig, CLAUDE_CODE_DEFAULT_MODEL
-    from agent_flow.hooks import require_tool_call_stop_hook
-
-    hooks = require_tool_call_stop_hook(["append_planner_progress"])
-    backend = BackendConfig(
-        kind="claude-code", model=CLAUDE_CODE_DEFAULT_MODEL, tools=planner_tools, hooks=hooks
-    )
-
+``require_tool_call_stop_hook`` remains a Claude-native alternative for
+existing callers. It inspects a transcript and requires ANY of its listed
+tools, using Claude's Stop hook rather than a framework-initiated turn.
 """
 
 from __future__ import annotations
@@ -27,7 +17,45 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from claude_agent_sdk.types import HookMatcher
+from .types import ToolCallEvent
+
+
+class RequiredToolCallError(RuntimeError):
+    """A layer finished its corrective turn without all required tool calls."""
+
+
+class RequiredToolPolicy:
+    """Track ALL required root-agent calls within one logical invocation.
+
+    This counts attempted calls, matching the legacy transcript hook's
+    contract; it does not claim the tool's operation succeeded. Unlike the
+    legacy helper's ANY matching, workflows require every configured tool.
+    """
+
+    def __init__(self, required_tools: Iterable[str]) -> None:
+        self._remaining = dict.fromkeys(required_tools)
+
+    @property
+    def missing(self) -> tuple[str, ...]:
+        return tuple(self._remaining)
+
+    def record(self, event: ToolCallEvent) -> None:
+        # Labels alone can identify a child when no invocation ID was
+        # supplied upstream. Neither form of child activity can discharge
+        # a root agent's obligation to write its own progress/status.
+        if event.parent_tool_use_id is not None or event.agent_label is not None:
+            return
+        for required in self.missing:
+            if _matches_required(event.name, {required}):
+                del self._remaining[required]
+
+    def correction_message(self) -> str:
+        names = ", ".join(f"`{name}`" for name in self.missing)
+        return (
+            f"You must call every remaining required tool before completing this request: {names}. "
+            "Call each now using the work already completed in this session, then finish. "
+            "Do not repeat tool calls whose requirement was already satisfied."
+        )
 
 
 def _iter_transcript_entries(transcript_path: str | Path) -> list[dict]:
@@ -152,6 +180,8 @@ def require_tool_call_stop_hook(
     one per stop event, which is enough in practice while keeping the
     guarantee bounded.
     """
+    from claude_agent_sdk.types import HookMatcher
+
     required = list(required_tool_names)
     if not required:
         raise ValueError("required_tool_names must not be empty")

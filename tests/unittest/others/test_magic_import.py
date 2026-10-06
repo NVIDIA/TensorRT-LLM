@@ -450,6 +450,7 @@ def test_importing_the_module_installs_the_finder():
         env={**os.environ, "PYTHONPATH": str(tests_root)},
         capture_output=True,
         text=True,
+        timeout=60,
     )
 
     assert result.stdout.strip() == "True", result.stderr
@@ -920,6 +921,7 @@ def _run_pytest_with_the_check(
         },
         capture_output=True,
         text=True,
+        timeout=300,
     )
 
 

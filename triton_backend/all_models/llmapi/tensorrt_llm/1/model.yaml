@@ -17,3 +17,7 @@ pipeline_parallel_size: 1
 triton_config:
   max_batch_size: 0 # The current implementation does not support batching, batch support is tracked in JIRA-4496
   decoupled: False
+  # Accept the optional `image_url` request input and serve multimodal
+  # models. Off by default so that a deployment already declaring an
+  # `image_url` input for another purpose is unaffected by an upgrade.
+  multimodal: False

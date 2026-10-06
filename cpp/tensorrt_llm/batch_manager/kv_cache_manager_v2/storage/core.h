@@ -48,6 +48,35 @@ struct Slot
 {
     CachedCudaEvent readyEvent = CachedCudaEvent::makeNull();
 
+    Slot() = default;
+
+    ~Slot()
+    {
+        KVCM2_CHECK_FATAL_DEBUG_WITH_INFO(
+            !hasValidSlot(), "Slot %zu destroyed without being released", toSizeT(mSlotId.value()));
+    }
+
+    // A slot id has exactly one owner: transferring a Slot empties the source, so it cannot be
+    // released twice. Copying is not available for the same reason.
+    Slot(Slot&& other) noexcept
+        : readyEvent(std::move(other.readyEvent))
+        , mSlotId(std::exchange(other.mSlotId, std::nullopt))
+    {
+    }
+
+    Slot& operator=(Slot&& other) noexcept
+    {
+        if (this != &other)
+        {
+            readyEvent = std::move(other.readyEvent);
+            mSlotId = std::exchange(other.mSlotId, std::nullopt);
+        }
+        return *this;
+    }
+
+    Slot(Slot const&) = delete;
+    Slot& operator=(Slot const&) = delete;
+
     // Mirrors Python @property slot_id: asserts valid, returns unwrapped value.
     [[nodiscard]] SlotId slotId() const
     {
@@ -74,16 +103,15 @@ struct Slot
         return readyEvent.queryComplete();
     }
 
-    // Transfer slot ownership: moves slotId and readyEvent from src to this.
+    // Transfer slot ownership into an empty slot. Overwriting an occupied slot would drop its
+    // id without releasing it, so that is rejected rather than silently allowed by the move.
     void setSlot(Slot& src)
     {
         if (hasValidSlot())
         {
             throw LogicError("Slot::setSlot: already has a valid slot");
         }
-        mSlotId = src.mSlotId;
-        readyEvent = std::move(src.readyEvent);
-        src.mSlotId.reset();
+        *this = std::move(src);
     }
 
     // Replace this slot, invalidate replacement, and return the previous slot.
@@ -117,6 +145,13 @@ public:
     [[nodiscard]] SlotCount numSlots() const noexcept
     {
         return mCapacity;
+    }
+
+    // SlotId is signed, so a bare `slot < numSlots()` admits negatives. Both ends are checked
+    // here so no caller has to remember the lower one.
+    [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
+    {
+        return slot >= SlotId{0} && slot < numSlots();
     }
 
     Slot allocate();
@@ -185,6 +220,13 @@ public:
     }
 
     virtual SlotCount numSlots() const noexcept = 0;
+
+    // SlotId is signed, so a bare `slot < numSlots()` admits negatives, which then convert to a
+    // huge size_t offset. Both ends are checked here so no caller has to remember the lower one.
+    [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
+    {
+        return slot >= SlotId{0} && slot < numSlots();
+    }
 
     size_t numBytes() const noexcept
     {
@@ -268,6 +310,11 @@ public:
 
 private:
     int mFd = kBadFileDescriptor;
+    // Tracks the file size, which only resize() changes: the file is created unlinked and owned
+    // solely by this pool, so nothing else can grow or shrink it behind us. Held here because
+    // slotAddress() bounds-checks against it on every call, and querying the file would make that
+    // an lseek per page of a migration.
+    SlotCount mNumSlots{0};
 };
 
 // ---------------------------------------------------------------------------

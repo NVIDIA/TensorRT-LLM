@@ -34,7 +34,7 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.utils.smem_allocator import SmemAllocator
 
 from .cute_ptx_utils import EVICT_FIRST, fp8x4_to_fp16x4, mma_sync, simple_tma_copy
-from .utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
+from .utils import TRTLLM_ENABLE_PDL, griddepcontrol_wait
 
 __all__ = ["IndexDecodeScoreKernel"]
 
@@ -217,36 +217,35 @@ class IndexDecodeScoreKernel:
         tma_full_mbar = smem.allocate_array(Int64, num_stages)
         tma_empty_mbar = smem.allocate_array(Int64, num_stages)
 
-        # TODO: this load precedes the griddepcontrol_wait() below, so under PDL
-        # it can observe seq_lens as the predecessor grid left it. num_blocks
-        # bounds both the block_table load and the score store, neither of which
-        # is otherwise masked, so a stale length here is an out-of-bounds write.
-        # Safe only while no PDL predecessor writes seq_lens (nothing between
-        # on_update_kv_lens and this kernel does today). Either move the load
-        # past the wait, as triton_sparse_decode.py orders its gdc_wait against
-        # the same tensor, or record the constraint here.
+        # Barrier init and descriptor prefetch do not depend on the predecessor
+        # grid, so they are the work PDL can overlap. Every CTA runs them, even
+        # the ones that own no blocks, since ownership is not known until
+        # seq_lens is read below.
+        if warp_id == 0:
+            with cute.arch.elect_one():
+                for i in cutlass.range_constexpr(num_stages):
+                    cute.arch.mbarrier_init(tma_full_mbar + i, 1)
+                    cute.arch.mbarrier_init(tma_empty_mbar + i, 128)
+                cute.arch.mbarrier_init_fence()
+        elif warp_id == 1:
+            cpasync.prefetch_descriptor(q_tma_atom)
+            cpasync.prefetch_descriptor(k_tma_atom)
+        cute.arch.sync_threads()
+
+        # No explicit launch_dependents: the only consumer is the block selector,
+        # which reduces over every block this grid writes, so triggering it early
+        # would leave it resident and spinning in its own wait. The implicit
+        # trigger as the CTAs exit still gives it the launch overlap.
+        griddepcontrol_wait()
+
+        # seq_lens must be read after the wait. It is a graph-stable buffer that
+        # on_update_kv_lens patches every step, and num_blocks bounds an unmasked
+        # block_table load and an unmasked score store, so a stale length is an
+        # out-of-bounds write rather than just a wrong answer.
         seqlen = seq_lens[batch_id]
         num_blocks = cute.ceil_div(seqlen, BLOCK_K)
 
         if split_id < num_blocks:
-            if warp_id == 0:
-                with cute.arch.elect_one():
-                    for i in cutlass.range_constexpr(num_stages):
-                        cute.arch.mbarrier_init(tma_full_mbar + i, 1)
-                        cute.arch.mbarrier_init(tma_empty_mbar + i, 128)
-                    cute.arch.mbarrier_init_fence()
-            elif warp_id == 1:
-                cpasync.prefetch_descriptor(q_tma_atom)
-                cpasync.prefetch_descriptor(k_tma_atom)
-            cute.arch.sync_threads()
-
-            griddepcontrol_wait()
-            # TODO: releasing dependents here, rather than after the epilogue
-            # stores, is safe only while no PDL-launched successor reads score.
-            # Confirm that and either move the release past the stores or record
-            # the constraint here.
-            griddepcontrol_launch_dependents()
-
             if warp_id == 4:
                 # TMA warp
                 tma_stage = 0

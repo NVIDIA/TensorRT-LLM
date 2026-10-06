@@ -318,8 +318,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python.yaml",
         "overlap_transceiver_runtime_python_bounce":
         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python_bounce.yaml",
-        "python_transceiver_host_offload":
-        f"{test_configs_root}/disagg_config_python_transceiver_host_offload.yaml",
         "tool_calls":
         f"{test_configs_root}/disagg_config_overlap.yaml",
         "perf_metrics":
@@ -418,10 +416,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "cancel_stress_test":
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
-        "cancel_stress_test_large":
-        f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
-        "llama31_8b":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b.yaml",
+        "qwen3_8b":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_qwen3_8b.yaml",
         "mamba_conc_greater_than_mbs":
         f"{test_configs_root}/disagg_config_mamba_conc_greater_than_mbs.yaml",
         "mamba_bs1_concurrency2":
@@ -811,6 +807,9 @@ def setup_disagg_cluster(
     ctx_worker_config["internal_request_auth_key"] = internal_request_auth_key
     gen_worker_config["internal_request_auth_key"] = internal_request_auth_key
 
+    cluster_start = time.perf_counter()
+    print("[startup] cluster_launch_to_ready: start", flush=True)
+
     # Launch workers
     model = model_name or config.get("model")
     if model:
@@ -839,7 +838,7 @@ def setup_disagg_cluster(
             ctx_workers.append(w)
             log_suffix = f", logging to {w.log_path}" if w.log_path else ""
             print(
-                f"Launching ctx worker {i + 1}/{num_ctx_instances} on device {device_ids}{log_suffix}"
+                f"Launching ctx worker {i + 1}/{num_ctx_instances} on device {device_ids}, pid={w.process.pid}{log_suffix}"
             )
             next_device += gpus_per_ctx
 
@@ -860,7 +859,7 @@ def setup_disagg_cluster(
             gen_workers.append(w)
             log_suffix = f", logging to {w.log_path}" if w.log_path else ""
             print(
-                f"Launching gen worker {i + 1}/{num_gen_instances} on device {device_ids}{log_suffix}"
+                f"Launching gen worker {i + 1}/{num_gen_instances} on device {device_ids}, pid={w.process.pid}{log_suffix}"
             )
             next_device += gpus_per_gen
 
@@ -994,7 +993,13 @@ def setup_disagg_cluster(
                     raise t.exception()
 
         asyncio.run(_wait_with_ticker())
+        print(
+            f"[startup] cluster_launch_to_ready: done in {time.perf_counter() - cluster_start:.3f}s",
+            flush=True)
     except Exception:
+        print(
+            f"[startup] cluster_launch_to_ready: failed after {time.perf_counter() - cluster_start:.3f}s",
+            flush=True)
         terminate(*ctx_workers, *gen_workers, disagg_server)
         if not save_log:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -1306,8 +1311,14 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
             results = [f.result(timeout=120) for f in futures]
 
         errors = [r for r in results if isinstance(r, Exception)]
-        assert len(errors) > 0, \
-            "Expected at least one error due to insufficient KV cache"
+        # The executor's fail-fast message must reach a client; any other
+        # exception (connection refused, worker crash) is a different failure.
+        fail_fast_errors = [
+            e for e in errors
+            if "Insufficient KV cache for gen-only benchmark mode" in str(e)
+        ]
+        assert fail_fast_errors, \
+            f"Expected the insufficient-KV fail-fast error, got: {errors!r}"
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -1498,169 +1509,6 @@ def test_disaggregated_overlap_transceiver_runtime_python_bounce(
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory(),
                            assert_gen_log_contains="[kv-bounce] coalesced")
-
-
-def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
-    """End-to-end check: Python transceiver + ctx-side host offload.
-
-    The fix translates logical block IDs to primary-pool slot indices in
-    `_CacheReuseAdapterV1.get_block_ids` before they reach the disagg
-    sender. Without that translation, once host offload moves blocks
-    around, the sender computes pool pointers from stale block IDs and
-    either reads garbage memory or aborts. This test stresses that path
-    end-to-end:
-
-      1. Send several distinct prompts to fill the (deliberately small)
-         ctx primary pool, committing each to the reuse radix tree.
-      2. Send more prompts, evicting earlier blocks to the host pool.
-      3. Re-issue the earlier prompts. Reuse hits force onboard from host
-         back to primary, and the disagg transfer must read primary slots
-         that no longer match the original block IDs. With the fix, this
-         succeeds; without it, the sender either crashes on a primary
-         assertion or returns nonsense tokens.
-
-    Assertions are deliberately content-agnostic (TinyLlama outputs vary
-    run-to-run): we check that responses are non-empty, the server stays
-    up across the eviction/onboard cycle, and `cached_tokens > 0` on
-    repeats so we know reuse actually fired.
-    """
-    timeout = aiohttp.ClientTimeout(total=180)
-    max_tokens = 16
-    # Workload sizing: ctx-side primary pool = max_tokens(1024) /
-    # tokens_per_block(64) = 16 blocks. Each prompt below tokenizes to
-    # ~200 tokens ≈ 4 KV blocks. We send 6 distinct prompts → ~24 blocks
-    # of primary demand > 16-block primary pool, forcing eviction of an
-    # earlier prefix to host. Replaying earlier prompts (Pass 2) then
-    # forces onboard from host back to primary, and onboard typically
-    # places the block in a *different* primary slot than its block_id.
-    # That divergence is exactly what the disagg pointer-arithmetic fix
-    # has to handle — without the fix, the sender computes
-    # `base + block_id * slot_bytes` and reads the wrong primary slot.
-    _filler = (
-        "This is filler context describing computer systems, distributed "
-        "inference, KV cache management, host memory offload policies, "
-        "block reuse via radix prefix trees, and the disaggregated serving "
-        "architecture used by modern large language model deployments. ")
-    _topics = [
-        "transformer KV cache management",
-        "the disaggregated prefill/decode split",
-        "host (CPU) memory offload trade-offs",
-        "block eviction and onboard cycles",
-        "primary versus secondary KV pools",
-        "radix prefix tree block reuse",
-    ]
-    distinct_prompts = [
-        f"Topic: {topic}. {_filler * 4} Now answer briefly:"
-        for topic in _topics
-    ]
-
-    async def send(session, prompt):
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-            "ignore_eos": True,
-        }
-        async with session.post(f"{server_url}/v1/completions",
-                                json=payload,
-                                timeout=timeout) as resp:
-            assert resp.status == 200, (
-                f"completions request failed with {resp.status}: "
-                f"{await resp.text()}")
-            return await resp.json()
-
-    def assert_sane(resp, label):
-        choices = resp.get("choices") or []
-        assert choices, f"{label}: response missing 'choices': {resp}"
-        text = choices[0].get("text") or ""
-        assert text.strip(), f"{label}: empty/whitespace text: {resp}"
-        usage = resp.get("usage") or {}
-        assert usage.get("completion_tokens") == max_tokens, (
-            f"{label}: completion_tokens != {max_tokens}; "
-            f"got {usage.get('completion_tokens')}")
-        return text
-
-    async def drive():
-        async with aiohttp.ClientSession() as session:
-            # Pass 1: prime the radix tree with each distinct prompt and
-            # capture the deterministic output (temperature=0).
-            first_texts = []
-            for idx, p in enumerate(distinct_prompts):
-                resp = await send(session, p)
-                first_texts.append(assert_sane(resp, f"pass1[{idx}]"))
-
-            # Pass 2: send all prompts CONCURRENTLY each replay. Concurrent
-            # in-flight prefills hold their KV blocks simultaneously; with
-            # primary capacity smaller than the union of in-flight prompts,
-            # this is the scenario that produces non-trivial alloc/free
-            # interleaving and onboard-to-different-slot for replayed
-            # prompts. Strict serial sends (Pass 1 above) typically alloc
-            # back to original slots and miss the bug.
-            for replay in range(5):
-                results = await asyncio.gather(
-                    *[send(session, p) for p in distinct_prompts])
-                for idx, resp in enumerate(results):
-                    text = assert_sane(resp,
-                                       f"pass2.replay{replay}.prompt{idx}")
-                    usage = resp["usage"]
-                    cached = (usage.get("prompt_tokens_details")
-                              or {}).get("cached_tokens", 0)
-                    print(f"[host_offload_e2e] replay={replay} prompt={idx} "
-                          f"prompt_tokens={usage.get('prompt_tokens')} "
-                          f"cached_tokens={cached}")
-                    # Reuse must hit — otherwise we never exercise onboard
-                    # back from host, which is the path the fix protects.
-                    assert cached > 0, (
-                        f"replay={replay} prompt={idx}: expected reuse "
-                        f"hit (cached_tokens > 0), got usage={usage}")
-                    # Primary regression check: deterministic decoding +
-                    # correct KV must reproduce Pass 1's output bit-for-bit.
-                    assert text == first_texts[idx], (
-                        f"replay={replay} prompt={idx}: output diverged "
-                        f"from Pass 1, indicating wrong KV was read after "
-                        f"offload/onboard.\n"
-                        f"  pass1: {first_texts[idx]!r}\n"
-                        f"  replay: {text!r}")
-
-    asyncio.run(drive())
-
-
-# Plain parametrize (not the `llama_model_root` indirect fixture) so the
-# test ID picks up the `[TinyLlama-1.1B-Chat-v1.0]` suffix that matches
-# the other disagg tests, without forcing LLM_MODELS_ROOT / NFS access —
-# trtllm-serve resolves the HuggingFace id directly.
-@pytest.mark.parametrize("llama_model_root", ["TinyLlama-1.1B-Chat-v1.0"])
-def test_disaggregated_python_transceiver_host_offload(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        llama_model_root):  # noqa: ARG001 — used only for the parametrize label
-    """E2E regression for block_id -> primary-slot translation in the Python disagg cache transceiver.
-
-    See `_verify_python_transceiver_under_host_offload` for what this
-    test proves. The setup pairs the Python transceiver runtime with a
-    ctx-side `host_cache_size` and a deliberately tight primary pool so
-    that prefix reuse is forced through an offload+onboard cycle before
-    each KV transfer.
-
-    Model resolution: trtllm-serve loads the HuggingFace id from the
-    config's `model:` field (TinyLlama/TinyLlama-1.1B-Chat-v1.0) via
-    huggingface_hub on first use. No LLM_MODELS_ROOT / NFS dependency.
-    """
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = get_ucx_tls()
-
-    def post_client_test(server_url: str):
-        _verify_python_transceiver_under_host_offload(
-            server_url, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "python_transceiver_host_offload",
-                           env=env,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           post_client_test=post_client_test)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -1926,11 +1774,14 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
                                      llama_model_root):
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    # Cold model initialization and JIT across eight Blackwell ranks took
+    # about 640s on B300; allow headroom for CI variability (NVBug 6771023).
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
                            env=llm_venv._new_env,
                            model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=900)
 
 
 #tiny llama pp4 will have uneven layer per pp. pp4
@@ -2359,9 +2210,6 @@ def benchmark_model_root(request):
         model_path = os.path.join(models_root, "DeepSeek-V3-Lite", "fp8")
     elif (request.param == "DeepSeek-V3-Lite-bf16"):
         model_path = os.path.join(models_root, "DeepSeek-V3-Lite", "bf16")
-    elif request.param == "llama-3.1-8b-instruct-hf-fp8":
-        model_path = os.path.join(models_root, "llama-3.1-model",
-                                  "Llama-3.1-8B-Instruct-FP8")
     else:
         raise ValueError(f"Failed to find the model: {request.param}")
     return model_path
@@ -4083,11 +3931,8 @@ def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
 
 
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b-instruct'],
-                         indirect=True)
 def test_disaggregated_logprobs_serving(disaggregated_test_root,
-                                        disaggregated_example_root, llm_venv,
-                                        llama_model_root):
+                                        disaggregated_example_root, llm_venv):
     """Test logprobs via OpenAI API in disaggregated serving with multi-GPU TP.
 
     Covers the RCCA scenario (NVBug 5926823): disaggregated + streaming + logprobs,
@@ -4149,10 +3994,11 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
         logprobs = [item.get("logprob") for item in content]
         return tokens, logprobs
 
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "llama-3.1-model/Llama-3.1-8B-Instruct")
+    model_path = "Qwen3/Qwen3-8B"
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
 
-    config_file = get_test_config("llama31_8b", disaggregated_example_root,
+    config_file = get_test_config("qwen3_8b", disaggregated_example_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
@@ -4160,13 +4006,13 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,
-                             model_name=llama_model_root,
+                             model_name=model_dir,
                              cwd=llm_venv.get_working_directory(),
                              server_start_timeout=600)
 
     server_host = config.get("hostname", "localhost")
     server_url = f"http://{server_host}:{server_port}"
-    model_name = "llama-3.1-model/Llama-3.1-8B-Instruct"
+    model_name = model_path
     max_tokens = 20
     timeout = aiohttp.ClientTimeout(total=120)
     # Use emoji prompt to also stress-test multi-byte tokenizer handling
@@ -4279,29 +4125,6 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
         terminate(*ctx_workers, *gen_workers, disagg_server)
         if work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
-
-
-@pytest.mark.skip_less_device(8)
-@skip_pre_blackwell
-@pytest.mark.parametrize("model_path", ['DeepSeek-V3-0324-FP4'])
-def test_disaggregated_cancel_large_context_requests_long(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        model_path):
-    """Test that disaggregated server handles request cancellations gracefully.
-
-    This test sends bursts of requests with large contexts and cancels them
-    during prefill to stress test resource cleanup.
-    """
-    model_dir = f"{llm_models_root()}/{model_path}"
-    setup_model_symlink(llm_venv, model_dir, model_path)
-
-    run_disaggregated_cancel_test(disaggregated_example_root,
-                                  "cancel_stress_test_large",
-                                  env=llm_venv._new_env,
-                                  num_bursts=1000,
-                                  requests_per_burst=32,
-                                  model_path=model_dir,
-                                  cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(8)

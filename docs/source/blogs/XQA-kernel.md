@@ -25,7 +25,7 @@ Looking at the Throughput-Latency curves below, we see that the enabling of XQA 
 |          |   8 |          128 |          2048 |             13,232 |            25,300 | 1.9x
 
 
-###### Closing
+### Closing
 
 These improvements will be published in the `main` branch soon, and will be
 included in the v0.8 releases.

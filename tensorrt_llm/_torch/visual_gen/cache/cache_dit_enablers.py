@@ -437,6 +437,7 @@ CUSTOM_CACHE_DIT_ENABLERS = {
     "Flux2Pipeline": lambda p, c: enable_cache_dit_for_flux(p, c, is_flux2=True),
     "LTX2Pipeline": enable_cache_dit_for_ltx2,
     "QwenImagePipeline": enable_cache_dit_for_qwen_image,
+    "QwenImageLayeredPipeline": enable_cache_dit_for_qwen_image,
 }
 
 

@@ -280,52 +280,28 @@ struct Fragment_base_
     using Input_type_ = Data_type_;
 
     // Does it store the array of elements.
-    enum
-    {
-        HAS_ELTS = BITS_PER_ELT_ >= 8
-    };
+    static constexpr int HAS_ELTS = BITS_PER_ELT_ >= 8;
 
     // The number of elements.
-    enum
-    {
-        NUM_ELTS = NUM_ELTS_
-    };
+    static constexpr int NUM_ELTS = NUM_ELTS_;
 
     // The size of element in bits.
-    enum
-    {
-        BITS_PER_ELT = BITS_PER_ELT_
-    };
+    static constexpr int BITS_PER_ELT = BITS_PER_ELT_;
 
     // The size of byte of a single register.
-    enum
-    {
-        BYTES_PER_REG = 4
-    };
+    static constexpr int BYTES_PER_REG = 4;
 
     // The size in bits.
-    enum
-    {
-        BITS_PER_REG = BYTES_PER_REG * 8
-    };
+    static constexpr int BITS_PER_REG = BYTES_PER_REG * 8;
 
     // The number of registers needed to store the fragment.
-    enum
-    {
-        NUM_REGS = Div_up<NUM_ELTS * BITS_PER_ELT, BITS_PER_REG>::VALUE
-    };
+    static constexpr int NUM_REGS = Div_up<NUM_ELTS * BITS_PER_ELT, BITS_PER_REG>::VALUE;
 
     // The size in bytes (as returned by sizeof(Fragment_base<>).
-    enum
-    {
-        SIZE_IN_BYTES = NUM_REGS * BYTES_PER_REG
-    };
+    static constexpr int SIZE_IN_BYTES = NUM_REGS * BYTES_PER_REG;
 
     // The alignment.
-    enum
-    {
-        ALIGNMENT = ALIGNMENT_ > 0 ? ALIGNMENT_ : Min<NUM_REGS * BYTES_PER_REG, 16>::VALUE
-    };
+    static constexpr int ALIGNMENT = ALIGNMENT_ > 0 ? ALIGNMENT_ : Min<NUM_REGS * BYTES_PER_REG, 16>::VALUE;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -345,10 +321,7 @@ struct alignas(static_cast<int>(Base_::ALIGNMENT)) Fragment_base : public Base_
 {
 
     // The size of a load/store.
-    enum
-    {
-        BYTES_PER_LOAD_STORE = Base_::NUM_REGS * sizeof(uint32_t)
-    };
+    static constexpr int BYTES_PER_LOAD_STORE = Base_::NUM_REGS * sizeof(uint32_t);
 
     // Clear the fragment. Using PTX in that code seems to produce better SASS...
     inline __device__ void clear()
@@ -1212,49 +1185,25 @@ struct Tile_o_normalizer
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of MMAs in M/N dimensions.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::VALID_MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::VALID_MMAS_N;
 
     // The number of rows per thread.
-    enum
-    {
-        ROWS_PER_THREAD = 2 * MMAS_M
-    };
+    static constexpr int ROWS_PER_THREAD = 2 * MMAS_M;
 
     // The number of registers per thread
-    enum
-    {
-        REGS_PER_THREAD = 4
-    };
+    static constexpr int REGS_PER_THREAD = 4;
 
     // Warps.
-    enum
-    {
-        WARPS_M = Cta_tile::WARPS_M
-    };
+    static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-    enum
-    {
-        WARPS_N = Cta_tile::WARPS_N
-    };
+    static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-    enum
-    {
-        WARPS_K = Cta_tile::WARPS_K
-    };
+    static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
     // softmax data bytes
-    enum
-    {
-        BYTES_PER_ELEMENT = sizeof(float)
-    };
+    static constexpr int BYTES_PER_ELEMENT = sizeof(float);
 
     // Initialize the attention sinks.
     template <typename Params, typename Block_info>
@@ -1443,50 +1392,26 @@ struct Tile_o_normalizer_fp32
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of MMAs in the M dimension.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
     // The number of MMAs in the N dimension.
-    enum
-    {
-        MMAS_N = Mma_tile::VALID_MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::VALID_MMAS_N;
 
     // The number of rows per thread.
-    enum
-    {
-        ROWS_PER_THREAD = 2 * MMAS_M
-    };
+    static constexpr int ROWS_PER_THREAD = 2 * MMAS_M;
 
     // The number of registers per thread.
-    enum
-    {
-        REGS_PER_THREAD = 8
-    };
+    static constexpr int REGS_PER_THREAD = 8;
 
     // Warps.
-    enum
-    {
-        WARPS_M = Cta_tile::WARPS_M
-    };
+    static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-    enum
-    {
-        WARPS_N = Cta_tile::WARPS_N
-    };
+    static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-    enum
-    {
-        WARPS_K = Cta_tile::WARPS_K
-    };
+    static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
     // softmax data bytes
-    enum
-    {
-        BYTES_PER_ELEMENT = sizeof(float)
-    };
+    static constexpr int BYTES_PER_ELEMENT = sizeof(float);
 
     // Initialize the attention sinks.
     template <typename Params, typename Block_info>
@@ -1636,27 +1561,15 @@ struct Tile_o_normalizer<Volta_hmma_fp16_16x16x16_traits, Cta_tile>
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of MMAs in M/N dimensions.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::VALID_MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::VALID_MMAS_N;
 
     // The number of rows per thread.
-    enum
-    {
-        ROWS_PER_THREAD = MMAS_M
-    };
+    static constexpr int ROWS_PER_THREAD = MMAS_M;
 
     // The number of registers per thread
-    enum
-    {
-        REGS_PER_THREAD = 8
-    };
+    static constexpr int REGS_PER_THREAD = 8;
 
     // Update o.
     inline __device__ void update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float (&curr_max)[ROWS_PER_THREAD],
@@ -1838,22 +1751,13 @@ struct Tile_o_normalizer<Ada_qmma_e4m3_fp32_traits, Cta_tile, true>
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of MMAs in the M dimension.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
     // The number of MMAs in the N dimension.
-    enum
-    {
-        MMAS_N = Mma_tile::VALID_MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::VALID_MMAS_N;
 
     // The number of registers per thread.
-    enum
-    {
-        REGS_PER_THREAD = 8
-    };
+    static constexpr int REGS_PER_THREAD = 8;
 
     // The ctor.
     template <typename Params, typename Block_info>
@@ -1926,49 +1830,25 @@ struct Softmax_saver
 {
 
     // The number of MMAs in M/N dimensions.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::VALID_MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::VALID_MMAS_N;
 
     // The number of rows per thread.
-    enum
-    {
-        ROWS_PER_THREAD = 2 * MMAS_M
-    };
+    static constexpr int ROWS_PER_THREAD = 2 * MMAS_M;
 
     // The number of registers per thread
-    enum
-    {
-        REGS_PER_THREAD = 4
-    };
+    static constexpr int REGS_PER_THREAD = 4;
 
     // Warps.
-    enum
-    {
-        WARPS_M = Cta_tile::WARPS_M
-    };
+    static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-    enum
-    {
-        WARPS_N = Cta_tile::WARPS_N
-    };
+    static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-    enum
-    {
-        WARPS_K = Cta_tile::WARPS_K
-    };
+    static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
     // softmax data bytes
-    enum
-    {
-        BYTES_PER_ELEMENT = sizeof(float)
-    };
+    static constexpr int BYTES_PER_ELEMENT = sizeof(float);
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -2051,49 +1931,25 @@ struct Fragment_updater
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of MMAs in M/N dimensions.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::VALID_MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::VALID_MMAS_N;
 
     // The number of rows per thread.
-    enum
-    {
-        ROWS_PER_THREAD = 2 * MMAS_M
-    };
+    static constexpr int ROWS_PER_THREAD = 2 * MMAS_M;
 
     // The number of registers per thread
-    enum
-    {
-        REGS_PER_THREAD = 4
-    };
+    static constexpr int REGS_PER_THREAD = 4;
 
     // Warps.
-    enum
-    {
-        WARPS_M = Cta_tile::WARPS_M
-    };
+    static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-    enum
-    {
-        WARPS_N = Cta_tile::WARPS_N
-    };
+    static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-    enum
-    {
-        WARPS_K = Cta_tile::WARPS_K
-    };
+    static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
     // softmax data bytes
-    enum
-    {
-        BYTES_PER_ELEMENT = sizeof(float)
-    };
+    static constexpr int BYTES_PER_ELEMENT = sizeof(float);
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -2291,50 +2147,26 @@ struct Fragment_updater_ampere_fp32
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of MMAs in the M dimension.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
     // The number of MMAs in the N dimension.
-    enum
-    {
-        MMAS_N = Mma_tile::VALID_MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::VALID_MMAS_N;
 
     // The number of rows per thread.
-    enum
-    {
-        ROWS_PER_THREAD = 2 * MMAS_M
-    };
+    static constexpr int ROWS_PER_THREAD = 2 * MMAS_M;
 
     // The number of registers per thread.
-    enum
-    {
-        REGS_PER_THREAD = 8
-    };
+    static constexpr int REGS_PER_THREAD = 8;
 
     // Warps.
-    enum
-    {
-        WARPS_M = Cta_tile::WARPS_M
-    };
+    static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-    enum
-    {
-        WARPS_N = Cta_tile::WARPS_N
-    };
+    static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-    enum
-    {
-        WARPS_K = Cta_tile::WARPS_K
-    };
+    static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
     // softmax data bytes
-    enum
-    {
-        BYTES_PER_ELEMENT = sizeof(float)
-    };
+    static constexpr int BYTES_PER_ELEMENT = sizeof(float);
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -2615,27 +2447,15 @@ struct Fragment_updater<Volta_hmma_fp16_16x16x16_traits, Cta_tile>
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of MMAs in M/N dimensions.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::VALID_MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::VALID_MMAS_N;
 
     // The number of rows per thread.
-    enum
-    {
-        ROWS_PER_THREAD = MMAS_M
-    };
+    static constexpr int ROWS_PER_THREAD = MMAS_M;
 
     // The number of registers per thread
-    enum
-    {
-        REGS_PER_THREAD = 8
-    };
+    static constexpr int REGS_PER_THREAD = 8;
 
     // init all statistics
     inline __device__ Fragment_updater()

@@ -112,6 +112,103 @@ EXAONE_4_5_TEST_CONFIG = {
 _EXAONE_4_5_ASSET_PATH = EXAONE_4_5_TEST_CONFIG.get("_name_or_path")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_exaone4_construction_and_forward() -> None:
+    """Check EXAONE 4 construction, BF16 weights, and forward behavior."""
+    from transformers import Exaone4Config
+
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_exaone4 import Exaone4ForCausalLM
+    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+
+    config = Exaone4Config(
+        architectures=["Exaone4ForCausalLM"],
+        vocab_size=128,
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        sliding_window=4,
+        sliding_window_pattern="LG",
+        layer_types=["sliding_attention", "full_attention"],
+        attention_dropout=0.0,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=None,
+        tie_word_embeddings=False,
+    )
+    model_class = MODEL_CLASS_MAPPING["Exaone4ForCausalLM"]
+    assert model_class is Exaone4ForCausalLM
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(42)
+        with torch.device("cuda"):
+            model = model_class(
+                ModelConfig(
+                    pretrained_config=config,
+                    attn_backend="TRTLLM",
+                    max_num_tokens=4,
+                    max_seq_len=32,
+                )
+            ).eval()
+        for parameter in model.parameters():
+            if parameter.ndim == 1:
+                parameter.fill_(1.0)
+            else:
+                parameter.normal_(mean=0.0, std=0.02)
+
+    assert isinstance(model, Exaone4ForCausalLM)
+    assert model.config.torch_dtype == torch.bfloat16
+    assert model.model.embed_tokens.weight.dtype == torch.bfloat16
+    assert model.lm_head.weight.dtype == torch.bfloat16
+    assert len(model.model.layers) == 2
+    assert [layer.self_attn.is_sliding for layer in model.model.layers] == [True, False]
+
+    input_ids = torch.tensor([1, 5, 7, 9], dtype=torch.int32, device="cuda")
+    position_ids = torch.arange(4, dtype=torch.int32, device="cuda")
+    metadata = TrtllmAttentionMetadata(
+        max_num_requests=1,
+        max_num_tokens=4,
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        num_contexts=1,
+        request_ids=[0],
+    )
+    metadata.max_seq_len = 32
+    metadata.prepare()
+    embeddings = model.model.embed_tokens(input_ids)
+    logits = model(
+        attn_metadata=metadata,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+    embedded_logits = model(
+        attn_metadata=metadata,
+        inputs_embeds=embeddings,
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+    changed_ids = torch.tensor([3, 6, 8, 9], dtype=torch.int32, device="cuda")
+    changed_logits = model(
+        attn_metadata=metadata,
+        input_ids=changed_ids,
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+
+    for output in (logits, embedded_logits, changed_logits):
+        assert isinstance(output, torch.Tensor)
+        assert output.shape == (4, config.vocab_size)
+        assert torch.isfinite(output).all()
+    torch.testing.assert_close(logits, embedded_logits, rtol=1e-2, atol=1e-2)
+    assert not torch.allclose(logits[-1].float(), changed_logits[-1].float(), rtol=1e-2, atol=1e-2)
+    bypass_logits = model.lm_head(model.model.norm(embeddings))
+    assert not torch.allclose(logits[-1].float(), bypass_logits[-1].float(), rtol=1e-2, atol=1e-2)
+
+
 def test_exaone4_5_config_normalizes_trailing_mtp_layer_types():
     config = copy.deepcopy(EXAONE_4_5_TEST_CONFIG)
     text_config = config["text_config"]

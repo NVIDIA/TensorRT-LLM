@@ -13,6 +13,9 @@ import torch
 from tensorrt_llm._torch.pyexecutor import model_engine as model_engine_module
 from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _StandInMambaCacheManager:
@@ -67,6 +70,9 @@ def _engine(
         tp_size=tp_size,
     )
     engine._reset_moe_alltoall_state = mock.Mock()
+    engine.is_spec_decode = False
+    engine.spec_config = None
+    engine.max_draft_len = 0
     return engine
 
 
@@ -85,13 +91,18 @@ def _no_cuda_side_effects() -> Iterator[tuple[mock.Mock, mock.Mock]]:
 
 
 @contextlib.contextmanager
-def _guard_env(*, global_size: int) -> Iterator[tuple[mock.Mock, mock.Mock]]:
+def _guard_env(
+    *, global_size: int, symmetric_crash: bool = False
+) -> Iterator[tuple[mock.Mock, mock.Mock]]:
     with (
         mock.patch.object(py_executor_module, "start_rank_crash_kill_watchdog") as watchdog,
         mock.patch.object(py_executor_module, "propagate_hard_kill") as hard_kill,
         mock.patch.object(py_executor_module, "global_mpi_size", return_value=global_size),
+        mock.patch.object(
+            py_executor_module, "all_ranks_crashed", return_value=symmetric_crash
+        ) as probe,
     ):
-        yield watchdog, hard_kill
+        yield watchdog, hard_kill, probe
 
 
 def _run_guard(*, world_size: int, dwdp_size: int, error: BaseException) -> None:
@@ -116,7 +127,7 @@ def test_guard_topology_policy(
     expected_peer_count: int | None,
 ) -> None:
     error = ValueError("warmup failed")
-    with _guard_env(global_size=global_size) as (watchdog, hard_kill):
+    with _guard_env(global_size=global_size) as (watchdog, hard_kill, _probe):
         with pytest.raises(ValueError) as excinfo:
             _run_guard(world_size=world_size, dwdp_size=dwdp_size, error=error)
 
@@ -133,12 +144,95 @@ def test_guard_topology_policy(
 
 @pytest.mark.parametrize("signal", [KeyboardInterrupt, SystemExit])
 def test_guard_leaves_teardown_signals_unarmed(signal: type) -> None:
-    with _guard_env(global_size=4) as (watchdog, hard_kill):
+    with _guard_env(global_size=4) as (watchdog, hard_kill, _probe):
         with pytest.raises(signal):
             _run_guard(world_size=4, dwdp_size=0, error=signal())
 
     watchdog.assert_not_called()
     hard_kill.assert_not_called()
+
+
+def test_guard_skips_the_kill_on_a_symmetric_crash() -> None:
+    """Every rank crashed the same way: nobody is stranded, so no kill."""
+    error = ValueError("warmup failed on every rank")
+    with _guard_env(global_size=4, symmetric_crash=True) as (
+        watchdog,
+        hard_kill,
+        probe,
+    ):
+        with pytest.raises(ValueError):
+            _run_guard(world_size=4, dwdp_size=0, error=error)
+
+    probe.assert_called_once_with(4)
+    watchdog.assert_not_called()
+    hard_kill.assert_not_called()
+
+
+def test_guard_arms_the_kill_when_the_crash_is_not_proven_symmetric() -> None:
+    """A False probe (stranded peer, MPI unavailable, timeout) keeps the kill."""
+    with _guard_env(global_size=4, symmetric_crash=False) as (
+        watchdog,
+        _hard_kill,
+        probe,
+    ):
+        with pytest.raises(ValueError):
+            _run_guard(world_size=4, dwdp_size=0, error=ValueError("boom"))
+
+    probe.assert_called_once_with(4)
+    watchdog.assert_called_once_with(4, error_delivered=None)
+
+
+class TestAllRanksCrashedProbe:
+    """Local policy of the probe; the Ibarrier itself needs a real world."""
+
+    def test_single_rank_is_never_symmetric(self) -> None:
+        from tensorrt_llm._torch.pyexecutor import hang_detector
+
+        assert hang_detector.all_ranks_crashed(1) is False
+
+    def test_mpi_disabled_falls_back_to_the_kill(self) -> None:
+        from tensorrt_llm._torch.pyexecutor import hang_detector
+
+        with mock.patch.object(hang_detector, "mpi_disabled", return_value=True):
+            assert hang_detector.all_ranks_crashed(4) is False
+
+    def test_probe_errors_fall_back_to_the_kill(self) -> None:
+        from mpi4py import MPI
+
+        from tensorrt_llm._torch.pyexecutor import hang_detector
+
+        with (
+            mock.patch.object(hang_detector, "mpi_disabled", return_value=False),
+            mock.patch.object(MPI, "Is_initialized", return_value=True),
+            mock.patch.object(MPI, "Query_thread", return_value=MPI.THREAD_MULTIPLE),
+            mock.patch.object(hang_detector, "ENABLE_MULTI_DEVICE", True),
+            mock.patch.object(
+                hang_detector, "mpi_comm", side_effect=RuntimeError("no comm")
+            ) as mpi_comm,
+        ):
+            assert hang_detector.all_ranks_crashed(4) is False
+            mpi_comm.assert_called_once_with()
+
+    def test_disabled_hard_kill_skips_the_barrier(self) -> None:
+        # With the kill disabled (grace is None) no kill follows a False
+        # verdict, so posting Ibarrier would leak it into a surviving world.
+        # The probe must return False without posting the barrier.
+        from mpi4py import MPI
+
+        from tensorrt_llm._torch.pyexecutor import hang_detector
+
+        comm = mock.Mock()
+        comm.Get_size.return_value = 4
+        with (
+            mock.patch.object(hang_detector, "mpi_disabled", return_value=False),
+            mock.patch.object(MPI, "Is_initialized", return_value=True),
+            mock.patch.object(MPI, "Query_thread", return_value=MPI.THREAD_MULTIPLE),
+            mock.patch.object(hang_detector, "ENABLE_MULTI_DEVICE", True),
+            mock.patch.object(hang_detector, "mpi_comm", return_value=comm),
+            mock.patch.object(hang_detector, "_rank_crash_kill_grace", return_value=None),
+        ):
+            assert hang_detector.all_ranks_crashed(4) is False
+            comm.Ibarrier.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -295,6 +389,7 @@ def test_tp_agreement_lets_a_symmetric_world_run() -> None:
 
 def _general_warmup_engine(*, world_size: int, dwdp_size: int) -> PyTorchModelEngine:
     engine = _engine(world_size=world_size, dwdp_size=dwdp_size)
+    engine._warmup_timer = _WarmupTimer(rank=engine.dist.rank)
     batch = object()
     engine._create_warmup_request = mock.Mock(return_value=batch)
     engine._release_batch_context = lambda *_a, **_kw: _released_batch(batch)
@@ -308,7 +403,7 @@ def _general_warmup_engine(*, world_size: int, dwdp_size: int) -> PyTorchModelEn
 def test_general_warmup_oom_policy(world_size: int, dwdp_size: int, is_fatal: bool) -> None:
     engine = _general_warmup_engine(world_size=world_size, dwdp_size=dwdp_size)
     error = torch.OutOfMemoryError("asymmetric OOM")
-    engine.forward = mock.Mock(side_effect=error if is_fatal else [error, None])
+    engine._forward_warmup = mock.Mock(side_effect=error if is_fatal else [error, None])
 
     with _no_cuda_side_effects() as (empty_cache, _synchronize):
         if is_fatal:
@@ -321,9 +416,9 @@ def test_general_warmup_oom_policy(world_size: int, dwdp_size: int, is_fatal: bo
     if is_fatal:
         # The remaining shape is never attempted: this rank's peers are
         # already stuck in the failed forward's collectives.
-        engine.forward.assert_called_once()
+        engine._forward_warmup.assert_called_once()
     else:
-        assert engine.forward.call_count == 2
+        assert engine._forward_warmup.call_count == 2
         # A retry after an OOM between dispatch() and combine() has to start
         # from a clean MoE all-to-all state.
         engine._reset_moe_alltoall_state.assert_called_once_with()
@@ -340,9 +435,12 @@ def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[PyTorchMo
     engine.batch_size = 4
     engine.max_seq_len = 8
     engine.original_max_draft_len = 0
-    engine.is_draft_model = False
     engine.llm_args = SimpleNamespace(enable_autotuner=False)
     engine.no_cuda_graph = contextlib.nullcontext
+    # The warmup resolves its chunk-alignment variant off the model's Mamba
+    # metadata class; a model declaring none takes the ``Mamba2Metadata``
+    # default, i.e. no alignment rewrite.
+    engine.model = SimpleNamespace()
     batch = object()
     engine._release_batch_context = lambda *_a, **_kw: _released_batch(batch)
 
@@ -379,7 +477,7 @@ def _run_mamba_warmup(engine: PyTorchModelEngine, resource_manager: object) -> N
 def test_mamba_preforward_error_policy_when_alone(error: Exception, recoverable: bool) -> None:
     engine, resource_manager = _mamba_engine()
     engine._create_warmup_request = mock.Mock(side_effect=error)
-    engine.forward = mock.Mock()
+    engine._forward_warmup = mock.Mock()
 
     with _no_cuda_side_effects():
         if recoverable:
@@ -388,7 +486,7 @@ def test_mamba_preforward_error_policy_when_alone(error: Exception, recoverable:
             with pytest.raises(RuntimeError, match="unexpected"):
                 _run_mamba_warmup(engine, resource_manager)
 
-    engine.forward.assert_not_called()
+    engine._forward_warmup.assert_not_called()
     # The failure predates dispatch(), so there is no half-finished MoE
     # all-to-all exchange to unwind.
     engine._reset_moe_alltoall_state.assert_not_called()
@@ -397,15 +495,15 @@ def test_mamba_preforward_error_policy_when_alone(error: Exception, recoverable:
 def test_mamba_midforward_runtime_error_recovers_when_alone() -> None:
     engine, resource_manager = _mamba_engine()
     engine._create_warmup_request = mock.Mock(return_value=object())
-    engine.forward = mock.Mock(side_effect=RuntimeError("mid-forward failure"))
+    engine._forward_warmup = mock.Mock(side_effect=RuntimeError("mid-forward failure"))
 
     with _no_cuda_side_effects():
         _run_mamba_warmup(engine, resource_manager)
 
     # Every shape is attempted, and each failed forward has to leave the MoE
     # all-to-all state clean for the shape that follows it.
-    assert engine.forward.call_count >= 1
-    assert engine._reset_moe_alltoall_state.call_count == engine.forward.call_count
+    assert engine._forward_warmup.call_count >= 1
+    assert engine._reset_moe_alltoall_state.call_count == engine._forward_warmup.call_count
 
 
 @pytest.mark.parametrize("phase", ["pre-forward", "mid-forward"])
@@ -414,10 +512,10 @@ def test_mamba_error_is_fatal_when_distributed(phase: str) -> None:
     error = RuntimeError(_KV_ALLOC_ERROR)
     if phase == "pre-forward":
         engine._create_warmup_request = mock.Mock(side_effect=error)
-        engine.forward = mock.Mock()
+        engine._forward_warmup = mock.Mock()
     else:
         engine._create_warmup_request = mock.Mock(return_value=object())
-        engine.forward = mock.Mock(side_effect=error)
+        engine._forward_warmup = mock.Mock(side_effect=error)
 
     with _no_cuda_side_effects():
         with pytest.raises(RuntimeError) as excinfo:
@@ -427,35 +525,3 @@ def test_mamba_error_is_fatal_when_distributed(phase: str) -> None:
     # The remaining shape is never attempted: recovering locally would leave
     # peers waiting in a forward this rank has abandoned.
     engine._create_warmup_request.assert_called_once()
-
-
-def _encoder_engine(*, world_size: int) -> PyTorchModelEngine:
-    engine = _engine(world_size=world_size)
-    engine.no_encoder_cuda_graph = contextlib.nullcontext
-    engine._create_encoder_warmup_inputs = mock.Mock(return_value={"input_ids": [0]})
-    return engine
-
-
-def test_encoder_oom_recovers_when_alone() -> None:
-    engine = _encoder_engine(world_size=1)
-    engine.encoder_forward = mock.Mock(side_effect=[torch.OutOfMemoryError("OOM"), None])
-
-    with _no_cuda_side_effects() as (empty_cache, _synchronize):
-        engine._general_warmup_encoder([(2, 16, 8), (1, 8, 8)])
-
-    assert engine.encoder_forward.call_count == 2
-    empty_cache.assert_called_once_with()
-
-
-def test_encoder_oom_is_fatal_when_distributed() -> None:
-    engine = _encoder_engine(world_size=2)
-    error = torch.OutOfMemoryError("OOM")
-    engine.encoder_forward = mock.Mock(side_effect=error)
-
-    with _no_cuda_side_effects():
-        with pytest.raises(torch.OutOfMemoryError) as excinfo:
-            engine._general_warmup_encoder([(2, 16, 8), (1, 8, 8)])
-
-    assert excinfo.value is error
-    # The second shape is never attempted; peers are stuck in the first.
-    engine.encoder_forward.assert_called_once()

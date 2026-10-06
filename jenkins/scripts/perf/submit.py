@@ -22,12 +22,18 @@ jenkins/scripts/perf/disaggregated/submit.py.
 Three test shapes are supported (all flow through the same parsing logic):
   1. Multi-node aggregated:        aggr[_upload]-{config_base}-{server_name}
         runtime_mode = "aggregated", benchmark_mode = None
-  2. Multi-node ctx_only disagg:   aggr[_upload]-ctx_only-{config_base}
-        runtime_mode = "aggregated", benchmark_mode = "ctx_only"
-        (reads disagg yaml, but launches via the aggregated single-pytest path
-         using the ctx worker's parallel sizes)
-  3. Multi-node disagg e2e/gen:    disagg[_upload]-{e2e|gen_only}-{config_base}
-        runtime_mode = "disaggregated", benchmark_mode in {"e2e", "gen_only"}
+  2. Disagg yaml on the agg path:  aggr[_upload]-{ctx_only|gen_only_no_context}
+                                     [-{modifier}]-{config_base}
+        runtime_mode = "aggregated", benchmark_mode in AGGREGATED_DISAGG_YAML_MODES
+        (both read a disagg yaml but launch via the aggregated single-pytest path)
+  3. Multi-node disagg e2e/gen:    disagg[_upload]-{e2e|gen_only}[-{modifier}]-{config_base}
+        runtime_mode = "disaggregated", benchmark_mode in DISAGG_BENCHMARK_MODES
+        (four roles, one pytest each, rendezvousing through the hostnames dir)
+
+The optional {modifier} segment is an instrumentation flag that is orthogonal to
+the benchmark mode; the only one today is "time_breakdown", which launches
+exactly like its bare mode and differs only in what the harness asks the servers
+and the client to record.
 
 Test name → yaml folder mapping mirrors test_perf_sanity.py:parse_test_string.
 """
@@ -40,9 +46,18 @@ import os
 import re
 import shlex
 import sys
+from typing import List, Optional, Tuple
 
 import yaml
-from benchmark_utils import parse_positive_concurrency
+from benchmark_utils import (
+    AGGREGATED_DISAGG_YAML_MODES,
+    DISAGG_BENCHMARK_MODES,
+    GEN_ONLY_NO_CONTEXT_MODE,
+    gen_only_no_context_server_counts,
+    gen_only_no_context_world_size,
+    is_gen_only_no_context,
+    parse_positive_concurrency,
+)
 from cluster_env import get_ucx_tls_cmd, gpu_type_from_stage_name
 
 
@@ -61,6 +76,20 @@ def _import_precheck_config(llm_src):
 
 AGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/aggregated"
 DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
+
+# Optional instrumentation segments that may follow the benchmark mode in a test
+# id. Keep in sync with test_perf_sanity.py:TEST_ID_MODIFIERS -- the grammar is
+# only decidable because no config file stem starts with one of these.
+TIME_BREAKDOWN_MODIFIER = "time_breakdown"
+TEST_ID_MODIFIERS = (TIME_BREAKDOWN_MODIFIER,)
+
+# Benchmark modes test_perf_sanity.py actually mints a time_breakdown test id
+# for. gen_only is deliberately absent: its regression metric is the gen-worker
+# device step time, so the lifecycle spans add nothing there, and the collector
+# generates no such id. Keep in sync with the two *_TIME_BREAKDOWN_CONFIGS loops
+# in test_perf_sanity.py:get_disagg_test_cases and with the identical constant in
+# jenkins/scripts/perf/local/submit.py.
+TIME_BREAKDOWN_BENCHMARK_MODES = ("e2e", "ctx_only")
 
 
 # --------------------------------------------------------------------------- #
@@ -316,11 +345,41 @@ def select_test_case_line(test_list_path, llm_src, script_prefix_lines, split_gr
     return selected[0]
 
 
-def parse_test_case_name(llm_src, selected_line):
+def _split_modifiers(
+    rest: List[str], bracket_content: str, benchmark_mode: str
+) -> Tuple[bool, str]:
+    """Peel the optional modifier segment off the front of the config stem.
+
+    Mirrors test_perf_sanity.py:parse_test_string.split_modifiers.
+    Returns (time_breakdown, config_base_name).
+    """
+    time_breakdown = bool(rest) and rest[0] == TIME_BREAKDOWN_MODIFIER
+    if time_breakdown:
+        rest = rest[1:]
+    if not rest:
+        raise ValueError(f"Test name has a modifier but no config: {bracket_content}")
+    # Reject here rather than let the id through: it is well-formed and parses
+    # fine, but test_perf_sanity.py never generates it, so pytest would exit "no
+    # tests ran" after the whole job has been queued, built and allocated -- and
+    # every gate reports green on an empty selection.
+    if time_breakdown and benchmark_mode not in TIME_BREAKDOWN_BENCHMARK_MODES:
+        raise ValueError(
+            f"The {TIME_BREAKDOWN_MODIFIER} modifier is not generated for "
+            f"benchmark_mode {benchmark_mode!r}; supported modes are "
+            f"{', '.join(TIME_BREAKDOWN_BENCHMARK_MODES)}: {bracket_content}"
+        )
+    return time_breakdown, "-".join(rest)
+
+
+def parse_test_case_name(
+    llm_src: str, selected_line: str
+) -> Tuple[str, Optional[str], Optional[str], str, bool]:
     """Parse the selected test-list line.
 
-    Returns (config_yaml_path, server_name, benchmark_mode, runtime_mode).
-    See the module docstring for the supported test name shapes.
+    Returns (config_yaml_path, server_name, benchmark_mode, runtime_mode,
+    time_breakdown). server_name is None for every disagg shape and for ctx_only;
+    benchmark_mode is None for a normal aggregated case. See the module docstring
+    for the supported test name shapes.
     """
     line = selected_line
 
@@ -332,29 +391,37 @@ def parse_test_case_name(llm_src, selected_line):
     if len(parts) < 2:
         raise ValueError(f"Invalid test name (need at least prefix and config): {bracket_content}")
 
+    time_breakdown = False
     prefix = parts[0]
     if "disagg" in prefix:
         if len(parts) < 3:
             raise ValueError(
-                f"Invalid disagg test format. Expected disagg[_upload]-{{e2e|gen_only}}-"
-                f"{{config_base}}, got: {bracket_content}"
+                f"Invalid disagg test format. Expected disagg[_upload]-"
+                f"{{{'|'.join(DISAGG_BENCHMARK_MODES)}}}[-{{modifier}}]-{{config_base}}, "
+                f"got: {bracket_content}"
             )
         benchmark_mode = parts[1]
-        if benchmark_mode not in ("e2e", "gen_only"):
+        if benchmark_mode not in DISAGG_BENCHMARK_MODES:
             raise ValueError(
-                f"Invalid disagg benchmark_mode: {benchmark_mode}. Expected 'e2e' or 'gen_only'."
+                f"Invalid disagg benchmark_mode: {benchmark_mode}. Expected one of "
+                f"{', '.join(repr(mode) for mode in DISAGG_BENCHMARK_MODES)}."
             )
         runtime_mode = "disaggregated"
         server_name = None
-        config_base_name = "-".join(parts[2:])
+        time_breakdown, config_base_name = _split_modifiers(
+            parts[2:], bracket_content, benchmark_mode
+        )
         config_yaml_path = os.path.join(llm_src, DISAGG_CONFIG_FOLDER, f"{config_base_name}.yaml")
     elif "aggr" in prefix:
-        if len(parts) > 2 and parts[1] == "ctx_only":
-            # ctx_only: aggr[_upload]-ctx_only-{config_base}; reads disagg yaml.
-            benchmark_mode = "ctx_only"
+        if len(parts) > 2 and parts[1] in AGGREGATED_DISAGG_YAML_MODES:
+            # ctx_only / gen_only_no_context:
+            # aggr[_upload]-{mode}[-{modifier}]-{config_base}; reads disagg yaml.
+            benchmark_mode = parts[1]
             runtime_mode = "aggregated"
             server_name = None
-            config_base_name = "-".join(parts[2:])
+            time_breakdown, config_base_name = _split_modifiers(
+                parts[2:], bracket_content, benchmark_mode
+            )
             config_yaml_path = os.path.join(
                 llm_src, DISAGG_CONFIG_FOLDER, f"{config_base_name}.yaml"
             )
@@ -381,7 +448,7 @@ def parse_test_case_name(llm_src, selected_line):
     if not os.path.exists(config_yaml_path):
         raise FileNotFoundError(f"Config file not found: {config_yaml_path}")
 
-    return config_yaml_path, server_name, benchmark_mode, runtime_mode
+    return config_yaml_path, server_name, benchmark_mode, runtime_mode, time_breakdown
 
 
 # --------------------------------------------------------------------------- #
@@ -405,7 +472,9 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
     if gpus_per_node is None:
         raise ValueError("hardware.gpus_per_node is required")
 
-    if benchmark_mode == "ctx_only":
+    if benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE:
+        gpus_per_server = gen_only_no_context_world_size(config)
+    elif benchmark_mode == "ctx_only":
         # ctx_only reads disagg yaml; size the launch from worker_config.ctx.
         worker_config = config.get("worker_config", {}) or {}
         ctx_config = worker_config.get("ctx", {}) or {}
@@ -431,13 +500,13 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
         ctx_config = worker_config.get("ctx", {}) or {}
         gen_config = worker_config.get("gen", {}) or {}
 
-        # gen_only_no_context comes from the yaml's benchmark.mode, not the
-        # test name (test name is always "gen_only" for both gen_only and
-        # gen_only_no_context tests). When set, ctx workers are not launched.
-        yaml_mode = (config.get("benchmark", {}) or {}).get("mode", "")
-        is_gen_only_no_context = benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode
-        num_ctx_servers = 0 if is_gen_only_no_context else hardware.get("num_ctx_servers")
-        num_gen_servers = hardware.get("num_gen_servers")
+        # On this path gen_only_no_context can only come from the yaml's
+        # benchmark.mode, not the test name. When set, ctx workers are not launched.
+        if is_gen_only_no_context(benchmark_mode, config):
+            num_ctx_servers, num_gen_servers = gen_only_no_context_server_counts()
+        else:
+            num_ctx_servers = hardware.get("num_ctx_servers")
+            num_gen_servers = hardware.get("num_gen_servers")
 
         ctx_tp = ctx_config.get("tensor_parallel_size", 1)
         ctx_pp = ctx_config.get("pipeline_parallel_size", 1)
@@ -520,14 +589,16 @@ def get_env_config(config, runtime_mode, benchmark_mode, server_name):
     ctx_env = _join_env(common, ctx_extra)
     gen_env = _join_env(common, gen_extra)
     if runtime_mode == "aggregated":
-        if benchmark_mode == "ctx_only":
+        if benchmark_mode in AGGREGATED_DISAGG_YAML_MODES:
             return {
                 "worker_env_var": common,
                 "ctx_worker_env_var": ctx_env,
                 "gen_worker_env_var": gen_env,
-                # ctx_only launches through the aggregated single-pytest path;
-                # the ctx-merged env is what actually runs.
-                "server_env_var": ctx_env,
+                # These modes launch through the aggregated single-pytest path;
+                # the env of the worker they actually run is what goes here.
+                "server_env_var": (
+                    gen_env if benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE else ctx_env
+                ),
                 "benchmark_env_var": env.get("benchmark_env_var", "") or "",
             }
         agg_server_env_var = ""
@@ -808,7 +879,9 @@ def main():
     )
     if selected_test_skipped:
         print("Selected test is SKIP-waived; cache-transceiver precheck will not run")
-    config_yaml, server_name, benchmark_mode, runtime_mode = parse_test_case_name(
+    # time_breakdown only changes what the harness records, never the launch
+    # topology or the mode token handed to the precheck, so it is unused here.
+    config_yaml, server_name, benchmark_mode, runtime_mode, _time_breakdown = parse_test_case_name(
         args.llm_src,
         selected_test_line,
     )
@@ -846,16 +919,31 @@ def main():
     gpu_type = gpu_type_from_stage_name(args.stage_name)
 
     if runtime_mode == "aggregated":
-        # Aggregated (incl. ctx_only): single pytestCommand built from the
-        # matched server_config's server_env_var (regular agg) or the disagg
-        # yaml's environment.worker_env_var (ctx_only). The prefix runs on
-        # every rank before trtllm-llmapi-launch dispatches to pytest (rank 0)
-        # or mgmn_worker_node (others).
+        # Aggregated (incl. ctx_only and gen_only_no_context): single pytestCommand
+        # built from the matched server_config's server_env_var (regular agg) or the
+        # disagg yaml's merged worker env. The prefix runs on every rank before
+        # trtllm-llmapi-launch dispatches to pytest (rank 0) or mgmn_worker_node
+        # (others). ucx_prefix is a shell command prefix, so it must lead.
+        ucx_prefix = ""
+        env_prefix_parts = []
+        if benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE:
+            env_prefix_parts.append(
+                "FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${SLURM_LOCALID} "
+                "HF_HOME=/tmp/hf_home"
+            )
+            ucx_tls_cmd = get_ucx_tls_cmd(args.cluster_name, gpu_type)
+            print(f"UCX env: cluster={args.cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
+            ucx_prefix = ucx_tls_cmd.strip()
+            env_prefix_parts.append("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
+            script_prefix_lines.append("export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
+            srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
+
         server_env_var = env_config["server_env_var"]
         if server_env_var.strip():
-            pytest_command_with_env = (
-                f'export pytestCommand="{server_env_var} $partialPytestCommand"'
-            )
+            env_prefix_parts.append(server_env_var.strip())
+        env_prefix = " ".join([ucx_prefix] + env_prefix_parts).strip()
+        if env_prefix:
+            pytest_command_with_env = f'export pytestCommand="{env_prefix} $partialPytestCommand"'
         else:
             pytest_command_with_env = 'export pytestCommand="$partialPytestCommand"'
 
@@ -886,10 +974,9 @@ def main():
         gen_worker_env_vars = f"{base_prefix} {env_config['gen_worker_env_var']}".rstrip()
         server_env_vars = env_config["server_env_var"]
 
-        # gen_only_no_context comes from yaml's benchmark.mode, not the test
-        # name — see get_hardware_config.
-        yaml_mode = benchmark_config.get("mode", "")
-        if benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode:
+        # On this path gen_only_no_context comes from the yaml's benchmark.mode,
+        # not the test name -- see get_hardware_config.
+        if is_gen_only_no_context(benchmark_mode, config):
             gen_worker_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {gen_worker_env_vars}"
             server_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {server_env_vars}"
             script_prefix_lines.append("export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")

@@ -36,7 +36,11 @@ class TestLlmDefaultBackend:
         from tensorrt_llm.llmapi import LLM, KvCacheConfig, TorchLlmArgs
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
-        llm = LLM(model=model_path, kv_cache_config=kv_cache_config)
+        # This backend smoke test generates one request; avoid reserving
+        # recurrent states for the generic default batch size of 2048.
+        llm = LLM(model=model_path,
+                  kv_cache_config=kv_cache_config,
+                  max_batch_size=1)
 
         # The default backend should be PyTorch
         assert llm.args.backend == "pytorch"

@@ -11,10 +11,11 @@ from torch import nn
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.models.modeling_kimi_linear import (
-    _convert_kda_projections_to_fp8_weight_read,
-)
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
+from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 
 class _Cfg:
@@ -29,19 +30,6 @@ class _Cfg:
     }
 
 
-class _Layer(nn.Module):
-    def __init__(self, attention: KimiKDALinearAttention) -> None:
-        super().__init__()
-        self.is_kda = True
-        self.linear_attn = attention
-
-
-class _Model(nn.Module):
-    def __init__(self, attention: KimiKDALinearAttention) -> None:
-        super().__init__()
-        self.layers = nn.ModuleList([_Layer(attention)])
-
-
 def _has_supported_gpu() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability(0) in {(10, 0), (10, 3)}
 
@@ -53,9 +41,24 @@ pytestmark = pytest.mark.skipif(
 
 
 def _make_attention() -> KimiKDALinearAttention:
-    attention = KimiKDALinearAttention(_Cfg(), layer_idx=0).to("cuda")
-    assert _convert_kda_projections_to_fp8_weight_read(_Model(attention)) == 5
-    attention.finalize_decode_weights_fp8()
+    config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES))
+    attention = KimiKDALinearAttention(
+        _Cfg(),
+        layer_idx=0,
+        model_config=config,
+    ).to("cuda")
+    for module in attention.children():
+        if isinstance(module, Linear):
+            # Checkpoint-native codes and scales, independent of any BF16 quantizer.
+            codes = torch.randint(-64, 65, module.weight.shape, device="cuda").to(
+                torch.float8_e4m3fn
+            )
+            scales = torch.full(module.weight_scale.shape, 0.001, device="cuda")
+            module.load_weights([{"weight": codes, "weight_scale": scales}])
+    attention.finalize_decode_weights()
+    for module in attention.modules():
+        if isinstance(module, Linear):
+            module.post_load_weights()
     return attention
 
 

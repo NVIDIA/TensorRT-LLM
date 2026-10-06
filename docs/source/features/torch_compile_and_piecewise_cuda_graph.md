@@ -6,7 +6,7 @@ Piecewise CUDA Graph is a technique that runs cudagraph-unsupported components (
 
 ## Table of Contents
 
-- [Torch Compile & Piecewise CUDA Graph](#torch-compile--piecewise-cuda-graph)
+- [Torch Compile & Prefill CUDA Graph](#torch-compile--prefill-cuda-graph)
   - [Table of Contents](#table-of-contents)
   - [Usage](#usage)
   - [Tips for Piecewise CUDA Graph](#tips-for-piecewise-cuda-graph)
@@ -115,21 +115,8 @@ Even with Piecewise CUDA Graph enabled, you may still observe bubbles in the con
 
 ## Known Issue
 
-Torch compile cannot work with multi-ModelEngine config.
-
-1. Speculative Decoding in Two-Model Style
-
-``` yaml
-speculative_config:
-  decoding_type: "MTP"
-  mtp_eagle_one_model: False # Not supported
-
-speculative_config:
-  decoding_type: "Eagle3"
-  eagle3_one_model: False # Not supported
-```
-
-2. Multimodal Model Family
+Torch compile cannot work with multi-ModelEngine config, which currently means
+the Multimodal Model Family.
 
 ## Development Guide
 

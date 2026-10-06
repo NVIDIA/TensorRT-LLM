@@ -1,0 +1,185 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Whole-model gates for the deepseek-v3 modeling_v2 targets.
+
+One file per model family, beside the other accuracy suites rather than inside
+test_llm_api_pytorch.py: these gate a parallel implementation, and reading them
+next to the built-in model's tests would invite treating one as a variant of
+the other.
+
+Every test here runs under ``TRTLLM_MODELING_V2=require``, which the case puts
+in place itself -- see ``modeling_v2_env``. Under ``"auto"`` a configuration
+that missed a target's criteria would quietly fall back to the built-in
+implementation, pass, and report the built-in's numbers as the target's --
+which is the one failure this whole system exists to prevent. The one exception
+is the stock leg of the acceptance gate, which asks for ``"off"`` on purpose.
+
+These targets are multi-rank, and the mode has to hold on every rank rather
+than only on the one running the test body; ``modeling_v2_env`` explains why
+that rules out setting the variable directly.
+"""
+
+import pytest
+
+from tensorrt_llm import LLM
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
+
+from ..conftest import llm_models_root
+from .accuracy_core import (
+    GSM8K,
+    LlmapiAccuracyTestHarness,
+    assert_acceptance_length,
+    compute_acceptance_length,
+)
+from .modeling_v2_env import modeling_v2_llm_args
+
+# The targets assert their own SM at construction: certification is per GPU
+# architecture, and a receipt from another one says nothing here.
+skip_not_sm103 = pytest.mark.skipif(
+    get_sm_version() != 103, reason="modeling_v2 targets in this batch are certified on sm_103 only"
+)
+
+# The filter the modeling_v2 anchors were measured on. Unset, the evaluator
+# averages every metric GSM8K reports, which means the mean of strict-match and
+# flexible-extract -- two numbers measuring different things on a checkpoint
+# that does not answer purely in the strict "#### N" form.
+_SCORES_FILTER = {"scores_filter": "exact_match,flexible-extract"}
+
+
+class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
+    """deepseek-r1-0528-nvfp4 / sm_103 / dep4, identity and the mtp3 variant."""
+
+    MODEL_NAME = "deepseek-ai/DeepSeek-R1-0528"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4"
+
+    # The parallel topology the path's dep4 segment declares. Routing derives
+    # the target *from* these, and the target then asserts every one of them
+    # against the mapping the engine actually built.
+    DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=True)
+
+    # The kv-cache fraction is a boot requirement of the variant rather than a
+    # tuning choice: the drafting forward's post-pool transient does not fit
+    # what the default 0.9 leaves.
+    MTP3 = MTPDecodingConfig(max_draft_len=3)
+    MTP3_KV = KvCacheConfig(free_gpu_memory_fraction=0.75)
+
+    # One anchor shared by both legs of the acceptance gate below. It names the
+    # target and variant, not a test function, because that is what the number
+    # is a property of.
+    ACCEPTANCE_KEY = "ModelingV2DeepseekR10528Nvfp4Sm103Dep4::mtp3"
+
+    # There is deliberately no standalone identity gsm8k case. The paired test
+    # below evaluates the identity config as its first leg, and
+    # ``task.evaluate`` asserts accuracy against the reference on the way past,
+    # so a separate one would gate nothing new and would cost a fifth engine
+    # boot of a 61-layer, 4-rank model.
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_gsm8k_identity_vs_mtp3(self, mocker, monkeypatch):
+        """The identity accuracy gate, and the gate on MTP not moving it.
+
+        Turning MTP on must not move the answers.
+
+        Rejection sampling holds the emitted distribution to the target
+        model's, so the two scores should differ only by sampling noise.
+
+        Both legs assert accuracy against the registered reference as they
+        run -- this test is therefore the identity gate as well as the
+        comparison.
+
+        Both measurements are taken **in this one test** on purpose. The same
+        identity forward measured 94.7688 and 95.0720 on consecutive days --
+        0.30 apart, on bit-identical code -- so a delta against a score
+        recorded in some earlier session carries that session's variance into
+        the judgement. Paired, the variance is common to both and cancels.
+        """
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
+        task = GSM8K(self.MODEL_NAME)
+
+        # One dict for both legs: the comparison only means anything if the two
+        # engines were built under the same mode.
+        modeling_v2 = modeling_v2_llm_args("require", monkeypatch)
+
+        with LLM(self.MODEL_PATH, **modeling_v2, **self.DEP4) as llm:
+            identity = task.evaluate(llm)
+
+        with LLM(
+            self.MODEL_PATH,
+            speculative_config=self.MTP3,
+            kv_cache_config=self.MTP3_KV,
+            **modeling_v2,
+            **self.DEP4,
+        ) as llm:
+            mtp3 = task.evaluate(llm)
+
+        delta = mtp3 - identity
+        print(f"[modeling_v2] gsm8k identity={identity:.4f} mtp3={mtp3:.4f} delta={delta:+.4f}")
+        # 2 sigma at the ~0.6 stderr this benchmark reports at n=1319.
+        assert abs(delta) < 1.2, (
+            f"MTP moved gsm8k by {delta:+.4f} (identity={identity:.4f}, "
+            f"mtp3={mtp3:.4f}); rejection sampling should have held the "
+            f"distribution, so this is not sampling noise"
+        )
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("mode", ["require", "off"], ids=["modeling_v2", "stock"])
+    def test_mtp3_acceptance(self, mode, mocker, monkeypatch):
+        """The only gate that can see a miscomputed draft layer.
+
+        Rejection sampling makes a wrong draft path *slower*, not wrong: every
+        draft is rejected, the text stays correct, and the boot and accuracy
+        gates both pass. Acceptance length is the sole detector.
+
+        Two independent cases rather than one that compares them in-session.
+        They share ``ACCEPTANCE_KEY``, so both are read against the same
+        recorded minimum, which is what makes the pair informative:
+
+          modeling_v2 fails, stock passes -> the draft path regressed
+          both fail                     -> the anchor is stale; re-derive it
+                                           rather than blaming the target
+
+        The anchor is populated from the **stock** leg. Populating it from the
+        target's own number would make the gate self-referential.
+        """
+        # Stock cannot boot this checkpoint at dep4 with MTP otherwise: under
+        # attention DP + EP the MoE communication factory lands on
+        # DeepEPLowLatency, whose dispatch takes only NVFP4 uint8 hidden states,
+        # and the MTP layer is bf16 because modelopt excludes model.layers.61*
+        # from quantization. Disabling DeepEP lands on AllGatherReduceScatter --
+        # which is the strategy the modeling_v2 target implements by hand, so it
+        # makes the two comparable rather than less so. Only this leg needs it:
+        # the target builds that path itself and never consults the factory.
+        # It rides along with the switch because it is read on the ranks too.
+        deep_ep = {"TRTLLM_CAN_USE_DEEP_EP": "0"} if mode == "off" else {}
+
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
+
+        with LLM(
+            self.MODEL_PATH,
+            speculative_config=self.MTP3,
+            kv_cache_config=self.MTP3_KV,
+            cuda_graph_config=CudaGraphConfig(),
+            enable_iter_perf_stats=True,
+            **modeling_v2_llm_args(mode, monkeypatch, **deep_ep),
+            **self.DEP4,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            acceptance_length = compute_acceptance_length(llm)
+            print(f"[AL] {mode} acceptance_length = {acceptance_length:.3f}")
+            assert_acceptance_length(self.ACCEPTANCE_KEY, acceptance_length)

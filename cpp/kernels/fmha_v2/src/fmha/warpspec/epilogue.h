@@ -59,64 +59,34 @@ struct Softmax_base
     using Fragment_p = typename Compute_tile_o::Fragment;
 
     // The step size of KV loop.
-    enum
-    {
-        STEP_KV = Kernel_traits::STEP_KV
-    };
+    static constexpr int STEP_KV = Kernel_traits::STEP_KV;
 
     // Whether apply causal mask or not.
-    enum
-    {
-        CAUSAL_MASK = Kernel_traits::CAUSAL_MASK
-    };
+    static constexpr int CAUSAL_MASK = Kernel_traits::CAUSAL_MASK;
 
     // Whether do we attend to the specific sliding window or chunk ?
-    enum
-    {
-        SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION
-    };
+    static constexpr int SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION;
 
     // Whether use the bidirectional sliding window attention or not.
-    enum
-    {
-        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION
-    };
+    static constexpr int BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION;
 
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
-    enum
-    {
-        APPLY_ALIBI = Kernel_traits::APPLY_ALIBI
-    };
+    static constexpr int APPLY_ALIBI = Kernel_traits::APPLY_ALIBI;
 
     // Are we applying softcapping scale for qk products ?
-    enum
-    {
-        ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE
-    };
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = Kernel_traits::ENABLE_BMM1_SOFTCAPPING_SCALE;
 
     // Do we use custom mask input ?
-    enum
-    {
-        USE_CUSTOM_MASK = Kernel_traits::USE_CUSTOM_MASK
-    };
+    static constexpr int USE_CUSTOM_MASK = Kernel_traits::USE_CUSTOM_MASK;
 
     // Apply the exp2f optimization (fuse bmm1_scale and -max into FMAs).
-    enum
-    {
-        EXP2F_OPTIMIZATION = Kernel_traits::EXP2F_OPTIMIZATION
-    };
+    static constexpr int EXP2F_OPTIMIZATION = Kernel_traits::EXP2F_OPTIMIZATION;
 
     // Whether we need to check if local_max could be -inf or not.
-    enum
-    {
-        CHECK_IF_NEG_INF_EXISTS = SLIDING_OR_CHUNKED_ATTENTION || USE_CUSTOM_MASK
-    };
+    static constexpr int CHECK_IF_NEG_INF_EXISTS = SLIDING_OR_CHUNKED_ATTENTION || USE_CUSTOM_MASK;
 
     // There are 2 warpgroups so 0x3 and 0x4 are used
-    enum
-    {
-        SKIP_SOFTMAX_BARRIER = Kernel_traits::SKIP_SOFTMAX_BARRIER_ID
-    };
+    static constexpr int SKIP_SOFTMAX_BARRIER = Kernel_traits::SKIP_SOFTMAX_BARRIER_ID;
 
     // Ctor.
     template <typename Params>
@@ -667,46 +637,25 @@ struct Softmax_fp32_base : public Softmax_base<Traits, Kernel_traits>
     using Fragment_p = typename Compute_tile_o::Fragment;
 
     // Whether apply causal mask or not.
-    enum
-    {
-        CAUSAL_MASK = Base::CAUSAL_MASK
-    };
+    static constexpr int CAUSAL_MASK = Base::CAUSAL_MASK;
 
     // Do we use custom mask input ?
-    enum
-    {
-        USE_CUSTOM_MASK = Base::USE_CUSTOM_MASK
-    };
+    static constexpr int USE_CUSTOM_MASK = Base::USE_CUSTOM_MASK;
 
     // Whether we attend to the specific sliding window or chunk ?
-    enum
-    {
-        SLIDING_OR_CHUNKED_ATTENTION = Base::SLIDING_OR_CHUNKED_ATTENTION
-    };
+    static constexpr int SLIDING_OR_CHUNKED_ATTENTION = Base::SLIDING_OR_CHUNKED_ATTENTION;
 
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
-    enum
-    {
-        APPLY_ALIBI = Base::APPLY_ALIBI
-    };
+    static constexpr int APPLY_ALIBI = Base::APPLY_ALIBI;
 
     // Are we applying softcapping_scale for qk products ?
-    enum
-    {
-        ENABLE_BMM1_SOFTCAPPING_SCALE = Base::ENABLE_BMM1_SOFTCAPPING_SCALE
-    };
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = Base::ENABLE_BMM1_SOFTCAPPING_SCALE;
 
     // Apply the exp2f optimization (fuse bmm1_scale and -max into FMAs).
-    enum
-    {
-        EXP2F_OPTIMIZATION = Base::EXP2F_OPTIMIZATION
-    };
+    static constexpr int EXP2F_OPTIMIZATION = Base::EXP2F_OPTIMIZATION;
 
     // Whether we need to check if local_max could be -inf or not.
-    enum
-    {
-        CHECK_IF_NEG_INF_EXISTS = Base::CHECK_IF_NEG_INF_EXISTS
-    };
+    static constexpr int CHECK_IF_NEG_INF_EXISTS = Base::CHECK_IF_NEG_INF_EXISTS;
 
     // Ctor.
     template <typename Params>
@@ -918,40 +867,22 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
     using Fragment_p = typename Compute_tile_o::Fragment;
 
     // Whether apply causal mask or not.
-    enum
-    {
-        CAUSAL_MASK = Base::CAUSAL_MASK
-    };
+    static constexpr int CAUSAL_MASK = Base::CAUSAL_MASK;
 
     // Whether we attend to the specific sliding window or chunk ?
-    enum
-    {
-        SLIDING_OR_CHUNKED_ATTENTION = Base::SLIDING_OR_CHUNKED_ATTENTION
-    };
+    static constexpr int SLIDING_OR_CHUNKED_ATTENTION = Base::SLIDING_OR_CHUNKED_ATTENTION;
 
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
-    enum
-    {
-        APPLY_ALIBI = Base::APPLY_ALIBI
-    };
+    static constexpr int APPLY_ALIBI = Base::APPLY_ALIBI;
 
     // Apply the exp2f optimization (fuse bmm1_scale and -max into FMAs).
-    enum
-    {
-        EXP2F_OPTIMIZATION = Base::EXP2F_OPTIMIZATION
-    };
+    static constexpr int EXP2F_OPTIMIZATION = Base::EXP2F_OPTIMIZATION;
 
     // Are we applying softcapping_scale for qk products ?
-    enum
-    {
-        ENABLE_BMM1_SOFTCAPPING_SCALE = Base::ENABLE_BMM1_SOFTCAPPING_SCALE
-    };
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = Base::ENABLE_BMM1_SOFTCAPPING_SCALE;
 
     // Whether we need to check if local_max could be -inf or not.
-    enum
-    {
-        CHECK_IF_NEG_INF_EXISTS = Base::CHECK_IF_NEG_INF_EXISTS
-    };
+    static constexpr int CHECK_IF_NEG_INF_EXISTS = Base::CHECK_IF_NEG_INF_EXISTS;
 
     // Ctor.
     template <typename Params>
@@ -1221,10 +1152,7 @@ struct Tile_o_epilogue_base
     using Mma_tile_o = typename Kernel_traits::Mma_tile_o;
 
     // Apply the exp2f optimization (fuse bmm1_scale and -max into FMAs).
-    enum
-    {
-        EXP2F_OPTIMIZATION = Kernel_traits::EXP2F_OPTIMIZATION
-    };
+    static constexpr int EXP2F_OPTIMIZATION = Kernel_traits::EXP2F_OPTIMIZATION;
 
     template <typename Params, typename Block_info>
     inline __device__ Tile_o_epilogue_base(Params const& params, Block_info& block_info)
@@ -1413,10 +1341,7 @@ struct Tile_o_epilogue<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
     using Mma_tile_o = typename Base::Mma_tile_o;
 
     // Apply the exp2f optimization (fuse bmm1_scale and -max into FMAs).
-    enum
-    {
-        EXP2F_OPTIMIZATION = Base::EXP2F_OPTIMIZATION
-    };
+    static constexpr int EXP2F_OPTIMIZATION = Base::EXP2F_OPTIMIZATION;
 
     // Ctor.
     template <typename Params, typename Block_info>

@@ -17,7 +17,7 @@ CuTe DSL (NVIDIA kernels) FMHA Backend for Visual Generation Models
 
 JIT-compiles dense or SkipSoftmax FMHA and caches the compiled artifact for each kernel
 configuration. Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16 inputs. The VSA
-sparse path uses VSAAttention from vsa.py instead.
+sparse backend uses `VSACuTeDSLAttention` in `attention_backend.sparse.vsa` instead.
 """
 
 import math
@@ -26,6 +26,7 @@ from typing import Any, NamedTuple, Tuple
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxParams
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
@@ -86,7 +87,12 @@ def _resolve_skip_softmax_threshold_scale_factor(
                 "through.",
                 key="cute_dsl_skip_softmax_missing_timestep",
             )
-        runtime_params = sparse_params.scheduler.get_runtime_params(timestep=timestep)
+        # Prefer the phase the CUDA-graph runner resolved host-side; the tensor
+        # read is a `.item()`, which is illegal while a graph is being captured.
+        runtime_params = sparse_params.scheduler.get_runtime_params(
+            timestep=timestep,
+            graph_phase=resolved_extra_key("sparse_attn_phase"),
+        )
         threshold_scale_factor = runtime_params.threshold_scale_factor_prefill
     if threshold_scale_factor is None or threshold_scale_factor <= 0.0:
         return None

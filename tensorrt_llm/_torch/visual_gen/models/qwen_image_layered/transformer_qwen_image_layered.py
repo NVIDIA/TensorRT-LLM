@@ -21,15 +21,46 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.utils.fp8_utils import ceil_to_ue8m0
+
 from ..qwen_image.transformer_qwen_image import (
     QwenEmbedRope,
     QwenImageTransformer2DModel,
+    QwenJointAttention,
     QwenTimestepProjEmbeddings,
+    _remap_checkpoint_keys,
 )
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
     from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner
+
+
+def _quantize_fp8_blockwise_e8m0(
+    weight: torch.Tensor, block_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a 2D weight directly with E8M0-compatible block scales."""
+    out_features, in_features = weight.shape
+    num_blocks_out = (out_features + block_size - 1) // block_size
+    num_blocks_in = (in_features + block_size - 1) // block_size
+    out_padded = num_blocks_out * block_size
+    in_padded = num_blocks_in * block_size
+
+    weight_padded = torch.nn.functional.pad(
+        weight.float(),
+        (0, in_padded - in_features, 0, out_padded - out_features),
+    )
+    blocks = weight_padded.reshape(num_blocks_out, block_size, num_blocks_in, block_size).permute(
+        0, 2, 1, 3
+    )
+    amax = blocks.abs().amax(dim=(-1, -2)).clamp_min(1.0e-4)
+    scales = ceil_to_ue8m0(amax / torch.finfo(torch.float8_e4m3fn).max)
+    qblocks = (blocks / scales[:, :, None, None]).to(torch.float8_e4m3fn)
+    qweight = qblocks.permute(0, 2, 1, 3).reshape(out_padded, in_padded)
+    return qweight[:out_features, :in_features], scales
 
 
 class QwenEmbedLayer3DRope(QwenEmbedRope):
@@ -115,6 +146,73 @@ class QwenEmbedLayer3DRope(QwenEmbedRope):
         return freqs.clone().contiguous()
 
 
+class QwenImageLayeredJointAttention(QwenJointAttention):
+    """Qwen-Image-Layered joint attention with compact masked text tokens."""
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        timestep: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if attention_mask is None:
+            return super().forward(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                image_rotary_emb=image_rotary_emb,
+                fused_rotary_emb=fused_rotary_emb,
+                attention_mask=None,
+                timestep=timestep,
+            )
+
+        batch_size, seq_txt = encoder_hidden_states.shape[:2]
+        expected_mask_len = seq_txt + hidden_states.shape[1]
+        mask_bool = attention_mask.to(torch.bool)
+        if mask_bool.shape != (batch_size, expected_mask_len):
+            raise ValueError(
+                "QwenImageLayeredJointAttention attention_mask shape mismatch: "
+                f"expected {(batch_size, expected_mask_len)}, got {tuple(mask_bool.shape)}."
+            )
+
+        img_outputs = []
+        txt_outputs = []
+        for batch_idx in range(batch_size):
+            batch_slice = slice(batch_idx, batch_idx + 1)
+            txt_indices = torch.nonzero(mask_bool[batch_idx, :seq_txt], as_tuple=False).flatten()
+
+            compact_rotary_emb = None
+            if image_rotary_emb is not None:
+                img_freqs, txt_freqs = image_rotary_emb
+                compact_rotary_emb = (img_freqs, txt_freqs[txt_indices])
+
+            batch_timestep = timestep
+            if timestep is not None and timestep.ndim > 0 and timestep.shape[0] == batch_size:
+                batch_timestep = timestep[batch_slice]
+
+            img_output, compact_txt_output = super().forward(
+                hidden_states=hidden_states[batch_slice],
+                encoder_hidden_states=encoder_hidden_states[batch_slice, txt_indices],
+                image_rotary_emb=compact_rotary_emb,
+                attention_mask=None,
+                timestep=batch_timestep,
+            )
+            txt_output = torch.zeros(
+                (1, seq_txt, compact_txt_output.shape[-1]),
+                device=compact_txt_output.device,
+                dtype=compact_txt_output.dtype,
+            )
+            if self.to_add_out.bias is not None:
+                txt_output += self.to_add_out.bias
+            txt_output[:, txt_indices] = compact_txt_output
+            img_outputs.append(img_output)
+            txt_outputs.append(txt_output)
+
+        return torch.cat(img_outputs, dim=0), torch.cat(txt_outputs, dim=0)
+
+
 class QwenImageLayeredTransformer2DModel(QwenImageTransformer2DModel):
     """Qwen-Image transformer variant for RGBA layer decomposition."""
 
@@ -146,6 +244,19 @@ class QwenImageLayeredTransformer2DModel(QwenImageTransformer2DModel):
             axes_dims_rope=axes_dims_rope,
             attn_backend=attn_backend,
         )
+        if self.model_config.attention.backend == "TRTLLM":
+            for layer_idx, block in enumerate(self.transformer_blocks):
+                block.attn = QwenImageLayeredJointAttention(
+                    dim=self.inner_dim,
+                    num_attention_heads=num_attention_heads,
+                    attention_head_dim=attention_head_dim,
+                    dtype=self.model_config.torch_dtype,
+                    config=self.model_config,
+                    layer_idx=layer_idx,
+                    module_name=f"transformer_blocks.{layer_idx}.attn",
+                )
+            self.apply_quant_config_exclude_modules()
+
         if use_layer3d_rope:
             self.pos_embed = QwenEmbedLayer3DRope(
                 theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
@@ -155,6 +266,44 @@ class QwenImageLayeredTransformer2DModel(QwenImageTransformer2DModel):
                 embedding_dim=self.inner_dim,
                 use_additional_t_cond=True,
             )
+
+    @staticmethod
+    def _uses_e8m0_post_load_repack(module: Linear) -> bool:
+        return (
+            is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm)
+        ) or get_sm_version() == 120
+
+    def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        if not self.model_config.dynamic_weight_quant:
+            super().load_weights(weights)
+            return
+
+        weights = _remap_checkpoint_keys(weights)
+        for name, module in self.named_modules():
+            quant_config = getattr(module, "quant_config", None)
+            if (
+                not isinstance(module, Linear)
+                or quant_config is None
+                or quant_config.quant_algo != QuantAlgo.FP8_BLOCK_SCALES
+                or not self._uses_e8m0_post_load_repack(module)
+            ):
+                continue
+
+            weight_name = f"{name}.weight"
+            weight = weights.get(weight_name)
+            if weight is None or weight.dtype not in (
+                torch.bfloat16,
+                torch.float16,
+                torch.float32,
+            ):
+                continue
+            if weight.device.type != "cuda":
+                weight = weight.cuda()
+            qweight, scale = _quantize_fp8_blockwise_e8m0(weight, quant_config.group_size or 128)
+            weights[weight_name] = qweight
+            weights[f"{name}.weight_scale"] = scale
+
+        super().load_weights(weights)
 
     @staticmethod
     def _normalize_img_shapes_for_cuda_graph(*args, **kwargs) -> Optional[Tuple]:

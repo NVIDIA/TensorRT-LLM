@@ -48,7 +48,7 @@ public:
     /// @brief Constructor.
     /// @param cacheState The cache state (KV, and optionally RNN if hasRnnConfig() is true).
     /// @param kvFormatter The KV cache formatter.
-    /// @param rnnFormatter Optional RNN cache formatter (for separate RnnStateManager pool).
+    /// @param rnnFormatter Optional RNN cache formatter for a separate RNN-state pool.
     CacheTransferLayer(executor::kv_cache::CacheState cacheState, std::unique_ptr<BaseCacheFormatter> kvFormatter,
         std::unique_ptr<RnnCacheFormatter> rnnFormatter = nullptr);
 

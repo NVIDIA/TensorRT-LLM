@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,18 +41,18 @@ TEST(RequestWithIdTest, serializeDeserialize)
     biasData[2] = 32.f;
     biasData[3] = 48.f;
 
-    auto request1 = Request({1, 2, 3, 4}, 1000, true, SamplingConfig(1, 4, 0.77), OutputConfig(false, true), 177, 234,
+    auto request1 = Request({1, 2, 3, 4}, 1000, true, SamplingConfig(1, 4, 0.77), OutputConfig(false, true), 177,
         std::make_optional<std::vector<SizeType32>>({0, 1, 2, 3}), badWords, stopWords, embeddingBias, std::nullopt,
         std::nullopt);
 
     auto request2 = Request({100, 200, 300, 400}, 77, false, SamplingConfig(1, 1, 0.33), OutputConfig(true, false), 66,
-        99, std::make_optional<std::vector<SizeType32>>({0, 1, 1, 2}), badWords2, stopWords2, embeddingBias,
-        std::nullopt, std::nullopt);
+        std::make_optional<std::vector<SizeType32>>({0, 1, 1, 2}), badWords2, stopWords2, embeddingBias, std::nullopt,
+        std::nullopt);
     request2.setEncoderInputFeatures(encoderInputFeatures);
 
     auto samplingConfig3 = SamplingConfig(1, 1, 0.9);
     samplingConfig3.setNumReturnSequences(3);
-    auto request3 = Request({37, 19, 87, 29}, 4, false, samplingConfig3, OutputConfig(false, false), 66, 99,
+    auto request3 = Request({37, 19, 87, 29}, 4, false, samplingConfig3, OutputConfig(false, false), 66,
         std::make_optional<std::vector<SizeType32>>({0, 1, 1, 2}), badWords2, stopWords2, embeddingBias, std::nullopt,
         std::nullopt);
 

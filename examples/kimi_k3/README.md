@@ -50,7 +50,7 @@ architectures may be added in a future release.
   that virtual environment are available. Packages installed only in the preparation
   container's base environment are not:
   repository-root `.venv-3.12` is the build environment created by `build_wheel.py`
-  (it contains Conan and pip, not PyTorch or Transformers), and `pip install
+  (it contains build-time packages installed by pip, not PyTorch or Transformers), and `pip install
   --no-deps -e .` installs `tensorrt_llm` alone. With an image that lacks the dependencies, every rank
   fails with a `ModuleNotFoundError` that does not name the image, such as
   `No module named 'transformers'`.
@@ -115,8 +115,9 @@ sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
     --sa
 ```
 
-This selects `eval_extra_llm_options_sa.yaml` (see Current limitations
-below for what SA changes) and logs a speculative-decoding acceptance
+This selects `eval_extra_llm_options_sa.yaml` (see the suffix-automaton
+section and its restrictions under Current limitations below for what SA
+changes) and logs a speculative-decoding acceptance
 summary at the end of the run. SA is lossless, so the scores should match
 the non-SA run within noise. Speedup is workload-dependent, proportional
 to the n-gram repetition in the generated output.
@@ -201,7 +202,21 @@ sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
 ```
 
 Block reuse stays off by default because suffix-automaton speculative
-decoding requires the default cache manager, which cannot reuse blocks.
+decoding is incompatible with KV-cache block reuse.
+
+## Suffix-automaton speculative decoding
+
+Suffix-automaton (SA) speculation is supported for aggregated serving: set
+`speculative_config: {decoding_type: SA}` in the extra LLM API options. For
+GSM8K evaluation, pass `--sa` to the eval job (see "Run the model" above),
+which selects `eval_extra_llm_options_sa.yaml`.
+
+SA also works under disaggregated serving: enable it on the generation
+server with `examples/kimi_k3/disagg/gen_config.yaml`, and see
+`examples/kimi_k3/disagg/README.md` for the full walkthrough.
+
+The configuration restrictions that apply to SA are listed under "Current
+limitations" below.
 
 ## Current limitations
 
@@ -224,4 +239,12 @@ decoding requires the default cache manager, which cannot reuse blocks.
   and the TEP16/TEP8 latency recipes are unaffected. Tracked as
   TRTLLM-14904.
 - FP8 KV cache (`kv_cache_config.dtype: fp8`) is not yet supported.
-- Speculative decoding: suffix-automaton speculation is supported for aggregated serving (`speculative_config: {decoding_type: SA}` in the extra LLM API options). For evaluation, use `eval_extra_llm_options_sa.yaml` (the `--sa` flag of the GSM8K job): that configuration runs with the overlap scheduler off, `max_batch_size` 8, and a matching CUDA-graph `max_batch_size`. Suffix-automaton speculation also works under disaggregated serving; enable it on the generation server with `examples/kimi_k3/disagg/gen_config.yaml` (SA runs eager with `max_batch_size` ≤ 8; see `examples/kimi_k3/disagg/README.md`).
+- Suffix-automaton speculative decoding (see the dedicated section above)
+  carries configuration restrictions. SA is incompatible with KV-cache
+  block reuse. The evaluated
+  aggregated configuration (`eval_extra_llm_options_sa.yaml`) runs with the
+  overlap scheduler off, chunked prefill off, and `max_batch_size` 8 with a
+  matching CUDA-graph `max_batch_size`. Under disaggregated serving, SA runs
+  eagerly (no CUDA graphs, no overlap scheduler) and requires
+  `max_batch_size` ≤ 8 on the generation server
+  (`examples/kimi_k3/disagg/gen_config.yaml`).

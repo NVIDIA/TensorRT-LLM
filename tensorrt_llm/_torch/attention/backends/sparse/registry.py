@@ -110,6 +110,15 @@ def get_trtllm_sparse_attn_attention_backend(
         # returns an instantiable AttentionBackend under the trtllm
         # attention backend slot.
         return _resolve_minimax_m3_backend_cls(sparse_params)
+    elif sparse_params.algorithm == "glm_kpool":
+        # GLM-5.3-Flash fully-NoPE pool-compressed sparse MLA: a narrow
+        # TrtllmAttention subclass beside the DSA branch (stock DSA assumes
+        # the 576-wide rope'd DeepSeek geometry). The model layer predicts the
+        # pool-expanded indices; the backend owns the metadata-derived paged
+        # latent/indexer cache path and the FlashMLA sparse-MLA core.
+        from .glm_kpool import GlmKpoolSparseAttention
+
+        return GlmKpoolSparseAttention
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm in trtllm attention backend: {sparse_params.algorithm}"

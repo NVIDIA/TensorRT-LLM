@@ -167,10 +167,7 @@ class TestGlmImageHuggingFaceComparison(unittest.TestCase):
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_glm_image_allclose_to_hf(self):
-        try:
-            from diffusers import GlmImageTransformer2DModel as HFGlmImageTransformer2DModel
-        except ImportError:
-            self.skipTest("diffusers not installed")
+        from diffusers import GlmImageTransformer2DModel as HFGlmImageTransformer2DModel
 
         from tensorrt_llm._torch.visual_gen.models.glm_image import GlmImageTransformer2DModel
 

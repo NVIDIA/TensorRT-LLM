@@ -64,12 +64,7 @@ def _raise_for_invalid_paged_metadata(
         return
     reason = {
         4: (f"seq_lens_kv values must lie in [{minimum_seq_len_kv}, {max_seq_len_kv}]"),
-        5: (
-            "paged_kv_indptr must start at zero and each row must be "
-            "bounded and monotone"
-        ),
-        6: "paged_kv_indptr rows must contain enough pages for seq_lens_kv",
-        7: "paged_kv_indices must contain an in-range physical page ID",
+        5: "block_tables must contain an in-range physical page ID for every live page",
     }.get(error_code)
     if reason is None:
         reason = (
@@ -152,8 +147,7 @@ def _inspect_block_sparse_bsr(
 def _inspect_paged_block_sparse_metadata(
     block_indptr: torch.Tensor,
     block_indices: torch.Tensor,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
+    block_tables: torch.Tensor,
     seq_lens_kv: torch.Tensor,
     *,
     static: _BlockSparseStaticProfile,
@@ -186,8 +180,8 @@ def _inspect_paged_block_sparse_metadata(
         inspect_metadata(
             block_indptr,
             block_indices,
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
+            block_tables.stride(0),
             seq_lens_kv,
             num_physical_kv_pages,
             summary,

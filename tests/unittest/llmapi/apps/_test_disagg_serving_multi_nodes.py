@@ -84,7 +84,7 @@ def env():
 
 @pytest.fixture(scope="module")
 def model_name():
-    return "llama-3.1-model/Llama-3.1-8B-Instruct"
+    return "Qwen3.5-4B"
 
 
 @pytest.fixture(scope="module", params=['pytorch'], ids=["pytorch"])
@@ -115,7 +115,7 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
             "backend": "DEFAULT"
         },
         "kv_cache_config": {
-            "free_gpu_memory_fraction": 0.5,
+            "free_gpu_memory_fraction": 0.8,
             "enable_block_reuse": False,
         },
         "disable_overlap_scheduler": True,

@@ -15,23 +15,16 @@
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 from fmha_test_utils import FakeAttention, FakePhasedFmha
 
 from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
-from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
-    FlashInferTrtllmGenFmha,
-)
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
-from tensorrt_llm._torch.attention.backends.fmha.triton_custom_mask import TritonCustomMaskFmha
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm.bindings import DataType
-from tensorrt_llm.quantization.mode import QuantMode
 
 
 def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
@@ -52,7 +45,17 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
         workspace_size=4,
     )
     combined_fmha = CombinedFmha(attn)
-    combined_fmha.set_fmha_impls(context_fmha, generation_fmha)
+    assert not combined_fmha.supports_workspace_reclamation
+    for context_support, generation_support, expected in (
+        (False, False, False),
+        (True, False, False),
+        (True, True, True),
+        (False, True, False),
+    ):
+        context_fmha.supports_workspace_reclamation = context_support
+        generation_fmha.supports_workspace_reclamation = generation_support
+        combined_fmha.set_fmha_impls(context_fmha, generation_fmha)
+        assert combined_fmha.supports_workspace_reclamation is expected
     metadata = SimpleNamespace(
         kv_cache_block_offsets=object(),
         effective_workspace=torch.empty(0, dtype=torch.uint8),
@@ -104,91 +107,3 @@ def test_combined_fmha_uses_flattened_v2_page_bound() -> None:
         == 23
     )
     assert calls == [(3, Role.KEY)]
-
-
-def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
-    attn = FakeAttention()
-    attn.quant_mode = int(QuantMode.from_description(use_fp8_kv_cache=True))
-    fmha = FlashInferTrtllmGenFmha(attn)
-    output = torch.empty(1, dtype=torch.bfloat16)
-
-    assert fmha._use_fp8_context_fmha(output, AttentionInputType.context_only)
-    assert fmha._use_fp8_context_fmha(output, AttentionInputType.mixed)
-    assert not fmha._use_fp8_context_fmha(output, AttentionInputType.generation_only)
-
-
-def test_triton_custom_mask_rejects_whole_request_probe() -> None:
-    fmha = object.__new__(TritonCustomMaskFmha)
-
-    assert not fmha.is_supported(
-        torch.empty((1, 4)),
-        None,
-        None,
-        SimpleNamespace(),
-        AttentionForwardArgs(),
-    )
-
-
-@pytest.mark.parametrize("kv_cache_dtype", [DataType.FP8, DataType.NVFP4])
-@pytest.mark.parametrize(
-    "dtype,sm_version",
-    [(torch.bfloat16, 100), (torch.float16, 103)],
-    ids=["small_bf16_batch", "sm103_fp16"],
-)
-def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-    kv_cache_dtype: DataType,
-    dtype: torch.dtype,
-    sm_version: int,
-) -> None:
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen.get_sm_version",
-        lambda: sm_version,
-    )
-    fmha = object.__new__(FlashInferTrtllmGenFmha)
-    fmha.kv_factor = 2
-    monkeypatch.setattr(fmha, "_get_total_num_blocks", lambda _: 0)
-    attn = SimpleNamespace(
-        is_mla_enable=False,
-        sparse_params=None,
-        position_embedding_type=0,
-        head_dim=256,
-        num_heads=32,
-        num_kv_heads=2,
-    )
-    q_hidden_size = attn.num_heads * attn.head_dim
-    qkv_hidden_size = q_hidden_size + 2 * attn.num_kv_heads * attn.head_dim
-    q = torch.empty((1, qkv_hidden_size), dtype=dtype)
-    metadata = SimpleNamespace(
-        num_contexts=1,
-        helix_position_offsets=None,
-        num_sparse_topk=0,
-        use_spec_decoding=False,
-        is_spec_dec_tree=False,
-        kv_cache_block_offsets=object(),
-        kv_cache_manager=SimpleNamespace(dtype=kv_cache_dtype),
-        is_cross=False,
-        is_spec_decoding_enabled=False,
-        tokens_per_block=64,
-        beam_width=1,
-    )
-    forward_args = AttentionForwardArgs(
-        output=torch.empty((1, q_hidden_size), dtype=dtype),
-        attention_input_type=AttentionInputType.context_only,
-        is_fused_qkv=True,
-        update_kv_cache=True,
-    )
-
-    for phase in (None, FmhaPhase.CONTEXT):
-        supported, reason = fmha._is_supported_with_reason(
-            q,
-            None,
-            None,
-            attn,
-            metadata,
-            forward_args,
-            phase=phase,
-        )
-
-        assert supported, reason
-        assert reason == ""

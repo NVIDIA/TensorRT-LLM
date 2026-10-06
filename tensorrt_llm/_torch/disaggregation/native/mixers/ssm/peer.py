@@ -28,6 +28,11 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     KVCachePageTable,
     MambaLayerGroup,
     MapperKind,
+    PoolView,
+)
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    find_replicated_role_mismatch,
+    get_pool_view_global_layer_ids,
 )
 from tensorrt_llm._utils import nvtx_range
 
@@ -343,9 +348,18 @@ class MambaPolicy:
     def __init__(self, self_rank_info: RankInfo):
         self._ri = self_rank_info
 
-    def should_send(self, peer_overlap, peer_rank_info) -> "bool | None":
-        """Mamba TP routing: always send (each rank owns unique sharded state).
-        When mamba_tp == 1 (attention_dp), returns None to signal fan-in election."""
+    def should_send(
+        self, peer_overlap, peer_rank_info, *, mapper_kind: Optional[MapperKind] = None
+    ) -> "bool | None":
+        """Mamba TP routing.
+
+        Sharded state (conv/SSM): always send, each rank owns a unique shard.
+        When mamba_tp == 1 (attention_dp) the state is replicated, so return
+        None to signal fan-in election. REPLICATED side state holds identical
+        bytes on every rank regardless of mamba_tp, so it always elects.
+        """
+        if mapper_kind == MapperKind.REPLICATED:
+            return None
         mamba_tp, _ = MambaPolicy._mamba_tp(self._ri)
         if mamba_tp == 1:
             return None  # caller should use fan-in election
@@ -364,6 +378,8 @@ class MambaPolicy:
         peer_buffers_per_layer: int = 1,
         self_lg=None,
         peer_lg=None,
+        self_pv: Optional[PoolView] = None,
+        peer_pv: Optional[PoolView] = None,
         src_layer_off: int = 0,
         dst_layer_off: int = 0,
     ) -> RegionMapperBase:
@@ -379,11 +395,29 @@ class MambaPolicy:
         ``extract_slot``. Under full PP overlap these are 0; under partial PP
         overlap they identify which slice of the extraction to transfer.
 
-        The ``mapper_kind`` discriminates conv (SECTIONED) from ssm (INDEXED).
-        TP info comes from ``self._ri`` and ``peer_ri``. Per-head / per-section
-        metadata comes from ``self_lg`` / ``peer_lg`` (MambaLayerGroup).
+        The ``mapper_kind`` discriminates conv (SECTIONED), ssm (INDEXED) and
+        replicated side state (REPLICATED). TP info comes from ``self._ri``
+        and ``peer_ri``. Per-section / per-head resharding metadata comes
+        from the views themselves (``PoolView.section_bytes`` /
+        ``PoolView.bytes_per_head``).
         """
         transfer_layers = len(self_layer_offsets)
+
+        if mapper_kind == MapperKind.REPLICATED:
+            # Identical bytes on every rank: whole per-layer copy, no TP
+            # resharding. Fan-in ownership is decided by should_send.
+            if self_bytes_per_layer != peer_bytes_per_layer:
+                raise ValueError(
+                    "Replicated state size differs between peers: "
+                    f"local={self_bytes_per_layer}, peer={peer_bytes_per_layer}"
+                )
+            return MambaHeadMatchMapper(
+                transfer_layers=transfer_layers,
+                src_layer_off=src_layer_off,
+                dst_layer_off=dst_layer_off,
+                block_bytes_per_layer=self_bytes_per_layer,
+            )
+
         self_mamba_tp, self_mamba_tp_rank = MambaPolicy._mamba_tp(self._ri)
         peer_mamba_tp, peer_mamba_tp_rank = MambaPolicy._mamba_tp(peer_ri)
         tp_match = self_mamba_tp == peer_mamba_tp
@@ -396,30 +430,40 @@ class MambaPolicy:
                 block_bytes_per_layer=self_bytes_per_layer,
             )
 
-        is_conv = mapper_kind == MapperKind.SECTIONED
-        if is_conv:
+        if self_pv is None or peer_pv is None:
+            raise ValueError("MambaPolicy.build_mapper needs both pool views under a TP mismatch")
+
+        if mapper_kind == MapperKind.SECTIONED:
+            if self_pv.section_bytes is None or peer_pv.section_bytes is None:
+                raise ValueError(
+                    f"SECTIONED view {sorted(self_pv.pool_role)} lacks section_bytes on "
+                    "one side; cannot reshard under a TP mismatch"
+                )
             return ConvStateMismatchMapper(
                 transfer_layers=transfer_layers,
                 src_layer_off=src_layer_off,
                 dst_layer_off=dst_layer_off,
-                self_section_bytes=self_lg.conv_section_bytes,
-                peer_section_bytes=peer_lg.conv_section_bytes,
+                self_section_bytes=self_pv.section_bytes,
+                peer_section_bytes=peer_pv.section_bytes,
                 self_tp_per_dp=self_mamba_tp,
                 peer_tp_per_dp=peer_mamba_tp,
                 self_tp_rank=self_mamba_tp_rank,
                 peer_tp_rank=peer_mamba_tp_rank,
             )
 
-        # SSM state (INDEXED): head-level granularity
-        assert self_lg.ssm_bytes_per_head is not None, "ssm_bytes_per_head required for SSM mapper"
-        assert peer_lg.ssm_bytes_per_head is not None, "ssm_bytes_per_head required for SSM mapper"
-        self_nheads = self_bytes_per_layer // self_lg.ssm_bytes_per_head
-        peer_nheads = peer_bytes_per_layer // peer_lg.ssm_bytes_per_head
+        # INDEXED state: head-level granularity
+        if self_pv.bytes_per_head is None or peer_pv.bytes_per_head is None:
+            raise ValueError(
+                f"INDEXED view {sorted(self_pv.pool_role)} lacks bytes_per_head on one "
+                "side; cannot reshard under a TP mismatch"
+            )
+        self_nheads = self_bytes_per_layer // self_pv.bytes_per_head
+        peer_nheads = peer_bytes_per_layer // peer_pv.bytes_per_head
         return MambaHeadMismatchMapper(
             transfer_layers=transfer_layers,
             src_layer_off=src_layer_off,
             dst_layer_off=dst_layer_off,
-            bytes_per_head=self_lg.ssm_bytes_per_head,
+            bytes_per_head=self_pv.bytes_per_head,
             self_nheads=self_nheads,
             peer_nheads=peer_nheads,
             self_tp_per_dp=self_mamba_tp,
@@ -483,19 +527,6 @@ class MambaPolicy:
         # invariants below are per-layer-slot quantities, uniform across a
         # model's recurrent layers, so they apply regardless of which layers
         # overlap.
-        if (
-            self_mlg.ssm_bytes_per_head is not None
-            and peer_mlg.ssm_bytes_per_head is not None
-            and self_mlg.ssm_bytes_per_head != peer_mlg.ssm_bytes_per_head
-        ):
-            # TP-invariant: head_dim * d_state * element_size. A mismatch
-            # means different state shape or SSM cache dtype.
-            raise ValueError(
-                "MambaPolicy.validate_peer_compatible: ssm_bytes_per_head differs "
-                f"(local={self_mlg.ssm_bytes_per_head}, peer={peer_mlg.ssm_bytes_per_head}); "
-                "check head_dim / d_state / mamba_ssm_cache_dtype"
-            )
-
         self_tp, _ = MambaPolicy._mamba_tp(self_ri)
         peer_tp, _ = MambaPolicy._mamba_tp(peer_ri)
 
@@ -512,37 +543,68 @@ class MambaPolicy:
                     "only with attention-DP enabled on both sides."
                 )
 
-        # Resolve slot_bytes from pool_views by pool_role (conv_states/ssm_states
-        # fields were removed; pool_views carry the same geometry).
-        from tensorrt_llm._torch.disaggregation.resource.page import MAMBA_CONV_ROLE, MAMBA_SSM_ROLE
-
-        def _slot_bytes_by_role(mlg, role):
-            for pv in mlg.pool_views:
-                if pv.pool_role == role:
-                    return pv.bytes_per_layer
-            return None
-
-        self_ssm_slot = _slot_bytes_by_role(self_mlg, MAMBA_SSM_ROLE)
-        peer_ssm_slot = _slot_bytes_by_role(peer_mlg, MAMBA_SSM_ROLE)
-        self_conv_slot = _slot_bytes_by_role(self_mlg, MAMBA_CONV_ROLE)
-        peer_conv_slot = _slot_bytes_by_role(peer_mlg, MAMBA_CONV_ROLE)
-
-        if self_ssm_slot is not None and peer_ssm_slot is not None:
-            _check_global("ssm slot_bytes", self_ssm_slot, peer_ssm_slot)
-        if self_conv_slot is not None and peer_conv_slot is not None:
-            _check_global("conv slot_bytes", self_conv_slot, peer_conv_slot)
-
-        if self_mlg.conv_section_bytes is not None and peer_mlg.conv_section_bytes is not None:
-            if len(self_mlg.conv_section_bytes) != len(peer_mlg.conv_section_bytes):
+        # Views pair up by pool_role, exactly as get_pool_mapping matches them.
+        # A role present on only one side is a peer-declaration mismatch for
+        # REPLICATED views (checked below); for sharded views it is left to
+        # pool matching, which skips it.
+        peer_views = {pv.pool_role: pv for pv in peer_mlg.pool_views}
+        for self_pv in self_mlg.pool_views:
+            peer_pv = peer_views.get(self_pv.pool_role)
+            if peer_pv is None:
+                continue
+            role = sorted(self_pv.pool_role)
+            if self_pv.mapper_kind != peer_pv.mapper_kind:
                 raise ValueError(
-                    "MambaPolicy.validate_peer_compatible: conv section count differs "
-                    f"(local={len(self_mlg.conv_section_bytes)}, "
-                    f"peer={len(peer_mlg.conv_section_bytes)})"
+                    f"MambaPolicy.validate_peer_compatible: mapper kind of role {role} differs "
+                    f"(local={self_pv.mapper_kind.name}, peer={peer_pv.mapper_kind.name})"
                 )
-            for i, (s, p) in enumerate(
-                zip(self_mlg.conv_section_bytes, peer_mlg.conv_section_bytes)
+            if self_pv.bytes_per_layer is None or peer_pv.bytes_per_layer is None:
+                continue
+
+            if self_pv.mapper_kind == MapperKind.REPLICATED:
+                # Identical bytes on every rank: sizes must match exactly.
+                if self_pv.bytes_per_layer != peer_pv.bytes_per_layer:
+                    raise ValueError(
+                        "MambaPolicy.validate_peer_compatible: replicated state size differs "
+                        f"for role {role} (local={self_pv.bytes_per_layer}, "
+                        f"peer={peer_pv.bytes_per_layer})"
+                    )
+                continue
+
+            _check_global(f"{role} slot_bytes", self_pv.bytes_per_layer, peer_pv.bytes_per_layer)
+
+            if self_pv.mapper_kind == MapperKind.SECTIONED:
+                if self_pv.section_bytes is not None and peer_pv.section_bytes is not None:
+                    if len(self_pv.section_bytes) != len(peer_pv.section_bytes):
+                        raise ValueError(
+                            f"MambaPolicy.validate_peer_compatible: section count of role {role} "
+                            f"differs (local={len(self_pv.section_bytes)}, "
+                            f"peer={len(peer_pv.section_bytes)})"
+                        )
+                    for i, (s, p) in enumerate(zip(self_pv.section_bytes, peer_pv.section_bytes)):
+                        _check_global(f"{role} section_bytes[{i}]", s, p)
+            elif (
+                self_pv.bytes_per_head is not None
+                and peer_pv.bytes_per_head is not None
+                and self_pv.bytes_per_head != peer_pv.bytes_per_head
             ):
-                _check_global(f"conv_section_bytes[{i}]", s, p)
+                # TP-invariant: head_dim * d_state * element_size. A mismatch
+                # means different state shape or SSM cache dtype.
+                raise ValueError(
+                    f"MambaPolicy.validate_peer_compatible: bytes_per_head of role {role} "
+                    f"differs (local={self_pv.bytes_per_head}, peer={peer_pv.bytes_per_head}); "
+                    "check head_dim / d_state / mamba_ssm_cache_dtype"
+                )
+
+        # Replicated side state (e.g. PLE) is copied whole per layer, so both
+        # sides must declare the same roles on shared layers. A role missing
+        # on one side would otherwise be dropped silently by pool matching.
+        differing = find_replicated_role_mismatch(self_page_table, peer_page_table, CacheKind.STATE)
+        if differing:
+            raise ValueError(
+                "MambaPolicy.validate_peer_compatible: replicated roles differ on "
+                f"overlapping layers: {differing}"
+            )
 
     @staticmethod
     def _mamba_tp(ri: RankInfo) -> Tuple[int, int]:
@@ -597,19 +659,19 @@ def mamba_receiver_payload_bytes(
     if sender_mlg is None or receiver_mlg is None:
         return 0
 
-    sender_globals = {ll.global_layer_id for ll in sender_mlg.local_layers}
-    receiver_globals = {ll.global_layer_id for ll in receiver_mlg.local_layers}
-    overlap = sender_globals & receiver_globals
-    if not overlap:
-        return 0
-
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
-
-    receiver_lg_idx = next(
-        i for i, lg in enumerate(receiver_page_table.layer_groups) if lg.kind == CacheKind.STATE
-    )
-    per_layer = sum(
-        get_physical_pool(receiver_page_table, receiver_lg_idx, pv.pool_idx).slot_bytes
-        for pv in receiver_mlg.pool_views
-    )
-    return len(overlap) * per_layer
+    sender_views = {
+        (pool_view.pool_role, pool_view.mapper_kind): pool_view
+        for pool_view in sender_mlg.pool_views
+    }
+    total = 0
+    for receiver_view in receiver_mlg.pool_views:
+        sender_view = sender_views.get((receiver_view.pool_role, receiver_view.mapper_kind))
+        if sender_view is None:
+            continue
+        sender_layers = set(get_pool_view_global_layer_ids(sender_view, sender_mlg))
+        receiver_layers = set(get_pool_view_global_layer_ids(receiver_view, receiver_mlg))
+        overlap = sender_layers & receiver_layers
+        if not overlap:
+            continue
+        total += len(overlap) * receiver_view.bytes_per_layer
+    return total

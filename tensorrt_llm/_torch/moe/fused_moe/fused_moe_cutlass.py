@@ -115,6 +115,7 @@ class CutlassFusedMoE(MoEImplBase):
         }),
         alpha_beta=ActivationParamShape.PER_EXPERT_TENSOR,
         limit=ActivationParamShape.PER_EXPERT_TENSOR,
+        clamp_after_silu=True,
     )
 
     # Quantization algorithm support table for can_implement()
@@ -139,9 +140,9 @@ class CutlassFusedMoE(MoEImplBase):
             "sm_constraint": ("in", {90, 120}),
             "dtypes": {torch.bfloat16},
         },
-        # NVFP4: SM in {100, 103, 120, 121}
+        # NVFP4: SM in {100, 103, 107, 120, 121}
         QuantAlgo.NVFP4: {
-            "sm_constraint": ("in", {100, 103, 120, 121}),
+            "sm_constraint": ("in", {100, 103, 107, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         },
         # W4A16_NVFP4: weights stay NVFP4 but are dequantized to the activation
@@ -166,14 +167,14 @@ class CutlassFusedMoE(MoEImplBase):
             "sm_constraint": ("exact", 90),
             "dtypes": {torch.float16, torch.bfloat16},
         },
-        # W4A8_MXFP4_FP8: SM in {100, 103}
+        # W4A8_MXFP4_FP8: SM in {100, 103, 107}
         QuantAlgo.W4A8_MXFP4_FP8: {
-            "sm_constraint": ("in", {100, 103}),
+            "sm_constraint": ("in", {100, 103, 107}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
-        # W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
+        # W4A8_MXFP4_MXFP8: SM in {100, 103, 107, 120, 121}
         QuantAlgo.W4A8_MXFP4_MXFP8: {
-            "sm_constraint": ("in", {100, 103, 120, 121}),
+            "sm_constraint": ("in", {100, 103, 107, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16},
         },
         # MXFP8 (W8A8 e4m3xe4m3 with UE8M0 1x32 block scales): SM in {100, 103}.
@@ -276,6 +277,16 @@ class CutlassFusedMoE(MoEImplBase):
                 MoERejectReason.DTYPE_UNSUPPORTED,
                 f"CutlassFusedMoE {algo_name} requires {dtype_list}, "
                 f"got {p.dtype_act}")
+
+        # SM120 FP8 block scales use the Triton fallback below rather than the
+        # CUTLASS adaptor, and that fallback has no clamp-order parameter.
+        if (p.clamp_after_silu and quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+                and sm_version == 120):
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                "CutlassFusedMoE SM120 FP8 block scales use a Triton fallback "
+                "that does not implement post-SiLU clamping",
+            )
 
         # Routed-expert MoE LoRA supports unquantized fp16/bf16 or per-tensor FP8 only.
         if d.moe_lora_enabled and quant_algo not in (None, QuantAlgo.FP8):
@@ -453,8 +464,8 @@ class CutlassFusedMoE(MoEImplBase):
         CudaGraphLoraManager does this automatically.
 
         Args:
-            max_num_tokens: Worst-case tokens in a captured forward
-                (max_batch_size * max_tokens_per_seq).
+            max_num_tokens: Larger of the captured-decode capacity
+                (max_batch_size * max_tokens_per_seq) and the engine-wide token limit.
             max_lora_rank: Largest LoRA rank across adapters.
             max_lora_size: Adapter-slot pool size for the slot-indexed device tables.
         """
@@ -1039,6 +1050,7 @@ class CutlassFusedMoE(MoEImplBase):
             swiglu_alpha=self.act_alpha,
             swiglu_beta=self.act_beta,
             swiglu_limit=self.act_clamp,
+            swiglu_clamp_after_silu=self.act_clamp_after_silu,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,
@@ -1135,6 +1147,7 @@ class CutlassFusedMoE(MoEImplBase):
             swiglu_alpha=self.act_alpha,
             swiglu_beta=self.act_beta,
             swiglu_limit=self.act_clamp,
+            swiglu_clamp_after_silu=self.act_clamp_after_silu,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,

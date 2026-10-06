@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -568,3 +568,12 @@ def test_mla_helix_distributed(
     comms_medium: str,
 ):
     run_helix_test(_full_test_multi_gpu, scenario, comms_medium)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
+@skip_pre_blackwell
+def test_mla_helix_fifo_v2_unaligned_softmax_stats():
+    # Six heads over CP2 produce three local heads and a 24-byte softmax-stats
+    # row, exercising the float2 fallback used by Kimi K3 over CP32.
+    scenario = Scenario(num_heads=6, num_kv_heads=6, batch=1, ctx_len=64)
+    run_helix_test(_full_test_multi_gpu, scenario, "fifo_v2")

@@ -139,7 +139,6 @@ def test_integrator_tool_records_authoritative_verdict(tmp_path):
             "remediation_attempts": 0,
             "measured_gain_pct": 11.0,
             "measured_value": 111.0,
-            "required_gain_pct": 7.4,
             "best_candidate_id": "opt-001",
         },
     )

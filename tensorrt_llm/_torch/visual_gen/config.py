@@ -51,11 +51,17 @@ from tensorrt_llm.visual_gen.args import (
 
 def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
     """
-    Discover components from diffusers pipeline's model_index.json.
+    Discover components from a Diffusers pipeline manifest.
+
+    Standard pipelines use ``model_index.json``. Experimental modular
+    pipelines use ``modular_model_index.json`` but retain the same component
+    subdirectory/config layout needed by TRT-LLM.
 
     Returns dict mapping component name to config.json path.
     """
     model_index_path = checkpoint_path / "model_index.json"
+    if not model_index_path.exists():
+        model_index_path = checkpoint_path / "modular_model_index.json"
     if not model_index_path.exists():
         return {}
 
@@ -74,7 +80,14 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
 
 
 def create_attention_metadata_state() -> Dict[str, Any]:
-    """Create model-scoped state shared by visual-gen attention layers."""
+    """Create state shared by attention layers in one model component.
+
+    The state outlives individual forwards and CUDA Graph captures. It owns the
+    shape-keyed TRTLLM metadata cache, whose metadata objects also carry the FMHA
+    plan caches, so one static block-sparse profile is planned once per component
+    and shape instead of once per layer. Each model component receives a distinct
+    state and must not execute concurrent forwards.
+    """
     return {"metadata_cache": {}}
 
 
@@ -123,6 +136,7 @@ class DiffusionModelConfig(_VisualGenConfigBase):
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     cpu_offload_config: CpuOffloadConfig = PydanticField(default_factory=CpuOffloadConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    # Per-component metadata cache shared by VisualGen TRTLLM attention layers.
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
@@ -196,6 +210,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     cpu_offload_config: CpuOffloadConfig = PydanticField(default_factory=CpuOffloadConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    # Seed state copied into each model component before attention metadata is created.
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
@@ -537,7 +552,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         cls,
         checkpoint_dir: str,
         args: Optional["VisualGenArgs"] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> "DiffusionPipelineConfig":
         """
         Load config from pretrained checkpoint.
@@ -549,8 +564,9 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             )
 
         Supports two checkpoint formats:
-        * **Diffusers directory layout** -- ``model_index.json`` with
-          component sub-directories each containing ``config.json``.
+        * **Diffusers directory layout** -- ``model_index.json`` or
+          ``modular_model_index.json`` with component sub-directories each
+          containing ``config.json``.
         * **Single-safetensors** -- no ``model_index.json``; config embedded
           in the safetensors metadata header under a ``"config"`` key.  The
           transformer section is extracted as ``pretrained_config`` and the
@@ -623,6 +639,8 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                 pretrained_config._name_or_path = str(checkpoint_path)
 
             model_index_path = checkpoint_path / "model_index.json"
+            if not model_index_path.exists():
+                model_index_path = checkpoint_path / "modular_model_index.json"
             if model_index_path.exists():
                 with open(model_index_path) as f:
                     model_index = json.load(f)
@@ -675,7 +693,8 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             else:
                 raise ValueError(
                     f"Config not found at {checkpoint_dir}. "
-                    "Expected model_index.json (diffusers) or "
+                    "Expected model_index.json or modular_model_index.json "
+                    "(Diffusers), or "
                     "safetensors with embedded config metadata."
                 )
 

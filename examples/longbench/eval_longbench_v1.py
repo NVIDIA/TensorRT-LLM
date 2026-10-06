@@ -122,7 +122,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--backend',
                         type=str,
                         default='pytorch',
-                        choices=['pytorch', 'tensorrt'],
+                        choices=['pytorch'],
                         help='LLM backend to use')
     parser.add_argument('--chat_template',
                         type=str,
@@ -390,12 +390,6 @@ def initialize_llm(args: argparse.Namespace) -> Tuple[LLM, AutoTokenizer]:
             batch_sizes=args.cuda_graph_batch_sizes,
             enable_padding=args.cuda_graph_padding_enabled,
         ) if args.use_cuda_graph else None
-
-        # Validate backend compatibility
-        if args.backend == 'tensorrt' and (args.dsa_sparse or args.mtp > 0):
-            parser.error(
-                "DSA sparse attention and MTP speculative decoding require "
-                "--backend pytorch (tensorrt backend is not supported)")
 
         # Configure sparse attention
         if args.rocket_sparse:

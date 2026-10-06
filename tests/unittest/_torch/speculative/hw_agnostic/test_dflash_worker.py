@@ -54,6 +54,10 @@ class _FakeDraftModel:
     def _get_attention_mask_args(self, layer_idx):
         return True, (-1, -1)
 
+    def validate_block_attention_windows(self):
+        # Every layer is causal and unwindowed, so the TRTLLM check passes.
+        pass
+
 
 def test_trtllm_backend_builds_private_paged_context_cache(monkeypatch):
     monkeypatch.setattr(

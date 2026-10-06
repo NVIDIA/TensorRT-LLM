@@ -5,7 +5,7 @@
 
 Subcommands:
   sync-core  Add missing accuracy/disaggregated pytest ids from test-db GPU YAMLs
-             (backend pytorch / autodeploy) into llm_function_core.txt.
+             (backend pytorch) into llm_function_core.txt.
              Never removes existing entries.
 
 Run from the repository root (or pass --repo-root).
@@ -20,7 +20,7 @@ from pathlib import Path
 
 TEST_DB_REL = Path("tests/integration/test_lists/test-db")
 CORE_REL = Path("tests/integration/test_lists/qa/llm_function_core.txt")
-BACKENDS = frozenset({"pytorch", "autodeploy"})
+BACKENDS = frozenset({"pytorch"})
 
 
 def normalize_list_item(s: str) -> str | None:
@@ -39,7 +39,7 @@ def normalize_list_item(s: str) -> str | None:
 
 
 def extract_accuracy_disaggregated_from_yml(text: str) -> set[str]:
-    """Parse test-db YAML text; return node ids from pytorch/autodeploy ``tests:`` blocks."""
+    """Parse test-db YAML text; return node ids from pytorch ``tests:`` blocks."""
     lines = text.splitlines()
     found: set[str] = set()
     i = 0
@@ -107,9 +107,7 @@ def cmd_sync_core(repo_root: Path, dry_run: bool) -> int:
     existing_lines, existing_set = load_core_node_ids(core_path)
     missing = sorted(from_db - existing_set)
 
-    print(
-        f"test-db (backend pytorch + autodeploy) accuracy + disaggregated node ids: {len(from_db)}"
-    )
+    print(f"test-db (backend pytorch) accuracy + disaggregated node ids: {len(from_db)}")
     print(f"{core_path.name} lines (non-comment): {len(existing_lines)}")
     print(f"missing (will add): {len(missing)}")
 

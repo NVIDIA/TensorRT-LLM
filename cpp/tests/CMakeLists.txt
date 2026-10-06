@@ -58,7 +58,7 @@ function(add_gtest test_name test_src)
     target_compile_definitions(${test_name} PUBLIC ENABLE_MULTI_DEVICE)
   endif()
 
-  target_compile_features(${test_name} PRIVATE cxx_std_17)
+  target_compile_features(${test_name} PRIVATE cxx_std_20)
   target_compile_definitions(${test_name}
                              PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 

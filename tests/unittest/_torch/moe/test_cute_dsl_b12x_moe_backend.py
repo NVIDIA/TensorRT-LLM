@@ -22,7 +22,10 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
+    CuteDslB12xFusedMoE,
+    _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
@@ -312,3 +315,84 @@ def test_dispatch_rejects_non_tensor():
     so the existing ValueError surfaces in quantize_input."""
     stub = _RoutePredicateStub()
     assert stub._route_to_cutlass(object()) is False
+
+
+# ---------------------------------------------------------------------------
+# flashinfer W4A16 ultra-wide FC2 tile re-validation shim (nvbug 6721561)
+# ---------------------------------------------------------------------------
+
+# FC2 problem of Qwen3.6-35B-A3B (N=hidden_size, K=moe_intermediate_size) and
+# the RTX PRO 6000 opt-in shared memory minus flashinfer's 512-byte reserve:
+# the exact geometry the post-merge failure re-pinned.
+_QWEN36_FC2 = dict(problem_n=2048, problem_k=512)
+_RTX_PRO_6000_SMEM = 101376 - 512
+_ULTRA_FC2 = dict(tile_n=512, tile_k=32, cta_threads=256)
+
+
+def _flashinfer_w4a16_kernel():
+    kernel = pytest.importorskip("flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel")
+    if hasattr(kernel, "_ultra_wide_fc2_tile_fits"):
+        pytest.skip("installed flashinfer ships the ultra-wide FC2 tile fix; drop the shim")
+    return kernel
+
+
+def _reset_to_stock_validator(kernel, monkeypatch) -> None:
+    """Start every test from flashinfer's own validator, whichever test or
+    backend construction installed the shim earlier in this process."""
+    fits = kernel._candidate_tile_fits
+    monkeypatch.setattr(
+        kernel, "_candidate_tile_fits", getattr(fits, "_trtllm_upstream_fits", fits)
+    )
+
+
+def _fits(kernel, **overrides) -> bool:
+    kwargs = dict(cta_m_blocks=1, max_shared_mem=_RTX_PRO_6000_SMEM, **_QWEN36_FC2, **_ULTRA_FC2)
+    kwargs.update(overrides)
+    return kernel._candidate_tile_fits(**kwargs)
+
+
+def test_w4a16_ultra_wide_fc2_shim_accepts_repinned_ultra_tile(monkeypatch):
+    kernel = _flashinfer_w4a16_kernel()
+    _reset_to_stock_validator(kernel, monkeypatch)
+    assert not _fits(kernel), (
+        "flashinfer's stock validator accepts the ultra-wide FC2 tile; the shim in "
+        "fused_moe_cute_dsl_b12x.py is no longer needed"
+    )
+    stock_wide_fc2 = _fits(kernel, tile_n=256, tile_k=64)
+
+    assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is True
+
+    # The failing re-pin now passes ...
+    assert _fits(kernel)
+    assert _fits(kernel, scale_format="e8m0_k32")
+    # ... under the override's own rule: exact N/K tiling and shared-memory fit.
+    assert not _fits(kernel, problem_n=2048 + 256)
+    assert not _fits(kernel, problem_k=512 + 16)
+    assert not _fits(kernel, max_shared_mem=16 * 1024)
+    # Everything that is not the ultra-wide FC2 tile still goes to flashinfer.
+    assert _fits(kernel, tile_n=256, tile_k=64) is stock_wide_fc2
+    assert not _fits(kernel, tile_n=256, tile_k=32, cta_threads=128)
+    assert not _fits(kernel, tile_n=512, tile_k=32, cta_threads=128)
+
+
+def test_w4a16_ultra_wide_fc2_shim_is_idempotent(monkeypatch):
+    kernel = _flashinfer_w4a16_kernel()
+    _reset_to_stock_validator(kernel, monkeypatch)
+    stock = kernel._candidate_tile_fits
+
+    assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is True
+    installed = kernel._candidate_tile_fits
+    assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is True
+
+    assert kernel._candidate_tile_fits is installed
+    assert installed._trtllm_upstream_fits is stock
+
+
+def test_w4a16_ultra_wide_fc2_shim_yields_to_upstream_fix(monkeypatch):
+    kernel = _flashinfer_w4a16_kernel()
+    _reset_to_stock_validator(kernel, monkeypatch)
+    stock = kernel._candidate_tile_fits
+    monkeypatch.setattr(kernel, "_ultra_wide_fc2_tile_fits", lambda **_: True, raising=False)
+
+    assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is False
+    assert kernel._candidate_tile_fits is stock

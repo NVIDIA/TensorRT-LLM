@@ -362,7 +362,7 @@ struct CutlassGemmConfig
         FP8_ONLY = 1u << 6,
         FP4_ONLY = 1u << 7,
         FP8FP4_MIXED = 1u << 8,
-        // MXFP8xMXFP8 block-scaled MoE on SM100/103. Restricts the candidate
+        // MXFP8xMXFP8 block-scaled MoE on the SM100 family (SM100/103/107). Restricts the candidate
         // tile shapes to the subset valid for the Mxf8f6f4 tensor-op (TileM=128,
         // TileN in {64,128,256}); otherwise autotuning would enumerate FP8 tile
         // shapes that the runtime dispatcher rejects.

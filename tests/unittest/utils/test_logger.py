@@ -240,6 +240,77 @@ class TestModuleLevelFiltering:
         singleton._module_levels = {}
 
 
+class TestIsDebugEnabled:
+    """Tests for is_debug_enabled, the guard for expensive debug arguments.
+
+    The guard has to agree with what ``debug()`` itself would emit. Comparing
+    ``logger.level`` to the literal ``"debug"`` does not: it drops ``verbose``
+    and ``trace``, and it ignores per-module overrides entirely.
+    """
+
+    @pytest.mark.parametrize(
+        "level,expected",
+        [
+            ("trace", True),
+            ("debug", True),
+            ("verbose", True),
+            ("info", False),
+            ("warning", False),
+            ("error", False),
+            ("internal_error", False),
+        ],
+    )
+    def test_follows_severity_order(self, level, expected):
+        singleton = Logger()
+        previous = singleton._min_severity
+        singleton._min_severity = level
+        try:
+            # Called from this test file, so no module override applies.
+            assert singleton.is_debug_enabled() is expected
+        finally:
+            singleton._min_severity = previous
+
+    def test_module_override_can_enable_below_the_global_level(self):
+        """A module raised to debug logs even when the global level is info."""
+        singleton = Logger()
+        previous = singleton._min_severity
+        previous_module_levels = singleton._module_levels
+        singleton._min_severity = "info"
+        singleton._module_levels = {"serve": 10}  # debug
+        try:
+            code = compile(
+                "from tensorrt_llm.logger import logger\nresult = logger.is_debug_enabled()\n",
+                "/fake/tensorrt_llm/serve/router.py",
+                "exec",
+            )
+            fake_globals = {"__name__": "tensorrt_llm.serve.router"}
+            exec(code, fake_globals)
+            assert fake_globals["result"] is True
+        finally:
+            singleton._module_levels = previous_module_levels
+            singleton._min_severity = previous
+
+    def test_module_override_can_disable_above_the_global_level(self):
+        """A module pinned to info stays quiet even when the global level is debug."""
+        singleton = Logger()
+        previous = singleton._min_severity
+        previous_module_levels = singleton._module_levels
+        singleton._min_severity = "debug"
+        singleton._module_levels = {"serve": 20}  # info
+        try:
+            code = compile(
+                "from tensorrt_llm.logger import logger\nresult = logger.is_debug_enabled()\n",
+                "/fake/tensorrt_llm/serve/other_router.py",
+                "exec",
+            )
+            fake_globals = {"__name__": "tensorrt_llm.serve.other_router"}
+            exec(code, fake_globals)
+            assert fake_globals["result"] is False
+        finally:
+            singleton._module_levels = previous_module_levels
+            singleton._min_severity = previous
+
+
 class TestLoggerAPI:
     """Tests that Logger exposes the expected API."""
 

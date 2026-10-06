@@ -139,8 +139,8 @@ class _DecodeRuntime:
 class _DecodePlanState:
     """One complete static paged-decode plan published atomically.
 
-    Request metadata is deliberately absent. Every launch supplies its own
-    sequence lengths, row-strided page table, and (for packed Q) query offsets.
+    Sequence lengths are owned either by the plan or by every run. The page
+    table and (for packed Q) query offsets remain per-run request metadata.
     """
 
     device: torch.device
@@ -166,6 +166,8 @@ class _DecodePlanState:
     compiled_reducer: Optional[Callable[..., object]]
     kv_prefix_mode: Literal["dynamic", "planned_full"]
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"]
+    planned_seq_lens_host: Optional[tuple[int, ...]]
+    planned_seq_lens_device: Optional[torch.Tensor]
     policy: tuple[tuple[str, object], ...]
 
 
@@ -223,9 +225,8 @@ def _planned_full_split_prefix(
     """Prove that host length evidence uses every configured split CTA.
 
     A successful proof permits a private JIT specialization that removes only
-    the no-op runtime split-prefix branch. Runtime lengths remain launch
-    arguments and, when validation is enabled, must independently satisfy the
-    same proof before they drive page tails and causal masking.
+    the no-op runtime split-prefix branch. The plan retains the evidenced
+    lengths and supplies an owned device copy to every launch.
 
     Q groups are enumerated with the same token-base/union rule as the device
     helper.  Every batch/group pair must prove the configured fanout; otherwise
@@ -280,8 +281,8 @@ def _planned_kv_lengths_mode(
 
     When every evidenced request is exactly the compiled maximum, native page
     addressing still uses the runtime block table while task domains and
-    masks can use the compile-time length. Validated runs recheck this equality
-    proof against their per-run lengths; the evidence itself is not retained.
+    masks can use the compile-time length. The plan retains the evidenced
+    lengths and supplies an owned device copy to every launch.
     """
 
     if not seq_lens or max_kv_len <= 0:
@@ -948,11 +949,10 @@ def _normalize_paged_kv_cache(
     )
 
 
-def _validate_block_table_metadata(
+def _validate_block_tables(
     block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
 ) -> tuple[torch.device, int, int]:
-    """Validate the synchronization-free fixed page-table structure."""
+    """Validate a fixed page table without requiring sequence-length storage."""
 
     if not isinstance(block_tables, torch.Tensor):
         raise TypeError("block_tables must be a torch.Tensor")
@@ -964,6 +964,34 @@ def _validate_block_table_metadata(
         raise ValueError("block_tables must be a CUDA tensor")
     if block_tables.data_ptr() % 4 != 0:
         raise ValueError("block_tables data pointer must be 4-byte aligned")
+
+    batch_size = int(block_tables.shape[0])
+    if batch_size <= 0:
+        raise ValueError("block_tables must contain at least one request row")
+    table_capacity = int(block_tables.shape[1])
+    if table_capacity <= 0:
+        raise ValueError("block_tables must contain at least one page column")
+    if table_capacity > _MAX_INT32:
+        raise ValueError("block_tables column count exceeds signed int32")
+    if block_tables.stride(1) != 1:
+        raise ValueError("block_tables must be contiguous within each row")
+    if block_tables.stride(0) < table_capacity:
+        raise ValueError(
+            "block_tables rows must not overlap: row stride must be at least "
+            f"the column count ({table_capacity}), got {block_tables.stride(0)}"
+        )
+    return block_tables.device, batch_size, table_capacity
+
+
+def _validate_block_table_metadata(
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> tuple[torch.device, int, int]:
+    """Validate fixed page-table and sequence-length tensor structure."""
+
+    block_table_device, block_table_batch_size, table_capacity = _validate_block_tables(
+        block_tables
+    )
 
     if not isinstance(seq_lens, torch.Tensor):
         raise TypeError("seq_lens must be a torch.Tensor")
@@ -977,28 +1005,16 @@ def _validate_block_table_metadata(
         raise ValueError("seq_lens must be contiguous")
     if seq_lens.data_ptr() % 4 != 0:
         raise ValueError("seq_lens data pointer must be 4-byte aligned")
-    if block_tables.device != seq_lens.device:
+    if block_table_device != seq_lens.device:
         raise ValueError("block_tables and seq_lens must be on the same device")
 
     batch_size = int(seq_lens.numel())
     if batch_size <= 0:
         raise ValueError("seq_lens must contain at least one request")
-    if int(block_tables.shape[0]) != batch_size:
+    if block_table_batch_size != batch_size:
         raise ValueError(
             "block_tables must have one row per request: expected "
-            f"{batch_size}, got {block_tables.shape[0]}"
-        )
-    table_capacity = int(block_tables.shape[1])
-    if table_capacity <= 0:
-        raise ValueError("block_tables must contain at least one page column")
-    if table_capacity > _MAX_INT32:
-        raise ValueError("block_tables column count exceeds signed int32")
-    if block_tables.stride(1) != 1:
-        raise ValueError("block_tables must be contiguous within each row")
-    if block_tables.stride(0) < table_capacity:
-        raise ValueError(
-            "block_tables rows must not overlap: row stride must be at least "
-            f"the column count ({table_capacity}), got {block_tables.stride(0)}"
+            f"{batch_size}, got {block_table_batch_size}"
         )
     return seq_lens.device, batch_size, table_capacity
 
@@ -1966,19 +1982,17 @@ def _normalize_plan_seq_lens(
     batch_size: int,
     max_kv_len: int,
 ) -> Optional[tuple[int, ...]]:
-    """Validate optional host-only evidence used for JIT specialization."""
+    """Validate optional host-only lengths retained by the plan."""
 
     if seq_lens is None:
         return None
     if isinstance(seq_lens, torch.Tensor):
         if seq_lens.device.type != "cpu":
-            raise ValueError("plan seq_lens specialization evidence must be on CPU")
+            raise ValueError("plan seq_lens must be on CPU")
         if seq_lens.ndim != 1:
-            raise ValueError("plan seq_lens specialization evidence must be 1D")
+            raise ValueError("plan seq_lens must be 1D")
         if seq_lens.dtype not in (torch.int32, torch.int64):
-            raise TypeError(
-                "plan seq_lens specialization evidence must have int32 or int64 dtype"
-            )
+            raise TypeError("plan seq_lens must have int32 or int64 dtype")
         raw_values: Sequence[object] = seq_lens.tolist()
     elif isinstance(seq_lens, Sequence) and not isinstance(
         seq_lens, (str, bytes, bytearray)
@@ -1986,26 +2000,25 @@ def _normalize_plan_seq_lens(
         raw_values = seq_lens
     else:
         raise TypeError(
-            "plan seq_lens specialization evidence must be a host sequence "
-            "of integers or a CPU tensor"
+            "plan seq_lens must be a host sequence of integers or a CPU tensor"
         )
 
     if len(raw_values) != batch_size:
         raise ValueError(
-            "plan seq_lens specialization evidence must contain exactly "
+            "plan seq_lens must contain exactly "
             f"batch_size ({batch_size}) values, got {len(raw_values)}"
         )
     normalized = []
     for request_idx, value in enumerate(raw_values):
         if isinstance(value, bool) or not isinstance(value, numbers.Integral):
             raise TypeError(
-                "plan seq_lens specialization evidence must contain integers; "
+                "plan seq_lens must contain integers; "
                 f"request {request_idx} has {value!r}"
             )
         seq_len = int(value)
         if seq_len <= 0 or seq_len > max_kv_len:
             raise ValueError(
-                "plan seq_lens specialization evidence values must be within "
+                "plan seq_lens values must be within "
                 f"[1, {max_kv_len}]; request {request_idx} has {seq_len}"
             )
         normalized.append(seq_len)
@@ -2064,9 +2077,11 @@ def _validate_decode_run_metadata_values(
     block_tables: torch.Tensor,
     qo_indptr: Optional[torch.Tensor],
 ) -> None:
-    """Synchronously validate per-run metadata values and constexpr evidence."""
+    """Synchronously validate per-run metadata values."""
 
-    runtime_seq_lens = tuple(int(value) for value in seq_lens.tolist())
+    runtime_seq_lens = state.planned_seq_lens_host
+    if runtime_seq_lens is None:
+        runtime_seq_lens = tuple(int(value) for value in seq_lens.tolist())
     table_capacity = int(block_tables.shape[1])
     for request_idx, seq_len in enumerate(runtime_seq_lens):
         if seq_len <= 0 or seq_len > state.max_kv_len:
@@ -2124,30 +2139,6 @@ def _validate_decode_run_metadata_values(
                     "no greater than its K/V length; request "
                     f"{request_idx} has Q={q_len} and K/V={kv_len}"
                 )
-
-    if state.kv_prefix_mode == "planned_full" and not _planned_full_split_prefix(
-        state.config,
-        runtime_seq_lens,
-        seq_len_q=state.seq_len_q,
-        max_kv_len=state.max_kv_len,
-        mask_type=state.mask_type,
-    ):
-        raise ValueError(
-            "runtime seq_lens do not satisfy the plan's full-split-prefix "
-            "specialization evidence"
-        )
-    if (
-        state.kv_lengths_mode == "planned_uniform_max"
-        and _planned_kv_lengths_mode(
-            runtime_seq_lens,
-            max_kv_len=state.max_kv_len,
-        )
-        != "planned_uniform_max"
-    ):
-        raise ValueError(
-            "runtime seq_lens do not satisfy the plan's uniform-maximum "
-            "specialization evidence"
-        )
 
 
 @flashinfer_api
@@ -2410,12 +2401,13 @@ def prims_ts_batch_decode_with_kv_cache(
 
 
 class BatchDecodePagedTSWrapper:
-    """Plan static paged-decode capacity and run with per-run request metadata.
+    """Plan static paged-decode capacity and bind request metadata.
 
     A plan fixes device, batch size, geometry, dtypes, query storage mode, and
-    maximum K/V capacity. It owns compiled callables and one mutable scratch
-    workspace, but no request tensors. Every run supplies sequence lengths and
-    a row-strided page table; packed-query plans also consume per-run Q offsets.
+    maximum K/V capacity. Sequence lengths are supplied either once to
+    :meth:`plan`, which retains an owned CUDA copy, or to every :meth:`run`.
+    Every run supplies a row-strided page table; packed-query plans also consume
+    per-run Q offsets.
 
     One wrapper supports one ordered execution lane. Concurrent streams or
     graph replays require separate wrappers and workspace buffers.
@@ -2468,19 +2460,19 @@ class BatchDecodePagedTSWrapper:
         seq_lens: Optional[Union[Sequence[int], torch.Tensor]] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
     ) -> None:
-        """Compile one static-capacity plan without retaining request metadata.
+        """Compile one static-capacity plan and optionally own sequence lengths.
 
         ``max_seq_len_q`` is the exact fixed Q length when ``packed_query`` is
         false and the per-request capacity when ``packed_query`` is true. A
         packed run supplies ``qo_indptr`` and compact ``[total_q, Hq, D]``
         storage.
 
-        ``seq_lens`` is optional CPU-only specialization evidence. When
-        omitted, both K/V prefix and length handling compile dynamically. When
-        supplied, planning may prove a full split prefix or uniform maximum
-        K/V length. The values are never passed to a launch. With validation
-        enabled, ``run`` synchronously verifies that per-run lengths still satisfy
-        every selected constexpr proof.
+        ``seq_lens`` optionally fixes the per-request lengths for the lifetime
+        of this plan. Planning validates the host values, retains them, and
+        creates an owned CUDA copy used by every launch. In this mode,
+        :meth:`run` requires its ``seq_lens`` argument to be ``None``. When
+        omitted, both K/V prefix and length handling compile dynamically and
+        every run must supply a CUDA length tensor.
 
         ``workspace_buffer`` is caller-owned scratch for this plan. It is
         allocated when omitted, initialized during planning, retained by the
@@ -2524,10 +2516,10 @@ class BatchDecodePagedTSWrapper:
             Left sliding-window extent, or ``-1`` to disable the window. A
             non-negative value requires causal masking.
         seq_lens : Sequence[int] or torch.Tensor, optional
-            Host-only per-request K/V lengths used as specialization evidence.
-            A tensor must be a one-dimensional CPU int32 or int64 tensor. The
-            sequence must contain exactly ``batch_size`` positive values no
-            larger than ``max_kv_len``.
+            Host-only per-request K/V lengths owned by the resulting plan and
+            used for specialization. A tensor must be a one-dimensional CPU
+            int32 or int64 tensor. The sequence must contain exactly
+            ``batch_size`` positive values no larger than ``max_kv_len``.
         workspace_buffer : torch.Tensor, optional
             Caller-owned contiguous int8 or uint8 scratch on ``device``. It
             must be 32-byte aligned and large enough for the selected plan.
@@ -2668,6 +2660,17 @@ class BatchDecodePagedTSWrapper:
         workspace.split_kv_counter.zero_()
         workspace.cu_seqlens_q.zero_()
         workspace.attention_sinks.zero_()
+        # Materialize from the normalized tuple so the plan never aliases
+        # caller-owned host or device storage.
+        planned_seq_lens_device = (
+            None
+            if specialization_seq_lens is None
+            else torch.tensor(
+                specialization_seq_lens,
+                dtype=torch.int32,
+                device=device,
+            )
+        )
 
         candidate = _DecodePlanState(
             device=device,
@@ -2693,6 +2696,8 @@ class BatchDecodePagedTSWrapper:
             compiled_reducer=compiled_reducer,
             kv_prefix_mode=kv_prefix_mode,
             kv_lengths_mode=kv_lengths_mode,
+            planned_seq_lens_host=specialization_seq_lens,
+            planned_seq_lens_device=planned_seq_lens_device,
             policy=policy,
         )
         # This is the only wrapper mutation. Any failure above leaves the
@@ -2704,7 +2709,7 @@ class BatchDecodePagedTSWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: PagedKVCache,
-        seq_lens: torch.Tensor,
+        seq_lens: Optional[torch.Tensor],
         block_tables: torch.Tensor,
         *,
         qo_indptr: Optional[torch.Tensor] = None,
@@ -2713,19 +2718,23 @@ class BatchDecodePagedTSWrapper:
         out: Optional[torch.Tensor] = None,
         validate: bool = True,
     ) -> torch.Tensor:
-        """Launch the current plan with per-run request metadata.
+        """Launch the current plan with one sequence-length owner.
 
-        ``validate=True`` performs structural, value,
-        specialization-evidence, and alias validation. It reads metadata
-        values back to the host. This is the safe public default.
+        When :meth:`plan` received sequence lengths, ``seq_lens`` must be
+        ``None`` and the plan's owned CUDA copy is used. Otherwise, ``seq_lens``
+        must be supplied on every run. This ownership check is unconditional.
+
+        ``validate=True`` performs structural, value, and alias validation. It
+        reads per-run metadata values back to the host. This is the safe public
+        default.
         ``validate=False`` treats every run argument as a trusted binding,
         performs no explicit wrapper validation, and remains free of metadata
         device-to-host synchronization. K/V view selection, scale forwarding,
         and optional output allocation are unavoidable in both modes.
 
         Packed plans require ``qo_indptr`` with ``B + 1`` int32 offsets. Fixed
-        plans require ``qo_indptr`` to be omitted. All metadata tensors belong
-        to this launch and may change identity between ordered runs.
+        plans require ``qo_indptr`` to be omitted. Per-run metadata tensors may
+        change identity between ordered runs.
 
         Parameters
         ----------
@@ -2733,8 +2742,10 @@ class BatchDecodePagedTSWrapper:
             Runtime fixed or packed query tensor matching the plan.
         paged_kv_cache : torch.Tensor or tuple[torch.Tensor, torch.Tensor]
             Runtime combined or separate paged K/V storage matching the plan.
-        seq_lens : torch.Tensor
+        seq_lens : torch.Tensor, optional
             Per-run contiguous int32 CUDA K/V lengths with shape ``[B]``.
+            Required when omitted from :meth:`plan` and otherwise required to
+            be ``None``.
         block_tables : torch.Tensor
             Per-run int32 CUDA physical page IDs with shape ``[B, C]``. Entries
             must be contiguous within each row; the row stride may be any value
@@ -2750,9 +2761,9 @@ class BatchDecodePagedTSWrapper:
         out : torch.Tensor, optional
             Caller-owned output tensor. A new tensor is allocated when omitted.
         validate : bool
-            Run explicit structural, value, specialization-evidence, and alias
-            validation. Disable only when the caller guarantees the complete
-            runtime contract. Defaults to ``True``.
+            Run explicit structural, value, and alias validation. Disable only
+            when the caller guarantees the complete runtime contract. Sequence
+            length ownership is enforced in either mode. Defaults to ``True``.
 
         Returns
         -------
@@ -2763,6 +2774,20 @@ class BatchDecodePagedTSWrapper:
         state = self._require_plan_state()
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
+        planned_seq_lens = state.planned_seq_lens_device
+        plan_owns_seq_lens = planned_seq_lens is not None
+        if plan_owns_seq_lens:
+            if seq_lens is not None:
+                raise ValueError(
+                    "seq_lens must be None when plan() owns sequence lengths"
+                )
+            effective_seq_lens = planned_seq_lens
+        else:
+            if seq_lens is None:
+                raise ValueError(
+                    "seq_lens is required when plan() does not own sequence lengths"
+                )
+            effective_seq_lens = seq_lens
 
         runtime_qo_indptr = qo_indptr if state.use_packed_q else None
         caller_provided_out = out is not None
@@ -2771,9 +2796,13 @@ class BatchDecodePagedTSWrapper:
                 metadata_device,
                 metadata_batch_size,
                 _,
-            ) = _validate_block_table_metadata(
-                block_tables,
-                seq_lens,
+            ) = (
+                _validate_block_tables(block_tables)
+                if plan_owns_seq_lens
+                else _validate_block_table_metadata(
+                    block_tables,
+                    effective_seq_lens,
+                )
             )
             if metadata_device != state.device:
                 raise ValueError(
@@ -2816,7 +2845,7 @@ class BatchDecodePagedTSWrapper:
             _validate_decode_run_metadata_values(
                 state,
                 runtime,
-                seq_lens=seq_lens,
+                seq_lens=effective_seq_lens,
                 block_tables=block_tables,
                 qo_indptr=runtime_qo_indptr,
             )
@@ -2826,7 +2855,7 @@ class BatchDecodePagedTSWrapper:
                 ("query", runtime.q),
                 ("k_cache", runtime.k_cache),
                 ("v_cache", runtime.v_cache),
-                ("seq_lens", seq_lens),
+                ("seq_lens", effective_seq_lens),
                 ("qo_indptr", runtime_qo_indptr),
                 ("block_tables", block_tables),
                 ("out", runtime.out),
@@ -2834,7 +2863,7 @@ class BatchDecodePagedTSWrapper:
             if caller_provided_out:
                 _validate_decode_output_aliasing(
                     runtime,
-                    seq_lens=seq_lens,
+                    seq_lens=effective_seq_lens,
                     qo_indptr=runtime_qo_indptr,
                     block_tables=block_tables,
                     workspace_buffer=state.workspace_buffer,
@@ -2851,7 +2880,7 @@ class BatchDecodePagedTSWrapper:
 
         return _launch_decode(
             runtime,
-            seq_lens=seq_lens,
+            seq_lens=effective_seq_lens,
             qo_indptr=runtime_qo_indptr,
             block_tables=block_tables,
             workspace=state.workspace,
@@ -2889,7 +2918,8 @@ def batch_decode_with_paged_kv_cache(
     The one-shot planner reads ``seq_lens_kv`` on the host to derive exact plan
     bounds, so this convenience API is not CUDA-graph-capturable. Capture
     callers should plan :class:`BatchDecodePagedTSWrapper` before capture and
-    bind ``block_tables`` plus ``seq_lens`` directly during replay.
+    either bind a stable runtime ``seq_lens`` tensor or let the plan retain
+    fixed sequence lengths before replay.
 
     Parameters
     ----------
@@ -3091,7 +3121,7 @@ def batch_decode_with_paged_kv_cache(
     return wrapper.run(
         q,
         paged_kv_cache,
-        seq_lens_kv,
+        None,
         block_tables,
         qo_indptr=qo_indptr,
         bmm1_scale=bmm1_scale,

@@ -521,10 +521,8 @@ class TestLlama(unittest.TestCase):
 
         spec_tree_mgr = SpecTreeManager(
             max_num_requests=1,
-            use_dynamic_tree=is_spec_dec_dynamic_tree,
             max_total_draft_tokens=max_total_draft_tokens,
             max_draft_len=max_total_draft_tokens,
-            eagle_choices=None,
             dynamic_tree_max_topK=10,
         )
         # Populate with test data
@@ -613,17 +611,15 @@ class TestLlama(unittest.TestCase):
             max_draft_1 = gen_input_ids_1.size(-1) - 1
             spec_tree_mgr_phase1 = SpecTreeManager(
                 max_num_requests=1,
-                use_dynamic_tree=True,
                 max_total_draft_tokens=max_draft_1,
                 max_draft_len=max_draft_1,
-                eagle_choices=None,
                 dynamic_tree_max_topK=10,
             )
             spec_metadata_phase1 = SpecMetadata(
                 max_num_requests=1,
                 max_draft_len=max_draft_1,
                 max_total_draft_tokens=max_draft_1,
-                spec_dec_mode=SpeculativeDecodingMode.EAGLE3,
+                spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
             )
         attn_metadata_gen_phase_0.update_spec_dec_param(
             batch_size=batch_size,
@@ -687,17 +683,15 @@ class TestLlama(unittest.TestCase):
             max_draft_ref = gen_input_ids_ref.size(-1) - 1
             spec_tree_mgr_ref = SpecTreeManager(
                 max_num_requests=1,
-                use_dynamic_tree=True,
                 max_total_draft_tokens=max_draft_ref,
                 max_draft_len=max_draft_ref,
-                eagle_choices=None,
                 dynamic_tree_max_topK=10,
             )
             spec_metadata_ref = SpecMetadata(
                 max_num_requests=1,
                 max_draft_len=max_draft_ref,
                 max_total_draft_tokens=max_draft_ref,
-                spec_dec_mode=SpeculativeDecodingMode.EAGLE3,
+                spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
             )
         attn_metadata_ref.update_spec_dec_param(
             batch_size=batch_size,

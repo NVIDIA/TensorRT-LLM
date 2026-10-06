@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import unittest
 from unittest.mock import Mock, patch
 
@@ -45,6 +48,7 @@ def test_dynamic_draft_len(enforce_single_worker):
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         free_gpu_memory_fraction=0.6,
+        use_kv_cache_manager_v2=True,
     )
     eagle_model_dir = f"{llm_models_root()}/Qwen3/qwen3_8b_eagle3"
     target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"
@@ -52,7 +56,6 @@ def test_dynamic_draft_len(enforce_single_worker):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=4,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=True,
         draft_len_schedule={
             1: 4
         },  # It doesn't matter which value is used here, as the draft length will be controlled by the mock function.

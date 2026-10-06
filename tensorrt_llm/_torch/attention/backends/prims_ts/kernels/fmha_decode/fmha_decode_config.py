@@ -102,6 +102,16 @@ _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
     (Float16, Float16, Float16, 256, 128, 1, 1),
 }
 
+# Per-thread register budgets for the Q64/KV256 warp groups once the launch
+# bound enables ``setmaxnreg``. The MMA, load, and scheduler warps keep 56, so
+# the two softmax groups and the correction group share the remainder:
+# 8 * softmax + 4 * correction = 65536 / 32 - 4 * 56. An even split measured
+# fastest on B200 for both the static grid and the persistent scheduler; the
+# correction group needs the extra room for its persistent bookkeeping and
+# the KV256 tail merge, while the rolled softmax fragment loop needs less.
+KV_TILE_256_SOFTMAX_TASK_REGISTERS = 152
+KV_TILE_256_CORRECTION_TASK_REGISTERS = 152
+
 _KV_TILE_256_PHYSICAL_DEFAULTS: Mapping[str, ConfigValue] = {
     "tmem_s_cols": 128,
     "tmem_stats_cols": 32,
@@ -505,6 +515,10 @@ class FmhaDecodeConfig:
     # restricted to 8/16/32 or positive multiples of 64 and are assembled into
     # a profile-selected fixed KV128 or KV256 route.
     use_block_sparse: bool = False
+    # Interpret prepared records as a typed proxy/exact stream. Proxy records
+    # source semantic-block summaries while exact records retain the K/V
+    # atom path. Source selection is orthogonal to the physical Q/KV profile.
+    use_block_sparse_proxy_routes: bool = False
     q_block_size: int = 0
     kv_block_size: int = 0
     # Optional batch-wide physical-token validity metadata shared by every head
@@ -644,13 +658,13 @@ class FmhaDecodeConfig:
     def softmax_task_num_registers(self) -> int | None:
         if not self.uses_task_register_reallocation:
             return None
-        return 176 if self.tile_size_kv == 256 else 184
+        return KV_TILE_256_SOFTMAX_TASK_REGISTERS if self.tile_size_kv == 256 else 184
 
     @property
     def correction_task_num_registers(self) -> int | None:
         if not self.uses_task_register_reallocation:
             return None
-        return 104 if self.tile_size_kv == 256 else 88
+        return KV_TILE_256_CORRECTION_TASK_REGISTERS if self.tile_size_kv == 256 else 88
 
     @property
     def mma_load_task_num_registers(self) -> int | None:
@@ -1066,12 +1080,13 @@ class FmhaDecodeConfig:
     def softmax_score_fragment_regs(self) -> int:
         """Return the maximum score fragment kept live in registers.
 
-        KV256 owns 128 score values per lane but streams them as four native
-        32-register LDTM atoms. Other profiles retain their complete score
-        fragment, so this property is intentionally distinct from
-        ``num_s_regs_per_thread`` (the total logical ownership).
+        Streamed profiles own 128 score values per lane but process them as
+        four native 32-register LDTM atoms. Other profiles retain their
+        complete score fragment, so this property is intentionally distinct
+        from ``num_s_regs_per_thread`` (the total logical ownership). The
+        selection of streamed profiles lives in ``streams_tmem_p_fragments``.
         """
-        if self.tile_size_kv == 256:
+        if self.streams_tmem_p_fragments:
             return 32
         return self.num_s_regs_per_thread
 
@@ -1079,6 +1094,30 @@ class FmhaDecodeConfig:
     def num_softmax_score_fragments(self) -> int:
         """Return score fragments used to cover one logical KV tile."""
         return self.num_s_regs_per_thread // self.softmax_score_fragment_regs
+
+    @property
+    def block_sparse_kv_atom_size(self) -> int:
+        """Return the K token span of one block-sparse route origin."""
+        assert self.use_block_sparse
+        return _block_sparse_kv_atom_size(self.kv_block_size)
+
+    @property
+    def softmax_fragments_per_route_atom(self) -> int:
+        """Return the streamed score fragments that share one route origin.
+
+        Route origins are staged per K64 atom, so a 128-token KV block spans
+        two origins; the fragment-to-origin mapping follows the atom.
+        """
+        return self.block_sparse_kv_atom_size // self.softmax_score_fragment_regs
+
+    @property
+    def uses_ws_2x2_datapath(self) -> bool:
+        """Whether QK and PV issue the WS 2x2 instruction over two lane halves.
+
+        KV256 exposes two spatial KV128 partials per logical Q row; every other
+        Keeps profile issues the plain CTA-local instruction.
+        """
+        return self.tile_size_kv == 256
 
     @property
     def num_packed_p_regs(self) -> int:
@@ -1246,6 +1285,10 @@ class FmhaDecodeConfig:
 
     def validate_block_sparse_profile(self, *, heads_q_per_kv: int) -> None:
         """Validate the qualified host profile for block-sparse."""
+        if self.use_block_sparse_proxy_routes and not self.use_block_sparse:
+            raise ValueError("proxy routes require block-sparse attention")
+        if self.use_block_sparse_proxy_routes and self.mask_type != DENSE:
+            raise ValueError("block-sparse proxy routes require mask_type='dense'")
         if not self.use_block_sparse:
             if self.use_parallel_sparse_kv_loads:
                 raise ValueError(
@@ -1282,6 +1325,13 @@ class FmhaDecodeConfig:
             raise ValueError(
                 "block-sparse tile_size_kv=256 requires the Q64 16-bit Keeps "
                 "profile with coarse KV blocks and one load task"
+            )
+        if self.use_keeps_mma_ab and not self.streams_tmem_p_fragments:
+            # The block-sparse Keeps softmax and P passes exist only in their
+            # streamed K32-fragment form.
+            raise ValueError(
+                "block-sparse KeepsMmaAb requires a streamed TMEM-P profile "
+                "(Q64/KV256 or 16-bit Q128/KV128)"
             )
         if self.tile_size_q != selected_q_tile:
             raise ValueError(
@@ -1330,6 +1380,42 @@ class FmhaDecodeConfig:
         return tuple(
             (config_field.name, getattr(self, config_field.name))
             for config_field in fields(self)
+        )
+
+    @property
+    def uses_prepared_score_keep_words(self) -> bool:
+        """Whether prepared routes carry BMM1 score-column validity words.
+
+        Dense block-sparse Keeps plans prepare them even without a caller
+        token mask: the streamed max pass trusts the words directly, which is
+        cheaper than deriving each fragment's visible range in the softmax
+        warps. The plan sizes its route storage and the prepare kernels store
+        the words from this same property, via the resolved launch spec.
+        """
+
+        return (
+            self.use_kv_valid_bits
+            or self.use_block_sparse_proxy_routes
+            or (
+                self.use_block_sparse
+                and self.use_keeps_mma_ab
+                and self.mask_type == DENSE
+            )
+        )
+
+    @property
+    def trusts_prepared_score_words(self) -> bool:
+        """Whether prepared words fully describe dense score-column validity.
+
+        Dense prepared routes have already combined structural tail validity
+        with any caller-provided exact-token bits. Their K32 words therefore
+        apply to exact and proxy sources alike.
+        """
+
+        return (
+            self.use_block_sparse
+            and self.uses_prepared_score_keep_words
+            and self.mask_type == DENSE
         )
 
     @property
@@ -1435,10 +1521,10 @@ class FmhaDecodeConfig:
     @property
     def uses_ordered_softmax_barrier(self) -> bool:
         """Whether this profile selects the ordered P0/P1 softmax barrier."""
-        if self.tile_size_kv == 256:
-            # KV256 uses independent four-stage P-fragment pipelines. Ordering
-            # the two softmax groups would serialize fragment production and
-            # defeat the intended P/PV overlap.
+        if self.streams_tmem_p_fragments:
+            # Streamed profiles use independent per-fragment P pipelines.
+            # Ordering the two softmax groups would serialize fragment
+            # production and defeat the intended P/PV overlap.
             return False
         if self.ordered_softmax_barrier_mode == 2:
             return True
@@ -1554,10 +1640,11 @@ class FmhaDecodeConfig:
     def uses_two_inst_tmem_p(self) -> bool:
         """Whether a two-instance Keeps profile uses the TMEM-P overlay.
 
-        Q128/KV128 and sparse Q64/KV128 publish a complete packed-P row per
-        pipeline token. Q64/KV256 uses the same S-to-P aliasing contract but
-        streams four independently ready K32 fragments. Dense Q64/KV128 keeps
-        the base kernel's faster SMEM-P cadence.
+        FP8 Q128/KV128 and dense 16-bit Q128/KV128 publish a complete
+        packed-P row per pipeline token. Q64/KV256 and block-sparse 16-bit
+        Q128/KV128 use the same S-to-P aliasing contract but stream four
+        independently ready K32 fragments (see ``streams_tmem_p_fragments``).
+        Q64/KV128 keeps the base kernel's faster SMEM-P cadence.
         """
         # Two-instance Keeps keeps stats outside S, so both static and persistent
         # work tiles can overlay P on the consumed S instance. The split K/V
@@ -1568,11 +1655,6 @@ class FmhaDecodeConfig:
             and (
                 (self.tile_size_q == 128 and self.tile_size_kv == 128)
                 or (self.tile_size_q == 64 and self.tile_size_kv == 256)
-                or (
-                    self.use_block_sparse
-                    and self.tile_size_q == 64
-                    and self.tile_size_kv == 128
-                )
             )
             and self.head_dim_per_stage_kv == 0
             and self.num_insts_kv == 2
@@ -1582,8 +1664,43 @@ class FmhaDecodeConfig:
 
     @property
     def streams_tmem_p_fragments(self) -> bool:
-        """Whether P is published as independently ready TMEM fragments."""
-        return self.uses_two_inst_tmem_p and self.num_softmax_score_fragments > 1
+        """Whether P is published as independently ready TMEM fragments.
+
+        Streamed profiles produce their K32 fragments from one rolled runtime
+        loop: the max pass writes masked scores back to TMEM, so the P pass
+        reloads each fragment without mask logic and the exponentiation body
+        exists once in the instruction stream. Each published fragment lets
+        the MMA warp start its PV k-slice before the row is complete, at the
+        cost of one barrier round per fragment.
+
+        Streaming is limited to the 16-bit two-instance profiles whose route
+        loop waits on the K/V loads, where the earlier PV start hides load
+        latency: Q64/KV256 and block-sparse Q128/KV128. Dense Q128/KV128
+        keeps the complete row because its route loop is not load-bound, so
+        the per-fragment barriers are not compensated. FP8 Q128 keeps the
+        complete row because its P publication packs four values per column
+        into one store.
+        """
+        return (
+            self.uses_two_inst_tmem_p
+            and not self.use_fp8_qkv
+            and (self.tile_size_kv == 256 or self.use_block_sparse)
+        )
+
+    @property
+    def defers_softmax_anchor_updates(self) -> bool:
+        """Whether small row-max increases keep the previous exponent anchor.
+
+        Keeps correction skips the in-place O rescale whenever the anchor is
+        unchanged, so keeping the prior anchor within
+        ``SOFTMAX_RESCALE_THRESHOLD_LOG2`` trades a bounded 16-bit P range
+        (2**8) for fewer TMEM rescales. The profiles listed here are the ones
+        where that trade was measured to pay: KV256 tiles and block-sparse
+        routes, whose row maximum moves often but rarely by much.
+        """
+        return self.use_keeps_mma_ab and (
+            self.tile_size_kv == 256 or self.use_block_sparse
+        )
 
     @property
     def matches_kv256_task_topology(self) -> bool:
@@ -1592,32 +1709,6 @@ class FmhaDecodeConfig:
             getattr(self, field) == expected
             for field, expected in _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS.items()
         )
-
-    @property
-    def uses_rotating_kv256_exchange(self) -> bool:
-        """Whether this profile selects KV-ring scratch for correction.
-
-        Persistent direct output can overlap the next work tile's first two
-        K loads with correction by placing its exchange in the third, drained
-        KV stage. Split-KV and attention sinks retain the fixed exchange because
-        their tail storage and lifetime differ from direct output.
-        """
-        selects_persistent_kv256 = (
-            self.streams_tmem_p_fragments
-            and self.tile_size_q == 64
-            and self.tile_size_kv == 256
-            and self.use_persistent_scheduler
-        )
-        if not selects_persistent_kv256:
-            return False
-
-        has_rotating_kv_ring = (
-            self.num_head_dim_stages_kv == 1
-            and self.kv_stages == KV_TILE_256_SHARED_FIFO_STAGES
-            and self.load_num_warps == 1
-        )
-        has_direct_output_lifetime = not (self.use_split_kv or self.use_attention_sinks)
-        return has_rotating_kv_ring and has_direct_output_lifetime
 
     @property
     def keeps_separates_tmem_s_and_stats(self) -> bool:
@@ -2195,17 +2286,6 @@ def _validate_kv256_static_config(cfg: FmhaDecodeConfig) -> None:
             f"q_stages={cfg.q_stages}, kv_stages={cfg.kv_stages} require "
             f"{pipeline_smem_bytes} bytes, limit is "
             f"{pipeline_smem_budget_bytes} bytes"
-        )
-    if (
-        cfg.use_persistent_scheduler
-        and not cfg.use_split_kv
-        and not cfg.use_attention_sinks
-        and cfg.kv_stages != KV_TILE_256_SHARED_FIFO_STAGES
-    ):
-        raise ValueError(
-            "persistent KV256 requires kv_stages="
-            f"{KV_TILE_256_SHARED_FIFO_STAGES} for the rotating shared-KV "
-            f"exchange, got {cfg.kv_stages}"
         )
     if not cfg.supports_grouped_keeps:
         raise ValueError(

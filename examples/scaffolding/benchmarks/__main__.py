@@ -164,8 +164,8 @@ def parse_arguments():
     parser.add_argument(
         "--mcp_url",
         type=str,
-        default="http://0.0.0.0:8083/sse",
-        help="Coder Apiary MCP server URL (default: http://0.0.0.0:8083/sse)",
+        default="http://127.0.0.1:8083/mcp",
+        help="Coder Apiary MCP server URL (default: http://127.0.0.1:8083/mcp)",
     )
     parser.add_argument(
         "--coder_image",

@@ -189,7 +189,11 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
     // subclass type is not directly registered (e.g., agents created via factory).
     nb::class_<kvc::TransferStatus>(m, "TransferStatus")
         .def("is_completed", &kvc::TransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
-        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>());
+        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>())
+        // Failure detail for the last terminal state (empty if unavailable). Named to match the
+        // lookup in BindingsNixlTransferStatus.last_status_str (nixl/_agent_cpp.py), which is what
+        // the Python transceiver's error log reads.
+        .def("get_last_status_str", &kvc::TransferStatus::getLastStatusStr);
 
     // BaseAgentConfig struct
     nb::class_<kvc::BaseAgentConfig>(m, "BaseAgentConfig")
@@ -199,15 +203,18 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             [](kvc::BaseAgentConfig* self, std::string name, bool use_prog_thread, bool multi_thread,
                 bool use_listen_thread, bool enable_telemetry,
                 std::unordered_map<std::string, std::string> backend_params, std::optional<int> rank,
-                std::optional<int> world_size)
+                std::optional<int> world_size, size_t agent_buffer_size_mb,
+                std::unordered_map<std::string, std::string> bounce_params)
             {
                 new (self) kvc::BaseAgentConfig{std::move(name), use_prog_thread, multi_thread, use_listen_thread,
-                    enable_telemetry, std::move(backend_params), rank, world_size};
+                    enable_telemetry, std::move(backend_params), rank, world_size, agent_buffer_size_mb,
+                    std::move(bounce_params)};
             },
             nb::arg("name"), nb::arg("use_prog_thread") = true, nb::arg("multi_thread") = false,
             nb::arg("use_listen_thread") = false, nb::arg("enable_telemetry") = false,
             nb::arg("backend_params") = std::unordered_map<std::string, std::string>{}, nb::arg("rank") = std::nullopt,
-            nb::arg("world_size") = std::nullopt)
+            nb::arg("world_size") = std::nullopt, nb::arg("agent_buffer_size_mb") = 0,
+            nb::arg("bounce_params") = std::unordered_map<std::string, std::string>{})
         .def_rw("name", &kvc::BaseAgentConfig::mName)
         .def_rw("use_prog_thread", &kvc::BaseAgentConfig::useProgThread)
         .def_rw("multi_thread", &kvc::BaseAgentConfig::multiThread)
@@ -215,7 +222,9 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def_rw("enable_telemetry", &kvc::BaseAgentConfig::enableTelemetry)
         .def_rw("backend_params", &kvc::BaseAgentConfig::backendParams)
         .def_rw("rank", &kvc::BaseAgentConfig::rank)
-        .def_rw("world_size", &kvc::BaseAgentConfig::worldSize);
+        .def_rw("world_size", &kvc::BaseAgentConfig::worldSize)
+        .def_rw("agent_buffer_size_mb", &kvc::BaseAgentConfig::agentBufferSizeMb)
+        .def_rw("bounce_params", &kvc::BaseAgentConfig::bounceParams);
 
     // BaseTransferAgent class (abstract base)
     // All transfer-engine operations release the GIL: they may block on NIXL /
@@ -293,7 +302,26 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def("get_notified_sync_messages", &kvc::NixlTransferAgent::getNotifiedSyncMessages,
             nb::call_guard<nb::gil_scoped_release>())
         .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"),
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::call_guard<nb::gil_scoped_release>())
+        // Programmatic bounce v2 observability (deployment checks and tests; no log parsing).
+        .def_prop_ro("bounce_enabled", &kvc::NixlTransferAgent::isBounceEnabled)
+        .def_prop_ro("bounce_submit_count", &kvc::NixlTransferAgent::getBounceSubmitCount)
+        .def_prop_ro("bounce_reject_count", &kvc::NixlTransferAgent::getBounceRejectCount)
+        .def_prop_ro("bounce_reject_counts",
+            [](kvc::NixlTransferAgent const& self)
+            {
+                // Python dicts keep insertion order, so filling by index yields BounceRejectReason
+                // (evaluation) order — more useful than the alphabetical order a std::map would give.
+                nb::dict out;
+                auto const counts = self.getBounceRejectCounts();
+                for (std::size_t i = 0; i < counts.size(); ++i)
+                {
+                    out[nb::str(kvc::NixlTransferAgent::bounceRejectReasonName(
+                        static_cast<kvc::bounce::BounceRejectReason>(i)))]
+                        = nb::int_(counts[i]);
+                }
+                return out;
+            });
 #endif
 
     // NOTE: MooncakeTransferAgent/MooncakeTransferStatus class bindings are intentionally

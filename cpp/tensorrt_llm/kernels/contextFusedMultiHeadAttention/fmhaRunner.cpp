@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -84,12 +84,16 @@ static inline void set_alpha(uint32_t& alpha, float norm, Data_type dtype)
 FusedMHARunnerV2::FusedMHARunnerV2(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
 {
-    TLLM_CHECK_WITH_INFO((mSM == kSM_80 || mSM == kSM_86 || mSM == kSM_89 || mSM == kSM_90 || mSM == kSM_100
-                             || mSM == kSM_103 || mSM == kSM_120 || mSM == kSM_121),
+    TLLM_CHECK_WITH_INFO((mSM == kSM_80 || mSM == kSM_86 || mSM == kSM_89 || mSM == kSM_90
+                             || tensorrt_llm::common::isSM100Family(mSM) || mSM == kSM_120 || mSM == kSM_121),
         "Unsupported architecture");
     TLLM_CHECK_WITH_INFO((mFixedParams.dataType == DATA_TYPE_FP16 || mFixedParams.dataType == DATA_TYPE_BF16
                              || mFixedParams.dataType == DATA_TYPE_E4M3),
         "Unsupported data type");
+    if (tensorrt_llm::common::isSM100Family(mSM))
+    {
+        mSM = kSM_100;
+    }
     xmmaKernel = getXMMAKernelsV2(mFixedParams.dataType, mFixedParams.dataTypeOut, mSM);
 
     if (mFixedParams.headSizeV == 0)
@@ -190,12 +194,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
             // Tensor K is contiguous.
             mKernelParams.k_stride_in_bytes
                 = get_size_in_bytes(mFixedParams.numKvHeads * mFixedParams.headSize, mFixedParams.dataType);
-            if (runnerParams.vStrideInBytes > 0)
-            {
-                // Caller provided the actual V stride (supports both contiguous and non-contiguous V).
-                mKernelParams.v_stride_in_bytes = runnerParams.vStrideInBytes;
-            }
-            else if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
+            if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
             {
                 // Non-FP8 context MLA: tensor V is not contiguous. The token stride is numKvHeads * (headSizeQkNope +
                 // headSizeV).
@@ -358,7 +357,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     bool const isSm8x = (mSM == kSM_86 || mSM == kSM_89);
     bool const isSm80 = (mSM == kSM_80);
     bool const isSm89 = (mSM == kSM_89);
-    bool const isSm100f = (mSM == kSM_100 || mSM == kSM_103);
+    bool const isSm100f = tensorrt_llm::common::isSM100Family(mSM);
     bool const isSm120f = (mSM == kSM_120 || mSM == kSM_121);
 
     // Sliding_or_chunked_causal mask.

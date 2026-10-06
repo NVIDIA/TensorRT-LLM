@@ -145,6 +145,9 @@ struct MlaParams
     // `latent_cache` row stride in elements; the fused path passes a slice of
     // kv_a_proj, so rows are wider than packed. 0 means packed.
     int latent_row_stride = 0;
+    // The caller has already applied Q RoPE and written the complete FP8 Q to
+    // `quant_q_buf`. Context preprocessing must still rotate/cache K.
+    bool q_rope_applied = false;
 
     // DSv4 fused inverse-RoPE + FP8 quant epilogue parameters.
     Dsv4EpilogueFusionParams dsv4_epilogue_fusion;
@@ -155,6 +158,13 @@ struct MlaParams
     // for Helix parallelism: whether the current rank is inactive, shape [b]
     // (the current query tokens are not appended to this rank's KV cache)
     bool const* helix_is_inactive_rank{nullptr};
+
+    // for Helix parallelism with speculative verify groups: per-token
+    // rank-local KV write slot, shape [num_tokens]; -1 means another CP rank
+    // owns the token's global position. Non-null supersedes the per-sequence
+    // helix_is_inactive_rank gate (a 1 + draft_len group can straddle a
+    // ledger-page boundary, splitting ownership between two ranks).
+    int32_t const* helix_local_slots{nullptr};
 };
 
 template <typename T, typename KVCacheBuffer>

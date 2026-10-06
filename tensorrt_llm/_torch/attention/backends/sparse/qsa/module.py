@@ -162,6 +162,7 @@ def qsa_sparse_gqa(
     softmax_scale: float,
     query_positions: torch.Tensor | None = None,
     compress_ratio: int | None = None,
+    output_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA over V2 paged K/V, using Triton on CUDA by default."""
     if request_indices is None:
@@ -175,7 +176,10 @@ def qsa_sparse_gqa(
         )
     if request_indices.shape != (q.shape[0],):
         raise ValueError("QSA sparse GQA request indices must match query rows")
-    if q.is_cuda and _is_power_of_two(q.shape[-1]):
+    use_fused = q.is_cuda and _is_power_of_two(q.shape[-1])
+    if output_gate is not None and not use_fused:
+        raise ValueError("QSA output-gate fusion requires the fused CUDA sparse path")
+    if use_fused:
         from .kernels import triton_qsa_paged_sparse_gqa
 
         logger.info_once(
@@ -193,6 +197,7 @@ def qsa_sparse_gqa(
             softmax_scale=softmax_scale,
             query_positions=query_positions,
             compress_ratio=compress_ratio,
+            output_gate=output_gate,
         )
     logger.info_once(
         "QSA sparse GQA reference path is active",
@@ -251,6 +256,47 @@ def qsa_sparse_gqa_reference(
         values.float(),
     )
     return output.to(q.dtype).reshape(rows, num_q_heads, head_dim)
+
+
+def _capture_mtp_shared_topk(
+    metadata: "QSAAttentionMetadata",
+    slot: int,
+    indices: torch.Tensor,
+    visible_blocks: torch.Tensor,
+) -> None:
+    """Stash the selection the draft loop will reuse, one row per request.
+
+    ``slot`` is the calling layer's row in the shared buffers; the draft steps
+    read back the selection this layer's own indexer produced.
+
+    The row kept for each request is its last accepted one, so the reuse starts
+    from the ranking the target actually committed to.
+    """
+    shared = metadata.qsa_shared_topk_indices
+    if shared is None:
+        return
+    num_seqs = metadata.num_seqs
+    num_rows = indices.shape[0]
+    if num_seqs <= 0 or num_rows <= 0:
+        return
+
+    # Requests contribute different row counts, so each one's rows are located
+    # from its own start offset. This is the same packing the reuse kernel
+    # reads back through ``request_indices``.
+    seq_lens = metadata.seq_lens_cuda[:num_seqs].to(torch.int64)
+    row_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
+    num_accepted = metadata.qsa_mtp_num_accepted
+    if num_accepted is None:
+        offsets = seq_lens - 1
+    else:
+        offsets = torch.minimum(num_accepted[:num_seqs].to(torch.int64) - 1, seq_lens - 1)
+    rows = (row_starts + offsets).clamp_(0, num_rows - 1)
+
+    shared[slot, :num_seqs].copy_(indices.index_select(0, rows))
+    metadata.qsa_shared_topk_visible_blocks[slot, :num_seqs].copy_(
+        visible_blocks.index_select(0, rows)
+    )
+    metadata.qsa_shared_topk_captured_slots.add(slot)
 
 
 def select_qsa_tokens(
@@ -327,14 +373,46 @@ def select_qsa_paged_tokens(
     top_k_row_starts: torch.Tensor | None = None,
     visible_blocks: torch.Tensor | None = None,
     context_rows: bool = False,
+    mtp_share_slot: int | None = None,
 ) -> torch.Tensor:
     """Select tokens with packed, fixed-width paged scoring.
 
     ``context_rows`` marks the caller that packs many consecutive query rows
     per request; scoring can then share one gather of compressed keys across a
     tile of rows.
+
+    ``mtp_share_slot`` lets one MTP iteration score once: the draft-extend
+    pass stores each request's last accepted selection and the draft decode
+    steps rebuild their rows from it without running the indexer at all. It is
+    the calling layer's row in the shared buffers, and ``None`` turns the reuse
+    off.
     """
-    from .kernels import triton_qsa_paged_index_scores
+    from .kernels import triton_qsa_mtp_reuse_topk, triton_qsa_paged_index_scores
+
+    if visible_blocks is None:
+        visible_blocks = ((query_positions + 1) // params.compress_ratio).to(torch.int32)
+
+    if (
+        mtp_share_slot is not None
+        and metadata.qsa_indexer_skip_topk
+        and mtp_share_slot in metadata.qsa_shared_topk_captured_slots
+        and top_k_output is not None
+        and q.is_cuda
+    ):
+        indices = triton_qsa_mtp_reuse_topk(
+            shared_indices=metadata.qsa_shared_topk_indices[mtp_share_slot],
+            shared_visible_blocks=metadata.qsa_shared_topk_visible_blocks[mtp_share_slot],
+            request_indices=request_indices,
+            visible_blocks=visible_blocks,
+            output=top_k_output[: q.shape[0]],
+        )
+        return expand_qsa_block_indices(
+            indices,
+            query_positions,
+            sequence_lengths,
+            compress_ratio=params.compress_ratio,
+            token_topk=params.token_topk,
+        )
 
     logits = triton_qsa_paged_index_scores(
         q=q,
@@ -354,8 +432,6 @@ def select_qsa_paged_tokens(
         if top_k_output is None or top_k_row_starts is None:
             raise ValueError("QSA CUDA Top-K requires caller-owned output and row starts")
         indices = top_k_output[: q.shape[0]]
-        if visible_blocks is None:
-            visible_blocks = ((query_positions + 1) // params.compress_ratio).to(torch.int32)
         # QSA always has explicit per-row compressed-block bounds, including
         # generation and speculative rows. Use TopK's row-range API rather
         # than its request-grouped decode API; this is a layout choice, not a
@@ -386,6 +462,8 @@ def select_qsa_paged_tokens(
                 (0, params.block_topk - width),
                 value=-1,
             )
+    if mtp_share_slot is not None:
+        _capture_mtp_shared_topk(metadata, mtp_share_slot, indices, visible_blocks)
     return expand_qsa_block_indices(
         indices,
         query_positions,
@@ -413,6 +491,7 @@ class QSASparseHooks(AttentionSparseHooks):
         relative_attention_bias: Optional[torch.Tensor],
         relative_attention_max_distance: int,
         has_lora: bool,
+        output_gate: Optional[torch.Tensor],
         **kwargs: object,
     ) -> Optional[torch.Tensor]:
         if attention_mask is not PredefinedAttentionMask.CAUSAL:
@@ -456,6 +535,19 @@ class QSASparseHooks(AttentionSparseHooks):
                 f"QSA sparse K/V kernels do not support {kv_cache_dtype}; "
                 "using the regular attention backend",
                 key=f"qsa_dense_fallback_{kv_cache_dtype}",
+            )
+            return None
+
+        from .kernels import qsa_supports_head_dims
+
+        head_dim = attention.head_dim
+        index_head_dim = attention.sparse_params.index_head_dim
+        if not qsa_supports_head_dims(head_dim, index_head_dim):
+            logger.warning_once(
+                f"QSA kernels need power-of-two head dimensions; got head_dim="
+                f"{head_dim} and index_head_dim={index_head_dim}. Using the "
+                "regular attention backend",
+                key="qsa_dense_fallback_head_dim",
             )
             return None
 
@@ -551,6 +643,11 @@ class QSASparseHooks(AttentionSparseHooks):
             # lengths on device and the host mirror is not updated between its
             # sub-steps.
             sequence_lengths = attn_metadata.qsa_sequence_lengths[:num_tokens]
+            mtp_share_slot = None
+            if params.mtp_index_share and attn_metadata.qsa_in_mtp_draft_loop:
+                mtp_share_slot = attn_metadata.kv_cache_manager.qsa_shared_topk_slots[
+                    attention.layer_idx
+                ]
             selected = select_qsa_paged_tokens(
                 q_index,
                 index_cache,
@@ -563,7 +660,23 @@ class QSASparseHooks(AttentionSparseHooks):
                 top_k_output=attn_metadata.qsa_topk_indices,
                 top_k_row_starts=attn_metadata.qsa_topk_row_starts,
                 visible_blocks=attn_metadata.qsa_visible_blocks[:num_tokens],
+                mtp_share_slot=mtp_share_slot,
             )
+            fuse_output_gate = False
+            if output_gate is not None:
+                from .kernels import can_fuse_qsa_splitk_output_gate
+
+                fuse_output_gate = can_fuse_qsa_splitk_output_gate(
+                    q,
+                    k_cache,
+                    selected,
+                    output_gate,
+                )
+                if fuse_output_gate:
+                    logger.info_once(
+                        "QSA split-K merge fuses the attention output gate",
+                        key="qsa_fused_output_gate_active",
+                    )
             output = qsa_sparse_gqa(
                 q=q,
                 k_cache=k_cache,
@@ -572,8 +685,12 @@ class QSASparseHooks(AttentionSparseHooks):
                 request_indices=req_idx,
                 metadata=attn_metadata,
                 softmax_scale=1.0 / (attention.q_scaling * attention.head_dim**0.5),
+                output_gate=output_gate if fuse_output_gate else None,
             )
-            return output.reshape(num_tokens, -1)
+            output = output.reshape(num_tokens, -1)
+            if output_gate is not None and not fuse_output_gate:
+                output = attention.apply_output_gate(output, output_gate)
+            return output
 
         index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)
         if index_cache is None:
@@ -612,7 +729,10 @@ class QSASparseHooks(AttentionSparseHooks):
                 query_positions=logical[packed_slice],
                 compress_ratio=params.compress_ratio,
             )
-        return output.reshape(num_tokens, -1)
+        output = output.reshape(num_tokens, -1)
+        if output_gate is not None:
+            output = attention.apply_output_gate(output, output_gate)
+        return output
 
 
 register_attention_sparse_hooks("qsa", QSASparseHooks)

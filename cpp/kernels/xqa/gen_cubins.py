@@ -67,8 +67,8 @@ clean_cubin = True
 cubin_dir = "cubin/"
 
 nvcc_bin = 'nvcc'
-nvcc_flags = '-std=c++17 -O3 -cubin -DGENERATE_CUBIN=1 -DNDEBUG --use_fast_math -Xptxas=-v --allow-unsupported-compiler --expt-relaxed-constexpr -t 0'
-# nvcc_flags = '-std=c++17 -G -cubin -DGENERATE_CUBIN=1 -Xptxas=-v --allow-unsupported-compiler --expt-relaxed-constexpr -t 0'
+nvcc_flags = '-std=c++20 -O3 -cubin -DGENERATE_CUBIN=1 -DNDEBUG --use_fast_math -Xptxas=-v --allow-unsupported-compiler --expt-relaxed-constexpr -t 0'
+# nvcc_flags = '-std=c++20 -G -cubin -DGENERATE_CUBIN=1 -Xptxas=-v --allow-unsupported-compiler --expt-relaxed-constexpr -t 0'
 
 cpp_file_prefix_text = R"""/*
 * SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION &
@@ -439,7 +439,7 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1 and sys.argv[1] == 'spec_dec':
         is_spec_dec = True
-        nvcc_flags = '-std=c++17 -O3 -cubin -DGENERATE_CUBIN=1 -DNDEBUG -DSPEC_DEC --use_fast_math -Xptxas=-v --allow-unsupported-compiler --expt-relaxed-constexpr -t 0'
+        nvcc_flags = '-std=c++20 -O3 -cubin -DGENERATE_CUBIN=1 -DNDEBUG -DSPEC_DEC --use_fast_math -Xptxas=-v --allow-unsupported-compiler --expt-relaxed-constexpr -t 0'
         arch_options = [80, 86, 89, 90]
         config_list = [[
             CompileMacroOption('DTYPE', 'dt', ['__half', '__nv_bfloat16']),

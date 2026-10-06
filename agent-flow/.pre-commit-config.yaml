@@ -32,10 +32,3 @@ repos:
     -   id: ruff
         args: [--fix, --exit-non-zero-on-fix]
     -   id: ruff-format
--   repo: https://github.com/executablebooks/mdformat
-    rev: 0.7.17
-    hooks:
-    -   id: mdformat
-        additional_dependencies:
-        - mdformat_frontmatter
-        files: ".*/auto_deploy/.*"

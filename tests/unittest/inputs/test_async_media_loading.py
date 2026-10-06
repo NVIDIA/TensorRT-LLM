@@ -243,3 +243,72 @@ class TestRetrieveAllAsync:
         data, embeddings = await tracker.retrieve_all_async()
         assert data is None
         assert embeddings is None
+
+
+# ──────────────────────────────────────────────────────────────
+# data: URI declared-MIME vs modality check
+# ──────────────────────────────────────────────────────────────
+
+
+class TestDataUriMimeCheck:
+    """Declared-MIME vs modality validation for data URIs.
+
+    A data URI whose declared media type does not match the content part's
+    modality must be rejected, even when the payload bytes would decode.
+    """
+
+    @staticmethod
+    def _jpeg_b64() -> str:
+        img = Image.new("RGB", (8, 8), color=(10, 20, 30))
+        buf = BytesIO()
+        img.save(buf, format="JPEG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("declared_mime", ["text/plain", "video/mp4", "application/pdf"])
+    async def test_image_rejects_non_image_mime(self, declared_mime):
+        io = media_io_module.ImageMediaIO(format="pil")
+        url = f"data:{declared_mime};base64,{self._jpeg_b64()}"
+        with pytest.raises(ValueError, match="does not.*match"):
+            await io.async_load(url)
+
+    @pytest.mark.asyncio
+    async def test_image_accepts_image_mime(self):
+        io = media_io_module.ImageMediaIO(format="pil")
+        image = await io.async_load(f"data:image/jpeg;base64,{self._jpeg_b64()}")
+        assert isinstance(image, Image.Image)
+
+    @pytest.mark.asyncio
+    async def test_image_accepts_missing_mime_for_backward_compat(self):
+        io = media_io_module.ImageMediaIO(format="pil")
+        image = await io.async_load(f"data:;base64,{self._jpeg_b64()}")
+        assert isinstance(image, Image.Image)
+
+    @pytest.mark.asyncio
+    async def test_audio_rejects_non_audio_mime(self):
+        io = media_io_module.AudioMediaIO()
+        with pytest.raises(ValueError, match="does not.*match"):
+            await io.async_load(f"data:image/jpeg;base64,{self._jpeg_b64()}")
+
+    @pytest.mark.asyncio
+    async def test_audio_accepts_audio_mime(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+            _make_audio_file(f.name)
+            wav_b64 = base64.b64encode(open(f.name, "rb").read()).decode()
+        io = media_io_module.AudioMediaIO()
+        audio_array, sample_rate = await io.async_load(f"data:audio/wav;base64,{wav_b64}")
+        assert isinstance(audio_array, np.ndarray)
+        assert sample_rate == 16000
+
+    @pytest.mark.asyncio
+    async def test_video_rejects_non_video_mime(self):
+        io = media_io_module.VideoMediaIO()
+        with pytest.raises(ValueError, match="does not.*match"):
+            await io.async_load(f"data:image/jpeg;base64,{self._jpeg_b64()}")
+
+    @pytest.mark.asyncio
+    async def test_video_accepts_video_mime(self):
+        io = media_io_module.VideoMediaIO()
+        with patch.object(media_io_module.VideoMediaIO, "load_base64", return_value="decoded"):
+            result = await io.async_load("data:video/mp4;base64,AAAA")
+        assert result == "decoded"

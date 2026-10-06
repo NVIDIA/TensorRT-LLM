@@ -290,7 +290,12 @@ void causalConv1dFwd(at::Tensor const& x, at::Tensor const& weight, std::optiona
     // with unit stride (and vectorises across it), so it is only correct for a token-contiguous
     // x.  A channel-contiguous (token-major) x instead goes to the channel-last kernel, which
     // saves the caller the pair of transposes it would otherwise need.
-    bool const channel_last = params.x_c_stride == 1 && params.x_l_stride > 1 && dim > 1;
+    // A zero-token x is routed to the channel-major kernel regardless of its strides: an empty
+    // tensor keeps whatever strides its (no-op) transpose left behind and empty CUDA allocations
+    // can alias, so both the stride classification and the overlap guard below would misfire on
+    // it, while the channel-major kernel handles seqlen == 0 (state write-back only) as it always
+    // has (https://nvbugs/6705034).
+    bool const channel_last = params.x_c_stride == 1 && params.x_l_stride > 1 && dim > 1 && seqlen > 0;
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Static cast to signed char (AKA c10::DeviceIndex - the input to CUDAGuard) to avoid compiler warning about
@@ -314,7 +319,11 @@ void causalConv1dFwd(at::Tensor const& x, at::Tensor const& weight, std::optiona
     }
     else
     {
-        TORCH_CHECK(params.out_l_stride == params.x_l_stride && params.out_c_stride == params.x_c_stride,
+        // With zero tokens the kernel touches neither x nor out (state write-back only), so the
+        // layout of out is irrelevant; the caller may have allocated it channel-last to match the
+        // strides an empty x kept from its no-op transpose (https://nvbugs/6705034).
+        TORCH_CHECK(
+            seqlen == 0 || (params.out_l_stride == params.x_l_stride && params.out_c_stride == params.x_c_stride),
             "causal_conv1d_fwd: out must have the same layout as x for the channel-major kernel");
         DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(x.scalar_type(), "causal_conv1d_fwd",
             [&] { tensorrt_llm::kernels::causal_conv1d::causal_conv1d_fwd_cuda<input_t, weight_t>(params, stream); });

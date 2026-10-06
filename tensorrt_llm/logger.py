@@ -14,7 +14,9 @@
 # limitations under the License.
 import logging
 import os
+import re
 import sys
+from collections.abc import Mapping
 from typing import Dict, Optional
 
 try:
@@ -264,6 +266,35 @@ class Logger(metaclass=Singleton):
         else:
             raise AttributeError(f"No such severity: {severity}")
 
+    # A %-conversion specifier (not an escaped %%): %s, %d, %.3f, %(name)s...
+    _PERCENT_SPEC = re.compile(
+        r"%(?!%)(\([^)]*\))?[-+ #0]*(\d+|\*)?(\.(\d+|\*))?[hlL]?[diouxXeEfFgGcrsa]"
+    )
+
+    @classmethod
+    def _percent_format(cls, msg) -> Optional[str]:
+        """printf-style support: the formatted message, or None to space-join.
+
+        Call sites are widely written in the stdlib-logging style
+        ``logger.warning("fell back to %s", choice)``; joining used to print
+        the format string literally with the argument appended.  Mirror the
+        stdlib rules: a lone Mapping argument feeds ``%(name)s`` fields,
+        otherwise the argument tuple is applied.  A message whose arguments do
+        not match its specifiers falls back to the historical join rather
+        than raising from inside a log call.
+        """
+        if len(msg) < 2 or not isinstance(msg[0], str):
+            return None
+        if cls._PERCENT_SPEC.search(msg[0]) is None:
+            return None
+        args = msg[1:]
+        if len(args) == 1 and isinstance(args[0], Mapping):
+            args = args[0]
+        try:
+            return msg[0] % args
+        except (TypeError, ValueError, KeyError):
+            return None
+
     def log(self, severity, *msg):
         module = _get_caller_module()
         if not self.is_severity_enabled(severity, module):
@@ -277,7 +308,11 @@ class Logger(metaclass=Singleton):
             module_rank += f"[RANK {self.rank}]"
         if module_rank:
             parts.append(module_rank)
-        parts.extend(map(str, msg))
+        formatted = self._percent_format(msg)
+        if formatted is not None:
+            parts.append(formatted)
+        else:
+            parts.extend(map(str, msg))
         self._func_wrapper(severity)(" ".join(parts))
 
     def log_once(self, severity, *msg, key):
@@ -318,6 +353,18 @@ class Logger(metaclass=Singleton):
 
     def debug_once(self, *msg, key):
         self.log_once(self.VERBOSE, *msg, key=key)
+
+    def is_debug_enabled(self) -> bool:
+        """Whether a ``debug()`` call from the caller's module would be emitted.
+
+        Guards debug messages whose *arguments* are expensive to build, so that
+        the guard and the emission agree on one predicate. Comparing
+        ``logger.level`` against the literal ``"debug"`` does not: ``verbose``
+        and ``trace`` are at least as verbose, and a per-module
+        ``TLLM_LOG_LEVEL_BY_MODULE`` override can enable or disable the
+        caller's module independently of the global level.
+        """
+        return self.is_severity_enabled(self.VERBOSE, _get_caller_module())
 
     @property
     def level(self) -> str:

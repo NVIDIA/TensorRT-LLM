@@ -1,0 +1,19 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Aggregated serving on one Blackwell GPU, block-FP8 or NVFP4 checkpoint.
+# For the BF16 checkpoint use tensor_parallel_size: 2 and moe_config.backend: CUTLASS.
+trust_remote_code: true
+max_batch_size: 16
+enable_chunked_prefill: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 16
+moe_config:
+  backend: TRTLLM
+kv_cache_config:
+  free_gpu_memory_fraction: 0.5
+  mamba_ssm_cache_dtype: bfloat16
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3

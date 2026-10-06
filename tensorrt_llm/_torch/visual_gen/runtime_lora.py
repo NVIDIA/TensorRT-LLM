@@ -133,6 +133,8 @@ def _prepare_runtime_lora(
     strip_prefixes = _dedupe_prefixes(
         tuple(config.strip_prefixes) + tuple(default_strip_prefixes) + _DEFAULT_STRIP_PREFIXES
     )
+    if _is_minimax_h3_turbo_lora(modules, pairs, strip_prefixes=strip_prefixes):
+        pairs = _normalize_minimax_h3_turbo_pairs(pairs)
 
     qkv_groups: Dict[str, Dict[str, _LoRAPair]] = {}
     incomplete_qkv_names: List[str] = []
@@ -579,6 +581,38 @@ def _candidate_names(
                 yield normalized
 
 
+def _is_minimax_h3_turbo_lora(
+    modules: Dict[str, nn.Module],
+    pairs: Iterable[_LoRAPair],
+    *,
+    strip_prefixes: Tuple[str, ...],
+) -> bool:
+    if not all(
+        name in modules
+        for name in (
+            "transformer_blocks",
+            "token_refiner.refiner_blocks",
+            "norm_out.linear",
+        )
+    ):
+        return False
+
+    names = {_strip_known_prefix(pair.name, strip_prefixes) for pair in pairs}
+    return (
+        "final_layer.adaln_proj.linear" in names
+        and any(name.startswith("blocks.") for name in names)
+        and any(name.startswith("token_refiner.blocks.") for name in names)
+    )
+
+
+def _normalize_minimax_h3_turbo_pairs(pairs: Iterable[_LoRAPair]) -> List[_LoRAPair]:
+    # MiniMax-H3 Turbo LoRA adapters use Diffusers-style target names.
+    return [
+        _LoRAPair(_normalize_minimax_h3_turbo_name(pair.name), pair.a, pair.b, pair.scale)
+        for pair in pairs
+    ]
+
+
 def _normalize_common_name(name: str) -> str:
     normalized = name
     for ff_prefix in (".ff.", ".audio_ff.", ".ffn.", ".img_mlp.", ".txt_mlp."):
@@ -589,6 +623,17 @@ def _normalize_common_name(name: str) -> str:
     normalized = normalized.replace(".q_norm.", ".norm_q.")
     normalized = normalized.replace(".k_norm.", ".norm_k.")
     return normalized
+
+
+def _normalize_minimax_h3_turbo_name(name: str) -> str:
+    normalized = name
+    if normalized.startswith("blocks."):
+        normalized = "transformer_blocks." + normalized[len("blocks.") :]
+    normalized = normalized.replace("token_refiner.blocks.", "token_refiner.refiner_blocks.")
+    normalized = normalized.replace(".attn.out_proj", ".attn.to_out.0")
+    normalized = normalized.replace(".mlp.fc1", ".ff.gate_up_proj")
+    normalized = normalized.replace(".mlp.fc2", ".ff.down_proj")
+    return normalized.replace("final_layer.adaln_proj.linear", "norm_out.linear")
 
 
 def _strip_known_prefix(name: str, strip_prefixes: Tuple[str, ...]) -> str:

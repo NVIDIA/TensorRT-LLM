@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -85,41 +85,6 @@ public:
         return anyBitSet(kEagle);
     }
 
-    [[nodiscard]] bool constexpr updatesPositionIds() const
-    {
-        return anyBitSet(kLookaheadDecoding | kExplicitDraftTokens);
-    }
-
-    [[nodiscard]] bool constexpr requiresAttentionMask() const
-    {
-        return anyBitSet(kLookaheadDecoding | kMedusa | kExplicitDraftTokens | kEagle);
-    }
-
-    [[nodiscard]] bool constexpr predictsDraftTokens() const
-    {
-        return anyBitSet(kLookaheadDecoding | kMedusa | kExplicitDraftTokens | kEagle);
-    }
-
-    [[nodiscard]] bool constexpr needsKVCacheRewind() const
-    {
-        return anyBitSet(kLookaheadDecoding | kMedusa | kExplicitDraftTokens | kEagle);
-    }
-
-    [[nodiscard]] bool constexpr variableDraftLength() const
-    {
-        return anyBitSet(kDraftTokensExternal | kExplicitDraftTokens | kLookaheadDecoding | kEagle);
-    }
-
-    [[nodiscard]] bool constexpr hasDraftLogits() const
-    {
-        return anyBitSet(kMedusa);
-    }
-
-    [[nodiscard]] bool constexpr needsDecoderPrologue() const
-    {
-        return anyBitSet(kExplicitDraftTokens | kLookaheadDecoding | kEagle);
-    }
-
     using UnderlyingType = std::uint8_t;
 
     bool operator==(SpeculativeDecodingMode const& other) const
@@ -144,11 +109,6 @@ private:
     [[nodiscard]] bool constexpr anyBitSet(UnderlyingType bits) const
     {
         return (mState & bits) != 0;
-    }
-
-    [[nodiscard]] bool constexpr allBitSet(UnderlyingType bits) const
-    {
-        return (mState & bits) == bits;
     }
 
     UnderlyingType mState{kNone};

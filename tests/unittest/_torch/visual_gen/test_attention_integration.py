@@ -18,6 +18,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 # ============================================================================
 # Flash Attention 4 availability
 # ============================================================================
+from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
 from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
@@ -166,11 +167,23 @@ def create_model_config(
     return config
 
 
-def _require_attention_backend(attn_backend: str) -> None:
+def _require_attention_backend(
+    attn_backend: str,
+    quant_attention_config: "QuantAttentionConfig | None" = None,
+) -> None:
     if attn_backend == "FA4" and not _flash_attn4_available:
         pytest.fail("FlashAttention 4 backend is required for FA4 attention test")
     if attn_backend == "CUTEDSL" and not _cute_dsl_available:
         pytest.fail("CuTe DSL backend is required for CUTEDSL attention test")
+    if attn_backend == "CUDNN":
+        quant_dtype = CuDNNAttention.check_quant_dtype(quant_attention_config)
+        try:
+            if not torch.cuda.is_available():
+                raise ImportError("CUDA not available")
+            CuDNNAttention.check_hardware_compatibility(torch.device("cuda"), quant_dtype)
+            CuDNNAttention.check_library_feature(quant_dtype)
+        except ImportError as e:
+            pytest.skip(f"cuDNN detected hardware/library incompatibility: {e}")
     if attn_backend == "CUTEDSL":
         compute_capability = torch.cuda.get_device_capability()
         gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
@@ -349,13 +362,16 @@ class TestSageAttentionBackendRouting:
         ("FA4", None),
         ("CUTEDSL", None),
         ("CUTEDSL", QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8")),
+        ("CUDNN", None),
+        ("CUDNN", QuantAttentionConfig(qk_dtype="fp8", v_dtype="fp8")),
+        ("CUDNN", QuantAttentionConfig(qk_dtype="mxfp8", v_dtype="mxfp8")),
     ],
 )
 def test_self_attention_equivalence(
     head_dim: int, attn_backend: str, quant_attention_config: "QuantAttentionConfig | None"
 ):
     """Test that integrated self-attention produces same output as naive."""
-    _require_attention_backend(attn_backend)
+    _require_attention_backend(attn_backend, quant_attention_config)
 
     print("\n" + "=" * 60)
     print("Testing Self-Attention Equivalence")
@@ -409,7 +425,14 @@ def test_self_attention_equivalence(
     # Compare (using looser tolerance for bf16)
     max_diff = (out_naive - out_integrated).abs().max().item()
     mean_diff = (out_naive - out_integrated).abs().mean().item()
-    tol = 1e-2 if quant_attention_config is None else 2e-2
+    if quant_attention_config is None:
+        tol = 1e-2
+    elif quant_attention_config.qk_dtype == "bf16":
+        # V-only quantization (QK16PV8): Bmm1 still runs in BF16.
+        tol = 2e-2
+    else:
+        # Q/K quantized as well (CUDNN FP8 / MXFP8): both GEMMs carry FP8 noise.
+        tol = 4e-2
     is_close = torch.allclose(out_naive, out_integrated, rtol=tol, atol=tol)
 
     print("\nResults:")
@@ -548,7 +571,7 @@ def test_cross_attention_equivalence(
     head_dim: int, attn_backend: str, quant_attention_config: "QuantAttentionConfig | None"
 ):
     """Test that integrated cross-attention produces same output as naive."""
-    _require_attention_backend(attn_backend)
+    _require_attention_backend(attn_backend, quant_attention_config)
 
     print("\n" + "=" * 60)
     print("Testing Cross-Attention Equivalence")
@@ -637,6 +660,8 @@ def test_cross_attention_equivalence(
         ("FA4", None),
         ("CUTEDSL", None),
         ("CUTEDSL", QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8")),
+        ("CUDNN", None),
+        ("CUDNN", QuantAttentionConfig(qk_dtype="mxfp8", v_dtype="mxfp8")),
     ],
 )
 def test_fast_cross_attention_wan_shapes(
@@ -649,7 +674,7 @@ def test_fast_cross_attention_wan_shapes(
     quant_attention_config: "QuantAttentionConfig | None",
 ):
     """Test fast cross-attention correctness at Wan-realistic shapes."""
-    _require_attention_backend(attn_backend)
+    _require_attention_backend(attn_backend, quant_attention_config)
 
     hidden_size = num_heads * head_dim
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -695,107 +720,6 @@ def test_fast_cross_attention_wan_shapes(
     is_close = torch.allclose(out_ref, out_fast, rtol=tol, atol=tol)
     print(f"  Max diff: {max_diff:.2e}, match: {is_close}")
     assert is_close, f"{attn_backend} cross-attn mismatch at Wan shapes: max_diff={max_diff:.2e}"
-
-
-# ============================================================================
-# VSA self-attention (CUTEDSL backend, sparse_attention_config.algorithm='vsa')
-# ============================================================================
-
-
-def _build_vsa_setup(sparsity: float, batch_size: int, seed: int):
-    """Build naive + integrated models, VSA metadata, and inputs for a VSA test.
-
-    latent (8,8,8) -> 512 tokens (divisible by block_size=64), head_dim=128.
-    """
-    from tensorrt_llm._torch.visual_gen.attention_backend import VSAMetadataBuilder
-
-    latent_shape = (8, 8, 8)
-    seq_len = latent_shape[0] * latent_shape[1] * latent_shape[2]
-    num_heads = 4
-    head_dim = 128
-    hidden_size = num_heads * head_dim
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-
-    naive = NaiveWanSelfAttention(hidden_size, num_heads, head_dim, dtype=dtype).to(device)
-    cfg_vsa = create_model_config(
-        hidden_size, num_heads, head_dim, attn_backend="CUTEDSL", vsa_sparsity=sparsity
-    )
-    integrated = Attention(hidden_size, num_heads, qkv_mode=QKVMode.FUSE_QKV, config=cfg_vsa).to(
-        device
-    )
-    # Fail loudly if the VSA path silently fell back to dense (which would set
-    # attn_backend to "VANILLA") instead of selecting the CUTEDSL/VSA backend.
-    assert integrated.attn_backend == "CUTEDSL", (
-        f"Expected CUTEDSL (VSA) backend, got {integrated.attn_backend!r}"
-    )
-    copy_weights_self_attention(naive, integrated)
-    naive.eval()
-    integrated.eval()
-
-    metadata = VSAMetadataBuilder().build(
-        current_timestep=0,
-        raw_latent_shape=latent_shape,
-        patch_size=(1, 1, 1),
-        vsa_sparsity=sparsity,
-        device=device,
-    )
-    torch.manual_seed(seed)
-    hidden_states = torch.randn(batch_size, seq_len, hidden_size, device=device, dtype=dtype)
-    return SimpleNamespace(
-        naive=naive,
-        integrated=integrated,
-        metadata=metadata,
-        hidden_states=hidden_states,
-        gate_compress_zero=torch.zeros_like(hidden_states),
-        freqs_HSD=generate_rope_embeddings(seq_len, head_dim, device, is_HSD=True),
-        freqs_SHD=generate_rope_embeddings(seq_len, head_dim, device, is_HSD=False),
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")
-def test_vsa_self_attention_equivalence_at_sparsity_zero():
-    """VSA at sparsity=0 with G_c=0 reduces to dense attention (top_k=num_cubes,
-    output=O_f); must match the naive SDPA reference modulo bf16 rounding."""
-    from tensorrt_llm._torch.visual_gen.attention_backend import set_vsa_forward_context
-
-    s = _build_vsa_setup(sparsity=0.0, batch_size=2, seed=42)
-
-    with torch.no_grad():
-        out_naive = s.naive(s.hidden_states, *s.freqs_HSD)
-    with torch.no_grad(), set_vsa_forward_context(s.metadata):
-        out_vsa = s.integrated(
-            s.hidden_states, freqs=s.freqs_SHD, gate_compress=s.gate_compress_zero
-        )
-
-    assert out_naive.shape == out_vsa.shape, (
-        f"shape mismatch: naive={out_naive.shape}, vsa={out_vsa.shape}"
-    )
-    max_diff = (out_naive - out_vsa).abs().max().item()
-    mean_diff = (out_naive - out_vsa).abs().mean().item()
-    assert torch.allclose(out_naive, out_vsa, rtol=1e-2, atol=1e-2), (
-        f"VSA(sparsity=0, G_c=0) deviates from naive dense SDPA: "
-        f"max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e}"
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")
-@pytest.mark.parametrize("sparsity", [0.0, 0.5], ids=["s0", "s0p5"])
-def test_vsa_self_attention_finite(sparsity: float):
-    """VSA forward must produce finite output (no NaN/Inf) at any supported sparsity."""
-    from tensorrt_llm._torch.visual_gen.attention_backend import set_vsa_forward_context
-
-    s = _build_vsa_setup(sparsity=sparsity, batch_size=1, seed=0)
-
-    with torch.no_grad(), set_vsa_forward_context(s.metadata):
-        out = s.integrated(s.hidden_states, freqs=s.freqs_SHD, gate_compress=s.gate_compress_zero)
-
-    assert out.shape == s.hidden_states.shape
-    nan_count = torch.isnan(out).sum().item()
-    inf_count = torch.isinf(out).sum().item()
-    assert nan_count == 0 and inf_count == 0, (
-        f"VSA produced non-finite output at sparsity={sparsity}: NaN={nan_count}, Inf={inf_count}"
-    )
 
 
 def test_trtllm_cached_prepare():

@@ -31,6 +31,12 @@ class EventSink
 public:
     virtual ~EventSink() = default;
 
+    //! Whether blocks should retain the latest digest token in their prefix for event decoding.
+    virtual bool needsTokenDigestContext() const
+    {
+        return false;
+    }
+
     virtual void addStoredBlock(Block const& block) = 0;
     virtual void addStoredLifeCycle(Block const& block, LifeCycleId lifeCycle) = 0;
     virtual void addRemovedBlock(Digest const& blockKey) = 0;

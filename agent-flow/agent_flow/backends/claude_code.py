@@ -12,7 +12,8 @@ import claude_agent_sdk
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
-    PermissionResultAllow,
+    SdkMcpTool,
+    ToolAnnotations,
     create_sdk_mcp_server,
 )
 from claude_agent_sdk.types import (
@@ -28,6 +29,7 @@ from claude_agent_sdk.types import (
     ToolUseBlock,
 )
 
+from ..tools import normalize_tool, tool_result_to_claude
 from ..types import (
     AgentTextEvent,
     CompactBoundaryEvent,
@@ -420,12 +422,43 @@ def _claude_backend_version() -> str:
 _REASONING_EFFORT = "max"
 
 
+def _sdk_tools(tools: list) -> list[SdkMcpTool]:
+    """Translate framework or legacy tool definitions at the SDK boundary."""
+    result = []
+    for original in tools:
+        definition = normalize_tool(original)
+
+        async def handler(arguments, definition=definition):
+            return tool_result_to_claude(await definition.handler(arguments))
+
+        result.append(
+            SdkMcpTool(
+                name=definition.name,
+                description=definition.description,
+                input_schema=definition.input_schema,
+                handler=handler,
+                annotations=ToolAnnotations(**definition.annotations)
+                if definition.annotations
+                else None,
+            )
+        )
+    return result
+
+
 class ClaudeCodeBackend(Backend):
+    def __init__(
+        self,
+        reasoning_effort: str | None = None,
+        disabled_skills: tuple[str, ...] = (),
+    ) -> None:
+        self._reasoning_effort = reasoning_effort or _REASONING_EFFORT
+        self._disabled_skills = disabled_skills
+
     def version(self) -> str:
         return _claude_backend_version()
 
     def reasoning_effort(self) -> str:
-        return _REASONING_EFFORT
+        return self._reasoning_effort
 
     @asynccontextmanager
     async def create_client(
@@ -453,11 +486,8 @@ class ClaudeCodeBackend(Backend):
         if tools:
             mcp_servers["agent-tools"] = create_sdk_mcp_server(
                 name="agent-tools",
-                tools=tools,
+                tools=_sdk_tools(tools),
             )
-
-        async def _approve_tool(tool_name, tool_input, context):
-            return PermissionResultAllow()
 
         options = ClaudeAgentOptions(
             tools=ToolsPreset(type="preset", preset="claude_code"),
@@ -468,13 +498,15 @@ class ClaudeCodeBackend(Backend):
             ),
             mcp_servers=mcp_servers,
             model=model,
-            effort=_REASONING_EFFORT,
+            effort=self._reasoning_effort,
             cwd=cwd or Path.cwd(),
             sandbox={"enabled": False},
             permission_mode="bypassPermissions",
-            can_use_tool=_approve_tool,
             hooks=hooks,
-            disallowed_tools=list(disallowed_tools or []),
+            disallowed_tools=[
+                *(disallowed_tools or []),
+                *(f"Skill({name})" for name in self._disabled_skills),
+            ],
         )
 
         async with ClaudeSDKClient(options=options) as sdk_client:

@@ -50,7 +50,9 @@ public:
     StorageManager* manager;
     LifeCycleId lifeCycle;
     CacheLevel cacheLevel;
-    Priority priority;
+    // Immutable: PrioritizedEvictionPolicy locates a scheduled page's sub-queue by this value,
+    // so changing it while the page is scheduled would erase from the wrong list.
+    Priority const priority;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
 
@@ -70,7 +72,11 @@ public:
     // Prevent the page from being dropped (returns/creates a PageHolder).
     SharedPtr<PageHolder> hold();
 
-    // Acquire a shared lock (migrates to GPU if needed).
+    //! Return the lock destination for read-only use, preserving pages already at the hot GPU level.
+    //! Cold sparse pages use host memory; callers must force writable pages to GPU.
+    [[nodiscard]] CacheLevel queryLockLevel() const;
+
+    // Acquire a shared lock at the current level. The caller handles any migration.
     // skip_wait: caller guarantees the page is ready on kvCache's stream.
     SharedPageLock lock(
         KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle, bool skipWait = false);
@@ -229,9 +235,9 @@ public:
     // Explicitly release the lock (called by destructor if not already released).
     SharedPtr<Page> unlock();
 
-    SharedPtr<Page> const& page() const;
+    [[nodiscard]] SharedPtr<Page> const& page() const;
 
-    bool isValid() const noexcept
+    [[nodiscard]] bool isValid() const noexcept
     {
         return mUniqLock != nullptr;
     }
@@ -246,7 +252,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// BatchedLockTarget — input for batched_lock_to_gpu.
+// BatchedLockTarget — page, owner, and intended storage level for a lock.
 // ---------------------------------------------------------------------------
 struct BatchedLockTarget
 {
@@ -254,19 +260,20 @@ struct BatchedLockTarget
     BeamIndex beamIndex;
     BlockOrdinal ordinal;
     LifeCycleId lifeCycle;
+    CacheLevel cacheLevel = kHotLevel;
 };
 
 // ---------------------------------------------------------------------------
-// batchedLockToGpu — migrate pages to GPU then lock them.
+// batchedLockPages — restore pages to their intended levels, then lock them.
 // Returns one SharedPageLock per target.
-// Mirrors Python's batched_lock_to_gpu().
+// Only promotes cold pages; GPU-to-host offload has a separate ownership handoff.
 // ---------------------------------------------------------------------------
-std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
+std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
 
 // ---------------------------------------------------------------------------
 // ScratchSlotLock — manages a scratch slot for SWA prefill memory reuse.
 // Wraps a Slot with owner (KvCache) and lifecycle references.
-// On destruction, releases the slot back to the StorageManager.
+// GPU-only: on destruction, releases the slot back to the GPU storage pool.
 // Mirrors _page.py::ScratchSlotLock.
 // ---------------------------------------------------------------------------
 class ScratchSlotLock

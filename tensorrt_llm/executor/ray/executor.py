@@ -43,7 +43,6 @@ from ..postproc_worker import PostprocWorkerConfig
 from ..request import GenerationRequest
 from ..result import GenerationResult
 from ..rpc_proxy_mixin import RpcExecutorMixin
-from ..utils import has_event_loop
 from .gpu_worker import RayGPUWorker, RayWorkerWrapper
 
 __all__ = [
@@ -117,8 +116,10 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                 ]  # Placeholder, will be initialized in setup_async
                 self._mainloop_started = False  # DO NOT start mainloop until after setup_engine_remote_async is called
             else:
-                if not has_event_loop():
-                    self.init_workers_sync()
+                # Deferring is requested through defer_workers_init above, not
+                # inferred from the calling context: a synchronous LLM() built
+                # inside a coroutine still has to create its workers here.
+                self.init_workers_sync()
                 self.setup_engine_remote()
                 self.setup_mainloop(tasks=[self._fetch_responses_loop_async],
                                     thread_name="ray_executor_main_loop")
@@ -562,8 +563,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         # path 2
         return _get_default(tp_size)
 
-    @property
-    def enable_postprocess_parallel(self) -> bool:
-        ret = super().enable_postprocess_parallel
-        assert ret == False, "Postprocess parallel is not supported in RayExecutor"
-        return ret
+    # Postprocess parallelism is supported: the rank-0 RayGPUWorker spawns a
+    # local PostprocWorker pool and feeds finished Output records back into
+    # the RPC response stream (see RpcWorkerMixin.init_postproc_workers), so
+    # the base-class property applies unchanged.

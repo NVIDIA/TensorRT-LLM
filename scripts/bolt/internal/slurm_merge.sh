@@ -84,7 +84,11 @@ echo "[INFO] merge: FDATA_ROOT=$FDATA_ROOT  REF=$BOLT_REF  TRIPLE=$TRIPLE  OUT=$
 export ENROOT_CACHE_PATH="${ENROOT_CACHE_PATH:-/home/svc_tensorrt/.cache/enroot}"
 
 # ---- CI self-staging: llvm-bolt --------------------------------------------
-LLVM_BOLT_VERSION="${LLVM_BOLT_VERSION:-21.1.5}"
+# Pin comes from llvm_bolt_version.sh so this job, the collect hook, and the
+# Jenkins build pods cannot drift onto different llvm-bolt releases. Resolved via
+# TOOLKIT_HOST, not BASH_SOURCE: sbatch runs a COPY of this script out of the
+# node's spool dir, so its own path says nothing about where the toolkit lives.
+. "$TOOLKIT_HOST/internal/llvm_bolt_version.sh"
 if [ ! -x "$BUILDS_HOST/llvm/bin/llvm-bolt" ]; then
     echo "[INFO] Installing llvm-bolt ${LLVM_BOLT_VERSION} -> $BUILDS_HOST/llvm"
     case "$(uname -m)" in

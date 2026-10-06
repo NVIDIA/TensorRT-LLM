@@ -43,132 +43,69 @@ struct DMA
     using Circular_buffer_v_scratch_writer = typename Kernel_traits::Circular_buffer_v_scratch_writer;
 
     // The step size of Q loop.
-    enum
-    {
-        STEP_Q = Kernel_traits::STEP_Q
-    };
+    static constexpr int STEP_Q = Kernel_traits::STEP_Q;
 
     // The step size of KV loop.
-    enum
-    {
-        STEP_KV = Kernel_traits::STEP_KV
-    };
+    static constexpr int STEP_KV = Kernel_traits::STEP_KV;
 
     // The tile size of Q.
-    enum
-    {
-        TILE_SIZE_Q = STEP_Q * Kernel_traits::D
-    };
+    static constexpr int TILE_SIZE_Q = STEP_Q * Kernel_traits::D;
 
     // The tile size of Q after head_dimension split.
-    enum
-    {
-        TILE_SIZE_Q_PER_D_GROUP = STEP_Q * Kernel_traits::D_PER_GROUP
-    };
+    static constexpr int TILE_SIZE_Q_PER_D_GROUP = STEP_Q * Kernel_traits::D_PER_GROUP;
 
     // The tile size of K.
-    enum
-    {
-        TILE_SIZE_K = STEP_KV * Kernel_traits::D
-    };
+    static constexpr int TILE_SIZE_K = STEP_KV * Kernel_traits::D;
 
     // The tile size of K after head_dimension split.
-    enum
-    {
-        TILE_SIZE_K_PER_D_GROUP = STEP_KV * Kernel_traits::D_PER_GROUP
-    };
+    static constexpr int TILE_SIZE_K_PER_D_GROUP = STEP_KV * Kernel_traits::D_PER_GROUP;
 
     // The tile size of V.
-    enum
-    {
-        TILE_SIZE_V = STEP_KV * Kernel_traits::DV
-    };
+    static constexpr int TILE_SIZE_V = STEP_KV * Kernel_traits::DV;
 
     // The tile size of V after head_dimension split.
-    enum
-    {
-        TILE_SIZE_V_PER_D_GROUP = TILE_SIZE_K_PER_D_GROUP
-    };
+    static constexpr int TILE_SIZE_V_PER_D_GROUP = TILE_SIZE_K_PER_D_GROUP;
 
     // Whether apply causal mask or not.
-    enum
-    {
-        CAUSAL_MASK = Kernel_traits::CAUSAL_MASK
-    };
+    static constexpr int CAUSAL_MASK = Kernel_traits::CAUSAL_MASK;
 
     // Whether use custom mask input or not.
-    enum
-    {
-        USE_CUSTOM_MASK = Kernel_traits::USE_CUSTOM_MASK
-    };
+    static constexpr int USE_CUSTOM_MASK = Kernel_traits::USE_CUSTOM_MASK;
 
     // Whether we skip those masked tiles when causal mask is enabled ?
-    enum
-    {
-        SKIP_CAUSAL_MASK_TILES = CAUSAL_MASK && !USE_CUSTOM_MASK
-    };
+    static constexpr int SKIP_CAUSAL_MASK_TILES = CAUSAL_MASK && !USE_CUSTOM_MASK;
 
     // Whether we attend to the specific sliding window or chunk ?
-    enum
-    {
-        SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION
-    };
+    static constexpr int SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION;
 
     // Whether use the bidirectional sliding window attention or not.
-    enum
-    {
-        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION
-    };
+    static constexpr int BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION;
 
     // Is heads interleaved ?
-    enum
-    {
-        HEADS_INTERLEAVED = Kernel_traits::HEADS_INTERLEAVED
-    };
+    static constexpr int HEADS_INTERLEAVED = Kernel_traits::HEADS_INTERLEAVED;
 
     // Named barrier for inter-warpgroup sync
-    enum
-    {
-        SYNC_BARRIER = Kernel_traits::DMA_SYNC_BARRIER_ID
-    };
+    static constexpr int SYNC_BARRIER = Kernel_traits::DMA_SYNC_BARRIER_ID;
 
     // The number of compute groups (currently fixed at 2).
-    enum
-    {
-        NUM_COMPUTE_GROUPS = Kernel_traits::NUM_COMPUTE_GROUPS
-    };
+    static constexpr int NUM_COMPUTE_GROUPS = Kernel_traits::NUM_COMPUTE_GROUPS;
 
     // The tile scheduling mode: static (0), dynamic (1)
-    enum
-    {
-        SCHEDULING_MODE = Kernel_traits::SCHEDULING_MODE
-    };
+    static constexpr int SCHEDULING_MODE = Kernel_traits::SCHEDULING_MODE;
 
     // Whether read from paged kv buffers or not.
-    enum
-    {
-        PAGED_KV_INPUT = Kernel_traits::PAGED_KV_INPUT
-    };
+    static constexpr int PAGED_KV_INPUT = Kernel_traits::PAGED_KV_INPUT;
 
     // Whether the dma group transposes the v tile explicitly.
-    enum
-    {
-        DMA_GROUP_TRANSPOSE_V = Kernel_traits::DMA_GROUP_TRANSPOSE_V
-    };
+    static constexpr int DMA_GROUP_TRANSPOSE_V = Kernel_traits::DMA_GROUP_TRANSPOSE_V;
 
     // How many threads get involved in the dma group.
-    enum
-    {
-        NUM_THREADS_IN_DMA_GROUP = Kernel_traits::NUM_THREADS_IN_DMA_GROUP
-    };
+    static constexpr int NUM_THREADS_IN_DMA_GROUP = Kernel_traits::NUM_THREADS_IN_DMA_GROUP;
 
     // Transpose V
     // K is the sequence length dimension (128 for GMMA). The unroll factor is decided according to
     // empirical evidence so as to avoid register spill.
-    enum
-    {
-        K_ = STEP_KV % 128 == 0 ? 128 : 64
-    };
+    static constexpr int K_ = STEP_KV % 128 == 0 ? 128 : 64;
 
     static_assert(STEP_KV % K_ == 0);
     using Transposer = Transposer<typename Kernel_traits::Traits_o, typename Kernel_traits::Cta_tile_o, K_,

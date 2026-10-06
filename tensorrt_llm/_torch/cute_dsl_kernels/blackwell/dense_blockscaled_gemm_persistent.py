@@ -43,7 +43,7 @@
 
 # This file is copied and modified from cutlass example https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py
 
-from typing import Literal, Optional, Tuple, Type, Union
+from typing import Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -53,8 +53,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass._mlir.dialects import llvm
-from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
-from cutlass.cute.runtime import make_ptr
+from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 
 from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
@@ -2543,47 +2542,3 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
     for i in cutlass.range(cute.size(sf_ref_tensor)):
         mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
         sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
-
-
-def scaled_mm(
-    gemm_obj: Sm100BlockScaledPersistentDenseGemmKernel,
-    a_dtype: Type[cutlass.Numeric],
-    b_dtype: Type[cutlass.Numeric],
-    c_dtype: Type[cutlass.Numeric],
-    sf_dtype: Type[cutlass.Numeric],
-    a_major: Literal["m", "k"],
-    b_major: Literal["n", "k"],
-    c_major: Literal["m", "n"],
-    max_active_clusters: cutlass.Constexpr,
-    stream: cuda.CUstream,
-    epilogue_op: cutlass.Constexpr = lambda x: x,
-    options: str = "",
-):
-    """Compile the persistent dense blockscaled GEMM operation."""
-    a_ptr = make_ptr(a_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
-    b_ptr = make_ptr(b_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
-    c_ptr = make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
-    sfa_ptr = make_ptr(sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=32)
-    sfb_ptr = make_ptr(sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=32)
-
-    a_major_mode = (OperandMajorMode.K
-                    if a_major == "k" else OperandMajorMode.MN)
-    b_major_mode = (OperandMajorMode.K
-                    if b_major == "k" else OperandMajorMode.MN)
-    c_layout = (utils.LayoutEnum.ROW_MAJOR
-                if c_major == "n" else utils.LayoutEnum.COL_MAJOR)
-    return cute.compile(
-        gemm_obj,
-        a_ptr,
-        b_ptr,
-        sfa_ptr,
-        sfb_ptr,
-        c_ptr,
-        (a_major_mode, b_major_mode, c_layout),
-        (cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0),
-         cutlass.Int32(0)),
-        max_active_clusters,
-        stream,
-        epilogue_op,
-        options=options,
-    )

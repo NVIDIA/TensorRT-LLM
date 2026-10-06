@@ -8,6 +8,7 @@ from typing import Any, Callable, Iterator, Optional
 import torch
 from torch import nn
 
+from ..models.modeling_utils import timing_metric
 from ..utils import make_weak_ref
 from .breakable_cuda_graph import (
     BreakableCUDAGraph,
@@ -28,6 +29,9 @@ class BreakableCUDAGraphRunner:
 
     _WARMUP_STEPS = 2
 
+    CUDA_GRAPH_WARMUP_METRIC = "cuda_graph_warmup_seconds"
+    CUDA_GRAPH_CAPTURE_METRIC = "cuda_graph_capture_seconds"
+
     def __init__(self, layer_model: nn.Module) -> None:
         self.layer_model = layer_model
         self._graphs: dict[int, BreakableCUDAGraph] = {}
@@ -38,6 +42,12 @@ class BreakableCUDAGraphRunner:
         self._state = BreakableCUDAGraphRunnerState.IDLE
         self._active_graph: Optional[BreakableCUDAGraph] = None
         self._active_num_tokens: Optional[int] = None
+        self._metrics: dict[str, float] = {}
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        """Warmup and capture timings for the most recent token bucket."""
+        return self._metrics
 
     @property
     def state(self) -> BreakableCUDAGraphRunnerState:
@@ -67,7 +77,12 @@ class BreakableCUDAGraphRunner:
             self._state = BreakableCUDAGraphRunnerState.IDLE
 
     def capture(self, num_tokens: int, engine_forward: Callable[[], Any]) -> None:
-        """Warm up eagerly, then capture one prefill token bucket."""
+        """Warm up eagerly, then capture one prefill token bucket.
+
+        Record each phase in metrics, replacing the previous bucket's timings.
+        Both phases run on the capture stream and synchronize before timing ends.
+        """
+        self._metrics.clear()
         if self._state != BreakableCUDAGraphRunnerState.IDLE:
             raise RuntimeError(f"Cannot capture BCG while runner is {self._state.value}")
         if num_tokens in self._graphs:
@@ -79,21 +94,25 @@ class BreakableCUDAGraphRunner:
         created_memory_pool = False
         try:
             with torch.cuda.stream(self._capture_stream):
-                self.warmup(engine_forward)
+                with timing_metric(self.CUDA_GRAPH_WARMUP_METRIC, self._metrics):
+                    self.warmup(engine_forward)
+                    torch.cuda.synchronize()
 
-                # Every segment in the first BCG bucket must receive the same
-                # explicit pool handle. Passing None lets each CUDAGraph create
-                # its own private pool, which multiplies the model workspace by
-                # the number of eager breaks.
-                if self._memory_pool is None:
-                    self._memory_pool = torch.cuda.graph_pool_handle()
-                    created_memory_pool = True
+                with timing_metric(self.CUDA_GRAPH_CAPTURE_METRIC, self._metrics):
+                    # Every segment in the first BCG bucket must receive the same
+                    # explicit pool handle. Passing None lets each CUDAGraph create
+                    # its own private pool, which multiplies the model workspace by
+                    # the number of eager breaks.
+                    if self._memory_pool is None:
+                        self._memory_pool = torch.cuda.graph_pool_handle()
+                        created_memory_pool = True
 
-                self._state = BreakableCUDAGraphRunnerState.CAPTURE
-                graph = BreakableCUDAGraph()
-                self._active_graph = graph
-                self._active_num_tokens = num_tokens
-                output = engine_forward()
+                    self._state = BreakableCUDAGraphRunnerState.CAPTURE
+                    graph = BreakableCUDAGraph()
+                    self._active_graph = graph
+                    self._active_num_tokens = num_tokens
+                    output = engine_forward()
+                    torch.cuda.synchronize()
 
             current_stream.wait_stream(self._capture_stream)
             if not torch.is_tensor(output):

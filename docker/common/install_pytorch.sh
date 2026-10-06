@@ -12,8 +12,8 @@ fi
 
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05
-TORCH_VERSION="2.12.0"
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html#rel-26-08
+TORCH_VERSION="2.14.0"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 
 prepare_environment() {
@@ -78,7 +78,7 @@ install_from_pypi() {
     if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
 
     pip3 uninstall -y torch torchvision
-    pip3 install torch==${TORCH_VERSION} torchvision --index-url https://download.pytorch.org/whl/cu130
+    pip3 install torch==${TORCH_VERSION} torchvision --index-url https://download.pytorch.org/whl/cu132
 }
 
 case "$1" in

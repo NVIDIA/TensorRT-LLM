@@ -145,6 +145,8 @@ struct MHARunnerFixedParams
     int sageBlockSizeV = 0;
     // Use sparse MLA ?
     bool useSparseMLA = false;
+    // Use spcompress (context phase, SM107 only) ?
+    bool useSpcompress = false;
     // Use sparse attention in trtllm-gen ?
     bool useTllmGenSparseAttention = false;
     // Fuse DSv4 inverse RoPE and FP8 output quantization in trtllm-gen.
@@ -200,6 +202,7 @@ struct MHARunnerFixedParams
         output += ", sageBlockSizeK = " + std::to_string(sageBlockSizeK);
         output += ", sageBlockSizeV = " + std::to_string(sageBlockSizeV);
         output += ", useSparseMLA = " + std::string(useSparseMLA ? "true" : "false");
+        output += ", useSpcompress = " + std::string(useSpcompress ? "true" : "false");
         output += ", useTllmGenSparseAttention = " + std::string(useTllmGenSparseAttention ? "true" : "false");
         output += ", fusesDsv4InvRopeFp8Quant = " + std::string(fusesDsv4InvRopeFp8Quant ? "true" : "false");
 
@@ -282,10 +285,6 @@ struct MHARunnerParams
     void const* kPtr;
     // The V buffer ptr (for separate V input).
     void const* vPtr;
-    // The V tensor token stride in bytes (0 = compute from head dimensions).
-    // Set this when V's actual stride differs from the default (e.g. contiguous V in AutoDeploy
-    // vs non-contiguous V from kv.split() in PyTorch backend).
-    int64_t vStrideInBytes = 0;
     // The paged kv cache array.
     KVBlockArray pagedKvCache;
     // The paged kv cache array for scaling factor.

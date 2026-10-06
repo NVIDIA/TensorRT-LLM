@@ -24,7 +24,7 @@ Imported by tensorrt_llm.llmapi.llm_args for use in BaseLlmArgs.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Literal, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -52,31 +52,15 @@ class UsageContext(str, Enum):
 class TelemetryField:
     """Field-local opt-in metadata for LLM API config telemetry capture."""
 
-    kind: Literal["value", "categorical"] = "value"
-    converter: Optional[Literal["allowlist"]] = None
-    allowed_values: Optional[tuple[Any, ...]] = None
+    allowed_values: tuple[Any, ...]
 
     @classmethod
     def categorical(cls, *allowed_values: Any) -> "TelemetryField":
-        """Build a categorical allowlist field from the recognized values.
-
-        Shorthand for the common bare-string allowlist case: marks the field
-        categorical and pins capture to the explicit allowed values via the
-        allowlist converter.
-        """
-        return cls(
-            kind="categorical",
-            converter="allowlist",
-            allowed_values=tuple(allowed_values),
-        )
+        """Allow capture only for the specified values and their exact types."""
+        return cls(allowed_values=allowed_values)
 
     def as_json_schema_extra(self) -> dict[str, Any]:
-        data: dict[str, Any] = {"kind": self.kind}
-        if self.converter is not None:
-            data["converter"] = self.converter
-        if self.allowed_values is not None:
-            data["allowed_values"] = list(self.allowed_values)
-        return data
+        return {"allowed_values": list(self.allowed_values)}
 
 
 class TelemetryConfig(_StrictUsageBaseModel):

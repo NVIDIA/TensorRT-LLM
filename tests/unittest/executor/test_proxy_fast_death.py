@@ -566,6 +566,8 @@ def _teardown_proxy(engine_dead):
     proxy.worker_init_status_queue = _Mock()
     proxy.result_queue = _Mock()
     proxy._resource_governor_queue = None
+    # Closed by shutdown() alongside the queues above.
+    proxy.profile_ack_queue = _Mock()
     proxy._owns_mpi_session = True
     proxy.mpi_session = _Mock()
     proxy._handle_background_error = lambda *a, **k: None

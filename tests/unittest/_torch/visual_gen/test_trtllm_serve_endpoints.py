@@ -20,8 +20,10 @@ import asyncio
 import base64
 import json
 import os
+import tempfile
 import threading
 import time
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -671,6 +673,92 @@ def test_response_format_path_rejected_when_disabled(tmp_path, monkeypatch, endp
     body = resp.json()
     _assert_llm_envelope(body, code=400)
     assert "path" in body["message"] and "disabled" in body["message"]
+
+
+def test_the_default_media_storage_path_is_timestamped(tmp_path, monkeypatch):
+    """Without ``TRTLLM_MEDIA_STORAGE_PATH`` each server gets its own
+    timestamped directory under the working directory, so servers running side
+    by side do not write their media into a shared one."""
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    monkeypatch.delenv("TRTLLM_MEDIA_STORAGE_PATH", raising=False)
+    # The default is relative to the working directory, so move off the
+    # checkout rather than leaving a directory in it on every run.
+    monkeypatch.chdir(tmp_path)
+    with patch(
+        "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
+        return_value=True,
+    ):
+        server = OpenAIServer(
+            generator=MockVisualGen(image_output=_make_dummy_image_tensor()),
+            model="test-model",
+            tool_parser=None,
+            server_role=ServerRole.VISUAL_GEN,
+            metadata_server_cfg=None,
+        )
+
+    assert server.media_storage_path.parent == Path.cwd() / "trtllm_generated"
+    # Raises if the directory name is not a yymmdd-hhmmss stamp.
+    datetime.strptime(server.media_storage_path.name, "%y%m%d-%H%M%S")
+
+
+def test_a_server_starts_from_a_working_directory_it_cannot_write_to(tmp_path, monkeypatch):
+    """Some deployments start the server from a read-only directory. Media has
+    to land somewhere else rather than the server failing to come up, since the
+    caller may never ask for any."""
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    if os.geteuid() == 0:
+        # root writes through the mode bits, so the directory this test needs
+        # cannot exist.
+        pytest.skip("cannot make a directory unwritable for root")
+
+    monkeypatch.delenv("TRTLLM_MEDIA_STORAGE_PATH", raising=False)
+    # The fallback creates a real directory, so point it inside tmp_path for
+    # pytest to remove. Setting TMPDIR would not reach it: tempfile caches the
+    # directory on first use, and this process has already used it.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    read_only = tmp_path / "read_only"
+    read_only.mkdir()
+    read_only.chmod(0o555)
+    monkeypatch.chdir(read_only)
+    try:
+        with patch(
+            "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
+            return_value=True,
+        ):
+            server = OpenAIServer(
+                generator=MockVisualGen(image_output=_make_dummy_image_tensor()),
+                model="test-model",
+                tool_parser=None,
+                server_role=ServerRole.VISUAL_GEN,
+                metadata_server_cfg=None,
+            )
+        resolved = server.media_storage_path
+    finally:
+        read_only.chmod(0o755)
+
+    assert resolved.is_dir()
+    assert resolved.parent == Path(tempfile.gettempdir())
+    assert resolved.name.startswith("trtllm_generated-")
+    assert list(read_only.iterdir()) == []
+
+
+def test_servers_starting_in_the_same_second_get_separate_directories(tmp_path):
+    """The stamp has one-second resolution, so two servers that start together
+    would otherwise share a directory and interleave their media."""
+    from tensorrt_llm.serve.openai_server import _new_media_dir
+
+    with patch("tensorrt_llm.serve.openai_server.datetime") as clock:
+        clock.now.return_value = datetime(2026, 9, 15, 7, 12, 38)
+        first = _new_media_dir(tmp_path)
+        second = _new_media_dir(tmp_path)
+
+    assert first.name == "260915-071238"
+    assert second.name == "260915-071238-2"
+    assert first.is_dir() and second.is_dir()
 
 
 # =========================================================================

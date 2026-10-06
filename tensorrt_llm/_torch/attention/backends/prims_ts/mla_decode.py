@@ -828,7 +828,13 @@ def _resolve_mla_decode_launch_spec(
                 throughput_latency_persistent=None,
             )
             if not decision.implementation_ready or decision.config is None:
-                raise NotImplementedError(decision.reason)
+                if policy_source != "auto":
+                    raise NotImplementedError(decision.reason)
+                requested_policy = "throughput_2cta"
+                use_throughput_latency = False
+
+        if use_throughput_latency:
+            assert decision.config is not None
             reduction_mode = resolve_runtime_cluster_reduction_mode(
                 decision.config,
                 reduction_mode=None,

@@ -193,7 +193,7 @@ def test_mlp_nvfp4_gelu_gather_output_is_ineligible() -> None:
             create=True,
         ),
     ):
-        assert mlp._nvfp4_gelu_fusion_eligibility() == (False, False)
+        assert mlp._nvfp4_gelu_fusion_eligibility() == (False, False, False)
 
 
 def _quantize_nvfp4(x_bf16: torch.Tensor):
@@ -495,3 +495,332 @@ def test_fused_act_flattens_3d_fp4_input(kind):
         f"(kernel would see rank {captured['dim']})"
     )
     assert captured["shape"] == (B * S, K // 2)
+
+
+@skip_pre_blackwell
+@skip_rubin
+@pytest.mark.parametrize("all_zeros", [False, True])
+@pytest.mark.parametrize("use_bias", [False, True])
+@pytest.mark.parametrize("m, k, n", [(128, 256, 512), (129, 256, 512), (256, 512, 2048)])
+def test_dense_gemm_gelu_deferred_fp4out(
+    m: int, k: int, n: int, use_bias: bool, all_zeros: bool
+) -> None:
+    """deferred fp4-out fused up-GEMM + bias + GELU(tanh) with nvfp4_sfc_finalize."""
+    torch.manual_seed(0)
+    a_bf16 = torch.randint(-5, 5, (m, k), dtype=torch.int32, device="cuda").to(torch.bfloat16)
+    b_bf16 = torch.randint(-5, 5, (n, k), dtype=torch.int32, device="cuda").to(torch.bfloat16)
+    a, a_sf, a_gsf = _quantize_nvfp4(a_bf16)
+    b, b_sf, b_gsf = _quantize_nvfp4(b_bf16)
+    alpha = (a_gsf * b_gsf).view(1)
+    bias = (torch.randn(n, dtype=torch.bfloat16, device="cuda") * 0.1) if use_bias else None
+
+    if all_zeros:
+        # Zero the packed activation after quantizing at a finite input scale.
+        a.zero_()
+        if bias is not None:
+            bias.zero_()
+
+    c, raw_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell(
+        a, b, a_sf, b_sf, alpha, bias
+    )
+    assert c.shape == (m, n // 2)
+    assert raw_sf.shape == (m, n // 16)
+
+    sf, s, max_raw = torch.ops.trtllm.nvfp4_sfc_finalize(raw_sf)
+    reciprocal_scale = max_raw / 448.0
+    assert sf.numel() == pad_up(m, 128) * pad_up(n // 16, 4)
+    assert torch.isfinite(reciprocal_scale).all()
+    assert torch.isfinite(s).all()
+
+    if all_zeros:
+        # The zero-gmax branch must emit zero payload and finite zero scales.
+        for output in (c, raw_sf, sf, s, max_raw, reciprocal_scale):
+            assert torch.count_nonzero(output) == 0
+        return
+
+    # Compare with static reference at the matching dynamic scale
+    gemm = _gemm_ref(a, b, a_sf, b_sf, alpha)
+    ref = F.gelu(gemm + (bias.float() if bias is not None else 0.0), approximate="tanh").to(
+        torch.bfloat16
+    )
+    norm_const = (1.0 / (ref.abs().max().float() / (FP8_E4M3_MAX * FP4_E2M1_MAX))).view(1)
+    ref_fp4, ref_sf = torch.ops.trtllm.fp4_quantize(ref, norm_const, SF_VEC, False, True)
+
+    assert _nibble_match(c, ref_fp4) > 0.95, "deferred fp4-out GELU nibble match < 95%"
+    assert _sf_match(sf, ref_sf, m, n) > 0.95, "deferred fp4-out GELU SF match < 95%"
+
+    if m % 128:
+        # Check the partial tile separately: a missed final row could otherwise
+        # pass the aggregate 95% threshold across all 129 rows.
+        assert _nibble_match(c[-1:], ref_fp4[-1:]) > 0.95
+        sf_rows = unswizzle_sf(sf.view(-1), pad_up(m, 128), n).view(torch.uint8)
+        ref_sf_rows = unswizzle_sf(ref_sf.view(-1), pad_up(m, 128), n).view(torch.uint8)
+        tail_match = (sf_rows[m - 1].int() - ref_sf_rows[m - 1].int()).abs() <= 1
+        assert tail_match.float().mean().item() > 0.95
+        assert torch.count_nonzero(sf_rows[m:]) == 0
+
+
+def test_mlp_deferred_fp4out_min_m_switch():
+    """MLP.forward picks deferred_fp4_out only at m >= _FP4OUT_MIN_M when down_proj is dynamic."""
+    import types
+
+    from tensorrt_llm._torch.modules.mlp import MLP
+    from tensorrt_llm._torch.utils import gelu_tanh
+
+    mlp = MLP(hidden_size=64, intermediate_size=128, bias=True, activation=gelu_tanh)
+    fake_qm = types.SimpleNamespace(_input_prepare=lambda *a, **k: None)
+    mlp._use_fused_gelu = True
+    mlp._use_fused_gelu_fp4out = False
+    mlp._use_fused_gelu_deferred_fp4out = True
+    up = torch.nn.Identity()
+    up.quant_method = fake_qm
+    up.has_nvfp4_activation_quantization = True
+    mlp.up_proj = up
+
+    down = torch.nn.Identity()
+    down.quant_method = fake_qm
+    down.has_nvfp4_activation_quantization = True
+    down.force_dynamic_quantization = True
+    down.input_scale = torch.ones(1)
+    down.pre_quant_scale = None
+    down.weight_scale_2 = torch.ones(1)
+    mlp.down_proj = down
+
+    seen = {}
+
+    def _spy(x, fp4_out=False, deferred_fp4_out=False):
+        seen["deferred_fp4_out"] = deferred_fp4_out
+        return torch.zeros(MLP._token_count(x), mlp.intermediate_size)
+
+    mlp._fused_gelu = _spy
+
+    assert MLP._FP4OUT_MIN_M == 128
+    for m, expected in [(64, False), (127, False), (128, True), (256, True)]:
+        mlp.forward(torch.randn(m, 64))
+        assert seen["deferred_fp4_out"] == expected, (
+            f"m={m}: expected deferred_fp4_out={expected}, got {seen['deferred_fp4_out']}"
+        )
+
+    # Fallback case 1: Static down_proj (not eligible for dynamic deferred scaling)
+    down_static = torch.nn.Identity()
+    down_static.quant_method = fake_qm
+    down_static.has_nvfp4_activation_quantization = True
+    down_static.input_scale = torch.tensor(1.0)
+    down_static.force_dynamic_quantization = False
+    down_static.pre_quant_scale = None
+    down_static.weight_scale_2 = torch.ones(1)
+    mlp.down_proj = down_static
+    seen["deferred_fp4_out"] = None
+    mlp.forward(torch.randn(256, 64))
+    assert seen["deferred_fp4_out"] is False
+
+    # Fallback case 2: Dynamic down_proj lacking quant_method._input_prepare
+    down_no_prep = torch.nn.Identity()
+    down_no_prep.quant_method = types.SimpleNamespace()
+    down_no_prep.has_nvfp4_activation_quantization = True
+    down_no_prep.force_dynamic_quantization = True
+    down_no_prep.input_scale = torch.ones(1)
+    down_no_prep.pre_quant_scale = None
+    down_no_prep.weight_scale_2 = torch.ones(1)
+    mlp.down_proj = down_no_prep
+    seen["deferred_fp4_out"] = None
+    mlp.forward(torch.randn(256, 64))
+    assert seen["deferred_fp4_out"] is False
+
+
+def test_nvfp4_linear_reciprocal_scale_alpha():
+    """NVFP4LinearMethod._input_prepare computes alpha = reciprocal_scale * weight_scale_2."""
+    from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+
+    linear = Linear.__new__(Linear)
+    linear.pre_quant_scale = None
+    linear.force_dynamic_quantization = True
+    linear.weight_scale_2 = torch.tensor(0.5)
+
+    qm = NVFP4LinearMethod()
+    recip = torch.tensor(0.25)
+    fp4_in = Fp4QuantizedTensor(
+        fp4_tensor=torch.zeros(4, 32, dtype=torch.uint8),
+        scaling_factor=torch.zeros(4, 4, dtype=torch.uint8),
+        reciprocal_scale=recip,
+    )
+
+    act_fp4, act_sf, alpha = qm._input_prepare(linear, fp4_in)
+    assert act_fp4 is fp4_in.fp4_tensor
+    assert act_sf is fp4_in.scaling_factor
+    assert torch.isclose(alpha, torch.tensor(0.125))
+
+
+def test_nvfp4_linear_apply_preserves_3d_deferred_metadata() -> None:
+    """Flattening in apply preserves deferred metadata and derives the GEMM alpha."""
+    from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+
+    linear = Linear.__new__(Linear)
+    torch.nn.Module.__init__(linear)
+    linear.pre_quant_scale = None
+    linear.force_dynamic_quantization = True
+    linear.weight_scale_2 = torch.tensor(0.5)
+    linear.nvfp4_allowed_backends = []
+    linear.all_reduce = None
+    linear.mapping = None
+    linear.out_features = 7
+    linear.dtype = torch.bfloat16
+    linear.weight = torch.zeros(7, 32, dtype=torch.uint8)
+    linear.weight_scale = torch.zeros(512, dtype=torch.uint8)
+
+    qm = NVFP4LinearMethod()
+    fp4_in = Fp4QuantizedTensor(
+        fp4_tensor=torch.zeros(2, 3, 32, dtype=torch.uint8),
+        scaling_factor=torch.zeros(512, dtype=torch.uint8),
+        unquantized_hidden_states=torch.zeros(2, 3, 64, dtype=torch.bfloat16),
+        reciprocal_scale=torch.tensor(0.25),
+    )
+    gemm_output = torch.arange(6 * 7, dtype=torch.float32).reshape(6, 7).to(linear.dtype)
+
+    with (
+        mock.patch.object(qm, "_input_prepare", wraps=qm._input_prepare) as prepare,
+        mock.patch.object(torch.ops.trtllm, "nvfp4_gemm", return_value=gemm_output) as gemm,
+    ):
+        output = qm.apply(linear, fp4_in, bias=None)
+
+    prepare.assert_called_once()
+    flattened = prepare.call_args.args[1]
+    assert flattened.fp4_tensor.shape == (6, 32)
+    assert flattened.scaling_factor is fp4_in.scaling_factor
+    assert flattened.is_sf_swizzled is fp4_in.is_sf_swizzled
+    assert flattened.unquantized_hidden_states is fp4_in.unquantized_hidden_states
+    assert flattened.reciprocal_scale is fp4_in.reciprocal_scale
+    gemm.assert_called_once()
+    act_fp4, _, act_sf, _, alpha, dtype = gemm.call_args.args
+    assert act_fp4 is flattened.fp4_tensor
+    assert act_sf is fp4_in.scaling_factor
+    torch.testing.assert_close(alpha, torch.tensor(0.125))
+    assert dtype == linear.dtype
+    torch.testing.assert_close(output, gemm_output.reshape(2, 3, 7))
+
+
+@skip_pre_blackwell
+@skip_rubin
+def test_sfc_finalize_all_zeros():
+    """All-zero raw scales must produce finite, zero-valued scale metadata (no NaN/Inf)."""
+    if not hasattr(torch.ops.trtllm, "nvfp4_sfc_finalize"):
+        pytest.skip("op nvfp4_sfc_finalize not loaded")
+
+    raw = torch.zeros(128, 8, dtype=torch.float32, device="cuda")
+    sf, s, max_raw = torch.ops.trtllm.nvfp4_sfc_finalize(raw)
+
+    assert torch.isfinite(s), f"s must be finite for all-zero raw, got {s}"
+    assert torch.isfinite(max_raw), f"max_raw must be finite, got {max_raw}"
+    assert s == 0.0
+    assert max_raw == 0.0
+    # The consumer GEMM's reciprocal_scale collapses to zero, not NaN/Inf.
+    assert (max_raw / FP8_E4M3_MAX) == 0.0
+    assert (sf == 0).all()
+
+
+@skip_pre_blackwell
+@skip_rubin
+@pytest.mark.parametrize("all_zeros", [False, True])
+def test_sfc_finalize_cuda_graph(all_zeros: bool) -> None:
+    """Capture and replay finalization with changing zero/nonzero raw scales."""
+    if not hasattr(torch.ops.trtllm, "nvfp4_sfc_finalize"):
+        pytest.skip("op nvfp4_sfc_finalize not loaded")
+
+    torch.manual_seed(0)
+    raw = torch.rand(129, 9, dtype=torch.float32, device="cuda")
+    if all_zeros:
+        raw.zero_()
+
+    # Warm up the custom op and Triton kernel before capture.
+    torch.ops.trtllm.nvfp4_sfc_finalize(raw)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = torch.ops.trtllm.nvfp4_sfc_finalize(raw)
+
+    for zero_input in (all_zeros, not all_zeros):
+        if zero_input:
+            raw.zero_()
+        else:
+            raw.uniform_()
+        expected = torch.ops.trtllm.nvfp4_sfc_finalize(raw)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+        assert torch.isfinite(captured[1])
+        assert torch.isfinite(captured[2])
+        if zero_input:
+            assert all(torch.count_nonzero(output) == 0 for output in captured)
+
+
+@skip_pre_blackwell
+@skip_rubin
+def test_sfc_finalize_rejects_invalid_raw():
+    """nvfp4_sfc_finalize rejects non-2D, non-fp32, non-CUDA and non-row-major raw scales."""
+    if not hasattr(torch.ops.trtllm, "nvfp4_sfc_finalize"):
+        pytest.skip("op nvfp4_sfc_finalize not loaded")
+
+    with pytest.raises(ValueError, match="2D"):
+        torch.ops.trtllm.nvfp4_sfc_finalize(
+            torch.zeros(2, 128, 8, dtype=torch.float32, device="cuda")
+        )
+
+    with pytest.raises(ValueError, match="fp32"):
+        torch.ops.trtllm.nvfp4_sfc_finalize(
+            torch.zeros(128, 8, dtype=torch.bfloat16, device="cuda")
+        )
+
+    with pytest.raises(ValueError, match="CUDA"):
+        torch.ops.trtllm.nvfp4_sfc_finalize(torch.zeros(128, 8, dtype=torch.float32))
+
+    # Row-major but padded: stride(0) exceeds the row width, so the kernel's
+    # flat [M, K/16] indexing would read the wrong elements.
+    padded = torch.zeros(128, 16, dtype=torch.float32, device="cuda")[:, :8]
+    assert padded.stride() == (16, 1)
+    with pytest.raises(ValueError, match="row-major contiguous"):
+        torch.ops.trtllm.nvfp4_sfc_finalize(padded)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA tensors")
+@pytest.mark.parametrize("shape", [(0, 8), (128, 0), (0, 0)])
+def test_sfc_finalize_rejects_empty_raw(shape: tuple[int, int]) -> None:
+    """Eager finalization rejects either zero-sized dimension before reduction."""
+    raw = torch.empty(shape, dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="dimensions must be non-zero"):
+        torch.ops.trtllm.nvfp4_sfc_finalize(raw)
+
+
+@pytest.mark.parametrize("shape", [(0, 8), (128, 0), (0, 0)])
+def test_sfc_finalize_fake_rejects_empty_raw(shape: tuple[int, int]) -> None:
+    """Fake finalization enforces the same non-empty shape contract as eager."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        raw = torch.empty(shape, dtype=torch.float32, device="cuda")
+        with pytest.raises(ValueError, match="dimensions must be non-zero"):
+            torch.ops.trtllm.nvfp4_sfc_finalize(raw)
+
+
+def test_cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_fake():
+    """Test fake tensor registration for cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell."""
+    if not hasattr(torch.ops.trtllm, "cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell"):
+        pytest.skip("op cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell not loaded")
+
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        a = torch.empty(128, 256, dtype=torch.uint8, device="cuda")
+        b = torch.empty(512, 256, dtype=torch.uint8, device="cuda")
+        a_sf = torch.empty(128 * 4, dtype=torch.uint8, device="cuda")
+        b_sf = torch.empty(512 * 4, dtype=torch.uint8, device="cuda")
+        alpha = torch.empty(1, dtype=torch.float32, device="cuda")
+
+        c, raw_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell(
+            a, b, a_sf, b_sf, alpha
+        )
+        assert c.shape == (128, 256)
+        assert raw_sf.shape == (128, 32)
+        assert raw_sf.dtype == torch.float32

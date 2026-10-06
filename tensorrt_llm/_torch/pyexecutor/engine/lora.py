@@ -40,6 +40,7 @@ def make_cuda_graph_lora_manager(
     lora_model_config: LoraModelConfig,
     max_batch_size: int,
     max_tokens_per_seq: int,
+    max_num_tokens: int,
 ) -> CudaGraphLoraManager:
     """Build the CUDA-graph LoRA manager. Only call this when graphs are enabled."""
     max_lora_size = lora_config.max_loras or 8  # Default fallback
@@ -52,6 +53,7 @@ def make_cuda_graph_lora_manager(
         overlap_lora_and_base=lora_config.overlap_lora_and_base,
         device="cuda",
         max_tokens_per_seq=max_tokens_per_seq,
+        max_num_tokens=max_num_tokens,
     )
 
     logger.info(
@@ -62,30 +64,29 @@ def make_cuda_graph_lora_manager(
 
 
 class LoraParamBuilder:
-    """Builds the per-iteration ``lora_params`` dict for the model forward.
+    """Own LoRA preparation state and build per-iteration model parameters.
 
-    Holds no model, no CUDA-graph manager and no device buffers -- only the two
-    construction-time values the token-count logic needs. The engine passes
-    everything else in on each :meth:`build` call.
-
-    Latching those two is safe: the engine assigns each exactly once, before it
-    constructs the builder. The state that capture and warmup rewrite between
-    forwards -- ``enable_spec_decode`` and ``runtime_draft_len`` -- is what
-    :meth:`build` takes per call instead.
+    The optional graph manager is supplied at construction; None selects eager
+    preparation only. Graph selection and parameter preparation use the same
+    manager. Speculative execution decisions remain per-call inputs.
     """
 
     def __init__(
-        self, *, spec_config: DecodingBaseConfig | None, attn_backend: type[AttentionMetadata]
+        self,
+        *,
+        spec_config: DecodingBaseConfig | None,
+        attn_backend: type[AttentionMetadata],
+        cuda_graph_manager: CudaGraphLoraManager | None,
     ) -> None:
         self._spec_config = spec_config
         self._attn_backend = attn_backend
+        self.cuda_graph_manager = cuda_graph_manager
 
     def build(
         self,
         scheduled_requests: ScheduledRequests,
         attn_metadata: AttentionMetadata,
         *,
-        cuda_graph_lora_manager: CudaGraphLoraManager | None,
         enable_spec_decode: bool,
         runtime_draft_len: int,
         peft_cache_manager: PeftCacheManager | None = None,
@@ -99,6 +100,7 @@ class LoraParamBuilder:
         Returns:
             Dictionary containing LoRA parameters, or None if no LoRA requests
         """
+        cuda_graph_lora_manager = self.cuda_graph_manager
         use_cuda_graph_mode = cuda_graph_lora_manager is not None and maybe_graph
 
         if use_cuda_graph_mode:

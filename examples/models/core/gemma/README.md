@@ -59,7 +59,6 @@ cat > gemma4_mtp.yaml <<'EOF'
 speculative_config:
   decoding_type: MTP
   max_draft_len: 3
-  mtp_eagle_one_model: true
   speculative_model: google/gemma-4-E4B-it-assistant
 kv_cache_config:
   enable_block_reuse: false
@@ -85,7 +84,6 @@ python3 examples/llm-api/quickstart_advanced.py \
     --draft_model_dir google/gemma-4-E4B-it-assistant \
     --spec_decode_algo MTP \
     --spec_decode_max_draft_len 3 \
-    --use_one_model \
     --disable_kv_cache_reuse \
     --apply_chat_template
 ```

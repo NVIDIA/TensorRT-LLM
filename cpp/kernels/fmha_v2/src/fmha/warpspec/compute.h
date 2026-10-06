@@ -87,143 +87,73 @@ struct Compute
     using Tile_o_epilogue = Tile_o_epilogue<Instruction_traits, Kernel_traits>;
 
     // The step size of Q loop.
-    enum
-    {
-        STEP_Q = Kernel_traits::STEP_Q
-    };
+    static constexpr int STEP_Q = Kernel_traits::STEP_Q;
 
     // The step size of KV loop.
-    enum
-    {
-        STEP_KV = Kernel_traits::STEP_KV
-    };
+    static constexpr int STEP_KV = Kernel_traits::STEP_KV;
 
     // The number of compute groups (currently fixed at 2).
-    enum
-    {
-        NUM_COMPUTE_GROUPS = Kernel_traits::NUM_COMPUTE_GROUPS
-    };
+    static constexpr int NUM_COMPUTE_GROUPS = Kernel_traits::NUM_COMPUTE_GROUPS;
 
     // Whether we skip those masked tiles when causal mask is enabled ?
-    enum
-    {
-        SKIP_CAUSAL_MASK_TILES = Kernel_traits::CAUSAL_MASK && !Kernel_traits::USE_CUSTOM_MASK
-    };
+    static constexpr int SKIP_CAUSAL_MASK_TILES = Kernel_traits::CAUSAL_MASK && !Kernel_traits::USE_CUSTOM_MASK;
 
     // Whether we attend to the specific sliding window or chunk ?
-    enum
-    {
-        SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION
-    };
+    static constexpr int SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION;
 
     // Whether use the bidirectional sliding window attention or not.
-    enum
-    {
-        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION
-    };
+    static constexpr int BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION;
 
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
-    enum
-    {
-        APPLY_ALIBI = Kernel_traits::APPLY_ALIBI
-    };
+    static constexpr int APPLY_ALIBI = Kernel_traits::APPLY_ALIBI;
 
     // Do we use custom mask input ?
-    enum
-    {
-        USE_CUSTOM_MASK = Kernel_traits::USE_CUSTOM_MASK
-    };
+    static constexpr int USE_CUSTOM_MASK = Kernel_traits::USE_CUSTOM_MASK;
 
     // Do we always need to apply the mask ?
-    enum
-    {
-        ALWAYS_APPLY_MASK = APPLY_ALIBI || USE_CUSTOM_MASK
-    };
+    static constexpr int ALWAYS_APPLY_MASK = APPLY_ALIBI || USE_CUSTOM_MASK;
 
     // Enable mutex for overlapping mma and softmax instructions.
-    enum
-    {
-        ENABLE_MUTEX = Kernel_traits::ENABLE_MUTEX
-    };
+    static constexpr int ENABLE_MUTEX = Kernel_traits::ENABLE_MUTEX;
 
     // The head_dimension groups.
-    enum
-    {
-        D_GROUPS = Kernel_traits::D_GROUPS
-    };
+    static constexpr int D_GROUPS = Kernel_traits::D_GROUPS;
 
     // The MMA_K groups (corresponding to head_dimension groups).
-    enum
-    {
-        BMM1_MMAS_K_GROUPS = Kernel_traits::D_GROUPS
-    };
+    static constexpr int BMM1_MMAS_K_GROUPS = Kernel_traits::D_GROUPS;
 
     // The number of MMAS_K for each head_dimension group.
-    enum
-    {
-        BMM1_MMAS_K_PER_GROUP = Mma_tile_p::MMAS_K / BMM1_MMAS_K_GROUPS
-    };
+    static constexpr int BMM1_MMAS_K_PER_GROUP = Mma_tile_p::MMAS_K / BMM1_MMAS_K_GROUPS;
 
     // The MMA_K groups (corresponding to kv_step groups).
-    enum
-    {
-        BMM2_MMAS_K_GROUPS = Kernel_traits::BMM2_K_GROUPS
-    };
+    static constexpr int BMM2_MMAS_K_GROUPS = Kernel_traits::BMM2_K_GROUPS;
 
     // The number of MMAS_K for each head_dimension group.
-    enum
-    {
-        BMM2_MMAS_K_PER_GROUP = Mma_tile_o::MMAS_K / BMM2_MMAS_K_GROUPS
-    };
+    static constexpr int BMM2_MMAS_K_PER_GROUP = Mma_tile_o::MMAS_K / BMM2_MMAS_K_GROUPS;
 
     // The tile size of V after head_dimension split.
-    enum
-    {
-        TILE_SIZE_V_PER_D_GROUP = STEP_KV * Kernel_traits::D_PER_GROUP
-    };
+    static constexpr int TILE_SIZE_V_PER_D_GROUP = STEP_KV * Kernel_traits::D_PER_GROUP;
 
-    enum
-    {
-        TILE_SIZE_V = STEP_KV * Kernel_traits::DV
-    };
+    static constexpr int TILE_SIZE_V = STEP_KV * Kernel_traits::DV;
 
-    enum
-    {
-        TILE_BYTES_V_PER_D_GROUP = STEP_KV * Kernel_traits::D_BYTES_PER_GROUP
-    };
+    static constexpr int TILE_BYTES_V_PER_D_GROUP = STEP_KV * Kernel_traits::D_BYTES_PER_GROUP;
 
-    enum
-    {
-        TILE_BYTES_V_PER_K_GROUP = BMM2_MMAS_K_PER_GROUP * Kernel_traits::D_BYTES_PER_GROUP
-    };
+    static constexpr int TILE_BYTES_V_PER_K_GROUP = BMM2_MMAS_K_PER_GROUP * Kernel_traits::D_BYTES_PER_GROUP;
 
     // Named barrier for inter-warpgroup sync
-    enum
-    {
-        SYNC_BARRIER = Kernel_traits::MMA_SYNC_BARRIER_ID
-    };
+    static constexpr int SYNC_BARRIER = Kernel_traits::MMA_SYNC_BARRIER_ID;
 
     // Whether Q and KV is in separate buffer, which means we need to consider different Q and KV lengths.
-    enum
-    {
-        SEPARATE_Q_KV_BUFFER = Kernel_traits::SEPARATE_Q_KV_BUFFER
-    };
+    static constexpr int SEPARATE_Q_KV_BUFFER = Kernel_traits::SEPARATE_Q_KV_BUFFER;
 
-    enum
-    {
-        SAGE_BLOCK_SIZE_Q = Kernel_traits::SAGE_BLOCK_SIZE_Q
-    };
+    static constexpr int SAGE_BLOCK_SIZE_Q = Kernel_traits::SAGE_BLOCK_SIZE_Q;
 
     // sanitize 0 to -1, avoid DIV BY ZERO below
-    enum
-    {
-        SAGE_BLOCK_SIZE_K = Kernel_traits::SAGE_BLOCK_SIZE_K > 0 ? Kernel_traits::SAGE_BLOCK_SIZE_K : -1
-    };
+    static constexpr int SAGE_BLOCK_SIZE_K
+        = Kernel_traits::SAGE_BLOCK_SIZE_K > 0 ? Kernel_traits::SAGE_BLOCK_SIZE_K : -1;
 
-    enum
-    {
-        SAGE_BLOCK_SIZE_V = Kernel_traits::SAGE_BLOCK_SIZE_V > 0 ? Kernel_traits::SAGE_BLOCK_SIZE_V : -1
-    };
+    static constexpr int SAGE_BLOCK_SIZE_V
+        = Kernel_traits::SAGE_BLOCK_SIZE_V > 0 ? Kernel_traits::SAGE_BLOCK_SIZE_V : -1;
 
     // BLOCK_SIZE_Q should be multiply of STEP_Q (usually 64) so that q scale can be fused into scale_bmm1
     static_assert(SAGE_BLOCK_SIZE_Q < 0 || SAGE_BLOCK_SIZE_Q % STEP_Q == 0);
@@ -234,15 +164,9 @@ struct Compute
     // if SAGE_BLOCKS_PER_STEP_X == 0, you will get `zero-sized variable is not allowed in device code`
     // error from nvcc, so the minimal value have to be 1. But don't worry, unused local variables will
     // be optimized out by compiler.
-    enum
-    {
-        SAGE_BLOCKS_PER_STEP_K = std::max(STEP_KV / SAGE_BLOCK_SIZE_K, 1)
-    };
+    static constexpr int SAGE_BLOCKS_PER_STEP_K = std::max(STEP_KV / SAGE_BLOCK_SIZE_K, 1);
 
-    enum
-    {
-        SAGE_BLOCKS_PER_STEP_V = std::max(STEP_KV / SAGE_BLOCK_SIZE_V, 1)
-    };
+    static constexpr int SAGE_BLOCKS_PER_STEP_V = std::max(STEP_KV / SAGE_BLOCK_SIZE_V, 1);
 
 #define K_TILE_WAIT()                                                                                                  \
     int ready_k = cbr_k.peek();                                                                                        \

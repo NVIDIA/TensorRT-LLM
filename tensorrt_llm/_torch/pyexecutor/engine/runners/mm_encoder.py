@@ -117,6 +117,12 @@ class MultimodalEncoderRunner(NoKVCacheRunner):
             "mm_embedding_request_indices": mm_request_indices_with_payload,
             "mm_embedding_lengths": mm_embedding_lengths,
         }
+        embedding_metadata = [
+            param.multimodal_data.get("multimodal_embedding_metadata")
+            for param in mm_params_with_payload
+        ]
+        if any(metadata is not None for metadata in embedding_metadata):
+            result["mm_embedding_metadata"] = embedding_metadata
         if mrope_position_ids_list:
             result["mrope_position_ids"] = mrope_position_ids_list
         if mrope_position_deltas_list:

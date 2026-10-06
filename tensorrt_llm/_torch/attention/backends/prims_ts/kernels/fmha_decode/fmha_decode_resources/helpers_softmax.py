@@ -72,6 +72,70 @@ def _pack_float4_to_fp8_e4m3_inline(
 
 
 @cute.jit
+def _combine_int_frac_ex2(
+    x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=None
+) -> Float32:
+    """Scale ``frac_ex2`` by ``2**floor(x)`` through the FP32 exponent bits.
+
+    ``x_rounded`` still carries the magic rounding constant, so its low
+    mantissa bits hold ``floor(x)``; shifting them into the exponent field and
+    adding the bits of the polynomial result multiplies by the integer power.
+    """
+    return cute.arch.inline_ptx(
+        "{\n"
+        "  .reg .b32 xi;\n"
+        "  .reg .b32 fi;\n"
+        "  .reg .b32 xe;\n"
+        "  .reg .b32 oi;\n"
+        "  mov.b32 xi, {$r0};\n"
+        "  mov.b32 fi, {$r1};\n"
+        "  shl.b32 xe, xi, 23;\n"
+        "  add.s32 oi, xe, fi;\n"
+        "  mov.b32 {$w0}, oi;\n"
+        "}",
+        write_only_types=[Float32],
+        read_only_args=[x_rounded, frac_ex2],
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def _ex2_emulation_packed_f32x2(x: Float32, y: Float32) -> tuple[Float32, Float32]:
+    """Evaluate ``2**x`` and ``2**y`` on the FMA pipe instead of MUFU.
+
+    Inputs are non-positive scaled scores minus the row maximum. The integer
+    part is split off with a magic-constant rounding add, the fraction in
+    [0, 1) goes through a degree-3 minimax polynomial, and the two parts are
+    recombined through the exponent bits. The relative error stays below the
+    BF16 rounding of the P operand, matching the emulation used by the dense
+    Blackwell FMHA kernels.
+    """
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm"
+    )
+    xy_rounded_back = cute.arch.sub_packed_f32x2(
+        xy_rounded, (fp32_round_int, fp32_round_int)
+    )
+    xy_frac = cute.arch.sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    coeff = (
+        1.0,
+        0.695146143436431884765625,
+        0.227564394474029541015625,
+        0.077119089663028717041015625,
+    )
+    out = (coeff[3], coeff[3])
+    for degree in cutlass.range_constexpr(2, -1, -1):
+        out = cute.arch.fma_packed_f32x2(out, xy_frac, (coeff[degree], coeff[degree]))
+    return (
+        _combine_int_frac_ex2(xy_rounded[0], out[0]),
+        _combine_int_frac_ex2(xy_rounded[1], out[1]),
+    )
+
+
+@cute.jit
 def _compute_fp8_p_regs_and_local_sums(
     scale_softmax_log2: Float32,
     new_max_0: Float32,

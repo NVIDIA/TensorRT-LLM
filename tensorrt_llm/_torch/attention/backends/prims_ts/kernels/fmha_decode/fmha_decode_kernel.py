@@ -56,8 +56,8 @@ from cutlass.experimental.task_scheduling.task import Task
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
 
 from ..._block_sparse.common import (
-    _block_sparse_kv_atom_size,
-    _prepared_kv_routes_are_block_aligned,
+    _block_sparse_contiguous_kv_copy_geometry,
+    _block_sparse_proxy_summary_geometry,
 )
 from ..._block_sparse.prepared import _BlockSparseRouteLayout
 from ..tensor_map import (
@@ -95,7 +95,7 @@ from .fmha_decode_resources.helpers_kv_tile_idx import _runtime_active_splits_kv
 from .fmha_decode_tasks import (
     PackedDecodeWorkQueue,
     ScheduleTokenThrottleResource,
-    SmemKvReuseCreditResource,
+    _prefetch_prepared_sparse_row,
     create_block_sparse_load_tasks_per_inst,
     create_correction_task,
     create_correction_task_one_inst_qkv,
@@ -113,7 +113,6 @@ from .fmha_decode_tasks import (
     create_softmax0_task,
     create_softmax1_task,
 )
-
 from .reduction import (  # noqa: F401
     decode_gen_separate_reduction_kernel,
     fmha_decode_separate_reduction_launch,
@@ -322,6 +321,10 @@ def _build_decode_gen_schedule(
     tma_desc_v: cutlass.Pointer | None = None,
     tma_desc_k_atom: cutlass.Pointer | None = None,
     tma_desc_v_atom: cutlass.Pointer | None = None,
+    tma_desc_k_summary: cutlass.Pointer | None = None,
+    tma_desc_v_summary: cutlass.Pointer | None = None,
+    tma_desc_k_summary_atom: cutlass.Pointer | None = None,
+    tma_desc_v_summary_atom: cutlass.Pointer | None = None,
     page_idx_kv: cute.Pointer | None = None,
     h_k_idx: Int32 | None = None,
     b_idx: Int32 | None = None,
@@ -341,6 +344,8 @@ def _build_decode_gen_schedule(
     sparse_row_route_offsets: cute.Pointer | None = None,
     sparse_row_route_counts: cute.Pointer | None = None,
     sparse_route_metadata: cute.Pointer | None = None,
+    sparse_row_route_begin: Int32 | None = None,
+    sparse_route_count: Int32 | None = None,
 ) -> tuple[
     list[Task],
     dict[MemoryResource, list[MemoryResource]],
@@ -408,6 +413,15 @@ def _build_decode_gen_schedule(
                 "tma_desc_k_atom": tma_desc_k_atom,
                 "tma_desc_v_atom": tma_desc_v_atom,
             }
+            if cfg.use_block_sparse_proxy_routes:
+                segment_tensormaps.update(
+                    {
+                        "tma_desc_k_summary": tma_desc_k_summary,
+                        "tma_desc_v_summary": tma_desc_v_summary,
+                        "tma_desc_k_summary_atom": tma_desc_k_summary_atom,
+                        "tma_desc_v_summary_atom": tma_desc_v_summary_atom,
+                    }
+                )
             for name, descriptor in segment_tensormaps.items():
                 if descriptor is None:
                     raise ValueError(
@@ -741,7 +755,6 @@ def _build_decode_gen_schedule(
     # ------------------------------------------------------------------
     work_queue = None
     schedule_token_throttle = None
-    smem_kv_reuse_credit = None
     # CLC remains the single persistent policy for every supported topology.
     # The stock static WorkQueue advances and decodes coordinates separately
     # in every task, which regresses multi-wave decode workloads. CLC computes
@@ -799,17 +812,6 @@ def _build_decode_gen_schedule(
             ),
             name="schedule_token_throttle",
         )
-        if cfg.uses_rotating_kv256_exchange:
-            smem_kv_reuse_credit = SmemKvReuseCreditResource(
-                cfg=cfg,
-                pipeline_config=PipelineConfig.create_async_async_pipeline_cfg(
-                    num_stages=1,
-                    producer_group=load_grp,
-                    consumer_group=correction_grp,
-                    cta_layout_vmnk=cta_layout,
-                ),
-                name="smem_kv_reuse_credit",
-            )
     smem_q = SmemQResource(
         pipeline_config=smem_q_cfg,
         cfg=cfg,
@@ -873,10 +875,12 @@ def _build_decode_gen_schedule(
     sparse_softmax_metadata0 = None
     sparse_softmax_metadata1 = None
     if cfg.use_block_sparse:
+        # This selects the prepared-record storage ABI. Causal consumers still
+        # intersect these column-validity words with each Q row's causal mask.
         prepared_route_layout = _BlockSparseRouteLayout.create(
             kv_route_size=cfg.tile_size_kv,
             kv_block_size=cfg.kv_block_size,
-            has_token_bits=cfg.use_kv_valid_bits,
+            has_token_bits=cfg.uses_prepared_score_keep_words,
             route_metadata_capacity=0,
             num_rows=1,
             page_size=cfg.num_tokens_per_page if cfg.use_paged_kv else None,
@@ -928,6 +932,10 @@ def _build_decode_gen_schedule(
             tma_desc_v=tma_desc_v,
             tma_desc_k_atom=tma_desc_k_atom,
             tma_desc_v_atom=tma_desc_v_atom,
+            tma_desc_k_summary=tma_desc_k_summary,
+            tma_desc_v_summary=tma_desc_v_summary,
+            tma_desc_k_summary_atom=tma_desc_k_summary_atom,
+            tma_desc_v_summary_atom=tma_desc_v_summary_atom,
             sparse_kv_metadata=sparse_kv_metadata0,
             page_offsets_kv=smem_page_offsets,
             seqlens_kv=kv_seqlens,
@@ -947,6 +955,10 @@ def _build_decode_gen_schedule(
             tma_desc_v=tma_desc_v,
             tma_desc_k_atom=tma_desc_k_atom,
             tma_desc_v_atom=tma_desc_v_atom,
+            tma_desc_k_summary=tma_desc_k_summary,
+            tma_desc_v_summary=tma_desc_v_summary,
+            tma_desc_k_summary_atom=tma_desc_k_summary_atom,
+            tma_desc_v_summary_atom=tma_desc_v_summary_atom,
             sparse_kv_metadata=sparse_kv_metadata1,
             page_offsets_kv=smem_page_offsets,
             seqlens_kv=kv_seqlens,
@@ -966,6 +978,10 @@ def _build_decode_gen_schedule(
             tma_desc_v=tma_desc_v,
             tma_desc_k_atom=tma_desc_k_atom,
             tma_desc_v_atom=tma_desc_v_atom,
+            tma_desc_k_summary=tma_desc_k_summary,
+            tma_desc_v_summary=tma_desc_v_summary,
+            tma_desc_k_summary_atom=tma_desc_k_summary_atom,
+            tma_desc_v_summary_atom=tma_desc_v_summary_atom,
             sparse_kv_metadata=sparse_kv_metadata0,
             page_offsets_kv=smem_page_offsets_v or smem_page_offsets,
             seqlens_kv=kv_seqlens,
@@ -985,6 +1001,10 @@ def _build_decode_gen_schedule(
             tma_desc_v=tma_desc_v,
             tma_desc_k_atom=tma_desc_k_atom,
             tma_desc_v_atom=tma_desc_v_atom,
+            tma_desc_k_summary=tma_desc_k_summary,
+            tma_desc_v_summary=tma_desc_v_summary,
+            tma_desc_k_summary_atom=tma_desc_k_summary_atom,
+            tma_desc_v_summary_atom=tma_desc_v_summary_atom,
             sparse_kv_metadata=sparse_kv_metadata1,
             page_offsets_kv=smem_page_offsets_v or smem_page_offsets,
             seqlens_kv=kv_seqlens,
@@ -1005,6 +1025,10 @@ def _build_decode_gen_schedule(
             tma_desc_v=tma_desc_v,
             tma_desc_k_atom=tma_desc_k_atom,
             tma_desc_v_atom=tma_desc_v_atom,
+            tma_desc_k_summary=tma_desc_k_summary,
+            tma_desc_v_summary=tma_desc_v_summary,
+            tma_desc_k_summary_atom=tma_desc_k_summary_atom,
+            tma_desc_v_summary_atom=tma_desc_v_summary_atom,
             sparse_kv_metadata0=sparse_kv_metadata0,
             sparse_kv_metadata1=sparse_kv_metadata1,
             page_offsets_kv=smem_page_offsets,
@@ -1213,6 +1237,8 @@ def _build_decode_gen_schedule(
         "seq_len_q": seq_len_q,
         "sparse_row_route_offsets": sparse_row_route_offsets,
         "sparse_row_route_counts": sparse_row_route_counts,
+        "sparse_row_route_begin": sparse_row_route_begin,
+        "sparse_route_count": sparse_route_count,
         "num_heads_kv": num_heads_kv,
     }
     if use_one_inst_qkv:
@@ -1283,7 +1309,6 @@ def _build_decode_gen_schedule(
                 smem_kv,
                 work_queue,
                 schedule_token_throttle,
-                smem_kv_reuse_credit,
                 cfg,
                 domain=load_domain,
                 domain_bias=0,
@@ -1431,7 +1456,6 @@ def _build_decode_gen_schedule(
             tmem_corr0,
             tmem_corr1,
             work_queue,
-            smem_kv_reuse_credit,
             cfg,
             domain=corr_domain,
             tmem_stats_done0=tmem_stats_done0,
@@ -1607,10 +1631,6 @@ def _build_decode_gen_schedule(
         )
     if schedule_token_throttle is not None:
         resource_dependency_graph[schedule_token_throttle] = [work_queue]
-    if smem_kv_reuse_credit is not None:
-        # A self-edge models the one-slot ownership token: Load produces it
-        # for the current tile and Correction consumes it before the next Load.
-        resource_dependency_graph[smem_kv_reuse_credit] = [smem_kv_reuse_credit]
     dma_consumer_release_labels: dict[
         tuple[MemoryResource, MemoryResource], set[str]
     ] = {}
@@ -1662,8 +1682,6 @@ def _build_decode_gen_schedule(
         smem_allocator.add_resource(work_queue)
     if schedule_token_throttle is not None:
         smem_allocator.add_resource(schedule_token_throttle)
-    if smem_kv_reuse_credit is not None:
-        smem_allocator.add_resource(smem_kv_reuse_credit)
     smem_allocator.add_resource(smem_q)
     if smem_page_offsets is not None:
         smem_allocator.add_resource(smem_page_offsets)
@@ -1701,21 +1719,10 @@ def _build_decode_gen_schedule(
     smem_allocator.add_resource(tmem_corr0)
     if not use_one_inst_qkv:
         smem_allocator.add_resource(tmem_corr1)
-    if cfg.tile_size_kv == 256:
-        # KV256 direct-output correction rotates one compact 35,840-byte
-        # payload through the shared 192-KiB K/V ring. Split-KV retains the
-        # fixed full exchange. Neither path increases the CTA SMEM footprint.
-        smem_allocator.add_alias_group(
-            [
-                smem_kv.get_smem_requirements(),
-                tmem_corr1.get_smem_requirements(),
-            ]
-        )
     smem_allocator.add_tmem_ptr(
         SmemAllocation("fmha_tmem_ptr_i32", dtype=cutlass.Int32, alignment=4)
     )
     smem_allocator.compute_layout()
-
     tmem_allocator = TmemAllocator()
     if cfg.use_keeps_mma_ab:
         if use_one_inst_qkv:
@@ -1774,13 +1781,15 @@ def _build_decode_gen_schedule(
         p0_alloc = smem_p0.get_tmem_requirements()[0]
         p1_alloc = smem_p1.get_tmem_requirements()[0]
         o_alloc = tmem_o.get_tmem_requirements()[0]
-        if cfg.tile_size_kv == 256:
-            # KV256 keeps O in the low 256 columns and overlays packed P on
-            # each S region from its first column. Softmax streams K32
-            # fragments in order, so every 16-column P store only overwrites
-            # scores that have already been consumed. Starting P after the
-            # nominal stats columns would instead clobber the next unread S
-            # fragment; KV256 keeps its softmax stats in SMEM.
+        if cfg.streams_tmem_p_fragments:
+            # Streamed profiles keep O in the low 256 columns and overlay
+            # packed P on each S region from its first column. Softmax streams
+            # K32 fragments in order, so every 16-column P store only
+            # overwrites scores that have already been consumed. Starting P
+            # after the nominal stats columns would instead clobber the next
+            # unread S fragment; streamed profiles keep their softmax stats in
+            # SMEM.
+            assert cfg.keeps_stats_via_smem
             o_alloc.offset = 0
             s0_alloc.offset = 2 * cfg.tmem_o_stage_cols
             s1_alloc.offset = s0_alloc.offset + cfg.tmem_s_cols
@@ -1835,12 +1844,8 @@ def _build_decode_gen_schedule(
     eager_init_resources = (
         [tmem_corr0] if use_one_inst_qkv else [tmem_corr0, tmem_corr1]
     )
-    if smem_kv_reuse_credit is not None:
-        # Initialize the persistent ring cursor under the same CTA-wide fence
-        # and barrier used by other manually managed SMEM control state.
-        eager_init_resources.append(smem_kv_reuse_credit)
-    if cfg.tile_size_kv == 256:
-        # KV256's TMEM P operands use one-way per-fragment ready barriers.
+    if cfg.streams_tmem_p_fragments:
+        # Streamed TMEM P operands use one-way per-fragment ready barriers.
         # Initialize them beside correction's manually managed SMEM state.
         eager_init_resources.extend([smem_p0, smem_p1])
 
@@ -1863,10 +1868,10 @@ def _has_unmodeled_tmem_p_alias_protocol(cfg: FmhaDecodeConfig) -> bool:
     """Whether exhaustive TS checking would report a known false P/S race.
 
     The staged D256 path selects one of two physical P/S stages at runtime.
-    Static KV256 instead orders streamed P fragments with private mbarriers and
+    Static streamed profiles instead order P fragments with private mbarriers and
     reuses the matching TmemO-full barrier as the next-QK overwrite credit.
     Those intra-work protocols are below TaskManager's resource transitions,
-    so its allocation-level checker cannot prove them. Persistent KV256 has
+    so its allocation-level checker cannot prove them. Persistent streaming has
     enough task-level ordering for the checker and remains covered.
     """
     return cfg.uses_staged_one_inst_tmem_p or (
@@ -1982,6 +1987,10 @@ def _run_decode_gen_active(
     g_sparse_row_route_offsets: cute.Pointer | None = None,
     g_sparse_row_route_counts: cute.Pointer | None = None,
     g_sparse_route_metadata: cute.Pointer | None = None,
+    tma_desc_k_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
 ) -> None:
     """Run the complete decode body for one runtime-valid Q tile.
 
@@ -2021,28 +2030,43 @@ def _run_decode_gen_active(
         else Int32(cfg.static_seq_len_kv)
     )
     use_clc_dynamic_scheduler = cfg.use_persistent_scheduler
+    tma_desc_k_summary_ptr = None
+    tma_desc_v_summary_ptr = None
+    tma_desc_k_summary_atom_ptr = None
+    tma_desc_v_summary_atom_ptr = None
+    if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+        assert tma_desc_k_summary is not None
+        assert tma_desc_v_summary is not None
+        assert tma_desc_k_summary_atom is not None
+        assert tma_desc_v_summary_atom is not None
+        tma_desc_k_summary_ptr = tma_desc_k_summary.get_ptr()
+        tma_desc_v_summary_ptr = tma_desc_v_summary.get_ptr()
+        tma_desc_k_summary_atom_ptr = tma_desc_k_summary_atom.get_ptr()
+        tma_desc_v_summary_atom_ptr = tma_desc_v_summary_atom.get_ptr()
 
     # Prefetch TMA
+    uses_atom_desc = False
+    if cutlass.const_expr(cfg.use_block_sparse):
+        _, _, uses_atom_desc = _block_sparse_contiguous_kv_copy_geometry(
+            kv_block_size=cfg.kv_block_size,
+            kv_route_size=cfg.tile_size_kv,
+        )
     init_warp = 1
     if warp_idx == init_warp:
         prims.prefetch_tensormap(tma_desc_q.get_ptr())
         prims.prefetch_tensormap(tma_desc_k.get_ptr())
         prims.prefetch_tensormap(tma_desc_v.get_ptr())
-        if cutlass.const_expr(
-            cfg.use_block_sparse
-            and _block_sparse_kv_atom_size(cfg.kv_block_size) == 64
-            and (
-                cfg.tile_size_kv == 256
-                or not _prepared_kv_routes_are_block_aligned(
-                    cfg.kv_block_size,
-                    cfg.tile_size_kv,
-                )
-            )
-        ):
-            # KV256 always issues semantic KV64 atoms. KV128 needs this second
-            # descriptor only for non-aligned coarse routes.
+        if cutlass.const_expr(cfg.use_block_sparse and uses_atom_desc):
+            # KV256 and non-aligned coarse KV128 may select the exact atom maps.
             prims.prefetch_tensormap(tma_desc_k_atom.get_ptr())
             prims.prefetch_tensormap(tma_desc_v_atom.get_ptr())
+        if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+            if cutlass.const_expr(cfg.tile_size_kv != 256):
+                prims.prefetch_tensormap(tma_desc_k_summary_ptr)
+                prims.prefetch_tensormap(tma_desc_v_summary_ptr)
+            if cutlass.const_expr(uses_atom_desc):
+                prims.prefetch_tensormap(tma_desc_k_summary_atom_ptr)
+                prims.prefetch_tensormap(tma_desc_v_summary_atom_ptr)
     init_warp += 1
 
     clc_response_ptr = None
@@ -2054,6 +2078,27 @@ def _run_decode_gen_active(
     q_output_rows = g_h_r
     if cutlass.const_expr(cfg.max_seq_len_q > 1):
         q_output_rows = g_h_r * Int32(cfg.max_seq_len_q)
+
+    # Static block-sparse tiles read their prepared row header here, before
+    # TMEM allocation and barrier setup, so that global-memory round trip is
+    # hidden instead of stalling every task at its first schedule step.
+    sparse_row_route_begin = None
+    sparse_route_count = None
+    if cutlass.const_expr(
+        cfg.use_block_sparse
+        and not cfg.use_persistent_scheduler
+        and g_sparse_row_route_offsets is not None
+        and g_sparse_row_route_counts is not None
+    ):
+        sparse_row_route_begin, sparse_route_count = _prefetch_prepared_sparse_row(
+            cfg,
+            g_sparse_row_route_offsets,
+            g_sparse_row_route_counts,
+            q_group_idx,
+            h_k_idx,
+            b_idx,
+            g_h_k,
+        )
 
     (
         task_list,
@@ -2083,6 +2128,10 @@ def _run_decode_gen_active(
         tma_desc_v=tma_desc_v.get_ptr(),
         tma_desc_k_atom=tma_desc_k_atom.get_ptr(),
         tma_desc_v_atom=tma_desc_v_atom.get_ptr(),
+        tma_desc_k_summary=tma_desc_k_summary_ptr,
+        tma_desc_v_summary=tma_desc_v_summary_ptr,
+        tma_desc_k_summary_atom=tma_desc_k_summary_atom_ptr,
+        tma_desc_v_summary_atom=tma_desc_v_summary_atom_ptr,
         page_idx_kv=g_page_idx_kv,
         h_k_idx=h_k_idx,
         b_idx=b_idx,
@@ -2102,6 +2151,8 @@ def _run_decode_gen_active(
         sparse_row_route_offsets=g_sparse_row_route_offsets,
         sparse_row_route_counts=g_sparse_row_route_counts,
         sparse_route_metadata=g_sparse_route_metadata,
+        sparse_row_route_begin=sparse_row_route_begin,
+        sparse_route_count=sparse_route_count,
     )
 
     smem_allocator.allocate()
@@ -2264,6 +2315,10 @@ def _run_decode_gen_runtime_prefix(
     g_sparse_row_route_offsets: cute.Pointer | None,
     g_sparse_row_route_counts: cute.Pointer | None,
     g_sparse_route_metadata: cute.Pointer | None,
+    tma_desc_k_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
 ) -> None:
     """Run the general runtime split-prefix producer or retire its suffix."""
 
@@ -2328,6 +2383,10 @@ def _run_decode_gen_runtime_prefix(
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
+                tma_desc_k_summary=tma_desc_k_summary,
+                tma_desc_v_summary=tma_desc_v_summary,
+                tma_desc_k_summary_atom=tma_desc_k_summary_atom,
+                tma_desc_v_summary_atom=tma_desc_v_summary_atom,
             )
         else:
             _run_decode_gen_inactive_cluster_rank()
@@ -2371,6 +2430,10 @@ def _run_decode_gen_runtime_prefix(
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
+                tma_desc_k_summary=tma_desc_k_summary,
+                tma_desc_v_summary=tma_desc_v_summary,
+                tma_desc_k_summary_atom=tma_desc_k_summary_atom,
+                tma_desc_v_summary_atom=tma_desc_v_summary_atom,
             )
         else:
             _signal_padded_pdl_producer(cfg)
@@ -2409,6 +2472,10 @@ def decode_gen_kernel(
     g_sparse_row_route_counts: cute.Pointer | None = None,
     g_sparse_route_metadata: cute.Pointer | None = None,
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
+    tma_desc_k_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
 ) -> None:
     """Dispatch one static Q/split tile and drain padded launch slots safely."""
     q_group_cta_idx, h_k_idx, b_idx = cute.arch.block_idx()
@@ -2470,6 +2537,10 @@ def decode_gen_kernel(
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
+                tma_desc_k_summary=tma_desc_k_summary,
+                tma_desc_v_summary=tma_desc_v_summary,
+                tma_desc_k_summary_atom=tma_desc_k_summary_atom,
+                tma_desc_v_summary_atom=tma_desc_v_summary_atom,
             )
         else:
             _run_decode_gen_runtime_prefix(
@@ -2510,6 +2581,10 @@ def decode_gen_kernel(
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
+                tma_desc_k_summary=tma_desc_k_summary,
+                tma_desc_v_summary=tma_desc_v_summary,
+                tma_desc_k_summary_atom=tma_desc_k_summary_atom,
+                tma_desc_v_summary_atom=tma_desc_v_summary_atom,
             )
     else:
         # Packed-Q grids use a batch-wide maximum envelope. These Q CTAs own no
@@ -2754,7 +2829,6 @@ def fmha_decode_launch(
         tma_desc_q,
         tma_desc_k,
         tma_desc_v,
-        # Dense/paged profiles never inspect the 64-token descriptor slots.
         tma_desc_k,
         tma_desc_v,
         o_iter,
@@ -2799,6 +2873,8 @@ def fmha_block_sparse_launch(
     q_iter: cute.Pointer,
     k_iter: cute.Pointer,
     v_iter: cute.Pointer,
+    k_summary_iter: cute.Pointer,
+    v_summary_iter: cute.Pointer,
     o_iter: cute.Pointer,
     row_route_offsets_iter: cute.Pointer,
     row_route_counts_iter: cute.Pointer,
@@ -2813,14 +2889,18 @@ def fmha_block_sparse_launch(
     k_page_stride: Int64 = 0,
     v_page_stride: Int64 = 0,
 ) -> None:
-    """Launch attention over contiguous or paged prepared KV routes.
+    """Launch attention over exact and typed exact/proxy prepared KV routes.
 
     A preceding prepare kernel has already resolved each BSR row into compact
     logical atom origins, storage locators, validity flags, and optional token
-    words. Both layouts execute the same ``decode_gen_kernel`` schedule.
+    words. Exact routes address K/V; proxy routes address summary K/V. Both
+    layouts execute the same ``decode_gen_kernel`` schedule and
+    physical copy policy. Exact builds constexpr-elide summary TensorMaps.
     """
     if cutlass.const_expr(not cfg.use_block_sparse):
-        raise ValueError("fmha_block_sparse_launch requires cfg.use_block_sparse=True")
+        raise ValueError("fmha_block_sparse_launch requires block-sparse config")
+    if cutlass.const_expr(cfg.use_block_sparse_proxy_routes and cfg.use_paged_kv):
+        raise ValueError("block-sparse proxy routes require contiguous K/V")
 
     log2_e = math.log2(math.e)
     b, h_q, h_k, s_k, d = problem_shape
@@ -2855,7 +2935,18 @@ def fmha_block_sparse_launch(
         swizzle=tma_swizzle,
     )
 
-    kv_atom_size = _block_sparse_kv_atom_size(cfg.kv_block_size)
+    (
+        primary_kv_box_size,
+        kv_atom_size,
+        uses_atom_desc,
+    ) = _block_sparse_contiguous_kv_copy_geometry(
+        kv_block_size=cfg.kv_block_size,
+        kv_route_size=cfg.tile_size_kv,
+    )
+    k_desc_summary_primary = None
+    v_desc_summary_primary = None
+    k_desc_summary_atom = None
+    v_desc_summary_atom = None
     if cutlass.const_expr(cfg.use_paged_kv):
         # Paged HND storage is addressed as (D, token-in-page, Hkv, page).
         # Prepared routes already contain each atom's physical page ID, so no
@@ -2899,9 +2990,10 @@ def fmha_block_sparse_launch(
         k_desc_primary = k_desc_atom
         v_desc_primary = v_desc_atom
     else:
-        # Contiguous sparse coordinates retain the logical (D, S, H, B)
-        # order and the established primary/atom descriptor split.
-        primary_kv_box_size = 2 * kv_atom_size if kv_atom_size == 64 else kv_atom_size
+        # Exact and summary tensors form one logical segmented KV coordinate
+        # space. Each physical source owns the same primary/atom descriptor
+        # pair; the prepared route kind selects the pair, while the loader
+        # retains the existing KV128/fine/KV256 copy policy.
         kv_dims = (d, s_k, h_k, b)
         k_desc_primary = create_tensor_map_tiled(
             global_address=k_iter.toint(),
@@ -2921,16 +3013,7 @@ def fmha_block_sparse_launch(
         )
         k_desc_atom = k_desc_primary
         v_desc_atom = v_desc_primary
-        if cutlass.const_expr(
-            kv_atom_size == 64
-            and (
-                cfg.tile_size_kv == 256
-                or not _prepared_kv_routes_are_block_aligned(
-                    cfg.kv_block_size,
-                    cfg.tile_size_kv,
-                )
-            )
-        ):
+        if cutlass.const_expr(uses_atom_desc):
             # KV256 always stages four semantic KV64 atoms. KV128 needs this
             # map only when a route may join unrelated BSR entries.
             k_desc_atom = create_tensor_map_tiled(
@@ -2949,6 +3032,55 @@ def fmha_block_sparse_launch(
                 box_dims=(tma_box0, kv_atom_size, 1, 1),
                 swizzle=tma_swizzle,
             )
+
+        if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+            num_kv_blocks, _ = _block_sparse_proxy_summary_geometry(
+                seq_len_kv,
+                cfg.kv_block_size,
+            )
+            _, summary_kv_strides = _block_sparse_bshd_tma_strides(
+                q_seq=q_seq,
+                h_q=h_q,
+                h_k=h_k,
+                s_k=num_kv_blocks,
+                d=d,
+            )
+            summary_dims = (d, num_kv_blocks, h_k, b)
+            k_desc_summary_primary = create_tensor_map_tiled(
+                global_address=k_summary_iter.toint(),
+                dtype=cfg.kv_dtype,
+                global_dims=summary_dims,
+                global_strides=summary_kv_strides,
+                box_dims=(tma_box0, primary_kv_box_size, 1, 1),
+                swizzle=tma_swizzle,
+            )
+            v_desc_summary_primary = create_tensor_map_tiled(
+                global_address=v_summary_iter.toint(),
+                dtype=cfg.kv_dtype,
+                global_dims=summary_dims,
+                global_strides=summary_kv_strides,
+                box_dims=(tma_box0, primary_kv_box_size, 1, 1),
+                swizzle=tma_swizzle,
+            )
+            k_desc_summary_atom = k_desc_summary_primary
+            v_desc_summary_atom = v_desc_summary_primary
+            if cutlass.const_expr(uses_atom_desc):
+                k_desc_summary_atom = create_tensor_map_tiled(
+                    global_address=k_summary_iter.toint(),
+                    dtype=cfg.kv_dtype,
+                    global_dims=summary_dims,
+                    global_strides=summary_kv_strides,
+                    box_dims=(tma_box0, kv_atom_size, 1, 1),
+                    swizzle=tma_swizzle,
+                )
+                v_desc_summary_atom = create_tensor_map_tiled(
+                    global_address=v_summary_iter.toint(),
+                    dtype=cfg.kv_dtype,
+                    global_dims=summary_dims,
+                    global_strides=summary_kv_strides,
+                    box_dims=(tma_box0, kv_atom_size, 1, 1),
+                    swizzle=tma_swizzle,
+                )
 
     q_groups = Int32(
         (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
@@ -3008,6 +3140,10 @@ def fmha_block_sparse_launch(
         row_route_counts_iter,
         route_metadata_iter,
         False,  # static_full_split_prefix
+        tma_desc_k_summary=k_desc_summary_primary,
+        tma_desc_v_summary=v_desc_summary_primary,
+        tma_desc_k_summary_atom=k_desc_summary_atom,
+        tma_desc_v_summary_atom=v_desc_summary_atom,
     ).launch(
         grid=grid,
         block=[cfg.threads_per_cta, 1, 1],

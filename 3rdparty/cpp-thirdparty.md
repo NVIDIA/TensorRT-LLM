@@ -70,35 +70,6 @@ Include a comment indicating the intended usage of the package.
 my-package==1.2.24
 ```
 
-#### C/C++ Packages via conan
-
-Add a new entry to [conandata.yml][6] indicating the package version for the
-dependency you are adding. Include a yaml comment indicating the intended usage
-of the package. Then add a new invocation of `self.require()` within the `def
-requirements(self)` method of [conanfile.py], referencing the version you added
-to conandata.
-
-[6]: https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/conandata.yml
-[7]: https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/conanfile.py
-
-**Example:**
-
-`conandata.yml`:
-
-```.yml
-# my_dependency is needed by <feature> where it is used for <reason>
-my_dependency: 1.2.24+1
-```
-
-`conanfile.py`:
-
-```.py
-def requirements(self):
-    ...
-    my_dependency_version = self.conandata["my_dependency"]
-    self.requires(f"my_dependency/{my_dependency_version}")
-```
-
 #### Source integration via CMake
 
 If you have a package you need to build from source then use CMake
@@ -159,16 +130,13 @@ There are many ways to integrate a package with the build through cmake.
 
 ### find\_package for binary packages
 
-For binary packages (os-provided via apt-get or yum, or conan-provided), prefer
-the use of [find\_package][10] to integrate the package into the build. Conan
-will generate a find-script for packages that don't already come with a Cmake
-configuration file and the conan-specific logic is provided through the
-conan-generated toolchain already used in our build.
+For binary packages provided by the operating system, prefer the use of
+[find\_package][10] to integrate the package into the build.
 
-For any packages which do not have provided find modules (either built-in, or
-available from conan), please implement one in [cpp/cmake/modules][11]. Please
-do not add "direct" invocations of `find_library` / `add_library` / `find_file`
-/ `find_path` outside of a find module the package.
+For packages which do not provide a CMake configuration or built-in find
+module, please implement one in [cpp/cmake/modules][11]. Please do not add
+"direct" invocations of `find_library` / `add_library` / `find_file` /
+`find_path` outside of a find module for the package.
 
 Please add invocations of `find_package` directly in the root Cmake file.
 

@@ -5,7 +5,7 @@ import asyncio
 import subprocess
 import tempfile
 import time
-from unittest.mock import ANY, AsyncMock
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -125,6 +125,22 @@ async def test_heartbeat_survives_stalled_refresh_within_ttl():
         f"refresh landed at {refreshed_at[0]} after the registration expired "
         f"at {deadline}")
     storage.set.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_timeout_past_grace_returns_without_retry():
+    config = worker_config()
+    storage = AsyncMock()
+    storage.expire.side_effect = asyncio.TimeoutError
+    worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001, config,
+                                 storage)
+    worker._registration_expires_at = 100
+
+    with patch("tensorrt_llm.serve.disagg_auto_scaling.key_time",
+               side_effect=[105, 105]):
+        assert not await worker._refresh_registration()
+
+    assert storage.expire.await_count == 1
 
 
 def get_uri(storage_type):

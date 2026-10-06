@@ -1107,6 +1107,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             self._current_lora_cuda_graph_state,
             lambda: self.transformer.active_topology,
         )
+        # Same registration the single-stage pipeline does: without it the
+        # dense-prefix and sparse phases of skip-softmax / Sol-Attn share one
+        # captured graph and the wrong kernel is replayed.
+        self.transformer.register_cuda_graph_extra_key_fns(runner)
         compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         logger.info(
             "CUDA graph runner: wrapping LTX-2 two-stage transformer.forward "
@@ -1793,6 +1797,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     audio=audio_mod,
                     text_cache=_s2_static,
                     step_index=i,
+                    timestep=timestep,
                 )
 
                 # Video: velocity → x0 → post-process → Euler step

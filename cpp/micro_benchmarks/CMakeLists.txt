@@ -39,7 +39,7 @@ function(add_benchmark test_name test_src)
   target_link_libraries(${test_name} PUBLIC ${SHARED_TARGET}
                                             benchmark::benchmark)
 
-  target_compile_features(${test_name} PRIVATE cxx_std_17)
+  target_compile_features(${test_name} PRIVATE cxx_std_20)
   target_compile_definitions(
     ${test_name} PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}"
                         USING_OSS_CUTLASS_MOE_GEMM)

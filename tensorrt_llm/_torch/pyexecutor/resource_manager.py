@@ -65,6 +65,8 @@ PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheMana
 WorldConfig = tensorrt_llm.bindings.WorldConfig
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tensorrt_llm._torch.attention.backends.interface import \
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
@@ -1198,8 +1200,8 @@ class KVCacheManager(BaseResourceManager):
         # reuse, so we rebuild the context request lists here.
         scheduled_batch.reset_context_requests()
 
-    def publish_connector_scheduler_output(
-            self, scheduled_batch: ScheduledRequests) -> None:
+    def report_batch_to_connector(self,
+                                  scheduled_batch: ScheduledRequests) -> None:
         """Report the batch to the KV connector.
 
         Driven by ``ResourceManager.prepare_resources`` *after* the token-budget
@@ -1305,6 +1307,8 @@ class KVCacheManager(BaseResourceManager):
                 top_k=capture_sampling_params.top_k
                 if capture_sampling_params is not None else None,
                 top_p=capture_sampling_params.top_p
+                if capture_sampling_params is not None else None,
+                min_p=capture_sampling_params.min_p
                 if capture_sampling_params is not None else None,
             )
             # Here 1+max_num_draft_tokens is used to extend the prompt length to
@@ -1771,10 +1775,8 @@ class KVCacheManager(BaseResourceManager):
         request_ids: List[int],
         layer_idx: Optional[int] = None,
         window_size: Optional[int] = None,
-        beam_width: Optional[int] = 1,
         num_blocks_per_seq: Optional[Sequence[int]] = None,
     ) -> List[List[int]]:
-        beam_width = beam_width or 1
         if window_size is None:
             if layer_idx is None:
                 window_size = self._resolve_window_size(
@@ -1789,12 +1791,7 @@ class KVCacheManager(BaseResourceManager):
 
         result = self.impl.get_batch_cache_block_ids(request_ids, window_size)
         for i in range(len(result)):
-            beams = [list(beam) for beam in result[i]]
-            assert len(beams) == beam_width, (
-                f"Expected {beam_width} index arrays per request, got {len(beams)}"
-            )
-            result[i] = beams[
-                0] if beam_width == 1 else self._pack_beam_cache_indices(beams)
+            result[i] = list(result[i][0])
             if num_blocks_per_seq is not None:
                 result[i] = result[i][:num_blocks_per_seq[i]]
         return result
@@ -1818,22 +1815,6 @@ class KVCacheManager(BaseResourceManager):
         for block_ids, n in zip(block_ids_per_seq, num_blocks):
             indices_list.extend(block_ids[:n])
         return torch.tensor(indices_list, dtype=torch.int32)
-
-    @staticmethod
-    def _pack_beam_cache_indices(beams: List[List[int]]) -> List[int]:
-        """Pack beam-search blocks into a flat beam-0 layout.
-
-        The first beam owns the shared prompt blocks. For every other beam,
-        append only the final block when it differs from beam 0's final block.
-        """
-        if not beams:
-            return []
-        packed = list(beams[0])
-        beam0_last = beams[0][-1] if beams[0] else None
-        for beam in beams[1:]:
-            if beam and beam[-1] != beam0_last:
-                packed.append(beam[-1])
-        return packed
 
     def get_num_free_blocks(self) -> int:
         if self.is_linear_attention:
@@ -2808,8 +2789,14 @@ class KVCacheCompressionManager(BaseResourceManager):
     uses_iteration_lifecycle = True
     provides_cold_page_codec = False
 
-    def __init__(self, config: "KvCacheCompressionConfig") -> None:
+    def __init__(
+        self,
+        config: "KvCacheCompressionConfig",
+        *,
+        pretrained_config: Optional["PretrainedConfig"] = None,
+    ) -> None:
         self.config = config
+        self.pretrained_config = pretrained_config
         self.kv_cache_manager: Optional["KVCacheManagerV2"] = None
         self.draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None
 
@@ -3066,11 +3053,11 @@ class ResourceManager:
         self.maybe_fit_token_budget(scheduled_batch)
         # Strictly after the trim: the connector is told how many tokens the
         # forward pass will compute, which is only settled once the trim has
-        # run. See KVCacheManager.publish_connector_scheduler_output.
+        # run. See `report_batch_to_connector`.
         kv_cache_manager = self.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if hasattr(kv_cache_manager, "publish_connector_scheduler_output"):
-            kv_cache_manager.publish_connector_scheduler_output(scheduled_batch)
+        if hasattr(kv_cache_manager, "report_batch_to_connector"):
+            kv_cache_manager.report_batch_to_connector(scheduled_batch)
 
     @nvtx_range("update_resources")
     def update_resources(

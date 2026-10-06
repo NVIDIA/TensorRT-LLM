@@ -18,6 +18,7 @@
 #include "bindings.h"
 #include "hostfunc.h"
 #include "moeBindings.h"
+#include "tensorrt_llm/common/bindingUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
@@ -33,6 +34,7 @@
 #include "tensorrt_llm/runtime/locality_domain/locality_domain_utils.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/mcastGPUBuffer.h"
+#include "tensorrt_llm/runtime/mcastGroupCommPg.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/torchView.h"
 #include "tensorrt_llm/runtime/virtualMemory.h"
@@ -49,6 +51,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/trampoline.h>
 #include <torch/extension.h>
@@ -155,6 +158,21 @@ void initBindings(nb::module_& m)
         .def(nb::init<size_t, uint32_t, uint32_t, uint32_t, bool, int64_t>(), nb::arg("buf_size"),
             nb::arg("group_size"), nb::arg("group_rank"), nb::arg("device_idx"), nb::arg("mn_nvlink"),
             nb::arg("mpi_comm_fortran_handle"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "__init__",
+            [](tensorrt_llm::runtime::McastGPUBuffer* self, size_t bufSize, uint32_t groupSize, uint32_t groupRank,
+                uint32_t deviceIdx, bool mnNvlink, nb::object pgObj, std::string const& pybind11Abi)
+            {
+                // Unboxing the pybind11-owned ProcessGroup needs the GIL; the collectives run
+                // afterwards do not.
+                auto pg = common::get_intrusive_ptr<c10d::ProcessGroup, nb::python_error>(pgObj.ptr(), pybind11Abi);
+                auto groupComm = std::make_shared<tensorrt_llm::runtime::PgMcastGroupComm>(std::move(pg));
+                nb::gil_scoped_release release;
+                new (self) tensorrt_llm::runtime::McastGPUBuffer(
+                    bufSize, groupSize, groupRank, deviceIdx, mnNvlink, std::move(groupComm));
+            },
+            nb::arg("buf_size"), nb::arg("group_size"), nb::arg("group_rank"), nb::arg("device_idx"),
+            nb::arg("mn_nvlink"), nb::arg("process_group"), nb::arg("pybind11_abi"))
         .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer,
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer,
@@ -162,11 +180,26 @@ void initBindings(nb::module_& m)
         .def("checkpoint_prepare", &tensorrt_llm::runtime::McastGPUBuffer::checkpointPrepare,
             "Internal, experimental hook; the caller must establish engine-wide quiescence before invoking it.",
             nb::call_guard<nb::gil_scoped_release>())
-        .def("checkpoint_restore", &tensorrt_llm::runtime::McastGPUBuffer::checkpointRestore,
+        .def("checkpoint_restore",
+            nb::overload_cast<int64_t>(&tensorrt_llm::runtime::McastGPUBuffer::checkpointRestore),
             nb::arg("mpi_comm_fortran_handle"),
             "Internal, experimental hook; the restored communicator must have the original ordered membership and "
             "the engine must remain quiescent. A successful restore retains an owned communicator duplicate.",
             nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "checkpoint_restore",
+            [](tensorrt_llm::runtime::McastGPUBuffer& self, nb::object pgObj, std::string const& pybind11Abi)
+            {
+                // Unboxing the pybind11-owned ProcessGroup needs the GIL; the collectives run
+                // afterwards do not.
+                auto pg = common::get_intrusive_ptr<c10d::ProcessGroup, nb::python_error>(pgObj.ptr(), pybind11Abi);
+                auto groupComm = std::make_shared<tensorrt_llm::runtime::PgMcastGroupComm>(std::move(pg));
+                nb::gil_scoped_release release;
+                return self.checkpointRestore(std::move(groupComm));
+            },
+            nb::arg("process_group"), nb::arg("pybind11_abi"),
+            "checkpoint_restore for a non-MPI orchestrator. The process group must cover the same processes, in the "
+            "same order, as the one the workspace was created with.")
         .def("checkpoint_restore_complete", &tensorrt_llm::runtime::McastGPUBuffer::checkpointRestoreComplete,
             nb::arg("local_protocol_reset_succeeded"),
             "Collectively publish or abort a pending internal MNNVL restore after protocol reset.",
@@ -313,27 +346,5 @@ void initBindingsEarly(nb::module_& m)
         .def(nb::init<tr::BufferManager::CudaStreamPtr, bool>(), nb::arg("stream"), nb::arg("trim_pool") = false,
             nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("stream", &tr::BufferManager::getStream);
-
-    nb::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
-        .def(nb::init<tr::SpeculativeDecodingMode::UnderlyingType>(), nb::arg("state"))
-        .def_static("NoneType", &tr::SpeculativeDecodingMode::None)
-        .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal)
-        .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa)
-        .def_static("Eagle", &tr::SpeculativeDecodingMode::Eagle)
-        .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding)
-        .def_static("ExplicitDraftTokens", &tr::SpeculativeDecodingMode::ExplicitDraftTokens)
-        .def_prop_ro("is_none", &tr::SpeculativeDecodingMode::isNone)
-        .def_prop_ro("is_draft_tokens_external", &tr::SpeculativeDecodingMode::isDraftTokensExternal)
-        .def_prop_ro("is_medusa", &tr::SpeculativeDecodingMode::isMedusa)
-        .def_prop_ro("is_eagle", &tr::SpeculativeDecodingMode::isEagle)
-        .def_prop_ro("is_lookahead_decoding", &tr::SpeculativeDecodingMode::isLookaheadDecoding)
-        .def_prop_ro("is_explicit_draft_tokens", &tr::SpeculativeDecodingMode::isExplicitDraftTokens)
-        .def_prop_ro("updates_position_ids", &tr::SpeculativeDecodingMode::updatesPositionIds)
-        .def_prop_ro("requires_attention_mask", &tr::SpeculativeDecodingMode::requiresAttentionMask)
-        .def_prop_ro("predicts_draft_tokens", &tr::SpeculativeDecodingMode::predictsDraftTokens)
-        .def_prop_ro("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind)
-        .def_prop_ro("variable_draft_length", &tr::SpeculativeDecodingMode::variableDraftLength)
-        .def_prop_ro("has_draft_logits", &tr::SpeculativeDecodingMode::hasDraftLogits)
-        .def_prop_ro("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue);
 }
 } // namespace tensorrt_llm::nanobind::runtime

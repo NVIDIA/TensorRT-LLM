@@ -14,6 +14,7 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -80,3 +81,29 @@ async def test_server_info_includes_tokens_per_block_from_kv_cache_config():
     response = await server.get_server_info()
     content = json.loads(response.body)
     assert content["tokens_per_block"] == 64
+
+
+@pytest.mark.asyncio
+async def test_server_info_prefers_live_tokens_per_block():
+    server = _make_server(kv_cache_config=KvCacheConfig(tokens_per_block=32))
+    server.generator.get_kv_cache_capacity = Mock(return_value={"tokensPerBlock": 64})
+
+    response = await server.get_server_info()
+
+    content = json.loads(response.body)
+    assert content["tokens_per_block"] == 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capacity", [{}, RuntimeError("encode only")])
+async def test_server_info_preserves_configured_tokens_per_block_on_live_lookup_failure(capacity):
+    server = _make_server(kv_cache_config=KvCacheConfig(tokens_per_block=32))
+    if isinstance(capacity, Exception):
+        server.generator.get_kv_cache_capacity = Mock(side_effect=capacity)
+    else:
+        server.generator.get_kv_cache_capacity = Mock(return_value=capacity)
+
+    response = await server.get_server_info()
+
+    content = json.loads(response.body)
+    assert content["tokens_per_block"] == 32

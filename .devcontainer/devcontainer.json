@@ -29,7 +29,6 @@
             // Python
             "ms-python.python",
             "eeyore.yapf",
-            // AutoDeploy Linting and Formatting
             "charliermarsh.ruff",
             // Build Tools
             // "ms-azuretools.vscode-docker",

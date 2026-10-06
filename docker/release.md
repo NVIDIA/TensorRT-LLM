@@ -30,6 +30,9 @@ python3 -c "import tensorrt_llm"
 This command will print the TensorRT LLM version if everything is working correctly. After verification, you can explore
 and try the example scripts included in `/app/tensorrt_llm/examples`.
 
+The release image includes the OpenEngine gRPC runtime, so no additional Python package installation is required to use
+`trtllm-serve --grpc --grpc-protocol openengine`.
+
 Alternatively, if you have already cloned the TensorRT LLM repository, you can use the following convenient command to
 run the container:
 

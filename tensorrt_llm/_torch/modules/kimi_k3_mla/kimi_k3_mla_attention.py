@@ -10,39 +10,20 @@ gated output projection.
 
 from __future__ import annotations
 
+import copy
 from typing import Optional
 
 import torch
 
 from ....functional import PositionEmbeddingType
 from ....mapping import Mapping
+from ....quantization import QuantAlgo
 from ...attention.backends import TrtllmAttention
 from ...attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ...attention.mla import MLA
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType
 from ..linear import Linear, TensorParallelMode
-
-
-def _meta_safe_cast_dtype(module, dtype):
-    """``module.to(dtype=dtype)`` that also works under ``MetaInitMode``.
-
-    ``Module.to`` dispatches ``aten._to_copy``, which MetaInitMode rejects
-    (it would silently fall back to full CPU construction of the model —
-    ~70 GB of host RAM per rank for Kimi K3). Under meta init the values
-    are garbage anyway, so a dtype-only re-allocation via ``empty_like``
-    (an allowed init op) is equivalent; off meta this matches ``.to``.
-    """
-    import torch as _torch
-
-    def _cast(t):
-        if not t.is_floating_point():
-            return t
-        if t.is_meta:
-            return _torch.empty_like(t, dtype=dtype)
-        return t.to(dtype=dtype)
-
-    module._apply(_cast)
 
 
 def _make_pos_embd_params(
@@ -163,6 +144,20 @@ class KimiK3MLAAttention(MLA):
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         mapping_with_cp: Optional[Mapping] = None,
     ) -> None:
+        projection_configs = model_config.quant_config_dict or {}
+        q_a_config = projection_configs.get("q_a_proj", model_config.quant_config)
+        kv_a_config = projection_configs.get("kv_a_proj_with_mqa", model_config.quant_config)
+        q_a_algo = q_a_config.quant_algo if q_a_config else None
+        kv_a_algo = kv_a_config.quant_algo if kv_a_config else None
+        fuse_qkv_a_proj = q_a_algo == kv_a_algo and (
+            q_a_algo is None or (q_a_algo == QuantAlgo.FP8_BLOCK_SCALES and q_lora_rank % 128 == 0)
+        )
+        # Resolve each Linear's recipe before allocating weights, as in the
+        # model's layerwise quantization post-init. Shared MLA stays generic.
+        deferred_config = copy.copy(model_config)
+        deferred_config._frozen = False
+        deferred_config.skip_create_weights_in_init = True
+        deferred_config._frozen = model_config._frozen
         pos_embd_params = _make_pos_embd_params(
             qk_rope_head_dim=qk_rope_head_dim,
             max_position_embeddings=max_position_embeddings,
@@ -183,11 +178,11 @@ class KimiK3MLAAttention(MLA):
             layer_idx=layer_idx,
             dtype=dtype,
             dense_bias=False,
-            config=model_config,
+            config=deferred_config,
             aux_stream_dict=aux_stream_dict,
             mapping_with_cp=mapping_with_cp,
             reduce_output=False,
-            fuse_qkv_a_proj=False,
+            fuse_qkv_a_proj=fuse_qkv_a_proj,
             rms_norm_eps=rms_norm_eps,
         )
         # Keep the base MLA registration enabled so breakable CUDA graphs use
@@ -207,13 +202,24 @@ class KimiK3MLAAttention(MLA):
                 dtype=dtype,
                 mapping=self.o_proj.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
-                quant_config=model_config.get_quant_config(),
-                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                quant_config=(model_config.quant_config_dict or {}).get(
+                    "g_proj", model_config.quant_config
+                ),
+                skip_create_weights_in_init=True,
                 allreduce_strategy=model_config.allreduce_strategy,
                 force_dynamic_quantization=model_config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
                 use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
             )
+
+        for name, module in self.named_children():
+            if isinstance(module, Linear):
+                module.quant_config = projection_configs.get(name, model_config.quant_config)
+        if not model_config.skip_create_weights_in_init:
+            self.create_weights()
+            for module in self.children():
+                if isinstance(module, Linear):
+                    module.create_weights()
 
         # K3 is NoPE. The base MLA backends still require real RoPE tables, so
         # retain their expected shape and replace every rotation with identity.
@@ -223,9 +229,6 @@ class KimiK3MLAAttention(MLA):
         _install_identity_rope_table(self.mqa)
         self.rotary_emb = None
         self.apply_rotary_emb = False
-
-        if dtype is not None:
-            _meta_safe_cast_dtype(self, dtype)
 
     def _apply_output_gate(
         self,

@@ -13,16 +13,10 @@ Models:
 Run:
     pytest tests/unittest/_torch/visual_gen/test_wan21_i2v_pipeline.py -v -s -k 480p
     pytest tests/unittest/_torch/visual_gen/test_wan21_i2v_pipeline.py -v -s -k 720p
-
-Override checkpoint paths:
-    DIFFUSION_MODEL_PATH_WAN21_I2V_480P=/path/to/480p \\
-    DIFFUSION_MODEL_PATH_WAN21_I2V_720P=/path/to/720p \\
-        pytest tests/unittest/_torch/visual_gen/test_wan21_i2v_pipeline.py -v -s
 """
 
 import gc
 import os
-from pathlib import Path
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
@@ -32,6 +26,7 @@ import torch
 import torch.nn.functional as F
 from diffusers import DiffusionPipeline
 from PIL import Image
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import (
@@ -49,33 +44,10 @@ def _cleanup_mpi_env():
 
 
 # ============================================================================
-# Path helpers
+# Checkpoints
 # ============================================================================
 
-
-def _llm_models_root() -> str:
-    """Return LLM_MODELS_ROOT path if set in env, assert when it's set but not a valid path."""
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return str(root)
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
-
-
-WAN21_I2V_480P_PATH = _checkpoint(
-    "DIFFUSION_MODEL_PATH_WAN21_I2V_480P", "Wan2.1-I2V-14B-480P-Diffusers"
-)
-WAN21_I2V_720P_PATH = _checkpoint(
-    "DIFFUSION_MODEL_PATH_WAN21_I2V_720P", "Wan2.1-I2V-14B-720P-Diffusers"
-)
+WAN21_I2V_480P_SUBDIR = "Wan2.1-I2V-14B-480P-Diffusers"
 
 # ============================================================================
 # Test constants
@@ -104,8 +76,6 @@ def _make_test_image(height: int, width: int) -> Image.Image:
 
 def _load_trtllm_pipeline(checkpoint_path: str):
     """Load TRTLLM WanImageToVideoPipeline without torch.compile or warmup."""
-    if not os.path.exists(checkpoint_path):
-        pytest.skip(f"Checkpoint not found: {checkpoint_path}")
     args = VisualGenArgs(
         model=checkpoint_path,
         torch_compile_config=TorchCompileConfig(enable=False),
@@ -267,7 +237,7 @@ class TestWan21_I2V_480P_PipelineCorrectness:
 
     def test_cosine_similarity(self):
         _assert_pipeline_matches_hf(
-            checkpoint_path=WAN21_I2V_480P_PATH,
+            checkpoint_path=get_checkpoint(WAN21_I2V_480P_SUBDIR),
             height=480,
             width=832,
             num_frames=33,
@@ -293,11 +263,8 @@ class TestWanI2VBatchGeneration:
     @pytest.fixture(scope="class")
     def i2v_full_pipeline(self):
         """Load full I2V pipeline (all components) for batch tests."""
-        if not WAN21_I2V_480P_PATH or not os.path.exists(WAN21_I2V_480P_PATH):
-            pytest.skip("Checkpoint not available. Set DIFFUSION_MODEL_PATH_WAN21_I2V_480P.")
-
         args = VisualGenArgs(
-            model=WAN21_I2V_480P_PATH,
+            model=get_checkpoint(WAN21_I2V_480P_SUBDIR),
             torch_compile_config=TorchCompileConfig(enable=False),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
@@ -358,10 +325,8 @@ class TestWan21I2VCombinedOptimizations:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_fp8_teacache_trtllm(self):
-        if not os.path.exists(WAN21_I2V_480P_PATH):
-            pytest.skip(f"Checkpoint not found: {WAN21_I2V_480P_PATH}")
         args = VisualGenArgs(
-            model=WAN21_I2V_480P_PATH,
+            model=get_checkpoint(WAN21_I2V_480P_SUBDIR),
             torch_compile_config=TorchCompileConfig(enable=False),
             quant_config={"quant_algo": "FP8", "dynamic": True},
             attention_config=AttentionConfig(backend="TRTLLM"),

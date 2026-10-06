@@ -392,7 +392,7 @@ def run_gsm8k(base_url, model, out_dir, limit, concurrency, timeout, trust_remot
     if limit:
         cmd += ["--limit", str(limit)]
     print(f"[parity] running: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, timeout=10800)
     results = sorted(
         glob.glob(os.path.join(out_dir, "**", "results*.json"), recursive=True),
         key=os.path.getmtime,

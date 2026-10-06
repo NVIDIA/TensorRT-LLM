@@ -69,8 +69,30 @@ def remove_copy_for_mutates_args(graph: Graph):
                     kwargs[arg.name] = (None if base_index is None else
                                         all_bases[base_index])
 
+        with graph.inserting_before(node):
+            inplace_node = graph.call_function(inplace_func, kwargs=kwargs)
+        num_returns = len(inplace_func._schema.returns)
+        if num_returns:
+            inplace_node.meta = node.meta.copy()
+            for key in ("val", "example_value"):
+                if key in node.meta:
+                    values = node.meta[key]
+                    inplace_node.meta[key] = (values[0] if num_returns == 1 else
+                                              values[:num_returns])
+
         for getitem_node in getitem_nodes:
             idx = getitem_node.args[1]
+            if idx < num_returns:
+                # Mutable producers can also return fresh tensors. Preserve
+                # those values while reconnecting the cache mutation outputs.
+                with graph.inserting_before(node):
+                    replacement = (inplace_node
+                                   if num_returns == 1 else graph.call_function(
+                                       getitem, args=(inplace_node, idx)))
+                replacement.meta = getitem_node.meta.copy()
+                getitem_node.replace_all_uses_with(replacement)
+                nodes_to_remove.append(getitem_node)
+                continue
             if idx in tensor_list_replacements:
                 mutated_arg, replacement = tensor_list_replacements[idx]
             else:
@@ -81,9 +103,6 @@ def remove_copy_for_mutates_args(graph: Graph):
                 "has no base tensor -- graph is malformed")
             getitem_node.replace_all_uses_with(replacement)
             nodes_to_remove.append(getitem_node)
-
-        with graph.inserting_before(node):
-            graph.call_function(inplace_func, kwargs=kwargs)
 
         nodes_to_remove.append(node)
 

@@ -16,10 +16,6 @@ Layered as:
                                 KV-slot writer, block-priority sentinels, and
                                 the paged-cache slot mapping builder shared by
                                 both backends.
-  * :mod:`.msa_utils`       -- MSA-only (fmha_sm100) helpers: import guard,
-                                kernel precondition constants, HND paged-cache
-                                adapters, main-KV writer, page-table builder,
-                                valid-block counting, and top-k selection.
   * :mod:`.triton_kernels`  -- OpenAI Triton kernels (per-block max
                                 score, masked softmax for sparse GQA).
   * :mod:`.triton_backend`  -- the Triton reference algorithm (vectorized
@@ -35,6 +31,10 @@ Layered as:
                                 selection submodule.
   * :mod:`.msa_availability`-- SM100 and fmha_sm100 gating for the MSA
                                 path.
+  * :mod:`.kernels`         -- the kernels themselves and the paged-cache
+                                write they share with the backends, imported
+                                directly by the FMHA libraries that drive
+                                them.
 
 This package's public surface re-exports the names callers
 historically imported from ``...sparse.minimax_m3`` so external
@@ -42,8 +42,8 @@ importers (the model code, ``sparse.utils``, focused tests) keep
 working unchanged.
 """
 
-# The dense Triton oracle in the model imports these paged-cache helpers, so
-# they stay importable from the package. They are package-private and are not
+# The dense Triton oracle in the model imports the two paged-cache helpers, so
+# they stay reachable from the package. They are package-private and are not
 # part of __all__. Every other backend/metadata/config symbol is imported
 # directly from its defining submodule by the code that needs it.
 from .cache_manager import MiniMaxM3KVCacheManagerV2

@@ -295,6 +295,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         current_stream: cuda.CUstream,
         swap_ab: cutlass.Constexpr = False,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        layouts: cutlass.Constexpr = None,
     ):
         """Executes the wrapped GEMM kernel with dynamically shaped tensors.
 
@@ -321,18 +322,15 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             swap_ab (cutlass.Constexpr, optional): Whether to swap A and B. Defaults to False.
             epilogue_op (cutlass.Constexpr, optional): Elementwise lambda for epilogue.
                 Must be linear when split_k is greater than one.
+            layouts (cutlass.Constexpr, optional): A/B operand major modes and C layout.
+                Defaults to the layouts selected by swap_ab.
         """
-        # Determine layouts based on swap_ab
-        # When swap_ab=False: A is K-major, B is K-major, C is row-major (N-major)
-        # When swap_ab=True: same but tensors are swapped
-        a_major_mode = OperandMajorMode.K
-        b_major_mode = OperandMajorMode.K
-        if cutlass.const_expr(swap_ab):
-            c_layout = utils.LayoutEnum.COL_MAJOR
-        else:
-            c_layout = utils.LayoutEnum.ROW_MAJOR
-
-        layouts = (a_major_mode, b_major_mode, c_layout)
+        if cutlass.const_expr(layouts is None):
+            if cutlass.const_expr(swap_ab):
+                c_layout = utils.LayoutEnum.COL_MAJOR
+            else:
+                c_layout = utils.LayoutEnum.ROW_MAJOR
+            layouts = (OperandMajorMode.K, OperandMajorMode.K, c_layout)
         problem_mnkl = (cutlass.Int32(m), cutlass.Int32(n), cutlass.Int32(k), l)
 
         # Alpha scaling is applied inside the kernel epilogue (fused).
@@ -3688,6 +3686,70 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         return True
 
 
+def scaled_mm(
+    gemm_obj: Sm107BlockScaledPersistentDenseGemmKernel,
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    c_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+    a_major: Literal["m", "k"],
+    b_major: Literal["n", "k"],
+    c_major: Literal["m", "n"],
+    max_active_clusters: cutlass.Constexpr,
+    stream: cuda.CUstream,
+    epilogue_op: cutlass.Constexpr = lambda x: x,
+    options: str = "",
+    *,
+    alpha_tensor: cute.Tensor,
+    batch_size: int = 1,
+):
+    """Compile the base SM107 kernel through its wrapper interface.
+
+    MixedClustersKernel is unsupported because its argument order differs.
+
+    Alpha must be a single-element FP32 device tensor. The returned function
+    takes M/N/K, scale-factor M/N/K, A/B/SFA/SFB/C pointers, alpha, C leading
+    dimension, and a stream. The batch size is fixed at compile time.
+    Keep alpha's backing allocation alive until execution completes.
+    """
+    if type(gemm_obj) is not Sm107BlockScaledPersistentDenseGemmKernel:
+        raise TypeError(
+            "scaled_mm only supports the base Sm107BlockScaledPersistentDenseGemmKernel"
+        )
+
+    a_ptr = make_ptr(a_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+    b_ptr = make_ptr(b_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+    c_ptr = make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+    sfa_ptr = make_ptr(sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=32)
+    sfb_ptr = make_ptr(sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=32)
+
+    a_major_mode = OperandMajorMode.K if a_major == "k" else OperandMajorMode.MN
+    b_major_mode = OperandMajorMode.K if b_major == "k" else OperandMajorMode.MN
+    c_layout = utils.LayoutEnum.ROW_MAJOR if c_major == "n" else utils.LayoutEnum.COL_MAJOR
+    return cute.compile(
+        gemm_obj.wrapper,
+        cutlass.Int64(0),  # m
+        cutlass.Int64(0),  # n
+        cutlass.Int64(0),  # k
+        cutlass.Int64(0),  # sf_m
+        cutlass.Int64(0),  # sf_n
+        cutlass.Int64(0),  # sf_k
+        batch_size,
+        a_ptr,
+        b_ptr,
+        sfa_ptr,
+        sfb_ptr,
+        c_ptr,
+        alpha_tensor,
+        cutlass.Int64(0),  # c_ld
+        max_active_clusters,
+        stream,
+        epilogue_op=epilogue_op,
+        layouts=(a_major_mode, b_major_mode, c_layout),
+        options=options,
+    )
+
+
 def run_scaled_mm_with_emulated_dtype(
     gemm_obj: Sm107BlockScaledPersistentDenseGemmKernel,
     mnkl: Tuple[int, int, int, int],
@@ -3776,6 +3838,7 @@ def run_scaled_mm_with_emulated_dtype(
 
     # Unpack parameters
     m, n, k, l = mnkl
+    sf_m, sf_n, sf_k = m, n, ceil_div(k, sf_vec_size)
 
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
@@ -3792,24 +3855,22 @@ def run_scaled_mm_with_emulated_dtype(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
 
-    # Compile against the SM107 __call__ signature (alpha is a runtime tensor).
-    alpha_torch = torch.ones(1, dtype=torch.float32, device="cuda")
+    # Compile against the SM107 wrapper signature (alpha is a runtime tensor).
+    alpha_torch = torch.full((1,), 0.5, dtype=torch.float32, device="cuda")
     alpha_tensor = from_dlpack(alpha_torch, assumed_align=16)
-    a_major_mode = OperandMajorMode.K if a_major == "k" else OperandMajorMode.MN
-    b_major_mode = OperandMajorMode.K if b_major == "k" else OperandMajorMode.MN
-    c_layout = utils.LayoutEnum.ROW_MAJOR if c_major == "n" else utils.LayoutEnum.COL_MAJOR
-    compiled_gemm = cute.compile(
+    compiled_gemm = scaled_mm(
         gemm_obj,
-        make_ptr(a_dtype, 0, cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(b_dtype, 0, cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=32),
-        make_ptr(sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=32),
-        make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16),
-        alpha_tensor,
-        (a_major_mode, b_major_mode, c_layout),
-        (cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0)),
+        a_dtype,
+        b_dtype,
+        c_dtype,
+        sf_dtype,
+        a_major,
+        b_major,
+        c_major,
         max_active_clusters,
         current_stream,
+        alpha_tensor=alpha_tensor,
+        batch_size=l,
     )
 
     # Create Torch Tensors for A, scale factor A, B, scale factor B, C
@@ -3844,19 +3905,25 @@ def run_scaled_mm_with_emulated_dtype(
     if not skip_ref_check:
         # Execute kernel once for reference checking
         compiled_gemm(
+            m,
+            n,
+            k,
+            sf_m,
+            sf_n,
+            sf_k,
             a_ptr,
             b_ptr,
             sfa_reordered.iterator,
             sfb_reordered.iterator,
             c_ptr,
             alpha_tensor,
-            (m, n, k, l),
+            0,  # c_ld: contiguous output
             current_stream,
         )
 
         res_a = torch.einsum("mkl,mkl->mkl", a_f32_ref, sfa_f32_ref.cuda())
         res_b = torch.einsum("nkl,nkl->nkl", b_f32_ref, sfb_f32_ref.cuda())
-        ref = torch.einsum("mkl,nkl->mnl", res_a, res_b)
+        ref = torch.einsum("mkl,nkl->mnl", res_a, res_b) * alpha_torch
         c_ref = ref.to(dtype=cutlass_torch.dtype(c_dtype))
 
         torch.testing.assert_close(c, c_ref, atol=tolerance, rtol=tolerance)
@@ -3865,13 +3932,19 @@ def run_scaled_mm_with_emulated_dtype(
     if gemm_obj.split_k > 1:
 
         def benchmark_gemm(
+            m,
+            n,
+            k,
+            sf_m,
+            sf_n,
+            sf_k,
             a_ptr,
             b_ptr,
             sfa_ptr,
             sfb_ptr,
             c_ptr,
             alpha,
-            problem_mnkl,
+            c_ld,
             stream,
             c_tensor,
         ):
@@ -3879,13 +3952,19 @@ def run_scaled_mm_with_emulated_dtype(
             # warmup and measured launch, including workspace reuse.
             c_tensor.zero_()
             compiled_gemm(
+                m,
+                n,
+                k,
+                sf_m,
+                sf_n,
+                sf_k,
                 a_ptr,
                 b_ptr,
                 sfa_ptr,
                 sfb_ptr,
                 c_ptr,
                 alpha,
-                problem_mnkl,
+                c_ld,
                 stream,
             )
 
@@ -3919,13 +3998,19 @@ def run_scaled_mm_with_emulated_dtype(
         )
 
         kernel_args = [
+            m,
+            n,
+            k,
+            sf_m,
+            sf_n,
+            sf_k,
             a_ptr,
             b_ptr,
             sfa_reordered.iterator,
             sfb_reordered.iterator,
             c_ptr,
             alpha_tensor,
-            (m, n, k, l),
+            0,  # c_ld: contiguous output
             current_stream,
         ]
         if gemm_obj.split_k > 1:

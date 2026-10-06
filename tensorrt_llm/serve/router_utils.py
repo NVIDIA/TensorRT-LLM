@@ -25,9 +25,7 @@ from tensorrt_llm.bindings.internal.batch_manager import BlockKey as _NativeBloc
 from tensorrt_llm.bindings.internal.batch_manager import BlockKeyHasher as _NativeBlockKeyHasher
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import kv_cache_hash
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import Block as V2Block
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import ReuseScope
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import RootBlock as V2RootBlock
+from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope, sequence_to_blockchain_keys
 from tensorrt_llm.serve.chat_tokenization import (
     resolve_model_type_from_config,
     tokenize_chat_request_for_serving,
@@ -65,7 +63,6 @@ __all__ = [
     "BlockHash",
     "get_request_num_tokens",
     "block_key_hasher",
-    "v2_sha256_block_hasher",
     "BlockHashMixin",
     "PrefixBlockSet",
 ]
@@ -168,17 +165,6 @@ def block_key_hasher(
     if cache_salt_id is None:
         return _NativeBlockKeyHasher.hash(_NativeBlockKey(token_ids), parent)
     return hash_v1_block_key(token_ids, parent_hash=parent, cache_salt_id=cache_salt_id)
-
-
-def v2_sha256_block_hasher(
-    token_ids: list[int], parent_hash: Optional[str] = None, cache_salt_id: Optional[int] = None
-) -> str:
-    parent_key = (
-        V2RootBlock.make_key(ReuseScope(salt=cache_salt_id))
-        if parent_hash is None
-        else bytes.fromhex(parent_hash)
-    )
-    return V2Block.make_key(parent_key, token_ids).hex()
 
 
 class BlockHashMixin:
@@ -327,19 +313,24 @@ class BlockHashMixin:
     ) -> list[list[BlockHash]]:
         if hash_algo == KV_CACHE_HASH_ALGO_V1:
             block_hasher = block_key_hasher
-        elif hash_algo == KV_CACHE_HASH_ALGO_V2:
-            block_hasher = v2_sha256_block_hasher
-        elif hash_algo == KV_CACHE_HASH_ALGO_V2_SHA256_64:
+        elif hash_algo in (KV_CACHE_HASH_ALGO_V2, KV_CACHE_HASH_ALGO_V2_SHA256_64):
+            # V2 keys chain from a reuse-scope root, which is exactly what
+            # sequence_to_blockchain_keys yields; its first pair is the root itself, so
+            # skip it. In KvCacheManager the last token is not part of any block key.
             reuse_scope = ReuseScope(salt=cache_salt_id)
+            to_hash = truncate_sha256_hash_to_int64
+            if hash_algo == KV_CACHE_HASH_ALGO_V2:
+
+                def to_hash(key: bytes) -> BlockHash:
+                    return key.hex()
+
             block_hashes: list[list[BlockHash]] = []
             for token_list in token_lists:
-                hash_list = []
-                parent_key = V2RootBlock.make_key(reuse_scope)
-                for t in range(0, len(token_list) - 1, self._tokens_per_block):
-                    t_end = min(t + self._tokens_per_block, len(token_list) - 1)
-                    parent_key = V2Block.make_key(parent_key, token_list[t:t_end])
-                    hash_list.append(truncate_sha256_hash_to_int64(parent_key))
-                block_hashes.append(hash_list)
+                keys = sequence_to_blockchain_keys(
+                    self._tokens_per_block, reuse_scope, token_list[:-1]
+                )
+                next(keys, None)  # the root key labels no block
+                block_hashes.append([to_hash(key) for _, key in keys])
             return block_hashes
         else:
             raise ValueError(f"Unsupported KV cache hash algorithm: {hash_algo}")

@@ -320,7 +320,8 @@ def parse_args() -> argparse.Namespace:
             "Per-target-rank local expert histogram pattern. balanced builds a balanced "
             "plan by default; random keeps logits uncontrolled when comm_pattern is also random. "
             "Examples: balanced, random, "
-            "hotspot,hotness=0.5, hotspot,active_experts=2."
+            "hotspot,hotness=0.5, hotspot,active_experts=2, "
+            "powerlaw, powerlaw,alpha=0.8."
         ),
     )
     routing_group.add_argument(

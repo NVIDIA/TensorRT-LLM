@@ -67,7 +67,7 @@ class PeriodicJUnitXML:
                 interval=18000,    # Save every 5 hours
                 batch_size=10,     # Or save every 10 tests
             )
-            reporter.pytest_configure(config)
+            # Registration replays the historic pytest_configure hook.
             config.pluginmanager.register(reporter, 'periodic_junit')
     """
 

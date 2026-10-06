@@ -566,8 +566,7 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   if (options.mGroupsTokensHeadsQ) {
     TLLM_CHECK_ERROR(!isContextKernel(options.mFmhaKernelType),
                      "mGroupsTokensHeadsQ should only be enabled for generation kernels.");
-    TLLM_CHECK_ERROR(!options.mIsMlaGen
-                       || options.mSelectsGroupedMla,
+    TLLM_CHECK_ERROR(!options.mIsMlaGen || options.mSelectsGroupedMla,
                      "MLA generation with mGroupsTokensHeadsQ requires mSelectsGroupedMla.");
   }
 
@@ -594,7 +593,8 @@ inline void checkFmhaOptions(FmhaOptions const& options,
     // TODO Are there more features that are not compatible?
   }
   if (options.mFineGrainedProducer) {
-    TLLM_CHECK_ERROR(options.mFineGrainedForceValid, "fineGrainedProducer requires fineGrainedForceValid");
+    TLLM_CHECK_ERROR(options.mFineGrainedForceValid,
+                     "fineGrainedProducer requires fineGrainedForceValid");
   }
 #endif // TLLM_RUBIN_FEATURES
 
@@ -614,9 +614,17 @@ inline void checkFmhaOptions(FmhaOptions const& options,
 #endif // TLLM_RUBIN_FEATURES
 
   // For transformed K/V, MmaOrder must be Pv0_Qk0_Pv1_Qk1.
-  if (options.mDtypeQ != options.mDtypeKv) {
+  if (options.mDtypeQ != options.mDtypeK || getDtypeBmm2(options) != options.mDtypeV) {
     TLLM_CHECK_ERROR(options.mMmaOrder == MmaOrder::Pv0_Qk0_Pv1_Qk1,
                      "Only MMA order Pv0_Qk0_Pv1_Qk1 is supported for transformed K/V.");
+  }
+  if (isFp8KNvFp4V(options)) {
+    TLLM_CHECK_ERROR(isFp8QFp8KNvFp4V(options),
+                     "FP8-K/NVFP4-V is supported only with FP8 Q on Blackwell.");
+    TLLM_CHECK_ERROR(options.mDtypeOut == tg::Dtype::Bfloat16,
+                     "FP8-K/NVFP4-V requires BF16 output.");
+    TLLM_CHECK_ERROR(isContextKernel(options.mFmhaKernelType) || !options.mGroupsTokensHeadsQ,
+                     "FP8-K/NVFP4-V generation does not support groupsTokensHeadsQ.");
   }
   if (options.mEnablesBf16QFp8KvKOnlyTransform) {
     TLLM_CHECK_ERROR(usesKOnlyTransformPipeline(options),
@@ -628,10 +636,11 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   if (options.mSeparateTransformedKv) {
     TLLM_CHECK_ERROR(!usesKOnlyTransformPipeline(options),
                      "BF16Q+FP8KV K-only transform cannot be combined with separateTransformedKv.");
-    TLLM_CHECK_ERROR(supportsSeparateTransformedKv(options),
-                     "separateTransformedKv is only supported by BF16Q+E4M3KV full-transform "
-                     "generation kernels on Blackwell with numInstsQ=1, numInstsKv=1, and equal "
-                     "H64/H128/H256 K/V heads.");
+    TLLM_CHECK_ERROR(
+      supportsSeparateTransformedKv(options),
+      "separateTransformedKv is only supported by BF16-Q full-transform generation kernels "
+      "with E4M3 K/V on Blackwell, numInstsQ=1, numInstsKv=1, and equal "
+      "H64/H128/H256 K/V heads.");
   }
 
   if (options.mMmaOrder == MmaOrder::Qk0_Qk1_Pv0_Pv1) {
@@ -653,7 +662,14 @@ inline void checkFmhaOptions(FmhaOptions const& options,
 // Update the fmha options if needed.
 inline void updateFmhaOptions(FmhaOptions& options, FmhaOptionsFromArgs const& optionsFromArgs) {
   // Set default absolute/relative tolerance for different data types.
-  if ((options.mDtypeQ == tg::Dtype::Fp16) || (options.mDtypeQ == tg::Dtype::Bfloat16)) {
+  if (options.mDtypeK == tg::Dtype::E2m1 || options.mDtypeV == tg::Dtype::E2m1) {
+    if (!optionsFromArgs.mIsAtolSet) {
+      options.mAtol = 0.3f;
+    }
+    if (!optionsFromArgs.mIsRtolSet) {
+      options.mRtol = 0.1f;
+    }
+  } else if ((options.mDtypeQ == tg::Dtype::Fp16) || (options.mDtypeQ == tg::Dtype::Bfloat16)) {
     // Use smaller tolerance for float16/bfloat16 if it is not set.
     if (options.mDtypeOut == tg::Dtype::E4m3) {
       if (!optionsFromArgs.mIsAtolSet) {
@@ -676,13 +692,6 @@ inline void updateFmhaOptions(FmhaOptions& options, FmhaOptionsFromArgs const& o
       if (!optionsFromArgs.mIsRtolSet) {
         options.mRtol = 1e-3f;
       }
-    }
-  } else if (options.mDtypeKv == tg::Dtype::E2m1) {
-    if (!optionsFromArgs.mIsAtolSet) {
-      options.mAtol = 0.3f;
-    }
-    if (!optionsFromArgs.mIsRtolSet) {
-      options.mRtol = 0.1f;
     }
   } else if (options.mDtypeOut == tg::Dtype::E2m1) {
     if (!optionsFromArgs.mIsAtolSet) {

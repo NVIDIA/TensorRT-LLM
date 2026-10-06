@@ -82,15 +82,13 @@ class TestProcessLifecycleCounters:
         usage_lib._SESSION_LOCK = threading.Lock()
         usage_lib._REPORTER_STARTED = False
         usage_lib._REPORTER_ACTIVE = False
-        usage_lib._REPORTER_STOP = threading.Event()
-        usage_lib._PENDING_TERMINAL = None
+        usage_lib._HEARTBEAT_STOP = threading.Event()
         usage_lib._PROCESS_PID = os.getpid()
         yield
-        usage_lib._REPORTER_STOP.set()
+        usage_lib._HEARTBEAT_STOP.set()
         usage_lib._SESSION = None
         usage_lib._SESSION_DISABLED = False
         usage_lib._REPORTER_ACTIVE = False
-        usage_lib._PENDING_TERMINAL = None
 
     def test_two_live_objects_update_concurrency_counters(self, enable_telemetry):
         """Two successful constructors share one session and prove overlap."""
@@ -244,6 +242,80 @@ class TestTelemetryPyTorchBackend:
         assert pretrained_config.architectures[0] == "LlamaForCausalLM"
 
         assert captured.get("llm_args") is not None, "report_usage was not called with llm_args"
+
+
+class TestRuntimeArchitecturePayloadFlow:
+    """Verify config selection reaches the payload with a stubbed executor."""
+
+    @pytest.mark.parametrize(
+        "executor_state,expected_architecture",
+        [
+            ("runtime", "Qwen3ForTextEmbedding"),
+            ("generation", "Qwen3ForCausalLM"),
+            ("missing_executor", "Qwen3ForCausalLM"),
+            ("missing_model", "Qwen3ForCausalLM"),
+            ("null_runtime_config", "Qwen3ForCausalLM"),
+        ],
+    )
+    def test_reports_selected_architecture(
+        self, monkeypatch, enable_telemetry, executor_state, expected_architecture
+    ) -> None:
+        """Report the runtime architecture or retain the checkpoint fallback."""
+        raw_config = SimpleNamespace(architectures=["Qwen3ForCausalLM"])
+        runtime_config = SimpleNamespace(architectures=["Qwen3ForTextEmbedding"])
+        if executor_state == "null_runtime_config":
+            runtime_config = None
+        llm = object.__new__(BaseLLM)
+        llm.args = SimpleNamespace(telemetry_config=None)
+        llm._hf_model_config = raw_config
+        llm._encoder_executor = SimpleNamespace(
+            model_engine=SimpleNamespace(
+                model=SimpleNamespace(
+                    model_config=SimpleNamespace(pretrained_config=runtime_config)
+                )
+            )
+        )
+        if executor_state == "generation":
+            llm._encoder_executor = None
+        elif executor_state == "missing_executor":
+            del llm._encoder_executor
+        elif executor_state == "missing_model":
+            del llm._encoder_executor.model_engine.model
+
+        report_args = {}
+
+        def capture_report_args(**kwargs):
+            report_args.update(kwargs)
+
+        with patch("tensorrt_llm.usage.report_usage", side_effect=capture_report_args):
+            llm._start_usage_reporting()
+
+        payloads = []
+        stop_event = threading.Event()
+        stop_event.set()
+        monkeypatch.setattr(usage_lib, "_SESSION", None)
+        monkeypatch.setattr(usage_lib, "_SESSION_DISABLED", False)
+        monkeypatch.setattr(usage_lib, "_SESSION_LOCK", threading.Lock())
+        monkeypatch.setattr(usage_lib, "_REPORTER_STARTED", False)
+        monkeypatch.setattr(usage_lib, "_REPORTER_ACTIVE", False)
+        monkeypatch.setattr(usage_lib, "_PROCESS_PID", os.getpid())
+        monkeypatch.setattr(usage_lib, "_PROCESS_EXIT_HOOK_REGISTERED", True)
+        assert usage_lib.apply_usage_session_config()
+
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=payloads.append),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
+        ):
+            usage_lib._background_reporter(
+                report_args["llm_args"],
+                report_args["pretrained_config"],
+                "",
+            )
+
+        assert len(payloads) == 1
+        params = payloads[0]["events"][0]["parameters"]
+        assert params["architectureClassName"] == expected_architecture
+        assert params["architectureClassHash"] == ""
 
 
 class TestTelemetryArchitectureExtraction:
