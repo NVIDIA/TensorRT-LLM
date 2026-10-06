@@ -243,7 +243,7 @@
         "num_tokens",
         "batch_size"
       ],
-      "capture_policy": "tuple[int|literal]",
+      "capture_policy": "list[tuple[int|literal]]",
       "kind": "categorical",
       "path": "cuda_graph_config.extra_model_inputs.shape"
     },
@@ -442,7 +442,7 @@
         "num_tokens",
         "batch_size"
       ],
-      "capture_policy": "tuple[int|literal]",
+      "capture_policy": "list[tuple[int|literal]]",
       "kind": "categorical",
       "path": "encoder_cuda_graph_config.extra_model_inputs.shape"
     },
