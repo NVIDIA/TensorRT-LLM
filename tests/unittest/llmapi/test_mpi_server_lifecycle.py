@@ -95,14 +95,45 @@ def test_stop_is_processed_while_all_futures_are_pending(monkeypatch):
     assert queue.closed
 
 
-def test_async_failure_triggers_shutdown_without_waiting_for_peer():
-    queue = _Queue([mpi.RemoteTask(_task, (), {})])
-    server = _server(queue, [[Future(), _future(error=ValueError("rank failed"))]])
-    with pytest.raises(RuntimeError, match="asynchronous task failed"):
+@pytest.mark.parametrize("peer_fails", [False, True], ids=["stuck-peer", "all-failed"])
+@pytest.mark.parametrize("send_stop", [False, True], ids=["deadline", "stop"])
+def test_async_failure_waits_for_client_without_starting_more_work(
+    monkeypatch: pytest.MonkeyPatch, peer_fails: bool, send_stop: bool
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr(mpi.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(mpi, "_mgmn_shutdown_grace_seconds", lambda: 10)
+    failed, peer = Future(), Future()
+    error = ValueError("rank failed")
+    queue = _Queue([mpi.RemoteTask(_task, (0,), {}), mpi.RemoteTask(_task, (1,), {})])
+    server = _server(queue, [[failed, peer]])
+
+    def advance(queue):
+        now[0] += 1
+        if queue.polls == 3:
+            # The next batch is already queued when the first batch fails.
+            failed.set_exception(error)
+            if peer_fails:
+                peer.set_exception(ValueError("peer failed"))
+        if queue.sent:
+            server._shutdown_session.assert_not_called()
+            server.session.submit.assert_called_once()
+        if queue.polls == 4:
+            # Requests arriving after the failure must not start either.
+            queue.messages.append(mpi.RemoteTask(_task, (2,), {}))
+        if send_stop and queue.polls == 8:
+            queue.messages.append(None)
+
+    queue.on_poll = advance
+    with pytest.raises(RuntimeError, match="asynchronous task failed") as raised:
         server.serve()
+    assert raised.value.__cause__ is error
     assert queue.sent == [mpi.RemoteWorkerDeath("ValueError", "rank failed")]
     assert queue.thread_ids == {threading.get_ident()}
-    server._shutdown_session.assert_called_once()
+    assert queue.polls == (8 if send_stop else 13)
+    server.session.submit.assert_called_once()
+    # A later stop request cannot extend the original failure deadline.
+    server._shutdown_session.assert_called_once_with(5 if send_stop else 0)
     assert queue.closed
 
 

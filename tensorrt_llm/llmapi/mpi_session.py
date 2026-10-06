@@ -344,7 +344,12 @@ _DEFAULT_IDENTITY_TIMEOUT = 300.0
 
 
 def _mgmn_shutdown_grace_seconds() -> float:
-    """Bound draining a failed batch and shutting down the server-owned world."""
+    """Bound draining a failed batch and shutting down the server-owned world.
+
+    When using trtllm-llmapi-launch, allow this grace plus cold stop-helper
+    startup/import, communication and cleanup overhead in
+    TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT.
+    """
     raw = os.environ.get("TLLM_MGMN_SHUTDOWN_GRACE_SECONDS", "60")
     try:
         value = float(raw)
@@ -1041,6 +1046,7 @@ class RemoteMpiCommSessionServer():
         results = []
         sync = False
         first_error = None
+        async_failed = False
         drain_deadline = None
         stop_deadline = None
         try:
@@ -1066,19 +1072,25 @@ class RemoteMpiCommSessionServer():
                                     f"Failed to send MPI worker error: {send_error!r}"
                                 )
                                 raise
-                            if not sync:
-                                raise RuntimeError(
-                                    "Remote MPI asynchronous task failed"
-                                ) from error
                             drain_deadline = time.monotonic() + grace
+                            if not sync:
+                                # Keep the error channel alive until the client
+                                # stops or its observation window expires.
+                                async_failed = True
+                                queued_tasks.clear()
 
-                if drain_deadline is not None and pending:
+                if async_failed:
+                    if (stop_deadline is not None
+                            or time.monotonic() >= drain_deadline):
+                        raise RuntimeError("Remote MPI asynchronous task failed"
+                                           ) from first_error
+                elif drain_deadline is not None and pending:
                     if time.monotonic() >= drain_deadline:
                         raise RuntimeError(
                             "MPI workers did not drain after a task failure"
                         ) from first_error
 
-                if not pending:
+                if not pending and not async_failed:
                     if sync and first_error is None:
                         self.queue.put(results)
                     # Results and error state belong to a single submitted batch.
@@ -1112,7 +1124,7 @@ class RemoteMpiCommSessionServer():
                     message = self.queue.get()
                     if message is None:
                         stop_deadline = time.monotonic() + grace
-                    else:
+                    elif not async_failed:
                         queued_tasks.append(message)
         finally:
             try:

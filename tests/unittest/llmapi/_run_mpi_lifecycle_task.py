@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import time
+import traceback
 from pathlib import Path
 
 import psutil
@@ -51,6 +52,11 @@ def worker_task(directory_name: str, scenario: str, batch: int, size: int) -> tu
 
     if scenario == "async_drain" and batch == 0:
         _wait_for_markers(directory, ["engine-exiting"])
+
+    if scenario == "all_failure":
+        _wait_for_markers(directory, [f"started-{batch}-{peer}" for peer in range(size)])
+        _mark(directory, f"failed-{batch}-{rank}")
+        raise RuntimeError("injected MPI lifecycle failure")
 
     if scenario in ("mixed_failure", "mixed_collective", "all_hang"):
         _wait_for_markers(directory, [f"started-{batch}-{peer}" for peer in range(size)])
@@ -105,6 +111,37 @@ def main() -> int:
     def assert_results(response: object, batch: int) -> None:
         assert isinstance(response, list), response
         assert sorted(response) == [(rank, batch) for rank in range(args.ranks)], response
+
+    if args.scenario == "all_failure":
+        try:
+            client.submit(remote_task, str(directory), args.scenario, 0, args.ranks)
+            _wait_for_markers(directory, [f"failed-0-{rank}" for rank in range(args.ranks)])
+            delayed_at = time.monotonic()
+            _mark(directory, "client-poll-delayed", {"monotonic": delayed_at})
+            # A remote proxy may wait five seconds before checking worker death.
+            time.sleep(5.1)
+            _mark(directory, "client-first-poll", {"monotonic": time.monotonic()})
+            while time.monotonic() - delayed_at < 30:
+                error = client.check_worker_error()
+                if error is not None:
+                    assert "injected MPI lifecycle failure" in str(error), error
+                    try:
+                        raise error
+                    except RuntimeError:
+                        error_trace = traceback.format_exc()
+                        traceback.print_exc()
+                        _mark(
+                            directory,
+                            "error-observed",
+                            {"error": str(error), "traceback": error_trace},
+                        )
+                    _mark(directory, "engine-exiting", {"status": 23})
+                    return 23
+                time.sleep(5.1)
+            raise TimeoutError("No worker failure reached the delayed client")
+        finally:
+            # Release the PAIR connection before the launcher's stop helper connects.
+            client.queue.close()
 
     if args.scenario in ("mixed_failure", "mixed_collective", "all_hang"):
         client.submit(remote_task, str(directory), args.scenario, 0, args.ranks)

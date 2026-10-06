@@ -357,7 +357,8 @@ def _launcher_env(tmp_path: Path, home: str) -> dict:
     ``python3`` and ``openssl`` are stubbed so the launcher can hand out an IPC
     address and an HMAC key without importing tensorrt_llm; the stubbed
     ``python3 -S`` used for the workspace lock exits 0, so the persistent slot
-    is treated as acquired.
+    is treated as acquired. Process guard invocations execute the real Python
+    helper so launcher registration and cleanup retain their normal behavior.
     """
     stub_bin = tmp_path / "bin"
     stub_bin.mkdir(exist_ok=True)
@@ -366,7 +367,10 @@ def _launcher_env(tmp_path: Path, home: str) -> dict:
     os.mkfifo(stop_fifo)
     python_stub.write_text(
         "#!/bin/sh\n"
-        "if [ \"$1\" = \"-c\" ]; then\n"
+        "if [ \"$1\" = \"-S\" ] && "
+        "[ \"${2##*/}\" = \"_llmapi_process_guard.py\" ]; then\n"
+        "    exec \"$LAUNCHER_TEST_PYTHON\" \"$@\"\n"
+        "elif [ \"$1\" = \"-c\" ]; then\n"
         "    echo ipc:///tmp/trtllm-pmi-workspace-test\n"
         "elif [ \"$1\" = \"-m\" ]; then\n"
         "    if [ \"$4\" = \"stop\" ]; then\n"
@@ -385,6 +389,7 @@ def _launcher_env(tmp_path: Path, home: str) -> dict:
         env.pop(name, None)
     env["PMI_RANK"] = "0"
     env["LAUNCHER_TEST_STOP_FIFO"] = str(stop_fifo)
+    env["LAUNCHER_TEST_PYTHON"] = sys.executable
     env["HOME"] = home
     env["PATH"] = f"{stub_bin}{os.pathsep}{env['PATH']}"
     return env
