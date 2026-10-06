@@ -1135,8 +1135,8 @@ def test_llm_update_weights_nemotron_h():
 
     Requires mamba-ssm and causal-conv1d to be importable: without them HF
     falls back to the naive Python selective_scan path, which OOMs on
-    Nemotron-H and produces unmatched logits. Ray CI installs both from wheels
-    built against the same torch in the TensorRT-LLM build artifact."""
+    Nemotron-H and produces unmatched logits. Ray CI builds both against the
+    installed torch with jenkins/scripts/install_mamba.sh."""
     try:
         import causal_conv1d  # noqa: F401
         import mamba_ssm  # noqa: F401
@@ -1145,9 +1145,8 @@ def test_llm_update_weights_nemotron_h():
         # which is a much harder failure to read.
         pytest.fail(
             f"The mamba fast path is unavailable: {e}. "
-            "Install the matching CI wheels with "
-            "bash jenkins/scripts/mamba_wheels.sh install WHEEL_DIR, or build them "
-            "against the current torch with the script's build command."
+            "Build and install the extensions against the current torch with "
+            "bash jenkins/scripts/install_mamba.sh."
         )
     from transformers.models.nemotron_h import modeling_nemotron_h
 
