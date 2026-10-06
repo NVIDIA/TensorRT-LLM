@@ -163,7 +163,8 @@ file(GLOB_RECURSE MIXED_SRC_CU fpA_intB_gemm/*.cu)
 # Get the sources for MOE Grouped GEMM launchers. They live in the MoE domain
 # directory; the targets stay here, next to the CUTLASS instantiation generator
 # and the helpers (process_target, add_instantiations) they use.
-set(MOE_CUTLASS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../moe/cutlass)
+get_filename_component(MOE_CUTLASS_DIR
+                       "${CMAKE_CURRENT_SOURCE_DIR}/../moe/cutlass" ABSOLUTE)
 file(GLOB_RECURSE GROUPED_SRC_CPP ${MOE_CUTLASS_DIR}/*.cpp)
 file(GLOB_RECURSE GROUPED_SRC_CU ${MOE_CUTLASS_DIR}/*.cu)
 
@@ -242,6 +243,10 @@ endif()
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
   file(GLOB MOE_GEMM_SRC_CU "${MOE_CUTLASS_DIR}/*.cu")
+  list(
+    REMOVE_ITEM MOE_GEMM_SRC_CU "${MOE_CUTLASS_DIR}/moe_lora_pointer_expand.cu"
+    "${MOE_CUTLASS_DIR}/moe_lora_problem_builder.cu"
+    "${MOE_CUTLASS_DIR}/moe_lora_slot_expand.cu")
   set(MOE_GEMM_SRC_CU_LAUNCHER ${MOE_GEMM_SRC_CU})
   list(FILTER MOE_GEMM_SRC_CU_LAUNCHER EXCLUDE REGEX ".*moe_gemm_kernels_.*")
   list(FILTER MOE_GEMM_SRC_CU INCLUDE REGEX ".*moe_gemm_kernels_.*")
@@ -276,8 +281,8 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
 
   add_instantiations(moe_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm_grouped)
   target_link_libraries(
-    moe_gemm_src PRIVATE _moe_gemm_launcher _moe_gemm_hopper_fp4 _moe_gemm_fp4
-                         _moe_gemm_fp8)
+    moe_gemm_src PRIVATE tllm::kernel_moe_lora _moe_gemm_launcher
+                         _moe_gemm_hopper_fp4 _moe_gemm_fp4 _moe_gemm_fp8)
   target_include_directories(
     moe_gemm_src
     PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)

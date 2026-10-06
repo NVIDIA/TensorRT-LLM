@@ -98,3 +98,11 @@ add_tllm_kernel_library(
 add_tllm_kernel_library(
   tllm_kernel_moe_load_balance SOURCES moe/loadBalance/moeLoadBalanceKernels.cu
   LINK_LIBRARIES tllm::common_environment)
+
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  add_tllm_kernel_library(
+    tllm_kernel_moe_lora SOURCES moe/cutlass/moe_lora_pointer_expand.cu
+    moe/cutlass/moe_lora_problem_builder.cu moe/cutlass/moe_lora_slot_expand.cu)
+  target_include_directories(
+    tllm_kernel_moe_lora PUBLIC ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include)
+endif()
