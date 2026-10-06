@@ -186,9 +186,10 @@ The following optimizations are available to models that implement
     `multimodal_config.encoder_scheduling_policy` is `DISABLED`. Cached items are reused before
     encoder work is selected, so they use none of the per-iteration encoder item or token budget.
     Only missing items are encoded, mixed-modality requests are cached per item, and newly encoded
-    items populate the cache for later requests. The item path also keeps encoder outputs in this
-    cache until the request's prefill completes, so the cache is never smaller than the output of
-    one encoder iteration, even when `encoder_cache_max_bytes` is `0`. Item scheduling does not
+    items populate the cache for later requests. Prefill waits only for the items its current
+    chunk uses, items inside a reusable KV-cache prefix are not encoded, and the item path keeps
+    each encoder output in this cache until prefill moves past it, so the cache is never smaller
+    than the output of one encoder iteration, even when `encoder_cache_max_bytes` is `0`. Item scheduling does not
     support side-stream prefetch or pipeline parallelism yet. With `pipeline_parallel_size > 1`,
     the `DEFAULT` policy, explicit or unset, logs a warning and falls back to the inline path, and
     the `EAGER` policy raises an error.
