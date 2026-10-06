@@ -153,7 +153,17 @@ class PeerRegistrar:
     def _unique_key(self, name: str, rank: int) -> str:
         return name + str(rank)
 
+    def validate_bounded_replay_compatible(self, peer_ri: RankInfo) -> None:
+        """Require the same generation replay mode on both peers."""
+        if self._ri.bounded_replay_on_generation != peer_ri.bounded_replay_on_generation:
+            raise ValueError(
+                "PeerRegistrar: bounded_replay_on_generation must match between peers "
+                f"(local={self._ri.bounded_replay_on_generation}, "
+                f"peer={peer_ri.bounded_replay_on_generation})."
+            )
+
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
+        self.validate_bounded_replay_compatible(peer_ri)
         if not self._get_policy(CacheKind.PAGED).check_peer_compatible(peer_ri):
             return False
 

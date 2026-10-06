@@ -1937,10 +1937,13 @@ def test_session_has_transferring_tasks_false():
 
 
 @pytest.mark.timeout(120)
-def test_incompatible_peer_fails_only_affected_requests():
+@pytest.mark.parametrize("replay_flags", [None, (False, True), (True, False)])
+def test_incompatible_peer_fails_only_affected_requests(
+    replay_flags: tuple[bool, bool] | None,
+) -> None:
     """An incompatible context peer must fail only the requests targeting it.
 
-    When MambaPolicy.validate_peer_compatible rejects a peer during first
+    When peer validation rejects a peer during first
     registration, the receiver must (a) not raise out of receive() — the
     session fails through the normal transfer-error path (WaitResult.FAILED)
     with the diagnostic preserved; (b) cache the incompatibility so later
@@ -1962,6 +1965,18 @@ def test_incompatible_peer_fails_only_affected_requests():
     gen_tw = setup_good["gen_transfer_workers"][0]
     receiver = gen_tw._receiver
     bad_endpoint = setup_bad["ctx_info_endpoint"]
+    expected_error = "synthetic recurrent-state mismatch"
+    expected_validate_calls = 1
+    if replay_flags is not None:
+        local_replay, peer_replay = replay_flags
+        gen_tw._rank_info.bounded_replay_on_generation = local_replay
+        setup_good["ctx_transfer_workers"][0]._rank_info.bounded_replay_on_generation = local_replay
+        setup_bad["ctx_transfer_workers"][0]._rank_info.bounded_replay_on_generation = peer_replay
+        expected_error = (
+            "bounded_replay_on_generation must match between peers "
+            f"(local={local_replay}, peer={peer_replay})"
+        )
+        expected_validate_calls = 0
 
     sampling_params = SamplingParams(temperature=0)
     sc = tensorrt_llm.bindings.SamplingConfig(sampling_params._get_sampling_config())
@@ -2015,8 +2030,8 @@ def test_incompatible_peer_fails_only_affected_requests():
             assert rx1.has_failed()
             exc = rx1._kv_tasks[0]._exception
             assert exc is not None
-            assert "synthetic recurrent-state mismatch" in str(exc)
-            assert len(validate_calls) == 1
+            assert expected_error in str(exc)
+            assert len(validate_calls) == expected_validate_calls
             rx1.close()
 
             # (b) Second request to the same endpoint: fails fast from the
@@ -2027,8 +2042,8 @@ def test_incompatible_peer_fails_only_affected_requests():
             assert rx2.wait_complete(blocking=True) == WaitResult.FAILED
             assert rx2.wait_complete(blocking=False) == WaitResult.FAILED
             assert rx2.has_failed()
-            assert "synthetic recurrent-state mismatch" in str(rx2._kv_tasks[0]._exception)
-            assert len(validate_calls) == 1
+            assert expected_error in str(rx2._kv_tasks[0]._exception)
+            assert len(validate_calls) == expected_validate_calls
             assert bad_endpoint in receiver._incompatible_peers
             assert bad_endpoint not in receiver._sender_ep_instance_map
             rx2.close()

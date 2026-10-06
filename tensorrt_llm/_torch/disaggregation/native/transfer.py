@@ -3380,7 +3380,7 @@ class Receiver(ReceiverBase):
             finally:
                 messenger.stop()
 
-            # Recurrent-state (Mamba/KDA) layout gate on the receiver side.
+            # Peer compatibility gates on the receiver side.
             # The sender-side check (PeerRegistrar.register) runs in the
             # sender's listener thread, where exceptions are only logged, so
             # reject here — before REGISTER_RANK_INFO is even sent, so no
@@ -3389,6 +3389,7 @@ class Receiver(ReceiverBase):
             # (handled in dispatch_task) so only requests targeting this peer
             # fail, and cached so later requests fail fast.
             try:
+                self._registrar.validate_bounded_replay_compatible(sender_info)
                 MambaPolicy.validate_peer_compatible(
                     self._registrar.self_rank_info,
                     sender_info,
