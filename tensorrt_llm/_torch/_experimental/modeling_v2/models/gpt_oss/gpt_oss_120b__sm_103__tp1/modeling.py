@@ -93,7 +93,7 @@ _CALL_CONSTANTS = dict(
 _FC1_K_ALIGN = _weights.FC1_K_ALIGN
 
 
-class GptOssModelingV2(DecoderModel):
+class GptOssTp1ModelingV2(DecoderModel):
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
         cfg = model_config.pretrained_config
@@ -183,7 +183,7 @@ class PrefillTarget(Target):
 
     def __init__(
         self,
-        core: GptOssModelingV2,
+        core: GptOssTp1ModelingV2,
         *,
         yarn_factor: float,
         yarn_low: float,
@@ -393,7 +393,7 @@ class DecodeTarget(Target):
 
     def __init__(
         self,
-        core: GptOssModelingV2,
+        core: GptOssTp1ModelingV2,
         *,
         yarn_factor: float,
         yarn_low: float,
@@ -598,7 +598,7 @@ class DecodeTarget(Target):
         return x
 
 
-class ModelingV2GptOss120bSm103Tp1(DecoderModelForCausalLM[GptOssModelingV2, PretrainedConfig]):
+class ModelingV2GptOss120bSm103Tp1(DecoderModelForCausalLM[GptOssTp1ModelingV2, PretrainedConfig]):
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config
         # This checkpoint's config.json declares no dtype, so lm_head would be sized fp32 while every
@@ -606,7 +606,7 @@ class ModelingV2GptOss120bSm103Tp1(DecoderModelForCausalLM[GptOssModelingV2, Pre
         if cfg.torch_dtype is None:
             cfg.torch_dtype = model_config.torch_dtype
         super().__init__(
-            GptOssModelingV2(model_config),
+            GptOssTp1ModelingV2(model_config),
             config=model_config,
             hidden_size=cfg.hidden_size,
             vocab_size=cfg.vocab_size,
