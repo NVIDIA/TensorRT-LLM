@@ -81,8 +81,7 @@ function(add_tllm_gtest test_name)
   target_compile_definitions(${test_name}
                              PRIVATE TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
-  set(test_properties ENVIRONMENT "CUDA_MODULE_LOADING=LAZY" LABELS
-                      "${ARG_LABELS}")
+  set(test_properties ENVIRONMENT "CUDA_MODULE_LOADING=LAZY")
   if(ARG_REQUIRES_GPU)
     list(APPEND test_properties RESOURCE_LOCK gpu)
   endif()
@@ -90,7 +89,7 @@ function(add_tllm_gtest test_name)
     list(APPEND test_properties TIMEOUT "${ARG_TIMEOUT}")
   endif()
   gtest_discover_tests(${test_name} DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30
-                       PROPERTIES ${test_properties})
+                       PROPERTIES LABELS "${ARG_LABELS}" ${test_properties})
 
   add_dependencies(google-tests ${test_name})
   if(ARG_OWNER)
