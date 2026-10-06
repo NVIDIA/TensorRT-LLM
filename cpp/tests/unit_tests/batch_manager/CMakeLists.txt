@@ -13,95 +13,356 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_gtest(radixTreeTest radixTreeTest.cpp)
-add_gtest(blockKeyTest blockKeyTest.cpp)
-add_gtest(radixBlockTreeTest radixBlockTreeTest.cpp)
-add_gtest(cacheTransBufferTest cacheTransBufferTest.cpp)
-add_gtest(bufferIndexHolderTest bufferIndexHolderTest.cpp)
-add_gtest(capacitySchedulerTest capacitySchedulerTest.cpp)
-add_gtest(contextProgressTest contextProgressTest.cu)
-add_gtest(contextTransferCoordinatorTest contextTransferCoordinatorTest.cpp)
-add_gtest(evictionPolicyTest evictionPolicyTest.cpp)
-add_gtest(kvCacheManagerTest kvCacheManagerTest.cpp)
-add_gtest(kvCacheManagerFabricMemoryTest kvCacheManagerFabricMemoryTest.cpp)
-add_gtest(kvCacheManagerV2ConfigTest
-          "kvCacheManagerV2ConfigTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
-target_include_directories(
-  kvCacheManagerV2ConfigTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(
-  kvCacheManagerV2DefaultColdPageCodecTest
-  "kvCacheManagerV2DefaultColdPageCodecTest.cpp;kvCacheManagerV2PoisonCheck.cpp"
-)
-target_include_directories(
-  kvCacheManagerV2DefaultColdPageCodecTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(kvCacheManagerV2ColdPageTest
-          "kvCacheManagerV2ColdPageTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
-target_include_directories(
-  kvCacheManagerV2ColdPageTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
-          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
-add_gtest(kvCacheManagerV2ColdPageCopyTest
-          "kvCacheManagerV2ColdPageCopyTest.cu;kvCacheManagerV2PoisonCheck.cpp")
-target_include_directories(
-  kvCacheManagerV2ColdPageCopyTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(coldPageCodecTest coldPageCodecTest.cpp)
-target_include_directories(
-  coldPageCodecTest PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(kvCacheManagerV2TypedIndexTest
-          "kvCacheManagerV2TypedIndexTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
-target_include_directories(
-  kvCacheManagerV2TypedIndexTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(kvCacheManagerV2HostMemTest
-          "kvCacheManagerV2HostMemTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
-target_include_directories(
-  kvCacheManagerV2HostMemTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(
-  kvCacheManagerV2StagingBufferTest
-  "kvCacheManagerV2StagingBufferTest.cu;kvCacheManagerV2PoisonCheck.cpp")
-target_include_directories(
-  kvCacheManagerV2StagingBufferTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(kvCacheManagerV2StatsTest
-          "kvCacheManagerV2StatsTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
-target_include_directories(
-  kvCacheManagerV2StatsTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
-          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
-add_gtest(
-  kvCacheManagerV2SlotAllocatorTest
-  "kvCacheManagerV2SlotAllocatorTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
-target_include_directories(
-  kvCacheManagerV2SlotAllocatorTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(
-  kvCacheManagerV2ReentrantSharedMutexTest
-  "kvCacheManagerV2ReentrantSharedMutexTest.cpp;kvCacheManagerV2PoisonCheck.cpp"
-)
-target_include_directories(
-  kvCacheManagerV2ReentrantSharedMutexTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(kvCacheManagerV2ConcurrencyTest
-          "kvCacheManagerV2ConcurrencyTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
-target_include_directories(
-  kvCacheManagerV2ConcurrencyTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
-          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+# Whole-archive keeps the poison listener's static registration in each test.
+add_library(tllm_kv_cache_test_support STATIC EXCLUDE_FROM_ALL
+            kvCacheManagerV2PoisonCheck.cpp)
+target_link_libraries(
+  tllm_kv_cache_test_support
+  PUBLIC tllm::kv_cache
+  PRIVATE gtest)
+target_compile_features(tllm_kv_cache_test_support PRIVATE cxx_std_20)
 
-add_gtest(kvCacheManagerV2DigestPoolTest
-          "kvCacheManagerV2DigestPoolTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
-target_include_directories(
+add_tllm_gtest(
+  radixTreeTest
+  OWNER
+  batch-manager
+  SOURCES
+  radixTreeTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache_legacy
+  LABELS
+  "unit;batch-manager;host")
+
+add_tllm_gtest(
+  blockKeyTest
+  OWNER
+  batch-manager
+  SOURCES
+  blockKeyTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache_legacy
+  LABELS
+  "unit;batch-manager;host")
+
+add_tllm_gtest(
+  radixBlockTreeTest
+  OWNER
+  batch-manager
+  SOURCES
+  radixBlockTreeTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache_legacy
+  LABELS
+  "unit;batch-manager;host")
+
+add_tllm_gtest(
+  cacheTransBufferTest
+  OWNER
+  batch-manager
+  SOURCES
+  cacheTransBufferTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache_legacy
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
+  bufferIndexHolderTest
+  OWNER
+  batch-manager
+  SOURCES
+  bufferIndexHolderTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache_legacy
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
+  capacitySchedulerTest
+  OWNER
+  batch-manager
+  SOURCES
+  capacitySchedulerTest.cpp
+  LINK_LIBRARIES
+  tllm::batch_scheduler
+  tllm::executor_request_utils
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
+  contextProgressTest
+  OWNER
+  batch-manager
+  SOURCES
+  contextProgressTest.cu
+  LINK_LIBRARIES
+  tllm::batch_scheduler
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_gtest(contextTransferCoordinatorTest contextTransferCoordinatorTest.cpp)
+
+add_tllm_gtest(
+  evictionPolicyTest
+  OWNER
+  batch-manager
+  SOURCES
+  evictionPolicyTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache_legacy
+  LABELS
+  "unit;batch-manager;host")
+
+add_tllm_gtest(
+  kvCacheManagerTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache_legacy
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
+  kvCacheManagerFabricMemoryTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerFabricMemoryTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache_legacy
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
+  kvCacheManagerV2ConfigTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2ConfigTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;host")
+
+add_tllm_gtest(
+  kvCacheManagerV2DefaultColdPageCodecTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2DefaultColdPageCodecTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
+  kvCacheManagerV2ColdPageTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2ColdPageTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
+  kvCacheManagerV2ColdPageCopyTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2ColdPageCopyTest.cu
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
+  coldPageCodecTest
+  OWNER
+  batch-manager
+  SOURCES
+  coldPageCodecTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
+  kvCacheManagerV2TypedIndexTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2TypedIndexTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;host")
+
+add_tllm_gtest(
+  kvCacheManagerV2HostMemTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2HostMemTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
+  kvCacheManagerV2StagingBufferTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2StagingBufferTest.cu
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
+  kvCacheManagerV2StatsTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2StatsTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
+  kvCacheManagerV2SlotAllocatorTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2SlotAllocatorTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;host")
+
+add_tllm_gtest(
+  kvCacheManagerV2ReentrantSharedMutexTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2ReentrantSharedMutexTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;host")
+
+add_tllm_gtest(
+  kvCacheManagerV2ConcurrencyTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2ConcurrencyTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
   kvCacheManagerV2DigestPoolTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
-          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
-add_gtest(kvCacheUtilsTest kvCacheUtilsTest.cpp)
-add_gtest(llmRequestTest llmRequestTest.cpp)
-add_gtest(microBatchSchedulerTest microBatchSchedulerTest.cpp)
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2DigestPoolTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;host")
+
+add_tllm_gtest(
+  kvCacheUtilsTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache_legacy
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
+  llmRequestTest
+  OWNER
+  batch-manager
+  SOURCES
+  llmRequestTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache_legacy
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
+  microBatchSchedulerTest
+  OWNER
+  batch-manager
+  SOURCES
+  microBatchSchedulerTest.cpp
+  LINK_LIBRARIES
+  tllm::batch_scheduler
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
 add_gtest(peftCacheManagerTest peftCacheManagerTest.cpp)
+
 add_gtest(rnnCacheFormatterTest rnnCacheFormatterTest.cpp)
-add_gtest(agentTreeTest agentTreeTest.cpp)
-add_gtest(truncateBlocksTest truncateBlocksTest.cpp)
+
+add_tllm_gtest(
+  agentTreeTest
+  OWNER
+  batch-manager
+  SOURCES
+  agentTreeTest.cpp
+  LINK_LIBRARIES
+  tllm::batch_scheduler
+  LABELS
+  "unit;batch-manager;host")
+
+add_tllm_gtest(
+  truncateBlocksTest
+  OWNER
+  batch-manager
+  SOURCES
+  truncateBlocksTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache_legacy
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
