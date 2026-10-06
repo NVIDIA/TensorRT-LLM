@@ -67,3 +67,18 @@ if(TLLM_BOUNCE_ZMQ_FOUND AND EXISTS ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
   set_target_properties(tllm_executor_bounce_control
                         PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
+
+if(NIXL_ROOT AND TARGET tllm_executor_bounce_control)
+  add_library(tllm_executor_bounce_reactor STATIC EXCLUDE_FROM_ALL
+              BounceTransport.cpp)
+  add_library(tllm::executor_bounce_reactor ALIAS tllm_executor_bounce_reactor)
+  target_link_libraries(
+    tllm_executor_bounce_reactor
+    PUBLIC tllm::executor_bounce_cuda tllm::executor_bounce_arena
+           tllm::executor_bounce_control tllm::executor_transfer_agent
+    PRIVATE NIXL::nixl)
+  target_compile_features(tllm_executor_bounce_reactor PUBLIC cxx_std_20)
+  target_compile_options(tllm_executor_bounce_reactor PRIVATE -Wno-error)
+  set_target_properties(tllm_executor_bounce_reactor
+                        PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()

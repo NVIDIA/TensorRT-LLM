@@ -13,19 +13,20 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
+if(NIXL_ROOT)
+  find_package(NIXL REQUIRED)
+  if(NOT NIXL_FOUND)
+    message(
+      FATAL_ERROR "NIXL not found. Please install NIXL or set `NIXL_ROOT`.")
+  endif()
+endif()
+
 add_subdirectory(bounce)
 
 # ============================================================================
 # NIXL Wrapper Library
 # ============================================================================
 if(NIXL_ROOT)
-  find_package(NIXL REQUIRED)
-  # Check if all required packages were found
-  if(NOT NIXL_FOUND)
-    message(
-      FATAL_ERROR "NIXL not found. Please install NIXL or set `NIXL_ROOT`.")
-  endif()
-
   # Define the NIXL wrapper target
   set(NIXL_WRAPPER_TARGET "tensorrt_llm_nixl_wrapper")
 
@@ -61,12 +62,19 @@ if(NIXL_ROOT)
   # only).
   # ------------------------------------------------------------------------
   if(TARGET tllm_executor_bounce_control)
-    target_sources(${NIXL_WRAPPER_TARGET} PRIVATE bounce/BounceTransport.cpp)
     target_link_libraries(
       ${NIXL_WRAPPER_TARGET}
       PRIVATE
-        $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_executor_bounce_core,tllm_executor_bounce_cuda,tllm_executor_bounce_arena,tllm_executor_bounce_control>
+        $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_executor_bounce_reactor,tllm_executor_bounce_core,tllm_executor_bounce_cuda,tllm_executor_bounce_arena,tllm_executor_bounce_control>
         ${NIXL_BUILD_LIBRARY})
+    foreach(
+      component IN
+      ITEMS tllm_executor_bounce_reactor tllm_executor_bounce_core
+            tllm_executor_bounce_cuda tllm_executor_bounce_arena
+            tllm_executor_bounce_control)
+      set_property(TARGET ${NIXL_WRAPPER_TARGET}
+                   PROPERTY LINK_LIBRARY_OVERRIDE_${component} WHOLE_ARCHIVE)
+    endforeach()
     target_compile_definitions(${NIXL_WRAPPER_TARGET} PRIVATE TLLM_BOUNCE_V2=1)
     # The .cu device symbols must resolve into this shared lib.
     set_target_properties(${NIXL_WRAPPER_TARGET}
