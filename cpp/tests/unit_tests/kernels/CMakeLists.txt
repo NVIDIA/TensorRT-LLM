@@ -71,7 +71,17 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;kernels;rope;gpu")
-add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
+add_tllm_gtest(
+  smoothQuantKernelTest
+  OWNER
+  kernel
+  SOURCES
+  smoothQuant/smoothQuantKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_smooth_quant
+  tllm::kernel_int8_gemm
+  LABELS
+  "unit;kernels;smooth-quant;gpu")
 add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
 add_tllm_gtest(
   mlaPreprocessTest
