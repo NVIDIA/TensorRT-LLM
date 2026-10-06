@@ -90,6 +90,7 @@ class CommunicationFactory:
         use_flashinfer: bool = False,
         hidden_size: Optional[int] = None,
         communication_method: Optional[str] = None,
+        allow_alltoall: bool = True,
     ) -> Optional[Communication]:
         """
         Create the best communication method for the given configuration
@@ -117,6 +118,7 @@ class CommunicationFactory:
                 Falls back to pretrained_config.hidden_size when not provided.
             communication_method: Optional model-selected communication method.
                 ``TRTLLM_FORCE_COMM_METHOD`` takes precedence when set.
+            allow_alltoall: Whether the backend supports all-to-all dispatch.
             # TODO: Need a way to indicate whether EPLB is enabled.
 
         Returns:
@@ -160,6 +162,17 @@ class CommunicationFactory:
             force_method, force_source = env_method, "TRTLLM_FORCE_COMM_METHOD"
         else:
             force_method, force_source = communication_method, "communication_method"
+
+        if not allow_alltoall:
+            if force_method is not None and force_method.upper() != "ALLGATHER":
+                raise ValueError(
+                    f"{force_source}={force_method} requires all-to-all, which the "
+                    "selected MoE backend does not support; use ALLGATHER"
+                )
+            logger.info(
+                "Selected communication strategy: AllGatherReduceScatter (backend capability)"
+            )
+            return AllGatherReduceScatter(mapping)
 
         if force_method is not None:
             strategy = CommunicationFactory._create_forced_method(

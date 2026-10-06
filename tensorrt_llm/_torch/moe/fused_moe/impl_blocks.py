@@ -73,6 +73,11 @@ class MoEExecutionContractMixin:
         return False
 
     @property
+    def supports_alltoall(self) -> bool:
+        """Whether the kernel can consume tokens dispatched with all-to-all."""
+        return True
+
+    @property
     def uses_locality_domain(self) -> bool:
         """True when this impl runs partitioned across locality domains."""
         return False

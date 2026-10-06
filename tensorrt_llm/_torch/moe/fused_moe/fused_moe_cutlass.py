@@ -335,9 +335,12 @@ class CutlassFusedMoE(MoEImplBase):
 
         return MoEEligibility.ok()
 
+    @property
+    def supports_alltoall(self) -> bool:
+        return collect_moe_environment().oss_cutlass_moe
+
     def validate_configurable_moe(self, moe: torch.nn.Module) -> None:
-        environment = collect_moe_environment()
-        if moe.enable_alltoall and not environment.oss_cutlass_moe:
+        if moe.enable_alltoall and not self.supports_alltoall:
             raise ValueError("CutlassFusedMoE all-to-all requires a build with "
                              "USING_OSS_CUTLASS_MOE_GEMM=ON")
 

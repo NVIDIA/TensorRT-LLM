@@ -653,8 +653,10 @@ included in its fingerprint. Libraries without the build-mode query preserve
 the OSS default. CUTLASS eligibility rejects unavailable activation and
 quantization formats, post-SiLU clamping, dynamic FC2 scaling, and routed-expert
 LoRA. W4A8 AWQ uses per-expert activation-scale buffers and is unavailable in
-the legacy build. All-to-all is checked after the layer selects its communication
-strategy, during construction. Input layout and token-count options supplied
+the legacy build. The backend exposes `supports_alltoall` before communication
+selection. Unsupported auto-selection falls back to AllGather/ReduceScatter, and
+explicit all-to-all requests fail before allocation. Construction validation
+retains an all-to-all backstop. Input layout and token-count options supplied
 to native operators directly retain runtime guards.
 The neutral SwiGLU tensors are cached by device, expert count and CUDA stream;
 warm eager forwards reuse them without allocations or fill kernels. During CUDA

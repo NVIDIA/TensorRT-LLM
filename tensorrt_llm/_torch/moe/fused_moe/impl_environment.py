@@ -171,6 +171,7 @@ def _is_oss_cutlass_moe() -> bool:
     try:
         query = torch.ops.trtllm.is_oss_cutlass_moe
     except AttributeError:
+        logger.debug("CUTLASS MoE build-mode query is unavailable; assuming OSS kernels")
         return True
     return bool(query())
 

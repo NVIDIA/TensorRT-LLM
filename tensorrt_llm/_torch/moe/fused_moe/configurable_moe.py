@@ -624,6 +624,7 @@ class ConfigurableMoE(MoE):
             use_flashinfer=self.use_flashinfer,
             hidden_size=self.hidden_size,
             communication_method=self.communication_method,
+            allow_alltoall=self.backend.supports_alltoall,
         )
 
     def forward_impl(

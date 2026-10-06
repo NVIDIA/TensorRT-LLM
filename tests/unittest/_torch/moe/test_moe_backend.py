@@ -169,21 +169,27 @@ def test_cutlass_moe_routing_round_trip(dtype: torch.dtype) -> None:
 
 
 @pytest.mark.parametrize(
-    "activation_type,clamp_limit",
+    "activation_type,clamp_limit,alpha_only,capture_first",
     [
-        (ActivationType.Identity, None),
-        (ActivationType.Gelu, None),
-        (ActivationType.Relu, None),
-        (ActivationType.Silu, None),
-        (ActivationType.Swiglu, None),
-        (ActivationType.Geglu, None),
-        (ActivationType.SwigluBias, None),
-        (ActivationType.Swiglu, 0.2),
-        (ActivationType.SwigluBias, 0.2),
+        (ActivationType.Identity, None, False, False),
+        (ActivationType.Gelu, None, False, False),
+        (ActivationType.Relu, None, False, False),
+        (ActivationType.Silu, None, False, False),
+        (ActivationType.Swiglu, None, False, False),
+        (ActivationType.Geglu, None, False, False),
+        (ActivationType.SwigluBias, None, False, False),
+        (ActivationType.Swiglu, 0.2, False, False),
+        (ActivationType.SwigluBias, 0.2, False, False),
+        pytest.param(ActivationType.Swiglu, 0.2, True, False, id="alpha-only-clamp"),
+        pytest.param(ActivationType.Swiglu, 0.2, False, True, id="capture-before-eager"),
     ],
 )
 def test_cutlass_moe_public_activation_ids(
-    activation_type: ActivationType, clamp_limit: Optional[float]
+    activation_type: ActivationType,
+    clamp_limit: Optional[float],
+    alpha_only: bool,
+    capture_first: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not torch.cuda.is_available() or get_sm_version() < 80:
         pytest.skip("BF16 CUTLASS MoE requires CUDA and SM80 or newer")
@@ -204,7 +210,7 @@ def test_cutlass_moe_public_activation_ids(
     scores = torch.ones(8, 1, device="cuda", dtype=torch.float32)
     alpha = (
         torch.ones(num_experts, device="cuda")
-        if activation_type == ActivationType.SwigluBias
+        if activation_type == ActivationType.SwigluBias or alpha_only
         else None
     )
     beta = (
@@ -216,21 +222,43 @@ def test_cutlass_moe_public_activation_ids(
         torch.full((num_experts,), clamp_limit, device="cuda") if clamp_limit is not None else None
     )
 
-    actual = torch.ops.trtllm.fused_moe(
-        x,
-        selected,
-        scores,
-        w1,
-        None,
-        w2,
-        None,
-        dtype,
-        [],
-        activation_type=int(activation_type),
-        swiglu_alpha=alpha,
-        swiglu_beta=beta,
-        swiglu_limit=limit,
-    )[0]
+    def run_moe():
+        return torch.ops.trtllm.fused_moe(
+            x,
+            selected,
+            scores,
+            w1,
+            None,
+            w2,
+            None,
+            dtype,
+            [],
+            activation_type=int(activation_type),
+            swiglu_alpha=alpha,
+            swiglu_beta=beta,
+            swiglu_limit=limit,
+        )[0]
+
+    if capture_first:
+        from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+        # Isolate the native runner from earlier parameterized cases. Construct
+        # it before capture, with no eager forward or cached neutral defaults.
+        key = (dtype, dtype, dtype, False, False, False, False, False)
+        runner = torch.classes.trtllm.FusedMoeRunner(*key, True)
+        monkeypatch.setattr(MoERunner, "runner_dict", {key: runner})
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(graph, stream=stream):
+            captured = run_moe()
+        # Same stream, before replay: the eager call must not read defaults
+        # whose initialization was only recorded in the captured graph.
+        with torch.cuda.stream(stream):
+            actual = run_moe()
+        torch.cuda.current_stream().wait_stream(stream)
+    else:
+        actual = run_moe()
 
     expected = []
     for row, expert in zip(x, selected[:, 0]):
@@ -259,23 +287,10 @@ def test_cutlass_moe_public_activation_ids(
 
     torch.testing.assert_close(actual, torch.stack(expected), atol=0.01, rtol=0.05)
     if clamp_limit is not None:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured = torch.ops.trtllm.fused_moe(
-                x,
-                selected,
-                scores,
-                w1,
-                None,
-                w2,
-                None,
-                dtype,
-                [],
-                activation_type=int(activation_type),
-                swiglu_alpha=alpha,
-                swiglu_beta=beta,
-                swiglu_limit=limit,
-            )[0]
+        if not capture_first:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = run_moe()
         graph.replay()
         torch.testing.assert_close(captured, torch.stack(expected), atol=0.01, rtol=0.05)
 

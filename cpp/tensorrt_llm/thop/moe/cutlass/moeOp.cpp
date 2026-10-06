@@ -174,7 +174,9 @@ ActivationType getActivationType(int64_t activation_type)
     using PublicActivationType = tensorrt_llm::kernels::cutlass_kernels::ActivationType;
     switch (static_cast<PublicActivationType>(activation_type))
     {
-    case PublicActivationType::InvalidType: TORCH_CHECK(false, "Invalid MoE activation type.");
+    case PublicActivationType::InvalidType:
+        TORCH_CHECK(false, "Invalid MoE activation type.");
+        return ActivationType::InvalidType;
     case PublicActivationType::Identity: return ActivationType::Identity;
     case PublicActivationType::Gelu: return ActivationType::Gelu;
     case PublicActivationType::Relu: return ActivationType::Relu;

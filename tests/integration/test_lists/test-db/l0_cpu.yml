@@ -15,6 +15,7 @@ l0_cpu:
   - unittest/_torch/moe/test_moe_impl.py::test_cutlass_build_mode_resolution
   - unittest/_torch/moe/test_moe_impl.py::test_cutlass_dynamic_scale_resolution
   - unittest/_torch/moe/test_moe_impl.py::test_cutlass_communication_validation
+  - unittest/_torch/moe/test_moe_impl.py::test_cutlass_communication_selection
   - unittest/_torch/moe/test_moe_impl.py::test_cutlass_build_mode_probe
   - unittest/_torch/moe/test_moe_impl.py::test_cutlass_build_mode_fingerprint
   - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
