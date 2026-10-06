@@ -72,6 +72,8 @@ The launcher owns the executor and a private local coordinator. Other frontends 
 
 Readiness requires the whole frontend group. Failure of a frontend, coordinator connection, or engine stops the group; individual frontends are not automatically restarted. Shutdown stops admission and drains or cancels streams before releasing the engine. A signal received during synchronous model initialization is handled at the next initialization cleanup boundary.
 
+If the coordinator fails during final request cleanup, a client can receive a trailing `UNAVAILABLE` even after its stream delivered every response. Clients that retry this status may repeat completed work.
+
 With multiple frontends, request IDs in `Generate` and `Abort(request_id)` are limited to 1024 UTF-8 bytes. Larger IDs return `INVALID_ARGUMENT` before reaching the coordinator, without affecting other requests or frontend readiness.
 
 Abort snapshots are sent in batches of at most 128 requests, with at most one batch in flight per target frontend. Each batch is below 1 MiB even with maximum-length, JSON-escaped IDs. Private abort operations have a 30-second caller deadline. The coordinator limits snapshot dispatch to 25 seconds, leaving 5 seconds to return the outcome; individual batch RPCs retain the 5-second control deadline. When the snapshot budget expires, confirmed outcomes are preserved and unconfirmed or unsent requests are counted as failures. The public abort returns `INTERNAL` for incomplete cancellation without stopping the serving group.

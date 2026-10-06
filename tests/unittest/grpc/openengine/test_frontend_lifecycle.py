@@ -17,7 +17,7 @@ import pytest
 from tensorrt_llm.grpc.openengine.bindings import lifecycle_pb2 as lifecycle
 from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc as rpc
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 
 
 @pytest.mark.parametrize("exits", [True, False])

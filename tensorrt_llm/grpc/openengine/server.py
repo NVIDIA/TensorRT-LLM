@@ -9,6 +9,7 @@ import os
 import signal
 import tempfile
 import threading
+from collections.abc import Callable
 from typing import Any
 
 import click
@@ -106,8 +107,7 @@ class OpenEngineServer:
         self.host = host
         self.port = port
         options = list(_SERVER_OPTIONS)
-        if frontend is not None:
-            options.append(("grpc.so_reuseport", 1))
+        options.append(("grpc.so_reuseport", 1 if frontend is not None else 0))
         self._server = grpc.aio.server(options=options)
         kv_transfer_backend = _kv_transfer_backend(llm)
         inference = OpenEngineInferenceServicer(
@@ -169,6 +169,7 @@ def launch_server(
     port: int,
     llm_args: dict[str, Any],
     served_model_name: str | None = None,
+    report_failure: Callable[[int, str, str], None] | None = None,
 ) -> None:
     """Launch the dedicated OpenEngine gRPC server.
 
@@ -177,6 +178,7 @@ def launch_server(
         port: Port on which the server listens.
         llm_args: Arguments for LLM initialization.
         served_model_name: Model name accepted by Generate. Defaults to the model path.
+        report_failure: Records a child exit before startup readiness.
     """
 
     async def serve() -> None:
@@ -268,6 +270,13 @@ def launch_server(
             instance_id = str(llm.llm_id)
             if mode.is_launcher:
                 directory = tempfile.TemporaryDirectory(prefix="tllm-openengine-")
+                longest_name = max("coordinator", f"frontend-{mode.num_frontends - 1}", key=len)
+                socket_path = os.path.join(directory.name, longest_name)
+                if len(os.fsencode(socket_path)) >= 108:
+                    raise ValueError(
+                        f"OpenEngine private Unix socket path exceeds 107 bytes: {socket_path}. "
+                        "Set TMPDIR to a shorter directory."
+                    )
                 coordinator = Coordinator(
                     directory.name, mode.num_frontends, instance_id, healthy, fail
                 )
@@ -297,6 +306,7 @@ def launch_server(
                             "TLLM_OPENENGINE_INSTANCE_ID": instance_id,
                         },
                         cancelled=startup_cancelled,
+                        report_failure=report_failure,
                     )
                 except FrontendStartupCancelled:
                     # The spawn helper has already reaped its children. The

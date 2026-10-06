@@ -158,6 +158,10 @@ class Coordinator:
                 # The current batch has no confirmed outcome. Include it and
                 # unsent batches as failures without invalidating the group.
                 return {"aborted": aborted, "failed": failed + len(requests) - start}
+            except grpc.aio.AioRpcError as error:
+                if error.code() != grpc.StatusCode.DEADLINE_EXCEEDED:
+                    raise
+                return {"aborted": aborted, "failed": failed + len(requests) - start}
             aborted += reply["aborted"]
             failed += reply["failed"]
         return {"aborted": aborted, "failed": failed}
@@ -215,8 +219,12 @@ class Coordinator:
                     *(
                         self._abort_frontend(frontend, requests, deadline)
                         for frontend, requests in by_frontend.items()
-                    )
+                    ),
+                    return_exceptions=True,
                 )
+                for reply in replies:
+                    if isinstance(reply, BaseException):
+                        raise reply
             except grpc.aio.AioRpcError as error:
                 self.ready = False
                 self._fail(f"Frontend control connection failed: {error}")

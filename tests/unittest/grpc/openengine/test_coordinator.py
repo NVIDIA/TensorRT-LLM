@@ -40,12 +40,12 @@ class Handle:
 
 
 @asynccontextmanager
-async def group(coordinator_type=Coordinator):
+async def group(coordinator_type=Coordinator, client_type=FrontendClient):
     # Short paths avoid the AF_UNIX pathname limit under pytest's tmp_path.
     with TemporaryDirectory(prefix="oe-test-") as directory:
         failures = []
         coordinator = coordinator_type(directory, 2, "shared-engine", lambda: True, failures.append)
-        clients = [FrontendClient(directory, i, failures.append) for i in range(2)]
+        clients = [client_type(directory, i, failures.append) for i in range(2)]
         await coordinator.start()
         for client in clients:
             await client.start()
@@ -342,6 +342,25 @@ async def test_abort_all_deadline_preserves_group_and_partial_outcomes(monkeypat
         assert calls == 2
         assert (await second.request("status"))["ready"]
         assert not failures
+
+
+@pytest.mark.asyncio
+async def test_peer_abort_rpc_deadline_preserves_group(monkeypatch):
+    """A slow peer's gRPC deadline is an incomplete abort, not a group failure."""
+    monkeypatch.setattr(coordination, "_RPC_TIMEOUT", 0.05)
+
+    class SlowFrontend(FrontendClient):
+        async def _abort(self, message, context):
+            await asyncio.sleep(0.2)
+            return await super()._abort(message, context)
+
+    async with group(client_type=SlowFrontend) as (_, (first, second), failures):
+        reservation = await first.reserve("slow")
+        reservation.bind(Handle())
+        assert await second.request("abort") == {"aborted": 0, "failed": 1}
+        assert (await second.request("status"))["ready"]
+        assert not failures
+        await reservation.release()
 
 
 @pytest.mark.asyncio
