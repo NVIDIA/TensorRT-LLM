@@ -96,7 +96,17 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;sparse-attention;gpu")
 
-add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
+add_tllm_gtest(
+  cudaCoreGemmKernelTest
+  OWNER
+  kernel
+  SOURCES
+  cudaCoreGemm/cudaCoreGemmKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_cuda_core_gemm
+  CUDA::cublasLt
+  LABELS
+  "unit;kernels;cuda-core-gemm;gpu")
 
 add_tllm_gtest(
   mlaChunkedPrefillTest
