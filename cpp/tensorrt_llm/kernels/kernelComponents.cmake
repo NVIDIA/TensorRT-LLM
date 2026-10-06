@@ -82,3 +82,6 @@ add_tllm_kernel_library(
 
 add_tllm_kernel_library(tllm_kernel_sparse_attention SOURCES
                         sparseAttentionKernels.cu)
+
+add_tllm_kernel_library(tllm_kernel_mla SOURCES mlaKernels.cu LINK_LIBRARIES
+                        tllm::common_environment)

@@ -76,7 +76,18 @@ add_tllm_gtest(
   REQUIRES_GPU)
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
 add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
-add_gtest(mlaPreprocessTest mlaPreprocessTest.cu)
+add_tllm_gtest(
+  mlaPreprocessTest
+  OWNER
+  kernel
+  SOURCES
+  mlaPreprocessTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_mla
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;mla;gpu"
+  REQUIRES_GPU)
 add_tllm_gtest(
   sparseAttentionKernelsTest
   OWNER
