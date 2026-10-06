@@ -17,6 +17,8 @@ import json
 import click
 import pytest
 
+_TOKEN_TYPE_IDS_SPEC = {"name": "token_type_ids", "shape": ["num_tokens"], "dtype": "int32"}
+
 
 def _write_config(tmp_path, architecture):
     (tmp_path / "config.json").write_text(
@@ -127,6 +129,54 @@ def test_encode_only_server_rejects_multi_gpu_config(monkeypatch, parallelism_ke
     )
 
     with pytest.raises(click.BadParameter, match="single-GPU only"):
+        serve._prepare_encode_only_llm_args(
+            model="reranker",
+            max_batch_size=8,
+            max_num_tokens=4096,
+            trust_remote_code=False,
+            revision=None,
+            extra_llm_api_options=None,
+            telemetry=False,
+            server_name="rerank",
+        )
+
+
+@pytest.mark.parametrize(
+    "cuda_graph_config",
+    [
+        {"num_tokens": [64], "seq_lens": [32], "extra_model_inputs": [_TOKEN_TYPE_IDS_SPEC]},
+        "parsed",
+    ],
+    ids=["yaml_mapping", "parsed_config"],
+)
+def test_rerank_server_rejects_extra_model_inputs(monkeypatch, cuda_graph_config):
+    from tensorrt_llm.commands import serve
+    from tensorrt_llm.llmapi import EncodeCudaGraphConfig
+
+    if cuda_graph_config == "parsed":
+        cuda_graph_config = EncodeCudaGraphConfig(
+            num_tokens=[64], seq_lens=[32], extra_model_inputs=[_TOKEN_TYPE_IDS_SPEC]
+        )
+    llm_args = {"model": "reranker", "cuda_graph_config": cuda_graph_config}
+    monkeypatch.setattr(serve, "collect_explicit_cli_keys", lambda **kwargs: set())
+    monkeypatch.setattr(serve, "get_llm_args", lambda **kwargs: (llm_args, None))
+    monkeypatch.setattr(
+        serve._command_telemetry,
+        "apply_raw_config_telemetry_opt_out",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        serve,
+        "update_llm_args_with_extra_dict",
+        lambda args, *unused_args, **unused_kwargs: args,
+    )
+    monkeypatch.setattr(
+        serve,
+        "_apply_effective_telemetry_config",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(click.BadParameter, match="trtllm-serve rerank"):
         serve._prepare_encode_only_llm_args(
             model="reranker",
             max_batch_size=8,
