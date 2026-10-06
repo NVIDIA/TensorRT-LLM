@@ -391,11 +391,6 @@ class DynamicResolutionImageTiler:
                 target_patch_height += inc_h
             else:
                 target_patch_height = max(required_divisor, target_patch_height - rem_h)
-                if target_patch_height * target_patch_width > num_tokens_available:
-                    target_patch_width = max(
-                        required_divisor,
-                        (num_tokens_available // target_patch_height) // required_divisor * required_divisor,
-                    )
 
         rem_w = target_patch_width % required_divisor
         if rem_w != 0:
@@ -404,18 +399,11 @@ class DynamicResolutionImageTiler:
                 target_patch_width += inc_w
             else:
                 target_patch_width = max(required_divisor, target_patch_width - rem_w)
-                if target_patch_height * target_patch_width > num_tokens_available:
-                    target_patch_height = max(
-                        required_divisor,
-                        (num_tokens_available // target_patch_width) // required_divisor * required_divisor,
-                    )
 
         if target_patch_height * target_patch_width > num_tokens_available:
             target_patch_height = max(
                 required_divisor,
-                (num_tokens_available // target_patch_width)
-                // required_divisor
-                * required_divisor,
+                (num_tokens_available // target_patch_width) // required_divisor * required_divisor,
             )
             if target_patch_height * target_patch_width > num_tokens_available:
                 target_patch_width = max(
