@@ -40,6 +40,16 @@ foreach(owner common runtime executor batch-manager kernel)
   add_custom_target(${owner}-tests)
 endforeach()
 
+function(tllm_assert_test_is_component_local target)
+  get_target_property(link_libraries ${target} LINK_LIBRARIES)
+  if("${SHARED_TARGET}" IN_LIST link_libraries)
+    message(
+      FATAL_ERROR
+        "${target} links the full TensorRT-LLM library; use FULL_STACK explicitly"
+    )
+  endif()
+endfunction()
+
 function(add_tllm_gtest test_name)
   set(options FULL_STACK NO_GTEST_MAIN REQUIRES_GPU)
   set(one_value_args TIMEOUT OWNER TEST_PREFIX)
@@ -77,6 +87,9 @@ function(add_tllm_gtest test_name)
     endif()
   endif()
   target_link_libraries(${test_name} PRIVATE ${ARG_LINK_LIBRARIES})
+  if(NOT ARG_FULL_STACK)
+    tllm_assert_test_is_component_local(${test_name})
+  endif()
   target_compile_features(${test_name} PRIVATE cxx_std_20)
   target_compile_definitions(${test_name}
                              PRIVATE TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
