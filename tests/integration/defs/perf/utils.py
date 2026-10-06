@@ -237,9 +237,9 @@ def _run_command_with_captured_output(cmd: list[str],
                 break
 
         proc.wait()
-        if proc.returncode != 0:
-            # Leftover workers may also keep the stdout pipe open.
-            _cleanup_after_abort()
+        # Leftover workers may also keep the stdout pipe open, even when the
+        # launcher exits successfully.
+        _cleanup_after_abort()
         thread.join(timeout=30)
 
         with lock:
