@@ -272,7 +272,26 @@ if(USING_OSS_CUTLASS_FP4_GEMM)
 endif()
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
-  file(GLOB MOE_GEMM_SRC_CU "${MOE_CUTLASS_DIR}/*.cu")
+  set(MOE_GEMM_SRC_CU
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_bf16_bf16.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_bf16_fp4.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_bf16_fp8.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_bf16_uint4.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_bf16_uint8.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp16_fp16.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp16_fp4.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp16_uint4.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp16_uint8.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp32_fp32.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp4_fp4.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp8_fp4.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp8_fp8.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp8_uint4.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_tma_warp_specialized_input.cu"
+      "${MOE_CUTLASS_DIR}/moe_kernels.cu"
+      "${MOE_CUTLASS_DIR}/moe_lora_pointer_expand.cu"
+      "${MOE_CUTLASS_DIR}/moe_lora_problem_builder.cu"
+      "${MOE_CUTLASS_DIR}/moe_lora_slot_expand.cu")
   list(
     REMOVE_ITEM MOE_GEMM_SRC_CU "${MOE_CUTLASS_DIR}/moe_lora_pointer_expand.cu"
     "${MOE_CUTLASS_DIR}/moe_lora_problem_builder.cu"
@@ -293,6 +312,12 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX ".*fp8.*")
 
   add_library(moe_gemm_src STATIC ${MOE_GEMM_SRC_CU} ${GROUPED_SRC_CPP})
+  add_library(tllm::kernel_moe ALIAS moe_gemm_src)
+  target_link_libraries(
+    moe_gemm_src
+    PUBLIC tllm::kernel_gemm_utilities tllm::kernel_fp8_block_scale_gemm
+           tllm::kernel_lora tllm::kernel_pre_quant_scale
+           tllm::common_environment)
 
   add_library(_moe_gemm_launcher OBJECT ${MOE_GEMM_SRC_CU_LAUNCHER})
   add_cuda_architectures(_moe_gemm_launcher 89)

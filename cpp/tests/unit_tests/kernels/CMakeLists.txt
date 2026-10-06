@@ -55,15 +55,38 @@ macro(remove_compile_definition TARGET_NAME DEFINITION)
   endif()
 endmacro()
 
-add_gtest(mixtureOfExpertsTest moe/mixtureOfExpertsTest.cu)
+add_tllm_gtest(
+  mixtureOfExpertsTest
+  OWNER
+  kernel
+  SOURCES
+  moe/mixtureOfExpertsTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_moe
+  tllm::kernel_quantization
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;moe;gpu")
 
 # If we are using oss cutlass, build an explicit internal test
 if(USING_OSS_CUTLASS_MOE_GEMM)
   target_compile_definitions(mixtureOfExpertsTest
                              PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
 
-  add_gtest(mixtureOfExpertsInternalTest moe/mixtureOfExpertsTest.cu
-            TEST_PREFIX "Internal.")
+  add_tllm_gtest(
+    mixtureOfExpertsInternalTest
+    TEST_PREFIX
+    "Internal."
+    OWNER
+    kernel
+    SOURCES
+    moe/mixtureOfExpertsTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_moe_internal
+    tllm::kernel_quantization
+    tllm::runtime_buffers
+    LABELS
+    "unit;kernels;moe;gpu")
   remove_compile_definition(mixtureOfExpertsInternalTest
                             USING_OSS_CUTLASS_MOE_GEMM)
 endif()

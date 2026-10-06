@@ -234,3 +234,16 @@ add_tllm_kernel_library(tllm_kernel_pre_quant_scale SOURCES
                         preQuantScaleKernel.cu)
 target_link_libraries(tllm_kernel_weight_only
                       PUBLIC tllm::kernel_pre_quant_scale)
+
+add_library(tllm_kernel_moe_internal INTERFACE)
+add_library(tllm::kernel_moe_internal ALIAS tllm_kernel_moe_internal)
+target_link_libraries(
+  tllm_kernel_moe_internal
+  INTERFACE ${INTERNAL_CUTLASS_KERNELS_TARGET} CUDA::cuda_driver
+            tllm::kernel_gemm_utilities tllm::kernel_lora
+            tllm::kernel_pre_quant_scale tllm::common_environment)
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  list(APPEND TLLM_KERNEL_COMPONENT_TARGETS moe_gemm_src)
+else()
+  add_library(tllm::kernel_moe ALIAS tllm_kernel_moe_internal)
+endif()
