@@ -100,7 +100,10 @@ l0_b200:
   #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
   #               rebind mpi4py's serializer at import time, which applies process-wide on
   #               every stage that collects them, including where the tests themselves skip.
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py
+  # Keep cold-JIT MSA coverage out of the 60-minute attention aggregate.
+  # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
+  - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/compilation
   - unittest/_torch/debugger

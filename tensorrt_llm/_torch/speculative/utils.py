@@ -788,7 +788,7 @@ def get_num_extra_kv_tokens(spec_config):
 
 def get_draft_kv_cache_manager(spec_config, resource_manager):
     """
-    Return the one-model draft cache manager, including a shared subpage view
+    Return the one-model draft cache manager, including a shared draft KV view
     when the target manager owns the draft cache storage.
     """
     from ..pyexecutor.resource_manager import ResourceManagerType
@@ -803,7 +803,7 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
         return draft
     target = resource_manager.get_resource_manager(
         ResourceManagerType.KV_CACHE_MANAGER)
-    get_view = getattr(target, "get_draft_subpage_view", None)
+    get_view = getattr(target, "get_draft_kv_cache_view", None)
     return get_view() if get_view is not None else None
 
 
