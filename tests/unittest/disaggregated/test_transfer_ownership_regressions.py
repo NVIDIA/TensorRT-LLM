@@ -1342,6 +1342,8 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender._enforce_physical_ownership = True
     sender._sessions_lock, sender._sessions = threading.Lock(), {}
     sender._pre_cancelled_rids = {}
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_requests, sender._peer_requests_timestamps = {}, {}
     sender._shutdown = sender._shutdown_requested = False
     sender._ownership_poisoned, sender._ownership_poison_lock = None, threading.Lock()
     sender._loaded_remote_agents_lock, sender._loaded_remote_agents = threading.Lock(), set()
