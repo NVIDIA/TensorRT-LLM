@@ -316,6 +316,8 @@ target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
 set(TLLM_FACADE_COMPONENT_TARGETS
     ipc_nvls_memory_src
+    tllm_batch_cache_transceiver
+    tllm_batch_context_progress
     tllm_batch_request_info
     tllm_batch_rnn_cache_routing
     tllm_batch_scheduler
@@ -331,7 +333,9 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_executor_agent_connection
     tllm_executor_agent_name
     tllm_executor_cache_routing
+    tllm_executor_cache_transfer_cuda
     tllm_executor_memory_desc
+    tllm_executor_mpi_connection
     tllm_executor_serialization
     tllm_executor_socket_serialization
     tllm_executor_transfer_agent

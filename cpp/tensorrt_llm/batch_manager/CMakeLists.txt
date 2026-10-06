@@ -18,17 +18,7 @@ set(BATCH_MANAGER_STATIC_TARGET ${BATCH_MANAGER_TARGET_NAME}_static)
 set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # keep this list sorted alphabetically
-set(SRCS
-    cacheFormatter.cpp
-    cacheTransceiver.cpp
-    cacheTransferLayer.cpp
-    contextTransferCoordinator.cpp
-    dataTransceiver.cpp
-    kvCacheManagerV2Utils.cpp
-    kvCacheManagerV2Utils.cu
-    mlaCacheFormatter.cpp
-    rnnCacheFormatter.cpp
-    rnnCacheTransBuffer.cpp)
+set(SRCS kvCacheManagerV2Utils.cpp kvCacheManagerV2Utils.cu)
 
 set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
 file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")
@@ -107,12 +97,18 @@ target_link_libraries(
   PRIVATE tllm::common_environment tllm::executor_transfer_agent
           tllm::kernel_kv_cache_copy)
 
+add_library(tllm_batch_context_progress STATIC contextProgress.cpp)
+add_library(tllm::batch_context_progress ALIAS tllm_batch_context_progress)
+target_link_libraries(tllm_batch_context_progress PUBLIC tllm::common_cuda)
+
 add_library(
-  tllm_batch_scheduler STATIC
-  agentTree.cpp capacityScheduler.cpp contextProgress.cpp
-  microBatchScheduler.cpp noOpPeftCacheManager.cpp)
+  tllm_batch_scheduler STATIC agentTree.cpp capacityScheduler.cpp
+                              microBatchScheduler.cpp noOpPeftCacheManager.cpp)
 add_library(tllm::batch_scheduler ALIAS tllm_batch_scheduler)
-target_link_libraries(tllm_batch_scheduler PUBLIC tllm::kv_cache_legacy)
+target_link_libraries(
+  tllm_batch_scheduler
+  PUBLIC tllm::kv_cache_legacy
+  PRIVATE tllm::batch_context_progress)
 target_include_directories(tllm_batch_scheduler
                            PRIVATE ${maybe_nvtx_includedir})
 
@@ -158,7 +154,7 @@ set_target_properties(tllm_peft_cache PROPERTIES CXX_EXTENSIONS OFF
                                                  POSITION_INDEPENDENT_CODE ON)
 
 foreach(component tllm_kv_cache_host_memory tllm_kv_cache tllm_kv_cache_legacy
-                  tllm_batch_scheduler)
+                  tllm_batch_scheduler tllm_batch_context_progress)
   target_compile_features(${component} PUBLIC cxx_std_20)
   set_target_properties(
     ${component} PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON
@@ -168,12 +164,47 @@ target_compile_options(
   tllm_kv_cache PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 add_cuda_architectures(tllm_kv_cache 89)
 
+add_library(
+  tllm_batch_cache_transceiver STATIC
+  cacheFormatter.cpp
+  cacheTransceiver.cpp
+  cacheTransferLayer.cpp
+  contextTransferCoordinator.cpp
+  dataTransceiver.cpp
+  mlaCacheFormatter.cpp
+  rnnCacheFormatter.cpp
+  rnnCacheTransBuffer.cpp)
+add_library(tllm::batch_cache_transceiver ALIAS tllm_batch_cache_transceiver)
+target_link_libraries(
+  tllm_batch_cache_transceiver
+  PUBLIC tllm::kv_cache_legacy tllm::batch_request_info
+  PRIVATE tllm::executor_cache_transfer_cuda
+          tllm::executor_mpi_connection
+          tllm::executor_agent_connection
+          tllm::batch_rnn_cache_routing
+          tllm::batch_context_progress
+          tllm::context_transfer_consensus
+          tllm::common_environment
+          pg_utils
+          ${TORCH_PYTHON_LIB}
+          ${Python3_LIBRARIES}
+          ${CMAKE_DL_LIBS}
+          Threads::Threads)
+target_compile_features(tllm_batch_cache_transceiver PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_batch_cache_transceiver PROPERTIES CXX_EXTENSIONS OFF
+                                          POSITION_INDEPENDENT_CODE ON)
+
 add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
 target_link_libraries(
   ${BATCH_MANAGER_STATIC_TARGET}
-  PUBLIC tllm::kv_cache tllm::batch_scheduler tllm::context_transfer_consensus
-         tllm::peft_cache tllm::batch_request_info
-         tllm::batch_rnn_cache_routing)
+  PUBLIC tllm::kv_cache
+         tllm::batch_scheduler
+         tllm::context_transfer_consensus
+         tllm::peft_cache
+         tllm::batch_request_info
+         tllm::batch_rnn_cache_routing
+         tllm::batch_cache_transceiver)
 target_include_directories(
   ${BATCH_MANAGER_STATIC_TARGET}
   PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}

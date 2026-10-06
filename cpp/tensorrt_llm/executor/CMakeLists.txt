@@ -18,12 +18,7 @@ set(EXECUTOR_STATIC_TARGET ${EXECUTOR_TARGET_NAME}_static)
 set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # keep this list sorted alphabetically
-set(SRCS
-    cache_transmission/cacheSplitConcat.cu
-    cache_transmission/mpi_utils/connection.cpp
-    cache_transmission/rnnCacheSplitConcat.cu
-    executorKVCacheEventManager.cpp
-    jsonSerialization.cpp)
+set(SRCS executorKVCacheEventManager.cpp jsonSerialization.cpp)
 
 if(NOT WIN32)
   # additional warnings
@@ -138,6 +133,27 @@ target_link_libraries(
   PRIVATE tllm::executor_agent_name tllm::executor_cache_routing
           tllm::common_environment pg_utils ${Python3_LIBRARIES})
 
+add_library(
+  tllm_executor_cache_transfer_cuda STATIC
+  cache_transmission/cacheSplitConcat.cu
+  cache_transmission/rnnCacheSplitConcat.cu)
+add_library(tllm::executor_cache_transfer_cuda ALIAS
+            tllm_executor_cache_transfer_cuda)
+target_link_libraries(
+  tllm_executor_cache_transfer_cuda
+  PUBLIC tllm::runtime_buffers tllm::executor_cache_routing
+  PRIVATE tllm::common_environment tllm::executor_values)
+set_target_properties(
+  tllm_executor_cache_transfer_cuda
+  PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON
+             CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+add_library(tllm_executor_mpi_connection STATIC
+            cache_transmission/mpi_utils/connection.cpp)
+add_library(tllm::executor_mpi_connection ALIAS tllm_executor_mpi_connection)
+target_link_libraries(tllm_executor_mpi_connection
+                      PUBLIC tllm::runtime_distributed tllm::executor_values)
+
 foreach(
   component
   tllm_executor_values
@@ -146,7 +162,9 @@ foreach(
   tllm_executor_memory_desc
   tllm_executor_cache_routing
   tllm_executor_socket_serialization
-  tllm_executor_agent_connection)
+  tllm_executor_agent_connection
+  tllm_executor_cache_transfer_cuda
+  tllm_executor_mpi_connection)
   target_compile_features(${component} PUBLIC cxx_std_20)
   set_target_properties(${component} PROPERTIES CXX_EXTENSIONS OFF
                                                 POSITION_INDEPENDENT_CODE ON)
@@ -155,9 +173,14 @@ endforeach()
 add_library(${EXECUTOR_STATIC_TARGET} STATIC ${SRCS})
 target_link_libraries(
   ${EXECUTOR_STATIC_TARGET}
-  PUBLIC tllm::executor_values tllm::executor_transfer_agent
-         tllm::executor_agent_name tllm::executor_memory_desc
-         tllm::executor_cache_routing tllm::executor_agent_connection)
+  PUBLIC tllm::executor_values
+         tllm::executor_transfer_agent
+         tllm::executor_agent_name
+         tllm::executor_memory_desc
+         tllm::executor_cache_routing
+         tllm::executor_agent_connection
+         tllm::executor_cache_transfer_cuda
+         tllm::executor_mpi_connection)
 set_target_properties(
   ${EXECUTOR_STATIC_TARGET}
   PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
