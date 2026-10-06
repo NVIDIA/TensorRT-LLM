@@ -202,9 +202,10 @@ The Torch Sampler samples every non-greedy strategy (temperature, top-k, top-p, 
 combinations) with one fused kernel, which applies all the filters in a single launch and takes
 the sampling parameters and the random seed and offset per row. A seeded request's random stream
 therefore depends only on its own seed and how far it has decoded, not on where it sits in the
-batch. The kernel computes the complete set of token sampling probabilities (after top-k / top-p
-masking etc.) only when the user requests them or speculative decoding (rejection sampling)
-requires them.
+batch. The sampled tokens can still differ across batch sizes, because the kernel picks its
+algorithm by the number of rows. The kernel computes the complete set of token sampling
+probabilities (after top-k / top-p masking etc.) only when the user requests them or speculative
+decoding (rejection sampling) requires them.
 
 Moreover, Torch Sampler internally batches requests with compatible sampling parameters. This
 can greatly reduce the overall latency of the sampling step when request batches are comprised

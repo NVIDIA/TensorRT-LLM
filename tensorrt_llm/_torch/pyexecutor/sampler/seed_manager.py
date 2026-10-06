@@ -35,12 +35,12 @@ __all__ = ["_SeedManager"]
 class _SeedManager:
     """Per-row Philox ``(seed, offset)`` for the fused sampling kernel.
 
-    A seeded request must produce the same tokens regardless of which other
-    requests share its batch, so its RNG stream cannot come from a single
-    batch-wide ``torch.Generator`` whose state advances by the batch's total
-    draw count. Instead every row is sampled with its own Philox
-    ``(seed, offset)``, and the kernel is told not to mix in the row index, so
-    a row's draws depend on that pair alone.
+    A seeded request's RNG stream must not depend on which other requests
+    share its batch, so it cannot come from a single batch-wide
+    ``torch.Generator`` whose state advances by the batch's total draw count.
+    Instead every row is sampled with its own Philox ``(seed, offset)``, and
+    the kernel keeps the row index out of per-row streams, so a row's draws
+    depend on that pair alone.
 
     - A seeded request uses its own seed, and an offset counted per sequence
       slot. The counter restarts when a new request takes the slot, so the

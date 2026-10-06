@@ -3242,7 +3242,7 @@ class TestRequestSeed:
 
     def test_seed_is_independent_of_batch_composition(self, monkeypatch: pytest.MonkeyPatch):
         """The core guarantee: batching must not perturb a seeded stream."""
-        logits = self._logits(3)
+        logits = self._logits(1).expand(3, -1).contiguous()
         seeded = self._sampling_params(1234)
 
         alone = self._run([seeded], logits=logits[:1], monkeypatch=monkeypatch)
