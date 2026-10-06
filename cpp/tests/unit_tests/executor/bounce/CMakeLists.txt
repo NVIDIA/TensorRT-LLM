@@ -134,7 +134,6 @@ if(NIXL_ROOT)
   # when NIXL is on); all of them share this source set + include/link sets.
   # Same gate as the zmq-only tier above.
   if(BOUNCE_CPPZMQ_AVAILABLE)
-    set(BOUNCE_REACTOR_SRCS ${BOUNCE_DIR}/BounceTransport.cpp)
     set(BOUNCE_TSAN_SRCS
         ${BOUNCE_DIR}/BounceTransport.cpp
         ${BOUNCE_DIR}/BounceTransferPlan.cpp
@@ -149,23 +148,29 @@ if(NIXL_ROOT)
     set(BOUNCE_TEST_LIBS tensorrt_llm_nixl_wrapper NIXL::nixl
                          ${NIXL_BUILD_LIBRARY} PkgConfig::TLLM_BOUNCE_ZMQ)
 
-    # One reactor test target: the bounce sources compiled in, plus the shared
-    # include/link sets.
+    # Reactor tests use the production component, with a separately compiled
+    # source set for ThreadSanitizer instrumentation.
     function(add_bounce_reactor_test name src)
       cmake_parse_arguments(ARG "INSTRUMENTED" "" "" ${ARGN})
-      add_tllm_gtest(${name} SOURCES ${src} FULL_STACK LABELS
-                     "unit;full-stack;gpu")
       if(ARG_INSTRUMENTED)
+        add_tllm_gtest(${name} SOURCES ${src} FULL_STACK LABELS
+                       "unit;full-stack")
         target_sources(${name} PRIVATE ${BOUNCE_TSAN_SRCS})
+        target_link_libraries(${name} PRIVATE ${BOUNCE_TEST_LIBS})
       else()
-        target_sources(${name} PRIVATE ${BOUNCE_REACTOR_SRCS})
-        target_link_libraries(
+        add_tllm_gtest(
           ${name}
-          PRIVATE tllm::executor_bounce_core tllm::executor_bounce_cuda
-                  tllm::executor_bounce_arena tllm::executor_bounce_control)
+          OWNER
+          executor
+          SOURCES
+          ${src}
+          LINK_LIBRARIES
+          tllm::executor_bounce_reactor
+          ${BOUNCE_TEST_LIBS}
+          LABELS
+          "unit;executor;bounce;integration;gpu")
       endif()
       target_include_directories(${name} PRIVATE ${BOUNCE_TEST_INCS})
-      target_link_libraries(${name} PRIVATE ${BOUNCE_TEST_LIBS})
     endfunction()
 
     # End-to-end transport over real RDMA (gather -> RDMA write -> scatter +
