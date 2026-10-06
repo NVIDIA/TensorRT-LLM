@@ -144,11 +144,15 @@ def test_launch_server_disables_gc_only_when_requested(
 
     monkeypatch.setattr(oe_server, "PyTorchLLM", _Llm)
     monkeypatch.setattr(oe_server, "OpenEngineServer", _Server)
+    gc_was_enabled = gc.isenabled()
     gc.enable()
     try:
         with pytest.raises(_StopLaunch):
             oe_server.launch_server("127.0.0.1", 0, {"backend": "pytorch", "model": "test-model"})
     finally:
-        gc.enable()
+        if gc_was_enabled:
+            gc.enable()
+        else:
+            gc.disable()
 
     assert seen["gc_enabled"] is gc_enabled
