@@ -157,7 +157,29 @@ set_target_properties(
   tllm_common_safetensors PROPERTIES CXX_EXTENSIONS OFF
                                      POSITION_INDEPENDENT_CODE ON)
 
-add_library(common_src OBJECT cudaArchitectures.cpp cudaFp8Utils.cu opUtils.cpp
+add_library(tllm_common_op_utils STATIC opUtils.cpp)
+add_library(tllm::common_op_utils ALIAS tllm_common_op_utils)
+target_link_libraries(
+  tllm_common_op_utils
+  PUBLIC tllm::common_cublas CUDA::cuda_driver
+  PRIVATE Threads::Threads)
+target_compile_definitions(
+  tllm_common_op_utils
+  PUBLIC ENABLE_MULTI_DEVICE=$<BOOL:${ENABLE_MULTI_DEVICE}>)
+if(ENABLE_MULTI_DEVICE)
+  target_include_directories(tllm_common_op_utils SYSTEM
+                             PUBLIC ${NCCL_INCLUDE_DIR})
+endif()
+if(ENABLE_CUBLASLT_FP4_GEMM)
+  target_compile_definitions(tllm_common_op_utils
+                             PRIVATE ENABLE_CUBLASLT_FP4_GEMM)
+endif()
+target_compile_features(tllm_common_op_utils PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_common_op_utils PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE
+                                                     ON)
+
+add_library(common_src OBJECT cudaArchitectures.cpp cudaFp8Utils.cu
                               sageQuant.cu)
 
 list(JOIN CMAKE_CUDA_ARCHITECTURES_ORIG "," TRTLLM_BUILT_CUDA_ARCHITECTURES)

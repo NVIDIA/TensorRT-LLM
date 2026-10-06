@@ -331,6 +331,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_common_native_memory
     tllm_common_nccl
     tllm_common_nccl_comm
+    tllm_common_op_utils
     tllm_common_profiler
     tllm_common_safetensors
     tllm_context_transfer_consensus
