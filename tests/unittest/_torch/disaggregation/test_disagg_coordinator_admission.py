@@ -264,7 +264,7 @@ def test_revert_is_a_no_op_without_deferred_v2_candidates(
 # -- early window predicate ---------------------------------------------------
 
 
-def test_early_window_needs_the_async_python_runtime_with_v2_and_pp1() -> None:
+def test_early_window_needs_the_python_runtime_with_v2_and_pp1() -> None:
     pp1, pp2 = SimpleNamespace(pp_size=1), SimpleNamespace(pp_size=2)
     async_python = SimpleNamespace(consumes_transfer_buffer=False)
     cpp = SimpleNamespace(consumes_transfer_buffer=True)
@@ -285,9 +285,15 @@ def test_early_window_does_not_assume_pp1_when_dist_lacks_pp_size() -> None:
 
 
 @pytest.mark.parametrize(
-    "mode", ["TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"]
+    "mode,eligible",
+    [
+        ("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", False),
+        ("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", True),
+    ],
 )
-def test_early_window_is_disabled_without_async_transfers(monkeypatch, mode: str) -> None:
+def test_early_window_supports_sync_but_skips_no_context_benchmarks(
+    monkeypatch, mode: str, eligible: bool
+) -> None:
     monkeypatch.setenv(mode, "1")
     transceiver = SimpleNamespace(consumes_transfer_buffer=False)
-    assert not early_transfer_window_eligible(transceiver, SimpleNamespace(pp_size=1), True)
+    assert early_transfer_window_eligible(transceiver, SimpleNamespace(pp_size=1), True) is eligible

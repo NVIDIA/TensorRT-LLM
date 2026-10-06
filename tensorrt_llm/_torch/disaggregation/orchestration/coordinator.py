@@ -43,15 +43,16 @@ def uses_async_gen_transfer() -> bool:
 
 
 def early_transfer_window_eligible(transceiver, dist, is_kv_manager_v2: bool) -> bool:
-    """Whether the V2 scheduler owns transfer admission while scheduling.
+    """Whether the V2 scheduler applies transfer admission while preparing INITs.
 
     PP followers reconcile their local allocations with the canonical schedule,
-    so PP and synchronous transfers retain post-scheduling admission.
+    so PP retains post-scheduling admission. Synchronous transfers also retain
+    the coordinator's token-window recheck.
     """
     return (
         transceiver is not None
         and transceiver.consumes_transfer_buffer is False
-        and uses_async_gen_transfer()
+        and not is_gen_only_no_context_benchmark()
         and dist.pp_size == 1
         and is_kv_manager_v2
     )
@@ -270,7 +271,9 @@ class DisaggTransferCoordinator:
             return fitting_gen_init, False
 
         controller = self._admission_controller
-        if early_transfer_window_eligible(self._transceiver, self._dist, self._is_kv_manager_v2):
+        if uses_async_gen_transfer() and early_transfer_window_eligible(
+            self._transceiver, self._dist, self._is_kv_manager_v2
+        ):
             # The scheduler has already applied the window to this list.
             if controller.cost_unit == "bytes":
                 return self._transceiver.sync_receive_admission(

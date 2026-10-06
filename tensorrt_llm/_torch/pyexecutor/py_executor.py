@@ -60,7 +60,7 @@ from ..disaggregation.orchestration.admission import \
     DisaggTransferAdmissionController
 from ..disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator, NoopDisaggCoordinator, attach_ctx_usage,
-    early_transfer_window_eligible)
+    early_transfer_window_eligible, uses_async_gen_transfer)
 from ..disaggregation.orchestration.pp_termination import \
     DisaggPPTerminationHandler
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
@@ -1022,8 +1022,10 @@ class PyExecutor:
                                    None)
         scheduler_owns_admission = early_transfer_window_eligible(
             kv_cache_transceiver, self.dist, self._is_kv_manager_v2)
+        bypass_token_window = (scheduler_owns_admission
+                               and uses_async_gen_transfer())
         capacity = None
-        if scheduler_owns_admission:
+        if bypass_token_window:
             from ..disaggregation.transceiver import KvCacheTransceiverV2
             if isinstance(kv_cache_transceiver, KvCacheTransceiverV2):
                 capacity = kv_cache_transceiver.get_receive_admission_capacity_bytes(
@@ -1042,7 +1044,7 @@ class PyExecutor:
                 "scheduler checks prepared receive layouts")
         else:
             self._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
-                None if scheduler_owns_admission else max_tokens_in_buffer,
+                None if bypass_token_window else max_tokens_in_buffer,
                 tokens_per_block)
         if (self._disagg_transfer_admission_controller.enabled()
                 and scheduler_owns_admission):
@@ -3911,9 +3913,9 @@ class PyExecutor:
 
         Args:
             scheduler_fitting_disagg_gen_init_requests: Generation INIT
-                requests that fit KV capacity before transfer admission. A
-                nonempty list means KV capacity exists even if transfer
-                admission temporarily defers every request.
+                candidates selected by the scheduler. An early transfer window
+                can also leave this list empty, so the accompanying transfer
+                backpressure flag distinguishes that case from KV exhaustion.
             wait_for_disagg_gen_transfer_progress: Whether active generation
                 transfers are consuming the admission budget and transfer
                 progress can unblock a deferred request.
@@ -4055,9 +4057,9 @@ class PyExecutor:
             # scheduler could not allocate KV for any of them, the benchmark
             # will hang forever because in-progress generation requests won't
             # release their KV cache.
-            # Check the scheduler result from before transfer admission. An
-            # empty admitted list can mean that active transfers are
-            # temporarily consuming the transfer budget.
+            # Pair scheduler candidates with transfer backpressure: an empty
+            # list alone does not distinguish an early window deferral from
+            # exhausted KV capacity.
             has_insufficient_kv = self._sync_gen_only_benchmark_has_insufficient_kv(
                 scheduler_fitting_disagg_gen_init_requests,
                 wait_for_disagg_gen_transfer_progress)
