@@ -115,7 +115,6 @@ class TestExaoneMoe(unittest.TestCase):
         config = ExaoneMoeConfig.from_dict(config_dict)
 
         self.assertIs(MODEL_CLASS_MAPPING["ExaoneMoeForCausalLM"], ExaoneMoeForCausalLM)
-        self.assertIs(MODEL_CLASS_MAPPING["ExaoneMoEForCausalLM"], ExaoneMoeForCausalLM)
         self.assertEqual(get_exaone_attention_window(config, 0, False), WINDOW_SIZE)
         self.assertEqual(get_exaone_attention_window(config, 1, False), WINDOW_SIZE)
         self.assertIsNone(get_exaone_attention_window(config, 3, False))
