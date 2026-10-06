@@ -255,7 +255,17 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;kernels;attention-mask;gpu")
-add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
+add_tllm_gtest(
+  fmhaDsv4EpilogueFusionTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaDsv4EpilogueFusionTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_trtllm_gen_fmha
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;fmha;gpu")
 add_tllm_gtest(
   fmhaHead104Test
   OWNER
