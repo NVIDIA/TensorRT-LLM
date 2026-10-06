@@ -45,6 +45,15 @@ import run_precheck as rp
 
 KEY = b"k" * 32
 
+_DEEPSEEK_V4_CONFIGS = [
+    (suite, path)
+    for suite in ("perf", "perf-sanity")
+    for path in sorted(
+        (Path(rp.__file__).parents[2] / suite / "disaggregated").glob("*deepseek-v4*.yaml")
+    )
+]
+assert _DEEPSEEK_V4_CONFIGS, "No DeepSeek V4 disaggregated configurations found"
+
 
 # --------------------------------------------------------------------------- #
 # rid / seed scheme
@@ -1323,13 +1332,7 @@ class TestInternalApiContract:
     @pytest.mark.parametrize("role", ["ctx", "gen"])
     @pytest.mark.parametrize(
         "config_path",
-        [
-            pytest.param(path, id=f"{suite}/{path.stem}")
-            for suite in ("perf", "perf-sanity")
-            for path in sorted(
-                (Path(rp.__file__).parents[2] / suite / "disaggregated").glob("*deepseek-v4*.yaml")
-            )
-        ],
+        [pytest.param(path, id=f"{suite}/{path.stem}") for suite, path in _DEEPSEEK_V4_CONFIGS],
     )
     def test_deepseek_v4_declared_architecture_without_checkpoint(
         self, api: object, tmp_path: Path, role: str, config_path: Path

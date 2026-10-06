@@ -932,6 +932,11 @@ class PrecheckRunner:
         self.work_dir = args.work_dir
         model_dir_resolved = plan.get("_model_dir") is not None
         kv_shape = plan.get("_kv_shape", {})
+        self.synthetic_kv_shape = (
+            not model_dir_resolved
+            or bool(kv_shape.get("simplified"))
+            or kv_shape.get("source") == "fallback"
+        )
         self.recorder = StatusRecorder(
             self.work_dir,
             self.role,
@@ -939,11 +944,7 @@ class PrecheckRunner:
             self.is_leader,
             metadata={
                 "model_dir_resolved": model_dir_resolved,
-                "synthetic_kv_shape": (
-                    not model_dir_resolved
-                    or bool(kv_shape.get("simplified"))
-                    or kv_shape.get("source") == "fallback"
-                ),
+                "synthetic_kv_shape": self.synthetic_kv_shape,
             },
         )
         self.zmq_ctx = None
@@ -1011,7 +1012,7 @@ class PrecheckRunner:
                 key: kv_shape[key] for key in ("num_layers", "num_kv_heads", "head_dim", "is_mla")
             },
         }
-        if self.is_leader and (kv_shape.get("simplified") or self.plan.get("_model_dir") is None):
+        if self.is_leader and self.synthetic_kv_shape:
             print(
                 f"[precheck {self.role}_{self.server_idx}] synthetic KV pool; "
                 f"model_dir={self.plan.get('_model_dir')!r}, "
