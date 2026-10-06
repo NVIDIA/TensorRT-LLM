@@ -26,7 +26,6 @@ set(SRCS
     ipcUtils.cpp
     ipcSocket.cpp
     mcastDeviceMemory.cpp
-    moeLoadBalancer/gdrwrap.cpp
     moeLoadBalancer/hostAccessibleDeviceAllocator.cpp
     moeLoadBalancer/moeLoadBalancer.cpp
     ncclCommunicator.cpp)
@@ -98,6 +97,15 @@ target_link_libraries(tllm_runtime_numpy PUBLIC tllm::runtime_buffers)
 target_compile_features(tllm_runtime_numpy PUBLIC cxx_std_20)
 set_target_properties(tllm_runtime_numpy PROPERTIES POSITION_INDEPENDENT_CODE
                                                     ON)
+
+add_library(tllm_runtime_gdr STATIC moeLoadBalancer/gdrwrap.cpp)
+add_library(tllm::runtime_gdr ALIAS tllm_runtime_gdr)
+target_link_libraries(
+  tllm_runtime_gdr
+  PUBLIC tllm::common_logging CUDA::cudart
+  PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+target_compile_features(tllm_runtime_gdr PUBLIC cxx_std_20)
+set_target_properties(tllm_runtime_gdr PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 foreach(component
         tllm_runtime_memory tllm_runtime_buffers tllm_runtime_distributed
