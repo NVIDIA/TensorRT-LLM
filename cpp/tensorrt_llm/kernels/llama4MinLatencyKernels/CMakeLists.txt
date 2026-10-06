@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2025-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -15,10 +15,10 @@
 # the License.
 #
 
-file(GLOB_RECURSE SRC_CPP *.cpp)
-file(GLOB_RECURSE SRC_CU *.cu)
-
-add_library(llama4_min_latency_kernels OBJECT ${SRC_CPP} ${SRC_CU})
+add_library(
+  llama4_min_latency_kernels OBJECT
+  llama4Bf16Bf16Gemm.cu llama4Fp8Bf16Gemm.cu llama4Fp8Fp8GemmSwiGLU.cu
+  llama4MinLatencyMoEOp.cu)
 set_property(TARGET llama4_min_latency_kernels
              PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET llama4_min_latency_kernels

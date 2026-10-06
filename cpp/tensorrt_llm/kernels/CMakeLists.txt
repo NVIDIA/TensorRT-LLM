@@ -38,10 +38,16 @@ add_subdirectory(csa2SparseContext)
 add_subdirectory(csa2SparseDecode)
 add_subdirectory(fusedSampling)
 
-file(GLOB_RECURSE SRC_CPP *.cpp)
-file(GLOB_RECURSE SRC_CU *.cu)
+# Attention dispatch objects are incorporated into tllm_common_attention.
+add_library(tllm_kernel_attention_dispatch OBJECT fmhaDispatcher.cpp
+                                                  xqaDispatcher.cpp)
+target_link_libraries(tllm_kernel_attention_dispatch
+                      PRIVATE trtllm_gen_fmha_interface)
+target_compile_features(tllm_kernel_attention_dispatch PRIVATE cxx_std_20)
+set_target_properties(
+  tllm_kernel_attention_dispatch PROPERTIES CXX_EXTENSIONS OFF
+                                            POSITION_INDEPENDENT_CODE ON)
 
-list(REMOVE_ITEM SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/kvCachePartialCopy.cu")
 add_library(tllm_kernel_kv_cache_copy STATIC kvCachePartialCopy.cu)
 add_library(tllm::kernel_kv_cache_copy ALIAS tllm_kernel_kv_cache_copy)
 target_link_libraries(tllm_kernel_kv_cache_copy PUBLIC tllm::common_cuda)
@@ -50,56 +56,6 @@ set_target_properties(
   tllm_kernel_kv_cache_copy PROPERTIES POSITION_INDEPENDENT_CODE ON
                                        CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_cuda_architectures(tllm_kernel_kv_cache_copy 89)
-
-# Exclude files in the cutlass_kernels, decoderMaskedMultiheadAttention and
-# selectiveScan trtllmGenKernels folder
-list(FILTER SRC_CPP EXCLUDE REGEX "cutlass_kernels/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "cutlass_kernels/.*")
-# Everything under moe/ is that directory's own business: its backend
-# sub-directories build their own targets, and moe/CMakeLists.txt hands the rest
-# back as MOE_KERNELS_SRC, which joins kernels_src below. Anchored on
-# "/kernels/" because the glob above yields absolute paths.
-list(FILTER SRC_CPP EXCLUDE REGEX "/kernels/moe/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "/kernels/moe/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "flashMLA/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "flashMLA/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "trtllmGenKernels/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "trtllmGenKernels/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "selectiveScan/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "selectiveScan/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "userbuffers/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "userbuffers/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "fusedLayernormKernels/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "fusedGatedRMSNormQuant/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "mamba2MTPSSMCache/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "kdaDecode/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "kdaDecode/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "kimiK3AttnRes/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "kimiK3AttnRes/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "mhcKernels/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "mhcKernels/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "compressorKernels/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "compressorKernels/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "csa2SparseContext/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "csa2SparseContext/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "csa2SparseDecode/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "csa2SparseDecode/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "fusedSampling/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "fusedSampling/.*")
-# Marlin is built as its own architecture-scoped OBJECT library below.
-list(FILTER SRC_CPP EXCLUDE REGEX "marlin/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "marlin/.*")
-# The MiniMax-M3 decode attention kernels are built as their own
-# architecture-scoped OBJECT library below.
-list(FILTER SRC_CU EXCLUDE REGEX
-     "minimaxM3/(fusedDecodeAttn|attnMega|attnC1)\\.cu$")
-# The MiniMax-M3 sm_107 decode kernels are built as their own sm_107-only OBJECT
-# library below.
-list(FILTER SRC_CU EXCLUDE REGEX "minimaxM3Sm107(Tp[248])?/.*")
 
 # Lower CUDA optimization level when FAST_BUILD is enabled to speed up
 # compilation. CMake by default adds -O3 to CMAKE_CUDA_FLAGS_RELEASE. We
@@ -115,25 +71,29 @@ if(FAST_BUILD)
 endif()
 
 include(kernelComponents.cmake)
+set(existing_kernel_components ${TLLM_KERNEL_COMPONENT_TARGETS})
+include(residualKernelComponents.cmake)
+set(residual_kernel_components ${TLLM_KERNEL_COMPONENT_TARGETS})
+list(REMOVE_ITEM residual_kernel_components ${existing_kernel_components})
 set(TLLM_KERNEL_COMPONENT_TARGETS
     ${TLLM_KERNEL_COMPONENT_TARGETS}
     PARENT_SCOPE)
 
-# Marlin NVFP4: build Ada/Hopper kernels and the dense W4A16/repack kernels used
-# on SM12x. Unsupported device passes emit empty kernel stubs.
-file(GLOB_RECURSE MARLIN_SRC "marlin/*.cu" "marlin/*.cpp")
-if(MARLIN_SRC)
-  add_library(marlin_src OBJECT ${MARLIN_SRC})
-  set_property(TARGET marlin_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-  set_property(TARGET marlin_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-  target_include_directories(
-    marlin_src
-    PRIVATE
-      $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
-  )
-  target_link_libraries(marlin_src PRIVATE trtllm_gen_fmha_interface)
-  set_cuda_architectures(marlin_src 89 90 120f)
-endif()
+# Marlin owns its architecture-scoped translation units; kernels_src packages
+# the resulting objects for legacy aggregate consumers.
+add_library(
+  marlin_src OBJECT
+  marlin/marlin_nvfp4_dispatch_utils.cpp marlin/marlin_nvfp4_gemm.cu
+  marlin/marlin_nvfp4_moe_gemm.cu marlin/marlin_repack.cu)
+set_property(TARGET marlin_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET marlin_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_include_directories(
+  marlin_src
+  PRIVATE
+    $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
+)
+target_link_libraries(marlin_src PRIVATE trtllm_gen_fmha_interface)
+set_cuda_architectures(marlin_src 89 90 120f)
 
 # MiniMax-M3 decode attention: block-scaled tcgen05 MMAs (.scale_vec::1X) exist
 # on the arch-specific sm_100a / sm_103a targets only, not on the sm_100f family
@@ -173,11 +133,18 @@ endif()
 set_property(TARGET minimax_m3_sm107_src PROPERTY CUDA_ARCHITECTURES
                                                   ${MINIMAX_M3_SM107_ARCHS})
 
+# Compatibility archive: specialized object libraries have one compilation
+# owner, and ordinary kernel families are selected through component libraries.
 add_library(
   kernels_src STATIC
-  ${SRC_CPP} ${SRC_CU} ${MOE_KERNELS_SRC}
-  $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>
-  $<TARGET_OBJECTS:minimax_m3_attn_src> $<TARGET_OBJECTS:minimax_m3_sm107_src>)
+  $<TARGET_OBJECTS:minimax_m3_attn_src>
+  $<TARGET_OBJECTS:minimax_m3_sm107_src>
+  $<TARGET_OBJECTS:moe_dynamic_eplb_src>
+  $<TARGET_OBJECTS:marlin_src>
+  $<TARGET_OBJECTS:causalConv1d_src>
+  $<TARGET_OBJECTS:groupRmsNormKernels_src>
+  $<TARGET_OBJECTS:dsv3_min_latency_kernels>
+  $<TARGET_OBJECTS:llama4_min_latency_kernels>)
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories(
@@ -185,5 +152,41 @@ target_include_directories(
   PUBLIC
     $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
 )
-target_link_libraries(kernels_src PUBLIC trtllm_gen_fmha_interface)
+target_link_libraries(kernels_src PUBLIC ${residual_kernel_components}
+                                         trtllm_gen_fmha_interface)
 add_cuda_architectures(kernels_src 89)
+
+include(kernelSourceOwnership.cmake)
+get_property(
+  kernel_targets
+  DIRECTORY
+  PROPERTY BUILDSYSTEM_TARGETS)
+tllm_check_kernel_source_ownership(
+  TARGETS
+  ${kernel_targets}
+  causalConv1d_src
+  groupRmsNormKernels_src
+  dsv3_min_latency_kernels
+  llama4_min_latency_kernels
+  DELEGATED_DIRECTORIES
+  cutlass_kernels
+  contextFusedMultiHeadAttention
+  decoderMaskedMultiheadAttention
+  flashMLA
+  trtllmGenKernels
+  selectiveScan
+  userbuffers
+  fusedLayernormKernels
+  fusedGatedRMSNormQuant
+  mamba2MTPSSMCache
+  kdaDecode
+  kimiK3AttnRes
+  mhcKernels
+  compressorKernels
+  fusedSampling
+  csa2SparseContext
+  csa2SparseDecode
+  moe/loadBalance/dynamicEplb
+  moe/cutlass=cutlass_kernels
+  moe/trtllmGen
+  moe/cuteDsl)

@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -15,9 +15,7 @@
 # the License.
 #
 
-file(GLOB_RECURSE SRC_CPP *.cpp)
-file(GLOB_RECURSE SRC_CU *.cu)
-add_library(causalConv1d_src OBJECT ${SRC_CPP} ${SRC_CU})
+add_library(causalConv1d_src OBJECT causalConv1d.cu)
 
 target_compile_options(causalConv1d_src
                        PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-maxrregcount=32>)
