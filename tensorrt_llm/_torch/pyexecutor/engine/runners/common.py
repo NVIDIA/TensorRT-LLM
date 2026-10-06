@@ -5,18 +5,24 @@
 
 import bisect
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_multimodal_utils import filter_mm_token_from_input_ids
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+from .interface import ScheduledInputs
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.sampler.sampler import SampleStateTensors
 
 
 def get_all_rank_num_tokens(
@@ -207,3 +213,24 @@ def ship_multimodal_indices(
         text_token_indices_cpu = torch.cat([text_token_indices_cpu, extra_text])
     text_token_indices_cpu = maybe_pin_memory(text_token_indices_cpu)
     inputs["text_token_indices"] = text_token_indices_cpu.to("cuda", non_blocking=True)
+
+
+def make_scheduled_inputs(
+    batch: ScheduledRequests,
+    new_tensors_device: "SampleStateTensors | None",
+    cache_indirection_buffer: torch.Tensor | None,
+    *,
+    enable_spec_decode: bool,
+    runtime_draft_len: int,
+) -> ScheduledInputs:
+    """Build a scheduled record that gathers context logits when any request returns them."""
+    return ScheduledInputs(
+        batch=batch,
+        new_tensors_device=new_tensors_device,
+        cache_indirection_buffer=cache_indirection_buffer,
+        gather_context_logits=any(
+            request.py_return_context_logits for request in batch.context_requests
+        ),
+        enable_spec_decode=enable_spec_decode,
+        runtime_draft_len=runtime_draft_len,
+    )

@@ -94,6 +94,10 @@ KVCacheEventManager = _cpp.KVCacheEventManager
 KVCacheIterationStatsDelta = _cpp.KVCacheIterationStatsDelta
 KVCacheManager = _cpp.KVCacheManager
 KVCacheManagerConfig = _cpp.KVCacheManagerConfig
+StreamingBlockRemovedData = _cpp.StreamingBlockRemovedData
+StreamingBlockStoredData = _cpp.StreamingBlockStoredData
+StreamingEventSink = _cpp.StreamingEventSink
+StreamingEventStats = _cpp.StreamingEventStats
 IKvCacheColdPageCodec = _cpp.IKvCacheColdPageCodec
 create_default_kv_cache_cold_page_codec = _cpp.create_default_kv_cache_cold_page_codec
 # The C++ KVCacheManagerConfig binding replaces the Python @dataclass, but
@@ -258,6 +262,10 @@ __all__ = [
     "SlotDesc",
     "SlotDescVariant",
     "SsmLayerConfig",
+    "StreamingBlockRemovedData",
+    "StreamingBlockStoredData",
+    "StreamingEventSink",
+    "StreamingEventStats",
     "SwaScratchReuseConfig",
     "TokenId",
     "TokenIdExt",
