@@ -1130,6 +1130,24 @@ class AttentionBackend(Generic[TMetadata]):
         """
         return True
 
+    @classmethod
+    def runtime_workspace_fixed_bytes(
+        cls,
+        model_config: "ModelConfig",
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        max_num_tokens: int,
+        max_seq_len: int,
+        enable_cuda_graph: bool,
+    ) -> int:
+        """Capacity-sized workspace not bounded by summed attended KV length.
+
+        The estimator reserves the full capacity alongside the profiled peak,
+        covering arenas first allocated after the peak prefill step.
+        """
+        return 0
+
     def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:
         """
         Create the output tensors for the attention operation.

@@ -354,7 +354,9 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # ---- Main scheduling loop ----
 
-    def _schedule_loop(self, active_requests, inflight_request_ids):
+    def _schedule_loop(
+        self, active_requests, inflight_request_ids, *, defer_remote_tail_context=False
+    ):
         scheduled_ctx: RequestList = []
         scheduled_remote_mode = None
         scheduled_encoder: RequestList = []
@@ -378,7 +380,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             (
                 getattr(req, "py_csa2_remote_tail_mode", None)
                 for req in requests_list
-                if self.remote_tail_phase is not RemoteTailPhase.DECODE
+                if not defer_remote_tail_context
+                and self.remote_tail_phase is not RemoteTailPhase.DECODE
                 and req.request_id not in inflight_request_ids
                 and req.state_value == self._context_init_state_value
                 and getattr(req, "py_csa2_remote_tail_mode", None) is not None
@@ -577,6 +580,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             if req.py_request_id in preempted_ids:
                 continue
             remote_mode = getattr(req, "py_csa2_remote_tail_mode", None)
+            if defer_remote_tail_context and remote_mode is not None:
+                continue
             if exclusive_remote_mode is not None and remote_mode != exclusive_remote_mode:
                 continue
             # Destination replay is atomic; source prefix processing may be chunked.
@@ -644,21 +649,33 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
+        made_progress = bool(
+            scheduled_gen
+            or scheduled_ctx
+            or scheduled_encoder
+            or disagg_candidates
+            or evicted
+            or recompute_paused
+            or deferred_behind_contributor
+        )
+        if (
+            self.remote_tail_phase is None
+            and exclusive_remote_mode is not None
+            and not made_progress
+        ):
+            # A non-ADP replay that cannot acquire KV must let decode release
+            # pages. Retry admission without replay; keep its forward isolated.
+            return self._schedule_loop(
+                requests_list, inflight_request_ids, defer_remote_tail_context=True
+            )
+
         # Phase and frozen-membership deferrals are not KV capacity stalls.
         self._detect_deadlock(
             requests_list,
             inflight_request_ids,
             pending_ctx,
             preempted_ids,
-            made_progress=bool(
-                scheduled_gen
-                or scheduled_ctx
-                or scheduled_encoder
-                or disagg_candidates
-                or evicted
-                or recompute_paused
-                or deferred_behind_contributor
-            ),
+            made_progress=made_progress,
         )
 
         return (

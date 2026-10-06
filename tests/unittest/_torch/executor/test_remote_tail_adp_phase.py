@@ -160,6 +160,29 @@ def test_eligible_generation_kv_exhaustion_still_raises(phase: RemoteTailPhase |
     manager.suspend_request.assert_not_called()
 
 
+@pytest.mark.parametrize("remote_mode", ["source", "destination"])
+def test_non_adp_blocked_remote_tail_allows_generation_progress(remote_mode) -> None:
+    manager = make_kv_cache_manager(prepare_context_fn=lambda req, reuse_limit=None: False)
+    scheduler = make_scheduler(manager, max_num_tokens=128, enable_recompute_pause=False)
+    scheduler._DEADLOCK_STALL_ITERS = 2
+    replay = make_ctx_request(1, 64)
+    replay.py_csa2_remote_tail_mode = remote_mode
+    generation = _make_generation_request(2)
+    assert scheduler.remote_tail_phase is None
+
+    for _ in range(scheduler._DEADLOCK_STALL_ITERS + 2):
+        result = scheduler.schedule_request([replay, generation], set())
+        assert not result.context_requests
+        assert result.generation_requests == [generation]
+        assert scheduler._stalled_schedules == 0
+
+    manager.prepare_context.side_effect = lambda req, reuse_limit=None: True
+    replay.context_remaining_length = 64
+    resumed = scheduler.schedule_request([replay], set())
+    assert resumed.context_requests == [replay]
+    assert not resumed.generation_requests
+
+
 @pytest.mark.parametrize("phase", list(RemoteTailPhase))
 def test_frozen_phase_filters_before_kv_work_and_keeps_transfer_admission(
     phase: RemoteTailPhase,

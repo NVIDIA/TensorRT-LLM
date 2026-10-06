@@ -218,8 +218,8 @@ def _fp8_mla_model_config(sparse_algorithm):
         # Absorption path, TRTLLM-gen SM, fallback off -> K/V read from the paged cache, nothing staged.
         ("dsa", 100, "0", True),
         ("deepseek_v4", 103, "0", True),
-        # CSA2 always passes selected indices to C++ and has no short-seq MHA fallback.
-        ("csa2", 100, "1024", True),
+        # CSA2 gathers compressed index history even without a dense MLA fallback.
+        ("csa2", 100, "1024", False),
         # Short-seq MHA fallback sends short contexts down the dense path -> buffer is staged.
         ("dsa", 100, "1024", False),
         # Skip-softmax is a sparse config but passes no sparse indices to C++, so MLA stays dense.
@@ -238,8 +238,22 @@ def test_workspace_bytes_zero_only_for_absorption_mode_sparse_mla(
     # admission cap -- exactly the mid-forward OOM this reservation exists to prevent.
     monkeypatch.setattr(trtllm_backend, "get_sm_version", lambda: sm)
     monkeypatch.setenv("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", short_seq_mha)
+    model_config = _fp8_mla_model_config(sparse_algorithm)
+    if sparse_algorithm == "csa2":
+        model_config.pretrained_config = SimpleNamespace(
+            kv_lora_rank=448,
+            qk_rope_head_dim=64,
+            compress_ratios=(0, 2),
+            kv_source_layer_ids=(1,),
+            index_source_layer_ids=(1,),
+            candidate_source_layer_id=None,
+            candidate_topk_blocks=2048,
+            candidate_block_size=8,
+            index_topk=512,
+            sliding_window=128,
+        )
     w = get_attention_workspace_bytes_per_token(
-        _fp8_mla_model_config(sparse_algorithm),
+        model_config,
         SimpleNamespace(enable_attention_dp=False, tp_size=8),
     )
     assert (w == 0) if expect_zero else (w > 0)

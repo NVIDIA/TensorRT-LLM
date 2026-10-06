@@ -25,7 +25,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .indexer import CSA2Indexer
 from .metadata import CSA2TrtllmMetadata
-from .params import CSA2BackendForwardArgs, CSA2Mode, CSA2Params, select_csa2_backend
+from .params import CSA2BackendForwardArgs, CSA2Layout, CSA2Mode, CSA2Params, select_csa2_backend
 
 if TYPE_CHECKING:
     from flashinfer.prefill import (
@@ -78,6 +78,59 @@ class CSA2TrtllmAttention(TrtllmAttention):
 
     Metadata = CSA2TrtllmMetadata
     compute_backend = "trtllm"
+
+    @classmethod
+    def runtime_workspace_bytes_per_token(cls, model_config, mapping) -> int:
+        return CSA2TrtllmMetadata.cache_gather_bytes_per_token(model_config)
+
+    @classmethod
+    def runtime_workspace_is_chunked_prefill_bounded(cls, model_config) -> bool:
+        # Index prefill gathers the complete compressed prefix of each query chunk.
+        return False
+
+    @classmethod
+    def runtime_workspace_fixed_bytes(
+        cls,
+        model_config,
+        mapping,
+        *,
+        max_batch_size: int,
+        max_num_tokens: int,
+        max_seq_len: int,
+        enable_cuda_graph: bool,
+    ) -> int:
+        if not is_sm_100f() or max_batch_size <= 0 or max_num_tokens <= 0:
+            return 0
+        layout = CSA2Layout.from_hf_config(model_config.pretrained_config)
+        owners = layout.kv_source_layer_ids
+        if not owners:
+            return 0
+        max_positions = max(1, max_seq_len // min(layout.compress_ratios[i] for i in owners))
+        pages = max(1, (max_positions + 63) // 64)
+        spec_config = model_config.spec_config
+        draft_width = spec_config.tokens_per_gen_step if spec_config is not None else 1
+        query_capacity = max_batch_size * draft_width
+        num_sms = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+
+        def arena_bytes(queries: int, page_capacity: int) -> int:
+            return CSA2TrtllmMetadata.workspace_reservation_bytes(
+                max_batch_size,
+                queries,
+                page_capacity * 64,
+                layout.index_topk,
+                num_sms,
+                num_owners=len(owners),
+            )
+
+        # Eager arenas grow to a power-of-two page capacity. The graph arena
+        # uses exact maximum geometry and is shared across captured batch sizes.
+        eager_pages = 1 << (pages - 1).bit_length()
+        reserve = arena_bytes(min(max_num_tokens, query_capacity), eager_pages)
+        if enable_cuda_graph:
+            reserve += arena_bytes(query_capacity, pages)
+        return reserve
 
     def __init__(
         self,

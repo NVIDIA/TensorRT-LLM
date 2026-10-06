@@ -857,10 +857,12 @@ def test_temporal_prefill_seeds_first_decode(manager_requests, monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
-def test_graph_workspace_rejects_underfunded_resolved_cap(manager_requests):
+def test_graph_workspace_is_independent_of_context_gather_cap(manager_requests):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.metadata import KVCacheParams
 
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Native FP4 paged descriptors require SM100-family GPUs")
     manager, requests = manager_requests
     metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=8, kv_cache_manager=manager)
     metadata.is_cuda_graph = True
@@ -871,9 +873,41 @@ def test_graph_workspace_rejects_underfunded_resolved_cap(manager_requests):
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0, 0])
     metadata.prepare()
     manager.fp8_ctx_mla_kv_len_cap = 1
-    with pytest.raises(ValueError, match="full admitted request KV bound"):
-        metadata.prepare_indexer(1)
-    assert not hasattr(metadata, "_csa2_indexer_workspaces")
+    metadata.prepare_indexer(1)
+    metadata.prepare_indexer(3)
+    arenas = list(metadata._csa2_indexer_workspaces.values())
+    assert len(arenas) == 1
+    assert arenas[0]["block_table"].shape[0] == metadata.max_num_requests
+    expected = metadata._workspace_storage_bytes(arenas)
+    assert expected > 0
+    from tensorrt_llm._torch.pyexecutor._util import (
+        get_attention_workspace_fixed_bytes,
+        get_attention_workspace_is_chunked_prefill_bounded,
+    )
+
+    layout = vars(manager.layout).copy()
+    layout["sliding_window"] = layout.pop("window_size")
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(**layout, kv_lora_rank=448, qk_rope_head_dim=64),
+        sparse_attention_config=SimpleNamespace(algorithm="csa2"),
+        attn_backend="TRTLLM",
+        quant_config=None,
+        spec_config=None,
+    )
+    assert not get_attention_workspace_is_chunked_prefill_bounded(model_config)
+    # At this power-of-two geometry, eager and graph arenas have equal size.
+    # Compare the estimator declaration against real retained GPU storage.
+    assert (
+        get_attention_workspace_fixed_bytes(
+            model_config,
+            Mapping(),
+            max_batch_size=2,
+            max_num_tokens=8,
+            max_seq_len=512,
+            enable_cuda_graph=True,
+        )
+        == 2 * expected
+    )
 
 
 @pytest.fixture
