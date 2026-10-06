@@ -185,6 +185,21 @@ def _is_pytest_basedir(directory: str) -> bool:
     return False
 
 
+def _in_virtualenv(directory: str, root: str) -> bool:
+    """True when ``directory`` sits inside a virtualenv that lives under ``root``.
+
+    A virtualenv kept in the project tree puts its own entries on sys.path:
+    the ``bin`` directory of the entry script that launched pytest, and the
+    directories that installed packages append to themselves. None of that is
+    test code, so it is not the check's concern.
+    """
+    while directory != root and directory != os.path.dirname(directory):
+        if os.path.exists(os.path.join(directory, "pyvenv.cfg")):
+            return True
+        directory = os.path.dirname(directory)
+    return False
+
+
 def _under_exempt_tree(relative: str) -> bool:
     """Whether a project-relative entry sits in one of _NON_TEST_TREES.
 
@@ -242,9 +257,14 @@ def _check_sys_path(config) -> list[str]:
         relative = _project_relative(entry)
         if relative is None or relative in expected:
             continue
-        if _under_exempt_tree(relative):
+        directory = os.path.join(root, relative)
+        # Not a directory: a path-hook marker such as the one an editable
+        # install registers, which puts no project directory on the path.
+        if not os.path.isdir(directory):
             continue
-        if _is_pytest_basedir(os.path.join(root, relative)):
+        if _under_exempt_tree(relative) or _in_virtualenv(directory, root):
+            continue
+        if _is_pytest_basedir(directory):
             continue
         if relative not in unexpected:
             unexpected.append(relative)

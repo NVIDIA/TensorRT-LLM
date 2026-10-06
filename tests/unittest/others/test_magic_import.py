@@ -776,6 +776,37 @@ def test_sys_path_check_ignores_paths_outside_the_project(sys_path_report, tmp_p
     assert sys_path_report(outside, "/usr/lib/python3", "") == []
 
 
+def test_sys_path_check_ignores_a_virtualenv_inside_the_project(sys_path_report, tree):
+    """The launcher's bin directory and directories installed packages append to."""
+    venv = tree.project_root / ".venv"
+    venv.mkdir()
+    (venv / "pyvenv.cfg").write_text("")
+    launcher = venv / "bin"
+    package = venv / "lib" / "site-packages" / "dsl" / "base"
+    launcher.mkdir()
+    package.mkdir(parents=True)
+    (package / "mi_helper.py").write_text("")
+
+    assert sys_path_report(launcher, package) == []
+
+
+def test_sys_path_check_reports_a_venv_lookalike(sys_path_report, tree):
+    helpers = tree.project_root / ".venv" / "helpers"
+    helpers.mkdir(parents=True)
+    (helpers / "mi_helper.py").write_text("")
+
+    assert sys_path_report(helpers) == [os.path.join(".venv", "helpers")]
+
+
+def test_sys_path_check_ignores_an_entry_that_is_not_a_directory(
+    sys_path_report, tree, monkeypatch
+):
+    """An editable install registers a path-hook marker, not a directory."""
+    monkeypatch.chdir(tree.project_root)
+
+    assert sys_path_report("__editable__.pkg-1.0.finder.__path_hook__") == []
+
+
 @pytest.mark.parametrize("ignored_tree", _NON_TEST_TREES)
 def test_sys_path_check_ignores_every_non_test_tree(sys_path_report, tree, ignored_tree):
     """Entries the product or a vendored package adds when imported.
