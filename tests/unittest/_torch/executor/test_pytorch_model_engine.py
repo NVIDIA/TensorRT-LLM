@@ -910,9 +910,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
         self.assertEqual(
             key,
-            KeyType(batch_size=1,
-                    draft_len=0,
-                    use_lora_graph=True),
+            KeyType(batch_size=1, draft_len=0, use_lora_graph=True),
         )
 
     def test_lora_graph_variant_selection(self) -> None:
