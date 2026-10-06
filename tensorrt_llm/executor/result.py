@@ -73,6 +73,16 @@ class LogProbsResult(NamedTuple):
     generation: Optional[TokenLogprobs | SimpleTokenLogprobs] = None
 
 
+class _SpecDecCounters(NamedTuple):
+    """Speculative-decoding counters reported by the request behind one sequence.
+
+    Field names match the executor response so a formatter can read either.
+    """
+    per_pos_drafted: Optional[List[int]] = None
+    per_pos_accepted: Optional[List[int]] = None
+    spec_dec_totals: Optional[tuple[int, int]] = None
+
+
 class ResponseWrapper:
     """1. Wrapper of runtime response with optional outputs computed post runtime.
     2. A workaround to pass around RequestPerfMetrics.
@@ -157,6 +167,10 @@ class CompletionOutput:
                                                 repr=False)
     # the result of result_handler passed to postprocess workers
     _postprocess_result: Any = None
+    # this sequence's own spec-decode counters; see _handle_sequence
+    _spec_dec_counters: Optional[_SpecDecCounters] = field(default=None,
+                                                           init=False,
+                                                           repr=False)
 
     def __getstate__(self) -> dict:
         # _incremental_states holds a tokenizers.DecodeStream (a Rust object,
@@ -367,6 +381,15 @@ class GenerationResultBase:
         output.disaggregated_params = self.disaggregated_params
         output._last_token_ids_len = len(output.token_ids)
         output._last_logprobs_len = len(output.logprobs)
+        # With n > 1 each candidate is its own child request with its own
+        # counters, while the request-level copies on self are overwritten by
+        # every candidate's response. Capture this sequence's here so a choice
+        # never reports whichever candidate happened to respond last.
+        output._spec_dec_counters = _SpecDecCounters(
+            per_pos_drafted=getattr(response_tensors, 'per_pos_drafted', None),
+            per_pos_accepted=getattr(response_tensors, 'per_pos_accepted',
+                                     None),
+            spec_dec_totals=getattr(response_tensors, 'spec_dec_totals', None))
         decoder_output_prefix = ()
         if (self.sampling_params.exclude_input_from_output
                 or getattr(self, "_streaming", False)):

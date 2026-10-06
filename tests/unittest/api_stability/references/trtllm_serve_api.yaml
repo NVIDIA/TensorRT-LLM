@@ -364,6 +364,12 @@ models:
         default: null
         status: beta
         required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
+        required: false
 
   CompletionResponse:
     fields:
@@ -453,6 +459,12 @@ models:
         type: Optional[float]
         default: null
         status: beta
+        required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
         required: false
 
   CompletionStreamResponse:
@@ -883,6 +895,12 @@ models:
         default: null
         status: beta
         required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
+        required: false
 
   ChatCompletionResponse:
     fields:
@@ -972,6 +990,12 @@ models:
         type: Optional[float]
         default: null
         status: beta
+        required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
         required: false
 
   ChatCompletionStreamResponse:

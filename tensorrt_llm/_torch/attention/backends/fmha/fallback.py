@@ -45,6 +45,7 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
         "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention.forward`` for NVFP4 path
         "skip_mla_rope_generation",  # handled in ``TrtllmAttention.forward`` for the test-only MLA path
         "timestep",  # consumed by sparse prediction before FMHA dispatch
+        "sparse_attn_phase",  # host-resolved sparse phase, consumed before FMHA dispatch
     }
 )
 

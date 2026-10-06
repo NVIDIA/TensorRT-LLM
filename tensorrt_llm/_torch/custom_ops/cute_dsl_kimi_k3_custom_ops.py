@@ -1005,11 +1005,7 @@ def _chunk_kda_fwd(
         if chunk_indices is None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
         NT = len(chunk_indices)
-        # Any chunk count is launchable: the varlen scheduler rounds up
-        # (`total_cgs_per_head = ceil(num_chunks / CHUNKS_PER_BLOCK)`), launches
-        # the constant `NUM_SMS` grid, and guards every chunk loop with
-        # `chunk_idx < num_chunks`. Only eqlen needs divisibility, and it gets
-        # that from its own `CPB_BT` pad above.
+        # The varlen scheduler supports any chunk count.
         N_seqs = len(cu_seqlens) - 1
     else:
         NT = T // BT
