@@ -57,6 +57,8 @@ def _manager() -> Mock:
     manager.enable_block_reuse = False
     manager._has_cp_helix = False
     manager.num_extra_kv_tokens = 0
+    manager._standalone_draft_reserve = 0
+    manager.draft_layer_ids = ()
     manager.kv_cache_map = {}
     manager.prepare_context_cache.return_value = 0
     manager.prepare_disagg_gen_init = MethodType(KVCacheManagerV2.prepare_disagg_gen_init, manager)

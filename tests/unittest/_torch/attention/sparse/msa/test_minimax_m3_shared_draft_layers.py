@@ -181,6 +181,7 @@ def test_block_scale_role_uses_global_layer_ids(dtype: DataType) -> None:
     manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
     manager.dtype = dtype
     manager.pp_layers = [60, 7, 2]
+    manager.dtype_per_layer = [dtype] * len(manager.pp_layers)
     manager.sparse_layer_ids = {7}
     for local_layer, expected_nvfp4 in enumerate((None, Role.KEY_BLOCK_SCALE, None)):
         expected = expected_nvfp4 if dtype == DataType.NVFP4 else None
@@ -188,6 +189,7 @@ def test_block_scale_role_uses_global_layer_ids(dtype: DataType) -> None:
         assert manager._get_block_scale_role(Role.VALUE, local_layer) is None
     generic = KVCacheManagerV2.__new__(KVCacheManagerV2)
     generic.dtype = dtype
+    generic.dtype_per_layer = [dtype]
     expected = Role.KEY_BLOCK_SCALE if dtype == DataType.NVFP4 else None
     assert generic._get_block_scale_role(Role.KEY, 0) == expected
 

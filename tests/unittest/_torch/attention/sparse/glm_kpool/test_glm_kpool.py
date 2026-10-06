@@ -158,6 +158,8 @@ def test_indexer_runtime_cache_cost_matches_registered_buffers(fp8, snapshot_int
     manager.kv_cache_type = CacheTypeCpp.SELFKONLY
     manager.kv_factor = 1
     manager.dtype = DataType.FP8 if fp8 else DataType.BF16
+    manager.dtype_per_layer = [manager.dtype] * manager.num_local_layers
+    manager.kv_factor_per_layer = [manager.kv_factor] * manager.num_local_layers
     manager.tokens_per_block = 32
     manager.max_batch_size = 4
     manager.max_num_tokens = 16

@@ -877,6 +877,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         is_kv_aggregate: bool = True,
         num_blocks_per_seq: Optional[Sequence[int]] = None,
         index_scale: Optional[int] = None,
+        kv_factor: Optional[int] = None,
     ):
         """Return page indices; padded entries remain ``BAD_PAGE_INDEX`` (-1).
 

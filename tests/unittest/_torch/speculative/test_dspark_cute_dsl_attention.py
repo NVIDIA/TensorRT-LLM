@@ -1,20 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""GPU correctness tests for the DSpark CuteDSL attention op."""
-
-from unittest.mock import Mock
+"""GPU correctness tests for paged DSpark CuteDSL attention and preparation."""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.custom_ops import dspark_attention_custom_op as attention_op
+from tensorrt_llm._torch.custom_ops import dspark_rmsnorm_rope_custom_op as preparation_op
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._torch.models.modeling_dspark import (
-    _rope_last_dims_batched,
-    dspark_attention_forward,
-    precompute_dspark_freqs_cis,
-)
+from tensorrt_llm._torch.models import modeling_dspark as dspark
 from tensorrt_llm._utils import get_sm_version
 
 _ROPE_DIM = 64
@@ -28,337 +24,422 @@ pytestmark = pytest.mark.skipif(
 
 
 def _make_inputs(
-    seed: int = 0,
-    batch: int = 2,
-    block: int = 6,
-    start_pos_values=None,
-    cache_pages: int | None = None,
-    page_size: int = 256,
+    seed=0,
+    batch=2,
+    block=6,
+    heads=128,
+    page_size=32,
+    positions=None,
+    valid_lengths=None,
+    capacities=None,
+    extra_pages=0,
 ):
     torch.manual_seed(seed)
     device = torch.device("cuda")
-    if start_pos_values is not None:
-        batch = len(start_pos_values)
-    heads, head_dim = 128, 512
-    q = torch.randn(batch, block, heads, head_dim, device=device, dtype=torch.bfloat16)
-    main_kv = torch.randn(batch, head_dim, device=device, dtype=torch.bfloat16)
-    block_kv = torch.randn(batch, block, head_dim, device=device, dtype=torch.bfloat16)
-
-    if start_pos_values is None:
-        start_pos_values = [199 * i + 1 for i in range(batch)]
-    start_pos = torch.tensor(start_pos_values, device=device, dtype=torch.int64)
-    width = (max(start_pos_values) + page_size - 1) // page_size
-    required_pages = batch * width
-    cache_pages = max(cache_pages or 0, required_pages + 1)
-    cache_storage = torch.randn(
-        cache_pages, 3, page_size, head_dim, device=device, dtype=torch.bfloat16
+    if positions is None:
+        positions = [1 + (37 * i) % 386 for i in range(batch)]
+    batch = len(positions)
+    positions = torch.tensor(positions, device=device, dtype=torch.int64)
+    lengths = (
+        positions.clamp(max=128)
+        if valid_lengths is None
+        else torch.tensor(valid_lengths, device=device, dtype=torch.int64)
     )
-    kv_cache = cache_storage[:, 1]
-    assert not kv_cache.is_contiguous()
-    # Physical pages differ from logical positions and from batch row indices.
-    tables = torch.arange(required_pages, 0, -1, device=device, dtype=torch.int32)
-    tables = tables.reshape(batch, width)
-    sink = torch.randn(heads, device=device, dtype=torch.float32)
-    # Per-request RoPE phases match the runtime indexing contract.
-    table = precompute_dspark_freqs_cis(_ROPE_DIM, int(start_pos.max()) + block + 2, device=device)
-    blk_freqs = table[start_pos.long().unsqueeze(1) + 1 + torch.arange(block, device=device)]
-    inverse_rope_freqs = torch.view_as_real(blk_freqs).contiguous()
-    return q, main_kv, block_kv, kv_cache, tables, start_pos, sink, blk_freqs, inverse_rope_freqs
-
-
-def _valid_len(start_pos):
-    return start_pos.clamp(max=128)
-
-
-def _capacities(kv_cache, tables):
-    return torch.full(
-        (tables.shape[0],),
-        tables.shape[1] * kv_cache.shape[1],
-        dtype=torch.int64,
-        device=kv_cache.device,
+    capacities = torch.tensor(
+        [512] * batch if capacities is None else capacities, device=device, dtype=torch.int64
     )
-
-
-def _prepare_attention_inputs(main_kv, block_kv, kv_cache, tables, start_pos):
-    positions = start_pos - 1
-    pages = tables.gather(1, (positions // kv_cache.shape[1]).unsqueeze(1)).squeeze(1)
-    kv_cache[pages.long(), positions % kv_cache.shape[1]] = main_kv
-    draft_block = block_kv.new_zeros((block_kv.shape[0], 8, block_kv.shape[2]))
-    draft_block[:, : block_kv.shape[1]].copy_(block_kv)
-    return draft_block, tables, start_pos
-
-
-def _with_row_padding(x: torch.Tensor, padding: int = 128) -> torch.Tensor:
-    storage = torch.empty((*x.shape[:-1], x.shape[-1] + padding), device=x.device, dtype=x.dtype)
-    padded = storage[..., : x.shape[-1]]
-    padded.copy_(x)
-    return padded
+    pages_per_request = 512 // page_size
+    num_pages = batch * pages_per_request + extra_pages
+    # Both the pool and table rows have padding, as in managed cache views.
+    storage = torch.randn(num_pages, 3, page_size, 512, device=device, dtype=torch.bfloat16)
+    table_storage = torch.full((batch, pages_per_request + 1), -1, device=device, dtype=torch.int32)
+    tables = table_storage[:, :pages_per_request]
+    tables.copy_(
+        torch.randperm(num_pages, device=device, dtype=torch.int32)[
+            : batch * pages_per_request
+        ].reshape(batch, pages_per_request)
+    )
+    tables[capacities == 0] = -1
+    freqs = dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 1024, device=device)
+    block_freqs = freqs[positions[:, None] + 1 + torch.arange(block, device=device)]
+    return dict(
+        q=torch.randn(batch, block, heads, 512, device=device, dtype=torch.bfloat16),
+        draft_block=torch.randn(batch, 8, 512, device=device, dtype=torch.bfloat16),
+        kv_pages=storage[:, 1],
+        block_tables=tables,
+        positions=positions,
+        valid_lengths=lengths,
+        capacities=capacities,
+        attn_sink=torch.randn(heads, device=device),
+        inverse_rope_freqs=torch.view_as_real(block_freqs).contiguous(),
+        softmax_scale=512**-0.5,
+    )
 
 
 def _reference(
     q,
-    main_kv,
-    block_kv,
-    kv_cache,
-    slots,
-    start_pos,
-    valid_len,
-    sink,
-    blk_freqs,
+    draft_block,
+    kv_pages,
+    block_tables,
+    positions,
+    valid_lengths,
+    capacities,
+    attn_sink,
+    inverse_rope_freqs,
     softmax_scale,
 ):
-    cache = kv_cache.clone()
-    positions = start_pos - 1
-    pages = slots.gather(1, (positions // cache.shape[1]).unsqueeze(1)).squeeze(1)
-    cache[pages.long(), positions % cache.shape[1]] = main_kv
+    """Gather absolute context positions and compute sink attention in FP32."""
+    tables = block_tables.cpu()
     outputs = []
-    for row in range(q.shape[0]):
-        end = int(start_pos[row])
-        length = min(128, end, int(valid_len[row]))
-        logical = torch.arange(end - length, end, device=q.device)
-        physical = slots[row, logical // cache.shape[1]].long()
-        history = cache[physical, logical % cache.shape[1]]
-        kv = torch.cat((history, block_kv[row])).float()
-        scores = torch.einsum("mhd,nd->mhn", q[row].float(), kv) * softmax_scale
-        scores = torch.cat((scores, sink[None, :, None].expand(q.shape[1], -1, 1)), dim=-1)
-        probs = torch.softmax(scores, dim=-1)[..., :-1]
-        outputs.append(torch.einsum("mhn,nd->mhd", probs, kv).to(q.dtype))
-    output = torch.stack(outputs)
-    return _rope_last_dims_batched(output, _ROPE_DIM, blk_freqs, inverse=True), cache
+    for row, (end, length, capacity) in enumerate(
+        zip(positions.tolist(), valid_lengths.tolist(), capacities.tolist())
+    ):
+        tokens = list(range(max(0, end - min(128, length)), min(end, capacity)))
+        if tokens:
+            pages = [int(tables[row, token // kv_pages.shape[1]]) for token in tokens]
+            offsets = [token % kv_pages.shape[1] for token in tokens]
+            context = kv_pages[pages, offsets]
+            kv = torch.cat((context, draft_block[row, : q.shape[1]]))
+        else:
+            kv = draft_block[row, : q.shape[1]]
+        scores = torch.einsum("shd,td->sht", q[row].float(), kv.float()) * softmax_scale
+        sink = attn_sink[None, :, None].expand(q.shape[1], -1, 1)
+        probs = torch.cat((scores, sink), dim=-1).softmax(-1)[..., :-1]
+        outputs.append(torch.einsum("sht,td->shd", probs, kv.float()).to(q.dtype))
+    return dspark._rope_last_dims_batched(
+        torch.stack(outputs), _ROPE_DIM, torch.view_as_complex(inverse_rope_freqs), inverse=True
+    )
+
+
+def _norm_rope(x, weight, freqs):
+    normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+    normalized = (normalized * weight.float()).to(x.dtype)
+    return dspark._rope_last_dims_batched(normalized, _ROPE_DIM, freqs)
+
+
+def _write_reference(cache, main_kv, inputs):
+    cache = cache.clone()
+    for row, (end, capacity) in enumerate(
+        zip(inputs["positions"].tolist(), inputs["capacities"].tolist())
+    ):
+        token = end - 1
+        if 0 <= token < capacity:
+            page = int(inputs["block_tables"][row, token // cache.shape[1]])
+            cache[page, token % cache.shape[1]] = main_kv[row, 0]
+    return cache
 
 
 @pytest.mark.parametrize(
-    ("invalid_case", "reason"),
+    "invalid_case,reason",
     [
         ("q_dtype", "must use BF16"),
         ("block_size", "requires block 5/6"),
-        ("valid_len_dtype", "contiguous INT64"),
-        ("freqs_shape", "inverse RoPE frequencies"),
+        ("heads", "64/128 heads"),
+        ("page_size", "16/32/64/128/256-token pages"),
+        ("draft_shape", "draft KV must have shape"),
+        ("draft_layout", "must be contiguous"),
+        ("table_dtype", "contiguous INT32 rows"),
+        ("table_layout", "contiguous INT32 rows"),
+        ("positions", "contiguous INT64 batch vectors"),
+        ("valid_lengths", "contiguous INT64 batch vectors"),
+        ("capacities", "contiguous INT64 batch vectors"),
+        ("sink_dtype", "sink must be FP32"),
+        ("freqs_shape", "inverse RoPE frequencies must be FP32"),
     ],
 )
-def test_fused_dsv4_dspark_attention_support_gate_logs_rejection(monkeypatch, invalid_case, reason):
-    import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as dspark_attention_op
-
-    q, main, block, cache, tables, pos, sink, _, freqs = _make_inputs()
-    draft, tables, pos = _prepare_attention_inputs(main, block, cache, tables, pos)
-    inputs = [
-        q,
-        draft,
-        cache,
-        tables,
-        pos,
-        _valid_len(pos),
-        _capacities(cache, tables),
-        sink,
-        freqs,
-        512**-0.5,
-    ]
-    if invalid_case == "q_dtype":
-        inputs[0] = q.float()
-    elif invalid_case == "block_size":
-        inputs[0] = q[:, :4].contiguous()
-        inputs[8] = freqs[:, :4].contiguous()
-    elif invalid_case == "valid_len_dtype":
-        inputs[5] = inputs[5].int()
-    else:
-        inputs[8] = freqs[:, :, :-1].contiguous()
-    monkeypatch.setattr(
-        dspark_attention_op,
-        "_compile_dspark_attention",
-        lambda *args: pytest.fail("invalid inputs reached compilation"),
-    )
-    with pytest.raises(ValueError, match=reason):
-        dspark_attention_op.fused_dsv4_dspark_attention(*inputs)
-
-
-@pytest.mark.parametrize("invalid_case", ("draft_block_shape", "draft_block_layout", "index_dtype"))
 def test_fused_dsv4_dspark_attention_rejects_invalid_inputs_before_launch(
-    monkeypatch, invalid_case
+    monkeypatch, invalid_case, reason
 ):
-    import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as dspark_attention_op
-
-    q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, freqs = _make_inputs()
-    valid_len = _valid_len(start_pos)
-    draft_block, slots_i32, cache_seqs = _prepare_attention_inputs(
-        main_kv, block_kv, kv_cache, slots, start_pos
-    )
-    if invalid_case == "draft_block_shape":
-        draft_block = draft_block[:, :-1].contiguous()
-    elif invalid_case == "draft_block_layout":
-        draft_block = _with_row_padding(draft_block)
-        assert not draft_block.is_contiguous()
+    inputs = _make_inputs()
+    if invalid_case == "q_dtype":
+        inputs["q"] = inputs["q"].float()
+    elif invalid_case == "block_size":
+        inputs["q"] = inputs["q"][:, :4].contiguous()
+    elif invalid_case == "heads":
+        inputs["q"] = inputs["q"][:, :, :24].contiguous()
+    elif invalid_case == "page_size":
+        inputs["kv_pages"] = inputs["kv_pages"][:, :24]
+    elif invalid_case == "draft_shape":
+        inputs["draft_block"] = inputs["draft_block"][:, :7].contiguous()
+    elif invalid_case == "draft_layout":
+        inputs["draft_block"] = F.pad(inputs["draft_block"], (0, 128))[..., :512]
+    elif invalid_case == "table_dtype":
+        inputs["block_tables"] = inputs["block_tables"].long()
+    elif invalid_case == "table_layout":
+        inputs["block_tables"] = inputs["block_tables"][:, ::2]
+    elif invalid_case in ("positions", "valid_lengths", "capacities"):
+        inputs[invalid_case] = inputs[invalid_case].int()
+    elif invalid_case == "sink_dtype":
+        inputs["attn_sink"] = inputs["attn_sink"].bfloat16()
     else:
-        slots_i32 = slots_i32.long()
+        inputs["inverse_rope_freqs"] = inputs["inverse_rope_freqs"][:, :, :-1].contiguous()
 
-    monkeypatch.setattr(
-        dspark_attention_op,
-        "_compile_dspark_attention",
-        lambda *args: pytest.fail("invalid inputs reached the kernel launch"),
-    )
-    with pytest.raises(ValueError):
-        dspark_attention_op.fused_dsv4_dspark_attention(
-            q,
-            draft_block,
-            kv_cache,
-            slots_i32,
-            cache_seqs,
-            valid_len,
-            _capacities(kv_cache, slots_i32),
-            sink,
-            freqs,
-            q.shape[-1] ** -0.5,
-        )
+    def unexpected_launch(*args):
+        pytest.fail("invalid inputs reached compilation or a kernel launch")
+
+    key = (6, 128, 32, attention_op._get_dspark_arch_str())
+    monkeypatch.setattr(attention_op, "_dspark_attention_kernel_cache", {key: unexpected_launch})
+    monkeypatch.setattr(attention_op, "_compile_dspark_attention", unexpected_launch)
+    with pytest.raises(ValueError, match=reason):
+        attention_op.fused_dsv4_dspark_attention(**inputs)
 
 
+@pytest.mark.parametrize("heads", (64, 128))
 @pytest.mark.parametrize("block", (5, 6))
-@pytest.mark.parametrize(
-    ("start_pos_values", "valid_len_values"),
-    [
-        # Full windows with slots != start_pos: catches the window-validity
-        # mask being fed anything but the absolute decode position.
-        ([257, 390], [128, 128]),
-        # Partially filled windows: only rows 0..start_pos are attended.
-        ([5, 100], [6, 101]),
-        # Bootstrapped positions with short physical suffixes exercise wraparound.
-        ([257, 390], [3, 5]),
-    ],
-    ids=["full_window", "partial_window", "wrapped_suffix"],
-)
-def test_fused_dsv4_dspark_attention_matches_reference(block, start_pos_values, valid_len_values):
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
-        fused_dsv4_dspark_attention,
+@pytest.mark.parametrize("page_size", (16, 32, 64, 128, 256))
+def test_fused_dsv4_dspark_attention_matches_reference(heads, block, page_size):
+    inputs = _make_inputs(
+        29,
+        heads=heads,
+        block=block,
+        page_size=page_size,
+        positions=[0, 1, 32, 33, 127, 128, 129, 257, 390, 99],
+        valid_lengths=[0, 1, 3, 32, 127, 128, 17, 128, 3, 128],
+        capacities=[512] * 9 + [0],
     )
-
-    q, main_kv, block_kv, kv_cache, slots, start_pos, sink, blk_freqs, inverse_rope_freqs = (
-        _make_inputs(
-            29,
-            block=block,
-            start_pos_values=start_pos_values,
-            page_size=(128 if block == 5 else 256)
-            if valid_len_values[0] == 128
-            else (16 if start_pos_values[0] == 5 else 32),
-        )
-    )
-    valid_len = torch.tensor(valid_len_values, device=q.device, dtype=torch.long)
-    expected, expected_cache = _reference(
-        q,
-        main_kv,
-        block_kv,
-        kv_cache,
-        slots,
-        start_pos,
-        valid_len,
-        sink,
-        blk_freqs,
-        q.shape[-1] ** -0.5,
-    )
-    draft_block, slots_i32, cache_seqs = _prepare_attention_inputs(
-        main_kv, block_kv, kv_cache, slots, start_pos
-    )
-
-    actual = fused_dsv4_dspark_attention(
-        q,
-        draft_block,
-        kv_cache,
-        slots_i32,
-        cache_seqs,
-        valid_len,
-        _capacities(kv_cache, slots_i32),
-        sink,
-        inverse_rope_freqs,
-        q.shape[-1] ** -0.5,
-    )
-
+    original_cache = inputs["kv_pages"].clone()
+    expected = _reference(**inputs)
+    actual = attention_op.fused_dsv4_dspark_attention(**inputs)
     torch.testing.assert_close(actual, expected, rtol=5e-2, atol=3e-2)
-    torch.testing.assert_close(kv_cache, expected_cache, rtol=0, atol=0)
+    torch.testing.assert_close(inputs["kv_pages"], original_cache, rtol=0, atol=0)
 
 
-def test_fused_dsv4_dspark_attention_cuda_graph_replay():
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
-        fused_dsv4_dspark_attention,
+@pytest.mark.parametrize("heads,page_size", [(64, 32), (128, 64), (128, 256)])
+def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size):
+    inputs = _make_inputs(
+        3, heads=heads, page_size=page_size, positions=[257, 5, 390], capacities=[512, 512, 0]
     )
-    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
-        cute_dsl_dspark_rmsnorm_rope,
-        cute_dsl_dspark_rmsnorm_rope_draft_block,
-        cute_dsl_dspark_rmsnorm_rope_page_write,
-    )
+    main_x = torch.randn(3, 1, 512, device="cuda", dtype=torch.bfloat16)
+    block_x = torch.randn(3, 6, 512, device="cuda", dtype=torch.bfloat16)
+    weight = torch.ones(512, device="cuda", dtype=torch.bfloat16)
+    freqs = dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 1024, device="cuda")
+    main_freqs = torch.view_as_real(freqs[inputs["positions"]]).contiguous()
+    block_freqs = inputs["inverse_rope_freqs"].view(-1, 32, 2)
 
-    q, main_kv, block_kv, kv_cache, slots, start_pos, sink, blk_freqs, inverse_rope_freqs = (
-        _make_inputs(3, start_pos_values=[257, 5, 390], page_size=64)
-    )
-    batch, block, dim = block_kv.shape
-    scale = dim**-0.5
-    main_x = main_kv.unsqueeze(1)
-    block_x = block_kv
-    weight = torch.ones(dim, device=q.device, dtype=q.dtype)
-    main_freqs = torch.zeros(batch, _ROPE_DIM // 2, 2, device=q.device)
-    block_freqs = torch.zeros(batch * block, _ROPE_DIM // 2, 2, device=q.device)
-    main_freqs[..., 0] = 1
-    block_freqs[..., 0] = 1
-    start_pos = start_pos.long()
-    valid_len = _valid_len(start_pos)
-
-    capacities = _capacities(kv_cache, slots)
-
-    def run():
-        cute_dsl_dspark_rmsnorm_rope_page_write(
-            main_x, weight, main_freqs, kv_cache, slots, start_pos, capacities, 1e-6
+    def forward():
+        preparation_op.cute_dsl_dspark_rmsnorm_rope_page_write(
+            main_x,
+            weight,
+            main_freqs,
+            inputs["kv_pages"],
+            inputs["block_tables"],
+            inputs["positions"],
+            inputs["capacities"],
+            1e-6,
         )
-        draft = cute_dsl_dspark_rmsnorm_rope_draft_block(block_x, weight, block_freqs, 1e-6)
-        output = fused_dsv4_dspark_attention(
-            q,
-            draft,
-            kv_cache,
-            slots,
-            start_pos,
-            valid_len,
-            capacities,
-            sink,
-            inverse_rope_freqs,
-            scale,
+        draft = preparation_op.cute_dsl_dspark_rmsnorm_rope_draft_block(
+            block_x, weight, block_freqs, 1e-6
         )
-        return output, draft
+        return attention_op.fused_dsv4_dspark_attention(**(inputs | {"draft_block": draft})), draft
 
-    run()
+    # Eager execution warms all preparation and attention specializations.
+    forward()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured, draft_block = run()
+        captured, draft = forward()
+    for end in (127, 128, 129, 255):
+        inputs["positions"][:2].copy_(torch.tensor([end, end + 1], device="cuda"))
+        inputs["valid_lengths"].copy_(torch.tensor([128, 3, 128], device="cuda"))
+        inputs["block_tables"][:2].copy_(inputs["block_tables"][:2].roll(1, dims=1))
+        main_x.normal_()
+        block_x.normal_()
+        main_freqs.copy_(torch.view_as_real(freqs[inputs["positions"]]))
+        block_phases = freqs[inputs["positions"][:, None] + 1 + torch.arange(6, device="cuda")]
+        inputs["inverse_rope_freqs"].copy_(torch.view_as_real(block_phases))
+        expected_main = _norm_rope(main_x, weight, freqs[inputs["positions"]][:, None])
+        expected_block = _norm_rope(block_x, weight, block_phases)
+        expected_cache = _write_reference(inputs["kv_pages"], expected_main, inputs)
+        expected_draft = F.pad(expected_block, (0, 0, 0, 2))
+        expected = _reference(
+            **(inputs | {"kv_pages": expected_cache, "draft_block": expected_draft})
+        )
+        graph.replay()
+        torch.testing.assert_close(captured, expected, rtol=5e-2, atol=3e-2)
+        torch.testing.assert_close(inputs["kv_pages"], expected_cache, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(draft, expected_draft, rtol=2e-2, atol=2e-2)
+        assert torch.count_nonzero(draft[:, 6:]) == 0
 
-    main_x.copy_(torch.randn_like(main_x))
-    block_x.copy_(torch.randn_like(block_x))
-    valid_len.copy_(torch.tensor([3, 2, 7], device=q.device))
-    expected_main = cute_dsl_dspark_rmsnorm_rope(
-        main_x, weight, main_freqs, 1, _ROPE_DIM, 1e-6, True, True, False
-    ).squeeze(1)
-    expected_block = cute_dsl_dspark_rmsnorm_rope(
-        block_x, weight, block_freqs, 1, _ROPE_DIM, 1e-6, True, True, False
-    )
-    expected, expected_cache = _reference(
-        q,
-        expected_main,
-        expected_block,
-        kv_cache,
-        slots,
-        start_pos,
-        valid_len,
-        sink,
-        blk_freqs,
-        scale,
-    )
-    graph.replay()
 
-    torch.testing.assert_close(captured, expected, rtol=5e-2, atol=3e-2)
-    torch.testing.assert_close(kv_cache, expected_cache, rtol=0, atol=0)
-    torch.testing.assert_close(draft_block[:, :block], expected_block, rtol=0, atol=0)
-    torch.testing.assert_close(
-        draft_block[:, block:], torch.zeros_like(draft_block[:, block:]), rtol=0, atol=0
+@pytest.mark.parametrize("heads", (64, 128))
+def test_dspark_attention_forward_matches_reference(heads):
+    inputs = _make_inputs(17, heads=heads, positions=[5, 390], valid_lengths=[5, 3])
+    batch, block, hidden, rank, groups, o_rank = 2, 6, 64, 64, 8, 32
+
+    def weight(*shape):
+        return torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * 0.02
+
+    x, main_x = weight(batch, block, hidden), weight(batch, 1, hidden)
+    kwargs = dict(
+        wq_a=weight(rank, hidden),
+        q_norm_w=torch.ones(rank, device="cuda", dtype=x.dtype),
+        wq_b=weight(heads * 512, rank),
+        wkv=weight(512, hidden),
+        kv_norm_w=torch.ones(512, device="cuda", dtype=x.dtype),
+        wo_a=weight(groups * o_rank, heads * 512 // groups),
+        wo_b=weight(hidden, groups * o_rank),
+        attn_sink=inputs["attn_sink"],
+        n_heads=heads,
+        head_dim=512,
+        rope_head_dim=_ROPE_DIM,
+        n_groups=groups,
+        o_lora_rank=o_rank,
+        window_size=128,
+        eps=1e-6,
+        softmax_scale=inputs["softmax_scale"],
+        freqs_cis=dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 1024, device="cuda"),
     )
+    positions = inputs["positions"]
+    block_freqs = torch.view_as_complex(inputs["inverse_rope_freqs"])
+    q = F.linear(
+        dspark._rmsnorm(F.linear(x, kwargs["wq_a"]), kwargs["q_norm_w"], 1e-6), kwargs["wq_b"]
+    ).unflatten(-1, (heads, 512))
+    q = _norm_rope(q, torch.ones(512, device="cuda", dtype=x.dtype), block_freqs)
+    main = _norm_rope(
+        F.linear(main_x, kwargs["wkv"]),
+        kwargs["kv_norm_w"],
+        kwargs["freqs_cis"][positions][:, None],
+    )
+    draft = _norm_rope(F.linear(x, kwargs["wkv"]), kwargs["kv_norm_w"], block_freqs)
+    expected_cache = _write_reference(inputs["kv_pages"], main, inputs)
+    output = _reference(**(inputs | {"q": q, "draft_block": draft, "kv_pages": expected_cache}))
+    output = torch.einsum(
+        "bsgd,grd->bsgr",
+        output.reshape(batch, block, groups, -1),
+        kwargs["wo_a"].view(groups, o_rank, -1),
+    )
+    expected = F.linear(output.flatten(2), kwargs["wo_b"])
+    actual = dspark.dspark_attention_forward(
+        x,
+        main_x,
+        positions,
+        inputs["kv_pages"],
+        inputs["block_tables"],
+        inputs["capacities"],
+        inputs["valid_lengths"],
+        **kwargs,
+    )
+    torch.testing.assert_close(actual, expected, rtol=8e-2, atol=1e-2)
+    torch.testing.assert_close(inputs["kv_pages"], expected_cache, rtol=2e-2, atol=2e-2)
+
+
+def test_self_jit_reuses_one_kernel_across_runtime_shapes_and_scales(monkeypatch):
+    assert [attention_op._get_dspark_arch_str(sm) for sm in (100, 103)] == ["sm_100", "sm_103"]
+    assert all(attention_op._get_dspark_arch_str(sm) is None for sm in (90, 101, 109))
+    cache = {}
+    monkeypatch.setattr(attention_op, "_dspark_attention_kernel_cache", cache)
+    for batch in (1, 3, 32):
+        inputs = _make_inputs(17 + batch, batch=batch, extra_pages=batch + 41)
+        if batch == 3:
+            inputs["kv_pages"] = inputs["kv_pages"].clone()
+            inputs["block_tables"] = inputs["block_tables"].clone()
+        inputs["softmax_scale"] *= 0.5 if batch % 2 == 0 else 1
+        expected = _reference(**inputs)
+        actual = attention_op.fused_dsv4_dspark_attention(**inputs)
+        torch.testing.assert_close(actual, expected, rtol=5e-2, atol=3e-2)
+        assert len(cache) == 1
+        if batch == 1:
+
+            def unexpected_compile(*args):
+                pytest.fail("runtime shape or scale change caused recompilation")
+
+            monkeypatch.setattr(attention_op, "_compile_dspark_attention", unexpected_compile)
+
+
+def test_compile_without_real_specimens_and_cached_wrapper_avoids_views(monkeypatch):
+    arch_str = attention_op._get_dspark_arch_str()
+
+    def unexpected_compile_op(*args, **kwargs):
+        pytest.fail("DSpark compilation used a real tensor specimen")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "empty", unexpected_compile_op)
+        patch.setattr(torch, "empty_like", unexpected_compile_op)
+        patch.setattr(attention_op.cute.runtime, "from_dlpack", unexpected_compile_op)
+        compiled = attention_op._compile_dspark_attention(5, arch_str, 32, 128)
+    monkeypatch.setattr(
+        attention_op, "_dspark_attention_kernel_cache", {(5, 128, 32, arch_str): compiled}
+    )
+    inputs = _make_inputs(41, block=5, positions=[257, 9])
+
+    def unexpected_host_op(*args, **kwargs):
+        pytest.fail("cached DSpark host wrapper used a Python tensor conversion or view")
+
+    monkeypatch.setattr(attention_op.cute.runtime, "from_dlpack", unexpected_host_op)
+    monkeypatch.setattr(torch.cuda, "current_stream", unexpected_host_op)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", unexpected_host_op)
+    for method in ("permute", "unsqueeze", "reshape"):
+        monkeypatch.setattr(torch.Tensor, method, unexpected_host_op)
+    output = attention_op.fused_dsv4_dspark_attention(**inputs)
+    assert output.shape == inputs["q"].shape
+
+
+def test_attention_cache_miss_rejects_cuda_graph_capture(monkeypatch):
+    inputs = _make_inputs(43, block=5)
+    monkeypatch.setattr(attention_op, "_dspark_attention_kernel_cache", {})
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("compiler or allocation was called before the capture guard")
+
+    monkeypatch.setattr(attention_op, "_compile_dspark_attention", unexpected_compile)
+    monkeypatch.setattr(torch, "empty_like", unexpected_compile)
+    with pytest.raises(RuntimeError, match="must run eagerly before graph capture"):
+        attention_op.fused_dsv4_dspark_attention(**inputs)
+
+
+def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch):
+    preparation_op._compile_dspark_rmsnorm_rope_page_write.cache_clear()
+    preparation_op._compile_dspark_rmsnorm_rope_draft_block.cache_clear()
+    device = torch.cuda.current_device()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("preparation compiler was called during CUDA graph capture")
+
+    monkeypatch.setattr(preparation_op.cute, "compile", unexpected_compile)
+    with pytest.raises(RuntimeError, match="page-write must be warmed up"):
+        preparation_op._compile_dspark_rmsnorm_rope_page_write(32, 1e-6, device)
+    with pytest.raises(RuntimeError, match="draft-block must be warmed up"):
+        preparation_op._compile_dspark_rmsnorm_rope_draft_block(5, 1e-6, device)
+
+
+def test_preparation_self_jit_covers_dynamic_batches():
+    preparation_op._compile_dspark_rmsnorm_rope_page_write.cache_clear()
+    preparation_op._compile_dspark_rmsnorm_rope_draft_block.cache_clear()
+    weight = torch.ones(512, device="cuda", dtype=torch.bfloat16)
+    for batch in (1, 3, 32):
+        inputs = _make_inputs(31 + batch, batch=batch)
+        main = torch.randn(batch, 1, 512, device="cuda", dtype=torch.bfloat16)
+        block = inputs["draft_block"][:, :6].contiguous()
+        freqs = dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 1024, device="cuda")
+        main_freqs = freqs[inputs["positions"]][:, None]
+        block_freqs = torch.view_as_complex(inputs["inverse_rope_freqs"])
+        expected_cache = _write_reference(
+            inputs["kv_pages"], _norm_rope(main, weight, main_freqs), inputs
+        )
+        expected_block = _norm_rope(block, weight, block_freqs)
+        preparation_op.cute_dsl_dspark_rmsnorm_rope_page_write(
+            main,
+            weight,
+            torch.view_as_real(main_freqs).view(batch, 32, 2),
+            inputs["kv_pages"],
+            inputs["block_tables"],
+            inputs["positions"],
+            inputs["capacities"],
+            1e-6,
+        )
+        draft = preparation_op.cute_dsl_dspark_rmsnorm_rope_draft_block(
+            block, weight, inputs["inverse_rope_freqs"].view(-1, 32, 2), 1e-6
+        )
+        torch.testing.assert_close(inputs["kv_pages"], expected_cache, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(draft[:, :6], expected_block, rtol=2e-2, atol=2e-2)
+        assert torch.count_nonzero(draft[:, 6:]) == 0
+    assert preparation_op._compile_dspark_rmsnorm_rope_page_write.cache_info().misses == 1
+    assert preparation_op._compile_dspark_rmsnorm_rope_draft_block.cache_info().misses == 1
 
 
 @pytest.mark.parametrize("page_size", (128, 256))
 def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, page_size):
-    import tensorrt_llm._torch.models.modeling_dspark as model
-
     g = _make_attn_inputs(seed=17, device="cuda", page_size=page_size)
     for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
         g[name].mul_(0.2)
@@ -368,347 +449,42 @@ def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, page_siz
     actual = _run(g)
     actual_cache = g["kv_cache0"].clone()
     g["kv_cache0"].copy_(before)
-
-    def reference_attention(
-        q, draft, pages, tables, positions, lengths, capacities, sink, freqs, scale
-    ):
-        main_positions = positions - 1
-        main_pages = tables.gather(1, (main_positions // page_size).unsqueeze(1)).squeeze(1)
-        main = pages[main_pages.long(), main_positions % page_size]
-        output, _ = _reference(
-            q,
-            main,
-            draft[:, : q.shape[1]],
-            pages,
-            tables,
-            positions,
-            lengths,
-            sink,
-            torch.view_as_complex(freqs),
-            scale,
-        )
-        return output
-
     with monkeypatch.context() as patch:
-        patch.setattr(torch.ops.trtllm, "fused_dsv4_dspark_attention", reference_attention)
-        patch.setattr(model, "is_fused_dspark_rmsnorm_rope_supported", lambda *a: False)
+        patch.setattr(torch.ops.trtllm, "fused_dsv4_dspark_attention", _reference)
+        patch.setattr(dspark, "is_fused_dspark_rmsnorm_rope_supported", lambda *a: False)
         expected = _run(g)
     torch.testing.assert_close(actual, expected, rtol=8e-2, atol=1e-2)
     torch.testing.assert_close(actual_cache, g["kv_cache0"], rtol=2e-2, atol=2e-2)
 
 
 def test_warmup_propagates_compile_failure(monkeypatch):
-    import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as op
+    inputs = _make_inputs(page_size=256)
+    monkeypatch.setattr(attention_op, "_dspark_attention_kernel_cache", {})
 
-    op._dspark_attention_kernel_cache.clear()
-    monkeypatch.setattr(
-        op, "_compile_dspark_attention", Mock(side_effect=RuntimeError("synthetic compile failure"))
-    )
-    q, main, block, cache, tables, pos, sink, _, freqs = _make_inputs()
-    draft, tables, pos = _prepare_attention_inputs(main, block, cache, tables, pos)
+    def fail_compile(*args):
+        raise RuntimeError("synthetic compile failure")
+
+    monkeypatch.setattr(attention_op, "_compile_dspark_attention", fail_compile)
     with pytest.raises(RuntimeError, match="synthetic compile failure"):
-        op.fused_dsv4_dspark_attention(
-            q,
-            draft,
-            cache,
-            tables,
-            pos,
-            _valid_len(pos),
-            _capacities(cache, tables),
-            sink,
-            freqs,
-            512**-0.5,
-        )
-
-
-def test_self_jit_reuses_one_kernel_across_runtime_shapes_and_scales():
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
-        _dspark_attention_kernel_cache,
-        _get_dspark_arch_str,
-        fused_dsv4_dspark_attention,
-    )
-
-    assert [_get_dspark_arch_str(sm) for sm in (100, 103)] == [
-        "sm_100",
-        "sm_103",
-    ]
-    assert _get_dspark_arch_str(101) is None
-    assert _get_dspark_arch_str(109) is None
-    assert _get_dspark_arch_str() in ("sm_100", "sm_103")
-    _dspark_attention_kernel_cache.clear()
-    q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, freqs = _make_inputs(
-        11, start_pos_values=[300, 4, 250], cache_pages=40
-    )
-    scale = q.shape[-1] ** -0.5
-    valid_len = _valid_len(start_pos)
-
-    expected, expected_cache = _reference(
-        q,
-        main_kv,
-        block_kv,
-        kv_cache,
-        slots,
-        start_pos,
-        valid_len,
-        sink,
-        torch.view_as_complex(freqs),
-        scale,
-    )
-    # A missing key self-JITs through the production op.
-    draft_block, slots_i32, cache_seqs = _prepare_attention_inputs(
-        main_kv, block_kv, kv_cache, slots, start_pos
-    )
-    actual = fused_dsv4_dspark_attention(
-        q,
-        draft_block,
-        kv_cache,
-        slots_i32,
-        cache_seqs,
-        valid_len,
-        _capacities(kv_cache, slots_i32),
-        sink,
-        freqs,
-        scale,
-    )
-    torch.testing.assert_close(actual, expected, rtol=5e-2, atol=3e-2)
-    torch.testing.assert_close(kv_cache, expected_cache, rtol=0, atol=0)
-    assert len(_dspark_attention_kernel_cache) == 1
-
-    # Every runtime batch, page count, page stride, and softmax scale is a hot
-    # hit on the same compiled object without compiler calls or runtime padding.
-    for batch in (1, 3, 32):
-        values = [5 + (37 * i) % 386 for i in range(batch)]
-        args = _make_inputs(17 + batch, start_pos_values=values, cache_pages=batch + 41)
-        q_b, main_b, block_b, cache_b, slots_b, pos_b, sink_b, blk_freqs_b, freqs_b = args
-        if batch == 3:
-            cache_b = cache_b.clone()
-            assert cache_b.is_contiguous()
-        runtime_scale = scale if batch % 2 else scale * 0.5
-        valid_len_b = _valid_len(pos_b)
-        expected, expected_cache = _reference(
-            q_b,
-            main_b,
-            block_b,
-            cache_b,
-            slots_b,
-            pos_b,
-            valid_len_b,
-            sink_b,
-            blk_freqs_b,
-            runtime_scale,
-        )
-        draft_block_b, slots_i32_b, cache_seqs_b = _prepare_attention_inputs(
-            main_b, block_b, cache_b, slots_b, pos_b
-        )
-        actual = fused_dsv4_dspark_attention(
-            q_b,
-            draft_block_b,
-            cache_b,
-            slots_i32_b,
-            cache_seqs_b,
-            valid_len_b,
-            _capacities(cache_b, slots_i32_b),
-            sink_b,
-            freqs_b,
-            runtime_scale,
-        )
-        torch.testing.assert_close(actual, expected, rtol=5e-2, atol=3e-2)
-        torch.testing.assert_close(cache_b, expected_cache, rtol=0, atol=0)
-    assert len(_dspark_attention_kernel_cache) == 1
-
-
-def test_compile_without_real_specimens_and_cached_wrapper_avoids_views(monkeypatch):
-    import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as dspark_attention_op
-
-    dspark_attention_op._dspark_attention_kernel_cache.clear()
-    arch_str = dspark_attention_op._get_dspark_arch_str()
-    assert arch_str is not None
-
-    def unexpected_compile_op(*args, **kwargs):
-        del args, kwargs
-        pytest.fail("DSpark compilation used a real tensor specimen")
-
-    # Compile before runtime inputs exist. Compile-only pointers and the fake
-    # output anchor must not allocate or wrap a PyTorch tensor.
-    with monkeypatch.context() as patch:
-        patch.setattr(torch, "empty", unexpected_compile_op)
-        patch.setattr(torch, "empty_like", unexpected_compile_op)
-        patch.setattr(dspark_attention_op.cute.runtime, "from_dlpack", unexpected_compile_op)
-        compiled = dspark_attention_op._compile_dspark_attention(5, arch_str, 256, 128)
-    dspark_attention_op._dspark_attention_kernel_cache[(5, 128, 256, arch_str)] = compiled
-
-    args = _make_inputs(41, block=5, start_pos_values=[257, 9])
-    q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, freqs = args
-    draft_block, slots_i32, cache_seqs = _prepare_attention_inputs(
-        main_kv, block_kv, kv_cache, slots, start_pos
-    )
-    valid_len = _valid_len(start_pos)
-    scale = q.shape[-1] ** -0.5
-
-    def unexpected_host_op(*args, **kwargs):
-        del args, kwargs
-        pytest.fail("cached DSpark host wrapper used a Python tensor conversion or view")
-
-    monkeypatch.setattr(dspark_attention_op.cute.runtime, "from_dlpack", unexpected_host_op)
-    monkeypatch.setattr(torch.cuda, "current_stream", unexpected_host_op)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", unexpected_host_op)
-    monkeypatch.setattr(torch.Tensor, "permute", unexpected_host_op)
-    monkeypatch.setattr(torch.Tensor, "unsqueeze", unexpected_host_op)
-    monkeypatch.setattr(torch.Tensor, "reshape", unexpected_host_op)
-
-    output = dspark_attention_op.fused_dsv4_dspark_attention(
-        q,
-        draft_block,
-        kv_cache,
-        slots_i32,
-        cache_seqs,
-        valid_len,
-        _capacities(kv_cache, slots_i32),
-        sink,
-        freqs,
-        scale,
-    )
-    assert output.shape == q.shape
-
-
-def test_attention_cache_miss_rejects_cuda_graph_capture(monkeypatch):
-    import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as dspark_attention_op
-
-    dspark_attention_op._dspark_attention_kernel_cache.clear()
-    q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, freqs = _make_inputs(43, block=5)
-    draft_block, slots_i32, cache_seqs = _prepare_attention_inputs(
-        main_kv, block_kv, kv_cache, slots, start_pos
-    )
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    monkeypatch.setattr(
-        dspark_attention_op,
-        "_compile_dspark_attention",
-        lambda *args: pytest.fail("compiler was called during CUDA graph capture"),
-    )
-    monkeypatch.setattr(
-        torch,
-        "empty_like",
-        lambda *args, **kwargs: pytest.fail("output allocated before the capture guard"),
-    )
-
-    with pytest.raises(RuntimeError, match="must run eagerly before graph capture"):
-        dspark_attention_op.fused_dsv4_dspark_attention(
-            q,
-            draft_block,
-            kv_cache,
-            slots_i32,
-            cache_seqs,
-            _valid_len(start_pos),
-            _capacities(kv_cache, slots_i32),
-            sink,
-            freqs,
-            q.shape[-1] ** -0.5,
-        )
-
-
-def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch):
-    import tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op as preparation_op
-
-    preparation_op._compile_dspark_rmsnorm_rope_page_write.cache_clear()
-    preparation_op._compile_dspark_rmsnorm_rope_draft_block.cache_clear()
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    monkeypatch.setattr(
-        preparation_op.cute,
-        "compile",
-        lambda *args: pytest.fail("preparation compiler was called during CUDA graph capture"),
-    )
-
-    with pytest.raises(RuntimeError, match="page-write must be warmed up"):
-        preparation_op._compile_dspark_rmsnorm_rope_page_write(256, 1e-6, 0)
-    with pytest.raises(RuntimeError, match="draft-block must be warmed up"):
-        preparation_op._compile_dspark_rmsnorm_rope_draft_block(5, 1e-6, 0)
-
-
-def test_preparation_self_jit_covers_dynamic_batches():
-    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
-        _compile_dspark_rmsnorm_rope_draft_block,
-        _compile_dspark_rmsnorm_rope_page_write,
-        cute_dsl_dspark_rmsnorm_rope_draft_block,
-        cute_dsl_dspark_rmsnorm_rope_page_write,
-    )
-
-    _compile_dspark_rmsnorm_rope_page_write.cache_clear()
-    _compile_dspark_rmsnorm_rope_draft_block.cache_clear()
-    q, main_kv, block_kv, kv_cache, slots, start_pos, _, _, _ = _make_inputs(
-        23, start_pos_values=[300, 4, 250], cache_pages=40
-    )
-    weight = torch.ones(512, device=q.device, dtype=q.dtype)
-    main_freqs = torch.zeros(q.shape[0], _ROPE_DIM // 2, 2, device=q.device)
-    block_freqs = torch.zeros(q.shape[0] * q.shape[1], _ROPE_DIM // 2, 2, device=q.device)
-    main_freqs[..., 0] = 1
-    block_freqs[..., 0] = 1
-
-    for batch in (1, 3, 32):
-        args = _make_inputs(31 + batch, batch=batch, cache_pages=40)
-        q_b, main_b, block_b, cache_b, slots_b, pos_b, _, _, _ = args
-        main_freqs_b = torch.zeros(batch, _ROPE_DIM // 2, 2, device=q.device)
-        block_freqs_b = torch.zeros(batch * q_b.shape[1], _ROPE_DIM // 2, 2, device=q.device)
-        main_freqs_b[..., 0] = 1
-        block_freqs_b[..., 0] = 1
-        before = cache_b.clone()
-        cute_dsl_dspark_rmsnorm_rope_page_write(
-            main_b.unsqueeze(1),
-            weight,
-            main_freqs_b,
-            cache_b,
-            slots_b,
-            pos_b,
-            _capacities(cache_b, slots_b),
-            1e-6,
-        )
-        draft_block = cute_dsl_dspark_rmsnorm_rope_draft_block(block_b, weight, block_freqs_b, 1e-6)
-        expected_main = main_b.float() * torch.rsqrt(
-            main_b.float().square().mean(-1, keepdim=True) + 1e-6
-        )
-        pos = pos_b - 1
-        pages = slots_b.gather(1, (pos // cache_b.shape[1]).unsqueeze(1)).squeeze(1)
-        before[pages.long(), pos % cache_b.shape[1]] = expected_main.to(cache_b.dtype)
-        torch.testing.assert_close(cache_b, before, rtol=2e-2, atol=2e-2)
-        assert draft_block.shape == (batch, 8, 512)
-        assert torch.count_nonzero(draft_block[:, q_b.shape[1] :]) == 0
-
-    assert _compile_dspark_rmsnorm_rope_page_write.cache_info().misses == 1
-    assert _compile_dspark_rmsnorm_rope_draft_block.cache_info().misses == 1
+        attention_op.fused_dsv4_dspark_attention(**inputs)
 
 
 def _attention_case(seed=0, start_positions=(40, 40), lengths=None, sink=None):
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
-        fused_dsv4_dspark_attention,
+    inputs = _make_inputs(
+        seed, block=5, page_size=256, positions=start_positions, valid_lengths=lengths
     )
-
-    q, main, block, pages, tables, positions, default_sink, _, _ = _make_inputs(
-        seed,
-        block=5,
-        start_pos_values=start_positions,
-    )
-    lengths = torch.tensor(lengths or [min(128, p) for p in start_positions], device="cuda")
-    sink = default_sink if sink is None else torch.full_like(default_sink, sink)
-    draft, _, _ = _prepare_attention_inputs(main, block, pages, tables, positions)
-    freqs = torch.zeros(q.shape[0], q.shape[1], 32, 2, device="cuda")
-    freqs[..., 0] = 1
-    output = fused_dsv4_dspark_attention(
-        q,
-        draft,
-        pages,
-        tables,
-        positions,
-        lengths,
-        _capacities(pages, tables),
-        sink,
-        freqs,
-        512**-0.5,
-    )
+    if sink is not None:
+        inputs["attn_sink"].fill_(sink)
+    inputs["inverse_rope_freqs"].zero_()
+    inputs["inverse_rope_freqs"][..., 0] = 1
+    output = attention_op.fused_dsv4_dspark_attention(**inputs)
     histories = []
-    for row, (end, length) in enumerate(zip(start_positions, lengths.tolist())):
+    pages, tables = inputs["kv_pages"], inputs["block_tables"]
+    for row, (end, length) in enumerate(zip(start_positions, inputs["valid_lengths"].tolist())):
         logical = torch.arange(end - length, end, device="cuda")
         history = pages[tables[row, logical // pages.shape[1]].long(), logical % pages.shape[1]]
-        histories.append(torch.cat((history, block[row])))
-    return output, q, histories, sink
+        histories.append(torch.cat((history, inputs["draft_block"][row, :5])))
+    return output, inputs["q"], histories, inputs["attn_sink"]
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
@@ -751,24 +527,18 @@ def test_sparse_attn_masked_indices_excluded():
 def test_page_mapping_matches_reference(start_pos, page_size, block):
     from tensorrt_llm._torch.attention.kernels.dspark import write_dspark_context
 
-    q, values, _, pages, tables, positions, *_ = _make_inputs(
-        block=block,
-        start_pos_values=[start_pos] * 3,
-        page_size=page_size,
-    )
-    before = pages.clone()
+    inputs = _make_inputs(block=block, positions=[start_pos] * 3, page_size=page_size)
+    values = inputs["draft_block"][:, :1].contiguous()
+    expected = _write_reference(inputs["kv_pages"], values, inputs)
     write_dspark_context(
-        values[:, None],
-        positions[:, None],
-        torch.ones(3, 1, device=q.device, dtype=torch.bool),
-        pages,
-        tables,
-        _capacities(pages, tables),
+        values,
+        inputs["positions"][:, None],
+        torch.ones(3, 1, device="cuda", dtype=torch.bool),
+        inputs["kv_pages"],
+        inputs["block_tables"],
+        inputs["capacities"],
     )
-    for row in range(3):
-        logical = start_pos - 1
-        before[int(tables[row, logical // page_size]), logical % page_size] = values[row]
-    torch.testing.assert_close(pages, before, rtol=0, atol=0)
+    torch.testing.assert_close(inputs["kv_pages"], expected, rtol=0, atol=0)
 
 
 def test_page_mapping_masks_non_generation_rows():
@@ -826,13 +596,13 @@ def _make_attn_inputs(seed=0, device="cuda", page_size=256):
     g["q_norm"] = torch.ones(q_lora, dtype=bf)
     g["kv_norm"] = torch.ones(head_dim, dtype=bf)
     g["attn_sink"] = torch.randn(n_heads)
-    g["freqs"] = precompute_dspark_freqs_cis(rd, start_pos + 1 + block + 2)
+    g["freqs"] = dspark.precompute_dspark_freqs_cis(rd, start_pos + 1 + block + 2)
     g["start_pos"] = torch.full((b,), start_pos, dtype=torch.long)
     return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in g.items()}
 
 
 def _run(g):
-    return dspark_attention_forward(
+    return dspark.dspark_attention_forward(
         g["x"],
         g["main_x"],
         g["start_pos"],
