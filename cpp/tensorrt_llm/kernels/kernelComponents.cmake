@@ -130,3 +130,6 @@ add_tllm_kernel_library(
   tllm_kernel_gemm_utilities SOURCES cutlass_kernels/cutlass_heuristic.cpp
   cutlass_kernels/cutlass_preprocessors.cpp LINK_LIBRARIES
   tllm::kernel_cutlass_headers)
+
+list(APPEND TLLM_KERNEL_COMPONENT_TARGETS
+     trtllm_gen_fp8_block_scale_moe_routing)
