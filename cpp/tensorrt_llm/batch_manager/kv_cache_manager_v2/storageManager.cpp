@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/kvCache.h"
+#include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
@@ -234,6 +235,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     , mEventSink(std::move(eventSink))
     , mHotPoolGroupMapping(config.lifeCycleGrouping())
     , mSwaScratchReuse(std::move(swaScratchReuse))
+    , mUsesDefaultColdPageCodec(!coldPageCodec)
     , mColdPageCodec(coldPageCodec ? std::move(coldPageCodec) : createDefaultKvCacheColdPageCodec())
 {
     IKvCacheColdPageCodec& codec = *mColdPageCodec;
@@ -1267,12 +1269,15 @@ void StorageManager::batchedMigrate(
 void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<SharedPtr<Page>> const& pages,
     MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
 {
+    bool const copyOnly = requestingCache.manager().config().sparseOffloadCopyOnly;
+
     struct OffloadBatch
     {
         std::vector<SharedPtr<Page>> srcPages;
         std::vector<SharedPtr<UniqPageLock>> srcPageLocks;
         std::vector<Slot> dstSlots;
         std::vector<PageIndexPair> srcDstPageIndices;
+        std::vector<std::shared_ptr<SparseOffloadCopy>> copies;
     };
 
     std::map<LayerGroupId, OffloadBatch> batches;
@@ -1298,6 +1303,17 @@ void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<Sh
         if (page->cacheLevel == kSparseHistoryLevel)
         {
             continue;
+        }
+        if (copyOnly)
+        {
+            if (auto copy = page->sparseOffloadCopy.lock())
+            {
+                for (auto const& owner : lock->owners())
+                {
+                    owner.kvCache->retainSparseOffloadCopy(owner, copy);
+                }
+                continue;
+            }
         }
         auto& batch = batches[getMigrationBatchingLayerGroupId(kSparseHistoryLevel, kHotLevel, page->lifeCycle)];
         batch.srcPages.push_back(page);
@@ -1345,6 +1361,43 @@ void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<Sh
         }
     }
 
+    auto discardCopies = FuncGuard(
+        [&]()
+        {
+            if (!copyOnly)
+            {
+                return;
+            }
+            for (auto& [layerGroup, batch] : batches)
+            {
+                for (size_t i = 0; i < batch.copies.size(); ++i)
+                {
+                    batch.srcPages[i]->sparseOffloadCopy.reset();
+                    for (auto const& owner : batch.srcPageLocks[i]->owners())
+                    {
+                        owner.kvCache->retainSparseOffloadCopy(owner, nullptr);
+                    }
+                }
+            }
+        });
+    if (copyOnly)
+    {
+        for (auto& [layerGroup, batch] : batches)
+        {
+            batch.copies.reserve(batch.srcPages.size());
+            for (size_t i = 0; i < batch.srcPages.size(); ++i)
+            {
+                auto copy = std::make_shared<SparseOffloadCopy>(*this, batch.srcPages[i]->lifeCycle, Slot{});
+                batch.copies.push_back(copy);
+                batch.srcPages[i]->sparseOffloadCopy = copy;
+                for (auto const& owner : batch.srcPageLocks[i]->owners())
+                {
+                    owner.kvCache->retainSparseOffloadCopy(owner, copy);
+                }
+            }
+        }
+    }
+
     CUstream const stream = requestingCache.cudaStream();
     auto const cudaStream = reinterpret_cast<CudaStream>(stream);
     std::vector<CachedCudaEvent> ownerEvents;
@@ -1378,7 +1431,7 @@ void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<Sh
                 for (size_t i = 0; i < batch.srcPages.size(); ++i)
                 {
                     batch.dstSlots[i].readyEvent = completion;
-                    batch.srcPageLocks[i]->recordOffloadEvent(completion);
+                    batch.srcPageLocks[i]->recordOffloadEvent(completion, !copyOnly);
                 }
             }
         });
@@ -1388,6 +1441,19 @@ void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<Sh
             batch.srcDstPageIndices.size(), stream);
     }
     fenceCopies.run();
+
+    if (copyOnly)
+    {
+        for (auto& [layerGroup, batch] : batches)
+        {
+            for (size_t i = 0; i < batch.copies.size(); ++i)
+            {
+                batch.copies[i]->adoptSlot(std::move(batch.dstSlots[i]));
+            }
+        }
+        discardCopies.cancel();
+        return;
+    }
 
     // Subsequent host readers on every owner's stream must observe the completed copy.
     for (auto const ownerStream : ownerStreams)

@@ -16,6 +16,7 @@
 """Sparse offload metadata, attention integration, and CUDA graph replay tests."""
 
 import math
+import os
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -24,11 +25,14 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
+    MLAParams,
 )
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4AttentionType
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend import (
     DeepseekV4TrtllmAttention,
 )
@@ -43,11 +47,20 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
 from tensorrt_llm._torch.attention.backends.sparse.hooks import prepare_sparse_runtime_params
 from tensorrt_llm._torch.attention.backends.sparse.params import SparseBackendForwardArgs
 from tensorrt_llm._torch.memory_buffer_utils import Buffers
+from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
+from tensorrt_llm.mapping import Mapping
 
+from .test_deepseek_v4_cache_manager import TestDeepseekV4CacheManager as _CacheManagerCase
 from .test_deepseek_v4_cache_manager import _history_case, _manager
+from .test_deepseek_v4_sparse_mla import (
+    Scenario,
+    _build_compressed_topk_indices,
+    _create_pos_embd_params,
+)
 
 _requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
@@ -77,14 +90,16 @@ def _metadata(manager, *, enabled=True, graph=False, buffers=None, initialize=Tr
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("local_csa", [False, True])
+@pytest.mark.parametrize("copy_only", [False, True])
 @pytest.mark.parametrize(
     "unsupported",
     ["beam", "configured_beam", "draft", "configured_draft", "draft_tree", "draft_cache"],
 )
 def test_sparse_offload_rejects_configuration_before_allocation(
-    unsupported: str, local_csa: bool
+    unsupported: str, local_csa: bool, copy_only: bool
 ) -> None:
     manager = _manager()
+    manager._sparse_offload_copy_only = copy_only
     if not local_csa:
         manager.pp_layers = [3]
     metadata = _metadata(manager, initialize=False)
@@ -114,6 +129,40 @@ def test_sparse_offload_disabled_allocates_nothing():
         metadata = _metadata(manager, enabled=False)
     assert metadata.sparse_offload_state is None
     describe.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("graph", [False, True])
+def test_sparse_offload_copy_only_uses_resident_tables_without_fetch_state(graph: bool) -> None:
+    manager = _manager()
+    manager._sparse_offload_copy_only = True
+    with patch.object(manager, "get_sparse_offload_descriptors") as describe:
+        metadata = _metadata(manager, graph=graph)
+    assert metadata.sparse_offload_state is None
+    describe.assert_not_called()
+
+    metadata.request_ids = [20, 10]
+    metadata._num_contexts, metadata._num_generations = 1, 1
+    metadata._seq_lens = torch.tensor([8, 1], dtype=torch.int32)
+    metadata.sliding_block_tables = object()
+    metadata.compress_block_tables = {4: object(), 128: object()}
+    with (
+        patch.object(manager, "prepare_sparse_offload") as prepare_fetch,
+        patch.object(manager, "copy_batch_sliding_block_tables"),
+        patch.object(manager, "copy_batch_compress_block_tables") as copy_tables,
+    ):
+        metadata.prepare_for_block_tables()
+    prepare_fetch.assert_not_called()
+    assert copy_tables.call_count == 2
+    for ratio, table in metadata.compress_block_tables.items():
+        copy_tables.assert_any_call(
+            table,
+            metadata.request_ids,
+            compress_ratio=ratio,
+            beam_width=1,
+            num_contexts=1,
+            num_seqs=2,
+        )
 
 
 @pytest.mark.cpu_only
@@ -384,6 +433,20 @@ def test_offload_admits_prefill_and_rejects_decode(prefill):
             DeepseekV4TrtllmAttentionMetadata.validate_sparse_offload_batch(metadata)
     assert not metadata.sparse_offload_state.prepared
     assert metadata.sparse_offload_state.is_prefill == prefill
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("phase", ["prefill", "decode", "mixed", "warmup"])
+def test_copy_only_offload_admits_resident_batch_layouts(phase: str) -> None:
+    metadata = _host_batch(prefill=phase == "prefill")
+    metadata.kv_cache_manager._sparse_offload_copy_only = True
+    metadata.sparse_offload_state = None
+    if phase == "mixed":
+        metadata.num_contexts = metadata.num_generations = 1
+    elif phase == "warmup":
+        metadata.request_ids = [CUDA_GRAPH_DUMMY_REQUEST_ID] * 2
+    DeepseekV4TrtllmAttentionMetadata.validate_sparse_offload_batch(metadata)
+    assert metadata.sparse_offload_state is None
 
 
 @pytest.mark.cpu_only
@@ -763,6 +826,193 @@ def test_offload_disabled_and_other_ratios_do_not_fetch():
     )
     _consume(case, backend)
     assert not case.calls
+
+
+@_requires_cuda
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("fp8", [False, True])
+def test_copy_only_decode_consumes_resident_gpu_tables(graph: bool, fp8: bool) -> None:
+    case = _attention_case(fp8=fp8)
+    backend = case.backends[0]
+    case.metadata.compress_block_tables[4].copy_(
+        torch.tensor([[0, 2, 4, -1, -1, -1]] * 4, dtype=torch.int32, device="cuda")
+    )
+    backend.sparse_attention_config.enable_kv_cache_offload = False
+    expected = _consume(case, backend).sparse_attn_indices.clone()
+    backend.sparse_attention_config.enable_kv_cache_offload = True
+    case.manager._sparse_offload_copy_only = True
+    case.metadata.sparse_offload_state = None
+    with patch.object(
+        case.manager, "fetch_sparse_read_table", side_effect=AssertionError("Unexpected refetch")
+    ) as fetch:
+        actual = _consume(case, backend)
+        if graph:
+            captured = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(captured):
+                actual = _consume(case, backend)
+            captured.replay()
+        fetch.assert_not_called()
+    assert not case.calls
+    torch.testing.assert_close(actual.sparse_attn_indices, expected, rtol=0, atol=0)
+    if fp8:
+        assert case.args.fmha_scheduler_counter.item() == 0
+        torch.testing.assert_close(case.args.mla_bmm2_scale, torch.tensor([0.25], device="cuda"))
+
+
+@_requires_cuda
+@skip_pre_blackwell
+@pytest.mark.parametrize("graph", [False, True])
+@torch.no_grad()
+def test_copy_only_offload_preserves_real_decode_attention(monkeypatch, graph: bool) -> None:
+    if graph and os.environ.get("TLLM_DEBUG_MODE", "").startswith("1"):
+        pytest.skip("TLLM_DEBUG_MODE attention validation synchronizes during CUDA graph capture")
+    monkeypatch.setenv("TLLM_DSV4_OFFLOAD_COPY_ONLY", "1")
+    torch.manual_seed(42)
+    helper = _CacheManagerCase()
+    with torch.cuda.stream(torch.cuda.Stream()):
+        manager, config = helper._create_deepseek_v4_cache_manager(
+            tokens_per_block=128,
+            max_batch_size=1,
+            max_seq_len=384,
+            compress_ratios=[4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            indexer_k_dtype="fp8",
+            host_cache_size=16 << 20,
+            enable_kv_cache_offload=True,
+            enable_swa_scratch_reuse=False,
+        )
+    torch.cuda.current_stream().wait_stream(manager._stream)
+    config.index_n_heads = 64
+    config.skip_indexer_for_short_seqs = False
+    prompt_len, head_dim, num_heads = 129, 512, 16
+    request = helper._create_request(20, prompt_len)
+    try:
+        assert manager.prepare_context(request)
+        assert manager.resize_context(request, request.context_chunk_size)
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [request]
+        manager.prepare_resources(batch)
+        torch.cuda.current_stream().wait_stream(manager._stream)
+        helper._write_request_prefill(
+            request,
+            prompt_len,
+            manager,
+            {
+                (0, attn_type): (
+                    torch.randn((length, head_dim), device="cuda", dtype=torch.bfloat16),
+                    None,
+                )
+                for attn_type, length in (
+                    (DeepseekV4AttentionType.SWA, prompt_len),
+                    (DeepseekV4AttentionType.COMPRESS, prompt_len // 4),
+                )
+            },
+        )
+        request.context_current_position = prompt_len
+        request.add_new_token(1, 0)
+        manager.update_context_resources(batch)
+        cache = manager.kv_cache_map[request.py_request_id]
+        # Reserve the comparison query's slot while history is still GPU-only.
+        assert cache.resize(prompt_len + 1)
+        torch.cuda.current_stream().wait_stream(manager._stream)
+        assert not cache.is_decoding
+        metadata = DeepseekV4TrtllmAttentionMetadata(
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            num_contexts=0,
+            max_num_requests=1,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[prompt_len]),
+            kv_cache_manager=manager,
+            request_ids=[request.py_request_id],
+            prompt_lens=[prompt_len],
+            max_num_tokens=1,
+            mapping=Mapping(),
+            sparse_attention_config=config,
+            is_cuda_graph=graph,
+            cuda_graph_buffers=Buffers() if graph else None,
+        )
+        metadata.prepare()
+        resident_table = metadata.compress_block_tables[4].clone()
+        table_pointer = metadata.compress_block_tables[4].data_ptr()
+        layer = DeepseekV4TrtllmAttention(
+            layer_idx=0,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=1,
+            q_scaling=1.0,
+            pos_embd_params=_create_pos_embd_params(Scenario(max_position_embeddings=512)),
+            mla_params=MLAParams(
+                q_lora_rank=1536,
+                kv_lora_rank=448,
+                qk_rope_head_dim=64,
+                qk_nope_head_dim=128,
+                v_head_dim=head_dim,
+                rope_append=False,
+                predicted_tokens_per_seq=1,
+                hidden_size=7168,
+            ),
+            sparse_attention_config=config,
+            skip_create_weights_in_init=True,
+            dtype=torch.bfloat16,
+        )
+        layer.update_quant_config(None)
+        fused_q = torch.randn((1, num_heads * head_dim), device="cuda", dtype=torch.bfloat16)
+        q_pe = torch.randn((1, num_heads, 64), device="cuda", dtype=torch.bfloat16)
+        latent_cache = torch.randn((1, head_dim), device="cuda", dtype=torch.bfloat16)
+        cu_q = torch.empty(2, dtype=torch.int32, device="cuda")
+        cu_kv = torch.empty_like(cu_q)
+        counter = torch.empty(1, dtype=torch.uint32, device="cuda")
+        topk = _build_compressed_topk_indices(
+            [prompt_len], 4, config.index_topk, torch.device("cuda")
+        )
+
+        def attend() -> torch.Tensor:
+            query, kv = fused_q.clone(), latent_cache.clone()
+            layer.mla_rope_generation(
+                query, q_pe, kv, metadata, cu_q, cu_kv, counter, None, None, None
+            )
+            return layer.forward(
+                query,
+                None,
+                None,
+                metadata,
+                attention_input_type=AttentionInputType.generation_only,
+                latent_cache=kv,
+                q_pe=q_pe,
+                cu_q_seqlens=cu_q,
+                cu_kv_seqlens=cu_kv,
+                fmha_scheduler_counter=counter,
+                sparse_backend_args=SparseBackendForwardArgs(topk_indices=topk),
+            )
+
+        with patch.object(
+            manager, "fetch_sparse_read_table", side_effect=AssertionError("Unexpected refetch")
+        ) as fetch:
+            expected = attend().clone()
+            if graph:
+                captured = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(captured):
+                    actual = attend()
+            assert manager.try_allocate_generation(request)
+            assert cache.is_decoding
+            pages, copied_bytes = manager.verify_sparse_offload_copies(request.py_request_id)
+            assert pages == 1
+            assert copied_bytes == 128 // 4 * head_dim * 2
+            metadata.prepare()
+            assert metadata.compress_block_tables[4].data_ptr() == table_pointer
+            torch.testing.assert_close(metadata.compress_block_tables[4], resident_table)
+            if graph:
+                captured.replay()
+            else:
+                actual = attend()
+            fetch.assert_not_called()
+        assert torch.isfinite(expected).all()
+        assert expected.count_nonzero() > 0
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        if request.py_request_id in manager.kv_cache_map:
+            manager.free_resources(request)
+        manager.shutdown()
 
 
 @_requires_cuda

@@ -211,7 +211,7 @@ CacheLevel KvCache::_lockLevel(Page const& page, BlockOrdinal ordinal) const
 {
     bool const readOnly = page.isCommitted()
         || (ordinal != kBadBlockOrdinal && ordinal < BlockOrdinal{mHistoryLength / mTokensPerBlock});
-    return mIsDecoding && readOnly ? page.queryLockLevel() : kHotLevel;
+    return mIsDecoding && readOnly && !mManager->config().sparseOffloadCopyOnly ? page.queryLockLevel() : kHotLevel;
 }
 
 void KvCache::_offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int historyLength)
@@ -243,7 +243,8 @@ void KvCache::_offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int histo
                 for (auto const& owner : lock->owners())
                 {
                     int const ownerHistory = owner.kvCache == this ? historyLength : owner.kvCache->historyLength();
-                    if ((owner.kvCache != this && !owner.kvCache->isDecoding())
+                    if ((!mManager->config().sparseOffloadCopyOnly && owner.kvCache != this
+                            && !owner.kvCache->isDecoding())
                         || owner.ordinal >= BlockOrdinal{ownerHistory / owner.kvCache->tokensPerBlock()})
                     {
                         needsGpu = true;
@@ -316,6 +317,117 @@ void KvCache::offloadSparsePages(std::vector<SharedPtr<Page>> const& pages)
     DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& dropped, CacheLevel level)
     { _recordDroppedPages(dropped, level); };
     storageManager()->offloadSparsePages(*this, pages, migrationRecorder, dropRecorder);
+}
+
+void KvCache::retainSparseOffloadCopy(LockOwner const& owner, std::shared_ptr<SparseOffloadCopy> const& copy)
+{
+    auto& copies = mBlocks.at(owner.ordinal).sparseOffloadCopies;
+    auto const key = std::pair{owner.beamIndex, owner.lifeCycle};
+    if (copy)
+    {
+        copies[key] = copy;
+    }
+    else
+    {
+        copies.erase(key);
+    }
+}
+
+std::vector<int> KvCache::getSparseOffloadCopyIndices(LayerGroupId layerGroupId, BeamIndex beamIndex) const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = mManager->lockShared();
+    if (beamIndex < BeamIndex{0} || beamIndex >= mBeamWidth)
+    {
+        throw std::out_of_range("Invalid beam index");
+    }
+    LifeCycleId const lifeCycle = layerGroupId;
+    mManager->lifeCycles().getLifeCycle(lifeCycle);
+    std::vector<int> result;
+    result.reserve(toSizeT(mBlocks.size()));
+    for (auto const& block : mBlocks)
+    {
+        auto const copy = block.sparseOffloadCopies.find({beamIndex, lifeCycle});
+        result.push_back(
+            copy == block.sparseOffloadCopies.end() ? -1 : slotIdToPageIndexValue(copy->second->slot().slotId()));
+    }
+    return result;
+}
+
+void KvCache::synchronizeSparseOffloadCopies() const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = mManager->lockShared();
+    for (auto const& block : mBlocks)
+    {
+        for (auto const& [owner, copy] : block.sparseOffloadCopies)
+        {
+            copy->slot().readyEvent.synchronize();
+        }
+    }
+}
+
+std::vector<std::optional<std::vector<char>>> KvCache::getSparseOffloadCopyData(
+    LayerId layerId, DataRole const& role, BeamIndex beamIndex) const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = mManager->lockShared();
+    if (beamIndex < BeamIndex{0} || beamIndex >= mBeamWidth)
+    {
+        throw std::out_of_range("Invalid beam index");
+    }
+    auto const& storage = *storageManager();
+    if (!storage.usesDefaultColdPageCodec())
+    {
+        throw std::invalid_argument("Diagnostic buffer snapshots require the default cold-page codec");
+    }
+    LifeCycleId const lifeCycle = storage.getLayerAttr(layerId).lifeCycleId;
+    PoolGroupIndex const poolGroup = storage.getPoolGroupIndex(kSparseHistoryLevel, lifeCycle);
+    PoolGroupIndex const hotPoolGroup = storage.getPoolGroupIndex(kHotLevel, lifeCycle);
+    std::optional<std::pair<size_t, size_t>> buffer;
+    for (auto const& variant : storage.slotDescList(kHotLevel).at(hotPoolGroup).variants)
+    {
+        if (variant.lifeCycleId != lifeCycle)
+        {
+            continue;
+        }
+        size_t poolOffset = 0;
+        for (PoolIndex pool{0}; pool < variant.coalescedBuffers.size(); ++pool)
+        {
+            auto const& coalesced = variant.coalescedBuffers[pool];
+            auto const position
+                = std::find(coalesced.bufferIds.begin(), coalesced.bufferIds.end(), BufferId{layerId, role});
+            if (position != coalesced.bufferIds.end())
+            {
+                buffer = {poolOffset
+                        + static_cast<size_t>(position - coalesced.bufferIds.begin()) * coalesced.singleBufferSize,
+                    coalesced.singleBufferSize};
+            }
+            poolOffset += coalesced.size();
+        }
+    }
+    if (!buffer)
+    {
+        throw std::invalid_argument("Diagnostic host buffer is unavailable in this cold-page layout");
+    }
+    auto const [offset, bytes] = *buffer;
+    std::vector<std::optional<std::vector<char>>> result;
+    result.reserve(toSizeT(mBlocks.size()));
+    for (auto const& block : mBlocks)
+    {
+        auto const copy = block.sparseOffloadCopies.find({beamIndex, lifeCycle});
+        if (copy == block.sparseOffloadCopies.end())
+        {
+            result.emplace_back(std::nullopt);
+            continue;
+        }
+        copy->second->slot().readyEvent.synchronize();
+        auto const address = std::get<MemAddress>(
+            storage.slotAddress(kSparseHistoryLevel, poolGroup, copy->second->slot().slotId(), PoolIndex{0}));
+        auto const* data = reinterpret_cast<char const*>(address + offset);
+        result.emplace_back(std::vector<char>(data, data + bytes));
+    }
+    return result;
 }
 
 void KvCache::activate()
@@ -2409,6 +2521,13 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
             CacheLevel const level = page->cacheLevel;
             auto& bpSlot = mBlocks[ordinal].pages[beamIdx][lcId];
             bpSlot = page->hold();
+            if (ordinal < fullReusedEnd)
+            {
+                if (auto copy = page->sparseOffloadCopy.lock())
+                {
+                    retainSparseOffloadCopy({this, beamIdx, ordinal, lcId}, copy);
+                }
+            }
             if (!isAttention)
             {
                 return;

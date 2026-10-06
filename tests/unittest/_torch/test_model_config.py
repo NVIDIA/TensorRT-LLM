@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import struct
 import types
@@ -259,6 +274,32 @@ def test_deepseek_v4_missing_compress_ratios_raises(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="compress_ratios"):
         ModelConfig.from_pretrained(str(tmp_path))
+
+
+@pytest.mark.parametrize("enable_offload", [None, False, True])
+def test_deepseek_v4_preserves_offload_when_resolving_checkpoint_config(
+    tmp_path, monkeypatch, enable_offload: bool | None
+) -> None:
+    from tensorrt_llm._torch import model_config as model_config_module
+    from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
+    from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
+
+    pretrained_config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        compress_ratios=[0, 4, 128, 4] * 2,
+        num_hidden_layers=8,
+    )
+    monkeypatch.setattr(
+        model_config_module, "load_pretrained_config", lambda *args, **kwargs: pretrained_config
+    )
+    kwargs = {}
+    if enable_offload is not None:
+        kwargs["sparse_attention_config"] = DeepSeekV4SparseAttentionConfig(
+            enable_kv_cache_offload=enable_offload
+        )
+    config = ModelConfig.from_pretrained(str(tmp_path), moe_backend="TRTLLM", **kwargs)
+    assert config.sparse_attention_config.enable_kv_cache_offload is (enable_offload is True)
+    assert config.sparse_attention_config.compress_ratios == [1, 4, 128, 4] * 2
 
 
 def test_model_config_sets_is_encoder_decoder_from_pretrained_config():

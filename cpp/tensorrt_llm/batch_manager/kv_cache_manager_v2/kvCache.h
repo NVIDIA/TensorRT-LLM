@@ -29,6 +29,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <variant>
@@ -82,6 +83,7 @@ struct SeqBlock
 {
     BeamBlockPages pages;
     SharedPtr<Block> treeBlock; // non-null iff committed
+    std::map<std::pair<BeamIndex, LifeCycleId>, std::shared_ptr<SparseOffloadCopy>> sparseOffloadCopies;
 
     bool isCommitted() const noexcept
     {
@@ -281,6 +283,19 @@ public:
     //! Duplicate pages and pages already in host history are ignored. Does not advance history length.
     //! Caller must ensure every owner has finished the execution phase that requires these pages on GPU.
     void offloadSparsePages(std::vector<SharedPtr<Page>> const& pages);
+
+    //! Return diagnostic host-slot indices by block ordinal, with -1 for missing copies.
+    std::vector<int> getSparseOffloadCopyIndices(LayerGroupId layerGroupId, BeamIndex beamIndex) const;
+
+    //! Wait until this request's diagnostic copies are safe for CPU inspection.
+    void synchronizeSparseOffloadCopies() const;
+
+    //! Return independent per-block host payloads for a layer buffer; missing copies are nullopt.
+    std::vector<std::optional<std::vector<char>>> getSparseOffloadCopyData(
+        LayerId layerId, DataRole const& role, BeamIndex beamIndex) const;
+
+    //! Attach a diagnostic copy to the request block that owns the corresponding page.
+    void retainSparseOffloadCopy(LockOwner const& owner, std::shared_ptr<SparseOffloadCopy> const& copy);
 
     // CPU-side invalidation for page indices, levels, readiness, eligibility and row/buffer bindings.
     // Several changes leave one pending refresh. Acknowledging an older version never clears it.

@@ -1253,6 +1253,9 @@ class ModelConfig(Generic[TConfig]):
                             compress_ratios=compress_ratios,
                             window_size=window_size,
                             indexer_k_dtype=indexer_k_dtype,
+                            enable_kv_cache_offload=(
+                                sparse_attention_config.enable_kv_cache_offload
+                                if sparse_attention_config else False),
                             **indexer_config)
             else:
                 raise ValueError(

@@ -329,6 +329,9 @@ struct KVCacheManagerConfig
     // (a text-only deployment forbids a request claiming otherwise). Default false.
     bool textOnly = false;
 
+    //! Diagnostic sparse copies retain authoritative GPU pages and reserve separate host slots.
+    bool sparseOffloadCopyOnly = false;
+
     bool enableSwaScratchReuse() const noexcept
     {
         return swaScratchReuse.has_value();

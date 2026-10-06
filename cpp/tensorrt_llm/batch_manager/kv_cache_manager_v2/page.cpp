@@ -19,6 +19,7 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/kvCache.h"        // for KvCache
+#include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/storageManager.h" // for StorageManager
 
 #include "tensorrt_llm/common/assert.h"
@@ -200,6 +201,28 @@ UncommittedPage::~UncommittedPage()
     // Delegate slot release to Page::~Page().
 }
 
+SparseOffloadCopy::SparseOffloadCopy(StorageManager& manager, LifeCycleId lifeCycle, Slot hostSlot)
+    : mSlot(std::move(hostSlot))
+    , mManager(manager)
+    , mLifeCycle(lifeCycle)
+{
+}
+
+SparseOffloadCopy::~SparseOffloadCopy()
+{
+    if (mSlot.hasValidSlot())
+    {
+        mManager.releaseSlot(mLifeCycle, kSparseHistoryLevel, std::move(mSlot));
+    }
+}
+
+void SparseOffloadCopy::adoptSlot(Slot&& slot)
+{
+    TLLM_CHECK_WITH_INFO(
+        !mSlot.hasValidSlot() && slot.hasValidSlot(), "A diagnostic copy can adopt a valid host slot only once");
+    mSlot = std::move(slot);
+}
+
 SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock)
 {
@@ -217,6 +240,7 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
     committed->readyEvent = std::move(readyEvent);
+    committed->sparseOffloadCopy = std::move(sparseOffloadCopy);
     resetSlot();
     readyEvent = CachedCudaEvent::makeNull();
 
@@ -360,7 +384,10 @@ void UniqPageLock::prepareSparseOffload(KvCache const& requestingCache)
     {
         throw LogicError("Offload requires a locked sparse attention page on GPU or in host history");
     }
-    if (p.isCommitted() && static_cast<CommittedPage const&>(p).numTokensInBlock != requestingCache.tokensPerBlock())
+    // A prompt tail can finish filling during decode after its shorter reusable prefix is committed.
+    // Diagnostic copies follow completed request history without expanding that prefix's reuse coverage.
+    if (!requestingCache.manager().config().sparseOffloadCopyOnly && p.isCommitted()
+        && static_cast<CommittedPage const&>(p).numTokensInBlock != requestingCache.tokensPerBlock())
     {
         throw LogicError("Cannot offload a partial committed page");
     }
@@ -381,15 +408,20 @@ void UniqPageLock::prepareSparseOffload(KvCache const& requestingCache)
     finishEvents.reserve(1);
 }
 
-void UniqPageLock::recordOffloadEvent(CachedCudaEvent const& event)
+void UniqPageLock::recordOffloadEvent(CachedCudaEvent const& event, bool publishStorageChange)
 {
     // The copy stream already waited for every event being replaced here.
     page()->readyEvent = event;
     finishEvents.clear();
     finishEvents.push_back(event);
     // A rejected copy can change readiness without changing the source slot.
-    for (auto const& owner : mOwners)
-        owner.kvCache->onPageStorageChanged();
+    if (publishStorageChange)
+    {
+        for (auto const& owner : mOwners)
+        {
+            owner.kvCache->onPageStorageChanged();
+        }
+    }
 }
 
 Slot UniqPageLock::moveToSparseHistory(Slot&& hostSlot)
@@ -439,6 +471,14 @@ SharedPageLock::SharedPageLock(SharedPtr<UniqPageLock> ul, KvCache& kvCache, Bea
     if (!skipWait)
     {
         page()->readyEvent.waitInStream(reinterpret_cast<CudaStream>(kvCache.cudaStream()));
+    }
+
+    if (ordinal >= BlockOrdinal{0} && ordinal < BlockOrdinal{kvCache.historyLength() / kvCache.tokensPerBlock()})
+    {
+        if (auto copy = page()->sparseOffloadCopy.lock())
+        {
+            kvCache.retainSparseOffloadCopy(mUser, copy);
+        }
     }
 
     mUniqLock->mOwners.push_back(mUser);

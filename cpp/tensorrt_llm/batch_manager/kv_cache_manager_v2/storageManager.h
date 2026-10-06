@@ -301,6 +301,12 @@ public:
     // Address of a slot's buffer in a specific pool at a cache level.
     Address slotAddress(CacheLevel level, PoolGroupIndex pgIdx, SlotId slotId, PoolIndex poolIdx) const;
 
+    //! Whether cold pages concatenate the unmodified hot-pool buffers in pool order.
+    bool usesDefaultColdPageCodec() const noexcept
+    {
+        return mUsesDefaultColdPageCodec;
+    }
+
     // Cache tier for a given level.
     CacheTier cacheTier(CacheLevel level) const;
 
@@ -423,6 +429,7 @@ private:
     std::optional<SwaScratchReuseConfig> mSwaScratchReuse;
 
     // Owns the configured codec and outlives the storage and staging resources declared below.
+    bool mUsesDefaultColdPageCodec;
     std::unique_ptr<IKvCacheColdPageCodec> mColdPageCodec;
 
     // Optional model-sized page staging is owned here and borrowed by CopyEngine.

@@ -324,7 +324,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         """Allocate metadata for the standalone sparse-fetch adapter."""
         self.sparse_offload_state = None
         self._validate_sparse_offload_config()
-        if not self.sparse_metadata_params.enable_kv_cache_offload:
+        if (
+            not self.sparse_metadata_params.enable_kv_cache_offload
+            or self.kv_cache_manager.sparse_offload_copy_only
+        ):
             return
         manager = self.kv_cache_manager
         # Descriptor setup also validates the fixed KV dtype and pool layout.
@@ -609,9 +612,13 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         Fresh and cached unchunked prefill use resident KV. Decode admission and history
         offload run through the cache manager, but consuming offloaded history
-        requires refetch. Reject decode before building tables or running kernels.
+        requires refetch. Copy-only diagnostics retain GPU KV and use ordinary
+        resident attention for every batch layout.
         """
-        if not self.sparse_metadata_params.enable_kv_cache_offload:
+        if (
+            not self.sparse_metadata_params.enable_kv_cache_offload
+            or self.kv_cache_manager.sparse_offload_copy_only
+        ):
             return
         state = self.sparse_offload_state
         if state is not None:

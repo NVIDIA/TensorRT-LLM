@@ -1654,7 +1654,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::vector<kv::BatchDesc> constraints, std::optional<kv::BatchDesc> typicalStep,
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
-                bool textOnly)
+                bool textOnly, bool sparseOffloadCopyOnly)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1677,6 +1677,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->commitMinSnapshot = commitMinSnapshot;
                 cfg->enableStats = enableStats;
                 cfg->textOnly = textOnly;
+                cfg->sparseOffloadCopyOnly = sparseOffloadCopyOnly;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1686,7 +1687,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("reuse_match_backoff") = 0, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
             nb::arg("typical_step") = std::nullopt, nb::arg("initial_pool_ratio").none() = std::nullopt,
             nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("commit_min_snapshot") = false,
-            nb::arg("enable_stats") = true, nb::arg("text_only") = false)
+            nb::arg("enable_stats") = true, nb::arg("text_only") = false, nb::arg("sparse_offload_copy_only") = false)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -1701,6 +1702,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("commit_min_snapshot", &kv::KVCacheManagerConfig::commitMinSnapshot)
         .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
         .def_rw("text_only", &kv::KVCacheManagerConfig::textOnly)
+        .def_rw("sparse_offload_copy_only", &kv::KVCacheManagerConfig::sparseOffloadCopyOnly)
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
         .def("validate", &kv::KVCacheManagerConfig::validate) DEF_COPY(kv::KVCacheManagerConfig);
 
@@ -1829,6 +1831,37 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("cuda_stream") = nb::none(), nb::arg("is_decoding") = nb::none())
         .def("enter_decode", &kv::KvCache::enterDecode, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_sparse_offload_copy_indices",
+            [](kv::KvCache const& self, int layerGroupId, int beamIndex)
+            { return self.getSparseOffloadCopyIndices(kv::LayerGroupId{layerGroupId}, kv::BeamIndex{beamIndex}); },
+            nb::arg("layer_group_id"), nb::arg("beam_id") = 0, nb::call_guard<nb::gil_scoped_release>())
+        .def("synchronize_sparse_offload_copies", &kv::KvCache::synchronizeSparseOffloadCopies,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_sparse_offload_copy_data",
+            [](kv::KvCache const& self, int layerId, std::string const& role, int beamIndex)
+            {
+                std::vector<std::optional<std::vector<char>>> data;
+                {
+                    nb::gil_scoped_release release;
+                    data = self.getSparseOffloadCopyData(layerId, role, kv::BeamIndex{beamIndex});
+                }
+                nb::list result;
+                for (auto const& block : data)
+                {
+                    if (block)
+                    {
+                        result.append(nb::bytes(block->data(), block->size()));
+                    }
+                    else
+                    {
+                        result.append(nb::none());
+                    }
+                }
+                return result;
+            },
+            nb::arg("layer_id"), nb::arg("data_role"), nb::arg("beam_id") = 0)
         .def_prop_ro("is_decoding", &kv::KvCache::isDecoding)
         .def_prop_ro("page_storage_version", &kv::KvCache::pageStorageVersion, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("page_storage_dirty", &kv::KvCache::pageStorageDirty, nb::call_guard<nb::gil_scoped_release>())

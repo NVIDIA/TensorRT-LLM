@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import defaultdict
 from dataclasses import replace
 from math import gcd
@@ -337,9 +338,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 "for DeepseekV4CacheManager"
             )
 
-        self._enable_kv_cache_offload = sparse_attn_config.enable_kv_cache_offload
-        if self._enable_kv_cache_offload:
-            if kv_cache_config.host_cache_size is None or kv_cache_config.host_cache_size <= 0:
+        offload_requested = sparse_attn_config.enable_kv_cache_offload
+        # Estimation managers hold only dummy GPU KV and have no host budget.
+        self._enable_kv_cache_offload = offload_requested and not kwargs.get(
+            "is_estimating_kv_cache", False
+        )
+        self._sparse_offload_copy_only = (
+            offload_requested and os.environ.get("TLLM_DSV4_OFFLOAD_COPY_ONLY", "0") == "1"
+        )
+        if offload_requested:
+            if self._enable_kv_cache_offload and (
+                kv_cache_config.host_cache_size is None or kv_cache_config.host_cache_size <= 0
+            ):
                 raise ValueError("DeepSeek-V4 sparse offload requires a positive host_cache_size")
             if dtype not in (DataType.BF16, DataType.FP8) or kv_cache_config.dtype == "fp8_ds_mla":
                 raise NotImplementedError(
@@ -439,6 +449,12 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             **kwargs,
         )
         self.is_vswa = True  # DeepSeek-V4 must has VSWA
+
+        if self._enable_kv_cache_offload and self.sparse_offload_copy_only:
+            logger.info(
+                "DeepSeek-V4 copy-only offload diagnostic enabled: completed sparse KV is "
+                "copied to host while GPU allocations and attention tables remain resident."
+            )
 
         if self._enable_kv_cache_offload:
             sparse_groups = {
@@ -1252,6 +1268,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         return replace(
             config,
             layers=layers,
+            sparse_offload_copy_only=self.sparse_offload_copy_only,
         )
 
     def _init_indexer_dtype(self, sparse_attn_config: DeepSeekV4SparseAttentionConfig) -> None:
@@ -1659,9 +1676,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
-        if self._enable_kv_cache_offload and any(
-            not (request.is_first_context_chunk and request.is_last_context_chunk)
-            for request in scheduled_batch.context_requests
+        if (
+            self._enable_kv_cache_offload
+            and not self.sparse_offload_copy_only
+            and any(
+                not (request.is_first_context_chunk and request.is_last_context_chunk)
+                for request in scheduled_batch.context_requests
+            )
         ):
             # Attention metadata's prompt_lens contains the current chunk's
             # length, so only the scheduled request can identify a first chunk
@@ -1669,6 +1690,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             raise NotImplementedError("Sparse offload does not support chunked prefill")
         self._wait_for_sparse_model_work()
         super().prepare_resources(scheduled_batch)
+
+    @property
+    def sparse_offload_copy_only(self) -> bool:
+        """Whether host history is diagnostic while GPU KV remains authoritative."""
+        return self._sparse_offload_copy_only
 
     @property
     def requires_synchronized_admission(self) -> bool:
@@ -1710,6 +1736,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         if needs_wait:
             self._wait_for_sparse_model_work()
 
+    @nvtx_range_debug("dsv4_sparse_decode_admission")
     def try_allocate_generation(self, req: llm_request.LlmRequest) -> bool:
         self._order_sparse_history_update((req,), include_suspended=True)
         cache = self.kv_cache_map.get(req.py_request_id)
@@ -1748,13 +1775,82 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
     def free_resources(self, request: llm_request.LlmRequest, pin_on_release: bool = False) -> None:
         self._order_sparse_history_update((request,))
-        super().free_resources(request, pin_on_release)
+        try:
+            cache = self.kv_cache_map.get(request.py_request_id)
+            if (
+                self._enable_kv_cache_offload
+                and self.sparse_offload_copy_only
+                and not request.is_dummy_request
+                and request.py_request_id not in _RESERVED_REQUEST_IDS
+                and cache is not None
+                and cache.is_active
+            ):
+                pages, copied_bytes = self.verify_sparse_offload_copies(request.py_request_id)
+                logger.info(
+                    f"DeepSeek-V4 copy-only offload: request {request.py_request_id} verified "
+                    f"{pages} host pages ({copied_bytes} bytes); GPU KV retained."
+                )
+        finally:
+            super().free_resources(request, pin_on_release)
+
+    @nvtx_range_debug("dsv4_verify_offload_copies")
+    def verify_sparse_offload_copies(self, request_id: int) -> tuple[int, int]:
+        """Synchronously compare diagnostic host copies with a live request's GPU KV.
+
+        Returns the number of physical host pages and verified payload bytes.
+        This diagnostic runs outside capture, requires an active request, and
+        raises on a byte mismatch. Ordinary offload does not use this path.
+        """
+        if not self.sparse_offload_copy_only:
+            raise ValueError("Host-copy verification requires TLLM_DSV4_OFFLOAD_COPY_ONLY=1")
+        if not self._enable_kv_cache_offload:
+            raise ValueError("Host-copy verification is unavailable during KV cache estimation")
+        cache = self.kv_cache_map[request_id]
+        if not cache.is_active:
+            raise ValueError("Host-copy verification requires an active request")
+        self._wait_for_sparse_model_work()
+        pages = 0
+        copied_bytes = 0
+        counted_groups = set()
+        with torch.cuda.device(self._stream.device):
+            torch.cuda.current_stream().wait_stream(self._stream)
+            for layer in self.pp_layers:
+                if self._compress_ratios[layer] != DEEPSEEK_V4_SPARSE_RATIO:
+                    continue
+                layer_id = self._layer_attn_to_layer_id[layer, DeepseekV4AttentionType.COMPRESS]
+                group = self.impl.get_layer_group_id(layer_id)
+                if group not in counted_groups:
+                    pages += sum(
+                        index >= 0 for index in cache.get_sparse_offload_copy_indices(group)
+                    )
+                    counted_groups.add(group)
+                payloads = cache.get_sparse_offload_copy_data(
+                    layer_id, DeepseekV4AttentionType.COMPRESS.role
+                )
+                if not any(payload is not None for payload in payloads):
+                    continue
+                table = torch.empty((1, self.max_blocks_per_seq), dtype=torch.int32)
+                self.copy_batch_compress_block_tables(table, [request_id], 4, 1, 0, 1)
+                buffer = self.get_buffers(layer, DeepseekV4AttentionType.COMPRESS)
+                for ordinal, payload in enumerate(payloads):
+                    if payload is None:
+                        continue
+                    gpu_bytes = buffer[table[0, ordinal]].view(torch.uint8).cpu().numpy().tobytes()
+                    if gpu_bytes != payload:
+                        raise RuntimeError(
+                            f"DeepSeek-V4 host-copy mismatch: request={request_id}, "
+                            f"layer={layer}, block={ordinal}"
+                        )
+                    copied_bytes += len(payload)
+        return pages, copied_bytes
 
     def release_index_slot(self, request_id: int) -> None:
         self._wait_for_sparse_model_work()
         super().release_index_slot(request_id)
 
     def _publish_sparse_metadata(self) -> None:
+        if self.sparse_offload_copy_only:
+            return
         self._wait_for_sparse_model_work()
         super()._publish_sparse_metadata()
 
@@ -1762,6 +1858,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         self._order_sparse_history_update(scheduled_batch.context_requests)
         super().update_context_resources(scheduled_batch)
 
+    @nvtx_range_debug("dsv4_sparse_history_update")
     def update_resources(
         self,
         scheduled_batch: ScheduledRequests,
@@ -2032,6 +2129,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """Build the COMPRESS block table for one compression ratio and copy it to the destination."""
         if (
             self._enable_kv_cache_offload
+            and not self.sparse_offload_copy_only
             and compress_ratio == DEEPSEEK_V4_SPARSE_RATIO
             and (
                 num_contexts != num_seqs

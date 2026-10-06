@@ -294,9 +294,10 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 assert topk_indices is not None, "topk_indices is required when compress_ratio=4"
                 compressed_local_indices = topk_indices
                 # Metadata setup and prepare() validate the dtype and batch layout.
-                # Fresh prefill already uses the resident write table.
+                # Prefill and copy-only diagnostics use the resident write table.
                 if (
                     self.sparse_attention_config.enable_kv_cache_offload
+                    and not kv_cache_manager.sparse_offload_copy_only
                     and attention_input_type == AttentionInputType.generation_only
                 ):
                     state = metadata.sparse_offload_state

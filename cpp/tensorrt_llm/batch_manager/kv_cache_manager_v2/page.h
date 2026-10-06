@@ -39,6 +39,31 @@ class PageHolder;
 class UniqPageLock;
 class SharedPageLock;
 
+//! A diagnostic host copy owned by live request blocks, independently of the GPU page.
+class SparseOffloadCopy
+{
+public:
+    SparseOffloadCopy(StorageManager& manager, LifeCycleId lifeCycle, Slot hostSlot);
+    ~SparseOffloadCopy();
+
+    SparseOffloadCopy(SparseOffloadCopy const&) = delete;
+    SparseOffloadCopy& operator=(SparseOffloadCopy const&) = delete;
+
+    //! Read the reserved host slot and its copy-completion fence.
+    Slot const& slot() const noexcept
+    {
+        return mSlot;
+    }
+
+    //! Adopt a completed copy submission's host slot into an empty diagnostic record.
+    void adoptSlot(Slot&& slot);
+
+private:
+    Slot mSlot;
+    StorageManager& mManager;
+    LifeCycleId mLifeCycle;
+};
+
 // ---------------------------------------------------------------------------
 // Page — base class for all KV-cache pages.
 // Inherits from Slot (holds slotId + readyEvent).
@@ -55,6 +80,7 @@ public:
     Priority const priority;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
+    std::weak_ptr<SparseOffloadCopy> sparseOffloadCopy;
 
     Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio);
 
@@ -214,7 +240,7 @@ public:
     void prepareSparseOffload(KvCache const& requestingCache);
 
     //! Record a copy ordered after page readiness, finished readers, and all live owners' prior work.
-    void recordOffloadEvent(CachedCudaEvent const& event);
+    void recordOffloadEvent(CachedCudaEvent const& event, bool publishStorageChange = true);
 
     //! Publish the host slot to every owner and return the fenced GPU slot. Caller holds the API lock.
     [[nodiscard]] Slot moveToSparseHistory(Slot&& hostSlot);
