@@ -80,14 +80,17 @@ class FallbackFmha(Fmha):
     # the 16-bit KV entries are proven by ``test_context_fmha_kernel_presence``
     # (head-size-64 kernels present for matched 16-bit Q/KV across the SM100
     # family) and exercised by the SM103 L0 suites that run paged-context
-    # attention with a BF16 KV cache. Every entry is an assertion about a
+    # attention with a BF16 KV cache. The NVFP4 KV entry is proven by the same
+    # test (head-size-64 E4M3-Q / E2M1-KV kernels present across the SM100
+    # family; the SM103 trtllm-gen table carries them with E4M3 and BF16
+    # output). Every entry is an assertion about a
     # kernel set the running build may not contain (a build whose
     # ``--cuda_architectures`` omits the SM carries none of these), so
     # ``validate_metadata`` confirms each against the native kernel lookup
     # rather than trusting it: on a build without the kernel the combination
     # stays refused. Unlisted dtypes stay refused (fail closed).
     CONTEXT_FMHA_PRESENT_KV_DTYPES: ClassVar[dict[tuple[int, int], tuple[DataType, ...]]] = {
-        (103, 64): (DataType.FP8, DataType.BF16, DataType.HALF),
+        (103, 64): (DataType.FP8, DataType.NVFP4, DataType.BF16, DataType.HALF),
     }
 
     @classmethod

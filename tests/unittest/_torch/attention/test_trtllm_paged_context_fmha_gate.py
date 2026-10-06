@@ -142,11 +142,13 @@ def test_disabled_fallback_library_disables_gate(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "kv_dtype", [DataType.FP8, DataType.BF16, DataType.HALF], ids=["fp8", "bf16", "half"]
+    "kv_dtype",
+    [DataType.FP8, DataType.NVFP4, DataType.BF16, DataType.HALF],
+    ids=["fp8", "nvfp4", "bf16", "half"],
 )
 def test_exempt_kv_dtypes_admit_blocked_combination(kv_dtype):
-    """A full build carries the fused kernel for FP8 and matched 16-bit KV
-    caches on SM 103 / head_dim 64 (the SM103 L0 suites run paged-context
+    """A full build carries the fused kernel for FP8, NVFP4 and matched 16-bit
+    KV caches on SM 103 / head_dim 64 (the SM103 L0 suites run paged-context
     attention with a BF16 KV cache): the dtype exemption must admit the
     otherwise-blocked configuration once the kernel lookup confirms it."""
     metadata = _make_metadata(head_dim=64, sm_version=103, features=ALL_FEATURES, kv_dtype=kv_dtype)
