@@ -2089,7 +2089,8 @@ def _offload_request_pair(index: int, tokens: List[int], ctx_info_endpoint):
     ctx.py_disaggregated_params = DisaggregatedParams(disagg_request_id=disagg_request_id)
     gen = make(2 * index + 1, LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY)
     gen.py_disaggregated_params = DisaggregatedParams(
-        ctx_request_id=ctx.py_request_id,
+        # As in a real ctx response: the id the ctx TxSession registered under.
+        ctx_request_id=disagg_request_id,
         ctx_dp_rank=0,
         ctx_info_endpoint=ctx_info_endpoint,
         disagg_request_id=disagg_request_id,
@@ -2430,10 +2431,14 @@ def test_cache_transceiver_host_offload_scheduler_lifecycle(monkeypatch) -> None
             for i, tokens in enumerate([*prompts, prompts[1]])
         ]
         # Use the supported ctx_request_id rendezvous. Local status IDs must
-        # match each executor's registry/transfer-manager keys.
+        # match each executor's registry/transfer-manager keys. Without a
+        # disagg_request_id the context TxSession registers under the context
+        # request's own id, which is what a real context response reports as
+        # ctx_request_id.
         for sender, receiver in pairs:
             sender.py_disaggregated_params.disagg_request_id = None
             receiver.py_disaggregated_params.disagg_request_id = None
+            receiver.py_disaggregated_params.ctx_request_id = sender.py_request_id
         (a, ga), (b, gb), (c, gc_req), (replay, greplay) = pairs
 
         def expected_kv(tokens: list[int]) -> list[torch.Tensor]:

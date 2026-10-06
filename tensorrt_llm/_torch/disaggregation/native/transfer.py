@@ -3122,6 +3122,7 @@ class Receiver(ReceiverBase):
                 f"RxSession {rx_session.disagg_request_id}: refusing a second attempt while "
                 f"the earlier one is still active"
             )
+            rx_session._holds_key = False
             rx_session.fail_admission(
                 RuntimeError(
                     f"RxSession {rx_session.disagg_request_id}: an earlier attempt for this "
@@ -3643,6 +3644,9 @@ class RxSession(RxSessionBase):
             raise
         self._exception: Optional[Exception] = None
         self._closed = False
+        # False once Receiver.setup_session refused this session because an earlier
+        # attempt holds the key: nothing of this session's was ever published under it.
+        self._holds_key = True
         self._terminal_status: Optional[SessionStatus] = None
         self.transfer_start_time = None
         self.transfer_end_time = None
@@ -4438,9 +4442,13 @@ class RxSession(RxSessionBase):
         # Unregister from Receiver; keep fields alive for in-flight listener messages.
         if self._receiver is not None:
             # Reclaim any bounce region still live at teardown (closed mid-transfer) so it isn't
-            # leaked; a no-op for finished or non-bounce transfers.
-            for task in self._kv_tasks:
-                self._receiver._bounce.orphan_reservation((self.disagg_request_id, task.slice_id))
+            # leaked; a no-op for finished or non-bounce transfers. A refused session skips this:
+            # the key's reservations belong to the attempt that holds it.
+            if self._holds_key:
+                for task in self._kv_tasks:
+                    self._receiver._bounce.orphan_reservation(
+                        (self.disagg_request_id, task.slice_id)
+                    )
             self._receiver.clear_session(self.disagg_request_id, self)
         return True
 
