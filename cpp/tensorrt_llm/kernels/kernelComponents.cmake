@@ -89,3 +89,8 @@ add_tllm_kernel_library(tllm_kernel_mla SOURCES mlaKernels.cu LINK_LIBRARIES
 add_tllm_kernel_library(
   tllm_kernel_mla_chunked_prefill SOURCES mlaChunkedPrefill.cu
   INCLUDE_DIRECTORIES ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include)
+
+add_tllm_kernel_library(
+  tllm_kernel_moe_communication SOURCES
+  moe/communication/fusedMoeCommKernels.cu LINK_LIBRARIES
+  tllm::common_environment CUDA::cuda_driver)
