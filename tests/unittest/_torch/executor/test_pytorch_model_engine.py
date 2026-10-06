@@ -1306,6 +1306,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 elif case == "speculative_nonzero_runtime_draft":
                     engine.enable_spec_decode = True
                     engine.runtime_draft_len = 1
+                    engine._runner._config.spec_config = SimpleNamespace(
+                        is_linear_tree=True,
+                        get_runtime_tokens_per_gen_step=Mock(return_value=1))
                 elif case == "beam":
                     engine._runner._config.max_beam_width = 2
                 elif case == "encoder_decoder":

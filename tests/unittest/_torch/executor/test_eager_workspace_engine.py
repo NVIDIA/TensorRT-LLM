@@ -232,13 +232,13 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.freeze(is_encoder_decoder=True)
         self.assertIsNone(self.engine._eager_workspace_reclaimer)
         self.reclaimer_class.assert_not_called()
-        for name, value in [
-            ("is_spec_decode", True),
-            ("_torch_compile_backend", object()),
-            ("breakable_cuda_graph_runner", object()),
-            ("sparse_attention_config", object()),
+        for target, name, value in [
+            (self.engine._config, "is_spec_decode", True),
+            (self.engine, "_torch_compile_backend", object()),
+            (self.engine, "breakable_cuda_graph_runner", object()),
+            (self.engine, "sparse_attention_config", object()),
         ]:
-            with self.subTest(mode=name), patch.object(self.engine, name, value):
+            with self.subTest(mode=name), patch.object(target, name, value):
                 self.freeze()
                 self.assertIsNone(self.engine._eager_workspace_reclaimer)
         with patch.object(self.engine.mapping, "cp_size", 2):
