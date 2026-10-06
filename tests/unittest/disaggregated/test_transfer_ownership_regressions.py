@@ -257,7 +257,7 @@ class _ReceiverProbe:
     def send_cancel_to_senders(self, _unique_rid: int, _sender_endpoints: set[str]) -> None:
         self.cancel_count += 1
 
-    def clear_session(self, _unique_rid: int) -> None:
+    def clear_session(self, _unique_rid: int, session: RxSession | None = None) -> None:
         self.clear_count += 1
 
 
