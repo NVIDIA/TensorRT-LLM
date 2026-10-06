@@ -167,27 +167,33 @@ def test_mxfp8_scale_factor_layout_roundtrip(seq_len, head_dim):
     assert rel_err_v < 0.05, f"V MXFP8 round-trip error {rel_err_v} exceeds e4m3 block noise"
 
 
+_SM_VERSION = "tensorrt_llm._torch.visual_gen.attention_backend.cudnn._device_sm_version"
+
+
 @pytest.mark.parametrize("sm_version", [100, 103, 107])
 @pytest.mark.parametrize("quant_dtype", ["fp8", "mxfp8"])
 def test_cudnn_quantized_attention_allowed_on_supported_sm(sm_version, quant_dtype):
     """Quantized attention passes the hardware gate on Blackwell and Rubin (SM107)."""
-    with patch(
-        "tensorrt_llm._torch.visual_gen.attention_backend.cudnn.get_sm_version",
-        return_value=sm_version,
-    ):
-        CuDNNAttention.check_hardware_compatibility(torch.device("cpu"), quant_dtype)
+    with patch(_SM_VERSION, return_value=sm_version):
+        CuDNNAttention.check_hardware_compatibility(torch.device("cuda:0"), quant_dtype)
 
 
 @pytest.mark.parametrize("sm_version", [90, 120])
 def test_cudnn_quantized_attention_rejected_on_unsupported_sm(sm_version):
     """Quantized attention fails fast on other SMs; unquantized attention is not gated."""
-    with patch(
-        "tensorrt_llm._torch.visual_gen.attention_backend.cudnn.get_sm_version",
-        return_value=sm_version,
-    ):
+    with patch(_SM_VERSION, return_value=sm_version):
         with pytest.raises(RuntimeError, match="SM 100, 103 or 107"):
-            CuDNNAttention.check_hardware_compatibility(torch.device("cpu"), "fp8")
-        CuDNNAttention.check_hardware_compatibility(torch.device("cpu"), None)
+            CuDNNAttention.check_hardware_compatibility(torch.device("cuda:0"), "fp8")
+        CuDNNAttention.check_hardware_compatibility(torch.device("cuda:0"), None)
+
+
+def test_cudnn_hardware_gate_checks_target_device():
+    """On a mixed-GPU host the gate follows the tensors' device, not CUDA device 0."""
+    sm_by_index = {0: 90, 1: 107}
+    with patch(_SM_VERSION, side_effect=lambda device: sm_by_index[device.index]):
+        CuDNNAttention.check_hardware_compatibility(torch.device("cuda:1"), "fp8")
+        with pytest.raises(RuntimeError, match="SM 100, 103 or 107"):
+            CuDNNAttention.check_hardware_compatibility(torch.device("cuda:0"), "fp8")
 
 
 def test_cudnn_graph_cache_reuses_plans():
