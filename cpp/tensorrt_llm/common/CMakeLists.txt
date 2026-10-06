@@ -37,7 +37,8 @@ add_library(tllm::common_headers ALIAS tllm_common_headers)
 target_include_directories(tllm_common_headers INTERFACE ${API_INCLUDE_DIR}
                                                          ${PROJECT_SOURCE_DIR})
 
-add_library(tllm_common_error STATIC stringUtils.cpp tllmException.cpp)
+add_library(tllm_common_error STATIC assert.cpp stringUtils.cpp
+                                     tllmException.cpp)
 add_library(tllm::common_error ALIAS tllm_common_error)
 target_link_libraries(
   tllm_common_error
@@ -57,13 +58,30 @@ target_link_libraries(
 set_target_properties(tllm_common_logging PROPERTIES POSITION_INDEPENDENT_CODE
                                                      ON)
 
+add_library(tllm_common_cuda STATIC cudaDriverWrapper.cpp memoryUtils.cu
+                                    nvmlWrapper.cpp)
+add_library(tllm::common_cuda ALIAS tllm_common_cuda)
+target_link_libraries(
+  tllm_common_cuda
+  PUBLIC tllm::common_logging CUDA::cudart
+  PRIVATE ${CMAKE_DL_LIBS})
+target_compile_features(tllm_common_cuda PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_common_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON
+                              CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_cuda_architectures(tllm_common_cuda 89)
+
 list(
   REMOVE_ITEM
   SRCS
+  "${CMAKE_CURRENT_SOURCE_DIR}/assert.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/stringUtils.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/tllmException.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/logger.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/timestampUtils.cpp")
+  "${CMAKE_CURRENT_SOURCE_DIR}/timestampUtils.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/cudaDriverWrapper.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/nvmlWrapper.cpp")
+list(REMOVE_ITEM CU_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/memoryUtils.cu")
 add_library(common_src OBJECT ${SRCS} ${CU_SRCS})
 add_cuda_architectures(common_src 89)
 set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)

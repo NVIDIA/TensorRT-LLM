@@ -271,7 +271,7 @@ target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 target_link_libraries(
   ${SHARED_TARGET}
   PRIVATE
-    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_error,tllm_common_logging,tllm_executor_types,tllm_executor_serialization>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_error,tllm_common_logging,tllm_common_cuda,tllm_executor_types,tllm_executor_serialization,tllm_runtime_memory,tllm_runtime_buffers,tllm_runtime_distributed>
     $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
     $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
     $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
@@ -284,6 +284,11 @@ set_property(TARGET ${SHARED_TARGET}
              PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_logging WHOLE_ARCHIVE)
 set_property(TARGET ${SHARED_TARGET}
              PROPERTY LINK_LIBRARY_OVERRIDE_tllm_executor_types WHOLE_ARCHIVE)
+
+foreach(component tllm_common_cuda tllm_runtime_memory)
+  set_property(TARGET ${SHARED_TARGET}
+               PROPERTY LINK_LIBRARY_OVERRIDE_${component} WHOLE_ARCHIVE)
+endforeach()
 
 # Link kernel_src and cutlass_src. static internal cutlass lib overridden.
 target_link_libraries(${SHARED_TARGET} PUBLIC kernels_src cutlass_src)
