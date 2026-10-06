@@ -2247,13 +2247,6 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             if self.is_cuda_graph
             else (device, request_count, count, manager.layout.index_topk, False)
         )
-        if self.is_cuda_graph:
-            resolved_cap = getattr(manager, "fp8_ctx_mla_kv_len_cap", None)
-            if (
-                resolved_cap is not None
-                and resolved_cap < self.max_num_requests * manager.max_seq_len
-            ):
-                raise ValueError("CSA2 graph workspace requires the full admitted request KV bound")
         if not hasattr(self, "_csa2_indexer_workspaces"):
             self._csa2_indexer_workspaces = {}
         if not self.is_cuda_graph:
@@ -2492,8 +2485,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
 
         Decode reads index pages in place. Prefill still gathers dequantized
         index rows and row-index intermediates per logical raw source token.
-        This component rate must not be used as the generic backend workspace
-        declaration or substituted for the fixed arena reservation below.
+        The backend declares this conservative component rate separately from
+        the capacity-sized native index arena reservation below.
         """
         from .params import CSA2Layout
 
@@ -2505,7 +2498,13 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
 
     @staticmethod
     def workspace_reservation_bytes(
-        request_capacity: int, query_capacity: int, max_positions: int, topk: int, num_sms: int
+        request_capacity: int,
+        query_capacity: int,
+        max_positions: int,
+        topk: int,
+        num_sms: int,
+        *,
+        num_owners: int = 1,
     ) -> int:
         """Exact retained bytes for one native index descriptor arena, including schedule.
 
@@ -2515,16 +2514,17 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         temporal priors, generic metadata, FMHA native/provider workspaces and
         transient logits; report those separately with get_workspace_bytes.
         """
-        if min(request_capacity, query_capacity, max_positions, topk, num_sms) < 0:
+        if min(request_capacity, query_capacity, max_positions, topk, num_sms, num_owners) < 0:
             raise ValueError("CSA2 workspace capacities must be nonnegative")
         pages_per_request = max(1, (max_positions + 63) // 64)
         # Per query: int32 block table, context and visible lengths, one
         # validity byte per position, and the exact radix TopK scratch.
         per_query = pages_per_request * (4 + 64) + 8 + 80 * topk
-        return query_capacity * per_query + (num_sms + 1) * 2 * 4
+        return query_capacity * per_query + num_owners * (num_sms + 1) * 2 * 4
 
-    def get_workspace_bytes(self) -> int:
-        """Report retained GPU workspace once per storage, excluding KV pools."""
+    @staticmethod
+    def _workspace_storage_bytes(values) -> int:
+        """Count GPU storages once, including aliased descriptor views."""
         seen = set()
         total = 0
 
@@ -2548,9 +2548,17 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 for item in value:
                     visit(item)
 
-        for name, value in vars(self).items():
-            if isinstance(value, torch.Tensor) and name != "position_ids":
-                visit(value)
+        for value in values:
+            visit(value)
+        return total
+
+    def get_workspace_bytes(self) -> int:
+        """Report retained GPU workspace once per storage, excluding KV pools."""
+        values = [
+            value
+            for name, value in vars(self).items()
+            if isinstance(value, torch.Tensor) and name != "position_ids"
+        ]
         for name in (
             "workspace",
             "cuda_graph_workspace",
@@ -2560,12 +2568,12 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             "_csa2_manager_states",
             "_csa2_shared_domains",
         ):
-            visit(getattr(self, name, None))
+            values.append(getattr(self, name, None))
         for metadata in getattr(self, "_csa2_query_tiles", {}).values():
             for name, value in vars(metadata).items():
                 if name != "kv_cache_manager":
-                    visit(value)
-        return total
+                    values.append(value)
+        return self._workspace_storage_bytes(values)
 
     def register_indexer_reset(self, layer_idx: int, callback) -> None:
         """Register a host-prepare emission reset, before a captured replay."""

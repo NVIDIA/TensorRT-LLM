@@ -517,6 +517,15 @@ def get_attention_workspace_is_chunked_prefill_bounded(model_config) -> bool:
             model_config)
 
 
+def get_attention_workspace_fixed_bytes(model_config, mapping,
+                                        **capacities) -> int:
+    """Capacity-sized reserve declared by the model's selected backend."""
+    from ..attention.backends.utils import get_attention_backend
+    return get_attention_backend(
+        model_config.attn_backend).runtime_workspace_fixed_bytes(
+            model_config, mapping, **capacities)
+
+
 def get_mla_context_workspace_kv_len_cap(
         kv_cache_config,
         max_batch_size,
@@ -1736,6 +1745,22 @@ class KvCacheCreator:
             logger.info(
                 f"Reserving {mem_gb:.2f} GiB for multimodal encoder memory "
                 "not materialized by the profiling run.")
+
+        fixed_workspace_reserve = get_attention_workspace_fixed_bytes(
+            self._model_engine.model.model_config,
+            self._mapping,
+            max_batch_size=self._max_batch_size,
+            max_num_tokens=self._max_num_tokens,
+            max_seq_len=self._max_seq_len,
+            enable_cuda_graph=self._llm_args.cuda_graph_config is not None,
+        )
+        # A decode arena can first appear after the peak prefill step. Reserve
+        # its full capacity for coexistence with the profiled transient peak.
+        peak_memory += fixed_workspace_reserve
+        if fixed_workspace_reserve:
+            logger.info(
+                f"Reserving {fixed_workspace_reserve / GB:.2f} GiB for capacity-sized "
+                "attention workspace across serving steps.")
 
         # calculate max memory from peak memory and free gpu memory fraction
         kv_cache_max_memory = self._cal_max_memory(peak_memory,

@@ -1,5 +1,22 @@
 # Feature Combination Matrix
 
+The general combinations below are subject to each model's attention constraints.
+For DeepSeek-V4.1 CSA2, use these additional limits:
+
+| Feature | CSA2 constraint |
+|---|---|
+| Hardware / shape | SM90, SM100 family or SM120/121; one KV head, head dimension 512, checkpoint-owned compression and source layout |
+| TP / EP / attention DP | Supported by the model integration |
+| PP / CP / disabled layers | Unsupported |
+| Overlap / CUDA graphs | Supported with graph-owned metadata and serialized shared arenas |
+| Chunked prefill / KV reuse | Supported; GLOBAL is REQUIRED, Encoder SWA may be OPTIONAL, bounded Decoder SWA is PRIVATE |
+| Speculative decoding | Embedded DSpark linear verification; tree verification unsupported |
+| Disaggregated serving | Role mappings and cache transfer have component coverage; end-to-end serving requires separate validation |
+| Bounded replay | Approximate Decoder replay defaults on for eligible layouts; Encoder recovery is opt-in |
+
+See [CSA2 sparse attention](sparse-attention.md#deepseek-v41-csa2) for staging
+dtypes, replay environment variables, and accuracy-validation requirements.
+
 | Feature                                                     | Overlap Scheduler | CUDA Graph | Tensor Parallelism | Pipeline Parallelism | Expert Parallelism | Helix Parallelism | Attention Data Parallelism | Disaggregated Serving | Chunked Prefill | Speculative Decoding — Linear | Speculative Decoding — Dynamic Trees | Speculative Decoding — Legacy Path (NGram, user-provided) | Torch Sampler | KV Cache Reuse | Sliding Window Attention | Logits Post Processor | Guided Decoding | LoRA     |
 | ----------------------------------------------------------- | ----------------- | ---------- | ------------------ | -------------------- | ------------------ | ----------------- | -------------------------- | --------------------- | --------------- | ----------------------------- | ------------------------------------ | --------------------------------------------------------- | ------------- | -------------- | ------------------------ | --------------------- | --------------- | -------- |
 | Overlap Scheduler                                           | ---               |            |                    |                      |                    |                   |                            |                       |                 |                               |                                      |                                                           |               |                |                          |                       |                 |          |

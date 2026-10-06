@@ -390,15 +390,19 @@ configured maximum graph arena per device/topk across graph batch sizes and
 serialized owners. Replays refresh packed pages, visibility and scheduling.
 
 `workspace_reservation_bytes()` reports one retained native index arena from
-explicit serving capacities. `get_workspace_bytes()` deduplicates retained
-metadata/frame/arena/prior storage separately from manager pools. Cache-gather
-component estimates exclude query-dependent logits and other temporaries;
-the optional packed kernel has its own workspace-size helper. A resolved cap
-that cannot cover the admitted graph arena is rejected before allocation.
-These attention-local APIs do not install generic executor admission or a
-complete serving-memory reserve. Model integration must account for fixed
-arenas, projection/provider/native workspace and measured transient peaks at
-the actual serving geometry.
+explicit serving capacities, including each owner's schedule. The backend
+declares eager power-of-two page capacity and the optional shared graph arena
+through `runtime_workspace_fixed_bytes()`. Before KV-pool sizing the executor
+conservatively reserves the full fixed capacity alongside the profiled peak.
+A decode arena may first appear after peak prefill, so its final retained bytes
+do not establish how much arena storage coexisted with that earlier peak.
+`get_workspace_bytes()` also deduplicates metadata/frame/prior storage separately
+from manager pools. The index-prefill gather declares a conservative per-token
+rate; it consumes the full compressed prefix even with chunked prefill. The
+executor's attended-KV admission cap bounds that gather independently of the
+fixed graph arena. Query-dependent logits, projection/provider/native scratch
+and the optional packed kernel's split-KV workspace still require representative
+peak-memory profiling at the actual serving geometry.
 
 ## Optional packed attention and remaining scope
 
@@ -413,8 +417,8 @@ owner-role mappings and transferred cache bytes; they do not establish
 whole-model disaggregated serving. The model integrates CED and embedded
 DSpark, including full-encoder cache production and target-row capture mapping.
 Full-checkpoint and GPU validation results are tracked separately from these
-implementation capabilities. Whole-model performance and generic executor
-workspace admission require their own measurements and integration.
+implementation capabilities. Whole-model accuracy and performance require
+their own measurements.
 Component/runtime tests live in `tests/unittest/_torch/attention/sparse/csa2/`.
 
 Numerical definitions follow the official
