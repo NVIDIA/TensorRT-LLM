@@ -116,7 +116,18 @@ add_tllm_gtest(
   "unit;kernels;mla-chunked-prefill;gpu"
   REQUIRES_GPU)
 
-add_gtest(fusedMoeCommKernelTest moe/fusedMoeCommKernelTest.cpp)
+add_tllm_gtest(
+  fusedMoeCommKernelTest
+  OWNER
+  kernel
+  SOURCES
+  moe/fusedMoeCommKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_moe_communication
+  Threads::Threads
+  LABELS
+  "unit;kernels;moe-communication;gpu"
+  REQUIRES_GPU)
 
 add_gtest(
   gemmSwigluRunnerTest
