@@ -173,3 +173,28 @@ def test_openengine_server_missing_bindings_raises_import_error(
         importlib.import_module("tensorrt_llm.grpc.openengine.server")
 
     assert exc_info.value.name == "openengine"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("via_config", [False, True])
+def test_smg_rejects_multiple_frontends_before_engine_start(tmp_path, via_config):
+    """Config-file overrides must not bypass the SMG single-frontend guard."""
+    from click.testing import CliRunner
+
+    from tensorrt_llm.commands.serve import serve
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        '{"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]}'
+    )
+    args = [str(model), "--grpc"]
+    if via_config:
+        config = tmp_path / "serve.yml"
+        config.write_text("num_serve_frontends: 4\n")
+        args.extend(["--config", str(config)])
+    else:
+        args.extend(["--num_serve_frontends", "4"])
+    result = CliRunner().invoke(serve, args)
+    assert result.exit_code != 0
+    assert "Multiple gRPC frontends require --grpc-protocol openengine" in result.output
