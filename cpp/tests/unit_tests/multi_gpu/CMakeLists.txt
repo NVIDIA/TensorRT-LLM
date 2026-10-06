@@ -15,9 +15,22 @@
 
 add_subdirectory(kernels)
 
-add_tllm_gtest(cacheTransceiverTest SOURCES cacheTransceiverTest.cpp FULL_STACK
-               LABELS "unit;full-stack;gpu")
-target_link_libraries(cacheTransceiverTest PRIVATE ${Python3_LIBRARIES})
+add_tllm_gtest(
+  cacheTransceiverTest
+  OWNER
+  batch-manager
+  SOURCES
+  cacheTransceiverTest.cpp
+  LINK_LIBRARIES
+  tllm::batch_cache_transceiver
+  LABELS
+  "unit;batch-manager;cache-transfer;integration;multi-gpu;gpu")
+foreach(wrapper IN ITEMS tensorrt_llm_ucx_wrapper tensorrt_llm_nixl_wrapper
+                         tensorrt_llm_mooncake_wrapper)
+  if(TARGET ${wrapper})
+    target_link_libraries(cacheTransceiverTest PRIVATE ${wrapper})
+  endif()
+endforeach()
 
 add_tllm_gtest(
   kvCacheManagerV2HostMemNumaTest
@@ -65,8 +78,7 @@ add_tllm_gtest(ncclUtilsTest SOURCES ncclUtilsTest.cpp FULL_STACK LABELS
                "unit;full-stack;gpu")
 target_link_libraries(ncclUtilsTest PRIVATE ${Python3_LIBRARIES})
 if(BUILD_PYT)
-  target_compile_definitions(cacheTransceiverTest PUBLIC BUILD_PYT)
-  target_link_libraries(cacheTransceiverTest PUBLIC ${TORCH_LIBRARIES})
+  target_compile_definitions(cacheTransceiverTest PRIVATE BUILD_PYT)
 endif()
 if(BUILD_PYT)
   target_compile_definitions(ncclUtilsTest PUBLIC BUILD_PYT)
