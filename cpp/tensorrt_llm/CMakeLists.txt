@@ -143,11 +143,6 @@ endif()
 find_package(Threads REQUIRED)
 add_subdirectory(common)
 
-add_library(ipc_nvls_memory_src STATIC runtime/ipcNvlsMemory.cu)
-set_target_properties(
-  ipc_nvls_memory_src PROPERTIES POSITION_INDEPENDENT_CODE ON
-                                 CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-
 add_subdirectory(kernels)
 set(KIMI_K3_MODEL_CSRC
     "${CMAKE_CURRENT_SOURCE_DIR}/../../tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/csrc"
@@ -289,6 +284,7 @@ foreach(
   tllm_runtime_distributed
   tllm_runtime_topology
   tllm_runtime_worker_pool
+  ipc_nvls_memory_src
   tllm_runtime_locality
   tllm_runtime_numpy
   tllm_runtime_gdr
@@ -332,6 +328,7 @@ foreach(
   tllm_runtime_distributed
   tllm_runtime_topology
   tllm_runtime_worker_pool
+  ipc_nvls_memory_src
   tllm_runtime_locality
   tllm_runtime_gdr
   tllm_runtime_numpy

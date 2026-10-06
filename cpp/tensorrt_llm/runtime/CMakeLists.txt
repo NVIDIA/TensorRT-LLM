@@ -16,14 +16,12 @@ include(FetchContent)
 
 set(SRCS
     bufferManagerNvls.cpp
-    mcastGroupComm.cpp
     utils/runtimeUtils.cpp
     utils/debugUtils.cu
     loraUtils.cpp
     loraModule.cpp
     loraCache.cpp
     ipcUtils.cpp
-    ipcSocket.cpp
     mcastDeviceMemory.cpp
     moeLoadBalancer/hostAccessibleDeviceAllocator.cpp
     moeLoadBalancer/moeLoadBalancer.cpp
@@ -81,6 +79,25 @@ target_compile_definitions(
   PUBLIC ENABLE_MULTI_DEVICE=$<BOOL:${ENABLE_MULTI_DEVICE}>)
 if(ENABLE_MULTI_DEVICE)
   target_link_libraries(tllm_runtime_distributed PUBLIC MPI::MPI_C)
+endif()
+
+add_library(ipc_nvls_memory_src STATIC ipcNvlsMemory.cu ipcSocket.cpp
+                                       mcastGroupComm.cpp)
+add_library(tllm::runtime_ipc_nvls ALIAS ipc_nvls_memory_src)
+target_link_libraries(
+  ipc_nvls_memory_src PUBLIC tllm::common_cuda tllm::runtime_distributed
+                             CUDA::cuda_driver)
+target_compile_features(ipc_nvls_memory_src PUBLIC cxx_std_20)
+set_target_properties(
+  ipc_nvls_memory_src
+  PROPERTIES POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+if(ENABLE_MULTI_DEVICE)
+  target_link_libraries(ipc_nvls_memory_src PRIVATE ${NCCL_LIB})
+endif()
+if(ENABLE_NVSHMEM)
+  target_link_libraries(ipc_nvls_memory_src PRIVATE nvshmem::nvshmem_host
+                                                    nvshmem::nvshmem_device)
 endif()
 
 add_library(tllm_runtime_worker_pool STATIC workerPool.cpp)
