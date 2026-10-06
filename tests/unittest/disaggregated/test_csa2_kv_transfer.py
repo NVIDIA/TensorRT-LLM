@@ -189,7 +189,7 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(monkeypatch, ctx_tp, gen
     def fill_pages(manager, req_id, end):
         # Distinct logical page/layer/role bytes catch shifted or omitted
         # transfers, while matching reused data across independent allocators.
-        for (layer, role), virtual_layer in manager._layer_roles.items():
+        for (layer, _, role), virtual_layer in manager._layer_roles.items():
             pages = manager.get_cache_indices(req_id, layer, role)
             data = manager.get_buffers(layer, role)
             for logical, page in enumerate(pages[:end]):
@@ -228,7 +228,7 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(monkeypatch, ctx_tp, gen
             assert gen_req.py_ced_replay is None
             for group in manager._encoder_optional_groups:
                 assert cache.reuse_status[group].complete == (group not in missing)
-            for (layer, role), virtual_layer in manager._layer_roles.items():
+            for (layer, _, role), virtual_layer in manager._layer_roles.items():
                 group = manager.impl.get_layer_group_id(virtual_layer)
                 restored = cache.reuse_status[group].complete
                 data = manager.get_buffers(layer, role)

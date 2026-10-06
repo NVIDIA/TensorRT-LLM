@@ -1717,7 +1717,7 @@ def test_swa_fresh_publication_reuses_tables_and_keeps_captured_backing(
     # rewriting layer 0's base SWA pages, without dereferencing synthetic pages.
     base = manager.host_kv_cache_block_offsets
     rows = manager.index_mapper.get_copy_index([r.py_request_id for r in requests], 0, 1).long()
-    pool = manager.layer_to_pool_mapping_dict[manager._layer_roles[0, CSA2CacheRole.SWA]]
+    pool = manager.layer_to_pool_mapping_dict[manager._layer_roles[0, 1, CSA2CacheRole.SWA]]
     saved = base[pool, rows, 0, :2].clone()
 
     def remap(shift):
@@ -2099,7 +2099,7 @@ def test_compressor_readiness_uses_current_rows(manager_requests):
 
     prepare_source(2)  # Source spans logical pages 0 and 1.
     for role in (CSA2CacheRole.COMPRESSOR_KV, CSA2CacheRole.COMPRESSOR_SCORE):
-        pool = manager.layer_to_pool_mapping_dict[manager._layer_roles[1, role]]
+        pool = manager.layer_to_pool_mapping_dict[manager._layer_roles[1, 2, role]]
         saved = int(base[pool, row, 0, 1])
         base[pool, row, 0, 1] = -1
         try:

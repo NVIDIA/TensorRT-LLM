@@ -122,11 +122,11 @@ def test_warmup_cache_cleanup_preserves_swa_guards(manager) -> None:
     allocate(manager, 90, [], 129)
     buffers = {
         (layer, role): manager.get_buffers(layer, role)
-        for layer, role in manager._physical_roles.values()
+        for layer, _, role in manager._physical_roles.values()
     }
     assert {role for _, role in buffers} == set(CSA2CacheRole)
     assert any(
-        manager._layer_roles[layer, CSA2CacheRole.SWA] != layer for layer in manager.pp_layers
+        manager._layer_roles[layer, 1, CSA2CacheRole.SWA] != layer for layer in manager.pp_layers
     )
     if manager._guard_page_value is not None:
         assert set(manager._guard_page_by_layer) == set(manager.pp_layers)
@@ -169,6 +169,11 @@ def test_owner_views_and_lifecycle(manager):
     )
     for owner in (1, 3):
         main, index = manager.get_main_buffer(owner), manager.get_index_pages(owner)
+        ratio = manager.layout.compress_ratios[owner]
+        assert manager.get_main_buffer(owner + 1) is main
+        assert manager.get_index_pages(owner + 1) is index
+        assert manager._global_buffers[owner, ratio, CSA2CacheRole.GLOBAL] is main
+        assert manager._global_buffers[owner, ratio, CSA2CacheRole.INDEX] is index
         assert main.stride() == (288, 1)
         # Native page-footer index pages, read in place by the paged kernels.
         assert index.shape[1:] == (64, 1, 68) and index.is_contiguous()
@@ -213,7 +218,7 @@ def test_owner_views_and_lifecycle(manager):
 def test_prefix_reuse_preserves_combined_records(manager):
     tokens = list(range(512))
     first = allocate(manager, 20, [], len(tokens))
-    for model_layer, role in manager._physical_roles.values():
+    for model_layer, _, role in manager._physical_roles.values():
         pages = manager.get_cache_indices(20, model_layer, role)
         pool = manager.get_buffers(model_layer, role)
         for page in pages:
@@ -243,7 +248,7 @@ def test_prefix_reuse_preserves_combined_records(manager):
 def test_partial_page_copy_on_write_and_state(manager):
     tokens = list(range(129))
     source = allocate(manager, 30, [], 129)
-    for model_layer, role in manager._physical_roles.values():
+    for model_layer, _, role in manager._physical_roles.values():
         pool = manager.get_buffers(model_layer, role)
         for page in manager.get_cache_indices(30, model_layer, role):
             if page >= 0:
@@ -347,7 +352,7 @@ def test_decoder_replay_selects_cache_lifecycles(monkeypatch, fallback, partial_
         if replay:
             assert manager._decoder_replay_window == manager.layout.window_size
             for layer in manager.impl.init_config.layers:
-                decoder = layer.layer_id == manager._layer_roles[1, CSA2CacheRole.SWA]
+                decoder = layer.layer_id == manager._layer_roles[1, 1, CSA2CacheRole.SWA]
                 assert layer.reuse_policy == (
                     AttentionReusePolicy.PRIVATE if decoder else AttentionReusePolicy.REQUIRED
                 )

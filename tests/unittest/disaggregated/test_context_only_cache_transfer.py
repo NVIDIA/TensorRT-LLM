@@ -89,7 +89,7 @@ def _bytes(pointer: int, count: int) -> torch.Tensor:
 
 def _physical_pages(manager: CSA2CacheManager, request: LlmRequest):
     """Independent model-role oracle; do not reuse transport's pool mapping."""
-    for layer, role in manager._physical_roles.values():
+    for layer, _, role in manager._physical_roles.values():
         buffers = manager.get_buffers(layer, role)
         pages = manager.get_cache_indices(request.py_request_id, layer, role)
         yield layer, role, buffers, pages
@@ -143,8 +143,8 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
                     buffers[page].view(torch.uint8).zero_()
 
         assert (
-            source._layer_roles[20, CSA2CacheRole.GLOBAL]
-            != target._layer_roles[20, CSA2CacheRole.GLOBAL]
+            source._layer_roles[20, 1, CSA2CacheRole.GLOBAL]
+            != target._layer_roles[20, 1, CSA2CacheRole.GLOBAL]
         )
         # Exercise the real wire serialization, including attention-DP routing.
         source_info = RankInfo.from_bytes(
@@ -191,11 +191,11 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
         }
         assert matched_global_ids == expected_global_ids
         assert len(matched_global_ids) == 20 + 4 + 3
-        assert (20, CSA2CacheRole.GLOBAL) in source._physical_roles.values()
-        assert (20, CSA2CacheRole.INDEX) in source._physical_roles.values()
+        assert (20, 1, CSA2CacheRole.GLOBAL) in source._physical_roles.values()
+        assert (20, 1, CSA2CacheRole.INDEX) in source._physical_roles.values()
         assert all(
             layer < 20 or role != CSA2CacheRole.SWA
-            for layer, role in source._physical_roles.values()
+            for layer, _, role in source._physical_roles.values()
         )
 
         source_slice, target_slice = _slice(source, source_request), _slice(target, target_request)
