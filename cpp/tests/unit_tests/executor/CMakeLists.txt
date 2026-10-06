@@ -96,9 +96,17 @@ add_tllm_gtest(
   tllm::executor_transfer_agent
   LABELS
   "unit;executor;host")
-add_tllm_gtest(genUniqueAgentNameTest SOURCES genUniqueAgentNameTest.cpp
-               FULL_STACK LABELS "unit;full-stack;host")
-target_link_libraries(genUniqueAgentNameTest PRIVATE ${Python3_LIBRARIES})
+add_tllm_gtest(
+  genUniqueAgentNameTest
+  OWNER
+  executor
+  SOURCES
+  genUniqueAgentNameTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_agent_name
+  Threads::Threads
+  LABELS
+  "unit;executor;host")
 add_tllm_gtest(
   ucxCommTest
   SOURCES
