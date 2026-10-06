@@ -1204,3 +1204,21 @@ def test_workflow_resume_preserves_progress_yaml(tmp_path):
     data = progress.read_progress(resumed.progress_path)
     assert data["plan_stage"][0]["agent"] == "plan_drafter"
     assert data["build_stage"] == []
+
+
+def test_record_progress_entry_stamps_and_appends(tmp_path):
+    """``record_progress_entry`` stamps iteration/agent/timestamp and appends."""
+    path = tmp_path / "progress.yaml"
+    progress_module.init_progress_file(path)
+    entry = progress_module.record_progress_entry(
+        path, "qa", 4, {"summary": "s", "decision": "APPROVE", "weighted_score": 9.0}
+    )
+    assert entry["iteration"] == 4
+    assert entry["agent"] == "qa"
+    assert "timestamp" in entry
+    assert entry["summary"] == "s"
+    assert entry["decision"] == "APPROVE"
+    assert entry["weighted_score"] == 9.0
+    # It is persisted into the correct stage and readable back.
+    assert progress_module.latest_entry(path, "qa") == entry
+    assert progress_module.read_progress(path)["build_stage"] == [entry]

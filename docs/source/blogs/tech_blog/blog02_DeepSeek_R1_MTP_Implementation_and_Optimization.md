@@ -21,7 +21,6 @@ by NVIDIA TensorRT LLM team
   - [Future Works](#future-works)
     - [Tree-based speculative decoding support](#tree-based-speculative-decoding-support)
     - [Eagle3 support](#eagle3-support)
-    - [Fix known issues](#fix-known-issues)
   - [Acknowledgment](#acknowledgment)
 
 

@@ -312,7 +312,7 @@ public:
         options.mCudaArch = intToCudaArch(mSM);
 
         std::tie(options, optionsFromArgs, ctaDim)
-            = selectKernelWithCgaSmemReductionLimit(options, optionsFromArgs, params.mMultiProcessorCount);
+            = selectKernelAutotuned(options, optionsFromArgs, params.mMultiProcessorCount);
 
         // Check if the options are valid or not.
         checkFmhaOptions(options, optionsFromArgs);
@@ -410,7 +410,7 @@ private:
         options.mCudaArch = intToCudaArch(mSM);
 
         std::tie(options, optionsFromArgs, ctaDim)
-            = selectKernelWithCgaSmemReductionLimit(options, optionsFromArgs, params.mMultiProcessorCount);
+            = selectKernelAutotuned(options, optionsFromArgs, params.mMultiProcessorCount);
 
         checkFmhaOptions(options, optionsFromArgs);
         updateFmhaOptions(options, optionsFromArgs);
@@ -528,7 +528,7 @@ public:
         options.mCudaArch = intToCudaArch(mSM);
 
         std::tie(options, optionsFromArgs, ctaDim)
-            = selectKernelWithCgaSmemReductionLimit(options, optionsFromArgs, params.mMultiProcessorCount);
+            = selectKernelAutotuned(options, optionsFromArgs, params.mMultiProcessorCount);
 
         // Overwrite AutoTuner decision: SageAttention with SfsPV is known to cause regression to persistent scheduler.
         // Remove this overwritten once we refresh the cubin kernels that containing the related fix.
@@ -663,9 +663,20 @@ public:
     }
 
 private:
-    std::tuple<FmhaOptions, FmhaOptionsFromArgs, int32_t> selectKernelWithCgaSmemReductionLimit(
+    // Autotuner entry for checkIfKernelExist, warmupOneKernel, and run. SM107 may select
+    // CgaSmemReduction configs where clusterDimX * mMaxNumCtasPerSeqKv must stay <= 16;
+    // the pre/post clamps below enforce that. Other architectures keep the legacy path.
+    std::tuple<FmhaOptions, FmhaOptionsFromArgs, int32_t> selectKernelAutotuned(
         FmhaOptions options, FmhaOptionsFromArgs optionsFromArgs, int32_t multiProcessorCount) const
     {
+        // CGA SMEM reduction cluster limits are Rubin SM107-specific; clamping on SM100/SM103
+        // changed autotuner choices without fixing a known failure mode on those GPUs.
+        if (mSM != kSM_107)
+        {
+            FmhaAutoTuner autoTuner(options, optionsFromArgs, multiProcessorCount);
+            return autoTuner.selectKernel();
+        }
+
         if (isGmemReduction(options.mMultiCtasKvMode) && options.mTileScheduler == TileScheduler::Static)
         {
             constexpr int kMaxCgaClusterDimX = 16;
@@ -1188,7 +1199,7 @@ private:
         options.mIsCustomSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && params.mIsSpecDecTree;
         options.mIsCausalSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && !params.mIsSpecDecTree;
         options.mNumSpecDecodingTokens = !isContext && params.mMaxSeqLenQ > 1 ? params.mMaxSeqLenQ : 0;
-        // Carry static tree length into FMHA kernel selection.
+        // Carry the tree length into FMHA kernel selection.
         options.mSpecDecodingTargetMaxGenLen = params.mSpecDecodingTargetMaxGenLen;
 
         options.mIsTrtllmLayout = true;
@@ -1400,6 +1411,9 @@ private:
         case 103: return tg::CudaArch::Sm103a;
 #ifdef TLLM_RUBIN_FEATURES
         case 107: return tg::CudaArch::Sm107a;
+#else
+        // Sm107a is compiled out; the family arch keeps NVRTC output loadable on SM107.
+        case 107: return tg::CudaArch::Sm100f;
 #endif // TLLM_RUBIN_FEATURES
         default: assert(false && "Unsupported CUDA architecture"); return tg::CudaArch::Sm100a;
         }

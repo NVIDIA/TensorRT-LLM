@@ -24,7 +24,6 @@ SPECULATIVE_MAP = {
 class RuntimeConfig(BaseModel):
     model: str
     model_path: Optional[Path] = None
-    engine_dir: Optional[Path] = None
     revision: Optional[str] = None
     sw_version: str
     settings_config: ExecutorSettingsConfig
@@ -33,13 +32,13 @@ class RuntimeConfig(BaseModel):
     mapping: Dict[str, Any]
     decoding_config: Optional[DecodingConfig] = None
     performance_options: PerformanceOptions
-    backend: Literal["pytorch", "_autodeploy", None] = None
+    backend: Literal["pytorch", None] = None
     extra_llm_api_options: Optional[str] = None
     iteration_log: Optional[Path] = None
     explicit_cli_keys: Optional[Set[str]] = None
 
     def get_llm_args(self) -> Dict:
-        model = self.engine_dir or self.model_path or self.model
+        model = self.model_path or self.model
 
         llm_args = {
             "scheduler_config":
@@ -76,7 +75,6 @@ class RuntimeConfig(BaseModel):
 
         backend_config_map = {
             "pytorch": self.performance_options.get_pytorch_perf_config,
-            "_autodeploy": self.performance_options.get_autodeploy_perf_config
         }
 
         if self.backend in backend_config_map:
@@ -132,11 +130,6 @@ class PerformanceOptions:
 
     def get_pytorch_perf_config(self):
         return self.pytorch_config
-
-    def get_autodeploy_perf_config(self) -> Dict:
-        AutoDeployPerfConfig = dict
-        ad_config = AutoDeployPerfConfig()
-        return ad_config
 
 
 class DecodingConfig(BaseModel):

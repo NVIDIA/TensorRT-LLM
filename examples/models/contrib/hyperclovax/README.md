@@ -90,7 +90,7 @@ The output will be like:
 For more information, you can refer to [examples/llm-api](../../../llm-api).
 
 ## TRT flow
-The next section describes how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format. We will use llama's [convert_checkpoint.py](../../core/llama/convert_checkpoint.py) for the HyperCLOVAX model and then build the model with `trtllm-build`.
+The next section describes how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format. We will use llama's [convert_checkpoint.py](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/examples/models/core/llama/convert_checkpoint.py) for the HyperCLOVAX model and then build the model with `trtllm-build`.
 
 ### Convert checkpoint and build TensorRT engine(s)
 
@@ -230,7 +230,7 @@ trtllm-build \
 ```
 
 ### Run Engine
-Test your engine with the [run.py](../../../run.py) script:
+Test your engine with the [run.py](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/examples/run.py) script:
 
 ```bash
 python3 ../../../run.py \
@@ -254,5 +254,5 @@ python ../../../summarize.py \
     --engine_dir trt_engines/$MODEL_NAME/fp16/1-gpu
 ```
 
-The TensorRT LLM HyperCLOVAX implementation is based on the LLaMA model. The implementation can be found in [llama/model.py](../../../../tensorrt_llm/models/llama/model.py).
-For more examples, see [`examples/models/core/llama/README.md`](../../core/llama/README.md)
+The TensorRT LLM HyperCLOVAX implementation is based on the LLaMA model. The implementation can be found in [llama/model.py](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/tensorrt_llm/models/llama/model.py).
+For more examples, see [`examples/models/core/llama/README.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/examples/models/core/llama/README.md)

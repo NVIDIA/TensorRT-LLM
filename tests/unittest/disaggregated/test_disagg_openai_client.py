@@ -16,16 +16,24 @@ import json
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
+import msgspec
 import pytest
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
-from tensorrt_llm.serve.disagg_auth import INTERNAL_DISAGG_AUTH_HEADER
+from tensorrt_llm.serve.conversation_id import SUBAGENT_AFFINITY_HEADER
+from tensorrt_llm.serve.disagg_auth import (
+    INTERNAL_DISAGG_AUTH_HEADER,
+    SUBAGENT_AFFINITY_AUTH_HEADER,
+    validate_internal_disagg_request,
+    validate_subagent_affinity,
+)
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
+    ConversationParams,
     DisaggregatedParams,
     UsageInfo,
 )
@@ -776,7 +784,7 @@ class TestDisaggIdRegenOnRetry:
         r.__aexit__ = AsyncMock()
         return r
 
-    def _make_client(self, session, **kwargs):
+    def _make_client(self, session, role=ServerRole.CONTEXT, **kwargs):
         from prometheus_client.registry import REGISTRY
 
         REGISTRY._names_to_collectors = {}
@@ -788,7 +796,7 @@ class TestDisaggIdRegenOnRetry:
         router.finish_request = AsyncMock()
         return OpenAIHttpClient(
             router=router,
-            role=ServerRole.CONTEXT,
+            role=role,
             timeout_secs=10,
             max_retries=2,
             retry_interval_sec=0,
@@ -848,6 +856,121 @@ class TestDisaggIdRegenOnRetry:
 
         assert req.disaggregated_params.disagg_request_id == 42
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("role", [ServerRole.CONTEXT, ServerRole.GENERATION])
+    @pytest.mark.parametrize("regenerate_id", [False, True])
+    async def test_retry_affinity_signature_matches_wire_request(
+        self, role: ServerRole, regenerate_id: bool
+    ) -> None:
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(
+            session,
+            role=role,
+            internal_disagg_auth_key="secret",
+            disagg_id_generator=AsyncMock(return_value=1000) if regenerate_id else None,
+        )
+        session.post.side_effect = [
+            aiohttp.ClientError("transient"),
+            self._mock_http_ok(self._ok_response()),
+        ]
+        request = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            conversation_params=ConversationParams(
+                conversation_id="child", subagent_affinity_id="parent"
+            ),
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only" if role == ServerRole.CONTEXT else "generation_only",
+                disagg_request_id=42,
+                encoded_opaque_state="b3BhcXVl" if role == ServerRole.GENERATION else None,
+            ),
+        )
+
+        await client.send_request(request)
+
+        # Bytes and per-attempt header dicts retain the first request's ID even
+        # though the original request object is mutated before the second POST.
+        assert session.post.call_count == 2
+        bodies = [
+            msgspec.msgpack.decode(call.kwargs["data"]) for call in session.post.call_args_list
+        ]
+        headers = [dict(call.kwargs["headers"]) for call in session.post.call_args_list]
+        assert [body["disaggregated_params"]["disagg_request_id"] for body in bodies] == [
+            42,
+            1000 if regenerate_id else 42,
+        ]
+        wire_requests = [CompletionRequest.model_validate(body) for body in bodies]
+        for body, wire_request, attempt_headers in zip(bodies, wire_requests, headers):
+            assert "subagent_affinity_id" not in body["conversation_params"]
+            assert attempt_headers[SUBAGENT_AFFINITY_HEADER] == "parent"
+            assert (
+                validate_subagent_affinity("secret", wire_request, role, attempt_headers)
+                == "parent"
+            )
+            if role == ServerRole.GENERATION:
+                validate_internal_disagg_request("secret", wire_request, attempt_headers)
+        if role == ServerRole.GENERATION:
+            assert (
+                headers[0][INTERNAL_DISAGG_AUTH_HEADER] == headers[1][INTERNAL_DISAGG_AUTH_HEADER]
+            )
+        if regenerate_id:
+            assert (
+                headers[0][SUBAGENT_AFFINITY_AUTH_HEADER]
+                != headers[1][SUBAGENT_AFFINITY_AUTH_HEADER]
+            )
+            for index in (0, 1):
+                with pytest.raises(ValueError, match="Invalid internal subagent"):
+                    validate_subagent_affinity(
+                        "secret", wire_requests[index], role, headers[1 - index]
+                    )
+        else:
+            assert (
+                headers[0][SUBAGENT_AFFINITY_AUTH_HEADER]
+                == headers[1][SUBAGENT_AFFINITY_AUTH_HEADER]
+            )
+
+    @pytest.mark.asyncio
+    async def test_retry_keeps_original_reservation_id_without_explicit_req_id(self):
+        """Renew/finish must keep using the id the request was routed with.
+
+        Without an explicit req_id the coordinator router keys a context
+        reservation by disagg_request_id, which the retry path re-issues. If the
+        client let that leak into renew/finish, the coordinator would look up a
+        reservation it never created and the original one would linger until it
+        expired.
+        """
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        ids = iter(range(1000, 2000))
+
+        async def next_id():
+            return next(ids)
+
+        client = self._make_client(session, disagg_id_generator=next_id)
+        session.post.side_effect = [
+            aiohttp.ClientError("transient"),
+            self._mock_http_ok(self._ok_response()),
+        ]
+        req = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=42
+            ),
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await client.send_request(req)
+
+        assert req.disaggregated_params.disagg_request_id != 42
+        assert client._router.renew_request.await_count == 2
+        assert all(
+            call.kwargs["req_id"] == 42 for call in client._router.renew_request.await_args_list
+        )
+        assert client._router.finish_request.await_count == 1
+        assert client._router.finish_request.await_args.kwargs["req_id"] == 42
+
 
 class TestSelectiveTransientTcpRetry:
     """Selective retry budget for transient TCP race symptoms.
@@ -904,6 +1027,25 @@ class TestSelectiveTransientTcpRetry:
             disaggregated_params=DisaggregatedParams(
                 request_type="context_only", disagg_request_id=1
             ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_retry_renews_coordinator_reservation(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(session)
+        session.post.side_effect = [
+            aiohttp.ClientError("transient"),
+            self._mock_http_ok(self._ok_response()),
+        ]
+        request = self._make_request()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await client.send_request(request, req_id=71)
+
+        assert client._router.renew_request.await_count == 2
+        assert all(
+            call.args == (request,) and call.kwargs == {"req_id": 71}
+            for call in client._router.renew_request.await_args_list
         )
 
     @pytest.mark.asyncio
@@ -975,6 +1117,18 @@ class TestSelectiveTransientTcpRetry:
             await client.send_request(self._make_request())
 
         assert session.post.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_no_retry_env_disables_all_http_retries(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        with patch("tensorrt_llm.serve.openai_client.logger.info") as log_info:
+            client = self._make_client(session, max_retries=5)
+        assert "TRTLLM_DISAGG_NO_RETRY=1" in log_info.call_args.args[0]
+        session.post.side_effect = aiohttp.ServerDisconnectedError()
+        with pytest.raises(aiohttp.ServerDisconnectedError):
+            await client.send_request(self._make_request())
+        assert session.post.call_count == 1
 
     @pytest.mark.asyncio
     async def test_transient_tcp_capped_at_5_when_max_retries_smaller(self):

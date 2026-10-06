@@ -132,6 +132,14 @@ class TestBaseABC:
         # So PyExecutor's main loop auto-invokes prepare/update/free_resources.
         assert issubclass(KVCacheCompressionManager, BaseResourceManager)
 
+    def test_retains_optional_pretrained_config(self):
+        pretrained_config = object()
+        manager = KVCacheCompressionManager(
+            _compression_config(), pretrained_config=pretrained_config
+        )
+
+        assert manager.pretrained_config is pretrained_config
+
     def test_lifecycle_hooks_default_noop(self, fake_kv_cache_manager):
         m = KVCacheCompressionManager(_compression_config())
         m.bind_kv_cache_managers(fake_kv_cache_manager)

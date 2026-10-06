@@ -8,6 +8,7 @@ from .._utils import nvtx_range_debug
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue
 from ..logger import logger
+from .postproc_worker import PostprocWorker
 from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc import RPCClient
@@ -121,8 +122,16 @@ class RpcExecutorMixin:
                 else:
                     queue.put(r)
 
-                if (is_llm_response(r) and r.result.is_final) or isinstance(r, ErrorResponse):
-                    self._results.pop(client_id)
+                # PostprocWorker.Output records arrive on the same stream when
+                # postprocess parallelism is enabled (worker-side pool); they
+                # carry their own is_final, mirroring the classic proxy's
+                # dispatch_result_task handling.
+                if (
+                    (is_llm_response(r) and r.result.is_final)
+                    or isinstance(r, ErrorResponse)
+                    or (isinstance(r, PostprocWorker.Output) and r.is_final)
+                ):
+                    self._results.pop(client_id, None)
 
         # Handle the case where responses might not be a list of lists
         if responses and not isinstance(responses[0], list):

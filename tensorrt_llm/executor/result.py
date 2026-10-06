@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import dataclasses
 import json
@@ -70,6 +73,16 @@ class LogProbsResult(NamedTuple):
     generation: Optional[TokenLogprobs | SimpleTokenLogprobs] = None
 
 
+class _SpecDecCounters(NamedTuple):
+    """Speculative-decoding counters reported by the request behind one sequence.
+
+    Field names match the executor response so a formatter can read either.
+    """
+    per_pos_drafted: Optional[List[int]] = None
+    per_pos_accepted: Optional[List[int]] = None
+    spec_dec_totals: Optional[tuple[int, int]] = None
+
+
 class ResponseWrapper:
     """1. Wrapper of runtime response with optional outputs computed post runtime.
     2. A workaround to pass around RequestPerfMetrics.
@@ -125,6 +138,7 @@ class CompletionOutput:
         token_ids_diff (List[int]): Newly generated token ids.
         logprobs_diff (TokenLogprobs | SimpleTokenLogprobs): Logprobs of newly generated tokens.
         text_diff (str): Newly generated tokens.
+        routed_experts (Optional[torch.Tensor]): Per-token pre-EPLB logical top-k MoE expert ids (Router Replay / R3), or None when not requested.
     """
     index: int
     text: str = ""
@@ -153,10 +167,53 @@ class CompletionOutput:
                                                 repr=False)
     # the result of result_handler passed to postprocess workers
     _postprocess_result: Any = None
+    # this sequence's own spec-decode counters; see _handle_sequence
+    _spec_dec_counters: Optional[_SpecDecCounters] = field(default=None,
+                                                           init=False,
+                                                           repr=False)
+
+    def __getstate__(self) -> dict:
+        # _incremental_states holds a tokenizers.DecodeStream (a Rust object,
+        # not picklable) used for process-local incremental detokenization.
+        # Receivers never need it, so drop it when this output crosses a
+        # process boundary — e.g. a PostprocWorker streaming a raw
+        # CompletionOutput (no postproc_params) back over IPC.
+        # Built explicitly from __slots__ (walking the MRO) rather than via
+        # object.__getstate__, which does not exist on Python 3.10.
+        state = {
+            name: getattr(self, name)
+            for klass in type(self).__mro__
+            for name in getattr(klass, "__slots__", ()) if hasattr(self, name)
+        }
+        state["_incremental_states"] = None
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        for name, value in state.items():
+            object.__setattr__(self, name, value)
 
     @property
     def length(self) -> int:
         return len(self.token_ids)
+
+    @property
+    def routed_experts(self) -> Optional[torch.Tensor]:
+        """Per-token pre-EPLB logical top-k MoE expert ids (Router Replay / R3).
+
+        Shape ``[seq_len - 1, num_moe_layers, top_k]`` when requested via
+        ``SamplingParams.return_routed_experts`` (with the engine-level
+        ``enable_return_routed_experts``); ``None`` otherwise. Surfaced from
+        ``additional_generation_outputs["routed_experts"]``.
+        """
+        outs = self.additional_generation_outputs
+        if not outs or "routed_experts" not in outs:
+            return None
+        val = outs["routed_experts"]
+        if isinstance(val, (list, tuple)):
+            if not val:
+                return None
+            return val[0] if len(val) == 1 else torch.cat(list(val), dim=0)
+        return val
 
     @property
     def text_diff(self) -> str:
@@ -324,6 +381,15 @@ class GenerationResultBase:
         output.disaggregated_params = self.disaggregated_params
         output._last_token_ids_len = len(output.token_ids)
         output._last_logprobs_len = len(output.logprobs)
+        # With n > 1 each candidate is its own child request with its own
+        # counters, while the request-level copies on self are overwritten by
+        # every candidate's response. Capture this sequence's here so a choice
+        # never reports whichever candidate happened to respond last.
+        output._spec_dec_counters = _SpecDecCounters(
+            per_pos_drafted=getattr(response_tensors, 'per_pos_drafted', None),
+            per_pos_accepted=getattr(response_tensors, 'per_pos_accepted',
+                                     None),
+            spec_dec_totals=getattr(response_tensors, 'spec_dec_totals', None))
         decoder_output_prefix = ()
         if (self.sampling_params.exclude_input_from_output
                 or getattr(self, "_streaming", False)):

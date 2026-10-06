@@ -38,7 +38,8 @@ from tensorrt_llm.deep_gemm import (
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .params import DSAParams, use_self_sampling_gvr
+from ..params import use_self_sampling_gvr
+from .params import DSAParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -1881,6 +1882,8 @@ class Indexer(nn.Module):
                 if gvr_prior_indices is not None
                 else None
             )
+            assert metadata.radix_aux_indices is not None
+            assert metadata.radix_aux_logits is not None
             self.top_k(
                 logits_decode,
                 topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
@@ -1890,6 +1893,8 @@ class Indexer(nn.Module):
                 next_n=next_n,
                 max_seq_len=indexer_max_seq_len,
                 gvr_ext_kwargs=gvr_ext_kwargs,
+                radix_aux_indices=metadata.radix_aux_indices,
+                radix_aux_logits=metadata.radix_aux_logits,
             )
 
         elif has_decode and metadata.skip_indexer_for_gen_reqs:

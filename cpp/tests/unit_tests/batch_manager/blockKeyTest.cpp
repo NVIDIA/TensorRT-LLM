@@ -188,7 +188,7 @@ TEST_F(BlockKeyTest, GenerateExtraKeysUsesExactMultimodalRuns)
         /*multimodalRunLengths=*/std::vector<SizeType32>{2, 2});
 
     Request executorRequest({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
-        OutputConfig(), /*endId=*/std::nullopt, /*padId=*/std::nullopt,
+        OutputConfig(), /*endId=*/std::nullopt,
         /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt, /*stopWords=*/std::nullopt,
         /*embeddingBias=*/std::nullopt,
         /*pTuningConfig=*/std::nullopt, multimodalInput);
@@ -231,12 +231,12 @@ TEST_F(BlockKeyTest, GenerateExtraKeysFallsBackToLegacyForIncompleteRunMetadata)
 
     Request executorRequestA({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
         OutputConfig(),
-        /*endId=*/std::nullopt, /*padId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,
+        /*endId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,
         /*stopWords=*/std::nullopt, /*embeddingBias=*/std::nullopt,
         /*pTuningConfig=*/std::nullopt, multimodalInputA);
     Request executorRequestB({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
         OutputConfig(),
-        /*endId=*/std::nullopt, /*padId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,
+        /*endId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,
         /*stopWords=*/std::nullopt, /*embeddingBias=*/std::nullopt,
         /*pTuningConfig=*/std::nullopt, multimodalInputB);
     LlmRequest llmRequestA(/*requestId=*/0, executorRequestA);
@@ -268,7 +268,7 @@ TEST_F(BlockKeyTest, GenerateExtraKeysFallsBackToLegacyForInvalidRunRange)
         /*multimodalRunLengths=*/std::vector<SizeType32>{-1});
 
     Request executorRequest({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
-        OutputConfig(), /*endId=*/std::nullopt, /*padId=*/std::nullopt,
+        OutputConfig(), /*endId=*/std::nullopt,
         /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt, /*stopWords=*/std::nullopt,
         /*embeddingBias=*/std::nullopt,
         /*pTuningConfig=*/std::nullopt, multimodalInput);

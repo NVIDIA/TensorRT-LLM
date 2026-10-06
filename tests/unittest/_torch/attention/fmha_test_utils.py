@@ -32,6 +32,7 @@ class FakeAttention:
         self.num_kv_heads = 1
         self.predicted_tokens_per_seq = 1
         self.has_fp8_kv_cache = False
+        self.skip_correction_threshold = 0.0
         self.local_layer_idx = local_layer_idx
 
 
@@ -52,7 +53,7 @@ class FakePhasedFmha(PhasedFmha):
         self._workspace_size = workspace_size
         self._support_predicate = support_predicate
 
-    def is_supported(
+    def _is_supported(
         self,
         q: torch.Tensor,
         k: torch.Tensor | None,
@@ -120,7 +121,7 @@ class FakeFmha(Fmha):
         self._support_predicate = support_predicate
         self._request_support_predicate = request_support_predicate
 
-    def is_supported(
+    def _is_supported(
         self,
         q: torch.Tensor,
         k: torch.Tensor | None,

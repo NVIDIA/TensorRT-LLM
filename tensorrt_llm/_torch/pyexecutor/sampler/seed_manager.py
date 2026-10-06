@@ -124,9 +124,9 @@ class _SeedManager:
         ``any_seeded`` reflects only the requests passed in, so it falls back to
         False once no scheduled request carries a seed.
 
-        Draft batches are ignored. ``ModelDrafter`` allocates draft slots from
-        its own ``SeqSlotManager`` over the same numeric range, so a draft
-        request can occupy a slot number that a live target request owns here.
+        Draft batches are ignored. A drafter allocates draft slots from its own
+        ``SeqSlotManager`` over the same numeric range, so a draft request can
+        occupy a slot number that a live target request owns here.
         Observing it would look like a change of occupant and reset that
         target's offset, making it replay a stretch of its Philox stream. Draft
         sampling keeps using the shared generator.

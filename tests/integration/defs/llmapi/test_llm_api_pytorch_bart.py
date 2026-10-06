@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 from transformers import AutoTokenizer
 
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
@@ -77,12 +78,23 @@ _EXPECTED_BEAM_OUTPUT_TOKEN_IDS_BY_BEAMS = {
         [0, 0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940],
     ],
 }
-_MIXED_ENCODER_EXPECTED_TOKEN_IDS_BY_REQUEST = [
-    # "The update improves batching, lowers latency,"
-    [[0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940, 6]],
-    # "The company opened a training center on Monday."
-    [[0, 133, 138, 1357, 10, 1058, 1312, 15, 302, 4]],
-]
+_MIXED_ENCODER_EXPECTED_TOKEN_IDS_BY_REQUEST_AND_BEAMS = {
+    1: [
+        # "The update improves batching, lowers latency,"
+        [[0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940, 6]],
+        # "The company opened a training center on Monday."
+        [[0, 133, 138, 1357, 10, 1058, 1312, 15, 302, 4]],
+    ],
+    2: [
+        _EXPECTED_BEAM_OUTPUT_TOKEN_IDS_BY_BEAMS[2],
+        [
+            # "The company opened a training center on Monday."
+            [0, 133, 138, 1357, 10, 1058, 1312, 15, 302, 4],
+            # "The company opened a training center on Monday"
+            [0, 0, 133, 138, 1357, 10, 1058, 1312, 15, 302],
+        ],
+    ],
+}
 
 
 def _test_case(
@@ -247,6 +259,13 @@ _MIXED_BATCH_TEST_CASES = [
         num_beams=1,
         num_return_sequences=1,
         feature_id="bf16-kv-v1-decoder-cuda-graph-on-greedy-batch2",
+    ),
+    _mixed_batch_test_case(
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=True,
+        num_beams=2,
+        num_return_sequences=2,
+        feature_id="bf16-kv-v2-decoder-cuda-graph-on-beam2-batch2",
     ),
     _mixed_batch_test_case(
         torch_dtype="bfloat16",
@@ -600,9 +619,9 @@ def test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
                 tokenizer,
                 token_ids,
                 exact_match=True,
-                expected_token_ids_by_output=_MIXED_ENCODER_EXPECTED_TOKEN_IDS_BY_REQUEST[
-                    request_idx
-                ],
+                expected_token_ids_by_output=(
+                    _MIXED_ENCODER_EXPECTED_TOKEN_IDS_BY_REQUEST_AND_BEAMS[num_beams][request_idx]
+                ),
             )
 
 
@@ -676,7 +695,8 @@ def test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs
         decoder_replay_keys = []
         if tensor_parallel_size == 1:
             model_engine = llm._executor.engine.model_engine
-            encoder_runner = model_engine.encoder_cuda_graph_runner
+            assert isinstance(model_engine._runner, EncoderDecoderRunner)
+            encoder_runner = model_engine._runner._encoder_cuda_graph_runner
             decoder_runner = model_engine.cuda_graph_runner
 
             assert encoder_runner.enabled
@@ -736,7 +756,7 @@ def test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs
                 token_ids,
                 exact_match=True,
                 expected_token_ids_by_output=(
-                    _MIXED_ENCODER_EXPECTED_TOKEN_IDS_BY_REQUEST[request_idx]
+                    _MIXED_ENCODER_EXPECTED_TOKEN_IDS_BY_REQUEST_AND_BEAMS[1][request_idx]
                 ),
             )
 

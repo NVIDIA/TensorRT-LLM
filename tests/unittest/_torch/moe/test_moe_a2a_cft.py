@@ -27,6 +27,10 @@ from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
     should_use_cft,
 )
 
+# Environment-variable parsing only. The marker is also what makes the file
+# reachable: the CPU stage collects only files that carry it.
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize(
     ("value", "expected"),

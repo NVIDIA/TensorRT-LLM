@@ -48,7 +48,7 @@ Skill(skill="trtllm-test-specialist", args=\"\"\"
 - eval_tasks: gsm8k,mmlu                        # evaluation only
 - dataset_path: <path>                          # benchmark/evaluation, optional
 - bench_subcommand: <throughput|latency>        # benchmark only
-- backend: <pytorch|tensorrt|_autodeploy>       # benchmark only
+- backend: <pytorch>                             # benchmark only
 - device_type / extra_llm_api_options_yaml: <…> # optional
 - report_file: <markdown_path>
 \"\"\")
@@ -117,9 +117,6 @@ DOMAIN_PRIMING = """\
   focused tests. If the selected backend or runtime/cache path needs changes,
   plan and implement those changes inside the attention task; do not skip them
   just because the current backend/runtime support is missing.
-- Do not read, cite, or use `auto_deploy/` as a technical source for modeling
-  bring-up; it may only be mentioned as an excluded path. Do not edit
-  `auto_deploy/` or `tests/.../auto_deploy/` paths.
 - Runtime-adjacent edits are allowed when they are part of the current task.
 - Pass-critical unit and focused parity tests must include CUDA/GPU execution.
   Do not treat skipped or CPU-only tests as pass evidence; if CUDA/GPU
@@ -590,7 +587,7 @@ STATUS_DONE_TODO_RUBRIC = """\
 In addition to the rolling-state sections (current status, execution
 path, what was tried, pointers for the next step), `status.md` must
 carry a `## Done / TODO` section that both the Coder and the Reviewer
-keep current when they call `update_status`. It is the cheap signal
+keep current when they update it. It is the cheap signal
 the next agent uses to pick up where this iteration left off and the
 human uses to read out progress at a glance.
 
@@ -740,8 +737,6 @@ SOURCE_BOUNDARY = """\
   * The current workspace
   * HF/vLLM reference files or directories explicitly named in the user spec
 - Do not read or cite local files outside those roots.
-- Do not read, cite, or use `auto_deploy/` as a technical source; it may only
-  be mentioned as an excluded path.
 - Do not use external agent prompts, skills, memories, or policy documents as
   technical sources unless the user explicitly names them in the spec.
 - Evidence must cite HF/vLLM, TensorRT-LLM, current workspace artifacts, or the

@@ -65,6 +65,61 @@ def test_qsa_config_uses_checkpoint_geometry_without_mutating_user_config() -> N
     assert sparse_config.model_dump() == initial_config
 
 
+def test_qsa_config_forwards_heuristic_topk_opt_in() -> None:
+    """The GVR opt-in is a serving knob, not checkpoint geometry."""
+    checkpoint_config = SimpleNamespace(
+        indexer_n_heads=4,
+        indexer_kv_heads=1,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+    )
+
+    params = QSASparseAttentionConfig(enable_heuristic_topk=True).to_sparse_params(
+        pretrained_config=checkpoint_config
+    )
+
+    assert params.enable_heuristic_topk is True
+    assert params.block_topk == 512
+    assert (
+        QSASparseAttentionConfig()
+        .to_sparse_params(pretrained_config=checkpoint_config)
+        .enable_heuristic_topk
+        is False
+    )
+
+
+def test_qsa_config_resolves_mtp_index_share_from_user_then_checkpoint() -> None:
+    """The draft-loop reuse is a serving knob the checkpoint can also default."""
+    base = dict(
+        indexer_n_heads=4,
+        indexer_kv_heads=1,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+    )
+    plain = SimpleNamespace(**base)
+    from_checkpoint = SimpleNamespace(**base, index_share_for_mtp_iteration=True)
+
+    assert not QSASparseAttentionConfig().to_sparse_params(pretrained_config=plain).mtp_index_share
+    assert (
+        QSASparseAttentionConfig()
+        .to_sparse_params(pretrained_config=from_checkpoint)
+        .mtp_index_share
+    )
+    # An explicit user value wins over the checkpoint default in both directions.
+    assert (
+        QSASparseAttentionConfig(index_share_for_mtp_iteration=True)
+        .to_sparse_params(pretrained_config=plain)
+        .mtp_index_share
+    )
+    assert (
+        not QSASparseAttentionConfig(index_share_for_mtp_iteration=False)
+        .to_sparse_params(pretrained_config=from_checkpoint)
+        .mtp_index_share
+    )
+
+
 def test_qsa_config_rejects_missing_checkpoint_geometry() -> None:
     with pytest.raises(ValueError, match="indexer_budget"):
         QSASparseAttentionConfig().to_sparse_params(pretrained_config=SimpleNamespace())
@@ -159,6 +214,7 @@ def test_qsa_empty_batch_keeps_the_regular_backend_path() -> None:
         relative_attention_bias=None,
         relative_attention_max_distance=0,
         has_lora=False,
+        output_gate=None,
     )
 
     assert output is None
@@ -188,6 +244,10 @@ def test_qsa_hybrid_routes_to_sparse_v2_cache_manager(monkeypatch) -> None:
         pretrained_config=SimpleNamespace(),
         sparse_attention_config=QSASparseAttentionConfig(),
         get_num_mamba_layers=lambda: 1,
+        # Real ModelConfig declares both with defaults; the helix x
+        # speculation manager check reads them.
+        mapping=None,
+        spec_config=None,
     )
     kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
 
@@ -204,6 +264,10 @@ def test_qsa_hybrid_rejects_kv_cache_manager_v1(monkeypatch) -> None:
         pretrained_config=SimpleNamespace(),
         sparse_attention_config=QSASparseAttentionConfig(),
         get_num_mamba_layers=lambda: 1,
+        # Real ModelConfig declares both with defaults; the helix x
+        # speculation manager check reads them.
+        mapping=None,
+        spec_config=None,
     )
 
     with pytest.raises(ValueError, match="requires use_kv_cache_manager_v2=True"):
@@ -235,6 +299,7 @@ def test_qsa_cache_manager_uses_resolved_index_geometry(
     from tensorrt_llm._torch.pyexecutor import _util
 
     checkpoint_config = SimpleNamespace(
+        vocab_size=151936,
         hidden_size=2560,
         num_attention_heads=24,
         num_key_value_heads=2,
@@ -322,6 +387,36 @@ def test_qsa_cache_manager_delegates_regular_kv_layout(
     assert calls == [(manager, 7, "HND")]
 
 
+def test_qsa_uses_regular_attention_for_unsupported_head_dim() -> None:
+    """Triton indexes head dims with tl.arange, so non-powers of two go dense."""
+    metadata = object.__new__(QSAAttentionMetadata)
+    metadata._num_tokens = 1
+    metadata.kv_cache_manager = SimpleNamespace(dtype=DataType.BF16)
+    # head_dim comes from the module, not from q: q is still the fused QKV here.
+    attention = SimpleNamespace(head_dim=96, sparse_params=_sparse_params(), layer_idx=0)
+
+    output = QSASparseHooks().forward(
+        attention=attention,
+        q=torch.empty((1, 96 * (4 + 2 + 2))),
+        k=None,
+        v=None,
+        attn_metadata=metadata,
+        attention_mask=PredefinedAttentionMask.CAUSAL,
+        attention_window_size=None,
+        attention_mask_data=None,
+        mrope_config=None,
+        attention_sinks=None,
+        relative_attention_bias=None,
+        relative_attention_max_distance=0,
+        has_lora=False,
+        output_gate=None,
+        qsa_index_hidden_states=torch.empty((1, 1)),
+        qsa_position_ids=torch.zeros((1,), dtype=torch.int32),
+    )
+
+    assert output is None
+
+
 def test_qsa_uses_regular_attention_for_scale_paged_kv_cache() -> None:
     metadata = object.__new__(QSAAttentionMetadata)
     metadata._num_tokens = 1
@@ -343,6 +438,7 @@ def test_qsa_uses_regular_attention_for_scale_paged_kv_cache() -> None:
         relative_attention_bias=None,
         relative_attention_max_distance=0,
         has_lora=False,
+        output_gate=None,
         qsa_index_hidden_states=torch.empty((1, 1)),
         qsa_position_ids=torch.zeros((1,), dtype=torch.int32),
     )

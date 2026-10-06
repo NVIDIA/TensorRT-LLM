@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/loraModule.h"
@@ -545,16 +547,6 @@ public:
     void setModelVariant(ModelVariant modelVariant)
     {
         mModelVariant = modelVariant;
-    }
-
-    [[nodiscard]] SizeType32 getMaxDecodingDraftTokens() const
-    {
-        return getSpeculativeDecodingMode().isNone() ? 0 : getSpeculativeDecodingModule().getMaxDecodingDraftTokens();
-    }
-
-    [[nodiscard]] SizeType32 constexpr getMaxDecodingTokens() const noexcept
-    {
-        return getSpeculativeDecodingMode().isNone() ? 1 : getSpeculativeDecodingModule().getMaxDecodingTokens();
     }
 
     void constexpr setContextFMHA(bool contextFMHA) noexcept
