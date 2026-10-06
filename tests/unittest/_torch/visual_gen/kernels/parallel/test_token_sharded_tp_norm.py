@@ -26,7 +26,7 @@ from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
-from tensorrt_llm._torch.visual_gen.modules.fused_norm_quant import (
+from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
     apply_fused_layernorm_adaln_quant,
     apply_fused_layernorm_affine_quant,
 )

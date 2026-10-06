@@ -32,13 +32,11 @@ from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
     WanPerTokenAdaLN,
     WanPerTokenAdaLNRuntime,
+    apply_fused_layernorm_adaln_quant,
+    apply_fused_layernorm_affine_quant,
     get_nvfp4_input_scale,
 )
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-from tensorrt_llm._torch.visual_gen.modules.fused_norm_quant import (
-    apply_fused_layernorm_adaln_quant,
-    apply_fused_layernorm_affine_quant,
-)
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
 from tensorrt_llm._torch.visual_gen.parallel import static_nvfp4_input_scale
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
