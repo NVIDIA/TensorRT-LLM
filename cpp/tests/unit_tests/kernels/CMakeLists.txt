@@ -140,14 +140,31 @@ add_tllm_gtest(
   "unit;kernels;moe-communication;gpu"
   REQUIRES_GPU)
 
-add_gtest(
+add_tllm_gtest(
   gemmSwigluRunnerTest
+  OWNER
+  kernel
+  SOURCES
   fused_gated_gemm/gemmSwigluRunnerTest.cu
-  ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/kernels/fused_gated_gemm/gemm_swiglu_e4m3.cu
-  NO_GTEST_MAIN)
-add_gtest(gemmSwigluKernelTestSm90Fp8
-          fused_gated_gemm/gemmSwigluKernelTestSm90Fp8.cu NO_GTEST_MAIN
-          NO_TLLM_LINKAGE)
+  LINK_LIBRARIES
+  tllm::kernel_gated_gemm
+  LABELS
+  "unit;kernels;gated-gemm;gpu"
+  NO_GTEST_MAIN
+  REQUIRES_GPU)
+
+add_executable(gemmSwigluKernelTestSm90Fp8 EXCLUDE_FROM_ALL
+               fused_gated_gemm/gemmSwigluKernelTestSm90Fp8.cu)
+target_link_libraries(gemmSwigluKernelTestSm90Fp8
+                      PRIVATE gtest tllm::kernel_cutlass_headers)
+target_compile_features(gemmSwigluKernelTestSm90Fp8 PRIVATE cxx_std_20)
+add_test(NAME gemmSwigluKernelTestSm90Fp8 COMMAND gemmSwigluKernelTestSm90Fp8)
+set_tests_properties(
+  gemmSwigluKernelTestSm90Fp8
+  PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=LAZY" LABELS
+             "unit;kernels;gated-gemm;gpu" RESOURCE_LOCK gpu)
+add_dependencies(kernel-tests gemmSwigluKernelTestSm90Fp8)
+add_dependencies(google-tests gemmSwigluKernelTestSm90Fp8)
 
 foreach(target_name gemmSwigluRunnerTest;gemmSwigluKernelTestSm90Fp8)
   set_property(TARGET ${target_name} PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
