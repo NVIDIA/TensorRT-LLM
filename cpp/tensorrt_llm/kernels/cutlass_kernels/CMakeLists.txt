@@ -263,8 +263,9 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
 
   add_instantiations(moe_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm_grouped)
   target_link_libraries(
-    moe_gemm_src PRIVATE tllm::kernel_moe_lora _moe_gemm_launcher
-                         _moe_gemm_hopper_fp4 _moe_gemm_fp4 _moe_gemm_fp8)
+    moe_gemm_src
+    PRIVATE tllm::kernel_moe_lora tllm::kernel_pre_quant_scale
+            _moe_gemm_launcher _moe_gemm_hopper_fp4 _moe_gemm_fp4 _moe_gemm_fp8)
   target_include_directories(
     moe_gemm_src
     PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
