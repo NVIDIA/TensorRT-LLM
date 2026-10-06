@@ -245,6 +245,8 @@ limitations" below.
   aggregated configuration (`eval_extra_llm_options_sa.yaml`) runs with the
   overlap scheduler off, chunked prefill off, and `max_batch_size` 8 with a
   matching CUDA-graph `max_batch_size`. Under disaggregated serving, SA runs
-  eagerly (no CUDA graphs, no overlap scheduler) and requires
-  `max_batch_size` ≤ 8 on the generation server
-  (`examples/kimi_k3/disagg/gen_config.yaml`).
+  without the overlap scheduler and requires `max_batch_size` ≤ 8 on the
+  generation server (`examples/kimi_k3/disagg/gen_config.yaml`). That
+  example configuration also disables CUDA graphs; SA with CUDA graphs is
+  functional, but its disaggregated performance points have not been
+  re-measured yet.
