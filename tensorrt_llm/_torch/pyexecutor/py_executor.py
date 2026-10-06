@@ -7963,6 +7963,20 @@ class PyExecutor:
                 cache_indirection_buffer=cache_indirection_buffer)
 
         try:
+            # Test-only fault injection: fail the Nth non-warmup forward step
+            # (1-based, comma-separated list) so the forward-error survival
+            # path can be exercised end to end on a real engine. Inert unless
+            # TLLM_TEST_INJECT_FORWARD_FAIL_STEPS is set in the worker's
+            # environment.
+            inject_steps = os.environ.get("TLLM_TEST_INJECT_FORWARD_FAIL_STEPS")
+            if inject_steps and not self.is_warmup:
+                step = getattr(self, "_inject_forward_fail_step_counter", 0) + 1
+                self._inject_forward_fail_step_counter = step
+                if str(step) in inject_steps.split(","):
+                    raise RuntimeError(
+                        f"injected forward failure at forward step {step} "
+                        "(TLLM_TEST_INJECT_FORWARD_FAIL_STEPS)")
+
             cache_indirection_buffer = self.sampler.get_cache_indirection()
 
             # Run model forward on the execution stream for proper synchronization
