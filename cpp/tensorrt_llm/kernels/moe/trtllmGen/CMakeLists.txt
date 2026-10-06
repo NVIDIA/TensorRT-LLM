@@ -24,21 +24,36 @@ set(ROUTING_CUSTOM_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingCustomEntry.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingCustomSmallToken.cu)
 
-list(REMOVE_ITEM SRC_CU ${ROUTING_CUSTOM_SRC_CU})
+set(ROUTING_OTHER_SRC_CU
+    ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingDeepSeek.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingFromTopKIds.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingLlama4.cu)
+set(ROUTING_SRC_CU ${ROUTING_CUSTOM_SRC_CU} ${ROUTING_OTHER_SRC_CU})
+list(REMOVE_ITEM SRC_CU ${ROUTING_SRC_CU})
 
-# Build routing as multiple translation units without NVCC's internal parallel
-# split pipeline: one TU per heavy kernel family (block group, small cluster,
-# large cluster, small-token, entry) so ptxas runs them in parallel.
-add_library(trtllm_gen_fp8_block_scale_moe_routing OBJECT
-            ${ROUTING_CUSTOM_SRC_CU})
+# Custom routing uses one translation unit per kernel family and disables NVCC's
+# internal split pipeline so ptxas can process the families in parallel.
+add_library(trtllm_gen_fp8_block_scale_moe_routing STATIC ${ROUTING_SRC_CU})
+add_library(tllm::kernel_moe_routing ALIAS
+            trtllm_gen_fp8_block_scale_moe_routing)
+target_link_libraries(trtllm_gen_fp8_block_scale_moe_routing
+                      PUBLIC tllm::kernel_cutlass_headers)
+target_compile_features(trtllm_gen_fp8_block_scale_moe_routing
+                        PUBLIC cxx_std_20)
 set_property(TARGET trtllm_gen_fp8_block_scale_moe_routing
              PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET trtllm_gen_fp8_block_scale_moe_routing
              PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-target_compile_options(trtllm_gen_fp8_block_scale_moe_routing
-                       PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--split-compile=1>)
+set_source_files_properties(
+  ${ROUTING_CUSTOM_SRC_CU}
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--split-compile=1>")
+set_source_files_properties(
+  ${ROUTING_OTHER_SRC_CU}
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--split-compile=0>")
 
 add_library(trtllm_gen_fp8_block_scale_moe OBJECT ${SRC_CPP} ${SRC_CU})
+target_link_libraries(trtllm_gen_fp8_block_scale_moe
+                      PUBLIC tllm::kernel_moe_routing)
 set_property(TARGET trtllm_gen_fp8_block_scale_moe
              PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET trtllm_gen_fp8_block_scale_moe
