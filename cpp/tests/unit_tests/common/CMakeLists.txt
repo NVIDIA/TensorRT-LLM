@@ -136,3 +136,14 @@ add_tllm_gtest(
   Threads::Threads
   LABELS
   "unit;common;host")
+
+add_tllm_gtest(
+  ncclWindowSupportTest
+  OWNER
+  common
+  SOURCES
+  ncclWindowSupportTest.cpp
+  LINK_LIBRARIES
+  tllm::common_nccl
+  LABELS
+  "unit;common;nccl;host")
