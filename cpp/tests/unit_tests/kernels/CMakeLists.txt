@@ -167,7 +167,18 @@ target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
 add_gtest(blockScaleMoeActivationTest moe/blockScaleMoeActivationTest.cu)
 add_gtest(blockScaleMoeFinalizeTest moe/blockScaleMoeFinalizeTest.cu)
 
-add_gtest(moeLoadBalanceKernelTest moe/moeLoadBalanceKernelTest.cpp)
+add_tllm_gtest(
+  moeLoadBalanceKernelTest
+  OWNER
+  kernel
+  SOURCES
+  moe/moeLoadBalanceKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_moe_load_balance
+  Threads::Threads
+  LABELS
+  "unit;kernels;moe-load-balance;gpu"
+  REQUIRES_GPU)
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
   add_gtest(moeLoraPointerExpandTest moe/moeLoraPointerExpandTest.cu)

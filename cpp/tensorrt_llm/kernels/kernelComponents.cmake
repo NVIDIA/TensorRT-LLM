@@ -94,3 +94,7 @@ add_tllm_kernel_library(
   tllm_kernel_moe_communication SOURCES
   moe/communication/fusedMoeCommKernels.cu LINK_LIBRARIES
   tllm::common_environment CUDA::cuda_driver)
+
+add_tllm_kernel_library(
+  tllm_kernel_moe_load_balance SOURCES moe/loadBalance/moeLoadBalanceKernels.cu
+  LINK_LIBRARIES tllm::common_environment)
