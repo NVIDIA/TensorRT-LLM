@@ -214,7 +214,8 @@ class TestBaseABC:
 
 
 class TestResourceManagerAPI:
-    def test_target_update_receives_metadata_before_final_compression(self):
+    @pytest.mark.parametrize("skip_target", [False, True])
+    def test_update_preserves_other_managers_and_metadata(self, skip_target: bool) -> None:
         calls = []
         metadata = MagicMock(name="attention_metadata")
         draft = MagicMock(name="draft_kv_cache_manager")
@@ -232,13 +233,13 @@ class TestResourceManagerAPI:
         )
         batch = _batch(generation=[_req(1)])
 
-        manager.update_resources(batch, metadata, 2.0)
+        manager.update_resources(batch, metadata, 2.0, skip_kv_cache_manager=skip_target)
 
-        assert calls == [
-            ("draft", (batch,)),
-            ("target", (batch, metadata, 2.0)),
-            ("compression", (batch,)),
-        ]
+        expected = [("draft", (batch,))]
+        if not skip_target:
+            expected.append(("target", (batch, metadata, 2.0)))
+        expected.append(("compression", (batch,)))
+        assert calls == expected
 
     def test_real_v2_target_receives_relocation_metadata(self):
         from tensorrt_llm._torch.pyexecutor.kv_cache import (
@@ -254,7 +255,9 @@ class TestResourceManagerAPI:
         with patch.object(kv_cache_v2_module, "_update_kv_cache_draft_token_location") as relocate:
             manager.update_resources(batch, metadata, 2.0)
 
-        relocate.assert_called_once_with(target, batch, metadata, 2.0)
+        relocate.assert_called_once_with(
+            target, batch, metadata, 2.0, include_finished_requests=True
+        )
 
     def test_prepare_fires_init_on_first_chunk_only(self, fake_kv_cache_manager):
         rec = []

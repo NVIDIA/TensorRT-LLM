@@ -3109,6 +3109,39 @@ def test_non_last_pp_rank_drains_every_relay_send():
     assert waited == [0, 1, 2, 3]
 
 
+def test_previous_batch_updates_target_v2_before_response_cleanup():
+    executor = object.__new__(PyExecutor)
+    batch = ScheduledRequests()
+    metadata = object()
+    executor.previous_batch = types.SimpleNamespace(scheduled_requests=batch)
+    executor._is_kv_manager_v2 = True
+    executor.model_engine = types.SimpleNamespace(
+        attn_metadata=metadata, kv_cache_dtype_byte_size=2.0
+    )
+    executor.kv_cache_manager = Mock()
+    executor.resource_manager = Mock()
+    executor.enable_early_first_token_response = False
+    executor.enable_kv_cache_events = False
+    executor.enable_iter_perf_stats = False
+    events = []
+    executor._handle_canceled_requests = Mock(side_effect=lambda: events.append("cancel"))
+    executor.kv_cache_manager.update_resources.side_effect = lambda *args: events.append(
+        "target_update"
+    )
+    executor._handle_responses = Mock(side_effect=lambda **kwargs: events.append("responses"))
+    executor.resource_manager.update_resources.side_effect = lambda *args, **kwargs: events.append(
+        "other_updates"
+    )
+
+    executor._process_previous_batch()
+
+    assert events == ["cancel", "target_update", "responses", "other_updates"]
+    executor.kv_cache_manager.update_resources.assert_called_once_with(batch, metadata, 2.0)
+    executor.resource_manager.update_resources.assert_called_once_with(
+        batch, metadata, 2.0, skip_kv_cache_manager=True
+    )
+
+
 # -- first-token logprobs and logits transferred from prefill -----------------
 
 
