@@ -71,7 +71,11 @@ def test_dflash_graph_bucket_uses_full_seq_slot_pool():
         config = SimpleNamespace(max_position_embeddings=8)
         fc = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
         hidden_norm = object()
+        # _lazy_init_ctx_buffers validates the draft backend first and reads
+        # _num_heads unconditionally; VANILLA matches the worker's config.
+        dflash_attention_backend = "VANILLA"
         _num_attn_layers = 1
+        _num_heads = 2
         _num_kv_heads = 2
         _head_dim = 4
 
