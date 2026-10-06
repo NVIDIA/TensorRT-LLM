@@ -55,7 +55,6 @@ class _CaptureState:
         self.excluded_field_count = 0
         self.unsafe_excluded = False
         self.sequence_truncated = False
-        self.payload_truncated = False
 
 
 def _canonical_json(data: Any) -> str:
@@ -701,11 +700,6 @@ def collect_llm_api_config_payloads(llm_args: Any) -> tuple[str, str]:
                 state.excluded_field_count += 1
                 state.unsafe_excluded = True
 
-        config_json = _canonical_json(state.values)
-        if len(config_json.encode("utf-8")) > MAX_CONFIG_BYTES:
-            state.values, config_json = _truncate_to_budget(state.values)
-            state.payload_truncated = True
-
         rows = _manifest_rows(entries)
         metadata = {
             "api_contract_version": API_CONTRACT_VERSION,
@@ -714,15 +708,25 @@ def collect_llm_api_config_payloads(llm_args: Any) -> tuple[str, str]:
             "capture_succeeded": True,
             "capture_version": CAPTURE_VERSION,
             "capturable_field_count": len(entries),
-            "captured_field_count": len(state.values),
             "excluded_field_count": state.excluded_field_count,
             "field_policy_version": FIELD_POLICY_VERSION,
-            "payload_truncated": state.payload_truncated,
+            "payload_truncated": False,
             "schema_digest": _schema_digest(cls),
             "sequence_truncated": state.sequence_truncated,
             "source": CAPTURE_SOURCE,
             "unsafe_excluded": state.unsafe_excluded,
         }
+        observation = getattr(llm_args, "_worker_config_observation", None)
+        if observation is not None:
+            from .worker_config import merge_observation
+
+            merge_observation(state.values, metadata, observation)
+        # Worker replacements may free space; budget only the final configuration.
+        config_json = _canonical_json(state.values)
+        if len(config_json.encode("utf-8")) > MAX_CONFIG_BYTES:
+            state.values, config_json = _truncate_to_budget(state.values)
+            metadata["payload_truncated"] = True
+        metadata["captured_field_count"] = len(state.values)
         return config_json, _canonical_json(metadata)
     except (AttributeError, TypeError, ValueError, KeyError):
         # Stay fail-silent only for the sanitizer/walk error family we expect.

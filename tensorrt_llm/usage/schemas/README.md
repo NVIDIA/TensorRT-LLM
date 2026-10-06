@@ -1,6 +1,6 @@
 # TRT-LLM Telemetry Schema Reference
 
-Schema version: **0.7** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
+Schema version: **0.8** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
 
 ## Overview
 
@@ -31,7 +31,7 @@ these top-level fields in Kibana alongside the event parameters.
 | `clientType` | string | Always `"Native"`. |
 | `clientVer` | string | TRT-LLM version, e.g. `"1.3.0rc9"`. |
 | `eventProtocol` | string | Always `"1.6"`. |
-| `eventSchemaVer` | string | Schema version, currently `"0.7"`. |
+| `eventSchemaVer` | string | Schema version, currently `"0.8"`. |
 | `eventSysVer` | string | Always `"trtllm-telemetry/1.0"`. |
 | `sessionId` | string | Unique hex UUID per telemetry session. Use this to correlate initial, heartbeat, and terminal events. |
 | `sentTs` | string | ISO 8601 UTC timestamp of when the payload was sent. |
@@ -41,6 +41,69 @@ hardcoded to `"undefined"` — TRT-LLM is a server-side SDK with no browser or
 login context.
 
 ## Events
+
+### Initialization-time worker configuration observations
+
+Capture version `3` preserves the existing flat `llmApiConfigJson` format.
+The initial report never waits for worker snapshots: it omits
+`kv_cache_config.host_cache_size`, `disk_cache_size`, and `enable_partial_reuse`
+and marks their coverage `pending` (or `unavailable` if collection cannot start).
+Other fields remain parent-sourced. After the initial-report attempt, the parent
+may send one `trtllm_worker_config_update` containing verified worker values.
+These observations describe startup arguments, not allocated capacity or later
+runtime changes.
+
+`llmApiConfigMetaJson.worker_capture` contains `expected`, `received`,
+`status` (`pending`, `complete`, `partial`, or `unavailable`), and bounded lists named
+`verified_fields`, `conflicting_fields`, and `unavailable_fields`. `received`
+counts compatible snapshots; `complete` does not imply every field is verified. Conflicting
+or unavailable values are omitted, not replaced with null, false, or the
+original parent value. Worker counts exclude postprocessing processes and
+must not be used as deployment counts or GPU-hour weights. Version `2` and
+fields outside the verified list must not be presented as worker-verified.
+
+Collection is optional and obeys the existing opt-outs. Model workers send one
+authenticated JSON datagram to the constructing process after engine setup;
+they do not start usage-reporting sessions. The endpoint and authentication key
+are private startup arguments and never enter telemetry payloads. Messages are
+capped at 2 KiB and collection at 4096 workers. A local UDP socket is bound before
+startup without DNS or a receiver-readiness wait. Workers resolve the parent
+hostname and send from daemon threads. The receiver closes after all workers
+respond or one second after model startup completes; only the telemetry thread
+waits for collection, never model startup or inference. There are no
+acknowledgements, retries or MPI collectives. Unreachable host addresses,
+firewalls, dropped packets, or worker capture failures produce incomplete
+coverage without failing inference. The same best-effort channel is used by
+MPI/IPC, MPI/RPC, Ray, and inline decoder workers.
+
+Attached frontends and deferred Ray initialization do not initiate collection
+and report unavailable worker observations. Encoder-only execution currently
+retains parent-only capture.
+Observations belong to the same LLM construction as the first initial report;
+later LLM objects do not send additional updates. The existing initial/exit claim
+ordering is unchanged: a rapid terminal event can still suppress a pending
+initial report, and hard termination can lose any unsent report. Updates are
+optional and abandoned on shutdown or opt-out; they never delay exit reporting.
+
+### `trtllm_worker_config_update`
+
+Schema 0.8 adds this event without changing the existing event fields. It uses
+the parent's session ID and has three required parameters:
+
+- `captureId`: random 32-character hex ID matching `llmApiConfigMetaJson.capture_id`
+  in the initial report, not a model name, path, worker identity, or persistent ID.
+- `workerConfigJson`: at most 2048 characters, containing only verified values
+  for the three supported paths. Missing and conflicting values are omitted.
+- `workerConfigMetaJson`: at most 4096 characters, containing manifest/policy
+  versions and final worker coverage.
+
+Consumers must match session, capture ID, manifest and policy before applying
+the update. Updates can arrive before the initial event, be duplicated, or be
+lost. They do not create sessions, extend measured runtime, change GPU-hour
+weights, or increment initial/heartbeat/exit counts. If no update arrives,
+coverage remains pending. Deploy compatible dashboard/cache handling and stage
+and promote schema 0.8 before enabling the producer in production. Existing
+schema versions remain valid; do not overwrite an already finalized schema.
 
 ### `trtllm_initial_report`
 

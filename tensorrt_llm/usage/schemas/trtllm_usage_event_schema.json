@@ -1,6 +1,9 @@
 {
     "oneOf": [
         {
+            "$ref": "#/definitions/events/trtllm_worker_config_update"
+        },
+        {
             "$ref": "#/definitions/events/trtllm_initial_report"
         },
         {
@@ -12,7 +15,7 @@
     ],
     "$schema": "http://json-schema.org/draft-07/schema#",
     "schemaMeta": {
-        "schemaVersion": "0.7",
+        "schemaVersion": "0.8",
         "clientId": "616561816355034",
         "clientName": "TrtllmTelemetry",
         "definitionVersion": "2.0"
@@ -37,6 +40,34 @@
             }
         },
         "events": {
+            "trtllm_worker_config_update": {
+                "eventMeta": {
+                    "service": "telemetry",
+                    "gdpr": {
+                        "category": "functional",
+                        "description": "Parent-owned, sanitized worker configuration enrichment. No additional usage session or PII."
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "properties": {
+                    "captureId": {
+                        "type": "string",
+                        "minLength": 32,
+                        "maxLength": 32,
+                        "pattern": "^[0-9a-f]{32}$"
+                    },
+                    "workerConfigJson": {
+                        "type": "string",
+                        "maxLength": 2048
+                    },
+                    "workerConfigMetaJson": {
+                        "type": "string",
+                        "maxLength": 4096
+                    }
+                },
+                "required": ["captureId", "workerConfigJson", "workerConfigMetaJson"]
+            },
             "trtllm_initial_report": {
                 "eventMeta": {
                     "service": "telemetry",

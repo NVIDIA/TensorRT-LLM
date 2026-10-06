@@ -488,7 +488,15 @@ class BaseLLM:
             # Raw JSON preserves explicit keys; GenerationConfig fills defaults.
             self._generation_config_explicit_values: dict[str, Any] = {}
 
-            self._build_model()
+            try:
+                from tensorrt_llm.usage.worker_config import observe_workers
+                worker_observation = observe_workers(self.args)
+            except Exception:
+                from contextlib import nullcontext
+                worker_observation = nullcontext()
+            with worker_observation as worker_collector:
+                self._build_model()
+            self._worker_config_collector = worker_collector
 
         except Exception:
             # _owns_mpi_session is assigned before this try block, so it is
@@ -537,6 +545,9 @@ class BaseLLM:
                 llm_args=self.args,
                 pretrained_config=pretrained_config,
                 telemetry_config=telemetry_config,
+                worker_config_collector=getattr(self,
+                                                "_worker_config_collector",
+                                                None),
             )
         except Exception as exc:
             logger.debug("Usage telemetry setup failed: %s", exc)

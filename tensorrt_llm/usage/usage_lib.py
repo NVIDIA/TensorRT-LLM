@@ -652,6 +652,7 @@ def _background_reporter(
     llm_args: Any,
     pretrained_config: Any,
     usage_context: str = "",
+    worker_config_collector: Any = None,
 ) -> None:
     """Background thread entry point. Sends initial report + heartbeats.
 
@@ -739,6 +740,37 @@ def _background_reporter(
         if not session.claim_initial():
             return
         _send_if_session_active(session, payload)
+
+        # Enrichment is lower priority than the initial attempt and never delays
+        # application startup. The independent terminal sender remains unchanged.
+        if worker_config_collector is not None and not _HEARTBEAT_STOP.is_set():
+            try:
+                from .worker_config import merge_observation
+
+                observation = worker_config_collector.finish()
+                config_meta = json.loads(llm_api_config_meta_json)
+                update_meta = {
+                    key: config_meta[key]
+                    for key in ("capture_manifest_digest", "field_policy_version")
+                }
+                worker_values = {}
+                merge_observation(worker_values, update_meta, observation)
+                update = schema.TrtllmWorkerConfigUpdate(
+                    captureId=config_meta["capture_id"],
+                    workerConfigJson=json.dumps(worker_values, separators=(",", ":")),
+                    workerConfigMetaJson=json.dumps(update_meta, separators=(",", ":")),
+                )
+                if not _HEARTBEAT_STOP.is_set():
+                    _send_if_session_active(
+                        session,
+                        schema.build_gxt_payload(
+                            event=update,
+                            session_id=session_id,
+                            trtllm_version=trtllm_version,
+                        ),
+                    )
+            except Exception:
+                pass  # Optional enrichment must not suppress heartbeats or exit reporting.
 
         # --- Heartbeat loop ---
         heartbeat_interval = _get_heartbeat_interval()
@@ -1464,6 +1496,7 @@ def report_usage(
     llm_args: Any = None,
     pretrained_config: Any = None,
     telemetry_config: Any = None,
+    worker_config_collector: Any = None,
 ) -> None:
     """Start background usage telemetry reporting.
 
@@ -1478,6 +1511,9 @@ def report_usage(
         llm_args: The LlmArgs object from BaseLLM (for config extraction).
         pretrained_config: The pretrained model config (for architecture name).
         telemetry_config: TelemetryConfig object (opt-out + usage context).
+        worker_config_collector: Optional collector for a separate configuration
+            update. Only the background reporter waits for it, after the initial
+            report attempt; model startup and exit reporting do not wait for it.
     """
     global _REPORTER_ACTIVE
     global _REPORTER_STARTED
@@ -1504,7 +1540,7 @@ def report_usage(
 
         thread = threading.Thread(
             target=_background_reporter,
-            args=(llm_args, pretrained_config, usage_context),
+            args=(llm_args, pretrained_config, usage_context, worker_config_collector),
             daemon=True,
             name="trtllm-usage-stats",
         )

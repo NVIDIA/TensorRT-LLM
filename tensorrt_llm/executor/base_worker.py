@@ -226,6 +226,13 @@ class BaseWorker(GenerationExecutor):
             assert lora_model_config is not None
             self._lora_model_config = lora_model_config
 
+        try:
+            from tensorrt_llm.usage.worker_config import publish_worker_config
+            publish_worker_config(self.llm_args, self.rank)
+        except Exception:
+            # Optional observation must not change engine initialization.
+            pass
+
     def await_responses(self, timeout: Optional[float] = None) -> list:
         return self.engine.await_responses(timeout=datetime.timedelta(
             seconds=timeout) if timeout is not None else None)
