@@ -14,8 +14,7 @@
 # the License.
 include(FetchContent)
 
-set(SRCS bufferManagerNvls.cpp utils/debugUtils.cu mcastDeviceMemory.cpp
-         ncclCommunicator.cpp)
+set(SRCS bufferManagerNvls.cpp mcastDeviceMemory.cpp ncclCommunicator.cpp)
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 
@@ -194,6 +193,16 @@ foreach(component
   target_compile_features(${component} PUBLIC cxx_std_20)
   set_target_properties(${component} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endforeach()
+
+add_library(tllm_runtime_debug STATIC utils/debugUtils.cu)
+add_library(tllm::runtime_debug ALIAS tllm_runtime_debug)
+target_link_libraries(tllm_runtime_debug PUBLIC tllm::runtime_buffers)
+target_compile_features(tllm_runtime_debug PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_runtime_debug
+  PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_cuda_architectures(tllm_runtime_debug 89)
 
 add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)

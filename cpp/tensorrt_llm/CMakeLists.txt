@@ -348,6 +348,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_kv_cache_legacy
     tllm_peft_cache
     tllm_runtime_buffers
+    tllm_runtime_debug
     tllm_runtime_distributed
     tllm_runtime_gdr
     tllm_runtime_host_accessible_memory
