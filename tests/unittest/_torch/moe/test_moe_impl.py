@@ -1428,6 +1428,8 @@ def test_cutlass_build_mode_probe(monkeypatch: pytest.MonkeyPatch, mode: bool | 
     from tensorrt_llm._torch.moe.fused_moe import impl_environment
 
     query = MagicMock(return_value=mode)
+    debug = MagicMock()
+    monkeypatch.setattr(impl_environment.logger, "debug", debug)
     namespace = SimpleNamespace() if mode is None else SimpleNamespace(is_oss_cutlass_moe=query)
     monkeypatch.setattr(torch.ops, "trtllm", namespace)
     impl_environment.reset_moe_environment_cache()
@@ -1436,6 +1438,12 @@ def test_cutlass_build_mode_probe(monkeypatch: pytest.MonkeyPatch, mode: bool | 
         assert impl_environment._is_oss_cutlass_moe() is expected
         assert impl_environment._is_oss_cutlass_moe() is expected
         assert query.call_count == (0 if mode is None else 1)
+        if mode is None:
+            debug.assert_called_once_with(
+                "CUTLASS MoE build-mode query is unavailable; assuming OSS kernels"
+            )
+        else:
+            debug.assert_not_called()
     finally:
         impl_environment.reset_moe_environment_cache()
 
@@ -1445,3 +1453,79 @@ def test_cutlass_build_mode_fingerprint() -> None:
         MoEEnvironment(sm=90).fingerprint()
         != MoEEnvironment(sm=90, oss_cutlass_moe=False).fingerprint()
     )
+
+
+@pytest.mark.parametrize("is_oss", [False, True])
+@pytest.mark.parametrize("method", [None, "ALLGATHER", "NVLINK_ONE_SIDED"])
+@pytest.mark.parametrize("force_source", ["model", "env"])
+def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_source):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.moe.fused_moe.communication import communication_factory
+    from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+
+    monkeypatch.delenv("TRTLLM_FORCE_COMM_METHOD", raising=False)
+    if force_source == "env" and method is not None:
+        monkeypatch.setenv("TRTLLM_FORCE_COMM_METHOD", method)
+    mapping = SimpleNamespace(
+        enable_attention_dp=True,
+        dp_size=2,
+        moe_tp_size=1,
+        moe_ep_size=2,
+        has_cp_helix=lambda: False,
+    )
+    config = SimpleNamespace(
+        mapping=mapping,
+        pretrained_config=SimpleNamespace(hidden_size=128),
+        torch_dtype=torch.bfloat16,
+        quant_config=None,
+        max_num_tokens=8,
+        moe_max_num_tokens=8,
+        use_cuda_graph=False,
+        use_low_precision_moe_combine=False,
+        moe_load_balancer=None,
+    )
+    constructors = {}
+    for name in (
+        "AllGatherReduceScatter",
+        "NVLinkOneSided",
+        "NVLinkTwoSided",
+        "NVLinkTwoSidedFlashinfer",
+        "NcclEP",
+        "DeepEP",
+        "DeepEPLowLatency",
+    ):
+        constructors[name] = MagicMock(name=name)
+        monkeypatch.setattr(communication_factory, name, constructors[name])
+    monkeypatch.setattr(communication_factory, "get_wide_ep_ft_options", lambda _: (None, 60, 1))
+    moe = SimpleNamespace(
+        backend=CutlassFusedMoE.__new__(CutlassFusedMoE),
+        enable_dwdp=False,
+        model_config=config,
+        num_experts=4,
+        num_slots=4,
+        routing_method=SimpleNamespace(experts_per_token=1),
+        expert_size_per_partition=2,
+        use_flashinfer=False,
+        hidden_size=128,
+        communication_method=method if force_source == "model" else None,
+    )
+    with override_moe_environment(MoEEnvironment(sm=90, oss_cutlass_moe=is_oss)):
+        if not is_oss and method == "NVLINK_ONE_SIDED":
+            with pytest.raises(ValueError, match="requires all-to-all.*use ALLGATHER"):
+                ConfigurableMoE._create_comm_strategy_auto(moe)
+            assert all(constructor.call_count == 0 for constructor in constructors.values())
+        else:
+            strategy = ConfigurableMoE._create_comm_strategy_auto(moe)
+            selected = (
+                "AllGatherReduceScatter"
+                if not is_oss or method == "ALLGATHER"
+                else "NVLinkOneSided"
+            )
+            assert strategy is constructors[selected].return_value
+            constructors[selected].assert_called_once()
+            assert all(
+                constructor.call_count == 0
+                for name, constructor in constructors.items()
+                if name != selected
+            )
