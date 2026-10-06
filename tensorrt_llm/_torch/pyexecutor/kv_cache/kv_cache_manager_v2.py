@@ -2515,23 +2515,6 @@ class KVCacheManagerV2(BaseResourceManager):
         for entry in entries:
             logger.info(entry)
 
-    def _get_attention_op_page_index_params(
-        self, layer_id: LayerId, role: DataRole
-    ) -> Tuple[int, int, int]:
-        """Scale, layer offset and scratch span for one entry per logical block."""
-        converter = self.impl.get_page_index_converter(layer_id, role)
-        if converter.expansion != 1:
-            raise NotImplementedError(
-                "SWA scratch block-table conversion does not support "
-                f"expanded page indices yet: layer={layer_id}, role={role}, "
-                f"expansion={converter.expansion}"
-            )
-        return (
-            int(converter.scale),
-            int(converter.layer_offset),
-            int(converter.scratch_pages_per_block),
-        )
-
     def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
         pool_ids = torch.empty(
             self.num_attention_op_pools,
@@ -2556,13 +2539,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 role_a if role_b is None else role_b,
             ]
             for role_idx, role in enumerate(roles):
-                scale, layer_offset, scratch_span = self._get_attention_op_page_index_params(
-                    layer_id, role
-                )
+                converter = self.impl.get_page_index_converter(layer_id, role)
+                if converter.expansion != 1:
+                    raise NotImplementedError(
+                        "SWA scratch block-table conversion does not support "
+                        f"expanded page indices yet: layer={layer_id}, role={role}, "
+                        f"expansion={converter.expansion}"
+                    )
                 pool_ids[local_layer_idx, role_idx] = pool_id
-                scales[local_layer_idx, role_idx] = scale
-                layer_offsets[local_layer_idx, role_idx] = layer_offset
-                scratch_pages[local_layer_idx, role_idx] = scratch_span
+                scales[local_layer_idx, role_idx] = int(converter.scale)
+                layer_offsets[local_layer_idx, role_idx] = int(converter.layer_offset)
+                scratch_pages[local_layer_idx, role_idx] = int(converter.scratch_pages_per_block)
 
         staging_capacity = index_mapper_capacity * self.max_beam_width
         device = torch.device("cuda", torch.cuda.current_device())
