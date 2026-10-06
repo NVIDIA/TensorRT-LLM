@@ -222,24 +222,11 @@ class DeepseekV3Dep4ModelingV2(DecoderModel):
         self.dp_group = list(range(mapping.world_size))
         self.dp_size = mapping.world_size
 
-        dt = model_config.torch_dtype
         self.quant_mode = _QUANT_MODE_FP8_KV
 
-        num_layers = cfg.num_hidden_layers
-        hidden = cfg.hidden_size
-        vocab = cfg.vocab_size
         self.mtp_layers = int(getattr(cfg, "num_nextn_predict_layers", 0) or 0)
         spec_config = getattr(model_config, "spec_config", None)
         self.mtp_enabled = spec_config is not None
-
-        heads = cfg.num_attention_heads
-        nope = cfg.qk_nope_head_dim
-        rope_dim = cfg.qk_rope_head_dim
-        v_dim = cfg.v_head_dim
-        kv_lora = cfg.kv_lora_rank
-        q_lora = cfg.q_lora_rank
-        qk_dim = nope + rope_dim
-        lat_dim = kv_lora + rope_dim
 
         rope_cfg = getattr(cfg, "rope_scaling", None) or getattr(cfg, "rope_parameters", None)
         theta = rope_cfg.get("rope_theta", getattr(cfg, "rope_theta", None))
@@ -259,89 +246,11 @@ class DeepseekV3Dep4ModelingV2(DecoderModel):
         self.q_scaling = 1.0 / (temperature * temperature)
         self._call = dict(_CALL_INERT, quant_mode=self.quant_mode, q_scaling=self.q_scaling)
 
-        dense_layers = cfg.first_k_dense_replace
         num_experts = cfg.n_routed_experts
-        moe_inter = cfg.moe_intermediate_size
-        shared_inter = cfg.moe_intermediate_size * cfg.n_shared_experts
-        dense_inter = cfg.intermediate_size
         self.local_experts = num_experts // mapping.moe_ep_size
         self.expert_offset = self.local_experts * self.ep_rank
 
-        def P(*shape, dtype=dt):
-            return nn.Parameter(torch.empty(*shape, dtype=dtype), requires_grad=False)
-
-        u8, f32 = torch.uint8, torch.float32
-        w = nn.ParameterDict()
-        for i in range(num_layers):
-            w[f"l{i}_norm1"] = P(hidden)
-            w[f"l{i}_qa"] = P(q_lora, hidden)
-            w[f"l{i}_q_norm"] = P(q_lora)
-            w[f"l{i}_qb"] = P(heads * qk_dim, q_lora)
-            w[f"l{i}_kva"] = P(lat_dim, hidden)
-            w[f"l{i}_kv_norm"] = P(kv_lora)
-            w[f"l{i}_kvb"] = P(heads * (nope + v_dim), kv_lora)
-            w[f"l{i}_o"] = P(hidden, heads * v_dim)
-            w[f"l{i}_k_scale"] = P(1, dtype=f32)
-            w[f"l{i}_v_scale"] = P(1, dtype=f32)
-            w[f"l{i}_norm2"] = P(hidden)
-            inter = dense_inter if i < dense_layers else shared_inter
-            w[f"l{i}_mlp_gu_w"] = P(2 * inter, hidden // 2, dtype=u8)
-            w[f"l{i}_mlp_gu_s"] = P(2 * inter * (hidden // _SF_VEC), dtype=u8)
-            w[f"l{i}_mlp_dn_w"] = P(hidden, inter // 2, dtype=u8)
-            w[f"l{i}_mlp_dn_s"] = P(hidden * (inter // _SF_VEC), dtype=u8)
-            for name in (
-                "isc1",
-                "isc1_up",
-                "ws2_1",
-                "ws2_1_up",
-                "isc2",
-                "ws2_2",
-            ):
-                w[f"l{i}_mlp_{name}"] = P(1, dtype=f32)
-            if i < dense_layers:
-                continue
-            e, mi = self.local_experts, moe_inter
-            w[f"l{i}_router"] = P(num_experts, hidden)
-            w[f"l{i}_router_bias"] = P(num_experts, dtype=f32)
-            w[f"l{i}_fc1_w"] = P(e, 2 * mi, hidden // 2, dtype=u8)
-            w[f"l{i}_fc1_s"] = P(e, 2 * mi, hidden // _SF_VEC, dtype=u8)
-            w[f"l{i}_fc2_w"] = P(e, hidden, mi // 2, dtype=u8)
-            w[f"l{i}_fc2_s"] = P(e, hidden, mi // _SF_VEC, dtype=u8)
-            for name in (
-                "isc1",
-                "isc1_up",
-                "ws2_1",
-                "ws2_1_up",
-                "isc2",
-                "ws2_2",
-            ):
-                w[f"l{i}_e_{name}"] = P(num_experts, dtype=f32)
-        w["final_norm"] = P(hidden)
-        w["embed"] = P(vocab, hidden)
-        if self.mtp_enabled:
-            e, mi = self.local_experts, moe_inter
-            w["mtp_enorm"] = P(hidden)
-            w["mtp_hnorm"] = P(hidden)
-            w["mtp_eh"] = P(hidden, 2 * hidden)
-            w["mtp_norm1"] = P(hidden)
-            w["mtp_qa"] = P(q_lora, hidden)
-            w["mtp_q_norm"] = P(q_lora)
-            w["mtp_qb"] = P(heads * qk_dim, q_lora)
-            w["mtp_kva"] = P(lat_dim, hidden)
-            w["mtp_kv_norm"] = P(kv_lora)
-            w["mtp_kvb"] = P(heads * (nope + v_dim), kv_lora)
-            w["mtp_o"] = P(hidden, heads * v_dim)
-            w["mtp_k_scale"] = P(1, dtype=f32)
-            w["mtp_v_scale"] = P(1, dtype=f32)
-            w["mtp_norm2"] = P(hidden)
-            w["mtp_router"] = P(num_experts, hidden)
-            w["mtp_router_bias"] = P(num_experts, dtype=f32)
-            w["mtp_fc1"] = P(e, 2 * mi, hidden)
-            w["mtp_fc2"] = P(e, hidden, mi)
-            w["mtp_sh_gu"] = P(2 * shared_inter, hidden)
-            w["mtp_sh_dn"] = P(hidden, shared_inter)
-            w["mtp_head_norm"] = P(hidden)
-        self.w = w
+        self.w = _weights.MODEL_WEIGHTS.declare(_weights.MODEL_WEIGHTS.dims(self))
 
         self._mtp: dict | None = None
         self._rope: dict | None = None
@@ -443,6 +352,7 @@ class DeepseekV3Dep4ModelingV2(DecoderModel):
 
     def _derive_mtp(self) -> dict:
         """The MTP layer's operand set, derived exactly as a trunk layer's is."""
+        nl = self.model_config.pretrained_config.num_hidden_layers
         cfg = self.model_config.pretrained_config
         heads = cfg.num_attention_heads
         nope = cfg.qk_nope_head_dim
@@ -450,29 +360,29 @@ class DeepseekV3Dep4ModelingV2(DecoderModel):
         kv_lora = cfg.kv_lora_rank
         w = self.w
         hn = heads * nope
-        kvb = w["mtp_kvb"]
+        kvb = w[f"l{nl}_kvb"]
         return {
-            "enorm": w["mtp_enorm"],
-            "hnorm": w["mtp_hnorm"],
-            "eh": w["mtp_eh"].t(),
-            "norm1": w["mtp_norm1"],
-            "qa": w["mtp_qa"].t(),
-            "q_norm": w["mtp_q_norm"],
-            "qb": w["mtp_qb"].t(),
-            "kva": w["mtp_kva"].t(),
-            "kv_norm": w["mtp_kv_norm"],
+            "enorm": w[f"l{nl}_enorm"],
+            "hnorm": w[f"l{nl}_hnorm"],
+            "eh": w[f"l{nl}_eh"].t(),
+            "norm1": w[f"l{nl}_norm1"],
+            "qa": w[f"l{nl}_qa"].t(),
+            "q_norm": w[f"l{nl}_q_norm"],
+            "qb": w[f"l{nl}_qb"].t(),
+            "kva": w[f"l{nl}_kva"].t(),
+            "kv_norm": w[f"l{nl}_kv_norm"],
             "k_b": kvb[:hn].reshape(heads, nope, kv_lora),
             "v_b_t": torch.transpose(kvb[hn:].reshape(heads, v_dim, kv_lora), 1, 2),
             "kvb": kvb.t(),
-            "o": w["mtp_o"].t(),
-            "norm2": w["mtp_norm2"],
-            "router": w["mtp_router"].t(),
-            "router_bias": w["mtp_router_bias"],
-            "fc1": w["mtp_fc1"],
-            "fc2": w["mtp_fc2"],
-            "sh_gu": w["mtp_sh_gu"].t(),
-            "sh_dn": w["mtp_sh_dn"].t(),
-            "head_norm": w["mtp_head_norm"],
+            "o": w[f"l{nl}_o"].t(),
+            "norm2": w[f"l{nl}_norm2"],
+            "router": w[f"l{nl}_router"].t(),
+            "router_bias": w[f"l{nl}_router_bias"],
+            "fc1": w[f"l{nl}_fc1"],
+            "fc2": w[f"l{nl}_fc2"],
+            "sh_gu": w[f"l{nl}_sh_gu"].t(),
+            "sh_dn": w[f"l{nl}_sh_dn"].t(),
+            "head_norm": w[f"l{nl}_head_norm"],
         }
 
     def _derive_first_step(self, md) -> None:
@@ -1991,7 +1901,7 @@ class ModelingV2DeepseekR10528Nvfp4Sm103Dep4(
         )
 
     def load_weights(self, weights, *args, **kwargs):
-        _weights.load(self, weights)
+        _weights.MODEL_WEIGHTS.load(self, weights)
 
     def post_load_weights(self):
         super().post_load_weights()
