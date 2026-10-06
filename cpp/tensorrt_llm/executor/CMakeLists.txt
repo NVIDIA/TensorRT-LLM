@@ -18,7 +18,7 @@ set(EXECUTOR_STATIC_TARGET ${EXECUTOR_TARGET_NAME}_static)
 set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # keep this list sorted alphabetically
-set(SRCS executorKVCacheEventManager.cpp jsonSerialization.cpp)
+set(SRCS executorKVCacheEventManager.cpp)
 
 if(NOT WIN32)
   # additional warnings
@@ -58,6 +58,20 @@ target_link_libraries(
 target_compile_features(tllm_executor_types PUBLIC cxx_std_20)
 set_target_properties(tllm_executor_types PROPERTIES POSITION_INDEPENDENT_CODE
                                                      ON)
+
+add_library(tllm_executor_json_serialization STATIC jsonSerialization.cpp)
+add_library(tllm::executor_json_serialization ALIAS
+            tllm_executor_json_serialization)
+target_link_libraries(tllm_executor_json_serialization
+                      PUBLIC tllm::common_headers)
+target_include_directories(
+  tllm_executor_json_serialization SYSTEM
+  PUBLIC ${CUDAToolkit_INCLUDE_DIRS}
+  PRIVATE ${CMAKE_BINARY_DIR}/_deps/json-src/include)
+target_compile_features(tllm_executor_json_serialization PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_executor_json_serialization PROPERTIES CXX_EXTENSIONS OFF
+                                              POSITION_INDEPENDENT_CODE ON)
 
 add_library(tllm_executor_serialization STATIC samplingConfigSerialization.cpp)
 add_library(tllm::executor_serialization ALIAS tllm_executor_serialization)
@@ -173,7 +187,8 @@ endforeach()
 add_library(${EXECUTOR_STATIC_TARGET} STATIC ${SRCS})
 target_link_libraries(
   ${EXECUTOR_STATIC_TARGET}
-  PUBLIC tllm::executor_values
+  PUBLIC tllm::executor_json_serialization
+         tllm::executor_values
          tllm::executor_transfer_agent
          tllm::executor_agent_name
          tllm::executor_memory_desc

@@ -337,6 +337,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_executor_agent_name
     tllm_executor_cache_routing
     tllm_executor_cache_transfer_cuda
+    tllm_executor_json_serialization
     tllm_executor_memory_desc
     tllm_executor_mpi_connection
     tllm_executor_serialization
