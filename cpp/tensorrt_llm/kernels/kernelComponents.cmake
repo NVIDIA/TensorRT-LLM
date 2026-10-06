@@ -193,3 +193,20 @@ set_property(TARGET tllm_kernel_moe_block_scale
              PROPERTY CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 target_compile_options(tllm_kernel_moe_block_scale
                        PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--split-compile=0>)
+
+add_tllm_kernel_library(
+  tllm_kernel_cascade_attention SOURCES
+  decoderMaskedMultiheadAttention/cascadeAttentionKernel.cu LINK_LIBRARIES
+  tllm::common_environment)
+set_property(TARGET tllm_kernel_cascade_attention
+             PROPERTY CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+
+if(WIN32)
+  set(mmha_targets tllm_mmha)
+  list(APPEND TLLM_KERNEL_COMPONENT_TARGETS tllm_mmha)
+else()
+  set(mmha_targets ${DECODER_SHARED_TARGET_0} ${DECODER_SHARED_TARGET_1})
+endif()
+add_tllm_kernel_library(
+  tllm_kernel_attention_decode SOURCES decoderMaskedMultiheadAttention.cu
+  LINK_LIBRARIES ${mmha_targets})
