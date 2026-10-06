@@ -132,3 +132,20 @@ add_tllm_kernel_library(
   tllm::kernel_cutlass_headers)
 
 list(APPEND TLLM_KERNEL_COMPONENT_TARGETS gemm_swiglu_sm90_src)
+
+add_tllm_kernel_library(
+  tllm_kernel_int8_gemm
+  SOURCES
+  cutlass_kernels/int8_gemm/int8_gemm_bf16.cu
+  cutlass_kernels/int8_gemm/int8_gemm_fp16.cu
+  cutlass_kernels/int8_gemm/int8_gemm_fp32.cu
+  cutlass_kernels/int8_gemm/int8_gemm_int32.cu
+  LINK_LIBRARIES
+  tllm::kernel_gemm_utilities)
+
+add_tllm_kernel_library(
+  tllm_kernel_smooth_quant SOURCES weightOnlyBatchedGemv/int8SQ.cu
+  LINK_LIBRARIES tllm::kernel_cutlass_headers)
+
+set_property(TARGET tllm_kernel_int8_gemm
+             PROPERTY CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
