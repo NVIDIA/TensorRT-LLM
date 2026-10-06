@@ -34,11 +34,12 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_physical_pool,
     get_unique_layers,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    MambaHybridCacheManagerV2,
-    MambaRole,
+from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
+    PLE_NGRAM_CONTEXT,
+    Qwen4ExpHybridCacheManager,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaRole
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
     DataType,
@@ -746,7 +747,7 @@ def test_mamba_layer_group_serialization():
 
 
 def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
-    """Duck-typed MambaHybridCacheManagerV2 whose descriptors hold two life cycles.
+    """Qwen4 manager stub whose descriptors hold two life cycles.
 
     Life cycle 0 is recurrent (layers 0 and 1): SSM and conv state coalesce
     into one 64-byte pool in ``[ssm, conv]`` order per layer, and PLE n-gram
@@ -783,7 +784,7 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
                         ),
                         SimpleNamespace(
                             single_buffer_size=32,
-                            buffer_ids=[buf(ple_on_layer, MambaRole.PLE_NGRAM_CONTEXT)],
+                            buffer_ids=[buf(ple_on_layer, PLE_NGRAM_CONTEXT)],
                         ),
                     ],
                 )
@@ -809,7 +810,7 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
         ),
     )
 
-    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.impl = SimpleNamespace(
         layer_grouping=((0, 1), (2,)),
         init_config=SimpleNamespace(
@@ -863,7 +864,7 @@ def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
     assert set(by_role) == {
         MAMBA_SSM_ROLE,
         MAMBA_CONV_ROLE,
-        frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)}),
+        frozenset({str(PLE_NGRAM_CONTEXT)}),
     }
 
     ssm = by_role[MAMBA_SSM_ROLE]
@@ -882,7 +883,7 @@ def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
     assert conv.bytes_per_head is None
     assert [tuple(int(x) for x in e) for e in conv.buffer_entries] == [(0, 64, 64), (1, 192, 64)]
 
-    ple = by_role[frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)})]
+    ple = by_role[frozenset({str(PLE_NGRAM_CONTEXT)})]
     assert ple.pool_idx == 1
     assert ple.mapper_kind == MapperKind.REPLICATED
     assert ple.bytes_per_layer == 32
@@ -893,7 +894,7 @@ def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
     extractor = KVRegionExtractorV1(page_table)
     view_index = {pv.pool_role: idx for idx, pv in enumerate(recurrent.pool_views)}
     conv_idx = view_index[MAMBA_CONV_ROLE]
-    ple_idx = view_index[frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)})]
+    ple_idx = view_index[frozenset({str(PLE_NGRAM_CONTEXT)})]
     assert extractor.extract_slot(2, 0, conv_idx).memory.ptrs.tolist() == [
         0x10000 + 2 * 256 + 64,
         0x10000 + 2 * 256 + 192,
