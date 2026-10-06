@@ -15,6 +15,16 @@ Python and C++ codebase with a PyTorch execution path.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
 - LLM args or nested-config changes must run `python3 scripts/generate_llm_args_golden_manifest.py` and commit
   `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval
+- Changes to serving YAML fields, aliases, defaults, types, or constraints (including nested,
+  disaggregated, and VisualGen configs) must regenerate and inspect the editor JSON Schemas with
+  `python3 scripts/generate_trtllm_serve_schemas.py`, using a
+  TensorRT-LLM build matching the checkout. Update the generator's YAML-specific adaptations when
+  configuration annotations alone do not capture the change, and add regression coverage for the
+  affected accepted/rejected values. Run
+  `pytest -m cpu_only tests/unittest/llmapi/test_trtllm_serve_config_schemas.py`.
+  Commit the generated `tensorrt_llm/schemas/*.json` snapshots; never hand-edit them.
+  `python3 scripts/generate_trtllm_serve_schemas.py --check` and the CPU schema tests
+  reject missing or stale snapshots. Wheels package these same files for offline use.
 - When adding or renaming a public model architecture identifier, update
   `tensorrt_llm/usage/architecture_allowlist.py` with its exact identifier. It must be publicly
   documented by the upstream model provider or in `docs/source/models/supported-models.md`; never add

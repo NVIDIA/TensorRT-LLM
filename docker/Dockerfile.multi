@@ -183,6 +183,13 @@ RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,sour
     test -n "${TRTLLM_WHEEL}" && \
     pip install "${TRTLLM_WHEEL}[mx,openengine]"
 
+# Expose wheel-bundled editor schemas without importing CUDA-linked Python modules.
+RUN mkdir -p /opt/tensorrt_llm && \
+    ln -s "$(python3 -c 'from importlib.metadata import distribution; print(distribution("tensorrt_llm").locate_file("tensorrt_llm/schemas"))')" /opt/tensorrt_llm/schemas && \
+    test -f /opt/tensorrt_llm/schemas/trtllm-serve-config.schema.json && \
+    test -f /opt/tensorrt_llm/schemas/trtllm-serve-disagg-config.schema.json && \
+    test -f /opt/tensorrt_llm/schemas/trtllm-serve-visual-gen-config.schema.json
+
 RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     --mount=type=bind,source=docs,target=/mnt/ctx/docs \
     --mount=type=bind,source=cpp/include,target=/mnt/ctx/include \
