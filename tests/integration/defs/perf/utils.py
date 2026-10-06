@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
 import pytest
-from defs.trt_test_alternative import (cleanup_process_tree, print_error,
+from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_error,
                                        print_info)
 
 from ..common import get_trt_llm_lib_dir
@@ -181,11 +181,11 @@ def _run_command_with_captured_output(cmd: list[str],
         env = env.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
 
-    proc = subprocess.Popen(cmd,
-                            env=env,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            start_new_session=True)
+    proc = Popen(cmd,
+                 env=env,
+                 stdout=subprocess.PIPE,
+                 stderr=subprocess.STDOUT,
+                 start_new_session=True)
 
     output_lines: list = []
     lock = threading.Lock()
