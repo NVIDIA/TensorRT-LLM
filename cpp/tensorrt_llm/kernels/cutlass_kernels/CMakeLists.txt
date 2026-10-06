@@ -226,6 +226,9 @@ else()
 endif()
 
 add_library(fpA_intB_gemm_src STATIC ${MIXED_SRC_CPP} ${MIXED_SRC_CU})
+add_library(tllm::kernel_weight_only_gemm ALIAS fpA_intB_gemm_src)
+target_link_libraries(fpA_intB_gemm_src PUBLIC tllm::kernel_gemm_utilities
+                                               tllm::common_environment)
 add_cuda_architectures(fpA_intB_gemm_src 89)
 add_instantiations(fpA_intB_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm)
 
