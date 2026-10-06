@@ -172,7 +172,10 @@ file(GLOB_RECURSE GROUPED_SRC_CU ${MOE_CUTLASS_DIR}/*.cu)
 file(GLOB_RECURSE FBGEMM_SRC_CU fp8_rowwise_gemm/*.cu)
 
 # Get the sources for FP8 Blockwise GEMM launchers
-file(GLOB_RECURSE FP8_BLOCKSCALE_GEMM_SRC_CU fp8_blockscale_gemm/*.cu)
+set(FP8_BLOCKSCALE_GEMM_SRC_CU
+    ${CMAKE_CURRENT_SOURCE_DIR}/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/fp8_blockscale_gemm/fp8_blockscale_quant_packed.cu
+)
 
 # Get the sources for FP4 GEMM launchers
 file(GLOB_RECURSE FP4_SRC_CU fp4_gemm/*.cu)
@@ -238,6 +241,11 @@ set_cuda_architectures(fb_gemm_src ${CUTLASS_COMMON_ARCHS})
 # ${INSTANTIATION_GENERATION_DIR}/fp8_rowwise_gemm)
 
 add_library(fp8_blockscale_gemm_src STATIC ${FP8_BLOCKSCALE_GEMM_SRC_CU})
+add_library(tllm::kernel_fp8_block_scale_gemm ALIAS fp8_blockscale_gemm_src)
+target_link_libraries(
+  fp8_blockscale_gemm_src
+  PUBLIC tllm::kernel_gemm_utilities tllm::common_environment CUDA::cuda_driver
+         ${NVRTC_LIB} ${NVRTC_BUILTINS_LIB})
 set_cuda_architectures(fp8_blockscale_gemm_src ${CUTLASS_COMMON_ARCHS})
 
 set(GEMM_SWIGLU_SM90_SRC_CU
