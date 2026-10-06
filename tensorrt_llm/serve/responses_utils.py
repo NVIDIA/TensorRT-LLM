@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -11,8 +12,9 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Mapping
 from copy import copy
-from typing import (Any, Callable, List, Literal, Optional, OrderedDict, Tuple,
-                    Union)
+from dataclasses import dataclass
+from typing import (Any, Callable, List, Literal, NamedTuple, Optional,
+                    OrderedDict, Tuple, Union)
 
 from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
@@ -36,6 +38,8 @@ from openai.types.responses.response_content_part_added_event import \
     PartReasoningText
 from openai.types.responses.response_content_part_done_event import \
     Part as ResponseContentPart
+from openai.types.responses.response_content_part_done_event import \
+    PartReasoningText as PartReasoningTextDone
 from openai.types.responses.response_function_web_search import (
     ActionFind, ActionOpenPage, ActionSearch, ResponseFunctionWebSearch)
 from openai.types.responses.response_reasoning_item import Content
@@ -107,6 +111,52 @@ ENABLE_RESPONSES_DEBUG_MSG = os.environ.get("TRTLLM_RESPONSES_DEBUG") == "1"
 # The parameter a freeform custom tool is described with; see
 # _get_chat_completion_function_tools and _tool_call_output_item.
 CUSTOM_TOOL_INPUT_ARG = "input"
+
+
+class StreamedToolCall(NamedTuple):
+    """One tool call exactly as the stream delivered it.
+
+    The final snapshot is a second, independent re-parse of the generated
+    text, and on malformed markup the incremental state machine and the
+    whole-text regex read *different arguments out of the same bytes* - two
+    consecutive ``<arg_key>`` tags stream as ``{"input": ...}`` but re-parse
+    into a corrupted key ``input</arg_key><arg_key>cmd`` (2 live cases a
+    week). The ids alone cannot fix that: a call named consistently but
+    described differently still tells the client two stories. So the record
+    carries the name and the assembled arguments the deltas were built from,
+    and the rebuild defers to them; see ``_create_output_content``.
+
+    ``name``/``arguments`` are the parser-level values
+    (``ToolCallItem.name``/``.parameters``), not the output item's fields:
+    feeding them back through ``_tool_call_output_item`` with the same tool
+    resolution reproduces the streamed item byte for byte, custom-tool
+    unwrapping included. ``None`` means the recorder was not given them, in
+    which case the rebuild keeps its own parse as before.
+    """
+    item_id: str
+    call_id: str
+    name: Optional[str] = None
+    arguments: Optional[str] = None
+
+
+@dataclass
+class StreamedItem:
+    """One reasoning/message output item as the stream published it.
+
+    ``text`` accumulates every delta emitted for the item - appended by the
+    same call that emits the delta, so it is exactly the characters the
+    client received, kept even if the stream is cut off before the item
+    closes. The final snapshot assembles its reasoning/message items from
+    these records (``_create_output_content``): a re-derive from the
+    accumulated text can disagree with the stream on segmentation (an
+    unterminated call's fallback streams as two message items the re-parse
+    merges into one; 10 live cases a week) and on whitespace (the re-parse
+    stripped what the stream kept; 716 a week), and what already reached the
+    client is the one account of the generation that cannot be revised.
+    """
+    item_type: str
+    item_id: str
+    text: str = ""
 
 
 def _responses_debug_log(msg):
@@ -1002,6 +1052,54 @@ def _response_output_item_to_chat_completion_message(
             return None
 
 
+def _fold_tool_calls_into_open_assistant_turn(
+        messages: list[ChatCompletionMessageParam],
+        message: ChatCompletionMessageParam, turn_start: int) -> bool:
+    """Attach a converted tool-call item to the assistant message before it.
+
+    A Responses assistant turn that made N calls arrives as N consecutive
+    ``function_call`` items (after any reasoning/message items), and each one
+    converts to an assistant chat message carrying a single tool call.
+    Appending those separately splits one turn across N assistant messages,
+    and the GLM chat template aligns tool results only against the LAST
+    assistant message's ``tool_calls`` - so results for every call but the
+    last matched nothing and were rendered positionally, WITHOUT their ids.
+    Proven consequence: swapping two function_call_output call_ids produced a
+    byte-identical 596k-char prompt, i.e. the call-result binding was
+    unrecoverable downstream. One assistant message carrying the ordered list
+    of all N calls is the chat-completions shape (the history replay above
+    already stores turns that way), and it is what lets the template bind
+    each result to its call by id.
+
+    The fold targets only messages converted from this request's input -
+    ``turn_start`` marks where those begin - so the instructions message and
+    replayed history are never mutated. A tool result or a user message
+    between two calls ends the assistant turn naturally: ``messages[-1]`` is
+    then no longer an assistant message and the next call opens a fresh one.
+    Preceding assistant text or reasoning stays in the same message, which is
+    where chat completions carries it alongside ``tool_calls``.
+    """
+    if message.get("role") != "assistant" or not message.get("tool_calls"):
+        return False
+    if message.get("content") is not None:
+        # Not a converted call item: both tool-call conversions carry
+        # content=None, and a message with its own content is a turn of its
+        # own, not a fragment of the previous one.
+        return False
+    if len(messages) <= turn_start:
+        return False
+    last = messages[-1]
+    if last.get("role") != "assistant":
+        return False
+    # Rebuilt rather than extended in place: the target may carry
+    # "tool_calls" as None (clients send extra fields verbatim), and a list a
+    # caller handed in is not this function's to mutate.
+    last["tool_calls"] = [
+        *(last.get("tool_calls") or []), *message["tool_calls"]
+    ]
+    return True
+
+
 async def _create_input_messages(
     request: ResponsesRequest,
     prev_msgs: list[ChatCompletionMessageParam],
@@ -1040,10 +1138,20 @@ async def _create_input_messages(
     if isinstance(request.input, str):
         messages.append({"role": "user", "content": request.input})
     else:
+        # Where this request's own items start: the fold below must never
+        # reach back into the instructions message or the replayed history.
+        turn_start = len(messages)
         for inp in request.input:
             message = _response_output_item_to_chat_completion_message(inp)
-            if message is not None:
-                messages.append(message)
+            if message is None:
+                continue
+            # N calls from one assistant turn become ONE assistant message
+            # with N tool_calls, or the template loses the call-result
+            # binding; see the fold's docstring.
+            if _fold_tool_calls_into_open_assistant_turn(
+                    messages, message, turn_start):
+                continue
+            messages.append(message)
 
     return messages
 
@@ -1677,14 +1785,42 @@ def _apply_tool_parser(
     return normal_text, calls
 
 
+def _streamed_items_cover(streamed_items: list[StreamedItem],
+                          reasoning_text: Optional[str],
+                          text: Optional[str]) -> bool:
+    """Whether the stream's item record accounts for the re-parsed content.
+
+    True means the two passes read the same characters out of the generation
+    and differ at most in segmentation (the stream can split one fallback
+    text across two message items) or in edge whitespace (the whole-text
+    GLM-4.7 parse strips what the stream kept) - exactly the differences the
+    streamed record exists to settle. False means the record cannot describe
+    this rebuild: text the stream never published (a cut-off stream whose
+    tail only the accumulated text holds) or a reasoning/content split the
+    two parsers genuinely disagree on. The caller then falls back to the
+    re-derived items, which is the one choice that loses no generated text,
+    and the structural mismatch is warned about as before.
+
+    Compared per item type and stripped on both sides: whitespace inside the
+    joined streamed text is preserved by the join itself, so only the edges -
+    the part the whole-text parser may have stripped - are forgiven.
+    """
+    streamed_reasoning = "".join(item.text for item in streamed_items
+                                 if item.item_type == "reasoning")
+    streamed_message = "".join(item.text for item in streamed_items
+                               if item.item_type == "message")
+    return (streamed_reasoning.strip() == (reasoning_text or "").strip()
+            and streamed_message.strip() == (text or "").strip())
+
+
 def _create_output_content(
     final_res: RequestOutput,
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     tools: Optional[list[Tool]] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
-    streamed_tool_call_ids: Optional[list[Optional[Tuple[str, str]]]] = None,
-    streamed_item_ids: Optional[list[Tuple[str, str]]] = None,
+    streamed_tool_call_ids: Optional[list[Optional[StreamedToolCall]]] = None,
+    streamed_item_ids: Optional[list[StreamedItem]] = None,
 ) -> Tuple[list[ResponseOutputItem], list[ChatCompletionMessageParam],
            list[str]]:
     output_items: list[ResponseOutputItem] = []
@@ -1695,24 +1831,35 @@ def _create_output_content(
     reasoning_texts: list[str] = []
     available_tools = _get_chat_completion_function_tools(tools)
 
-    # The (item type, item id) pairs the stream published in
-    # `response.output_item.added/done`, in emission order. This rebuild is a
-    # second, independent pass over the generated text and used to mint fresh
-    # ids for the reasoning and message items it re-derives, so the snapshot
-    # named the very items the stream had already announced under different
-    # ids - 216 of 221 measured responses - and a client joining streamed
-    # items with the snapshot by id saw phantom items. Reuse is positional
-    # per item type, first-emitted first, because emission order is the only
+    # The reasoning/message items the stream published in
+    # `response.output_item.added/done`, in emission order and with the text
+    # their deltas carried. This rebuild is a second, independent pass over
+    # the generated text and used to mint fresh ids for the items it
+    # re-derives, so the snapshot named the very items the stream had already
+    # announced under different ids - 216 of 221 measured responses - and a
+    # client joining streamed items with the snapshot by id saw phantom
+    # items. When the record and the re-parse read the same characters the
+    # snapshot now repeats the record outright (see the assembly below); the
+    # per-type pools here serve the fallback, where reuse is positional per
+    # item type, first-emitted first, because emission order is the only
     # correspondence the two passes share. None means no stream ran (a
     # non-streaming request) and every id is minted fresh, as before.
     streamed_ids_by_type: dict[str, list[str]] = {
         "reasoning": [],
         "message": []
     }
-    for item_type, item_id in streamed_item_ids or []:
-        if item_type in streamed_ids_by_type:
-            streamed_ids_by_type[item_type].append(item_id)
+    for record in streamed_item_ids or []:
+        if record.item_type in streamed_ids_by_type:
+            streamed_ids_by_type[record.item_type].append(record.item_id)
     used_ids_by_type = {"reasoning": 0, "message": 0}
+
+    # The record is per request while this loop is per output, and a stream
+    # only ever runs over outputs[0] (process_single_output), so the whole
+    # record describes a single output. More than one output means no stream
+    # produced it and the positional id reuse below is all there is.
+    streamed_items_available = (streamed_item_ids is not None
+                                and len(final_res.outputs) == 1)
+    used_streamed_assembly = False
 
     def _streamed_or_fresh_id(item_type: str) -> str:
         # Running past the pool means this pass derived items the stream never
@@ -1758,9 +1905,9 @@ def _create_output_content(
                 text, calls = _verify_empty_calls_against_streaming(
                     tool_parser, available_tools, parsed_source, text, calls)
 
-        text_item = None
-        reasoning_item = None
         tool_calls_item = []
+        stored_text: Optional[str] = None
+        stored_reasoning: Optional[str] = None
 
         # Reasoning first, then the answer, then any tool calls.
         #
@@ -1772,36 +1919,99 @@ def _create_output_content(
         # generation: a client replaying `output` read the answer before the
         # reasoning that produced it, and one reconstructing a turn from the
         # snapshot fed the model its own thinking as a follow-up to its reply.
-        if reasoning_text:
-            reasoning_item = ResponseReasoningItem(
-                id=_streamed_or_fresh_id("reasoning"),
-                summary=[],
-                type="reasoning",
-                content=[
-                    Content(text=reasoning_text.strip(), type="reasoning_text")
-                ],
-                status=None,
-            )
-            output_items.append(reasoning_item)
+        #
+        # For a streamed request the items themselves come from the stream's
+        # own record, not from the re-parse above. The re-parse can disagree
+        # with the stream on item boundaries - an unterminated call's fallback
+        # streams as two message items that a whole-text parse can only read
+        # as one, so the second streamed item simply vanished from the
+        # snapshot (10 live cases a week) - and on edge whitespace, which it
+        # stripped while the stream had already sent it (` Backbone` on the
+        # wire, `Backbone` in the snapshot; 716 a week). What was streamed is
+        # irrevocable, so when the two passes read the same characters the
+        # snapshot repeats the stream's items verbatim: same count, same
+        # boundaries, same ids, same bytes. When they did not read the same
+        # characters the views genuinely diverged (a stream cut off while the
+        # accumulated text kept growing), and the re-derived items are kept -
+        # the choice that loses no generated text - with the mismatch warned
+        # about below, as before.
+        if streamed_items_available and _streamed_items_cover(
+                streamed_item_ids, reasoning_text, text):
+            used_streamed_assembly = True
+            for record in streamed_item_ids:
+                if record.item_type == "reasoning":
+                    output_items.append(
+                        ResponseReasoningItem(
+                            id=record.item_id,
+                            summary=[],
+                            type="reasoning",
+                            content=[
+                                Content(text=record.text, type="reasoning_text")
+                            ],
+                            status=None,
+                        ))
+                else:
+                    output_items.append(
+                        ResponseOutputMessage(
+                            id=record.item_id,
+                            content=[
+                                ResponseOutputText(
+                                    text=record.text,
+                                    annotations=[],
+                                    type="output_text",
+                                    logprobs=None,
+                                )
+                            ],
+                            role="assistant",
+                            status="completed",
+                            type="message",
+                        ))
+            # The conversation store keeps one assistant message per output,
+            # so the per-item boundaries flatten back out here - but to the
+            # streamed characters, not the re-parsed ones.
+            stored_reasoning = "".join(
+                record.text for record in streamed_item_ids
+                if record.item_type == "reasoning") or None
+            stored_text = "".join(record.text for record in streamed_item_ids
+                                  if record.item_type == "message") or None
+        else:
+            if reasoning_text:
+                reasoning_item = ResponseReasoningItem(
+                    id=_streamed_or_fresh_id("reasoning"),
+                    summary=[],
+                    type="reasoning",
+                    # Verbatim: the whitespace around a reasoning block was
+                    # generated too, and the streamed view of the same
+                    # generation delivers it. A strip here made the two views
+                    # disagree about the model's own characters.
+                    content=[
+                        Content(text=reasoning_text, type="reasoning_text")
+                    ],
+                    status=None,
+                )
+                output_items.append(reasoning_item)
+                stored_reasoning = reasoning_text
 
-        # Check again after tool parsing to avoid empty text
-        if text:
-            output_text = ResponseOutputText(
-                text=text.strip(),
-                annotations=[],
-                type="output_text",
-                logprobs=None,
-            )
+            # Check again after tool parsing to avoid empty text
+            if text:
+                output_text = ResponseOutputText(
+                    # Verbatim, for the same reason as the reasoning above.
+                    text=text,
+                    annotations=[],
+                    type="output_text",
+                    logprobs=None,
+                )
 
-            text_item = ResponseOutputMessage(
-                id=_streamed_or_fresh_id("message"),
-                content=[output_text],
-                role="assistant",
-                status="completed",
-                type="message",
-            )
+                text_item = ResponseOutputMessage(
+                    id=_streamed_or_fresh_id("message"),
+                    content=[output_text],
+                    role="assistant",
+                    status="completed",
+                    type="message",
+                )
 
-            output_items.append(text_item)
+                output_items.append(text_item)
+                stored_text = text
 
         if calls:
             tool_resolution = _tool_resolution(tools)
@@ -1827,11 +2037,11 @@ def _create_output_content(
                     f"final response rebuilt {len(calls)} tool call(s) but the "
                     f"stream saw {len(reusable)}; ids beyond the streamed ones "
                     f"are new and will not match the client's tool outputs")
-                reusable = [ids for ids in reusable if ids is not None]
+                reusable = [record for record in reusable if record is not None]
             tool_calls_item = []
             for index, call in enumerate(calls):
-                ids = reusable[index] if index < len(reusable) else (None, None)
-                if entity_aligned and ids is None:
+                record = reusable[index] if index < len(reusable) else None
+                if entity_aligned and record is None:
                     # This entity is the call the stream dropped: its
                     # arguments never assembled into valid JSON and no id was
                     # published for it. The snapshot must describe the stream,
@@ -1844,27 +2054,59 @@ def _create_output_content(
                         f"and never delivered it, so the snapshot does not "
                         f"deliver it either")
                     continue
+                # Same call entity, two parses. On malformed markup they read
+                # different arguments out of the same bytes - two consecutive
+                # `<arg_key>` tags stream as `{"input": ...}` while the
+                # whole-text regex delivers a corrupted key - and the client
+                # has already received, and possibly executed, the streamed
+                # version; a snapshot that re-describes the call under the
+                # same call_id hands the client two different inputs for one
+                # identity (2 live cases a week). The streamed bytes are the
+                # ones that cannot be unsent, so they win. Only under entity
+                # alignment: when the two passes disagree about what the call
+                # entities *are*, pairing a streamed description with a
+                # re-parsed call would guess, and the ids-only reuse above is
+                # as far as certainty goes.
+                streamed_name = getattr(record, "name", None)
+                streamed_arguments = getattr(record, "arguments", None)
+                if (entity_aligned and streamed_name is not None
+                        and streamed_arguments is not None):
+                    if (call.name != streamed_name
+                            or (call.parameters or "") != streamed_arguments):
+                        logger.warning(
+                            f"final response re-parsed the tool call to "
+                            f"{call.name!r} differently from the stream "
+                            f"(streamed arguments "
+                            f"{streamed_arguments[:200]!r}, re-parsed "
+                            f"{(call.parameters or '')[:200]!r}); keeping the "
+                            f"streamed name and arguments, which the client "
+                            f"already received")
+                        call = ToolCallItem(tool_index=call.tool_index,
+                                            name=streamed_name,
+                                            parameters=streamed_arguments)
                 tool_calls_item.append(
-                    _tool_call_output_item(call,
-                                           tool_resolution,
-                                           item_id=ids[0],
-                                           call_id=ids[1]))
+                    _tool_call_output_item(
+                        call,
+                        tool_resolution,
+                        item_id=record.item_id if record else None,
+                        call_id=record.call_id if record else None))
             output_items.extend(tool_calls_item)
 
         output_messages.extend(
             _create_output_messages({
-                "text_content":
-                text_item.content[0].text if text_item else None,
-                "reasoning_content":
-                reasoning_item.content[0].text if reasoning_item else None,
-                "tool_calls":
-                tool_calls_item,
+                "text_content": stored_text,
+                "reasoning_content": stored_reasoning,
+                "tool_calls": tool_calls_item,
             }))
 
     # Checked against None, not truthiness: an empty list still means a
     # stream ran and published nothing of this type, and a rebuild that then
     # derives such an item is exactly the divergence worth saying out loud.
-    if streamed_item_ids is not None:
+    # Skipped when the snapshot was assembled from the streamed record: the
+    # counts then match by construction and the only mismatch left - the
+    # re-parse segmenting the same characters differently - is the one the
+    # record exists to settle, not a divergence.
+    if streamed_item_ids is not None and not used_streamed_assembly:
         for item_type in ("reasoning", "message"):
             streamed = len(streamed_ids_by_type[item_type])
             rebuilt = used_ids_by_type[item_type]
@@ -2166,8 +2408,8 @@ def _create_response(
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
-    streamed_tool_call_ids: Optional[list[Optional[Tuple[str, str]]]] = None,
-    streamed_item_ids: Optional[list[Tuple[str, str]]] = None,
+    streamed_tool_call_ids: Optional[list[Optional[StreamedToolCall]]] = None,
+    streamed_item_ids: Optional[list[StreamedItem]] = None,
     tokenizer: Optional[TokenizerBase] = None,
 ) -> tuple[ResponsesResponse, list[Message | ChatCompletionMessageParam]]:
     _responses_debug_log("================================================")
@@ -2255,8 +2497,8 @@ async def create_response(
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
-    streamed_tool_call_ids: Optional[list[Optional[Tuple[str, str]]]] = None,
-    streamed_item_ids: Optional[list[Tuple[str, str]]] = None,
+    streamed_tool_call_ids: Optional[list[Optional[StreamedToolCall]]] = None,
+    streamed_item_ids: Optional[list[StreamedItem]] = None,
     tokenizer: Optional[TokenizerBase] = None,
 ) -> ResponsesResponse:
 
@@ -2307,8 +2549,8 @@ def create_response_non_store(
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
-    streamed_tool_call_ids: Optional[list[Optional[Tuple[str, str]]]] = None,
-    streamed_item_ids: Optional[list[Tuple[str, str]]] = None,
+    streamed_tool_call_ids: Optional[list[Optional[StreamedToolCall]]] = None,
+    streamed_item_ids: Optional[list[StreamedItem]] = None,
     tokenizer: Optional[TokenizerBase] = None,
 ) -> ResponsesResponse:
     response_creation_time = create_time if create_time is not None else int(
@@ -2377,19 +2619,24 @@ class ResponsesStreamingStateTracker:
         # calls behind it.
         #
         # A list here rather than a class attribute, for the reason above.
-        self.emitted_tool_call_ids: list[Optional[Tuple[str, str]]] = []
+        self.emitted_tool_call_ids: list[Optional[StreamedToolCall]] = []
 
-        # (item type, item id) of every reasoning and message item this
-        # stream opened, in the order their `output_item.added` went out.
-        # The final response re-derives those items from the accumulated text
-        # and used to mint fresh ids for them, so the snapshot named the very
+        # Every reasoning and message item this stream opened, in the order
+        # their `output_item.added` went out, each carrying the text its
+        # deltas delivered (appended as they are emitted; see
+        # ResponsesStreamingEventsHelper.append_text/append_reasoning). The
+        # final response re-derives those items from the accumulated text and
+        # used to mint fresh ids for them, so the snapshot named the very
         # items the stream had already announced under different ids - 216 of
         # 221 measured responses - and a client joining streamed items with
-        # the snapshot by id saw phantom items. Same shape and cure as
+        # the snapshot by id saw phantom items. The texts travel with the ids
+        # because the re-derive can also disagree on item boundaries and on
+        # edge whitespace; the snapshot assembles these records verbatim
+        # instead (see _create_output_content). Same shape and cure as
         # emitted_tool_call_ids above.
         #
         # A list here rather than a class attribute, for the reason above.
-        self.emitted_item_ids: list[Tuple[str, str]] = []
+        self.emitted_item_ids: list[StreamedItem] = []
 
 
 class ResponsesStreamingEventsHelper:
@@ -2418,8 +2665,8 @@ class ResponsesStreamingEventsHelper:
         self.state_tracker.emitted_tool_calls = count
 
     @property
-    def emitted_tool_call_ids(self) -> list[Optional[Tuple[str, str]]]:
-        """(item id, call id) of the tool calls already streamed, in order.
+    def emitted_tool_call_ids(self) -> list[Optional[StreamedToolCall]]:
+        """The tool calls already streamed, in order; see StreamedToolCall.
 
         None entries hold the place of calls the stream assembled and then
         dropped for invalid-JSON arguments; see the state tracker.
@@ -2427,18 +2674,27 @@ class ResponsesStreamingEventsHelper:
         return self.state_tracker.emitted_tool_call_ids
 
     @property
-    def emitted_item_ids(self) -> list[Tuple[str, str]]:
-        """(item type, item id) of the reasoning/message items streamed, in order."""
+    def emitted_item_ids(self) -> list[StreamedItem]:
+        """The reasoning/message items streamed, in order; see StreamedItem."""
         return self.state_tracker.emitted_item_ids
 
-    def record_emitted_tool_call(self, item) -> None:
-        """Remember the ids a streamed call went out under.
+    def record_emitted_tool_call(self,
+                                 item,
+                                 call: Optional[ToolCallItem] = None) -> None:
+        """Remember the identity and content a streamed call went out under.
 
         The final response is built by a second, independent pass over the
         generated text; handing it these lets it name the same call the same
-        way instead of minting new ids the client has never seen.
+        way instead of minting new ids the client has never seen - and, when
+        `call` (the parser-level ToolCallItem the item was built from) is
+        given, describe it with the same name and arguments instead of
+        whatever its own re-parse read out of malformed markup.
         """
-        self.state_tracker.emitted_tool_call_ids.append((item.id, item.call_id))
+        self.state_tracker.emitted_tool_call_ids.append(
+            StreamedToolCall(item_id=item.id,
+                             call_id=item.call_id,
+                             name=getattr(call, "name", None),
+                             arguments=getattr(call, "parameters", None)))
 
     def record_dropped_tool_call(self) -> None:
         """Hold a dropped call's place in the emission record.
@@ -2452,11 +2708,26 @@ class ResponsesStreamingEventsHelper:
         """
         self.state_tracker.emitted_tool_call_ids.append(None)
 
+    def _record_item_delta(self, item_type: str, delta: str) -> None:
+        # The emission record mirrors every delta the moment it is appended,
+        # so the record holds exactly the characters the client received for
+        # the item - including for an item the stream was cut off inside,
+        # which no close will ever flush. The open item is always the last
+        # record of its type to have been announced (one item is open at a
+        # time, and the opener runs before the first append); when no record
+        # matches, nothing was announced and there is nothing to mirror,
+        # which is the state the buffer-only unit tests drive this in.
+        records = self.state_tracker.emitted_item_ids
+        if records and records[-1].item_type == item_type:
+            records[-1].text += delta
+
     def append_text(self, delta: str) -> None:
         self.state_tracker.text_buffer += delta
+        self._record_item_delta("message", delta)
 
     def append_reasoning(self, delta: str) -> None:
         self.state_tracker.reasoning_buffer += delta
+        self._record_item_delta("reasoning", delta)
 
     def take_text(self) -> str:
         text = self.state_tracker.text_buffer
@@ -2620,9 +2891,13 @@ class ResponsesStreamingEventsHelper:
             # where announcing actually happens. The final response is built
             # by a second, independent pass over the generated text; handing
             # it these lets it name the same items the same way instead of
-            # minting ids the client has never seen.
+            # minting ids the client has never seen. The record's text starts
+            # empty and accumulates with every delta (append_text /
+            # append_reasoning), so the snapshot can also repeat the item's
+            # characters rather than re-deriving them.
             self.state_tracker.emitted_item_ids.append(
-                (output_item.type, output_item.id))
+                StreamedItem(item_type=output_item.type,
+                             item_id=output_item.id))
 
             if output_item.type == "message":
                 content_part = ResponseOutputText(
@@ -2924,6 +3199,16 @@ def _close_open_item(helper):
             status="completed",
         )
         yield helper.get_reasoning_text_done_event(text)
+        # The reasoning part was opened with content_part.added (see
+        # _get_output_added_events), so it has to close with
+        # content_part.done - before the item's own done, which is OpenAI's
+        # order. The message branch below has always done this; reasoning
+        # omitted it, leaving every reasoning turn with one more
+        # content_part.added than content_part.done (~294k unpaired events a
+        # week) and clients tracking part state holding a part that never
+        # ends.
+        yield helper.get_content_part_done_event(
+            PartReasoningTextDone(type="reasoning_text", text=text))
         yield helper.get_output_item_done_event(item)
         helper.is_reasoning_sent = False
     else:
@@ -3154,6 +3439,12 @@ def _generate_streaming_event(
             )
             yield streaming_events_helper.get_reasoning_text_done_event(
                 reasoning_text)
+            # Close the reasoning part the opener added, before the item's
+            # done - the same pairing _close_open_item restores and the
+            # message branch below has always had.
+            yield streaming_events_helper.get_content_part_done_event(
+                PartReasoningTextDone(type="reasoning_text",
+                                      text=reasoning_text))
             yield streaming_events_helper.get_output_item_done_event(
                 reasoning_item)
             streaming_events_helper.is_reasoning_sent = False
@@ -3240,7 +3531,12 @@ def _generate_streaming_event(
                     tool_call_item)
                 yield streaming_events_helper.get_output_item_done_event(
                     tool_call_item)
-                streaming_events_helper.record_emitted_tool_call(tool_call_item)
+                # `call` rides along so the record holds the name and
+                # assembled arguments these events were built from; the final
+                # snapshot repeats them rather than trusting its own re-parse
+                # of the same markup (see _create_output_content).
+                streaming_events_helper.record_emitted_tool_call(
+                    tool_call_item, call)
                 streaming_events_helper.output_index_increment()
             streaming_events_helper.emitted_tool_calls = len(entities)
             streaming_events_helper.is_output_item_added_sent = False

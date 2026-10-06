@@ -40,7 +40,9 @@ from tensorrt_llm.serve.openai_protocol import (
 pytestmark = pytest.mark.cpu_only
 
 
-def _responses_response(finish_reason="length", disagg=True, prompt_token_ids=None):
+def _responses_response(
+    finish_reason="length", disagg=True, prompt_token_ids=None, status="incomplete"
+):
     return ResponsesResponse(
         model="m",
         output=[],
@@ -51,7 +53,7 @@ def _responses_response(finish_reason="length", disagg=True, prompt_token_ids=No
         top_p=1.0,
         background=False,
         service_tier="auto",
-        status="incomplete",
+        status=status,
         top_logprobs=0,
         truncation="disabled",
         finish_reason=finish_reason,
@@ -201,23 +203,46 @@ def _drain(generator):
     return asyncio.run(collect())
 
 
-def test_ctx_only_stream_ends_with_response_completed():
+def test_ctx_only_stream_ends_with_a_terminal_event():
     """Regression: the completions terminator hangs a Responses client.
 
     The Responses protocol has no ``[DONE]`` sentinel -- a client watches for
-    ``response.completed``. Emitting ``data: [DONE]`` leaves it waiting for an
+    a terminal event. Emitting ``data: [DONE]`` leaves it waiting for an
     event that never arrives, and drops the answer the context worker already
-    produced.
+    produced. A response that ran to its natural end terminates with
+    ``response.completed``.
     """
     from tensorrt_llm.serve.responses_utils import responses_done_generator
 
-    chunks = _drain(responses_done_generator(_responses_response()))
+    chunks = _drain(
+        responses_done_generator(_responses_response(finish_reason="stop", status="completed"))
+    )
     body = b"".join(chunks).decode("utf-8")
 
     assert "event: response.completed" in body
     assert "[DONE]" not in body
     # A well-formed run opens before it closes.
     assert body.index("response.created") < body.index("response.completed")
+
+
+def test_ctx_only_truncated_replay_terminates_as_incomplete():
+    """A replayed response cut off at its token budget says so.
+
+    The terminal event is chosen by status, exactly as on every other
+    completed stream (_stream_terminal_event): a ``response.completed``
+    around a status of "incomplete" asserts the one thing its payload
+    denies. The fixture's default is the truncated shape this generator
+    replays when the context phase finished the whole request.
+    """
+    from tensorrt_llm.serve.responses_utils import responses_done_generator
+
+    chunks = _drain(responses_done_generator(_responses_response()))
+    body = b"".join(chunks).decode("utf-8")
+
+    assert "event: response.incomplete" in body
+    assert "max_output_tokens" in body
+    assert "[DONE]" not in body
+    assert body.index("response.created") < body.index("response.incomplete")
 
 
 def test_ctx_only_stream_events_are_sse_framed():

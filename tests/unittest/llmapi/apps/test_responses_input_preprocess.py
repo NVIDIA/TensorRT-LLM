@@ -846,3 +846,214 @@ def test_other_roles_are_left_alone():
             }
         )
         assert msg["role"] == role
+
+
+# ---------------------------------------------------------------------------
+# A multi-call assistant turn stays one assistant message
+#
+# N function_call items from one turn used to convert into N assistant
+# messages of one tool call each. The GLM chat template aligns tool results
+# only against the LAST assistant message's tool_calls and, when alignment
+# fails, renders the results positionally WITHOUT their ids - proven on live
+# traffic by swapping two function_call_output call_ids and getting a
+# byte-identical 596k-char prompt. The binding has to survive conversion:
+# one assistant message, all N calls, in order.
+# ---------------------------------------------------------------------------
+
+
+def _function_call_item(index):
+    return {
+        "type": "function_call",
+        "id": f"fc_{index}",
+        "call_id": f"call_{index}",
+        "name": "exec",
+        "arguments": f'{{"cmd": "step {index}"}}',
+        "status": "completed",
+    }
+
+
+def _function_call_output_item(index, call_id=None):
+    return {
+        "type": "function_call_output",
+        "call_id": call_id or f"call_{index}",
+        "output": f"result {index}",
+    }
+
+
+def _five_call_turn(swap=False):
+    """The acceptance pattern: text, five calls, five results.
+
+    With swap=True the first two results trade call_ids, which changes which
+    call each result answers - the counterfactual that used to render to a
+    byte-identical prompt.
+    """
+    outputs = [_function_call_output_item(i) for i in range(5)]
+    if swap:
+        outputs[0]["call_id"], outputs[1]["call_id"] = (
+            outputs[1]["call_id"],
+            outputs[0]["call_id"],
+        )
+    return {
+        "input": [
+            _message_item("user", "run the plan", item_id=None),
+            {
+                "id": "msg_a",
+                "status": "completed",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "Running all five.", "annotations": []}
+                ],
+            },
+            *[_function_call_item(i) for i in range(5)],
+            *outputs,
+        ]
+    }
+
+
+def _glm_like_render(messages):
+    """A minimal stand-in for the GLM template's result alignment.
+
+    Tool results are matched only against the LAST assistant message's
+    tool_calls; a result whose call_id is found renders bound to that call's
+    arguments, an unmatched one renders positionally with no id - which is
+    the information loss the real template exhibits.
+    """
+    rendered = []
+    last_tool_calls = []
+    for message in messages:
+        if message.get("role") == "assistant":
+            last_tool_calls = message.get("tool_calls") or []
+            for call in last_tool_calls:
+                rendered.append(f"<call {call['function']['arguments']}>")
+        elif message.get("role") == "tool":
+            by_id = {call["id"]: call for call in last_tool_calls}
+            call = by_id.get(message.get("tool_call_id"))
+            bound = call["function"]["arguments"] if call else "UNBOUND"
+            rendered.append(f"<result of={bound} out={message['content']}>")
+    return "".join(rendered)
+
+
+def test_five_calls_from_one_turn_become_one_assistant_message():
+    messages = _messages(_five_call_turn())
+
+    assert [m["role"] for m in messages] == ["user", "assistant"] + ["tool"] * 5
+    assistant = messages[1]
+    # The turn's own text survives in the same message, alongside the calls.
+    assert assistant["content"] == "Running all five."
+    assert [c["id"] for c in assistant["tool_calls"]] == [f"call_{i}" for i in range(5)]
+    assert [c["function"]["arguments"] for c in assistant["tool_calls"]] == [
+        f'{{"cmd": "step {i}"}}' for i in range(5)
+    ]
+    # Every result still names the call it answers.
+    assert [m["tool_call_id"] for m in messages[2:]] == [f"call_{i}" for i in range(5)]
+
+
+def test_swapping_two_result_ids_now_changes_the_binding():
+    """The counterfactual that used to be invisible.
+
+    Same items, two results trading call_ids: the message lists must differ,
+    and a GLM-like alignment must bind the results to different calls - not
+    render both variants identically because neither could be aligned.
+    """
+    straight = _messages(_five_call_turn())
+    swapped = _messages(_five_call_turn(swap=True))
+
+    assert straight != swapped
+    assert _glm_like_render(straight) != _glm_like_render(swapped)
+    # And not because anything fell off: both bind every result.
+    assert "UNBOUND" not in _glm_like_render(straight)
+    assert "UNBOUND" not in _glm_like_render(swapped)
+
+
+def test_the_old_per_call_split_is_what_lost_the_binding():
+    """Why the fold exists, demonstrated on the unfolded shape.
+
+    Converting each item separately - the old behavior - leaves the last
+    assistant message holding only call 4, so results 0-3 align with nothing
+    and the swapped variant renders byte-identically: the binding is
+    unrecoverable downstream, which is exactly what the fold prevents.
+    """
+
+    def _unfolded(request_kwargs):
+        return [
+            m
+            for m in (
+                _response_output_item_to_chat_completion_message(item)
+                for item in request_kwargs["input"]
+            )
+            if m is not None
+        ]
+
+    straight = _unfolded(_five_call_turn())
+    swapped = _unfolded(_five_call_turn(swap=True))
+    assert _glm_like_render(straight) == _glm_like_render(swapped)
+    assert "UNBOUND" in _glm_like_render(straight)
+
+
+def test_a_tool_result_between_calls_ends_the_assistant_turn():
+    """Sequential call/result pairs are separate turns and stay separate."""
+    messages = _messages(
+        {
+            "input": [
+                _function_call_item(0),
+                _function_call_output_item(0),
+                _function_call_item(1),
+                _function_call_output_item(1),
+            ]
+        }
+    )
+    assert [m["role"] for m in messages] == ["assistant", "tool", "assistant", "tool"]
+    assert [len(m.get("tool_calls") or []) for m in messages] == [1, 0, 1, 0]
+
+
+def test_a_user_message_between_calls_ends_the_assistant_turn():
+    messages = _messages(
+        {
+            "input": [
+                _function_call_item(0),
+                _message_item("user", "wait, also do this"),
+                _function_call_item(1),
+            ]
+        }
+    )
+    assert [m["role"] for m in messages] == ["assistant", "user", "assistant"]
+
+
+def test_calls_fold_onto_a_reasoning_message():
+    """Reasoning-then-calls is the GLM turn shape.
+
+    The calls ride the same assistant message, which is also how the
+    conversation store keeps them.
+    """
+    messages = _messages(
+        {
+            "input": [
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "plan both"}],
+                },
+                _function_call_item(0),
+                _function_call_item(1),
+            ]
+        }
+    )
+    assert len(messages) == 1
+    assert messages[0]["reasoning"] == "plan both"
+    assert [c["id"] for c in messages[0]["tool_calls"]] == ["call_0", "call_1"]
+
+
+def test_calls_never_fold_into_replayed_history():
+    """The history's messages are stored turns, not this turn's opening."""
+    import asyncio
+
+    from tensorrt_llm.serve.responses_utils import _create_input_messages
+
+    request = ResponsesRequest(model="m", input=[_function_call_item(0)])
+    history = [{"role": "assistant", "content": "a stored turn"}]
+    messages = asyncio.run(_create_input_messages(request=request, prev_msgs=history))
+
+    assert messages[0] == {"role": "assistant", "content": "a stored turn"}
+    assert "tool_calls" not in messages[0]
+    assert messages[1]["role"] == "assistant"
+    assert [c["id"] for c in messages[1]["tool_calls"]] == ["call_0"]

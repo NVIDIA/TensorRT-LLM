@@ -238,6 +238,83 @@ def _output_text(text):
 
 
 # ---------------------------------------------------------------------------
+# Every content part that is opened must close, in OpenAI's order
+#
+# A part is opened with response.content_part.added and has to end with
+# response.content_part.done before its item's response.output_item.done.
+# The message close has always done this; the reasoning close yielded
+# reasoning_text.done and output_item.done but never closed the part it had
+# opened - one more content_part.added than content_part.done on every turn
+# with reasoning, ~294k unpaired events a week - so a client tracking part
+# state held a reasoning part that never ended.
+# ---------------------------------------------------------------------------
+
+
+def _event_stream(chunks):
+    """All events the real dispatch emits for a sequence of chunks."""
+    helper = ResponsesStreamingEventsHelper()
+    parsers = {}
+    events, accumulated = [], ""
+    for i, chunk in enumerate(chunks):
+        accumulated += chunk
+        events.extend(
+            _generate_streaming_event(
+                output=_FakeOutput(accumulated, chunk),
+                request=_FakeRequest(),
+                finished_generation=(i == len(chunks) - 1),
+                streaming_events_helper=helper,
+                reasoning_parser_id="glm",
+                reasoning_parser_dict=parsers,
+            )
+        )
+    return events
+
+
+def _assert_reasoning_part_closes(events, reasoning_text):
+    kinds = [getattr(e, "type", "") for e in events]
+    assert kinds.count("response.content_part.added") == kinds.count(
+        "response.content_part.done"
+    ), "every part opened must close"
+
+    # The reasoning item's own closing sequence, in OpenAI's order:
+    # reasoning_text.done, then content_part.done, then output_item.done.
+    done_index = kinds.index("response.reasoning_text.done")
+    assert kinds[done_index + 1] == "response.content_part.done"
+    assert kinds[done_index + 2] == "response.output_item.done"
+
+    part_done = events[done_index + 1]
+    assert part_done.part.type == "reasoning_text"
+    assert part_done.part.text == reasoning_text
+    # The part closes under the id of the item it was opened in.
+    reasoning_done = events[done_index + 2]
+    assert reasoning_done.item.type == "reasoning"
+    assert part_done.item_id == reasoning_done.item.id
+
+
+def test_a_reasoning_part_closed_by_the_answer_gets_content_part_done():
+    """The transition close (_close_open_item): reasoning ends, text begins."""
+    events = _event_stream(["Plan the fix.", "</think>", "Done."])
+    _assert_reasoning_part_closes(events, "Plan the fix.")
+
+
+def test_a_reasoning_part_closed_by_end_of_generation_gets_content_part_done():
+    """The other closing branch: generation ends inside the reasoning item."""
+    events = _event_stream(["All reasoning, no answer."])
+    _assert_reasoning_part_closes(events, "All reasoning, no answer.")
+
+
+def test_message_part_pairing_is_unchanged():
+    """The branch that was always right, pinned against regression."""
+    events = _event_stream(["Plan.", "</think>", "Done."])
+    kinds = [getattr(e, "type", "") for e in events]
+    text_done = kinds.index("response.output_text.done")
+    assert kinds[text_done + 1] == "response.content_part.done"
+    assert kinds[text_done + 2] == "response.output_item.done"
+    assert events[text_done + 1].part.type == "output_text"
+    assert events[text_done + 1].part.text == "Done."
+
+
+# ---------------------------------------------------------------------------
 # Streams that stop before response.completed
 #
 # response.completed is the only event that repeats the full text, so a stream
@@ -704,9 +781,13 @@ def test_final_response_reuses_the_call_ids_the_stream_published():
     helper = processor.streaming_events_helper
     helper.record_emitted_tool_call(SimpleNamespace(id="fc_fixed", call_id="call_fixed"))
 
-    assert helper.emitted_tool_call_ids == [("fc_fixed", "call_fixed")]
+    assert [(r.item_id, r.call_id) for r in helper.emitted_tool_call_ids] == [
+        ("fc_fixed", "call_fixed")
+    ]
     # And the processor reaches it by the path the final response uses.
-    assert processor.streaming_events_helper.emitted_tool_call_ids == [("fc_fixed", "call_fixed")]
+    assert [
+        (r.item_id, r.call_id) for r in processor.streaming_events_helper.emitted_tool_call_ids
+    ] == [("fc_fixed", "call_fixed")]
 
 
 def _processor_with_tools():

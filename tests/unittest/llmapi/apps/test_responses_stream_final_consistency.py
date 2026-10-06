@@ -42,6 +42,7 @@ from openai.types.responses.tool import FunctionTool
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
     ResponsesStreamingProcessor,
+    StreamedItem,
     _create_output_content,
     create_response_non_store,
     stamp_sse_sequence_number,
@@ -165,7 +166,9 @@ def test_streamed_ids_are_reused_positionally_in_emission_order():
     """Two items of one type map onto the rebuild first-emitted first.
 
     Emission order is the only correspondence the two passes share, which is
-    also how the tool-call precedent matches its calls.
+    also how the tool-call precedent matches its calls. Two outputs mean no
+    stream produced the record (streaming reads outputs[0] alone), so this is
+    the positional-reuse fallback, not the record assembly.
     """
     items, _messages, _reasoning = _create_output_content(
         SimpleNamespace(
@@ -175,7 +178,10 @@ def test_streamed_ids_are_reused_positionally_in_emission_order():
             ]
         ),
         reasoning_parser=None,
-        streamed_item_ids=[("message", "msg_first"), ("message", "msg_second")],
+        streamed_item_ids=[
+            StreamedItem("message", "msg_first"),
+            StreamedItem("message", "msg_second"),
+        ],
     )
     assert [(i.type, i.id) for i in items] == [
         ("message", "msg_first"),
@@ -187,7 +193,10 @@ def test_reasoning_and_message_ids_are_reused_per_type():
     items, _messages, _reasoning = _create_output_content(
         SimpleNamespace(outputs=[SimpleNamespace(index=0, text="think</think>answer")]),
         reasoning_parser="glm",
-        streamed_item_ids=[("reasoning", "rs_r1"), ("message", "msg_m1")],
+        streamed_item_ids=[
+            StreamedItem("reasoning", "rs_r1", "think"),
+            StreamedItem("message", "msg_m1", "answer"),
+        ],
     )
     assert [(i.type, i.id) for i in items] == [
         ("reasoning", "rs_r1"),
@@ -227,15 +236,53 @@ def test_rebuilding_items_the_stream_never_opened_is_said_out_loud():
 
 
 def test_streamed_items_the_rebuild_drops_are_said_out_loud_too():
-    """The mismatch matters in both directions; the first id is still reused."""
+    """The mismatch matters in both directions; the first id is still reused.
+
+    The streamed texts here cannot account for the rebuilt content - the
+    second item's tail exists nowhere in the accumulated text - so this is a
+    genuine divergence, not a segmentation difference: the rebuild keeps its
+    own (complete) view, reuses what ids it can, and says so.
+    """
     with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
         items, _messages, _reasoning = _create_output_content(
             SimpleNamespace(outputs=[SimpleNamespace(index=0, text="answer")]),
             reasoning_parser=None,
-            streamed_item_ids=[("message", "msg_first"), ("message", "msg_second")],
+            streamed_item_ids=[
+                StreamedItem("message", "msg_first", "answer"),
+                StreamedItem("message", "msg_second", " and a tail the text never held"),
+            ],
         )
     assert [i.id for i in items] == ["msg_first"]
     assert mock_logger.warning.called
+
+
+def test_matching_streamed_items_are_repeated_rather_than_rederived():
+    """The record assembly itself, at the unit level.
+
+    When the streamed texts read the same characters the re-parse does, the
+    snapshot repeats the streamed items verbatim - count, boundaries, ids and
+    bytes - instead of re-deriving one merged item. The boundary between
+    "the" and " answer" exists only in the record; a re-parse of the
+    accumulated text has no way to find it.
+    """
+    with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
+        items, messages, _reasoning = _create_output_content(
+            SimpleNamespace(outputs=[SimpleNamespace(index=0, text="the answer")]),
+            reasoning_parser=None,
+            streamed_item_ids=[
+                StreamedItem("message", "msg_first", "the"),
+                StreamedItem("message", "msg_second", " answer"),
+            ],
+        )
+    assert [(i.type, i.id, i.content[0].text) for i in items] == [
+        ("message", "msg_first", "the"),
+        ("message", "msg_second", " answer"),
+    ]
+    # Same characters, same views: nothing to warn about.
+    assert not mock_logger.warning.called
+    # The conversation store flattens the items back into one assistant
+    # message, built from the streamed characters.
+    assert messages == [{"role": "assistant", "content": "the answer"}]
 
 
 # ---------------------------------------------------------------------------
@@ -367,23 +414,24 @@ def test_an_unterminated_call_reaches_both_views_as_the_same_text():
     assert all(item_type != "function_call" for item_type, _ in _streamed_items(frames))
 
     final = _final_output(processor, result)
+    # The snapshot repeats the stream's items: same count, same boundaries,
+    # same texts. A whole-text re-parse can only read the fallback as one
+    # merged message - its regex has no memory of where the first message
+    # closed - so the snapshot used to publish one item where the stream
+    # published two, and the second streamed item vanished from the record
+    # the client reconciles against (10 live cases a week).
+    assert [item["type"] for item in final] == ["reasoning", "message", "message"]
     final_messages = [item for item in final if item["type"] == "message"]
-    assert [item["type"] for item in final] == ["reasoning", "message"]
-    # The same characters, in the same order, on both views. The final pass
-    # re-parses the whole text so its fallback is a single message; equality
-    # is on the concatenated text, which is what a training-data consumer
-    # reads.
-    assert "".join(streamed_texts) == final_messages[0]["content"][0]["text"]
-    assert _UNTERMINATED in final_messages[0]["content"][0]["text"]
+    assert [item["content"][0]["text"] for item in final_messages] == streamed_texts
 
 
-def test_the_unterminated_fragment_keeps_the_streamed_ids_it_can():
-    """Id linkage under the structural divergence the fragment causes.
+def test_the_unterminated_fragment_keeps_every_streamed_id():
+    """Item identity across the segmentation the fragment causes.
 
-    The stream published two message items, the rebuild derives one: the one
-    it derives answers to the first streamed id, and the mismatch is warned
-    about rather than hidden - it is the visible residue of a call the model
-    never finished.
+    The stream published two message items; the snapshot, assembled from the
+    stream's own record, answers to both ids - including the second, which
+    the old re-derive could not even represent. Nothing warns: the two views
+    read the same characters, and segmentation is the stream's to decide.
     """
     processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
     frames, result = _stream(processor, ["Plan it.", "</think>Run it.", _UNTERMINATED])
@@ -397,9 +445,45 @@ def test_the_unterminated_fragment_keeps_the_streamed_ids_it_can():
     with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
         final = _final_output(processor, result)
 
-    assert (final[0]["type"], final[0]["id"]) == streamed[0]
-    assert (final[1]["type"], final[1]["id"]) == streamed[1]
-    assert mock_logger.warning.called
+    assert [(item["type"], item["id"]) for item in final] == streamed
+    assert not mock_logger.warning.called
+
+
+# ---------------------------------------------------------------------------
+# Edge whitespace: the snapshot keeps the characters the stream sent
+# ---------------------------------------------------------------------------
+
+
+def test_final_text_keeps_the_whitespace_the_stream_sent():
+    """The live shape: stream ` Backbone`, snapshot `Backbone` (716/week).
+
+    Leading and trailing whitespace is part of the generation; the stream
+    delivered it as deltas and the snapshot used to strip it, so the two
+    views disagreed about the model's own characters on roughly every turn
+    that started with a space token.
+    """
+    processor = _processor()
+    frames, result = _stream(processor, ["Think hard.", "</think>", " Backbone of the design. "])
+    assert _message_texts(frames) == [" Backbone of the design. "]
+
+    final = _final_output(processor, result)
+    messages = [item for item in final if item["type"] == "message"]
+    assert messages[0]["content"][0]["text"] == " Backbone of the design. "
+
+
+def test_non_streaming_text_is_verbatim_too():
+    """No stream ran, so there is no second view to match.
+
+    The strip still falsified the generation: the whitespace was generated,
+    and the JSON body is the only account a non-streaming client gets.
+    """
+    items, _messages, _reasoning = _create_output_content(
+        SimpleNamespace(outputs=[SimpleNamespace(index=0, text="think</think> Backbone ")]),
+        reasoning_parser="glm",
+        streamed_item_ids=None,
+    )
+    assert [i.type for i in items] == ["reasoning", "message"]
+    assert items[1].content[0].text == " Backbone "
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +595,143 @@ def test_a_dropped_call_does_not_donate_its_identity_to_the_next_one():
         (streamed_calls[0]["id"], streamed_calls[0]["call_id"])
     ]
     assert json.loads(final_calls[0]["arguments"]) == {"cmd": "ls"}
+
+
+# ---------------------------------------------------------------------------
+# One call entity, two parses: the snapshot repeats the streamed arguments
+# ---------------------------------------------------------------------------
+
+# Malformed GLM-4.7 markup, the live shape: the model emits two consecutive
+# <arg_key> tags. The incremental state machine reads it as the key "input"
+# (re-anchoring on the second tag); the whole-text pair regex swallows the
+# first closing tag into the key and delivers the corrupted
+# `{"input</arg_key><arg_key>cmd": "ls -la"}` - both valid JSON, both
+# "successful" parses, different inputs for the same call identity. 2 live
+# cases a week.
+_DOUBLE_ARG_KEY = (
+    "<tool_call>exec<arg_key>input</arg_key><arg_key>cmd</arg_key>"
+    "<arg_value>ls -la</arg_value></tool_call>"
+)
+
+
+def _streamed_function_calls(frames):
+    return [
+        data["item"]
+        for data in map(_event_data, frames)
+        if data.get("type") == "response.output_item.done"
+        and data["item"]["type"] == "function_call"
+    ]
+
+
+def test_final_call_arguments_are_byte_identical_to_the_streamed_ones():
+    """The same call_id must not carry two different tool inputs.
+
+    The stream already delivered - and the client possibly executed - its
+    version of the arguments; a snapshot that re-describes the same call_id
+    from its own re-parse hands the client a second, different input for one
+    identity (live case: stream `false`, final `{}`; another: stream a shell
+    script, final JSON under a corrupted key). The record the stream keeps
+    per call now carries the assembled arguments, and the snapshot repeats
+    them.
+    """
+    tool = FunctionTool(
+        name="exec",
+        type="function",
+        strict=False,
+        parameters={
+            "type": "object",
+            "properties": {"input": {"type": "string"}, "cmd": {"type": "string"}},
+        },
+    )
+    processor = _processor(tools=[tool], reasoning_parser="glm47", tool_parser="glm47")
+    with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
+        frames, result = _stream(
+            processor,
+            ["Plan it.", "</think>Run it. ", _DOUBLE_ARG_KEY[:40], _DOUBLE_ARG_KEY[40:]],
+        )
+        streamed_calls = _streamed_function_calls(frames)
+        assert [c["arguments"] for c in streamed_calls] == ['{"input": "ls -la"}']
+
+        final_calls = _function_call_items(_final_output(processor, result))
+
+    # Byte-identical arguments and name, under the streamed identity. The
+    # whole-text re-parse of the same markup reads a corrupted key; it must
+    # reach no client.
+    assert [(c["id"], c["call_id"], c["name"], c["arguments"]) for c in final_calls] == [
+        (
+            streamed_calls[0]["id"],
+            streamed_calls[0]["call_id"],
+            streamed_calls[0]["name"],
+            streamed_calls[0]["arguments"],
+        )
+    ]
+    # The disagreement is said out loud, naming both versions.
+    disagreements = [
+        str(call.args[0])
+        for call in mock_logger.warning.call_args_list
+        if "differently from the stream" in str(call.args[0])
+    ]
+    assert len(disagreements) == 1
+    assert "ls -la" in disagreements[0]
+
+
+def test_the_streamed_message_text_keeps_its_whitespace_alongside_a_call():
+    """The whitespace the glm47 whole-text parse strips survives via the record.
+
+    The parser-internal strip only feeds the re-parse: the stream sent
+    `Run it. ` with its trailing space, and the snapshot repeats the stream.
+    """
+    tool = _exec_tool()
+    processor = _processor(tools=[tool], reasoning_parser="glm47", tool_parser="glm47")
+    whole_call = "<tool_call>exec<arg_key>input</arg_key><arg_value>ls</arg_value></tool_call>"
+    frames, result = _stream(processor, ["Plan it.", "</think>Run it. ", whole_call])
+    assert _message_texts(frames) == ["Run it. "]
+
+    final = _final_output(processor, result)
+    messages = [item for item in final if item["type"] == "message"]
+    assert [m["content"][0]["text"] for m in messages] == ["Run it. "]
+
+
+def test_non_streaming_whole_text_parse_is_unchanged_by_the_record():
+    """Pin: with no stream there is no record to prefer.
+
+    The whole-text parse is the only account there is - including its
+    corrupted-key reading of this markup. Fixing that is a parser change,
+    deliberately out of scope here; this pin is what makes the streamed
+    fix's boundary visible.
+    """
+    request = ResponsesRequest(
+        model="test-model",
+        input="hi",
+        stream=False,
+        tools=[
+            FunctionTool(
+                name="exec",
+                type="function",
+                strict=False,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "input": {"type": "string"},
+                        "cmd": {"type": "string"},
+                    },
+                },
+            )
+        ],
+    )
+    result = _generation_chunk("Plan it.</think>Run it. " + _DOUBLE_ARG_KEY, "", True)
+    response = create_response_non_store(
+        generation_result=result,
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="test-model",
+        use_harmony=False,
+        reasoning_parser="glm47",
+        tool_parser="glm47",
+        num_prompt_tokens=2,
+    ).model_dump()
+    calls = [i for i in response["output"] if i["type"] == "function_call"]
+    assert [c["arguments"] for c in calls] == ['{"input</arg_key><arg_key>cmd": "ls -la"}']
 
 
 # ---------------------------------------------------------------------------
