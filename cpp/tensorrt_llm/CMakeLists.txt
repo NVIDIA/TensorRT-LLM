@@ -195,8 +195,6 @@ add_subdirectory(common)
 add_subdirectory(kernels)
 add_subdirectory(runtime)
 
-set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
-set(BATCH_MANAGER_TARGET_ARCH ${TARGET_ARCH})
 add_subdirectory(batch_manager)
 
 set(EXECUTOR_TARGET tensorrt_llm_executor_static)
@@ -214,7 +212,6 @@ endif()
 
 add_subdirectory(executor)
 
-target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE Threads::Threads)
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE Threads::Threads)
 
 set(TRTLLM_LINK_LIBS
@@ -314,6 +311,12 @@ endif()
 
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
+find_library(TORCH_PYTHON_LIB torch_python REQUIRED
+             HINTS ${TORCH_INSTALL_PREFIX}/lib)
+target_link_libraries(
+  ${SHARED_TARGET} PRIVATE ${TORCH_PYTHON_LIB} Python3::Python pg_utils
+                           tensorrt_llm_xgrammar_static Threads::Threads)
+
 set(TLLM_FACADE_COMPONENT_TARGETS
     ipc_nvls_memory_src
     tllm_batch_cache_transceiver
@@ -362,10 +365,8 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_runtime_worker_pool
     userbuffers_src)
 
-foreach(
-  component
-  ${TLLM_FACADE_COMPONENT_TARGETS} ${BATCH_MANAGER_TARGET} ${EXECUTOR_TARGET}
-  fp8_blockscale_gemm_src ${INTERNAL_CUTLASS_KERNELS_TARGET})
+foreach(component ${TLLM_FACADE_COMPONENT_TARGETS} ${EXECUTOR_TARGET}
+                  fp8_blockscale_gemm_src ${INTERNAL_CUTLASS_KERNELS_TARGET})
   target_link_libraries(${SHARED_TARGET}
                         PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${component}>)
 endforeach()

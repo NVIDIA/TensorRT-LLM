@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved. SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License. You may obtain a copy of
+# the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations under
+# the License.
 set(TRTLLM_NB_MODULE bindings)
 set(TRTLLM_NB_MODULE
     ${TRTLLM_NB_MODULE}
@@ -45,9 +59,8 @@ else()
   nanobind_add_module(${TRTLLM_NB_MODULE} ${SRCS})
 endif()
 
-# SHA-256 symbols are provided by tensorrt_llm_batch_manager_static (via the
-# shared lib). Only add the include directory so headers resolve during
-# compilation of kvCacheManagerV2.cpp.
+# SHA-256 symbols are provided by tllm_kv_cache through the shared library. Its
+# headers are needed when compiling kvCacheManagerV2.cpp.
 target_include_directories(
   ${TRTLLM_NB_MODULE} PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 target_include_directories(${TRTLLM_NB_MODULE}

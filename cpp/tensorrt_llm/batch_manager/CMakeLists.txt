@@ -12,9 +12,6 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under
 # the License.
-set(BATCH_MANAGER_TARGET_NAME tensorrt_llm_batch_manager)
-set(BATCH_MANAGER_STATIC_TARGET ${BATCH_MANAGER_TARGET_NAME}_static)
-
 set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
 file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
@@ -202,21 +199,3 @@ set_target_properties(
   tllm_kv_cache_v2_utils
   PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20
              CUDA_STANDARD_REQUIRED ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-
-add_library(${BATCH_MANAGER_STATIC_TARGET} INTERFACE)
-find_library(TORCH_PYTHON_LIB torch_python REQUIRED
-             HINTS ${TORCH_INSTALL_PREFIX}/lib)
-target_link_libraries(
-  ${BATCH_MANAGER_STATIC_TARGET}
-  INTERFACE tllm::kv_cache_v2_utils
-            tllm::kv_cache
-            tllm::batch_scheduler
-            tllm::context_transfer_consensus
-            tllm::peft_cache
-            tllm::batch_request_info
-            tllm::batch_rnn_cache_routing
-            tllm::batch_cache_transceiver
-            ${TORCH_PYTHON_LIB}
-            Python3::Python
-            pg_utils
-            tensorrt_llm_xgrammar_static)
