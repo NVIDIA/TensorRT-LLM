@@ -77,7 +77,10 @@ def test_aux_outputs_outlive_the_calling_streams_reads(shape: str) -> None:
 
 def test_aux_output_over_memory_torch_did_not_allocate() -> None:
     # The native allocator skips such memory in record_stream; cudaMallocAsync raises on it.
-    cudart = pytest.importorskip("cuda.bindings.runtime")
+    # A plain import, not importorskip: cuda-python is a TensorRT-LLM requirement, so this test
+    # always runs and catches a change in cudaMallocAsync's error text.
+    from cuda.bindings import runtime as cudart
+
     numel = 1024
     err, ptr = cudart.cudaMalloc(numel * 4)
     assert err == cudart.cudaError_t.cudaSuccess
@@ -171,8 +174,10 @@ def test_aux_outputs_dropped_inside_graph_capture() -> None:
     torch.cuda.synchronize()
     assert torch.equal(acc, x * layers + sum(range(layers)))
     if torch.cuda.memory.get_allocator_backend() == "native":
-        # A recorded block freed during capture is held until the capture ends.
-        assert len(set(addresses)) == 1, f"{len(set(addresses))} blocks for {layers} outputs"
+        # A recorded block freed during capture is held until the capture ends, so recording
+        # would give every output its own block. Which free block an allocation reuses is up to
+        # the allocator; the bound does not depend on it.
+        assert len(set(addresses)) < layers, f"{len(set(addresses))} blocks for {layers} outputs"
 
 
 def test_compiled_caller_traces_fullgraph() -> None:
