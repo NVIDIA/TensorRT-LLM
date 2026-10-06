@@ -4355,6 +4355,19 @@ class BlockReuseConfig(StrictBaseModel):
         "This preference does not guarantee residency or change attention windows "
         "or prefix matching. Dummy and draft requests are excluded.")
 
+    enable_branch_snapshot: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Commit the sliding-window attention (SWA) cache where a request's "
+        "prompt diverges from the prefix cache, so later requests sharing that "
+        "prefix can reuse up to the fork. Helps when only the SWA window at a "
+        "chunk end is kept: policy 'per_request' or 'per_conversation', or SWA "
+        "scratch reuse. The fork is aligned down to a block boundary and becomes "
+        "a forced context chunk boundary. Requires KV cache manager v2 and block "
+        "reuse. Not applied with joint target/draft KV cache reuse. Hybrid Mamba "
+        "models use mamba_state_config.enable_branch_snapshot instead.")
+
     @model_validator(mode="after")
     def validate_swa_endpoint_policy(self) -> 'BlockReuseConfig':
         if self.swa_endpoint_rewind_tokens > 0 and self.policy != "all_reusable":
@@ -4719,6 +4732,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             if self.use_kv_cache_manager_v2 is False:
                 raise ValueError(
                     "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                    "kv_cache_config.use_kv_cache_manager_v2=True.")
+        return self
+
+    @model_validator(mode='after')
+    def validate_branch_snapshot(self) -> 'KvCacheConfig':
+        if self.block_reuse_config.enable_branch_snapshot:
+            if not self.enable_block_reuse:
+                raise ValueError(
+                    "block_reuse_config.enable_branch_snapshot requires "
+                    "kv_cache_config.enable_block_reuse=True.")
+            if self.use_kv_cache_manager_v2 is False:
+                raise ValueError(
+                    "block_reuse_config.enable_branch_snapshot requires "
                     "kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 

@@ -1141,6 +1141,32 @@ def _settle_context_cursor(req: LlmRequest, reuse: int, tokens_per_block: int) -
     req.context_chunk_size = req.context_remaining_length
 
 
+def _swa_branch_snapshot_point(
+    divergence: int,
+    num_lookup_tokens: int,
+    reused: int,
+    prompt_len: int,
+    tokens_per_block: int,
+) -> Optional[int]:
+    """Return the fork to commit, or None when committing there gains nothing.
+
+    ``divergence`` is where the prompt leaves the radix tree before any pruning,
+    and ``reused`` is the prefix the cache actually reused.
+    """
+    # The whole lookup range matched, so there is no fork here.
+    if divergence >= num_lookup_tokens:
+        return None
+    # Align down: tokens past a block boundary come from a partial-match child
+    # rather than a confirmed shared prefix, and an unaligned commit takes the
+    # partial-block snapshot path.
+    point = divergence // tokens_per_block * tokens_per_block
+    # Nothing to share, or reuse already reached the fork and its window is in
+    # the tree, or the point is the prompt end, which is committed anyway.
+    if point == 0 or point <= reused or point >= prompt_len:
+        return None
+    return point
+
+
 class KVCacheManagerV2(BaseResourceManager):
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
@@ -1148,6 +1174,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
+    # Branch snapshots (block_reuse_config.enable_branch_snapshot); declared on
+    # the class for instances built without running __init__.
+    _commit_branch_snapshots = False
+    _record_branch_snapshots = False
 
     def __init__(
         self,
@@ -1734,6 +1764,30 @@ class KVCacheManagerV2(BaseResourceManager):
             ConversationManager(block_reuse_config.max_num_turns)
             if enable_conversation_manager
             else None
+        )
+        # Commit the SWA window where a prompt leaves the radix tree; see
+        # _record_branch_snapshot_point. A draft pool commits at the target's
+        # points, which live on the shared request, but records none itself.
+        self._commit_branch_snapshots = (
+            block_reuse_config.enable_branch_snapshot and self.enable_block_reuse
+        )
+        # A paired draft pool caps the target lookup at the common reuse depth,
+        # which hides the fork, so joint reuse records no branch points.
+        if self._commit_branch_snapshots and self.enable_joint_kv_cache_reuse and not self.is_draft:
+            logger.warning(
+                "block_reuse_config.enable_branch_snapshot is not applied with joint "
+                "target/draft KV cache reuse."
+            )
+        self._record_branch_snapshots = (
+            self._commit_branch_snapshots
+            and self._can_publish_block_reuse
+            and not self.is_draft
+            and not self.enable_joint_kv_cache_reuse
+            and not self._has_cp_helix
+            and any(
+                getattr(layer, "sliding_window_size", None)
+                for layer in self.impl.init_config.layers
+            )
         )
 
         # With pipeline parallelism, multiple microbatches can be in-flight
@@ -3581,10 +3635,40 @@ class KVCacheManagerV2(BaseResourceManager):
             reuse_end = min(reuse_end, evidence_limit)
         return self._augment_tokens_for_block_reuse(all_tokens, req, end=reuse_end)
 
+    @property
+    def records_branch_snapshots(self) -> bool:
+        """Whether lookups write SWA branch points, which need forced context chunking."""
+        return self._record_branch_snapshots
+
     def _record_branch_snapshot_point(
         self, req: LlmRequest, kv_cache: _KVCache, num_lookup_tokens: Optional[int]
     ) -> None:
-        """Hook for recurrent-state managers; attention-only caches have no snapshots."""
+        """Plan a context chunk boundary where this request leaves the reuse tree.
+
+        With commit_min_snapshot or SWA scratch reuse, only the SWA window at a
+        chunk end reaches the radix tree, so a later request sharing this prompt
+        up to the fork cannot reuse past an earlier chunk end. Ending a chunk at
+        the fork commits the window there. Recurrent-state managers override this.
+        """
+        # A resumed cache (no fresh lookup) keeps the point its lookup wrote.
+        if not self._record_branch_snapshots or req.is_dummy_request or num_lookup_tokens is None:
+            return
+        divergence = kv_cache._get_num_reusable_tokens_before_pruning()
+        reused = kv_cache.num_committed_tokens
+        point = _swa_branch_snapshot_point(
+            divergence, num_lookup_tokens, reused, req.prompt_len, self.tokens_per_block
+        )
+        if point is None:
+            # Drop a point left by an earlier lookup of this request.
+            req.expect_snapshot_points = []
+            return
+        # Only recurrent-state managers rewrite this list each scheduler pass, so
+        # the point persists here until the request finishes.
+        req.expect_snapshot_points = [point]
+        logger.debug(
+            f"[KVCacheManagerV2] request {req.py_request_id} branch snapshot at {point} "
+            f"(divergence={divergence}, reused={reused}, prompt_len={req.prompt_len})"
+        )
 
     def probe_context_reuse(self, req: LlmRequest) -> int | None:
         """Reusable prefix depth for this pool, without claiming pages.
@@ -5760,8 +5844,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 and not req.is_dummy_request
             )
             is_all_reusable = self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
+            # A chunk that ends at a branch point commits there. History has
+            # advanced only to the point, so its SWA window is still held.
+            is_branch_point = (
+                self._commit_branch_snapshots
+                and req.context_remaining_length > 0
+                and req.context_current_position in req.expect_snapshot_points
+            )
             should_resize = not should_block_reuse or not is_all_reusable
-            should_commit = is_all_reusable or req.context_remaining_length == 0
+            should_commit = is_all_reusable or is_branch_point or req.context_remaining_length == 0
 
             if should_resize:
                 self._resize_context_history(req, kv_cache, req.context_current_position)

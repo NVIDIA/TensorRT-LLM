@@ -1194,6 +1194,42 @@ def test_swa_endpoint_rewind_auto_manager_selection(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("disabled",
+                         ["enable_block_reuse", "use_kv_cache_manager_v2"])
+def test_KvCacheConfig_branch_snapshot_requires_reuse_and_v2(
+        disabled: str) -> None:
+    with pytest.raises(ValidationError, match=disabled):
+        KvCacheConfig.model_validate({
+            disabled: False,
+            "block_reuse_config": {
+                "enable_branch_snapshot": True
+            },
+        })
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("preference", [None, "V1", "V2"])
+def test_branch_snapshot_auto_manager_selection(preference: str | None) -> None:
+
+    class Model:
+
+        @staticmethod
+        def get_preferred_kv_cache_manager_version(
+                config: object) -> str | None:
+            return preference
+
+    args = TorchLlmArgs(
+        model="dummy",
+        kv_cache_config=KvCacheConfig(block_reuse_config=BlockReuseConfig(
+            enable_branch_snapshot=True)))
+    if preference == "V2":
+        assert _resolve_kv_cache_manager_v2_auto(args, Model) is True
+    else:
+        with pytest.raises(ValueError, match="enable_branch_snapshot"):
+            _resolve_kv_cache_manager_v2_auto(args, Model)
+
+
+@pytest.mark.cpu_only
 def test_BlockReuseConfig_reports_renamed_policy_field():
     with pytest.raises(ValidationError, match="block_reuse_config\\.policy"):
         KvCacheConfig.model_validate(

@@ -245,6 +245,23 @@ def _set_model_engines_cache_reuse(model_engines, cache_reuse: bool):
         engine.attn_runtime_features.cache_reuse = cache_reuse
 
 
+def _branch_snapshot_ctx_chunk_config(ctx_chunk_config: Optional[tuple],
+                                      kv_cache_manager,
+                                      tokens_per_block: int) -> Optional[tuple]:
+    """Force chunk boundaries at SWA branch points if the manager records them.
+
+    Decided on the built manager, which alone knows whether branch points apply
+    (SWA layers present, no joint target/draft reuse). Otherwise the configured
+    chunking is kept unchanged.
+    """
+    if not getattr(kv_cache_manager, "records_branch_snapshots", False):
+        return ctx_chunk_config
+    # Keep the unit chosen for this model; it only aligns budget-shortened chunks.
+    chunk_unit_size = (ctx_chunk_config[1]
+                       if ctx_chunk_config is not None else tokens_per_block)
+    return (ContextChunkingPolicy.FORCE_CHUNK, chunk_unit_size)
+
+
 def _get_mapping(_mapping: Mapping) -> Mapping:
     if _mapping is None:
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
@@ -851,7 +868,14 @@ def _create_py_executor(
     else:
         ctx_chunk_config = None
 
-    if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
+    hybrid_linear = is_hybrid_linear(config)
+    if kv_cache_config.block_reuse_config.enable_branch_snapshot and hybrid_linear:
+        logger.warning(
+            "kv_cache_config.block_reuse_config.enable_branch_snapshot is ignored "
+            "for hybrid linear models; use "
+            "kv_cache_config.mamba_state_config.enable_branch_snapshot instead."
+        )
+    if kv_cache_config.enable_block_reuse and hybrid_linear:
         # Snapshot boundaries come from expect_snapshot_points.  The unit is
         # only used to align chunks shortened by the scheduling budget.
         ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
@@ -1092,7 +1116,10 @@ def _create_py_executor(
             resources=resources,
             mapping=mapping,
             llm_args=llm_args,
-            ctx_chunk_config=ctx_chunk_config,
+            ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
+                ctx_chunk_config,
+                resources.get(ResourceManagerType.KV_CACHE_MANAGER),
+                tokens_per_block),
             model_engine=model_engine,
             start_worker=False,
             sampler=sampler,
@@ -1173,7 +1200,10 @@ def _create_py_executor(
                 resources=resources,
                 mapping=mapping,
                 llm_args=llm_args,
-                ctx_chunk_config=ctx_chunk_config,
+                ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
+                    ctx_chunk_config,
+                    resources.get(ResourceManagerType.KV_CACHE_MANAGER),
+                    tokens_per_block),
                 model_engine=model_engine,
                 start_worker=False,
                 sampler=sampler,
