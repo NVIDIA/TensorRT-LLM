@@ -19,6 +19,7 @@ import json
 import signal
 import socket
 import traceback
+import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Optional
 
@@ -31,6 +32,10 @@ from pydantic import ValidationError
 
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
+from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         is_context_length_exceeded_message)
+from tensorrt_llm.inputs.chat_template_guard import \
+    UnusedChatTemplateKwargsError
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
@@ -47,7 +52,8 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicCountTokensRequest,
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, create_cluster_storage,
     validate_http_cluster_storage_scope)
-from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
+from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
+                                                resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
@@ -55,7 +61,7 @@ from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
-    UCompletionRequest, UCompletionResponse,
+    ConversationParams, ErrorResponse, UCompletionRequest, UCompletionResponse,
     ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
@@ -252,7 +258,8 @@ class OpenAIDisaggServer:
                 self._config, self._create_client,
                 metadata_config=self._metadata_server_cfg,
                 server_preparation_func=self._sync_server_clock,
-                server_start_timeout_secs=self._server_start_timeout_secs)
+                server_start_timeout_secs=self._server_start_timeout_secs,
+                request_timeout_secs=self._req_timeout_secs)
         self._ctx_router = self._coordinator.ctx_router
         self._gen_router = self._coordinator.gen_router
 
@@ -380,13 +387,27 @@ class OpenAIDisaggServer:
         return Response(content=body, status_code=status, headers=headers)
 
     @staticmethod
-    def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
-        """Populate conversation_params.conversation_id from supported headers.
-
-        Body ``conversation_params.conversation_id`` is canonical. Headers are
-        used only when the body does not provide an id.
-        """
+    def _extract_conversation_id(
+            req: UCompletionRequest,
+            raw_req: Request,
+            subagent_affinity_header: Optional[str] = None) -> None:
+        """Resolve conversation identity and the optional parent routing key."""
         resolve_request_conversation_id(req, raw_req.headers)
+
+        # The configured header is the source of parent affinity.
+        if req.conversation_params is not None:
+            req.conversation_params.subagent_affinity_id = None
+
+        parent = extract_subagent_parent_id(raw_req.headers,
+                                            subagent_affinity_header)
+        if not subagent_affinity_header or parent is None:
+            return
+
+        # Give parent-only requests an independent conversation identity.
+        if req.conversation_params is None:
+            req.conversation_params = ConversationParams(
+                conversation_id=f"subagent:{uuid.uuid4()}")
+        req.conversation_params.subagent_affinity_id = parent
 
     def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
         # Bind the concrete request model per route so FastAPI validates against it.
@@ -406,7 +427,9 @@ class OpenAIDisaggServer:
                         req, self._allow_request_chat_template)
                 except ValueError as e:
                     raise HTTPException(status_code=400, detail=str(e)) from e
-                self._extract_conversation_id(req, raw_req)
+                self._extract_conversation_id(
+                    req, raw_req,
+                    self._config.conversation_affinity_header_for_subagents)
                 hooks = RawRequestResponseHooks(
                     raw_req, self._perf_metrics_collector.queue_latency_seconds,
                     self._collect_perf_metrics)
@@ -418,7 +441,9 @@ class OpenAIDisaggServer:
                         media_type="text/event-stream")
                 return JSONResponse(content=response_or_generator.model_dump())
             except Exception as e:
-                self._handle_exception(e)
+                # Usually raises; returns a Response for worker errors that
+                # carry a machine-readable code (context_length_exceeded).
+                return self._handle_exception(e)
         return wrapper
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
@@ -510,13 +535,34 @@ class OpenAIDisaggServer:
             # caller, so it goes through the same unwrapping the Anthropic
             # route uses. This branch is shared with /v1/completions and
             # /v1/chat/completions, so those get the same treatment.
-            raise HTTPException(
-                status_code=status,
-                detail=_upstream_error_message(exception)) from exception
+            message = _upstream_error_message(exception)
+            if is_context_length_exceeded_message(message):
+                # The worker tagged this rejection with the machine-readable
+                # code "context_length_exceeded" (openai_server.py,
+                # create_error_response). HTTPException would flatten it to
+                # {"detail": message}, dropping the code, so re-emit the
+                # worker's error envelope. Detection is by message text, the
+                # same way the worker itself detects it: only the string is
+                # guaranteed to survive the hops.
+                return JSONResponse(status_code=status,
+                                    content=ErrorResponse(
+                                        message=message,
+                                        type="BadRequestError",
+                                        code=CONTEXT_LENGTH_EXCEEDED_CODE,
+                                    ).model_dump())
+            raise HTTPException(status_code=status,
+                                detail=message) from exception
         elif isinstance(exception, HTTPException):
             self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())
             raise exception
+        elif isinstance(exception, UnusedChatTemplateKwargsError):
+            # Raised while this server tokenizes a chat request for routing.
+            # It is a client mistake (a chat_template_kwargs key the template
+            # never reads), not a server fault, so it must not fall through to
+            # the generic 500 below.
+            self._perf_metrics_collector.http_exceptions.inc()
+            raise HTTPException(status_code=400, detail=str(exception)) from exception
         else:
             self._perf_metrics_collector.internal_errors.inc()
             logger.error("Internal server error: ", traceback.format_exc())

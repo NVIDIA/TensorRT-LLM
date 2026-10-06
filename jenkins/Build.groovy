@@ -143,6 +143,10 @@ def ACTION_INFO = "action_info"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def BOLT_CONSUME_BUILD = "bolt_consume_build"
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -152,6 +156,12 @@ def globalVars = [
     // that helper only updates keys already present in the target map, so a key that
     // is absent here (like this one previously) is silently dropped during the merge.
     (BOLT_CONSUME_BUILD): false,
+    // Pre-declared so updateMapWithJson() populates it from the parent: that
+    // helper only updates keys already present here, so an absent key is
+    // silently dropped -- which for this one would mean running unpinned
+    // without saying so.
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PROFILE_BRANCH): "",
 ]
 
 // TODO: Move common variables to an unified location
@@ -304,44 +314,50 @@ def echoNodeAndGpuInfo(pipeline, stageName)
     pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
 }
 
-def downloadArtifacts(stageName, reuseArtifactPath, artifacts, serverId = 'Artifactory')
+def copyCachedArtifacts(stageName, reuseArtifactPath, artifacts)
 {
-    def reused = true
+    def reused = false
     stage(stageName) {
-        for (downit in artifacts) {
-            def uploadpath = downit.key
-            try {
-                rtDownload(
-                    failNoOp: true,
-                    serverId: serverId,
-                    spec: """{
-                        "files": [
-                            {
-                            "pattern": "${reuseArtifactPath}/${uploadpath}"
-                            }
-                        ]
-                    }""",
-                )
-            } catch (Exception e) {
-                echo "failed downloading ${reuseArtifactPath}/${uploadpath}, need rebuild."
-                reused = false
-                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') { throw e }
+        // The copy API does not support virtual repositories. Both paths point
+        // at the default deployment repository behind sw-tensorrt-generic.
+        def sourceRoot = reuseArtifactPath.replaceFirst(
+            /^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
+        def targetRoot = UPLOAD_PATH.replaceFirst(
+            /^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
+
+        catchError(
+            buildResult: 'SUCCESS',
+            stageResult: 'UNSTABLE',
+            catchInterruptions: false) {
+            withCredentials([usernamePassword(
+                    credentialsId: 'urm-artifactory-creds',
+                    usernameVariable: 'ART_USER',
+                    passwordVariable: 'ART_PASS')]) {
+                for (artifact in artifacts) {
+                    def artifactPath = artifact.key
+                    def sourcePath = "${sourceRoot}/${artifactPath}"
+                    def targetPath = "${targetRoot}/${artifactPath}"
+                    echo "Copying cached artifact ${sourcePath} to ${targetPath}"
+                    withEnv([
+                        "ARTIFACTORY_COPY_SOURCE=${sourcePath}",
+                        "ARTIFACTORY_COPY_TARGET=${targetPath}",
+                    ]) {
+                        sh(
+                            script: '''artifactory_url="https://urm.nvidia.com/artifactory"
+                                copy_url="${artifactory_url}/api/copy/$ARTIFACTORY_COPY_SOURCE"
+                                curl -fsSL --max-time 300 --user "$ART_USER:$ART_PASS" --request POST \
+                                    "${copy_url}?to=/$ARTIFACTORY_COPY_TARGET"'''
+                        )
+                    }
+                }
             }
+            reused = true
         }
-
         if (!reused) {
-            return null
+            echo "Failed to copy cached artifacts from ${sourceRoot}; need rebuild."
         }
-
-        reuseArtifactPath = reuseArtifactPath.substring(reuseArtifactPath.indexOf('/')+1)
-        def newArtifacts = [:]
-        for (reuseit in artifacts) {
-            def uploadpath = reuseit.key
-            newArtifacts[reuseit.key] = "${reuseArtifactPath}/${uploadpath}"
-        }
-
-        return newArtifacts
     }
+    return reused
 }
 
 def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 'Artifactory')
@@ -371,10 +387,7 @@ def buildOrCache(pipeline, key, reuseArtifactPath, artifacts, image, k8s_cpu, ru
 {
     if (reuseArtifactPath) {
         stage(key) {
-            def newArtifacts = downloadArtifacts("[${key}] Reuse", reuseArtifactPath, artifacts)
-            if (newArtifacts != null) {
-                uploadArtifacts(newArtifacts)
-            } else {
+            if (!copyCachedArtifacts("[${key}] Reuse", reuseArtifactPath, artifacts)) {
                 reuseArtifactPath = null
             }
         }
@@ -474,9 +487,7 @@ def runLLMBuild(
         "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
         "TRTLLM_VERSION_OVERRIDE=${versionOverride}",
     ]) {
-        withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-            sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
-        }
+        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
     }
 
     // Type-check with the compiled bindings that build_wheel.py just produced in
@@ -548,7 +559,6 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     def branch = env.gitlabTargetBranch ?: env.branch_name ?: "main"
     def triple = is_linux_x86_64 ? "x86_64-linux-gnu" : "aarch64-linux-gnu"
     def llvmArch = is_linux_x86_64 ? "X64" : "ARM64"
-    def llvmVer = "21.1.5"   // keep in sync with scripts/bolt internal/slurm_*.sh
     stage("BOLT consume") {
         // apply_latest.sh exit codes: 3 = no promoted bundle for branch/triple,
         // 2 = apply error, 0 = applied. Capture the code so a MISSING bundle (e.g.
@@ -558,11 +568,12 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
             set -e
             export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
             if ! command -v llvm-bolt >/dev/null 2>&1; then
-                echo '[bolt-consume] staging llvm-bolt ${llvmVer}'
-                tb=LLVM-${llvmVer}-Linux-${llvmArch}.tar.xz
+                . ${LLM_ROOT}/scripts/bolt/internal/llvm_bolt_version.sh
+                echo "[bolt-consume] staging llvm-bolt \${LLVM_BOLT_VERSION}"
+                tb=LLVM-\${LLVM_BOLT_VERSION}-Linux-${llvmArch}.tar.xz
                 mkdir -p .bolt-llvm
                 curl -fSL --retry 10 --retry-all-errors --retry-delay 15 --connect-timeout 60 \
-                     -o /tmp/\$tb https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/\$tb
+                     -o /tmp/\$tb "https://github.com/llvm/llvm-project/releases/download/llvmorg-\${LLVM_BOLT_VERSION}/\$tb"
                 tar -xJf /tmp/\$tb -C .bolt-llvm --strip-components=1
                 rm -f /tmp/\$tb
             fi
@@ -634,9 +645,7 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     }
     sh "bash -c 'git config --global --add safe.directory \"*\"'"
     // Because different architectures involve different macros, a comprehensive test is conducted here.
-    withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}\"")
-    }
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}\"")
 }
 
 def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
@@ -663,11 +672,6 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
             BOLT_CONSUME_ENABLED = true
             echo "[bolt-consume] enabled via globalVars.bolt_consume_build"
         }
-    }
-
-    def wheelDockerImage = env.wheelDockerImagePy310
-    if (!wheelDockerImage && cpu_arch == AARCH64_TRIPLE) {
-        wheelDockerImage = env.dockerImage
     }
 
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""

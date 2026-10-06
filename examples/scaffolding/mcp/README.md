@@ -2,6 +2,7 @@
 
 This directory contains all MCP (Model Context Protocol) servers used by scaffolding examples.
 Each subdirectory is a standalone MCP server that can be reused across different projects.
+The Weather and E2B examples expose the Streamable HTTP endpoint at `/mcp`.
 
 ## Available Servers
 
@@ -85,6 +86,8 @@ uv run wordllama_serve.py
 ```
 
 ## Test
+
+Start the Weather server, then run:
 
 ```bash
 python3 mcptest.py --API_KEY YOUR_API_KEY

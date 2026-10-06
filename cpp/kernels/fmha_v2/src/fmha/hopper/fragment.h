@@ -447,20 +447,11 @@ struct Softmax_saver_tma
 {
 
     // Warps.
-    enum
-    {
-        WARPS_M = Cta_tile::WARPS_M
-    };
+    static constexpr int WARPS_M = Cta_tile::WARPS_M;
 
-    enum
-    {
-        WARPS_N = Cta_tile::WARPS_N
-    };
+    static constexpr int WARPS_N = Cta_tile::WARPS_N;
 
-    enum
-    {
-        WARPS_K = Cta_tile::WARPS_K
-    };
+    static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
     // Ctor.
     template <typename Params, typename Head_info>

@@ -73,6 +73,25 @@ perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_8k1k_con30_ct
 
 # GB300 Qwen3-235B
 
+# VR200 DeepSeek-V4-Pro
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_deepseek-v4-pro-fp4_8k1k_con1229_ctx7_dep4_gen1_dep8_eplb384_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_deepseek-v4-pro-fp4_8k1k_con2_ctx1_dep4_gen5_tep4_eplb0_mtp3_ccb-NIXL]
+
+# VR200 Kimi-K3
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_kimi-k3-fp4_8k1k_con512_ctx1_dep16_gen1_dep16_eplb0_mtp0_ccb-NIXL]
+
+# VR200 MiniMax-M3
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_minimax-m3-fp4_8k1k_con256_ctx4_tp4_gen1_dep16_eplb0_eagle3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_minimax-m3-fp4_8k1k_con256_ctx4_tp4_gen1_dep8_eplb0_eagle3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_minimax-m3-fp4_8k1k_con30_ctx1_tep2_gen2_tp4_eplb0_eagle3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_minimax-m3-fp4_8k1k_con30_ctx1_tp4_gen2_tp4_eplb0_eagle3_ccb-NIXL]
+
+# VR200 Nemotron-3-Ultra
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_nemotron-ultra-v3-fp4_8k64k_con1_ctx1_dep4_gen1_tep4_eplb0_mtp5_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_nemotron-ultra-v3-fp4_8k64k_con64_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_nemotron-ultra-v3-fp4_50k2k_con178_ctx5_dep4_gen1_dep4_eplb0_mtp6_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_nemotron-ultra-v3-fp4_50k2k_con12_ctx1_dep4_gen6_tep4_eplb0_mtp6_ccb-NIXL]
+
 # wideep multi-node
 # GB200 wideep
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_wideep_deepseek-r1-fp4_8k1k_ctx2_gen1_dep32_bs128_eplb288_mtp3_con1024_ccb-NIXL]

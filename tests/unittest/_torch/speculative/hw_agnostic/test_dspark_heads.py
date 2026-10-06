@@ -23,6 +23,8 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     VanillaMarkov,
     build_markov_head,
     confident_prefix_length,
+    dspark_markov_step_bias,
+    markov_prev_embeddings,
 )
 
 VOCAB, RANK, HID, B, BLK = 257, 16, 32, 3, 5
@@ -115,3 +117,33 @@ def test_confidence_head_with_markov_concat_dim():
     assert out.shape == (B, BLK)
     with pytest.raises(AssertionError):
         head(hid)  # with_markov requires prev_embeddings
+
+
+# The anchor is a rejection-sampled token id, which can be -1 or out of vocab;
+# an unmasked lookup raises IndexError on CPU and asserts device-side on CUDA.
+@pytest.mark.parametrize("bad_token", [-1, VOCAB])
+def test_markov_bias_is_zero_for_out_of_vocab_anchor(bad_token):
+    torch.manual_seed(3)
+    w1, w2 = torch.randn(VOCAB, RANK), torch.randn(VOCAB, RANK)
+    prev = torch.tensor([0, bad_token], dtype=torch.long)
+
+    emb = markov_prev_embeddings(prev, w1)
+    assert torch.equal(emb[0], w1[0])
+    assert torch.all(emb[1] == 0.0)
+    assert torch.all(dspark_markov_step_bias(prev, w1, w2)[1] == 0.0)
+
+
+def test_markov_head_tolerates_out_of_vocab_anchor():
+    # Same guard reached through the module's get_prev_embeddings, which the
+    # gated/RNN heads also use.
+    torch.manual_seed(4)
+    head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).eval()
+    base = torch.randn(2, BLK, VOCAB)
+    first = torch.tensor([-1, 0], dtype=torch.long)
+    with torch.no_grad():
+        _, corrected = head.sample_block_tokens(
+            base, first_prev_token_ids=first, hidden_states=None, temperature=0.0
+        )
+    # Invalid anchor -> no step-0 bias; the valid neighbour still gets one.
+    assert torch.allclose(corrected[0, 0], base[0, 0], atol=1e-5)
+    assert not torch.allclose(corrected[1, 0], base[1, 0], atol=1e-5)

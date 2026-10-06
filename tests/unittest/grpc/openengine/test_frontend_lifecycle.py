@@ -14,8 +14,8 @@ from unittest.mock import Mock
 import grpc
 import pytest
 
-rpc = pytest.importorskip("openengine.v1.openengine_pb2_grpc")
-lifecycle = pytest.importorskip("openengine.v1.lifecycle_pb2")
+from tensorrt_llm.grpc.openengine.bindings import lifecycle_pb2 as lifecycle
+from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc as rpc
 
 pytestmark = pytest.mark.cpu_only
 

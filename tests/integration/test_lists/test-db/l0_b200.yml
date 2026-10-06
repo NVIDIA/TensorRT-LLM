@@ -31,6 +31,13 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_horizontal_producer.py
+  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_nvfp4_horizontal_producer.py
+  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_indexer.py
+  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_unfused_index_projection_tp_construction
+  - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_explicit_caches_match_manager
+  - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage[cuda]
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
@@ -81,15 +88,9 @@ l0_b200:
   - accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[nemotron_nano_v3_omni_nvfp4]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_mtp
   - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0] # nvbugs 5300551
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-8B]
   - test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Nano-9B-v2-nvfp4-NVIDIA-Nemotron-Nano-9B-v2-NVFP4]
-  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
   - test_e2e.py::test_ptp_quickstart_advanced_mtp[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]
   - test_e2e.py::test_ptp_quickstart_advanced_mtp_eagle[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]
-  - test_e2e.py::test_ptp_quickstart_advanced_mixed_precision
-  - test_e2e.py::test_ptp_quickstart_advanced_eagle3[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]
-  - test_e2e.py::test_ptp_quickstart_advanced_ngram[Llama-3.1-8B-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
-  - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
   - test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b]
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
@@ -99,13 +100,15 @@ l0_b200:
   #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
   #               rebind mpi4py's serializer at import time, which applies process-wide on
   #               every stage that collects them, including where the tests themselves skip.
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py
+  # Keep cold-JIT MSA coverage out of the 60-minute attention aggregate.
+  # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
+  - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/compilation
   - unittest/_torch/debugger
   - unittest/_torch/peft/test_fp8_lora_grouped_gemm_regressions.py
   - unittest/_torch/kv_cache_compression
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_2_model_mtp
   - unittest/disaggregated/test_deepseek_v4_kv_transfer.py
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_sparse_mla.py TIMEOUT (60)
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py TIMEOUT (60)
@@ -116,10 +119,13 @@ l0_b200:
   - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_tf32.py TIMEOUT (15)
   - unittest/_torch/attention/sparse/test_sparse_mla_forward.py TIMEOUT (60)
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
+  - unittest/_torch/modeling/test_glm5_next_contracts.py
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
+  - unittest/_torch/modeling/test_kimi_k3_checkpoint.py TIMEOUT (15)
+  - unittest/_torch/modeling/test_kimi_k3_mla.py TIMEOUT (15)
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
   - unittest/_torch/modeling/test_kimi_kda_fp8_packed_prefill.py
@@ -131,6 +137,11 @@ l0_b200:
   # CuTe MTP verify kernel parity (trtllm::kda_mtp_decode).
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
+  # KDA runtime: host-derived prefill metadata and the bf16 state pool
+  # round-trip. Both are single-device cases that use GPU 0 only.
+  - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
   # stage's "not cpu_only" markexpr and run on the CPU-Generic stage instead).
   - unittest/disaggregated/test_kda_mamba_transfer.py
@@ -138,7 +149,6 @@ l0_b200:
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py
   - unittest/_torch/modeling/test_kimi_k3_config_routing.py
   - unittest/_torch/modeling/test_kimi_linear_checkpoint.py
-  - unittest/_torch/modeling/test_kimi_k3_fp8_weight_read_gates.py
   # CPU self-test of the Kimi K3 disagg parity harness comparison logic.
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
   # ------------- modules (non-MoE) ---------------
@@ -154,10 +164,13 @@ l0_b200:
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_mxfp8_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
+  - unittest/_torch/modules/test_swiglu_2in.py
+  - unittest/_torch/modules/test_gated_mlp_split.py
   - unittest/_torch/modules/test_low_m_gemm.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
+  - unittest/_torch/moe/fused_moe/test_cutedsl_fc2_tuning.py
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
@@ -167,6 +180,11 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_kimi_fused_route_quant_skips_prequantized_input
   - unittest/_torch/moe/test_moe_backend.py::test_kimi_mxfp8_quantized_tensor_handoff
   - unittest/_torch/moe/test_megamoe_streaming_load.py
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_tactic_autotune_defaults_off
+  - unittest/_torch/moe/test_moe_backend.py::test_enumerate_megamoe_candidate_tactics_curated_space
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
@@ -174,12 +192,23 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_streaming_reload_resets_slot_claims
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
-  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_bakes_situ_softcaps_as_uniform_scalars
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_plain_swiglu_carries_no_constants
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_forwards_situ_activation_as_one_carrier
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_backend_rejects_apply_router_weight_on_input_by_declaration
   - unittest/_torch/moe/test_moe_backend.py::test_apply_router_weight_on_input_support_is_not_inherited
+  # WideEP DeepEP-to-CuTeDSL metadata selection and adapter-free contracts.
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_deep_ep_direct_metadata_disable_env
+  - unittest/_torch/moe/test_moe_backend.py::test_deep_ep_adapter_free_output_matches_schema_and_reuses_cache
+  - unittest/_torch/moe/test_moe_backend.py::test_deep_ep_adapter_free_cache_miss_rejected_during_capture
+  - unittest/_torch/moe/test_moe_backend.py::test_scheduler_selects_cutedsl_deep_ep_direct_metadata
+  - unittest/_torch/moe/test_moe_backend.py::test_other_backend_rejects_deep_ep_direct_metadata
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_rejects_direct_metadata_without_fused_finalize
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_direct_metadata_request_fails_without_fused_finalize
+  - unittest/_torch/moe/test_moe_backend.py::test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl
+  - unittest/_torch/thop/parallel/test_cute_dsl_moe.py::test_count_native_cutedsl_matches_legacy_sort_bitwise
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
@@ -210,6 +239,10 @@ l0_b200:
   # cuda-availability skipif like the sibling KDA parity tests; relocated
   # from tests/torch/ which test-db cannot list).
   - unittest/_torch/speculative/test_suffix_automaton.py
+  # Fused sampling kernel; its numerics are architecture-dependent (the only
+  # accuracy deviation found so far is Blackwell-only), so it is not
+  # hw-agnostic and needs its own Blackwell run.
+  - unittest/_torch/speculative/test_fused_sampling_op.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
@@ -227,7 +260,6 @@ l0_b200:
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e4b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_multimodal_26b_dummy
-  - unittest/auto_deploy/standalone/test_standalone_package.py::TestStandalonePackage::test_run_unit_tests
   - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
@@ -275,11 +307,18 @@ l0_b200:
   - unittest/_torch/visual_gen/test_pertoken_adaln.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
   - unittest/_torch/visual_gen/test_fa4_cutlass_compatibility.py
-  - unittest/_torch/visual_gen/test_attention_cute_dsl_vsa.py
+  - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_attention.py
+  - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_kernels.py
+  - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_parity.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_attention.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_parity.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_predictor.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_predictor_kernels.py
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_attention_cudnn.py
   - unittest/_torch/visual_gen/test_attention_integration.py
+  - unittest/_torch/visual_gen/test_trtllm_attention_metadata.py
   - unittest/_torch/visual_gen/test_attention_fa4.py
   - unittest/_torch/visual_gen/test_attention_perf.py
   - unittest/_torch/visual_gen/test_qwen_image_layered_registry.py
@@ -314,8 +353,11 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_action.py
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
+  - unittest/_torch/visual_gen/test_attention_qkv_share.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
   - unittest/_torch/visual_gen/test_cosmos3_distilled.py
+  - unittest/_torch/visual_gen/test_cosmos3_fp8.py
+  - unittest/_torch/visual_gen/test_cosmos3_step_precision_component.py
   - unittest/_torch/visual_gen/test_cosmos3_transfer.py
   - unittest/_torch/visual_gen/test_control_kernels.py
   - unittest/_torch/visual_gen/test_hunyuan_video1_5_transformer.py
@@ -326,7 +368,8 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_reference_image_example
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
-  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example[nano-1gpu]
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example[super-1gpu]
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_policy_droid_example TIMEOUT (20)
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_example
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_example
@@ -336,6 +379,10 @@ l0_b200:
   - unittest/_torch/visual_gen/test_cosmos3_example_prompts.py
   - unittest/_torch/visual_gen/test_glm_image_transformer.py
   - unittest/_torch/visual_gen/test_glm_image_pipeline.py
+  - unittest/_torch/visual_gen/test_minimax_h3_transformer.py
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_public_visual_gen_api_smoke TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (30)
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
@@ -363,7 +410,6 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_i2v_example TIMEOUT (30)
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_mtp_non_greedy_cuda_graph_matches_eager
 - condition:
     ranges:
       system_gpu_count:
@@ -463,6 +509,13 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_trtllm_backend
   - examples/visual_gen/test_visual_gen_wan.py::test_wan21_t2v_lpips_against_golden
   - examples/visual_gen/test_visual_gen_wan.py::test_wan22_t2v_lpips_against_golden
+  # Real-checkpoint cases; the weights come from the shared CI model store.
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_loads_and_runs TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8] TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8_BLOCK_SCALES] TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[NVFP4] TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_pipeline_smoke TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va-fp8-blockwise] TIMEOUT (30)
   # Measured on B200 with TRT-LLM commit 85665f5f from the staging main image:
   # QwenImage ~5 min, Cosmos3-Nano T2I ~3 min, and T2V ~5 min.
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_lpips_against_golden TIMEOUT (10)

@@ -46,22 +46,12 @@ def initialize_tokenizer(model_name: str,
         PreTrainedTokenizer: An initialized HuggingFace tokenizer.
     """
     if custom_tokenizer:
-        from tensorrt_llm.tokenizer import TOKENIZER_ALIASES
+        from tensorrt_llm.tokenizer import load_custom_tokenizer
 
-        tokenizer_path = TOKENIZER_ALIASES.get(custom_tokenizer,
-                                               custom_tokenizer)
-        from importlib import import_module
-        try:
-            module_path, class_name = tokenizer_path.rsplit('.', 1)
-            module = import_module(module_path)
-            tokenizer_class = getattr(module, class_name)
-            tokenizer = tokenizer_class.from_pretrained(model_name,
-                                                        padding_side="left",
-                                                        trust_remote_code=True)
-        except (ValueError, ImportError, AttributeError) as e:
-            raise ValueError(
-                f"Failed to load custom_tokenizer '{custom_tokenizer}'. "
-                "Expected alias or 'module.path.ClassName'.") from e
+        tokenizer = load_custom_tokenizer(custom_tokenizer,
+                                          model_name,
+                                          trust_remote_code=True,
+                                          padding_side="left")
     else:
         # Route through TransformersTokenizer so trtllm-bench inherits its
         # post-load fixes -- in particular ``maybe_fix_byte_level_tokenizer``,

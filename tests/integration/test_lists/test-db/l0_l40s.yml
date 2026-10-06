@@ -16,7 +16,7 @@ l0_l40s:
   # ------------- PyTorch tests ---------------
   # Multimodal modeling tests
   - unittest/_torch/modeling -k "modeling_siglip"
-  - unittest/_torch/modeling -k "modeling_nemotron_nano_v2_vl"
+  - unittest/_torch/modeling -k "modeling_nemotron_h_multimodal"
   - unittest/_torch/modeling/test_modeling_qwen3vl_moe.py::TestQwen3VLMoe::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl.py::TestQwen3VL::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl.py::test_qwen3vl_init_preserves_caller_quant_config
@@ -30,6 +30,8 @@ l0_l40s:
   - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embedding_matches_huggingface[qwen3-embedding-8b]
   # PyTorch: force NVFP4 Marlin on Ada to cover the SM89-compiled Marlin kernels.
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_nvfp4_marlin_multi_gpus[tp_size=1]
+  # Marlin NVFP4: Triton top-k combine matches the established ATen scatter-reduce.
+  - unittest/_torch/moe/test_marlin_triton_sum_topk.py
   # ------------- Encoder-decoder tests ---------------
   # Representative pre-merge set: eager smoke, CUDA-graph greedy/beam, kv-v2,
   # overlap scheduler, mBART, mixed batches.

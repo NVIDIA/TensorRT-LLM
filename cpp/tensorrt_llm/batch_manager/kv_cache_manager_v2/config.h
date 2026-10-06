@@ -105,6 +105,8 @@ struct BufferConfig
     // If set, overrides tokens_per_block for this buffer.
     // Must be a divisor of KVCacheManagerConfig::tokensPerBlock.
     std::optional<int> tokensPerBlockOverride;
+
+    bool isSparse = false; //!< Whether history uses the sparse attention lifecycle.
 };
 
 // ---------------------------------------------------------------------------
@@ -129,8 +131,7 @@ inline void validateNoDuplicateBufferRoles(std::vector<BufferConfig> const& buff
     std::unordered_set<DataRole> roles;
     for (auto const& buf : buffers)
     {
-        if (!roles.insert(buf.role).second)
-            throw std::invalid_argument("duplicate buffer role");
+        TLLM_CHECK(roles.insert(buf.role).second);
     }
 }
 
@@ -149,7 +150,7 @@ struct AttentionLayerConfig
     // nullopt or 0 = no sink tokens.
     std::optional<int> numSinkTokens;
 
-    std::optional<int> windowSize() const noexcept
+    [[nodiscard]] std::optional<int> windowSize() const noexcept
     {
         return slidingWindowSize;
     }
@@ -157,6 +158,13 @@ struct AttentionLayerConfig
     void validate() const
     {
         detail::validateNoDuplicateBufferRoles(buffers);
+        for (auto const& buf : buffers)
+        {
+            if (buf.isSparse != buffers.front().isSparse)
+            {
+                throw std::invalid_argument("Sparse and non-sparse buffers cannot share an attention layer lifecycle");
+            }
+        }
     }
 };
 
@@ -177,7 +185,13 @@ struct SsmLayerConfig
         for (auto const& buf : buffers)
         {
             if (buf.tokensPerBlockOverride.has_value())
+            {
                 throw std::invalid_argument("tokensPerBlockOverride not supported for SSM layers");
+            }
+            if (buf.isSparse)
+            {
+                throw std::invalid_argument("Sparse buffers are only supported for attention layers");
+            }
         }
     }
 };
@@ -195,7 +209,7 @@ struct KVCacheDesc
 
     void validate() const
     {
-        TLLM_CHECK_DEBUG(0 <= historyLength && historyLength <= capacity);
+        TLLM_CHECK(0 <= historyLength && historyLength <= capacity);
     }
 
     // Value equality, mirroring the Python @dataclass(frozen=True) semantics the
@@ -222,7 +236,11 @@ struct BatchDesc
 
     void validate() const
     {
-        TLLM_CHECK_DEBUG(systemPromptLength >= 0);
+        TLLM_CHECK(systemPromptLength >= 0);
+        for (auto const& desc : kvCaches)
+        {
+            desc.validate();
+        }
     }
 
     // Value equality, mirroring the Python @dataclass(frozen=True) semantics the

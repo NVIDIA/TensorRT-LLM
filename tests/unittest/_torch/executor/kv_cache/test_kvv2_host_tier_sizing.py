@@ -54,6 +54,41 @@ class TestComputeAutoHostTierQuota:
         )
         assert per_rank * local_ranks <= mem_available
 
+    def test_integrated_gpu_charges_device_quota_against_budget(self):
+        # GB10 / DGX Spark. Host and device are one 119.69 GiB
+        # unified pool, so SC_AVPHYS_PAGES counts bytes the device quota is
+        # about to take. Without the charge the tier was sized 93.58/2 =
+        # 46.79 GiB on top of an 81.68 GiB device quota -- 128.5 GiB requested
+        # from a 119.69 GiB pool -- and the worker was OOM-killed.
+        quota = 81 * GiB
+        mem_available = float(93 * GiB)
+        host_quota = _compute_auto_host_tier_quota(
+            quota=quota,
+            local_ranks=1,
+            mem_available=mem_available,
+            memlock_limit=float("inf"),
+            shares_device_memory=True,
+        )
+        assert host_quota == int((93 - 81) * GiB / 1 * 0.5)
+        # The invariant that actually matters on shared memory: both tiers
+        # together must fit the one pool.
+        assert quota + host_quota <= mem_available
+
+    def test_integrated_gpu_without_headroom_provisions_no_tier(self):
+        # The device quota consumes the whole budget. Returning `quota` here
+        # (the non-integrated fallback) would ask for 2x the pool and get the
+        # process SIGKILLed, so the tier must be dropped instead.
+        assert (
+            _compute_auto_host_tier_quota(
+                quota=95 * GiB,
+                local_ranks=1,
+                mem_available=float(93 * GiB),
+                memlock_limit=float("inf"),
+                shares_device_memory=True,
+            )
+            == 0
+        )
+
     def test_memlock_limit_caps_quota(self):
         assert _compute_auto_host_tier_quota(
             quota=173 * GiB,

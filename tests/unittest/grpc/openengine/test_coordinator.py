@@ -11,11 +11,12 @@ from types import SimpleNamespace
 import grpc
 import pytest
 
-pytest.importorskip("openengine.v1.openengine_pb2_grpc")
-
-from openengine.v1 import generation_pb2, lifecycle_pb2, openengine_pb2_grpc  # noqa: E402
-
 import tensorrt_llm.grpc.openengine.coordinator as coordination  # noqa: E402
+from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
+    generation_pb2,
+    lifecycle_pb2,
+    openengine_pb2_grpc,
+)
 from tensorrt_llm.grpc.openengine.coordinator import (  # noqa: E402
     CoordinationError,
     Coordinator,

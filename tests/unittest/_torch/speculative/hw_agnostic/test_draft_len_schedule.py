@@ -60,7 +60,10 @@ def test_correctness_across_batch_sizes(
     max_draft_len = max(schedule.values())  # Use max from schedule
 
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False, enable_partial_reuse=False, max_tokens=1024
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+        max_tokens=1024,
+        use_kv_cache_manager_v2=True,
     )
 
     llm_common_config = dict(
@@ -217,7 +220,10 @@ def test_draft_len_schedule_functionality(
     max_batch_size = 7
 
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False, enable_partial_reuse=False, max_tokens=1024
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+        max_tokens=1024,
+        use_kv_cache_manager_v2=True,
     )
 
     llm_common_config = dict(
