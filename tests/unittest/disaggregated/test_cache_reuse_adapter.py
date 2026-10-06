@@ -28,6 +28,7 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
 
 pytestmark = pytest.mark.cpu_only
 
@@ -516,14 +517,15 @@ class TestAdapterBlockOrdinals:
         ordinals = _CacheReuseAdapterV1(mgr).get_block_ordinals(self._v1_req(), 0, _lg(window=512))
         assert ordinals.size == 0
 
-    def test_v2_reports_stale_as_holes_via_valid_only_false(self):
+    def test_v2_reports_stale_as_holes_in_storage_snapshot(self):
         class _KvCache:
-            def __init__(self):
-                self.valid_only = None
+            is_active = True
 
-            def get_aggregated_page_indices(self, group_idx, valid_only=False):
-                self.valid_only = valid_only
-                return iter([-1, -1, 12, 13])
+            def get_page_storage_snapshot(self, group_idx):
+                return SimpleNamespace(
+                    base_page_indices=[-1, -1, 12, 13],
+                    cache_levels=[None, None, GPU_LEVEL, GPU_LEVEL],
+                )
 
         class _V2Mgr:
             enable_block_reuse = True
@@ -538,8 +540,6 @@ class TestAdapterBlockOrdinals:
         req.py_beam_width = 1
         ordinals = _CacheReuseAdapterV2(mgr).get_block_ordinals(req, 0, _lg(window=512))
         np.testing.assert_array_equal(ordinals, [-1, -1, 12, 13])
-        # Must request the positional view (holes kept), not the compact one.
-        assert mgr.kv_cache_map[7].valid_only is False
 
 
 class TestAdapterPerLayerGroup:

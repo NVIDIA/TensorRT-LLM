@@ -46,6 +46,7 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     RegMemoryDescs,
     TransferOp,
     TransferRequest,
+    TransferStatus,
 )
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     ReceiverBase,
@@ -79,7 +80,10 @@ from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
-from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_physical_pool,
+    get_unique_pool_memory_descs,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import CUASSERT, nvtx_range
@@ -179,6 +183,44 @@ class WriteMeta:
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
+    # Contiguous fragment counts and source/destination memory types. Empty
+    # preserves the existing all-VRAM KV (or all-DRAM AUX) path.
+    memory_segments: tuple[tuple[int, str, str], ...] = ()
+
+
+class _TransferBatch:
+    """Keep every request and backend handle alive for one mixed-memory write.
+
+    The task owns this object before submission starts. If a later submission
+    fails, earlier handles remain reachable through the task's quarantine roots.
+    All sub-transfers must complete before the task's physical operation retires.
+    """
+
+    def __init__(self, requests: list[TransferRequest]) -> None:
+        self.requests = requests
+        self.statuses: list[TransferStatus] = []
+        self.op = TransferOp.WRITE
+        self.remote_name = requests[0].remote_name
+
+    def submit(self, agent: BaseTransferAgent) -> "_TransferBatch":
+        for request in self.requests:
+            self.statuses.append(agent.submit_transfer_requests(request))
+        return self
+
+    def is_completed(self) -> bool:
+        # A partial submission has no proof of completion for the whole batch.
+        return len(self.statuses) == len(self.requests) and all(
+            status.is_completed() is True for status in self.statuses
+        )
+
+    def wait(self) -> bool:
+        completed = len(self.statuses) == len(self.requests)
+        for status in self.statuses:
+            completed = status.wait() and completed
+        return completed
+
+    def last_status_str(self) -> str:
+        return "Mixed-memory KV transfer did not complete"
 
 
 class MessageType:
@@ -664,7 +706,7 @@ class _PhysicalOperation:
     """State plus strong backend roots retained until physical quiescence."""
 
     state: _PhysicalOperationState
-    request: Optional[TransferRequest] = None
+    request: TransferRequest | _TransferBatch | None = None
     status: Optional[object] = None
 
 
@@ -746,7 +788,7 @@ class SendTaskBase(_LogicalTask):
     def begin_backend_submission(
         self,
         peer_rank: int,
-        request: TransferRequest,
+        request: TransferRequest | _TransferBatch,
     ) -> None:
         with self._physical_lock:
             operation = self._require_physical_operation_locked(
@@ -1156,10 +1198,14 @@ class Sender(SenderBase):
         self,
         task: SendTaskBase,
         peer_rank: int,
-        request: TransferRequest,
+        request: TransferRequest | _TransferBatch,
     ) -> tuple[bool, Optional[str]]:
         if not self._enforce_physical_ownership:
-            status = self._agent.submit_transfer_requests(request)
+            status = (
+                request.submit(self._agent)
+                if isinstance(request, _TransferBatch)
+                else self._agent.submit_transfer_requests(request)
+            )
             completed = status.wait()
             detail = None if completed else getattr(status, "last_status_str", lambda: None)()
             return completed, detail
@@ -1172,9 +1218,13 @@ class Sender(SenderBase):
                 ) from error
             task.begin_backend_submission(peer_rank, request)
         try:
-            # SUBMITTING already retains the request. Neither backend admission
-            # nor completion may hold the lock needed by deadline containment.
-            status = self._agent.submit_transfer_requests(request)
+            # SUBMITTING retains the batch and every submitted backend handle.
+            # Admission must not hold the lock needed by deadline containment.
+            status = (
+                request.submit(self._agent)
+                if isinstance(request, _TransferBatch)
+                else self._agent.submit_transfer_requests(request)
+            )
             task.record_backend_submission(peer_rank, status)
         except Exception as error:
             with self._ownership_poison_lock:
@@ -1335,7 +1385,9 @@ class Sender(SenderBase):
 
     @staticmethod
     @nvtx_range("_make_agent_request")
-    def _make_agent_request(write_meta: WriteMeta, device_id: int) -> "TransferRequest":
+    def _make_agent_request(
+        write_meta: WriteMeta, device_id: int
+    ) -> TransferRequest | _TransferBatch:
         if not (write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size):
             raise ValueError(
                 f"Pointer/size mismatch for unique_rid={write_meta.unique_rid}: "
@@ -1344,6 +1396,52 @@ class Sender(SenderBase):
                 f"{write_meta.sizes.size=}"
             )
         n = write_meta.src_ptrs.size
+        if write_meta.memory_segments:
+            if write_meta.meta_type != WriteMetaType.KV:
+                raise ValueError("Memory segments are only supported for KV transfers")
+            if sum(count for count, _, _ in write_meta.memory_segments) != n:
+                raise ValueError("Memory segment counts must cover every KV fragment")
+            parts: dict[tuple[str, str], list[slice]] = {}
+            offset = 0
+            for count, src_type, dst_type in write_meta.memory_segments:
+                if (
+                    count < 0
+                    or src_type not in ("DRAM", "VRAM")
+                    or dst_type not in ("DRAM", "VRAM")
+                ):
+                    raise ValueError("Invalid KV memory segment")
+                if count:
+                    parts.setdefault((src_type, dst_type), []).append(slice(offset, offset + count))
+                offset += count
+            requests = []
+            memory_types = {"DRAM": MemoryType.DRAM, "VRAM": MemoryType.VRAM}
+            for (src_type, dst_type), ranges in parts.items():
+                if dst_type == "VRAM" and write_meta.dst_device_id is None:
+                    raise ValueError("GPU KV destination requires a device ID")
+                src_ptrs = np.concatenate([write_meta.src_ptrs[r] for r in ranges])
+                dst_ptrs = np.concatenate([write_meta.dst_ptrs[r] for r in ranges])
+                sizes = np.concatenate([write_meta.sizes[r] for r in ranges])
+                requests.append(
+                    TransferRequest(
+                        TransferOp.WRITE,
+                        MemoryDescs.from_arrays_uniform_device(
+                            memory_types[src_type],
+                            src_ptrs,
+                            sizes,
+                            device_id if src_type == "VRAM" else 0,
+                        ),
+                        MemoryDescs.from_arrays_uniform_device(
+                            memory_types[dst_type],
+                            dst_ptrs,
+                            sizes,
+                            write_meta.dst_device_id if dst_type == "VRAM" else 0,
+                        ),
+                        write_meta.peer_name,
+                        None,
+                    )
+                )
+            if requests:
+                return requests[0] if len(requests) == 1 else _TransferBatch(requests)
         if write_meta.meta_type == WriteMetaType.AUX:
             src_dev, dst_dev, mem_type = 0, 0, MemoryType.DRAM
         else:
@@ -1736,6 +1834,7 @@ class Sender(SenderBase):
         # tuples and construct the final sizes array with a single np.repeat().
         # For 48k+ items this avoids many small allocations in the hot loop.
         size_specs: list[tuple[int, int]] = []
+        memory_segments: list[tuple[int, str, str]] = []
         dst_device_id = peer_ri.device_id
         extractor = self._registrar.self_extractor
         peer_extractor = self._registrar.peer_extractor(
@@ -1753,6 +1852,14 @@ class Sender(SenderBase):
                 continue
 
             lg_info = extractor.page_table.layer_groups[self_lg]
+            src_view = lg_info.pool_views[self_pi]
+            dst_view = peer_extractor.page_table.layer_groups[peer_lg].pool_views[peer_pi]
+            src_memory_type = get_physical_pool(
+                extractor.page_table, self_lg, src_view.pool_idx
+            ).memory_type
+            dst_memory_type = get_physical_pool(
+                peer_extractor.page_table, peer_lg, dst_view.pool_idx
+            ).memory_type
             src_block_ids = src_block_ids_per_groups[self_lg]
             dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
@@ -1797,6 +1904,16 @@ class Sender(SenderBase):
                 src_frag_parts.append(rp.src.memory.ptrs)
                 dst_frag_parts.append(rp.dst.memory.ptrs)
                 size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
+                memory_segments.append((rp.src.memory.ptrs.size, src_memory_type, dst_memory_type))
+
+        has_host_memory = any(
+            src_type == "DRAM" or dst_type == "DRAM" for _, src_type, dst_type in memory_segments
+        )
+        if has_host_memory:
+            if req_info.bounce_dst_base is not None:
+                raise ValueError("Host KV transfer requires the direct path, without GPU bounce")
+            if not self._enforce_physical_ownership:
+                raise ValueError("Host KV transfer requires physical transfer ownership")
 
         if src_frag_parts:
             src_frags = np.concatenate(src_frag_parts)
@@ -1831,6 +1948,7 @@ class Sender(SenderBase):
             receiver_slice_id=req_info.slice_id if req_info.slice_id is not None else 0,
             is_last_slice=task._chunk.is_last,
             bounce_dst_base=req_info.bounce_dst_base,
+            memory_segments=tuple(memory_segments) if has_host_memory else (),
         )
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -4664,14 +4782,17 @@ class TransferWorker:
 
     def _register_kv_cache(self):
         assert self._rank_info.page_table is not None
-        memory_descs = get_unique_pool_memory_descs(
-            self._rank_info.page_table, self._rank_info.device_id
-        )
-        if memory_descs:
-            reg_memory_desc = RegMemoryDescs("VRAM", memory_descs)
-            self._agent.register_memory(reg_memory_desc)
-            logger.debug(f"Registered KV cache memory with transfer agent: {memory_descs}")
-            self._registered_mem.append(reg_memory_desc)
+        for memory_type in ("VRAM", "DRAM"):
+            memory_descs = get_unique_pool_memory_descs(
+                self._rank_info.page_table, self._rank_info.device_id, memory_type
+            )
+            if memory_descs:
+                reg_memory_desc = RegMemoryDescs(memory_type, memory_descs)
+                self._agent.register_memory(reg_memory_desc)
+                logger.debug(
+                    f"Registered {memory_type} KV memory with transfer agent: {memory_descs}"
+                )
+                self._registered_mem.append(reg_memory_desc)
 
     def _register_aux_buffer(self):
         assert self._aux_buffer is not None

@@ -22,6 +22,7 @@ import numpy as np
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
 
 from .page import AttentionLayerGroup
 from .utils import get_global_layer_ids
@@ -183,7 +184,7 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
 
 
 class _CacheReuseAdapterV2(CacheReuseAdapter):
-    """Python-based KVCacheManagerV2."""
+    """C++-backed KVCacheManagerV2."""
 
     def __init__(self, mgr: KVCacheManagerV2) -> None:
         self._mgr = mgr
@@ -205,29 +206,30 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         tpb = self.tokens_per_block
         return (kv_cache.num_committed_tokens // tpb) * tpb
 
+    def _gpu_page_indices(self, req: LlmRequest, group_idx: int) -> np.ndarray:
+        cache = self._mgr.kv_cache_map[req.py_request_id]
+        if not cache.is_active:
+            raise RuntimeError("GPU KV transfer requires an active request with locked GPU pages")
+        snapshot = cache.get_page_storage_snapshot(group_idx)
+        slots = np.asarray(snapshot.base_page_indices, dtype=np.int64)
+        levels = snapshot.cache_levels
+        if len(levels) != len(slots):
+            raise ValueError("KV storage snapshot indices and cache levels must have equal lengths")
+        # Raw slot IDs are nonnegative in both GPU and host pools. Only the
+        # explicit storage tier distinguishes a GPU offset from a host offset.
+        if any(slot >= 0 and level != GPU_LEVEL for slot, level in zip(slots, levels)):
+            raise RuntimeError(
+                "GPU KV transfer requires locked GPU pages; offloaded history requires "
+                "a native transfer lease and host pool layout"
+            )
+        return slots
+
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
-        # V2 already returns per-cache-level pool slot indices (not logical block
-        # IDs), and active sequences GPU-lock their pages (_UniqPageLock enforces
-        # cache_level==GPU), so the slot_ids yielded here are already the right
-        # offsets for primary-pool pointer arithmetic. No translation is needed,
-        # unlike V1 (see _CacheReuseAdapterV1.get_block_ids).
-        return np.fromiter(
-            self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
-                group_idx, valid_only=True
-            ),
-            dtype=np.int64,
-        )
+        slots = self._gpu_page_indices(req, group_idx)
+        return slots[slots >= 0]
 
     def get_block_ordinals(self, req, group_idx, lg):  # noqa: ARG002
-        # valid_only=False yields one entry per block ordinal, with -1
-        # (BAD_PAGE_INDEX) for out-of-window (SWA-evicted) and unbound blocks.
-        # Position is the index; no length arithmetic needed.
-        return np.fromiter(
-            self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
-                group_idx, valid_only=False
-            ),
-            dtype=np.int64,
-        )
+        return self._gpu_page_indices(req, group_idx)
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         self._mgr.try_commit_blocks(req)
