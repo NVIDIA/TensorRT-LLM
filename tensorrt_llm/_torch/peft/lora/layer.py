@@ -308,8 +308,6 @@ class LoraLayer(torch.nn.Module):
         for lora_output in lora_outputs:
             if not isinstance(lora_output, torch.Tensor):
                 continue
-            if execute_in_parallel:
-                lora_output.record_stream(torch.cuda.current_stream())
             base_output = add_lora_result(base_output, lora_output)
 
         return base_output
