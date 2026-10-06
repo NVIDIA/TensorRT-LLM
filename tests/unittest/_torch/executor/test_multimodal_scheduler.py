@@ -375,22 +375,76 @@ def test_scheduler_encodes_only_the_items_of_the_prompt_window(
     assert bound_items == [item_idx in expected_items for item_idx in range(2)]
 
 
-@pytest.mark.parametrize("whole_request_output_resident", [True, False])
-def test_admission_checks_only_outputs_resident_at_once(whole_request_output_resident):
-    request = make_mm_request(1, [1, 1])
+def test_first_chunk_reclaims_an_output_another_request_is_consuming():
+    # Each request holds the item at its chunk start and needs the next item
+    # in the same chunk; with the cache full, neither could progress unless
+    # the first one may drop the other's held item.
+    scheduler = _scheduler(
+        max_batch_size=2,
+        max_num_tokens=8,
+        cache_capacity=8,
+        base_scheduler=_BaseScheduler(chunk_size=3),
+        context_chunk_unit_size=4,
+    )
+    first, second = (make_mm_request(rid, [4, 4], interleaved=True) for rid in (1, 2))
+    for request in (first, second):
+        cache_key = _item_cache_keys(request)[0]
+        scheduler.encoder_cache.acquire(cache_key, 4, retain_after_release=False)
+        scheduler.encoder_cache.commit(cache_key, torch.ones(1))
+        request.py_mm_encoder_state.set_item_cache_key(0, cache_key, ready=True)
+    # The second request's next chunk starts at its item 0.
+    second.context_current_position = 1
+
+    output = scheduler.schedule_request([first, second], set())
+
+    assert output.scheduled_mm_encoder_items == {1: [1]}
+    assert output.context_requests == [first]
+    assert second.py_mm_encoder_state.item_cache_keys == [None, None]
+
+
+def test_request_whose_next_chunk_exceeds_one_encoder_step_keeps_its_items():
+    # Both items share the first 4-token chunk unit, but one encoder step fits
+    # only one item: keep both entries so the outputs accumulate.
+    scheduler = _scheduler(
+        max_batch_size=2,
+        max_num_tokens=1,
+        context_chunk_unit_size=4,
+    )
+    request = make_mm_request(1, [1, 1], interleaved=True)
+
+    output = scheduler.schedule_request([request], set())
+
+    assert output.scheduled_mm_encoder_items == {1: [0]}
+    assert output.context_requests == []
+    assert None not in request.py_mm_encoder_state.item_cache_keys
+
+
+@pytest.mark.parametrize(
+    ("context_chunk_unit_size", "admitted"),
+    [
+        # Without chunking, every item must be resident at once.
+        (None, False),
+        # Positions 1 and 3 share a 4-token chunk unit, so both items must be.
+        (4, False),
+        # In separate 2-token units, only one item is needed at a time.
+        (2, True),
+    ],
+)
+def test_admission_checks_only_outputs_resident_at_once(context_chunk_unit_size, admitted):
+    request = make_mm_request(1, [1, 1], interleaved=True)
     budget = dict(
         max_num_tokens=1 << 30,
         max_output_bytes=4,  # One 1-row item.
         bytes_per_encoder_embedding=4,
-        whole_request_output_resident=whole_request_output_resident,
+        context_chunk_unit_size=context_chunk_unit_size,
     )
 
-    if whole_request_output_resident:
-        with pytest.raises(ValueError, match="enable chunked prefill"):
-            initialize_multimodal_encoder_request(request, **budget)
-    else:
+    if admitted:
         initialize_multimodal_encoder_request(request, **budget)
         assert request.py_mm_encoder_state.embedding_lengths == [1, 1]
+    else:
+        with pytest.raises(ValueError, match="raise encoder_max_num_tokens"):
+            initialize_multimodal_encoder_request(request, **budget)
 
 
 def test_completed_context_chunk_releases_only_consumed_items():

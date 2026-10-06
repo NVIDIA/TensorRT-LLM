@@ -1388,25 +1388,60 @@ def format_multimodal_encoder_output_budget_error(
         f"{chunking_hint}")
 
 
+def get_mm_max_resident_embeddings(
+        request: LlmRequest, embedding_lengths: List[int],
+        context_chunk_unit_size: Optional[int]) -> int:
+    """Return the most encoder output rows that prefill needs resident at once.
+
+    Without context chunking, or without `multimodal_embed_mask_cumsum` to
+    place item rows in the prompt, prefill uses every item at once. Otherwise
+    prefill holds only the items of its current chunk and releases each item
+    after consuming it. A chunk can end at any multiple of
+    `context_chunk_unit_size`, so the items that share one unit of the prompt
+    are the ones that must be resident together.
+    """
+    mm_data = request.py_multimodal_data
+    cumsum = (mm_data.get("multimodal_embed_mask_cumsum") if isinstance(
+        mm_data, dict) else None)
+    if context_chunk_unit_size is None or cumsum is None:
+        return sum(embedding_lengths)
+    first_rows, last_rows, lengths = [], [], []
+    row_end = 0
+    for length in embedding_lengths:
+        if length > 0:
+            first_rows.append(row_end + 1)
+            last_rows.append(row_end + length)
+            lengths.append(length)
+        row_end += length
+    # The prompt position of a row is the first position whose cumsum reaches it.
+    positions = torch.searchsorted(
+        cumsum, torch.tensor(first_rows + last_rows,
+                             dtype=cumsum.dtype)).tolist()
+    unit_ranges = [(first // context_chunk_unit_size,
+                    last // context_chunk_unit_size) for first, last in zip(
+                        positions[:len(lengths)], positions[len(lengths):])]
+    # A unit shared by several items is the last unit of the first of them.
+    return max((sum(length
+                    for (first, last), length in zip(unit_ranges, lengths)
+                    if first <= unit <= last) for _, unit in unit_ranges),
+               default=0)
+
+
 def initialize_multimodal_encoder_request(
         request: LlmRequest,
         max_num_tokens: int,
         *,
         max_output_bytes: Optional[int] = None,
         bytes_per_encoder_embedding: int = 0,
-        whole_request_output_resident: bool = True) -> None:
+        context_chunk_unit_size: Optional[int] = None) -> None:
     """Initialize immutable request kind and mutable per-item encoder state.
 
     Raises `ValueError` (failing only this request) when raw encoder inputs
     have missing or empty item metadata, an atomic item is larger than the
     effective encoder token budget, the items' embedding rows do not match
     the prompt's embedding slots, or — when the encoder-output budget is
-    supplied — the outputs that must be resident at once could never fit.
-    With context chunking, prefill needs only the items in its current prompt
-    window and releases each item after consuming it, so only the largest
-    item must fit. Without chunking (`whole_request_output_resident`), no
-    chunk boundary exists before a later item, so the complete footprint must
-    be resident before prefill.
+    supplied — the outputs that must be resident at once could never fit
+    (see `get_mm_max_resident_embeddings`).
     """
     mm_data = request.py_multimodal_data
     has_raw_payload = isinstance(mm_data, dict) and any(
@@ -1449,10 +1484,9 @@ def initialize_multimodal_encoder_request(
                     "embedding rows but the prompt has "
                     f"{num_embedding_slots} embedding slots")
         if (max_output_bytes is not None and bytes_per_encoder_embedding > 0):
-            resident_embeddings = (sum(embedding_lengths)
-                                   if whole_request_output_resident else
-                                   max(embedding_lengths))
-            resident_bytes = resident_embeddings * bytes_per_encoder_embedding
+            resident_bytes = get_mm_max_resident_embeddings(
+                request, embedding_lengths,
+                context_chunk_unit_size) * bytes_per_encoder_embedding
             if resident_bytes > max_output_bytes:
                 raise ValueError(
                     format_multimodal_encoder_output_budget_error(
@@ -1460,8 +1494,8 @@ def initialize_multimodal_encoder_request(
                         max_output_bytes,
                         max_num_tokens,
                         request_id=request.py_request_id,
-                        whole_request_output_resident=(
-                            whole_request_output_resident),
+                        whole_request_output_resident=(context_chunk_unit_size
+                                                       is None),
                     ))
         request.py_mm_encoder_state = (
             MultimodalEncoderRequestState.from_embedding_lengths(

@@ -812,8 +812,10 @@ class MultimodalScheduler(RequestScheduler):
 
         The first request with pending items decides: it keeps whole-request
         selection once it holds every entry it still needs, and starts it only
-        when all of its remaining outputs fit the cache and its unbound items
-        fit one encoder step.
+        when its unbound remaining outputs fit the free cache space and its
+        unbound items fit one encoder step. Whole-request selection cannot
+        reclaim space that other requests hold, so a request that only fits
+        the empty cache follows context chunks instead.
         """
         if self.context_chunk_unit_size is None:
             return True
@@ -830,20 +832,28 @@ class MultimodalScheduler(RequestScheduler):
                 return True
             item_cache_keys, _ = self._get_request_item_cache_keys(request, state)
             # Read cache keys only; do not change cache state for this check.
-            output_bytes = {
-                item_cache_keys[item_idx]: state.embedding_lengths[item_idx]
-                * self.bytes_per_encoder_embedding
+            unbound_items = [
+                item_idx
                 for item_idx in get_mm_items_for_chunk(
                     request, get_mm_context_chunk_start(request), request.prompt_len
                 )
+                if state.item_cache_keys[item_idx] is None
+            ]
+            output_bytes = {
+                item_cache_keys[item_idx]: state.embedding_lengths[item_idx]
+                * self.bytes_per_encoder_embedding
+                for item_idx in unbound_items
             }
             encoder_tokens = {
                 item_cache_keys[item_idx]: state.encoder_token_lengths[item_idx]
-                for item_idx in pending_item_indices
-                if state.item_cache_keys[item_idx] is None
+                for item_idx in unbound_items
             }
+            cache_stats = self.encoder_cache.stats()
+            free_bytes = (
+                cache_stats.max_bytes - cache_stats.reserved_bytes - cache_stats.in_use_bytes
+            )
             return (
-                sum(output_bytes.values()) <= self.encoder_cache.max_bytes
+                sum(output_bytes.values()) <= free_bytes
                 and len(encoder_tokens) <= self.max_batch_size
                 and sum(encoder_tokens.values()) <= self.max_num_tokens
             )
@@ -903,11 +913,13 @@ class MultimodalScheduler(RequestScheduler):
     ) -> list[tuple[LlmRequest, int]]:
         """Return held outputs that no chunk of this pass uses, newest first.
 
-        A request's next chunk always uses the item at its chunk start, so that
-        item is kept. A dropped output is acquired and encoded again when a
-        later chunk uses it.
+        A dropped output is acquired and encoded again when a later chunk uses
+        it. Outputs at a request's next chunk start come last: that request
+        needs them immediately, but requests that each hold one and need
+        another item could otherwise block each other permanently.
         """
         candidates = []
+        chunk_start_candidates = []
         for request in reversed(active_requests):
             state = request.py_mm_encoder_state
             if state is None:
@@ -919,12 +931,14 @@ class MultimodalScheduler(RequestScheduler):
                 if (
                     cache_key is None
                     or cache_key in step.cache_keys
-                    or item_idx in next_items
                     or (request.request_id, item_idx) in protected_items
                 ):
                     continue
-                candidates.append((request, item_idx))
-        return candidates
+                if item_idx in next_items:
+                    chunk_start_candidates.append((request, item_idx))
+                else:
+                    candidates.append((request, item_idx))
+        return candidates + chunk_start_candidates
 
     def _reclaim_and_acquire_item_cache_entry(
         self,
@@ -1014,9 +1028,11 @@ class MultimodalScheduler(RequestScheduler):
                 request.context_chunk_size = self._get_chunk_size_before_item(
                     request, begin, unavailable_item
                 )
-                final_items = set(
-                    get_mm_items_for_chunk(request, begin, begin + request.context_chunk_size)
-                )
+                # A request that cannot run any chunk keeps the items of its
+                # smallest next chunk, so their outputs accumulate when they
+                # do not fit one encoder step together.
+                kept_end = begin + (request.context_chunk_size or self.context_chunk_unit_size or 0)
+                final_items = set(get_mm_items_for_chunk(request, begin, kept_end))
                 for item_idx in chunk_items:
                     if item_idx not in final_items:
                         step.unselect(request, state, item_idx)

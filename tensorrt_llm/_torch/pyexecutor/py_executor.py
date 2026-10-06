@@ -6260,9 +6260,8 @@ class PyExecutor:
                             "bytes_per_mm_encoder_embedding",
                             0,
                         ),
-                        whole_request_output_resident=getattr(
-                            self.scheduler, "context_chunk_unit_size",
-                            None) is None)
+                        context_chunk_unit_size=getattr(
+                            self.scheduler, "context_chunk_unit_size", None))
                 return False
             except Exception as e:
                 self._handle_errors(str(e),
