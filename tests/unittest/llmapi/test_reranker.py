@@ -74,6 +74,7 @@ class FakeBatcher:
 
 def _server(logits, *, max_seq_len=4096, max_num_tokens=4096):
     server = OpenAIServer.__new__(OpenAIServer)
+    server.model = "served-reranker"
     server.tokenizer = CharacterTokenizer()
     server.encode_batcher = FakeBatcher(logits)
     server._input_proc_executor = None
@@ -191,6 +192,22 @@ async def test_v1_rerank_sorts_top_n_and_returns_documents():
     assert [result["document"]["text"] for result in body["results"]] == ["high", "middle"]
     assert all(0.0 <= result["relevance_score"] <= 1.0 for result in body["results"])
     assert body["usage"]["prompt_tokens"] == body["usage"]["total_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_v1_rerank_reports_served_model():
+    server = _server([0.0])
+    request = RerankRequest(
+        model="requested-reranker",
+        query="query",
+        documents=["document"],
+    )
+
+    response = await server._rerank(request)
+    body = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert body["model"] == "served-reranker"
 
 
 @pytest.mark.asyncio

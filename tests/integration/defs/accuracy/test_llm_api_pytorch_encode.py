@@ -285,6 +285,7 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
                 inputs = tokenizer(prompt, return_tensors="pt").to(hf_model.device)
                 hf_last = hf_model(**inputs, logits_to_keep=1).logits[0, -1].float().cpu()
             hf_score = hf_last[yes_token_id] - hf_last[no_token_id]
+            assert outputs[index].logits.numel() == 1
             trtllm_score = outputs[index].logits.flatten()[0].float().cpu()
 
             torch.testing.assert_close(

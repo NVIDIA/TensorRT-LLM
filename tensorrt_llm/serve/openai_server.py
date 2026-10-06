@@ -1750,7 +1750,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                  relevance_score=score,
                                  document=document))
             prompt_tokens = sum(len(token_ids) for token_ids in token_ids_list)
-            response = RerankResponse(model=request.model or self.model,
+            response = RerankResponse(model=self.model,
                                       results=results,
                                       usage=RerankUsageInfo(
                                           prompt_tokens=prompt_tokens,

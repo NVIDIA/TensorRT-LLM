@@ -23,6 +23,7 @@ from .openai_server import RemoteRerankServer
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 MODEL = "Qwen/Qwen3-Reranker-0.6B"
+SERVED_MODEL = MODEL.rsplit("/", 1)[-1]
 QUERY = "What is the capital of China?"
 DOCUMENTS = [
     "Bananas are typically grown in tropical climates.",
@@ -58,7 +59,7 @@ def test_v1_rerank_aliases_and_top_n(server):
         response = _post(server, path, top_n=1, return_documents=True)
         assert response.status_code == 200
         body = response.json()
-        assert body["model"] == MODEL
+        assert body["model"] == SERVED_MODEL
         assert len(body["results"]) == 1
         assert body["results"][0]["index"] == 1
         assert body["results"][0]["document"]["text"] == DOCUMENTS[1]
