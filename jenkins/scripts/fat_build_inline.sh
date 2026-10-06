@@ -80,8 +80,6 @@ pip3 install --no-user --retries 10 -r TensorRT-LLM/src/requirements-dev.txt
 # here too, or fat-sqsh jobs run against a smaller environment than everyone else.
 echo "[fat_build] Installing requirements-grpc-smg.txt..."
 pip3 install --no-user --retries 10 -r TensorRT-LLM/src/requirements-grpc-smg.txt
-echo "[fat_build] Installing requirements-openengine.txt..."
-pip3 install --no-user --retries 10 -r TensorRT-LLM/src/requirements-openengine.txt
 echo "[fat_build] Installing trtllm wheel..."
 pip3 install --no-user --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
 # Baked in even though the non-fat paths let the test fixtures install it on
