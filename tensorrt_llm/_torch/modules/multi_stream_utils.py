@@ -43,6 +43,10 @@ def _record_stream(obj: Any, stream: torch.cuda.Stream) -> None:
                 # The cudaMallocAsync backend asserts on memory it did not
                 # allocate (a buffer from outside PyTorch, wrapped as a
                 # tensor). It never frees that memory: nothing to record.
+                # The text is the TORCH_INTERNAL_ASSERT in
+                # CudaMallocAsyncAllocator::recordStream
+                # (c10/cuda/CUDAMallocAsyncAllocator.cpp, torch
+                # 2.14.0a0+4fdf77b940.nv26.08); re-check it on torch upgrades.
                 if (torch.cuda.memory.get_allocator_backend()
                         != "cudaMallocAsync"
                         or "ptr not found in ptr_info" not in str(e)):
@@ -76,7 +80,12 @@ def maybe_execute_in_parallel(
     stream, so their memory outlives the caller's use. During capture nothing
     is recorded: a captured graph relies on every later use of aux_stream
     first waiting for the calling stream, as the next call's event0.wait()
-    does. Other work captured on aux_stream must do the same.
+    does. Other work captured on aux_stream must do the same. Callers should
+    not record fn1()'s outputs themselves.
+
+    A caller that torch.compile traces with disable_on_compile=False runs
+    fn1() on aux_stream without this record, outside CUDA graphs too, so it
+    must order the reuse of fn1()'s outputs itself.
 
     Args:
         fn0 (Callable): callable for the default stream
