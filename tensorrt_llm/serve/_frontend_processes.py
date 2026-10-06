@@ -6,7 +6,9 @@
 import json
 import os
 import select
-import subprocess
+
+# Re-exec the serving CLI with sys.executable and an argument list, without a shell.
+import subprocess  # nosec B404
 import sys
 import threading
 import time
