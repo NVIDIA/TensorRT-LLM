@@ -153,7 +153,6 @@ set_property(TARGET tllm_kernel_int8_gemm
 add_tllm_kernel_library(
   tllm_kernel_weight_only
   SOURCES
-  preQuantScaleKernel.cu
   weightOnlyBatchedGemv/kernelDispatcherBf16Int4GroupwiseColumnMajorFalse.cu
   weightOnlyBatchedGemv/kernelDispatcherBf16Int4GroupwiseColumnMajorInterleavedForHopperTrue.cu
   weightOnlyBatchedGemv/kernelDispatcherBf16Int4GroupwiseColumnMajorInterleavedTrue.cu
@@ -230,3 +229,8 @@ add_tllm_kernel_library(
 
 add_tllm_kernel_library(tllm_kernel_quantization SOURCES quantization.cu
                         LINK_LIBRARIES tllm::common_environment)
+
+add_tllm_kernel_library(tllm_kernel_pre_quant_scale SOURCES
+                        preQuantScaleKernel.cu)
+target_link_libraries(tllm_kernel_weight_only
+                      PUBLIC tllm::kernel_pre_quant_scale)
