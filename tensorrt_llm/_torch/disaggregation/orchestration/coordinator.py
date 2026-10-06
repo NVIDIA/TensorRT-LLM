@@ -269,10 +269,12 @@ class DisaggTransferCoordinator:
         if is_gen_only_no_context_benchmark():
             return fitting_gen_init, False
 
-        if not (self._transfer_window_is_active() and fitting_gen_init):
+        if not self._transfer_window_is_active():
             return fitting_gen_init, False
 
         controller = self._admission_controller
+        if not fitting_gen_init:
+            return fitting_gen_init, controller.scheduling_blocked_by_active_transfers
         admission_result = controller.select(self._registry.active_requests(), fitting_gen_init)
         if admission_result.deferred_request_count > 0:
             logger.debug(
@@ -287,7 +289,8 @@ class DisaggTransferCoordinator:
 
         return (
             admission_result.admitted_requests,
-            admission_result.is_blocked_by_active_transfers(),
+            admission_result.is_blocked_by_active_transfers()
+            or controller.scheduling_blocked_by_active_transfers,
         )
 
     def revert_deferred_gen_init(

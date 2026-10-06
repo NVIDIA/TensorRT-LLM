@@ -60,7 +60,8 @@ from ..disaggregation.orchestration.admission import \
     DisaggTransferAdmissionController
 from ..disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator, NoopDisaggCoordinator, attach_ctx_usage,
-    transfer_window_bypass_eligible)
+    is_gen_only_no_context_benchmark, transfer_window_bypass_eligible,
+    uses_async_gen_transfer)
 from ..disaggregation.orchestration.pp_termination import \
     DisaggPPTerminationHandler
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
@@ -117,6 +118,7 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter, count_retiring_requests
+from .scheduler.scheduler_v2 import KVCacheV2Scheduler
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -1021,6 +1023,7 @@ class PyExecutor:
                                    None)
         self._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
             max_tokens_in_buffer, tokens_per_block)
+        self._bind_sync_disagg_transfer_admission()
         if (self.global_rank == 0
                 and self._disagg_transfer_admission_controller.enabled()
                 and transfer_window_bypass_eligible(self.kv_cache_transceiver,
@@ -3810,6 +3813,26 @@ class PyExecutor:
             self.kv_cache_manager.commit_scheduled_kv_cache_stats(
                 scheduled_batch)
 
+    def _bind_sync_disagg_transfer_admission(self) -> None:
+        """Apply early INIT admission to the direct synchronous V2 scheduler."""
+        controller = self._disagg_transfer_admission_controller
+        transceiver = self.kv_cache_transceiver
+        if (self._is_kv_manager_v2
+                and type(self.scheduler) is KVCacheV2Scheduler
+                and self.scheduler.peft_cache_manager is None
+                and self.scheduler.draft_kv_cache_manager is None
+                and self.scheduler.cross_kv_cache_manager is None
+                and self.drafter is None
+                and not self.model_engine.is_spec_decode
+                and self.kv_cache_manager.kv_connector_manager is None
+                and transceiver is not None
+                and transceiver.consumes_transfer_buffer is False
+                and self.dist.pp_size == 1 and self.dist.cp_size == 1
+                and not self.enable_attention_dp
+                and not is_gen_only_no_context_benchmark()
+                and not uses_async_gen_transfer() and controller.enabled()):
+            self.scheduler.set_sync_transfer_admission(controller)
+
     @property
     def disagg(self) -> DisaggTransferCoordinator:
         """Disagg transfer entry points; built on first use."""
@@ -3892,9 +3915,9 @@ class PyExecutor:
 
         Args:
             scheduler_fitting_disagg_gen_init_requests: Generation INIT
-                requests that fit KV capacity before transfer admission. A
-                nonempty list means KV capacity exists even if transfer
-                admission temporarily defers every request.
+                candidates selected by the scheduler. An early transfer window
+                can also leave this list empty, so the accompanying transfer
+                backpressure flag distinguishes that case from KV exhaustion.
             wait_for_disagg_gen_transfer_progress: Whether active generation
                 transfers are consuming the admission budget and transfer
                 progress can unblock a deferred request.
@@ -4036,9 +4059,9 @@ class PyExecutor:
             # scheduler could not allocate KV for any of them, the benchmark
             # will hang forever because in-progress generation requests won't
             # release their KV cache.
-            # Check the scheduler result from before transfer admission. An
-            # empty admitted list can mean that active transfers are
-            # temporarily consuming the transfer budget.
+            # Pair scheduler candidates with transfer backpressure: an empty
+            # list alone does not distinguish an early window deferral from
+            # exhausted KV capacity.
             has_insufficient_kv = self._sync_gen_only_benchmark_has_insufficient_kv(
                 scheduler_fitting_disagg_gen_init_requests,
                 wait_for_disagg_gen_transfer_progress)

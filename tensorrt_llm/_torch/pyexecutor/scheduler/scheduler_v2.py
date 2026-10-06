@@ -18,6 +18,9 @@ import os
 from collections import Counter
 from typing import Callable, Optional
 
+from tensorrt_llm._torch.disaggregation.orchestration.admission import (
+    DisaggTransferAdmissionController,
+)
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
 
@@ -208,6 +211,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             scheduler_policy = CapacitySchedulerPolicy.MAX_UTILIZATION
         self.policy = scheduler_policy
         self.peft_cache_manager = peft_cache_manager
+        self._sync_transfer_admission: DisaggTransferAdmissionController | None = None
 
         # Chunking config.
         self.chunking_enabled = False
@@ -259,6 +263,10 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
+
+    def set_sync_transfer_admission(self, controller: DisaggTransferAdmissionController) -> None:
+        """Bound INIT allocations by the executor's synchronous transfer window."""
+        self._sync_transfer_admission = controller
 
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
@@ -327,6 +335,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
         requests_list = list(active_requests)
+        controller = self._sync_transfer_admission
+        transfer_admission = (
+            controller.start_scheduling(requests_list) if controller is not None else None
+        )
 
         # Opt-in: prioritize disagg-gen first-token requests (see __init__).
         # py_decoding_iter == 0 covers DISAGG_GENERATION_INIT /
@@ -390,6 +402,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             # no free slots remain, so the request is skipped and retried next
             # iteration. PEFT budget is still checked and committed.
             if req_state_value == self._disagg_gen_init_state_value:
+                if transfer_admission is not None and not controller.can_admit(
+                    transfer_admission, req
+                ):
+                    # A closed INIT window must not prevent later decodes from
+                    # releasing KV space. Retry its FCFS head next iteration.
+                    req_it += 1
+                    continue
                 peft_pages = budget.peft_pages_needed(req)
                 if peft_pages is None:
                     break
@@ -401,6 +420,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                     req_it += 1
                     continue
                 disagg_candidates.append(req)
+                if transfer_admission is not None:
+                    controller.commit(transfer_admission, req)
                 # Disagg requests only commit PEFT (not num_requests/num_tokens)
                 # because they don't participate in the forward pass. Counting
                 # them toward num_requests would steal batch slots from gen/ctx

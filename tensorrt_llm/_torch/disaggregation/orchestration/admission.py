@@ -31,6 +31,7 @@ class DisaggTransferAdmissionController:
     ) -> None:
         self.max_transfer_blocks = self._to_block_budget(max_tokens_in_buffer, tokens_per_block)
         self.tokens_per_block = tokens_per_block or 0
+        self._scheduling_result: DisaggTransferAdmissionResult | None = None
 
     def enabled(self) -> bool:
         return self.max_transfer_blocks is not None
@@ -68,9 +69,6 @@ class DisaggTransferAdmissionController:
         prompt_len = self._get_request_transfer_token_count(request)
         return (prompt_len + self.tokens_per_block - 1) // self.tokens_per_block
 
-    def _estimate_requests_blocks(self, requests: Iterable[LlmRequest]) -> int:
-        return sum(self._estimate_request_blocks(request) for request in requests)
-
     def _estimate_active_transfer_blocks(self, active_requests: Iterable[LlmRequest]) -> int:
         return sum(
             self._estimate_request_blocks(request)
@@ -78,37 +76,61 @@ class DisaggTransferAdmissionController:
             if request.is_disagg_generation_transmission_in_progress
         )
 
+    def start_scheduling(
+        self, active_requests: Iterable[LlmRequest]
+    ) -> DisaggTransferAdmissionResult:
+        """Start a fresh allocation pass, including its active-transfer backpressure."""
+        self._scheduling_result = self._new_result(active_requests)
+        return self._scheduling_result
+
+    @property
+    def scheduling_blocked_by_active_transfers(self) -> bool:
+        """Whether the current allocation pass is waiting for transfers, not KV space."""
+        return (
+            self._scheduling_result is not None
+            and self._scheduling_result.is_blocked_by_active_transfers()
+        )
+
+    def _new_result(self, active_requests: Iterable[LlmRequest]) -> DisaggTransferAdmissionResult:
+        return DisaggTransferAdmissionResult(
+            admitted_requests=[],
+            active_transfer_blocks=self._estimate_active_transfer_blocks(active_requests),
+        )
+
+    def can_admit(self, result: DisaggTransferAdmissionResult, request: LlmRequest) -> bool:
+        """Check the next FCFS candidate; a budget rejection closes this pass."""
+        if not self.enabled():
+            return True
+        if result.limited_by_budget:
+            return False
+        request_blocks = self._estimate_request_blocks(request)
+        max_transfer_blocks = self.max_transfer_blocks
+        assert max_transfer_blocks is not None
+        fits_budget = (
+            result.active_transfer_blocks + result.admitted_transfer_blocks + request_blocks
+            <= max_transfer_blocks
+        )
+        admit_oversized_head = (
+            not result.admitted_requests
+            and result.active_transfer_blocks == 0
+            and request_blocks > max_transfer_blocks
+        )
+        result.limited_by_budget = not (fits_budget or admit_oversized_head)
+        return not result.limited_by_budget
+
+    def commit(self, result: DisaggTransferAdmissionResult, request: LlmRequest) -> None:
+        """Charge an accepted candidate; allocation callers commit only on success."""
+        result.admitted_requests.append(request)
+        result.admitted_transfer_blocks += self._estimate_request_blocks(request)
+
     def select(
         self, active_requests: Iterable[LlmRequest], candidates: List[LlmRequest]
     ) -> DisaggTransferAdmissionResult:
-        if not self.enabled():
-            return DisaggTransferAdmissionResult(
-                admitted_requests=list(candidates),
-                active_transfer_blocks=self._estimate_active_transfer_blocks(active_requests),
-                admitted_transfer_blocks=self._estimate_requests_blocks(candidates),
-            )
-
-        result = DisaggTransferAdmissionResult(admitted_requests=[])
-        result.active_transfer_blocks = self._estimate_active_transfer_blocks(active_requests)
-
-        used_blocks = result.active_transfer_blocks
-        max_transfer_blocks = self.max_transfer_blocks
-        assert max_transfer_blocks is not None
+        result = self._new_result(active_requests)
         for request in candidates:
-            request_blocks = self._estimate_request_blocks(request)
-            fits_budget = used_blocks + request_blocks <= max_transfer_blocks
-            admit_oversized_head = (
-                not result.admitted_requests
-                and result.active_transfer_blocks == 0
-                and request_blocks > max_transfer_blocks
-            )
-            if not fits_budget and not admit_oversized_head:
-                result.limited_by_budget = True
+            if not self.can_admit(result, request):
                 break
-
-            result.admitted_requests.append(request)
-            used_blocks += request_blocks
-            result.admitted_transfer_blocks += request_blocks
+            self.commit(result, request)
 
         result.deferred_request_count = len(candidates) - len(result.admitted_requests)
         return result
