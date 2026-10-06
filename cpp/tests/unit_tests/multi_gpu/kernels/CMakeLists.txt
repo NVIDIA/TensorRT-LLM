@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -14,9 +14,12 @@
 # the License.
 
 if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
-  add_gtest(allReduceKernelTest allReduce/allReduceKernelTest.cu)
-  add_gtest(allReduceFusionTest allReduce/allReduceFusionTest.cu)
-  add_gtest(gemmAllReduceTest allReduce/gemmAllReduceTest.cu)
+  add_tllm_gtest(allReduceKernelTest SOURCES allReduce/allReduceKernelTest.cu
+                 FULL_STACK LABELS "unit;full-stack")
+  add_tllm_gtest(allReduceFusionTest SOURCES allReduce/allReduceFusionTest.cu
+                 FULL_STACK LABELS "unit;full-stack")
+  add_tllm_gtest(gemmAllReduceTest SOURCES allReduce/gemmAllReduceTest.cu
+                 FULL_STACK LABELS "unit;full-stack")
   if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
     target_link_libraries(gemmAllReduceTest PRIVATE ar_gemm_src)
     target_compile_definitions(gemmAllReduceTest

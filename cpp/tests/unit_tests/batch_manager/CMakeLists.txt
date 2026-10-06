@@ -103,7 +103,9 @@ add_tllm_gtest(
   "unit;batch-manager;gpu"
   REQUIRES_GPU)
 
-add_gtest(contextTransferCoordinatorTest contextTransferCoordinatorTest.cpp)
+add_tllm_gtest(
+  contextTransferCoordinatorTest SOURCES contextTransferCoordinatorTest.cpp
+  FULL_STACK LABELS "unit;full-stack")
 
 add_tllm_gtest(
   evictionPolicyTest
@@ -348,9 +350,11 @@ add_tllm_gtest(
   "unit;batch-manager;gpu"
   REQUIRES_GPU)
 
-add_gtest(peftCacheManagerTest peftCacheManagerTest.cpp)
+add_tllm_gtest(peftCacheManagerTest SOURCES peftCacheManagerTest.cpp FULL_STACK
+               LABELS "unit;full-stack")
 
-add_gtest(rnnCacheFormatterTest rnnCacheFormatterTest.cpp)
+add_tllm_gtest(rnnCacheFormatterTest SOURCES rnnCacheFormatterTest.cpp
+               FULL_STACK LABELS "unit;full-stack")
 
 add_tllm_gtest(
   agentTreeTest
