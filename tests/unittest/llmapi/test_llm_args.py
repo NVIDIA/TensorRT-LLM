@@ -251,6 +251,58 @@ moe_backend: TRTLLM
 
 
 @pytest.mark.cpu_only
+class TestMoeConfigRebalanceCompatibility:
+
+    @staticmethod
+    def _active_rebalance() -> dict[str, object]:
+        return {"enabled": True, "helper_slots_per_rank": 4}
+
+    def test_rejects_load_balancer_with_active_rebalance(self,
+                                                         monkeypatch) -> None:
+        monkeypatch.delenv("TRTLLM_MOE_REBALANCE_DISABLE", raising=False)
+
+        with pytest.raises(
+                ValidationError,
+                match=r"rebalance cannot be combined.*load_balancer"):
+            MoeConfig(
+                backend="MEGAMOE_CUTEDSL",
+                load_balancer="load-balancer-config",
+                rebalance=self._active_rebalance(),
+            )
+
+    @pytest.mark.parametrize("backend", ["AUTO", "CUTLASS"])
+    def test_rejects_explicit_incompatible_backend(self, monkeypatch,
+                                                   backend: str) -> None:
+        monkeypatch.delenv("TRTLLM_MOE_REBALANCE_DISABLE", raising=False)
+
+        with pytest.raises(
+                ValidationError,
+                match=r"rebalance requires backend='MEGAMOE_CUTEDSL'"):
+            MoeConfig(backend=backend, rebalance=self._active_rebalance())
+
+    @pytest.mark.parametrize("backend", [None, "MEGAMOE_CUTEDSL"])
+    def test_accepts_compatible_backend(self, monkeypatch,
+                                        backend: str | None) -> None:
+        monkeypatch.delenv("TRTLLM_MOE_REBALANCE_DISABLE", raising=False)
+        kwargs = {} if backend is None else {"backend": backend}
+
+        config = MoeConfig(rebalance=self._active_rebalance(), **kwargs)
+
+        assert config.rebalance is not None and config.rebalance.is_active
+
+    def test_disable_override_makes_conflicts_inert(self, monkeypatch) -> None:
+        monkeypatch.setenv("TRTLLM_MOE_REBALANCE_DISABLE", "1")
+
+        config = MoeConfig(
+            backend="CUTLASS",
+            load_balancer="load-balancer-config",
+            rebalance=self._active_rebalance(),
+        )
+
+        assert config.rebalance is not None and not config.rebalance.is_active
+
+
+@pytest.mark.cpu_only
 def test_rejection_sampling_allows_attention_dp(monkeypatch):
     """ADP (incl. ADP+LM-head-TP) supports rejection sampling.
 

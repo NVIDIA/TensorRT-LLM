@@ -1922,6 +1922,20 @@ class MoeConfig(StrictBaseModel):
         "Use low precision combine in MoE operations (only for NVFP4 quantization). When enabled, uses lower precision for combining expert outputs to improve performance."
     )
 
+    @model_validator(mode="after")
+    def validate_rebalance_compatibility(self) -> "MoeConfig":
+        if self.rebalance is None or not self.rebalance.is_active:
+            return self
+        if self.load_balancer is not None:
+            raise ValueError("moe_config.rebalance cannot be combined with "
+                             "moe_config.load_balancer")
+        if ("backend" in self.model_fields_set
+                and self.backend != "MEGAMOE_CUTEDSL"):
+            raise ValueError(
+                "active moe_config.rebalance requires "
+                "backend='MEGAMOE_CUTEDSL' when backend is explicitly set")
+        return self
+
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
 
