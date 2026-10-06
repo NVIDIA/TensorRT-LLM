@@ -102,6 +102,7 @@ def _capture_manager_kwargs(
         SimpleNamespace(
             model=SimpleNamespace(model_config=model_config),
             is_multimodal=is_multimodal,
+            _max_cuda_graph_batch_size=4,
         )
         if is_multimodal is not None
         else None

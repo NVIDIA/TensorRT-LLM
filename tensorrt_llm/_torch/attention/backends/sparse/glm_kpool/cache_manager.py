@@ -230,6 +230,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             if layer_id in self.layer_offsets
         }
 
+    @override
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: DataRole) -> int:
         index_bytes = (
             self.index_state_dim * torch.bfloat16.itemsize
@@ -241,6 +242,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         cache_bytes = super().get_layer_bytes_per_token(local_layer_idx, data_role)
         return cache_bytes + index_bytes if data_role == Role.ALL else cache_bytes
 
+    @override
     def _attention_cache_bytes_per_token(self) -> int:
         return sum(
             self.get_layer_bytes_per_token(local_layer_idx, Role.ALL)
@@ -248,6 +250,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         )
 
     @staticmethod
+    @override
     def get_cache_size_per_token(
         model_config: ModelConfig,
         mapping: Mapping,
