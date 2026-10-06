@@ -18,7 +18,6 @@ set(SRCS
     bufferManagerNvls.cpp
     utils/runtimeUtils.cpp
     utils/debugUtils.cu
-    loraCache.cpp
     ipcUtils.cpp
     mcastDeviceMemory.cpp
     moeLoadBalancer/hostAccessibleDeviceAllocator.cpp
@@ -138,6 +137,16 @@ target_link_libraries(tllm_runtime_lora PUBLIC tllm::runtime_buffers
                                                tllm::runtime_distributed)
 target_compile_features(tllm_runtime_lora PUBLIC cxx_std_20)
 set_target_properties(tllm_runtime_lora PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(tllm_runtime_lora_cache STATIC loraCache.cpp)
+add_library(tllm::runtime_lora_cache ALIAS tllm_runtime_lora_cache)
+target_link_libraries(
+  tllm_runtime_lora_cache
+  PUBLIC tllm::runtime_lora
+  PRIVATE Threads::Threads)
+target_compile_features(tllm_runtime_lora_cache PUBLIC cxx_std_20)
+set_target_properties(tllm_runtime_lora_cache
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 foreach(component
         tllm_runtime_memory tllm_runtime_buffers tllm_runtime_distributed

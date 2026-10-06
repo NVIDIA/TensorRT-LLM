@@ -76,8 +76,17 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;runtime;host")
-add_tllm_gtest(loraCacheTest SOURCES loraCacheTest.cpp FULL_STACK LABELS
-               "unit;full-stack;gpu")
+add_tllm_gtest(
+  loraCacheTest
+  OWNER
+  runtime
+  SOURCES
+  loraCacheTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_lora_cache
+  tllm::runtime_numpy
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   loraUtilsTest
   OWNER
