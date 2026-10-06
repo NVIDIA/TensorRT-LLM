@@ -187,7 +187,7 @@ def cache_case(
         )
         # Exercise actual index queries even for short rows and generation.
         buffers = {}
-        for layer, role in manager._layer_roles:
+        for layer, _, role in manager._layer_roles:
             buffer = manager.get_buffers(layer, role)
             buffers.setdefault(buffer.data_ptr(), buffer)
         # Initialize storage to finite bytes before cold writes / prefix warm-up.

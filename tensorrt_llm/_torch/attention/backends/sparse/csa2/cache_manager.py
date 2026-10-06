@@ -149,6 +149,9 @@ class CSA2CacheManager(KVCacheManagerV2):
     exactly the ``[pages, 64, 1, 68]`` layout the native paged index kernels
     read in place (as the DeepSeek-V4 indexer cache does), so decode never
     repacks index rows.
+
+    Logical buffer identities include model layer, compression ratio and role.
+    SWA belongs to the uncompressed family regardless of the layer's GLOBAL ratio.
     """
 
     def __init__(
@@ -240,7 +243,7 @@ class CSA2CacheManager(KVCacheManagerV2):
                 self.layout.window_size, self._decoder_replay_window
             ):
                 raise ValueError("Encoder recovery requires max_num_tokens > window_size")
-        self._global_buffers = {}
+        self._global_buffers: dict[tuple[int, int, CSA2CacheRole], torch.Tensor] = {}
         super().__init__(
             kv_cache_config,
             kv_cache_type,
@@ -255,16 +258,16 @@ class CSA2CacheManager(KVCacheManagerV2):
         if self.enable_block_reuse and self._decoder_replay_window:
             owner = max(self.layout.kv_source_layer_ids)
             self._encoder_roles = tuple(
-                (layer, role)
-                for layer, role in self._layer_roles
+                (layer, ratio, role)
+                for layer, ratio, role in self._layer_roles
                 if role not in (CSA2CacheRole.GLOBAL, CSA2CacheRole.INDEX)
                 and (layer < owner or role != CSA2CacheRole.SWA)
             )
             self._encoder_optional_groups = tuple(
                 sorted(
                     {
-                        self.impl.get_layer_group_id(self._layer_roles[layer, role])
-                        for layer, role in self._encoder_roles
+                        self.impl.get_layer_group_id(self._layer_roles[key])
+                        for key in self._encoder_roles
                         if self._encoder_replay_enabled
                     }
                 )
@@ -477,10 +480,17 @@ class CSA2CacheManager(KVCacheManagerV2):
         limit = getattr(self, "context_swa_layer_limit", None)
         return limit is None or layer_idx < limit
 
+    def _cache_role_key(
+        self, layer_idx: int, role: CSA2CacheRole
+    ) -> tuple[int, int, CSA2CacheRole]:
+        """Return the model layer, buffer compression family and role."""
+        ratio = 1 if role == CSA2CacheRole.SWA else self.layout.compress_ratios[layer_idx]
+        return layer_idx, ratio, role
+
     def _cache_layer_id(self, layer_idx: int, role: CSA2CacheRole) -> LayerId:
         if role == CSA2CacheRole.SWA and not self.has_swa_cache(layer_idx):
             raise ValueError(f"Context decoder layer {layer_idx} has no SWA cache")
-        return self._layer_roles[layer_idx, role]
+        return self._layer_roles[self._cache_role_key(layer_idx, role)]
 
     def _window(self, base: int) -> int:
         return base + self.max_draft_len + self.reuse_match_backoff
@@ -510,15 +520,21 @@ class CSA2CacheManager(KVCacheManagerV2):
 
     def _build_cache_config(self, config):
         layers = []
-        self._layer_roles = {}
-        self._physical_roles = {}
+        self._layer_roles: dict[tuple[int, int, CSA2CacheRole], LayerId] = {}
+        self._physical_roles: dict[tuple[LayerId, DataRole], tuple[int, int, CSA2CacheRole]] = {}
         # Reuse the V2 extractor's virtual-layer contract. Physical layer IDs
         # include GLOBAL and compressor groups and cannot index pp_layers.
         # Only canonical owners enter this map; consumer aliases below must
         # not change the identity peers use for a shared GLOBAL allocation.
         self._layer_attn_to_layer_id = {}
 
-        def add(model_layer, roles, sizes, window):
+        def add(
+            model_layer: int,
+            ratio: int,
+            roles: list[CSA2CacheRole],
+            sizes: list[int],
+            window: int | None,
+        ) -> None:
             layer_id = LayerId(len(layers))
             if roles[0] == CSA2CacheRole.SWA:
                 kind = _CSA2LayerKind.SWA
@@ -528,8 +544,8 @@ class CSA2CacheManager(KVCacheManagerV2):
                 kind = _CSA2LayerKind.COMPRESSOR_STATE
             self._layer_attn_to_layer_id[model_layer, kind] = layer_id
             for role in roles:
-                self._layer_roles[model_layer, role] = layer_id
-                self._physical_roles[layer_id, role.role] = (model_layer, role)
+                self._layer_roles[model_layer, ratio, role] = layer_id
+                self._physical_roles[layer_id, role.role] = (model_layer, ratio, role)
             private_config = {}
             if self._decoder_replay_window and window is not None:
                 decoder_swa = roles[0] == CSA2CacheRole.SWA and model_layer >= max(
@@ -555,6 +571,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             if self.has_swa_cache(layer):
                 add(
                     layer,
+                    1,
                     [CSA2CacheRole.SWA],
                     [528],
                     self._swa_retention(layer),
@@ -565,6 +582,7 @@ class CSA2CacheManager(KVCacheManagerV2):
                 # native-layout index rows for the paged indexer kernels.
                 add(
                     layer,
+                    ratio,
                     [CSA2CacheRole.GLOBAL, CSA2CacheRole.INDEX],
                     [MAIN_ROW_BYTES // ratio, INDEX_ROW_BYTES // ratio],
                     None,
@@ -572,6 +590,7 @@ class CSA2CacheManager(KVCacheManagerV2):
                 if ratio == 2:
                     add(
                         layer,
+                        ratio,
                         [CSA2CacheRole.COMPRESSOR_KV, CSA2CacheRole.COMPRESSOR_SCORE],
                         [2048, 2048],
                         self._window(2),
@@ -579,8 +598,9 @@ class CSA2CacheManager(KVCacheManagerV2):
         for layer in self.pp_layers:
             owner = self.layout.layer(layer).kv_source
             if owner is not None:
+                ratio = self.layout.compress_ratios[layer]
                 for role in (CSA2CacheRole.GLOBAL, CSA2CacheRole.INDEX):
-                    self._layer_roles[layer, role] = self._layer_roles[owner, role]
+                    self._layer_roles[layer, ratio, role] = self._layer_roles[owner, ratio, role]
         scratch = config.swa_scratch_reuse
         if scratch is not None:
             # Linear verification may reject every draft token. Context
@@ -620,7 +640,9 @@ class CSA2CacheManager(KVCacheManagerV2):
             layer for layer in self.pp_layers if layer >= first_layer and self.has_swa_cache(layer)
         ]
         return bool(layers) and all(
-            self.impl.init_config.layers[self._layer_roles[layer, CSA2CacheRole.SWA]].reuse_policy
+            self.impl.init_config.layers[
+                self._cache_layer_id(layer, CSA2CacheRole.SWA)
+            ].reuse_policy
             == AttentionReusePolicy.PRIVATE
             for layer in layers
         )
@@ -633,11 +655,12 @@ class CSA2CacheManager(KVCacheManagerV2):
         owner = self.layout.layer(layer_idx).kv_source
         if owner is None:
             raise ValueError("SWA-only layers have no global cache")
-        if owner not in self._global_buffers:
-            self._global_buffers[owner] = self.get_buffers(owner, CSA2CacheRole.GLOBAL).view(
+        key = self._cache_role_key(owner, CSA2CacheRole.GLOBAL)
+        if key not in self._global_buffers:
+            self._global_buffers[key] = self.get_buffers(owner, CSA2CacheRole.GLOBAL).view(
                 -1, MAIN_ROW_BYTES
             )
-        return self._global_buffers[owner]
+        return self._global_buffers[key]
 
     def get_index_pages(self, layer_idx: int) -> torch.Tensor:
         """Index records as native ``[pages, 64, 1, 68]`` page-footer pages.
@@ -650,7 +673,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         owner = self.layout.layer(layer_idx).kv_source
         if owner is None:
             raise ValueError("SWA-only layers have no global cache")
-        key = (owner, CSA2CacheRole.INDEX)
+        key = self._cache_role_key(owner, CSA2CacheRole.INDEX)
         if key not in self._global_buffers:
             pool = self.get_buffers(owner, CSA2CacheRole.INDEX)
             self._global_buffers[key] = pool.view(-1, INDEX_PAGE_ROWS, 1, INDEX_ROW_BYTES)
@@ -903,7 +926,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             [
                 [
                     self.impl.get_mem_pool_base_address(
-                        self._layer_roles[layer, CSA2CacheRole.SWA],
+                        self._cache_layer_id(layer, CSA2CacheRole.SWA),
                         CSA2CacheRole.SWA.role,
                         PageIndexMode.PER_LAYER,
                     )
@@ -954,7 +977,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             specs += [
                 (owner, role)
                 for owner in self.layout.kv_source_layer_ids
-                if (owner, role) in self._layer_roles
+                if self._cache_role_key(owner, role) in self._layer_roles
             ]
         params = []
         for layer_idx, role in specs:
@@ -1027,7 +1050,7 @@ class CSA2CacheManager(KVCacheManagerV2):
     @property
     def blocks_in_primary_pool(self):
         return self.impl.get_page_index_upper_bound(
-            self._layer_roles[self.pp_layers[0], CSA2CacheRole.SWA], CSA2CacheRole.SWA.role
+            self._cache_layer_id(self.pp_layers[0], CSA2CacheRole.SWA), CSA2CacheRole.SWA.role
         )
 
     def get_num_free_blocks(self):
@@ -1039,7 +1062,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         return (
             max(
                 self.impl.get_page_index_upper_bound(
-                    self._layer_roles[layer, CSA2CacheRole.SWA], CSA2CacheRole.SWA.role
+                    self._cache_layer_id(layer, CSA2CacheRole.SWA), CSA2CacheRole.SWA.role
                 )
                 for layer in self.pp_layers
                 if self.has_swa_cache(layer)
@@ -1102,7 +1125,7 @@ class CSA2CacheManager(KVCacheManagerV2):
                     continue
                 transfer = {
                     cache_role != CSA2CacheRole.SWA or model_layer < split_layer
-                    for model_layer, cache_role in identities
+                    for model_layer, _ratio, cache_role in identities
                 }
                 if len(transfer) != 1:
                     raise ValueError(
@@ -1128,7 +1151,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         protected_blocks = (committed + self.tokens_per_block - 1) // self.tokens_per_block
         state = self._fresh_pages_filled.setdefault(request_id, {})
         filled = 0
-        for (physical_layer, data_role), (layer, role) in self._physical_roles.items():
+        for (physical_layer, data_role), (layer, _ratio, role) in self._physical_roles.items():
             converter = self._get_page_index_converter(physical_layer, data_role)
             pages = np.asarray(self.get_cache_indices(request_id, layer, role), dtype=np.int64)
             key = (physical_layer, data_role)
@@ -1162,7 +1185,7 @@ class CSA2CacheManager(KVCacheManagerV2):
                 yield layer, self.get_buffers(layer)
 
     def _iter_cache_buffers_for_invalid_check(self) -> Iterator[tuple[int, torch.Tensor]]:
-        for model_layer, role in self._physical_roles.values():
+        for model_layer, _ratio, role in self._physical_roles.values():
             guard_key = model_layer if role == CSA2CacheRole.SWA else -1
             yield guard_key, self.get_buffers(model_layer, role)
 

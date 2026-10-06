@@ -66,14 +66,25 @@ def test_prune_only_physical_swa_groups(limit: int | None) -> None:
     assert manager.pp_layers == list(range(40))
     assert len(built.layers) == retained + 7
     identities = set(manager._physical_roles.values())
-    assert {layer for layer, role in identities if role == CSA2CacheRole.SWA} == set(
+    assert {layer for layer, _, role in identities if role == CSA2CacheRole.SWA} == set(
         range(retained)
     )
+    assert {ratio for _, ratio, role in identities if role == CSA2CacheRole.SWA} == {1}
     for role in (CSA2CacheRole.GLOBAL, CSA2CacheRole.INDEX):
-        assert {layer for layer, item in identities if item == role} == {2, 8, 14, 20}
-        assert manager._layer_roles[39, role] == manager._layer_roles[20, role]
+        assert {(layer, ratio) for layer, ratio, item in identities if item == role} == {
+            (2, 2),
+            (8, 2),
+            (14, 2),
+            (20, 1),
+        }
+        assert manager._layer_roles[3, 2, role] == manager._layer_roles[2, 2, role]
+        assert manager._layer_roles[39, 1, role] == manager._layer_roles[20, 1, role]
     for role in (CSA2CacheRole.COMPRESSOR_KV, CSA2CacheRole.COMPRESSOR_SCORE):
-        assert {layer for layer, item in identities if item == role} == {2, 8, 14}
+        assert {(layer, ratio) for layer, ratio, item in identities if item == role} == {
+            (2, 2),
+            (8, 2),
+            (14, 2),
+        }
     sizes, windows = manager._get_runtime_cache_size_layer_components()
     assert sizes.count(528) == retained
     assert sum(size for size, window in zip(sizes, windows) if window is None) == 890
@@ -163,8 +174,10 @@ def test_fresh_fill_uses_physical_roles_and_preserves_relocated_committed_pages(
         for identity in manager._physical_roles.values()
     }
     page_tables = {identity: [1, 2, 3, 4, BAD_PAGE_INDEX, BAD_PAGE_INDEX] for identity in buffers}
-    manager.get_buffers = lambda layer, role: buffers[layer, role]
-    manager.get_cache_indices = lambda request, layer, role: page_tables[layer, role]
+    manager.get_buffers = lambda layer, role: buffers[manager._cache_role_key(layer, role)]
+    manager.get_cache_indices = lambda request, layer, role: page_tables[
+        manager._cache_role_key(layer, role)
+    ]
     manager._get_page_index_converter = lambda *args: SimpleNamespace(expansion=2)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     manager._fill_fresh_kv_pages(1)

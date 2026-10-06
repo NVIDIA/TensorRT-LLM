@@ -76,7 +76,7 @@ def test_snapshot_policy_follows_reuse_and_encoder_recovery(
             else AttentionReusePolicy.REQUIRED
         )
         for layer in manager.impl.init_config.layers:
-            owner, role = manager._physical_roles[layer.layer_id, layer.buffers[0].role]
+            owner, _, role = manager._physical_roles[layer.layer_id, layer.buffers[0].role]
             expected = (
                 AttentionReusePolicy.REQUIRED
                 if role == CSA2CacheRole.GLOBAL
@@ -85,12 +85,12 @@ def test_snapshot_policy_follows_reuse_and_encoder_recovery(
                 else expected_encoder
             )
             assert layer.reuse_policy == expected
-        encoder = manager._layer_roles[0, CSA2CacheRole.SWA]
-        decoder = manager._layer_roles[5, CSA2CacheRole.SWA]
+        encoder = manager._layer_roles[0, 1, CSA2CacheRole.SWA]
+        decoder = manager._layer_roles[5, 1, CSA2CacheRole.SWA]
         if reuse:
             assert all(
                 role not in (CSA2CacheRole.GLOBAL, CSA2CacheRole.INDEX)
-                for _, role in manager._encoder_roles
+                for _, _, role in manager._encoder_roles
             )
             if replay:
                 expected_groups = {
@@ -169,7 +169,7 @@ def test_recovery_retention_matches_static_sizing(
         assert manager.layout.window_size == 128
         reserve = manager.max_draft_len + manager.reuse_match_backoff
         for layer in manager.pp_layers:
-            physical = manager._layer_roles[layer, CSA2CacheRole.SWA]
+            physical = manager._layer_roles[layer, 1, CSA2CacheRole.SWA]
             window = manager.impl.init_config.layers[physical].sliding_window_size
             expected = (
                 capture_window + 1 if encoder_replay else capture_window if layer >= 5 else 128
@@ -268,7 +268,7 @@ def test_encoder_snapshot_resumes_without_replay(
         manager.kv_cache_map[0].commit(list(range(256)))
         frozen = global_bytes(metadata, 0, 256)
         saved = []
-        for layer, role in manager._encoder_roles:
+        for layer, _, role in manager._encoder_roles:
             slot = manager.get_cache_indices(0, layer, role)[1]
             saved.append((layer, role, slot, manager.get_buffers(layer, role)[slot].clone()))
         manager.free_resources(warm)
@@ -342,7 +342,7 @@ def test_encoder_window_spans_two_blocks(cache_config, monkeypatch, missing_page
         assert manager.layout.window_size == 256 and manager.tokens_per_block == 128
         warm = manager.kv_cache_map[0]
         warm.commit(list(range(512)))
-        swa = manager._layer_roles[0, CSA2CacheRole.SWA]
+        swa = manager._layer_roles[0, 1, CSA2CacheRole.SWA]
         group = manager.impl.get_layer_group_id(swa)
         original = manager.get_cache_indices(0, 0, CSA2CacheRole.SWA)[2:4]
         if missing_page:
