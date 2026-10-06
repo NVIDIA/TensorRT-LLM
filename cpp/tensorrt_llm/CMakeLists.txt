@@ -330,6 +330,7 @@ foreach(
   tllm_runtime_buffers
   tllm_runtime_distributed
   tllm_runtime_topology
+  tllm_common_cublas
   tllm_common_environment
   tllm_executor_values
   tllm_executor_transfer_agent
@@ -352,6 +353,9 @@ foreach(component IN LISTS TLLM_KERNEL_COMPONENT_TARGETS)
   set_property(TARGET ${SHARED_TARGET}
                PROPERTY LINK_LIBRARY_OVERRIDE_${component} WHOLE_ARCHIVE)
 endforeach()
+
+set_property(TARGET ${SHARED_TARGET}
+             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_cublas WHOLE_ARCHIVE)
 
 # Components also link each other normally; retain all component exports here.
 set_property(TARGET ${SHARED_TARGET}
