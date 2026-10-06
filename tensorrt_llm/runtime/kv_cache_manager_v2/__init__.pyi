@@ -332,6 +332,47 @@ class KVCacheEvent:
     attention_dp_rank: int | None = None
     layer_group_id: int | None = None
 
+class StreamingBlockStoredData:
+    @property
+    def lora_id(self) -> int | None: ...
+    @property
+    def block_hashes(self) -> list[int]: ...
+    @property
+    def parent_block_hash(self) -> int | None: ...
+    @property
+    def token_ids(self) -> list[EventTokenId]: ...
+    @property
+    def mm_keys(self) -> list[list[MmKey]]: ...
+
+class StreamingBlockRemovedData:
+    @property
+    def block_hashes(self) -> list[int]: ...
+
+class StreamingEventStats:
+    @property
+    def stored_blocks(self) -> int: ...
+    @property
+    def removed_blocks(self) -> int: ...
+    @property
+    def partial_blocks_suppressed(self) -> int: ...
+    @property
+    def non_target_life_cycles_ignored(self) -> int: ...
+    @property
+    def dropped_events(self) -> int: ...
+
+class StreamingEventSink:
+    def __init__(
+        self,
+        max_entries: int = ...,
+        mm_token_id_offset: int | None = None,
+    ) -> None: ...
+    def set_target_life_cycle(self, life_cycle_id: int) -> None: ...
+    def drain_iteration_events(
+        self,
+    ) -> list[StreamingBlockStoredData | StreamingBlockRemovedData]: ...
+    @property
+    def stats(self) -> StreamingEventStats: ...
+
 class KVCacheEventManager:
     def __init__(
         self,
@@ -594,7 +635,7 @@ class KVCacheManager:
     def __init__(
         self,
         config: KVCacheManagerConfig,
-        event_manager: KVCacheEventManager | None = None,
+        event_manager: KVCacheEventManager | StreamingEventSink | None = None,
         cold_page_codec: IKvCacheColdPageCodec | None = None,
     ) -> None: ...
     def __del__(self) -> None: ...
