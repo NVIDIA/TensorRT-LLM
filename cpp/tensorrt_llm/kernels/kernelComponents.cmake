@@ -67,6 +67,8 @@ add_tllm_kernel_library(
   tllm_kernel_custom_all_reduce SOURCES customAllReduceKernels.cu
   LINK_LIBRARIES tllm::common_environment)
 
+add_tllm_kernel_library(tllm_kernel_rms_norm SOURCES rmsnormKernels.cu)
+
 add_tllm_kernel_library(tllm_kernel_logits SOURCES logitsBitmask.cu)
 
 add_tllm_kernel_library(
