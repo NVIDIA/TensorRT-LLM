@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: NVIDIA TensorRT
 # Source Code License Agreement
 #
@@ -29,6 +29,10 @@ if(MOONCAKE_ROOT AND NOT IS_ROCKY8)
     set(MOONCAKE_WRAPPER_TARGET "tensorrt_llm_mooncake_wrapper")
 
     add_library(${MOONCAKE_WRAPPER_TARGET} SHARED transferAgent.cpp)
+    target_link_libraries(
+      ${MOONCAKE_WRAPPER_TARGET}
+      PRIVATE tllm::executor_transfer_agent tllm::common_environment
+              tllm::common_ip tllm::runtime_distributed)
     target_compile_options(${MOONCAKE_WRAPPER_TARGET} PRIVATE -Wno-error)
 
     target_include_directories(${MOONCAKE_WRAPPER_TARGET}

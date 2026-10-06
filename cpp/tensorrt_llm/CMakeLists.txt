@@ -322,6 +322,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_common_cuda
     tllm_common_environment
     tllm_common_error
+    tllm_common_ip
     tllm_common_logging
     tllm_common_native_memory
     tllm_common_profiler
@@ -388,12 +389,10 @@ if(TARGET ${UCX_WRAPPER_TARGET})
 endif()
 
 if(TARGET ${NIXL_WRAPPER_TARGET})
-  target_link_libraries(${NIXL_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
   add_dependencies(${SHARED_TARGET} ${NIXL_WRAPPER_TARGET})
 endif()
 
 if(TARGET ${MOONCAKE_WRAPPER_TARGET})
-  target_link_libraries(${MOONCAKE_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
   add_dependencies(${SHARED_TARGET} ${MOONCAKE_WRAPPER_TARGET})
 endif()
 

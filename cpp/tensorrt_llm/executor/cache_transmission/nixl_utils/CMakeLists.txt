@@ -31,6 +31,10 @@ if(NIXL_ROOT)
 
   # Add the NIXL wrapper target
   add_library(${NIXL_WRAPPER_TARGET} SHARED transferAgent.cpp)
+  target_link_libraries(
+    ${NIXL_WRAPPER_TARGET}
+    PRIVATE tllm::executor_transfer_agent tllm::common_cuda
+            tllm::common_environment tllm::common_ip tllm::runtime_distributed)
   target_compile_options(${NIXL_WRAPPER_TARGET} PRIVATE -Wno-error)
 
   # Add include directories
