@@ -25,30 +25,38 @@ set(BOUNCE_DIR
 )
 
 # ---- Pure-logic + GPU unit tests (no NIXL / zmq / network) ----
-add_gtest(creditSchedulerTest creditSchedulerTest.cpp)
+add_tllm_gtest(creditSchedulerTest SOURCES creditSchedulerTest.cpp FULL_STACK
+               LABELS "unit;full-stack")
 target_sources(creditSchedulerTest PRIVATE ${BOUNCE_DIR}/CreditScheduler.cpp
                                            ${BOUNCE_DIR}/BuddyAllocator.cpp)
-add_gtest(bounceTransferPlanTest bounceTransferPlanTest.cpp)
+add_tllm_gtest(bounceTransferPlanTest SOURCES bounceTransferPlanTest.cpp
+               FULL_STACK LABELS "unit;full-stack")
 target_sources(bounceTransferPlanTest
                PRIVATE ${BOUNCE_DIR}/BounceTransferPlan.cpp)
-add_gtest(bounceMessageCodecTest bounceMessageCodecTest.cpp)
+add_tllm_gtest(bounceMessageCodecTest SOURCES bounceMessageCodecTest.cpp
+               FULL_STACK LABELS "unit;full-stack")
 target_sources(bounceMessageCodecTest PRIVATE ${BOUNCE_DIR}/BounceMessage.cpp)
 # Header-only: knob resolution (agent_bounce_params dict > TRTLLM_NIXL_BOUNCE_*
 # env > default), byte-size suffixes, garbage fallback, derived-timeout
 # invariants.
-add_gtest(bounceConfigTest bounceConfigTest.cpp)
-add_gtest(buddyAllocatorTest buddyAllocatorTest.cpp)
+add_tllm_gtest(bounceConfigTest SOURCES bounceConfigTest.cpp FULL_STACK LABELS
+               "unit;full-stack")
+add_tllm_gtest(buddyAllocatorTest SOURCES buddyAllocatorTest.cpp FULL_STACK
+               LABELS "unit;full-stack")
 target_sources(buddyAllocatorTest PRIVATE ${BOUNCE_DIR}/BuddyAllocator.cpp)
 # GPU test: execution-context pool (stream/event/scratch/hostPinned)
 # acquire/release.
-add_gtest(execPoolTest execPoolTest.cpp)
+add_tllm_gtest(execPoolTest SOURCES execPoolTest.cpp FULL_STACK LABELS
+               "unit;full-stack")
 target_sources(execPoolTest PRIVATE ${BOUNCE_DIR}/ExecPool.cpp)
 # GPU test: gather/scatter CUDA kernel round-trip (needs a CUDA device to run).
-add_gtest(gatherScatterKernelTest gatherScatterKernelTest.cpp)
+add_tllm_gtest(gatherScatterKernelTest SOURCES gatherScatterKernelTest.cpp
+               FULL_STACK LABELS "unit;full-stack")
 target_sources(gatherScatterKernelTest
                PRIVATE ${BOUNCE_DIR}/GatherScatterKernel.cu)
 # GPU test: shared data-arena alloc / address mapping / shutdown.
-add_gtest(bounceArenaTest bounceArenaTest.cpp)
+add_tllm_gtest(bounceArenaTest SOURCES bounceArenaTest.cpp FULL_STACK LABELS
+               "unit;full-stack")
 target_sources(bounceArenaTest PRIVATE ${BOUNCE_DIR}/BounceArena.cpp)
 
 # ---- Control-plane unit test — needs only zmq (+ the fetched cppzmq header),
@@ -65,7 +73,8 @@ else()
   set(BOUNCE_CPPZMQ_AVAILABLE FALSE)
 endif()
 if(BOUNCE_CPPZMQ_AVAILABLE)
-  add_gtest(zmqControlChannelTest zmqControlChannelTest.cpp)
+  add_tllm_gtest(zmqControlChannelTest SOURCES zmqControlChannelTest.cpp
+                 FULL_STACK LABELS "unit;full-stack")
   target_sources(
     zmqControlChannelTest PRIVATE ${BOUNCE_DIR}/ZmqControlChannel.cpp
                                   ${BOUNCE_DIR}/BounceMessage.cpp)
@@ -102,7 +111,7 @@ if(NIXL_ROOT)
     # One reactor test target: the bounce sources compiled in, plus the shared
     # include/link sets.
     function(add_bounce_reactor_test name src)
-      add_gtest(${name} ${src})
+      add_tllm_gtest(${name} SOURCES ${src} FULL_STACK LABELS "unit;full-stack")
       target_sources(${name} PRIVATE ${BOUNCE_REACTOR_SRCS})
       target_include_directories(${name} PRIVATE ${BOUNCE_TEST_INCS})
       target_link_libraries(${name} PRIVATE ${BOUNCE_TEST_LIBS})
@@ -138,7 +147,8 @@ if(NIXL_ROOT)
     # wrapper; this test only uses the public agent API (the zmq include is
     # needed only because the shared bounceTestNixlNode.h helpers pull in
     # ZmqControlChannel.h at compile time).
-    add_gtest(bounceAgentE2ETest bounceAgentE2ETest.cpp)
+    add_tllm_gtest(bounceAgentE2ETest SOURCES bounceAgentE2ETest.cpp FULL_STACK
+                   LABELS "unit;full-stack")
     target_include_directories(bounceAgentE2ETest PRIVATE ${BOUNCE_TEST_INCS})
     target_link_libraries(
       bounceAgentE2ETest PRIVATE tensorrt_llm_nixl_wrapper NIXL::nixl
