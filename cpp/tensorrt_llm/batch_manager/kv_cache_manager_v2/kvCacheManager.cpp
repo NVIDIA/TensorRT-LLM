@@ -112,9 +112,9 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     : mConfig(config)
     , mLifeCycles(config)
     , mEventSink(std::move(eventSink))
-    , mAvgReusedLength(0.9999)
-    , mAvgSqrCapacity(0.9999)
-    , mAvgSqrHistoryLength(0.9999)
+    , mAvgReusedLength(config.poolRebalance.movingAverageDecay)
+    , mAvgSqrCapacity(config.poolRebalance.movingAverageDecay)
+    , mAvgSqrHistoryLength(config.poolRebalance.movingAverageDecay)
 {
     mConfig.validate();
 
@@ -951,7 +951,7 @@ void KvCacheManager::unregisterKvCache(KvCache* kvc)
 
 void KvCacheManager::tryUpdateTargetRatios()
 {
-    if (mNumSampledKvCaches - mLastUpdateNumSampledKvCaches < 100)
+    if (mNumSampledKvCaches - mLastUpdateNumSampledKvCaches < mConfig.poolRebalance.targetRatioUpdateInterval)
         return;
     mLastUpdateNumSampledKvCaches = mNumSampledKvCaches;
 
@@ -1014,12 +1014,14 @@ bool KvCacheManager::_needAdjustment(CacheLevel level) const
 {
     auto const& target = _getTargetRatioList(level);
     auto current = (level == kHotLevel) ? _currentHotRatio() : _currentColdRatios();
-    constexpr float kThreshold = 1.25f;
+    float const tolerance = mConfig.poolRebalance.ratioTolerance;
     for (PoolGroupIndex pgIdx{0}; pgIdx < target.size() && pgIdx < current.size(); ++pgIdx)
     {
         TLLM_CHECK_DEBUG_WITH_INFO(current[pgIdx] > 0.f && target[pgIdx] > 0.f, "ratios must not be zero");
         float ratio = target[pgIdx] / current[pgIdx];
-        if (ratio < 1.f / kThreshold || ratio > kThreshold)
+        // Symmetric in target vs current: compare the larger of the two ratios, so the test
+        // does not depend on which side has drifted.
+        if (std::max(ratio, 1.f / ratio) > 1.f + tolerance)
             return true;
     }
     return false;
@@ -1028,10 +1030,10 @@ bool KvCacheManager::_needAdjustment(CacheLevel level) const
 bool KvCacheManager::needAdjustment() const
 {
     auto const apiLock = lockShared();
-    if (mNumSampledKvCaches < 2000)
+    if (mNumSampledKvCaches < mConfig.poolRebalance.minSampledKvCaches)
         return false;
     double now = nowSeconds();
-    if (now - mLastAdjustmentTime < 120.0)
+    if (now - mLastAdjustmentTime < mConfig.poolRebalance.cooldownSecs)
         return false;
     CacheLevel lastLevel = mStorage->numCacheLevels() - 1;
     return _needAdjustment(kHotLevel) || _needAdjustment(lastLevel);
