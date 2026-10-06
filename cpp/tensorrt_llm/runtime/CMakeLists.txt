@@ -18,8 +18,6 @@ set(SRCS
     bufferManagerNvls.cpp
     utils/runtimeUtils.cpp
     utils/debugUtils.cu
-    loraUtils.cpp
-    loraModule.cpp
     loraCache.cpp
     ipcUtils.cpp
     mcastDeviceMemory.cpp
@@ -133,6 +131,13 @@ target_link_libraries(
 target_compile_features(tllm_runtime_locality PUBLIC cxx_std_20)
 set_target_properties(tllm_runtime_locality PROPERTIES POSITION_INDEPENDENT_CODE
                                                        ON)
+
+add_library(tllm_runtime_lora STATIC loraModule.cpp loraUtils.cpp)
+add_library(tllm::runtime_lora ALIAS tllm_runtime_lora)
+target_link_libraries(tllm_runtime_lora PUBLIC tllm::runtime_buffers
+                                               tllm::runtime_distributed)
+target_compile_features(tllm_runtime_lora PUBLIC cxx_std_20)
+set_target_properties(tllm_runtime_lora PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 foreach(component
         tllm_runtime_memory tllm_runtime_buffers tllm_runtime_distributed
