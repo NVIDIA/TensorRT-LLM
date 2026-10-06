@@ -77,7 +77,18 @@ add_tllm_gtest(
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
 add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
 add_gtest(mlaPreprocessTest mlaPreprocessTest.cu)
-add_gtest(sparseAttentionKernelsTest sparseAttentionKernelsTest.cpp)
+add_tllm_gtest(
+  sparseAttentionKernelsTest
+  OWNER
+  kernel
+  SOURCES
+  sparseAttentionKernelsTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_sparse_attention
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;sparse-attention;gpu"
+  REQUIRES_GPU)
 
 add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 

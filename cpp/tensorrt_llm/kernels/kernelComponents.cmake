@@ -79,3 +79,6 @@ add_tllm_kernel_library(
   unfusedAttentionKernels/unfusedAttentionKernels_2_half_int8.cu
   LINK_LIBRARIES
   tllm::common_environment)
+
+add_tllm_kernel_library(tllm_kernel_sparse_attention SOURCES
+                        sparseAttentionKernels.cu)
