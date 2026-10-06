@@ -991,15 +991,8 @@ class NVLinkOneSided(Communication):
                 active_rank_mask,
             )
         )
-        # The CFT dispatch kernel completes through counted-write counters and
-        # never publishes the completion flags the watchdog polls, so watching
-        # this phase would report every healthy peer as missing. Passing None
-        # still advances the shared generation, keeping the next fence-mode
-        # phase aligned with flag_val.
         self._watchdog_coordinator.watch_collective(
-            None if can_use_cft_for_dispatch else self._alltoall_watchdog,
-            "dispatch",
-            active_rank_mask,
+            self._alltoall_watchdog, "dispatch", active_rank_mask
         )
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None

@@ -1047,6 +1047,23 @@ __global__ void moeA2ADispatchKernel_Cft(int32_t const* token_selected_experts, 
             counted_payload_bytes_per_token += ptrs.payload_bytes_per_token[p];
         }
 
+        // Publish this rank's completion flag for the host watchdog only; the counted
+        // writes above already order the data, and peers below wait on the counters
+        // rather than on this flag. It marks "this rank issued its sends", not "the
+        // data arrived", so it carries no release fence and must not be used for
+        // synchronization.
+        uint32_t const health_flag_value = *ptrs.flag_val;
+#pragma unroll 1
+        for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
+        {
+            if constexpr (ENABLE_RANK_MASK)
+            {
+                if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                    continue;
+            }
+            publish_round_flag(&ptrs.completion_flags[target_rank][rank_id], health_flag_value);
+        }
+
         // Poll data counters from all active peers. Self data is placed locally, not via fabric.
 #pragma unroll 1
         for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
