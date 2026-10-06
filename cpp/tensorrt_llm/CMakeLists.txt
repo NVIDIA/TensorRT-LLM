@@ -284,6 +284,7 @@ foreach(
   tllm_runtime_distributed
   tllm_runtime_topology
   tllm_runtime_worker_pool
+  tllm_runtime_lora
   ipc_nvls_memory_src
   tllm_runtime_locality
   tllm_runtime_numpy
@@ -330,6 +331,7 @@ foreach(
   tllm_runtime_distributed
   tllm_runtime_topology
   tllm_runtime_worker_pool
+  tllm_runtime_lora
   ipc_nvls_memory_src
   tllm_runtime_locality
   tllm_runtime_gdr
