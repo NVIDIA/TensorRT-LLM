@@ -103,7 +103,18 @@ add_tllm_gtest(
 
 add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 
-add_gtest(mlaChunkedPrefillTest mlaChunkedPrefillTest.cu)
+add_tllm_gtest(
+  mlaChunkedPrefillTest
+  OWNER
+  kernel
+  SOURCES
+  mlaChunkedPrefillTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_mla_chunked_prefill
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;mla-chunked-prefill;gpu"
+  REQUIRES_GPU)
 
 add_gtest(fusedMoeCommKernelTest moe/fusedMoeCommKernelTest.cpp)
 
