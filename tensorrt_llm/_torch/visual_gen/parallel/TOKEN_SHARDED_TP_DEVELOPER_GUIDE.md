@@ -151,7 +151,8 @@ the call sites a model already has for Ulysses carry token-sharded TP:
 
 | Call | Under token-sharded TP |
 |---|---|
-| `shard(x, dim=1)`: residual stream, per-token tables | `begin(B, S)`, then this rank's rows as `[n, g, ...]` sample groups |
+| `shard(x, dim=1)`: the residual stream | `begin(B, S)` (selects the forward's plan), then this rank's rows as `[n, g, ...]` sample groups |
+| `shard(t, dim=1, expected_seq_len=S)`: per-token tables | the same rows; `t` must match the stream's `[B, S]` |
 | `shard_per_sample(t)`: per-sample `[B, ...]` tables | the shard's `[n, ...]` entries |
 | `gather(x, dim=1)` | all real tokens, `[B, S, ...]` |
 | `shard_rope(...)`, `shard_attention_input(...)`: RoPE, positions, masks, attention-side K/V | unchanged: attention sees all tokens |
@@ -187,7 +188,9 @@ declares no exceptions. Its forward adds one `shard_per_sample` call and keys fo
 `sharder.token_sharded_tp`: the `expand_timesteps` broadcast, the per-token AdaLN runtime
 (off on shards), the static-scale rule for its norms' NVFP4 output, and the VSA
 rejection. `WanBlock.forward` raises when the modulation table does not match its hidden
-states, so a global table cannot silently mix samples in the fused AdaLN kernel.
+states, so a global table cannot silently mix samples in the fused AdaLN kernel. The check
+is necessary, not sufficient: when `n == B` (`gcd(tp, B) == 1` with `B > 1`, e.g. TP3 with
+`B = 2`) the global table has the shard's shape, and only the sharder's table is right.
 
 ## The converter
 
@@ -198,6 +201,11 @@ states, so a global table cannot silently mix samples in the fused AdaLN kernel.
   cannot decide.
 - **`register_token_sharded_adapter(module_cls, adapter)`**: an adapter for a custom module
   class (e.g. a joint projection with its own all-reduce), used wherever the class appears.
+- **`TokenShardedAdapter.prepare(module, tp, name)`** runs on every converted module before
+  its class is swapped: it checks that the module was built for the adapter and stops its
+  all-reduce. The built-in adapters check the column / row `Linear`, the MLP's projections
+  and the TP size, and refuse a `Linear` built for the fused GEMM + all-reduce. A custom
+  adapter overrides it to stop its module's own all-reduce.
 - **Validation** raises when:
   - a block has nothing to convert (is the model built with `tp_size > 1`?);
   - an all-reduce would act on a token shard. Allowed are a converted projection's own, a
@@ -214,10 +222,12 @@ states, so a global table cannot silently mix samples in the fused AdaLN kernel.
 1. Plain TP must work: the rules read its TP metadata.
 2. Set `_supports_token_sharded_tp = True`, call `self._apply_tp_layout()` at the end of
    `__init__` (after `self.sharder` exists), and set `_token_sharded_tp_blocks` if the block
-   containers are not `blocks`.
-3. Route the residual stream and per-token tables through `sharder.shard` / `gather` (as for
-   Ulysses), per-sample tables through `sharder.shard_per_sample`, and attention-side inputs
-   (RoPE, positions, masks) through `shard_rope` / `shard_attention_input`.
+   containers are not `blocks`. The pipeline loader calls `check_tp_layout_applied()`, so a
+   model that declares support but never applies the layout raises.
+3. Route the residual stream through `sharder.shard` / `gather` (as for Ulysses), then
+   per-token tables through `sharder.shard(..., expected_seq_len=S)`, per-sample tables
+   through `sharder.shard_per_sample`, and attention-side inputs (RoPE, positions, masks)
+   through `shard_rope` / `shard_attention_input`.
 4. Code between projections must be row-local, and must take batch and sequence lengths
    from the projected q (not from the block input) where it needs them.
 5. Add exceptions or register adapters for custom modules, and add a bitwise test at
@@ -229,13 +239,12 @@ states, so a global table cannot silently mix samples in the fused AdaLN kernel.
 - **One token stream per model.** MMDiT text + image or audio + video need a plan per
   stream, and Attention recording which stream its q and k/v read.
 - **Separate q/k/v self-attention projections gather three times**, once per projection.
+  Such an `Attention` must set `separate_qkv_is_self_attention=True`; without it only
+  `to_q` converts, and `get_qkv` raises because q and k cover different tokens.
 - **The rank-agreement check runs only on the first use of each shape.** A rank that reuses a
   cached shape while a peer starts a new one is not detected: the collectives then hang or
   fail instead of raising.
 - **NVFP4 gathers need static scales;** dynamic NVFP4 gathers BF16 (see below).
-- **The NVFP4 quantize before the gather uses the consuming `Linear`'s op.** That is the
-  autotuned one when VisualGen enables it, and its tactic is chosen per rank. Agreeing on it
-  across ranks, or pinning the plain op, is a follow-up.
 - **Per-token AdaLN fused kernels stay off under this layout.**
 
 ## Quantization: what is all-gathered
@@ -244,7 +253,10 @@ The rule: gather NVFP4 iff the consumer has a **static** NVFP4 input scale
 (`static_nvfp4_input_scale(linear)` is not `None`); quantizing each shard with that
 scale gives exactly the bytes the consumer would produce on all rows. The column and MLP
 adapters quantize a bf16 input by this rule (decided per call); Wan's fused norms already
-emit NVFP4 at `D == 5120`, with their scales wired by the same rule.
+emit NVFP4 at `D == 5120`, with their scales wired by the same rule. That quantize is pinned
+to `trtllm::fp4_quantize`, even when VisualGen tunes the Linears' quantize: the tunable op
+may pick FlashInfer's kernel, which shuffles rows and scaling factors in 128-row tiles,
+while the all-gather and the scale regroup need plain row order.
 
 | Checkpoint / mode | Gathered | Numerics vs all-reduce TP |
 |---|---|---|

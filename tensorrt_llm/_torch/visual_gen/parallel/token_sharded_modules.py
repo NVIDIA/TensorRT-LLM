@@ -174,7 +174,8 @@ def _check_linear(module: nn.Module | None, name: str, mode: TensorParallelMode,
 
 
 def _stop_all_reduce(linear: Linear, name: str) -> None:
-    """Leave ``linear`` in the state ``reduce_output=False`` builds, as the runtime reads it."""
+    """Leave ``linear`` in the state ``reduce_output=False`` builds: the quant methods'
+    ``apply()`` paths key on ``all_reduce`` too (NCCL-window output buffers, bias-in-GEMM)."""
     if linear.use_fused_gemm_allreduce:
         # create_weights() already chose the quant method and workspace for the fused op.
         raise ValueError(
