@@ -956,8 +956,8 @@ class TestDisaggTransferAdmissionController:
         result = controller.select(active_requests=[active], candidates=[admitted, deferred])
 
         assert result.admitted_requests == [admitted]
-        assert result.active_transfer_blocks == 1
-        assert result.admitted_transfer_blocks == 1
+        assert result.active_transfer_cost == 1
+        assert result.admitted_transfer_cost == 1
         assert result.deferred_request_count == 1
         assert result.limited_by_budget
         assert not result.is_blocked_by_active_transfers()
@@ -970,7 +970,7 @@ class TestDisaggTransferAdmissionController:
         result = controller.select(active_requests=[active], candidates=[candidate])
 
         assert result.admitted_requests == []
-        assert result.active_transfer_blocks == 1
+        assert result.active_transfer_cost == 1
         assert result.deferred_request_count == 1
         assert result.is_blocked_by_active_transfers()
 
@@ -982,7 +982,7 @@ class TestDisaggTransferAdmissionController:
         result = controller.select(active_requests=[], candidates=[oversized, deferred])
 
         assert result.admitted_requests == [oversized]
-        assert result.admitted_transfer_blocks == 3
+        assert result.admitted_transfer_cost == 3
         assert result.deferred_request_count == 1
         assert result.limited_by_budget
         assert not result.is_blocked_by_active_transfers()
@@ -996,7 +996,7 @@ class TestDisaggTransferAdmissionController:
         result = controller.select(active_requests=[], candidates=[request])
 
         assert result.admitted_requests == [request]
-        assert result.admitted_transfer_blocks == 3
+        assert result.admitted_transfer_cost == 3
 
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")

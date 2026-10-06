@@ -3054,6 +3054,18 @@ class TestStrictBaseModelArbitraryArgs:
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
             CacheTransceiverConfig(kv_cache_bounce_size_mb=-1)
 
+        assert config.kv_cache_bounce_admission_ratio == 0.8
+        for ratio in (0.25, 1.0, 1.5):
+            configured = CacheTransceiverConfig(
+                kv_cache_bounce_admission_ratio=ratio)
+            assert configured.kv_cache_bounce_admission_ratio == ratio
+            assert CacheTransceiverConfig.model_validate_json(
+                configured.model_dump_json(
+                )).kv_cache_bounce_admission_ratio == ratio
+        for ratio in (0, -0.5, float("inf"), float("nan")):
+            with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+                CacheTransceiverConfig(kv_cache_bounce_admission_ratio=ratio)
+
         # agent_bounce_buffer_enable defaults to the Python implementation (False); enabling the
         # C++ transfer-agent implementation with a zero capacity is a contradiction.
         assert config.agent_bounce_buffer_enable is False

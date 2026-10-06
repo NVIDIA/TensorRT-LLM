@@ -32,6 +32,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation.orchestration.admission import (
+    DisaggTransferAdmissionController,
+)
 from tensorrt_llm._torch.pyexecutor.error_classification import ErrorBudget
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import RequestScheduler, ScheduledRequests
@@ -1369,6 +1372,25 @@ class TestFailFastDuringBenchmarkFill:
 
         assert result is not None
         ex._handle_errors.assert_not_called()
+
+    def test_early_transfer_budget_block_with_empty_fitting_list_does_not_kill(self) -> None:
+        """Skipping KV allocation under an active window is not terminal KV exhaustion."""
+        ex = self._make_executor(fill_phase_active=True, fitting_init_requests=[])
+        ex.active_requests.append(_make_active_request(in_transfer=True))
+        scheduled = ex._schedule.return_value[0]
+        controller = DisaggTransferAdmissionController(32, 32)
+        controller.early_admission_blocked = True
+        ex._disagg_transfer_admission_controller = controller
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is scheduled
+        assert ex.disagg.admit([]) == ([], True)
+        ex.disagg.receive_gen_init.assert_called_once_with([])
+        ex.disagg.reap_context_sends.assert_called_once_with(0)
+        ex._handle_errors.assert_not_called()
+        controller.early_admission_blocked = False
+        assert ex.disagg.admit([]) == ([], False)
 
     def test_transfer_admission_backpressure_does_not_kill(self, monkeypatch):
         """NVBug 6438658: admission backpressure is not KV exhaustion.

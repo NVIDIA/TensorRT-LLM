@@ -20,6 +20,7 @@ no-op fallback, and the TP fan-in reserve/record/settle logic (GPU allocators/st
 
 import queue
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -58,6 +59,58 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 )
 
 _MIB = 1024 * 1024
+
+
+def test_receive_admission_uses_prepared_transfer_layout() -> None:
+    from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._mapping = SimpleNamespace(
+        pp_size=1, tp_size=1, cp_size=1, enable_attention_dp=False
+    )
+    bounce = object.__new__(btr.VmmBounceTransport)
+    bounce._block_bytes_per_group = [147456, 147456]
+    bounce._recv_alloc = SimpleNamespace(capacity=512 * _MIB)
+    worker = object.__new__(TransferWorker)
+    worker._bounce = bounce
+    transceiver._transfer_worker = worker
+    entries = np.array([], dtype=BUFFER_ENTRY_DTYPE)
+    transceiver._page_table = KVCachePageTable(
+        tokens_per_block=32,
+        layer_groups=[
+            AttentionLayerGroup(
+                pool_group_idx=index,
+                pool_views=[PoolView(pool_idx=0, buffer_entries=entries)],
+            )
+            for index in range(2)
+        ],
+        pool_groups=[PhysicalPoolGroup(pools=[PhysicalPool(0, 147456, 1024)]) for _ in range(2)],
+    )
+    # Full attention retains every block; SWA retains only the last four.
+    blocks = [np.arange(256), np.full(256, -1)]
+    blocks[1][-4:] = np.arange(4)
+    transceiver._reuse_adapter = SimpleNamespace(
+        tokens_per_block=32,
+        get_block_ordinals=lambda req, index, group: blocks[index],
+        get_cached_token_count_per_layer_group=lambda req, groups: [0, 0],
+    )
+    request = SimpleNamespace(prompt_len=8192, is_generation_only_request=True)
+    assert transceiver.get_receive_admission_capacity_bytes() == 512 * _MIB
+    assert transceiver.get_receive_admission_request_bytes(request) == 260 * 147456
+
+    # Same prompt length, but two sink blocks are now present in the layout.
+    blocks[1][:2] = [4, 5]
+    assert transceiver.get_receive_admission_request_bytes(request) == 262 * 147456
+    transceiver._reuse_adapter.get_cached_token_count_per_layer_group = lambda req, groups: [
+        128 * 32,
+        128 * 32,
+    ]
+    # Reused prefix blocks, including the two sink blocks, need no receive.
+    assert transceiver.get_receive_admission_request_bytes(request) == 132 * 147456
+    worker._bounce = btr.NoBounceTransport()
+    assert transceiver.get_receive_admission_capacity_bytes() is None
+    assert transceiver.get_receive_admission_request_bytes(request) == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -780,6 +833,43 @@ def _k3_rank_info(tp_size=1, tp_rank=0, cp_size=1, cp_rank=0):
 
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
 class TestHybridK3Bounce:
+    def test_admission_sizes_prepared_state_before_resource_setup(self):
+        from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
+        from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+        from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+            MambaHybridCacheManagerV2,
+        )
+
+        page_table = _k3_page_table()
+        bounce = object.__new__(btr.VmmBounceTransport)
+        bounce._block_bytes_per_group = btr.block_bytes_per_group(page_table)
+        worker = object.__new__(TransferWorker)
+        worker._bounce = bounce
+        worker._rank_info = SimpleNamespace(page_table=page_table)
+        manager = Mock(spec=MambaHybridCacheManagerV2)
+        manager.local_num_mamba_layers = 27
+        manager.ssm_layer_group_id = 1
+        cache = Mock()
+        cache.get_ssm_block_base_index.return_value = 5
+        manager.kv_cache_map = {1: cache}
+        # Filled later by prepare_resources; admission must use the prepared cache.
+        manager._request_id_to_state_index = {}
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver._kv_cache_manager = manager
+        transceiver._page_table = page_table
+        transceiver._transfer_worker = worker
+        transceiver._reuse_adapter = SimpleNamespace(
+            tokens_per_block=32,
+            get_cached_token_count_per_layer_group=lambda req, groups: [0, 0],
+            get_block_ordinals=lambda req, index, group: np.arange(67),
+        )
+        req = SimpleNamespace(py_request_id=1, prompt_len=67 * 32, is_generation_only_request=True)
+
+        expected = bbuf.SlotAllocator.aligned_size(67 * _K3_MLA_BLOCK_BYTES + _K3_KDA_PAYLOAD_BYTES)
+        assert transceiver.get_receive_admission_request_bytes(req) == expected
+        cache.get_ssm_block_base_index.assert_called_once_with(1)
+        manager.prepare_resources.assert_not_called()
+
     def test_block_bytes_per_group_keeps_mamba_placeholder(self):
         # The mamba group must stay in the list as a placeholder (None), aligned with the
         # layer-group indices a recv request uses, instead of truncating the list.

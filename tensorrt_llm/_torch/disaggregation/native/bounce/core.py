@@ -218,6 +218,15 @@ class BounceTransport(ABC):
     #: True for a real transport, False for the disabled null object.
     enabled: bool = False
 
+    @property
+    def recv_capacity_bytes(self) -> int:
+        """Actual receive-region capacity; zero when bounce is disabled."""
+        return 0
+
+    def recv_required_bytes(self, chunk, *, extra_bytes: int = 0) -> int:
+        """Receive-region footprint including recurrent-state payload bytes."""
+        return 0
+
     @abstractmethod
     def build_request(self, write_meta):
         """Gather the request's cache into a send region and build the coalesced write, or None to

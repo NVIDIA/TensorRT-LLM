@@ -503,10 +503,50 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Get the mamba state slot index for a request, or None."""
         if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
             if self._kv_cache_manager.local_num_mamba_layers > 0:
-                return self._kv_cache_manager._request_id_to_state_index[req.py_request_id]
+                cache = self._kv_cache_manager.kv_cache_map[req.py_request_id]
+                return cache.get_ssm_block_base_index(self._kv_cache_manager.ssm_layer_group_id)
         elif isinstance(self._kv_cache_manager, MambaHybridCacheManager):
             return self._kv_cache_manager.mamba_cache_index[req.py_request_id]
         return None
+
+    def get_receive_admission_capacity_bytes(self) -> Optional[int]:
+        """Local receive capacity, or None if the scheduling group has no Python bounce.
+
+        A rank with zero capacity still participates when a peer has bounce;
+        its own NoBounceTransport charges zero bytes for every request.
+        """
+        capacity = self._transfer_worker.recv_bounce_capacity_bytes
+        capacities = self._receive_admission_allgather(capacity)
+        return capacity if any(capacities) else None
+
+    def _receive_admission_allgather(self, value):
+        # Attention-DP ranks schedule independent requests; only their CP
+        # peers share a receive. Otherwise the whole TP+CP group must agree.
+        if self._mapping.enable_attention_dp:
+            return self._dist.cp_allgather(value) if self._mapping.cp_size > 1 else [value]
+        if self._mapping.cp_size > 1:
+            return self._dist.tp_cp_allgather(value)
+        return self._dist.tp_allgather(value) if self._mapping.tp_size > 1 else [value]
+
+    def sync_receive_admission(
+        self, candidates: List[LlmRequest], blocked: bool
+    ) -> tuple[List[LlmRequest], bool]:
+        """Start only receives whose prepared KV and byte budget fit on every rank."""
+        local_ids = {req.py_request_id for req in candidates}
+        votes = self._receive_admission_allgather((local_ids, blocked))
+        admitted_ids = local_ids.intersection(*(ids for ids, _ in votes))
+        admitted = []
+        for req in candidates:
+            if req.py_request_id in admitted_ids:
+                admitted.append(req)
+            else:
+                req.py_batch_idx = None
+                self._kv_cache_manager.suspend_request(req)
+        return admitted, not admitted and any(waiting for _, waiting in votes)
+
+    def get_receive_admission_request_bytes(self, req: LlmRequest) -> int:
+        """Size the prepared receive layout using bounce accounting without reserving a slot."""
+        return self._transfer_worker.recv_bounce_required_bytes(self._describe_local(req))
 
     def _create_chunk(self, req: LlmRequest) -> Chunk:
         """Just the blocks, for the callers that have no use for the rest of the extent."""
@@ -591,10 +631,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         coalesced pool carries one view per role class (summing slot_bytes per view would double
         count the slot) and ignored-role buffers occupy slot offsets no view transfers.
 
-        Counterpart accounting: the bounce reserve sizing (bounce/impl.py block_bytes_per_group)
-        computes per-block bytes for the same layer groups but reads pool 0 only, while this sums
-        every pool view of a group. The pool-0-only sizing gap for multi-pool attention groups is
-        tracked under TRTLLM-15194; keep the two accountings in mind together when changing either.
+        Bounce reserve sizing uses physical slot bytes across distinct pools in each paged group;
+        that footprint can include padding and buffers omitted from the transferred payload.
         """
         pt = self._page_table
         if pt is None:

@@ -129,10 +129,15 @@ class SlotAllocator:
             cursor = max(cursor, s + n)
         return cursor if self._cap - cursor >= size else None
 
+    @staticmethod
+    def aligned_size(size: int) -> int:
+        """Bytes charged for one contiguous reservation."""
+        return _div_up(size, _ALIGN) * _ALIGN
+
     def reserve(self, size: int, timeout: Optional[float] = None) -> Optional[Tuple[int, int]]:
         """Reserve a contiguous region, or None if it can never fit or nothing frees within the
         timeout."""
-        size = _div_up(size, _ALIGN) * _ALIGN
+        size = self.aligned_size(size)
         if size <= 0 or size > self._cap:
             return None
         deadline = None if timeout is None else time.monotonic() + timeout

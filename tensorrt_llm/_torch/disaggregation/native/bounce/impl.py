@@ -136,6 +136,21 @@ class VmmBounceTransport(BounceTransport):
             f"{self._send_alloc.capacity / _MIB:.1f}MiB each"
         )
 
+    @property
+    def recv_capacity_bytes(self) -> int:
+        return self._recv_alloc.capacity
+
+    def _recv_paged_bytes(self, valid_counts: list[int]) -> int:
+        return sum(
+            count * (self._block_bytes_per_group[group] or 0)
+            for group, count in enumerate(valid_counts)
+            if count
+        )
+
+    def recv_required_bytes(self, chunk, *, extra_bytes: int = 0) -> int:
+        valid_counts = [int((ids >= 0).sum()) for ids in chunk.block_ids_per_layer_groups]
+        return SlotAllocator.aligned_size(self._recv_paged_bytes(valid_counts) + extra_bytes)
+
     def _init_recv_state(self) -> None:
         # Live per-transfer state, guarded by a leaf lock: mutate and decide under it, then release
         # it before any CUDA sync, allocator call, or callback.
@@ -242,13 +257,10 @@ class VmmBounceTransport(BounceTransport):
         to the same coalesced write (mamba/KDA recurrent state, sized by the receiver via
         ``mamba_receiver_payload_bytes``); the region must cover it or the write would overrun into the
         neighboring slot."""
-        total = 0
         has_state_group = False
         # Block tables are positional with -1 holes (see Chunk); only the
         # slots the receiver actually accepts are written into the region.
-        valid_counts = [
-            int((block_ids >= 0).sum()) for block_ids in recv_req.block_ids_per_layer_groups
-        ]
+        valid_counts = [int((ids >= 0).sum()) for ids in recv_req.block_ids_per_layer_groups]
         for g, n_valid in enumerate(valid_counts):
             if n_valid == 0:
                 continue
@@ -262,7 +274,6 @@ class VmmBounceTransport(BounceTransport):
                 # its size is accounted for by extra_bytes below, not per-block math.
                 has_state_group = True
                 continue
-            total += n_valid * self._block_bytes_per_group[g]
         if has_state_group and num_writers > 1:
             # Fan-in with recurrent-state groups is unsafe: each writer may
             # append its own state fragments (different PP stages hold different
@@ -276,7 +287,7 @@ class VmmBounceTransport(BounceTransport):
                 f"equal split cannot account for per-writer state fragments",
                 warn_key="kv-bounce-mamba-fanin",
             )
-        total += int(extra_bytes)
+        total = self._recv_paged_bytes(valid_counts) + int(extra_bytes)
         if total <= 0:
             return self._skip_bounce(
                 f"computed transfer size {total} <= 0", warn_key="kv-bounce-nonpositive-size"

@@ -4870,7 +4870,10 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
-        description="The max number of tokens the transfer buffer can fit.")
+        description=
+        "Token window for generation transfer admission. Asynchronous Python "
+        "transfers with KVCM V2 and PP1 bypass this window; when Python receive "
+        "bounce is enabled they use kv_cache_bounce_admission_ratio instead.")
 
     kv_transfer_timeout_ms: Optional[PositiveInt] = Field(
         default=60000,
@@ -4907,6 +4910,23 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "instead and the size should be a power of two (256/512/1024). "
         "Requires the Python (v2) transceiver (transceiver_runtime); the C++ "
         "transceiver does not support bounce and ignores this field.")
+
+    kv_cache_bounce_admission_ratio: float = Field(
+        default=0.8,
+        gt=0,
+        allow_inf_nan=False,
+        description=
+        "Generation KV transfer admission budget as a multiple of the actual "
+        "Python receive bounce capacity on each rank. Defaults "
+        "to 0.8; any finite positive ratio is accepted. Larger windows may "
+        "increase overlap but can block receive setup when bounce fills. "
+        "Applies to asynchronous Python transfers with KVCM V2 and PP1. "
+        "Charges prepared receive layouts, excluding reused blocks and "
+        "including recurrent state. Only an empty window admits an oversized "
+        "head request. TP/CP peers must agree before starting a receive. "
+        "Without Python bounce, these transfers bypass admission; V1, PP>1, "
+        "synchronous transfers and the C++ transceiver retain max_tokens_in_buffer. "
+        "Does not apply to C++ transfer-agent bounce.")
 
     enable_pipelined_transfer: bool = Field(
         default=False,

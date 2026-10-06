@@ -4702,6 +4702,29 @@ class TransferWorker:
         assert self._rank_info is not None
         return self._rank_info.page_table
 
+    @property
+    def recv_bounce_capacity_bytes(self) -> int:
+        """Receive capacity after allocation, including any memory-budget clamp."""
+        return self._bounce.recv_capacity_bytes
+
+    def recv_bounce_required_bytes(self, chunk: Chunk) -> int:
+        """Bound the prepared chunk's receive footprint, including recurrent state.
+
+        The receiver's complete local state slot bounds every peer's layer
+        overlap. Admission need not connect to the sender or predict whether
+        its topology will fall back to per-fragment transfer.
+        """
+        extra_bytes = 0
+        for kind, ids in zip(chunk.kind_per_layer_group, chunk.block_ids_per_layer_groups):
+            if kind == CacheKind.STATE and len(ids) and ids[0] >= 0:
+                extra_bytes = mamba_receiver_payload_bytes(
+                    sender_page_table=self.page_table,
+                    receiver_page_table=self.page_table,
+                    dst_slot=int(ids[0]),
+                )
+                break
+        return self._bounce.recv_required_bytes(chunk, extra_bytes=extra_bytes)
+
     def shutdown(self):
         if getattr(self, "_shutdown", False):
             return

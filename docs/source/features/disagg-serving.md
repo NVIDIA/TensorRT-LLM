@@ -149,11 +149,14 @@ cache_transceiver_config:
   max_tokens_in_buffer: <int>
   kv_transfer_timeout_ms: <int>
   kv_cache_bounce_size_mb: <int>
+  kv_cache_bounce_admission_ratio: 0.8
 ```
 
 `backend` selects the communication library used to transfer the KV cache. Set it to `NIXL`, which transfers over RDMA / NVLink. The field has no default — if it is left unset, the worker still starts, but it brings up no cache transceiver and rejects the disaggregated requests it is then routed. Set the same value on the context and the generation worker.
 
-`max_tokens_in_buffer` is best left unset. It bounds how many KV transfers a generation worker admits concurrently, and the built-in default is derived from the model's maximum sequence length, so a small hand-written value only throttles the transfer path.
+`max_tokens_in_buffer` limits generation-side KV transfer admission in tokens and defaults to the model's maximum sequence length rounded up to a KV-block boundary. Asynchronous Python transfers with KVCM V2 and PP=1 bypass this limit.
+
+`kv_cache_bounce_admission_ratio` sets the byte admission budget for that path when Python receive bounce is enabled. The default `0.8` budgets 80% of the receive-buffer capacity without changing the buffer allocation.
 
 `kv_transfer_timeout_ms` bounds how long a request may wait for its KV cache before it is cancelled and cleaned up. The default is `60000`.
 

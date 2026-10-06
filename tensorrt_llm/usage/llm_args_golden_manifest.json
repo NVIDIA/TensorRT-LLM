@@ -137,6 +137,11 @@
       "path": "cache_transceiver_config.enable_pipelined_transfer"
     },
     {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "cache_transceiver_config.kv_cache_bounce_admission_ratio"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "cache_transceiver_config.kv_cache_bounce_size_mb"

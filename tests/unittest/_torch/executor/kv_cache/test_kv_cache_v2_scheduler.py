@@ -22,6 +22,9 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation.orchestration.admission import (
+    DisaggTransferAdmissionController,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BlockReusePolicy
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
@@ -4056,3 +4059,90 @@ def test_parked_connector_load_keeps_kv_pressure_retryable() -> None:
     output = scheduler.schedule_request([loading, generation], set())
     assert output.generation_requests == []
     assert output.recompute_paused_requests == []
+
+
+class TestDisaggEarlyTransferBudget:
+    @staticmethod
+    def _request(request_id: int, tokens: int, *, receiving: bool = False) -> Mock:
+        req = make_disagg_request(request_id, prompt_len=tokens)
+        req.total_input_len_cp = tokens
+        req.is_disagg_generation_transmission_in_progress = receiving
+        if receiving:
+            req.state_value = DISAGG_GEN_TRANS_IN_PROGRESS
+        return req
+
+    @pytest.mark.parametrize(
+        "active_tokens,candidate_tokens,failed_id,admitted_ids",
+        [
+            (0, [96, 0], None, [1]),  # Empty window permits one oversized head.
+            (0, [0, 96], None, [1]),  # Even a zero-cost admission spends the exception.
+            (64, [0, 32], None, [1]),  # Zero cost still fits a full window.
+            (64, [32, 0], None, []),  # Stop at the first budget rejection.
+            (32, [64, 0], None, []),
+            (32, [64, 0], 1, [2]),  # KV failure does not block later candidates.
+            (0, [32, 96, 0], 1, [2]),  # Nor does it spend the oversized exception.
+            (0, [32, 32], None, [1, 2]),
+        ],
+    )
+    def test_window_boundaries_match_token_admission(
+        self, active_tokens, candidate_tokens, failed_id, admitted_ids
+    ) -> None:
+        manager = make_kv_cache_manager(
+            prepare_disagg_gen_init_fn=lambda req: req.py_request_id != failed_id
+        )
+        scheduler = make_scheduler(manager)
+        controller = DisaggTransferAdmissionController(64, 32)
+        scheduler.set_disagg_transfer_admission_controller(controller)
+        active = self._request(0, active_tokens, receiving=True)
+        candidates = [self._request(i + 1, tokens) for i, tokens in enumerate(candidate_tokens)]
+        kv_fitting = [req for req in candidates if req.py_request_id != failed_id]
+
+        expected = controller.select([active], kv_fitting)
+        output = scheduler.schedule_request([active, *candidates], set())
+
+        assert ids(expected.admitted_requests) == admitted_ids
+        assert ids(output.fitting_disagg_gen_init_requests) == admitted_ids
+        assert controller.early_admission_blocked == expected.is_blocked_by_active_transfers()
+        rejected = kv_fitting[len(admitted_ids) : len(admitted_ids) + 1]
+        assert manager.suspend_request.call_args_list == [call(req) for req in rejected]
+        manager.revert_allocate_context.assert_not_called()
+        manager.free_resources.assert_not_called()
+
+    def test_byte_budget_suspends_then_retries_without_blocking_decode(self) -> None:
+        from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(manager, max_batch_size=1)
+        transceiver = Mock(spec=KvCacheTransceiverV2)
+        transceiver.get_receive_admission_request_bytes.return_value = 38_338_560
+        controller = DisaggTransferAdmissionController(
+            None, None, max_transfer_bytes=256 * 1024 * 1024, python_transceiver=transceiver
+        )
+        scheduler.set_disagg_transfer_admission_controller(controller)
+        active = [self._request(index, 8192, receiving=True) for index in range(7)]
+        head, tail = [self._request(index, 8192) for index in (7, 8)]
+        decode = make_gen_request(1000)
+        decode.is_disagg_generation_transmission_in_progress = False
+
+        # Seven fit in 256 MiB; the eighth must wait, even though KV preparation succeeds.
+        output = scheduler.schedule_request([*active, head, tail, decode], set())
+        assert output.fitting_disagg_gen_init_requests == []
+        assert output.generation_requests == [decode]
+        assert controller.early_admission_blocked
+        manager.prepare_disagg_gen_init.assert_called_once_with(head)
+        manager.suspend_request.assert_called_once_with(head)
+        assert head.state_value == DISAGG_GEN_INIT
+        assert head.py_batch_idx is None
+
+        # Completion returns credit; retry the same head and suspend the next request.
+        active[0].is_disagg_generation_transmission_in_progress = False
+        manager.prepare_disagg_gen_init.reset_mock()
+        manager.suspend_request.reset_mock()
+        output = scheduler.schedule_request([*active, head, tail, decode], set())
+        assert output.fitting_disagg_gen_init_requests == [head]
+        assert output.generation_requests == [decode]
+        assert not controller.early_admission_blocked
+        assert manager.prepare_disagg_gen_init.call_args_list == [call(head), call(tail)]
+        manager.suspend_request.assert_called_once_with(tail)
+        manager.revert_allocate_context.assert_not_called()
+        manager.free_resources.assert_not_called()

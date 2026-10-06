@@ -9,15 +9,17 @@ attention DP), so every case runs one ``CoordinatorHarness``.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from coordinator_harness import CoordinatorHarness, TransferRequest
+from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation.orchestration.admission import (
     DisaggTransferAdmissionController,
 )
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
-    transfer_window_bypass_eligible,
+    early_transfer_window_eligible,
 )
 from tensorrt_llm.bindings import LlmRequestState
 
@@ -105,18 +107,57 @@ def test_the_window_admits_the_head_and_reverts_only_the_deferred_tail() -> None
     assert h.effects.reverted == [[second]]
 
 
-def test_async_python_v2_pp1_bypasses_the_window() -> None:
-    """The asynchronous Python transceiver does not consume the C++ transfer
-    buffer; with KV cache manager V2 and PP1 the scheduler's own KV admission
-    bounds it, so the executor-level window is skipped."""
+def test_async_python_v2_pp1_uses_scheduler_admission() -> None:
+    """Only scheduler-admitted requests reach the receive entry point."""
     h = _harness(is_kv_manager_v2=True, consumes_transfer_buffer=False)
-    _receiving(h, 1)
-    candidates = [_candidate(2), _candidate(3)]
+    candidates = [_candidate(2)]
 
     admitted, blocked = h.coordinator.admit(candidates)
 
     assert (admitted, blocked) == (candidates, False)
     assert h.effects.reverted == []
+
+    _receiving(h, 1)
+    h.coordinator._admission_controller.early_admission_blocked = True
+    assert h.coordinator.admit([]) == ([], True)
+    assert h.effects.reverted == []
+
+
+@pytest.mark.parametrize("peer_count", [0, 1])
+def test_byte_admission_reconciles_ranks_even_when_one_admits_nothing(peer_count) -> None:
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    harnesses = []
+    candidates = [[_candidate(1), _candidate(2)], [_candidate(1)][:peer_count]]
+    for rank in range(2):
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver._dist = group.rank(rank)
+        transceiver._mapping = SimpleNamespace(tp_size=2, cp_size=1, enable_attention_dp=False)
+        transceiver._kv_cache_manager = Mock()
+        transceiver._transfer_worker = SimpleNamespace(recv_bounce_capacity_bytes=rank * 2048)
+        controller = DisaggTransferAdmissionController(
+            None, None, max_transfer_bytes=1024, python_transceiver=transceiver
+        )
+        controller.early_admission_blocked = rank == 1 and peer_count == 0
+        h = CoordinatorHarness(
+            admission_controller=controller, is_kv_manager_v2=True, dist=group.rank(rank)
+        )
+        h.coordinator._transceiver = transceiver
+        harnesses.append(h)
+
+    # A rank without Python bounce must join admission when a peer has it.
+    assert group.run(
+        lambda rank: harnesses[rank].coordinator._transceiver.get_receive_admission_capacity_bytes()
+    ) == [0, 2048]
+    results = group.run(lambda rank: harnesses[rank].coordinator.admit(candidates[rank]))
+
+    for rank, (admitted, blocked) in enumerate(results):
+        assert admitted == candidates[rank][:peer_count]
+        assert blocked == (peer_count == 0)
+        assert harnesses[rank].effects.reverted == []
+        manager = harnesses[rank].coordinator._transceiver._kv_cache_manager
+        assert manager.suspend_request.call_count == len(candidates[rank]) - peer_count
 
 
 @pytest.mark.parametrize(
@@ -220,25 +261,33 @@ def test_revert_is_a_no_op_without_deferred_v2_candidates(
     assert h.effects.reverted == []
 
 
-# -- window bypass predicate ---------------------------------------------------
+# -- early window predicate ---------------------------------------------------
 
 
-def test_window_bypass_needs_the_async_python_runtime_with_v2_and_pp1() -> None:
+def test_early_window_needs_the_async_python_runtime_with_v2_and_pp1() -> None:
     pp1, pp2 = SimpleNamespace(pp_size=1), SimpleNamespace(pp_size=2)
     async_python = SimpleNamespace(consumes_transfer_buffer=False)
     cpp = SimpleNamespace(consumes_transfer_buffer=True)
 
-    assert transfer_window_bypass_eligible(async_python, pp1, True)
-    assert not transfer_window_bypass_eligible(cpp, pp1, True)
-    assert not transfer_window_bypass_eligible(async_python, pp1, False)
-    assert not transfer_window_bypass_eligible(async_python, pp2, True)
-    assert not transfer_window_bypass_eligible(None, pp1, True)
+    assert early_transfer_window_eligible(async_python, pp1, True)
+    assert not early_transfer_window_eligible(cpp, pp1, True)
+    assert not early_transfer_window_eligible(async_python, pp1, False)
+    assert not early_transfer_window_eligible(async_python, pp2, True)
+    assert not early_transfer_window_eligible(None, pp1, True)
 
 
-def test_window_bypass_does_not_assume_pp1_when_dist_lacks_pp_size() -> None:
-    """A dist without ``pp_size`` must not silently count as PP1: bypassing
-    the window on a misconfigured executor would drop a real budget."""
+def test_early_window_does_not_assume_pp1_when_dist_lacks_pp_size() -> None:
+    """Missing PP metadata must not enable local pre-allocation admission."""
     async_python = SimpleNamespace(consumes_transfer_buffer=False)
 
     with pytest.raises(AttributeError):
-        transfer_window_bypass_eligible(async_python, SimpleNamespace(), True)
+        early_transfer_window_eligible(async_python, SimpleNamespace(), True)
+
+
+@pytest.mark.parametrize(
+    "mode", ["TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"]
+)
+def test_early_window_is_disabled_without_async_transfers(monkeypatch, mode: str) -> None:
+    monkeypatch.setenv(mode, "1")
+    transceiver = SimpleNamespace(consumes_transfer_buffer=False)
+    assert not early_transfer_window_eligible(transceiver, SimpleNamespace(pp_size=1), True)

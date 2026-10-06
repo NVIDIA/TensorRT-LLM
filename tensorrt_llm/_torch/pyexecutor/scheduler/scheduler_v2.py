@@ -18,6 +18,9 @@ import os
 from collections import Counter
 from typing import Callable, Optional
 
+from tensorrt_llm._torch.disaggregation.orchestration.admission import (
+    DisaggTransferAdmissionController,
+)
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
 
@@ -259,6 +262,15 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
+        self._disagg_transfer_admission_controller: Optional[DisaggTransferAdmissionController] = (
+            None
+        )
+
+    def set_disagg_transfer_admission_controller(
+        self, controller: DisaggTransferAdmissionController
+    ) -> None:
+        """Enable transfer admission for an executor-selected runtime."""
+        self._disagg_transfer_admission_controller = controller
 
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
@@ -339,6 +351,11 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
             )
 
+        transfer_controller = self._disagg_transfer_admission_controller
+        used_transfer_cost = 0
+        stop_disagg_init = False
+        if transfer_controller is not None and transfer_controller.enabled():
+            used_transfer_cost = transfer_controller.estimate_active_transfer_cost(requests_list)
         req_it_end = len(requests_list)
         recompute_pause_state = _RecomputePauseState(req_it_end)
         req_it = 0
@@ -390,6 +407,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             # no free slots remain, so the request is skipped and retried next
             # iteration. PEFT budget is still checked and committed.
             if req_state_value == self._disagg_gen_init_state_value:
+                if stop_disagg_init:
+                    req_it += 1
+                    continue
                 peft_pages = budget.peft_pages_needed(req)
                 if peft_pages is None:
                     break
@@ -400,6 +420,16 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if action is ScheduleAction.SKIP:
                     req_it += 1
                     continue
+                if transfer_controller is not None and transfer_controller.enabled():
+                    request_cost = transfer_controller.estimate_request_cost(req)
+                    if not transfer_controller.allows(
+                        request_cost, used_transfer_cost, has_admitted=bool(disagg_candidates)
+                    ):
+                        self._suspend_request(req)
+                        stop_disagg_init = True
+                        req_it += 1
+                        continue
+                    used_transfer_cost += request_cost
                 disagg_candidates.append(req)
                 # Disagg requests only commit PEFT (not num_requests/num_tokens)
                 # because they don't participate in the forward pass. Counting
@@ -583,6 +613,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                 or deferred_behind_contributor
             ),
         )
+
+        if transfer_controller is not None:
+            transfer_controller.early_admission_blocked = stop_disagg_init and not disagg_candidates
 
         return (
             scheduled_encoder,

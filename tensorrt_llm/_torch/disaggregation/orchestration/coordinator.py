@@ -42,14 +42,11 @@ def uses_async_gen_transfer() -> bool:
     )
 
 
-def transfer_window_bypass_eligible(transceiver, dist, is_kv_manager_v2: bool) -> bool:
-    """Whether this runtime may skip the executor-level transfer window.
+def early_transfer_window_eligible(transceiver, dist, is_kv_manager_v2: bool) -> bool:
+    """Whether the V2 scheduler owns transfer admission while scheduling.
 
-    ``max_tokens_in_buffer`` describes the C++ transceiver's physical buffer.
-    The asynchronous Python transceiver does not consume it, and with KV cache
-    manager V2 and PP1 its generation requests stay bounded by the scheduler's
-    inline KV admission, so no second budget is applied. Other configurations
-    keep the window.
+    PP followers reconcile their local allocations with the canonical schedule,
+    so PP and synchronous transfers retain post-scheduling admission.
     """
     return (
         transceiver is not None
@@ -269,25 +266,35 @@ class DisaggTransferCoordinator:
         if is_gen_only_no_context_benchmark():
             return fitting_gen_init, False
 
-        if not (self._transfer_window_is_active() and fitting_gen_init):
+        if not self._transfer_window_is_active():
             return fitting_gen_init, False
 
         controller = self._admission_controller
+        if early_transfer_window_eligible(self._transceiver, self._dist, self._is_kv_manager_v2):
+            # The scheduler has already applied the window to this list.
+            if controller.cost_unit == "bytes":
+                return self._transceiver.sync_receive_admission(
+                    fitting_gen_init, controller.early_admission_blocked
+                )
+            return fitting_gen_init, controller.early_admission_blocked
+        if not fitting_gen_init:
+            return fitting_gen_init, controller.early_admission_blocked
+
         admission_result = controller.select(self._registry.active_requests(), fitting_gen_init)
         if admission_result.deferred_request_count > 0:
             logger.debug(
                 "Disagg transfer admission deferred "
                 f"{admission_result.deferred_request_count} requests; "
-                f"active transfer blocks={admission_result.active_transfer_blocks}, "
-                f"admitted transfer blocks={admission_result.admitted_transfer_blocks}, "
-                f"budget={controller.max_transfer_blocks}"
+                f"active transfer {controller.cost_unit}={admission_result.active_transfer_cost}, "
+                f"admitted transfer {controller.cost_unit}={admission_result.admitted_transfer_cost}, "
+                f"budget={controller.max_transfer_cost}"
             )
 
         self.revert_deferred_gen_init(fitting_gen_init, admission_result.admitted_requests)
 
         return (
             admission_result.admitted_requests,
-            admission_result.is_blocked_by_active_transfers(),
+            admission_result.is_blocked_by_active_transfers() or controller.early_admission_blocked,
         )
 
     def revert_deferred_gen_init(
@@ -312,13 +319,7 @@ class DisaggTransferCoordinator:
 
     def _transfer_window_is_active(self) -> bool:
         """Whether the executor-level transfer window bounds admission."""
-        return (
-            self._admission_controller is not None
-            and self._admission_controller.enabled()
-            and not transfer_window_bypass_eligible(
-                self._transceiver, self._dist, self._is_kv_manager_v2
-            )
-        )
+        return self._admission_controller is not None and self._admission_controller.enabled()
 
     @nvtx_range("receive_gen_init")
     def receive_gen_init(self, admitted: List[LlmRequest]) -> None:

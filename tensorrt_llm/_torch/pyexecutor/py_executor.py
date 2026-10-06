@@ -60,7 +60,7 @@ from ..disaggregation.orchestration.admission import \
     DisaggTransferAdmissionController
 from ..disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator, NoopDisaggCoordinator, attach_ctx_usage,
-    transfer_window_bypass_eligible)
+    early_transfer_window_eligible)
 from ..disaggregation.orchestration.pp_termination import \
     DisaggPPTerminationHandler
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
@@ -113,7 +113,8 @@ from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
-from .scheduler import (RequestScheduler, ScheduledRequests,
+from .scheduler import (KVCacheV2Scheduler, MultimodalScheduler,
+                        RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter, count_retiring_requests
@@ -1019,20 +1020,38 @@ class PyExecutor:
                                        "max_tokens_in_buffer", None)
         tokens_per_block = getattr(self.kv_cache_manager, "tokens_per_block",
                                    None)
-        self._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
-            max_tokens_in_buffer, tokens_per_block)
-        if (self.global_rank == 0
-                and self._disagg_transfer_admission_controller.enabled()
-                and transfer_window_bypass_eligible(self.kv_cache_transceiver,
-                                                    self.dist,
-                                                    self._is_kv_manager_v2)):
-            logger.warning_once(
-                f"[PyExecutor] Bypassing the executor transfer window "
-                f"configured by max_tokens_in_buffer={max_tokens_in_buffer} "
-                "for asynchronous Python generation with KV cache manager "
-                "V2 and pp_size=1; "
-                "scheduler KV cache capacity admission remains active.",
-                key="disagg_transfer_window_bypass")
+        scheduler_owns_admission = early_transfer_window_eligible(
+            kv_cache_transceiver, self.dist, self._is_kv_manager_v2)
+        capacity = None
+        if scheduler_owns_admission:
+            from ..disaggregation.transceiver import KvCacheTransceiverV2
+            if isinstance(kv_cache_transceiver, KvCacheTransceiverV2):
+                capacity = kv_cache_transceiver.get_receive_admission_capacity_bytes(
+                )
+        if capacity is not None:
+            ratio = cache_transceiver_config.kv_cache_bounce_admission_ratio
+            budget_bytes = max(1, int(capacity * ratio))
+            self._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+                None,
+                None,
+                max_transfer_bytes=budget_bytes,
+                python_transceiver=kv_cache_transceiver)
+            logger.info(
+                f"Disagg byte admission: receive_capacity_bytes={capacity}, "
+                f"budget_bytes={budget_bytes}, ratio={ratio}; "
+                "scheduler checks prepared receive layouts")
+        else:
+            self._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+                None if scheduler_owns_admission else max_tokens_in_buffer,
+                tokens_per_block)
+        if (self._disagg_transfer_admission_controller.enabled()
+                and scheduler_owns_admission):
+            scheduler = self.scheduler
+            if isinstance(scheduler, MultimodalScheduler):
+                scheduler = scheduler.scheduler
+            assert isinstance(scheduler, KVCacheV2Scheduler)
+            scheduler.set_disagg_transfer_admission_controller(
+                self._disagg_transfer_admission_controller)
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
                                     and self.kv_cache_transceiver is not None)
         # True while the benchmark disagg fill phase is in progress (waiting
