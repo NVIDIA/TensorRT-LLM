@@ -120,6 +120,16 @@ add_tllm_gtest(
   LABELS
   "unit;executor;host")
 add_tllm_gtest(
+  transferAgentMetadataTest
+  OWNER
+  executor
+  SOURCES
+  transferAgentMetadataTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_transfer_agent
+  LABELS
+  "unit;executor;host")
+add_tllm_gtest(
   ucxCommTest
   SOURCES
   ucxCommTest.cpp
