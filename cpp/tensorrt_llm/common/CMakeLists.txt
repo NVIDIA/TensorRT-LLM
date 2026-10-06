@@ -32,6 +32,38 @@ else() # Windows
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
 endif()
 
+add_library(tllm_common_headers INTERFACE)
+add_library(tllm::common_headers ALIAS tllm_common_headers)
+target_include_directories(tllm_common_headers INTERFACE ${API_INCLUDE_DIR}
+                                                         ${PROJECT_SOURCE_DIR})
+
+add_library(tllm_common_error STATIC stringUtils.cpp tllmException.cpp)
+add_library(tllm::common_error ALIAS tllm_common_error)
+target_link_libraries(
+  tllm_common_error
+  PUBLIC tllm::common_headers
+  PRIVATE ${CMAKE_DL_LIBS})
+# stringUtils.h exposes CUDA half types, but needs no CUDA runtime linkage.
+target_include_directories(tllm_common_error SYSTEM
+                           PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+set_target_properties(tllm_common_error PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(tllm_common_logging STATIC logger.cpp timestampUtils.cpp)
+add_library(tllm::common_logging ALIAS tllm_common_logging)
+target_link_libraries(
+  tllm_common_logging
+  PUBLIC tllm::common_error
+  PRIVATE Threads::Threads CUDA::cudart)
+set_target_properties(tllm_common_logging PROPERTIES POSITION_INDEPENDENT_CODE
+                                                     ON)
+
+list(
+  REMOVE_ITEM
+  SRCS
+  "${CMAKE_CURRENT_SOURCE_DIR}/stringUtils.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tllmException.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/logger.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/timestampUtils.cpp")
 add_library(common_src OBJECT ${SRCS} ${CU_SRCS})
 add_cuda_architectures(common_src 89)
 set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)
