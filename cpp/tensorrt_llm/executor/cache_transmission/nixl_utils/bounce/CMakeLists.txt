@@ -24,3 +24,27 @@ target_compile_features(tllm_executor_bounce_core PUBLIC cxx_std_20)
 target_compile_options(tllm_executor_bounce_core PRIVATE -Wno-error)
 set_target_properties(tllm_executor_bounce_core
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(tllm_executor_bounce_cuda STATIC EXCLUDE_FROM_ALL
+            ExecPool.cpp GatherScatterKernel.cu)
+add_library(tllm::executor_bounce_cuda ALIAS tllm_executor_bounce_cuda)
+target_link_libraries(tllm_executor_bounce_cuda
+                      PUBLIC tllm::executor_bounce_core tllm::common_cuda)
+target_compile_features(tllm_executor_bounce_cuda PUBLIC cxx_std_20)
+target_compile_options(tllm_executor_bounce_cuda
+                       PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wno-error>)
+set_target_properties(
+  tllm_executor_bounce_cuda
+  PROPERTIES POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+add_library(tllm_executor_bounce_arena STATIC EXCLUDE_FROM_ALL BounceArena.cpp)
+add_library(tllm::executor_bounce_arena ALIAS tllm_executor_bounce_arena)
+target_link_libraries(
+  tllm_executor_bounce_arena
+  PUBLIC tllm::common_cuda
+  PRIVATE tllm::kv_cache_legacy)
+target_compile_features(tllm_executor_bounce_arena PUBLIC cxx_std_20)
+target_compile_options(tllm_executor_bounce_arena PRIVATE -Wno-error)
+set_target_properties(tllm_executor_bounce_arena
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
