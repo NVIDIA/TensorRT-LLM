@@ -62,14 +62,13 @@ if(NIXL_ROOT)
                                   # absent
   endif()
   if(ZMQ_FOUND)
-    target_sources(
-      ${NIXL_WRAPPER_TARGET}
-      PRIVATE bounce/BounceArena.cpp bounce/ExecPool.cpp
-              bounce/GatherScatterKernel.cu bounce/ZmqControlChannel.cpp
-              bounce/BounceTransport.cpp)
+    target_sources(${NIXL_WRAPPER_TARGET} PRIVATE bounce/ZmqControlChannel.cpp
+                                                  bounce/BounceTransport.cpp)
     target_link_libraries(
       ${NIXL_WRAPPER_TARGET}
-      PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_executor_bounce_core>)
+      PRIVATE
+        $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_executor_bounce_core,tllm_executor_bounce_cuda,tllm_executor_bounce_arena>
+    )
     target_include_directories(
       ${NIXL_WRAPPER_TARGET} PRIVATE ${CMAKE_BINARY_DIR}/_deps/cppzmq-src
                                      ${ZMQ_INCLUDE_DIRS})

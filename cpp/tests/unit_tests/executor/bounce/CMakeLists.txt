@@ -75,18 +75,41 @@ add_tllm_gtest(
   "unit;executor;bounce;host")
 # GPU test: execution-context pool (stream/event/scratch/hostPinned)
 # acquire/release.
-add_tllm_gtest(execPoolTest SOURCES execPoolTest.cpp FULL_STACK LABELS
-               "unit;full-stack")
-target_sources(execPoolTest PRIVATE ${BOUNCE_DIR}/ExecPool.cpp)
+add_tllm_gtest(
+  execPoolTest
+  OWNER
+  executor
+  SOURCES
+  execPoolTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_bounce_cuda
+  LABELS
+  "unit;executor;bounce;gpu"
+  REQUIRES_GPU)
 # GPU test: gather/scatter CUDA kernel round-trip (needs a CUDA device to run).
-add_tllm_gtest(gatherScatterKernelTest SOURCES gatherScatterKernelTest.cpp
-               FULL_STACK LABELS "unit;full-stack")
-target_sources(gatherScatterKernelTest
-               PRIVATE ${BOUNCE_DIR}/GatherScatterKernel.cu)
+add_tllm_gtest(
+  gatherScatterKernelTest
+  OWNER
+  executor
+  SOURCES
+  gatherScatterKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_bounce_cuda
+  LABELS
+  "unit;executor;bounce;gpu"
+  REQUIRES_GPU)
 # GPU test: shared data-arena alloc / address mapping / shutdown.
-add_tllm_gtest(bounceArenaTest SOURCES bounceArenaTest.cpp FULL_STACK LABELS
-               "unit;full-stack")
-target_sources(bounceArenaTest PRIVATE ${BOUNCE_DIR}/BounceArena.cpp)
+add_tllm_gtest(
+  bounceArenaTest
+  OWNER
+  executor
+  SOURCES
+  bounceArenaTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_bounce_arena
+  LABELS
+  "unit;executor;bounce;gpu"
+  REQUIRES_GPU)
 
 # ---- Control-plane unit test — needs only zmq (+ the fetched cppzmq header),
 # no NIXL. ZMQ_FOUND is reused by the real-NIXL block below. ----
@@ -122,10 +145,8 @@ if(NIXL_ROOT)
   # when NIXL is on); all of them share this source set + include/link sets.
   # Same gate as the zmq-only tier above.
   if(BOUNCE_CPPZMQ_AVAILABLE)
-    set(BOUNCE_REACTOR_SRCS
-        ${BOUNCE_DIR}/BounceTransport.cpp ${BOUNCE_DIR}/BounceArena.cpp
-        ${BOUNCE_DIR}/ExecPool.cpp ${BOUNCE_DIR}/GatherScatterKernel.cu
-        ${BOUNCE_DIR}/ZmqControlChannel.cpp)
+    set(BOUNCE_REACTOR_SRCS ${BOUNCE_DIR}/BounceTransport.cpp
+                            ${BOUNCE_DIR}/ZmqControlChannel.cpp)
     set(BOUNCE_TSAN_SRCS
         ${BOUNCE_DIR}/BounceTransport.cpp
         ${BOUNCE_DIR}/BounceTransferPlan.cpp
@@ -150,7 +171,9 @@ if(NIXL_ROOT)
         target_sources(${name} PRIVATE ${BOUNCE_TSAN_SRCS})
       else()
         target_sources(${name} PRIVATE ${BOUNCE_REACTOR_SRCS})
-        target_link_libraries(${name} PRIVATE tllm::executor_bounce_core)
+        target_link_libraries(
+          ${name} PRIVATE tllm::executor_bounce_core tllm::executor_bounce_cuda
+                          tllm::executor_bounce_arena)
       endif()
       target_include_directories(${name} PRIVATE ${BOUNCE_TEST_INCS})
       target_link_libraries(${name} PRIVATE ${BOUNCE_TEST_LIBS})
