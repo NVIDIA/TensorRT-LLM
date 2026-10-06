@@ -13,10 +13,14 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_gtest(cudaProfilerUtilsTest cudaProfilerUtilsTest.cpp)
-add_gtest(cudaUtilsTest cudaUtilsTest.cpp)
-add_gtest(attentionWorkspaceTest attentionWorkspaceTest.cpp)
-add_gtest(memoryUtilsTest memoryUtilsTest.cu)
+add_tllm_gtest(cudaProfilerUtilsTest SOURCES cudaProfilerUtilsTest.cpp
+               FULL_STACK LABELS "unit;full-stack")
+add_tllm_gtest(cudaUtilsTest SOURCES cudaUtilsTest.cpp FULL_STACK LABELS
+               "unit;full-stack")
+add_tllm_gtest(attentionWorkspaceTest SOURCES attentionWorkspaceTest.cpp
+               FULL_STACK LABELS "unit;full-stack")
+add_tllm_gtest(memoryUtilsTest SOURCES memoryUtilsTest.cu FULL_STACK LABELS
+               "unit;full-stack")
 add_tllm_gtest(
   optionalRefTest
   OWNER
@@ -78,7 +82,8 @@ add_tllm_gtest(
   tllm::common_logging
   LABELS
   "unit;common;host")
-add_gtest(cudaDriverWrapperTest cudaDriverWrapperTest.cpp)
+add_tllm_gtest(cudaDriverWrapperTest SOURCES cudaDriverWrapperTest.cpp
+               FULL_STACK LABELS "unit;full-stack")
 add_tllm_gtest(
   loggerTest
   OWNER
