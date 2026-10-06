@@ -41,10 +41,23 @@ if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
     ${NCCL_LIB}
     LABELS
     "unit;kernels;all-reduce;multi-gpu;gpu")
-  add_tllm_gtest(gemmAllReduceTest SOURCES allReduce/gemmAllReduceTest.cu
-                 FULL_STACK LABELS "unit;full-stack;gpu")
+  add_tllm_gtest(
+    gemmAllReduceTest
+    OWNER
+    kernel
+    SOURCES
+    allReduce/gemmAllReduceTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_gemm_all_reduce
+    tllm::kernel_cutlass_headers
+    tllm::kernel_userbuffers
+    tllm::runtime_ipc_nvls
+    tllm::runtime_distributed
+    ${NCCL_LIB}
+    LABELS
+    "unit;kernels;all-reduce;multi-gpu;gpu"
+    NO_GTEST_MAIN)
   if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
-    target_link_libraries(gemmAllReduceTest PRIVATE ar_gemm_src)
     target_compile_definitions(gemmAllReduceTest
                                PRIVATE USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   endif()

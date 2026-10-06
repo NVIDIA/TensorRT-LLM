@@ -78,6 +78,15 @@ add_tllm_kernel_library(
   tllm::common_environment
   tllm::runtime_ipc)
 
+if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  list(APPEND TLLM_KERNEL_COMPONENT_TARGETS ar_gemm_src)
+else()
+  add_library(tllm_kernel_gemm_all_reduce INTERFACE)
+  add_library(tllm::kernel_gemm_all_reduce ALIAS tllm_kernel_gemm_all_reduce)
+  target_link_libraries(tllm_kernel_gemm_all_reduce
+                        INTERFACE ${INTERNAL_CUTLASS_KERNELS_TARGET})
+endif()
+
 add_tllm_kernel_library(tllm_kernel_logits SOURCES logitsBitmask.cu)
 
 add_tllm_kernel_library(
