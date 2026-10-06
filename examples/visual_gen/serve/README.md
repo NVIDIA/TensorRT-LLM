@@ -816,9 +816,6 @@ curl -X DELETE "http://localhost:8000/v1/videos/{video_id}"
 - **Multipart/Form-Data**: Image- or video-conditioned generation with file upload
 - **Cosmos3 model-specific modes**: Transfer, Action, and synchronized audio-video through `extra_params`
 
-`/v1/videos/generations` is retained as a deprecated compatibility alias for
-`/v1/videos/sync`. New clients should use `/v1/videos/sync`.
-
 ## Error Handling
 
 All examples include comprehensive error handling:
