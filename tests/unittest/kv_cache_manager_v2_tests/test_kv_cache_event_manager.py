@@ -436,12 +436,10 @@ def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factor
         ]
         # UUIDs are event metadata, not an additional input to the block-key hash.
         digest_only_tokens = [
-            bytes.fromhex(token) if isinstance(token, str) else token
-            for token in stored.token_ids
+            bytes.fromhex(token) if isinstance(token, str) else token for token in stored.token_ids
         ]
         assert stored.block_hashes == [
-            truncate_sha256_hash_to_int64(key)
-            for key in _blockchain_keys(4, digest_only_tokens)
+            truncate_sha256_hash_to_int64(key) for key in _blockchain_keys(4, digest_only_tokens)
         ]
         payload = msgspec.msgpack.encode(published[0])
         assert msgspec.msgpack.decode(payload, type=KVEventBatch) == published[0]
