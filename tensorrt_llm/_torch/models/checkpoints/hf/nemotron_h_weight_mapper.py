@@ -1,10 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import re
 from typing import Optional
 
 import torch
 from torch import nn
 
-import tensorrt_llm.logger as logger
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
@@ -14,6 +16,17 @@ from tensorrt_llm._torch.utils import split
 @register_mapper("HF", "NemotronHPuzzleForCausalLM")
 @register_mapper("HF", "NemotronHForCausalLM")
 class NemotronHHfWeightMapper(HfWeightMapper):
+
+    @staticmethod
+    def map_mtp_module_name(name: str, num_hidden_layers: int) -> str:
+        """Map nested MTP sublayers and their exclusion patterns."""
+        name = re.sub(r"(model\.layers\.)?backbone", "model", name)
+        mtp_root = f"model.layers.{num_hidden_layers}"
+        if name in ("mtp", "mtp*", "mtp.*"):
+            return mtp_root
+        if name.startswith("mtp."):
+            return mtp_root + name[len("mtp"):]
+        return name
 
     def preprocess_weights(self, weights: dict) -> dict:
         config = self.config.pretrained_config
@@ -67,12 +80,7 @@ class NemotronHHfWeightMapper(HfWeightMapper):
 
             # MTP layers are stored as mtp.layers.0.xxx (sublayer 0, Attention) and mtp.layers.1.xxx (sublayer 1, MoE)
             if "mtp.layers." in key:
-                match = re.match(r'mtp\.layers\.(\d+)\.(.*)', key)
-                if match:
-                    sublayer_idx, rest = match.groups()
-                    key = f"model.layers.{config.num_hidden_layers}.layers.{sublayer_idx}.{rest}"
-                else:
-                    logger.error(f"Failed to match MTP pattern for: {name}")
+                key = self.map_mtp_module_name(key, config.num_hidden_layers)
 
             if "A_log" in key:
                 key = key.replace("A_log", "A")

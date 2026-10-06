@@ -32,8 +32,7 @@ from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, copytree, rmtree
-from subprocess import (DEVNULL, PIPE, CalledProcessError, Popen, check_output,
-                        run)
+from subprocess import PIPE, CalledProcessError, Popen, check_output, run
 from typing import Optional, Sequence
 
 try:
@@ -269,7 +268,7 @@ def setup_venv(project_dir: Path,
                requirements_file: Path,
                no_venv: bool,
                yes: bool = False,
-               build_root: Optional[Path] = None) -> tuple[Path, Path]:
+               build_root: Optional[Path] = None) -> Path:
     """Creates/updates a venv and installs requirements.
 
     Args:
@@ -280,7 +279,7 @@ def setup_venv(project_dir: Path,
             is created there instead of inside the checkout.
 
     Returns:
-        Tuple[Path, Path]: Paths to the python and conan executables in the venv.
+        Path to the Python executable in the virtual environment.
     """
     if no_venv or sys.prefix != sys.base_prefix:
         reason = "Explicitly requested by user" if no_venv else "Already inside virtual environment"
@@ -295,8 +294,6 @@ def setup_venv(project_dir: Path,
         venv_prefix = create_venv(venv_prefix)
 
     scheme = sysconfig_scheme({'base': venv_prefix})
-    # Determine venv executable paths
-    scripts_dir = Path(scheme["scripts"])
     venv_python = venv_prefix / sys.executable.removeprefix(sys.prefix)[1:]
 
     if os.environ.get("NVIDIA_PYTORCH_VERSION"):
@@ -352,54 +349,7 @@ def setup_venv(project_dir: Path,
     )
     build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
 
-    venv_conan = setup_conan(scripts_dir, venv_python)
-
-    return venv_python, venv_conan
-
-
-def setup_conan(scripts_dir, venv_python):
-    build_run(f'"{venv_python}" -m pip install conan==2.14.0')
-    # Determine the path to the conan executable within the venv
-    venv_conan = scripts_dir / "conan"
-    if not venv_conan.exists():
-        # Attempt to find it using shutil.which as a fallback, in case it's already installed in the system
-        try:
-            result = build_run(
-                f'''{venv_python} -c "import shutil; print(shutil.which('conan'))" ''',
-                capture_output=True,
-                text=True)
-            conan_path_str = result.stdout.strip()
-
-            if conan_path_str:
-                venv_conan = Path(conan_path_str)
-                print(
-                    f"-- Found conan executable via PATH search at: {venv_conan}"
-                )
-            else:
-                raise RuntimeError(
-                    f"Failed to locate conan executable in virtual environment {scripts_dir} or system PATH."
-                )
-
-        except CalledProcessError as e:
-            print(f"Fallback search command output: {e.stdout}",
-                  file=sys.stderr)
-            print(f"Fallback search command error: {e.stderr}", file=sys.stderr)
-            raise RuntimeError(
-                f"Failed to locate conan executable in virtual environment {scripts_dir} or system PATH."
-            )
-    else:
-        print(f"-- Found conan executable at: {venv_conan}")
-
-    # Create default profile
-    build_run(f'"{venv_conan}" profile detect -f')
-
-    # Add the TensorRT LLM remote if it doesn't exist
-    build_run(
-        f'"{venv_conan}" remote add --force TensorRT-LLM https://edge.urm.nvidia.com/artifactory/api/conan/sw-tensorrt-llm-conan',
-        stdout=DEVNULL,
-        stderr=DEVNULL)
-
-    return venv_conan
+    return venv_python
 
 
 def _fmha_generation_stamp(fmha_v2_cu_dir: Path) -> Path:
@@ -621,57 +571,6 @@ def generate_python_stubs_windows(venv_python: Path, pkg_dir: Path,
 
     print("Windows not supported for nanobind stubs")
     exit(1)
-
-
-def build_kv_cache_manager_v2(project_dir,
-                              venv_python,
-                              use_mypyc=False,
-                              build_root=None):
-    print("-- Building kv_cache_manager_v2...")
-    kv_cache_mgr_dir = project_dir / "tensorrt_llm/runtime/kv_cache_manager_v2"
-    runtime_dir = project_dir / "tensorrt_llm/runtime"
-
-    # The produced .so files always land in-place (they are final artifacts);
-    # only the intermediate object files are redirected out of the checkout.
-    build_temp_arg = ""
-    if build_root is not None:
-        build_temp_arg = f' --build-temp "{build_root / "kv_cache_manager_v2-temp"}"'
-
-    # Clean up any existing mypyc artifacts in runtime directory to prevent stale inclusion
-    # when switching from --mypyc to standard build
-    if not use_mypyc:
-        for so_file in runtime_dir.glob("*__mypyc*.so"):
-            print(f"Removing stale mypyc artifact: {so_file}")
-            so_file.unlink()
-
-        # Also clean up any .so files inside kv_cache_manager_v2
-        for so_file in kv_cache_mgr_dir.rglob("*.so"):
-            print(f"Removing stale artifact: {so_file}")
-            so_file.unlink()
-
-    # Build rawref
-    print("-- Building kv_cache_manager_v2 rawref extension...", end=" ")
-    rawref_dir = kv_cache_mgr_dir / "rawref"
-    build_run(f'"{venv_python}" setup.py build_ext --inplace{build_temp_arg}',
-              cwd=rawref_dir)
-    print("Done")
-
-    if use_mypyc:
-        # Build mypyc
-        print("-- Building kv_cache_manager_v2 mypyc extensions...", end=" ")
-        # setup_mypyc.py is in kv_cache_manager_v2 but executed from runtime dir
-        setup_mypyc = kv_cache_mgr_dir / "setup_mypyc.py"
-        build_run(
-            f'"{venv_python}" "{setup_mypyc}" build_ext --inplace{build_temp_arg}',
-            cwd=runtime_dir)
-
-        # Verify that the shared library was generated
-        if not list(runtime_dir.glob("*__mypyc*.so")):
-            raise RuntimeError(
-                "Failed to build kv_cache_manager_v2: no shared library generated."
-            )
-        print("Done")
-    print("-- Done building kv_cache_manager_v2.")
 
 
 def _tar_pipe_copy(src: Path, dst: Path) -> bool:
@@ -932,7 +831,6 @@ def main(*,
          generate_fmha: bool = False,
          no_venv: bool = False,
          nvrtc_dynamic_linking: bool = False,
-         mypyc: bool = False,
          require_dynamic_attributions: bool = False,
          plat_name: Optional[str] = None,
          yes: bool = False,
@@ -985,11 +883,11 @@ def main(*,
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
 
     # Setup venv and install requirements
-    venv_python, venv_conan = setup_venv(project_dir,
-                                         project_dir / requirements_filename,
-                                         no_venv,
-                                         yes=yes,
-                                         build_root=build_root)
+    venv_python = setup_venv(project_dir,
+                             project_dir / requirements_filename,
+                             no_venv,
+                             yes=yes,
+                             build_root=build_root)
 
     if cuda_architectures is not None:
         if "70-real" in cuda_architectures:
@@ -1158,8 +1056,7 @@ def main(*,
     # silently building the old configuration. The source directory is
     # included because an explicit build_dir can be reused across checkouts
     # (shared build_root, --no_venv) with every other argument equal while
-    # -S changes. The conan toolchain path is excluded: it is derived from
-    # build_dir and constant per build dir.
+    # -S changes.
     #
     # The arguments are listed in the same order the configure command below
     # passes them (built-in definitions, then cmake_def_args, then the
@@ -1195,23 +1092,6 @@ def main(*,
 
     with working_directory(build_dir):
         if clean or first_build or configure_cmake or configure_only:
-            # Conan writes a CMakeUserPresets.json convenience file next to
-            # cpp/CMakeLists.txt; with out-of-tree build state it would be
-            # the only build file left in the checkout (and would point at a
-            # possibly ephemeral location), so skip generating it.
-            conan_extra_args = (
-                " -c tools.cmake.cmaketoolchain:user_presets=False"
-                if build_root is not None else "")
-            # Pin the standard Conan builds against: the profile it detects
-            # follows the compiler default, which lags behind what cpp/
-            # CMakeLists.txt asks for. Extensions are off there, hence "20"
-            # rather than "gnu20".
-            build_run(
-                f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}' -s:a compiler.cppstd=20{conan_extra_args} {source_dir}"
-            )
-            cmake_def_args.append(
-                f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
-            )
             if internal_cutlass_kernels_root:
                 cmake_def_args.append(
                     f"-DINTERNAL_CUTLASS_KERNELS_PATH={internal_cutlass_kernels_root}"
@@ -1628,11 +1508,6 @@ def main(*,
                     bool(flash_mla_cuda_architectures), nixl_root is not None
                     or mooncake_root is not None, binding_lib_file_name)
 
-    build_kv_cache_manager_v2(wheel_project_dir,
-                              venv_python,
-                              use_mypyc=mypyc,
-                              build_root=build_root)
-
     if not skip_building_wheel:
         if dist_dir is None:
             dist_dir = build_root / "dist" if out_of_tree else project_dir / "build"
@@ -1700,10 +1575,6 @@ def main(*,
             )
 
         env = os.environ.copy()
-        if mypyc:
-            env["TRTLLM_ENABLE_MYPYC"] = "1"
-        else:
-            env["TRTLLM_ENABLE_MYPYC"] = "0"
 
         build_run(
             f'\"{venv_python}\" -m build {wheel_project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"',
@@ -1870,9 +1741,6 @@ def add_arguments(parser: ArgumentParser):
         "--nvrtc_dynamic_linking",
         action="store_true",
         help="Link against dynamic NVRTC libraries instead of static ones")
-    parser.add_argument("--mypyc",
-                        action="store_true",
-                        help="Compile kv_cache_manager_v2 with mypyc")
     parser.add_argument("--require_dynamic_attributions",
                         action="store_true",
                         help="Fail the build if attribution generation fails")

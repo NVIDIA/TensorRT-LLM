@@ -1,0 +1,191 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Semantic conflict review (disabled)
+# Bot-to-bot review requests and reply processing are disabled. Keep the manual
+# entry point and implementation available for inspecting historical runs.
+on:
+  workflow_dispatch:
+    inputs:
+      pull_number:
+        description: 'Open main/release PR to check, including drafts and already requested revisions'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'schedule' && 'semantic-review-scan' || format('semantic-review-run-{0}', github.run_id) }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  discover:
+    name: Select PRs for semantic analysis
+    if: ${{ false }}
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      statuses: read
+      checks: read
+      actions: read
+    outputs:
+      jobs: >-
+        ${{ (github.event_name != 'schedule' || steps.select.outputs.cursor == '' ||
+             steps.save_cursor.outcome == 'success') && steps.select.outputs.jobs || '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
+      - id: select
+        uses: actions/github-script@v8
+        env:
+          INPUT_PULL_NUMBER: ${{ inputs.pull_number }}
+          CURSOR_PATH: ${{ runner.temp }}/semantic-review-cursor/cursor.json
+        with:
+          script: |
+            const {mkdirSync, writeFileSync} = require('node:fs');
+            const {dirname} = require('node:path');
+            const {restoreCursor} = require('./.github/scripts/semantic_review_cursor.js');
+            const {discover} = require('./.github/scripts/semantic_review_request.js');
+            const state = await restoreCursor({github, context});
+            const cursor = state?.cursor;
+            if (context.eventName === 'schedule' && cursor === undefined) {
+              core.info('No retained semantic review cursor; start with the newest PR.');
+            }
+            const result = await discover({github, context, core, cursor});
+            if (result.cursor !== undefined) {
+              mkdirSync(dirname(process.env.CURSOR_PATH), {recursive: true});
+              writeFileSync(process.env.CURSOR_PATH, JSON.stringify({last_pr: result.cursor}));
+              core.setOutput('cursor', result.cursor);
+              core.setOutput('cursor_artifact', state.nextArtifact);
+              core.info(`Next scheduled scan continues below PR #${result.cursor}.`);
+            }
+            core.setOutput('jobs', JSON.stringify(result.jobs));
+      - id: save_cursor
+        name: Save the scheduled scan cursor
+        if: ${{ !cancelled() && github.event_name == 'schedule' && steps.select.outputs.cursor != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.select.outputs.cursor_artifact }}
+          path: ${{ runner.temp }}/semantic-review-cursor/cursor.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+
+  request:
+    name: 'Process semantic review for PR #${{ matrix.number }}'
+    needs: discover
+    if: >-
+      !cancelled() && needs.discover.outputs.jobs != '' &&
+      needs.discover.outputs.jobs != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.discover.outputs.jobs) }}
+    concurrency:
+      group: semantic-review-pr-${{ matrix.number }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      statuses: write
+      checks: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts
+            .github/semantic-review-prompt.md
+          sparse-checkout-cone-mode: false
+      - uses: actions/github-script@v8
+        env:
+          PULL_NUMBER: ${{ matrix.number }}
+          ALLOW_REQUEST: ${{ matrix.allowRequest }}
+          SEMANTIC_COMMAND_TOKEN: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
+        with:
+          script: |
+            const {run} = require('./.github/scripts/semantic_review_request.js');
+            const commandGithub = process.env.SEMANTIC_COMMAND_TOKEN ? new github.constructor({
+              auth: process.env.SEMANTIC_COMMAND_TOKEN, retry: {enabled: false},
+            }) : undefined;
+            await run({github, commandGithub, context, core, number: Number(process.env.PULL_NUMBER),
+              allowRequest: process.env.ALLOW_REQUEST === 'true'});
+
+  publish:
+    name: Publish semantic verdict
+    concurrency:
+      group: semantic-review-pr-${{ github.event.issue.number }}
+      cancel-in-progress: false
+      queue: max
+    if: ${{ false }}
+    permissions:
+      contents: read
+      issues: read
+      statuses: write
+      checks: write
+    outputs:
+      active: ${{ steps.publish.outputs.active }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/semantic_review.js
+          sparse-checkout-cone-mode: false
+      - id: publish
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const {publish} = require('./.github/scripts/semantic_review.js');
+            const state = await publish({github, context, core});
+            core.setOutput('active', state?.request ? 'true' : 'false');
+
+  tidy:
+    name: Tidy semantic review comments
+    needs: publish
+    # Runs on PRs with a semantic review request only. Comment writes are kept
+    # out of the publish job so the status/check writer never holds comment
+    # permissions and vice versa.
+    if: needs.publish.outputs.active == 'true'
+    concurrency:
+      group: semantic-review-pr-${{ github.event.issue.number }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: read
+      checks: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/semantic_review.js
+          sparse-checkout-cone-mode: false
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const {tidy} = require('./.github/scripts/semantic_review.js');
+            await tidy({github, context, core});

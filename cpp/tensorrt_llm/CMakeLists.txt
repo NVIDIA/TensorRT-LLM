@@ -141,6 +141,12 @@ if(NOT INTERNAL_CUTLASS_KERNELS_PATH)
 endif()
 
 add_subdirectory(common)
+
+add_library(ipc_nvls_memory_src STATIC runtime/ipcNvlsMemory.cu)
+set_target_properties(
+  ipc_nvls_memory_src PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                 CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
 add_subdirectory(kernels)
 add_subdirectory(runtime)
 
@@ -250,6 +256,15 @@ set_target_properties(
   ${SHARED_TARGET}
   PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+
+# Keep statically linked NVRTC symbols local so they cannot be interposed by a
+# dynamic NVRTC loaded elsewhere in the process.
+if(NOT WIN32 AND NOT NVRTC_DYNAMIC_LINKING)
+  target_link_options(
+    ${SHARED_TARGET} PRIVATE
+    "LINKER:--exclude-libs,$<TARGET_FILE_NAME:${NVRTC_LIB}>"
+    "LINKER:--exclude-libs,$<TARGET_FILE_NAME:${NVRTC_BUILTINS_LIB}>")
+endif()
 
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 

@@ -43,7 +43,6 @@ class Page;
 class KvCache;
 class CopyEngine;
 class StagingBufferManager;
-struct BatchedLockTarget;
 
 using MigrationRecorder
     = std::function<void(std::vector<SharedPtr<Page>> const&, std::vector<Slot> const&, CacheLevel, CacheLevel)>;
@@ -171,7 +170,7 @@ public:
     // Check if a page is evictable (optionally at a target level).
     bool isEvictable(Page const& page, std::optional<CacheLevel> level = std::nullopt) const noexcept;
 
-    // Ensure numFreeSlots[pgIdx] free GPU slots exist (evicting pages as needed).
+    // Ensure the requested free slots exist at this level (evicting pages as needed).
     void prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
@@ -189,8 +188,9 @@ public:
 
     // ---- Migration ---------------------------------------------------------
 
-    // Migrate a batch of pages to GPU (used by batchedLockToGpu).
-    void batchedMigrateToGpu(std::vector<BatchedLockTarget> const& targets, MigrationRecorder const& migrationRecorder);
+    // Migrate pages excluded from eviction to one destination level. Locked pages cannot move.
+    void batchedMigrate(
+        CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages, MigrationRecorder const& migrationRecorder);
 
     // Best-effort migration of grouped pages to a destination cache level. Returns how many pages
     // it moved off the disk tier, counted per migrated batch rather than per page. A throw reports
@@ -274,8 +274,10 @@ public:
     TypedVec<PoolGroupIndex, float> getRatioList(CacheLevel level) const;
 
     // Compute lifecycle allocation weights, then project them onto a cache level's pool grouping.
-    TypedVec<LifeCycleId, float> ratioFromLength(
-        CacheLevel level, int tokensPerBlock, int historyLength, int capacity) const;
+    // `beamWidth` / `promptLength` describe the typical request the weights are derived from; only
+    // the blocks from the prompt tail onward are replicated per beam (see KVCacheDesc).
+    TypedVec<LifeCycleId, float> ratioFromLength(CacheLevel level, int tokensPerBlock, int historyLength, int capacity,
+        int beamWidth = 1, int promptLength = 0) const;
     TypedVec<PoolGroupIndex, float> toPoolGroupRatio(
         CacheLevel level, TypedVec<LifeCycleId, float> const& lifeCycleRatio) const;
 

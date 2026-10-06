@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import ClassVar, Dict, List, Optional, Union
+from typing import ClassVar, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -214,6 +214,24 @@ def copy_weight(dst: Parameter, src: torch.Tensor):
     dst.data.copy_(src)
 
 
+def _load_kv_cache_scales(module: Linear, k_scales: List[torch.Tensor],
+                          v_scales: List[torch.Tensor]) -> None:
+    """Merge calibration scales without replacing graph-visible storage."""
+    if not hasattr(module, "kv_scales") or os.environ.get(
+            "TRTLLM_LOAD_KV_SCALES", "1") != "1":
+        return
+    if not k_scales and not v_scales:
+        return
+    assert k_scales and v_scales, "k_scale and v_scale must be loaded together"
+    copy_weight(
+        module.kv_scales,
+        torch.tensor([1.0, max(k_scales).item(),
+                      max(v_scales).item()],
+                     dtype=torch.float32),
+    )
+    copy_weight(module.inv_kv_scales, module.kv_scales.reciprocal())
+
+
 def copy_weight_shard(dst: Parameter, src: torch.Tensor, shard_offset: int,
                       shard_size: int):
     if dst.dtype != src.dtype:
@@ -397,6 +415,10 @@ class LinearMethodBase(ABC):
     # internally; callers do not pass output_buffer_kind as a parameter.
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = False
     quantizes_nvfp4_activations: ClassVar[bool] = False
+    # True only for methods that need the activation left unquantized. Callers
+    # that would otherwise quantize one activation once above several Linears
+    # (fused gate/up, shared q/k/v) must stand down for those.
+    requires_unquantized_activation: ClassVar[bool] = False
 
     @abstractmethod
     def create_weights(self, module: Linear, in_features: int,
@@ -685,7 +707,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                         [1.0, max(k_scales).item(),
                          max(v_scales).item()],
                         dtype=torch.float32))
-                module.inv_kv_scales.data = 1.0 / module.kv_scales
+                copy_weight(module.inv_kv_scales, module.kv_scales.reciprocal())
 
     def load_weights_fused_gate_up_linear(
             self,
@@ -991,7 +1013,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                         [1.0, max(k_scales).item(),
                          max(v_scales).item()],
                         dtype=torch.float32))
-                module.inv_kv_scales.data = 1.0 / module.kv_scales
+                copy_weight(module.inv_kv_scales, module.kv_scales.reciprocal())
 
         # Clean up temporary attributes
         if hasattr(module, "tmp_k_scales"):
@@ -1045,6 +1067,42 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         Post-process weights after all partial loads are complete.
         """
         self.rescale_fused_weights(module)
+
+
+class W8A16FP8LinearMethod(FP8QDQLinearMethod):
+    """W8A16 FP8 linear using on-the-fly weight dequantization.
+
+    Same weights, scales and loading as ``FP8QDQLinearMethod`` -- only the way
+    they are consumed differs, so everything but ``apply`` is inherited. The
+    activation is left in its 16-bit dtype and the weight is brought up to
+    meet it, which makes ``input_scale`` unused here.
+
+    Holds no state; one instance can serve every Linear in a model.
+    """
+
+    SUPPORTED_ACTIVATION_DTYPES: ClassVar[Tuple[torch.dtype,
+                                                ...]] = (torch.bfloat16,
+                                                         torch.float16)
+
+    requires_unquantized_activation: ClassVar[bool] = True
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        if module.weight.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                f"W8A16FP8LinearMethod requires float8_e4m3fn weights, got "
+                f"{module.weight.dtype}. This method only reinterprets how an "
+                f"FP8 checkpoint's weights are consumed; it cannot quantize.")
+        if input.dtype not in self.SUPPORTED_ACTIVATION_DTYPES:
+            raise RuntimeError(
+                f"W8A16FP8LinearMethod requires a 16-bit activation, got "
+                f"{input.dtype}.")
+
+        # In place: .to() always copies here (the checks above guarantee the
+        # dtypes differ), so only one 16-bit copy of the weight is alive.
+        weight = module.weight.to(input.dtype).mul_(
+            module.weight_scale.to(input.dtype))
+        return F.linear(input, weight, bias)
 
 
 class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
@@ -1975,19 +2033,8 @@ class NVFP4LinearMethod(LinearMethodBase):
         if weight_scale_2 is not None:
             copy_weight(module.weight_scale_2, weight_scale_2)
 
-        # Handle KV scales
-        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") == "1":
-            k_scales = getattr(module, "tmp_k_scales", [])
-            v_scales = getattr(module, "tmp_v_scales", [])
-            if k_scales:
-                assert v_scales, "k_scale and v_scale must be loaded together"
-                copy_weight(
-                    module.kv_scales,
-                    torch.tensor(
-                        [1.0, max(k_scales).item(),
-                         max(v_scales).item()],
-                        dtype=torch.float32))
-                module.inv_kv_scales.data = 1.0 / module.kv_scales
+        _load_kv_cache_scales(module, getattr(module, "tmp_k_scales", []),
+                              getattr(module, "tmp_v_scales", []))
 
         self._cleanup_nvfp4_tmp_attrs(
             module, extra_attrs=["tmp_k_scales", "tmp_v_scales"])
@@ -3482,6 +3529,20 @@ class MXFP8LinearMethod(LinearMethodBase):
                 dtype=torch.uint8),
                                             requires_grad=False)
 
+        if (module.quant_config is not None
+                and module.quant_config.layer_quant_mode.has_fp4_kv_cache()
+                and module.weights_loading_config.weight_mode
+                == WeightMode.FUSED_QKV_LINEAR):
+            # MXFP8 quantizes the projection weights only. NVFP4 KV-cache
+            # quantization still needs the same per-tensor K/V scales exposed
+            # by the other fused-QKV methods. Unit defaults support checkpoints
+            # without KV calibration; calibrated checkpoints overwrite them
+            # in load_weights_fused_qkv_linear().
+            module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                         requires_grad=False)
+            module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                             requires_grad=False)
+
         if bias:
             module.bias = Parameter(torch.empty((out_features), dtype=dtype),
                                     requires_grad=False)
@@ -3610,6 +3671,7 @@ class MXFP8LinearMethod(LinearMethodBase):
             f"MXFP8 vanilla load expects exactly one weight scale, got "
             f"{len(scales)}")
         self._store_scale(module, scales[0])
+        self.load_kv_cache_scales(module, weights)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]) -> None:
@@ -3624,6 +3686,20 @@ class MXFP8LinearMethod(LinearMethodBase):
         # Scales share the out_features dim with weights; concatenate along
         # dim 0 (out_features), same axis the weights are concatenated on.
         self._store_scale(module, torch.cat(scales, dim=0))
+
+        self.load_kv_cache_scales(module, weights)
+
+    def load_kv_cache_scales(self, module: Linear, weights: List[Dict]) -> None:
+        """Load per-tensor KV calibration for ordinary and prepacked QKV."""
+        # Do not materialize checkpoint slices when calibration is disabled.
+        if not hasattr(module, "kv_scales") or os.environ.get(
+                "TRTLLM_LOAD_KV_SCALES", "1") != "1":
+            return
+        _load_kv_cache_scales(
+            module,
+            [w["k_scale"][...].reshape([]) for w in weights if "k_scale" in w],
+            [w["v_scale"][...].reshape([]) for w in weights if "v_scale" in w],
+        )
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]) -> None:
@@ -4094,6 +4170,11 @@ class Linear(nn.Module):
                 and IS_CUTLASS_DSL_AVAILABLE
                 and self.has_nvfp4_activation_quantization
                 and get_sm_version() in (100, 103) and not self.has_bias)
+
+    @property
+    def requires_unquantized_activation(self):
+        assert self._weights_created
+        return self.quant_method.requires_unquantized_activation
 
     @property
     def has_nvfp4_activation_quantization(self):
