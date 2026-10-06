@@ -2445,8 +2445,15 @@ def test_gen_retry_refused_while_first_attempt_active(use_v2):
         rx_b.receive(_full_chunk(gen_b_block_ids, gen_b.prompt_len))
         assert rx_b.wait_complete(blocking=True) == WaitResult.FAILED
         # The refused attempt never reached the sender: only the holder asked.
-        first = ctx_tw._sender._get_first_req_info(tx.disagg_request_id)
+        # The holder's REQUEST_DATA travels over the wire, so wait for it.
+        sender = ctx_tw._sender
+        _wait_until(
+            lambda: sender._get_first_req_info(tx.disagg_request_id) is not None,
+            what="the holder's REQUEST_DATA to reach the sender",
+        )
+        first = sender._get_first_req_info(tx.disagg_request_id)
         assert first is not None and first.instance_rank == gen_tw._rank_info.instance_rank
+        assert len(sender._get_req_info(tx.disagg_request_id)) == 1
 
         tx.send(_full_chunk(ctx_block_ids, ctx_request.prompt_len))
         assert tx.wait_complete() == WaitResult.COMPLETED
