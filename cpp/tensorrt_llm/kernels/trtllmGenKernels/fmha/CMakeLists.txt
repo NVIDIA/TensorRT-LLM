@@ -46,9 +46,8 @@ configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_fmha_export/KernelParamsDecl.h
   ${CMAKE_CURRENT_BINARY_DIR}/KernelParamsDecl.h COPYONLY)
 
-file(GLOB_RECURSE SRC_CPP *.cpp)
-file(GLOB_RECURSE SRC_CU *.cu)
-list(REMOVE_ITEM SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/prepareCustomMask.cu")
+set(SRC_CPP ${CMAKE_CURRENT_SOURCE_DIR}/fmhaRunner.cpp)
+set(SRC_CU ${CMAKE_CURRENT_SOURCE_DIR}/fmhaReduction.cu)
 
 # Archs listed here are pruned when the build does not enable them. Sm100f has
 # no context FMHA kernel, so Rubin needs the prebuilt Sm107a cubins kept
@@ -65,11 +64,16 @@ target_include_directories(
   trtllm_gen_fmha_interface
   INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_fmha_export)
 
-add_library(trtllm_gen_fmha OBJECT ${SRC_CPP} ${SRC_CU})
+add_library(trtllm_gen_fmha STATIC ${SRC_CPP} ${SRC_CU})
+add_library(tllm::kernel_attention ALIAS trtllm_gen_fmha)
+target_compile_features(trtllm_gen_fmha PUBLIC cxx_std_20)
 set_property(TARGET trtllm_gen_fmha PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET trtllm_gen_fmha PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-target_link_libraries(trtllm_gen_fmha PUBLIC trtllm_gen_fmha_interface
-                                             tllm::kernel_attention_mask)
+target_link_libraries(
+  trtllm_gen_fmha
+  PUBLIC trtllm_gen_fmha_interface tllm::kernel_attention_mask
+         tllm::common_environment tllm::kernel_cutlass_headers
+         CUDA::cuda_driver)
 target_include_directories(
   trtllm_gen_fmha PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_fmha_export)
 

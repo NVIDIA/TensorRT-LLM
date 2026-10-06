@@ -344,7 +344,18 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;attention-mask;gpu"
   REQUIRES_GPU)
-add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
+add_tllm_gtest(
+  fmhaDsv4EpilogueFusionTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaDsv4EpilogueFusionTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_attention
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;fmha;gpu"
+  REQUIRES_GPU)
 
 add_tllm_gtest(
   nvfp4ColdPageKernelsTest
