@@ -41,7 +41,7 @@ equally fine; pass its directory to `--model` and omit `--revision`.
 `../../configs/cosmos3-fp8-1gpu.yaml` carries the same `revision: fp8` for callers
 that would rather set it in the config than on the command line.
 
-T2V, T2I, I2V, V2V and T2AV are validated on a **single GPU** for Nano and Super;
+Use a **single GPU** for Nano and Super FP8 T2V, T2I, I2V, V2V and T2AV;
 every multi-GPU generator configuration is refused with an explicit error, so
 use BF16 there. Static FP8 Reasoner serving has a separate deployment path; see
 [Reasoner chat](../../serve/README.md#reasoner-chat).
@@ -58,26 +58,6 @@ python cosmos3.py --model nvidia/Cosmos3-Nano --revision fp8 \
 Substitute `nvidia/Cosmos3-Super` for Super. For a local FP8 checkpoint, pass its
 directory as `--model` and omit `--revision`; the config's revision is ignored
 for local paths.
-
-T2AV validation on Tue 6 Oct 2026 used one B300 with 35 steps, 189 frames,
-1280×720 resolution and guidance scale 6. Both checkpoints produced stereo
-48 kHz audio with the same tensor shape as BF16. Same-seed comparisons gave:
-
-| Checkpoint | Audio waveform correlation | Spectrogram correlation | End-to-end speedup over BF16 |
-|---|---|---|---|
-| Nano | 0.91 | 0.94 | 1.39× |
-| Super | 0.98 | 0.97 | 1.17× |
-
-A listening check found no audible difference from BF16 in these samples.
-These are sample comparisons, not a general audio or video quality benchmark.
-TI2AV (image-conditioned audio-video) remains unvalidated; no FP8 audio quality
-claim is made for that mode.
-
-The generator applies the checkpoint's `diffusion_step_policy` automatically:
-these FP8 checkpoints use BF16 activations for the first and last three
-denoising steps. The INFO message `Cosmos3 diffusion_step_policy: ... FP8
-linears wrapped` confirms that the policy was installed. This policy does not
-apply to the standalone Reasoner.
 
 ## Guardrails
 
