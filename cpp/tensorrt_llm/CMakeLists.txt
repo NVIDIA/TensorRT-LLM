@@ -328,6 +328,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_common_error
     tllm_common_ip
     tllm_common_logging
+    tllm_common_mcast_registry
     tllm_common_native_memory
     tllm_common_nccl
     tllm_common_nccl_comm
@@ -358,6 +359,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_runtime_lora_cache
     tllm_runtime_memory
     tllm_runtime_moe_load_balance
+    tllm_runtime_multicast
     tllm_runtime_numpy
     tllm_runtime_nvls_buffers
     tllm_runtime_topology

@@ -14,7 +14,7 @@
 # the License.
 include(FetchContent)
 
-set(SRCS mcastDeviceMemory.cpp ncclCommunicator.cpp)
+set(SRCS ncclCommunicator.cpp)
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 
@@ -214,6 +214,15 @@ target_compile_features(tllm_runtime_nvls_buffers PUBLIC cxx_std_20)
 set_target_properties(
   tllm_runtime_nvls_buffers PROPERTIES CXX_EXTENSIONS OFF
                                        POSITION_INDEPENDENT_CODE ON)
+
+add_library(tllm_runtime_multicast STATIC mcastDeviceMemory.cpp)
+add_library(tllm::runtime_multicast ALIAS tllm_runtime_multicast)
+target_link_libraries(tllm_runtime_multicast PUBLIC tllm::runtime_ipc_nvls
+                                                    tllm::common_mcast_registry)
+target_compile_features(tllm_runtime_multicast PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_runtime_multicast PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE
+                                                       ON)
 
 add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
