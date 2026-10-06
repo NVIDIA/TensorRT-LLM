@@ -210,3 +210,5 @@ endif()
 add_tllm_kernel_library(
   tllm_kernel_attention_decode SOURCES decoderMaskedMultiheadAttention.cu
   LINK_LIBRARIES ${mmha_targets})
+
+list(APPEND TLLM_KERNEL_COMPONENT_TARGETS trtllm_gen_fmha)
