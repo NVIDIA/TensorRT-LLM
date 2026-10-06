@@ -14,9 +14,6 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 #
-file(GLOB SRCS *.cpp)
-file(GLOB CU_SRCS *.cu)
-
 if(NOT WIN32)
   # additional warnings
   #
@@ -71,18 +68,19 @@ set_target_properties(
                               CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_cuda_architectures(tllm_common_cuda 89)
 
-list(
-  REMOVE_ITEM
-  SRCS
-  "${CMAKE_CURRENT_SOURCE_DIR}/assert.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/stringUtils.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/tllmException.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/logger.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/timestampUtils.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/cudaDriverWrapper.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/nvmlWrapper.cpp")
-list(REMOVE_ITEM CU_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/memoryUtils.cu")
-add_library(common_src OBJECT ${SRCS} ${CU_SRCS})
+add_library(
+  common_src OBJECT
+  attentionOp.cpp
+  cublasMMWrapper.cpp
+  cudaFp8Utils.cu
+  cudaProfilerUtils.cpp
+  envUtils.cpp
+  ipUtils.cpp
+  mcastDevMemUtils.cpp
+  ncclUtils.cpp
+  opUtils.cpp
+  safetensors.cpp
+  sageQuant.cu)
 add_cuda_architectures(common_src 89)
 set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET common_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
