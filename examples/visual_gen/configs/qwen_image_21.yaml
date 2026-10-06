@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# Qwen-Image 2.1 VisualGen example config.
+#
+# Checkpoint source must be finalized at M4.  The official HF model ID is
+# Qwen/Qwen-Image-2.1; this file intentionally uses that ID so users can run the
+# normal VisualGen loader once download/cache policy is approved.
+model: Qwen/Qwen-Image-2.1
+revision: main
+torch_compile_config:
+  enable: true
+  enable_fullgraph: false
+  enable_autotune: true
+cuda_graph_config:
+  enable: false
+attention_config:
+  backend: VANILLA
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1
+  ring_size: 1
+  attn2d_size: [1, 1]
+  tp_size: 1
+pipeline_config: {}
