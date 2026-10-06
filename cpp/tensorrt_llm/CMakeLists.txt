@@ -322,6 +322,7 @@ foreach(
   component
   tllm_common_error
   tllm_common_logging
+  tllm_common_profiler
   tllm_common_cuda
   tllm_executor_types
   tllm_executor_serialization
@@ -363,6 +364,7 @@ set_property(TARGET ${SHARED_TARGET}
 foreach(
   component
   tllm_common_cuda
+  tllm_common_profiler
   tllm_runtime_memory
   tllm_runtime_buffers
   tllm_runtime_distributed
