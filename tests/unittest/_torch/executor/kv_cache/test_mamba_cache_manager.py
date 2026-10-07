@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for Python, Cpp, and V2 Mamba cache managers."""
 
-import math
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -3673,8 +3672,8 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
 @skip_no_cuda
 @pytest.mark.parametrize("kda_replay_num_spec", [2, None])
 def test_v2_kda_token_states_allocated_with_the_replay_caches(kda_replay_num_spec):
-    """With the replay caches, ``kda_token_states`` adds the fp32 state after every
-    draft of each slot, per layer; without them it allocates nothing."""
+    """With the replay caches, ``kda_token_states`` adds the fp32 records of every draft
+    of each slot (vn, beta * k, decay), per layer; without them it allocates nothing."""
     mgr = _build_v2_hybrid_with_mamba_layer(
         max_batch_size=4,
         num_mamba_layers=2,
@@ -3697,7 +3696,8 @@ def test_v2_kda_token_states_allocated_with_the_replay_caches(kda_replay_num_spe
             layer_cache = mgr.mamba_layer_cache(layer_idx)
             cache_size = layer_cache.temporal.shape[0]
             states = layer_cache.kda_state_tok
-            assert states.shape == (cache_size, 2, *layer_cache.temporal.shape[1:])
+            num_heads, _, head_dim = layer_cache.temporal.shape[1:]
+            assert states.shape == (cache_size, 3, 2, num_heads, head_dim)
             assert states.dtype is torch.float32
             assert states.data_ptr() == mgr.kda_state_tok[layer_idx].data_ptr()
             assert not states.any()
@@ -3779,8 +3779,8 @@ def _v2_kda_token_state_manager(kda_token_states, enable_block_reuse):
     mgr._attention_cache_bytes_per_token = lambda: 8
     mgr._use_kda_replay_update = True
     mgr._kda_token_states = kda_token_states
-    # The per-token states count in each slot's state bytes (_mamba_state_bytes_per_slot): num_spec fp32 states of
-    # the SSM state shape, 2 MiB each here.
+    # The drafts' records count in each slot's state bytes (_mamba_state_bytes_per_slot): per draft, vn, beta * k
+    # and the decay, fp32 [H, K] each (24 KiB here).
     mgr._kda_replay_num_spec = 2
     mgr.ssm_state_shape = [8, 256, 256]
     mgr.kv_cache_config = KvCacheConfig(
@@ -3798,9 +3798,9 @@ def _v2_kda_token_state_manager(kda_token_states, enable_block_reuse):
 def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
     kda_token_states, enable_block_reuse, at_floor
 ):
-    """The per-token KDA states take memory per SSM slot beside the V2 pools. Without block reuse the SSM pool keeps
-    only its live floor, the states' bytes come out of the quota, and attention gets the rest; without the states
-    (replay caches only, with or without block reuse) the typical step's ratio sizes the pool."""
+    """The KDA drafts' records take memory per SSM slot beside the V2 pools. Without block reuse the SSM pool keeps
+    only its live floor, the records' bytes come out of the quota, and attention gets the rest; without them (replay
+    caches only, with or without block reuse) the typical step's ratio sizes the pool."""
     mgr = _v2_kda_token_state_manager(kda_token_states, enable_block_reuse)
     base_config = KVCacheManagerConfig(
         tokens_per_block=32,
@@ -3822,16 +3822,19 @@ def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
     if at_floor:
         # The floor's min-slots constraint is scaled by 1 / max_util_for_resume (0.97).
         assert floor <= slots["ssm"] <= floor + 1
-        # kda_state_tok, allocated beside the pools: (layers, SSM slots, num_spec, *ssm_state_shape) fp32.
+        # kda_state_tok, allocated beside the pools: (layers, SSM slots, 3, num_spec, H, K) fp32.
         token_state_bytes = (
             mgr.local_num_mamba_layers
             * slots["ssm"]
+            * 3
             * mgr._kda_replay_num_spec
-            * math.prod(mgr.ssm_state_shape)
+            * mgr.ssm_state_shape[0]
+            * mgr.ssm_state_shape[-1]
             * 4
         )
-        # The pools and the states fit in the quota, and attention takes the rest of it, to within one 2 MiB grain.
-        assert (128 << 20) - (2 << 20) < pool_bytes + token_state_bytes <= 128 << 20
+        # The records' bytes come out of the quota and attention takes the rest of it. The runtime rounds the pools'
+        # quota up to whole 2 MiB grains, so the pools can take back less than one grain of the records' bytes.
+        assert 128 << 20 <= pool_bytes + token_state_bytes < (128 << 20) + (2 << 20)
     else:
         assert slots["ssm"] > 10 * floor
 
@@ -3861,14 +3864,14 @@ def test_v2_kda_token_states_refuse_a_pool_off_the_live_floor(off_the_floor):
 
 
 def test_v2_kda_token_states_reserve_quota_before_sizing():
-    """At the live floor the token states of every slot the SSM pool keeps come out of the GPU quota before the pools
-    are sized, and the minimum quota and the quota for max_tokens count them all."""
+    """At the live floor the drafts' records of every slot the SSM pool keeps come out of the GPU quota before the
+    pools are sized, and the minimum quota and the quota for max_tokens count them all."""
     mgr = _v2_kda_token_state_manager(kda_token_states=True, enable_block_reuse=False)
     plain = _v2_kda_token_state_manager(kda_token_states=False, enable_block_reuse=False)
     assert mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots == 3
-    # The pool keeps ceil(3 / max_util_for_resume) = 4 slots, each with 2 fp32 token states of 2 MiB; the quotas
-    # without token states differ by exactly those.
-    reserved = 4 * 2 * (2 << 20)
+    # The pool keeps ceil(3 / max_util_for_resume) = 4 slots, each with the records of 2 drafts (3 x 8 x 256 fp32
+    # each); the quotas without them differ by exactly those.
+    reserved = 4 * 2 * 3 * 8 * 256 * 4
     minimum = mgr._minimum_live_gpu_quota()
     assert minimum - plain._minimum_live_gpu_quota() == reserved
     for max_tokens in (0, 4096):
@@ -3907,7 +3910,7 @@ def test_v2_kda_token_states_reserve_the_slots_the_runtime_keeps():
             max_util_for_resume=0.95,
         )
     assert mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots == 19
-    reserved = 21 * 2 * (2 << 20)
+    reserved = 21 * 2 * 3 * 8 * 256 * 4
     minimum = mgr._minimum_live_gpu_quota()
     assert minimum - plain._minimum_live_gpu_quota() == reserved
     quota = minimum + (64 << 20)
@@ -4061,7 +4064,8 @@ def test_v2_kda_token_states_relocate_with_their_slot():
 
 @skip_no_cuda
 def test_v2_kda_token_states_count_in_the_per_slot_budget():
-    """The capacity math sees the per-token states: a slot costs one more fp32 SSM state per draft and layer."""
+    """The capacity math sees the drafts' records: per draft and layer, a slot costs vn, beta * k and the decay, fp32
+    [H, K] each."""
     kwargs = dict(
         num_mamba_layers=2,
         spec_config=MTPDecodingConfig(max_draft_len=2),
@@ -4079,7 +4083,8 @@ def test_v2_kda_token_states_count_in_the_per_slot_budget():
         plain.shutdown()
     with_states = _build_v2_hybrid_with_mamba_layer(kda_token_states=True, **kwargs)
     try:
-        per_token = 2 * 2 * math.prod(with_states.ssm_state_shape) * 4
+        num_heads, _, head_dim = with_states.ssm_state_shape
+        per_token = 2 * 2 * 3 * num_heads * head_dim * 4
         assert with_states._mamba_state_bytes_per_slot() == plain_bytes + per_token
     finally:
         with_states.shutdown()

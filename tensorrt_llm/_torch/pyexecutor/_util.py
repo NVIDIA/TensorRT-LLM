@@ -3048,9 +3048,9 @@ def _create_kv_cache_manager(
             if is_kda_mtp_verify_available():
                 kda_extra_kwargs["kda_replay_num_spec"] = (
                     spec_config.tokens_per_gen_step - 1)
-                # A model whose KDA verify starts from the state after the
-                # accepted drafts (instead of replaying them) asks for the
-                # state after every draft with `kda_token_states`.
+                # A model whose KDA verify replays the accepted drafts from
+                # its own per-draft records (instead of the replay caches)
+                # asks for a buffer of them with `kda_token_states`.
                 backbone = getattr(getattr(model_engine, "model", None),
                                    "model", None)
                 if (issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
