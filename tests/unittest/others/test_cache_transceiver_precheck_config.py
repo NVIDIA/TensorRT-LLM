@@ -965,6 +965,8 @@ class TestMultiPeerOrchestration:
         num_ctx_servers=2,
         first_ctx_wave_delay_s=0,
         peer_progress_timeout_s=None,
+        contract_difference=None,
+        corrupt_welcome=False,
     ):
         import threading
 
@@ -1007,6 +1009,23 @@ class TestMultiPeerOrchestration:
             )
             for i in range(num_ctx_servers)
         ]
+
+        if corrupt_welcome:
+            send_recv = gen._leader_send_recv_with_progress
+
+            def change_welcome(*args: object, **kwargs: object) -> list:
+                """Corrupt only the welcome to exercise the gen-side guard."""
+                reply = send_recv(*args, **kwargs)
+                if reply[0] == "welcome":
+                    reply[1]["transfer_contract"] = {"unexpected": True}
+                return reply
+
+            gen._leader_send_recv_with_progress = change_welcome
+
+        if contract_difference is not None:
+            gen.transfer_contract = {"ctx": {"use_v2": True, "runtime": "PYTHON"}}
+            for ctx in ctxs:
+                ctx.transfer_contract = contract_difference
 
         if fail_peer_idx is not None:
             real_gen_run_peer = rp.gen_run_peer
@@ -1059,6 +1078,39 @@ class TestMultiPeerOrchestration:
             leaked = [thread.name for thread in threads if thread.is_alive()]
             assert not leaked, f"ctx serve threads wedged: {leaked}"
         return plan, gen, ctxs, failures
+
+    @pytest.mark.parametrize(
+        "contract",
+        [
+            {"ctx": {"use_v2": False, "runtime": "PYTHON"}},
+            {"ctx": {"use_v2": True, "runtime": "CPP"}},
+            {"ctx": {"use_v2": True, "runtime": "PYTHON"}, "kv_shape": {"is_mla": True}},
+        ],
+        ids=["manager", "runtime", "shape"],
+    )
+    def test_resolved_contract_mismatch_stops_before_transfer(
+        self, tmp_path: object, monkeypatch: pytest.MonkeyPatch, contract: dict
+    ) -> None:
+        """Real peer sessions reject divergent resolution without dispatching KV."""
+        _, gen, ctxs, failures = self._run(
+            tmp_path, monkeypatch, num_ctx_servers=1, contract_difference=contract
+        )
+        assert failures
+        assert all(ctx._calls["waves"] == 0 for ctx in ctxs)
+        assert any(
+            "resolved transfer contract mismatch" in case["reason"] for case in gen.recorder.cases
+        )
+
+    def test_rejected_welcome_aborts_peer(
+        self, tmp_path: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Gen rejection completes the abort exchange so ctx does not time out."""
+        _, gen, ctxs, failures = self._run(
+            tmp_path, monkeypatch, num_ctx_servers=1, corrupt_welcome=True
+        )
+        assert failures == [("gen_0", "_PeerAbort")]
+        assert ctxs[0]._calls["waves"] == 0
+        assert any("handshake contract mismatch" in case["reason"] for case in gen.recorder.cases)
 
     def test_two_ctx_full_pass(self, tmp_path, monkeypatch):
         plan, gen, ctxs, failures = self._run(tmp_path, monkeypatch)
@@ -1390,3 +1442,65 @@ def test_python_transceiver_bandwidth_csv(tmp_path):
     assert abs(bw - 153600 * 1024 * 1024 / 1e9) < 1e-9
     # no perf files -> None
     assert rp.parse_python_bandwidth_gbps(str(tmp_path / "empty")) is None
+
+
+@pytest.mark.parametrize(
+    "metadata,expected",
+    [
+        ({}, None),
+        ({"architecture": "DeepseekV4ForCausalLM"}, "DeepseekV4ForCausalLM"),
+        ({"architecture": " DeepseekV4ForCausalLM "}, "DeepseekV4ForCausalLM"),
+    ],
+)
+def test_declared_architecture(metadata: dict, expected: str | None) -> None:
+    """Retain one optional, normalized architecture in both roles and the fingerprint."""
+    cfg = _disagg_yaml(metadata=metadata)
+    assert pcfg.declared_architecture(cfg) == expected
+    plan = pcfg.resolve_plan(cfg)
+    assert plan["architecture"] == expected
+    for role in ("ctx", "gen"):
+        assert pcfg.side_plan(plan, role)["architecture"] == expected
+    assert json.loads(plan["fingerprint"])["architecture"] == expected
+    if expected is not None:
+        normalized = pcfg.resolve_plan(_disagg_yaml(metadata={"architecture": expected}))
+        assert normalized["fingerprint"] == plan["fingerprint"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        " \t\n",
+        42,
+        {},
+        True,
+        [],
+        [""],
+        [" "],
+        [None],
+        [42],
+        ["DeepseekV4ForCausalLM"],
+        ["Unknown", "DeepseekV4ForCausalLM"],
+    ],
+)
+def test_invalid_declared_architecture(value: object) -> None:
+    """Reject malformed scalars and every list, including a valid later entry."""
+    with pytest.raises(ValueError, match=r"metadata\.architecture"):
+        pcfg.resolve_plan(_disagg_yaml(metadata={"architecture": value}))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("architecture", "DeepseekV4ForCausalLM"),
+        ("ctx_use_kv_cache_manager_v2", True),
+        ("gen_kv_dtype", "bf16"),
+    ],
+)
+def test_fingerprint_covers_preference_inputs(field: str, value: object) -> None:
+    """Different preference inputs cannot share a static plan fingerprint."""
+    plan = pcfg.resolve_plan(_disagg_yaml())
+    before = plan["fingerprint"]
+    plan[field] = value
+    assert pcfg.plan_fingerprint(plan) != before
