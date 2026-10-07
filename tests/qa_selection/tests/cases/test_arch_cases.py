@@ -12,19 +12,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Mock suite: a ceiling gate. Collected by the run under test, never run here.
+"""Mock suite: the architecture gates. Collected by the run under test, never run here.
 
-The test name says what the decorator means: `skip_post_blackwell` is
-encoded `sm >= 100`, so it keeps the test on Hopper and older.
+Each test name says what its decorator keeps: `skip_post_blackwell` is encoded
+`sm >= 100`, so `test_hopper_and_older` survives on Hopper and older.
+`test_unmarked` is the control every mock module carries: it states no
+requirement, so it survives on every machine.
 """
 
-from conftest import skip_post_blackwell
+from conftest import skip_arm, skip_post_blackwell, skip_pre_blackwell
 
 
 def test_unmarked():
     pass
 
 
+@skip_pre_blackwell
+def test_blackwell_and_newer():
+    pass
+
+
 @skip_post_blackwell
 def test_hopper_and_older():
+    pass
+
+
+@skip_arm
+def test_x86_only():
     pass
