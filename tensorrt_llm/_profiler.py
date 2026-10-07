@@ -16,15 +16,19 @@
 
 import math
 import os
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping
 from contextlib import AbstractContextManager, contextmanager
+from enum import Enum
 from functools import wraps
 from types import TracebackType
 from typing import Literal, ParamSpec, TypeAlias, TypeVar, cast
 
+import numpy as np
 import torch
 
 ProfilerRegion: TypeAlias = Literal["workflow", "mpi", "nccl", "nanobind", "kv", "moe"]
+MpiOperationKind: TypeAlias = Literal["collective", "p2p"]
+MpiDirection: TypeAlias = Literal["send", "recv"]
 MetadataValue: TypeAlias = (
     str
     | int
@@ -38,10 +42,13 @@ MetadataValue: TypeAlias = (
 
 __all__ = [
     "MetadataValue",
+    "MpiDirection",
+    "MpiOperationKind",
     "ProfilerRegion",
     "custom_region_enabled",
     "record_function_metadata_scope",
     "record_function_with_metadata",
+    "record_mpi_function",
 ]
 
 _CUSTOM_REGIONS_ENV = "TLLM_PROFILE_CUSTOM_REGIONS"
@@ -52,6 +59,7 @@ _CUSTOM_REGION_DEFAULTS = _CUSTOM_REGION_NAMES - {"kv", "moe"}
 _METADATA_PREFIX = "TRTLLM1"
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+_MISSING = object()
 
 
 def _parse_custom_regions(value: str | None) -> frozenset[ProfilerRegion]:
@@ -254,3 +262,107 @@ def record_function_with_metadata(
         does not re-execute Python decorators inside the captured model.
     """
     return _RecordFunctionWithMetadata(name, *values, metadata_factory=metadata_factory)
+
+
+def _mpi_metadata_value(value: object) -> MetadataValue:
+    if isinstance(value, Enum):
+        value = value.value
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    return cast(MetadataValue, value)
+
+
+def _mpi_payload_metadata(payload: object) -> dict[str, MetadataValue]:
+    fields: dict[str, MetadataValue] = {"mpi.payload.type": type(payload).__name__}
+    if isinstance(payload, torch.Tensor):
+        numel = payload.numel()
+        fields.update(
+            {
+                "mpi.payload.shape": list(payload.shape),
+                "mpi.payload.dtype": str(payload.dtype),
+                "mpi.payload.stride": list(payload.stride()),
+                "mpi.payload.device": str(payload.device),
+                "mpi.payload.numel": numel,
+                "mpi.payload.bytes": numel * payload.element_size(),
+            }
+        )
+    elif isinstance(payload, np.ndarray):
+        fields.update(
+            {
+                "mpi.payload.shape": list(payload.shape),
+                "mpi.payload.dtype": str(payload.dtype),
+                "mpi.payload.numel": int(payload.size),
+                "mpi.payload.bytes": int(payload.nbytes),
+            }
+        )
+    elif isinstance(payload, memoryview):
+        fields["mpi.payload.bytes"] = payload.nbytes
+    elif isinstance(payload, (bytes, bytearray)):
+        fields["mpi.payload.bytes"] = len(payload)
+    elif isinstance(payload, (str, list, tuple, dict, set)):
+        fields["mpi.payload.length"] = len(payload)
+    return fields
+
+
+@contextmanager
+def record_mpi_function(
+    operation: str,
+    *,
+    communicator: str,
+    group: Callable[[], Iterable[int]],
+    rank: int | Callable[[], int],
+    kind: MpiOperationKind = "collective",
+    direction: MpiDirection | None = None,
+    payload: object = _MISSING,
+    **fields: MetadataValue,
+) -> Generator[None, None, None]:
+    """Record shallow MPI metadata through the shared observational scope.
+
+    Args:
+        operation: Wrapped MPI method name, without the ``mpi_`` prefix.
+        communicator: Logical world, TP, PP, or CP communicator label.
+        group: Lazy ordered members in the active parent MPI communicator's rank space.
+        rank: Rank in that same space, or a lazy rank query.
+        kind: Collective or point-to-point operation.
+        direction: Send or receive direction for point-to-point operations.
+        payload: Optional object described without serialization or recursive traversal.
+            Tensors/NumPy arrays of any shape/dtype provide only shape, dtype and byte
+            counts; tensors also provide stride/device. No tensor values are read or
+            copied, including during CUDA capture. Other objects provide type and,
+            for built-in containers, length; byte buffers provide byte size.
+        **fields: Additional direct fields, such as communicator-local root/peer, tag,
+            reduction enum or chunk size. Direct NumPy scalars/enums become literals.
+
+    Yields:
+        None while the operation executes. Group, rank and payload inspection are
+        skipped for disabled/inactive scopes. Metadata/setup/cleanup failures are
+        observational and operation exceptions propagate unchanged.
+    """
+
+    def metadata() -> dict[str, MetadataValue]:
+        values: dict[str, MetadataValue] = {
+            "mpi.operation": operation,
+            "mpi.communicator": communicator,
+            "mpi.group": ",".join(str(int(member)) for member in group()),
+            "mpi.kind": kind,
+            "mpi.rank": _mpi_metadata_value(rank() if callable(rank) else rank),
+        }
+        if direction is not None:
+            values["mpi.direction"] = direction
+        values.update(
+            {
+                f"mpi.{name}": _mpi_metadata_value(value)
+                for name, value in fields.items()
+                if value is not None
+            }
+        )
+        if payload is not _MISSING:
+            values.update(_mpi_payload_metadata(payload))
+        return values
+
+    with record_function_metadata_scope(f"trtllm::mpi_{operation}", "mpi", metadata):
+        yield
