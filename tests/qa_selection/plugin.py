@@ -17,7 +17,8 @@
     pytest --collect-only -p qa_selection.plugin --machine=B200 [--ladder=1,4,8]
 
 Load with `-p` on the command line. No hardware is touched: every decision is
-read from marks.
+read from marks. The session header names the target, and a block after the
+run breaks the selection down by rung and the deselection by reason.
 """
 
 from pathlib import Path
@@ -25,9 +26,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
+from .core.artifacts import ArtifactNames
 from .core.machines import ProfileConfigError, default_catalog
 from .core.markers import default_markers
-from .core.report import SelectionOutput, TerminalSummary
+from .core.report import SelectionOutput, SelectionReport
 from .core.request import SelectionError, SelectionRequest
 from .core.selection import Selection
 from .core.selector import CollectedTest, Mark
@@ -44,6 +46,12 @@ def pytest_configure(config: pytest.Config) -> None:
     request = SelectionOptions.request_from(config)
     if request is not None:
         config.stash[SelectionStash.REQUEST] = request
+
+
+def pytest_report_header(config: pytest.Config) -> List[str]:
+    """Name the target in the session header, which `-q` hides."""
+    request = config.stash.get(SelectionStash.REQUEST, None)
+    return [] if request is None else [TerminalSummary.header(request)]
 
 
 @pytest.hookimpl(trylast=True)
@@ -85,6 +93,76 @@ def pytest_terminal_summary(terminalreporter) -> None:
     output = terminalreporter.config.stash.get(SelectionStash.OUTPUT, None)
     if output is not None:
         TerminalSummary.render(terminalreporter, output)
+
+
+class TerminalSummary:
+    """What a run prints: a header naming the target, and a block after the run.
+
+    The block states each count, then its parts on indented lines: rungs under
+    `selected` when the ladder has several, reasons under `deselected`, most
+    frequent first. At `-v`, each reason's node ids follow it.
+    """
+
+    TITLE = "qa selection"
+    LABEL_WIDTH = 14
+    INDENT = "  "
+
+    @classmethod
+    def header(cls, request: SelectionRequest) -> str:
+        """The one header line: machine, card, node size and ladder."""
+        profile = request.profile
+        return (
+            f"{cls.TITLE}: {request.machine} (sm {profile.sm}, "
+            f"{profile.max_gpu_per_node} GPUs/node), ladder {request.ladder}"
+        )
+
+    @classmethod
+    def render(cls, terminalreporter, output: SelectionOutput) -> None:
+        """Write the block through pytest's terminal reporter."""
+        terminalreporter.section(cls.TITLE, sep="-")
+        for line in cls.lines(output, verbose=terminalreporter.verbosity > 0):
+            terminalreporter.line(line)
+
+    @classmethod
+    def lines(cls, output: SelectionOutput, verbose: bool) -> List[str]:
+        """The block's lines, in order."""
+        report = output.report
+        lines = [
+            cls.line("target", f"{report.machine}, ladder {report.ladder}"),
+            cls.line("candidates", len(report.outcomes)),
+            cls.line("selected", len(report.selected)),
+        ]
+        if len(report.ladder) > 1:
+            lines += [
+                cls.line(f"{cls.INDENT}{rung}{ArtifactNames.RUNG_UNIT}", len(outcomes))
+                for rung, outcomes in report.rungs.items()
+            ]
+        lines += cls.deselected_lines(report, verbose)
+        if output.written:
+            names = " ".join(path.name for path in output.written)
+            lines.append(cls.line("written", f"{output.written[0].parent}/: {names}"))
+        return lines
+
+    @classmethod
+    def deselected_lines(cls, report: SelectionReport, verbose: bool) -> List[str]:
+        """The deselected count, then one line per reason with its count.
+
+        A test with several blockers counts under each, as in the record.
+        """
+        count = len(report.outcomes) - len(report.selected)
+        width = len(str(count))
+        lines = [cls.line("deselected", count)]
+        reasons = sorted(report.deselected_by_reason.items(), key=lambda item: -len(item[1]))
+        for reason, nodeids in reasons:
+            lines.append(f"{cls.INDENT}{len(nodeids):>{width}}  {reason}")
+            if verbose:
+                lines += [f"{cls.INDENT}{' ' * width}  {cls.INDENT}{nodeid}" for nodeid in nodeids]
+        return lines
+
+    @classmethod
+    def line(cls, label: str, value: object) -> str:
+        """One `label   value` line, aligned with every other."""
+        return f"{label:<{cls.LABEL_WIDTH}}{value}"
 
 
 class MarkerDeclaration:

@@ -14,7 +14,7 @@
 # limitations under the License.
 """Select the tests a target machine can run, before Slurm allocates it.
 
-    plugin.py        the options, the markers, the item adapter, the five hooks;
+    plugin.py        the options, the markers, the item adapter, the six hooks;
                      the `-p qa_selection.plugin` entry point, and the only
                      module here that imports pytest
 
@@ -28,7 +28,7 @@
       artifacts.py   what the output files are called          -> ArtifactNames
       request.py     what one run was asked for                -> SelectionRequest
       selection.py   what it decided about every test          -> Selection
-      report.py      the .ids lists, the JSON record, the summary lines
+      report.py      the .ids lists and the JSON record
 
 Three of those read a JSON file beside them: `machines.py` reads
 `profiles.json`, `rules.py` reads `rules.json`, `markers.py` reads

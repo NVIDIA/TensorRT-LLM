@@ -22,6 +22,7 @@
     run.outcome(nodeid)   one test's entry in that record
     run.ids(rung)         one rung's published identifier list
     run.written           every file name the run left in its output directory
+    run.summary           the plugin's terminal block, line by line
 
 `selection.refuse(...)` is the same call for a run that must fail as a usage
 error; it returns the same object, with `run.result` for the message.
@@ -35,7 +36,7 @@ import json
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 import pytest
 
@@ -63,10 +64,10 @@ class SelectionRun:
     RECORD = "{machine}.json"
     RUNG_IDS = "{machine}-{rung}gpu.ids"
 
-    #: The plugin's terminal block: a section, then `f"{label:<14}{value}"` lines.
+    #: The plugin's terminal block: a section title, then lines that each start
+    #: with a padded lowercase label or with indentation.
     SUMMARY_TITLE = "qa selection"
-    LABEL_WIDTH = 14
-    LABEL = re.compile(r"\S+ +$")
+    SUMMARY_LINE = re.compile(r"[a-z]+ {2,}\S| +\S")
 
     def __init__(
         self,
@@ -102,30 +103,22 @@ class SelectionRun:
         return sorted(entry.name for entry in self.out_dir.iterdir() if entry.is_file())
 
     @property
-    def summary(self) -> List[Tuple[str, str]]:
-        """The plugin's rendered block, as (label, value) pairs in order.
+    def summary(self) -> List[str]:
+        """The plugin's terminal block, line by line, as printed.
 
-        The block ends at the first line that is not a label-value pair.
+        Empty when no block was printed. The block ends at the first line that
+        neither starts with a label nor is indented.
         """
-        pairs: List[Tuple[str, str]] = []
+        lines: List[str] = []
         found_title = False
         for line in self.result.stdout.lines:
             if not found_title:
                 found_title = f" {self.SUMMARY_TITLE} " in line
-            elif self.LABEL.match(line[: self.LABEL_WIDTH]):
-                pairs.append((line[: self.LABEL_WIDTH].strip(), line[self.LABEL_WIDTH :]))
+            elif self.SUMMARY_LINE.match(line):
+                lines.append(line)
             else:
                 break
-        return pairs
-
-    def reported(self, label: str) -> str:
-        """The one value the block gives `label`; fails if it gives none or several."""
-        values = [value for reported, value in self.summary if reported == label]
-        assert len(values) == 1, (
-            f"{label!r} appears {len(values)} time(s) in the qa selection block of:\n"
-            f"  {self.command}\n" + "\n".join(f"  {name}  {value}" for name, value in self.summary)
-        )
-        return values[0]
+        return lines
 
     def artifact(self, name: str) -> Path:
         """One file the run was expected to write; fails naming the command if absent."""
