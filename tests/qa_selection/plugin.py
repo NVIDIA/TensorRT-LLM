@@ -107,16 +107,15 @@ class MarkerDeclaration:
 
 
 class SelectionOptions:
-    """The plugin's five command-line options; `--help` states each one.
+    """The plugin's four command-line options; `--help` states each one.
 
-    Only `--gpus` narrows feasibility; `--ladder` partitions what is written and
+    `--ladder` states the run's GPU count and partitions what is written, and
     `--rung` selects one of its parts. One machine per invocation.
     """
 
     GROUP = "qa selection"
 
     MACHINE = "qa_selection_machine"
-    GPUS = "qa_selection_gpus"
     LADDER = "qa_selection_ladder"
     RUNG = "qa_selection_rung"
     OUT_DIR = "qa_selection_out_dir"
@@ -136,25 +135,15 @@ class SelectionOptions:
             "without it changes nothing",
         )
         group.addoption(
-            "--gpus",
-            dest=cls.GPUS,
-            metavar="N",
-            type=int,
-            default=None,
-            help="GPUs this run may use: a feasibility ceiling, so everything "
-            "fitting in N is selected. Must not exceed the machine's GPUs per "
-            "node (the default). Cannot be combined with --ladder, which "
-            "states GPU counts of its own -- name an allocation with --rung",
-        )
-        group.addoption(
             "--ladder",
             dest=cls.LADDER,
             metavar="RUNGS",
             default=None,
             help="ascending allocation sizes, comma separated, e.g. 1,4,8. "
-            "Machine policy, held constant across a rerun. Partitions the "
-            "output into one list per rung and narrows nothing. No rung may "
-            "exceed the machine's GPUs per node",
+            "Defaults to one rung of the machine's GPUs per node. A test "
+            "needing more GPUs than the largest rung is deselected, and the "
+            "output holds one list per rung. No rung may exceed the "
+            "machine's GPUs per node",
         )
         group.addoption(
             "--rung",
@@ -163,10 +152,8 @@ class SelectionOptions:
             type=int,
             default=None,
             help="the allocation this run occupies: keep only the tests "
-            "--ladder assigned to the N-GPU rung. Requires --ladder and must "
-            "name one of its rungs. Narrows what executes, never what the "
-            "machine can do, so feasibility is decided against the whole node "
-            "either way",
+            "the ladder assigned to the N-GPU rung. Must name one of its "
+            "rungs",
         )
         group.addoption(
             "--selection-out-dir",
@@ -201,7 +188,6 @@ class SelectionOptions:
         try:
             return SelectionRequest.of(
                 machine=config.getoption(cls.MACHINE),
-                gpus=config.getoption(cls.GPUS),
                 ladder=config.getoption(cls.LADDER),
                 rung=config.getoption(cls.RUNG),
                 out_dir=config.getoption(cls.OUT_DIR),

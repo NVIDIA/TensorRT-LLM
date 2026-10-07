@@ -12,28 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Turn JSON machine facts into immutable allocation profiles.
+"""Turn JSON machine facts into immutable machine profiles.
 
-    profiles.json -> MachineCatalog.load() -> profile_for(name, gpu_count) -> MachineProfile
+    profiles.json -> MachineCatalog.load() -> profile_for(name) -> MachineProfile
 
-Each field answers a run-time probe without running it: `sm` holds what
-`get_sm_version()` returns, and likewise `device_name`, `device_memory_mib`,
-`gpu_count` and `cpu_arch` for `get_gpu_device_list()`, `get_device_memory()`,
-`get_device_count()` and `platform.machine()`.
+Each card field answers a run-time probe without running it: `sm` holds what
+`get_sm_version()` returns, and likewise `device_name`, `device_memory_mib` and
+`cpu_arch` for `get_gpu_device_list()`, `get_device_memory()` and
+`platform.machine()`.
 
-`max_gpu_per_node` and the optional `rungs` are allocation policy, not
-hardware. No rule reads either; `rungs` is there for a caller to pass back as
-`--ladder`.
+`max_gpu_per_node` is the machine's one GPU count. No rule reads it: it is the
+default ladder and the limit a `--ladder` is checked against. A machine sold
+with a different node size is a separate entry.
 """
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterator, Optional, Tuple
-
-from .ladder import Ladder
+from typing import Iterator, Optional
 
 
 class ProfileConfigError(ValueError):
@@ -62,23 +60,11 @@ class MachineProfile:
     device_memory_mib: int
     max_gpu_per_node: int
     cpu_arch: str
-    gpu_count: int
-
-    # The ladder this machine is scheduled at; read by callers, never by a rule.
-    rungs: Optional[Tuple[int, ...]] = None
 
     @classmethod
     def from_mapping(cls, source: Path, name: str, values: object) -> "MachineProfile":
         """Validate one raw catalogue entry and build a profile from it."""
         return CatalogEntry(source, name, values).to_profile()
-
-    def with_gpu_count(self, count: int) -> "MachineProfile":
-        """Return this machine sized for one allocation, leaving self unchanged."""
-        ProfileConfigError.check(
-            is_positive_int(count),
-            f"{self.name}: GPU count must be a positive integer, got {count!r}",
-        )
-        return replace(self, gpu_count=count)
 
 
 class CatalogEntry:
@@ -90,9 +76,6 @@ class CatalogEntry:
     DECLARED_FIELDS = ("sm", "device_name", "device_memory_mib", "max_gpu_per_node", "cpu_arch")
     NUMERIC_FIELDS = ("sm", "device_memory_mib", "max_gpu_per_node")
     CPU_ARCHS = ("aarch64", "x86_64")
-
-    # Omitting it means this machine declares no ladder.
-    OPTIONAL_FIELDS = ("rungs",)
 
     def __init__(self, source: Path, name: str, values: object) -> None:
         self.where = f"{source}: profile {name!r}"
@@ -107,34 +90,10 @@ class CatalogEntry:
             self.check_positive_int(field)
         self.check_device_name()
         self.check_cpu_arch()
-        # A fresh profile is sized to a full node until a caller narrows it.
         return MachineProfile(
             name=self.name,
-            gpu_count=self.values["max_gpu_per_node"],
-            rungs=self.declared_rungs(),
             **{field: self.values[field] for field in self.DECLARED_FIELDS},
         )
-
-    def declared_rungs(self) -> Optional[Tuple[int, ...]]:
-        """This entry's allocation ladder, or None when it declares none.
-
-        Checked by `Ladder.of`, the rule `--ladder` is parsed by, then against
-        this entry's `max_gpu_per_node`.
-        """
-        if "rungs" not in self.values:
-            return None
-        try:
-            ladder = Ladder.of(self.values["rungs"])
-        except (TypeError, ValueError) as error:
-            raise ProfileConfigError(f"{self.where}.rungs: {error}") from error
-
-        per_node = self.values["max_gpu_per_node"]
-        ProfileConfigError.check(
-            ladder.largest <= per_node,
-            f"{self.where}.rungs: rung {ladder.largest} exceeds this machine's "
-            f"{per_node} GPUs per node",
-        )
-        return tuple(ladder)
 
     def check_fields_declared(self) -> None:
         """Every declared field present, and nothing else.
@@ -146,7 +105,7 @@ class CatalogEntry:
         ProfileConfigError.check(
             not missing, f"{self.where} is missing: {', '.join(sorted(missing))}"
         )
-        unknown = self.values.keys() - declared - set(self.OPTIONAL_FIELDS)
+        unknown = self.values.keys() - declared
         ProfileConfigError.check(
             not unknown, f"{self.where} has unknown fields: {', '.join(sorted(unknown))}"
         )
@@ -176,11 +135,7 @@ class CatalogEntry:
 
 
 class MachineCatalog(Mapping):
-    """The machines selection can target, keyed by name.
-
-    Read-only, so sizing a profile for one allocation cannot corrupt the entry
-    the next caller reads.
-    """
+    """The machines selection can target, keyed by name, read-only."""
 
     def __init__(self, profiles: Mapping[str, MachineProfile]) -> None:
         self._profiles = dict(profiles)
@@ -222,10 +177,9 @@ class MachineCatalog(Mapping):
     def __len__(self) -> int:
         return len(self._profiles)
 
-    def profile_for(self, name: str, gpu_count: Optional[int] = None) -> MachineProfile:
-        """Return the named profile, optionally sized for one allocation."""
-        profile = self[name]
-        return profile if gpu_count is None else profile.with_gpu_count(gpu_count)
+    def profile_for(self, name: str) -> MachineProfile:
+        """Return the named profile."""
+        return self[name]
 
 
 @lru_cache(maxsize=1)

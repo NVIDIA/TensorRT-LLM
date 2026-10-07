@@ -41,9 +41,8 @@ class Selection:
     def of(cls, request: SelectionRequest, tests: Sequence[CollectedTest]) -> "Selection":
         """Decide every test, then place it on the ladder.
 
-        Feasibility is decided first and independently: a `Decision` says the
-        test can run on the machine, and the rung says which allocation it
-        belongs to.
+        A `Decision` says whether the rules allow the test on the machine's
+        card; the `Assignment` adds whether a rung holds it, and which.
         """
         selector = Selector(request.profile)
         return cls(
@@ -59,7 +58,7 @@ class Selection:
         An infeasible test never runs. With a target rung, only the tests placed
         on that rung run; without one, every feasible test does.
         """
-        if not assignment.decision.selected:
+        if not assignment.selected:
             return False
         return self.request.target_rung is None or assignment.rung == self.request.target_rung
 

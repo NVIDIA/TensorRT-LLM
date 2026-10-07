@@ -15,10 +15,10 @@
 """What a legal ladder is, in one place.
 
     Ladder.parse("1,4,8")   the `--ladder` option
-    Ladder.of([1, 4, 8])    a `rungs` array in profiles.json
+    Ladder.of([8])          the default: one rung of the machine's GPUs per node
 
-Both spellings go through `of`, so the catalogue cannot hold a ladder the
-option would reject.
+Both spellings go through `of`, so the default cannot be a ladder the option
+would reject.
 """
 
 from collections.abc import Sequence
