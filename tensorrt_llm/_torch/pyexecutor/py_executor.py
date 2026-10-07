@@ -3399,9 +3399,9 @@ class PyExecutor:
     ) -> Tuple[List[LlmRequest], bool]:
         # Disabled: the controller deferred gen-init requests to bound the
         # number of in-flight KV transfer blocks. Its FCFS deferral bursts
-        # admissions and was measured costing ~18% of GEN GPU-idle time. With
-        # the idle check above also removed there is no transfer budget left to
-        # wait on, so admit every fitting request and never report "blocked".
+        # admissions. With the idle check above also removed there is no
+        # transfer budget left to wait on, so admit every fitting request and
+        # never report "blocked".
         return fitting_disagg_gen_init_requests, False
 
         # gen_only_no_context has no CTX worker and does not transfer data.
@@ -3499,12 +3499,9 @@ class PyExecutor:
         # Disabled: this ran two collectives on every executor iteration --
         # _sync_disagg_gen_status_entry (WORLD-scoped) and
         # _sync_disagg_ctx_status_entry (TP/CP) -- purely to vote on whether any
-        # rank should enter a blocking transfer-status wait. Instrumented on a
-        # GLM-5.2 disagg GEN worker they were 3,995 ms of the method's 4,012 ms
-        # over 3,000 calls, i.e. 99% of its cost was the votes themselves. An
-        # NVTX capture of the CTX put the WORLD allreduce at 19.4% of context
-        # wall-clock (18 calls, 211 ms mean) because it spans every rank in the
-        # deployment, so each call waits on the slowest participant anywhere.
+        # rank should enter a blocking transfer-status wait. The WORLD-scoped
+        # vote spans every rank in the deployment, so each call waits on the
+        # slowest participant anywhere.
         #
         # The votes are still dropped, but the REAP is not. The original claim
         # here -- "removal is safe because transfer completion is still reaped
@@ -3514,13 +3511,8 @@ class PyExecutor:
         # empty-scheduled-batch forward-progress veto that turns a transient
         # stall into a permanent, silent fleet-wide hang.
         #
-        # Reproduced and fixed by measurement on the GLM-5.2 AgentX CTX-only
-        # conc32 cell (Lyris GB200, 4 nodes, 512k, tp8), which hangs 3/3 on
-        # this branch: frozen mid-warmup at returned={30,34,26}/37 with exactly
-        # one CTX "Observed timeout on context request". With the two
-        # non-blocking reaps below restored -- same image, same config, this
-        # the only variable -- warmup COMPLETED and the run reached the
-        # measurement phase with 0 transfer timeouts (SLURM 2591522).
+        # Restoring the two non-blocking reaps below keeps an empty scheduled
+        # batch from stalling the fleet.
         #
         # Both calls are non-blocking (atLeastNum=0) and rank-uniform: every
         # rank enters them unconditionally, and each performs its own internal
@@ -5910,9 +5902,9 @@ class PyExecutor:
           4. therefore its request never fits, and the cycle sustains itself.
 
         Nothing in that loop raises, times out, or completes a request, so the
-        client observes zero errors and zero progress indefinitely. Observed on
-        GLM-5.2 disaggregated context servers, where one rank drew a ~273k-token
-        prompt while ~222k tokens were free.
+        client observes zero errors and zero progress indefinitely. Observed when
+        one disaggregated context rank holds a request that does not fit the
+        free KV cache while other ranks still have room.
 
         The padding is deliberately **rank-local**: `_schedule()` performs a
         `tp_allgather` inside `_balance_adp_requests`, so re-scheduling on only
