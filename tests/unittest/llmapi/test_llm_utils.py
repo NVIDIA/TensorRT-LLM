@@ -134,6 +134,7 @@ def test_multimodal_encoder_build_passes_none_to_executor(
     encoder = object.__new__(MultimodalEncoder)
     encoder.args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=1)
     encoder.mpi_session = None
+    encoder._is_attached_frontend = False
     encoder._executor_cls = MagicMock()
 
     monkeypatch.setattr(CachedModelLoader, "__call__", lambda self: tmp_path)
