@@ -34,6 +34,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 import yaml
@@ -255,7 +256,7 @@ def _read_status(work_dir, name):
     return text, doc
 
 
-def _assert_all_passed(work_dir, launched):
+def _assert_all_passed(work_dir, launched, *, model_dir_resolved=True, synthetic_kv_shape=False):
     failures = []
     for name, proc, log_path in launched:
         if proc.returncode != 0:
@@ -270,6 +271,8 @@ def _assert_all_passed(work_dir, launched):
         assert doc["overall"] == "PASS"
         assert doc["transceiver_runtime"] == "PYTHON"
         assert doc["kv_cache_manager"] == "V2"
+        assert doc["model_dir_resolved"] is model_dir_resolved
+        assert doc["synthetic_kv_shape"] is synthetic_kv_shape
         # The Python transceiver records bandwidth on the ctx (sender) leader
         # via PerfLogManager CSVs in TRTLLM_KVCACHE_TIME_OUTPUT_PATH. Asserting
         # it here ties the whole chain (perf_logger naming -> CSV -> parser)
@@ -351,6 +354,45 @@ def test_precheck_fails_fast_on_fingerprint_mismatch(tmp_path):
         text, doc = _read_status(work_dir, name)
         assert text.startswith(f"FAIL {name}"), f"{name} status: {text}"
         assert doc["overall"] == "FAIL"
+        assert doc["model_dir_resolved"] is True
+        assert doc["synthetic_kv_shape"] is False
     # The gen driver saw the ctx abort its handshake: the reason must name it.
     text, _ = _read_status(work_dir, "gen_0")
     assert "fingerprint" in text or "abort" in text.lower()
+
+
+@pytest.mark.timeout(300)
+def test_precheck_declared_architecture_without_checkpoint(tmp_path: Path) -> None:
+    """Missing weights still allow actual V2/Python transfers after auto resolution."""
+    pytest.importorskip("mpi4py")
+    cfg = _disagg_yaml(1, 1, 1, 1)
+    cfg["metadata"] = {"model_dir_name": "unstaged", "architecture": "DeepseekV4ForCausalLM"}
+    for side in cfg["worker_config"].values():
+        side["kv_cache_config"].pop("use_kv_cache_manager_v2")
+        side["cache_transceiver_config"]["transceiver_runtime"] = "auto"
+    config_path, models_root = _write_inputs(tmp_path, cfg)
+    work_dir, launched = _launch_instances(tmp_path, _jobs(cfg, config_path), models_root)
+    _wait_all(launched)
+    _assert_all_passed(work_dir, launched, model_dir_resolved=False, synthetic_kv_shape=True)
+
+
+@pytest.mark.timeout(300)
+def test_precheck_rejects_inconsistent_checkpoint_visibility(tmp_path: Path) -> None:
+    """Peers with the same YAML plan reject different resolved synthetic layouts."""
+    pytest.importorskip("mpi4py")
+    ctx_cfg = _disagg_yaml(1, 1, 1, 1)
+    ctx_path, models_root = _write_inputs(tmp_path, ctx_cfg, name="ctx")
+    gen_cfg = _disagg_yaml(1, 1, 1, 1)
+    gen_cfg["metadata"]["model_dir_name"] = "unstaged"
+    gen_path, _ = _write_inputs(tmp_path, gen_cfg, name="gen")
+    jobs = [("ctx", 0, 1, ctx_path), ("gen", 0, 1, gen_path)]
+    work_dir, launched = _launch_instances(tmp_path, jobs, models_root)
+    _wait_all(launched)
+    for name, proc, log_path in launched:
+        assert proc.returncode != 0, _log_tail(log_path)
+        text, doc = _read_status(work_dir, name)
+        assert "resolved transfer contract mismatch" in text
+        assert doc["overall"] == "FAIL"
+        assert doc["model_dir_resolved"] is (name == "ctx_0")
+        assert doc["synthetic_kv_shape"] is (name == "gen_0")
+        assert not any(case["status"] == "PASS" for case in doc["cases"])
