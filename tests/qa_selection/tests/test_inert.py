@@ -23,15 +23,24 @@ plugin-absent arm collects it as an unknown marker -- which is why this suite's
 `pytest.ini` must not set `--strict-markers`.
 """
 
-from mock_suite import DeviceCount
+from mocks import DeviceCases
 
 
 def test_a_loaded_but_untargeted_plugin_is_invisible(selection):
     """Same ids in the same order as a run without `-p`, and nothing written."""
-    loaded = selection.run(DeviceCount.MODULE, "--selection-out-dir={out}")
-    bare = selection.without_plugin(DeviceCount.MODULE)
+    loaded = selection.run(DeviceCases.MODULE, "--selection-out-dir={out}")
+    bare = selection.without_plugin(DeviceCases.MODULE)
 
-    assert loaded.selected == bare.selected == [DeviceCount.UNMARKED, DeviceCount.NEEDS_EIGHT]
+    assert (
+        loaded.selected
+        == bare.selected
+        == [
+            DeviceCases.UNMARKED,
+            DeviceCases.TWO_GPUS,
+            DeviceCases.EIGHT_GPUS,
+            DeviceCases.EIGHT_RANKS,
+        ]
+    )
 
     # An output directory was named and nothing was written to it, not even
     # the directory itself.
@@ -47,6 +56,11 @@ def test_options_are_not_validated_while_inert(selection):
 
     `--ladder=999` is a usage error for any named machine.
     """
-    run = selection.run(DeviceCount.MODULE, "--ladder=999")
+    run = selection.run(DeviceCases.MODULE, "--ladder=999")
 
-    assert run.selected == [DeviceCount.UNMARKED, DeviceCount.NEEDS_EIGHT]
+    assert run.selected == [
+        DeviceCases.UNMARKED,
+        DeviceCases.TWO_GPUS,
+        DeviceCases.EIGHT_GPUS,
+        DeviceCases.EIGHT_RANKS,
+    ]
