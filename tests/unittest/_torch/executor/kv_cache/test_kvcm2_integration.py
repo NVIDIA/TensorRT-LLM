@@ -36,6 +36,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _update_kv_cache_draft_token_location,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
@@ -67,7 +69,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManager,
     KVCacheManagerConfig,
     LayerId,
+    ReuseScope,
     SsmLayerConfig,
+    _introspection,
 )
 
 TOKENS_PER_BLOCK = 4
@@ -124,6 +128,7 @@ def test_create_kv_cache_swa_endpoint_priority(
     manager.max_beam_width = 1
     manager.num_pools = 0
     manager.impl = Mock()
+    manager.impl.create_kv_cache.return_value.beam_width = 1
 
     manager._create_kv_cache(0, None, None, is_dummy=is_dummy, expected_prompt_length=prompt)
 
@@ -131,6 +136,113 @@ def test_create_kv_cache_swa_endpoint_priority(
     assert ("custom_priority_callback" in kwargs) is enabled
     if enabled:
         assert kwargs["custom_priority_callback"](255, AttnLifeCycle(4096, 0)) == 70
+
+
+def _commit_released_prompt(core: KVCacheManager, prompt: list[int], priority_callback) -> None:
+    """Run a prompt through a real cache and release it, leaving its pages reusable."""
+    cache = core.create_kv_cache(None, prompt, custom_priority_callback=priority_callback)
+    try:
+        assert cache.resume(CudaStream(torch.cuda.current_stream().cuda_stream))
+        # Grow capacity only: commit() advances the history itself. Advancing
+        # the history first (resize(len, len)) marks out-of-window pages stale
+        # before they are committed, so they would never become reusable.
+        assert cache.resize(len(prompt))
+        uncommitted = prompt[cache.num_committed_tokens :]
+        if uncommitted:
+            cache.commit(uncommitted)
+    finally:
+        cache.close()
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("with_callback", [True, False], ids=["endpoint-priority", "lru-baseline"])
+def test_swa_endpoint_priority_steers_real_eviction(with_callback: bool) -> None:
+    """Priority-based eviction of real pages must follow the endpoint callback.
+
+    A four-block SWA prompt is committed and released: with window 8 and rewind
+    4 its block 0 lies before the protected endpoint span (priority 0) while
+    blocks 1-3 overlap it (priority 70). A second request then reuses block 0,
+    re-releasing it as the most recently used page. Bounded pressure (exactly
+    one page beyond capacity) must evict:
+
+    * with the callback: block 0, the lowest-priority page, despite being MRU;
+    * without it (LRU baseline): block 1, the oldest page, an endpoint page.
+
+    The baseline leg proves recency alone sacrifices the endpoint page here, so
+    the endpoint-priority leg fails if the core ignores the callback or applies
+    its priorities incorrectly.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    # The sibling tests reach the core through the pyexecutor manager, whose
+    # constructor touches the torch CUDA runtime and thereby binds the primary
+    # context to this thread. This test constructs the raw core first, so bind
+    # the context explicitly or construction fails with CUDA error 201.
+    torch.cuda.synchronize()
+    window_size = 2 * TOKENS_PER_BLOCK
+    rewind_tokens = TOKENS_PER_BLOCK
+    prompt = list(range(4 * TOKENS_PER_BLOCK))
+    core = KVCacheManager(
+        KVCacheManagerConfig(
+            tokens_per_block=TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=2 << 20)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(role=Role.KEY, size=65536),
+                        BufferConfig(role=Role.VALUE, size=65536),
+                    ],
+                    sliding_window_size=window_size,
+                )
+            ],
+        )
+    )
+
+    def priority_callback(prompt_length: int):
+        if not with_callback:
+            return None
+        return _swa_endpoint_priority(prompt_length, TOKENS_PER_BLOCK, rewind_tokens)
+
+    pins = []
+    try:
+        _commit_released_prompt(core, prompt, priority_callback(len(prompt)))
+
+        # Reuse block 0 so its page is re-released after blocks 1-3. The touch
+        # request's one new page lies inside its own endpoint span, so it stays
+        # priority 70 under the callback and never absorbs the pressure.
+        touch_prompt = prompt[:TOKENS_PER_BLOCK] + [1000 + i for i in range(TOKENS_PER_BLOCK)]
+        _commit_released_prompt(core, touch_prompt, priority_callback(len(touch_prompt)))
+
+        swa_lc_id = _introspection.swa_life_cycle_ids(core)[0]
+        _, pages = _introspection.reuse_match_pages(core, ReuseScope(), prompt, swa_lc_id)
+        assert len(pages) == 4
+        # The all-reusable premise: out-of-window pages stay reusable until evicted.
+        assert all(page is not None for page in pages)
+
+        # Bounded pressure: pin every free page with held (unevictable)
+        # allocations, then demand one more page, forcing exactly one eviction.
+        stream = CudaStream(torch.cuda.current_stream().cuda_stream)
+        free_pages = core.get_storage_statistics()[0].free
+        for _ in range(free_pages + 1):
+            pin = core.create_kv_cache()
+            pins.append(pin)
+            assert pin.resume(stream)
+            assert pin.resize(TOKENS_PER_BLOCK)
+
+        _, pages = _introspection.reuse_match_pages(core, ReuseScope(), prompt, swa_lc_id)
+        if with_callback:
+            assert pages[0] is None, "the intermediate page must be evicted first"
+            assert all(page is not None for page in pages[1:]), "endpoint pages must be retained"
+        else:
+            assert pages[0] is not None, "pure LRU keeps the recently touched page"
+            assert pages[1] is None, "pure LRU evicts the oldest endpoint page"
+            assert all(page is not None for page in pages[2:])
+    finally:
+        for pin in pins:
+            pin.close()
+        core.shutdown()
 
 
 class _CacheTierInitError(Exception):
@@ -196,6 +308,7 @@ def _make_cache_config_for_test(
     assert len(max_attention_window_vec) == len(pp_layers)
 
     cache_manager = object.__new__(KVCacheManagerV2)
+    cache_manager.max_beam_width = 1
     cache_manager.kv_cache_type = kv_cache_type
     cache_manager.dtype = dtype
     cache_manager.head_dim_per_layer = [128] * len(pp_layers)
@@ -593,6 +706,42 @@ def test_zero_size_filter_rejects_empty_local_cache() -> None:
         manager._remove_zero_size_buffers(config)
 
 
+@pytest.mark.parametrize("sliding_window_size", [None, 8])
+@pytest.mark.parametrize("attention_first", [False, True])
+def test_event_window_sizes_filter_attention_without_backend_internals(
+    sliding_window_size: int | None, attention_first: bool
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.max_seq_len = MAX_SEQ_LEN
+    manager.kv_cache_manager_py_config = SimpleNamespace(
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=Role.KEY, size=128)],
+                sliding_window_size=sliding_window_size,
+            ),
+            SsmLayerConfig(
+                layer_id=LayerId(1),
+                buffers=[BufferConfig(role=DataRole("ssm_state"), size=128)],
+            ),
+        ]
+    )
+    # Match the C++ binding surface: layer_grouping is public, while the
+    # Python implementation's private _life_cycles registry is absent.
+    manager.impl = SimpleNamespace(layer_grouping=[[0], [1]] if attention_first else [[1], [0]])
+
+    attention_group_id = 0 if attention_first else 1
+    window_size = MAX_SEQ_LEN if sliding_window_size is None else sliding_window_size
+    # SSM must be excluded even when its window ties with full attention's window.
+    assert manager._get_event_window_sizes_by_layer_group(attention_only=True) == {
+        attention_group_id: window_size
+    }
+    assert manager._get_event_window_sizes_by_layer_group() == {
+        attention_group_id: window_size,
+        1 - attention_group_id: MAX_SEQ_LEN,
+    }
+
+
 def test_draft_token_relocation_uses_local_cache_layout(monkeypatch: pytest.MonkeyPatch) -> None:
     request = SimpleNamespace(
         state=LlmRequestState.GENERATION_IN_PROGRESS,
@@ -888,7 +1037,7 @@ def test_default_uses_allocator_fallback() -> None:
     assert config.constraints == []
 
 
-def test_avg_seq_len_builds_warmup_constraints() -> None:
+def test_avg_seq_len_builds_context_warmup_constraint() -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(host_cache_size=0, avg_seq_len=1024),
         max_batch_size=3,
@@ -901,16 +1050,7 @@ def test_avg_seq_len_builds_warmup_constraints() -> None:
         [KVCacheDesc(capacity=2048, history_length=0)]
         + [KVCacheDesc(capacity=1024, history_length=1021)] * 2
     )
-    assert config.constraints == [
-        BatchDesc(
-            [
-                KVCacheDesc(capacity=1024, history_length=1023),
-                KVCacheDesc(capacity=3, history_length=0),
-                KVCacheDesc(capacity=3, history_length=0),
-            ]
-        ),
-        BatchDesc([KVCacheDesc(capacity=2048, history_length=0)]),
-    ]
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=2048, history_length=0)])]
 
 
 def test_avg_seq_len_updates_typical_step() -> None:
@@ -1164,7 +1304,7 @@ def test_extra_tokens_are_in_context_capacity() -> None:
     )
 
     assert config.typical_step == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
-    assert config.constraints[1] == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=258, history_length=0)])]
 
 
 def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
@@ -1196,12 +1336,13 @@ def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
 def test_generation_allocation_reserves_dynamic_width() -> None:
     request = SimpleNamespace(
         py_request_id=80,
+        py_beam_width=1,
         py_num_accepted_draft_tokens=2,
         py_rewind_len=2,
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         max_beam_num_tokens=103,
     )
-    kv_cache = Mock(is_active=True, capacity=100)
+    kv_cache = Mock(is_active=True, capacity=100, beam_width=1)
 
     def resize(capacity, history_length=None):
         if capacity is not None:
@@ -1210,6 +1351,8 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
 
     kv_cache.resize.side_effect = resize
     manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELFKONLY
+    manager.max_beam_width = 1
     manager.is_draft = True
     manager._has_cp_helix = False
     manager.kv_cache_map = {request.py_request_id: kv_cache}
@@ -1306,9 +1449,11 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
     request.context_chunk_size = 128
     request.move_to_next_context_chunk()
 
-    kv_cache = Mock(num_committed_tokens=64, is_active=True, capacity=192)
+    kv_cache = Mock(num_committed_tokens=64, is_active=True, capacity=192, beam_width=1)
     manager = object.__new__(KVCacheManagerV2)
     manager.kv_connector_manager = None
+    manager.kv_cache_type = CacheType.SELFKONLY
+    manager.max_beam_width = 1
     manager.is_draft = True
     manager.enable_block_reuse = True
     manager.enable_joint_kv_cache_reuse = True
@@ -1571,6 +1716,61 @@ def test_external_draft_estimated_quota_supports_allocation_and_resume(
     finally:
         for cache in caches:
             cache.close()
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("draft_len", [0, 4])
+def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    spec_config = MTPDecodingConfig(max_draft_len=draft_len) if draft_len else None
+    manager = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=4 << 20),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=131072,
+        max_batch_size=2,
+        max_num_tokens=128,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        spec_config=spec_config,
+    )
+    try:
+        engine = SimpleNamespace(
+            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
+            spec_config=spec_config,
+            max_draft_len=draft_len,
+            max_draft_loop_tokens=draft_len,
+            max_seq_len=manager.max_seq_len,
+            max_beam_width=1,
+            use_mrope=False,
+            get_runtime_tokens_per_gen_step=lambda length: length + 1,
+            _get_draft_kv_cache_manager=lambda _: None,
+            _is_encoder_decoder_model=lambda: False,
+            model=SimpleNamespace(
+                model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
+            ),
+        )
+        resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+        batch = PyTorchModelEngine._create_cuda_graph_warmup_request(
+            engine, resources, batch_size=2, draft_len=draft_len
+        )
+        assert batch is not None
+        assert len(batch.generation_requests) == 2
+        longest_cache = manager.kv_cache_map[batch.generation_requests[0].py_request_id]
+        assert longest_cache.capacity % manager.tokens_per_block == 0
+        for request in batch.generation_requests:
+            cache = manager.kv_cache_map[request.py_request_id]
+            token_num = request.prompt_len + 1
+            assert cache.history_length == request.prompt_len
+            assert cache.capacity == token_num + manager.num_extra_kv_tokens + draft_len
+            manager.free_resources(request)
+        assert not manager.kv_cache_map
+    finally:
         manager.shutdown()
 
 

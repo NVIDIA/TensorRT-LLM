@@ -33,7 +33,7 @@ def _model_path() -> str:
     override = os.environ.get("POSTPROC_TEST_MODEL")
     if override:
         return override
-    return str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    return str(llm_models_root() / "Qwen3/Qwen3-0.6B")
 
 
 def _make_llm(num_postprocess_workers: int) -> LLM:

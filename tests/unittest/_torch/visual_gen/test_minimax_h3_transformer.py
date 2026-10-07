@@ -1169,3 +1169,60 @@ def test_pinned_diffusers_golden_matches_live_hf_reference() -> None:
         rtol=2e-2,
         atol=2e-2,
     )
+
+
+@requires_cuda
+def test_ref2va_bf16_matches_diffusers_rounding() -> None:
+    from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+
+    config = _make_model_config(num_layers=1, num_refiner_layers=1)
+    config.extra_attrs["workflow"] = "ref2va"
+    target = h3.MiniMaxH3Transformer3DModel(config).to("cuda")
+    _initialize_diffusers_golden_weights(target)
+    reference = MiniMaxH3Transformer3DModel(
+        **(_TINY_CONFIG | {"num_layers": 1, "num_refiner_layers": 1})
+    ).to(device="cuda", dtype=torch.bfloat16)
+    for name in ("proj_in", "audio_proj_in", "time_embedder", "rope", "proj_out", "audio_proj_out"):
+        getattr(reference, name).to(torch.float32)
+    _copy_golden_parameters_to_hf(reference, target)
+    inputs = {name: tensor.to("cuda") for name, tensor in _diffusers_golden_inputs().items()}
+    reference_inputs = dict(inputs)
+    reference_inputs["timestep"] = reference_inputs.pop("conditioning_timesteps")
+    with torch.inference_mode():
+        expected = reference(**reference_inputs)
+        actual = target(**inputs)
+    torch.testing.assert_close(actual.sample, expected.sample, rtol=0, atol=1e-6)
+    torch.testing.assert_close(actual.audio_sample, expected.audio_sample, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("workflow", ["fl2va", "ref2va"])
+def test_workflows_reuse_trtllm_norm_and_swiglu(workflow: str) -> None:
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+    from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
+
+    config = _make_model_config(num_layers=1, num_refiner_layers=1)
+    config.extra_attrs["workflow"] = workflow
+    model = h3.MiniMaxH3Transformer3DModel(config)
+    assert type(model.norm_out.norm) is RMSNorm
+    assert type(model.token_refiner.final_norm) is RMSNorm
+    blocks = [*model.transformer_blocks, *model.token_refiner.refiner_blocks]
+    for block in blocks:
+        assert type(block.norm1) is RMSNorm
+        assert type(block.norm2) is RMSNorm
+        assert block.ff.activation is F.silu
+        assert isinstance(block.attn.norm_q, RMSNormTPAware)
+        assert isinstance(block.attn.norm_k, RMSNormTPAware)
+
+
+def test_ref2va_norm_initialization_supports_deferred_weight_loading() -> None:
+    from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+
+    config = _make_model_config()
+    config.extra_attrs["workflow"] = "ref2va"
+    config.skip_create_weights_in_init = True
+    with MetaInitMode():
+        model = h3.MiniMaxH3Transformer3DModel(config)
+    for module in model.modules():
+        if isinstance(module, h3.RMSNorm):
+            assert module.weight.device.type != "meta"
+            torch.testing.assert_close(module.weight, torch.ones_like(module.weight))
