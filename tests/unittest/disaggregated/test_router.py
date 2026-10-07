@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import base64
 import copy
 import random
 import threading
@@ -11,6 +12,7 @@ from unittest import mock
 
 import aiohttp
 import msgpack
+import numpy as np
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
@@ -25,7 +27,9 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest,
                                                 ConversationParams,
                                                 DisaggregatedParams,
-                                                FunctionDefinition)
+                                                FunctionDefinition,
+                                                ResponsesRequest)
+from tensorrt_llm.serve.responses_utils import request_preprocess
 from tensorrt_llm.serve.router import (COORDINATOR_SELECT_MAX_ATTEMPTS,
                                        KV_CACHE_HASH_ALGO_V1,
                                        KV_CACHE_HASH_ALGO_V2,
@@ -35,7 +39,8 @@ from tensorrt_llm.serve.router import (COORDINATOR_SELECT_MAX_ATTEMPTS,
                                        KvCacheAwareRouter,
                                        KvCacheAwareServerState,
                                        LoadBalancingRouter, RoundRobinRouter,
-                                       block_key_hasher, create_router)
+                                       block_key_hasher, create_router,
+                                       responses_request_text)
 
 # yapf: enable
 
@@ -2577,3 +2582,102 @@ def test_v2_sha256_64_block_hashes_are_big_endian_prefix_of_frozen_values(
         for key in _V2_GOLDEN_PARTIAL_TAIL
     ]
     assert block_hashes == [expected]
+
+
+# ── ResponsesRequest routing ──
+
+
+def _message(role: str, content: str) -> dict[str, str]:
+    return {"role": role, "content": content}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_harmony", [False, True])
+async def test_kv_cache_aware_router_routes_responses_turns(
+        servers, use_harmony):
+    """A later turn of a Responses conversation follows its cached prefix."""
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                use_harmony=use_harmony)
+    history = [_message("user", "plan a trip " * 10)]
+    turn1 = ResponsesRequest(model="m", instructions="Be brief.", input=history)
+    turn2 = ResponsesRequest(
+        model="m",
+        instructions="Be brief.",
+        input=history +
+        [_message("assistant", "day one"),
+         _message("user", "add food")])
+    with mock.patch.object(router,
+                           "_get_tokenizer",
+                           return_value=_PrefixCacheFakeTokenizer()):
+        home, _ = await router.get_next_server(turn1)
+        await router.finish_request(turn1)
+        server, info = await router.get_next_server(turn2)
+    assert server == home and info["match_length"] > 0
+    # Routing ids are not stored on the request: the context worker renders
+    # the prompt itself.
+    assert turn1.prompt_token_ids is None
+    if use_harmony:
+        worker_ids, _ = await request_preprocess(turn2,
+                                                 None,
+                                                 None,
+                                                 enable_store=False,
+                                                 use_harmony=True)
+        assert router._tokenize(turn2) == [worker_ids]
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_tells_responses_conversations_apart():
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2", "server3"])
+    home_a, _ = await router.get_next_server(
+        ResponsesRequest(model="m", input="topic A " * 200))
+    home_b, _ = await router.get_next_server(
+        ResponsesRequest(model="m", input="topic B " * 200))
+    later_a = ResponsesRequest(model="m",
+                               input=[
+                                   _message("user", "topic A " * 200),
+                                   _message("assistant", "done"),
+                                   _message("user", "again")
+                               ])
+    assert home_b != home_a
+    assert (await router.get_next_server(later_a))[0] == home_a
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("relay",
+                         [None, "prompt_token_ids", "prompt_token_ids_b64"])
+async def test_responses_request_relayed_prompt_token_ids(relay):
+    """Routers use relayed prompt ids, plain or base64, and count the text without them."""
+    token_ids = list(range(40))
+    request = ResponsesRequest(
+        model="m",
+        input="hello " * 10,
+        disaggregated_params=DisaggregatedParams(
+            request_type="generation_only" if relay else "context_only"))
+    if relay == "prompt_token_ids_b64":
+        request.prompt_token_ids_b64 = base64.b64encode(
+            np.asarray(token_ids, dtype=np.int32).tobytes()).decode()
+    elif relay:
+        request.prompt_token_ids = token_ids
+    relayed = [token_ids] if relay else None
+
+    router = LoadBalancingRouter(server_role=None,
+                                 servers=["server1"],
+                                 use_tokens=True)
+    await router.get_next_server(request)
+    assert router._server_state["server1"]._num_active_tokens == (
+        len(token_ids) if relay else len(responses_request_text(request)))
+    await router.finish_request(request)
+    assert router._server_state["server1"]._num_active_tokens == 0
+    assert ConversationRouter._try_extract_token_ids(request) == relayed
+    if relay:
+        kv_router = KvCacheAwareRouter(server_role=None, servers=["server1"])
+        with mock.patch.object(kv_router,
+                               "_get_tokenizer",
+                               side_effect=AssertionError):
+            assert kv_router._tokenize(request) == relayed
+    # A base64 relay is decoded for routing, not expanded onto the request.
+    assert request.prompt_token_ids == (token_ids if relay == "prompt_token_ids"
+                                        else None)
