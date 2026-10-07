@@ -12,6 +12,11 @@ during collection instead.
 Functional tests only; perf runs are selected by their own configuration.
 
 ```bash
+# What can B200 run? Writes B200.json and one list, B200-8gpu.ids.
+pytest --collect-only -q -p qa_selection.plugin \
+       --machine=B200 --selection-out-dir=out/
+
+# How does a 1-, 4- and 8-GPU allocation policy divide it? One list per rung.
 pytest --collect-only -q -p qa_selection.plugin \
        --machine=B200 --ladder=1,4,8 --selection-out-dir=out/
 ```
@@ -87,14 +92,14 @@ before the plugin was run, so a test states a command line and the answer expect
 the plugin decides, and how to drive it.
 
 ```bash
-pytest tests/qa_selection/tests      # 27 tests, no GPU, no container, no wheel
+pytest tests/qa_selection/tests      # 28 tests, no GPU, no container, no wheel
 ```
 
 | | guarantee | proved by |
 |---|---|---|
 | **AC-1** | The target's **architecture** decides what is selected, wherever the mark sits — `sm`, CPU arch and device memory, on a function, a class or one `pytest.param`, read from the profile and never from the collecting host | [`test_arch.py`](tests/test_arch.py) (7) |
 | **AC-2** | The ladder's **largest rung** is the GPU count: the ladder defaults to one rung of the machine's GPUs per node, and no other value states one | [`test_gpu_count.py`](tests/test_gpu_count.py) (7) |
-| **AC-3** | The **ladder** routes each selected test to the smallest allocation that holds it, and publishes one list per rung | [`test_ladder.py`](tests/test_ladder.py) (5) |
+| **AC-3** | Each selected test lands on the **smallest rung** that holds it, and every rung publishes one `<machine>-<rung>gpu.ids` list, empty or not | [`test_ladder.py`](tests/test_ladder.py) (6) |
 | **AC-4** | Each **option answers one question**, and a rung run selects exactly what that rung published | [`test_options.py`](tests/test_options.py) (5) |
 | **AC-5** | A ladder **shorter than the machine** strands feasible tests audibly — named, counted and warned, never folded into the largest rung | [`test_stranded.py`](tests/test_stranded.py) (1) |
 | **AC-6** | Without `--machine`, loading the plugin **changes nothing**, so it can be loaded unconditionally | [`test_inert.py`](tests/test_inert.py) (2) |
