@@ -52,24 +52,14 @@ class Selection:
             ),
         )
 
-    def is_live(self, assignment: Assignment) -> bool:
-        """True when `assignment` runs in this invocation.
-
-        An infeasible test never runs. With a target rung, only the tests placed
-        on that rung run; without one, every feasible test does.
-        """
-        if not assignment.selected:
-            return False
-        return self.request.target_rung is None or assignment.rung == self.request.target_rung
-
     def partition(self, items: Sequence[T]) -> Tuple[List[T], List[T]]:
-        """`items` split into those to keep and those to drop, in order.
+        """`items` split into the selected and the rest, in order.
 
         Paired by position: `assignments` was built from the same sequence in
-        one pass.
+        one pass. The kept items are the ones the report publishes, rung by rung.
         """
         kept: List[T] = []
         dropped: List[T] = []
         for item, assignment in zip(items, self.assignments):
-            (kept if self.is_live(assignment) else dropped).append(item)
+            (kept if assignment.selected else dropped).append(item)
         return kept, dropped

@@ -21,7 +21,15 @@ pytest --collect-only -q -p qa_selection.plugin \
        --machine=B200 --ladder=1,4,8 --selection-out-dir=out/
 ```
 
-`pytest -p qa_selection.plugin --help` documents the four options. `-p` needs `tests/`
+A machine and a ladder are the whole command. The ladder chooses the question:
+
+| question | command | publishes |
+|---|---|---|
+| what can this machine run? | `--machine=B200` | `B200-8gpu.ids` |
+| what can one N-GPU allocation of it run? | `--machine=B200 --ladder=N` | `B200-<N>gpu.ids` |
+| how does an allocation policy divide it? | `--machine=B200 --ladder=1,4,8` | one list per rung |
+
+`pytest -p qa_selection.plugin --help` documents the three options. `-p` needs `tests/`
 importable: the integration suite's ini `pythonpath` provides it, elsewhere set
 `PYTHONPATH=tests`.
 
@@ -79,7 +87,7 @@ The rules are asked first and the GPU count second, and an `Assignment` keeps bo
 blockers; a test with none is selected. The selector never reads a GPU-count marker and demand
 never consults the profile, so each question is answered once. `selection.py` holds one answer
 per test in collection order, so `partition` can split the item list by position: whatever is
-not live goes to pytest's own deselection hook and is removed from the list in place.
+not selected goes to pytest's own deselection hook and is removed from the list in place.
 
 **After collection** `report.py` turns those decisions into the per-rung `.ids` lists the
 pipeline filters with `awk`, a JSON record, and a terminal summary. Nothing is written unless
@@ -100,7 +108,7 @@ pytest tests/qa_selection/tests      # 28 tests, no GPU, no container, no wheel
 | **AC-1** | The target's **architecture** decides what is selected, wherever the mark sits — `sm`, CPU arch and device memory, on a function, a class or one `pytest.param`, read from the profile and never from the collecting host | [`test_arch.py`](tests/test_arch.py) (7) |
 | **AC-2** | The ladder's **largest rung** is the GPU count: the ladder defaults to one rung of the machine's GPUs per node, and no other value states one | [`test_gpu_count.py`](tests/test_gpu_count.py) (7) |
 | **AC-3** | Each selected test lands on the **smallest rung** that holds it, and every rung publishes one `<machine>-<rung>gpu.ids` list, empty or not | [`test_ladder.py`](tests/test_ladder.py) (6) |
-| **AC-4** | Each **option answers one question**, and a rung run selects exactly what that rung published | [`test_options.py`](tests/test_options.py) (5) |
+| **AC-4** | A **machine and a ladder** are the whole command — the three questions above — and the tests a run keeps are exactly the tests its lists hold | [`test_options.py`](tests/test_options.py) (5) |
 | **AC-5** | A ladder **shorter than the machine** strands feasible tests audibly — named, counted and warned, never folded into the largest rung | [`test_stranded.py`](tests/test_stranded.py) (1) |
 | **AC-6** | Without `--machine`, loading the plugin **changes nothing**, so it can be loaded unconditionally | [`test_inert.py`](tests/test_inert.py) (2) |
 
