@@ -199,3 +199,38 @@ communication completion. Profiling introduces scope and metadata overhead.
 Direct `_utils.mpi_*` helpers and background-thread calls without a profiler are
 not covered by `MPIDist` annotations. A missing scope cannot establish that no
 communication occurred.
+
+## Nanobind binding coverage and compatibility
+
+Build with `ENABLE_NANOBIND_PROFILING=ON`; no NCCL profiling dependency is
+required. `tensorrt_llm.bindings.BuildInfo.ENABLE_NANOBIND_PROFILING` is a Python
+bool in both configurations. OFF builds retain the upstream dispatch paths.
+ON scopes are named `trtllm::nanobind::<module>.<qualname>`. All four pinned
+function vectorcall paths are covered, including rejected arguments and
+exceptions. Bound methods and constructors delegate to those paths without
+adding a second scope. Native startup and probes use the existing native
+shared-core implementation, not a second embedded selector.
+
+Names are extracted only for active callbacks. Direct Tensor positional and
+keyword arguments are inspected only when callbacks request inputs; nested
+containers are not traversed. Metadata uses region `nanobind` and the fields
+`nanobind.tensor_count` (int64) and `nanobind.tensor.<index>.shape` (int64 list),
+`.stride` (int64 list for strided tensors), `.dtype` and `.device` (strings).
+Indices follow positional arguments then keyword values, including self when
+it is a Tensor. Tensor handles are copied without reading data or synchronizing
+devices; Python Tensor subclasses are recognized by their concrete C subtype.
+Symbolic shape/stride failures can omit the observational scope, never the call.
+
+The private Tensor adapter supports PyTorch 2.14 and the full, GIL-enabled
+CPython API. The pinned nanobind version is recorded in
+[`3rdparty/fetch_content.json`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/3rdparty/fetch_content.json).
+Other Torch minors, stable Python ABI and free-threaded Python are not supported
+by this instrumentation. Revalidate private headers and adapter/vectorcall
+behavior when updating either dependency. OFF builds do not include the private
+adapter. Source overrides must include the checked-in dispatcher patch; configure
+time checks reject incompatible overrides when profiling is enabled.
+
+Setup and cleanup preserve the current Python error type, value and traceback.
+Name extraction, metadata and profiler failures remain observational. The scopes
+cover host binding dispatch, not GPU execution or graph replay, and do not replace
+executor-thread profiler start/stop.

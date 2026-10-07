@@ -66,12 +66,21 @@ option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+option(ENABLE_NANOBIND_PROFILING
+       "Emit PyTorch profiler regions around TensorRT-LLM nanobind calls" OFF)
 option(ENABLE_NCCL_PROFILING
        "Emit PyTorch profiler regions around NcclCommunicatorOp send/recv calls"
        OFF)
-add_compile_definitions(TRTLLM_ENABLE_NANOBIND_PROFILING=0)
+# Only the bindings and their dedicated runtime consume nanobind probes. Other
+# nanobind modules retain their ordinary runtime even in an instrumented build.
+add_compile_definitions(
+  TRTLLM_ENABLE_NANOBIND_PROFILING=$<AND:$<BOOL:${ENABLE_NANOBIND_PROFILING}>,$<BOOL:$<TARGET_PROPERTY:TRTLLM_NANOBIND_PROFILER_CONSUMER>>>
+)
 add_compile_definitions(
   TRTLLM_ENABLE_NCCL_PROFILING=$<BOOL:${ENABLE_NCCL_PROFILING}>)
+if(ENABLE_NANOBIND_PROFILING AND NOT BUILD_PYT)
+  message(FATAL_ERROR "ENABLE_NANOBIND_PROFILING requires BUILD_PYT=ON")
+endif()
 if(ENABLE_NCCL_PROFILING AND (NOT BUILD_PYT OR NOT ENABLE_MULTI_DEVICE))
   message(
     FATAL_ERROR

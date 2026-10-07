@@ -59,6 +59,41 @@ else()
   nanobind_add_module(${TRTLLM_NB_MODULE} ${SRCS})
 endif()
 
+target_compile_definitions(
+  ${TRTLLM_NB_MODULE}
+  PRIVATE ENABLE_NANOBIND_PROFILING=$<BOOL:${ENABLE_NANOBIND_PROFILING}>)
+if(ENABLE_NANOBIND_PROFILING)
+  if(NOT EXISTS "${nanobind_SOURCE_DIR}/src/trtllm_pytorch_tensor_adapter.h")
+    message(
+      FATAL_ERROR
+        "ENABLE_NANOBIND_PROFILING requires the nanobind profiler patch; apply 3rdparty/patches/nanobind_pytorch_profiler.patch to the nanobind source override"
+    )
+  endif()
+  set(TRTLLM_NB_PROFILING_RUNTIME nanobind-trtllm-profiled-static)
+  nanobind_build_library(${TRTLLM_NB_PROFILING_RUNTIME})
+  # Keep the default runtime unprofiled for other modules, including the
+  # transfer agent.
+  get_target_property(TRTLLM_NB_LINK_LIBRARIES ${TRTLLM_NB_MODULE}
+                      LINK_LIBRARIES)
+  list(TRANSFORM TRTLLM_NB_LINK_LIBRARIES
+       REPLACE "^nanobind-static$" "${TRTLLM_NB_PROFILING_RUNTIME}")
+  set_property(TARGET ${TRTLLM_NB_MODULE}
+               PROPERTY LINK_LIBRARIES "${TRTLLM_NB_LINK_LIBRARIES}")
+  target_compile_features(${TRTLLM_NB_PROFILING_RUNTIME} PRIVATE cxx_std_20)
+  target_compile_definitions(${TRTLLM_NB_PROFILING_RUNTIME}
+                             PRIVATE TLLM_NANOBIND_PROFILING)
+  target_compile_definitions(${TRTLLM_NB_MODULE}
+                             PRIVATE TLLM_NANOBIND_PROFILING)
+  target_include_directories(
+    ${TRTLLM_NB_PROFILING_RUNTIME} PRIVATE ${PROJECT_SOURCE_DIR}/include
+                                           ${TORCH_INCLUDE_DIRS})
+  # Reuse the shared core's selector and scope implementation; do not embed a
+  # hidden second copy in the nanobind static library or Python module.
+  target_link_libraries(
+    ${TRTLLM_NB_PROFILING_RUNTIME} PRIVATE th_common ${TORCH_LIBRARIES}
+                                           ${TORCH_PYTHON_LIB})
+endif()
+
 # SHA-256 symbols are provided by tensorrt_llm_batch_manager_static (via the
 # shared lib). Only add the include directory so headers resolve during
 # compilation of kvCacheManagerV2.cpp.
