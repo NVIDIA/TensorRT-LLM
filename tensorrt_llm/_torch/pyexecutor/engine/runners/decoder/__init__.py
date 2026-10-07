@@ -4,6 +4,6 @@
 """Scheduled decoder runner."""
 
 from .config import DecoderRunnerConfig
-from .runner import DecoderRunner
+from .runner import DecoderRunner, ExtraInputsCollector
 
-__all__ = ["DecoderRunner", "DecoderRunnerConfig"]
+__all__ = ["DecoderRunner", "DecoderRunnerConfig", "ExtraInputsCollector"]

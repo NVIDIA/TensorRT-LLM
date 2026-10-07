@@ -45,8 +45,7 @@ from .common import (
     get_position_id_offset,
     get_top_level_model,
 )
-from .decoder import DecoderRunner, DecoderRunnerConfig
-from .decoder.runner import NON_GREEDY_CAPTURE_SAMPLING_PARAMS, ExtraInputsCollector
+from .decoder import DecoderRunner, DecoderRunnerConfig, ExtraInputsCollector
 from .encoder import EncoderConfigMixin, EncoderMixin, EncoderPreparedInputs
 from .interface import RunnerConfig, ScheduledInputs
 
@@ -696,31 +695,19 @@ class EncoderDecoderRunner(DecoderRunner):
                     for req in batch.all_requests():
                         cross_kv_cache_manager.free_resources(req)
 
-    def _create_cuda_graph_warmup_request(
+    def _create_mixed_cuda_graph_warmup_request(
         self,
         resource_manager: ResourceManager,
         batch_size: int,
         draft_len: int,
-        max_seq_len: int = None,
-        mixed_context_encoder_output_lens: Sequence[int] | None = None,
-        mixed_context_query_len: int = ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
-        force_non_greedy: bool = False,
+        mixed_context_encoder_output_lens: Sequence[int],
+        mixed_context_query_len: int,
     ) -> ScheduledRequests | None:
-        """Creates a dummy ScheduledRequests tailored for CUDA graph capture.
+        """Creates a dummy ScheduledRequests for mixed CUDA graph capture.
 
-        With ``mixed_context_encoder_output_lens``, the first rows are context
-        requests whose encoder outputs have those lengths.
+        The first rows are context requests whose encoder outputs have
+        ``mixed_context_encoder_output_lens``; the rest are generation requests.
         """
-        if not mixed_context_encoder_output_lens:
-            return super()._create_cuda_graph_warmup_request(
-                resource_manager,
-                batch_size,
-                draft_len,
-                max_seq_len,
-                force_non_greedy=force_non_greedy,
-            )
-
-        capture_sampling_params = NON_GREEDY_CAPTURE_SAMPLING_PARAMS if force_non_greedy else None
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
 
@@ -750,7 +737,6 @@ class EncoderDecoderRunner(DecoderRunner):
             max_beam_width=self._config.max_beam_width,
             encoder_output_lens=list(mixed_context_encoder_output_lens),
             draft_kv_cache_manager=draft_kv_cache_manager,
-            capture_sampling_params=capture_sampling_params,
         )
         if context_requests is None:
             return None
@@ -768,7 +754,6 @@ class EncoderDecoderRunner(DecoderRunner):
                 max_beam_width=self._config.max_beam_width,
                 encoder_output_lens=[max_encoder_output_len] * len(generation_request_ids),
                 draft_kv_cache_manager=draft_kv_cache_manager,
-                capture_sampling_params=capture_sampling_params,
             )
             if generation_requests is None:
                 for request in context_requests:
@@ -782,9 +767,9 @@ class EncoderDecoderRunner(DecoderRunner):
             resource_manager,
             requests,
             batch_size,
-            max_seq_len,
-            runtime_draft_token_buffer_width,
-            capture_sampling_params,
+            max_seq_len=None,
+            runtime_draft_token_buffer_width=runtime_draft_token_buffer_width,
+            capture_sampling_params=None,
         )
         if max_seq_len_request is None:
             return None
@@ -944,7 +929,7 @@ class EncoderDecoderRunner(DecoderRunner):
             for batch_size in runner.supported_batch_sizes:
                 if batch_size <= num_contexts:
                     continue
-                warmup_request = self._create_cuda_graph_warmup_request(
+                warmup_request = self._create_mixed_cuda_graph_warmup_request(
                     resource_manager,
                     batch_size,
                     draft_len=0,
