@@ -34,6 +34,9 @@ Use the workflow's canonical benchmark contract:
 {BENCHMARK_FLAGS_REFERENCE}
 
 Finish by writing integration.md and calling append_integrator_progress once.
-Its decision and measurement fields drive the outcome after the orchestrator's
-consistency checks. Never commit to or edit the campaign checkout directly.
+Set `has_native_changes` true exactly when the final retained integration state
+contains native changes reported by an included candidate or introduced while
+resolving it; dropped candidates do not count. Its decision and measurement
+fields drive the outcome after the orchestrator's consistency checks. Never
+commit to or edit the campaign checkout directly.
 """
