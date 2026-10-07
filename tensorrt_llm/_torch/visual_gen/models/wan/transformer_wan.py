@@ -649,10 +649,47 @@ class WanBlock(nn.Module):
             else:
                 norm_x = self.norm2(x.float()).to(x.dtype)
 
-        # Text (+ I2V image) cross-attention; to_out once on the combined output.
-        attn2_proj = self.attn2.to_out[0](
-            self._cross_attention(self.attn2.to_q(norm_x), encoder_hidden_states, timestep)
+        # I2V: Split encoder_hidden_states into image and text parts if needed
+        encoder_hidden_states_img = None
+        encoder_hidden_states_text = encoder_hidden_states
+        if self.add_k_proj is not None:
+            image_context_length = encoder_hidden_states.shape[1] - 512
+            encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
+            encoder_hidden_states_text = encoder_hidden_states[:, image_context_length:]
+
+        # Text cross-attention. Batch and sequence lengths come from q: under token-sharded TP
+        # norm_x is this rank's shard and the converted to_q returns all tokens.
+        q, k, v = self.attn2.get_qkv(norm_x, encoder_hidden_states_text)
+        batch_size, seq_len = q.shape[:2]
+        q, k = self.attn2.apply_qk_norm(q, k)
+        attn2_output = self.attn2._attn_impl(
+            q,
+            k,
+            v,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            kv_seq_len=encoder_hidden_states_text.shape[1],
+            timestep=timestep,
         )
+
+        # I2V: image cross-attention
+        if encoder_hidden_states_img is not None:
+            key_img = self.add_k_proj(encoder_hidden_states_img)
+            value_img = self.add_v_proj(encoder_hidden_states_img)
+            key_img = self.norm_added_k(key_img)
+            attn_img_output = self.attn2._attn_impl(
+                q,
+                key_img,
+                value_img,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                kv_seq_len=encoder_hidden_states_img.shape[1],
+                timestep=timestep,
+            )
+            attn2_output = attn2_output + attn_img_output
+
+        # Apply to_out once to the combined (text + image) attention output
+        attn2_proj = self.attn2.to_out[0](attn2_output)
 
         # 3. Feed-forward. Mirrors norm1: fused LN+AdaLN (with optional NVFP4
         # quant) reshaped back to [B, S, D]; self.ffn consumes it.
@@ -685,56 +722,6 @@ class WanBlock(nn.Module):
         x = (x.float() + ffn_out.float() * c_gate_msa).to(x.dtype)
 
         return x
-
-    def _cross_attention(
-        self,
-        q: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        timestep: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """Text (+ I2V image) cross-attention from projected queries q [B, S, H_local * Dh].
-
-        Returns the attention output before attn2.to_out.
-        """
-        # I2V: Split encoder_hidden_states into image and text parts if needed
-        encoder_hidden_states_img = None
-        encoder_hidden_states_text = encoder_hidden_states
-        if self.add_k_proj is not None:
-            image_context_length = encoder_hidden_states.shape[1] - 512
-            encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
-            encoder_hidden_states_text = encoder_hidden_states[:, image_context_length:]
-
-        # Text cross-attention (same projections/order as Attention.get_qkv, SEPARATE_QKV)
-        batch_size, seq_len = q.shape[:2]
-        k = self.attn2.to_k(encoder_hidden_states_text)
-        v = self.attn2.to_v(encoder_hidden_states_text)
-        q, k = self.attn2.apply_qk_norm(q, k)
-        attn2_output = self.attn2._attn_impl(
-            q,
-            k,
-            v,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            kv_seq_len=encoder_hidden_states_text.shape[1],
-            timestep=timestep,
-        )
-
-        # I2V: image cross-attention
-        if encoder_hidden_states_img is not None:
-            key_img = self.add_k_proj(encoder_hidden_states_img)
-            value_img = self.add_v_proj(encoder_hidden_states_img)
-            key_img = self.norm_added_k(key_img)
-            attn_img_output = self.attn2._attn_impl(
-                q,
-                key_img,
-                value_img,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                kv_seq_len=encoder_hidden_states_img.shape[1],
-                timestep=timestep,
-            )
-            attn2_output = attn2_output + attn_img_output
-        return attn2_output
 
 
 class WanTransformer3DModel(BaseDiffusionModel):
