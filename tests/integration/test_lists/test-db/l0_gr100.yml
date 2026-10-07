@@ -8,10 +8,8 @@ l0_gr100:
       system_gpu_count:
         gte: 1
         lte: 1
-    wildcards:
-      gpu:
-      - '*gr100*'
     terms:
+      compute_capability: '10.7'
       stage: post_merge
       backend: pytorch
   tests:
