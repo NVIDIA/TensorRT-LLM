@@ -130,7 +130,6 @@ class SelectionReport:
     machine: str
     profile: MachineProfile
     ladder: Ladder
-    target_rung: Optional[int]
     source_revision: Optional[str]
     outcomes: Tuple[Outcome, ...]
 
@@ -142,7 +141,6 @@ class SelectionReport:
             machine=request.machine,
             profile=request.profile,
             ladder=request.ladder,
-            target_rung=request.target_rung,
             source_revision=SourceRevision.of(rootdir),
             outcomes=tuple(Outcome.of(assignment) for assignment in selection.assignments),
         )
@@ -151,16 +149,6 @@ class SelectionReport:
     def feasible(self) -> Tuple[Outcome, ...]:
         """The tests this machine can run, whatever allocation they land in."""
         return tuple(outcome for outcome in self.outcomes if outcome.selected)
-
-    @property
-    def live(self) -> Tuple[Outcome, ...]:
-        """The tests this invocation kept, by the rule `Selection.is_live` uses.
-
-        Equals `feasible` unless `--rung` named an allocation.
-        """
-        if self.target_rung is None:
-            return self.feasible
-        return tuple(outcome for outcome in self.feasible if outcome.rung == self.target_rung)
 
     @property
     def rungs(self) -> Dict[int, Tuple[Outcome, ...]]:
@@ -224,7 +212,6 @@ class SelectionReport:
             "candidates": len(self.outcomes),
             "feasible": len(self.feasible),
             "deselected": len(self.outcomes) - len(self.feasible),
-            "live": len(self.live),
             "unassignable": len(self.unassignable),
             "unclassified": 0,
         }
@@ -235,7 +222,6 @@ class SelectionReport:
             "machine": self.machine,
             "max_gpu_per_node": self.profile.max_gpu_per_node,
             "ladder": list(self.ladder),
-            "target_rung": self.target_rung,
             "source_revision": self.source_revision,
             "nodeid_form": NodeIds.FORM,
             "counts": self.counts,
@@ -371,7 +357,6 @@ class TerminalSummary:
             cls.line("target", cls.target(report)),
             cls.line("candidates", counts["candidates"]),
             cls.line("feasible", f"{counts['feasible']}  ({counts['deselected']} deselected)"),
-            cls.line("live", f"{counts['live']}{cls.rung_note(report)}"),
             cls.line("rungs", cls.rung_counts(report)),
         ]
         lines += cls.unassignable_line(report)
@@ -387,11 +372,6 @@ class TerminalSummary:
     def target(report: SelectionReport) -> str:
         """The machine and the ladder decisions were made against."""
         return f"{report.machine}, ladder {report.ladder}"
-
-    @staticmethod
-    def rung_note(report: SelectionReport) -> str:
-        """Names the rung when `--rung` narrowed the live set to one."""
-        return "" if report.target_rung is None else f"  (rung {report.target_rung} only)"
 
     @staticmethod
     def rung_counts(report: SelectionReport) -> str:

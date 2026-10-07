@@ -12,100 +12,70 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""AC-4: each option answers one question, and a rung run matches what was published.
+"""AC-4: a machine and a ladder are the whole command.
 
-    --ladder=R,..  allocation sizes that exist      partition
-    --rung=N       the allocation this run holds    neither
+Each criterion collects `DeviceCases.MODULE` for B200 (8 GPUs/node) into an
+output directory. The ladder chooses the question:
 
-    B200    8 GPUs/node
+    what can this machine run?                 --machine=B200                 B200-8gpu.ids
+    what can one N-GPU allocation of it run?   --machine=B200 --ladder=N      one list
+    how does an allocation policy divide it?   --machine=B200 --ladder=1,4,8  one list per rung
 
-`--rung` and `--selection-out-dir` are refused together, so a rung run is read
-through `run.selected` and `run.reported(...)`; a ladder alone publishes every
-rung's list.
+Every kept test is in exactly one published list, and nothing else is kept.
 """
 
 from mocks import DeviceCases
 
 
-def test_rung_run_selects_its_published_list(selection):
-    """The tests a rung run keeps are the tests that rung published, in order."""
-    plan = selection.run(
-        DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--selection-out-dir={out}"
-    )
-    rung = selection.run(DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--rung=4")
+def test_whole_node_by_default(selection):
+    """Without `--ladder`, the ladder is one rung of the machine's GPUs per node."""
+    run = selection.run(DeviceCases.MODULE, "--machine=B200", "--selection-out-dir={out}")
 
-    assert plan.ids(4) == [DeviceCases.TWO_GPUS]
-    assert rung.selected == plan.ids(4)
-
-
-def test_rung_narrows_what_executes_not_the_machine(selection):
-    """A rung miss is reported feasible with no blocker, never as infeasible."""
-    rung = selection.run(DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--rung=4")
-    plan = selection.run(
-        DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--selection-out-dir={out}"
-    )
-
-    assert DeviceCases.EIGHT_GPUS not in rung.selected
-
-    # Feasibility was decided against the whole node.
-    assert rung.reported("target") == "B200, ladder 1,4,8"
-    assert rung.reported("feasible") == "4  (0 deselected)"
-    assert rung.reported("live") == "1  (rung 4 only)"
-
-    # The record, which only the plan run writes, says the same.
-    assert plan.outcome(DeviceCases.EIGHT_GPUS)["selected"] is True
-    assert plan.outcome(DeviceCases.EIGHT_GPUS)["blockers"] == []
-    assert plan.outcome(DeviceCases.EIGHT_GPUS)["rung"] == 8
-
-
-def test_a_rung_run_differs_from_the_plan_only_in_what_runs(selection):
-    """Plan and rung runs agree on the machine and on feasibility; `live` differs.
-
-    The plan run keeps every feasible test and publishes one list per rung; the
-    rung run keeps that rung's share of them.
-    """
-    plan = selection.run(
-        DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--selection-out-dir={out}"
-    )
-    rung = selection.run(DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--rung=4")
-
-    assert plan.selected == [
+    assert run.selected == [
         DeviceCases.UNMARKED,
         DeviceCases.TWO_GPUS,
         DeviceCases.EIGHT_GPUS,
         DeviceCases.EIGHT_RANKS,
     ]
-    assert plan.written == [
-        "B200-1gpu.ids",
-        "B200-4gpu.ids",
-        "B200-8gpu.ids",
-        "B200.json",
-    ]
-    assert rung.selected == [DeviceCases.TWO_GPUS]
-
-    assert plan.reported("target") == rung.reported("target") == "B200, ladder 1,4,8"
-    assert plan.reported("feasible") == rung.reported("feasible") == "4  (0 deselected)"
-    assert plan.reported("live") == "4"
-    assert rung.reported("live") == "1  (rung 4 only)"
+    assert run.written == ["B200-8gpu.ids", "B200.json"]
+    assert run.record["ladder"] == [8]
 
 
-def test_rung_outside_the_ladder(selection):
-    """A rung the ladder does not hold is refused, not silently empty."""
-    run = selection.refuse(DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--rung=2")
-
-    run.result.stderr.fnmatch_lines(["*--rung: 2 is not a rung of --ladder=1,4,8*"])
-
-
-def test_rung_with_an_output_directory(selection):
-    """`--rung` and an output directory are refused, naming the command that writes them."""
-    run = selection.refuse(
-        DeviceCases.MODULE,
-        "--machine=B200",
-        "--ladder=1,4,8",
-        "--rung=4",
-        "--selection-out-dir={out}",
+def test_smaller_allocation(selection):
+    """`--ladder=4` asks what one 4-GPU allocation can run, and publishes that one list."""
+    run = selection.run(
+        DeviceCases.MODULE, "--machine=B200", "--ladder=4", "--selection-out-dir={out}"
     )
 
-    run.result.stderr.fnmatch_lines(
-        ["*--selection-out-dir: cannot be combined with --rung*without --rung*every rung*"]
+    assert run.selected == [DeviceCases.UNMARKED, DeviceCases.TWO_GPUS]
+    assert run.written == ["B200-4gpu.ids", "B200.json"]
+    assert run.ids(4) == [DeviceCases.UNMARKED, DeviceCases.TWO_GPUS]
+
+
+def test_allocation_policy(selection):
+    """`--ladder=1,4,8` divides the machine: one list per rung."""
+    run = selection.run(
+        DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--selection-out-dir={out}"
     )
+
+    assert run.written == ["B200-1gpu.ids", "B200-4gpu.ids", "B200-8gpu.ids", "B200.json"]
+    assert run.record["ladder"] == [1, 4, 8]
+
+
+def test_kept_equals_published(selection):
+    """The kept node ids are exactly the published ones; a test above every rung is in neither."""
+    run = selection.run(
+        DeviceCases.MODULE, "--machine=B200", "--ladder=1,4", "--selection-out-dir={out}"
+    )
+
+    published = run.ids(1) + run.ids(4)
+    assert sorted(run.selected) == sorted(published)
+    assert DeviceCases.EIGHT_GPUS not in published
+    assert DeviceCases.EIGHT_RANKS not in published
+
+
+def test_no_rung_option(selection):
+    """`--rung` is not an option: a run keeps every rung's tests and publishes each list."""
+    run = selection.refuse(DeviceCases.MODULE, "--machine=B200", "--rung=4")
+
+    run.result.stderr.fnmatch_lines(["*unrecognized arguments: --rung=4*"])

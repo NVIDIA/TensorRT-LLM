@@ -14,7 +14,7 @@
 # limitations under the License.
 """Pytest entry point: deselect the tests a target machine cannot run.
 
-    pytest --collect-only -p qa_selection.plugin --machine=B200 --ladder=1,4,8
+    pytest --collect-only -p qa_selection.plugin --machine=B200 [--ladder=1,4,8]
 
 Load with `-p` on the command line. No hardware is touched: every decision is
 read from marks.
@@ -107,17 +107,16 @@ class MarkerDeclaration:
 
 
 class SelectionOptions:
-    """The plugin's four command-line options; `--help` states each one.
+    """The plugin's three command-line options; `--help` states each one.
 
-    `--ladder` states the run's GPU count and partitions what is written, and
-    `--rung` selects one of its parts. One machine per invocation.
+    `--machine` names what the rules are asked about, and `--ladder` the
+    allocations its GPUs are divided into. One machine per invocation.
     """
 
     GROUP = "qa selection"
 
     MACHINE = "qa_selection_machine"
     LADDER = "qa_selection_ladder"
-    RUNG = "qa_selection_rung"
     OUT_DIR = "qa_selection_out_dir"
 
     @classmethod
@@ -140,32 +139,23 @@ class SelectionOptions:
             metavar="RUNGS",
             default=None,
             help="ascending allocation sizes, comma separated, e.g. 1,4,8. "
-            "Defaults to one rung of the machine's GPUs per node. A test "
-            "needing more GPUs than the largest rung is deselected, and the "
-            "output holds one list per rung. No rung may exceed the "
+            "Defaults to one rung of the machine's GPUs per node. One rung "
+            "asks what a single allocation of that size can run; several "
+            "divide the machine by an allocation policy, each test landing "
+            "on the smallest rung that holds it. A test needing more GPUs "
+            "than the largest rung is deselected. No rung may exceed the "
             "machine's GPUs per node",
-        )
-        group.addoption(
-            "--rung",
-            dest=cls.RUNG,
-            metavar="N",
-            type=int,
-            default=None,
-            help="the allocation this run occupies: keep only the tests "
-            "the ladder assigned to the N-GPU rung. Must name one of its "
-            "rungs",
         )
         group.addoption(
             "--selection-out-dir",
             dest=cls.OUT_DIR,
             metavar="DIR",
             default=None,
-            help="write <machine>.json and the .ids lists here, creating the "
-            "directory if needed. Absent writes nothing. The directory is "
-            "written into and never emptied, so a leftover list of this "
-            "machine's from a different ladder is a usage error. Cannot be "
-            "combined with --rung: the same command without it writes every "
-            "rung's list in one pass",
+            help="write <machine>.json and one <machine>-<rung>gpu.ids per "
+            "rung here, creating the directory if needed. Absent writes "
+            "nothing. The directory is written into and never emptied, so a "
+            "leftover list of this machine's from a different ladder is a "
+            "usage error",
         )
 
     @classmethod
@@ -189,7 +179,6 @@ class SelectionOptions:
             return SelectionRequest.of(
                 machine=config.getoption(cls.MACHINE),
                 ladder=config.getoption(cls.LADDER),
-                rung=config.getoption(cls.RUNG),
                 out_dir=config.getoption(cls.OUT_DIR),
             )
         except SelectionError as error:

@@ -14,7 +14,7 @@
 # limitations under the License.
 """What one run was asked for, resolved and checked before anything is collected.
 
-    SelectionRequest.of(machine=..., ladder=..., rung=..., out_dir=...)
+    SelectionRequest.of(machine=..., ladder=..., out_dir=...)
 
 Plain values in, a request or None out, `SelectionError` when the caller must
 fix something. The options are named in the messages because they are this
@@ -37,7 +37,7 @@ class SelectionError(ValueError):
 
 @dataclass(frozen=True)
 class SelectionRequest:
-    """One run's target: a machine, its ladder, and which allocation this run occupies.
+    """One run's target: a machine, its ladder, and where to write.
 
     `profile` answers *what the rules allow here*. `ladder` answers *how many
     GPUs, in which allocations*; its largest rung is the run's GPU count.
@@ -46,7 +46,6 @@ class SelectionRequest:
     machine: str
     profile: MachineProfile
     ladder: Ladder
-    target_rung: Optional[int]
     out_dir: Optional[Path]
 
     @classmethod
@@ -54,7 +53,6 @@ class SelectionRequest:
         cls,
         machine: Optional[str],
         ladder: Optional[str] = None,
-        rung: Optional[int] = None,
         out_dir: Optional[str] = None,
     ) -> Optional["SelectionRequest"]:
         """This run's request, or None when no machine is named.
@@ -66,28 +64,16 @@ class SelectionRequest:
             return None
         profile = cls.profile_for(machine)
         parsed_ladder = cls.ladder_for(ladder, profile)
-        target_rung = cls.target_rung_for(rung, parsed_ladder)
         return cls(
             machine=machine,
             profile=profile,
             ladder=parsed_ladder,
-            target_rung=target_rung,
-            out_dir=cls.out_dir_for(out_dir, machine, parsed_ladder, target_rung),
+            out_dir=cls.out_dir_for(out_dir, machine, parsed_ladder),
         )
 
     @classmethod
-    def out_dir_for(
-        cls,
-        text: Optional[str],
-        machine: str,
-        ladder: Ladder,
-        target_rung: Optional[int],
-    ) -> Optional[Path]:
+    def out_dir_for(cls, text: Optional[str], machine: str, ladder: Ladder) -> Optional[Path]:
         """Where to write, or None when nothing is written.
-
-        Naming a rung and asking for artifacts at once is a usage error: the
-        run without `--rung` writes every rung's list from the same single
-        collection.
 
         The directory is created here rather than at write time so that a run
         which cannot produce its output says so before collecting, and says it
@@ -96,11 +82,6 @@ class SelectionRequest:
         """
         if text is None:
             return None
-        if target_rung is not None:
-            raise SelectionError(
-                "--selection-out-dir: cannot be combined with --rung; the same command "
-                "without --rung writes every rung's list in one pass"
-            )
         out_dir = Path(text)
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -152,19 +133,6 @@ class SelectionRequest:
                 f"{profile.max_gpu_per_node} GPUs per node"
             )
         return ladder
-
-    @staticmethod
-    def target_rung_for(rung: Optional[int], ladder: Ladder) -> Optional[int]:
-        """The allocation this run occupies, or None when it names none.
-
-        A rung outside the ladder is a usage error rather than a run that
-        selects nothing.
-        """
-        if rung is None:
-            return None
-        if rung not in ladder:
-            raise SelectionError(f"--rung: {rung} is not a rung of --ladder={ladder}")
-        return rung
 
     @staticmethod
     def profile_for(machine: str) -> MachineProfile:
