@@ -1740,26 +1740,24 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
         spec_config=spec_config,
     )
     try:
-        runner = SimpleNamespace(
-            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
-            _config=SimpleNamespace(
-                spec_config=spec_config,
-                max_draft_len=draft_len,
-                max_draft_loop_tokens=draft_len,
-                max_seq_len=manager.max_seq_len,
-                max_beam_width=1,
-                use_mrope=False,
-                is_encoder_decoder=False,
-            ),
-            get_runtime_tokens_per_gen_step=lambda length: length + 1,
-            _get_draft_kv_cache_manager=lambda _: None,
-            model=SimpleNamespace(
-                model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
-            ),
+        runner = object.__new__(DecoderRunner)
+        runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        runner._config = SimpleNamespace(
+            spec_config=spec_config,
+            max_draft_len=draft_len,
+            max_draft_loop_tokens=draft_len,
+            max_seq_len=manager.max_seq_len,
+            max_beam_width=1,
+            use_mrope=False,
+        )
+        runner.get_runtime_tokens_per_gen_step = lambda length: length + 1
+        runner._get_draft_kv_cache_manager = lambda _: None
+        runner.model = SimpleNamespace(
+            model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
         )
         resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
-        batch = DecoderRunner._create_cuda_graph_warmup_request(
-            runner, resources, batch_size=2, draft_len=draft_len
+        batch = runner._create_cuda_graph_warmup_request(
+            resources, batch_size=2, draft_len=draft_len
         )
         assert batch is not None
         assert len(batch.generation_requests) == 2

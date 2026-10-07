@@ -772,8 +772,8 @@ def _run_warmup_tracked(
         ),
         patch.object(
             model_engine._runner,
-            "_capture_mixed_encoder_decoder_cuda_graphs",
-            side_effect=tracker("mixed_cuda_graph"),
+            "_capture_additional_cuda_graphs",
+            side_effect=tracker("additional_cuda_graph"),
         ),
         patch.object(
             model_engine._runner,
@@ -1038,8 +1038,8 @@ class TestWarmupCleanup(unittest.TestCase):
             ) as generation,
             patch.object(
                 runner,
-                "_capture_mixed_encoder_decoder_cuda_graphs",
-                side_effect=lambda _: events.append(("stage", "mixed")),
+                "_capture_additional_cuda_graphs",
+                side_effect=lambda _: events.append(("stage", "additional")),
             ),
             patch.object(
                 runner,
@@ -1054,7 +1054,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 [
                     ("enter", "gen_cuda_graph_capture_seconds"),
                     ("stage", "generation"),
-                    ("stage", "mixed"),
+                    ("stage", "additional"),
                     ("exit", "gen_cuda_graph_capture_seconds"),
                     ("stage", "piecewise"),
                 ],
@@ -1071,7 +1071,7 @@ class TestWarmupCleanup(unittest.TestCase):
                     ("enter", "gen_cuda_graph_warmup_seconds"),
                     ("enter", "lora_autotune"),
                     ("stage", "generation"),
-                    ("stage", "mixed"),
+                    ("stage", "additional"),
                     *lora_cleanup_events,
                 ],
             )

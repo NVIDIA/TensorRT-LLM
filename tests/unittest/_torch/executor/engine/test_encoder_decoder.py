@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from contextlib import nullcontext
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM
 from tensorrt_llm._torch.pyexecutor.engine.runners import encoder_decoder as encoder_decoder_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderPreparedInputs
@@ -16,6 +18,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
     EncoderStage,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInputs
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 pytestmark = pytest.mark.cpu_only
@@ -200,6 +203,7 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
         )
 
     assert runner._encoder_stage is stage_type.return_value
+    assert runner._encoder_graph_shapes is shapes
     stage_type.assert_called_once_with(
         model, encoder_config, mapping=mapping, dist=dist, moe_load_balancer=None
     )
@@ -209,7 +213,6 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
         mapping=mapping,
         dist=dist,
         moe_load_balancer=None,
-        encoder_graph_shapes=shapes,
         input_processor=input_processor,
     )
 
@@ -244,4 +247,79 @@ def test_encoder_decoder_runner_releases_stage_before_decoder_graphs() -> None:
     assert calls.mock_calls == [
         call.stage.release_graphs(),
         call.decoder(),
+    ]
+
+
+def test_encoder_decoder_runner_disables_decoder_only_paths() -> None:
+    assert EncoderDecoderRunner._dummy_request_tokens == ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM
+    assert not EncoderDecoderRunner._context_warmups_supported
+    assert not EncoderDecoderRunner._context_graph_promotion_supported
+    assert not EncoderDecoderRunner._steady_gen_cache_supported
+    assert not EncoderDecoderRunner._eager_workspace_reclaim_supported
+
+
+@dataclass
+class _GraphRunnerConfig:
+    is_encoder_decoder: bool = False
+    enable_encoder_decoder_mixed_cuda_graph: bool = False
+
+
+@pytest.mark.parametrize(
+    ("encoder_graph_shapes", "cuda_graph_config", "mixed_enabled", "expected"),
+    [
+        (frozenset({(1, 16)}), object(), True, True),
+        (frozenset(), object(), True, False),
+        (frozenset({(1, 16)}), None, True, False),
+        (frozenset({(1, 16)}), object(), False, False),
+    ],
+)
+def test_encoder_decoder_graph_runner_config_gates_mixed_graphs(
+    encoder_graph_shapes: frozenset,
+    cuda_graph_config: object,
+    mixed_enabled: bool,
+    expected: bool,
+) -> None:
+    runner = object.__new__(EncoderDecoderRunner)
+    runner._encoder_graph_shapes = encoder_graph_shapes
+    runner._config = SimpleNamespace(
+        cuda_graph_config=cuda_graph_config,
+        enable_encoder_decoder_mixed_cuda_graph=mixed_enabled,
+    )
+
+    with patch.object(
+        DecoderRunner, "_cuda_graph_runner_config", return_value=_GraphRunnerConfig()
+    ):
+        config = runner._cuda_graph_runner_config()
+
+    assert config.is_encoder_decoder
+    assert config.enable_encoder_decoder_mixed_cuda_graph is expected
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+def test_encoder_decoder_release_context_frees_cross_kv(fails: bool) -> None:
+    runner = object.__new__(EncoderDecoderRunner)
+    requests = [object(), object()]
+    batch = ScheduledRequests()
+    batch.generation_requests = requests
+    cross_kv_cache_manager = Mock()
+    resource_manager = Mock()
+    resource_manager.get_resource_manager.side_effect = lambda key: (
+        cross_kv_cache_manager if key == ResourceManagerType.CROSS_KV_CACHE_MANAGER else None
+    )
+
+    with (
+        patch.object(
+            DecoderRunner, "_release_batch_context", return_value=nullcontext(batch)
+        ) as release_decoder,
+        pytest.raises(RuntimeError) if fails else nullcontext(),
+        runner._release_batch_context(batch, resource_manager) as released,
+    ):
+        assert released is batch
+        cross_kv_cache_manager.free_resources.assert_not_called()
+        if fails:
+            raise RuntimeError("capture failure")
+
+    release_decoder.assert_called_once_with(batch, resource_manager)
+    assert cross_kv_cache_manager.free_resources.call_args_list == [
+        call(request) for request in requests
     ]

@@ -309,7 +309,6 @@ def _make_forward_only_engine(
         original_max_total_draft_tokens=0,
         spec_dec_max_total_draft_tokens=0,
         use_mrope=False,
-        is_encoder_decoder=False,
         spec_config=None,
     )
     decoder.guided_decoder = None
@@ -1312,7 +1311,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 elif case == "beam":
                     engine._runner._config.max_beam_width = 2
                 elif case == "encoder_decoder":
-                    engine._runner._config.is_encoder_decoder = True
+                    engine._runner._context_graph_promotion_supported = False
                 elif case == "ple_recurrent_state":
                     engine.model.has_ple = True
                 elif case == "nested_ple_recurrent_state":

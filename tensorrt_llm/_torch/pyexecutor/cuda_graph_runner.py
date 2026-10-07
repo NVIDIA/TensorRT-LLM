@@ -33,9 +33,9 @@ from .scheduler import ScheduledRequests
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 # Gen dummies get prompt_len = token_num - 1. Before capturing enc-dec decode
-# graphs, prepare_cross_batch temporarily runs each dummy generation request
-# as a one-token context chunk to write its cross-KV cache, so enc-dec
-# dummies need one prompt token plus one generated token.
+# graphs, EncoderDecoderRunner._prepare_capture_batch temporarily runs each
+# dummy generation request as a one-token context chunk to write its cross-KV
+# cache, so enc-dec dummies need one prompt token plus one generated token.
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 
 

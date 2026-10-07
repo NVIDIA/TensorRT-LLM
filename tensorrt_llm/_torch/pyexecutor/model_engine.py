@@ -58,6 +58,7 @@ from .engine.runners.common import (_set_moe_a2a_warmup, make_scheduled_inputs,
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
 from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
 from .engine.runners.encoder_decoder import (EncoderDecoderRunner,
+                                             EncoderDecoderRunnerConfig,
                                              EncoderStageConfig)
 from .engine.runners.interface import (ModelRunner, PackedInputs,
                                        PackedModelRunner, ScheduledInputs,
@@ -659,7 +660,13 @@ class PyTorchModelEngine(ModelEngine):
             enable_autotuner=self.llm_args.enable_autotuner,
             is_encoder_decoder=True,
         )
+        runner_config = self._decoder_runner_config(
+            EncoderDecoderRunnerConfig,
+            enable_encoder_decoder_mixed_cuda_graph=(
+                self.llm_args.enable_encoder_decoder_mixed_cuda_graph),
+        )
         return self._initialize_decoder_runner(runner_cls,
+                                               runner_config,
                                                encoder_config=encoder_config)
 
     def _initialize_no_kv_cache_runner(
@@ -702,10 +709,11 @@ class PyTorchModelEngine(ModelEngine):
             moe_load_balancer=self.moe_load_balancer,
         )
 
-    def _initialize_decoder_runner(self, runner_cls: Type[DecoderRunner],
-                                   **runner_kwargs: Any) -> DecoderRunner:
-        assert self._model_caller is not None
-        runner_config = DecoderRunnerConfig(
+    def _decoder_runner_config(
+            self,
+            config_cls: Type[DecoderRunnerConfig] = DecoderRunnerConfig,
+            **extra_fields: Any) -> DecoderRunnerConfig:
+        return config_cls(
             max_batch_size=self.batch_size,
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
@@ -741,15 +749,22 @@ class PyTorchModelEngine(ModelEngine):
             torch_compile_prefill_only=self._torch_compile_prefill_only,
             use_mrope=self.use_mrope,
             is_multimodal=self.is_multimodal,
-            is_encoder_decoder=self._is_encoder_decoder_model(),
             mm_encoder_cache_enabled=self._mm_encoder_cache_enabled,
             enable_autotuner=self.llm_args.enable_autotuner,
             cuda_graph_specialize_lora=(
                 self.llm_args.lora_config is not None
                 and self.llm_args.lora_config.cuda_graph_specialize_lora),
-            enable_encoder_decoder_mixed_cuda_graph=(
-                self.llm_args.enable_encoder_decoder_mixed_cuda_graph),
+            **extra_fields,
         )
+
+    def _initialize_decoder_runner(
+            self,
+            runner_cls: Type[DecoderRunner],
+            runner_config: Optional[DecoderRunnerConfig] = None,
+            **runner_kwargs: Any) -> DecoderRunner:
+        assert self._model_caller is not None
+        if runner_config is None:
+            runner_config = self._decoder_runner_config()
         return runner_cls(
             self.model,
             runner_config,
